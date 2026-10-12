@@ -34,6 +34,7 @@ fn wait_on_a_dead_generation_with_a_spent_budget_is_typed_and_early() {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     })
     .expect("the sh child handshakes");
     sleep(Duration::from_millis(400)); // the child exits; the death lands
@@ -41,7 +42,7 @@ fn wait_on_a_dead_generation_with_a_spent_budget_is_typed_and_early() {
     // A 10 s drain budget on a corpse must not park: the death gate errors
     // out before the wait begins.
     let started = Instant::now();
-    let outcome = runtime.wait_diagnostics(Duration::from_secs(10));
+    let outcome = runtime.wait_output(Duration::from_secs(10));
     let error = outcome.expect_err("a dead generation with a spent budget cannot be waited on");
     assert!(
         matches!(&error, RuntimeError::Crashed { reason }

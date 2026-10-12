@@ -25,6 +25,7 @@ fn spec(script: &str, retries: u32, request_ms: u64, stderr: StdioPolicy) -> Spa
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr,
+        serve_queries: false,
     }
 }
 

@@ -61,6 +61,7 @@ fn spawn_live(args: &[&str]) -> PluginRuntime {
         current_dir: host_package_dir(),
         manifest,
         stderr: StdioPolicy::Inherit,
+        serve_queries: false,
     })
     .expect("dart run spawns the live fixture and completes the handshake")
 }

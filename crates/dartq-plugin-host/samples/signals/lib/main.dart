@@ -12,8 +12,9 @@
 /// census reports what registered (`lint=5 warning=0 fix=0 assist=5`).
 ///
 /// The wire faces are deterministic bridges, not the upstream rules'
-/// semantics (those need the analyzer AST, which the v1 wire does not carry;
-/// the Query API lands with PRD section 14.2): the lint face reports the
+/// semantics (those need the analyzer AST; parsed-level AST access is
+/// host-local and resolution-owned facts ride the T4 Query API over
+/// `request/query`): the lint face reports the
 /// census, and the fixes face serves one marker edit per registered assist —
 /// the wire has no separate assists method (assists reuse `request/fixes`),
 /// so the manifest advertises `fix` for that face.
@@ -65,7 +66,7 @@ Future<void> run({
               'census lint=${rules.length} warning=0 fix=0 assist=${assists.length}',
         ),
     ],
-    onRequestFixes: (file, offset, length) => [
+    onRequestFixes: (file, offset, length, queries) => [
       // One change per registered upstream assist, each replacing the
       // requested UTF-16 range with the marker (the edit-application face).
       for (var i = 0; i < assists.length; i++)

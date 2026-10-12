@@ -36,6 +36,7 @@ fn shutdown_without_a_reply_hits_the_budget_and_kills() {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     })
     .expect("the sh child handshakes");
 

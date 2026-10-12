@@ -130,8 +130,9 @@ fn discovery_spawns_the_fixture_and_round_trips_fixes() {
         .feed(&[engine], &files, &CyclePush::default())
         .expect("engine feed");
     let echoed = runtime
-        .wait_diagnostics(Duration::from_mins(1))
-        .expect("plugin diagnostics arrive");
+        .wait_output(Duration::from_mins(1))
+        .expect("plugin diagnostics arrive")
+        .diagnostics;
     assert_eq!(echoed.len(), 1);
     assert_eq!(echoed[0].code, "fixer/roundtrip");
     assert_eq!(echoed[0].severity, WireSeverity::Warning);

@@ -56,9 +56,12 @@ budget (pinned by the `dartq-plugin` integration suites, e.g.
 carries 10 Dart test files under `test/` (97 `test(` occurrences) covering
 the codec, handshake, registry, and live loop.
 
-Explicitly post-1.0: the engine Query API — producers currently see only
-the latest pushed diagnostic batch, and wider producer context awaits the
-Query API's general availability — and `registerLintRule` breadth: the
+Explicitly post-1.0: full resolved-context parity — a producer whose fix
+needs the type of an arbitrary expression *without* a query stays out (the
+T4 boundary); parsed-level AST context is host-local, and resolution-owned
+facts ride the Query API (`ProducerContext.queries`: the index query kinds
+plus `element_at` over reverse `request/query`, available when the `query`
+capability was negotiated). Also `registerLintRule` breadth: the
 shim accepts official-style `registerAssist`/`registerFixForRule`
 registration, while `registerLintRule` throws an `UnsupportedError` naming
 the anchor (pinned by `test/shim_plugin_test.dart`).

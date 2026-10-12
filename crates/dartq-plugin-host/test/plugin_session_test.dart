@@ -213,7 +213,7 @@ void main() {
     test('every reply echoes the id of the request it answers', () async {
       final session = PluginSession(
         config: _config(),
-        onRequestFixes: (file, offset, length) => const [],
+        onRequestFixes: (file, offset, length, queries) => const [],
       );
       await session.handleFrame(
         PluginFrame.request(41, methodInitialize, {
@@ -277,7 +277,7 @@ void main() {
         'serialized best-first', () async {
       final calls = <(String, int, int)>[];
       final session = await _ready(
-        onRequestFixes: (file, offset, length) {
+        onRequestFixes: (file, offset, length, queries) {
           calls.add((file, offset, length));
           return [
             const PrioritizedChange(
@@ -314,7 +314,7 @@ void main() {
     test('an async handler is awaited: the reply carries the future\'s '
         'changes', () async {
       final session = await _ready(
-        onRequestFixes: (file, offset, length) =>
+        onRequestFixes: (file, offset, length, queries) =>
             Future<List<PrioritizedChange>>.delayed(
               Duration.zero,
               () => [
@@ -349,7 +349,7 @@ void main() {
       'a malformed payload is a fatal protocol error, not an error reply',
       () async {
         final session = await _ready(
-          onRequestFixes: (file, offset, length) => const [],
+          onRequestFixes: (file, offset, length, queries) => const [],
         );
         for (final params in [
           {'offset': 0, 'length': 0}, // missing file
@@ -373,7 +373,7 @@ void main() {
       'a throwing handler propagates — the session never fabricates a fix',
       () async {
         final session = await _ready(
-          onRequestFixes: (file, offset, length) => throw StateError('boom'),
+          onRequestFixes: (file, offset, length, queries) => throw StateError('boom'),
         );
         await expectLater(
           session.handleFrame(
@@ -390,7 +390,7 @@ void main() {
 
     test('a handler whose future fails propagates the same way', () async {
       final session = await _ready(
-        onRequestFixes: (file, offset, length) =>
+        onRequestFixes: (file, offset, length, queries) =>
             Future<List<PrioritizedChange>>.error(StateError('async boom')),
       );
       await expectLater(

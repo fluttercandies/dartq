@@ -32,6 +32,7 @@ export 'src/frame.dart'
         methodInitialize,
         methodPluginConfig,
         methodRequestFixes,
+        methodRequestQuery,
         methodShutdown,
         protocolVersion;
 export 'src/host.dart' show runPluginHost, servePlugin;
@@ -50,8 +51,19 @@ export 'src/plugin_session.dart'
         EngineBatch,
         EngineDiagnosticsHandler,
         FixesHandler,
+        FrameWriter,
         PluginConfigHandler,
         PluginSession,
         SessionState;
+export 'src/query_api.dart'
+    show
+        DeclarationRow,
+        QueryApi,
+        QueryError,
+        QueryKind,
+        QueryRequest,
+        QueryTransport,
+        ReferenceRow,
+        SymbolAnswer;
 export 'src/registry.dart' show PluginRegistry, PluginRegistryImpl;
 export 'src/rule_runner.dart' show runRules;

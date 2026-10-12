@@ -54,6 +54,7 @@ fn analyze_demand_without_diagnostics_is_killed_at_the_callback_budget() {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     })
     .expect("the sh child handshakes");
 
@@ -68,11 +69,11 @@ fn analyze_demand_without_diagnostics_is_killed_at_the_callback_budget() {
     // demand stays open across cycles (a re-feed must not refresh the
     // clock), so the waits keep returning empty until the monitor fires.
     let started = Instant::now();
-    let mut outcome = Ok(Vec::new());
+    let mut outcome = Ok(());
     for _ in 0..100 {
         outcome = runtime
             .feed(&row, &files, &CyclePush::default())
-            .and_then(|()| runtime.wait_diagnostics(Duration::from_millis(50)));
+            .and_then(|()| runtime.wait_output(Duration::from_millis(50)).map(|_| ()));
         if outcome.is_err() {
             break;
         }

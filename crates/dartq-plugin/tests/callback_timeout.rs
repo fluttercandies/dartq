@@ -39,6 +39,7 @@ fn dart_plugin_over_callback_budget_is_killed_and_restarted() {
         current_dir: host_package_dir(),
         manifest,
         stderr: StdioPolicy::Inherit,
+        serve_queries: false,
     })
     .expect("dart host spawns and handshakes");
 
@@ -101,6 +102,7 @@ fn repeated_callback_overruns_exhaust_the_budget_into_a_terminal_crash() {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     })
     .expect("the sh child handshakes");
 

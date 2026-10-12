@@ -11,7 +11,7 @@
 //! - [`PluginRuntime::feed`] pushes the engine's merged diagnostics to the
 //!   plugin as one `notification/engine_diagnostics` batch (its diagnostic
 //!   context); [`FileTable`] resolves [`FileId`]s to the wire's path strings.
-//! - [`PluginRuntime::take_diagnostics`] drains the diagnostics the plugin
+//! - [`PluginRuntime::take_output`] drains the diagnostics the plugin
 //!   emitted back (`notification/diagnostic`) for the caller to merge into
 //!   its output. Plugin findings keep their wire shape here: engine
 //!   [`CodeInfo`]s are `&'static`-interned, so namespacing plugin codes into
@@ -93,12 +93,13 @@ use dartq_source::{FileId, FileTable};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::capability::CapabilitySet;
+use crate::capability::{Capability, CapabilitySet};
 use crate::frame::{Frame, FrameDecoder, MAX_FRAME_SIZE, ProtocolError, encode_frame};
 use crate::manifest::Manifest;
 use crate::session::{
-    CycleConfig, CyclePush, FixesReply, Incoming, PluginDiagnostic, RuleCensus, Session,
-    SessionError, SessionState, Severity, engine_diagnostics_frame, plugin_config_frame,
+    CycleConfig, CyclePush, FixesReply, Incoming, PluginDiagnostic, QueryRequest, RuleCensus,
+    Session, SessionError, SessionState, Severity, engine_diagnostics_frame, plugin_config_frame,
+    query_error_frame, query_reply_frame,
 };
 use crate::stats::{PluginStats, PluginStatsSnapshot};
 
@@ -145,14 +146,16 @@ const RSS_SAMPLING_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "
 /// poll window instead of silently ending the enforcement.
 const RSS_SAMPLE_TOLERANCE: u32 = 3;
 
-/// Pending-diagnostics fuse: a plugin that queues more than this many
-/// un-drained diagnostics is torn down as a protocol violation instead of
-/// growing the buffer without bound — the same `10_000` fuse the parser's
-/// `MAX_DIAGNOSTICS` and the scanner's per-file cap enforce.
-const MAX_PENDING_DIAGNOSTICS: usize = 10_000;
+/// Pending-output fuse: a plugin that queues more than this many un-drained
+/// diagnostics *or reverse queries* is torn down as a protocol violation
+/// instead of growing the buffer without bound — the same `10_000` fuse the
+/// parser's `MAX_DIAGNOSTICS` and the scanner's per-file cap enforce. The
+/// two queues share one fuse: both are un-drained reader output, and a
+/// plugin flooding either is the same isolation breach.
+const MAX_PENDING_OUTPUT: usize = 10_000;
 
 /// Reply-burst settle window of the drain: after the first diagnostic of a
-/// reply arrives, [`PendingDiagnostics::wait_for_burst`] keeps absorbing
+/// reply arrives, [`PendingOutput::wait_for_output`] keeps absorbing
 /// rows this long of pipe quiet before handing the batch over. A plugin
 /// serves one analyze cycle with contiguous `notification/diagnostic`
 /// frames (the host loop writes them back-to-back), so without the window
@@ -181,6 +184,14 @@ pub struct SpawnSpec {
     /// startup buffer so a startup failure surfaces with the host's own
     /// error output instead of a bare "host died".
     pub stderr: StdioPolicy,
+    /// Whether this session serves the plugin's `request/query` reverse
+    /// requests (T4). Offering the `query` capability at the handshake is
+    /// gated on this: a face without a query server (the fix faces) never
+    /// advertises it, so a querying producer sees the capability absent
+    /// instead of timing out against a core that cannot answer. The analyze
+    /// face (the daemon's plugin set) opts in — its cycle pump serves
+    /// queries against the session's current engine view.
+    pub serve_queries: bool,
 }
 
 /// The stderr routing of the plugin process.
@@ -213,7 +224,9 @@ impl StdioPolicy {
 
 impl SpawnSpec {
     /// The manifest contract's default launch: run the manifest's entrypoint
-    /// script with `dart` inside the plugin directory.
+    /// script with `dart` inside the plugin directory. Query serving stays
+    /// off — a caller with a query server (the daemon's analyze face) flips
+    /// [`SpawnSpec::serve_queries`].
     #[must_use]
     pub fn dart(plugin_dir: &Path, manifest: Manifest) -> Self {
         Self {
@@ -222,6 +235,7 @@ impl SpawnSpec {
             current_dir: plugin_dir.to_path_buf(),
             manifest,
             stderr: StdioPolicy::Capture,
+            serve_queries: false,
         }
     }
 }
@@ -290,6 +304,11 @@ enum ProtocolEvent {
     Initialized(CapabilitySet),
     /// The `request/fixes` reply with the correlation id it completes.
     FixesReply { id: u64, reply: FixesReply },
+    /// The reader queued one or more of the plugin's reverse
+    /// `request/query` frames: the fixes/shutdown wait loops wake on this
+    /// to pump them (serve, or decline when no server exists) instead of
+    /// letting a querying producer stall its own reply past the budget.
+    QueriesQueued,
     /// The `shutdown` reply was accepted.
     ShutdownComplete,
     /// The session ended abnormally (protocol violation or lost stream).
@@ -308,68 +327,121 @@ enum WriterCommand {
     Close,
 }
 
-/// The per-generation diagnostic queue: the reader fills it, the handle
-/// drains it, and every push signals [`Self::wait_for_burst`] so the handle
-/// parks instead of polling.
+/// The per-generation reader output queue: plugin diagnostics and reverse
+/// queries share one bounded queue and one signal — the handle drains it at
+/// its interaction points, and every push wakes a parked waiter so the
+/// handle parks instead of polling.
 #[derive(Debug, Default)]
-struct PendingDiagnostics {
-    queue: Mutex<Vec<PluginDiagnostic>>,
+struct PendingOutput {
+    queues: Mutex<PendingQueues>,
     signal: Condvar,
 }
 
-impl PendingDiagnostics {
+/// The queued halves of [`PendingOutput`].
+#[derive(Debug, Default)]
+struct PendingQueues {
+    diagnostics: Vec<PluginDiagnostic>,
+    queries: Vec<PendingQuery>,
+}
+
+impl PendingOutput {
     /// Queues one plugin diagnostic and wakes a parked waiter. Past
-    /// [`MAX_PENDING_DIAGNOSTICS`] the queue is a protocol violation — a
-    /// plugin flooding diagnostics is torn down like any other contract
-    /// break. `Err` carries the teardown reason.
+    /// [`MAX_PENDING_OUTPUT`] combined un-drained rows the queue is a
+    /// protocol violation — a plugin flooding output is torn down like any
+    /// other contract break. `Err` carries the teardown reason.
     fn push(&self, diagnostic: PluginDiagnostic) -> Result<(), String> {
-        let mut queue = self.queue.lock().expect("pending diagnostics lock");
-        if queue.len() >= MAX_PENDING_DIAGNOSTICS {
+        let mut queues = self.queues.lock().expect("pending output lock");
+        if queues.diagnostics.len() + queues.queries.len() >= MAX_PENDING_OUTPUT {
             return Err(format!(
-                "plugin exceeded the {MAX_PENDING_DIAGNOSTICS}-diagnostic pending cap"
+                "plugin exceeded the {MAX_PENDING_OUTPUT}-row pending cap"
             ));
         }
-        queue.push(diagnostic);
+        queues.diagnostics.push(diagnostic);
         self.signal.notify_all();
         Ok(())
     }
 
-    /// Takes every queued diagnostic (the handle-side drain).
-    fn take_all(&self) -> Vec<PluginDiagnostic> {
-        std::mem::take(&mut self.queue.lock().expect("pending diagnostics lock"))
+    /// Queues one reverse query (the plugin's own correlation id) and wakes
+    /// a parked waiter. Queries do **not** close the analyze demand's
+    /// clock — a query round trip eats the plugin's own callback budget
+    /// (§14.3 CPU row): the clock closes when diagnostics are produced.
+    /// Shares the diagnostics fuse (see [`PendingOutput::push`]).
+    fn push_query(&self, query: PendingQuery) -> Result<(), String> {
+        let mut queues = self.queues.lock().expect("pending output lock");
+        if queues.diagnostics.len() + queues.queries.len() >= MAX_PENDING_OUTPUT {
+            return Err(format!(
+                "plugin exceeded the {MAX_PENDING_OUTPUT}-row pending cap"
+            ));
+        }
+        queues.queries.push(query);
+        self.signal.notify_all();
+        Ok(())
     }
 
-    /// Parks until diagnostics arrived and the reply burst settled, or
-    /// `deadline` passes (`None`). A non-empty queue on entry skips the
-    /// first-row wait and only settles the burst. The deadline bounds the
-    /// whole wait exactly — the settle window never extends past it — and a
-    /// push wakes the waiter immediately; there is no poll tick.
-    fn wait_for_burst(&self, deadline: Instant) -> Option<Vec<PluginDiagnostic>> {
-        let mut queue = self.queue.lock().expect("pending diagnostics lock");
-        while queue.is_empty() {
-            let remaining = deadline.checked_duration_since(Instant::now())?;
+    /// Takes every queued diagnostic (the diagnostics-only drain).
+    fn take_all(&self) -> Vec<PluginDiagnostic> {
+        std::mem::take(&mut self.queues.lock().expect("pending output lock").diagnostics)
+    }
+
+    /// How many reverse queries are queued (a peek — the queue is left for
+    /// [`PendingOutput::take_queries`], `serve_queries`'s handle).
+    fn queued_queries(&self) -> usize {
+        self.queues
+            .lock()
+            .expect("pending output lock")
+            .queries
+            .len()
+    }
+
+    /// Takes every queued reverse query, leaving diagnostics queued.
+    fn take_queries(&self) -> Vec<PendingQuery> {
+        std::mem::take(&mut self.queues.lock().expect("pending output lock").queries)
+    }
+
+    /// Parks until diagnostics arrived and the reply burst settled, or a
+    /// reverse query arrived (a query wakes the wait immediately, no settle:
+    /// the plugin is stalled awaiting its answer), or `deadline` passes
+    /// (`None`). Returns the queued diagnostics and how many reverse queries
+    /// are queued (a peek — the queries stay queued for `serve_queries`, the
+    /// one consumer that can answer them). The deadline bounds the whole
+    /// wait exactly — the settle window never extends past it.
+    fn wait_for_output(&self, deadline: Instant) -> (Vec<PluginDiagnostic>, usize) {
+        let mut queues = self.queues.lock().expect("pending output lock");
+        while queues.diagnostics.is_empty() && queues.queries.is_empty() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return (Vec::new(), 0);
+            };
             let (woken, _) = self
                 .signal
-                .wait_timeout(queue, remaining)
-                .expect("pending diagnostics lock");
-            queue = woken;
+                .wait_timeout(queues, remaining)
+                .expect("pending output lock");
+            queues = woken;
         }
-        // First row is in. The plugin answers one analyze cycle with
-        // contiguous notification frames; hold through a quiet window so
-        // the drain hands over the whole burst, never its first line.
+        if queues.diagnostics.is_empty() {
+            // Queries only: no burst to settle — hand the diagnostics over
+            // now; the queries stay queued for the pump.
+            return (
+                std::mem::take(&mut queues.diagnostics),
+                queues.queries.len(),
+            );
+        }
+        // First diagnostic row is in. The plugin answers one analyze cycle
+        // with contiguous notification frames; hold through a quiet window
+        // so the drain hands over the whole burst, never its first line.
+        // Reverse queries arriving inside the window ride along.
         loop {
             let now = Instant::now();
             let settle_end = deadline.min(now + BURST_SETTLE);
             if now >= settle_end {
                 break;
             }
-            let seen = queue.len();
+            let seen = queues.diagnostics.len();
             let (woken, timed_out) = self
                 .signal
-                .wait_timeout(queue, settle_end - now)
-                .expect("pending diagnostics lock");
-            queue = woken;
-            if queue.len() > seen {
+                .wait_timeout(queues, settle_end - now)
+                .expect("pending output lock");
+            queues = woken;
+            if queues.diagnostics.len() > seen {
                 // More of the burst arrived (possibly while the notify was
                 // racing this wait): settle again from now.
                 continue;
@@ -380,7 +452,10 @@ impl PendingDiagnostics {
             }
             // Spurious wake: keep waiting within the same window.
         }
-        Some(std::mem::take(&mut queue))
+        (
+            std::mem::take(&mut queues.diagnostics),
+            queues.queries.len(),
+        )
     }
 }
 
@@ -526,6 +601,28 @@ fn elapsed_millis(created: Instant) -> u64 {
     u64::try_from(created.elapsed().as_millis()).unwrap_or(AnalyzeClock::CLOSED - 1)
 }
 
+/// One queued reverse query: the plugin's correlation id plus the parsed
+/// request. The caller answers it through [`PluginRuntime::serve_queries`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingQuery {
+    /// The plugin's correlation id for this request (its own id space).
+    pub id: u64,
+    /// The parsed request payload.
+    pub request: QueryRequest,
+}
+
+/// One drain of the reader's output queue: the plugin diagnostics the
+/// caller merges, plus the count of reverse queries still queued — the
+/// caller answers those through [`PluginRuntime::serve_queries`], the one
+/// consumer that can write their replies.
+#[derive(Debug, Default)]
+pub struct CycleDrain {
+    /// The diagnostics emitted since the last drain, in arrival order.
+    pub diagnostics: Vec<PluginDiagnostic>,
+    /// How many reverse queries are queued, awaiting `serve_queries`.
+    pub pending_queries: usize,
+}
+
 /// One live plugin: child process, session, isolation monitor, counters.
 ///
 /// Created by [`PluginRuntime::spawn`]; `&mut self` methods make the handle
@@ -545,7 +642,7 @@ pub struct PluginRuntime {
     acks: mpsc::Receiver<std::io::Result<()>>,
     child: Arc<Mutex<Option<Child>>>,
     events: mpsc::Receiver<ProtocolEvent>,
-    pending: Arc<PendingDiagnostics>,
+    pending: Arc<PendingOutput>,
     analyze_clock: Arc<AnalyzeClock>,
     running: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
@@ -601,7 +698,7 @@ impl PluginRuntime {
             acks: mpsc::channel().1,
             child: Arc::new(Mutex::new(None)),
             events,
-            pending: Arc::new(PendingDiagnostics::default()),
+            pending: Arc::new(PendingOutput::default()),
             analyze_clock: Arc::new(AnalyzeClock::new()),
             running: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
@@ -702,9 +799,12 @@ impl PluginRuntime {
         Ok(())
     }
 
-    /// Drains the diagnostics the plugin emitted since the last call
-    /// (`notification/diagnostic`), in arrival order. The caller merges them
-    /// into its output (namespacing the codes is the output layer's job).
+    /// Drains the reader's diagnostics queue: the diagnostics the plugin
+    /// emitted since the last call (`notification/diagnostic`), in arrival
+    /// order. Reverse queries are **not** consumed — [`CycleDrain::pending_queries`]
+    /// reports how many are queued, and [`PluginRuntime::serve_queries`]
+    /// answers them. The caller merges the diagnostics into its output
+    /// (namespacing the codes is the output layer's job).
     ///
     /// # Errors
     ///
@@ -712,49 +812,105 @@ impl PluginRuntime {
     ///
     /// # Panics
     ///
-    /// Panics when the internal pending-diagnostics mutex is poisoned — a
-    /// thread panicked while holding it, a program bug, not a plugin failure.
-    pub fn take_diagnostics(&mut self) -> Result<Vec<PluginDiagnostic>, RuntimeError> {
+    /// Panics when the internal pending-output mutex is poisoned — a thread
+    /// panicked while holding it, a program bug, not a plugin failure.
+    pub fn take_output(&mut self) -> Result<CycleDrain, RuntimeError> {
         self.ensure_alive()?;
-        Ok(self.pending.take_all())
+        Ok(CycleDrain {
+            diagnostics: self.pending.take_all(),
+            pending_queries: self.pending.queued_queries(),
+        })
     }
 
-    /// [`Self::take_diagnostics`] with a wait: parks on the reader's push
-    /// signal until diagnostics arrived, then holds through one
-    /// [`BURST_SETTLE`] quiet window so a synchronous reply — one analyze
-    /// cycle answered with contiguous `notification/diagnostic` frames —
-    /// drains as the whole burst, never as its first line. The caller's
-    /// deadline bounds the whole wait exactly (the daemon's per-cycle drain
-    /// budget stays exact); there is no poll tick. A child death during the
-    /// wait restarts it, within budget: the parked phase may run to the
-    /// deadline on a dead child, and the final alive gate performs the
-    /// restart before the empty hand returns.
+    /// [`Self::take_output`] with a wait: parks on the reader's push signal
+    /// until diagnostics arrived (holding through one [`BURST_SETTLE`] quiet
+    /// window so a synchronous reply — one analyze cycle answered with
+    /// contiguous `notification/diagnostic` frames — drains as the whole
+    /// burst, never as its first line) or a reverse query arrived (returned
+    /// immediately, no settle — the plugin is stalled awaiting its answer).
+    /// The caller's deadline bounds the whole wait exactly (the daemon's
+    /// per-cycle drain budget stays exact); there is no poll tick. A child
+    /// death during the wait restarts it, within budget: the parked phase
+    /// may run to the deadline on a dead child, and the final alive gate
+    /// performs the restart before the empty drain returns.
     ///
     /// # Errors
     ///
     /// Restart budget exhaustion and transport failures, per [`RuntimeError`].
-    pub fn wait_diagnostics(
-        &mut self,
-        timeout: Duration,
-    ) -> Result<Vec<PluginDiagnostic>, RuntimeError> {
+    pub fn wait_output(&mut self, timeout: Duration) -> Result<CycleDrain, RuntimeError> {
         // Eager restart of a child that died since the last interaction, so
         // the wait below runs against a live generation (the crash-path
         // posture: restart at the caller's interaction, never lazily).
         self.ensure_alive()?;
         let deadline = Instant::now() + timeout;
-        match self.pending.wait_for_burst(deadline) {
-            Some(batch) => Ok(batch),
-            // Deadline: one final alive-gated drain — a push racing the
-            // expiry is still honored, and a death during the wait gets its
-            // restart (or its error) here rather than at the next
-            // interaction.
-            None => self.take_diagnostics(),
+        let (diagnostics, pending_queries) = self.pending.wait_for_output(deadline);
+        Ok(CycleDrain {
+            diagnostics,
+            pending_queries,
+        })
+    }
+
+    /// Answers the plugin's queued reverse `request/query` frames through
+    /// [server], one reply frame per query under the same correlation id
+    /// ([`query_reply_frame`]; a server that declines with `Err` answers the
+    /// wire's error channel via [`query_error_frame`] — the session stays
+    /// up). Queries are served in arrival order; a write failure surfaces
+    /// and leaves the remaining queries queued for the next call. Queries
+    /// that arrive while this call runs are served at the caller's next
+    /// pump.
+    ///
+    /// # Errors
+    ///
+    /// Transport failures per [`RuntimeError`]; the server's own failures
+    /// ride the wire as error replies, not through this result.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an internal mutex is poisoned — a thread panicked while
+    /// holding it, a program bug, not a plugin failure.
+    pub fn serve_queries(
+        &mut self,
+        server: &mut dyn FnMut(&PendingQuery) -> Result<serde_json::Map<String, Value>, String>,
+    ) -> Result<usize, RuntimeError> {
+        let queries = self.pending.take_queries();
+        let served = queries.len();
+        for query in &queries {
+            match server(query) {
+                Ok(params) => self.write_frame(&query_reply_frame(query.id, params))?,
+                Err(message) => self.write_frame(&query_error_frame(query.id, &message))?,
+            }
         }
+        Ok(served)
+    }
+
+    /// Declines the plugin's queued reverse queries with error replies —
+    /// the posture of a face whose session negotiated `query` but has no
+    /// server at this interaction (a querying producer fails immediately
+    /// with a typed message instead of stalling its own reply past the
+    /// callback budget).
+    pub fn decline_queued_queries(&mut self) -> Result<(), RuntimeError> {
+        let queries = self.pending.take_queries();
+        for query in &queries {
+            self.write_frame(&query_error_frame(
+                query.id,
+                "the `query` face has no server on this session (queries are only served on \
+                 the analyze face)",
+            ))?;
+        }
+        Ok(())
     }
 
     /// Sends `request/fixes` for `file` at the given UTF-16 range and awaits
     /// the reply under the manifest's `callback_ms` budget (§14.3 CPU row).
     /// Requires the `fix` capability to have been negotiated.
+    ///
+    /// A producer that queries while its fixes are computed stalls its own
+    /// reply, so the wait pumps the plugin's reverse queries: this
+    /// signature-less form has no query server and **declines** every query
+    /// queued while the reply is awaited (an immediate typed error reply on
+    /// the wire — the querying producer fails fast instead of timing out);
+    /// [`Self::request_fixes_serving`] is the serving form for faces that
+    /// can answer.
     ///
     /// A child that died since the last call is restarted here (within
     /// budget) before the request. An overrun kill consumes one restart and
@@ -780,6 +936,38 @@ impl PluginRuntime {
         offset: u64,
         length: u64,
     ) -> Result<FixesReply, RuntimeError> {
+        self.request_fixes_inner(file, offset, length, None)
+    }
+
+    /// [`Self::request_fixes`] with a query server: the plugin's reverse
+    /// queries queued while the fixes reply is awaited are answered through
+    /// [server] (`Err` answers the wire's error channel — the session stays
+    /// up). This is the form a query-capable face drives producers with;
+    /// the plain form declines instead.
+    ///
+    /// # Errors
+    ///
+    /// Per [`Self::request_fixes`]; the server's own failures ride the wire
+    /// as error replies, not through this result.
+    pub fn request_fixes_serving(
+        &mut self,
+        file: &str,
+        offset: u64,
+        length: u64,
+        server: &mut dyn FnMut(&PendingQuery) -> Result<serde_json::Map<String, Value>, String>,
+    ) -> Result<FixesReply, RuntimeError> {
+        self.request_fixes_inner(file, offset, length, Some(server))
+    }
+
+    fn request_fixes_inner(
+        &mut self,
+        file: &str,
+        offset: u64,
+        length: u64,
+        mut server: Option<
+            &mut dyn FnMut(&PendingQuery) -> Result<serde_json::Map<String, Value>, String>,
+        >,
+    ) -> Result<FixesReply, RuntimeError> {
         self.ensure_alive()?;
         let frame = self
             .session
@@ -791,48 +979,66 @@ impl PluginRuntime {
 
         let callback_ms = self.callback_timeout.as_millis();
         let deadline = Instant::now() + self.callback_timeout;
-        match self
-            .events
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        {
-            Ok(ProtocolEvent::FixesReply { id, reply }) => {
-                if id != request_id {
+        loop {
+            match self
+                .events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(ProtocolEvent::FixesReply { id, reply }) => {
+                    if id != request_id {
+                        return Err(RuntimeError::Crashed {
+                            reason: format!(
+                                "`request/fixes` reply id {id} does not match the outstanding \
+                                 request {request_id}"
+                            ),
+                        });
+                    }
+                    return Ok(reply);
+                }
+                // The plugin queried while its fixes were being computed:
+                // pump now, or the producer stalls its own reply past the
+                // budget. A queued query the pump cannot answer here gets
+                // the immediate error reply (the session stays up).
+                Ok(ProtocolEvent::QueriesQueued) => match server.as_deref_mut() {
+                    Some(server) => {
+                        self.serve_queries(server)?;
+                    }
+                    None => self.decline_queued_queries()?,
+                },
+                // The death slot is authoritative (the reader records the
+                // cause before sending the event; killers record before
+                // killing), so build the error from it — which also adds the
+                // uniform restart-budget suffix at the accounting point. A
+                // closed event channel is the same death observed from the
+                // reader side.
+                Ok(ProtocolEvent::Dead) | Err(RecvTimeoutError::Disconnected) => {
+                    return Err(self.crash_error());
+                }
+                Ok(ProtocolEvent::Initialized(_)) => {
                     return Err(RuntimeError::Crashed {
-                        reason: format!(
-                            "`request/fixes` reply id {id} does not match the outstanding \
-                             request {request_id}"
-                        ),
+                        reason: "plugin re-handshaked mid-session".to_owned(),
                     });
                 }
-                Ok(reply)
-            }
-            // The death slot is authoritative (the reader records the cause
-            // before sending the event; killers record before killing), so
-            // build the error from it — which also adds the uniform
-            // restart-budget suffix at the accounting point. A closed event
-            // channel is the same death observed from the reader side.
-            Ok(ProtocolEvent::Dead) | Err(RecvTimeoutError::Disconnected) => {
-                Err(self.crash_error())
-            }
-            Ok(ProtocolEvent::Initialized(_)) => Err(RuntimeError::Crashed {
-                reason: "plugin re-handshaked mid-session".to_owned(),
-            }),
-            Ok(ProtocolEvent::ShutdownComplete) => Err(RuntimeError::Crashed {
-                reason: "plugin answered shutdown before request/fixes".to_owned(),
-            }),
-            Err(RecvTimeoutError::Timeout) => {
-                // §14.3 CPU row: a callback that overruns its budget is a
-                // misbehaving child — kill it and consume one restart so the
-                // consumption is observable at this error site.
-                let reason = format!(
-                    "`request/fixes` was not answered within the {callback_ms} ms callback budget"
-                );
-                *self.death.lock().expect("death lock") = Some(reason);
-                self.kill_child();
-                self.ensure_alive()?;
-                Err(RuntimeError::CallbackTimeout {
-                    ms: u64::try_from(callback_ms).unwrap_or(u64::MAX),
-                })
+                Ok(ProtocolEvent::ShutdownComplete) => {
+                    return Err(RuntimeError::Crashed {
+                        reason: "plugin answered shutdown before request/fixes".to_owned(),
+                    });
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // §14.3 CPU row: a callback that overruns its budget is a
+                    // misbehaving child — kill it and consume one restart so the
+                    // consumption is observable at this error site.
+                    let reason = format!(
+                        "`request/fixes` was not answered within the {callback_ms} ms callback \
+                         budget"
+                    );
+                    *self.death.lock().expect("death lock") = Some(reason);
+                    self.kill_child();
+                    self.ensure_alive()?;
+                    return Err(RuntimeError::CallbackTimeout {
+                        ms: u64::try_from(callback_ms).unwrap_or(u64::MAX),
+                    });
+                }
             }
         }
     }
@@ -874,30 +1080,45 @@ impl PluginRuntime {
         let frame = self.session.lock().expect("session lock").send_shutdown()?;
         self.write_frame(&frame)?;
 
-        let outcome = match self.events.recv_timeout(
-            self.request_deadline()
-                .saturating_duration_since(Instant::now()),
-        ) {
-            Ok(ProtocolEvent::ShutdownComplete) => Ok(()),
-            // Authoritative death slot, as in `request_fixes` (see there);
-            // a closed channel is the same death from the reader side.
-            Ok(ProtocolEvent::Dead) | Err(RecvTimeoutError::Disconnected) => {
-                Err(self.crash_error())
-            }
-            Ok(ProtocolEvent::Initialized(_)) => Err(RuntimeError::Crashed {
-                reason: "plugin re-handshaked mid-session".to_owned(),
-            }),
-            // Unreachable through the session machine (shutdown is sent only
-            // from Ready with the fixes reply already consumed); a stray
-            // reply is a contract break like any other.
-            Ok(ProtocolEvent::FixesReply { .. }) => Err(RuntimeError::Crashed {
-                reason: "unsolicited request/fixes reply".to_owned(),
-            }),
-            Err(RecvTimeoutError::Timeout) => {
-                self.kill_child();
-                Err(RuntimeError::ShutdownTimeout {
-                    ms: u64::try_from(self.request_timeout.as_millis()).unwrap_or(u64::MAX),
-                })
+        // One budget for the whole wait: a crossing query re-awaits within
+        // the same deadline, so a chatty teardown cannot extend it.
+        let deadline = self.request_deadline();
+        let outcome = loop {
+            match self
+                .events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(ProtocolEvent::ShutdownComplete) => break Ok(()),
+                // Authoritative death slot, as in `request_fixes` (see there);
+                // a closed channel is the same death from the reader side.
+                Ok(ProtocolEvent::Dead) | Err(RecvTimeoutError::Disconnected) => {
+                    break Err(self.crash_error());
+                }
+                Ok(ProtocolEvent::Initialized(_)) => {
+                    break Err(RuntimeError::Crashed {
+                        reason: "plugin re-handshaked mid-session".to_owned(),
+                    });
+                }
+                // Unreachable through the session machine (shutdown is sent
+                // only from Ready with the fixes reply already consumed); a
+                // stray reply is a contract break like any other.
+                Ok(ProtocolEvent::FixesReply { .. }) => {
+                    break Err(RuntimeError::Crashed {
+                        reason: "unsolicited request/fixes reply".to_owned(),
+                    });
+                }
+                // A query crossing the shutdown request was queued (the
+                // session machine tolerates the window); the session is
+                // terminating and the query dies with the runtime — no
+                // answer is coming, which the host's own teardown absorbs.
+                // Keep waiting for the reply within the same deadline.
+                Ok(ProtocolEvent::QueriesQueued) => continue,
+                Err(RecvTimeoutError::Timeout) => {
+                    self.kill_child();
+                    break Err(RuntimeError::ShutdownTimeout {
+                        ms: u64::try_from(self.request_timeout.as_millis()).unwrap_or(u64::MAX),
+                    });
+                }
             }
         };
         if outcome.is_ok() {
@@ -955,6 +1176,20 @@ impl PluginRuntime {
         self.launch_with_budget()
     }
 
+    /// The capabilities the core offers at the handshake: everything the
+    /// protocol defines, minus `query` when this session has no query
+    /// server — negotiation must honestly represent what this session can
+    /// serve, so a querying producer on a fix face sees the capability
+    /// absent at the host side instead of stalling against a core that
+    /// cannot answer.
+    fn local_capabilities(serve_queries: bool) -> CapabilitySet {
+        let mut caps = CapabilitySet::all();
+        if !serve_queries {
+            caps.remove(Capability::Query);
+        }
+        caps
+    }
+
     /// Spawns one child generation and completes its handshake.
     fn launch_once(&mut self) -> Result<(), RuntimeError> {
         let mut command = Command::new(&self.spec.program);
@@ -991,10 +1226,12 @@ impl PluginRuntime {
 
         // Fresh per-generation state (the previous generation's Arcs stay
         // with its threads, which wind down on their own flags).
-        self.session = Arc::new(Mutex::new(Session::new(CapabilitySet::all())));
+        self.session = Arc::new(Mutex::new(Session::new(Self::local_capabilities(
+            self.spec.serve_queries,
+        ))));
         let (events_tx, events_rx) = mpsc::channel();
         self.events = events_rx;
-        self.pending = Arc::new(PendingDiagnostics::default());
+        self.pending = Arc::new(PendingOutput::default());
         self.analyze_clock = Arc::new(AnalyzeClock::new());
         self.running = Arc::new(AtomicBool::new(true));
         self.alive = Arc::new(AtomicBool::new(true));
@@ -1055,6 +1292,11 @@ impl PluginRuntime {
             // break like any other.
             Ok(ProtocolEvent::FixesReply { .. }) => Err(RuntimeError::Crashed {
                 reason: "unsolicited request/fixes reply".to_owned(),
+            }),
+            // Unreachable before the handshake completes (nothing has been
+            // fed, and no query is negotiable yet).
+            Ok(ProtocolEvent::QueriesQueued) => Err(RuntimeError::Crashed {
+                reason: "plugin queried before the handshake completed".to_owned(),
             }),
             Err(RecvTimeoutError::Timeout) => {
                 self.kill_child();
@@ -1311,7 +1553,7 @@ fn join_bounded(handle: JoinHandle<()>) {
 #[derive(Clone)]
 struct GenerationHandles {
     session: Arc<Mutex<Session>>,
-    pending: Arc<PendingDiagnostics>,
+    pending: Arc<PendingOutput>,
     events: Sender<ProtocolEvent>,
     clock: Arc<AnalyzeClock>,
     running: Arc<AtomicBool>,
@@ -1367,7 +1609,7 @@ fn spawn_reader(stdout: ChildStdout, h: GenerationHandles) -> JoinHandle<()> {
 fn run_reader(
     mut stdout: impl BufRead,
     session: &Mutex<Session>,
-    pending: &PendingDiagnostics,
+    pending: &PendingOutput,
     events: &Sender<ProtocolEvent>,
     stats: &PluginStats,
     clock: &AnalyzeClock,
@@ -1425,6 +1667,14 @@ fn run_reader(
                 }
                 Ok(Incoming::Fixes { id, reply }) => {
                     let _ = events.send(ProtocolEvent::FixesReply { id, reply });
+                }
+                Ok(Incoming::Query { id, request }) => {
+                    // The reverse direction: queue for the handle's next
+                    // pump and wake its wait loops. A query does not close
+                    // the analyze clock — the round trip eats the plugin's
+                    // own callback budget.
+                    pending.push_query(PendingQuery { id, request })?;
+                    let _ = events.send(ProtocolEvent::QueriesQueued);
                 }
                 Err(e) => return Err(e.to_string()),
             }
@@ -1973,7 +2223,7 @@ mod tests {
             session.send_initialize().expect("arm the handshake");
             session
         });
-        let pending = PendingDiagnostics::default();
+        let pending = PendingOutput::default();
         let (events, rx) = mpsc::channel();
         let stats = PluginStats::default();
 
@@ -1997,20 +2247,69 @@ mod tests {
             matches!(rx.try_recv(), Ok(ProtocolEvent::Initialized(_))),
             "the handshake reply was processed across the blank line"
         );
-        let drained = pending.queue.lock().expect("pending lock");
-        assert_eq!(drained.len(), 1, "the CRLF-terminated frame decoded");
-        assert_eq!(drained[0].code, "p/lint");
+        let drained = pending.queues.lock().expect("pending lock");
+        assert_eq!(
+            drained.diagnostics.len(),
+            1,
+            "the CRLF-terminated frame decoded"
+        );
+        assert_eq!(drained.diagnostics[0].code, "p/lint");
     }
 
     #[test]
-    fn pending_diagnostics_overflow_tears_the_session_down() {
-        // The reader-side fuse: the 10_001st un-drained diagnostic is a
-        // protocol violation (same 10_000 fuse as the parser's
-        // `MAX_DIAGNOSTICS`), not unbounded queue growth.
+    fn reader_queues_reverse_queries_and_signals_the_handle() {
+        // The reverse direction over the reader harness: a `request/query`
+        // frame routes through the session machine into the pending queue,
+        // and the wait loops learn about it through `QueriesQueued`.
+        let init_reply = r#"{"schema_version":1,"id":1,"method":"initialize","params":{"protocol_version":1,"capabilities":["query"]}}"#;
+        let query = r#"{"schema_version":1,"id":42,"method":"request/query","params":{"kind":"element_at","file":"lib/a.dart","offset":3}}"#;
+        let stream = format!("{init_reply}\n{query}\n");
+
+        let session = Mutex::new({
+            let mut session = Session::new(CapabilitySet::all());
+            session.send_initialize().expect("arm the handshake");
+            session
+        });
+        let pending = PendingOutput::default();
+        let (events, rx) = mpsc::channel();
+        let stats = PluginStats::default();
+
+        // The stream ends without a shutdown: the ordinary EOF error, after
+        // both frames were consumed.
+        let outcome = run_reader(
+            Cursor::new(stream.into_bytes()),
+            &session,
+            &pending,
+            &events,
+            &stats,
+            &AnalyzeClock::new(),
+        );
+        assert_eq!(
+            outcome,
+            Err("plugin process closed the connection".to_owned())
+        );
+        assert!(matches!(rx.try_recv(), Ok(ProtocolEvent::Initialized(_))));
+        assert!(matches!(rx.try_recv(), Ok(ProtocolEvent::QueriesQueued)));
+        let queries = pending.take_queries();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].id, 42);
+        assert_eq!(
+            queries[0].request.kind,
+            crate::session::QueryKind::ElementAt
+        );
+        assert_eq!(queries[0].request.file.as_deref(), Some("lib/a.dart"));
+    }
+
+    #[test]
+    fn pending_output_overflow_tears_the_session_down() {
+        // The reader-side fuse: the 10_001st un-drained row (diagnostics and
+        // reverse queries share one cap) is a protocol violation — same
+        // 10_000 fuse as the parser's `MAX_DIAGNOSTICS`, not unbounded
+        // queue growth.
         let init_reply = r#"{"schema_version":1,"id":1,"method":"initialize","params":{"protocol_version":1,"capabilities":["lint"]}}"#;
         let diagnostic = r#"{"schema_version":1,"id":null,"method":"notification/diagnostic","params":{"file":"f","severity":"warning","code":"c","message":"m"}}"#;
         let mut stream = format!("{init_reply}\n");
-        for _ in 0..=MAX_PENDING_DIAGNOSTICS {
+        for _ in 0..=MAX_PENDING_OUTPUT {
             stream.push_str(diagnostic);
             stream.push('\n');
         }
@@ -2020,7 +2319,7 @@ mod tests {
             session.send_initialize().expect("arm the handshake");
             session
         });
-        let pending = PendingDiagnostics::default();
+        let pending = PendingOutput::default();
         let (events, _rx) = mpsc::channel();
         let stats = PluginStats::default();
 
@@ -2035,20 +2334,53 @@ mod tests {
 
         let reason = outcome.expect_err("overflow must be a protocol violation");
         assert!(
-            reason.contains(&MAX_PENDING_DIAGNOSTICS.to_string()),
+            reason.contains(&MAX_PENDING_OUTPUT.to_string()),
             "the reason names the fuse: {reason}"
         );
-        let drained = pending.queue.lock().expect("pending lock");
+        let drained = pending.queues.lock().expect("pending lock");
         assert_eq!(
-            drained.len(),
-            MAX_PENDING_DIAGNOSTICS,
+            drained.diagnostics.len(),
+            MAX_PENDING_OUTPUT,
             "the queue stopped exactly at the cap"
         );
     }
 
     #[test]
-    fn wait_for_burst_wakes_on_the_reader_signal_not_the_deadline() {
-        let pending = Arc::new(PendingDiagnostics::default());
+    fn reverse_queries_share_the_output_fuse_with_diagnostics() {
+        let pending = PendingOutput::default();
+        let request = QueryRequest {
+            kind: crate::session::QueryKind::Symbol,
+            name: Some("x".to_owned()),
+            file: None,
+            offset: None,
+        };
+        // One diagnostic rides under the cap together with the queries: the
+        // drain must never mix the halves.
+        pending.push(row("context")).expect("under the cap");
+        for i in 0..MAX_PENDING_OUTPUT - 1 {
+            pending
+                .push_query(PendingQuery {
+                    id: u64::try_from(i).expect("fits"),
+                    request: request.clone(),
+                })
+                .expect("under the cap");
+        }
+        let err = pending
+            .push(row("over"))
+            .expect_err("the combined fuse fires across both queues");
+        assert!(err.contains(&MAX_PENDING_OUTPUT.to_string()));
+
+        // take_queries takes only the query half; diagnostics survive it.
+        let queries = pending.take_queries();
+        assert_eq!(queries.len(), MAX_PENDING_OUTPUT - 1);
+        assert_eq!(queries[0].id, 0);
+        assert_eq!(pending.take_all().len(), 1, "the diagnostic survived");
+        assert!(pending.take_queries().is_empty(), "queries were taken");
+    }
+
+    #[test]
+    fn wait_output_wakes_on_the_reader_signal_not_the_deadline() {
+        let pending = Arc::new(PendingOutput::default());
         let reader = {
             let pending = Arc::clone(&pending);
             std::thread::spawn(move || {
@@ -2069,36 +2401,45 @@ mod tests {
             })
         };
         let start = Instant::now();
-        let batch = pending
-            .wait_for_burst(start + Duration::from_secs(5))
-            .expect("the push woke the wait");
+        let (batch, pending_queries) = pending.wait_for_output(start + Duration::from_secs(5));
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "woke on the push signal, long before the deadline"
         );
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].code, "p/lint");
+        assert_eq!(pending_queries, 0);
         reader.join().expect("reader joins");
     }
 
     #[test]
-    fn wait_for_burst_returns_none_at_the_deadline() {
-        let pending = PendingDiagnostics::default();
+    fn wait_output_returns_queued_rows_at_the_deadline() {
+        let pending = PendingOutput::default();
+        pending.push(row("racing")).expect("under the cap");
         let start = Instant::now();
-        assert!(
-            pending
-                .wait_for_burst(start + Duration::from_millis(50))
-                .is_none()
-        );
+        // A non-empty queue skips the first-row wait and only settles the
+        // burst; the settle window (5 ms) bounds this far below the old
+        // full-deadline shape.
+        let (batch, pending_queries) = pending.wait_for_output(start + Duration::from_millis(50));
+        assert!(start.elapsed() < Duration::from_millis(50));
+        assert_eq!(batch.len(), 1);
+        assert_eq!(pending_queries, 0);
+
+        // An empty queue rides to the deadline and hands over what it holds.
+        let empty = PendingOutput::default();
+        let start = Instant::now();
+        let (batch, pending_queries) = empty.wait_for_output(start + Duration::from_millis(50));
         assert!(
             start.elapsed() >= Duration::from_millis(40),
             "the deadline bounds the wait"
         );
+        assert_eq!(batch.len(), 0);
+        assert_eq!(pending_queries, 0);
     }
 
     #[test]
-    fn wait_for_burst_drains_the_whole_reply_not_its_first_line() {
-        let pending = Arc::new(PendingDiagnostics::default());
+    fn wait_output_drains_the_whole_reply_not_its_first_line() {
+        let pending = Arc::new(PendingOutput::default());
         let reader = {
             let pending = Arc::clone(&pending);
             std::thread::spawn(move || {
@@ -2110,18 +2451,57 @@ mod tests {
                 pending.push(row("second")).expect("under the cap");
             })
         };
-        let batch = pending
-            .wait_for_burst(Instant::now() + Duration::from_secs(5))
-            .expect("the burst arrived");
+        let (batch, pending_queries) =
+            pending.wait_for_output(Instant::now() + Duration::from_secs(5));
         assert_eq!(batch.len(), 2, "both rows of the burst, one drain");
         assert_eq!(batch[0].message, "first");
         assert_eq!(batch[1].message, "second");
+        assert_eq!(pending_queries, 0);
+        reader.join().expect("reader joins");
+    }
+
+    #[test]
+    fn a_reverse_query_wakes_the_wait_without_the_burst_settle() {
+        // A plugin stalled awaiting its query answer must not wait out the
+        // diagnostics settle window: the query wakes the drain immediately.
+        let pending = Arc::new(PendingOutput::default());
+        let reader = {
+            let pending = Arc::clone(&pending);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(30));
+                pending
+                    .push_query(PendingQuery {
+                        id: 7,
+                        request: QueryRequest {
+                            kind: crate::session::QueryKind::ElementAt,
+                            name: None,
+                            file: Some("lib/a.dart".to_owned()),
+                            offset: Some(3),
+                        },
+                    })
+                    .expect("under the cap");
+            })
+        };
+        let start = Instant::now();
+        let (batch, pending_queries) = pending.wait_for_output(start + Duration::from_secs(5));
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the query woke the wait immediately"
+        );
+        assert_eq!(batch.len(), 0);
+        // The query was only peeked: it stays queued for `serve_queries`,
+        // the one consumer that can answer it.
+        assert_eq!(pending_queries, 1);
+        let queued = pending.take_queries();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, 7);
+        assert_eq!(queued[0].request.kind, crate::session::QueryKind::ElementAt);
         reader.join().expect("reader joins");
     }
 
     #[test]
     fn a_row_after_the_settle_window_lands_in_the_next_drain() {
-        let pending = Arc::new(PendingDiagnostics::default());
+        let pending = Arc::new(PendingOutput::default());
         let reader = {
             let pending = Arc::clone(&pending);
             std::thread::spawn(move || {
@@ -2133,15 +2513,11 @@ mod tests {
             })
         };
         let start = Instant::now();
-        let batch = pending
-            .wait_for_burst(start + Duration::from_secs(5))
-            .expect("the first burst arrived");
+        let (batch, _) = pending.wait_for_output(start + Duration::from_secs(5));
         assert_eq!(batch.len(), 1, "the window closed on a quiet pipe");
         assert_eq!(batch[0].message, "first");
 
-        let late = pending
-            .wait_for_burst(start + Duration::from_secs(5))
-            .expect("the later row arrives");
+        let (late, _) = pending.wait_for_output(start + Duration::from_secs(5));
         assert_eq!(late.len(), 1);
         assert_eq!(late[0].message, "late");
         reader.join().expect("reader joins");

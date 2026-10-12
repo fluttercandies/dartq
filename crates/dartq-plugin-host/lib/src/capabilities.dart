@@ -13,7 +13,14 @@ enum Capability {
   fix('fix'),
 
   /// The plugin contributes assists.
-  assist('assist');
+  assist('assist'),
+
+  /// The plugin pulls engine facts over `request/query` (the wire's
+  /// reverse direction, T4): the plugin's own id space carries the
+  /// requests, and the negotiated set gates it on both sides — a core
+  /// that cannot serve queries never advertises it, and a plugin that
+  /// never queries loses nothing by omitting it.
+  query('query');
 
   const Capability(this.wireName);
 

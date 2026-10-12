@@ -55,6 +55,13 @@ pub const METHOD_ENGINE_DIAGNOSTICS: &str = "notification/engine_diagnostics";
 pub const METHOD_PLUGIN_CONFIG: &str = "notification/plugin_config";
 /// Core-to-plugin: request source fixes for a location.
 pub const METHOD_REQUEST_FIXES: &str = "request/fixes";
+/// Plugin-to-core request (the wire's reverse direction, the T4 Query API):
+/// the plugin pulls engine facts — the daemon's index query kinds plus
+/// `element_at` — and the core answers with the same method and correlation
+/// id. The requesting direction is fixed per method (`request/fixes` only
+/// ever core→plugin, `request/query` only ever plugin→core), so one method
+/// name disambiguates request from reply on both sides.
+pub const METHOD_REQUEST_QUERY: &str = "request/query";
 
 /// One wire frame: a request, a reply, or a notification.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

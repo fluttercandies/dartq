@@ -34,6 +34,8 @@
 //! | `shutdown` | plugin → core | reply | `{}` |
 //! | `request/fixes` | core → plugin | request | `{file, offset, length}` (UTF-16 units) |
 //! | `request/fixes` | plugin → core | reply | `{fixes: [{priority, message, edits: [{offset, length, replacement}]}]}` |
+//! | `request/query` | plugin → core | request (the wire's reverse direction, T4) | `{kind, name?, file?, offset?}` — the five index kinds (`symbol`, `references`, `callers`, `implementations`, `dependencies`) are name-keyed; `element_at` is `{file, offset}`-keyed. The core answers with the same method and the plugin's id; a declined query is answered with `{"error": message}` and the session stays up |
+//! | `request/query` | core → plugin | reply | the frozen query envelope `{schema_version, name, declarations, references[, implementations, dependencies]}` for the index kinds; `{schema_version, file, offset, elements}` for `element_at` — the rows are the daemon face's own (schema-identical); no pagination in v1 (the 16 MiB frame bound is the response ceiling) |
 //! | `notification/diagnostic` | plugin → core | notification | `{file, severity, code, message, offset, length}` |
 //! | `notification/engine_diagnostics` | core → plugin | notification | `{diagnostics: [{file, severity, code, message, offset, length}], files: [path..]}` — `files` is the cycle's analyzed set, the files a rule-executing plugin runs its enabled rules over |
 //! | `notification/plugin_config` | core → plugin | notification | `{enabled_rules: [name..], severity_overrides: {code: severity}, overlays: [{file, content}]}` — the resolved per-cycle execution config; `overlays[].content` may be `null` (fall back to disk) |
@@ -92,9 +94,14 @@
 //! - **§14.1 extension points**: the wire layer is dartq's own v1 (the
 //!   official `analyzer_plugin` protocol is pre-1.0 and adapted here, risk
 //!   R2); the official `registerAssist`/`registerFixForRule` API shape is
-//!   mirrored by the host package's `Plugin`/`PluginRegistry`. The rich
-//!   Query API (AST/element/type pulls) is a later milestone — this surface
-//!   carries the diagnostics round trip and `request/fixes` only.
+//!   mirrored by the host package's `Plugin`/`PluginRegistry`. The Query API
+//!   (T4) rides the wire's reverse direction: a plugin whose `query`
+//!   capability was negotiated pulls resolution-owned facts — the daemon's
+//!   index query kinds plus `element_at` — through
+//!   [`runtime::PluginRuntime::serve_queries`] against the session's
+//!   current engine view. Parsed-level AST context stays host-local (the
+//!   host parses with its own analyzer); full resolved-context parity is
+//!   the recorded R2 evolution path.
 //! - **§14.3 isolation**: per-plugin counters (peak child RSS, frame/byte
 //!   totals per direction, 16 MiB guard drops, restart count) via
 //!   [`runtime::PluginRuntime::stats`] → [`stats::PluginStatsSnapshot`];
@@ -129,16 +136,19 @@ pub use capability::{Capability, CapabilitySet};
 pub use discovery::{DiscoveredPlugin, DiscoveryIssue, DiscoveryReport, discover};
 pub use frame::{
     Frame, FrameDecoder, MAX_FRAME_SIZE, METHOD_DIAGNOSTIC_NOTIFICATION, METHOD_ENGINE_DIAGNOSTICS,
-    METHOD_INITIALIZE, METHOD_PLUGIN_CONFIG, METHOD_REQUEST_FIXES, METHOD_SHUTDOWN,
-    PROTOCOL_VERSION, ProtocolError, decode_line, encode_frame,
+    METHOD_INITIALIZE, METHOD_PLUGIN_CONFIG, METHOD_REQUEST_FIXES, METHOD_REQUEST_QUERY,
+    METHOD_SHUTDOWN, PROTOCOL_VERSION, ProtocolError, decode_line, encode_frame,
 };
 pub use manifest::{
     DEFAULT_MEMORY_BUDGET_MB, MANIFEST_FILE_NAME, Manifest, ManifestError, Timeouts,
 };
-pub use runtime::{PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, crash_diagnostic};
+pub use runtime::{
+    CycleDrain, PendingQuery, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, crash_diagnostic,
+};
 pub use session::{
     CycleConfig, CyclePush, FixesReply, Incoming, OverlayEntry, PluginDiagnostic,
-    PrioritizedChange, RuleCensus, RuleCodeInfo, RuleKind, Session, SessionError, SessionState,
-    Severity, SourceEdit, engine_diagnostics_frame, plugin_config_frame,
+    PrioritizedChange, QueryKind, QueryRequest, RuleCensus, RuleCodeInfo, RuleKind, Session,
+    SessionError, SessionState, Severity, SourceEdit, engine_diagnostics_frame,
+    plugin_config_frame,
 };
 pub use stats::{PluginStats, PluginStatsSnapshot};

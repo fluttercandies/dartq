@@ -61,6 +61,7 @@ fn dart_host_survives_an_over_limit_outbound_batch() {
         current_dir: host_package_dir(),
         manifest,
         stderr: StdioPolicy::Inherit,
+        serve_queries: false,
     })
     .expect("dart host spawns and handshakes");
     run_guard_scenarios(runtime);
@@ -91,6 +92,7 @@ fn sh_host_survives_an_over_limit_outbound_batch() {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     })
     .expect("the sh child handshakes");
     run_guard_scenarios(runtime);

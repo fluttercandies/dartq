@@ -204,8 +204,9 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
     // seconds remain the only expressible unit for this budget.
     #[expect(clippy::duration_suboptimal_units, reason = "see above")]
     let findings = runtime
-        .wait_diagnostics(Duration::from_secs(60))
-        .expect("plugin findings arrive within the drain budget");
+        .wait_output(Duration::from_secs(60))
+        .expect("plugin findings arrive within the drain budget")
+        .diagnostics;
     assert_eq!(findings.len(), 1, "the enabled rule reports the literal");
     assert_eq!(findings[0].file, a_path);
     assert_eq!(findings[0].code, "boolean_literal");
@@ -229,8 +230,9 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
         .expect("engine feed");
     #[expect(clippy::duration_suboptimal_units, reason = "see above")]
     let findings = runtime
-        .wait_diagnostics(Duration::from_secs(60))
-        .expect("plugin findings arrive within the drain budget");
+        .wait_output(Duration::from_secs(60))
+        .expect("plugin findings arrive within the drain budget")
+        .diagnostics;
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].severity, WireSeverity::Error, "overridden");
     assert_eq!(findings[0].code, "boolean_literal");
@@ -355,6 +357,7 @@ fn compat_sample_crash_mode_surfaces_as_plugin_crashed() {
         current_dir: sample_dir(),
         manifest,
         stderr: StdioPolicy::Inherit,
+        serve_queries: false,
     })
     .expect("the crash-mode sample spawns and handshakes");
 
@@ -621,8 +624,9 @@ fn drive_overlay(row: &OverlayRow) {
     // seconds remain the only expressible unit for this budget.
     #[expect(clippy::duration_suboptimal_units, reason = "see above")]
     let findings = runtime
-        .wait_diagnostics(Duration::from_secs(60))
-        .expect("overlay findings arrive within the drain budget");
+        .wait_output(Duration::from_secs(60))
+        .expect("overlay findings arrive within the drain budget")
+        .diagnostics;
 
     // The census: the observable proof the upstream registration ran.
     assert_eq!(findings.len(), 1, "one census row per batch");

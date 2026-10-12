@@ -49,6 +49,7 @@ fn rss_over_the_memory_budget_is_killed_and_reported_as_the_memory_row() {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     })
     .expect("the sh child handshakes");
     let memory_budget_bytes: u64 = 32 * 1024 * 1024;

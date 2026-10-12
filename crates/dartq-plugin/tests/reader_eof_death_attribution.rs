@@ -61,6 +61,7 @@ fn a_natural_death_keeps_its_reason_past_the_callback_budget() {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     })
     .expect("the sh child handshakes");
 

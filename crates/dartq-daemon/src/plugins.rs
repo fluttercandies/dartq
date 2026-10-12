@@ -49,15 +49,20 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use dartq_commands::SCHEMA_VERSION;
+use dartq_commands::query as commands_query;
 use dartq_diagnostics::{Diagnostic, FileId};
+use dartq_engine::Engine;
+use dartq_index::{DeclRow, FileCapture};
 use dartq_plugin::{
-    CycleConfig, CyclePush, PluginDiagnostic, PluginRuntime, RuleCensus, RuleKind, RuntimeError,
-    Severity as PluginSeverity, SpawnSpec, crash_diagnostic, discover,
+    CycleConfig, CyclePush, PendingQuery, PluginDiagnostic, PluginRuntime, QueryKind, RuleCensus,
+    RuleKind, RuntimeError, Severity as PluginSeverity, SpawnSpec, crash_diagnostic, discover,
 };
-use dartq_source::{FileTable, LineIndex, utf16_len_of};
+use dartq_source::{FileTable, LineIndex, SourceRange, utf16_len_of};
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde_json::{Value, json};
 use serde_yaml::Value as Yaml;
 
 use crate::lsp;
@@ -221,6 +226,14 @@ pub struct CycleContext<'a> {
     /// source of the `plugins:` rule configs enablement resolves against
     /// (root-file-only semantics, T5).
     pub options_file: Option<&'a Path>,
+    /// The reverse-query server (T4): answers the plugins' `request/query`
+    /// pulls against the session's current engine view — the daemon's
+    /// analyze face always has one (it owns the engine); a cycle without
+    /// one declines queued queries with the wire's error channel, so a
+    /// querying producer fails fast instead of stalling into its callback
+    /// budget. `serve_query` is the canonical implementation.
+    pub query_server:
+        Option<&'a dyn Fn(&PendingQuery) -> Result<serde_json::Map<String, Value>, String>>,
 }
 
 /// One rule of a census, resolved for the cycle: enablement plus the
@@ -360,7 +373,13 @@ impl PluginSet {
             .into_iter()
             .map(|plugin| {
                 let name = plugin.manifest.name.clone();
-                match PluginRuntime::spawn(SpawnSpec::dart(&plugin.dir, plugin.manifest)) {
+                // The analyze face opts into the T4 Query API: the daemon
+                // owns the engine view the reverse queries answer against.
+                let spec = SpawnSpec {
+                    serve_queries: true,
+                    ..SpawnSpec::dart(&plugin.dir, plugin.manifest)
+                };
+                match PluginRuntime::spawn(spec) {
                     Ok(runtime) => PluginSlot {
                         name,
                         runtime: Some(runtime),
@@ -510,9 +529,20 @@ impl PluginSet {
                 analyzed: context.analyzed.to_vec(),
                 config: config.clone(),
             };
+            // The reverse-query pump adapter: the injected server behind the
+            // runtime's `&mut dyn FnMut` answer face.
+            let mut serve = context
+                .query_server
+                .map(|query_server| move |query: &PendingQuery| query_server(query));
+            let server: Option<
+                &mut dyn FnMut(&PendingQuery) -> Result<serde_json::Map<String, Value>, String>,
+            > = match serve.as_mut() {
+                Some(serve) => Some(serve),
+                None => None,
+            };
             let outcome = runtime
                 .feed(engine, files, &push)
-                .and_then(|()| runtime.wait_diagnostics(DRAIN_BUDGET));
+                .and_then(|()| pump_plugin(runtime, server, DRAIN_BUDGET));
             match outcome {
                 Ok(rows) if !rows.is_empty() => {
                     // A code an earlier plugin claimed is attributed away.
@@ -753,6 +783,339 @@ pub fn merge(
     merged
 }
 
+/// One plugin's bounded drain (the cycle's wait half): parks for at most
+/// [budget] total, hands back every diagnostic that arrived, and pumps the
+/// plugin's reverse `request/query` frames through [server] as they land —
+/// a producer that queries while its findings are computed stalls itself,
+/// so the answers go out within the same drain instead of past the plugin's
+/// own callback budget. A cycle without a server declines the queries (the
+/// immediate error reply — the producer fails fast, the session stays up).
+/// Findings that answer a query arrive after this budget publish on the
+/// next cycle, like every late row.
+fn pump_plugin(
+    runtime: &mut PluginRuntime,
+    mut server: Option<
+        &mut dyn FnMut(&PendingQuery) -> Result<serde_json::Map<String, Value>, String>,
+    >,
+    budget: Duration,
+) -> Result<Vec<PluginDiagnostic>, RuntimeError> {
+    let deadline = Instant::now() + budget;
+    let mut rows = Vec::new();
+    loop {
+        let drain = runtime.wait_output(deadline.saturating_duration_since(Instant::now()))?;
+        rows.extend(drain.diagnostics);
+        if drain.pending_queries == 0 {
+            return Ok(rows);
+        }
+        match server.as_deref_mut() {
+            Some(serve) => {
+                runtime.serve_queries(serve)?;
+            }
+            None => {
+                runtime.decline_queued_queries()?;
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(rows);
+        }
+    }
+}
+
+/// The canonical reverse-query server (T4): one `request/query` answered
+/// against the session's current engine view. The index kinds route through
+/// the shared `dartq-commands` query faces — the reply is the frozen query
+/// envelope, the same rows the daemon's own `dartq/query` answer carries
+/// (schema-identical by construction). `element_at` is the offset-keyed
+/// face over the engine's maintained index. `Err` rides the wire's error
+/// channel (`{"error": message}`) — a declined query never tears the
+/// session down.
+pub(crate) fn serve_query(
+    engine: &Engine,
+    query: &PendingQuery,
+) -> Result<serde_json::Map<String, Value>, String> {
+    match query.request.kind {
+        QueryKind::ElementAt => {
+            let file = query.request.file.as_deref().unwrap_or_default();
+            let offset = query.request.offset.unwrap_or(0);
+            element_at(engine, file, offset)
+        }
+        kind => {
+            let name = query.request.name.as_deref().unwrap_or_default();
+            let run = commands_query::kind_after_analysis(engine, name, index_kind(kind));
+            match commands_query::to_json(&run, name) {
+                Value::Object(map) => Ok(map),
+                // `to_json` builds the envelope as `json!({..})`.
+                _ => unreachable!("the query envelope is always a JSON object"),
+            }
+        }
+    }
+}
+
+/// The wire query kind → the shared query face's kind (the same five index
+/// kinds, one spelling each).
+fn index_kind(kind: QueryKind) -> commands_query::QueryKind {
+    match kind {
+        QueryKind::Symbol => commands_query::QueryKind::Symbol,
+        QueryKind::References => commands_query::QueryKind::References,
+        QueryKind::Callers => commands_query::QueryKind::Callers,
+        QueryKind::Implementations => commands_query::QueryKind::Implementations,
+        QueryKind::Dependencies => commands_query::QueryKind::Dependencies,
+        QueryKind::ElementAt => unreachable!("routed to `element_at` before this match"),
+    }
+}
+
+/// The `element_at` answer (T4): the element rows the `{file, offset}`
+/// position denotes — its own declaration when the offset falls on a name
+/// token, else the declarations the use at the offset resolves to (the
+/// engine's maintained reference surface is the resolution). A miss is an
+/// empty `elements` array: the position legitimately denotes nothing. An
+/// unknown file is an error: the plugin asked about a file the session has
+/// never seen.
+fn element_at(
+    engine: &Engine,
+    file: &str,
+    offset: u64,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let Some(file_id) = engine.file_table().try_file_id(Path::new(file)) else {
+        return Err(format!("unknown file `{file}`"));
+    };
+    let offset = u32::try_from(offset).unwrap_or(u32::MAX);
+    let mut elements: Vec<Value> = Vec::new();
+    if let Some(capture) = engine.file_capture(file_id) {
+        for row in capture.index.decls() {
+            if span_contains(row.range, offset) {
+                elements.push(declaration_row(engine, capture, row));
+            }
+        }
+        if elements.is_empty() {
+            // A use site: the enclosing library's surface holds the
+            // resolved reference rows; the position's row names its target.
+            let library = engine.library_of(file_id);
+            for (surface_library, surface) in engine.library_surfaces() {
+                if Some(surface_library) != library {
+                    continue;
+                }
+                for reference in surface.refs() {
+                    if reference.file != file_id || !span_contains(reference.range, offset) {
+                        continue;
+                    }
+                    let Some(target) = engine.file_capture(reference.target_file) else {
+                        continue;
+                    };
+                    let Some(rows) = target.index.by_name(reference.target_name) else {
+                        continue;
+                    };
+                    elements.extend(rows.iter().map(|row| declaration_row(engine, target, row)));
+                }
+            }
+        }
+    }
+    let answer = json!({
+        "schema_version": SCHEMA_VERSION,
+        "file": file,
+        "offset": offset,
+        "elements": elements,
+    });
+    let Some(map) = answer.as_object() else {
+        unreachable!("the element_at envelope is built as a JSON object");
+    };
+    Ok(map.clone())
+}
+
+/// The frozen declaration-row shape (the query face's `declarations[]`
+/// entry): file, container, kind, name, 1-based line/column through the
+/// engine's line index, and the UTF-16 name-span length.
+fn declaration_row(engine: &Engine, capture: &FileCapture, row: &DeclRow) -> Value {
+    let strings = engine.strings();
+    let container = (row.container != DeclRow::NONE)
+        .then(|| strings.resolve(capture.index.row(row.container).name));
+    let (line, column) = line_col(engine, capture.file, row.range.offset);
+    let path = engine
+        .file_table()
+        .path(capture.file)
+        .map_or_else(String::new, |path| path.display().to_string());
+    json!({
+        "file": path,
+        "container": container,
+        "kind": commands_query::decl_kind_name(row.kind),
+        "name": strings.resolve(row.name),
+        "line": line,
+        "column": column,
+        "length": row.range.length,
+    })
+}
+
+/// The 1-based (line, UTF-16 column) of an offset, the query face's
+/// convention. A plugin's offset is untrusted (the §14.3 posture): the
+/// clamp keeps `line_col_utf16`'s in-range assert out of a stale query's
+/// reach, exactly like the findings path clamps in [`to_lsp`].
+fn line_col(engine: &Engine, file: FileId, offset: u32) -> (u32, u32) {
+    let index = engine
+        .line_index(file)
+        .expect("captured file has a line index");
+    let text = engine.content(file).expect("captured file has content");
+    let text = std::str::from_utf8(text).expect("engine content is UTF-8");
+    index.line_col_utf16(text, offset.min(utf16_len_of(text)))
+}
+
+/// Whether the UTF-16 [offset] falls inside [range] (half-open: the end
+/// boundary belongs to the next token; a zero-length span holds nothing).
+fn span_contains(range: SourceRange, offset: u32) -> bool {
+    range.length > 0 && range.offset <= offset && offset < range.offset.saturating_add(range.length)
+}
+
+#[cfg(test)]
+mod query_server_tests {
+    //! The T4 reverse-query server over a real analyzed workspace: the
+    //! index kinds answer the frozen envelope (schema-identical with the
+    //! daemon's own `dartq/query` face), `element_at` resolves both faces
+    //! (the position's own declaration, and the target a use resolves to).
+
+    use dartq_engine::CancellationToken;
+    use dartq_plugin::QueryRequest;
+
+    use super::*;
+
+    /// `lib/main.dart` of the fixture: imports the a.dart pair below.
+    const MAIN: &str = "import 'a.dart';\nvoid main() { fa(1); }\n";
+    /// `lib/a.dart`: one class and one function. All-ASCII, so byte
+    /// offsets are UTF-16 offsets: `fa`'s name token spans 17..19.
+    const A: &str = "class Foo {}\nint fa(int x) => x;\n";
+
+    fn analyzed() -> (crate::test_fixtures::Workspace, Engine) {
+        let workspace = crate::test_fixtures::Workspace::new(MAIN);
+        std::fs::write(workspace.path("lib/a.dart"), A).expect("write a.dart");
+        let mut engine = Engine::new(workspace.engine_config()).expect("engine");
+        engine.discover_workspace().expect("discovery");
+        engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        (workspace, engine)
+    }
+
+    fn query(
+        kind: QueryKind,
+        name: Option<&str>,
+        file: Option<&str>,
+        offset: Option<u64>,
+    ) -> PendingQuery {
+        PendingQuery {
+            id: 1,
+            request: QueryRequest {
+                kind,
+                name: name.map(str::to_owned),
+                file: file.map(str::to_owned),
+                offset,
+            },
+        }
+    }
+
+    #[test]
+    fn index_kinds_answer_the_frozen_envelope_schema_identically() {
+        let (_workspace, engine) = analyzed();
+
+        let symbol = serve_query(&engine, &query(QueryKind::Symbol, Some("fa"), None, None))
+            .expect("symbol");
+        assert_eq!(symbol["schema_version"], 1);
+        assert_eq!(symbol["name"], "fa");
+        let declarations = symbol["declarations"].as_array().expect("declarations");
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0]["name"], "fa");
+        assert_eq!(declarations[0]["kind"], "function");
+
+        // The daemon's own `dartq/query` face produces the same object: the
+        // server reuses the shared routing and shaper verbatim.
+        let run = commands_query::symbol_after_analysis(&engine, "fa");
+        assert_eq!(
+            Value::Object(symbol),
+            commands_query::to_json(&run, "fa"),
+            "the wire reply is the daemon face's own answer"
+        );
+
+        // `callers` keeps the invocation-shaped subset: `fa(1)` in main.
+        let callers = serve_query(&engine, &query(QueryKind::Callers, Some("fa"), None, None))
+            .expect("callers");
+        let references = callers["references"].as_array().expect("references");
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0]["kind"], "invoked");
+
+        // `dependencies` names the declaring library's importer.
+        let dependencies = serve_query(
+            &engine,
+            &query(QueryKind::Dependencies, Some("fa"), None, None),
+        )
+        .expect("dependencies");
+        let rows = dependencies["dependencies"].as_array().expect("rows");
+        assert!(
+            rows.iter().any(|row| row["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("main.dart"))),
+            "main.dart imports the declaring library: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn element_at_resolves_declarations_and_use_sites() {
+        let (workspace, engine) = analyzed();
+        // The wire spelling is the analyzed set's: the table's canonical
+        // (absolute) path form.
+        let a_path = workspace.path("lib/a.dart").to_string_lossy().into_owned();
+        let main_path = workspace
+            .path("lib/main.dart")
+            .to_string_lossy()
+            .into_owned();
+
+        // On the name token: the position denotes its own declaration.
+        let on_decl = serve_query(
+            &engine,
+            &query(QueryKind::ElementAt, None, Some(&a_path), Some(17)),
+        )
+        .expect("on the declaration");
+        let elements = on_decl["elements"].as_array().expect("elements");
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0]["name"], "fa");
+        assert_eq!(elements[0]["kind"], "function");
+        assert_eq!(elements[0]["line"], 2);
+        assert_eq!(elements[0]["column"], 5);
+        assert_eq!(elements[0]["length"], 2);
+
+        // On the use: the position resolves to the target declaration.
+        let on_use = serve_query(
+            &engine,
+            &query(QueryKind::ElementAt, None, Some(&main_path), Some(31)),
+        )
+        .expect("on the use");
+        let elements = on_use["elements"].as_array().expect("elements");
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0]["name"], "fa");
+        assert_eq!(
+            elements[0]["file"], a_path,
+            "the target lives in the declaring file"
+        );
+
+        // Off either surface: the position denotes nothing — an empty
+        // answer, not an error.
+        let miss = serve_query(
+            &engine,
+            &query(QueryKind::ElementAt, None, Some(&main_path), Some(0)),
+        )
+        .expect("off any row");
+        assert_eq!(
+            miss["elements"].as_array().expect("elements").len(),
+            0,
+            "the import keyword denotes no element"
+        );
+
+        // A file the session never saw is the one error.
+        let unknown = serve_query(
+            &engine,
+            &query(QueryKind::ElementAt, None, Some("lib/gone.dart"), Some(0)),
+        )
+        .expect_err("unknown file");
+        assert!(unknown.contains("unknown file"), "{unknown}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -801,12 +1164,14 @@ mod tests {
     }
 
     /// The empty cycle context most tests cycle with: nothing analyzed, no
-    /// overlays, no options file.
+    /// overlays, no options file, and no query server (every test here runs
+    /// dead-plugin sets — no live runtime ever reaches the pump).
     fn cycle_context<'a>() -> CycleContext<'a> {
         CycleContext {
             analyzed: &[],
             overlays: &[],
             options_file: None,
+            query_server: None,
         }
     }
 

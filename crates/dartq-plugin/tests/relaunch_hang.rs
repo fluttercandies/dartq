@@ -47,6 +47,7 @@ fn relaunch_survives_a_descendant_holding_the_pipe() {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     })
     .expect("the sh child handshakes");
 
@@ -79,10 +80,13 @@ fn relaunch_survives_a_descendant_holding_the_pipe() {
     // CI slack over the 5 s park a healthy relaunch needs.
     let started = Instant::now();
     let drained = runtime
-        .wait_diagnostics(Duration::from_secs(5))
+        .wait_output(Duration::from_secs(5))
         .expect("the enforced death relaunches within budget");
     let elapsed = started.elapsed();
-    assert!(drained.is_empty(), "the dead generation produced nothing");
+    assert!(
+        drained.diagnostics.is_empty(),
+        "the dead generation produced nothing"
+    );
     assert!(
         elapsed < Duration::from_secs(15),
         "the relaunch must not wait out the descendant holding the pipe, took {elapsed:?}"

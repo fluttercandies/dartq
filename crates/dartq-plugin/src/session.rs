@@ -8,8 +8,11 @@
 //!    version must equal [`PROTOCOL_VERSION`], else the session fails with
 //!    [`SessionError::VersionMismatch`]. The effective capability set is the
 //!    **intersection** of both sides.
-//! 3. While `Ready`: the plugin may send `notification/diagnostic` frames and
-//!    the core may send `request/fixes` (only if `fix` was negotiated).
+//! 3. While `Ready`: the plugin may send `notification/diagnostic` frames
+//!    and `request/query` reverse requests (only if `query` was
+//!    negotiated), and the core may send `request/fixes` (only if `fix`
+//!    was negotiated). Each method has exactly one requesting direction,
+//!    so a frame's method disambiguates request from reply on both sides.
 //! 4. Core sends `shutdown`; the plugin's reply moves the session to
 //!    [`SessionState::Terminated`].
 //!
@@ -35,7 +38,8 @@ use std::collections::BTreeMap;
 use crate::capability::{Capability, CapabilitySet};
 use crate::frame::{
     Frame, METHOD_DIAGNOSTIC_NOTIFICATION, METHOD_ENGINE_DIAGNOSTICS, METHOD_INITIALIZE,
-    METHOD_PLUGIN_CONFIG, METHOD_REQUEST_FIXES, METHOD_SHUTDOWN, PROTOCOL_VERSION,
+    METHOD_PLUGIN_CONFIG, METHOD_REQUEST_FIXES, METHOD_REQUEST_QUERY, METHOD_SHUTDOWN,
+    PROTOCOL_VERSION,
 };
 
 /// Session lifecycle states, driven by [`Session::handle`] and the
@@ -83,6 +87,16 @@ pub enum Incoming {
         id: u64,
         /// The parsed reply payload.
         reply: FixesReply,
+    },
+    /// A `request/query` from the plugin (the wire's reverse direction):
+    /// the id lives in the plugin's own id space, and the caller answers it
+    /// with [`query_reply_frame`] or [`query_error_frame`] under the same
+    /// correlation.
+    Query {
+        /// The plugin's correlation id for this request.
+        id: u64,
+        /// The parsed request payload.
+        request: QueryRequest,
     },
     /// The `shutdown` reply was accepted; the session is over.
     ShutdownComplete,
@@ -331,6 +345,118 @@ pub struct SourceEdit {
     pub replacement: String,
 }
 
+/// Which engine fact a `request/query` asks for. The first five are the
+/// daemon's index query kinds (the frozen schema's rows); `element_at` is
+/// the offset-keyed face: what the queried position denotes. The lowercase
+/// spellings are the wire names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryKind {
+    /// Declaration rows plus every resolved reference to them.
+    Symbol,
+    /// The reference rows of the symbol face.
+    References,
+    /// The invocation-shaped subset of the reference rows.
+    Callers,
+    /// The queried type's subtypes / the queried member's overriding rows.
+    Implementations,
+    /// The declaring library's importers.
+    Dependencies,
+    /// Offset-keyed element lookup: `{file, offset}` → the element rows the
+    /// position denotes (its own declaration, or the declaration its use
+    /// resolves to).
+    #[serde(rename = "element_at")]
+    ElementAt,
+}
+
+impl QueryKind {
+    /// Whether this kind is name-keyed (the index query family) — the
+    /// payload validation's split.
+    #[must_use]
+    pub const fn is_name_keyed(self) -> bool {
+        !matches!(self, Self::ElementAt)
+    }
+}
+
+/// One `request/query` from the plugin. Name-keyed kinds require `name`;
+/// [`QueryKind::ElementAt`] requires `file` and `offset`. Additional fields
+/// are ignored (additive evolution, the same posture the rest of the wire
+/// takes).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct QueryRequest {
+    /// Which fact is requested.
+    pub kind: QueryKind,
+    /// The queried symbol name (name-keyed kinds).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The queried file, in the analyzed set's wire spelling
+    /// ([`QueryKind::ElementAt`]).
+    #[serde(default)]
+    pub file: Option<String>,
+    /// UTF-16 offset into `file` ([`QueryKind::ElementAt`]).
+    #[serde(default)]
+    pub offset: Option<u64>,
+}
+
+impl QueryRequest {
+    /// Checks the payload against the kind's requirements. A request the
+    /// core cannot interpret is answered with an error reply (the session
+    /// stays up), not a teardown — the plugin asked, the core declined.
+    ///
+    /// # Errors
+    ///
+    /// A human-readable reason when the payload does not satisfy the kind.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kind.is_name_keyed() {
+            match self.name.as_deref() {
+                Some(name) if !name.is_empty() => Ok(()),
+                _ => Err(format!(
+                    "query kind `{kind}` requires a non-empty string `name`",
+                    kind = match self.kind {
+                        QueryKind::Symbol => "symbol",
+                        QueryKind::References => "references",
+                        QueryKind::Callers => "callers",
+                        QueryKind::Implementations => "implementations",
+                        QueryKind::Dependencies => "dependencies",
+                        QueryKind::ElementAt => unreachable!("name-keyed by definition"),
+                    }
+                )),
+            }
+        } else {
+            let file_ok = self.file.as_deref().is_some_and(|f| !f.is_empty());
+            let offset_ok = self.offset.is_some();
+            match (file_ok, offset_ok) {
+                (true, true) => Ok(()),
+                (false, _) => {
+                    Err("query kind `element_at` requires a non-empty string `file`".to_owned())
+                }
+                (_, false) => {
+                    Err("query kind `element_at` requires an integer `offset`".to_owned())
+                }
+            }
+        }
+    }
+}
+
+/// Builds the core's reply frame to the plugin's query [id](Frame::id):
+/// same method, same correlation. `params` is the answer object — the
+/// index kinds answer with the frozen schema's query envelope, `element_at`
+/// with its element rows.
+#[must_use]
+pub fn query_reply_frame(id: u64, params: Map<String, Value>) -> Frame {
+    Frame::request(id, METHOD_REQUEST_QUERY, params)
+}
+
+/// Builds the core's error reply to the plugin's query [id](Frame::id):
+/// `{"error": message}`, the wire's only error channel. The session stays
+/// up — a declined query is not a contract break.
+#[must_use]
+pub fn query_error_frame(id: u64, message: &str) -> Frame {
+    let mut params = Map::new();
+    params.insert("error".into(), json!(message));
+    Frame::request(id, METHOD_REQUEST_QUERY, params)
+}
+
 /// The core side of one plugin session. Pure state over frames: no I/O, no
 /// threads — the caller owns the transport.
 #[derive(Debug)]
@@ -463,10 +589,56 @@ impl Session {
     /// version mismatch, frame not valid for the current state, unmatched
     /// reply id, missing capability, remote error payload, malformed payload.
     pub fn handle(&mut self, frame: Frame) -> Result<Incoming, SessionError> {
+        // The wire's reverse direction: `request/query` is always the
+        // plugin's request (the core never issues queries), regardless of
+        // which id space the frame's id belongs to. Every other id-carrying
+        // frame is a reply in the core's id space.
+        if frame.method == METHOD_REQUEST_QUERY {
+            return self.handle_query_request(frame);
+        }
         match frame.id {
             Some(id) => self.handle_reply(frame, id),
             None => self.handle_notification(frame),
         }
+    }
+
+    /// Routes one inbound `request/query` frame. Requests are served in
+    /// [`SessionState::Ready`] and tolerated (queued for an answer, like a
+    /// diagnostic) crossing the shutdown window; a query without a
+    /// negotiated `query` capability, in any earlier state, or without an
+    /// id is a contract break.
+    fn handle_query_request(&mut self, mut frame: Frame) -> Result<Incoming, SessionError> {
+        let state = self.state.as_str();
+        let Some(id) = frame.id else {
+            return Err(SessionError::UnexpectedFrame {
+                method: frame.method,
+                state,
+            });
+        };
+        match self.state {
+            SessionState::Ready | SessionState::AwaitingShutdownReply => {}
+            _ => {
+                return Err(SessionError::UnexpectedFrame {
+                    method: frame.method,
+                    state,
+                });
+            }
+        }
+        if !self
+            .negotiated
+            .is_some_and(|caps| caps.contains(Capability::Query))
+        {
+            return Err(SessionError::CapabilityNotNegotiated(Capability::Query));
+        }
+        let request: QueryRequest =
+            parse_payload(&frame.method, std::mem::take(&mut frame.params))?;
+        request
+            .validate()
+            .map_err(|reason| SessionError::InvalidPayload {
+                method: frame.method.clone(),
+                reason,
+            })?;
+        Ok(Incoming::Query { id, request })
     }
 
     fn handle_notification(&mut self, mut frame: Frame) -> Result<Incoming, SessionError> {
@@ -1137,5 +1309,158 @@ mod tests {
             session.send_initialize().unwrap_err(),
             SessionError::UnexpectedFrame { .. }
         ));
+    }
+
+    /// Completes a handshake advertising exactly [caps].
+    fn ready_session(caps: &[&str]) -> Session {
+        let mut session = Session::new(CapabilitySet::all());
+        let init = session.send_initialize().expect("send initialize");
+        session
+            .handle(FakePlugin::reply_initialize(init.id.expect("id"), caps, 1))
+            .expect("handshake");
+        session
+    }
+
+    /// A `request/query` frame as the Dart host would send it.
+    fn query_frame(id: u64, params: Value) -> Frame {
+        Frame::request(
+            id,
+            METHOD_REQUEST_QUERY,
+            params.as_object().expect("object").clone(),
+        )
+    }
+
+    #[test]
+    fn reverse_query_routes_to_the_caller_with_the_plugin_id() {
+        // The plugin's id space is its own: id 5 must route as a reverse
+        // request even while the core has its own id 5 outstanding — the
+        // method name is what separates request from reply.
+        let mut session = ready_session(&["lint", "fix", "query"]);
+        let fixes = session
+            .send_fixes_request("lib/main.dart", 0, 0)
+            .expect("send fixes");
+        // The handshake consumed id 1; the fixes request is id 2.
+        assert_eq!(fixes.id, Some(2));
+
+        let query = query_frame(5, json!({"kind": "symbol", "name": "Foo"}));
+        assert_eq!(
+            session.handle(query).expect("route"),
+            Incoming::Query {
+                id: 5,
+                request: QueryRequest {
+                    kind: QueryKind::Symbol,
+                    name: Some("Foo".to_owned()),
+                    file: None,
+                    offset: None,
+                },
+            },
+            "the plugin's id 5 routes as a request, not a reply"
+        );
+
+        // And the core's own fixes reply still correlates through its id —
+        // the two directions interleave freely.
+        let mut fixes_params = Map::new();
+        fixes_params.insert("fixes".into(), json!([]));
+        let reply = Frame::request(fixes.id.expect("id"), METHOD_REQUEST_FIXES, fixes_params);
+        assert!(matches!(
+            session.handle(reply).expect("reply"),
+            Incoming::Fixes { .. }
+        ));
+    }
+
+    #[test]
+    fn reverse_query_without_the_negotiated_capability_is_fatal() {
+        let mut session = ready_session(&["lint"]);
+        let query = query_frame(1, json!({"kind": "symbol", "name": "Foo"}));
+        assert_eq!(
+            session.handle(query).unwrap_err(),
+            SessionError::CapabilityNotNegotiated(Capability::Query)
+        );
+    }
+
+    #[test]
+    fn reverse_query_crossing_the_shutdown_window_is_accepted() {
+        let mut session = ready_session(&["query"]);
+        let shutdown = session.send_shutdown().expect("send shutdown");
+        let query = query_frame(
+            2,
+            json!({"kind": "element_at", "file": "f.dart", "offset": 3}),
+        );
+        assert_eq!(
+            session.handle(query).expect("crossing query queues"),
+            Incoming::Query {
+                id: 2,
+                request: QueryRequest {
+                    kind: QueryKind::ElementAt,
+                    name: None,
+                    file: Some("f.dart".to_owned()),
+                    offset: Some(3),
+                },
+            }
+        );
+        // The shutdown reply still ends the session.
+        let reply = Frame::request(shutdown.id.expect("id"), METHOD_SHUTDOWN, Map::new());
+        assert_eq!(
+            session.handle(reply).expect("handle"),
+            Incoming::ShutdownComplete
+        );
+        // After the reply the session is over; a late query is a violation.
+        let late = query_frame(3, json!({"kind": "symbol", "name": "x"}));
+        assert_eq!(
+            session.handle(late).unwrap_err(),
+            SessionError::UnexpectedFrame {
+                method: METHOD_REQUEST_QUERY.to_owned(),
+                state: SessionState::Terminated.as_str(),
+            }
+        );
+    }
+
+    #[test]
+    fn reverse_query_payloads_are_validated_by_kind() {
+        let mut session = ready_session(&["query"]);
+        for params in [
+            json!({"kind": "symbol"}),
+            json!({"kind": "callers", "name": ""}),
+            json!({"kind": "element_at", "offset": 3}),
+            json!({"kind": "element_at", "file": "f.dart"}),
+            json!({"kind": "mystery", "name": "x"}),
+        ] {
+            let frame = query_frame(1, params);
+            assert!(
+                matches!(
+                    session.handle(frame),
+                    Err(SessionError::InvalidPayload { .. } | SessionError::UnknownMethod { .. })
+                ),
+                "a query the core cannot interpret is a typed error"
+            );
+        }
+        // A request without an id is malformed regardless of state.
+        let mut session = ready_session(&["query"]);
+        let idless = Frame::notification(
+            METHOD_REQUEST_QUERY,
+            json!({"kind": "symbol", "name": "x"})
+                .as_object()
+                .expect("object")
+                .clone(),
+        );
+        assert!(matches!(
+            session.handle(idless),
+            Err(SessionError::UnexpectedFrame { .. })
+        ));
+    }
+
+    #[test]
+    fn query_reply_frames_round_trip_and_carry_the_error_channel() {
+        let mut params = Map::new();
+        params.insert("schema_version".into(), json!(1));
+        params.insert("declarations".into(), json!([]));
+        let reply = query_reply_frame(9, params);
+        assert_eq!(reply.method, METHOD_REQUEST_QUERY);
+        assert_eq!(reply.id, Some(9));
+        let line = crate::encode_frame(&reply).expect("encode");
+        assert_eq!(crate::decode_line(&line).expect("decode"), reply);
+
+        let error = query_error_frame(9, "unknown file `x.dart`");
+        assert_eq!(error.params["error"], json!("unknown file `x.dart`"));
     }
 }

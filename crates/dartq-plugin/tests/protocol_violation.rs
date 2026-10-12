@@ -56,6 +56,7 @@ fn violating_runtime(emit: &str) -> PluginRuntime {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     })
     .expect("the violating child still handshakes cleanly")
 }
@@ -72,14 +73,17 @@ fn await_death_settled(runtime: &mut PluginRuntime, cap: Duration) {
     let deadline = Instant::now() + cap;
     while Instant::now() < deadline {
         let restarts_before = runtime.stats().restarts;
-        match runtime.wait_diagnostics(Duration::from_millis(50)) {
+        match runtime.wait_output(Duration::from_millis(50)) {
             // Budget spent: the death surfaced terminally.
             Err(RuntimeError::Crashed { .. }) => return,
             Err(error) => {
                 panic!("unexpected error while awaiting the violation's death: {error:?}")
             }
             Ok(empty) => {
-                assert!(empty.is_empty(), "the violator never produces diagnostics");
+                assert!(
+                    empty.diagnostics.is_empty(),
+                    "the violator never produces diagnostics"
+                );
                 if runtime.stats().restarts > restarts_before {
                     return; // the death surfaced and its restart was consumed
                 }

@@ -43,6 +43,15 @@ const String methodPluginConfig = 'notification/plugin_config';
 /// Core-to-plugin: request source fixes for a location.
 const String methodRequestFixes = 'request/fixes';
 
+/// Plugin-to-core request (the wire's reverse direction, the T4 Query
+/// API): the plugin pulls engine facts — the daemon's index query kinds
+/// plus `element_at` — and the core answers with the same method and
+/// correlation id. The requesting direction is fixed per method
+/// (`request/fixes` only ever core→plugin, `request/query` only ever
+/// plugin→core), so one method name disambiguates request from reply on
+/// both sides.
+const String methodRequestQuery = 'request/query';
+
 /// One wire frame: a request, a reply, or a notification.
 ///
 /// ```json

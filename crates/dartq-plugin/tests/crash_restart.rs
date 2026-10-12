@@ -25,6 +25,7 @@ fn spec(script: &str, retries: u32) -> SpawnSpec {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     }
 }
 

@@ -258,6 +258,7 @@ dependencies = [
  "dartq-commands",
  "dartq-diagnostics",
  "dartq-engine",
+ "dartq-index",
  "dartq-package",
  "dartq-plugin",
  "dartq-pub",

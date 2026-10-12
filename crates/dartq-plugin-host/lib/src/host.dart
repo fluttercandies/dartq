@@ -18,6 +18,7 @@ import 'frame.dart';
 import 'plugin.dart';
 import 'plugin_config.dart';
 import 'plugin_session.dart';
+import 'query_api.dart';
 import 'registry.dart';
 import 'rule_runner.dart';
 
@@ -28,7 +29,11 @@ import 'rule_runner.dart';
 /// `notification/diagnostic` frames); the per-cycle execution config goes
 /// through [onPluginConfig]; `request/fixes` is served by [onRequestFixes].
 /// The session's `initialize` reply advertises [ruleCensus] (the
-/// registration census the core resolves enablement against).
+/// registration census the core resolves enablement against). The same
+/// [send] doubles as the reverse-query transport: a plugin's
+/// `request/query` pull (T4) must reach the wire while its handler is
+/// still awaiting the answer, so the session writes it through this hook
+/// instead of the post-frame flush.
 ///
 /// Throws on the first wire-contract violation (malformed UTF-8/JSON,
 /// foreign schema version, oversize frame); the process must then exit —
@@ -48,6 +53,7 @@ Future<void> runPluginHost(
     onEngineDiagnostics: onEngineDiagnostics,
     onPluginConfig: onPluginConfig,
     onRequestFixes: onRequestFixes,
+    writeFrame: (frame) => send(frame.encode()),
   );
   final buffer = BytesBuilder(copy: false);
   await for (final chunk in input) {
@@ -158,8 +164,9 @@ Future<void> servePlugin(
           batch: batch,
         );
       },
-      onRequestFixes: (file, offset, length) => _serveFixes(
+      onRequestFixes: (file, offset, length, queries) => _serveFixes(
         registry,
+        queries,
         [...engineDiagnostics, ...ownFindings],
         file,
         offset,
@@ -173,9 +180,12 @@ Future<void> servePlugin(
 
 /// Serves one `request/fixes` from the registry: assists at the requested
 /// range, rule fixes at their matching diagnostic's range (the engine batch
-/// together with the plugin's own rule findings), best first.
+/// together with the plugin's own rule findings), best first. The
+/// producers receive [queries] — the T4 Query API facade — so a
+/// resolution-owned fact rides a reverse `request/query` pull.
 Future<List<PrioritizedChange>> _serveFixes(
   PluginRegistryImpl registry,
+  QueryApi queries,
   List<PluginDiagnostic> fixContext,
   String file,
   int offset,
@@ -196,7 +206,7 @@ Future<List<PrioritizedChange>> _serveFixes(
   for (final generator in registry.assists) {
     await run(
       generator,
-      ProducerContext(file: file, offset: offset, length: length),
+      ProducerContext(file: file, offset: offset, length: length, queries: queries),
     );
   }
   for (final diagnostic in fixContext) {
@@ -214,6 +224,7 @@ Future<List<PrioritizedChange>> _serveFixes(
       file: file,
       offset: diagnostic.offset,
       length: diagnostic.length,
+      queries: queries,
     );
     for (final generator in generators) {
       await run(generator, context);

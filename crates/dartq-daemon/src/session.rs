@@ -2122,10 +2122,16 @@ impl Session {
                 })
                 .collect();
             let options = options_file.as_deref();
+            // The T4 reverse-query server: the plugins' `request/query`
+            // pulls answer against this context's engine view — the same
+            // analyzed state the cycle's findings resolve against.
+            let query_server =
+                |query: &dartq_plugin::PendingQuery| plugins::serve_query(engine, query);
             let cycle_context = plugins::CycleContext {
                 analyzed: &analyzed,
                 overlays: &overlays,
                 options_file: options,
+                query_server: Some(&query_server),
             };
             let cycle =
                 self.plugins

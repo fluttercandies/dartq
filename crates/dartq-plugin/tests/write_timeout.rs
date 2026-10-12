@@ -37,6 +37,7 @@ fn stdin_write_into_a_stopped_reader_hits_the_deadline_and_kills() {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     })
     .expect("the sh child handshakes");
 

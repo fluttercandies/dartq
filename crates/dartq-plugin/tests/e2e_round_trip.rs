@@ -42,6 +42,7 @@ fn spawn_echo() -> PluginRuntime {
         current_dir: host_package_dir(),
         manifest,
         stderr: StdioPolicy::Inherit,
+        serve_queries: false,
     })
     .expect("dart host spawns and handshakes")
 }
@@ -79,8 +80,9 @@ fn engine_diagnostics_round_trip_through_the_dart_host() {
         .feed(&[engine], &files, &CyclePush::default())
         .expect("engine feed");
     let echoed = runtime
-        .wait_diagnostics(Duration::from_mins(1))
-        .expect("plugin diagnostics arrive");
+        .wait_output(Duration::from_mins(1))
+        .expect("plugin diagnostics arrive")
+        .diagnostics;
     assert_eq!(echoed.len(), 1, "the echo plugin emits exactly one frame");
     let diagnostic = &echoed[0];
     // The table normalizes paths (relative spellings absolutize), so the

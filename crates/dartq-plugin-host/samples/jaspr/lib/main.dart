@@ -83,7 +83,7 @@ Future<void> run({
               ' assist=${bridge.assists}',
         ),
     ],
-    onRequestFixes: (file, offset, length) => serveFixes(bridge, offset, length),
+    onRequestFixes: (file, offset, length, queries) => serveFixes(bridge, offset, length),
   );
   // The core closed its stdin: the session is over.
   await plugin.shutDown();

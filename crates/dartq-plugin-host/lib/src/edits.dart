@@ -9,6 +9,8 @@ library;
 
 import 'dart:async';
 
+import 'query_api.dart';
+
 /// One contiguous text replacement (wire shape `SourceEdit`).
 class SourceEdit {
   /// Builds an edit; [offset] and [length] are UTF-16 units.
@@ -61,14 +63,17 @@ class PrioritizedChange {
   };
 }
 
-/// Everything a producer sees for one request. The Query API surface
-/// (AST/element views) lands with the engine-side wiring (PRD section 14.2).
+/// Everything a producer sees for one request. [queries] is the T4 Query
+/// API facade — null when the host runs no query transport (then a
+/// resolution-owned fact is simply unavailable to the producer, the
+/// documented parsed-level limitation).
 class ProducerContext {
   /// Builds a context for the requested UTF-16 location.
   const ProducerContext({
     required this.file,
     required this.offset,
     required this.length,
+    this.queries,
   });
 
   /// Path of the file the request targets.
@@ -79,6 +84,11 @@ class ProducerContext {
 
   /// UTF-16 length the request targets.
   final int length;
+
+  /// The engine Query API (the reverse `request/query` face, T4): the
+  /// daemon's index query kinds plus `element_at`, typed. Throws
+  /// [QueryError] when the `query` capability was not negotiated.
+  final QueryApi? queries;
 }
 
 /// A computed, prioritized change returned by a [ProducerGenerator].

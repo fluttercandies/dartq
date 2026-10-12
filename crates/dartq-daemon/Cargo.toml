@@ -15,6 +15,10 @@ crossbeam-channel = { workspace = true }
 dartq-commands = { workspace = true }
 dartq-diagnostics = { workspace = true }
 dartq-engine = { workspace = true }
+# The `element_at` reverse-query rows (T4) read the engine's maintained
+# captures: `DeclRow`/`FileCapture` name the row shapes in the server's
+# signatures.
+dartq-index = { workspace = true }
 dartq-plugin = { workspace = true }
 dartq-snapshot = { workspace = true }
 dartq-source = { workspace = true }

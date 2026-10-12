@@ -25,7 +25,7 @@ Future<void> main() async {
     },
     // Blocking sleep inside the serve loop: the reply cannot make it out
     // before the core's callback budget expires.
-    onRequestFixes: (file, offset, length) {
+    onRequestFixes: (file, offset, length, queries) {
       sleep(const Duration(seconds: 30));
       return const <PrioritizedChange>[];
     },

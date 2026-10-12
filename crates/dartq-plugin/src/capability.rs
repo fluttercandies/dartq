@@ -17,6 +17,11 @@ pub enum Capability {
     Fix,
     /// The plugin contributes assists.
     Assist,
+    /// The plugin pulls engine facts over `request/query` (T4): the plugin's
+    /// own id space carries the requests, and the negotiated set gates it on
+    /// both sides — a core that cannot serve queries never advertises it,
+    /// and a plugin that never queries loses nothing by omitting it.
+    Query,
 }
 
 impl std::fmt::Display for Capability {
@@ -26,8 +31,14 @@ impl std::fmt::Display for Capability {
 }
 
 impl Capability {
-    /// Every capability defined by protocol v1.
-    pub const ALL: [Capability; 3] = [Capability::Lint, Capability::Fix, Capability::Assist];
+    /// Every capability defined by protocol v1 (query added additively by
+    /// the T4 revision; the wire order is declaration order).
+    pub const ALL: [Capability; 4] = [
+        Capability::Lint,
+        Capability::Fix,
+        Capability::Assist,
+        Capability::Query,
+    ];
 
     /// Parses a wire name; unknown names yield `None` (never an error).
     #[must_use]
@@ -36,6 +47,7 @@ impl Capability {
             "lint" => Some(Capability::Lint),
             "fix" => Some(Capability::Fix),
             "assist" => Some(Capability::Assist),
+            "query" => Some(Capability::Query),
             _ => None,
         }
     }
@@ -47,6 +59,7 @@ impl Capability {
             Capability::Lint => "lint",
             Capability::Fix => "fix",
             Capability::Assist => "assist",
+            Capability::Query => "query",
         }
     }
 }
@@ -65,12 +78,19 @@ impl CapabilitySet {
     /// Every capability of protocol v1.
     #[must_use]
     pub const fn all() -> Self {
-        Self(0b111)
+        Self(0b1111)
     }
 
     /// Enables `cap`.
     pub fn insert(&mut self, cap: Capability) {
         self.0 |= 1 << (cap as u8);
+    }
+
+    /// Disables `cap` (the runtime's local set drops `query` when no query
+    /// server is available — the negotiation then honestly represents what
+    /// this session can serve).
+    pub fn remove(&mut self, cap: Capability) {
+        self.0 &= !(1 << (cap as u8));
     }
 
     /// Adds the capabilities named in a JSON value (the `capabilities` array

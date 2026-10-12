@@ -30,6 +30,7 @@ fn silent_child_burns_the_handshake_budget_into_the_typed_timeout() {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     });
     let error = outcome.expect_err("a silent child cannot complete the handshake");
     assert!(

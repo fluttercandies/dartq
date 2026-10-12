@@ -63,6 +63,7 @@ fn a_satisfied_demand_reopens_and_stays_enforced() {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     })
     .expect("the sh child handshakes");
 
@@ -76,24 +77,25 @@ fn a_satisfied_demand_reopens_and_stays_enforced() {
         .feed(&batch, &files, &CyclePush::default())
         .expect("the first batch crosses");
     let drained = runtime
-        .wait_diagnostics(Duration::from_secs(5))
+        .wait_output(Duration::from_secs(5))
         .expect("the answered cycle drains");
     assert_eq!(
-        drained.len(),
+        drained.diagnostics.len(),
         1,
-        "the clock-closing diagnostic arrived: {drained:?}"
+        "the clock-closing diagnostic arrived: {:?}",
+        drained.diagnostics
     );
-    assert_eq!(drained[0].message, "burst one");
+    assert_eq!(drained.diagnostics[0].message, "burst one");
 
     // Cycle 2: the re-opened demand meets silence — the monitor must fire at
     // the callback budget through the ordinary crash path. A sticky (never
     // reopened) clock would keep this loop running green forever.
     let started = Instant::now();
-    let mut outcome = Ok(Vec::new());
+    let mut outcome = Ok(());
     for _ in 0..100 {
         outcome = runtime
             .feed(&batch, &files, &CyclePush::default())
-            .and_then(|()| runtime.wait_diagnostics(Duration::from_millis(50)));
+            .and_then(|()| runtime.wait_output(Duration::from_millis(50)).map(|_| ()));
         if outcome.is_err() {
             break;
         }

@@ -43,6 +43,7 @@ fn shutdown_kills_a_plugin_that_hangs_after_answering() {
         current_dir: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
         manifest,
         stderr: StdioPolicy::Null,
+        serve_queries: false,
     })
     .expect("the sh child handshakes");
 

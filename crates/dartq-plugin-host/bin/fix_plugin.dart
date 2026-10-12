@@ -40,7 +40,7 @@ Future<void> main() async {
         ),
       ];
     },
-    onRequestFixes: (file, offset, length) => <PrioritizedChange>[
+    onRequestFixes: (file, offset, length, queries) => <PrioritizedChange>[
       PrioritizedChange(
         priority: 1,
         message: 'insert const',
