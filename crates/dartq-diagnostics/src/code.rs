@@ -1,10 +1,10 @@
 //! Stable diagnostic codes: the official analyzer code set dartq aligns to,
 //! plus dartq's own `dartq/` namespace (PRD §13.2).
 //!
-//! The official set — 255 parser/scanner syntax codes plus the 3-code
-//! `// @dart=` language-version family — is generated at build time from
-//! `data/syntax-codes.tsv`, the authoritative table captured in
-//! `docs/facts/syntax-codes.md` §9 (dart 3.13.1 oracle lock). To update it,
+//! The official set — 255 registry-gated codes plus 4 supplemental rows —
+//! is generated at build time from `data/syntax-codes.tsv`, the
+//! authoritative table captured in `docs/facts/syntax-codes.md` §9
+//! (dart 3.13.1 oracle lock). To update it,
 //! edit the TSV and rebuild; the per-code constants, the [`OFFICIAL_CODES`]
 //! slice, and [`OFFICIAL_CODE_DATA`] are regenerated. Only codes outside that
 //! table (the M0-measured compile-time/warning/lint set and the dartq-own
