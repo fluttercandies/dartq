@@ -167,6 +167,91 @@ fn illegal_astral_char_double_emission() {
 }
 
 #[test]
+fn illegal_pure_junk_is_an_identifier() {
+    // A junk run with no adjacent ASCII identifier still becomes a real
+    // Identifier token (official `unexpected`, abstract_scanner.dart:2470:
+    // NonAsciiIdentifierToken appends IDENTIFIER over the collected code units;
+    // with no adjacent tail the token starts at the junk itself).
+    // Oracle `a = Щ;` (dart 3.13.1 --format=machine):
+    //   ILLEGAL_CHARACTER @1:5 len1 '1065'; UNDEFINED_IDENTIFIER @1:5 len1 'Щ'.
+    let r = scan_src("a = Щ;");
+    assert_kinds(&r, &[K::Identifier, K::Eq, K::Identifier, K::Semicolon]);
+    assert_codes(&r, &["illegal_character"]);
+    let t = &r.tokens;
+    assert_eq!(t.lexeme("a = Щ;", 2), "Щ");
+    assert_eq!(t.get(2).unwrap().byte_range(), 4..6);
+    assert_eq!(t.get(2).unwrap().utf16_offset, 4);
+    assert_eq!(r.diagnostics[0].range.offset, 4);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+    // Bare junk at file origin (`Щ`): same single-token shape at offset 0.
+    let r = scan_src("Щ");
+    assert_kinds(&r, &[K::Identifier]);
+    assert_codes(&r, &["illegal_character"]);
+    assert_eq!(r.tokens.first().byte_range(), 0..2);
+    assert_eq!(r.tokens.first().utf16_offset, 0);
+}
+
+#[test]
+fn illegal_run_merges_into_one_identifier() {
+    // Mixed ASCII + junk run: each junk character folds the partially built
+    // identifier back in (tail-merge, abstract_scanner.dart:2476-2481), so
+    // `a = ShcheгlovЩx;` scans to ONE Identifier spanning the whole run.
+    // Oracle `a = ShcheгlovЩx;` (dart 3.13.1 --format=machine):
+    //   UNDEFINED_IDENTIFIER @1:5 len11 'ShcheгlovЩx'
+    //   ILLEGAL_CHARACTER @1:10 len1 '1075' (г) and @1:14 len1 '1065' (Щ)
+    // — i.e. utf16 anchors 9 and 13, token utf16 span 4..15.
+    let src = "a = ShcheгlovЩx;";
+    let r = scan_src(src);
+    assert_kinds(&r, &[K::Identifier, K::Eq, K::Identifier, K::Semicolon]);
+    assert_codes(&r, &["illegal_character", "illegal_character"]);
+    let t = &r.tokens;
+    assert_eq!(t.lexeme(src, 2), "ShcheгlovЩx");
+    assert_eq!(t.get(2).unwrap().byte_range(), 4..17); // 5+2+3+2+1 bytes
+    assert_eq!(t.get(2).unwrap().utf16_offset, 4);
+    assert_eq!(byte_offset_to_utf16(src, 17), 15); // token utf16 end: 4+11
+    assert_eq!(r.diagnostics[0].range.offset, 9); // г
+    assert_eq!(r.diagnostics[0].range.length, 1);
+    assert_eq!(r.diagnostics[1].range.offset, 13); // Щ (utf16: 9 units + г)
+    assert_eq!(r.diagnostics[1].range.length, 1);
+}
+
+#[test]
+fn illegal_astral_char_token_span() {
+    // The astral junk run is one Identifier covering the whole character
+    // (official UTF-16 scanners see each surrogate hit `unexpected` separately;
+    // the low surrogate tail-merges into the high surrogate's token), so the
+    // downstream `Undefined name '😀'` face spans the surrogate pair.
+    // Oracle `f(😀);` (dart 3.13.1 --format=machine, line-scoped cols):
+    //   ILLEGAL_CHARACTER col5 len1 '55357'; UNDEFINED_IDENTIFIER col5 len2 '😀';
+    //   ILLEGAL_CHARACTER col6 len1 '56832'.
+    let src = "f(😀);";
+    let r = scan_src(src);
+    assert_kinds(
+        &r,
+        &[
+            K::Identifier,
+            K::OpenParen,
+            K::Identifier,
+            K::CloseParen,
+            K::Semicolon,
+        ],
+    );
+    assert_codes(&r, &["illegal_character", "illegal_character"]);
+    let t = &r.tokens;
+    assert_eq!(t.lexeme(src, 2), "😀");
+    assert_eq!(t.get(2).unwrap().byte_range(), 2..6); // 4-byte character
+    assert_eq!(t.get(2).unwrap().utf16_offset, 2);
+    assert_eq!(byte_offset_to_utf16(src, 6), 4); // utf16 span 2..4 (len 2)
+    // Surrogate anchors: high @2, low @3 (one unit each).
+    assert_eq!(r.diagnostics[0].range.offset, 2);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+    assert!(r.diagnostics[0].message.contains("55357"));
+    assert_eq!(r.diagnostics[1].range.offset, 3);
+    assert_eq!(r.diagnostics[1].range.length, 1);
+    assert!(r.diagnostics[1].message.contains("56832"));
+}
+
+#[test]
 fn unicode_whitespace_skipped() {
     // Non-ASCII whitespace like U+00A0: illegal_character + skip (official NonAsciiWhitespace).
     let r = scan_src("a\u{00A0}b");
