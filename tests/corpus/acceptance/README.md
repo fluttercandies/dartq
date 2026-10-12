@@ -33,6 +33,59 @@ no known-deliberate advisory rows in this corpus.
 | `lib/digit_separators.dart` | `_`/`__` separators in int/hex/double/exponent literals, coercion, const | `tests/language/number/separators_test.dart` |
 | `lib/kitchen_sink.dart` | all shipped families combined | per-family tests cited above |
 
+### Oracle-verified additions — 2026-10-12
+
+27 new files widened the family map below (ticket #918). Every file was
+admitted through the oracle protocol: copied into a `/tmp` probe package
+(`environment: sdk: ^3.13.0`), then run under fvm dart 3.13.1
+`dart analyze --format=machine` — **zero rows of any severity** is the
+admission bar. The file contents are byte-identical to the oracle-verified
+probe copies modulo header comments. All are also parseable by the 3.13.1
+oracle because every shipped feature of the 3.13–3.15 window landed at or
+before 3.13 (primary constructors `enabledIn 3.13.0`, private named
+parameters 3.12.0, dot shorthands 3.10.0); see the `modern/` note below.
+
+| File | Family | Official provenance (`.third/dart-sdk/`) | Verified |
+| --- | --- | --- | --- |
+| `lib/enhanced_enums.dart` | generative/const/factory enum constructors, fields, mixins/implements, generic enums with bounds, static members | `tests/language/enum/` (enhanced_enums_basic_test, syntax_test) | 2026-10-12 |
+| `lib/mixins.dart` | mixin declarations (on/super, base mixin), mixin application classes, multi-mixin chains | `tests/language/mixin_declaration/`, `tests/language/mixin/` | 2026-10-12 |
+| `lib/generics.dart` | generic classes/methods, extends/F-bounded/nullable bounds, nested generics, instantiate-to-bound use | `tests/language/generic/`, `tests/language/generic_methods/`, `tests/language/instantiate_to_bound/` | 2026-10-12 |
+| `lib/typedefs.dart` | old function aliases, new general typedefs, generic/nullable typedefs, typedefs of records | `tests/language/typedef/`, `tests/language/nonfunction_type_aliases/` | 2026-10-12 |
+| `lib/extension_types.dart` | representation declarations, const/private/factory constructors, generic + nullable representations, implements | `tests/language/extension_type/` | 2026-10-12 |
+| `lib/extensions.dart` | named/unnamed/generic extensions, static members, explicit application, conflict resolution by name | `tests/language/extension_methods/` | 2026-10-12 |
+| `lib/late_final.dart` | late top-level/static/instance fields, late final lazy init, initializer lists, definite assignment | `tests/language/final/`, `tests/language/variable/`, `tests/language/local_null_initialization.dart` | 2026-10-12 |
+| `lib/constructors.dart` | const/initializing formals, initializer lists with asserts, factory + redirecting factory + const factory redirect, super parameters | `tests/language/constructor/`, `tests/language/factory/`, `tests/language/redirecting/`, `tests/language/initializing_formal/` | 2026-10-12 |
+| `lib/operators.dart` | full overloadable-operator set incl. `>>>`, `[]`/`[]=`, `call`, unary `-`/`~`, `==`, `compareTo`, `++`/`--` usage | `tests/language/operator/` | 2026-10-12 |
+| `lib/string_literals.dart` | raw/adjacent/multiline strings, simple/braced/nested interpolation, escapes, const interpolation | `tests/language/string/` | 2026-10-12 |
+| `lib/number_literals.dart` | decimal/hex/leading-zero ints, doubles, signed exponents, mantissa-exponent forms | `tests/language/number/`, `tests/language/double_literals/` | 2026-10-12 |
+| `lib/collection_literals.dart` | typed/const collections, spread + null-aware spread, collection-if (with else), collection-for | `tests/language/control_flow_collections/`, `tests/language/spread_collections/`, `tests/language/set_literals/` | 2026-10-12 |
+| `lib/labels.dart` | labels on loops/blocks, labeled break/continue, labels across switch | `tests/language/label/` | 2026-10-12 |
+| `lib/cascades.dart` | cascade sections over methods/getters/setters/index, nested cascades, null-aware cascades | `tests/language/cascade/` | 2026-10-12 |
+| `lib/async_await.dart` | async/async*/sync* functions, await in bodies/expressions, await-for, yield/yield*, async closures | `tests/language/async/`, `tests/language/async_star/`, `tests/language/sync_star/` | 2026-10-12 |
+| `lib/null_safety_edges.dart` | local + private-final field promotion, `??`/`??=`/`?.`/`!`, null-aware chains, is/is! narrowing | `tests/language/null/`, `tests/language/null_aware/`, `tests/language/type_promotion/` | 2026-10-12 |
+| `lib/control_flow.dart` | switch statements (grouped/empty/constant/default cases), loops, try/on/catch/finally, rethrow, assert | `tests/language/switch/`, `tests/language/if/`, `tests/language/loop/`, `tests/language/exception/` | 2026-10-12 |
+| `lib/metadata.dart` | annotations on library/classes/type params/members/params/enum values/typedefs/locals/loop vars | `tests/language/metadata/` | 2026-10-12 |
+| `lib/getters_setters.dart` | top-level/static/instance accessor pairs, abstract accessors, covariant setters | `tests/language/getter/`, `tests/language/setter/` | 2026-10-12 |
+| `lib/external_abstract.dart` | external top-level functions/accessors/constructors/statics, abstract fields and members | `tests/language/external_abstract_fields/`, `tests/language/abstract/` | 2026-10-12 |
+| `lib/constants.dart` | const constructors/fields/collections, canonicalization, const ternary + interpolation, const record sets | `tests/language/const/`, `tests/language/constants_2018/` | 2026-10-12 |
+| `lib/functions.dart` | closures over all parameter shapes, constructor tear-offs + generic instantiation, callable classes, named args anywhere | `tests/language/function/`, `tests/language/named_arguments_anywhere/` | 2026-10-12 |
+| `lib/wildcard_variables.dart` | non-binding `_` (repeated params, for-in, list/map patterns, catch), binding `_`-prefixed locals | `tests/language/wildcard_variables/` | 2026-10-12 |
+| `lib/private_named_parameters.dart` | primary-ctor declaring params + `this._x` formals with private names, public-name invocation | `tests/language/private_named_parameters/` | 2026-10-12 |
+| `lib/directives.dart` | library, deferred import + `loadLibrary`, import combinators, export combinators, part directive | `tests/language/library/`, `tests/language/part/`, `tests/language/import/`, `tests/language/prefix/`, `tests/language/deferred/` | 2026-10-12 |
+| `lib/directives_part.dart` | companion `part` unit (string `part of`, private shared declarations) | `tests/language/part/`, `tests/language/library/` | 2026-10-12 |
+| `lib/deferred_impl.dart` | companion deferred-import target | `tests/language/deferred/` | 2026-10-12 |
+
+### The `modern/` sub-suite (empty as of 2026-10-12)
+
+Rule for future additions: a file that is valid for the 3.15 grammar window
+but NOT parseable by the 3.13.1 oracle (3.14/3.15-only shipped syntax) goes
+to `modern/` instead of `lib/`, and its README row must state that its
+oracle face is the implement face (3.15-main source-anchored), not the
+3.13.1 differential. As of 2026-10-12 the suite is empty: no shipped feature
+in the window has `enabledIn` above 3.13 (`tools/experimental_features.yaml`),
+so every admitted file passed the 3.13.1 differential. Experiment-gated
+families remain excluded per the section below.
+
 The corpus is a valid package (`pubspec.yaml`, `environment: sdk: ^3.15.0`).
 No `analysis_options.yaml` on purpose: the `dartq check` face is options-free
 by design (`crates/dartq-commands/src/check.rs`, `analyze_file` — the feature
@@ -60,7 +113,14 @@ experiment plumbing or the features ship:
 
 ## Needs first-run confirmation
 
-(none) — every included file mirrors shipped-feature syntax taken verbatim
-from the official language tests, and shipped features are enabled at the
-check face's default language version. Any first-run row is a gate defect to
-fix at its reported (code, file), not a corpus guess to adjudicate.
+Every included file mirrors shipped-feature syntax taken from the official
+language tests, and shipped features are enabled at the check face's default
+language version. Any first-run row is a gate defect to fix at its reported
+(code, file), not a corpus guess to adjudicate. One such defect is already
+known from the 2026-10-12 admission sweep (oracle-clean file, current-binary
+row — a fix ticket, not a corpus change):
+
+- `lib/constants.dart` line 54 — `const canonicalPairs = <(int, int)>{(1, 2),
+  (3, 4)};`: dartq emits `ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|...|54|24|1|
+  Expected '[' before this.` on the record type argument `<(int, int)>` of a
+  const set literal. fvm dart 3.13.1 reports no issues for this file.
