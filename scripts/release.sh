@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# release.sh — the one-shot 0.1.0 release harness (goal #892).
+# release.sh — the one-shot v1.0.0 release harness (goal #892).
 #
 # Orchestrates the adjudicated 0.1.0 release gate set (#622: the #881 gate
 # chain + the D1-D5 rulings from docs/audits/release-prep.md):
