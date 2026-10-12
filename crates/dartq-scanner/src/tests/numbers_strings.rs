@@ -337,6 +337,70 @@ fn interpolation_with_function_call() {
 }
 
 #[test]
+fn empty_interp_close_paren_faces() {
+    // #935, SII probe family (f-'${ insertion postures, #921): a `}` closing
+    // an interpolation is followed by string-body scanning, so an immediate
+    // closing quote ends the string — `f('${}')` scans with zero diagnostics
+    // (oracle dart 3.13.1: no scanner row; the #921 lane's static prediction
+    // of an unterminated_string_literal here was wrong, the replay overwrites
+    // it). A quote-less tail stays unterminated, pinned at the last content
+    // character before the break (the analyzer's `endOffset - 1` rule).
+    let src = "f('${}')";
+    let r = scan_src(src);
+    assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    assert_kinds(
+        &r,
+        &[
+            K::Identifier,
+            K::OpenParen,
+            K::String,
+            K::StringInterpolationExpression,
+            K::CloseCurly,
+            K::String,
+            K::CloseParen,
+        ],
+    );
+    let t = &r.tokens;
+    assert_eq!(t.lexeme(src, 2), "'");
+    assert_eq!(t.lexeme(src, 3), "${");
+    assert_eq!(t.matching_end(3), Some(5));
+    assert_eq!(t.lexeme(src, 6), "'");
+
+    // Quote-less tail inside the call: `)` and `;` stay string content; the
+    // pin lands on the `;` (oracle `f('${});` row 1|8|1).
+    let r = scan_src("f('${});");
+    assert_codes(&r, &["unterminated_string_literal"]);
+    assert_eq!(r.diagnostics[0].range.offset, 7);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+
+    // No enclosing call: same rule, pin on the `)` (oracle `var s = '${})`
+    // row 1|13|1).
+    let r = scan_src("var s = '${})");
+    assert_codes(&r, &["unterminated_string_literal"]);
+    assert_eq!(r.diagnostics[0].range.offset, 12);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+
+    // `)` inside the empty interpolation deep-matches the enclosing `(`: the
+    // `${` is reported unmatched at the `)` (insert posture), then the body
+    // resumes and hits the break (oracle `f('${)` rows expected_token 1|6|1 +
+    // unterminated 1|7|1).
+    let r = scan_src("f('${)");
+    assert_codes(&r, &["expected_token", "unterminated_string_literal"]);
+    assert_eq!(r.diagnostics[0].range.offset, 5);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+    assert_eq!(r.diagnostics[1].range.offset, 6);
+    assert_eq!(r.diagnostics[1].range.length, 1);
+
+    // EOF inside the interpolation: unterminated pinned at the break, then
+    // the eof-synthetic closer for the open `${` (oracle `g('${` rows
+    // unterminated 1|6|1 + expected_token at eof).
+    let r = scan_src("g('${");
+    assert_codes(&r, &["unterminated_string_literal", "expected_token"]);
+    assert_eq!(r.diagnostics[0].range.offset, 5);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+}
+
+#[test]
 fn multiline_interpolation() {
     let src = "\"\"\"a${b}c\"\"\"";
     assert_kinds(

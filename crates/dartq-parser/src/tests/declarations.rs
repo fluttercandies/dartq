@@ -633,6 +633,49 @@ fn spaced_empty_named_group_reports_missing_identifier() {
 }
 
 #[test]
+fn empty_interp_then_close_paren_parse_signature_matches_control() {
+    // #935, SII probe family (f-'${ insertion postures, #921): in
+    // `f('${}')` the `}` closes the interpolation and the `'` right after
+    // closes the string, so the string is scanner-well-formed — the oracle
+    // (dart 3.13.1, docs/audits/release-night/sii-probes) emits no scanner
+    // row, and the parse signature is exactly the well-formed control
+    // `f('${x}')`'s. (The #921 lane's static prediction of
+    // unterminated_string_literal + an eof expected_token for this shape was
+    // wrong; the replay overwrites it.)
+    let control = parse("f('${x}')");
+    assert_eq!(
+        control.error_codes(),
+        ["missing_identifier", "expected_token", "missing_function_body"]
+    );
+    assert_eq!(control.errors[0].1, 2); // the string head `'`
+    assert_eq!(control.errors[0].2, 3);
+    assert_eq!(control.errors[1].1, 3); // the `${` token span
+    assert_eq!(control.errors[1].2, 5);
+    assert_eq!(control.errors[2].1, 9); // eof
+    assert_eq!(control.errors[2].2, 9);
+    // The empty-interpolation sibling parses with the same signature, pinned
+    // to its own spans (eof at the 8-byte source's end).
+    let c = parse("f('${}')");
+    assert_eq!(
+        c.error_codes(),
+        ["missing_identifier", "expected_token", "missing_function_body"]
+    );
+    assert_eq!(c.errors[0].1, 2);
+    assert_eq!(c.errors[0].2, 3);
+    assert_eq!(c.errors[1].1, 3);
+    assert_eq!(c.errors[1].2, 5);
+    assert_eq!(c.errors[2].1, 8); // eof
+    assert_eq!(c.errors[2].2, 8);
+    assert_eq!(&c.texts[..2], &["Expected an identifier.", "Expected to find ')'."]);
+
+    // The control's first two rows are identical; only the eof row moves
+    // (the 9-byte source ends one byte later).
+    assert_eq!(&control.errors[..2], &c.errors[..2]);
+    assert_eq!(&control.texts[..2], &c.texts[..2]);
+    assert_eq!(control.error_codes(), c.error_codes());
+}
+
+#[test]
 fn required_modifier_walk_matches_official_order() {
     // `required` on a non-named formal reports `extraneous_modifier` once at
     // the first token after the walk (modifier_context.dart:212-221); a
