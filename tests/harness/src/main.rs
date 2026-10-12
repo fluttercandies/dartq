@@ -1321,6 +1321,250 @@ mod tests {
         }
     }
 
+    /// Corpus-hygiene pin for the M2 WARNING-tier gate corpus
+    /// (`tests/corpus/m2-warning`, the run of `scripts/m2-gate.sh`): the
+    /// gate's 1.000 bar over the 43-code universe holds only while the
+    /// corpus never triggers the excluded STATIC_WARNING families whose
+    /// codes are oracle-emittable from plain Dart (the #905 exemption
+    /// re-audit §5 S6 conditional keeps and §7 P2 watchlist: the
+    /// usage-analysis `unused_*` set, the deprecation machinery, doc-comment
+    /// directives & bidi, the async error-handler family,
+    /// `unnecessary_set_literal`). This pin makes that hygiene
+    /// load-bearing: it scans every corpus source for the trigger shapes
+    /// and fails naming each offending file and shape.
+    ///
+    /// Shape table (shape -> the excluded codes it keeps unreachable):
+    /// - `@Deprecated` / `@deprecated` declarations -> the `deprecated_*`
+    ///   kind family (12): one deprecated element makes plain usage
+    ///   (extend / implement / mixin / instantiate / field type / export)
+    ///   oracle-emittable. (Re-probe 2026-10-12: the plain use-kind face is
+    ///   itself never emitted by the 3.13.1 CLI; the kind-carrying family
+    ///   is the exposure.)
+    /// - `{@` doc-directive markers, `@docImport` -> the doc-comment
+    ///   directive family (`doc_directive_*`, `doc_import_*`,
+    ///   `uri_does_not_exist_in_doc_import`).
+    /// - bidi code points U+202E / U+200F / U+200E ->
+    ///   `text_direction_code_point_in_comment` /
+    ///   `text_direction_code_point_in_literal`.
+    /// - `.then(` / `.catchError(` -> the async error-handler family
+    ///   (`argument_type_not_assignable_to_error_handler`,
+    ///   `body_might_complete_normally_catch_error`,
+    ///   `invalid_return_type_for_catch_error`,
+    ///   `invalid_return_type_for_then`, `unawaited_return_in_try_block`).
+    /// - `Map()` / `Set()` bare constructor calls -> the
+    ///   `non_const_call_to_literal_constructor` trigger: a WARNING-tier
+    ///   universe member with no dartq implementation and no fixture yet
+    ///   (#749), so a stray call mints oracle-only rows. Legal only inside
+    ///   that code's dedicated targeted fixture (the corpus's "one surgical
+    ///   fixture per included code" contract).
+    /// - `=> {` arrow-body collection literals -> the
+    ///   `unnecessary_set_literal` face (a built-in WARNING at the oracle
+    ///   generation; fires on a void-returning arrow body producing a set
+    ///   literal). This textual shape is the deliberate superset: no
+    ///   return-type resolution happens here.
+    /// - a `catch` clause whose exception or stack-trace variable is never
+    ///   referenced again in the file -> `unused_catch_clause` /
+    ///   `unused_catch_stack` (the two textually pinnable `unused_*`
+    ///   faces).
+    ///
+    /// Not textually pinnable: the remaining `unused_*` usage-analysis
+    /// faces (`unused_local_variable`, `unused_field`, `unused_import`,
+    /// ...) fire on unreferenced declarations, whose absence only a real
+    /// usage analysis can prove — they stay under the re-audit's contract
+    /// that any corpus growth re-runs the P2 out-of-universe sweep. The
+    /// strict-analysis opt-in family (8 codes) is guarded structurally:
+    /// the corpus must carry no `analysis_options.yaml` at all.
+    #[test]
+    fn m2_warning_corpus_carries_no_excluded_code_trigger_shapes() {
+        fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // `.dart_tool` is pub-get output, not corpus content.
+                    if path.file_name().map(|n| n.to_string_lossy().into_owned())
+                        != Some(".dart_tool".to_owned())
+                    {
+                        collect_files(&path, out);
+                    }
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+
+        fn is_ident_byte(b: u8) -> bool {
+            b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+        }
+
+        /// Whole-word occurrence count of `word` in `text` (Dart
+        /// identifiers are ASCII letters/digits/`_`/`$` — the official
+        /// scanner's identifier rule).
+        fn word_occurrences(text: &str, word: &str) -> usize {
+            let b = text.as_bytes();
+            let w = word.as_bytes();
+            let mut count = 0;
+            let mut i = 0;
+            while i + w.len() <= b.len() {
+                if &b[i..i + w.len()] == w
+                    && (i == 0 || !is_ident_byte(b[i - 1]))
+                    && (i + w.len() == b.len() || !is_ident_byte(b[i + w.len()]))
+                {
+                    count += 1;
+                    i += w.len();
+                } else {
+                    i += 1;
+                }
+            }
+            count
+        }
+
+        /// The `catch`-clause variables declared but never referenced
+        /// anywhere else in the file: the `unused_catch_clause` /
+        /// `unused_catch_stack` trigger shape. A mention in a comment or
+        /// string counts as a use here — under-flagging is the safe
+        /// direction for a tripwire backed by the gate itself.
+        fn unused_catch_variables(text: &str) -> Vec<String> {
+            let b = text.as_bytes();
+            let mut unused = Vec::new();
+            let mut i = 0;
+            while let Some(found) = text[i..].find("catch (") {
+                let mut cursor = i + found + "catch (".len();
+                let mut idents: Vec<String> = Vec::new();
+                for _ in 0..2 {
+                    while cursor < b.len() && b[cursor] == b' ' {
+                        cursor += 1;
+                    }
+                    let start = cursor;
+                    while cursor < b.len() && is_ident_byte(b[cursor]) {
+                        cursor += 1;
+                    }
+                    if cursor == start {
+                        break;
+                    }
+                    idents.push(text[start..cursor].to_owned());
+                    while cursor < b.len() && b[cursor] == b' ' {
+                        cursor += 1;
+                    }
+                    if cursor < b.len() && b[cursor] == b',' {
+                        cursor += 1;
+                    } else {
+                        break;
+                    }
+                }
+                for ident in &idents {
+                    if word_occurrences(text, ident) == 1 {
+                        unused.push(ident.clone());
+                    }
+                }
+                i = cursor.max(i + found + 1);
+            }
+            unused
+        }
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("harness lives at <repo>/tests/harness");
+        let corpus = root.join("tests/corpus/m2-warning");
+
+        let mut files = Vec::new();
+        collect_files(&corpus, &mut files);
+        files.sort();
+        assert!(
+            !files.is_empty(),
+            "{} carries no files (corpus missing?)",
+            corpus.display()
+        );
+
+        let literal_constructor_fixture = "lib/targeted/non_const_call_to_literal_constructor.dart";
+        let substring_shapes: &[(&[&str], &str)] = &[
+            (
+                &["@Deprecated", "@deprecated"],
+                "deprecated declaration — deprecated_* kind family (12 excluded codes)",
+            ),
+            (&["{@"], "{@ doc directive — doc_directive_* family"),
+            (
+                &["@docImport"],
+                "@docImport directive — doc_import_* / uri_does_not_exist_in_doc_import",
+            ),
+            (
+                &[".then(", ".catchError("],
+                "Future error-handler call — async error-handler family (5 excluded codes)",
+            ),
+            (
+                &["=> {"],
+                "arrow-body collection literal — unnecessary_set_literal face \
+                 (void-arrow set literal)",
+            ),
+        ];
+
+        let mut violations: Vec<String> = Vec::new();
+        for file in &files {
+            let rel = file
+                .strip_prefix(&corpus)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .into_owned();
+            if rel.ends_with("analysis_options.yaml") {
+                violations.push(format!(
+                    "{rel}: analysis_options.yaml must not exist in the m2-warning \
+                     corpus (the strict_raw_type / inference_failure_on_* exclusions \
+                     rest on its absence)"
+                ));
+                continue;
+            }
+            if !rel.ends_with(".dart") {
+                continue;
+            }
+            let text = match std::fs::read_to_string(file) {
+                Ok(text) => text,
+                Err(e) => {
+                    violations.push(format!("{rel}: unreadable as UTF-8 ({e})"));
+                    continue;
+                }
+            };
+            for (needles, description) in substring_shapes {
+                if needles.iter().any(|needle| text.contains(needle)) {
+                    violations.push(format!("{rel}: {description}"));
+                }
+            }
+            if (word_occurrences(&text, "Map()") > 0 || word_occurrences(&text, "Set()") > 0)
+                && rel != literal_constructor_fixture
+            {
+                violations.push(format!(
+                    "{rel}: Map()/Set() bare constructor call — \
+                     non_const_call_to_literal_constructor trigger (unimplemented, \
+                     no fixture until #749); legal only inside {literal_constructor_fixture}"
+                ));
+            }
+            if text.contains(['\u{202E}', '\u{200F}', '\u{200E}']) {
+                violations.push(format!(
+                    "{rel}: bidi code point U+202E/U+200F/U+200E — \
+                     text_direction_code_point_in_comment/_in_literal"
+                ));
+            }
+            let unused = unused_catch_variables(&text);
+            if !unused.is_empty() {
+                violations.push(format!(
+                    "{rel}: catch clause variable(s) {unused:?} never referenced — \
+                     unused_catch_clause/unused_catch_stack trigger"
+                ));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "the m2-warning corpus carries excluded-code trigger shapes; the M2 \
+             WARNING gate's 1.000 bar holds only without them (remove the shape, \
+             or re-run the #905 P2 out-of-universe sweep and extend the audit \
+             trail first):\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
     /// Core codes-filter semantics: out-of-set entries are dropped on both sides --
     /// oracle-only out-of-set entries never enter the denominator; the gate judges only in-set entries.
     #[test]
