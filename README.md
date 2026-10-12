@@ -11,6 +11,25 @@ the priority order once: correctness against the oracle is the
 non-negotiable floor, and above that floor extreme performance and a
 bounded memory footprint outrank every other consideration.
 
+## Quickstart
+
+```bash
+cargo build --release -p dartq-cli   # the binary lands at target/release/dartq
+
+# Scan + parse a package tree: syntax diagnostics in the oracle's machine
+# format by default.
+target/release/dartq check lib/ test/
+
+# Full engine over a package directory (pubspec.yaml plus
+# .dart_tool/package_config.json — run `dart pub get` first). --sdk
+# defaults to $DART_SDK when omitted.
+target/release/dartq analyze . --format=machine --sdk <dart-sdk-root>
+```
+
+For differential confidence, the same faces are compared against
+`dart analyze` (Dart 3.13.1) by the harness — see
+[Differential Testing](#differential-testing).
+
 ## Design Pillars
 
 1. **Performance** — end-to-end budgets: cold/warm start, incremental
@@ -211,28 +230,15 @@ cache:
 
 ## Performance
 
-End-to-end numbers are measured over the M0 corpus (279 files, 22,656
-LOC) with **debug builds** of `dartq check` — labeled as measured, not
-projected:
+Measured numbers only — measured on the differential corpus, check face;
+analyze-face numbers pending the 0.1.0 gate run:
 
-| Metric | dartq | Comparison |
-| --- | --- | --- |
-| Incremental re-run, p95 | 13.97 ms | `dart analyze` ≈ 555 ms per step (≈ 40x) |
-| Peak RSS over the corpus | 7.2 MiB (≈ 31.6 MiB per 100k LOC) | — |
-| Machine-format output bytes | 175,114 | oracle 435,207 (see note) |
-
-The output-volume row compares identical machine-format faces, but the
-oracle currently emits a strictly larger diagnostic set (full analysis vs
-dartq's syntax tier), so the gap reflects the surface difference as much
-as output economy.
-
-Component microbenchmarks (release builds, Apple M1-class arm64):
-
-| Component | Measurement |
+| Measurement | Result |
 | --- | --- |
-| Scanner | 260.5 MB/s single-thread over the `dart-sdk` package corpus |
-| Type system | subtype chain 4.7M ops/s; interner hit path 29M ops/s; 64 B per interned type |
-| Source layer | ~1.16 MB of persistent storage per MB of source (content-addressed) |
+| Small corpus (the m0 differential corpus, 396 files): wall-clock vs `dart analyze` | 17.4x faster |
+| Small corpus: peak memory vs `dart analyze` | 33x lower |
+| 100k-tier corpus (99,598 files, ~5.4M LOC): wall-clock / peak memory (check face) | 30.1x / 38.7x |
+| Scanner micro-benchmark, single-thread tokenization | 245 MB/s |
 
 Design targets (budgets from the charter, not claims): ≥ 10x faster than
 `dart analyze` end-to-end as the shipping floor, 100x–1000x on cold
@@ -265,7 +271,7 @@ today:
 | Services | [`dartq-index`](crates/dartq-index) | Reference, inheritance, and test graphs | landed |
 | Services | [`dartq-snapshot`](crates/dartq-snapshot) | Persistence for analysis contexts and snapshots (atomic generation save/load) | landed |
 | Services | [`dartq-engine`](crates/dartq-engine) | Runtime, scheduler, cancellation, overlay management | landed |
-| Services | [`dartq-lints`](crates/dartq-lints) | Built-in lint rule set (the `package:lints` core + recommended sets, 90 rules), wired into the analyze face | landed |
+| Services | [`dartq-lints`](crates/dartq-lints) | Built-in lint rule set (all 89 `package:lints` rules — 34 core + 55 recommended — plus one opt-in diagnostic mirror), wired into the analyze face | landed |
 | Services | [`dartq-plugin`](crates/dartq-plugin) | Plugin system: protocol v1 (frames, codec, handshake, manifest) plus the enforced runtime — discovery, spawn, isolation budgets | landed |
 | Interface | [`dartq-ai`](crates/dartq-ai) | Agent-facing queries: impact, explain, compatibility, fix | landed |
 | Interface | [`dartq-commands`](crates/dartq-commands) | Per-command cores shared by the CLI and daemon faces: plain parameters in, typed results out — no parsing, printing, or exit codes | landed |
@@ -285,22 +291,29 @@ analyzer-suite cases), `m0-syntax` (syntax-broken files), and the syntax
 gate's code list `syntax-codes.txt` (255 codes, the scanner/parser subset
 of `crates/dartq-diagnostics/data/syntax-codes.tsv`).
 
-Current measured baseline (oracle: `dart analyze` 3.13.1, `--e2e-oracle`
-self-check, both sides the analyzer — Jaccard 1.000 across all runs):
+Every differential gate holds the full-parity bar — `(code, file)` Jaccard
+1.0 at the gate's tier, with residuals passing only via individually
+adjudicated pinned exemptions — against the single oracle of record:
+`dart analyze` from a pinned Dart 3.13.1 install, on `PATH` or the fvm
+default install (what the gate scripts resolve). The gate chain, one
+script per gate under `scripts/`, in release order:
 
-| Run | Corpus | Caliber | Files with diags | Instances | Jaccard |
-| --- | --- | --- | ---: | ---: | ---: |
-| full | `m0` | all | 166 | 1844 | 1.000 |
-| syntax | `m0-syntax` | codes ∩ ERROR | 272 | 2144 | 1.000 |
-| full | `m0` + `m0-syntax` | all | 439 | 6873 | 1.000 |
+| Gate | Face | Tier / universe |
+| --- | --- | --- |
+| `m0-gate.sh` run A | check | ERROR, the 255-code syntax universe |
+| `m0-gate.sh` run B | analyze | ERROR, the 290-code union (255 syntax + 36 M1 − 1 overlap) |
+| `m1-gate.sh` | analyze | ERROR, the frozen semantic code set (`tests/harness/m1_codes.txt`) |
+| `lint-gate.sh` | analyze | INFO × LINT, the frozen lint universe with adjudicated exclusions (`tests/harness/lint_codes.txt`, `lint_divergences.tsv`) |
+| `m2-gate.sh` | analyze | WARNING, the frozen M2 code set (`tests/harness/m2_warning_codes.txt`) |
+| `m3-gate.sh` | analyze | WARNING, the frozen unused-family set (`tests/harness/m3_unused_codes.txt`) |
+| `acceptance-gate.sh` | check | zero diagnostics of any tier over the valid-syntax feature-family corpus (`tests/corpus/acceptance/`) |
+| `repro-gate.sh` | — | fresh-process runs are byte-identical; the sealed `{tuple, output_digest}` pair lands under `docs/audits/repro/` |
 
-The M0 gate is the syntax-caliber run against the real dartq side,
-passing at ERROR-tier Jaccard ≥ 0.99. Honest state of the recorded
-evidence: the latest real-side gate run on disk
-(`docs/audits/gate-m0/gate-caliber-r5`) failed at Jaccard 0.620 over a
-corpus shape that has since been reorganized, so no current-tree gate
-evidence exists yet — the ≥ 0.99 passing baseline is to be
-re-established by the upcoming acceptance runs:
+Honest state of the recorded evidence: the last recorded gate runs predate
+the corpus reorganization and fell below the full-parity bars, so no
+current-tree gate numbers exist yet — the 0.1.0 release gate chain
+re-establishes the evidence, and the final per-gate numbers land in this
+section from that run. The harness itself is runnable directly:
 
 ```bash
 cargo test -p harness          # harness unit tests
@@ -323,15 +336,6 @@ Preflight requires every corpus package to carry a
 `.dart_tool/package_config.json` with `languageVersion >= 3.13`.
 `--oracle-dart`, `--type-filter`, and `--threshold` are also available; see
 `cargo run -p harness -- --help`.
-
-The M1 gate is the frozen-code semantic run over `tests/corpus/m1-semantic`
-(`tests/harness/m1_codes.txt`, ERROR tier, bar 0.95 — deliberately below
-the M0 0.99), driven by `scripts/m1-gate.sh`. Honest state of the recorded
-evidence: the latest run on disk (`docs/audits/gate-m1/r2`) failed at
-Jaccard 0.8235 over a 34-entry corpus — five dartq misses in the
-`wrong_number_of_type_arguments` family plus one dartq-only attribution —
-so the ≥ 0.95 passing baseline is likewise to be re-established by the
-next gate run.
 
 ## Oracle Baseline
 
@@ -359,13 +363,20 @@ these numbers.
 
 ## Limitations
 
-Honest state of the current tree:
+Honest state of the 0.1.0 tree:
 
-- Semantic diagnostics cover the families the default diagnoser implements
-  (undefined identifiers and members, wrong-number-of-arguments and
-  -type-arguments, the part/part-of family, dead code); full oracle parity
-  for the semantic tier is still below the gate bar and is tracked by the
-  differential harness (see the M1 gate state above).
+- Semantics are pinned to the Dart 3.13.1 oracle: syntax features that
+  newer SDKs ship behind experiment flags are diagnosed, never silently
+  accepted.
+- Incremental L3 fine-grained invalidation lands post-0.1.0.
+- The supported daemon/LSP shell lands post-0.1.0; the 0.1.0 differential
+  gates cover the `check` and `analyze` faces (see
+  [Differential Testing](#differential-testing)).
+- The semantic diagnostic tier is scoped to the families the diagnoser
+  implements (undefined identifiers and members, wrong-number-of-arguments
+  and -type-arguments, the part/part-of family, dead code); its parity is
+  what the frozen-code M1/M2/M3 differential gates assert, and the
+  recorded evidence is refreshed by the release gate chain.
 - Without an `analysis_options.yaml`, dartq enables the whole
   `package:lints` core + recommended slice — a deliberate divergence from
   the oracle, which enables nothing without an `include:`.
@@ -374,7 +385,6 @@ Honest state of the current tree:
   `.dart_tool/package_config.json` first.
 - `analyze --format=human` is a convenience view, not a differential
   face — its layout may change freely.
-- The benchmark numbers above are debug builds over a 22.7k-LOC corpus.
 
 ## Publication
 
@@ -396,6 +406,13 @@ The loop walks the workspace members (fixture/test-only members skipped),
 one crate at a time, and stops at the first failure naming the crate.
 Concurrency stays under the workspace job cap — `.cargo/config.toml`
 pins `jobs = 2`; the script passes no `-j`.
+
+The 0.1.0 release harness (`scripts/release.sh`) runs the full gate chain
+in order — `m0-gate` → `m1-gate` → `lint-gate` → `m2-gate` → `m3-gate` →
+`ci.sh` → `repro-gate` — one subprocess at a time, each with its own
+evidence directory under `docs/audits/`. Coverage floors and runners live
+alongside (`scripts/coverage-floors.tsv`, `coverage-run.sh`,
+`coverage-gate.sh`).
 
 ## Third-Party Notices
 
