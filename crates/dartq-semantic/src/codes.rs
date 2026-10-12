@@ -731,6 +731,23 @@ pub enum SemanticCode {
     /// map literal (same verifier site, reported at the later key); map
     /// values never participate. `messages.yaml` :26951.
     EqualKeysInMap,
+    // —— #748: the W5 member-invocation pair (all `STATIC_WARNING`) —————————
+    /// `The parameter type of '==' operators should be non-nullable.` — an
+    /// `==` operator whose single parameter's written type is `Object?`
+    /// (best_practices_verifier.dart:1345-1374, reported at the `==` name
+    /// token). Only `Object` and `dynamic` parameters reach the
+    /// nullability question — bare `Object` and `dynamic` stay silent, as
+    /// does every other type (the official double-report guard).
+    /// `diagnostic.g.dart` :13182-13192.
+    NonNullableEqualsParameter,
+    /// `Unnecessary 'noSuchMethod' declaration.` — a `noSuchMethod`
+    /// declaration whose body is exactly `super.noSuchMethod(<one
+    /// argument>)` (an expression body, or a block whose single statement
+    /// is that return) whose concrete super-dispatch target is a
+    /// `noSuchMethod` declared by a non-`Object` class
+    /// (best_practices_verifier.dart:1433-1478, reported at the
+    /// declaration's name token). `diagnostic.g.dart` :17515-17524.
+    UnnecessaryNoSuchMethod,
     // —— #911: the M3 primary-constructor field face (`STATIC_WARNING`) ——————
     /// `The value of the field '{0}' isn't used.` — a primary-constructor
     /// formal that declares a field (`var`/`final` keyword, no `this`/
@@ -1129,6 +1146,15 @@ impl SemanticCode {
             // `hasPublishedDocs: true`).
             Self::EqualElementsInSet => ("equal_elements_in_set", "EQUAL_ELEMENTS_IN_SET"),
             Self::EqualKeysInMap => ("equal_keys_in_map", "EQUAL_KEYS_IN_MAP"),
+            // The #748 W5 pair (diagnostic.g.dart :13184-13191 and
+            // :17517-17523 — both `hasPublishedDocs: true`).
+            Self::NonNullableEqualsParameter => (
+                "non_nullable_equals_parameter",
+                "NON_NULLABLE_EQUALS_PARAMETER",
+            ),
+            Self::UnnecessaryNoSuchMethod => {
+                ("unnecessary_no_such_method", "UNNECESSARY_NO_SUCH_METHOD")
+            }
             // The #911 M3 face (diagnostic.g.dart:18040-18055 —
             // `hasPublishedDocs: true`).
             Self::UnusedFieldFromPrimaryConstructor => (
@@ -1258,6 +1284,10 @@ impl SemanticCode {
             | Self::EqualKeysInMap
             // The #911 M3 face (`type: DiagnosticType.STATIC_WARNING`,
             // diagnostic.g.dart:18051).
+            // The #748 W5 pair (`type: DiagnosticType.STATIC_WARNING`,
+            // diagnostic.g.dart :13189 and :17521).
+            | Self::NonNullableEqualsParameter
+            | Self::UnnecessaryNoSuchMethod
             | Self::UnusedFieldFromPrimaryConstructor => DiagnosticType::StaticWarning,
             _ => DiagnosticType::CompileTimeError,
         }
@@ -1665,6 +1695,15 @@ impl SemanticCode {
             Self::EqualKeysInMap => {
                 "Two keys in a map literal shouldn't be equal.".to_string()
             }
+            // The #748 W5 pair: no-argument rows, verbatim
+            // (diagnostic.g.dart :13186 and :17518).
+            Self::NonNullableEqualsParameter => {
+                "The parameter type of '==' operators should be non-nullable."
+                    .to_string()
+            }
+            Self::UnnecessaryNoSuchMethod => {
+                "Unnecessary 'noSuchMethod' declaration.".to_string()
+            }
         }
     }
 
@@ -2036,6 +2075,14 @@ impl SemanticCode {
                 Some("Change or remove the duplicate element.".to_string())
             }
             Self::EqualKeysInMap => Some("Change or remove the duplicate key.".to_string()),
+            // The #748 W5 pair's verbatim oracle correctionMessages
+            // (diagnostic.g.dart :13187 and :17519).
+            Self::NonNullableEqualsParameter => {
+                Some("Try using a non-nullable type.".to_string())
+            }
+            Self::UnnecessaryNoSuchMethod => {
+                Some("Try removing the declaration of 'noSuchMethod'.".to_string())
+            }
             _ => None,
         }
     }
@@ -2239,6 +2286,9 @@ mod tests {
             // The #747 W4 pair.
             SemanticCode::EqualElementsInSet,
             SemanticCode::EqualKeysInMap,
+            // The #748 W5 pair.
+            SemanticCode::NonNullableEqualsParameter,
+            SemanticCode::UnnecessaryNoSuchMethod,
         ];
         for code in codes {
             let info = code.code_info();
@@ -2323,6 +2373,9 @@ mod tests {
         // The #747 W4 pair.
         SemanticCode::EqualElementsInSet,
         SemanticCode::EqualKeysInMap,
+        // The #748 W5 pair.
+        SemanticCode::NonNullableEqualsParameter,
+        SemanticCode::UnnecessaryNoSuchMethod,
         SemanticCode::DuplicateDefinition,
         SemanticCode::UndefinedAnnotation,
         SemanticCode::UndefinedClass,

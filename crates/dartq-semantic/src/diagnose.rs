@@ -723,6 +723,84 @@ enum RowShape {
     Value,
 }
 
+/// The #748 `==` operator-parameter latch: the operator's name-token anchor
+/// plus the formal-list progress. The written type is snapshotted from the
+/// first outer-list formal (`end_formal_parameter`); function/record type
+/// shapes poison the snapshot (their written heads cannot decide — the
+/// official's resolved `dartCoreObject` question never reads as `Object?`
+/// there, so the poison only preserves silence).
+struct EqualsCheck {
+    name_range: SourceRange,
+    /// 0 = the method's own parameter list has not opened; 1 = inside it;
+    /// higher = nested (function-typed formal) lists.
+    depth: u32,
+    /// The first outer-list formal's written type, `None` before the first
+    /// formal ends (or when no annotation was written).
+    first_ty: Option<Ty>,
+    /// A function/record type shape intervened before the first formal's
+    /// type completed.
+    poisoned: bool,
+    /// A type annotation completed inside the method's own parameter list
+    /// (`handle_type`): the formal-name snapshot reads it. Operator
+    /// declarations never latch their return type (`C::OperatorName`), so
+    /// the stale pre-list arming must not masquerade as the formal's.
+    ty_seen: bool,
+}
+
+/// The #748 `noSuchMethod` body-shape latch: tracks the
+/// `super.noSuchMethod(<one argument>)` shape across the body's events.
+/// The machine arms only after the formals close (closure bodies in
+/// parameter defaults predate the body and must not drive it), and the
+/// expression-body face adjudicates at `handle_expression_function_body`
+/// while the block face latches its candidate return for the block's end.
+struct NsmCheck {
+    name_range: SourceRange,
+    shape: NsmShape,
+    /// The method's own block-body `{` once seen (`None` until then — a
+    /// closure's body block in the defaults window also predates it).
+    body_block: Option<SourceRange>,
+    /// Formals have closed: body events may drive the machine.
+    armed: bool,
+    /// The machine is inside a return statement's expression (the block
+    /// face's poison window; the expression face is always "inside").
+    in_return: bool,
+    /// A candidate return was seen in the body block (`return_seen`) and
+    /// whether its expression completed the shape (`return_ok`), with the
+    /// candidate's span ends (`return_kw` — the `return` keyword's offset;
+    /// `return_semi_end` — the `;`'s exclusive end) for the block-face
+    /// statement-kind gate.
+    return_seen: bool,
+    return_ok: bool,
+    return_kw: Option<u32>,
+    return_semi_end: Option<u32>,
+    /// The selector name matched `noSuchMethod` at the identifier event
+    /// (the dot event's token is the send's end, not the name — the name
+    /// rides the `ExpressionContinuation` identifier).
+    name_ok: bool,
+}
+
+/// The `super.noSuchMethod(<one argument>)` shape machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NsmShape {
+    /// Awaiting the body's `super`.
+    Open,
+    /// `super` seen, awaiting `.` `noSuchMethod`.
+    Super,
+    /// The member name seen, awaiting `(`.
+    Method,
+    /// Inside the argument list; `depth` counts nested lists (argument
+    /// content is opaque — only the outermost count decides). The
+    /// selector's arguments parse BEFORE the member-name dot event (the
+    /// parser's `super.m(x)` order: `super`, the send, then the dot).
+    Args { depth: u32 },
+    /// The send closed; the dot event validating the member name is due.
+    Sent { count: u32 },
+    /// The shape completed.
+    Done,
+    /// The shape is broken.
+    Dead,
+}
+
 /// Scope stack frame.
 struct Frame {
     kind: FrameKind,
@@ -1190,6 +1268,12 @@ struct Engine<'a> {
     /// The row-stack mark where the current return statement's expression
     /// began (the return check reads it).
     return_mark: Option<usize>,
+    /// The #748 `==` operator-parameter latch (`begin_method` arms it when
+    /// the declaration's name is the `==` operator).
+    equals_check: Option<EqualsCheck>,
+    /// The #748 `noSuchMethod` body-shape latch (`begin_method` arms it
+    /// when the declaration's name is `noSuchMethod`).
+    nsm_check: Option<NsmCheck>,
     /// Inside a cascade (`a?..b` picks the `?..` message shape).
     in_cascade: bool,
     /// Per open argument list: the callee row index, when identifiable
@@ -2067,6 +2151,8 @@ impl<'a> Engine<'a> {
             body_mark: None,
             init_mark: None,
             return_mark: None,
+            equals_check: None,
+            nsm_check: None,
             switches: Vec::new(),
             pattern_stack: Vec::new(),
             pending_binary_operand: None,
@@ -6295,6 +6381,509 @@ impl<'a> Engine<'a> {
         }
         let text = self.strings.resolve(owner);
         self.emit(SemanticCode::MustCallSuper, range, &text, "");
+    }
+
+    // —— the W5 member-invocation pair (#748) ————————————————————————————
+
+    /// Arms the `==` operator-parameter latch at the method head
+    /// (`_checkForNullableEqualsParameterType`,
+    /// best_practices_verifier.dart:1345-1374): the check keys on the
+    /// OPERATOR token — a plain method named `equals` never matches (the
+    /// official reads `node.name.type == TokenType.EQ_EQ`). The parameter
+    /// question adjudicates when the method's own parameter list closes.
+    fn begin_equals_parameter(&mut self, name: Token) {
+        if self.text_of(name) != Some("==") {
+            return;
+        }
+        self.equals_check = Some(EqualsCheck {
+            name_range: name.range,
+            depth: 0,
+            first_ty: None,
+            poisoned: false,
+            ty_seen: false,
+        });
+    }
+
+    /// Arms the `noSuchMethod` body-shape latch at the method head
+    /// (`_checkForUnnecessaryNoSuchMethod`,
+    /// best_practices_verifier.dart:1433-1478): the official keys on the
+    /// raw name lexeme, so getters/setters spelled `noSuchMethod` join the
+    /// same face (probed: both delegate shapes report there).
+    fn begin_no_such_method(&mut self, name: Token) {
+        if self.text_of(name) != Some("noSuchMethod") {
+            return;
+        }
+        self.nsm_check = Some(NsmCheck {
+            name_range: name.range,
+            shape: NsmShape::Open,
+            body_block: None,
+            armed: false,
+            in_return: false,
+            return_seen: false,
+            return_ok: false,
+            return_kw: None,
+            return_semi_end: None,
+            name_ok: false,
+        });
+    }
+
+    /// The `==` latch's parameter-list progress: `begin_formal_parameters`
+    /// nesting (the outermost list is the method's own; function-typed
+    /// formals nest theirs inside it).
+    fn equals_formal_boundary(&mut self) {
+        let Some(check) = &mut self.equals_check else {
+            return;
+        };
+        check.depth += 1;
+    }
+
+    /// Snapshots the first outer-list formal's written type. The written
+    /// face decides (the briefing pins it over the official's resolved
+    /// type — a type-alias-to-`Object` under-reports, the documented
+    /// posture). Fires at the formal's close and again at a default-value
+    /// expression's open, whichever lands first before any closure or
+    /// function-type event inside the default can poison.
+    fn equals_formal_type(&mut self) {
+        let pending = self
+            .equals_check
+            .as_ref()
+            .is_some_and(|check| check.depth == 1 && check.first_ty.is_none() && check.ty_seen);
+        if !pending {
+            return;
+        }
+        if let Some(check) = &mut self.equals_check {
+            check.ty_seen = false;
+        }
+        match self.armed_ty.clone() {
+            None => {}
+            // `int Function(...)`, `(int, int)`, `void` heads and friends:
+            // poison rather than leave a nested head's stale write behind.
+            Some(ty @ (Ty::Named { .. } | Ty::Dynamic)) => {
+                if let Some(check) = &mut self.equals_check {
+                    check.first_ty = Some(ty);
+                }
+            }
+            Some(_) => {
+                if let Some(check) = &mut self.equals_check {
+                    check.poisoned = true;
+                }
+            }
+        }
+    }
+
+    /// The `==` adjudication at the method's own parameter-list close
+    /// (the official order: arity first, then the `Object`/`dynamic`
+    /// participant guard, then the nullability question — reported at the
+    /// `==` name token, `diagnostic.g.dart` :13186-13187).
+    fn equals_parameters_closed(&mut self, count: usize) {
+        let Some(check) = self.equals_check.take() else {
+            return;
+        };
+        if check.depth != 1 {
+            self.equals_check = Some(check);
+            return;
+        }
+        if count != 1 || check.poisoned {
+            return;
+        }
+        let Some(Ty::Named { name, nullable, .. }) = check.first_ty else {
+            // `dynamic`, an unwritten annotation (the resolved type is
+            // `dynamic`, never nullable), or an unresolved head: silent.
+            return;
+        };
+        if name == self.intern("Object") && nullable {
+            self.stage_usage(
+                SemanticCode::NonNullableEqualsParameter,
+                check.name_range,
+                "",
+            );
+        }
+    }
+
+    /// Breaks the `noSuchMethod` shape: any structural expression event
+    /// outside the argument window that is not part of
+    /// `super . noSuchMethod (` kills it (the official matches ONE
+    /// `ReceiverMethodInvocation` node — compound expressions never
+    /// match). Poison applies in the expression face and inside a return
+    /// statement's expression; argument content is opaque.
+    fn nsm_poison(&mut self) {
+        let Some(check) = &mut self.nsm_check else {
+            return;
+        };
+        if !check.armed || (check.body_block.is_some() && !check.in_return) {
+            return;
+        }
+        if !matches!(check.shape, NsmShape::Args { .. } | NsmShape::Dead) {
+            check.shape = NsmShape::Dead;
+        }
+    }
+
+    /// The shape machine's `super` transition.
+    fn nsm_super(&mut self) {
+        let Some(check) = &mut self.nsm_check else {
+            return;
+        };
+        if !check.armed {
+            return;
+        }
+        if check.shape == NsmShape::Open {
+            check.name_ok = false;
+            check.shape = NsmShape::Super;
+        } else if !matches!(check.shape, NsmShape::Args { .. }) {
+            check.shape = NsmShape::Dead;
+        }
+    }
+
+    /// The selector's member name at the identifier event (`super` face
+    /// only — the name precedes the send): latches whether the dot event
+    /// will validate.
+    fn nsm_member_name(&mut self, token: Token) {
+        let hits = self.text_of(token) == Some("noSuchMethod");
+        let Some(check) = &mut self.nsm_check else {
+            return;
+        };
+        if !check.armed || check.shape != NsmShape::Super {
+            return;
+        }
+        check.name_ok = hits;
+    }
+
+    /// `handle_type` completed an annotation inside the method's own
+    /// parameter list: the pending first-formal read may consume it.
+    fn equals_mark_type(&mut self) {
+        let Some(check) = &mut self.equals_check else {
+            return;
+        };
+        if check.depth >= 1 && check.first_ty.is_none() {
+            check.ty_seen = true;
+        }
+    }
+
+    /// The shape machine's `.` validation (`end` is the member name
+    /// token). The parser fires the selector's dot AFTER its send for the
+    /// `super.m(x)` face, so the name check validates the closed send;
+    /// argument content stays opaque. The null-aware spelling is never
+    /// the shape.
+    fn nsm_dot(&mut self, is_null_aware: bool) {
+        let Some(check) = &mut self.nsm_check else {
+            return;
+        };
+        if !check.armed {
+            return;
+        }
+        let hits = !is_null_aware && check.name_ok;
+        match check.shape {
+            NsmShape::Args { .. } | NsmShape::Dead => {}
+            NsmShape::Sent { count } if count == 1 && hits => check.shape = NsmShape::Done,
+            NsmShape::Super if hits => check.shape = NsmShape::Method,
+            _ => check.shape = NsmShape::Dead,
+        }
+    }
+
+    /// The shape machine's argument-list transitions.
+    fn nsm_arguments_open(&mut self) {
+        let Some(check) = &mut self.nsm_check else {
+            return;
+        };
+        if !check.armed {
+            return;
+        }
+        check.shape = match check.shape {
+            NsmShape::Super | NsmShape::Method => NsmShape::Args { depth: 1 },
+            NsmShape::Args { depth } => NsmShape::Args { depth: depth + 1 },
+            _ => NsmShape::Dead,
+        };
+    }
+
+    /// The shape machine's argument-list close: only the outermost list's
+    /// count decides (exactly one argument).
+    fn nsm_arguments_closed(&mut self, count: usize) {
+        let Some(check) = &mut self.nsm_check else {
+            return;
+        };
+        if !check.armed {
+            return;
+        }
+        check.shape = match check.shape {
+            NsmShape::Args { depth } if depth > 1 => NsmShape::Args { depth: depth - 1 },
+            NsmShape::Args { .. } => NsmShape::Sent {
+                count: u32::try_from(count).unwrap_or(u32::MAX),
+            },
+            _ => NsmShape::Dead,
+        };
+    }
+
+    /// A return statement inside the method's own body block: resets the
+    /// machine for the statement's expression, marks the window (the
+    /// block face's poison gate), and latches the candidate's `return`
+    /// keyword for the block-face statement-kind gate. Outside a block
+    /// body a return statement cannot be part of the shape
+    /// (`=> () { return ...; }()` closures).
+    fn nsm_return_open(&mut self, token: Token) {
+        let Some(check) = &mut self.nsm_check else {
+            return;
+        };
+        if !check.armed {
+            return;
+        }
+        if check.body_block.is_some() {
+            check.in_return = true;
+            check.shape = NsmShape::Open;
+            if !check.return_seen {
+                check.return_kw = Some(token.range.offset);
+            }
+        } else if !matches!(check.shape, NsmShape::Dead) {
+            check.shape = NsmShape::Dead;
+        }
+    }
+
+    /// A return statement's close: the block face latches its candidate —
+    /// the FIRST return of the body block only (later returns are other
+    /// statements' business; the statement-count gate rules them out).
+    fn nsm_return_closed(&mut self, has_expression: bool, end: Token) {
+        let Some(check) = &mut self.nsm_check else {
+            return;
+        };
+        if !check.armed {
+            return;
+        }
+        check.in_return = false;
+        if check.body_block.is_some() && !check.return_seen {
+            check.return_seen = true;
+            if has_expression && check.shape == NsmShape::Done {
+                check.return_ok = true;
+                check.return_semi_end = Some(end.range.end());
+            }
+        }
+        check.shape = NsmShape::Open;
+    }
+
+    /// The method's own block body opened (`begin_block_function_body`):
+    /// the first body-shaped block latches; nested blocks and closure
+    /// bodies (in the defaults window, before arming) never do.
+    fn nsm_block_open(&mut self, begin: Token) {
+        let Some(check) = &mut self.nsm_check else {
+            return;
+        };
+        if check.armed && check.body_block.is_none() && check.shape == NsmShape::Open {
+            check.body_block = Some(begin.range);
+        } else if !check.armed && !matches!(check.shape, NsmShape::Dead) {
+            // A block before the formals close is a defaults-window
+            // closure's body — poison (a closure body is not the shape).
+            check.shape = NsmShape::Dead;
+        }
+    }
+
+    /// The block-body adjudication at the method's own block's close: the
+    /// block held exactly one statement and that statement was the
+    /// shape-completing return — proven by the statement-kind gate below,
+    /// which the bare statement count cannot give (`if (c) return
+    /// super.noSuchMethod(i);` also counts 1).
+    fn nsm_block_closed(&mut self, count: usize, begin: Token, end: Token) {
+        let Some(check) = self.nsm_check.take() else {
+            return;
+        };
+        if check.body_block != Some(begin.range) {
+            // A nested block's close: keep the latch for the body's own.
+            self.nsm_check = Some(check);
+            return;
+        }
+        if count == 1 && check.return_ok && self.block_interior_is_the_candidate(begin, end, &check)
+        {
+            self.emit_unnecessary_no_such_method(check.name_range);
+        }
+    }
+
+    /// The block-face statement-kind gate: the braces' token interior is
+    /// exactly the candidate return — the first token after `{` starts at
+    /// the latched `return` keyword and the last token before `}` ends at
+    /// the latched `;`. Comments produce no tokens (the scanner stream
+    /// contract), so both ends are comment-proof; `{ return X; }` passes,
+    /// `{ if (c) return X; }` fails at `if`.
+    fn block_interior_is_the_candidate(&self, begin: Token, end: Token, check: &NsmCheck) -> bool {
+        let (Some(kw), Some(semi_end)) = (check.return_kw, check.return_semi_end) else {
+            return false;
+        };
+        let mut first: Option<(u32, u32)> = None;
+        let mut last = (0u32, 0u32);
+        let mut index = begin.id as usize + 1;
+        while let Some(token) = self.tokens.get(index) {
+            let span = token.byte_range();
+            if span.start as u32 >= end.range.offset {
+                break;
+            }
+            let ends = (span.start as u32, span.end as u32);
+            if first.is_none() {
+                first = Some(ends);
+            }
+            last = ends;
+            index += 1;
+        }
+        first == Some((kw, kw + "return".len() as u32)) && last.1 == semi_end
+    }
+
+    /// The expression-body adjudication at the arrow body's close: the
+    /// body expression was exactly the shape. Closure bodies inside the
+    /// method's own block never land here (the block latched first);
+    /// defaults-window closures predate the arm.
+    fn nsm_expression_closed(&mut self) {
+        if let Some(range) = self
+            .nsm_check
+            .as_ref()
+            .filter(|check| {
+                check.armed && check.body_block.is_none() && check.shape == NsmShape::Done
+            })
+            .map(|check| check.name_range)
+        {
+            self.emit_unnecessary_no_such_method(range);
+        }
+    }
+
+    /// The row emission: verbatim WARNING-tier template at the
+    /// declaration's name token (`diag.unnecessaryNoSuchMethod.at(node.name)`).
+    /// The superchain decides: a concrete `noSuchMethod` declared by a
+    /// nominal class in the super-dispatch chain reports; the `Object`
+    /// default, exhaustion, or a poisoned resolution stays silent.
+    fn emit_unnecessary_no_such_method(&mut self, name_range: SourceRange) {
+        if self.superchain_resolves_no_such_method() == Some(true) {
+            self.stage_usage(SemanticCode::UnnecessaryNoSuchMethod, name_range, "");
+        }
+    }
+
+    /// Opens the shape machine to body events (the method's own formals
+    /// closed — a getter's absent list counts through
+    /// `handle_no_formal_parameters`).
+    fn arm_no_such_method(&mut self) {
+        if let Some(check) = &mut self.nsm_check {
+            check.armed = true;
+        }
+    }
+
+    /// The `==` first-formal type question is unanswerable past a
+    /// function/record type shape (the written heads can never read as a
+    /// plain `Object?` annotation; the official's resolved type is not
+    /// `dartCoreObject` there either).
+    fn equals_type_poison(&mut self) {
+        let Some(check) = &mut self.equals_check else {
+            return;
+        };
+        if check.depth >= 1 && check.first_ty.is_none() {
+            check.poisoned = true;
+        }
+    }
+
+    /// The send-shaped poison for argless sends: an invocation-completed
+    /// shape is the send's own business (`Args`/`Done` stay), a send where
+    /// a shape part was expected is broken.
+    fn nsm_send_poison(&mut self) {
+        let Some(check) = &mut self.nsm_check else {
+            return;
+        };
+        if !check.armed {
+            return;
+        }
+        if matches!(
+            check.shape,
+            NsmShape::Open | NsmShape::Super | NsmShape::Method
+        ) {
+            check.shape = NsmShape::Dead;
+        }
+    }
+
+    /// The 3.13.1 oracle's concrete super-dispatch for `noSuchMethod`
+    /// (the `_checkForUnnecessaryNoSuchMethod` resolved-element face,
+    /// probed): the walk covers the nominal `extends` chain — mixin
+    /// applications are walked THROUGH in application order, and a
+    /// CONCRETE mixin declaration of the name poisons the resolution
+    /// (probed silent for `class C extends B with M` with a concrete
+    /// `M.noSuchMethod`, even when `B` also declares one), while abstract
+    /// declarations anywhere are transparent (probed: the walk continues
+    /// past an abstract superclass and an abstract mixin declaration).
+    /// The first CONCRETE nominal declaration reports; exhaustion (the
+    /// `Object` default) or an unresolvable chain stays silent. Names
+    /// resolve through each hop's owner library (the #491 S2a rule the
+    /// face walks share); only indexed containers are visible — ancestors
+    /// from unread files under-report.
+    fn superchain_resolves_no_such_method(&self) -> Option<bool> {
+        let nsm = self.intern("noSuchMethod");
+        let Some(elements) = self.index.get(self.file) else {
+            return None;
+        };
+        let Some((container, _)) = self.container_context() else {
+            return None;
+        };
+        let Some(decl) = elements.container(container) else {
+            return None;
+        };
+        // The delegating class's own `with` mixins sit closest in the
+        // applied chain (super resolves against the first application).
+        for mixin in decl.with_clause.iter().rev() {
+            if let Some((mixin_decl, _)) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                *mixin,
+            ) && let Some(entry) = mixin_decl.members.get(&nsm)
+                && !entry.is_static
+                && !entry.is_abstract
+            {
+                return Some(false);
+            }
+        }
+        let Some(mut name) = decl.superclass else {
+            return Some(false);
+        };
+        let mut owner = self.file;
+        let mut scope_lib = self.lib;
+        let mut seen = FxHashSet::default();
+        loop {
+            if !seen.insert(name) {
+                return None;
+            }
+            let (found, found_owner) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                scope_lib,
+                owner,
+                name,
+            )?;
+            if let Some(entry) = found.members.get(&nsm) {
+                if !entry.is_static && !entry.is_abstract {
+                    return Some(true);
+                }
+                // An abstract declaration is transparent: the concrete
+                // dispatch continues past it.
+            }
+            let owner_lib = self
+                .owner_library_of(found_owner, name)
+                .unwrap_or(scope_lib);
+            for mixin in found.with_clause.iter().rev() {
+                if let Some((mixin_decl, _)) = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    owner_lib,
+                    found_owner,
+                    *mixin,
+                ) && let Some(entry) = mixin_decl.members.get(&nsm)
+                    && !entry.is_static
+                    && !entry.is_abstract
+                {
+                    return Some(false);
+                }
+            }
+            match found.superclass {
+                Some(superclass) => {
+                    scope_lib = owner_lib;
+                    name = superclass;
+                    owner = found_owner;
+                }
+                None => return Some(false),
+            }
+        }
     }
 
     // —— class-modifier restriction families (#600) ——————————————————————
@@ -12687,11 +13276,15 @@ impl ParserListener for DiagnoseListener<'_> {
         // The #612 capture models them: the frame routes its return, bounds
         // of its own type parameters, and formals by region.
         self.engine.borrow_mut().var_begin_function_type();
+        // The `==` parameter's written type is never a function type (the
+        // official's resolved type cannot read `dartCoreObject` here).
+        self.engine.borrow_mut().equals_type_poison();
     }
 
     fn begin_record_type(&mut self, _left_paren: Token) {
         self.engine.borrow_mut().bounds.poison();
         self.engine.borrow_mut().var_begin_record_type();
+        self.engine.borrow_mut().equals_type_poison();
     }
 
     fn end_record_type(
@@ -12708,16 +13301,47 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_formal_parameters(&mut self, _token: Token, _kind: dartq_parser::MemberKind) {
         self.engine.borrow_mut().var_formal_boundary();
+        self.engine.borrow_mut().equals_formal_boundary();
     }
 
     fn end_formal_parameters(
         &mut self,
-        _count: usize,
+        count: usize,
         _begin: Token,
         _end: Token,
         _kind: dartq_parser::MemberKind,
     ) {
         self.engine.borrow_mut().var_formal_region_end();
+        let mut engine = self.engine.borrow_mut();
+        // The body may drive the `noSuchMethod` shape only after the
+        // method's own formals close (defaults-window closures predate it).
+        engine.arm_no_such_method();
+        // The `==` question adjudicates at the outermost list's close.
+        engine.equals_parameters_closed(count);
+    }
+
+    fn begin_formal_parameter_default_value_expression(&mut self, token: Token) {
+        self.flow()
+            .begin_formal_parameter_default_value_expression(token);
+        // A default value's expression follows the formal's own written
+        // type: snapshot it before closure/type events inside the default
+        // can poison (the #748 `==` first-formal read).
+        self.engine.borrow_mut().equals_formal_type();
+    }
+
+    fn begin_function_typed_formal_parameter(&mut self, token: Token) {
+        self.flow().begin_function_typed_formal_parameter(token);
+        self.engine.borrow_mut().equals_type_poison();
+    }
+
+    fn handle_no_formal_parameters(&mut self, token: Token, kind: dartq_parser::MemberKind) {
+        self.flow().handle_no_formal_parameters(token, kind);
+        let mut engine = self.engine.borrow_mut();
+        // A getter head (`get noSuchMethod`) has no list: the body may
+        // drive the shape. The `==` latch with no list cannot reach its
+        // one-parameter question.
+        engine.arm_no_such_method();
+        engine.equals_check = None;
     }
 
     // —— frames: executables ——————————————————————————————————————————
@@ -12756,6 +13380,11 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.open_toplevel_site = None;
         engine.open_exec_site = None;
         engine.push_executable_frame(static_kw.is_none());
+        // The W5 member-invocation latches arm at the head, keyed on the
+        // raw name token text (the official checks read the lexeme, so
+        // getters/setters spelled the same join the same face).
+        engine.begin_equals_parameter(name);
+        engine.begin_no_such_method(name);
         // The `invalid_override` check runs at the declaration head: the
         // element model is already complete (`collect` parsed before this
         // pass), and this event carries the name token whose span anchors
@@ -12804,6 +13433,10 @@ impl ParserListener for DiagnoseListener<'_> {
         // the executable frame closes.
         let super_invoked = engine.top_executable_super_invoked();
         engine.finish_must_call_super(super_invoked);
+        // The W5 latches die with the declaration (a body that never
+        // matched — `;`/native/recovery — stays silent by exhaustion).
+        engine.equals_check = None;
+        engine.nsm_check = None;
         engine.pop_frame();
     }
 
@@ -13025,6 +13658,7 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_function_expression(&mut self, _token: Token) {
         self.flow().begin_function_expression(_token);
 
+        self.engine.borrow_mut().nsm_poison();
         self.engine.borrow_mut().const_capture.begin_opaque_group();
         let instance = self.engine.borrow().instance_context();
         self.engine.borrow_mut().open_exec_site = None;
@@ -13044,6 +13678,7 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_named_function_expression(&mut self, _token: Token) {
         self.flow().begin_named_function_expression(_token);
 
+        self.engine.borrow_mut().nsm_poison();
         let instance = self.engine.borrow().instance_context();
         self.engine.borrow_mut().open_exec_site = None;
         self.engine.borrow_mut().pending_local_fn = None;
@@ -13294,6 +13929,9 @@ impl ParserListener for DiagnoseListener<'_> {
             }
             C::ExpressionContinuation => {
                 if let Some(name) = name {
+                    // The #748 selector name rides this event (the dot's
+                    // token is the send's end).
+                    engine.nsm_member_name(token);
                     engine.push_member(name, token.range);
                     engine.const_capture.identifier(name, token.range);
                 }
@@ -13349,6 +13987,9 @@ impl ParserListener for DiagnoseListener<'_> {
             }
             C::FormalParameterDeclaration => {
                 if let Some(name) = name {
+                    // The #748 `==` first-formal read runs before the
+                    // binding consumes the armed annotation.
+                    engine.equals_formal_type();
                     engine.note_parameter(name, token.range);
                     engine.bind_parameter_type(name);
                 }
@@ -13678,6 +14319,9 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.stage_usage(SemanticCode::UnnecessaryQuestionMark, q.range, &type_name);
         }
         engine.armed_ty = Some(ty);
+        // The #748 `==` read: an annotation completed inside the method's
+        // own parameter list is the first formal's written type candidate.
+        engine.equals_mark_type();
         // The written-argument latch: a group whose head this completion
         // re-fires arms its arguments for the binding declaration; any
         // other completion (a group-less head, a headless group's leaf)
@@ -13769,12 +14413,13 @@ impl ParserListener for DiagnoseListener<'_> {
     fn handle_super_expression(&mut self, token: Token, _context: IdentifierContext) {
         self.flow().handle_super_expression(token, _context);
 
-        self.engine.borrow_mut().push_keyword_receiver(token, true);
-        self.engine.borrow_mut().note_super_expression();
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .this_or_super(token.range);
+        {
+            let mut engine = self.engine.borrow_mut();
+            engine.nsm_super();
+            engine.push_keyword_receiver(token, true);
+            engine.note_super_expression();
+            engine.const_capture.this_or_super(token.range);
+        }
     }
 
     fn handle_dot_access(&mut self, token: Token, end: Token, is_null_aware: bool) {
@@ -13783,14 +14428,11 @@ impl ParserListener for DiagnoseListener<'_> {
         // The receiver's value flows into the extraction: every pending
         // candidate under it seals used (`_isUsed`'s `PropertyExtraction`
         // parent arm).
-        self.engine.borrow_mut().ur_seal_used();
-        self.engine
-            .borrow_mut()
-            .merge_member(is_null_aware, token.range.offset, end.range.end());
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .dot_access(is_null_aware, end.range);
+        let mut engine = self.engine.borrow_mut();
+        engine.nsm_dot(is_null_aware);
+        engine.ur_seal_used();
+        engine.merge_member(is_null_aware, token.range.offset, end.range.end());
+        engine.const_capture.dot_access(is_null_aware, end.range);
     }
 
     fn handle_cascade_access(&mut self, operator: Token, end: Token, is_null_aware: bool) {
@@ -13838,12 +14480,14 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.mark_assignment(operator);
         engine.check_assignment(operator);
         engine.check_dead_null_assignment(operator);
+        engine.nsm_poison();
     }
 
     fn begin_binary_expression(&mut self, operator: Token) {
         self.flow().begin_binary_expression(operator);
 
         let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
         let Some(text) = engine.text_of(operator) else {
             return;
         };
@@ -13880,6 +14524,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().end_binary_expression(_operator, end);
 
         let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
         // `BinaryOperatorInvocation`/`IfNull` are in the official used set
         // (both operands).
         engine.ur_seal_used();
@@ -13926,6 +14571,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().handle_unary_prefix_expression(operator);
 
         let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
         let op = match engine.text_of(operator) {
             Some("-") => UnOp::Neg,
             Some("!") => UnOp::Not,
@@ -13972,30 +14618,35 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_conditional_expression(&mut self, _question: Token) {
         self.flow().begin_conditional_expression(_question);
 
-        self.engine.borrow_mut().const_capture.begin_conditional();
+        let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
+        engine.const_capture.begin_conditional();
     }
 
     fn handle_conditional_expression_colon(&mut self) {
         self.flow().handle_conditional_expression_colon();
 
-        self.engine.borrow_mut().const_capture.conditional_colon();
+        let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
+        engine.const_capture.conditional_colon();
     }
 
     fn end_conditional_expression(&mut self, _question: Token, _colon: Token, end: Token) {
         self.flow()
             .end_conditional_expression(_question, _colon, end);
 
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .end_conditional(end.range);
+        let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
+        engine.const_capture.end_conditional(end.range);
     }
 
     fn begin_parenthesized_expression_or_record_literal(&mut self, _token: Token) {
         self.flow()
             .begin_parenthesized_expression_or_record_literal(_token);
 
-        self.engine.borrow_mut().const_capture.parenthesized_begin();
+        let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
+        engine.const_capture.parenthesized_begin();
     }
 
     fn handle_is_operator(&mut self, is_operator: Token, _not: Option<Token>) {
@@ -14006,6 +14657,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // `visitIsExpression` site (`_checkAllTypeChecks`,
         // best_practices_verifier.dart:987-1041).
         let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
         engine.check_type_check(is_operator.range, _not.is_some());
         engine.const_capture.not_constant(is_operator.range);
     }
@@ -14014,6 +14666,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().handle_as_operator(operator);
 
         let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
         // Pattern casts report through `handle_cast_pattern`; the
         // expression form is `visitAsExpression`'s `_isUnnecessaryCast`
         // (best_practices_verifier.dart:170-183, 1708-1741).
@@ -14095,6 +14748,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_const_expression(&mut self, const_keyword: Token) {
         let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
         engine.enter_ctor_pos();
         engine.open_const_ctor_invocation();
         let _ = const_keyword;
@@ -14119,6 +14773,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().begin_arguments(_token);
 
         let mut engine = self.engine.borrow_mut();
+        engine.nsm_arguments_open();
         // The watermark: only pendings registered inside the list seal used
         // at the close (the official `ArgumentList` parent arm); the
         // callee's own candidate predates it.
@@ -14181,6 +14836,7 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.close_arguments(u16::try_from(count).unwrap_or(u16::MAX));
         // The list's own expressions were uses (`ArgumentList`).
         engine.ur_seal_used_within();
+        engine.nsm_arguments_closed(count);
     }
 
     fn handle_positional_argument(&mut self, _token: Token) {
@@ -14198,6 +14854,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_return_statement(&mut self, _token: Token) {
         let mut engine = self.engine.borrow_mut();
+        engine.nsm_return_open(_token);
         engine.return_mark = Some(engine.rows.len());
     }
 
@@ -14208,6 +14865,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let mut engine = self.engine.borrow_mut();
         // `ReturnStatement` is in the official used set.
         engine.ur_seal_used();
+        engine.nsm_return_closed(has_expression, end);
         let mark = engine.return_mark.take();
         if !has_expression {
             // Bare `return;` is a `void` expression in the oracle's matrix.
@@ -14227,6 +14885,9 @@ impl ParserListener for DiagnoseListener<'_> {
         let mut engine = self.engine.borrow_mut();
         // `ExpressionFunctionBody` is in the official used set.
         engine.ur_seal_used();
+        // The #748 shape adjudicates before the mark is consumed (the
+        // body expression was exactly `super.noSuchMethod(<one argument>)`).
+        engine.nsm_expression_closed();
         let Some(mark) = engine.body_mark.take() else {
             return;
         };
@@ -14252,6 +14913,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().begin_cascade(operator);
 
         let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
         // The cascade target completed before the `..`: it is a use (the
         // official `CascadeExpression` target arm); the sections' pendings
         // discard at the close.
@@ -14265,6 +14927,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().end_cascade();
 
         let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
         // The sections are not uses (the official `CascadeExpression` arm
         // spares only the target).
         engine.ur_seal_discard();
@@ -14279,6 +14942,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().handle_indexed_expression(question, open, close);
 
         let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
         // `IndexExpression`/`IndexAssignmentTarget` are in the official
         // used set.
         engine.ur_seal_used();
@@ -14767,7 +15431,9 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_switch_expression(&mut self, token: Token) {
         self.flow().begin_switch_expression(token);
 
-        self.engine.borrow_mut().switch_kw_latch = Some(token.range);
+        let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
+        engine.switch_kw_latch = Some(token.range);
     }
 
     /// The expression-case header's pattern window opens before its
@@ -14969,6 +15635,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_literal_string(&mut self, begin: Token) {
         let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
         engine.const_string_begins.push(begin.range);
         engine.const_capture.begin_literal_string();
     }
@@ -15030,6 +15697,9 @@ impl ParserListener for DiagnoseListener<'_> {
         let mut engine = self.engine.borrow_mut();
         // `ListLiteral` is in the official used set.
         engine.ur_seal_used();
+        // No begin event brackets a list literal: the close poisons (the
+        // body expression was the literal, never the bare shape).
+        engine.nsm_poison();
         if let Some(elements) = engine.const_capture.literal_list(count, left.range) {
             // Implicit const literals in a const context check per element
             // with the element code too (the oracle evaluates the literal
@@ -15044,6 +15714,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_literal_set_or_map(&mut self, _left: Token, const_keyword: Option<Token>) {
+        self.engine.borrow_mut().nsm_poison();
         // The non-const duplicate window (#747): only literals without a
         // `const` keyword qualify; the capture skips anything already
         // inside a const window (implicitly const literals are the ERROR
@@ -15270,17 +15941,18 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_await_expression(&mut self, token: Token) {
         self.flow().begin_await_expression(token);
 
-        self.engine.borrow_mut().const_capture.begin_opaque_group();
+        let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
+        engine.const_capture.begin_opaque_group();
         let _ = token;
     }
 
     fn end_await_expression(&mut self, begin: Token, _end: Token) {
         self.flow().end_await_expression(begin, _end);
 
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .end_opaque_group(begin.range);
+        let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
+        engine.const_capture.end_opaque_group(begin.range);
     }
 
     fn handle_throw_expression(&mut self, throw: Token, _end: Token) {
@@ -15288,17 +15960,17 @@ impl ParserListener for DiagnoseListener<'_> {
 
         // `ThrowExpression` is in the official used set (the event fires
         // after the operand parsed).
-        self.engine.borrow_mut().ur_seal_used();
-        self.engine
-            .borrow_mut()
-            .const_capture
-            .throw_expression(throw.range);
+        let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
+        engine.ur_seal_used();
+        engine.const_capture.throw_expression(throw.range);
     }
 
     fn handle_non_null_assert_expression(&mut self, bang: Token) {
         self.flow().handle_non_null_assert_expression(bang);
 
         let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
         // The operand's row is the stack top (the postfix operand parsed
         // just before the `!` event): `visitNullAssertionExpression`'s
         // pair (best_practices_verifier.dart:795-799,
@@ -15321,9 +15993,15 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_block_function_body(&mut self, token: Token) {
         self.flow().begin_block_function_body(token);
-        // The block `{` is the executable-completion row's anchor (the
-        // official reports at the block's left bracket).
-        self.engine.borrow_mut().note_body_brace(token.range);
+        {
+            let mut engine = self.engine.borrow_mut();
+            // The #748 latch marks the method's own body block (nested
+            // blocks and defaults-window closures never match its begin).
+            engine.nsm_block_open(token);
+            // The block `{` is the executable-completion row's anchor (the
+            // official reports at the block's left bracket).
+            engine.note_body_brace(token.range);
+        }
     }
 
     fn begin_do_while_statement(&mut self, token: Token) {
@@ -15453,6 +16131,10 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_block_function_body(&mut self, count: usize, begin: Token, end: Token) {
         self.flow().end_block_function_body(count, begin, end);
+
+        // The #748 block-body face adjudicates at the method's own block's
+        // close (one statement, the shape-completing return spanning it).
+        self.engine.borrow_mut().nsm_block_closed(count, begin, end);
     }
 
     fn end_do_while_statement(&mut self, token: Token, while_kw: Token, end: Token) {
@@ -15519,6 +16201,11 @@ impl ParserListener for DiagnoseListener<'_> {
             kind,
             member_kind,
         );
+
+        // The #748 `==` first-formal read: a formal without a default
+        // value still holds its written type here (a default's snapshot
+        // landed at the default's open).
+        self.engine.borrow_mut().equals_formal_type();
 
         // A primary-constructor formal with a `var`/`final` keyword declares
         // a field (`FieldFormalParameterElement.isDeclaring`); `this`/`super`
@@ -15786,7 +16473,9 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().handle_pattern_assignment(equals);
         // `PatternAssignment` is in the official used set (the event fires
         // after the RHS parsed).
-        self.engine.borrow_mut().ur_seal_used();
+        let mut engine = self.engine.borrow_mut();
+        engine.nsm_poison();
+        engine.ur_seal_used();
     }
 
     fn handle_pattern_variable_declaration_statement(
@@ -15813,11 +16502,15 @@ impl ParserListener for DiagnoseListener<'_> {
     fn handle_send_without_arguments(&mut self, begin: Token, end: Token, next: Token) {
         self.flow().handle_send_without_arguments(begin, end, next);
 
-        // A non-invoked identifier expression is a bare-read candidate
-        // (the official `checkNameExpression` face): the read of a
-        // UseResult-carrying declaration discards here unless its context
-        // seals it.
-        self.engine.borrow_mut().ur_register_bare_read(begin);
+        {
+            let mut engine = self.engine.borrow_mut();
+            engine.nsm_send_poison();
+            // A non-invoked identifier expression is a bare-read candidate
+            // (the official `checkNameExpression` face): the read of a
+            // UseResult-carrying declaration discards here unless its
+            // context seals it.
+            engine.ur_register_bare_read(begin);
+        }
     }
 
     fn handle_spread_expression(&mut self, operator: Token) {
@@ -24226,6 +24919,349 @@ mod tests {
             dead_code_offsets(&report).is_empty(),
             "{:?}",
             code_names(&report)
+        );
+    }
+    // —— #748: non_nullable_equals_parameter / unnecessary_no_such_method ——
+    //
+    // Behavioral oracle: dart 3.13.1 `dart analyze --format=machine` probes
+    // (see the fixture headers under tests/corpus/m2-warning for the live
+    // rows). Official sources:
+    // best_practices_verifier.dart:1345-1374 (`_checkForNullableEqualsPara-
+    // meterType`) and :1433-1478 (`_checkForUnnecessaryNoSuchMethod`).
+
+    /// An `==` operator with a single `Object?` parameter reports at the
+    /// `==` name token with the verbatim oracle message and correction
+    /// (probed: `WARNING|STATIC_WARNING|NON_NULLABLE_EQUALS_PARAMETER` at
+    /// the `==` token, length 2).
+    #[test]
+    fn nullable_equals_parameter_reports_at_the_operator_token() {
+        let src = "class bool {}\nclass Object {}\n\
+                   class P {\n  @override\n  bool operator ==(Object? other) => true;\n}\n";
+        let rep = report(src);
+        assert_eq!(
+            code_names(&rep),
+            ["non_nullable_equals_parameter"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let d = &rep.diagnostics[0];
+        assert_eq!(
+            d.message,
+            "The parameter type of '==' operators should be non-nullable."
+        );
+        assert_eq!(
+            d.correction.as_deref(),
+            Some("Try using a non-nullable type.")
+        );
+        let at = src.find("==").expect("operator token");
+        assert_eq!(d.range.offset, u32::try_from(at).unwrap());
+        assert_eq!(d.range.length, 2);
+    }
+
+    /// The silent `==` faces (each probed silent on 3.13.1): bare `Object`,
+    /// `dynamic`, an unwritten annotation (resolved `dynamic`), a
+    /// non-participant type (`int?` — the official's `dartCoreObject`/
+    /// `DynamicType` guard returns before the nullability question), two
+    /// parameters, a plain method named `equals`, and a function-typed
+    /// formal (the resolved type is a function type, never `Object`).
+    #[test]
+    fn non_nullable_equals_parameter_silent_faces() {
+        let src = "class bool {}\nclass Object {}\nclass int {}\n\
+                   class A { @override bool operator ==(Object other) => true; }\n\
+                   class B { @override bool operator ==(dynamic other) => true; }\n\
+                   class C { @override bool operator ==(other) => true; }\n\
+                   class D { @override bool operator ==(int? other) => true; }\n\
+                   class F { bool equals(Object? other) => true; }\n\
+                   class G { @override bool operator ==(void Function() other) => true; }\n";
+        let rep = report(src);
+        assert!(
+            !code_names(&rep).contains(&"non_nullable_equals_parameter"),
+            "{:?}",
+            code_names(&rep)
+        );
+        // Two parameters: the official arity gate returns first (the
+        // wrong-number-of-parameters ERROR is the collector's own face).
+        let rep = report(
+            "class bool {}\nclass Object {}\n\
+             class U { @override bool operator ==(Object? a, Object? b) => true; }\n",
+        );
+        assert!(
+            !code_names(&rep).contains(&"non_nullable_equals_parameter"),
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// An abstract `==` declaration still reports — the official check
+    /// never reads the body (probed: `abstract class V { bool operator
+    /// ==(Object? other); }` emits the row).
+    #[test]
+    fn abstract_equals_parameter_still_reports() {
+        let src = "class bool {}\nclass Object {}\n\
+                   abstract class V {\n  @override\n  bool operator ==(Object? other);\n}\n";
+        let rep = report(src);
+        assert_eq!(
+            code_names(&rep),
+            ["non_nullable_equals_parameter"],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// A `noSuchMethod` declaration whose body is exactly
+    /// `super.noSuchMethod(<one argument>)` reports at the declaration's
+    /// name token with the verbatim oracle message and correction, when
+    /// the superchain carries a concrete declaration (probed: length 12
+    /// at the name). Both allowed body shapes fire — the arrow form and a
+    /// block whose single statement is that return.
+    #[test]
+    fn no_such_method_delegation_reports_at_the_name_token() {
+        let src = "class Invocation {}\n\
+                   class A {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => 42;\n}\n\
+                   class C extends A {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n}\n";
+        let rep = report(src);
+        assert_eq!(
+            code_names(&rep),
+            ["unnecessary_no_such_method"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let d = &rep.diagnostics[0];
+        assert_eq!(d.message, "Unnecessary 'noSuchMethod' declaration.");
+        assert_eq!(
+            d.correction.as_deref(),
+            Some("Try removing the declaration of 'noSuchMethod'.")
+        );
+        let at = src[src.find("class C").unwrap()..]
+            .find("noSuchMethod")
+            .expect("delegate name");
+        let at = src.find("class C").unwrap() + at;
+        assert_eq!(d.range.offset, u32::try_from(at).unwrap());
+        assert_eq!(d.range.length, 12);
+
+        // The block form: one statement, that return.
+        let src = "class Invocation {}\n\
+                   class A {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => 42;\n}\n\
+                   class B extends A {\n  @override\n  dynamic noSuchMethod(Invocation invocation) {\n    return super.noSuchMethod(invocation);\n  }\n}\n";
+        let rep = report(src);
+        assert_eq!(
+            code_names(&rep),
+            ["unnecessary_no_such_method"],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// The resolution climbs THROUGH clean intermediates: each delegating
+    /// class in `A <- C <- L2` reports (the concrete declaration one hop
+    /// up decides, probed through two levels). Argument content is
+    /// irrelevant — exactly one argument of any shape matches (probed
+    /// with a dotted argument).
+    #[test]
+    fn no_such_method_resolution_climbs_clean_intermediates() {
+        let src = "class Invocation {}\n\
+                   class A {\n  dynamic noSuchMethod(Invocation invocation) => 42;\n}\n\
+                   class C extends A {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n}\n\
+                   class L2 extends C {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n}\n";
+        let rep = report(src);
+        assert_eq!(
+            code_names(&rep),
+            ["unnecessary_no_such_method", "unnecessary_no_such_method"],
+            "{:?}",
+            code_names(&rep)
+        );
+
+        // A dotted argument stays one argument.
+        let src = "class Invocation {}\n\
+                   class A {\n  dynamic noSuchMethod(Invocation invocation) => 42;\n}\n\
+                   class D extends A {\n  Invocation other = Invocation();\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(other);\n}\n";
+        let rep = report(src);
+        assert_eq!(
+            code_names(&rep),
+            ["unnecessary_no_such_method"],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// The silent faces (each probed silent on 3.13.1): the direct
+    /// `Object` resolution (no `extends`, or `extends` a clean chain to
+    /// `Object`), a coalesced double delegation, a block with more than
+    /// one statement, a delegation to a different member, a bare self
+    /// call, and one/zero arguments.
+    #[test]
+    fn no_such_method_silent_faces() {
+        // The Object default: silent with and without `extends Object`.
+        let src = "class Invocation {}\nclass Object {}\n\
+                   class E {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n}\n";
+        let rep = report(src);
+        assert!(
+            !code_names(&rep).contains(&"unnecessary_no_such_method"),
+            "{:?}",
+            code_names(&rep)
+        );
+        let src = "class Invocation {}\nclass Object {}\n\
+                   class E2 extends Object {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n}\n";
+        let rep = report(src);
+        assert!(
+            !code_names(&rep).contains(&"unnecessary_no_such_method"),
+            "{:?}",
+            code_names(&rep)
+        );
+        // Compound expressions never match the one-invocation shape.
+        let src = "class Invocation {}\n\
+                   class A {\n  dynamic noSuchMethod(Invocation invocation) => 42;\n}\n\
+                   class K extends A {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation) ?? super.noSuchMethod(invocation);\n}\n";
+        let rep = report(src);
+        assert!(
+            !code_names(&rep).contains(&"unnecessary_no_such_method"),
+            "{:?}",
+            code_names(&rep)
+        );
+        // A block with more than one statement never matches.
+        let src = "class Invocation {}\n\
+                   class A {\n  dynamic noSuchMethod(Invocation invocation) => 42;\n}\n\
+                   class T2 extends A {\n  @override\n  dynamic noSuchMethod(Invocation invocation) {\n    noSuchMethod(invocation);\n    return super.noSuchMethod(invocation);\n  }\n}\n";
+        let rep = report(src);
+        assert!(
+            !code_names(&rep).contains(&"unnecessary_no_such_method"),
+            "{:?}",
+            code_names(&rep)
+        );
+        // A delegation to a different member, a bare self call, and the
+        // argument-count gates.
+        let src = "class Invocation {}\n\
+                   class A {\n  dynamic noSuchMethod(Invocation invocation) => 42;\n}\n\
+                   class F2 extends A {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.foo(invocation);\n}\n";
+        let rep = report(src);
+        assert!(
+            !code_names(&rep).contains(&"unnecessary_no_such_method"),
+            "{:?}",
+            code_names(&rep)
+        );
+        let src = "class Invocation {}\n\
+                   class A {\n  dynamic noSuchMethod(Invocation invocation) => 42;\n}\n\
+                   class N2 extends A {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => noSuchMethod(invocation);\n}\n";
+        let rep = report(src);
+        assert!(
+            !code_names(&rep).contains(&"unnecessary_no_such_method"),
+            "{:?}",
+            code_names(&rep)
+        );
+        let src = "class Invocation {}\n\
+                   class A {\n  dynamic noSuchMethod(Invocation invocation) => 42;\n}\n\
+                   class W2 extends A {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation, invocation);\n}\n";
+        let rep = report(src);
+        assert!(
+            !code_names(&rep).contains(&"unnecessary_no_such_method"),
+            "{:?}",
+            code_names(&rep)
+        );
+        let src = "class Invocation {}\n\
+                   class A {\n  dynamic noSuchMethod(Invocation invocation) => 42;\n}\n\
+                   class Z2 extends A {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod();\n}\n";
+        let rep = report(src);
+        assert!(
+            !code_names(&rep).contains(&"unnecessary_no_such_method"),
+            "{:?}",
+            code_names(&rep)
+        );
+        // A trailing selector on the delegation breaks the node shape.
+        let src = "class Invocation {}\n\
+                   class A {\n  dynamic noSuchMethod(Invocation invocation) => 42;\n}\n\
+                   class S2 extends A {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation).x;\n}\n";
+        let rep = report(src);
+        assert!(
+            !code_names(&rep).contains(&"unnecessary_no_such_method"),
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// Abstract declarations are TRANSPARENT to the concrete dispatch
+    /// (probed on 3.13.1): an abstract declaration one hop closer never
+    /// stops the walk (the concrete declaration behind it still reports),
+    /// while an abstract-only chain resolves to `Object` and stays silent.
+    #[test]
+    fn no_such_method_abstract_declarations_are_transparent() {
+        let src = "class Invocation {}\n\
+                   class A2 {\n  dynamic noSuchMethod(Invocation invocation) => 3;\n}\n\
+                   abstract class Mid extends A2 {\n  @override\n  dynamic noSuchMethod(Invocation invocation);\n}\n\
+                   class W extends Mid {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n}\n";
+        let rep = report(src);
+        assert_eq!(
+            code_names(&rep),
+            ["unnecessary_no_such_method"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let src = "class Invocation {}\n\
+                   abstract class Abs {\n  dynamic noSuchMethod(Invocation invocation);\n}\n\
+                   class V2 extends Abs {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n}\n";
+        let rep = report(src);
+        assert!(
+            !code_names(&rep).contains(&"unnecessary_no_such_method"),
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// A CONCRETE mixin declaration of `noSuchMethod` poisons the
+    /// resolution (probed silent on 3.13.1: the delegating class's own
+    /// `with M`, an intermediate application's `with M`, and the
+    /// direct `extends B with M` all stay silent — even when the nominal
+    /// superclass ALSO declares one), while an ABSTRACT mixin declaration
+    /// is transparent and the chain behind it still reports.
+    #[test]
+    fn no_such_method_concrete_mixin_declarations_poison() {
+        // The delegating class's own mixin declares.
+        let src = "class Invocation {}\n\
+                   mixin M {\n  dynamic noSuchMethod(Invocation invocation) => 7;\n}\n\
+                   class Base {}\n\
+                   class W extends Base with M {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n}\n";
+        let rep = report(src);
+        assert!(
+            !code_names(&rep).contains(&"unnecessary_no_such_method"),
+            "{:?}",
+            code_names(&rep)
+        );
+        // A mixin declares on an intermediate application, shadowing the
+        // concrete nominal declaration behind it.
+        let src = "class Invocation {}\n\
+                   mixin Mx {\n  dynamic noSuchMethod(Invocation invocation) => 13;\n}\n\
+                   class Base3 {\n  dynamic noSuchMethod(Invocation invocation) => 15;\n}\n\
+                   class Mid extends Base3 with Mx {}\n\
+                   class W3 extends Mid {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n}\n";
+        let rep = report(src);
+        assert!(
+            !code_names(&rep).contains(&"unnecessary_no_such_method"),
+            "{:?}",
+            code_names(&rep)
+        );
+        // A mixin without the name leaves the nominal chain decisive.
+        let src = "class Invocation {}\n\
+                   mixin Mh {\n  void helper() {}\n}\n\
+                   class Base4 {\n  dynamic noSuchMethod(Invocation invocation) => 15;\n}\n\
+                   class Mid4 extends Base4 with Mh {}\n\
+                   class W4 extends Mid4 {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n}\n";
+        let rep = report(src);
+        assert_eq!(
+            code_names(&rep),
+            ["unnecessary_no_such_method"],
+            "{:?}",
+            code_names(&rep)
+        );
+        // An abstract mixin declaration never poisons.
+        let src = "class Invocation {}\n\
+                   mixin Ma {\n  dynamic noSuchMethod(Invocation invocation);\n}\n\
+                   class Base7 {\n  dynamic noSuchMethod(Invocation invocation) => 5;\n}\n\
+                   class W7 extends Base7 with Ma {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n}\n";
+        let rep = report(src);
+        assert_eq!(
+            code_names(&rep),
+            ["unnecessary_no_such_method"],
+            "{:?}",
+            code_names(&rep)
         );
     }
 }
