@@ -394,11 +394,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                             | MemberKind::ExtensionTypeStaticMethod
                     ) =>
                 {
-                    // PrimaryConstructor is accepted silently here: the 3.13
-                    // oracle consumes `covariant` in primary-constructor
-                    // formals without a covariant-specific diagnostic (the
-                    // `invalidCovariantModifierInPrimaryConstructor` check
-                    // postdates the oracle).
+                    // Recorded silently; the walk-end gate reports the
+                    // primary-constructor case (modifier_context.dart:238)
+                    // once `var`/`final`/`const` is known.
                     covariant.get_or_insert(self.peek_span());
                     self.cursor.advance();
                 }
@@ -460,6 +458,20 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             && let Some(t) = var_final_or_const
         {
             self.report(msg::function_typed_parameter_var(), t);
+        }
+        // `invalidCovariantModifierInPrimaryConstructor`
+        // (modifier_context.dart:238-246): with the feature on, `covariant`
+        // in a primary-constructor formal is only legal alongside `var`
+        // (oracle 3.13.1, `class P(covariant int x) {}` → the face on the
+        // `covariant` token).
+        if member_kind == MemberKind::PrimaryConstructor
+            && let Some(t) = covariant
+            && self.features.primary_constructors_enabled
+            && !var_final_or_const
+                .map(|v| self.cursor.lexeme(v.id) == "var")
+                .unwrap_or(false)
+        {
+            self.report(msg::invalid_covariant_modifier_in_primary_constructor(), t);
         }
         self.listener.begin_formal_parameter(
             start,

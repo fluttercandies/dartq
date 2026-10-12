@@ -1708,7 +1708,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         let case_kw = self.peek_span();
                         self.cursor.advance();
                         self.listener.begin_case_expression(case_kw);
-                        let _ = self.parse_pattern(PatternContext::Matching);
+                        // Legacy (< 3.0) toolchains parse the case head as a
+                        // plain expression — the branch sits here, not inside
+                        // `parsePattern` (`parser_impl.dart:10945-10949`), so
+                        // no experiment-not-enabled face ever fires.
+                        if self.features.patterns_enabled {
+                            let _ = self.parse_pattern(PatternContext::Matching);
+                        } else {
+                            let _ = self.parse_expression();
+                        }
                         let mut when = None;
                         if self.peek_kind() == TokenKind::Keyword(Keyword::When) {
                             let when_kw = self.peek_span();

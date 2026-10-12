@@ -778,15 +778,26 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             type_info.parse_type(self);
             if self.peek_kind() == TokenKind::Eq {
                 // `typedef void = ...;` — a reserved type head with the `=`
-                // at the name position bails the whole typedef: the oracle
-                // reports `expectedToken(';')` anchored on the type head and
-                // restarts the declaration parse at the `=` (the reparse
-                // yields the top-level-member / alias-shape errors).
+                // at the name position. The official recovery reports
+                // `expectedToken(';')` anchored on the type head
+                // (ensureSemicolon's walked-back anchor), then the typedef
+                // parse itself finishes against the `=`: the name position
+                // reports `missing_identifier` on the `=`
+                // (insertSyntheticIdentifier's consume-in-doubt branch) and
+                // the required parameter list reports
+                // `missing_typedef_parameters` on the same token before the
+                // synthetic `()` splices in (`parseFormalParametersRequiredOpt`,
+                // parser_impl.dart:1913-1918); the `=` stays for the
+                // declaration loop, whose member reparse mints the
+                // expected_executable face.
                 let head_end = self
                     .cursor
                     .last_consumed_id()
                     .map_or_else(|| self.peek_span(), |id| self.span_of(id));
                 self.report(msg::expected_token(";"), head_end);
+                let eq = self.peek_span();
+                self.report(msg::missing_identifier(), eq);
+                self.report(msg::missing_typedef_parameters(), eq);
                 self.listener
                     .end_typedef(augment, typedef_keyword, None, head_end);
                 return;
@@ -925,10 +936,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                         // member parse could consume (official recovery
                         // guarantees termination via the rewriter; here the
                         // guard plays that role).
-                        self.report(
-                            msg::expected_declaration(self.cursor.lexeme(self.peek_id())),
-                            self.peek_span(),
-                        );
+                        self.report(msg::expected_executable(), self.peek_span());
                         self.force_advance();
                     }
                 }
@@ -1299,7 +1307,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         const_keyword: Option<TokenSpan>,
         name: TokenSpan,
     ) {
+        // `headerStart` (parser_impl.dart:3098): the position before the
+        // primary-constructor parameters — the missing-body recovery
+        // restarts from here, so an unconsumed-looking `(` ahead of a `{`
+        // takes the skipped-junk face (`class C({var int a})` at EOF).
+        let header_start = self.cursor.mark();
         if self.parse_primary_constructor_opt(DeclarationKind::Class, const_keyword, true) {
+            // The "params consumed" fact must be captured here — before the
+            // clause walk advances the cursor. Measured at recovery time the
+            // clause tokens (`extends A`, …) have already moved the cursor
+            // past `headerStart`, so every class looked param-consuming and
+            // the rewind re-walked the first pass's clauses, double-firing
+            // their faces (the official's learning reparse swallows those
+            // events; ours report directly).
+            let params_consumed =
+                self.cursor.real_pos() > crate::cursor::TokenCursor::mark_pos(header_start);
             let header = self.parse_class_header_opt(class_keyword, begin);
 
             if self.peek_kind() == TokenKind::Semicolon {
@@ -1311,11 +1333,22 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 self.listener.handle_no_class_body(semi);
             } else {
                 if self.peek_kind() != TokenKind::OpenCurly {
-                    // Recovery: out-of-order/duplicate clauses (the missing body
-                    // itself is ensured once, by the body parser below — official
-                    // `parseClassOrMixinOrExtensionBodyImpl` only asserts the `{`
-                    // its caller's `ensureBlock` guaranteed, so the class header's
-                    // own `ensureBlock` report and the body's must not stack).
+                    // Recovery for out-of-order/duplicate clauses. Rewind to
+                    // `headerStart` ONLY when the primary-constructor header
+                    // consumed tokens (the oracle anchors `expected_body` on
+                    // the `(` and re-forms the body from the params — probed
+                    // 3.13.1, `class C(int a)`); the recovery loop's junk-skip
+                    // refuses a `(` whose follower is not a clause keyword, so
+                    // the rewound walk jams there and nothing re-reports.
+                    // Without primary-constructor tokens the first pass's
+                    // clauses already reported their faces — rewinding would
+                    // re-walk them and double-fire, so the recovery continues
+                    // from the first pass's end (`paramsConsumed` was captured
+                    // right after `parse_primary_constructor_opt`, before the
+                    // clause walk moved the cursor).
+                    if params_consumed {
+                        self.cursor.reset(header_start);
+                    }
                     self.parse_class_header_recovery(DeclarationHeaderKind::Class, header);
                 }
                 self.parse_class_or_mixin_or_extension_body(DeclarationKind::Class, name);

@@ -482,7 +482,7 @@ fn uri_must_be_string() {
     // :1022-1025) re-reports `5` before the `;`; `part`'s
     // `ensureSemicolon` reports the missing `;` anchored at `part`
     // (`findPreviousNonZeroLengthToken`), and the top-level continuation
-    // then takes `5;` — `expected_declaration` (the shared
+    // then takes `5;` — `expected_executable` (the shared
     // `EXPECTED_EXECUTABLE` code) on `5`, `unexpectedToken` on `;`.
     assert_eq!(
         error_codes("import 5;"),

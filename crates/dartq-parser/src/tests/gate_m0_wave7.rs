@@ -125,23 +125,33 @@ fn sealed_mixin_class_reports_only_the_modifier_row() {
 // —— family: expected_body — class-head faces missing their body ————————————
 
 /// `class C(int a)` at EOF (the `class_primary_constructor_error.dart`
-/// tail face): the primary constructor consumes the declaring-parameter
-/// list, the header recovery makes no progress, and `ensureBlock` reports
-/// the message-flavored `expectedClassBody` anchored on the LAST CONSUMED
-/// token — the `)` (official `reportRecoverableError(token, message)`,
-/// parser_impl.dart:4995-5002, `findNonZeroLengthToken` keeps the real
-/// token; block_kind.dart:27-30). Pre-fix the anchor fell on the EOF
-/// follower.
+/// tail face): the header recovery restarts before the primary-constructor
+/// parameters and jams on the `(` (its follower `int` is not a clause
+/// keyword), so `ensureBlock` reports the message-flavored
+/// `expectedClassBody` ON the `(` (6..7) and the params re-enter the class
+/// body as junk members (probed 3.13.1: `expected_body` @`(`,
+/// `expected_executable` @`int`, `expected_token(';')` @`a`,
+/// `expected_executable` @`)`).
 #[test]
-fn class_with_primary_constructor_missing_body_anchors_on_close_paren() {
+fn class_with_primary_constructor_missing_body_anchors_on_open_paren() {
     let listener = assert_stream(
         "class C(int a)",
-        &[("expected_body", 13, 14)],
+        &[
+            ("expected_body", 6, 7),
+            ("expected_executable", 7, 8),
+            ("expected_token", 12, 13),
+            ("expected_executable", 13, 14),
+        ],
         "class head missing body at EOF",
     );
     assert_eq!(
         listener.texts,
-        ["A class declaration must have a body, even if it is empty."],
+        [
+            "A class declaration must have a body, even if it is empty.",
+            "Expected a method, getter, setter or operator declaration.",
+            "Expected to find ';'.",
+            "Expected a method, getter, setter or operator declaration.",
+        ],
         "message templates diverged"
     );
 }

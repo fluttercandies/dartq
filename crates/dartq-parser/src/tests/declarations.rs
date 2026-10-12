@@ -447,6 +447,47 @@ fn multiple_implements_reports() {
     assert_eq!(c.error_codes(), ["multiple_implements_clauses"]);
 }
 
+/// `class C(int a) extends A extends B {}` — the composite rewind shape
+/// (primary-constructor params + a duplicate clause, with a body). The
+/// params-present rewind restarts the header recovery before the `(`, whose
+/// follower `int` is not a clause keyword, so the re-walk jams there and
+/// re-derives nothing. Probed 3.13.1 (`dart analyze --format=machine`): the
+/// oracle keeps NO clause faces for this shape — `multiple_extends_clauses`
+/// is absent from the oracle multiset, the tail is consumed as junk members
+/// inside the body formed from the params, and the leading rows are
+/// `expected_body` @6, `expected_executable` @7, `expected_token` @12,
+/// `expected_executable` @13. Our first pass likewise reports no clause
+/// faces for a single-`extends` header, so the rewind needs no event
+/// swallow — this pin guards exactly that absence.
+#[test]
+fn composite_params_duplicate_extends_keeps_no_clause_faces() {
+    let c = parse("class C(int a) extends A extends B {}");
+    for (code, start, end) in &c.errors {
+        assert!(
+            !matches!(
+                code.as_str(),
+                "multiple_extends_clauses"
+                    | "multiple_with_clauses"
+                    | "multiple_implements_clauses"
+                    | "implements_before_extends"
+                    | "implements_before_with"
+                    | "with_before_extends"
+            ),
+            "clause face survived the rewind: {code} @{start}..{end}"
+        );
+    }
+    // The body face anchors on the class name (the last token consumed
+    // before the rewound header — `ensureBlock`'s
+    // `findPreviousNonZeroLengthToken` anchor), identical to the bare
+    // `class C(int a)` missing-body shape.
+    assert_eq!(
+        &c.errors[..1],
+        &[("expected_body".to_string(), 6, 7)],
+        "{:?}",
+        c.errors
+    );
+}
+
 // —— member recovery ——————————————————————————————————————————————————————
 
 #[test]

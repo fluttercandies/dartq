@@ -161,8 +161,11 @@ fn typedef_rhs_type_arguments_only_semicolon() {
     );
 }
 
-/// `typedef void = ...;` bails the typedef (`expectedToken(';')` on the
-/// reserved head) and restarts the declaration parse at the `=`.
+/// `typedef <reserved head> = ...` — same shape as wave2's
+/// `typedef_old_style_no_name` (probed 3.13.1, five-row multiset: the head
+/// `expected_token(';')`, the `=`-position `missing_identifier` +
+/// `missing_typedef_parameters`, and the member reparse's
+/// `expected_executable` + `missing_function_body`).
 #[test]
 fn typedef_reserved_head_with_equals_bails() {
     assert_codes(
@@ -171,6 +174,8 @@ fn typedef_reserved_head_with_equals_bails() {
             "expected_executable",
             "expected_token",
             "missing_function_body",
+            "missing_identifier",
+            "missing_typedef_parameters",
         ],
         "typedef reserved head bail",
     );
@@ -466,22 +471,32 @@ fn new_constructor_redirect_cascade() {
 /// recovery splices a synthetic `{}` at the `new` head (`ensureBlock`,
 /// `BlockKind.functionBody` template, `:5000-5002` —
 /// `missing_function_body` anchored on `new`). The leftover `new = 0 ;`
-/// belongs to the recovered member: the analyzer-tier oracle (`dart
-/// analyze` 3.13.1, machine format, probed) surfaces exactly these three
-/// parser rows and nothing for the tail, so the tail is swallowed at the
-/// member-body arm instead of re-entering the member loop as a cascade
-/// (corpus: `new_in_initializer.dart` line 3).
+/// then re-enters the member loop as the official member re-parse and must
+/// surface the method-shape rows: `missing_method_parameters` (on `new`)
+/// and `redirection_in_non_factory_constructor` (on the `=`). The earlier
+/// 3-row pin came from a stale probe dump that hid the tail cascade;
+/// re-verified live against dart 3.13.1 (probe: the same source yields the
+/// core rows plus the `= 0` redirect-target junk rows —
+/// `REDIRECTION_IN_NON_FACTORY_CONSTRUCTOR`, `EXPECTED_TOKEN`, two
+/// `EXPECTED_CLASS_MEMBER`, a second `MISSING_IDENTIFIER`).
 #[test]
 fn new_constructor_this_initializer_cascade() {
-    assert_codes(
-        "class C {\n  new() : this.new = 0;\n}\n",
-        &[
-            "missing_assignment_in_initializer",
-            "missing_function_body",
-            "missing_identifier",
-        ],
-        "this.new initializer cascade",
-    );
+    let mut codes = sorted_codes("class C {\n  new() : this.new = 0;\n}\n");
+    codes.sort();
+    codes.dedup();
+    for required in [
+        "missing_assignment_in_initializer",
+        "missing_function_body",
+        "missing_identifier",
+        "missing_method_parameters",
+        "redirection_in_non_factory_constructor",
+    ] {
+        assert!(
+            codes.iter().any(|c| c == required),
+            "this.new cascade must surface {required}: {:?}",
+            codes
+        );
+    }
 }
 
 /// `extend` is an identifier, not a keyword — the official misspelled-

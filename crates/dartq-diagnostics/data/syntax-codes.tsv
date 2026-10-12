@@ -168,6 +168,7 @@ invalid_constant_pattern_generic	INVALID_CONSTANT_PATTERN_GENERIC	ERROR	P	This e
 invalid_constant_pattern_negation	INVALID_CONSTANT_PATTERN_NEGATION	ERROR	P	Only negation of a numeric literal is supported as a constant pattern.	false
 invalid_constant_pattern_unary	INVALID_CONSTANT_PATTERN_UNARY	ERROR	P	The unary operator {0} is not supported as a constant pattern.	false
 invalid_constructor_name	INVALID_CONSTRUCTOR_NAME	ERROR	P	The name of a constructor must match the name of the enclosing class.	false
+invalid_covariant_modifier_in_primary_constructor	INVALID_COVARIANT_MODIFIER_IN_PRIMARY_CONSTRUCTOR	ERROR	P	The 'covariant' modifier can only be used on non-final declaring parameters.	false
 invalid_generic_function_type	INVALID_GENERIC_FUNCTION_TYPE	ERROR	P	Invalid generic function type.	false
 invalid_hex_escape	INVALID_HEX_ESCAPE	ERROR	P	An escape sequence starting with '\x' must be followed by 2 hexadecimal digits.	false
 invalid_initializer	INVALID_INITIALIZER	ERROR	P	Not a valid initializer.	false

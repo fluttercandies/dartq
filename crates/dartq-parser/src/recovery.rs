@@ -107,6 +107,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                 context,
                 crate::listener::IdentifierContext::ConstructorReferenceContinuation
                     | crate::listener::IdentifierContext::ConstructorReferenceContinuationAfterTypeArguments
+                    | crate::listener::IdentifierContext::MethodDeclarationContinuation
             )
         {
             let id = self.cursor.advance();
@@ -120,6 +121,33 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         // report `expectedIdentifierButGotKeyword` for reserved words and
         // consume them as the name; whatever the template rejects falls
         // through to the generic synthetic path.
+        // `LibraryIdentifierContext.ensureIdentifier` recovery branch 2b
+        // (identifier_context_impl.dart:977-991) and
+        // `TopLevelDeclarationIdentifierContext.ensureIdentifier` recovery
+        // branch 1 (:1321-1332): a reserved word that heads a top-level
+        // declaration is never eaten as the library name / variable name —
+        // report `missing_identifier` at it, splice the synthetic name, and
+        // leave the keyword current for the declaration loop (oracle
+        // `library` + `void f()` and `var class VarClass {}`; the variable
+        // directive's `;` then anchors on the walked-back head via
+        // ensureSemicolon's findPreviousNonZeroLengthToken). Built-in heads
+        // keep the template's fast path below.
+        if matches!(
+            peek.kind,
+            TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved
+        ) && matches!(
+            context,
+            crate::listener::IdentifierContext::LibraryName
+                | crate::listener::IdentifierContext::TopLevelVariableDeclaration
+        ) && self.looks_like_start_of_next_top_level_declaration_at(0)
+        {
+            self.report(msg::missing_identifier(), peek.span);
+            let id = self
+                .cursor
+                .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
+            self.cursor.advance();
+            return self.span_of(id);
+        }
         if matches!(peek.kind, TokenKind::Keyword(_))
             && let Some(message) = keyword_as_name_message(context, &peek, &self.cursor)
         {
@@ -382,6 +410,33 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                         | Keyword::While
                 )
                 | TokenKind::Eof
+        )
+    }
+
+    /// `looksLikeStartOfNextTopLevelDeclaration`
+    /// (identifier_context_impl.dart:1650): the `isTopLevelKeyword` heads
+    /// (token.dart: class/enum/export/extension/import/library/mixin/part/
+    /// typedef) plus const/get/final/set/var/void.
+    fn looks_like_start_of_next_top_level_declaration_at(&self, n: usize) -> bool {
+        matches!(
+            self.cursor.look_kind(n),
+            TokenKind::Keyword(
+                Keyword::Class
+                    | Keyword::Const
+                    | Keyword::Enum
+                    | Keyword::Export
+                    | Keyword::Extension
+                    | Keyword::Final
+                    | Keyword::Get
+                    | Keyword::Import
+                    | Keyword::Library
+                    | Keyword::Mixin
+                    | Keyword::Part
+                    | Keyword::Set
+                    | Keyword::Typedef
+                    | Keyword::Var
+                    | Keyword::Void
+            )
         )
     }
 

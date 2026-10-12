@@ -675,15 +675,25 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         )
     }
 
-    /// `rewriteSquareBrackets` (:4743) for the linear cursor: consume the
-    /// real `[]` token and queue synthetic `[`/`]` at its offset so the
-    /// index machinery parses a bracket group.
+    /// `rewriteSquareBrackets` (:4743/:5119) for the linear cursor: consume
+    /// the `[]` token and queue a `[`/`]` pair so the index machinery parses
+    /// a bracket group. A real `[]` splits into real tokens — `[` at its own
+    /// offset, `]` one past it — so missing-index recovery anchors on the
+    /// real `]` (the oracle's `foo[]` face is `missing_identifier` at the
+    /// `]`, length 1, never a zero-width synthetic anchor); a synthetic `[]`
+    /// keeps the synthetic posture.
     pub(crate) fn rewrite_square_brackets(&mut self) {
-        let offset = self.peek_span().range.offset;
+        let head = self.cursor.peek();
+        let offset = head.span.range.offset;
         self.cursor.advance();
-        let open = self.synthetic(TokenKind::OpenSquare, offset);
-        let close = self.synthetic(TokenKind::CloseSquare, offset);
-        let _ = (open, close);
+        if head.is_synthetic {
+            let open = self.synthetic(TokenKind::OpenSquare, offset);
+            let close = self.synthetic(TokenKind::CloseSquare, offset);
+            let _ = (open, close);
+        } else {
+            self.cursor.queue_split(TokenKind::OpenSquare, offset);
+            self.cursor.queue_split(TokenKind::CloseSquare, offset + 1);
+        }
     }
 
     /// Splits `?.` into `?` + `.` at a collection-entry boundary (official
@@ -2072,12 +2082,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             TokenKind::OpenSquare | TokenKind::Index => self.parse_list_literal(const_keyword),
             _ => {
-                // Recovery (:8360-8366): report and parse as an empty list
-                // through the synthetic `[]` token.
+                // Recovery (:8360-8366): report, splice the synthetic `[]`
+                // token after the type arguments (official
+                // `insertSyntheticToken(token, INDEX)`), and parse the
+                // empty-list arm over the queued synthetic itself — the
+                // follower stays unconsumed (`<int> 3;` then ends the
+                // declaration with the walk-back `;` expect and re-parses
+                // `3 ;` as a junk member, the pinned oracle cascade).
                 self.report(msg::expected_but_got("["), self.peek_span());
                 let offset = self.peek_span().range.offset;
                 let index = self.synthetic(TokenKind::Index, offset);
-                self.cursor.advance();
                 let _ = index;
                 self.parse_list_literal_index_arm(const_keyword)
             }

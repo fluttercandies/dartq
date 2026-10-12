@@ -91,19 +91,20 @@ fn new_expression_missing_args_recover_with_synthetic_args() {
 // —— incomplete const dot shorthand (#609 dot-shorthand) ————————————————
 
 /// `Color c = const .;` (corpus dot_shorthands/
-/// const_no_identifier_recovery.dart): the pinned 3.13.1 oracle face is a
-/// single `expected_token(';')` — the incomplete shorthand consumes the
-/// follower `;` as its operand and the declaration terminator expect fires
-/// once at the real block closer. No identifier expect may fire (the
-/// 3.15 CFE template behavior is NOT the pinned face).
+/// const_no_identifier_recovery.dart): the pinned 3.13.1 oracle faces
+/// (trend-w4 gate raw output + live probe) are `missing_identifier` on the
+/// follower `;` (kept unconsumed, real-token anchor) and
+/// `expected_token(';')` at the dot (the terminator's walked-back anchor
+/// over the synthetic operand). The earlier single-row pin came from a
+/// stale probe dump.
 #[test]
-fn incomplete_const_dot_shorthand_eats_terminator() {
+fn incomplete_const_dot_shorthand_missing_identifier() {
     let mut parser = setup("void main() {\n  Color c = const .;\n}\n");
     parser.parse_unit();
     assert_eq!(
         parser.listener.error_codes(),
-        ["expected_token"],
-        "exactly the terminator expect, no identifier expect: {:?}",
+        ["missing_identifier", "expected_token"],
+        "identifier expect on the follower + terminator expect at the dot: {:?}",
         parser.listener.errors
     );
 }

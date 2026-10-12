@@ -4,15 +4,13 @@
 //! the semantic layer solely owns. Official decision order
 //! (`parser_impl.dart`, Dart 3.15 main):
 //!
-//! * A missing member name recovers ONCE: `insertSyntheticIdentifier`
-//!   reports through the context's recovery template
-//!   (:4056-4067, `methodDeclaration` default `expectedIdentifier`) and the
-//!   synthetic flows INTO the member parse as the name token
-//!   (:4364-4369 insert-then-fall-through; :4398 `parseFields(...,
-//!   token.next!, ...)`). The name slot must not re-report — a second
-//!   `missing_identifier` at the junk token is a duplicate row (r5:
-//!   `use_late_in_non_nnbd.dart:9` n=2). `parseFields` then adds exactly
-//!   its own rider for the type-less, modifier-less head (:4478).
+//! * A missing member name recovers ONCE. The oracle split (probed
+//!   `dart analyze` 3.13.1, machine format): the head insert reports
+//!   `missing_identifier` only with a `var`/`final`/`const` modifier
+//!   (`var ;` → one row on the `;`); a `late` or type-headed junk name
+//!   (`late ;`, `int ;`, `x ;`) inserts silently and `parseFields`'s
+//!   type-less rider is the only row, anchored on the member head — the
+//!   `late` keyword or the type-position token, never the follower `;`.
 //! * The `abstract`+`final`/`interface`/`sealed` class-modifier combination
 //!   is reported by the analyzer in the resolution phase
 //!   (`pkg/analyzer/lib/src/dart/resolver/...` — the parser-side
@@ -23,53 +21,47 @@
 
 use super::collector::setup;
 
-/// Exact code stream for a member head missing its name before a `;`.
+/// Exact stream for a member head missing its name before a `;`. Oracle
+/// 3.13.1 (`dart analyze --format=machine`, `late;\nint x;\n`): the `late`
+/// head recovers silently — the inserted-name face only fires with a
+/// `var`/`final`/`const` modifier (`var ;` probe) — and `parseFields`'s
+/// type-less rider anchors on the member head `late` (offset 0..4), not the
+/// follower `;`. The earlier two-row pin predated the live probe.
 #[test]
 fn late_semicolon_top_level_single_missing_identifier() {
     let mut p = setup("late;\nint x;\n");
     p.parse_unit();
     let got = p.listener.errors;
-    let want = vec![
-        ("missing_identifier".to_owned(), 4, 5),
-        ("missing_const_final_var_or_type".to_owned(), 4, 5),
-    ];
+    let want = vec![("missing_const_final_var_or_type".to_owned(), 0, 4)];
     assert_eq!(got, want, "use_late `late;` head: {got:?}");
 }
 
-/// The class-member flavor (`late;` inside a class): the official
-/// `beforeStart` is captured before the modifier walk
-/// (`parser_impl.dart:5295`), so in `recoverFromInvalidMember` the
-/// no-progress check `token == beforeStart` (:11352) is false for a
-/// modifier-headed junk member and the head flows into `parseFields`,
-/// which reports its type-less rider FIRST (:4477-4480,
-/// `missingConstFinalVarOrType`) and then the name-slot
-/// `missingIdentifier` via `ensureIdentifierPotentiallyRecovered`
-/// (:4500-4504) — never `expectedClassMember` (:11355 only fires when
-/// nothing since member entry was consumed).
+/// The class-member flavor (`late;` inside a class): same oracle split —
+/// the silent head insert and ONE type-less rider anchored on the `late`
+/// keyword (probed 3.13.1: line 2 col 3, len 4), never
+/// `expectedClassMember` and never a name-slot `missing_identifier`.
 #[test]
 fn late_semicolon_class_member_official_stream() {
     let mut p = setup("class C {\n  late;\n}\n");
     p.parse_unit();
     let got = p.listener.errors;
-    let want = vec![
-        ("missing_const_final_var_or_type".to_owned(), 16, 17),
-        ("missing_identifier".to_owned(), 16, 17),
-    ];
+    let want = vec![("missing_const_final_var_or_type".to_owned(), 12, 16)];
     assert_eq!(got, want, "class-member `late;` official stream: {got:?}");
 }
 
-/// The reserved-word name recovery (`<return type>? <reserved> <follower>`)
-/// still parses and the following declaration stays clean — the synthetic
-/// name hands off without a second report.
+/// The reserved-word name recovery lane: `late;` recovers with the single
+/// type-less rider, the stray `;` is the only other row, and the following
+/// declaration stays clean — no inserted-name face anywhere in the unit
+/// (oracle 3.13.1, `late;\n;\nlate int x;\n`: exactly these two rows).
 #[test]
 fn missing_name_head_then_declaration_parses_clean() {
     let mut p = setup("late;\n;\nlate int x;\n");
     p.parse_unit();
-    let got = p.listener.error_codes();
     assert_eq!(
-        got.iter().filter(|c| *c == "missing_identifier").count(),
-        1,
-        "exactly one missing_identifier across the sequence: {got:?}"
+        p.listener.error_codes(),
+        ["missing_const_final_var_or_type", "unexpected_token"],
+        "oracle stream for `late;` + stray `;` + clean follow-up: {:?}",
+        p.listener.errors
     );
 }
 

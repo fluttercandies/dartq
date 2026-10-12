@@ -495,6 +495,20 @@ impl<'s, 't> TokenCursor<'s, 't> {
         }
         self.inserted.push(token);
     }
+
+    /// Queues a real (non-synthetic) split token carrying its fixed lexeme
+    /// at `utf16_offset` — the official operator-token splits
+    /// (`rewriteSquareBrackets` :5119, `splitCloser`/`splitGtGt`,
+    /// `util.dart:140-234`): error anchors ride the real token spans.
+    pub(crate) fn queue_split(&mut self, kind: TokenKind, utf16_offset: u32) -> TokenId {
+        let id = (self.table.len() + self.inserted.len()) as TokenId;
+        self.queue(InsertedToken {
+            kind,
+            utf16_offset,
+            synthetic: false,
+        });
+        id
+    }
 }
 
 /// Remainder tokens of a combined closer split, as `(kind, char offset from

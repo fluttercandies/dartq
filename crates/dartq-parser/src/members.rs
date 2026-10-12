@@ -14,6 +14,7 @@
 //! initializer list parses.
 
 use dartq_scanner::{Keyword, KeywordStyle, TokenKind};
+use dartq_source::SourceRange;
 
 use crate::listener::{
     AssertKind, ConstructorReferenceContext, DeclarationKind, IdentifierContext, MemberKind,
@@ -160,9 +161,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     // insertSyntheticIdentifier then fall-through — the
                     // synthetic flows into parseFields as the name token,
                     // parser_impl.dart:4367/:4398, so the name slot must not
-                    // re-report).
+                    // re-report). The report follows the probed oracle split:
+                    // with a `var`/`final`/`const` modifier the face is the
+                    // inserted-name `missing_identifier` (`var ;` probe), and
+                    // without one (`late ;`, `int ;`) the member-level insert
+                    // stays silent — `parseFields`' missing-type face is the
+                    // only row.
                     let at = self.peek_span();
-                    self.report(msg::missing_identifier(), at);
+                    if mods.var_final_or_const.is_some() {
+                        self.report(msg::missing_identifier(), at);
+                    }
                     let id = self
                         .cursor
                         .insert_synthetic(TokenKind::Identifier, at.range.offset);
@@ -1294,25 +1302,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 && self.async_state == AsyncModifier::Sync;
             self.parse_function_body(false, allow_abstract)
         };
-        // Analyzer-tier cascade gate (#577; oracle: `dart analyze` 3.13.1,
-        // machine format, `class C {\n  new() : this.new = 0;\n}` — exactly
-        // `missing_assignment_in_initializer` + `missing_identifier` +
-        // `missing_function_body`). When a constructor's initializer list
-        // ends on a junk head, the body recovery splices a synthetic `{}`
-        // at it (`ensureBlock`, `BlockKind.functionBody` template,
-        // `parser_impl.dart:5000-5002`, `insertBlock` :5006-5023) and the
-        // member ends there; the leftover run (`new = 0 ;`) belongs to the
-        // recovered member and surfaces nothing further, so it must not
-        // re-enter the member loop as a fresh `new`-head cascade. A real
-        // `;`/`{}`/`=>` body never trips the synthetic-close check.
-        if is_constructor
-            && begin_initializers.is_some()
-            && !self.is_bailed()
-            && self.cursor.resolve(end.id) == (TokenKind::CloseCurly, true)
-            && self.peek_kind() == TokenKind::Keyword(Keyword::New)
-        {
-            self.swallow_member_tail();
-        }
         self.async_state = saved_async;
 
         if is_constructor {
@@ -1663,7 +1652,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
         if matches!(type_info, TypeInfo::NoType) {
             if mods.var_final_or_const.is_none() {
-                self.report(msg::missing_const_final_var_or_type(), self.peek_span());
+                // The face anchors on the type-position token (official
+                // parseFields reports on the member's head — probed 3.13.1:
+                // `late;` → the `late` keyword, `late int;`/`int;`/`x;` → the
+                // type-position identifier). A junk token at the type position
+                // (`late;`'s `;`) falls back to the `late` keyword.
+                let at_type = self.span_at_mark(before_type);
+                let type_kind =
+                    crate::cursor::TokenCursor::mark_pos(before_type).min(self.table.len() - 1);
+                let at = if is_keyword_or_identifier(self.kind_at(type_kind)) {
+                    at_type
+                } else {
+                    mods.late_kw.unwrap_or(at_type)
+                };
+                self.report(msg::missing_const_final_var_or_type(), at);
             }
         } else if let Some(vfc) = mods.var_final_or_const
             && self.cursor.lexeme(vfc.id) == "var"
@@ -1694,6 +1696,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
         }
 
+        // The synthetic name's queued token is truncated by the reset below
+        // (its insert predates the `before_type` mark), so snapshot its
+        // lexeme — empty for a synthetic identifier — beforehand; the id
+        // stays span-valid but must not be lexeme-read afterwards.
+        let synthetic_name_text = synthetic_name.map(|s| self.cursor.lexeme(s.id));
         self.cursor.reset(before_type);
         type_info.parse_type(self);
 
@@ -1703,6 +1710,25 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         };
         let first_name = match synthetic_name {
             Some(name) => name,
+            None if mods.var_final_or_const.is_none()
+                && !is_keyword_or_identifier(self.peek_kind()) =>
+            {
+                // Member-level junk-name recovery arriving without a
+                // `var`/`final`/`const` modifier (`late ;`, `int ;`,
+                // `int }` — the class-member `recoverFromInvalidMember`
+                // fallback): the official insert is silent here and
+                // `parseFields`' type face is the only row (probed oracle
+                // 3.13.1: `late ;` → missingConstFinalVarOrType on `late`;
+                // `var ;` → missing_identifier on `;`). The keyword case
+                // stays on `ensureIdentifier`, which owns its own
+                // reporting split.
+                let at = self.peek_span();
+                let id = self
+                    .cursor
+                    .insert_synthetic(TokenKind::Identifier, at.range.offset);
+                self.cursor.advance();
+                self.span_of(id)
+            }
             None => {
                 if name_is_recovered {
                     self.ensure_identifier_recovered(context)
@@ -1731,12 +1757,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             .unwrap_or_else(|| self.span_at_mark(before_type));
         self.listener
             .begin_variables_declaration(decl_head, mods.late_kw, mods.var_final_or_const);
+        let first_name_text = match synthetic_name_text {
+            Some(text) => text,
+            None => self.cursor.lexeme(first_name.id),
+        };
         let mut field_count = 1usize;
-        self.parse_field_initializer_opt(first_name, kind, &mods);
+        self.parse_field_initializer_opt(first_name, first_name_text, kind, &mods);
         while self.peek_kind() == TokenKind::Comma {
             self.cursor.advance();
             let name = self.ensure_identifier(context);
-            self.parse_field_initializer_opt(name, kind, &mods);
+            let name_text = self.cursor.lexeme(name.id);
+            self.parse_field_initializer_opt(name, name_text, kind, &mods);
             field_count += 1;
         }
         let end = self.ensure_semicolon();
@@ -1801,6 +1832,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     fn parse_field_initializer_opt(
         &mut self,
         name: TokenSpan,
+        name_text: &'s str,
         kind: DeclarationKind,
         mods: &MemberModifiers,
     ) {
@@ -1810,7 +1842,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         } else {
             if let Some(vfc) = mods.var_final_or_const {
                 let lexeme = self.cursor.lexeme(vfc.id);
-                let name_text = self.cursor.lexeme(name.id);
                 if lexeme == "const" {
                     self.report(msg::const_field_without_initializer(name_text), name);
                 } else if lexeme == "final"
@@ -2133,34 +2164,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         end
     }
 
-    /// Consumes the junk run that trails a constructor body recovered by
-    /// the synthetic-block splice (see the gate at the member body arm):
-    /// up to and including the terminating `;`, leaving a class-body `}` or
-    /// EOF for the enclosing loop. Brace groups in the junk are skipped
-    /// whole (table-matched; the scanner guarantees `{` pairing) so the
-    /// junk can never swallow the enclosing class body. Terminates: every
-    /// branch consumes or returns, and EOF pins.
-    fn swallow_member_tail(&mut self) {
-        loop {
-            match self.peek_kind() {
-                TokenKind::Semicolon => {
-                    self.cursor.advance();
-                    return;
-                }
-                TokenKind::CloseCurly | TokenKind::Eof => return,
-                TokenKind::OpenCurly => {
-                    if let Some(close) = self.current_matching_end() {
-                        self.skip_to_token(close);
-                    }
-                    self.cursor.advance();
-                }
-                _ => {
-                    self.cursor.advance();
-                }
-            }
-        }
-    }
-
     /// Official `parseSuperInitializerExpression` (:4918): lookahead over
     /// `super (. name)?` to validate the shape, then the expression re-read.
     fn parse_super_initializer_expression(&mut self) -> TokenSpan {
@@ -2210,8 +2213,52 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 // false)` (:4948-4952): wrap the follower in empty parens.
                 let at = self.look_span_at(n);
                 self.report(msg::expected_after_but_got("("), at);
-                self.synthetic(TokenKind::OpenParen, at.range.offset);
-                self.synthetic(TokenKind::CloseParen, at.range.offset);
+                let type_param = self.compute_type_param_or_arg_at(n, false);
+                if matches!(type_param, TypeParamOrArg::None) {
+                    self.synthetic(TokenKind::OpenParen, at.range.offset);
+                    self.synthetic(TokenKind::CloseParen, at.range.offset);
+                } else {
+                    // `super<...>` (e.g. `: super<int>();`): the official
+                    // re-read parses the initializer as a plain expression —
+                    // `super` opens a relational chain whose node
+                    // `buildInitializer` rejects, so `endInitializers`
+                    // reports `invalid_initializer` over the expression span
+                    // (ast_builder.dart:2310-2323). Probes: `super<int>();`
+                    // yields exactly the `(` expect at `<` plus one
+                    // `invalid_initializer` of len 12 (`super<int>()`);
+                    // `super<int>;` the same pair ending at `>`. Consume the
+                    // balanced `<...>` group and a following balanced `(...)`
+                    // argument group, report once over the span, and leave
+                    // the follower (`;`) to the member loop — the synthetic
+                    // parens must not shadow the type group here or the
+                    // member-recovery cascade fires.
+                    for _ in 0..n {
+                        self.cursor.advance(); // `super` (. name)?
+                    }
+                    let mut end_id = type_param.skip(self.peek_id());
+                    let after = self.offset_of(end_id) + 1;
+                    if self.kind_at(after) == TokenKind::OpenParen {
+                        if let Some(close) = self.cursor.table_matching_end(self.real_id(after)) {
+                            end_id = close;
+                        }
+                    }
+                    let end_span = self.span_of(end_id);
+                    self.report(
+                        msg::invalid_initializer(),
+                        TokenSpan::new(
+                            head.id,
+                            SourceRange {
+                                offset: head.range.offset,
+                                length: end_span.range.offset + end_span.range.length
+                                    - head.range.offset,
+                            },
+                        ),
+                    );
+                    self.skip_to_token(end_id);
+                    self.cursor.advance();
+                    self.listener.end_initializer(end_span);
+                    return end_span;
+                }
             }
         } else if let Some(close) = self.cursor.table_matching_end(self.look_span_at(n).id) {
             let after = self.kind_at(self.offset_of(close) + 1);
@@ -2457,7 +2504,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         if kind == TokenKind::Semicolon {
             self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
         } else {
-            self.report(msg::expected_declaration(self.cursor.lexeme(at.id)), at);
+            self.report(msg::expected_executable(), at);
         }
         if kind == TokenKind::OpenCurly {
             self.skip_block(crate::message::BlockKind::Body);

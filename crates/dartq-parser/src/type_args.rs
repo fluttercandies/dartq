@@ -708,10 +708,11 @@ impl ComplexTypeParamOrArg {
             let mut type_info = parser.compute_type(true, false);
             if matches!(type_info, TypeInfo::NoType) {
                 // Recovery: annotations over type arguments are reported and
-                // skipped without events (official skipMetadata probe).
+                // skipped without events (official skipMetadata probe; the
+                // cursor sits on the `@` — official `skipMetadata(next)`
+                // consumes `next.next!`).
                 while matches!(type_info, TypeInfo::NoType) && parser.peek_kind() == TokenKind::At {
                     let at = parser.peek_span();
-                    parser.cursor.advance();
                     parser.skip_metadata_silent();
                     type_info = parser.compute_type(true, false);
                     let end_span = parser.peek_span();
@@ -719,6 +720,16 @@ impl ComplexTypeParamOrArg {
                 }
             }
             type_info.ensure_type_or_void(parser);
+            // Official `next = token.next!`: the NoType ensure path returns
+            // the inserted synthetic identifier as the consumed type, so the
+            // live pointer is its real follower (`,`/`>`), never the
+            // synthetic. Draining the queued synthetic keeps the comma and
+            // closer decisions on the real stream (a synthetic peek minted a
+            // spurious `Expected '>' after this.` for `Map<, int>` /
+            // `Map<int, >` / `f<>()`).
+            if parser.cursor.peek().is_synthetic {
+                parser.cursor.advance();
+            }
             count += 1;
             if parser.peek_kind() != TokenKind::Comma {
                 if parser.cursor.peek_is_closer() {
@@ -799,7 +810,11 @@ impl ComplexTypeParamOrArg {
             let iteration_before = parser.cursor.progress();
             parser.parse_metadata_star();
 
-            // Variance modifier (`in`/`inout`/`out`) when allowed.
+            // Variance modifier (`in`/`inout`/`out`) when allowed. The
+            // modifier parses regardless of the experiment state (official
+            // `parseVariables` has no feature gate); the analyzer reports
+            // `experiment_not_enabled_off_by_default` per kept modifier from
+            // `endTypeVariable` (ast_builder.dart:3604).
             let mut variance = None;
             if allows_variance && parser.peek_is_variance() && parser.peek_ahead_is_name(1) {
                 let variance_span = parser.peek_span();
@@ -809,6 +824,12 @@ impl ComplexTypeParamOrArg {
                 while parser.peek_is_variance() && parser.peek_ahead_is_name(1) {
                     parser.report(msg::multiple_variance_modifiers(), parser.peek_span());
                     parser.cursor.advance();
+                }
+                if !parser.features.variance_enabled {
+                    parser.report(
+                        msg::experiment_not_enabled_off_by_default("variance"),
+                        variance_span,
+                    );
                 }
             }
 

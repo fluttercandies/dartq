@@ -94,13 +94,17 @@ fn representation_field_modifier_only() {
     );
 }
 
-/// `covariant` alone is consumed silently in primary-constructor formals
-/// (the 3.13 oracle runs the feature enabled and reports nothing).
+/// `covariant` without `var` in a primary-constructor formal reports ONE
+/// `invalid_covariant_modifier_in_primary_constructor` row on the
+/// `covariant` token (probed 3.13.1: `extension type ET(covariant a b) {}`
+/// and `class P(covariant int x) {}` both yield exactly that row; only
+/// `covariant var` is legal, and that shape is the
+/// `representation_field_modifier` face instead).
 #[test]
-fn representation_field_covariant_silent() {
+fn representation_field_covariant_reports() {
     assert_codes(
         "extension type ET(covariant a b) {}\n",
-        &[],
+        &["invalid_covariant_modifier_in_primary_constructor"],
         "covariant representation",
     );
 }
@@ -267,6 +271,12 @@ fn enum_header_reserved_head_skip_refusal() {
 /// with `expectedToken(';')` anchored on the reserved type head
 /// (`typedef void = ...;`) and restarts the declaration parse at the `=`;
 /// the reparse yields the top-level-member and alias-shape reports.
+/// `typedef <reserved head> = ...`: the reserved type head bails the
+/// typedef with `expected_token(';')` on the head, then the `=`-position
+/// name slot reports `missing_identifier` + `missing_typedef_parameters`
+/// before the synthetic `()` splices in, and the declaration loop's member
+/// reparse of the `=` mints `expected_executable` (probed 3.13.1,
+/// `typedef void = void Function();`: exactly these five rows).
 #[test]
 fn typedef_old_style_no_name() {
     assert_codes(
@@ -275,6 +285,8 @@ fn typedef_old_style_no_name() {
             "expected_executable",
             "expected_token",
             "missing_function_body",
+            "missing_identifier",
+            "missing_typedef_parameters",
         ],
         "typedef missing name",
     );

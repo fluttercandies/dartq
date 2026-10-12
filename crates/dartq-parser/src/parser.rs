@@ -326,10 +326,7 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
                 let at = self.peek_span();
                 self.listener.begin_metadata_star(at);
                 self.listener.end_metadata_star(0);
-                self.report(
-                    crate::message::msg::expected_declaration(self.cursor.lexeme(at.id)),
-                    at,
-                );
+                self.report(crate::message::msg::expected_executable(), at);
                 self.listener.handle_invalid_top_level_declaration(at);
                 self.listener.end_top_level_declaration(at);
                 self.force_advance();

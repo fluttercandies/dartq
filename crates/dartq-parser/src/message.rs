@@ -65,7 +65,8 @@ pub(crate) mod msg {
         FINAL_AND_COVARIANT_LATE_WITH_INITIALIZER, FINAL_AND_VAR, FINAL_ENUM, FINAL_MIXIN,
         FINAL_MIXIN_CLASS, GETTER_CONSTRUCTOR, GETTER_WITH_PARAMETERS, IMPLEMENTS_BEFORE_EXTENDS,
         IMPLEMENTS_BEFORE_ON, IMPLEMENTS_BEFORE_WITH, INTERFACE_ENUM, INTERFACE_MIXIN,
-        INTERFACE_MIXIN_CLASS, INVALID_CONSTRUCTOR_NAME, INVALID_LITERAL_IN_CONFIGURATION,
+        INTERFACE_MIXIN_CLASS, INVALID_CONSTRUCTOR_NAME,
+        INVALID_COVARIANT_MODIFIER_IN_PRIMARY_CONSTRUCTOR, INVALID_LITERAL_IN_CONFIGURATION,
         MEMBER_WITH_CLASS_NAME, MISSING_CONST_FINAL_VAR_OR_TYPE, MISSING_FUNCTION_BODY,
         MISSING_FUNCTION_PARAMETERS, MISSING_METHOD_PARAMETERS, MISSING_PRIMARY_CONSTRUCTOR,
         MISSING_PRIMARY_CONSTRUCTOR_PARAMETERS, MISSING_STAR_AFTER_SYNC,
@@ -101,15 +102,16 @@ pub(crate) mod msg {
         EMPTY_RECORD_TYPE_NAMED_FIELDS_LIST, EMPTY_RECORD_TYPE_WITH_COMMA,
         EQUALITY_CANNOT_BE_EQUALITY_OPERAND, EXPECTED_ELSE_OR_COMMA,
         EXPECTED_IDENTIFIER_BUT_GOT_KEYWORD, EXPECTED_TOKEN, EXPECTED_TYPE_NAME,
-        ILLEGAL_PATTERN_ASSIGNMENT_VARIABLE_NAME, ILLEGAL_PATTERN_IDENTIFIER_NAME,
-        ILLEGAL_PATTERN_VARIABLE_NAME, INITIALIZED_VARIABLE_IN_FOR_EACH, INVALID_AWAIT_IN_FOR,
-        INVALID_CONSTANT_CONST_PREFIX, INVALID_CONSTANT_PATTERN_BINARY,
-        INVALID_INSIDE_UNARY_PATTERN, LATE_PATTERN_VARIABLE_DECLARATION, LITERAL_WITH_CLASS,
-        LITERAL_WITH_CLASS_AND_NEW, LITERAL_WITH_NEW, MISSING_ASSIGNABLE_SELECTOR,
-        MISSING_ASSIGNMENT_IN_INITIALIZER, MISSING_CATCH_OR_FINALLY, MISSING_EXPRESSION_IN_THROW,
-        MISSING_IDENTIFIER, MISSING_INITIALIZER, MULTIPLE_VARIANCE_MODIFIERS,
-        NAMED_FUNCTION_EXPRESSION, NULL_AWARE_CASCADE_OUT_OF_ORDER,
-        PATTERN_ASSIGNMENT_DECLARES_VARIABLE, RECORD_LITERAL_ONE_POSITIONAL_NO_TRAILING_COMMA,
+        EXPERIMENT_NOT_ENABLED_OFF_BY_DEFAULT, ILLEGAL_PATTERN_ASSIGNMENT_VARIABLE_NAME,
+        ILLEGAL_PATTERN_IDENTIFIER_NAME, ILLEGAL_PATTERN_VARIABLE_NAME,
+        INITIALIZED_VARIABLE_IN_FOR_EACH, INVALID_AWAIT_IN_FOR, INVALID_CONSTANT_CONST_PREFIX,
+        INVALID_CONSTANT_PATTERN_BINARY, INVALID_INSIDE_UNARY_PATTERN,
+        LATE_PATTERN_VARIABLE_DECLARATION, LITERAL_WITH_CLASS, LITERAL_WITH_CLASS_AND_NEW,
+        LITERAL_WITH_NEW, MISSING_ASSIGNABLE_SELECTOR, MISSING_ASSIGNMENT_IN_INITIALIZER,
+        MISSING_CATCH_OR_FINALLY, MISSING_EXPRESSION_IN_THROW, MISSING_IDENTIFIER,
+        MISSING_INITIALIZER, MULTIPLE_VARIANCE_MODIFIERS, NAMED_FUNCTION_EXPRESSION,
+        NULL_AWARE_CASCADE_OUT_OF_ORDER, PATTERN_ASSIGNMENT_DECLARES_VARIABLE,
+        RECORD_LITERAL_ONE_POSITIONAL_NO_TRAILING_COMMA,
         RECORD_TYPE_ONE_POSITIONAL_NO_TRAILING_COMMA, STACK_OVERFLOW,
         SWITCH_HAS_CASE_AFTER_DEFAULT_CASE, SWITCH_HAS_MULTIPLE_DEFAULT_CASES, VAR_AND_TYPE,
         VARIABLE_PATTERN_KEYWORD_IN_DECLARATION_CONTEXT, VOID_WITH_TYPE_ARGUMENTS,
@@ -314,6 +316,17 @@ pub(crate) mod msg {
         )
     }
 
+    /// `reportVarianceModifierNotEnabled` (listener.dart:1722) bridged to the
+    /// analyzer's `handleExperimentNotEnabled` in `endTypeVariable`
+    /// (ast_builder.dart:3604) — one report per kept variance modifier when
+    /// the opt-in `variance` experiment is off (default toolchain state).
+    pub(crate) fn experiment_not_enabled_off_by_default(feature: &str) -> Message {
+        Message::new(
+            EXPERIMENT_NOT_ENABLED_OFF_BY_DEFAULT,
+            format!("This requires the experimental '{feature}' language feature to be enabled."),
+        )
+    }
+
     pub(crate) fn void_with_type_arguments() -> Message {
         Message::new(
             VOID_WITH_TYPE_ARGUMENTS,
@@ -331,13 +344,6 @@ pub(crate) mod msg {
     // —— declarations (#18) ————————————————————————————————————————————
     // Texts follow the shared-parser templates (`diagnostic.g.dart`,
     // `messages.yaml`); `{0}`-style substitutions are formatted here.
-
-    pub(crate) fn expected_declaration(lexeme: &str) -> Message {
-        Message::new(
-            EXPECTED_EXECUTABLE,
-            format!("Expected a declaration, but got '{lexeme}'."),
-        )
-    }
 
     pub(crate) fn expected_class_member(lexeme: &str) -> Message {
         Message::new(
@@ -359,6 +365,14 @@ pub(crate) mod msg {
     }
 
     pub(crate) fn expected_executable() -> Message {
+        // The analyzer surface of the shared `expectedDeclaration` template:
+        // `diagnostic.g.dart` maps the code to its own fixed
+        // "Expected a method, getter, setter or operator declaration."
+        // regardless of the fasta call site, which is what
+        // `dart analyze --format=machine` prints (same re-wording precedent
+        // as `unexpected_token` above; probed 3.13.1 — top-level junk `(` /
+        // `)`, class-body junk members after a missing class body, all fixed
+        // text, never the interpolated fasta wording).
         Message::new(
             EXPECTED_EXECUTABLE,
             "Expected a method, getter, setter or operator declaration.".to_string(),
@@ -691,6 +705,17 @@ pub(crate) mod msg {
         Message::new(
             INVALID_CONSTRUCTOR_NAME,
             "The name of a constructor must match the name of the enclosing class.",
+        )
+    }
+
+    /// `invalidCovariantModifierInPrimaryConstructor`
+    /// (modifier_context.dart:238-246): with the primary-constructors
+    /// feature on, `covariant` in a primary-constructor formal is only
+    /// legal alongside `var`.
+    pub(crate) fn invalid_covariant_modifier_in_primary_constructor() -> Message {
+        Message::new(
+            INVALID_COVARIANT_MODIFIER_IN_PRIMARY_CONSTRUCTOR,
+            "The 'covariant' modifier can only be used on non-final declaring parameters.",
         )
     }
 

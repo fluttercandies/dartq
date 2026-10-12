@@ -41,6 +41,11 @@ pub(crate) fn binary_level(kind: TokenKind) -> Option<u8> {
         TokenKind::BarBar => LOGICAL_OR_PRECEDENCE,
         TokenKind::AmpersandAmpersand => LOGICAL_AND_PRECEDENCE,
         TokenKind::EqEq | TokenKind::BangEq => EQUALITY_PRECEDENCE,
+        // `===`/`!==` carry EQUALITY_PRECEDENCE in the official token table
+        // (token.dart:1767-1773): the scanner's `unsupported_operator`
+        // ErrorToken is the only diagnostic and the expression still parses
+        // (`var b = 1 !== 2;` — the oracle mints no parser rows).
+        TokenKind::EqEqEq | TokenKind::BangEqEq => EQUALITY_PRECEDENCE,
         TokenKind::Lt
         | TokenKind::Gt
         | TokenKind::LtEq
@@ -1019,31 +1024,25 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         end
                     } else {
                         // Recovery: an incomplete dot shorthand like
-                        // `C c = const .` (official comment). The pinned
-                        // 3.13.1 oracle face for this exact shape
-                        // (`dot_shorthands/const_no_identifier_recovery.dart`)
-                        // is a single `expected_token(';')` from the
-                        // declaration terminator: the follower `;` is
-                        // consumed as the shorthand operand here, and the
-                        // statement's own `ensureSemicolon` reports once at
-                        // the real block closer. (The 3.15 CFE instead keeps
-                        // the `;` and reports `expectedIdentifier` via the
-                        // expressionContinuation template — the pinned
-                        // oracle face wins; the `.`-led sister shape
-                        // `var c = .` has no `const` head, takes the plain
-                        // `_isDotShorthand` recovery above, and keeps the
-                        // template behavior.)
+                        // `C c = const .;`. The pinned 3.13.1 oracle
+                        // (trend-w4 gate raw output + probe reproduction,
+                        // dot_shorthands/const_no_identifier_recovery.dart)
+                        // reports `missing_identifier` on the follower's own
+                        // real span (`;` / `}`) and leaves it unconsumed —
+                        // the synthetic operand rides at the dot's offset,
+                        // so the declaration's `ensureSemicolon` fails
+                        // against it and its walked-back anchor lands on the
+                        // dot (`Expected to find ';'` at the `.`). The
+                        // leftover `;` parses as an empty statement, the
+                        // `}` still closes the block.
                         let dot = self.peek_span();
                         self.cursor.advance();
-                        let end = if self.peek_kind() == TokenKind::Semicolon {
-                            let semi = self.cursor.advance();
-                            self.span_of(semi)
-                        } else {
-                            self.ensure_identifier(IdentifierContext::ExpressionContinuation)
-                        };
+                        let at = self.peek_span();
+                        self.report(msg::missing_identifier(), at);
+                        let synthetic = self.synthetic(TokenKind::Identifier, dot.range.offset);
                         self.listener.handle_dot_shorthand_head(dot);
                         self.listener.handle_dot_shorthand_context(dot);
-                        end
+                        synthetic
                     };
                     self.listener.end_const_dot_shorthand(const_keyword);
                     return end;
