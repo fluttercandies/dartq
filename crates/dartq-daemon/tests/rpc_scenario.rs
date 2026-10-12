@@ -155,7 +155,7 @@ fn cockpit_script_over_the_daemon_rpc_surface() {
                 .expect("experimental capability map");
             assert_eq!(
                 experimental.len(),
-                12,
+                13,
                 "the full dartq/* family: {experimental:?}"
             );
             for method in [
@@ -163,6 +163,7 @@ fn cockpit_script_over_the_daemon_rpc_surface() {
                 "dartq/analyze",
                 "dartq/check",
                 "dartq/query",
+                "dartq/queryBatch",
                 "dartq/impact",
                 "dartq/fix",
                 "dartq/assists",

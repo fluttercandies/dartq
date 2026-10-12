@@ -45,6 +45,8 @@
 //! |                 | are deliberately different pipelines, and the    |
 //! |                 | agent mode is the overlay-aware one              |
 //! | `dartq/query`   | requested view                                   |
+//! | `dartq/queryBatch` | requested view (one graph walk per batch —     |
+//! |                 | §15.8.4's amortization across the round trip)    |
 //! | `dartq/impact`  | requested view                                   |
 //! | `dartq/fix`     | disk, always (`agentId`/`since` rejected)        |
 //! | `dartq/compat`  | disk, always — it rebuilds one engine per axis   |
@@ -71,6 +73,12 @@
 //!   files *explicitly written* — cascade-invalidated dependents are not
 //!   marked. For an agent view, an overlaid path's change cursor is the
 //!   `overlay.set` that staged it (the overlay masks base changes).
+//! * **Batch queries** — `dartq/queryBatch` (§15.8.4) answers every item's
+//!   kinds in one round trip over the session's already-built graph: one
+//!   frozen v1 query envelope per `(item, kind)` pair, request order, no
+//!   aggregate envelope (the schema crate's frozen batch convention). The
+//!   session selectors (`agentId`/`context`) and `since` apply to the whole
+//!   batch, exactly as they do to the single face.
 //! * **Short-id symbol table** — full-tier `dartq/check` and `dartq/analyze`
 //!   answers substitute path-valued row fields (`file`/`uri`) with
 //!   session-stable short ids (`s1`, `s2`, …) and carry a `symbols` preamble
@@ -109,7 +117,7 @@ use dartq_commands::discover::{self, DiscoverError};
 use dartq_commands::explain::{ExplainError, explain as explain_core};
 use dartq_commands::fix::FileFixSet;
 use dartq_commands::layout::EngineLayout;
-use dartq_commands::query::{decl_kind_name, ref_kind_name};
+use dartq_commands::query::{BatchQuery, QueryKind, decl_kind_name, ref_kind_name};
 use dartq_commands::{Verbosity, check, compat as compat_core, fix, impact as impact_core, query};
 use dartq_diagnostics::{Diagnostic, FileLayoutProvider};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -131,11 +139,12 @@ pub(crate) const SCHEMA_VERSION: u32 = dartq_commands::SCHEMA_VERSION;
 /// `dartq/assists`), stage onto the session's scheduler — the fix faces
 /// execute off the main loop at their drain (the session module's
 /// fix-dispatch notes).
-pub(crate) const METHODS: [&str; 12] = [
+pub(crate) const METHODS: [&str; 13] = [
     "dartq/index",
     "dartq/analyze",
     "dartq/check",
     "dartq/query",
+    "dartq/queryBatch",
     "dartq/impact",
     "dartq/fix",
     "dartq/assists",
@@ -145,23 +154,6 @@ pub(crate) const METHODS: [&str; 12] = [
     "dartq/overlay.commit",
     "dartq/overlay.clear",
 ];
-
-/// The `dartq/query` face's `kind` parameter (PRD §15.2): which query
-/// answers. Absent means [`QueryKind::Symbol`] — the face's pre-kind
-/// behavior, byte-identical.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum QueryKind {
-    /// Declaration rows plus every resolved reference to them (the default).
-    #[default]
-    Symbol,
-    /// The reference rows — the same rows the symbol face serves: the
-    /// index's reference surface is name-keyed and already kinded, so there
-    /// is nothing further to filter (the CLI references face's seam).
-    References,
-    /// The invocation-shaped subset of the reference rows (`invoked` only).
-    Callers,
-}
 
 /// A staged `dartq/*` request: decoded parameters. The request id — the
 /// identity `$/cancelRequest` keys on — stays on the session side.
@@ -189,10 +181,22 @@ pub(crate) enum Request {
         since: Option<u64>,
     },
     /// The §15.2 symbol-index face; `kind` picks the answered rows (symbol
-    /// by default, references, or the callers subset).
+    /// by default, references, the callers subset, the implementations
+    /// walk, or the declaring library's dependencies).
     Query {
         name: String,
         kind: QueryKind,
+        verbosity: Verbosity,
+        agent: Option<String>,
+        context: Option<String>,
+        since: Option<u64>,
+    },
+    /// The §15.8.4 batch face: every item's kinds answered over the one
+    /// session graph in a single round trip. The answer is one frozen v1
+    /// query envelope per `(item, kind)` pair — request order, no aggregate
+    /// envelope (the schema crate's frozen batch convention).
+    QueryBatch {
+        queries: Vec<BatchQuery>,
         verbosity: Verbosity,
         agent: Option<String>,
         context: Option<String>,
@@ -236,6 +240,7 @@ impl Request {
             | Self::Analyze { agent, .. }
             | Self::Check { agent, .. }
             | Self::Query { agent, .. }
+            | Self::QueryBatch { agent, .. }
             | Self::Impact { agent, .. } => agent.as_deref(),
             Self::Explain { .. } | Self::Fix { .. } | Self::Compat { .. } => None,
         }
@@ -249,6 +254,7 @@ impl Request {
             | Self::Analyze { context, .. }
             | Self::Check { context, .. }
             | Self::Query { context, .. }
+            | Self::QueryBatch { context, .. }
             | Self::Impact { context, .. } => context.as_deref(),
             Self::Explain { .. } | Self::Fix { .. } | Self::Compat { .. } => None,
         }
@@ -263,6 +269,7 @@ impl Request {
             | Self::Analyze { verbosity, .. }
             | Self::Check { verbosity, .. }
             | Self::Query { verbosity, .. }
+            | Self::QueryBatch { verbosity, .. }
             | Self::Impact { verbosity, .. }
             | Self::Explain { verbosity, .. }
             | Self::Fix { verbosity, .. }
@@ -305,6 +312,20 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
         kind: QueryKind,
         #[serde(default)]
         verbosity: Verbosity,
+    }
+    #[derive(Deserialize)]
+    struct BatchQueryParams {
+        queries: Vec<BatchItemParams>,
+        #[serde(default)]
+        verbosity: Verbosity,
+    }
+    #[derive(Deserialize)]
+    struct BatchItemParams {
+        name: String,
+        /// Absent means the symbol face (the single request's default); an
+        /// explicit empty set answers nothing for the item.
+        #[serde(default = "default_query_kinds")]
+        kinds: Vec<QueryKind>,
     }
     #[derive(Deserialize)]
     struct TargetParams {
@@ -404,6 +425,27 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
                 since,
             })
         }
+        "dartq/queryBatch" => {
+            let (agent, since) = session_fields(params)?;
+            let context = context_field(params)?;
+            let decoded =
+                serde_json::from_value::<BatchQueryParams>(params.clone()).map_err(invalid)?;
+            let queries = decoded
+                .queries
+                .into_iter()
+                .map(|item| BatchQuery {
+                    name: item.name,
+                    kinds: item.kinds,
+                })
+                .collect();
+            Ok(Request::QueryBatch {
+                queries,
+                verbosity: decoded.verbosity,
+                agent,
+                context,
+                since,
+            })
+        }
         "dartq/impact" => {
             let (agent, since) = session_fields(params)?;
             let context = context_field(params)?;
@@ -462,6 +504,12 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
         }
         _ => Err(format!("not a dartq command: {method}")),
     }
+}
+
+/// The batch item's kinds when the request omits them: the single request's
+/// own default (the symbol face).
+fn default_query_kinds() -> Vec<QueryKind> {
+    vec![QueryKind::Symbol]
 }
 
 /// The params' session-economics fields: the optional `agentId` view selector
@@ -808,6 +856,12 @@ pub(crate) fn answer(drain: &Drain<'_>, request: &Request) -> Result<Value, Sess
             since,
             ..
         } => Ok(query_answer(drain, name, *kind, *verbosity, *since)),
+        Request::QueryBatch {
+            queries,
+            verbosity,
+            since,
+            ..
+        } => Ok(query_batch_answer(drain, queries, *verbosity, *since)),
         Request::Impact {
             target,
             verbosity,
@@ -1052,15 +1106,13 @@ fn check_engine_view(
 }
 
 // ---------------------------------------------------------------------------
-// dartq/query — the symbol-index face by kind (symbol / references / callers,
-// CLI path labels)
+// dartq/query — the symbol-index face by kind (symbol / references / callers
+// / implementations / dependencies, CLI path labels)
 // ---------------------------------------------------------------------------
 
 /// The `dartq/query` answer: `kind` routes to the matching engine query
-/// face — symbol and references share the symbol rows (the index's
-/// reference surface is name-keyed and already kinded), callers keeps the
-/// invocation rows — and the shaping is the shared one, tier-for-tier, for
-/// every kind.
+/// face, then the shared shaper shapes the run — the one shaper the batch
+/// face reuses, so the two answers cannot drift.
 fn query_answer(
     drain: &Drain<'_>,
     name: &str,
@@ -1068,12 +1120,47 @@ fn query_answer(
     verbosity: Verbosity,
     since: Option<u64>,
 ) -> Value {
-    let mut run = match kind {
-        QueryKind::Symbol | QueryKind::References => {
-            query::symbol_after_analysis(drain.engine, name)
-        }
-        QueryKind::Callers => query::callers_after_analysis(drain.engine, name),
-    };
+    let run = query::kind_after_analysis(drain.engine, name, kind);
+    query_answer_shaped(drain, name, run, verbosity, since)
+}
+
+/// The `dartq/queryBatch` answer (PRD §15.8.4): one frozen v1 query
+/// envelope per `(item, kind)` pair — request order, item order then kind
+/// order — every pair walking the session's already-built graph, which is
+/// the round trip's whole point (one graph build amortized across N
+/// answers). The array carries no aggregate envelope (the schema crate's
+/// frozen batch convention); each element is the single face's own answer,
+/// shaper-for-shaper.
+fn query_batch_answer(
+    drain: &Drain<'_>,
+    queries: &[BatchQuery],
+    verbosity: Verbosity,
+    since: Option<u64>,
+) -> Value {
+    Value::Array(
+        query::batch_after_analysis(drain.engine, queries)
+            .into_iter()
+            .map(|answer| query_answer_shaped(drain, answer.name, answer.run, verbosity, since))
+            .collect(),
+    )
+}
+
+/// The since filter and tier shaping over an already-built query run: a
+/// delta answer keeps only the rows whose file changed since the cursor and
+/// echoes it; the minimal tier drops the convenience spellings (the
+/// declarations' `container`, the references' `qualified`); compact is the
+/// CLI JSON face verbatim (the shared shaper, which stamps
+/// `schema_version`); full adds nothing else (the canonical table lists no
+/// full-only query fields besides the session ones, and the rows' paths
+/// stay spelled out — the module docs' symbol-table note: the published
+/// `symbols` field pins `label|name` values).
+fn query_answer_shaped(
+    drain: &Drain<'_>,
+    name: &str,
+    mut run: dartq_commands::query::SymbolRun<'_>,
+    verbosity: Verbosity,
+    since: Option<u64>,
+) -> Value {
     if let Some(since) = since {
         run.decls.retain(|decl| {
             drain
@@ -1085,11 +1172,22 @@ fn query_answer(
                 .changes
                 .changed_since(run.layout.file_path(reference.target_file), since)
         });
+        // The kind arrays filter on their own row locators: the
+        // implementations rows are declaration rows (the declaring file);
+        // the dependencies rows carry the importing library's path.
+        run.implementations.retain(|decl| {
+            drain
+                .changes
+                .changed_since(run.layout.file_path(decl.file), since)
+        });
+        run.dependencies
+            .retain(|row| drain.changes.changed_since(Path::new(&row.path), since));
     }
     match verbosity {
         // Canonical query table: minimal drops the convenience fields
-        // (declarations[].container, references[].qualified); the row
-        // locators stay.
+        // (declarations[].container, references[].qualified) and the
+        // reserved kind arrays (non-locating detail sections — the frozen
+        // tier table); the row locators stay.
         Verbosity::Minimal => {
             let declarations: Vec<Value> = run
                 .decls
@@ -1129,14 +1227,6 @@ fn query_answer(
             }
             answer
         }
-        // Compact is the CLI JSON face verbatim (the shared shaper, which
-        // stamps `schema_version`); full adds the short-id economics. The
-        // canonical table lists no full-only query fields besides the
-        // session ones.
-        // Compact is the CLI JSON face verbatim (the shared shaper, which
-        // stamps `schema_version`) plus the delta echo when one came. The
-        // rows' paths stay spelled out — see the module docs' symbol-table
-        // note (the published `symbols` field pins `label|name` values).
         Verbosity::Compact | Verbosity::Full => {
             session_answer(query::to_json(&run, name), verbosity, since, drain, &[])
         }

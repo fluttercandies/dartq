@@ -1,8 +1,8 @@
 //! dartq CLI — `dartq check` (the M0 differential face), `dartq analyze`
 //! (the M1 engine face), the `dartq query` index faces (`symbol` /
-//! `references` / `callers`, PRD §20.3 + §15.2), `dartq explain` (the
-//! §15.3 one-stop AI report), `dartq index` (the §15.1 index build), and
-//! `dartq version`.
+//! `references` / `callers`, PRD §20.3 + §15.2, plus the §15.8.4 `batch`
+//! multi-symbol/multi-kind face), `dartq explain` (the §15.3 one-stop AI
+//! report), `dartq index` (the §15.1 index build), and `dartq version`.
 //!
 //! The per-command cores live in `dartq-commands` (the one implementation
 //! the daemon RPC faces share, PRD §15.1); this binary adds only argument
@@ -53,16 +53,15 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser as _, Subcommand, ValueEnum};
 
 use dartq_commands::analyze::AnalyzeRun;
-use dartq_commands::check::FileSet;
+use dartq_commands::check::{FileSet, write_machine_verbosity};
 use dartq_commands::discover::{DiscoverError, discover};
 use dartq_commands::explain::ExplainError;
-use dartq_commands::query::{decl_kind_name, ref_kind_name};
+use dartq_commands::query::{BatchQuery, DependencyRow, QueryKind, decl_kind_name, ref_kind_name};
 use dartq_commands::workspace::{
     WorkspaceAdvisory, engine_config_with_advisory, open_engine, open_engine_with_advisory,
 };
 use dartq_diagnostics::{
     AnalysisOutput, Diagnostic, FileLayoutProvider, Severity, SourceRange, write_json,
-    write_machine,
 };
 use dartq_engine::{DeclHit, RefHit};
 
@@ -101,6 +100,9 @@ fn run(args: &[String]) -> u8 {
             QueryFace::Symbol(symbol_args) => query_symbol(&symbol_args),
             QueryFace::References(symbol_args) => query_references(&symbol_args),
             QueryFace::Callers(symbol_args) => query_callers(&symbol_args),
+            QueryFace::Implementations(symbol_args) => query_implementations(&symbol_args),
+            QueryFace::Dependencies(symbol_args) => query_dependencies(&symbol_args),
+            QueryFace::Batch(batch_args) => query_batch(&batch_args),
         },
         Ok(Cli {
             command: Some(Command::Impact(impact_args)),
@@ -193,6 +195,20 @@ enum Command {
 struct CheckArgs {
     #[arg(long, value_enum, default_value_t = CheckFormat::Machine)]
     format: CheckFormat,
+    /// Machine-row volume (`-v`/`--verbosity concise|default|verbose`; the
+    /// token-cost sweep's tier axis): `concise` keeps the identifying
+    /// severity/type/code + span prefix but drops the message field,
+    /// `default` is the byte-parity oracle row, `verbose` appends the
+    /// correctionMessage as a ninth field (`-` when absent). The diagnostic
+    /// set is complete at every tier; the JSON face is unaffected.
+    #[arg(
+        short = 'v',
+        long,
+        value_enum,
+        value_name = "TIER",
+        default_value_t = DiagnosticVerbosity::Default
+    )]
+    verbosity: DiagnosticVerbosity,
     /// Write one metrics JSON object to PATH at exit (engine-api-spec §3).
     #[arg(long)]
     metrics_json: Option<PathBuf>,
@@ -221,6 +237,20 @@ struct AnalyzeArgs {
     dir: PathBuf,
     #[arg(long, value_enum, default_value_t = AnalyzeFormat::Machine)]
     format: AnalyzeFormat,
+    /// Machine-row volume (`-v`/`--verbosity concise|default|verbose`; the
+    /// token-cost sweep's tier axis): `concise` keeps the identifying
+    /// severity/type/code + span prefix but drops the message field,
+    /// `default` is the byte-parity oracle row, `verbose` appends the
+    /// correctionMessage as a ninth field (`-` when absent). The diagnostic
+    /// set is complete at every tier; the human face is unaffected.
+    #[arg(
+        short = 'v',
+        long,
+        value_enum,
+        value_name = "TIER",
+        default_value_t = DiagnosticVerbosity::Default
+    )]
+    verbosity: DiagnosticVerbosity,
     /// Write one metrics JSON object to PATH at exit (engine-api-spec §3).
     #[arg(long)]
     metrics_json: Option<PathBuf>,
@@ -273,6 +303,29 @@ enum AnalyzeFormat {
     Machine,
     /// Human-readable, grouped by file, severity-sorted.
     Human,
+}
+
+/// The machine rows' output volume (the token-cost sweep's tier axis); the
+/// canonical semantics live in dartq-commands' `check` module, the one
+/// renderer both diagnostic faces share.
+#[derive(Clone, Copy, ValueEnum)]
+enum DiagnosticVerbosity {
+    /// Code + span rows: the message field drops.
+    Concise,
+    /// The oracle machine row verbatim (the default).
+    Default,
+    /// The machine row plus the correctionMessage field (`-` when absent).
+    Verbose,
+}
+
+impl DiagnosticVerbosity {
+    fn into_commands(self) -> dartq_commands::check::DiagnosticVerbosity {
+        match self {
+            Self::Concise => dartq_commands::check::DiagnosticVerbosity::Concise,
+            Self::Default => dartq_commands::check::DiagnosticVerbosity::Default,
+            Self::Verbose => dartq_commands::check::DiagnosticVerbosity::Verbose,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -351,11 +404,44 @@ enum QueryFace {
     /// Declarations of one symbol name and resolved references to them.
     Symbol(SymbolArgs),
     /// All reference rows of one symbol name, kinded (the same rows the
-    /// symbol face serves today; the faces diverge as later semantics land).
+    /// symbol face serves today; the later faces carry their own row
+    /// families).
     References(SymbolArgs),
     /// Invocation-shaped use sites of one symbol name (the references rows
     /// with kind `invoked`).
     Callers(SymbolArgs),
+    /// The queried type's subtypes / the queried member's overriding rows
+    /// (PRD §15.2), on the declaration-row shape — the resolved supertype
+    /// edges the index maintains, walked in reverse.
+    Implementations(SymbolArgs),
+    /// The declaring library's importers (PRD §15.2), `path` rows — the
+    /// reverse import graph the explain face's `dependencies` section
+    /// serves.
+    Dependencies(SymbolArgs),
+    /// Every repeated `--symbol` × repeated `--kind` answer in one pass
+    /// over one workspace assembly (PRD §15.8.4): one graph build, results
+    /// in request order, one JSON envelope per line.
+    Batch(BatchArgs),
+}
+
+/// The batch face's flags: the item list is the daemon `dartq/queryBatch`
+/// request's own shape — one item per `--symbol`, each carrying the full
+/// `--kind` set (absent kinds are the symbol face).
+#[derive(Args)]
+struct BatchArgs {
+    /// The symbol names to look up; repeatable, order preserved.
+    #[arg(long = "symbol", value_name = "NAME", required = true)]
+    symbols: Vec<String>,
+    /// Which query answers every symbol gets; repeatable, default `symbol`.
+    #[arg(long, value_name = "KIND")]
+    kinds: Vec<QueryKind>,
+    /// Package directory holding pubspec.yaml and
+    /// `.dart_tool/package_config.json`; defaults to the current directory.
+    #[arg(default_value = ".")]
+    dir: PathBuf,
+    /// Dart SDK root; defaults to `$DART_SDK`.
+    #[arg(long)]
+    sdk: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -442,7 +528,9 @@ fn check(args: &CheckArgs) -> u8 {
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
     let written = match args.format {
-        CheckFormat::Machine => write_machine(&mut out, &run.output()),
+        CheckFormat::Machine => {
+            write_machine_verbosity(&mut out, &run.output(), args.verbosity.into_commands())
+        }
         CheckFormat::Json => write_json(&mut out, &run.output()),
     };
     if let Err(error) = written.and_then(|()| out.flush()) {
@@ -672,19 +760,20 @@ fn analyze_finish(
 ) -> u8 {
     let discovery_ms = elapsed_ms(run.discovery);
     let analyze_ms = elapsed_ms(run.analysis);
+    let verbosity = args.verbosity.into_commands();
 
     let written = match args.format {
-        AnalyzeFormat::Machine => {
-            write_stale_advisory_machine(out, stale_advisory).and_then(|()| {
-                write_machine(
+        AnalyzeFormat::Machine => write_stale_advisory_machine(out, stale_advisory, verbosity)
+            .and_then(|()| {
+                write_machine_verbosity(
                     out,
                     &AnalysisOutput {
                         diagnostics: &run.diagnostics,
                         files: &run.layout,
                     },
+                    verbosity,
                 )
-            })
-        }
+            }),
         AnalyzeFormat::Human => write_stale_advisory_human(out, stale_advisory)
             .and_then(|()| write_human(out, &run.diagnostics, &run.layout)),
     };
@@ -721,6 +810,7 @@ fn analyze_finish(
 fn write_stale_advisory_machine(
     out: &mut impl Write,
     advisory: Option<&WorkspaceAdvisory>,
+    verbosity: dartq_commands::check::DiagnosticVerbosity,
 ) -> io::Result<()> {
     let Some(advisory) = advisory else {
         return Ok(());
@@ -740,12 +830,13 @@ fn write_stale_advisory_machine(
         },
         None,
     );
-    write_machine(
+    write_machine_verbosity(
         out,
         &AnalysisOutput {
             diagnostics: &[diagnostic],
             files: &files,
         },
+        verbosity,
     )
 }
 
@@ -967,6 +1058,156 @@ fn query_callers_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     exit::CLEAN
 }
 
+/// `dartq query implementations` — crash tier like [`query_symbol`].
+fn query_implementations(args: &SymbolArgs) -> u8 {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        query_implementations_run(args, &mut BufWriter::new(io::stdout().lock()))
+    }));
+    match outcome {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!("dartq: internal error: analysis panicked");
+            exit::INTERNAL_ERROR
+        }
+    }
+}
+
+/// One implementations run: the reverse supertype walk
+/// (`dartq_commands::query::implementations`); exit 0 on success, zero
+/// results included.
+fn query_implementations_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+        Ok(faces) => faces,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
+    };
+    let run = match dartq_commands::query::implementations(&mut engine, &args.name) {
+        Ok(run) => run,
+        Err(error) => {
+            eprintln!("dartq: internal error: {error}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+
+    let written = write_query_out(out, &run, &args.name, args.format);
+    if let Err(error) = written.and_then(|()| out.flush()) {
+        eprintln!("dartq: internal error: writing query results failed: {error}");
+        return exit::INTERNAL_ERROR;
+    }
+    exit::CLEAN
+}
+
+/// `dartq query dependencies` — crash tier like [`query_symbol`].
+fn query_dependencies(args: &SymbolArgs) -> u8 {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        query_dependencies_run(args, &mut BufWriter::new(io::stdout().lock()))
+    }));
+    match outcome {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!("dartq: internal error: analysis panicked");
+            exit::INTERNAL_ERROR
+        }
+    }
+}
+
+/// One dependencies run: the declaring library's importers
+/// (`dartq_commands::query::dependencies`); exit 0 on success, zero
+/// results included.
+fn query_dependencies_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+        Ok(faces) => faces,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
+    };
+    let run = match dartq_commands::query::dependencies(&mut engine, &args.name) {
+        Ok(run) => run,
+        Err(error) => {
+            eprintln!("dartq: internal error: {error}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+
+    let written = write_query_out(out, &run, &args.name, args.format);
+    if let Err(error) = written.and_then(|()| out.flush()) {
+        eprintln!("dartq: internal error: writing query results failed: {error}");
+        return exit::INTERNAL_ERROR;
+    }
+    exit::CLEAN
+}
+
+/// `dartq query batch` — the §15.8.4 face: one workspace assembly, one
+/// analyze pass, then every (`--symbol` × `--kind`) pair answered in
+/// request order (item order, then kind order). Crash tier like
+/// [`query_symbol`]. Output is the JSONL batch convention — one frozen v1
+/// query envelope per line, no aggregate envelope (dartq-schema's
+/// token-economics docs) — so each line is the single faces' own JSON.
+fn query_batch(args: &BatchArgs) -> u8 {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        query_batch_run(args, &mut BufWriter::new(io::stdout().lock()))
+    }));
+    match outcome {
+        Ok(code) => code,
+        Err(_) => {
+            eprintln!("dartq: internal error: analysis panicked");
+            exit::INTERNAL_ERROR
+        }
+    }
+}
+
+/// One batch run: the request items (`--symbol` order, each carrying the
+/// full `--kind` set, the symbol face when no kind came), the shared
+/// `dartq_commands::query::batch` execution, then one JSON line per answer.
+fn query_batch_run(args: &BatchArgs, out: &mut impl Write) -> u8 {
+    let kinds = if args.kinds.is_empty() {
+        vec![QueryKind::Symbol]
+    } else {
+        args.kinds.clone()
+    };
+    let queries: Vec<BatchQuery> = args
+        .symbols
+        .iter()
+        .map(|name| BatchQuery {
+            name: name.clone(),
+            kinds: kinds.clone(),
+        })
+        .collect();
+    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+        Ok(faces) => faces,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
+    };
+    let answers = match dartq_commands::query::batch(&mut engine, &queries) {
+        Ok(answers) => answers,
+        Err(error) => {
+            eprintln!("dartq: internal error: {error}");
+            return exit::INTERNAL_ERROR;
+        }
+    };
+
+    let written = answers
+        .iter()
+        .try_for_each(|answer| {
+            writeln!(
+                out,
+                "{}",
+                dartq_commands::query::to_json(&answer.run, answer.name)
+            )
+        })
+        .and_then(|()| out.flush());
+    if let Err(error) = written {
+        eprintln!("dartq: internal error: writing query results failed: {error}");
+        return exit::INTERNAL_ERROR;
+    }
+    exit::CLEAN
+}
+
 /// The query faces' shared output: machine rows or the one-line JSON
 /// envelope (`dartq_commands::query::to_json`, the frozen v1 contract).
 fn write_query_out(
@@ -976,7 +1217,14 @@ fn write_query_out(
     format: QueryFormat,
 ) -> io::Result<()> {
     match format {
-        QueryFormat::Machine => write_query_machine(out, &run.layout, &run.decls, &run.refs),
+        QueryFormat::Machine => write_query_machine(
+            out,
+            &run.layout,
+            &run.decls,
+            &run.refs,
+            &run.implementations,
+            &run.dependencies,
+        ),
         QueryFormat::Json => writeln!(out, "{}", dartq_commands::query::to_json(run, name)),
     }
 }
@@ -1019,12 +1267,19 @@ fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
 /// REF|target-file|kind|qualified|offset|length|use-file
 ///                                                 (offset is the use
 ///                                                 site's UTF-16 offset)
+/// IMPL|file|container|kind|name|line|column|length  (the implementations
+///                                                     face's rows, the
+///                                                     DECL grammar)
+/// DEP|path                                          (the dependencies
+///                                                     face's importer)
 /// ```
 fn write_query_machine(
     out: &mut impl Write,
     layout: &dyn FileLayoutProvider,
     decls: &[DeclHit<'_>],
-    refs: &[RefHit],
+    refs: &[RefHit<'_>],
+    impls: &[DeclHit<'_>],
+    deps: &[DependencyRow],
 ) -> io::Result<()> {
     for decl in decls {
         let (line, column) = layout.line_col(decl.file, decl.range.offset);
@@ -1049,6 +1304,21 @@ fn write_query_machine(
             reference.range.length,
             layout.file_path(reference.file).display(),
         )?;
+    }
+    for decl in impls {
+        let (line, column) = layout.line_col(decl.file, decl.range.offset);
+        writeln!(
+            out,
+            "IMPL|{}|{}|{}|{}|{line}|{column}|{}",
+            layout.file_path(decl.file).display(),
+            decl.container.unwrap_or("-"),
+            decl_kind_name(decl.kind),
+            decl.name,
+            decl.range.length,
+        )?;
+    }
+    for row in deps {
+        writeln!(out, "DEP|{}", row.path)?;
     }
     Ok(())
 }
@@ -1173,6 +1443,10 @@ mod tests {
     fn check_defaults() {
         let check = check_args(&["check"]);
         assert!(matches!(check.format, CheckFormat::Machine));
+        assert!(
+            matches!(check.verbosity, DiagnosticVerbosity::Default),
+            "default verbosity tier"
+        );
         assert!(!check.no_fatal_warnings, "fatal-warnings default on");
         assert!(!check.fatal_infos, "fatal-infos default off");
         assert_eq!(check.paths, vec![PathBuf::from(".")], "default target cwd");
@@ -1204,6 +1478,43 @@ mod tests {
         assert_eq!(check.paths, vec![PathBuf::from("dir/")]);
     }
 
+    /// The `-v`/`--verbosity` tier flag on both diagnostic faces: the three
+    /// tiers parse through long, `=` and short spellings (the analyze face
+    /// pinned with the flag alongside the positional), the unset default is
+    /// `default`; the invalid spellings are covered by `usage_errors`.
+    #[test]
+    fn verbosity_tier_parse() {
+        assert!(
+            matches!(
+                check_args(&["check"]).verbosity,
+                DiagnosticVerbosity::Default
+            ),
+            "unset default"
+        );
+        assert!(
+            matches!(
+                check_args(&["check", "-v", "concise"]).verbosity,
+                DiagnosticVerbosity::Concise
+            ),
+            "short spelling"
+        );
+        assert!(
+            matches!(
+                check_args(&["check", "--verbosity=verbose"]).verbosity,
+                DiagnosticVerbosity::Verbose
+            ),
+            "= spelling"
+        );
+
+        let parsed = parse_args_of(&["analyze", "--verbosity", "concise", "/pkg"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Analyze(args) = parsed else {
+            panic!("expected analyze command")
+        };
+        assert!(matches!(args.verbosity, DiagnosticVerbosity::Concise));
+    }
+
     #[test]
     fn usage_errors() {
         for args in [
@@ -1212,6 +1523,9 @@ mod tests {
             &["check", "--format=yaml"][..],
             &["check", "--bogus"][..],
             &["check", "-x"][..],
+            &["check", "-v"][..],
+            &["check", "--verbosity", "chatty"][..],
+            &["analyze", "-v", "chatty", "/pkg"][..],
             &["frobnicate"][..],
             &["--bogus"][..],
             &["analyze"][..],
@@ -1340,6 +1654,7 @@ mod tests {
 
         let args = CheckArgs {
             format: CheckFormat::Machine,
+            verbosity: DiagnosticVerbosity::Default,
             metrics_json: None,
             no_fatal_warnings: false,
             fatal_infos: false,
@@ -1370,6 +1685,7 @@ mod tests {
 
         let args = CheckArgs {
             format: CheckFormat::Machine,
+            verbosity: DiagnosticVerbosity::Default,
             metrics_json: None,
             no_fatal_warnings: false,
             fatal_infos: false,
@@ -1407,6 +1723,7 @@ mod tests {
         let metrics_path = root.join("metrics.json");
         let args = CheckArgs {
             format: CheckFormat::Machine,
+            verbosity: DiagnosticVerbosity::Default,
             metrics_json: Some(metrics_path.clone()),
             no_fatal_warnings: false,
             fatal_infos: false,
@@ -1504,6 +1821,7 @@ mod tests {
         // End to end: the ignored arg parses nothing → empty set, exit 0.
         let args = CheckArgs {
             format: CheckFormat::Machine,
+            verbosity: DiagnosticVerbosity::Default,
             metrics_json: None,
             no_fatal_warnings: false,
             fatal_infos: false,
@@ -1531,6 +1849,10 @@ mod tests {
         assert!(
             matches!(args.format, AnalyzeFormat::Machine),
             "machine default"
+        );
+        assert!(
+            matches!(args.verbosity, DiagnosticVerbosity::Default),
+            "default verbosity tier"
         );
         assert!(args.metrics_json.is_none() && args.sdk.is_none());
         assert!(args.overlays.is_empty(), "no overlay by default");
@@ -1675,6 +1997,7 @@ mod tests {
         AnalyzeArgs {
             dir: root.to_path_buf(),
             format,
+            verbosity: DiagnosticVerbosity::Default,
             metrics_json,
             overlays: Vec::new(),
             sdk: Some(root.join("sdk")),
@@ -1734,6 +2057,58 @@ mod tests {
         assert_eq!(metrics["libraries_from_cache"], 0);
         assert!(metrics["max_rss_bytes"].is_u64(), "getrusage hook wired");
         assert!(metrics["total_ms"].is_u64());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The verbosity tiers ride the analyze face end to end: `concise`
+    /// strips each oracle row to its identifying prefix (the message field
+    /// gone), `verbose` extends every default row by exactly one field, and
+    /// the exit tier is untouched by the output volume. (The exact verbose
+    /// ninth-field bytes — correctionMessage vs `-`, escaping included —
+    /// are pinned at the shared renderer's tests in dartq-commands' check
+    /// module.)
+    #[test]
+    fn analyze_verbosity_tiers_thread_the_row_faces() {
+        let root = analyze_fixture("verbosity", &[("lib/broken.dart", "void f() { x }\n")]);
+
+        let mut out: Vec<u8> = Vec::new();
+        let concise = AnalyzeArgs {
+            verbosity: DiagnosticVerbosity::Concise,
+            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+        };
+        assert_eq!(analyze_run(&concise, &mut out), exit::ERRORS);
+        let concise_text = String::from_utf8(out).expect("UTF-8");
+        assert_eq!(
+            concise_text,
+            format!(
+                "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{}|1|12|1\n\
+                 ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{}|1|12|1\n",
+                root.canonicalize()
+                    .expect("root")
+                    .join("lib/broken.dart")
+                    .display(),
+                root.canonicalize()
+                    .expect("root")
+                    .join("lib/broken.dart")
+                    .display()
+            ),
+            "concise rows keep the code + span prefix and drop the message"
+        );
+
+        let mut out: Vec<u8> = Vec::new();
+        let verbose = AnalyzeArgs {
+            verbosity: DiagnosticVerbosity::Verbose,
+            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+        };
+        assert_eq!(analyze_run(&verbose, &mut out), exit::ERRORS);
+        let verbose_text = String::from_utf8(out).expect("UTF-8");
+        for (concise_row, verbose_row) in concise_text.lines().zip(verbose_text.lines()) {
+            assert!(
+                verbose_row.starts_with(&format!("{concise_row}|")),
+                "verbose extends the default row by one field: {verbose_row}"
+            );
+        }
 
         fs::remove_dir_all(&root).ok();
     }
@@ -2115,6 +2490,56 @@ mod tests {
         };
         assert_eq!(symbol.name, "Foo");
         assert_eq!(symbol.dir, PathBuf::from("."), "default target cwd");
+
+        // The implementations/dependencies faces share the same grammar,
+        // and the batch `--kind` set parses both spellings through the one
+        // `QueryKind: FromStr` surface.
+        let parsed = parse_args_of(&["query", "implementations", "Foo"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Query(args) = parsed else {
+            panic!("expected query command")
+        };
+        let QueryFace::Implementations(symbol) = args.face else {
+            panic!("expected implementations face")
+        };
+        assert_eq!(symbol.name, "Foo");
+        assert_eq!(symbol.dir, PathBuf::from("."), "default target cwd");
+
+        let parsed = parse_args_of(&["query", "dependencies", "Foo"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Query(args) = parsed else {
+            panic!("expected query command")
+        };
+        let QueryFace::Dependencies(symbol) = args.face else {
+            panic!("expected dependencies face")
+        };
+        assert_eq!(symbol.name, "Foo");
+
+        let parsed = parse_args_of(&[
+            "query",
+            "batch",
+            "--symbol",
+            "Animal",
+            "--kinds",
+            "implementations",
+            "--kinds",
+            "dependencies",
+        ])
+        .expect("parse")
+        .expect("subcommand");
+        let Command::Query(args) = parsed else {
+            panic!("expected query command")
+        };
+        let QueryFace::Batch(batch) = args.face else {
+            panic!("expected batch face")
+        };
+        assert_eq!(batch.symbols, vec!["Animal".to_owned()]);
+        assert_eq!(
+            batch.kinds,
+            vec![QueryKind::Implementations, QueryKind::Dependencies]
+        );
     }
 
     fn symbol_args(root: &Path, format: QueryFormat, name: &str) -> SymbolArgs {

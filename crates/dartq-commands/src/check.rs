@@ -19,7 +19,7 @@ use std::rc::Rc;
 
 use dartq_diagnostics::{
     AnalysisOutput, CodeInfo, CodeRegistry, Diagnostic, FileId, FileLayoutProvider, Severity,
-    SourceRange,
+    SourceRange, write_machine,
 };
 use dartq_language::{
     DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion, triple_shift_enabled,
@@ -71,6 +71,110 @@ impl CheckRun {
             .map(|source| source.bytes().filter(|&b| b == b'\n').count() as u64)
             .sum()
     }
+}
+
+// ---------------------------------------------------------------------------
+// The verbosity-tiered machine face
+//
+// The machine rows' output volume (`-v`/`--verbosity` on the CLI's `check`
+// and `analyze` faces; the token-cost sweep's tier axis). Rendering-only by
+// contract: the diagnostic set itself is complete and identical at every
+// tier — the same posture as the memory-budget rows (diagnostics stay
+// complete while the output volume moves).
+// ---------------------------------------------------------------------------
+
+/// The machine rows' output volume (the token-cost sweep's tier axis).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticVerbosity {
+    /// Code + span rows: the message field drops, the identifying
+    /// `SEVERITY|TYPE|CODE|FILE|LINE|COL|LENGTH` prefix stays.
+    Concise,
+    /// The oracle machine row verbatim (the default — the byte-parity
+    /// differential face).
+    Default,
+    /// The oracle machine row plus a ninth field: the correctionMessage
+    /// (`-` when the template carries none).
+    Verbose,
+}
+
+/// Writes the machine rows at `verbosity` — the one renderer the `check`
+/// and `analyze` faces share. The default tier delegates to the oracle-exact
+/// [`write_machine`], so byte parity with the pre-tier output is structural,
+/// not re-rendered.
+///
+/// # Errors
+/// Propagates any I/O error surfaced by `out`.
+pub fn write_machine_verbosity(
+    out: &mut impl io::Write,
+    output: &AnalysisOutput<'_>,
+    verbosity: DiagnosticVerbosity,
+) -> io::Result<()> {
+    if verbosity == DiagnosticVerbosity::Default {
+        return write_machine(out, output);
+    }
+    use std::fmt::Write as _;
+
+    let mut field = String::new();
+    for d in output.diagnostics {
+        let (line, column) = output.files.line_col(d.file, d.range.offset);
+        // The prefix through LENGTH is the tiers' common spine, assembled and
+        // flushed exactly like the oracle writer (one `write_all` per row).
+        field.clear();
+        field.push_str(d.severity.as_machine_str());
+        field.push('|');
+        field.push_str(d.code.dtype.as_str());
+        field.push('|');
+        field.push_str(d.code.machine);
+        field.push('|');
+        escape_machine_field(
+            output.files.file_path(d.file).to_string_lossy().as_ref(),
+            &mut field,
+        );
+        // Infallible: `String`'s `fmt::Write` never fails.
+        let _ = write!(field, "|{line}|{column}|{}", d.range.length);
+        match verbosity {
+            DiagnosticVerbosity::Concise => {}
+            // `Default` returned above, so this arm is `Verbose`: the
+            // message rides as the eighth field — the oracle writer's
+            // rendering verbatim — and the correctionMessage follows as
+            // the ninth, `-` when absent (the query face's
+            // absent-container posture), both escaped like every other
+            // free-text field.
+            _ => {
+                field.push('|');
+                escape_machine_field(&d.message, &mut field);
+                field.push('|');
+                match d.correction.as_deref() {
+                    Some(correction) => escape_machine_field(correction, &mut field),
+                    None => field.push('-'),
+                }
+            }
+        }
+        field.push('\n');
+        out.write_all(field.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Machine-format field escaping — `dartq-diagnostics`' private
+/// `writer.rs::escape_into` mirrored byte-for-byte: `\` → `\\`, `|` → `\|`,
+/// newline → literal `\n`, CR → literal `\r`, everything else verbatim.
+fn escape_machine_field(text: &str, out: &mut String) {
+    let bytes = text.as_bytes();
+    let mut copied = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let escaped = match b {
+            b'\\' => "\\\\",
+            b'|' => "\\|",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            _ => continue,
+        };
+        out.push_str(&text[copied..i]);
+        out.push_str(escaped);
+        copied = i + 1;
+    }
+    out.push_str(&text[copied..]);
 }
 
 /// Runs the M0 pipeline over a discovered file set (see
@@ -607,7 +711,7 @@ impl ParserListener for DiagnosticListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dartq_diagnostics::{EXPECTED_TOKEN, write_machine};
+    use dartq_diagnostics::{DiagnosticType, EXPECTED_TOKEN};
 
     /// Byte-shape parity with the harness machine parser
     /// (`tests/harness/src/machine.rs` `parse_machine`): 8 `|`-separated
@@ -640,6 +744,88 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|/c/lib/a.dart|1|12|1|Expected to find ';'.\n"
+        );
+    }
+
+    /// The verbosity tiers' row shapes (the bench sweep's tier axis):
+    /// `default` is the pre-change oracle bytes — delegation to
+    /// `write_machine`, pinned against the oracle writer's own output AND
+    /// the literal row (the regression guard) — `concise` drops the message
+    /// field, `verbose` appends the correctionMessage as the ninth field
+    /// (`-` when the template carries none; `|` escapes like the message
+    /// field).
+    #[test]
+    fn verbosity_tiers_pin_the_row_shapes() {
+        let mut set = FileSet::default();
+        let file = set.push("void f() { x }\n", Path::new("/c/lib/a.dart"));
+        let diagnostics = [
+            Diagnostic::new(
+                Severity::Error,
+                EXPECTED_TOKEN,
+                "Expected to find ';'.",
+                file,
+                SourceRange {
+                    offset: 11,
+                    length: 1,
+                },
+                None,
+            ),
+            Diagnostic::new(
+                Severity::Warning,
+                CodeInfo::new(
+                    "synthetic",
+                    "SYNTHETIC",
+                    DiagnosticType::StaticWarning,
+                    false,
+                ),
+                "Some | message",
+                file,
+                SourceRange {
+                    offset: 0,
+                    length: 3,
+                },
+                Some("Try removing the | keyword.".to_owned()),
+            ),
+        ];
+        let output = AnalysisOutput {
+            diagnostics: &diagnostics,
+            files: &set,
+        };
+        let render = |verbosity| {
+            let mut out = Vec::new();
+            write_machine_verbosity(&mut out, &output, verbosity).expect("write");
+            String::from_utf8(out).unwrap()
+        };
+
+        // `default`: byte-identical to the oracle writer (the pre-change
+        // output).
+        let mut oracle = Vec::new();
+        write_machine(&mut oracle, &output).expect("write");
+        assert_eq!(
+            render(DiagnosticVerbosity::Default),
+            String::from_utf8(oracle).unwrap(),
+            "the default tier is the oracle writer verbatim"
+        );
+        assert_eq!(
+            render(DiagnosticVerbosity::Default),
+            "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|/c/lib/a.dart|1|12|1|Expected to find ';'.\n\
+             WARNING|STATIC_WARNING|SYNTHETIC|/c/lib/a.dart|1|1|3|Some \\| message\n"
+        );
+
+        // `concise`: the message field drops, the identifying prefix stays.
+        assert_eq!(
+            render(DiagnosticVerbosity::Concise),
+            "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|/c/lib/a.dart|1|12|1\n\
+             WARNING|STATIC_WARNING|SYNTHETIC|/c/lib/a.dart|1|1|3\n"
+        );
+
+        // `verbose`: the correctionMessage rides as the ninth field, `-`
+        // when absent, `|`-escaped like every free-text field.
+        assert_eq!(
+            render(DiagnosticVerbosity::Verbose),
+            "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|/c/lib/a.dart|1|12|1|Expected to find ';'.|-\n\
+             WARNING|STATIC_WARNING|SYNTHETIC|/c/lib/a.dart|1|1|3|Some \\| message|\
+             Try removing the \\| keyword.\n"
         );
     }
 

@@ -273,7 +273,13 @@ fn unknown_kind_answers_invalid_params() {
     assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
     assert!(error.get("result").is_none(), "no result rides the error");
     let message = error["message"].as_str().expect("message");
-    for accepted in ["symbol", "references", "callers"] {
+    for accepted in [
+        "symbol",
+        "references",
+        "callers",
+        "implementations",
+        "dependencies",
+    ] {
         assert!(
             message.contains(accepted),
             "the accepted set is named ({accepted}): {message}"
@@ -292,6 +298,129 @@ fn unknown_kind_answers_invalid_params() {
     );
     let result = answer_result(&h, 3);
     assert_eq!(result["name"], "Foo");
+
+    h.step(&request(9, "shutdown", json!(null)), 1);
+    let (code, _) = h.exit();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+}
+
+/// The inheritance fixture: `Animal` declares the abstract member
+/// `breathe`, `Dog extends Animal` overrides it, `Cat extends Animal` does
+/// not, and b.dart's import makes it the declaring library's importer.
+fn seeded_inheritance_workspace() -> Workspace {
+    let workspace = Workspace::new(CLEAN_MAIN);
+    fs::write(
+        workspace.path("lib/a.dart"),
+        "abstract class Animal {\n  void breathe();\n}\n",
+    )
+    .expect("write a.dart");
+    fs::write(
+        workspace.path("lib/b.dart"),
+        "import 'a.dart';\nclass Dog extends Animal {\n  void breathe() {}\n}\nclass Cat extends Animal {}\n",
+    )
+    .expect("write b.dart");
+    workspace
+}
+
+/// The `implementations` and `dependencies` kinds end to end: the single
+/// face serves the subtype/override rows and the importer row on the
+/// frozen reserved arrays, the batch face answers both spellings through
+/// the same expansion, and every answer validates against the published
+/// query contract.
+#[test]
+fn implementation_and_dependency_kinds_end_to_end() {
+    let _guard = workspace_lock();
+    let workspace = seeded_inheritance_workspace();
+    let b = workspace.path("lib/b.dart");
+    let mut h = spawn(&workspace, &store_root("rpc-query-kind-impl-deps"));
+    handshake(&mut h);
+
+    // `implementations` over the type: both extends subtypes, no reference
+    // rows, the declaration row kept for identity.
+    h.step(
+        &request(
+            2,
+            "dartq/query",
+            json!({ "name": "Animal", "kind": "implementations" }),
+        ),
+        1,
+    );
+    let result = answer_result(&h, 2);
+    assert_eq!(result["name"], "Animal");
+    let implementations = result["implementations"].as_array().expect("array");
+    assert_eq!(
+        implementations.len(),
+        2,
+        "Dog and Cat, the extends subtypes: {implementations:?}"
+    );
+    assert_eq!(implementations[0]["name"], "Dog");
+    assert_eq!(implementations[0]["kind"], "class");
+    assert_eq!(implementations[1]["name"], "Cat");
+    let declarations = result["declarations"].as_array().expect("declarations");
+    assert_eq!(declarations.len(), 1);
+    assert!(result["references"].as_array().expect("array").is_empty());
+    let text = serde_json::to_string(&result).expect("serialize");
+    dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
+
+    // `implementations` over the member: the overriding row only (Cat
+    // overrides nothing).
+    h.step(
+        &request(
+            3,
+            "dartq/query",
+            json!({ "name": "breathe", "kind": "implementations" }),
+        ),
+        1,
+    );
+    let result = answer_result(&h, 3);
+    let implementations = result["implementations"].as_array().expect("array");
+    assert_eq!(implementations.len(), 1, "only Dog overrides breathe");
+    assert_eq!(implementations[0]["name"], "breathe");
+    assert_eq!(implementations[0]["container"], "Dog");
+    assert_eq!(implementations[0]["file"], b.display().to_string());
+
+    // `dependencies`: the declaring library's importer row, `path`-shaped.
+    h.step(
+        &request(
+            4,
+            "dartq/query",
+            json!({ "name": "Animal", "kind": "dependencies" }),
+        ),
+        1,
+    );
+    let result = answer_result(&h, 4);
+    let dependencies = result["dependencies"].as_array().expect("array");
+    assert_eq!(dependencies.len(), 1, "b.dart imports a.dart");
+    assert_eq!(dependencies[0]["path"], b.display().to_string());
+    let text = serde_json::to_string(&result).expect("serialize");
+    dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
+
+    // The batch face accepts both spellings through the same item shape.
+    h.step(
+        &request(
+            5,
+            "dartq/queryBatch",
+            json!({ "queries": [ {
+                "name": "Animal",
+                "kinds": ["implementations", "dependencies"],
+            } ] }),
+        ),
+        1,
+    );
+    let batch = answer_result(&h, 5);
+    let answers = batch.as_array().expect("batch answers");
+    assert_eq!(answers.len(), 2, "one answer per (item, kind) pair");
+    assert_eq!(
+        answers[0]["implementations"]
+            .as_array()
+            .expect("array")
+            .len(),
+        2
+    );
+    assert_eq!(
+        answers[1]["dependencies"].as_array().expect("array").len(),
+        1
+    );
 
     h.step(&request(9, "shutdown", json!(null)), 1);
     let (code, _) = h.exit();
