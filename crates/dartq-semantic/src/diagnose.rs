@@ -6112,14 +6112,19 @@ impl<'a> Engine<'a> {
             Receiver::Typed { type_name, .. } => (type_name, false),
             // A folded creation (`C().m(...)`): the instance face — the
             // constructor-argument membership check walks the superclass
-            // chain like a declaration-typed receiver. The table feeds the
-            // name-level arity/assignability faces only, so the unit's own
-            // slots ride along untouched.
+            // chain like a declaration-typed receiver. The table is not
+            // name-level only: `check_arguments` stages and renders formal
+            // types against it, and those renders stay single-pool because
+            // the walks below route every find through the boundary.
             Receiver::Created { name, .. } => (name, false),
             Receiver::Container {
                 name: container, ..
             } => {
-                let entry = resolve_container(
+                // F1: the hit may belong to a foreign unit's pool — project
+                // it through the boundary before its formals flow into rows
+                // or message text (the arms below reach the projection via
+                // `walk_members`/`walk_super`; this arm resolves directly).
+                let hit = resolve_container(
                     self.graph,
                     self.namespaces,
                     self.index,
@@ -6127,10 +6132,18 @@ impl<'a> Engine<'a> {
                     self.file,
                     container,
                 )
-                .and_then(|(c, _)| c.members.get(&name));
-                return match entry {
-                    Some(entry) if entry.kind == MemberKind::Method => {
-                        entry.formals.as_deref().map(std::borrow::Cow::Borrowed)
+                .and_then(|(c, owner)| c.members.get(&name).map(|entry| (owner, entry)));
+                return match hit {
+                    Some((owner, entry)) if entry.kind == MemberKind::Method => {
+                        match self.boundary.member(owner, container, name, entry) {
+                            Projected::Own(e) => {
+                                e.formals.as_deref().map(std::borrow::Cow::Borrowed)
+                            }
+                            Projected::Foreign(e) => e
+                                .formals
+                                .as_deref()
+                                .map(|formals| std::borrow::Cow::Owned(formals.to_owned())),
+                        }
                     }
                     _ => None,
                 };
@@ -25783,10 +25796,11 @@ mod tests {
 /// the single-file rig cannot express.
 #[cfg(test)]
 mod sealed_contract_tests {
+    use super::Receiver;
     use crate::collector::collect;
     use crate::diagnose::{Engine, FileReport, StrictModes, Walk, diagnose_with};
     use crate::library::ElementIndex;
-    use crate::model::{MicroKind, Ty};
+    use crate::model::{ContainerKind, MicroKind, Ty};
     use dartq_language::{FeatureSet, LanguageVersion};
     use dartq_parser::ParserFeatures;
     use dartq_resolution::{Combinators, ImportEdge, LibraryGraphBuilder, Namespaces};
@@ -26295,6 +26309,120 @@ mod sealed_contract_tests {
         assert_eq!(
             report.diagnostics[0].message,
             "A value of type 'Null' can't be assigned to a variable of type 'List<int>'."
+        );
+    }
+
+    /// A static call column on an imported container resolves through
+    /// `member_formals_full`'s direct `Receiver::Container` arm: the
+    /// named-argument membership face — the column that reaches a static
+    /// callee from a full parse (the positional argument face stays
+    /// placeholder-gated: the send closes before the receiver merge, so
+    /// `A.m(c)` itself reports nothing) — answers off the projected table
+    /// without touching a foreign slot.
+    #[test]
+    fn foreign_static_call_column_resolves_through_the_boundary() {
+        let report = foreign_unit_report(
+            "import 'other.dart'; class C {} void f(C c) { A.m(c); A.m(bad: 1); }",
+            "class A { static void m(List<int> x) {} }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_named_parameter"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The projection differential for that arm: the resolved container
+    /// table's `List<int>` formal renders exactly through the boundary pool.
+    /// Main's own pool is empty, so the one interned slot is the
+    /// projection's — an unprojected foreign slot has no local slot to read
+    /// and the render cannot decide at all.
+    #[test]
+    fn foreign_static_call_formals_render_through_the_boundary() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let dep_file = files.intern(Path::new("other.dart"));
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let main_source = "import 'other.dart'; class C {} void f(C c) { A.m(c); }";
+        let dep_source = "class A { static void m(List<int> x) {} }";
+        let scanned = dartq_scanner::scan(
+            main_source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty());
+        let scanned_dep = dartq_scanner::scan(
+            dep_source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            dep_file,
+        );
+        assert!(scanned_dep.diagnostics.is_empty());
+        let elements = collect(main_source, &scanned.tokens, features, &strings);
+        let dep_elements = collect(dep_source, &scanned_dep.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let dep_lib = builder.intern("package:t/other.dart");
+        for (name, decl) in elements.declarations() {
+            if decl.kind != MicroKind::TypeParam {
+                builder.declare(lib, name, file);
+            }
+        }
+        for (name, decl) in dep_elements.declarations() {
+            if decl.kind != MicroKind::TypeParam {
+                builder.declare(dep_lib, name, dep_file);
+            }
+        }
+        builder.import(
+            lib,
+            ImportEdge {
+                target: Some(dep_lib),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        index.insert(dep_file, dep_elements);
+        let tokens: &'static TokenTable = Box::leak(Box::new(scanned.tokens));
+        let engine = Engine::new(
+            &graph,
+            &namespaces,
+            &index,
+            &strings,
+            main_source,
+            tokens,
+            file,
+            lib,
+            false,
+            false,
+            StrictModes::default(),
+        );
+        let recv = Receiver::Container {
+            name: strings.intern("A"),
+            kind: ContainerKind::Class,
+        };
+        let formals = engine
+            .member_formals_full(&recv, strings.intern("m"))
+            .expect("the imported static method resolves");
+        let render = |ty: Ty| ty.render(&strings, &engine.boundary.args.borrow());
+        assert_eq!(render(formals.positional[0].ty), "List<int>");
+        assert_eq!(
+            engine.boundary.args.borrow().len(),
+            1,
+            "the projected formal is the boundary pool's one slot"
         );
     }
 
