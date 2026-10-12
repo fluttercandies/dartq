@@ -41,11 +41,24 @@ contains no `Cargo.toml`, and the workspace member list in the root
 
 ## Status
 
-Protocol v1 is complete on both sides (handshake, capability negotiation,
-diagnostic notifications, fixes round trip), and registered producers are
-executed: `servePlugin` answers `request/fixes` from the registry (assists
-at the requested range, rule fixes at a matching engine diagnostic's range
-of the latest pushed batch), best priority first. Widening the producer
-context beyond the engine batch needs the engine Query API, which lands
-later in M4; runtime enforcement of the manifest's timeout and memory
-budgets is likewise a later M4 step.
+Ships in 1.0.0: the complete protocol v1 host — newline-delimited JSON
+frames over stdio with a 16 MiB frame cap, the versioned handshake with
+capability negotiation, diagnostic and fix notifications, and producer
+execution via `servePlugin` (assists at the requested range, rule fixes at
+a matching engine diagnostic's range of the latest pushed batch, best
+priority first). The isolation model is one sidecar Dart process per
+plugin: the process never enters the Rust core and only ever speaks this
+wire contract, while the core enforces the manifest budgets on the child —
+`callback_ms` deadlines on initialize, `request/fixes`, and analyze
+demands, `memory_budget_mb` via an RSS monitor, and the crash/restart
+budget (pinned by the `dartq-plugin` integration suites, e.g.
+`crates/dartq-plugin/tests/memory_budget.rs`). The host package itself
+carries 10 Dart test files under `test/` (97 `test(` occurrences) covering
+the codec, handshake, registry, and live loop.
+
+Explicitly post-1.0: the engine Query API — producers currently see only
+the latest pushed diagnostic batch, and wider producer context awaits the
+Query API's general availability — and `registerLintRule` breadth: the
+shim accepts official-style `registerAssist`/`registerFixForRule`
+registration, while `registerLintRule` throws an `UnsupportedError` naming
+the anchor (pinned by `test/shim_plugin_test.dart`).
