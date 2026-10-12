@@ -53,12 +53,16 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser as _, Subcommand, ValueEnum};
 
 use dartq_commands::analyze::AnalyzeRun;
+use dartq_commands::check::FileSet;
 use dartq_commands::discover::{DiscoverError, discover};
 use dartq_commands::explain::ExplainError;
 use dartq_commands::query::{decl_kind_name, ref_kind_name};
-use dartq_commands::workspace::{engine_config, open_engine};
+use dartq_commands::workspace::{
+    WorkspaceAdvisory, engine_config_with_advisory, open_engine, open_engine_with_advisory,
+};
 use dartq_diagnostics::{
-    AnalysisOutput, Diagnostic, FileLayoutProvider, Severity, write_json, write_machine,
+    AnalysisOutput, Diagnostic, FileLayoutProvider, Severity, SourceRange, write_json,
+    write_machine,
 };
 use dartq_engine::{DeclHit, RefHit};
 
@@ -560,13 +564,14 @@ fn under_crash_tier<T>(
 /// The plain path: the shared run, byte-pinned.
 fn analyze_plain(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     let started = Instant::now();
-    let (mut engine, dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
-        Ok(faces) => faces,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return exit::USAGE;
-        }
-    };
+    let (mut engine, dir, stale_advisory) =
+        match open_engine_with_advisory(&args.dir, args.sdk.as_deref()) {
+            Ok(faces) => faces,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return exit::USAGE;
+            }
+        };
     engine.set_memory_limit(args.memory_limit);
     engine.set_trace_sink(match &args.trace_events {
         Some(path) => match dartq_engine::event::TraceSink::create(path) {
@@ -585,7 +590,7 @@ fn analyze_plain(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
         Ok(run) => run,
         Err(code) => return code,
     };
-    analyze_finish(args, &run, started, out)
+    analyze_finish(args, &run, started, out, stale_advisory.as_ref())
 }
 
 /// Arms the L3 content store (PRD §17.2) at the default cache root with
@@ -615,13 +620,14 @@ fn arm_content_store(engine: &mut dartq_engine::Engine, size_limit: Option<u64>)
 /// renders and tiers like every sibling.
 fn analyze_overlaid(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     let started = Instant::now();
-    let (mut engine, dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
-        Ok(faces) => faces,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return exit::USAGE;
-        }
-    };
+    let (mut engine, dir, stale_advisory) =
+        match open_engine_with_advisory(&args.dir, args.sdk.as_deref()) {
+            Ok(faces) => faces,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return exit::USAGE;
+            }
+        };
     engine.set_memory_limit(args.memory_limit);
     engine.set_trace_sink(match &args.trace_events {
         Some(path) => match dartq_engine::event::TraceSink::create(path) {
@@ -647,29 +653,40 @@ fn analyze_overlaid(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
         Ok(run) => run,
         Err(code) => return code,
     };
-    analyze_finish(args, &run, started, out)
+    analyze_finish(args, &run, started, out, stale_advisory.as_ref())
 }
 
-/// The shared analyze postlude: oracle-format diagnostics on `out`, the
-/// `--metrics-json` facts at exit, then the severity exit tier.
+/// The shared analyze postlude: the assembly's workspace advisory (the #732
+/// stale-config row, or its #759 missing-config sibling) in the face's own
+/// format, then the oracle-format diagnostics, the `--metrics-json` facts
+/// at exit, and the severity exit tier. The advisory prints inside the
+/// postlude (not at assembly time) so the crash tier's contract holds: a
+/// panicked run keeps stdout empty, advisory included. It never joins the
+/// per-file set, the metrics count, or the exit tier.
 fn analyze_finish(
     args: &AnalyzeArgs,
     run: &AnalyzeRun<'_>,
     started: Instant,
     out: &mut impl Write,
+    stale_advisory: Option<&WorkspaceAdvisory>,
 ) -> u8 {
     let discovery_ms = elapsed_ms(run.discovery);
     let analyze_ms = elapsed_ms(run.analysis);
 
     let written = match args.format {
-        AnalyzeFormat::Machine => write_machine(
-            out,
-            &AnalysisOutput {
-                diagnostics: &run.diagnostics,
-                files: &run.layout,
-            },
-        ),
-        AnalyzeFormat::Human => write_human(out, &run.diagnostics, &run.layout),
+        AnalyzeFormat::Machine => {
+            write_stale_advisory_machine(out, stale_advisory).and_then(|()| {
+                write_machine(
+                    out,
+                    &AnalysisOutput {
+                        diagnostics: &run.diagnostics,
+                        files: &run.layout,
+                    },
+                )
+            })
+        }
+        AnalyzeFormat::Human => write_stale_advisory_human(out, stale_advisory)
+            .and_then(|()| write_human(out, &run.diagnostics, &run.layout)),
     };
     if let Err(error) = written.and_then(|()| out.flush()) {
         eprintln!("dartq: internal error: writing diagnostics failed: {error}");
@@ -694,6 +711,60 @@ fn analyze_finish(
         }
     }
     severity_exit(&run.diagnostics, !args.no_fatal_warnings, args.fatal_infos)
+}
+
+/// The machine-format advisory row, ahead of the diagnostics: the exact
+/// 8-field shape every other `dartq/*` row uses (severity INFO — the
+/// `dartq/memory_degraded` posture for a note that must never fail the run
+/// through the exit tiers; type TOOL per the registry row), anchored at the
+/// config the advisory names, rendered through the one oracle-exact writer.
+fn write_stale_advisory_machine(
+    out: &mut impl Write,
+    advisory: Option<&WorkspaceAdvisory>,
+) -> io::Result<()> {
+    let Some(advisory) = advisory else {
+        return Ok(());
+    };
+    // An empty source positions the row at 1:1 — the assembly has no
+    // source span, the memory-budget row's own posture.
+    let mut files = FileSet::default();
+    let file = files.push("", advisory.config_path());
+    let diagnostic = Diagnostic::new(
+        Severity::Info,
+        advisory.code(),
+        advisory.message(),
+        file,
+        SourceRange {
+            offset: 0,
+            length: 0,
+        },
+        None,
+    );
+    write_machine(
+        out,
+        &AnalysisOutput {
+            diagnostics: &[diagnostic],
+            files: &files,
+        },
+    )
+}
+
+/// The human-format advisory line, ahead of the diagnostics groups: the
+/// face's own `severity • code • message` grammar, position-less (the
+/// assembly has no source span).
+fn write_stale_advisory_human(
+    out: &mut impl Write,
+    advisory: Option<&WorkspaceAdvisory>,
+) -> io::Result<()> {
+    let Some(advisory) = advisory else {
+        return Ok(());
+    };
+    writeln!(
+        out,
+        "Info • {} • {}",
+        advisory.code().name,
+        advisory.message()
+    )
 }
 
 /// Decodes `--overlay PATH=FILE` specs: the analyzed path (relative specs
@@ -742,14 +813,15 @@ fn load_overlays(specs: &[String], dir: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>
 /// `initialized`, so the client sees full diagnostics immediately after the
 /// handshake.
 fn daemon(args: &DaemonArgs) -> u8 {
-    let (config, _dir) = match engine_config(&args.dir, args.sdk.as_deref()) {
-        Ok(faces) => faces,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return exit::USAGE;
-        }
-    };
-    let session = match dartq_daemon::Session::new(config) {
+    let (config, _dir, stale_advisory) =
+        match engine_config_with_advisory(&args.dir, args.sdk.as_deref()) {
+            Ok(faces) => faces,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return exit::USAGE;
+            }
+        };
+    let session = match dartq_daemon::Session::new(config, stale_advisory) {
         Ok(session) => session,
         Err(error) => {
             eprintln!("dartq: internal error: daemon session unusable: {error}");
@@ -1081,6 +1153,7 @@ mod tests {
     use super::*;
     use dartq_diagnostics::{EXPECTED_TOKEN, SourceRange};
     use dartq_source::FileTable;
+    use filetime::{FileTime, set_file_mtime};
 
     /// Parses `args` (without the program name) into a subcommand; `None`
     /// means the bare-`dartq`/version fallback.
@@ -1580,6 +1653,17 @@ mod tests {
         for (relative, content) in libraries {
             write(relative, content);
         }
+        // Deterministic fresh resolution chain: the freshness judgment is
+        // strict mtime ordering (equal counts as stale), and coarse-mtime
+        // filesystems would false-stale the byte-pinned faces. pubspec <
+        // lock < config; the advisory tests re-stamp pubspec to stale.
+        let stamp = |relative: &str, secs: i64| {
+            set_file_mtime(root.join(relative), FileTime::from_unix_time(secs, 0))
+                .expect("set mtime");
+        };
+        stamp("pubspec.yaml", 1_000);
+        stamp("pubspec.lock", 2_000);
+        stamp(".dart_tool/package_config.json", 3_000);
         root
     }
 
@@ -1715,20 +1799,82 @@ mod tests {
         fs::remove_dir_all(&broken_root).ok();
     }
 
-    /// Usage tier: missing dir, missing package config, and unusable SDK all
-    /// exit 64 with stderr-only output (engine-api-spec §4.2; dartdev
-    /// EX_USAGE, dartdev.dart:209–210).
+    /// The stale-config advisory face (#732): a stale fixture surfaces
+    /// exactly ONE advisory ahead of the diagnostics — the machine row in
+    /// the exact 8-field `dartq/*` shape (INFO|TOOL, anchored at the config
+    /// the reasons name), the human line in the face's own grammar — and
+    /// the advisory never joins the per-file set, the metrics count, or the
+    /// exit tier. The fresh side of the contract is pinned by the byte-exact
+    /// faces above (`analyze_clean_and_human_faces` — no advisory row, no
+    /// extra human line).
+    #[test]
+    fn analyze_surfaces_stale_config_advisory_once() {
+        let message = "package_config.json is out of date; run `dart pub get` \
+                       (fixture's pubspec.yaml changed since the resolution was written)";
+
+        // Machine: the advisory row leads, the oracle rows follow byte-pinned.
+        let root = analyze_fixture("stale-machine", &[("lib/broken.dart", "void f() { x }\n")]);
+        set_file_mtime(
+            root.join("pubspec.yaml"),
+            FileTime::from_unix_time(9_000, 0),
+        )
+        .expect("stale pubspec");
+        let canonical = root.canonicalize().expect("root");
+        let config = canonical.join(".dart_tool/package_config.json");
+        let broken = canonical.join("lib/broken.dart");
+        let mut out: Vec<u8> = Vec::new();
+        let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Machine, None), &mut out);
+        assert_eq!(
+            String::from_utf8(out).expect("stdout is UTF-8"),
+            format!(
+                "INFO|TOOL|DARTQ/PACKAGE_CONFIG_OUT_OF_DATE|{}|1|1|0|{message}\n\
+                 ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{}|1|12|1|Expected to find ';'.\n\
+                 ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{}|1|12|1|Undefined name 'x'.\n",
+                config.display(),
+                broken.display(),
+                broken.display()
+            ),
+            "one advisory row, then the oracle bytes"
+        );
+        assert_eq!(code, exit::ERRORS, "the advisory never moves the exit tier");
+
+        // Human: the advisory line leads, the issues tail counts rows only.
+        let root = analyze_fixture("stale-human", &[("lib/broken.dart", "void f() { x }\n")]);
+        set_file_mtime(
+            root.join("pubspec.yaml"),
+            FileTime::from_unix_time(9_000, 0),
+        )
+        .expect("stale pubspec");
+        let mut out: Vec<u8> = Vec::new();
+        let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Human, None), &mut out);
+        assert_eq!(code, exit::ERRORS);
+        let text = String::from_utf8(out).expect("UTF-8");
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next().expect("first line"),
+            format!("Info • dartq/package_config_out_of_date • {message}"),
+            "the advisory line leads"
+        );
+        assert!(
+            !lines.any(|line| line.contains("package_config_out_of_date")),
+            "exactly one advisory line: {text}"
+        );
+        assert!(
+            text.contains("2 issues found."),
+            "the advisory is uncounted by the tail: {text}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Usage tier: missing dir and unusable SDK exit 64 with stderr-only
+    /// output (engine-api-spec §4.2; dartdev EX_USAGE, dartdev.dart:209–210).
     #[test]
     fn analyze_usage_tiers() {
         let root = analyze_fixture("usage", &[("lib/clean.dart", "var ok = 1;\n")]);
 
         let missing_dir = analyze_args(&root.join("nope"), AnalyzeFormat::Machine, None);
         assert_eq!(analyze_run(&missing_dir, &mut Vec::new()), exit::USAGE);
-
-        let no_config = analyze_fixture("noconfig", &[]);
-        fs::remove_file(no_config.join(".dart_tool/package_config.json")).ok();
-        let no_config_args = analyze_args(&no_config, AnalyzeFormat::Machine, None);
-        assert_eq!(analyze_run(&no_config_args, &mut Vec::new()), exit::USAGE);
 
         let no_sdk = AnalyzeArgs {
             sdk: Some(root.join("no-such-sdk")),
@@ -1737,7 +1883,51 @@ mod tests {
         assert_eq!(analyze_run(&no_sdk, &mut Vec::new()), exit::USAGE);
 
         fs::remove_dir_all(&root).ok();
-        fs::remove_dir_all(&no_config).ok();
+    }
+
+    /// No `package_config.json` no longer refuses (#759): the run degrades
+    /// to the oracle's BasicWorkspace floor — the missing-config advisory
+    /// leads, and the `package:` import resolves to nothing, producing the
+    /// same `uri_does_not_exist` ERROR row the oracle's degraded mode
+    /// emits for unknown packages (its no-config runs measure exactly that
+    /// face plus the cascades). The advisory still never moves the exit
+    /// tier (the row's own ERROR does).
+    #[test]
+    fn analyze_without_config_degrades_with_missing_config_advisory() {
+        let root = analyze_fixture(
+            "no-config",
+            &[(
+                "lib/main.dart",
+                "import 'package:missing/missing.dart';\nvar t = Missing;\n",
+            )],
+        );
+        fs::remove_file(root.join(".dart_tool/package_config.json")).ok();
+        let canonical = root.canonicalize().expect("root");
+        let config = canonical.join(".dart_tool/package_config.json");
+        let main = canonical.join("lib/main.dart");
+
+        let mut out: Vec<u8> = Vec::new();
+        let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Machine, None), &mut out);
+        let text = String::from_utf8(out).expect("stdout is UTF-8");
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next().expect("advisory row leads"),
+            format!(
+                "INFO|TOOL|DARTQ/PACKAGE_CONFIG_MISSING|{}|1|1|0|package_config.json not \
+                 found; run `dart pub get` (analyzing with `package:` imports unresolved)",
+                config.display()
+            ),
+            "the missing-config advisory leads the machine rows"
+        );
+        assert!(
+            lines.any(|line| {
+                line.contains("URI_DOES_NOT_EXIST") && line.contains(&main.display().to_string())
+            }),
+            "the package: import is unresolved, the oracle's degraded face: {text}"
+        );
+        assert_eq!(code, exit::ERRORS);
+
+        fs::remove_dir_all(&root).ok();
     }
 
     /// The analyze face's crash tier: a panic anywhere in the engine pass

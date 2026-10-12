@@ -25,7 +25,7 @@ use dartq_plugin::{Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy
 use dartq_source::{FileId, FileTable};
 
 /// The same shape the daemon feeds on the analyze path.
-fn engine_row(file: FileId, message: &str) -> Diagnostic {
+fn engine_row(file: FileId, message: &'static str) -> Diagnostic {
     Diagnostic::new(
         EngineSeverity::Warning,
         CodeInfo::new("test/row", "TEST_ROW", DiagnosticType::Tool, false),

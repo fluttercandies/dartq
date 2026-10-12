@@ -27,11 +27,18 @@ dartq-schema = { workspace = true }
 dartq-sdk = { workspace = true }
 dartq-semantic = { workspace = true }
 dartq-source = { workspace = true }
+rayon = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Directly pinning file mtimes in the stale-config advisory tests; std
+# cannot set them and the freshness rules are stated in strict mtime
+# ordering (equal counts as stale).
+filetime = { workspace = true }
 
 [lints]
 workspace = true

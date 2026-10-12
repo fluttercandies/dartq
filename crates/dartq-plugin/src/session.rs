@@ -736,7 +736,9 @@ mod tests {
         // and must ride out the window, not tear the session down.
         let crossing = FakePlugin::diagnostic("lib/main.dart", "in flight");
         assert_eq!(
-            session.handle(crossing).expect("crossing diagnostic queues"),
+            session
+                .handle(crossing)
+                .expect("crossing diagnostic queues"),
             Incoming::Diagnostic(PluginDiagnostic {
                 file: "lib/main.dart".to_owned(),
                 severity: Severity::Warning,

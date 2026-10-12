@@ -73,15 +73,18 @@
 
 use std::path::{Path, PathBuf};
 
+use dartq_language::DEFAULT_LANGUAGE_VERSION;
 use dartq_lints::{EnableSet, Features, Lint, RULES, parse_unit, run};
+use dartq_package::PackageTable;
 use dartq_plugin::{
     Capability, FixesReply, PluginRuntime, PrioritizedChange, SpawnSpec,
     discover as discover_plugins,
 };
-use dartq_source::{LineIndex, utf16_len_of, utf16_offset_to_byte};
+use dartq_source::{LineIndex, normalize_path, utf16_len_of, utf16_offset_to_byte};
 
 use crate::Verbosity;
 use crate::discover::{self, DiscoverError};
+use crate::lints::features_for;
 
 /// The patch document version (PRD §15.6; §15.7 versioning discipline).
 pub const SCHEMA_VERSION: u32 = 1;
@@ -328,7 +331,8 @@ impl PluginHosts {
 /// anchored edit, and every lint hit is a `request/fixes` location for
 /// the plugin hosts (one request per hit per live host — the protocol's
 /// only query granularity). One fix set per patched file — files without
-/// rows never enter the set.
+/// rows never enter the set. Each file runs under its containing package's
+/// language version ([`unit_features`]).
 ///
 /// # Errors
 ///
@@ -342,6 +346,16 @@ pub fn collect_set(
     if enabled == EnableSet::none() {
         return Ok(Vec::new());
     }
+    // One workspace assembly per run, seeded from the first discovered
+    // file, best-effort: a target set with no pub context around it — the
+    // face's historical shape — stays at the default-version posture
+    // instead of failing.
+    let table = files
+        .iter()
+        .next()
+        .and_then(|first| first.parent())
+        .and_then(|dir| crate::workspace::package_assembly(dir).ok())
+        .map(|(table, ..)| table);
     let mut out = Vec::new();
     for path in &files {
         let Ok(text) = std::fs::read_to_string(path) else {
@@ -349,7 +363,7 @@ pub fn collect_set(
             // face re-reads and reports on its own terms.
             continue;
         };
-        let parsed = parse_unit(&text, Features::default());
+        let parsed = parse_unit(&text, unit_features(table.as_ref(), path));
         let hits: Vec<Lint> = run(&parsed.unit(Some(path)), &enabled);
         let fixes = from_lints(&hits, &text, &parsed.lines);
         let plugin = dispatch_fixes(hosts, path, &text, &parsed.lines, &hits);
@@ -362,6 +376,31 @@ pub fn collect_set(
         }
     }
     Ok(out)
+}
+
+/// The file's unit features: its containing package's language version
+/// through the package table's attribution walk (the engine's
+/// `language_version_for` chain, engine-api-spec §1.1), the default
+/// version where no table or no package attributes the file. `table` is
+/// `None` when the run's workspace assembly failed — every file then runs
+/// at the default posture, the face's pre-wiring behavior. This is the
+/// package-version fallback the lint face also uses for unsettled files
+/// (#722): `collect_set` discovers and parses engine-free, so the
+/// engine's settled `@dart`/grant face cannot reach here — a `@dart`-pinned
+/// file parses at its package posture, not its pinned one.
+fn unit_features(table: Option<&PackageTable>, path: &Path) -> Features {
+    // The query joins the table's spelling universe before the walk: the
+    // attribution is purely lexical over the table's canonicalized roots
+    // (the build's one normalize rule), while this face's paths come raw
+    // off discovery — a user-spelled alias (`/var` vs `/private/var`, a
+    // symlinked root) would strand at the walk's bound, attribute to no
+    // package, and silently run the file at the default posture.
+    let version = table
+        .and_then(|table| table.containing(&normalize_path(path)))
+        .and_then(|identity| identity.language_version)
+        .map(dartq_pub::LanguageVersion::into_inner)
+        .unwrap_or(DEFAULT_LANGUAGE_VERSION);
+    features_for(version)
 }
 
 /// One `request/fixes` per lint hit against the hosts. The request names
@@ -1365,6 +1404,48 @@ mod tests {
         assert_eq!(doc["edits"][0]["source"], BUILTIN_SOURCE);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The fix face's per-unit version wiring: the fixture's
+    /// `languageVersion` attributes through the workspace assembly and each
+    /// bit tracks its official `enabledIn` gate
+    /// (`tools/experimental_features.yaml`): a 3.5 package is past
+    /// `patterns` (`3.0.0`) and `unnamed_libraries` (`2.19.0`) but before
+    /// `wildcard_variables` (`3.7.0`); a 2.19 package additionally drops
+    /// `patterns`. `enhanced_parts` has no `enabledIn` — off everywhere.
+    #[test]
+    fn unit_features_derive_from_the_containing_package() {
+        let fixture = |version: &str, tag: &str| {
+            let root = crate::workspace::test_fixture::workspace(tag, &[]);
+            std::fs::write(
+                root.join(".dart_tool/package_config.json"),
+                format!(
+                    r#"{{"configVersion": 2, "packages": [{{"name": "fixture", "rootUri": "../", "languageVersion": "{version}"}}], "generator": "pub"}}"#
+                ),
+            )
+            .expect("config");
+            let (table, _, _, _, _) = crate::workspace::package_assembly(&root).expect("assembly");
+            let features = unit_features(Some(&table), &root.join("lib/a.dart"));
+            std::fs::remove_dir_all(&root).ok();
+            features
+        };
+        assert_eq!(
+            fixture("3.5", "fix_features_pre_wildcard"),
+            Features {
+                wildcard_variables: false,
+                ..Features::default()
+            },
+            "3.5 predates wildcard-variables' 3.7.0 enabledIn",
+        );
+        assert_eq!(
+            fixture("2.19", "fix_features_legacy"),
+            Features {
+                wildcard_variables: false,
+                patterns: false,
+                ..Features::default()
+            },
+            "the wave9 pin: legacy duplicates report",
+        );
     }
 
     /// The assists document: rows keep the change grouping with their

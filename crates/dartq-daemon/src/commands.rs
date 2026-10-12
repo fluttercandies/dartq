@@ -125,11 +125,12 @@ use crate::session::SessionError;
 pub(crate) const SCHEMA_VERSION: u32 = dartq_commands::SCHEMA_VERSION;
 
 /// The `dartq/*` method names, announced under `capabilities.experimental`
-/// in `initialize`'s answer. The `dartq/overlay.*` faces and the two
-/// plugin-dispatch faces (`dartq/fix`, `dartq/assists`) answer at intake
-/// (the server intercepts them before the scheduler queue — disk and
-/// plugin-process work, no engine analysis to schedule); the rest ride the
-/// session's read task.
+/// in `initialize`'s answer. The `dartq/overlay.*` faces answer at intake
+/// (the server intercepts them before the scheduler queue — pure staging);
+/// the rest, including the two plugin-dispatch faces (`dartq/fix`,
+/// `dartq/assists`), stage onto the session's scheduler — the fix faces
+/// execute off the main loop at their drain (the session module's
+/// fix-dispatch notes).
 pub(crate) const METHODS: [&str; 12] = [
     "dartq/index",
     "dartq/analyze",
@@ -1270,9 +1271,9 @@ fn explain_answer(
 
 /// The fix answer over `hosts`: the §15.6 documents for the discovered
 /// files (built-in rows plus the plugin rows the hosts returned, every row
-/// provenance-tagged) and, when a host failed, the `errors` list. The
-/// intake dispatch (`server.rs`) passes its live host set; the scheduler
-/// arm has no host set and answers the built-in rows alone.
+/// provenance-tagged) and, when a host failed, the `errors` list. The fix
+/// worker (the session's off-loop dispatch) passes the live host set; the
+/// scheduler arm has no host set and answers the built-in rows alone.
 pub(crate) fn fix_answer(
     paths: &[PathBuf],
     verbosity: Verbosity,

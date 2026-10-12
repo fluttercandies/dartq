@@ -25,10 +25,12 @@ dartq-diagnostics = { workspace = true }
 dartq-engine = { workspace = true }
 serde_json = { workspace = true }
 
-# Test-only: the main.rs tests build `Diagnostic`s over a `FileTable`, and
-# the fix face's write-back tests anchor edits with a `LineIndex`.
+# Test-only: the main.rs tests build `Diagnostic`s over a `FileTable`, the
+# fix face's write-back tests anchor edits with a `LineIndex`, and the
+# stale-config advisory tests pin the pub faces' mtime chain.
 [dev-dependencies]
 dartq-source = { workspace = true }
+filetime = { workspace = true }
 
 # The metrics hook reads peak RSS through getrusage (engine-api-spec §3);
 # unix-only until a non-unix story exists.

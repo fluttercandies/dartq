@@ -20,18 +20,17 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Instant;
 
-use crossbeam_channel::RecvTimeoutError;
+use crossbeam_channel::SelectTimeoutError;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use dartq_commands::Verbosity;
-use dartq_commands::fix;
 
 use crate::codec::{self, FrameError};
 use crate::commands;
 use crate::jsonrpc::{self, Message, Notification, Request, Response, codes};
 use crate::lsp::{self, PublishDiagnosticsParams};
-use crate::session::{Publish, Session, SessionError};
+use crate::session::{FixJob, Publish, Session, SessionError, Turn};
 use crate::watch::{WatchOptions, Watcher, is_config_input};
 
 /// Exit code for a clean session end: `shutdown` + `exit`, or the client
@@ -109,24 +108,48 @@ where
         // happens before intake. (Only tests read the attempt outcome.)
         let _ = session.flush_if_due(Instant::now());
 
-        // While a save is pending, the receive is bounded by the window's
-        // remainder: an idle daemon wakes at the deadline and the turn-start
-        // check above saves, instead of blocking forever with the save
-        // queued. A clean sink blocks freely until the next frame. Either
-        // way the loop stays timer-free.
-        let first = match session.flush_deadline() {
-            None => match receiver.recv() {
-                Ok(first) => first,
-                Err(_) => break,
-            },
+        // A completion or budget expiry that landed while the loop was
+        // quiet answers here (the session module's fix-dispatch notes);
+        // with nothing to do the call writes nothing.
+        write_turn(&mut output, session.complete_fix(None))?;
+
+        // The wait: a select over intake and the fix workers' mailbox, so
+        // either wakes the loop — a completion must not sit behind a quiet
+        // client. The wait is deadline-bounded while a snapshot save or a
+        // fix budget is pending (the loop top fires them); a clean, idle
+        // session blocks freely. Either way the loop stays timer-free.
+        let deadline = session
+            .fix_deadline()
+            .into_iter()
+            .chain(session.flush_deadline())
+            .min();
+        let mut select = crossbeam_channel::Select::new();
+        let _intake = select.recv(&receiver);
+        let fix_done = select.recv(session.fix_mailbox());
+        let selected = match deadline {
+            None => select.select(),
             Some(deadline) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                match receiver.recv_timeout(remaining) {
-                    Ok(first) => first,
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => break,
+                match select.select_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(selected) => selected,
+                    // The loop top re-checks both deadlines: the save or
+                    // the expiry fires there. (A disconnect surfaces
+                    // through the selected operation's recv below.)
+                    Err(SelectTimeoutError) => continue,
                 }
             }
+        };
+        if selected.index() == fix_done {
+            // The mailbox never disconnects while the session lives — it
+            // owns the sender end, as does the worker holding the hosts.
+            let mail = selected
+                .recv(session.fix_mailbox())
+                .expect("the session owns the fix mailbox sender");
+            write_turn(&mut output, session.complete_fix(Some(mail)))?;
+            continue;
+        }
+        let first = match selected.recv(&receiver) {
+            Ok(first) => first,
+            Err(_) => break,
         };
 
         // The batch window: the reader forwards each buffered chunk as one
@@ -183,18 +206,11 @@ where
         }
 
         // The drain: staged writes apply, the coalesced read analyzes, and
-        // stale (cancelled) requests answer without a result.
-        let turn = session.service();
-        for publish in turn.publishes {
-            send_publish(&mut output, publish)?;
-        }
-        for (id, answer) in turn.answers {
-            let response = match answer {
-                Ok(result) => Response::ok(id, result),
-                Err(error) => answer_error(id, &error),
-            };
-            write_message(&mut output, &Message::Response(response))?;
-        }
+        // stale (cancelled) requests answer without a result. A completion
+        // that landed mid-batch answers right after (the slot may free and
+        // dispatch the next staged fix through the same drain).
+        write_turn(&mut output, session.service())?;
+        write_turn(&mut output, session.complete_fix(None))?;
     }
 
     // #306: the clean-shutdown write, window or no window.
@@ -347,18 +363,20 @@ fn handle_request(
                 Err(message) => Some(Response::error(Some(id), codes::INVALID_PARAMS, message)),
             }
         }
-        // The plugin-dispatch faces answer at intake too: their work is
-        // disk reads plus plugin-process requests (`request/fixes` under
-        // the manifests' budgets), never engine analysis — no scheduler
-        // task, no cancel surface. The session-owned host set launches at
-        // the first request that needs it; the session end shuts it down.
+        // The plugin-dispatch faces stage onto the scheduler like reads —
+        // the epoch machinery is their cancel surface — and run off the
+        // main loop at the drain: the plugin handshakes and the per-hit
+        // `request/fixes` round trips never hold the loop (PRD §14.3; the
+        // session module's fix-dispatch notes carry the full posture). Bad
+        // parameters still answer at intake; the answer itself arrives
+        // with the completion, preceded by one `dartq/fixProgress` notice.
         (Lifecycle::Ready, "dartq/fix") => {
             let params = request.params.unwrap_or(Value::Null);
-            Some(fix_response(session, &params, id))
+            fix_stage(session, &params, id)
         }
         (Lifecycle::Ready, "dartq/assists") => {
             let params = request.params.unwrap_or(Value::Null);
-            Some(assists_response(session, &params, id))
+            assists_stage(session, &params, id)
         }
         (Lifecycle::Ready, method) if commands::is_command(method) => {
             // Every `dartq/*` face queues onto the session's read task (the
@@ -456,11 +474,11 @@ fn resolve_path(root: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
-/// The `dartq/fix` intake dispatch: the §15.6 documents over the requested
-/// paths — built-in lint rows plus the plugin hosts' proposals, every row
-/// provenance-tagged, and the hosts' failures in `errors` when any host
-/// died. Paths resolve against the session workspace root.
-fn fix_response(session: &mut Session, params: &Value, id: jsonrpc::RequestId) -> Response {
+/// The `dartq/fix` intake: parameters decode and paths resolve against the
+/// session workspace root here (bad parameters answer `INVALID_PARAMS`
+/// immediately); the job stages onto the session's scheduler and the
+/// completion answers.
+fn fix_stage(session: &mut Session, params: &Value, id: jsonrpc::RequestId) -> Option<Response> {
     #[derive(Deserialize)]
     struct FixParams {
         paths: Vec<PathBuf>,
@@ -470,14 +488,14 @@ fn fix_response(session: &mut Session, params: &Value, id: jsonrpc::RequestId) -
     let invalid =
         |message: String| Response::error(Some(id.clone()), codes::INVALID_PARAMS, message);
     if let Err(message) = commands::reject_disk_view_only(params, "dartq/fix") {
-        return invalid(message);
+        return Some(invalid(message));
     }
     let decoded = match serde_json::from_value::<FixParams>(params.clone()) {
         Ok(decoded) => decoded,
-        Err(error) => return invalid(error.to_string()),
+        Err(error) => return Some(invalid(error.to_string())),
     };
     if decoded.paths.is_empty() {
-        return invalid("paths must be a non-empty array".into());
+        return Some(invalid("paths must be a non-empty array".into()));
     }
     let root = session.workspace_root().to_path_buf();
     let paths: Vec<PathBuf> = decoded
@@ -485,17 +503,24 @@ fn fix_response(session: &mut Session, params: &Value, id: jsonrpc::RequestId) -
         .into_iter()
         .map(|path| resolve_path(&root, path))
         .collect();
-    let hosts = session.fix_hosts();
-    match commands::fix_answer(&paths, decoded.verbosity, hosts) {
-        Ok(answer) => Response::ok(id, answer),
-        Err(error) => answer_error(id, &error),
-    }
+    session.queue_fix(
+        id,
+        FixJob::Fix {
+            paths,
+            verbosity: decoded.verbosity,
+        },
+    );
+    None
 }
 
-/// The `dartq/assists` intake dispatch: the plugin hosts' location-directed
-/// proposals for one file (`request/fixes` at `[offset, offset + length)`),
-/// anchored against the file's on-disk text.
-fn assists_response(session: &mut Session, params: &Value, id: jsonrpc::RequestId) -> Response {
+/// The `dartq/assists` intake: the same staging posture as `dartq/fix` —
+/// parameters decode and the path resolves at intake; the plugin hosts'
+/// location-directed proposals answer with the completion.
+fn assists_stage(
+    session: &mut Session,
+    params: &Value,
+    id: jsonrpc::RequestId,
+) -> Option<Response> {
     #[derive(Deserialize)]
     struct AssistsParams {
         path: PathBuf,
@@ -509,7 +534,7 @@ fn assists_response(session: &mut Session, params: &Value, id: jsonrpc::RequestI
     let invalid =
         |message: String| Response::error(Some(id.clone()), codes::INVALID_PARAMS, message);
     if let Err(message) = commands::reject_disk_view_only(params, "dartq/assists") {
-        return invalid(message);
+        return Some(invalid(message));
     }
     let root = session.workspace_root().to_path_buf();
     let decoded = match serde_json::from_value::<AssistsParams>(params.clone()) {
@@ -517,18 +542,18 @@ fn assists_response(session: &mut Session, params: &Value, id: jsonrpc::RequestI
             decoded.path = resolve_path(&root, decoded.path);
             decoded
         }
-        Err(error) => return invalid(error.to_string()),
+        Err(error) => return Some(invalid(error.to_string())),
     };
-    let hosts = session.fix_hosts();
-    match fix::assists(&decoded.path, decoded.offset, decoded.length, hosts) {
-        Ok(answer) => Response::ok(id, fix::assists_json(&answer, decoded.verbosity)),
-        Err(dartq_commands::discover::DiscoverError::Missing(path)) => {
-            invalid(format!("Directory or file doesn't exist: {path}"))
-        }
-        Err(dartq_commands::discover::DiscoverError::Io(io)) => {
-            Response::error(Some(id), codes::INTERNAL_ERROR, io.to_string())
-        }
-    }
+    session.queue_fix(
+        id,
+        FixJob::Assists {
+            path: decoded.path,
+            offset: decoded.offset,
+            length: decoded.length,
+            verbosity: decoded.verbosity,
+        },
+    );
+    None
 }
 
 /// Answers `initialize` with the negotiated capability set: the LSP surface
@@ -677,6 +702,26 @@ fn answer_error(id: jsonrpc::RequestId, error: &SessionError) -> Response {
 /// Notes a failed session call for an unanswerable notification.
 fn failed(method: &str, error: &SessionError) {
     eprintln!("dartq-daemon: {method} failed: {error}");
+}
+
+/// Writes one turn's output in contract order: publishes, then the turn's
+/// notifications (the fix progress notices ride the same pipeline), then
+/// the request answers.
+fn write_turn(output: &mut impl Write, turn: Turn) -> io::Result<()> {
+    for publish in turn.publishes {
+        send_publish(output, publish)?;
+    }
+    for notification in turn.notifications {
+        write_message(output, &Message::Notification(notification))?;
+    }
+    for (id, answer) in turn.answers {
+        let response = match answer {
+            Ok(result) => Response::ok(id, result),
+            Err(error) => answer_error(id, &error),
+        };
+        write_message(output, &Message::Response(response))?;
+    }
+    Ok(())
 }
 
 fn send_publish(output: &mut impl Write, publish: Publish) -> io::Result<()> {

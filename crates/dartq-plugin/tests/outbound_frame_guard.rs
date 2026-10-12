@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use dartq_diagnostics::{Diagnostic, Severity as EngineSeverity, SourceRange, URI_DOES_NOT_EXIST};
 use dartq_plugin::{
-    Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, MAX_FRAME_SIZE, ProtocolError,
+    MAX_FRAME_SIZE, Manifest, PluginRuntime, ProtocolError, RuntimeError, SpawnSpec, StdioPolicy,
 };
 use dartq_source::{FileId, FileTable};
 

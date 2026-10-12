@@ -136,8 +136,10 @@ pub fn run_overlaid<'a>(
     if !roots.is_empty() {
         // The lint rows ride the same severity face as the engine rows
         // (`analyzer.errors` re-levels and filters them identically — the
-        // engine pass already applied it to its own output).
-        let lint_rows = crate::lints::analyze_lints(engine, roots);
+        // engine pass already applied it to its own output). A one-shot
+        // run shares nothing across processes: a throwaway memo.
+        let lint_rows =
+            crate::lints::analyze_lints(engine, roots, &mut crate::lints::LintMemo::default());
         diagnostics.extend(engine.apply_severity_options(lint_rows));
         // The `undefined_lint` rows ride the same face: the lint registry
         // lives in dartq-lints (the engine holds no registry), so validity
@@ -203,7 +205,12 @@ mod tests {
 
     /// A hand-built diagnostic, identified by its message in the
     /// assertions; the engine never analyzes it.
-    fn diagnostic(severity: Severity, file: FileId, offset: u32, message: &str) -> Diagnostic {
+    fn diagnostic(
+        severity: Severity,
+        file: FileId,
+        offset: u32,
+        message: &'static str,
+    ) -> Diagnostic {
         Diagnostic::new(
             severity,
             CodeInfo::new(
@@ -247,7 +254,7 @@ mod tests {
             diagnostic(Severity::Error, a, 10, "alpha"),
         ];
         diagnostics.sort_by(|left, right| oracle_cmp(left, right, &layout));
-        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_ref()).collect();
         assert_eq!(messages, ["alpha", "beta", "gamma", "delta", "omega"]);
 
         std::fs::remove_dir_all(&root).ok();
@@ -275,7 +282,7 @@ mod tests {
         // yield is reduced to owned data inside its own scope.
         let hits = |diag: &[Diagnostic]| -> Vec<(u32, String)> {
             diag.iter()
-                .map(|d| (d.range.offset, d.message.clone()))
+                .map(|d| (d.range.offset, d.message.clone().into_owned()))
                 .collect()
         };
 
@@ -425,7 +432,7 @@ mod tests {
             .map(|d| {
                 (
                     run.layout.file_path(d.file).to_string_lossy().into_owned(),
-                    d.message.as_str(),
+                    d.message.as_ref(),
                     d.severity,
                     d.range.offset,
                 )

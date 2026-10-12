@@ -303,7 +303,11 @@ pub(crate) mod no_duplicate_case_values {
     /// folder over the syntax substrate — integer/string/bool/null
     /// literals, `+ - * ~/ %` and unary `-`, parentheses (64-bit wrapping
     /// integers, Dart `~/` truncation and `%` divisor-sign semantics),
-    /// descending through `ConstantPattern`/`ParenthesizedExpression`.
+    /// descending through `ConstantPattern`/`ParenthesizedExpression` and
+    /// the `CaseExpression` operand wrapper the fixed parse surface puts
+    /// around every legacy case operand (the bridge's parse posture is
+    /// patterns-on at every version, so the operand never sits bare under
+    /// the `SwitchCase`).
     /// Expressions outside the folder's grammar evaluate unknown and never
     /// dedupe — the documented under-report family (const identifiers,
     /// doubles, interpolation, adjacent strings, const constructors),
@@ -394,9 +398,9 @@ pub(crate) mod no_duplicate_case_values {
                 c.lexeme(c.head_token(expression)),
             )?)),
             NodeKind::StringLiteral => string_literal(c, expression),
-            NodeKind::ConstantPattern | NodeKind::ParenthesizedExpression => {
-                const_value(c, first_child(c, expression)?)
-            }
+            NodeKind::ConstantPattern
+            | NodeKind::ParenthesizedExpression
+            | NodeKind::CaseExpression => const_value(c, first_child(c, expression)?),
             NodeKind::UnaryPrefix => {
                 // The operator is the span head (collapse map §3.5,
                 // derivable-word0 face).

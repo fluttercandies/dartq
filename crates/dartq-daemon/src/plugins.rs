@@ -513,7 +513,7 @@ mod tests {
         }
     }
 
-    fn engine_row(file: FileId, message: &str) -> Diagnostic {
+    fn engine_row(file: FileId, message: &'static str) -> Diagnostic {
         Diagnostic::new(
             EngineSeverity::Warning,
             CodeInfo::new("test/row", "TEST_ROW", DiagnosticType::Tool, false),

@@ -23,6 +23,37 @@
 //! re-stamped with it so the publish diff still drains — an edit+cancel
 //! batch can never leave the client's diagnostics stale.
 //!
+//! # Fix dispatch off the main loop (PRD §14, §15.6)
+//!
+//! `dartq/fix` and `dartq/assists` stage like reads — one task per request
+//! on the default context's epoch, `Interactive` (a client waits) — so a
+//! cancel that advances the epoch voids them for free. At the drain the
+//! task does not run inline: the plugin handshakes and the per-hit
+//! `request/fixes` round trips (each bounded by the manifests' budgets,
+//! their sum unbounded) would hold the loop. The job moves to one worker
+//! thread (at most one at a time — the host set is one exclusive request
+//! surface); the main loop keeps serving edits, reads, publishes, and
+//! cancels, wakes on the worker's completion through a session-owned
+//! channel, and posts the answer then. A wall-clock budget
+//! ([`FIX_TIME_BUDGET`]) answers the request even when the worker is still
+//! running — the slow-plugin worst case degrades to one abandoned dispatch,
+//! never a wedged session; the late result is discarded when it lands. A
+//! `dartq/fixProgress` notification rides the turn's notification pipeline
+//! when the dispatch starts, so a client sees the work begin.
+//!
+//! The off-loop invariants: a fix job never blocks the select loop (the
+//! dispatch returns at the spawn — staging, the progress notice, and the
+//! completion drain are the loop's whole duty), and the completion drain
+//! ([`Session::complete_fix`] → `absorb_fix`) is the one mutation point
+//! for fix state: the worker only mails its [`FixMail`]; a cancel or the
+//! [`FIX_TIME_BUDGET`] expiry only flags the in-flight run, and a flagged
+//! run's late mail drops without answering. Ordering caveat: the epoch
+//! pins staging order, not worker execution — a running dispatch reads the
+//! workspace from disk through the plugin hosts, so its reads can
+//! interleave with the overlay writes of later batches; the answer
+//! reflects the disk state the worker observed, not the overlays a
+//! concurrent analysis sees.
+//!
 //! # Context routing (PRD §16.2)
 //!
 //! The runtime holds one context per declared `dartq.yaml` row (assembled
@@ -130,22 +161,25 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, unbounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use dartq_commands::Verbosity;
-use dartq_commands::fix::PluginHosts;
+use dartq_commands::discover::DiscoverError;
+use dartq_commands::fix::{self, PluginHosts};
 use dartq_commands::layout::{path_key, severity_rank};
+use dartq_commands::workspace::WorkspaceAdvisory;
 use dartq_diagnostics::{Diagnostic, FileId, Severity};
 use dartq_engine::{
     CancellationToken, Cancelled, ContextConfig, ContextId, Engine, EngineConfig, EngineError,
     OverlayChange, PersistedFacts, Runtime, Tier,
 };
 use rustc_hash::FxHashMap;
+use serde_json::json;
 use thiserror::Error;
 
 use dartq_snapshot::{SnapshotConfig, SnapshotStore};
 
 use crate::commands::{self, Request};
-use crate::jsonrpc::RequestId;
+use crate::jsonrpc::{Notification, RequestId};
 use crate::lsp;
 use crate::plugins::{self, PluginSet};
 use crate::uri;
@@ -197,6 +231,18 @@ const MAX_AGENTS: usize = 256;
 /// Small by design — a panic re-fires deterministically — and the count
 /// never resets, mirroring the transport's never-resetting restart budget.
 const PLUGIN_PANIC_LIMIT: u32 = 3;
+
+/// The wall-clock ceiling for one fix/assists dispatch (PRD §14.3's
+/// isolation posture at session granularity). The manifests' own budgets
+/// (`request_ms × (retries + 1)`, defaults 10 s × 4) bound each plugin
+/// round trip; their sum over N plugins × M hits is unbounded, so the
+/// session caps the whole dispatch: past the budget the request answers an
+/// internal error and the in-flight work is abandoned (its result is
+/// discarded when it lands — the host set still returns through the
+/// completion mail, so nothing leaks). Generous enough that only a
+/// genuinely wedged plugin set ever hits it; finite so the session never
+/// hangs on one.
+const FIX_TIME_BUDGET: Duration = Duration::from_secs(120);
 
 /// One agent's staged view (PRD §16.3): the files whose content the agent's
 /// requests see instead of the base view. Base bytes are never stored here —
@@ -264,6 +310,9 @@ pub struct Turn {
     /// Publishes from the turn's read task (a no-op diff when nothing
     /// changed).
     pub publishes: Vec<Publish>,
+    /// Server→client notifications the turn staged (the fix dispatch's
+    /// progress notice; the same pipeline the publishes ride).
+    pub notifications: Vec<Notification>,
     /// One entry per attached request; `Err` marks a request whose task was
     /// stale at the drain (cancelled) or whose parameters named no valid
     /// target, and produced nothing.
@@ -281,6 +330,97 @@ struct PendingRead {
     cookie: u64,
     requests: Vec<(RequestId, Request)>,
     tier: Tier,
+}
+
+/// The plugin-dispatch work one `dartq/fix`/`dartq/assists` request staged:
+/// the wire parameters, paths already resolved against the workspace root.
+#[derive(Debug)]
+pub(crate) enum FixJob {
+    /// The §15.6 patch documents over the requested paths (built-in lint
+    /// rows plus the hosts' proposals).
+    Fix {
+        paths: Vec<PathBuf>,
+        verbosity: Verbosity,
+    },
+    /// The hosts' location-directed proposals for one file.
+    Assists {
+        path: PathBuf,
+        offset: u64,
+        length: u64,
+        verbosity: Verbosity,
+    },
+}
+
+impl FixJob {
+    /// The wire method the job answers (the progress notice names it).
+    fn method(&self) -> &'static str {
+        match self {
+            Self::Fix { .. } => "dartq/fix",
+            Self::Assists { .. } => "dartq/assists",
+        }
+    }
+}
+
+/// One staged fix job: one request per task (the jobs share no work to
+/// coalesce), executed off the main loop at its drain.
+struct PendingFix {
+    id: RequestId,
+    job: FixJob,
+    /// The scheduler task's cookie (the drain report names tasks by it).
+    cookie: u64,
+}
+
+/// A fix dispatch in flight on its worker thread. The slot stays occupied
+/// until the worker's completion mail lands — even past the budget (the
+/// `expired` answer went out, but the host set is still owned by the
+/// worker, so the next dispatch must wait for it) — which is what keeps
+/// the hosts a single exclusive surface.
+struct FixRun {
+    id: RequestId,
+    deadline: Instant,
+    /// Set once the budget expiry answered; the late completion is then
+    /// discarded (no second answer for one request id).
+    expired: bool,
+    /// Set by a `$/cancelRequest` while the dispatch ran: the worker cannot
+    /// be stopped (it owns the host set), so the late completion drops and
+    /// the id answers `Cancelled` at the next drain.
+    cancelled: bool,
+}
+
+/// The worker's completion mail: the host set returns with the outcome.
+pub(crate) struct FixMail {
+    hosts: PluginHosts,
+    outcome: Result<serde_json::Value, SessionError>,
+}
+
+/// The worker-side execution of one fix job — the same faces the intake
+/// dispatch ran inline before the staging moved them off the main loop.
+fn run_fix_job(job: FixJob, hosts: &mut PluginHosts) -> Result<serde_json::Value, SessionError> {
+    match job {
+        FixJob::Fix { paths, verbosity } => commands::fix_answer(&paths, verbosity, hosts),
+        FixJob::Assists {
+            path,
+            offset,
+            length,
+            verbosity,
+        } => fix::assists(&path, offset, length, hosts)
+            .map(|answer| fix::assists_json(&answer, verbosity))
+            .map_err(|error| match error {
+                DiscoverError::Missing(path) => {
+                    SessionError::InvalidParams(format!("Directory or file doesn't exist: {path}"))
+                }
+                DiscoverError::Io(io) => SessionError::Io(io),
+            }),
+    }
+}
+
+/// The wire form of a request id (the progress notice carries it, so a
+/// client can match the notice to its request).
+fn id_value(id: &RequestId) -> serde_json::Value {
+    match id {
+        RequestId::Num(number) => json!(number),
+        RequestId::Str(text) => json!(text),
+    }
 }
 
 /// Debounced snapshot persistence state: dirty since the last overlay apply,
@@ -359,6 +499,12 @@ pub struct Session {
     /// Baseline for publish diffing: a push only goes out when a file's
     /// diagnostic set differs from what was last published for it.
     published: FxHashMap<dartq_diagnostics::FileId, Vec<lsp::Diagnostic>>,
+    /// The workspace assembly's stale-config advisory (#741), pre-built for
+    /// the publish channel and taken by the first drain: exactly one push
+    /// per session start, never part of the per-file diff baseline (the
+    /// config file is not an engine file, so no later cycle can reconcile
+    /// it away or republish it).
+    workspace_advisory: Option<Publish>,
     /// Per-agent overlay views (PRD §16.3), keyed by `agentId`. Bounded:
     /// cleared on `overlay.clear`/session end, capped at [`MAX_AGENTS`].
     agents: FxHashMap<String, AgentOverlay>,
@@ -379,6 +525,13 @@ pub struct Session {
     publishes_due: bool,
     /// The session symbol table (short-id economics, PRD §15.8).
     symbols: commands::SymbolTable,
+    /// The per-file lint-row memo (#772): rows keyed by content + features
+    /// + enable set + package facts + path, so a quiet turn's lint stage
+    /// answers unchanged files from memory and only parses the turn's
+    /// dirty set. One per session is sound: `ContentId` is the global
+    /// blake3-128 content hash, not per-context sequential, and every
+    /// other row input folds into the key — contexts cannot alias.
+    lint_memo: dartq_commands::lints::LintMemo,
     /// Shared-store contents at the last overlay-store sweep (the GC
     /// watermark).
     gc_watermark: usize,
@@ -404,11 +557,25 @@ pub struct Session {
     /// group-level containment bounds each panic to its own group; this
     /// ladder is the session-level answer to one that keeps coming back.
     plugin_path_panics: u32,
-    /// The `dartq/fix`/`dartq/assists` host set: lazily launched at the
-    /// first plugin-needing request (a session that never fixes never pays
-    /// the spawn handshakes). Session-owned so the graceful teardown covers
-    /// both plugin faces from one place.
+    /// The `dartq/fix`/`dartq/assists` host set: `None` until the first fix
+    /// worker launches it inside its thread (a session that never fixes
+    /// never pays the spawn handshakes, and the main loop never pays them
+    /// at all). The set travels into the worker at dispatch and returns
+    /// through the completion mail, so it stays one exclusive surface.
     fix_hosts: Option<PluginHosts>,
+    /// Staged fix jobs waiting for their drain (one task per request, on
+    /// the default context's epoch).
+    fixes: Vec<PendingFix>,
+    /// The fix dispatch currently running on its worker thread, if any.
+    /// One at a time — the host set is one exclusive request surface.
+    fix_running: Option<FixRun>,
+    /// The fix workers' completion channel. The session owns both ends:
+    /// workers get sender clones, the drain collects mails, and the main
+    /// loop selects on the receiver so a completion wakes it like intake
+    /// (a quiet client still gets its fix answer).
+    fix_done: (Sender<FixMail>, Receiver<FixMail>),
+    /// The dispatch budget (`FIX_TIME_BUDGET`; test seam overrides it).
+    fix_budget: Duration,
     snapshot: SnapshotSink,
 }
 
@@ -417,12 +584,18 @@ impl Session {
     /// (the CLI owns SDK and workspace discovery; the daemon is shell only)
     /// and opens the XDG-rooted snapshot store. A missing cache root only
     /// means no persistence (accelerator semantics), never a failed session.
+    /// `workspace_advisory` is the assembly's one stale-config advisory (#741);
+    /// when present, the session's first drain leads its publishes with the
+    /// advisory push.
     ///
     /// # Errors
     ///
     /// [`EngineError::PackageConfig`] when the config cannot back the
     /// URI-resolution table.
-    pub fn new(config: EngineConfig) -> Result<Self, EngineError> {
+    pub fn new(
+        config: EngineConfig,
+        workspace_advisory: Option<WorkspaceAdvisory>,
+    ) -> Result<Self, EngineError> {
         let store = match SnapshotStore::open(SnapshotConfig::default()) {
             Ok(store) => Some(store),
             Err(error) => {
@@ -430,7 +603,7 @@ impl Session {
                 None
             }
         };
-        Self::assemble(config, Vec::new(), store)
+        Self::assemble(config, Vec::new(), store, workspace_advisory)
     }
 
     /// [`Session::new`] with an explicit snapshot store (tests pin a
@@ -440,8 +613,12 @@ impl Session {
     ///
     /// [`EngineError::PackageConfig`] when the config cannot back the
     /// URI-resolution table.
-    pub fn with_store(config: EngineConfig, store: SnapshotStore) -> Result<Self, EngineError> {
-        Self::assemble(config, Vec::new(), Some(store))
+    pub fn with_store(
+        config: EngineConfig,
+        store: SnapshotStore,
+        workspace_advisory: Option<WorkspaceAdvisory>,
+    ) -> Result<Self, EngineError> {
+        Self::assemble(config, Vec::new(), Some(store), workspace_advisory)
     }
 
     /// [`Session::new`] plus declared contexts: `extra` names one context
@@ -454,7 +631,23 @@ impl Session {
     /// A request routes to a context by its `context` tag; the tagless
     /// default stays the base context. Equal configurations dedup to one
     /// runtime context (§16.1) — two tags may share one id, and a repeated
-    /// tag re-points at its later config.
+    /// tag re-points at its later config. Results differ from the default
+    /// exactly along the fork dimensions: an SDK, target, or declared
+    /// variable that changes resolution changes that context's diagnostics
+    /// (content itself is shared — a base write fans out to every
+    /// context).
+    ///
+    /// # Advisory ruling
+    ///
+    /// This constructor takes no [`WorkspaceAdvisory`], deliberately: the
+    /// advisory is produced by the shell's single-config workspace
+    /// resolution and forwarded by [`Session::new`] — the only production
+    /// face that builds sessions today (the CLI daemon shell has no
+    /// multi-context flag, so no caller reaches here holding an advisory).
+    /// When a multi-context shell face appears, it resolves its advisory
+    /// at the shell edge and passes it here — the session-start push (the
+    /// exactly-once take in [`Session::service`]) is the default view's
+    /// row and stays one per session.
     ///
     /// # Errors
     ///
@@ -468,13 +661,17 @@ impl Session {
     where
         I: IntoIterator<Item = (String, EngineConfig)>,
     {
-        Self::assemble(config, extra.into_iter().collect(), Some(store))
+        // Advisory ruling: none — see the doc above. The one production
+        // construction face (`new`) carries the advisory; this face gains
+        // the parameter when a multi-context shell appears.
+        Self::assemble(config, extra.into_iter().collect(), Some(store), None)
     }
 
     fn assemble(
         config: EngineConfig,
         extra: Vec<(String, EngineConfig)>,
         store: Option<SnapshotStore>,
+        workspace_advisory: Option<WorkspaceAdvisory>,
     ) -> Result<Self, EngineError> {
         let mut runtime = Runtime::new();
         // The contexts' workspace root (`config_dir` = root/.dart_tool) and
@@ -521,6 +718,31 @@ impl Session {
             }
             contexts.insert(tag, id);
         }
+        // The assembly's workspace advisory (#741: the stale-config row, or
+        // its #759 missing-config sibling), shaped for the publish channel:
+        // an INFO row anchored at the config path — the CLI analyze face's
+        // anchor — carrying the assembly's message. The empty range is the
+        // row's whole extent: the advisory names a file, not a span.
+        let workspace_advisory = workspace_advisory.map(|advisory| Publish {
+            uri: uri::from_path(advisory.config_path()),
+            version: None,
+            diagnostics: vec![lsp::Diagnostic {
+                range: lsp::Range {
+                    start: lsp::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                    end: lsp::Position {
+                        line: 0,
+                        character: 0,
+                    },
+                },
+                severity: 3,
+                code: advisory.code().name.to_owned(),
+                source: "dartq".into(),
+                message: advisory.message(),
+            }],
+        });
         // The plugin set spawns eagerly at assembly (PRD §14, #471 phase B):
         // the handshake completes before the first turn. An empty discovery
         // costs one directory walk and spawns nothing.
@@ -535,12 +757,14 @@ impl Session {
             next_cookie: 0,
             opened: FxHashMap::default(),
             published: FxHashMap::default(),
+            workspace_advisory,
             agents: FxHashMap::default(),
             worn: None,
             cursor: 0,
             changed: FxHashMap::default(),
             publishes_due: false,
             symbols: commands::SymbolTable::default(),
+            lint_memo: dartq_commands::lints::LintMemo::default(),
             gc_watermark: 0,
             staged: Vec::new(),
             write: None,
@@ -549,6 +773,10 @@ impl Session {
             plugins,
             plugin_path_panics: 0,
             fix_hosts: None,
+            fixes: Vec::new(),
+            fix_running: None,
+            fix_done: unbounded(),
+            fix_budget: FIX_TIME_BUDGET,
             snapshot: SnapshotSink {
                 store,
                 dirty: false,
@@ -748,6 +976,21 @@ impl Session {
         }
     }
 
+    /// `dartq/fix` / `dartq/assists`: stages one plugin-dispatch job on the
+    /// default context's epoch — the same read-task stamping the engine-view
+    /// faces take, `Interactive` (a client waits on the answer) — so a
+    /// cancel that advances the epoch voids it for free, and a batched write
+    /// still applies before it runs. The job executes off the main loop at
+    /// the drain (see the module's fix-dispatch notes); the parameters were
+    /// decoded and their paths resolved at intake.
+    pub(crate) fn queue_fix(&mut self, id: RequestId, job: FixJob) {
+        let cookie = self.next_cookie();
+        self.runtime
+            .enqueue(self.default_context, false, Tier::Interactive, cookie)
+            .expect("the default context lives for the session");
+        self.fixes.push(PendingFix { id, job, cookie });
+    }
+
     /// `dartq/overlay.set`: stages (merging per path) one agent's content
     /// deltas. Lazy — no analysis runs here; the next request naming the
     /// agent materializes the view. Bumps the delta cursor once.
@@ -882,22 +1125,50 @@ impl Session {
     /// (rust-analyzer cancels per id, not per batch). The coalesced read
     /// task is partitioned: the cancelled id answers `RequestCancelled` at
     /// the drain, while co-riding requests re-attach to a read task
-    /// re-stamped at the fresh epoch — mirroring the write re-stamp below.
-    /// When the cancelled request rode the default context and a write task
-    /// survives (staged, unobserved edits), the write re-stamps too and a
-    /// zero-request read joins it, so the publish diff the cancelled read
-    /// was carrying still runs. Cancels on other contexts' reads leave the
-    /// write alone — it rides the default context's epoch.
+    /// re-stamped at the fresh epoch. When the cancelled request rode the
+    /// default context, every task the bump voided re-stamps through
+    /// [`Session::restamp_default_tasks`] — the surviving read, the staged
+    /// write, and the staged fix jobs (a write survives too: a zero-request
+    /// read joins it, so the publish diff the cancelled read was carrying
+    /// still runs). Cancels on other contexts' reads re-stamp that context's
+    /// surviving read alone — its write and fix jobs ride the default
+    /// context's epoch, which the bump never touched.
     ///
     /// Cancelling an unknown or already-answered id is ignored (LSP
-    /// §cancelRequest). The staged overlay edits are *not* cancellable (LSP
-    /// notifications carry no ids).
+    /// §cancelRequest) — a duplicate cancel of a running dispatch whose
+    /// answer is still queued counts as already-answered. The staged overlay
+    /// edits are *not* cancellable (LSP notifications carry no ids).
     ///
     /// # Panics
     ///
     /// Never in practice: the re-stamps enqueue against open session
     /// contexts, which live for the session.
     pub fn cancel_request(&mut self, id: &RequestId) {
+        // A staged fix cancels like a read: the id answers `Cancelled`, the
+        // job never dispatches, and the epoch bump voids the default
+        // context's queued tasks — the survivors re-stamp below.
+        if let Some(position) = self.fixes.iter().position(|pending| pending.id == *id) {
+            self.fixes.remove(position);
+            self.cancelled.push(id.clone());
+            let _ = self.runtime.cancel(self.default_context);
+            self.restamp_default_tasks();
+            return;
+        }
+        // A running dispatch cannot be stopped (the worker owns the host
+        // set): the late completion drops and the id answers `Cancelled` at
+        // the next drain. One already answered past the budget is left
+        // alone, and so is a duplicate cancel of the still-queued answer —
+        // one entry in `cancelled` per id, or `service()` would answer it
+        // twice.
+        if let Some(run) = &mut self.fix_running {
+            if run.id == *id {
+                if !run.expired && !run.cancelled {
+                    run.cancelled = true;
+                    self.cancelled.push(id.clone());
+                }
+                return;
+            }
+        }
         let Some(read) = self
             .reads
             .iter()
@@ -914,27 +1185,74 @@ impl Session {
         let (cancelled, _) = pending.requests.remove(position);
         self.cancelled.push(cancelled);
         let _ = self.runtime.cancel(pending.context);
-        // Re-stamp the surviving work at the fresh epoch, keeping each
-        // task's tier — the stale (superseded) tasks drop at the drain.
-        let write_rides_cancel = self.write.is_some() && pending.context == self.default_context;
-        if write_rides_cancel {
-            let cookie = self.write.expect("checked above");
+        // The survivor read re-joins the queue before the re-stamp (its
+        // stale cookie is replaced there, its surviving requests kept); on
+        // the default context a zero-request read still joins, carrying the
+        // publish diff the cancelled read owned.
+        let context = pending.context;
+        let has_survivors = !pending.requests.is_empty();
+        if has_survivors || (context == self.default_context && self.write.is_some()) {
+            self.reads.push(pending);
+        }
+        if context == self.default_context {
+            // The bump voided every default-context stamp — the staged fix
+            // jobs' and the write's included. Left stamped at the dead
+            // epoch, a staged fix would drop silently at the drain: never
+            // dispatch, never start its budget, never answer, and hold its
+            // `fixes` entry forever. The shared restamp re-enqueues them
+            // all at the fresh epoch.
+            self.restamp_default_tasks();
+        } else if has_survivors {
+            // Other contexts' tasks keep their (still current) stamps; only
+            // the surviving read re-stamps, keeping its tier.
+            let index = self.reads.len() - 1;
+            let tier = self.reads[index].tier;
+            let cookie = self.next_cookie();
+            self.runtime
+                .enqueue(context, false, tier, cookie)
+                .expect("the read's context lives for the session; read re-stamp cannot fail");
+            self.reads[index].cookie = cookie;
+        }
+    }
+
+    /// Re-enqueues every default-context task still staged after a cancel
+    /// bumped the epoch — the surviving fix jobs, the coalesced read (its
+    /// requests and tier kept), and the pending write. The fresh stamps are
+    /// what lets them drain; the bump voided everything enqueued under the
+    /// old one. Other contexts' tasks keep their (still current) stamps.
+    ///
+    /// The single restamp authority for a default-context cancel: both
+    /// cancel arms (staged fix, coalesced read) route through here, so no
+    /// task class can be left holding a dead epoch's stamp.
+    fn restamp_default_tasks(&mut self) {
+        for mut pending in std::mem::take(&mut self.fixes) {
+            pending.cookie = self.next_cookie();
+            self.runtime
+                .enqueue(
+                    self.default_context,
+                    false,
+                    Tier::Interactive,
+                    pending.cookie,
+                )
+                .expect("the default context lives for the session; fix re-stamp cannot fail");
+            self.fixes.push(pending);
+        }
+        for index in 0..self.reads.len() {
+            if self.reads[index].context != self.default_context {
+                continue;
+            }
+            let cookie = self.next_cookie();
+            self.runtime
+                .enqueue(self.default_context, false, self.reads[index].tier, cookie)
+                .expect("the default context lives for the session; read re-stamp cannot fail");
+            self.reads[index].cookie = cookie;
+        }
+        if self.write.is_some() {
+            let cookie = self.next_cookie();
             self.runtime
                 .enqueue(self.default_context, true, Tier::Normal, cookie)
                 .expect("the default context lives for the session; write re-stamp cannot fail");
-        }
-        let survivors = pending.requests;
-        if !survivors.is_empty() || write_rides_cancel {
-            let cookie = self.next_cookie();
-            self.runtime
-                .enqueue(pending.context, false, pending.tier, cookie)
-                .expect("the read's context lives for the session; read re-stamp cannot fail");
-            self.reads.push(PendingRead {
-                context: pending.context,
-                cookie,
-                requests: survivors,
-                tier: pending.tier,
-            });
+            self.write = Some(cookie);
         }
     }
 
@@ -959,6 +1277,17 @@ impl Session {
     pub fn service(&mut self) -> Turn {
         let report = self.runtime.drain();
         let mut turn = Turn::default();
+        // Paths this turn's write removed (empty on every write-free turn):
+        // their publish-baseline entries drop once this turn's diff has run.
+        let mut removed: Vec<PathBuf> = Vec::new();
+        // The session-start advisory (#741): leads the first drain's
+        // publishes — the CLI faces render the advisory ahead of the rows —
+        // and `take` keeps it exactly-once. Every turn-producing path runs
+        // through here, so the push rides whichever intake wakes the loop
+        // first.
+        if let Some(advisory) = self.workspace_advisory.take() {
+            turn.publishes.push(advisory);
+        }
         // Cancelled requests were enqueued before every surviving task, so
         // their answers come first.
         turn.answers.extend(
@@ -990,11 +1319,20 @@ impl Session {
                         self.snapshot.note_apply();
                         self.cursor += 1;
                         for change in &changes {
-                            let path = match change {
-                                OverlayChange::Set { path, .. }
-                                | OverlayChange::Remove { path } => path,
-                            };
-                            self.changed.insert(path.clone(), self.cursor);
+                            match change {
+                                OverlayChange::Set { path, .. } => {
+                                    self.changed.insert(path.clone(), self.cursor);
+                                }
+                                OverlayChange::Remove { path } => {
+                                    // The file left the view: its delta cursor
+                                    // goes with it (a later re-creation
+                                    // re-inserts through the Set arm), and the
+                                    // path joins the turn's removals for the
+                                    // publish-baseline drop below.
+                                    self.changed.remove(path);
+                                    removed.push(path.clone());
+                                }
+                            }
                         }
                         self.publishes_due = true;
                     }
@@ -1016,6 +1354,27 @@ impl Session {
                         }
                     }
                 }
+            } else if let Some(position) = self
+                .fixes
+                .iter()
+                .position(|pending| pending.cookie == task.cookie)
+            {
+                // The fix job's epoch verified — its batch's writes applied
+                // before it. The job runs off the main loop (see the
+                // module's fix-dispatch notes): the dispatch moves to the
+                // worker when the single slot is free, and re-stages
+                // otherwise — it pops again at the next drain (the
+                // completion's or the next batch's) and dispatches then.
+                if self.fix_running.is_none() {
+                    let pending = self.fixes.remove(position);
+                    self.dispatch_fix(pending, &mut turn);
+                } else {
+                    let cookie = self.next_cookie();
+                    self.runtime
+                        .enqueue(self.default_context, false, Tier::Interactive, cookie)
+                        .expect("the default context lives for the session");
+                    self.fixes[position].cookie = cookie;
+                }
             } else {
                 let position = self
                     .reads
@@ -1024,6 +1383,21 @@ impl Session {
                     .expect("a drain-live read task is still pending");
                 let pending = self.reads.remove(position);
                 self.read_turn(pending, &mut turn);
+            }
+        }
+        // The turn's removals leave the publish baseline too: writes apply
+        // before reads, so this turn's diff already observed each removal —
+        // emitting the clearing push for a diagnosed file — and a file that
+        // no longer exists must not keep a baseline entry (watch churn would
+        // otherwise accumulate one per deleted file for the session's life).
+        // A turn without removals drops nothing.
+        for path in removed {
+            if let Some(file) = self
+                .engine(self.default_context)
+                .file_table()
+                .try_file_id(&path)
+            {
+                self.published.remove(&file);
             }
         }
         // Between turns the engine is base-resident: agent wears never
@@ -1049,17 +1423,141 @@ impl Session {
     /// Errors log inside; teardown quality never fails the session.
     pub fn shutdown_plugins(&mut self) {
         std::mem::take(&mut self.plugins).shutdown();
+        // A completion that landed before teardown reclaims the host set
+        // for the graceful handshake; one still in flight returns to a dead
+        // receiver and tears down kill-only when the worker finishes (every
+        // round trip is manifest-budgeted, so the worker is bounded).
+        if let Ok(mail) = self.fix_done.1.try_recv() {
+            self.fix_hosts = Some(mail.hosts);
+        }
         if let Some(hosts) = self.fix_hosts.take() {
             hosts.shutdown();
         }
     }
 
-    /// The live fix-face host set, launching it on first use (the
-    /// manifests' spawn + handshake cost lands on the first plugin-needing
-    /// request).
-    pub(crate) fn fix_hosts(&mut self) -> &mut PluginHosts {
-        self.fix_hosts
-            .get_or_insert_with(|| PluginHosts::launch(&self.workspace_root))
+    /// Moves one staged fix job onto the worker thread (the single
+    /// dispatch slot was free). The host set travels into the worker —
+    /// launched there on first use, so the main loop never pays the
+    /// handshakes — and returns through the completion mail. The progress
+    /// notice rides the turn's notification pipeline. A spawn refusal (only
+    /// under resource exhaustion) answers the request here: the failed
+    /// closure drops, tearing its host set down kill-only, and nothing ran.
+    fn dispatch_fix(&mut self, pending: PendingFix, turn: &mut Turn) {
+        let root = self.workspace_root.clone();
+        let done = self.fix_done.0.clone();
+        let id = pending.id.clone();
+        let method = pending.job.method();
+        let job = pending.job;
+        let hosts = self.fix_hosts.take();
+        let spawned = thread::Builder::new()
+            .name("dartq-fix".into())
+            .spawn(move || {
+                let mut hosts = hosts.unwrap_or_else(|| PluginHosts::launch(&root));
+                let outcome = run_fix_job(job, &mut hosts);
+                let _ = done.send(FixMail { hosts, outcome });
+            });
+        match spawned {
+            Ok(_) => {
+                turn.notifications.push(Notification::new(
+                    "dartq/fixProgress",
+                    json!({ "id": id_value(&id), "method": method }),
+                ));
+                self.fix_running = Some(FixRun {
+                    id,
+                    deadline: Instant::now() + self.fix_budget,
+                    expired: false,
+                    cancelled: false,
+                });
+            }
+            Err(error) => {
+                eprintln!("dartq-daemon: fix worker spawn failed: {error}");
+                turn.answers.push((
+                    id,
+                    Err(SessionError::Internal(
+                        "fix dispatch failed to start".into(),
+                    )),
+                ));
+            }
+        }
+    }
+
+    /// The fix dispatch's completion drain: fires the budget expiry,
+    /// collects the worker's mail (`mail` is the select-received one;
+    /// `try_recv` picks up any behind it), and — when a completion or the
+    /// expiry moved state — drains the session, so the answers flow, staged
+    /// work publishes, and the next staged fix dispatches. The quiet main
+    /// loop calls this with `None` every iteration; with nothing to do the
+    /// call is a no-op.
+    pub(crate) fn complete_fix(&mut self, mail: Option<FixMail>) -> Turn {
+        let mut turn = Turn::default();
+        let mut moved = false;
+        // The budget ceiling answers even though the worker still owns the
+        // hosts; the slot frees when the late mail lands (it is discarded —
+        // no second answer for one id).
+        if let Some(run) = &mut self.fix_running {
+            if !run.expired && Instant::now() >= run.deadline {
+                run.expired = true;
+                moved = true;
+                turn.answers.push((
+                    run.id.clone(),
+                    Err(SessionError::Internal(format!(
+                        "the fix dispatch exceeded its budget ({:?})",
+                        self.fix_budget
+                    ))),
+                ));
+            }
+        }
+        if let Some(mail) = mail {
+            self.absorb_fix(mail, &mut turn, &mut moved);
+        }
+        while let Ok(mail) = self.fix_done.1.try_recv() {
+            self.absorb_fix(mail, &mut turn, &mut moved);
+        }
+        if moved {
+            // The completion wakes the loop like a batch arrival: the drain
+            // flushes whatever staged (publishes, cancelled answers) and
+            // dispatches the next fix.
+            let drained = self.service();
+            turn.publishes.extend(drained.publishes);
+            turn.notifications.extend(drained.notifications);
+            turn.answers.extend(drained.answers);
+        }
+        turn
+    }
+
+    /// One completion mail: the host set comes home (the slot frees), and
+    /// the answer goes out unless the budget already answered it or the
+    /// client cancelled the request.
+    fn absorb_fix(&mut self, mail: FixMail, turn: &mut Turn, moved: &mut bool) {
+        *moved = true;
+        self.fix_hosts = Some(mail.hosts);
+        if let Some(run) = self.fix_running.take() {
+            if !run.expired && !run.cancelled {
+                turn.answers.push((run.id, mail.outcome));
+            }
+        }
+    }
+
+    /// The running dispatch's budget ceiling. `None` once the expiry
+    /// answered — nothing is left to time out, and the late mail wakes the
+    /// loop through the mailbox.
+    pub(crate) fn fix_deadline(&self) -> Option<Instant> {
+        self.fix_running
+            .as_ref()
+            .filter(|run| !run.expired)
+            .map(|run| run.deadline)
+    }
+
+    /// The fix workers' completion mailbox: the main loop selects on it
+    /// next to intake, so a completion wakes a quiet loop.
+    pub(crate) fn fix_mailbox(&self) -> &Receiver<FixMail> {
+        &self.fix_done.1
+    }
+
+    /// The dispatch budget seam (the slow-plugin tests shrink it).
+    #[cfg(test)]
+    fn set_fix_budget(&mut self, budget: Duration) {
+        self.fix_budget = budget;
     }
 
     /// Replaces the session's plugin set (test seam): lets a gate inject a
@@ -1254,13 +1752,20 @@ impl Session {
                 return;
             }
         };
-        // The lint stage (#355): the resident files' rows, one transient
-        // parse per file — joined before the severity-first sort so the
-        // answers keep the CLI analyze face's order.
+        // The lint stage (#355): the resident files' rows — memoized
+        // (#772), so a quiet turn parses only this turn's changed files —
+        // joined before the severity-first sort so the answers keep the
+        // CLI analyze face's order. The context engine reads through
+        // `runtime` directly so the memo field borrows disjointly.
         let lint_roots = [self.workspace_root().to_path_buf()];
+        let engine = self
+            .runtime
+            .context_state(context)
+            .expect("session contexts live for the session");
         diagnostics.extend(dartq_commands::lints::analyze_lints(
-            self.engine(context),
+            engine,
             &lint_roots,
+            &mut self.lint_memo,
         ));
         // The plugin weave (#471 phase B), on the publish-bearing group
         // only: the plugins feed once per base analysis — the editor's
@@ -1838,7 +2343,7 @@ impl Session {
             severity,
             code: diagnostic.code.name.to_owned(),
             source: "dartq".into(),
-            message: diagnostic.message.clone(),
+            message: diagnostic.message.clone().into_owned(),
         })
     }
 }
@@ -1939,6 +2444,8 @@ mod tests {
     use crate::commands::Request;
     use crate::test_fixtures::{BROKEN_MAIN, CLEAN_MAIN, Workspace, store_root};
     use dartq_commands::Verbosity;
+    use dartq_commands::workspace::StaleConfigAdvisory;
+    use dartq_pub::StaleReason;
     use dartq_snapshot::DEFAULT_CAPACITY_BYTES;
 
     /// A session over a throwaway workspace with a throwaway snapshot root.
@@ -1954,8 +2461,90 @@ mod tests {
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
         })
         .expect("store opens on a temp root");
-        let session = Session::with_store(workspace.engine_config(), store).expect("session");
+        let session = Session::with_store(workspace.engine_config(), store, None).expect("session");
         (workspace, session)
+    }
+
+    /// The stale-config advisory (#741): a session assembled with the
+    /// advisory leads its first drain with exactly one publish anchored at
+    /// the config path — INFO severity, the dartq/* code, the assembly's
+    /// message, no version (the config file is never client-opened) — and
+    /// no later drain repeats it; an assembly without the advisory never
+    /// publishes the config URI.
+    #[test]
+    fn stale_config_advisory_publishes_once_at_session_start() {
+        let workspace = Workspace::new(BROKEN_MAIN);
+        let config_path = workspace.path(".dart_tool/package_config.json");
+        let advisory = WorkspaceAdvisory::Stale(StaleConfigAdvisory {
+            reasons: vec![StaleReason::MissingLockFile],
+            config_path: config_path.clone(),
+        });
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("stale-advisory-stale")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session =
+            Session::with_store(workspace.engine_config(), store, Some(advisory)).expect("session");
+
+        session.sweep().expect("sweep");
+        let turn = session.service();
+        let config_uri = uri::from_path(&config_path);
+        let pushes: Vec<_> = turn
+            .publishes
+            .iter()
+            .filter(|push| push.uri == config_uri)
+            .collect();
+        assert_eq!(pushes.len(), 1, "exactly one advisory push");
+        assert_eq!(
+            turn.publishes[0].uri, config_uri,
+            "the advisory leads the turn's publishes"
+        );
+        let push = pushes[0];
+        assert_eq!(push.version, None, "the config file is not client-opened");
+        assert_eq!(push.diagnostics.len(), 1, "one advisory row");
+        let row = &push.diagnostics[0];
+        assert_eq!(row.severity, 3, "INFO — the registry row's severity");
+        assert_eq!(row.code, "dartq/package_config_out_of_date");
+        assert_eq!(row.source, "dartq");
+        assert_eq!(row.range.start.line, 0, "the row names a file, not a span");
+        assert!(
+            row.message.contains("pubspec.lock is missing"),
+            "the message carries the assembly's reasons: {}",
+            row.message
+        );
+
+        // The push is exactly-once: a later drain (a fresh analyze turn)
+        // never carries the config URI again.
+        session.queue_command(
+            RequestId::Num(1),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.publishes.iter().all(|push| push.uri != config_uri),
+            "the advisory never republishes"
+        );
+
+        // The fresh face: without the advisory, no config-URI push ever.
+        let fresh = Workspace::new(BROKEN_MAIN);
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("stale-advisory-fresh")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session = Session::with_store(fresh.engine_config(), store, None).expect("session");
+        session.sweep().expect("sweep");
+        let turn = session.service();
+        let fresh_uri = uri::from_path(&fresh.path(".dart_tool/package_config.json"));
+        assert!(
+            turn.publishes.iter().all(|push| push.uri != fresh_uri),
+            "a fresh assembly never publishes the advisory"
+        );
     }
 
     /// Writer priority (PRD §16.5), deterministically: two `dartq/analyze`
@@ -2151,6 +2740,512 @@ mod tests {
             .as_array()
             .expect("diagnostics array");
         assert!(entries.is_empty(), "post-write view: {entries:?}");
+    }
+
+    /// The fix dispatch leaves the main loop (the #682 P2 residual): the
+    /// drain stages the dispatch — one `dartq/fixProgress` notice, no
+    /// answer — and the answer arrives through the completion drain, after
+    /// which the host set is home and the slot is free.
+    #[test]
+    fn fix_stages_at_drain_and_answers_at_completion() {
+        let (workspace, mut session) = fixture("fix-stage-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        session.queue_fix(
+            RequestId::Num(2),
+            FixJob::Fix {
+                paths: vec![main],
+                verbosity: Verbosity::Compact,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.answers.is_empty(),
+            "the dispatch never holds the drain: {:?}",
+            turn.answers
+        );
+        assert_eq!(turn.notifications.len(), 1, "one progress notice");
+        assert_eq!(turn.notifications[0].method, "dartq/fixProgress");
+        assert_eq!(
+            turn.notifications[0].params.as_ref().expect("params")["id"].as_i64(),
+            Some(2),
+            "the notice names its request"
+        );
+        assert!(session.fix_running.is_some(), "the slot is owned");
+
+        let turn = wait_fix(&mut session);
+        let [(id, answer)] = turn.answers.as_slice() else {
+            panic!("one answer: {:?}", turn.answers);
+        };
+        assert_eq!(*id, RequestId::Num(2));
+        let answer = answer.as_ref().expect("the fix answers");
+        assert_eq!(
+            answer["schema_version"],
+            serde_json::json!(commands::SCHEMA_VERSION)
+        );
+        assert!(answer["files"].is_array(), "the patch document: {answer}");
+        assert!(session.fix_running.is_none(), "the mail freed the slot");
+        assert!(session.fix_hosts.is_some(), "the host set came home");
+    }
+
+    /// Cancelling a staged fix voids it like a read (the epoch bump is the
+    /// free cancel) while the co-rider sharing the batch still answers —
+    /// the cancel's re-stamp kept it.
+    #[test]
+    fn cancel_voids_a_staged_fix_but_not_its_co_riders() {
+        let (workspace, mut session) = fixture("fix-cancel-unit");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        session.queue_fix(
+            RequestId::Num(2),
+            FixJob::Fix {
+                paths: vec![workspace.path("lib/main.dart")],
+                verbosity: Verbosity::Compact,
+            },
+        );
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        session.cancel_request(&RequestId::Num(2));
+        let turn = session.service();
+
+        assert_eq!(turn.answers.len(), 2, "fix cancelled, analyze alive");
+        assert_eq!(turn.answers[0].0, RequestId::Num(2));
+        assert!(
+            matches!(turn.answers[0].1, Err(SessionError::Cancelled)),
+            "the staged fix answers cancelled: {:?}",
+            turn.answers[0]
+        );
+        assert_eq!(turn.answers[1].0, RequestId::Num(3));
+        assert!(
+            turn.answers[1].1.is_ok(),
+            "the co-rider survived the re-stamp: {:?}",
+            turn.answers[1]
+        );
+        assert!(
+            turn.notifications.is_empty(),
+            "no dispatch, no progress notice"
+        );
+        assert!(session.fix_running.is_none());
+        assert!(session.fixes.is_empty(), "the job left with the cancel");
+    }
+
+    /// Cancelling a read that co-rides a staged fix on the default context
+    /// must not orphan the fix: the epoch bump voids the fix job's stamp
+    /// too (it rides the same context), so the shared re-stamp has to cover
+    /// it — otherwise the job drops at the drain with its cookie dead
+    /// (never dispatches, never answers, holds its `fixes` entry forever).
+    #[test]
+    fn cancel_of_a_co_riding_read_keeps_the_staged_fix_alive() {
+        let (workspace, mut session) = fixture("fix-read-cancel-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        session.queue_fix(
+            RequestId::Num(2),
+            FixJob::Fix {
+                paths: vec![main],
+                verbosity: Verbosity::Compact,
+            },
+        );
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        session.cancel_request(&RequestId::Num(3));
+        assert_eq!(
+            session.fixes.len(),
+            1,
+            "the cancel targeted the analyze, not the fix"
+        );
+        let turn = session.service();
+
+        // The cancelled analyze answers; the fix dispatched at the same
+        // drain (the progress notice is the dispatch's signature).
+        assert_eq!(
+            turn.answers.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            [&RequestId::Num(3)],
+            "the cancelled analyze: {:?}",
+            turn.answers
+        );
+        assert!(matches!(turn.answers[0].1, Err(SessionError::Cancelled)));
+        assert_eq!(
+            turn.notifications.len(),
+            1,
+            "the fix survived the read cancel: {:?}",
+            turn.notifications
+        );
+        assert!(session.fix_running.is_some(), "the job is on the worker");
+
+        let turn = wait_fix(&mut session);
+        let [(id, answer)] = turn.answers.as_slice() else {
+            panic!("one answer: {:?}", turn.answers);
+        };
+        assert_eq!(*id, RequestId::Num(2));
+        assert!(
+            answer.as_ref().is_ok_and(|value| value["files"].is_array()),
+            "the re-stamped fix answers: {answer:?}"
+        );
+        assert!(session.fixes.is_empty(), "the job left with the dispatch");
+    }
+
+    /// A duplicate cancel of a running dispatch is ignored (LSP
+    /// §cancelRequest's already-answered rule): the first cancel queued the
+    /// answer, the second must not queue another — two `Cancelled` answers
+    /// for one id would violate JSON-RPC.
+    #[test]
+    fn double_cancel_of_a_running_dispatch_answers_once() {
+        let (workspace, mut session) = fixture("fix-double-cancel-unit");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        session.queue_fix(
+            RequestId::Num(2),
+            FixJob::Fix {
+                paths: vec![workspace.path("lib/main.dart")],
+                verbosity: Verbosity::Compact,
+            },
+        );
+        let turn = session.service();
+        assert!(turn.answers.is_empty());
+        assert!(session.fix_running.is_some(), "the dispatch is running");
+
+        session.cancel_request(&RequestId::Num(2));
+        session.cancel_request(&RequestId::Num(2));
+        let turn = session.service();
+        assert_eq!(
+            turn.answers.len(),
+            1,
+            "one cancel, one answer: {:?}",
+            turn.answers
+        );
+        assert_eq!(turn.answers[0].0, RequestId::Num(2));
+        assert!(matches!(turn.answers[0].1, Err(SessionError::Cancelled)));
+
+        // The worker's late completion drops (the run was cancelled): the
+        // slot frees without a second answer for the id.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while session.fix_running.is_some() {
+            assert!(Instant::now() < deadline, "the dispatch never finished");
+            let turn = session.complete_fix(None);
+            assert!(
+                turn.answers.is_empty(),
+                "a cancelled dispatch never answers: {:?}",
+                turn.answers
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(session.fix_hosts.is_some(), "the host set came home");
+    }
+
+    /// A single cancel of a running dispatch mirrors the budget-expiry
+    /// path end to end: exactly one `Cancelled` answer at the next drain,
+    /// an empty follow-up drain (one cancel, one answer), a read staged in
+    /// the same window answers untouched — this cancel arm never bumps the
+    /// epoch, so nothing re-stamps — and the abandoned worker's late mail
+    /// drops with the host set coming home.
+    #[test]
+    fn cancel_of_a_running_dispatch_answers_once_and_keeps_co_riders() {
+        let (workspace, mut session) = fixture("fix-run-cancel-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // The dispatch leaves the loop; the cancel lands while the worker
+        // owns the slot.
+        session.queue_fix(
+            RequestId::Num(2),
+            FixJob::Fix {
+                paths: vec![main],
+                verbosity: Verbosity::Compact,
+            },
+        );
+        let turn = session.service();
+        assert!(turn.answers.is_empty(), "{:?}", turn.answers);
+        assert!(session.fix_running.is_some(), "the dispatch is running");
+        session.cancel_request(&RequestId::Num(2));
+
+        // A read queued in the same window keeps its stamp (no epoch bump
+        // on this arm) and answers alongside the cancelled id.
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert_eq!(
+            turn.answers.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            [&RequestId::Num(2), &RequestId::Num(3)],
+            "the cancelled id first, the untouched read after: {:?}",
+            turn.answers
+        );
+        assert!(matches!(turn.answers[0].1, Err(SessionError::Cancelled)));
+        assert!(
+            turn.answers[1].1.is_ok(),
+            "the read never re-stamped, never lost: {:?}",
+            turn.answers[1]
+        );
+        let turn = session.service();
+        assert!(
+            turn.answers.is_empty(),
+            "one cancel, one answer — no duplicate: {:?}",
+            turn.answers
+        );
+
+        // The late mail drops (the run was cancelled): the slot frees
+        // without a second answer, and the host set comes home.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while session.fix_running.is_some() {
+            assert!(Instant::now() < deadline, "the dispatch never finished");
+            let turn = session.complete_fix(None);
+            assert!(
+                turn.answers.is_empty(),
+                "a cancelled dispatch never answers: {:?}",
+                turn.answers
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(session.fix_hosts.is_some(), "the host set came home");
+    }
+
+    /// One dispatch at a time: a fix staging while the slot is owned
+    /// re-stages at its drain (no second dispatch), and the completion
+    /// drain frees the slot, answers the first, and dispatches the second.
+    #[test]
+    fn fix_dispatches_serialize_on_the_single_slot() {
+        let (workspace, mut session) = fixture("fix-serialize-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        session.queue_fix(
+            RequestId::Num(2),
+            FixJob::Fix {
+                paths: vec![main.clone()],
+                verbosity: Verbosity::Compact,
+            },
+        );
+        let turn = session.service();
+        assert_eq!(turn.notifications.len(), 1, "the first job dispatches");
+
+        // The second fix stages while the slot is owned: its drain
+        // re-stages it — no dispatch, no answer.
+        session.queue_fix(
+            RequestId::Num(3),
+            FixJob::Fix {
+                paths: vec![main],
+                verbosity: Verbosity::Compact,
+            },
+        );
+        let turn = session.service();
+        assert!(turn.answers.is_empty(), "{:?}", turn.answers);
+        assert!(
+            turn.notifications.is_empty(),
+            "the second job waits for the slot"
+        );
+
+        // The completion frees the slot: the drain rides the same wake,
+        // answers the first job, and dispatches the second.
+        let turn = wait_fix(&mut session);
+        assert_eq!(turn.answers.len(), 1);
+        assert_eq!(turn.answers[0].0, RequestId::Num(2));
+        assert_eq!(
+            turn.notifications.len(),
+            1,
+            "the second job dispatches at the completion"
+        );
+
+        let turn = wait_fix(&mut session);
+        assert_eq!(turn.answers.len(), 1);
+        assert_eq!(turn.answers[0].0, RequestId::Num(3));
+    }
+
+    /// Spins the completion drain until the in-flight dispatch's answer
+    /// lands (the worker is off-loop; its mail takes a thread hop).
+    fn wait_fix(session: &mut Session) -> Turn {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let turn = session.complete_fix(None);
+            if !turn.answers.is_empty() {
+                return turn;
+            }
+            assert!(Instant::now() < deadline, "the fix completion never landed");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The slow-plugin worst case (the #682 P2 acceptance): a plugin that
+    /// stalls far past the dispatch budget still cannot wedge the session —
+    /// the budget answers while the worker runs, reads keep serving, the
+    /// abandoned worker's late mail drops without a second answer, the host
+    /// set comes home, and the next fix dispatches normally. Runs only with
+    /// a `dart` on PATH (the live fixture needs one, like the plugin crate's
+    /// `callback_timeout` suite).
+    #[test]
+    fn fix_budget_answers_a_slow_plugin_and_the_session_survives() {
+        let dart = std::process::Command::new("dart")
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !dart {
+            println!("skipping: no `dart` on PATH, the live fixture cannot run");
+            return;
+        }
+        let host = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dartq-plugin-host");
+        let (workspace, mut session) = fixture("fix-budget-unit");
+        session.set_fix_budget(Duration::from_millis(300));
+
+        // plugins/slow: the shared slow_plugin.dart fixture (a normal
+        // handshake, then a 30 s stall per `request/fixes`). The manifest's
+        // own request budget (2 s, no retries) is what ends the abandoned
+        // worker; the session budget (300 ms) is what answers the client.
+        let plugin = workspace.root.join("plugins/slow");
+        fs::create_dir_all(plugin.join("bin")).expect("plugin bin");
+        fs::write(
+            plugin.join("dartq_plugin.json"),
+            r#"{"name": "slow", "version": "0.1.0", "entrypoint": "bin/slow_plugin.dart",
+                "capabilities": ["lint", "fix"],
+                "timeouts": {"callback_ms": 500, "request_ms": 2000, "request_retries": 0}}"#,
+        )
+        .expect("manifest");
+        fs::write(
+            plugin.join("bin/slow_plugin.dart"),
+            include_str!("../../dartq-plugin-host/bin/slow_plugin.dart"),
+        )
+        .expect("fixture script");
+        // The plugin's `dart` process resolves packages by walking up to
+        // the workspace root's config — extend it with the host package.
+        let host_uri = fs::canonicalize(&host).expect("host package exists");
+        fs::write(
+            workspace.root.join(".dart_tool/package_config.json"),
+            format!(
+                r#"{{"configVersion": 2, "packages": [
+                    {{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}},
+                    {{"name": "dartq_plugin_host", "rootUri": "file://{}", "packageUri": "lib/", "languageVersion": "3.10"}}]}}"#,
+                host_uri.display()
+            ),
+        )
+        .expect("package config");
+        // One lint hit on the face's target (`camel_case_types`, in the
+        // default package:lints core set) is what schedules the
+        // `request/fixes` round trip the plugin stalls in — the seeded
+        // BROKEN_MAIN carries only an engine diagnostic, and with zero
+        // lint hits the worker finishes at process-startup speed, answering
+        // before the budget ever fires.
+        fs::write(
+            workspace.path("lib/main.dart"),
+            "class a {}\nvoid main() {}\n",
+        )
+        .expect("lint-hit target");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        session.queue_fix(
+            RequestId::Num(2),
+            FixJob::Fix {
+                paths: vec![workspace.path("lib/main.dart")],
+                verbosity: Verbosity::Compact,
+            },
+        );
+        let turn = session.service();
+        assert_eq!(
+            turn.notifications.len(),
+            1,
+            "the dispatch leaves the loop: {:?}",
+            turn.notifications
+        );
+
+        // The budget answers while the worker still owns the hosts.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let budget_answered = loop {
+            let turn = session.complete_fix(None);
+            if let [(_, answer)] = turn.answers.as_slice() {
+                break matches!(answer,
+                    Err(SessionError::Internal(message)) if message.contains("budget"));
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the budget expiry never answered"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            budget_answered,
+            "the budget expiry answers an internal error naming the budget"
+        );
+
+        // The loop keeps serving reads while the dispatch lingers.
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.answers[0].1.is_ok(),
+            "the session is not wedged: {:?}",
+            turn.answers
+        );
+
+        // The abandoned worker finishes (its manifest's request budget
+        // kills the stall), the late mail drops, the hosts come home, and
+        // the next fix dispatches normally.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while session.fix_running.is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "the abandoned dispatch never finished"
+            );
+            let _ = session.complete_fix(None);
+            thread::sleep(Duration::from_millis(50));
+        }
+        session.queue_fix(
+            RequestId::Num(4),
+            FixJob::Fix {
+                paths: vec![workspace.path("lib/main.dart")],
+                verbosity: Verbosity::Compact,
+            },
+        );
+        let turn = session.service();
+        assert_eq!(
+            turn.notifications.len(),
+            1,
+            "the host set serves again: {:?}",
+            turn.notifications
+        );
+        let turn = wait_fix(&mut session);
+        assert_eq!(turn.answers[0].0, RequestId::Num(4));
+        assert!(
+            turn.answers[0].1.is_ok(),
+            "the follow-up fix answers: {:?}",
+            turn.answers
+        );
     }
 
     /// Cancel partitions the coalesced read per id: the cancelled request
@@ -2394,6 +3489,73 @@ mod tests {
             turn.publishes
         );
         assert_eq!(turn.answers.len(), 1, "only the request ran");
+    }
+
+    /// Pin for the removal face of the two per-file tables: a removed file's
+    /// publish-baseline entry (`published`) and delta cursor (`changed`)
+    /// drop at the removal turn — watch churn must not accumulate per-file
+    /// entries for the session's life. The diagnosed file's clearing push
+    /// still rides the removal turn's diff (the baseline drops only after
+    /// it), and a turn without removals leaves both tables untouched.
+    #[test]
+    fn removal_drops_the_publish_baseline_and_delta_cursor() {
+        let (workspace, mut session) = fixture("removal-drop-unit");
+        let main = workspace.path("lib/main.dart");
+        let extra = workspace.path("lib/extra.dart");
+
+        session.sweep().expect("sweep");
+        let turn = session.service();
+        assert_eq!(turn.publishes.len(), 1, "the seeded error publishes");
+
+        let main_file = session
+            .engine(session.default_context)
+            .file_table()
+            .try_file_id(&main)
+            .expect("the seeded file is interned");
+        assert!(
+            session
+                .published
+                .get(&main_file)
+                .is_some_and(|rows| !rows.is_empty()),
+            "the diagnosed file holds a non-empty baseline"
+        );
+
+        // A watch-written file enters the delta cursor (the sweep alone
+        // never touches it — only explicit writes do).
+        fs::write(&extra, CLEAN_MAIN).expect("create on disk");
+        session.queue_disk_changes(&[extra.clone()]);
+        let _ = session.service();
+        assert!(
+            session.changed.contains_key(&extra),
+            "the explicit write gained a cursor"
+        );
+
+        // Deleting both in one turn: the diagnosed file's clearing push
+        // rides the diff, then both removed entries leave their tables.
+        fs::remove_file(&main).expect("delete on disk");
+        fs::remove_file(&extra).expect("delete on disk");
+        session.queue_disk_changes(&[main.clone(), extra.clone()]);
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the clearing push for the diagnosed file: {:?}",
+            turn.publishes
+        );
+        assert!(turn.publishes[0].diagnostics.is_empty());
+        assert!(
+            !session.changed.contains_key(&extra),
+            "the removed path left the delta cursor"
+        );
+        assert!(
+            session
+                .engine(session.default_context)
+                .file_table()
+                .try_file_id(&main)
+                .is_some_and(|file| !session.published.contains_key(&file)),
+            "the removed file's id stays interned (the engine never forgets) \
+             while its publish baseline entry is gone"
+        );
     }
 
     /// Re-discovery, additions: a file created after `initialized` and
@@ -4182,7 +5344,8 @@ mod tests {
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
         })
         .expect("store opens on a temp root");
-        let mut session = Session::with_store(workspace.engine_config(), store).expect("session");
+        let mut session =
+            Session::with_store(workspace.engine_config(), store, None).expect("session");
 
         session.sweep().expect("sweep");
         let _ = session.service();

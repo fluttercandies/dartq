@@ -33,7 +33,7 @@ fn silent_child_burns_the_handshake_budget_into_the_typed_timeout() {
     });
     let error = outcome.expect_err("a silent child cannot complete the handshake");
     assert!(
-        matches!(&error, RuntimeError::HandshakeTimeout { ms } if *ms == 500),
+        matches!(&error, RuntimeError::HandshakeTimeout { ms, .. } if *ms == 500),
         "the typed timeout with the enforced budget surfaces, got {error:?}"
     );
     // Three attempts (initial + 2 retries) cost 3 x 500 ms of budget; the

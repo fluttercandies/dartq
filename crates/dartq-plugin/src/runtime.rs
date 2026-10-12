@@ -58,7 +58,10 @@
 //! thread owns the child's stdin
 //! and is the only process writing to it — the handle (`&mut self`) feeds it
 //! frames and awaits per-write acks, which bounds every write without ever
-//! blocking the handle on a full pipe. All shared counters are atomics; the
+//! blocking the handle on a full pipe. Under [`StdioPolicy::Capture`] (the
+//! default) a stderr drain thread keeps the child's stderr pipe empty and
+//! feeds the bounded startup capture, whose text folds into the surfaced
+//! startup-failure error. All shared counters are atomics; the
 //! only cross-thread locks are the three leaf mutexes (session, pending,
 //! child) and the death slot, never nested.
 //!
@@ -72,11 +75,11 @@
 //! - `feed` skips unknown [`FileId`]s (a caller-contract violation, same
 //!   posture as `FileLayoutProvider`) rather than failing a whole batch.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -100,6 +103,18 @@ use crate::stats::{PluginStats, PluginStatsSnapshot};
 
 /// How often the isolation monitor samples the child's RSS.
 const RSS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Cap on the captured startup stderr: only the tail (the last
+/// [`STDERR_CAPTURE_CAP`] bytes) is retained — the end of a failing host's
+/// output is what names the failure (the fatal exception, the pub resolution
+/// error) — and a bounded capture cannot grow with a chatty host however
+/// long the startup takes.
+const STDERR_CAPTURE_CAP: usize = 8 * 1024;
+
+/// Read-chunk size of the stderr drain thread: large enough for a burst,
+/// small enough that the capture bound dominates the thread's transient
+/// memory.
+const STDERR_READ_CHUNK: usize = 4096;
 
 /// Teardown join bound: how long a generation teardown waits for the reader
 /// or writer after the kill before detaching it. After a kill the threads
@@ -161,16 +176,23 @@ pub struct SpawnSpec {
     pub current_dir: PathBuf,
     /// The parsed manifest: capabilities and §14.3 budgets.
     pub manifest: Manifest,
-    /// Where the child's stderr goes; `Null` keeps a chatty plugin from
-    /// filling an unread pipe.
+    /// Where the child's stderr goes; the default captures it into a bounded
+    /// startup buffer so a startup failure surfaces with the host's own
+    /// error output instead of a bare "host died".
     pub stderr: StdioPolicy,
 }
 
 /// The stderr routing of the plugin process.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StdioPolicy {
-    /// Discard (default; an unread pipe could block the plugin).
+    /// Capture into a bounded startup buffer (default): a dedicated drain
+    /// thread keeps the pipe empty — a chatty plugin can never block on a
+    /// full unread pipe — and the captured tail backs the startup-failure
+    /// error text; once the handshake succeeds the capture is discarded and
+    /// the thread keeps only draining.
     #[default]
+    Capture,
+    /// Discard unconditionally.
     Null,
     /// Pass through to dartq's own stderr (tests, debugging).
     Inherit,
@@ -179,9 +201,10 @@ pub enum StdioPolicy {
 impl StdioPolicy {
     fn stdio(self) -> Stdio {
         match self {
+            Self::Capture => Stdio::piped(),
+            Self::Null => Stdio::null(),
             // `stderr()` is the process handle; `Stdio::inherit()` needs the
             // raw fd — both route to the same stream.
-            Self::Null => Stdio::null(),
             Self::Inherit => Stdio::inherit(),
         }
     }
@@ -197,7 +220,7 @@ impl SpawnSpec {
             args: vec![manifest.entrypoint.clone()],
             current_dir: plugin_dir.to_path_buf(),
             manifest,
-            stderr: StdioPolicy::Null,
+            stderr: StdioPolicy::Capture,
         }
     }
 }
@@ -217,10 +240,14 @@ pub enum RuntimeError {
         source: std::io::Error,
     },
     /// The plugin did not answer `initialize` within the request budget.
-    #[error("plugin handshake timed out after {ms} ms")]
+    #[error("plugin handshake timed out after {ms} ms{}", stderr_note(stderr))]
     HandshakeTimeout {
         /// The enforced budget in milliseconds.
         ms: u64,
+        /// The host's stderr captured during the failed startup (empty when
+        /// the host wrote nothing or the policy was not
+        /// [`StdioPolicy::Capture`]).
+        stderr: String,
     },
     /// `shutdown` was answered neither in time nor at all.
     #[error("plugin shutdown timed out after {ms} ms")]
@@ -356,6 +383,91 @@ impl PendingDiagnostics {
     }
 }
 
+/// Bounded tail-of-stderr sink shared with one generation's stderr drain
+/// thread. Keeps the last [`STDERR_CAPTURE_CAP`] bytes read (the end of a
+/// failing host's output names the failure), drops earlier bytes from the
+/// front and counts them, and stops retaining once the handshake succeeded —
+/// the drain thread then only keeps the pipe empty. Memory is bounded by the
+/// cap however chatty the host's startup is.
+#[derive(Debug)]
+struct StderrCapture {
+    /// Whether bytes are still retained; false from the readiness verdict on.
+    retain: AtomicBool,
+    buf: Mutex<StderrBuf>,
+}
+
+#[derive(Debug, Default)]
+struct StderrBuf {
+    bytes: Vec<u8>,
+    /// Bytes dropped from the front once the cap was exceeded.
+    dropped_front: u64,
+}
+
+impl StderrCapture {
+    fn new() -> Self {
+        Self {
+            retain: AtomicBool::new(true),
+            buf: Mutex::new(StderrBuf::default()),
+        }
+    }
+
+    /// Absorbes one read from the drain thread. No-op once sealed.
+    fn push(&self, chunk: &[u8]) {
+        if !self.retain.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut buf = self.buf.lock().expect("stderr capture lock");
+        buf.bytes.extend_from_slice(chunk);
+        let excess = buf.bytes.len().saturating_sub(STDERR_CAPTURE_CAP);
+        if excess > 0 {
+            buf.dropped_front = buf
+                .dropped_front
+                .saturating_add(u64::try_from(excess).unwrap_or(u64::MAX));
+            buf.bytes.drain(..excess);
+        }
+    }
+
+    /// Readiness verdict reached: discard what was captured and stop
+    /// retaining (the drain thread keeps emptying the pipe so the host can
+    /// never block on a full one).
+    fn seal(&self) {
+        self.retain.store(false, Ordering::Relaxed);
+        let mut buf = self.buf.lock().expect("stderr capture lock");
+        buf.bytes.clear();
+        buf.dropped_front = 0;
+    }
+
+    /// The captured text with a front-truncation marker when bytes were
+    /// dropped; `None` when nothing was retained.
+    fn take_text(&self) -> Option<String> {
+        let buf = self.buf.lock().expect("stderr capture lock");
+        if buf.bytes.is_empty() {
+            return None;
+        }
+        let mut text = String::new();
+        if buf.dropped_front > 0 {
+            text.push_str(&format!(
+                "[{} earlier bytes truncated; showing the last {}]\n",
+                buf.dropped_front,
+                buf.bytes.len()
+            ));
+        }
+        text.push_str(&String::from_utf8_lossy(&buf.bytes));
+        Some(text)
+    }
+}
+
+/// The `; plugin stderr: …` suffix that folds a captured host stderr into a
+/// failure message — empty when nothing was captured, so unaffected errors
+/// keep their exact text.
+fn stderr_note(stderr: &str) -> String {
+    if stderr.is_empty() {
+        String::new()
+    } else {
+        format!("; plugin stderr: {}", stderr.trim_end())
+    }
+}
+
 /// The analyze demand's wall clock (§14.3 CPU row, analyze path): closed at
 /// birth, opened by [`PluginRuntime::feed`] when a batch goes on the wire,
 /// closed when the child produces diagnostics or the generation dies. The
@@ -435,6 +547,8 @@ pub struct PluginRuntime {
     running: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     death: Arc<Mutex<Option<String>>>,
+    stderr_capture: Arc<StderrCapture>,
+    stderr_drain: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
     writer: Option<JoinHandle<()>>,
     monitor: Option<JoinHandle<()>>,
@@ -483,6 +597,8 @@ impl PluginRuntime {
             running: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
             death: Arc::new(Mutex::new(None)),
+            stderr_capture: Arc::new(StderrCapture::new()),
+            stderr_drain: None,
             reader: None,
             writer: None,
             monitor: None,
@@ -810,6 +926,15 @@ impl PluginRuntime {
         // Both pipes were just piped: the invariants hold by construction.
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
+        // Startup stderr face: `Capture` pipes the host's stderr into the
+        // bounded capture, drained by its own thread (the host can never
+        // fill and stall on it); `Null`/`Inherit` leave no capture. Fresh
+        // per generation, like every other per-generation field.
+        self.stderr_capture = Arc::new(StderrCapture::new());
+        self.stderr_drain = match child.stderr.take() {
+            Some(stderr) => Some(spawn_stderr_drain(stderr, Arc::clone(&self.stderr_capture))),
+            None => None,
+        };
 
         // Fresh per-generation state (the previous generation's Arcs stay
         // with its threads, which wind down on their own flags).
@@ -856,7 +981,7 @@ impl PluginRuntime {
             .expect("session lock")
             .send_initialize()?;
         self.write_frame(&init)?;
-        match self.events.recv_timeout(
+        let handshake = match self.events.recv_timeout(
             self.request_deadline()
                 .saturating_duration_since(Instant::now()),
         ) {
@@ -882,8 +1007,18 @@ impl PluginRuntime {
                 self.kill_child();
                 Err(RuntimeError::HandshakeTimeout {
                     ms: u64::try_from(self.request_timeout.as_millis()).unwrap_or(u64::MAX),
+                    stderr: String::new(),
                 })
             }
+        };
+        match handshake {
+            // Readiness verdict reached: stop retaining — the drain thread
+            // keeps emptying the pipe, but nothing more is captured.
+            Ok(()) => {
+                self.stderr_capture.seal();
+                Ok(())
+            }
+            Err(error) => Err(self.attach_startup_stderr(error)),
         }
     }
 
@@ -903,6 +1038,11 @@ impl PluginRuntime {
         self.running.store(false, Ordering::Relaxed);
         self.commands = None;
         self.kill_child();
+        // The generation's stderr drain ends with the child (its pipe closes
+        // on death); the bound keeps a wedged drain from stalling a relaunch.
+        if let Some(drain) = self.stderr_drain.take() {
+            join_bounded(drain);
+        }
         if let Some(reader) = self.reader.take() {
             join_bounded(reader);
         }
@@ -917,6 +1057,9 @@ impl PluginRuntime {
     fn join_generation(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         self.commands = None;
+        if let Some(drain) = self.stderr_drain.take() {
+            let _ = drain.join();
+        }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -960,6 +1103,33 @@ impl PluginRuntime {
             );
         }
         RuntimeError::Crashed { reason }
+    }
+
+    /// Binds the captured startup stderr to a startup failure. Waits
+    /// (bounded) for the drain thread's EOF — the host is dead at this
+    /// point, so its stderr pipe closes and the thread exits in
+    /// microseconds, carrying every byte the host wrote — then folds the
+    /// captured text into the surfaced error: a startup failure never
+    /// reports a bare "host died" where the host itself said why (the
+    /// official plugin manager's failure report does the same for its
+    /// subprocesses). Errors that carry no startup stderr pass through
+    /// unchanged.
+    fn attach_startup_stderr(&mut self, error: RuntimeError) -> RuntimeError {
+        if let Some(drain) = self.stderr_drain.take() {
+            join_bounded(drain);
+        }
+        let Some(stderr) = self.stderr_capture.take_text() else {
+            return error;
+        };
+        match error {
+            RuntimeError::Crashed { reason } => RuntimeError::Crashed {
+                reason: format!("{reason}{}", stderr_note(&stderr)),
+            },
+            RuntimeError::HandshakeTimeout { ms, .. } => {
+                RuntimeError::HandshakeTimeout { ms, stderr }
+            }
+            error => error,
+        }
     }
 
     fn request_deadline(&self) -> Instant {
@@ -1246,6 +1416,30 @@ fn spawn_writer(
         .expect("spawn writer thread")
 }
 
+/// Spawns the per-generation stderr drain: the only reader of the child's
+/// stderr, so the host can write as much as it likes without ever blocking
+/// on a full pipe. Everything read is offered to the bounded capture (which
+/// discards once the handshake succeeded); the thread ends at the pipe's
+/// EOF — the child's death — and its bounded join at a failure site is what
+/// makes the final bytes deterministic in the surfaced error.
+fn spawn_stderr_drain(stderr: ChildStderr, capture: Arc<StderrCapture>) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("dartq-plugin-stderr".to_owned())
+        .spawn(move || {
+            let mut stderr = BufReader::new(stderr);
+            let mut chunk = [0u8; STDERR_READ_CHUNK];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) => return, // EOF: the host's stderr is closed
+                    Ok(n) => capture.push(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return, // pipe gone with the host
+                }
+            }
+        })
+        .expect("spawn stderr drain thread")
+}
+
 /// The monitor's RSS arm: armed at birth when the platform has a sampler,
 /// disarmed observably when sampling proves impossible. A sample can fail
 /// transiently on a healthy child (a racing proc read, an interrupted
@@ -1491,7 +1685,7 @@ fn wire_diagnostics(diagnostics: &[Diagnostic], files: &FileTable) -> Vec<Plugin
                     EngineSeverity::Info => Severity::Info,
                 },
                 code: d.code.name.to_owned(),
-                message: d.message.clone(),
+                message: d.message.clone().into_owned(),
                 offset: u64::from(d.range.offset),
                 length: u64::from(d.range.length),
             })
@@ -1514,9 +1708,12 @@ fn wire_diagnostics(diagnostics: &[Diagnostic], files: &FileTable) -> Vec<Plugin
 #[must_use]
 pub fn crash_diagnostic(plugin: &str, error: &RuntimeError, anchor: FileId) -> Diagnostic {
     let (code, reason) = match error {
-        RuntimeError::HandshakeTimeout { ms } => (
+        RuntimeError::HandshakeTimeout { ms, stderr } => (
             DARTQ_PLUGIN_TIMEOUT,
-            format!("handshake did not complete within {ms} ms"),
+            format!(
+                "handshake did not complete within {ms} ms{}",
+                stderr_note(&stderr)
+            ),
         ),
         RuntimeError::ShutdownTimeout { ms } => (
             DARTQ_PLUGIN_TIMEOUT,
@@ -1617,7 +1814,10 @@ mod tests {
         }
         assert!(watch.armed(), "armed at birth on a sampling platform");
         for _ in 0..RSS_SAMPLE_TOLERANCE {
-            assert!(!watch.failed(), "a failure inside the tolerance keeps the arm");
+            assert!(
+                !watch.failed(),
+                "a failure inside the tolerance keeps the arm"
+            );
             assert!(watch.armed());
         }
         // One delivered sample resets the count: only *consecutive* failures
@@ -1629,6 +1829,43 @@ mod tests {
         assert!(watch.failed(), "the tick past the tolerance disarms");
         assert!(!watch.armed(), "the RSS face is off after the disarm");
         assert!(!watch.failed(), "the disarm is reported exactly once");
+    }
+
+    #[test]
+    fn stderr_capture_keeps_only_the_bounded_tail_and_seals_on_success() {
+        let capture = StderrCapture::new();
+        // Front bytes past the cap are dropped (and counted), the tail and a
+        // truncation marker survive — memory is bounded by the cap.
+        capture.push(b"front line\n".as_slice());
+        let flood: Vec<u8> = (0..STDERR_CAPTURE_CAP + 100)
+            .map(|i| b'0' + u8::try_from(i % 10).expect("digit fits u8"))
+            .collect();
+        capture.push(&flood);
+        let text = capture.take_text().expect("captured text survives");
+        assert!(
+            text.len() <= STDERR_CAPTURE_CAP + 128,
+            "bounded by the cap (plus the marker): {} bytes",
+            text.len()
+        );
+        assert!(text.contains("truncated"), "front loss is marked: {text}");
+        assert!(!text.contains("front line"), "front bytes are gone");
+        assert!(
+            text.ends_with("678901"),
+            "the tail is kept verbatim: …{text}"
+        );
+
+        // Readiness verdict reached: the capture is discarded and nothing
+        // more is retained (the drain thread keeps only emptying the pipe).
+        capture.seal();
+        assert!(
+            capture.take_text().is_none(),
+            "success discards the capture"
+        );
+        capture.push(b"late noise");
+        assert!(
+            capture.take_text().is_none(),
+            "post-verdict writes are not retained"
+        );
     }
 
     #[test]

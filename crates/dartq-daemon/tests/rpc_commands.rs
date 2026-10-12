@@ -40,25 +40,17 @@ fn handshake(h: &mut common::Harness, publishes: usize) {
     h.step(&notification("initialized", json!({})), publishes);
 }
 
-/// The `result` of the answer frame for `id` (owned: the transcript clone
-/// dies here on purpose).
+/// The `result` of the answer frame for `id`. Waiting, not one-shot: the
+/// plugin-dispatch faces (`dartq/fix`, `dartq/assists`) stage at intake,
+/// emit their progress notice at the drain, and answer one worker hop
+/// later, so the answer may land after the step's frame count settled.
 fn answer_result(h: &common::Harness, id: i64) -> Value {
-    let transcript = h.transcript();
-    transcript
-        .iter()
-        .find(|frame| frame.get("id") == Some(&json!(id)))
-        .unwrap_or_else(|| panic!("request {id} answers: {transcript:?}"))["result"]
-        .clone()
+    h.wait_answer(id)["result"].clone()
 }
 
-/// The `error` of the answer frame for `id`.
+/// The `error` of the answer frame for `id` (same wait contract).
 fn answer_error(h: &common::Harness, id: i64) -> Value {
-    let transcript = h.transcript();
-    transcript
-        .iter()
-        .find(|frame| frame.get("id") == Some(&json!(id)))
-        .unwrap_or_else(|| panic!("request {id} answers: {transcript:?}"))["error"]
-        .clone()
+    h.wait_answer(id)["error"].clone()
 }
 
 /// Renders `diagnostics` through the CLI's machine writer and parses the
@@ -614,9 +606,12 @@ fn dartq_compat_matches_the_cli_matrix() {
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
-/// dartq/fix answers at intake with real patch documents (the #355 bridge
-/// feeds the built-in lint rows; the provenance tag rides every edit). A
-/// missing target answers the usage tier over RPC.
+/// dartq/fix answers with real patch documents (the #355 bridge feeds the
+/// built-in lint rows; the provenance tag rides every edit). The staged
+/// protocol's first frame is the `dartq/fixProgress` notice (written at the
+/// dispatch drain); the answer lands one worker hop later, which
+/// `answer_result` waits out. A missing target answers the usage tier over
+/// RPC.
 #[test]
 fn dartq_fix_reports_the_schema_shaped_empty_document() {
     let _guard = workspace_lock();
@@ -875,7 +870,8 @@ fn dartq_context_routes_and_unknown_tag_fails_loud() {
     fs::remove_dir_all(&workspace.root).ok();
 }
 
-/// dartq/fix emits real patch rows at intake: a file carrying an
+/// dartq/fix emits real patch rows through the staged dispatch (progress
+/// notice at the drain, answer one worker hop later): a file carrying an
 /// `unnecessary_new` hit materializes an anchored edit through the #355
 /// bridge, provenance-tagged `builtin-lint`, and an `agentId` selector is
 /// rejected (the disk-view rule).
@@ -929,9 +925,10 @@ fn dartq_fix_emits_real_builtin_rows_with_provenance() {
     fs::remove_dir_all(&workspace.root).ok();
 }
 
-/// dartq/assists answers at intake: with no plugins discovered the assist
-/// list is empty and schema-stamped; a missing target is the usage tier;
-/// an `agentId` selector is rejected.
+/// dartq/assists answers through the staged dispatch (progress notice at
+/// the drain, answer one worker hop later): with no plugins discovered the
+/// assist list is empty and schema-stamped; a missing target is the usage
+/// tier; an `agentId` selector is rejected.
 #[test]
 fn dartq_assists_answers_schema_stamped_without_plugins() {
     let _guard = workspace_lock();
@@ -1311,7 +1308,7 @@ fn watch_refreshes_the_context_on_a_non_dart_change() {
     })
     .expect("store opens on a temp root");
     let session =
-        dartq_daemon::Session::with_store(workspace.engine_config(), store).expect("session");
+        dartq_daemon::Session::with_store(workspace.engine_config(), store, None).expect("session");
     let (client, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
     let output = WatchOutput::default();
     let server_output = output.clone();

@@ -188,7 +188,7 @@ fn analyze_axis(
                 file: layout.file_path(diag.file).display().to_string(),
                 line,
                 col,
-                message: diag.message.clone(),
+                message: diag.message.clone().into_owned(),
             }
         })
         .collect();

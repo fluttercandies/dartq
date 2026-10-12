@@ -599,7 +599,7 @@ impl ParserListener for DiagnosticListener {
             message.text,
             self.file,
             SourceRange { offset, length },
-            None,
+            message.correction,
         ));
     }
 }
@@ -640,6 +640,25 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|/c/lib/a.dart|1|12|1|Expected to find ';'.\n"
+        );
+    }
+
+    /// The parser's registry-verbatim correctionMessage rides through the
+    /// check face's listener (#727): the `base_enum` modifier row carries
+    /// "Try removing the keyword 'base'." unmodified.
+    #[test]
+    fn parse_diagnostic_carries_the_registry_correction() {
+        let mut set = FileSet::default();
+        let file = set.push("base enum E { a }\n", Path::new("/c/lib/a.dart"));
+        let diags = analyze_file("base enum E { a }\n", Path::new("/c/lib"), file);
+        let diagnostic = diags
+            .iter()
+            .find(|d| d.code.name == "base_enum")
+            .expect("the base modifier row fires");
+        assert_eq!(diagnostic.message, "Enums can't be declared to be 'base'.");
+        assert_eq!(
+            diagnostic.correction.as_deref(),
+            Some("Try removing the keyword 'base'."),
         );
     }
 

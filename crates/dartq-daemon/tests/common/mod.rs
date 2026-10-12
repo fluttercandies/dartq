@@ -68,7 +68,7 @@ impl Workspace {
         );
         write(
             ".dart_tool/package_config.json",
-            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub"}"#,
         );
         write("sdk/version", "3.13.1\n");
         write(
@@ -231,7 +231,7 @@ pub fn spawn(workspace: &Workspace, store_root: &Path) -> Harness {
         capacity_bytes: DEFAULT_CAPACITY_BYTES,
     })
     .expect("store opens on a temp root");
-    start(Session::with_store(workspace.engine_config(), store).expect("session"))
+    start(Session::with_store(workspace.engine_config(), store, None).expect("session"))
 }
 
 /// [`spawn`] plus one declared context: the `t` tag forks the default by
@@ -362,6 +362,32 @@ impl Harness {
             self.transcript().len(),
             self.transcript()
         );
+    }
+
+    /// Waits until an answer frame for `id` appears in the transcript
+    /// (bounded by [`SETTLE`]) and returns it. The plugin-dispatch faces
+    /// (`dartq/fix`, `dartq/assists`) stage at intake, write their progress
+    /// notice at the drain, and answer one worker hop later — answer
+    /// readers cannot assume the frame is already written when the step's
+    /// frame count settled.
+    #[must_use]
+    pub fn wait_answer(&self, id: i64) -> Value {
+        let deadline = Instant::now() + SETTLE;
+        loop {
+            let transcript = self.transcript();
+            if let Some(frame) = transcript
+                .iter()
+                .find(|frame| frame.get("id") == Some(&json!(id)))
+            {
+                return frame.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "request {id} never answered; transcript: {:?}",
+                self.transcript()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// A frame-less step's sync: a `dartq/analyze` probe whose answer proves

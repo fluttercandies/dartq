@@ -189,15 +189,20 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// An unusable workspace (no package config) is the usage tier.
+    /// A missing `package_config.json` is no longer a workspace error
+    /// (#759, the oracle ContextLocator floor): the assembly degrades to
+    /// the single-package context over an empty `package:` map — the
+    /// advisory is output, not refusal — so the run reports a valid empty
+    /// index and the usage tier stays reserved for unusable pub faces.
     #[test]
-    fn missing_package_config_is_a_workspace_error() {
+    fn missing_package_config_degrades_to_an_empty_run() {
         let root = workspace("index_broken", &[]);
         std::fs::remove_file(root.join(".dart_tool/package_config.json")).ok();
-        match run(&root, Some(&root.join("sdk")), false) {
-            Err(IndexError::Workspace(_)) => {}
-            other => panic!("expected workspace error, got {other:?}"),
-        }
+        let run = run(&root, Some(&root.join("sdk")), false).expect("degraded run");
+        assert_eq!(
+            (run.files, run.libraries, run.symbols, run.references),
+            (0, 0, 0, 0)
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }
