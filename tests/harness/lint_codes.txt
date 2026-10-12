@@ -13,10 +13,12 @@
 # rules -- the rule names listed in the vendored copy
 # tests/corpus/lints/vendor/lints/lib/core.yaml (34) plus recommended.yaml
 # (55) = 89, lowercased to the SDK machine-name forms -- minus the r0
-# exclusions below. dartq's no-options default posture is exactly this
-# 89-rule slice, and the corpus root options include exactly
-# package:lints/recommended.yaml, so both sides run the same nominal
-# universe. Registry drift (a package:lints re-pin) forces a conscious
+# exclusions below -- plus the options-driven standalone waves appended by
+# their parity-plan tickets (see the W2 paragraph below). dartq's
+# no-options default posture is exactly the 89-rule slice, and the corpus
+# root options include exactly package:lints/recommended.yaml plus the
+# named standalone rules, so both sides run the same nominal universe.
+# Registry drift (a package:lints re-pin) forces a conscious
 # re-freeze: re-derive with
 #   LC_ALL=C sed -n 's/^    - //p' tests/corpus/lints/vendor/lints/lib/*.yaml \
 #     | tr 'A-Z' 'a-z' | LC_ALL=C sort
@@ -52,10 +54,31 @@
 # tests/corpus/lints/lib (the audit r1 blind/thin rows plus the ignore
 # suppression pair set and the pubspec secure_pubspec_urls face); the rest
 # join through the wave-2 kitchen files or leave with a ledger reason.
+#
+# W2 standalone expansion (#987, parity-plan wave 2): the first 11
+# registered SDK rules outside package:lints join the universe. They are
+# options-driven (no include set carries them): the corpus root
+# analysis_options.yaml names them in its linter.rules section, so the
+# oracle and dartq run the same nominal set on the same files. Their
+# fixtures live at tests/corpus/lints/lib/<rule>.dart, derived verbatim
+# from the official test data. The sed re-derivation above stays the
+# package:lints slice only; each wave appends its block through the
+# governance pin (lint_codes_freeze_matches_the_registry).
+always_declare_return_types
+always_put_control_body_on_new_line
+always_put_required_named_parameters_first
 annotate_overrides
+avoid_annotating_with_dynamic
+avoid_catches_without_on_clauses
+avoid_classes_with_only_static_members
+avoid_double_and_int_checks
 avoid_empty_else
+avoid_escaping_inner_quotes
+avoid_final_parameters
 avoid_function_literals_in_foreach_calls
 avoid_init_to_null
+avoid_js_rounded_ints
+avoid_multiple_declarations_per_line
 avoid_relative_lib_imports
 avoid_renaming_method_parameters
 avoid_return_types_on_setters

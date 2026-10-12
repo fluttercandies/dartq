@@ -3920,6 +3920,149 @@ pub(crate) mod invalid_runtime_check_with_js_interop_types {
         false
     }
 }
+pub(crate) mod avoid_double_and_int_checks {
+    use crate::rules::last_child;
+
+    use super::same_file::{BindingScope, binding};
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_double_and_int_checks.dart:28-59`
+    /// — an else-if chain whose branches test the same simple identifier —
+    /// `x is double` then `x is int` — with the identifier a formal
+    /// parameter or local variable reports at the else condition. The
+    /// written types must resolve to `double` / `int` (:43-46); both
+    /// operands must be `SimpleIdentifier`s with equal names (:41-42), and
+    /// only the *if* operand's element kind is checked (:47-49).
+    ///
+    /// dartq faces: the written types are plain single-token `Type` rows
+    /// (a prefixed or parameterized spelling resolves elsewhere and stays
+    /// silent — documented); the binding face is the shadow-correct
+    /// same-file walk ([`binding`]), so a same-file-typed local/parameter
+    /// answers and an import-bound one under-reports (the crate's
+    /// documented posture).
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_double_and_int_checks",
+        group: Group::Standalone,
+        problem: "Explicit check for double or int.",
+        correction: "Try removing the check.",
+        kinds: &[NodeKind::IfStatement],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `elseStatement is IfStatement` (:35-36).
+        let Some(else_if) = last_child(c, node) else {
+            return;
+        };
+        if c.kind(else_if) != NodeKind::IfStatement {
+            return;
+        }
+        let Some((if_operand, _if_is)) = condition_is_check(c, node, "double") else {
+            return;
+        };
+        let Some((else_operand, else_is)) = condition_is_check(c, else_if, "int") else {
+            return;
+        };
+        // Equal simple names (:41-42); the if operand must bind to a local
+        // or parameter (:47-49).
+        if c.lexeme(c.head_token(if_operand)) != c.lexeme(c.head_token(else_operand)) {
+            return;
+        }
+        let name = c.lexeme(c.head_token(if_operand));
+        if !matches!(
+            binding(c, if_operand, name),
+            Some((BindingScope::Local | BindingScope::Parameter, _))
+        ) {
+            return;
+        }
+        // `reportAtNode(elseCondition)` (:50).
+        let range = c.utf16_span(else_is);
+        c.report(range, &[]);
+    }
+
+    /// The `wanted`-typed `is` check of the condition: the condition's
+    /// `IsExpression` child with a plain single-token `Type` child named
+    /// `wanted`, paired with its operand row. The flat tiling parents
+    /// operand rows to the statement owner (probe), so the operand is the
+    /// window's `Identifier` row spanning from just past the condition's
+    /// open paren to the `is` keyword — the official `SimpleIdentifier`
+    /// face (a dotted operand leaves its head row short of the keyword).
+    fn condition_is_check(c: &Check<'_>, if_stmt: u32, wanted: &str) -> Option<(u32, u32)> {
+        let condition = c
+            .collect_direct(if_stmt)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::ParenthesizedCondition)?;
+        let is_row = c
+            .collect_direct(condition)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::IsExpression)?;
+        let type_row = c
+            .collect_direct(is_row)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Type)?;
+        let type_head = c.head_token(type_row);
+        if c.lexeme(type_head) != wanted || c.unit.ast.token_range(type_row).len() != 1 {
+            return None;
+        }
+        let condition_start = c.unit.ast.token_range(condition).start;
+        let is_kw = type_head.checked_sub(1)?;
+        let operand = c.children(if_stmt).find(|&row| {
+            c.kind(row) == NodeKind::Identifier
+                && c.unit.ast.token_range(row)
+                    == core::ops::Range {
+                        start: condition_start + 1,
+                        end: is_kw,
+                    }
+        })?;
+        Some((operand, is_row))
+    }
+}
+
+pub(crate) mod avoid_js_rounded_ints {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_js_rounded_ints.dart:24-41`
+    /// — an integer literal whose value does not survive the f64 round
+    /// trip (`value.toDouble().toInt() != value`, :29) reports at the
+    /// literal. Hexadecimal literals wrap modulo 2^64 (the VM face).
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_js_rounded_ints",
+        group: Group::Standalone,
+        problem: "Integer literal can't be represented exactly when compiled to JavaScript.",
+        correction: "Try using a 'BigInt' to represent the value.",
+        kinds: &[NodeKind::LiteralInt],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(value) = literal_value(c.lexeme(c.head_token(node))) else {
+            return;
+        };
+        // Rust's `as` saturates exactly like the VM's `toInt` clamp on the
+        // round trip.
+        if (value as f64) as i64 != value {
+            c.report(crate::rules::utf16_token_span(c, c.head_token(node)), &[]);
+        }
+    }
+
+    /// The literal's value: digit separators stripped, hexadecimal wraps,
+    /// decimal beyond `i64::MAX` is unrepresentable (the official
+    /// `node.value` never materializes there).
+    fn literal_value(lexeme: &str) -> Option<i64> {
+        let digits: String = lexeme.chars().filter(|&ch| ch != '_').collect();
+        let hex = digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"));
+        if let Some(hex) = hex {
+            return u64::from_str_radix(hex, 16).ok().map(|v| v as i64);
+        }
+        let value = u64::from_str_radix(&digits, 10).ok()?;
+        (value <= i64::MAX as u64).then_some(value as i64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -6248,5 +6391,82 @@ void k(List<int> xs) {
         assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
         let f = Fixture::parse("void f() { (null) is Null; }");
         assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
+    }
+
+    // —— avoid_double_and_int_checks ————————————————————————————————————
+
+    /// `test/rules/avoid_double_and_int_checks_test.dart` — `x is double`
+    /// with an `else if (x is int)` on the same operand reports at the
+    /// second `is` keyword.
+    #[test]
+    fn double_int_checks_reports_the_else_if_int() {
+        let source = "void f(num p) { if (p is double) {} else if (p is int) {} }";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("avoid_double_and_int_checks"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Explicit check for double or int.");
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try removing the check.")
+        );
+        let is = tok(&f.source, &f.tokens, "is", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, is));
+    }
+
+    /// A local variable operand reports the same way.
+    #[test]
+    fn double_int_checks_local_operand_reports() {
+        let f = Fixture::parse("void k() { num p = 1; if (p is double) {} else if (p is int) {} }");
+        assert_eq!(f.run(&one_rule("avoid_double_and_int_checks")).len(), 1);
+    }
+
+    /// Different operands, a lone check, two separate ifs, and the
+    /// reversed order are all exempt.
+    #[test]
+    fn double_int_checks_valid_faces_pass() {
+        let f = Fixture::parse(
+            "void g(num p, num q) { if (p is double) {} else if (q is int) {} }\n\
+             void h(num p) { if (p is double) {} }\n\
+             void i(num p) { if (p is double) {} if (p is int) {} }\n\
+             void j(num p) { if (p is int) {} else if (p is double) {} }",
+        );
+        assert!(f.run(&one_rule("avoid_double_and_int_checks")).is_empty());
+    }
+
+    // —— avoid_js_rounded_ints ——————————————————————————————————————————
+
+    /// `test/rules/avoid_js_rounded_ints_test.dart` — a literal beyond
+    /// 2^53 exact reports at the literal.
+    #[test]
+    fn js_rounded_ints_reports_an_imprecise_literal() {
+        let source = "var a = 9007199254740993;";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("avoid_js_rounded_ints"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Integer literal can't be represented exactly when compiled to JavaScript."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try using a 'BigInt' to represent the value.")
+        );
+        let literal = tok(&f.source, &f.tokens, "9007199254740993", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, literal));
+    }
+
+    /// The hexadecimal spelling of an imprecise value reports; a negated
+    /// imprecise literal reports at the literal itself.
+    #[test]
+    fn js_rounded_ints_hex_and_negative_faces() {
+        let f = Fixture::parse("var b = 0x20000000000001;\nvar e = -9007199254740993;");
+        assert_eq!(f.run(&one_rule("avoid_js_rounded_ints")).len(), 2);
+    }
+
+    /// 2^53 itself and small literals are exactly representable.
+    #[test]
+    fn js_rounded_ints_exact_literals_pass() {
+        let f = Fixture::parse("var c = 9007199254740992;\nvar d = 1;");
+        assert!(f.run(&one_rule("avoid_js_rounded_ints")).is_empty());
     }
 }

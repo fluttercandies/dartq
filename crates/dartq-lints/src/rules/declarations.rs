@@ -9,7 +9,7 @@ use dartq_ast::NodeKind;
 
 use crate::engine::Check;
 use crate::registry::{Group, RuleSpec};
-use crate::rules::{NONE_TOKEN, first_child, member_name, slice, type_before};
+use crate::rules::{NONE_TOKEN, body_members, first_child, member_name, slice, type_before};
 
 pub(crate) mod avoid_return_types_on_setters {
     use super::{Check, Group, NodeKind, RuleSpec};
@@ -2970,6 +2970,640 @@ pub(crate) mod unnecessary_overrides {
     }
 }
 
+pub(crate) mod always_declare_return_types {
+    use std::path::Component;
+
+    use super::{Check, Group, NodeKind, RuleSpec, get_set_token, type_before};
+
+    /// Official: `pkg/linter/lib/src/rules/always_declare_return_types.dart:38-85`
+    /// — a function, method, getter, or old-form `typedef` written without a
+    /// return type reports at its name. Setters never report (:47/:69-70),
+    /// `operator []=` never reports (:72-73), augmentations never report
+    /// (:71), and inside a test directory methods named `test_*` /
+    /// `solo_test_*` are exempt (:76-81). Messages: `diagnostic.g.dart`
+    /// `alwaysDeclareReturnTypesOfFunctions` /
+    /// `alwaysDeclareReturnTypesOfMethods` (the two-variant report face).
+    ///
+    /// Faces: [`NodeKind::TopLevelMethod`] (top-level functions and
+    /// accessors), [`NodeKind::Method`] (class members),
+    /// [`NodeKind::LocalFunctionDeclaration`] (local functions — the
+    /// official `visitFunctionDeclaration` arm), and old-form
+    /// [`NodeKind::Typedef`] (the official `visitFunctionTypeAlias` arm —
+    /// the `=` alias form carries a function type, not an omitted return
+    /// type). The written return type is the row before the name
+    /// ([`type_before`]; `NoType` = absent, collapse map §3.8).
+    ///
+    /// The test-directory exemption reads [`crate::WorkspaceFacts::root`]
+    /// (the official `context.isInTestDirectory`,
+    /// `workspace.dart:127-131` — a `test` / `integration_test` /
+    /// `test_driver` prefix of the package-relative path); without package
+    /// facts mounted the face stays out, the official no-package posture.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "always_declare_return_types",
+        group: Group::Standalone,
+        problem: "The function '{0}' should have a return type but doesn't.",
+        correction: "Try adding a return type to the function.",
+        kinds: &[
+            NodeKind::TopLevelMethod,
+            NodeKind::Method,
+            NodeKind::LocalFunctionDeclaration,
+            NodeKind::Typedef,
+        ],
+        check,
+    };
+
+    const METHODS_PROBLEM: &str = "The method '{0}' should have a return type but doesn't.";
+    const METHODS_CORRECTION: &str = "Try adding a return type to the method.";
+
+    /// The `augment` ModSet bit (bridge `mod_bits`; bit 1 of the class and
+    /// member families).
+    const AUGMENT_BIT: u16 = 1 << 1;
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        match c.kind(node) {
+            NodeKind::TopLevelMethod => {
+                // Setters skip (:69-70).
+                if get_set_token(c, node) == Some("set") {
+                    return;
+                }
+                if is_augmented(c, node) {
+                    return;
+                }
+                report_untyped(c, node, false);
+            }
+            NodeKind::Method => {
+                if get_set_token(c, node) == Some("set") {
+                    return;
+                }
+                if is_augmented(c, node) {
+                    return;
+                }
+                // The operator name rides the row's left sibling (probe):
+                // `operator []=` skips (:72-73), and every other operator
+                // carries a written return type on valid code, so the
+                // untyped non-`[]=` operator face is unreachable here.
+                if is_operator_declaration(c, node) {
+                    return;
+                }
+                let name_lexeme = report_name(c, node).map(|row| c.lexeme(c.head_token(row)));
+                // `test_*` / `solo_test_*` methods inside a test directory
+                // skip (:76-81).
+                if in_test_directory(c)
+                    && name_lexeme.is_some_and(|name| {
+                        name.starts_with("test_") || name.starts_with("solo_test_")
+                    })
+                {
+                    return;
+                }
+                report_untyped(c, node, true);
+            }
+            NodeKind::LocalFunctionDeclaration => {
+                let Some(name) = c
+                    .collect_direct(node)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::FunctionName)
+                else {
+                    return;
+                };
+                report_untyped_named(c, node, name, false);
+            }
+            NodeKind::Typedef => {
+                // The generic alias form (`typedef F = ...`) is a different
+                // official node (:57-63 fires only on `FunctionTypeAlias`).
+                if c.payload(node).get(1).copied() != Some(crate::rules::NONE_TOKEN) {
+                    return;
+                }
+                let Some(name) = c
+                    .collect_direct(node)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+                else {
+                    return;
+                };
+                report_untyped_named(c, node, name, false);
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the declaration is an operator: its name is an
+    /// [`NodeKind::OperatorName`] left sibling (the production wrapper,
+    /// probe shape), not a child row.
+    fn is_operator_declaration(c: &Check<'_>, node: u32) -> bool {
+        let Some(parent) = c.unit.ast.parent(node) else {
+            return false;
+        };
+        let siblings = c.collect_direct(parent);
+        let Some(pos) = siblings.iter().position(|&kid| kid == node) else {
+            return false;
+        };
+        siblings[..pos]
+            .iter()
+            .rev()
+            .any(|&kid| c.kind(kid) == NodeKind::OperatorName)
+    }
+
+    /// The declaration's name row: the LAST direct `Identifier` child. A
+    /// written return type rides earlier identifier/type rows (probe:
+    /// `String g()` keeps the type `Identifier` + `Type` rows before the
+    /// name), and the name is the identifier the parameter list follows.
+    fn report_name(c: &Check<'_>, node: u32) -> Option<u32> {
+        c.collect_direct(node)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::Identifier)
+            .next_back()
+    }
+
+    /// The shared verdict: the row before the name row decides (`NoType` =
+    /// the official `returnType == null`), then the two-variant report at
+    /// the name token.
+    fn report_untyped(c: &mut Check<'_>, node: u32, is_method: bool) {
+        let Some(name) = report_name(c, node) else {
+            return;
+        };
+        report_untyped_named(c, node, name, is_method);
+    }
+
+    fn report_untyped_named(c: &mut Check<'_>, node: u32, name_row: u32, is_method: bool) {
+        let typed = match type_before(c, node, name_row) {
+            None => false,
+            Some((_, kind)) => matches!(
+                kind,
+                NodeKind::Type | NodeKind::VoidType | NodeKind::FunctionType | NodeKind::RecordType
+            ),
+        };
+        if typed {
+            return;
+        }
+        let name_token = c.head_token(name_row);
+        let name = c.lexeme(name_token);
+        let start = c
+            .unit
+            .tokens
+            .get(name_token as usize)
+            .expect("name token")
+            .utf16_offset;
+        let len = name.encode_utf16().count() as u32;
+        if is_method {
+            c.report_texts(
+                start..start + len,
+                super::always_declare_return_types::METHODS_PROBLEM,
+                super::always_declare_return_types::METHODS_CORRECTION,
+                &[name],
+            );
+        } else {
+            c.report(start..start + len, &[name]);
+        }
+    }
+
+    /// Whether `node` or a declaration-shaped ancestor carries the
+    /// `augment` modifier (the official `isAugmentation` guard).
+    fn is_augmented(c: &Check<'_>, node: u32) -> bool {
+        if dartq_ast::mod_flags(&c.unit.ast, node) & AUGMENT_BIT != 0 {
+            return true;
+        }
+        c.path.iter().rev().skip(1).any(|&ancestor| {
+            matches!(
+                c.kind(ancestor),
+                NodeKind::Method
+                    | NodeKind::TopLevelMethod
+                    | NodeKind::Fields
+                    | NodeKind::TopLevelFields
+                    | NodeKind::Constructor
+                    | NodeKind::Factory
+                    | NodeKind::ClassDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::ExtensionDeclaration
+                    | NodeKind::EnumDeclaration
+                    | NodeKind::Typedef
+            ) && dartq_ast::mod_flags(&c.unit.ast, ancestor) & AUGMENT_BIT != 0
+        })
+    }
+
+    /// The official `context.isInTestDirectory`
+    /// (`workspace.dart:72-77,122-131`): the file sits under the package
+    /// root's `test` / `integration_test` / `test_driver` directory.
+    fn in_test_directory(c: &Check<'_>) -> bool {
+        let (Some(path), Some(workspace)) = (c.unit.path, c.unit.workspace) else {
+            return false;
+        };
+        path.strip_prefix(&workspace.root)
+            .ok()
+            .and_then(|rel| rel.components().next())
+            .is_some_and(|comp| {
+                matches!(
+                    comp,
+                    Component::Normal(name)
+                        if name == "test" || name == "integration_test" || name == "test_driver"
+                )
+            })
+    }
+}
+
+pub(crate) mod always_put_required_named_parameters_first {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/always_put_required_named_parameters_first.dart:31-92`
+    /// — a required named parameter written after a non-required named
+    /// parameter reports at the parameter's name. Required = the `required`
+    /// keyword (the `RequiredNamed` kind, collapse map §3.3) or a `@required`
+    /// annotation (:59 `element.metadata.hasRequired`). The parameter name
+    /// is the payload word 1 token.
+    ///
+    /// Approximation (documented): the official super-parameter ordering
+    /// face (:66-91 `_superParametersAreInOrder`) decides whether named
+    /// super-parameters count as non-required by resolving the super
+    /// constructor's parameter positions — an element-model question. The
+    /// lexical face treats named super-parameters as in-order (they never
+    /// arm the flag and never trigger the following required reports), so
+    /// the out-of-order super-parameter shape under-reports.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "always_put_required_named_parameters_first",
+        group: Group::Standalone,
+        problem: "Required named parameters should be before optional named parameters.",
+        correction: "Try moving the required named parameter to be before any optional named parameters.",
+        kinds: &[
+            NodeKind::FormalParameters,
+            NodeKind::OptionalFormalParameters,
+        ],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let mut non_required_seen = false;
+        for param in c.collect_direct(node) {
+            if c.kind(param) != NodeKind::FormalParameter {
+                continue;
+            }
+            let kind = c.payload(param).get(4).copied().unwrap_or(u32::MAX);
+            let required_kind = kind == dartq_parser::FormalParameterKind::RequiredNamed as u32;
+            let named =
+                required_kind || kind == dartq_parser::FormalParameterKind::OptionalNamed as u32;
+            if !named {
+                continue;
+            }
+            let required = required_kind || has_required_annotation(c, node, param);
+            if required {
+                if non_required_seen && let Some(&name) = c.payload(param).get(1) {
+                    let start = c
+                        .unit
+                        .tokens
+                        .get(name as usize)
+                        .expect("name token")
+                        .utf16_offset;
+                    let len = c.lexeme(name).encode_utf16().count() as u32;
+                    c.report(start..start + len, &[]);
+                }
+            } else if !is_super_formal(c, param) {
+                non_required_seen = true;
+            }
+        }
+    }
+
+    /// The `super` receiver word (collapse map §3.3 FormalParameter row).
+    fn is_super_formal(c: &Check<'_>, param: u32) -> bool {
+        let receiver = c
+            .payload(param)
+            .first()
+            .copied()
+            .unwrap_or(crate::rules::NONE_TOKEN);
+        receiver != crate::rules::NONE_TOKEN && c.lexeme(receiver) == "super"
+    }
+
+    /// The parameter's left sibling among the list's children is a
+    /// `MetadataStar` naming `required` (the probe shape: parameter
+    /// annotations ride a preceding sibling row).
+    fn has_required_annotation(c: &Check<'_>, list: u32, param: u32) -> bool {
+        let siblings = c.collect_direct(list);
+        let Some(index) = siblings.iter().position(|&kid| kid == param) else {
+            return false;
+        };
+        let Some(&star) = index.checked_sub(1).and_then(|i| siblings.get(i)) else {
+            return false;
+        };
+        if c.kind(star) != NodeKind::MetadataStar {
+            return false;
+        }
+        c.collect_direct(star).into_iter().any(|meta| {
+            c.kind(meta) == NodeKind::Metadata
+                && c.collect_direct(meta).into_iter().any(|piece| {
+                    c.kind(piece) == NodeKind::Identifier
+                        && c.lexeme(c.head_token(piece)) == "required"
+                })
+        })
+    }
+}
+
+pub(crate) mod avoid_final_parameters {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_final_parameters.dart:41-84`
+    /// — a parameter marked `final` reports at the keyword, except:
+    /// parameters of a generic function type (:63, the parent
+    /// `GenericFunctionType` list-level skip), function-typed-suffix
+    /// parameters (:76), and field/super formals (:77-78). The
+    /// primary-constructors registration gate (:56-59) is unreachable in
+    /// dartq: the parser does not accept that grammar.
+    ///
+    /// dartq faces: the list-level skip reads the owner row
+    /// ([`NodeKind::FunctionType`] / [`NodeKind::FunctionTypedFormalParameter`]
+    /// — the generic-function-type annotation collapses to the latter,
+    /// probe shape); the per-parameter skips read the receiver word and the
+    /// function-typed child. The `final` keyword is recovered from the
+    /// ModSet head (`VAR_FINAL_OR_CONST` bit, bridge `mod_bits`) by a
+    /// bounded scan past `required` / `covariant`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_final_parameters",
+        group: Group::Standalone,
+        problem: "Parameters should not be marked as 'final'.",
+        correction: "Try removing the keyword 'final'.",
+        kinds: &[
+            NodeKind::FormalParameters,
+            NodeKind::OptionalFormalParameters,
+        ],
+        check,
+    };
+
+    /// The `varFinalOrConst` ModSet bit (bridge `mod_bits`).
+    const VAR_FINAL_OR_CONST_BIT: u16 = 1 << 6;
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // The generic-function-type face (:63): the inner parameter lists of
+        // a written function type never report.
+        if c.ancestor(1).is_some_and(|owner| {
+            matches!(
+                c.kind(owner),
+                NodeKind::FunctionType | NodeKind::FunctionTypedFormalParameter
+            )
+        }) {
+            return;
+        }
+        for param in c.collect_direct(node) {
+            if c.kind(param) != NodeKind::FormalParameter {
+                continue;
+            }
+            // Function-typed suffix (:76) and field/super formals (:77-78).
+            if c.collect_direct(param)
+                .iter()
+                .any(|&kid| c.kind(kid) == NodeKind::FunctionTypedFormalParameter)
+            {
+                continue;
+            }
+            let receiver = c
+                .payload(param)
+                .first()
+                .copied()
+                .unwrap_or(crate::rules::NONE_TOKEN);
+            if receiver != crate::rules::NONE_TOKEN {
+                continue;
+            }
+            if let Some(kw) = final_keyword(c, param) {
+                c.report(crate::rules::utf16_token_span(c, kw), &[]);
+            }
+        }
+    }
+
+    /// The `final` keyword token of a `VAR_FINAL_OR_CONST`-marked
+    /// parameter, `None` when the written keyword is `var` / `const`.
+    fn final_keyword(c: &Check<'_>, param: u32) -> Option<u32> {
+        if dartq_ast::mod_flags(&c.unit.ast, param) & VAR_FINAL_OR_CONST_BIT == 0 {
+            return None;
+        }
+        // The ModSet head is the first modifier; `required` / `covariant`
+        // precede the storage keyword (bounded: three modifiers max).
+        let mut token = c.head_token(param);
+        for _ in 0..3 {
+            match c.lexeme(token) {
+                "final" => return Some(token),
+                "var" | "const" => return None,
+                "required" | "covariant" => token += 1,
+                _ => return None,
+            }
+        }
+        None
+    }
+}
+
+pub(crate) mod avoid_classes_with_only_static_members {
+    use super::{Check, Group, NodeKind, RuleSpec, body_members, get_set_token};
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_classes_with_only_static_members.dart:30-71`
+    /// — a class whose members are all static (and whose fields are not all
+    /// const) reports at the class name. Skips: sealed classes (:40-41),
+    /// classes inheriting instance members from any non-`Object` class
+    /// (:43-53 `interfaceMembers`), classes with a non-default constructor
+    /// (:57-61, default = unnamed without required parameters,
+    /// `element.dart:1237-1247`), and classes with any instance method
+    /// (:63-64 — subsumed by the interface-member face). The report fires
+    /// when a static method exists or a non-const field exists (:66-67).
+    ///
+    /// Approximation (documented): the inherited-instance-member face walks
+    /// the same-file ancestor chain (all clauses — the official
+    /// `interfaceMembers` includes `implements`); supertypes outside the
+    /// file resolve to no instance members, the crate's documented
+    /// same-file posture, which over-reports on cross-file instance
+    /// members.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_classes_with_only_static_members",
+        group: Group::Standalone,
+        problem: "Classes should define instance members.",
+        correction: "Try adding instance behavior or moving the members out of the class.",
+        kinds: &[NodeKind::ClassDeclaration],
+        check,
+    };
+
+    /// The `static` (member) / `sealed` (class) ModSet bit (bridge
+    /// `mod_bits`; `same_file::STATIC_BIT`).
+    const STATIC_OR_SEALED_BIT: u16 = 1 << 3;
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // Sealed classes skip (:40-41).
+        if dartq_ast::mod_flags(&c.unit.ast, node) & STATIC_OR_SEALED_BIT != 0 {
+            return;
+        }
+        // Own instance members (:43-53) — the official `interfaceMembers`
+        // face includes the class's own members.
+        if has_instance_members(c, node) {
+            return;
+        }
+        // Inherited instance members: the same-file ancestor chain over all
+        // clauses (documented approximation for cross-file supertypes).
+        if crate::rules::same_file_ancestors(c, node, false)
+            .iter()
+            .any(|&ancestor| has_instance_members(c, ancestor))
+        {
+            return;
+        }
+        // Non-default constructors skip (:57-61).
+        if body_members(c, node).iter().any(|&member| {
+            matches!(c.kind(member), NodeKind::Constructor | NodeKind::Factory)
+                && is_non_default_constructor(c, member)
+        }) {
+            return;
+        }
+        let members = body_members(c, node);
+        // `methods.isNotEmpty` (:66): static methods proper — accessors are
+        // the official `getters`/`setters` lists, not `methods`.
+        let has_static_method = members.iter().any(|&member| {
+            c.kind(member) == NodeKind::Method
+                && dartq_ast::mod_flags(&c.unit.ast, member) & STATIC_OR_SEALED_BIT != 0
+                && get_set_token(c, member).is_none()
+        });
+        // `fields.any((f) => !f.isConst)` (:66-67).
+        let has_non_const_field = members.iter().any(|&member| {
+            c.kind(member) == NodeKind::Fields
+                && c.collect_direct(member).into_iter().any(|decl| {
+                    c.kind(decl) == NodeKind::VariablesDeclaration
+                        && crate::rules::variables_declaration_keyword(c, decl)
+                            .is_none_or(|kw| c.lexeme(kw) != "const")
+                })
+        });
+        if has_static_method || has_non_const_field {
+            // The report sits at the class name (`node.namePart.typeName`,
+            // :67) — the production wrapper keeps the name `Identifier` as
+            // the row's left sibling (`class_declaration_name`'s contract),
+            // so the span resolves through the same two-step face.
+            let Some(name_row) = class_name_row(c, node) else {
+                return;
+            };
+            c.report(
+                crate::rules::utf16_token_span(c, c.head_token(name_row)),
+                &[],
+            );
+        }
+    }
+
+    /// The class-like declaration's name row: the direct child with a
+    /// class-name identifier context, else the row's left sibling (the
+    /// production wrapper — `class_declaration_name`'s two-step face,
+    /// kept row-bearing for the report span).
+    fn class_name_row(c: &Check<'_>, class_row: u32) -> Option<u32> {
+        let is_class_name = |kid: u32| {
+            c.kind(kid) == NodeKind::Identifier
+                && matches!(
+                    c.payload(kid).first().copied(),
+                    Some(ctx)
+                        if ctx
+                            == dartq_parser::IdentifierContext::ClassOrMixinOrExtensionDeclaration
+                                as u32
+                            || ctx == dartq_parser::IdentifierContext::EnumDeclaration as u32
+                )
+        };
+        if let Some(name) = c
+            .collect_direct(class_row)
+            .into_iter()
+            .find(|&kid| is_class_name(kid))
+        {
+            return Some(name);
+        }
+        let parent = c.unit.ast.parent(class_row)?;
+        let siblings = c.collect_direct(parent);
+        let pos = siblings.iter().position(|&kid| kid == class_row)?;
+        siblings[..pos]
+            .iter()
+            .rev()
+            .copied()
+            .find(|&kid| is_class_name(kid))
+    }
+
+    /// Whether any member row of the class-like declaration is an instance
+    /// member: a non-static `Fields` row or a non-static `Method` row.
+    fn has_instance_members(c: &Check<'_>, class_row: u32) -> bool {
+        body_members(c, class_row)
+            .iter()
+            .any(|&member| match c.kind(member) {
+                NodeKind::Fields => {
+                    c.payload(member).first()
+                        == Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+                }
+                NodeKind::Method => {
+                    dartq_ast::mod_flags(&c.unit.ast, member) & STATIC_OR_SEALED_BIT == 0
+                }
+                _ => false,
+            })
+    }
+
+    /// Non-default = named, or carrying a required parameter (the official
+    /// `isDefaultConstructor`, `element.dart:1237-1247`). The row anchors
+    /// at the declared name (bridge `begin_constructor`), so the named
+    /// form is the `.suffix` layout after the head token (`F.named()`); a
+    /// nameless row (recovery) reads as non-default — the conservative
+    /// face.
+    fn is_non_default_constructor(c: &Check<'_>, ctor: u32) -> bool {
+        let head = c.head_token(ctor);
+        let dot = c
+            .unit
+            .tokens
+            .get(head as usize + 1)
+            .is_some_and(|_| c.lexeme(head + 1) == ".");
+        if dot {
+            return true;
+        }
+        c.collect_direct(ctor).into_iter().any(|kid| {
+            matches!(
+                c.kind(kid),
+                NodeKind::FormalParameters | NodeKind::OptionalFormalParameters
+            ) && c.collect_direct(kid).into_iter().any(|param| {
+                c.kind(param) == NodeKind::FormalParameter
+                    && matches!(
+                        c.payload(param).get(4).copied(),
+                        Some(k)
+                            if k == dartq_parser::FormalParameterKind::RequiredPositional as u32
+                                || k == dartq_parser::FormalParameterKind::RequiredNamed as u32
+                    )
+            })
+        })
+    }
+}
+
+pub(crate) mod avoid_multiple_declarations_per_line {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_multiple_declarations_per_line.dart:30-49`
+    /// — a declaration list with more than one variable reports once, at
+    /// the second variable's name (despite the name, the official face is
+    /// per-declaration-list, not per-line). The classic `for` initializer
+    /// list skips (:38-40 `ForPartsWithDeclarations`). Message:
+    /// `diagnostic.g.dart` `avoidMultipleDeclarationsPerLine`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_multiple_declarations_per_line",
+        group: Group::Standalone,
+        problem: "Multiple variables declared on a single line.",
+        correction: "Try splitting the variable declarations into multiple lines.",
+        kinds: &[NodeKind::VariablesDeclaration],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `parent is ForPartsWithDeclarations` (:38-40): the production
+        // wrapper parents the for initializer's declaration list straight
+        // to the `ForStatement` row (probe), the hand-built shape uses a
+        // `ForParts` row — both owner faces skip.
+        if c.ancestor(1).is_some_and(|parent| {
+            matches!(c.kind(parent), NodeKind::ForStatement | NodeKind::ForParts)
+        }) {
+            return;
+        }
+        let second = c
+            .collect_direct(node)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::InitializedIdentifier)
+            .nth(1);
+        let Some(second) = second else {
+            return;
+        };
+        let Some(name) = crate::rules::initialized_identifier_name(c, second) else {
+            return;
+        };
+        c.report(crate::rules::utf16_token_span(c, name), &[]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -5320,5 +5954,348 @@ mod tests {
         assert_eq!(lints.len(), 2, "{lints:?}");
         assert_eq!(lints[0].message, "Unnecessary override.");
         assert_eq!(lints[1].message, "Unnecessary override.");
+    }
+
+    // —— always_declare_return_types ————————————————————————————————————
+
+    /// `test/rules/always_declare_return_types_test.dart` — the untyped
+    /// top-level function reports with the function variants.
+    #[test]
+    fn declare_return_types_reports_an_untyped_function() {
+        let f = Fixture::parse("f() => 1;");
+        let lints = f.run(&one_rule("always_declare_return_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The function 'f' should have a return type but doesn't."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try adding a return type to the function.")
+        );
+        assert_eq!(lints[0].range.start, utf16_at(&f, 0));
+        assert_eq!(lints[0].range.end, lints[0].range.start + 1);
+    }
+
+    /// A method uses the method variants of the message.
+    #[test]
+    fn declare_return_types_reports_an_untyped_method() {
+        let f = Fixture::parse("class C { m() {} }");
+        let lints = f.run(&one_rule("always_declare_return_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The method 'm' should have a return type but doesn't."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try adding a return type to the method.")
+        );
+    }
+
+    /// Getters count as functions (`get p => 1;`).
+    #[test]
+    fn declare_return_types_reports_an_untyped_getter() {
+        let f = Fixture::parse("get p => 1;");
+        let lints = f.run(&one_rule("always_declare_return_types"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "The function 'p' should have a return type but doesn't."
+        );
+    }
+
+    /// Local functions report with the function variants; a written `void`
+    /// return type skips like any other type.
+    #[test]
+    fn declare_return_types_reports_a_local_function() {
+        let f = Fixture::parse("void f() { g() {} }");
+        let lints = f.run(&one_rule("always_declare_return_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The function 'g' should have a return type but doesn't."
+        );
+    }
+
+    /// Setters never report (:69-70), top-level or in-class.
+    #[test]
+    fn declare_return_types_setters_pass() {
+        let f = Fixture::parse("set s(int v) {}\nclass C { set s(int v) {} }");
+        assert!(f.run(&one_rule("always_declare_return_types")).is_empty());
+    }
+
+    /// Written return types pass, on every declaration family.
+    #[test]
+    fn declare_return_types_typed_members_pass() {
+        let f = Fixture::parse("String g() => '';\nclass D { void m() {} int n() => 2; }");
+        assert!(f.run(&one_rule("always_declare_return_types")).is_empty());
+    }
+
+    /// The old `typedef F();` form reports; the `=` alias form carries a
+    /// function type and skips (:57-63).
+    #[test]
+    fn declare_return_types_old_typedef_reports() {
+        let f = Fixture::parse("typedef F(); typedef G = void Function();");
+        let lints = f.run(&one_rule("always_declare_return_types"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The function 'F' should have a return type but doesn't."
+        );
+    }
+
+    /// `operator []=` skips (:72-73); a typed operator passes.
+    #[test]
+    fn declare_return_types_operators_pass() {
+        let f =
+            Fixture::parse("class C { operator []=(int i, int v) {} int operator +(int o) => 1; }");
+        assert!(f.run(&one_rule("always_declare_return_types")).is_empty());
+    }
+
+    /// The `test_*` / `solo_test_*` exemption applies only inside a test
+    /// directory (:76-81, `isInTestDirectory`).
+    #[test]
+    fn declare_return_types_test_directory_exemption() {
+        let source = "class C { test_body() {} }\nclass D { other() {} }";
+        let mut f = Fixture::parse(source);
+        let facts = crate::engine::WorkspaceFacts {
+            own_package: "own".to_owned(),
+            dependencies: ["own".to_owned()].into_iter().collect(),
+            dev_dependencies: Default::default(),
+            root: std::path::PathBuf::from("/pkg"),
+            lib_dir: std::path::PathBuf::from("/pkg/lib"),
+        };
+        // Outside the test directories both methods report.
+        f.path = std::path::PathBuf::from("/pkg/lib/a.dart");
+        let lints = f.run_workspace(&one_rule("always_declare_return_types"), &facts);
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        // Under `test/` the `test_body` method is exempt.
+        f.path = std::path::PathBuf::from("/pkg/test/a_test.dart");
+        let lints = f.run_workspace(&one_rule("always_declare_return_types"), &facts);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The method 'other' should have a return type but doesn't."
+        );
+    }
+
+    // —— always_put_required_named_parameters_first —————————————————————
+
+    /// A required named parameter after an optional one reports at the
+    /// parameter's name.
+    #[test]
+    fn required_named_first_reports_a_misplaced_parameter() {
+        let source = "void f({int? a, required int b}) {}";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("always_put_required_named_parameters_first"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Required named parameters should be before optional named parameters."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some(
+                "Try moving the required named parameter to be before any optional named \
+                 parameters."
+            )
+        );
+        let b = tok(&f.source, &f.tokens, "b", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, b));
+    }
+
+    /// Every required parameter after the first optional reports.
+    #[test]
+    fn required_named_first_reports_each_misplaced_parameter() {
+        let f = Fixture::parse("void g({int? a, required int b, required int c}) {}");
+        let lints = f.run(&one_rule("always_put_required_named_parameters_first"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+    }
+
+    /// In-order lists pass, with or without positional parameters.
+    #[test]
+    fn required_named_first_ordered_lists_pass() {
+        let f = Fixture::parse(
+            "void h({required int a, int? b}) {}\nvoid i(int x, {required int a, int? b}) {}",
+        );
+        assert!(
+            f.run(&one_rule("always_put_required_named_parameters_first"))
+                .is_empty()
+        );
+    }
+
+    /// Positional parameters never arm the flag.
+    #[test]
+    fn required_named_first_positional_only_passes() {
+        let f = Fixture::parse("void j(int a, [int b = 1]) {}");
+        assert!(
+            f.run(&one_rule("always_put_required_named_parameters_first"))
+                .is_empty()
+        );
+    }
+
+    // —— avoid_final_parameters ————————————————————————————————————————
+
+    /// `final` on a positional formal reports at the keyword.
+    #[test]
+    fn final_parameters_reports_a_final_formal() {
+        let source = "void f(final int x) {}";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("avoid_final_parameters"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Parameters should not be marked as 'final'."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try removing the keyword 'final'.")
+        );
+        let kw = tok(&f.source, &f.tokens, "final", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, kw));
+    }
+
+    /// Named and optional formals report too.
+    #[test]
+    fn final_parameters_reports_named_and_optional() {
+        let f = Fixture::parse("void g({final int y = 1}) {}\nvoid h([final int z = 2]) {}");
+        let lints = f.run(&one_rule("avoid_final_parameters"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+    }
+
+    /// Untyped `final` formals report as well.
+    #[test]
+    fn final_parameters_reports_untyped_formals() {
+        let f = Fixture::parse("void l(final x) {}");
+        assert_eq!(f.run(&one_rule("avoid_final_parameters")).len(), 1);
+    }
+
+    /// Plain formals, local `final` variables, and generic function type
+    /// signatures pass (:63).
+    #[test]
+    fn final_parameters_valid_faces_pass() {
+        let f = Fixture::parse(
+            "void i(int x) {}\nvoid j(void Function(final int) cb) {}\n\
+             void k() { final int local = 1; }",
+        );
+        assert!(f.run(&one_rule("avoid_final_parameters")).is_empty());
+    }
+
+    // —— avoid_classes_with_only_static_members —————————————————————————
+
+    /// A static-only class with a method reports at the class name.
+    #[test]
+    fn only_static_members_reports_a_static_class() {
+        let source = "class A { static void m() {} }";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("avoid_classes_with_only_static_members"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Classes should define instance members.");
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try adding instance behavior or moving the members out of the class.")
+        );
+        let a = tok(&f.source, &f.tokens, "A", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, a));
+    }
+
+    /// A non-const static field alone reports (:66-67); all-const members
+    /// and instance members pass.
+    #[test]
+    fn only_static_members_field_and_const_faces() {
+        let f = Fixture::parse(
+            "class B { static int two = 2; }\nclass C { static const three = 3; }\n\
+             class D { int four = 4; }",
+        );
+        let lints = f.run(&one_rule("avoid_classes_with_only_static_members"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].range.start,
+            utf16_at(&f, tok(&f.source, &f.tokens, "B", 0))
+        );
+    }
+
+    /// A same-file supertype carrying instance members seals a subclass
+    /// (:43-53).
+    #[test]
+    fn only_static_members_inherited_instance_members_seal() {
+        let f = Fixture::parse(
+            "class Base { int five = 5; }\nclass E extends Base { static void m() {} }",
+        );
+        assert!(
+            f.run(&one_rule("avoid_classes_with_only_static_members"))
+                .is_empty()
+        );
+    }
+
+    /// A named constructor exempts (:57-61); the default-form constructor
+    /// does not; `sealed` classes skip (:40-41).
+    #[test]
+    fn only_static_members_constructor_and_sealed_faces() {
+        let f = Fixture::parse(
+            "class F { static void m() {} F.named(); }\n\
+             class G { static void m() {} G(); }\n\
+             sealed class H { static void m() {} }",
+        );
+        let lints = f.run(&one_rule("avoid_classes_with_only_static_members"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].range.start,
+            utf16_at(&f, tok(&f.source, &f.tokens, "G", 0))
+        );
+    }
+
+    // —— avoid_multiple_declarations_per_line ———————————————————————————
+
+    /// A multi-variable list reports once, at the second variable's name.
+    #[test]
+    fn multiple_declarations_reports_the_second_variable() {
+        let source = "var a = 1, b = 2;";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("avoid_multiple_declarations_per_line"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Multiple variables declared on a single line."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try splitting the variable declarations into multiple lines.")
+        );
+        let b = tok(&f.source, &f.tokens, "b", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, b));
+    }
+
+    /// Typed lists and field declarations report the same way.
+    #[test]
+    fn multiple_declarations_typed_and_field_faces() {
+        let f = Fixture::parse("int c = 3, d = 4;\nclass A { int x = 1, y = 2; }");
+        let lints = f.run(&one_rule("avoid_multiple_declarations_per_line"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+    }
+
+    /// Single-variable lists pass; the `for` initializer list skips
+    /// (:38-40, the production parent is the `ForStatement` row).
+    #[test]
+    fn multiple_declarations_single_and_for_faces_pass() {
+        let f = Fixture::parse(
+            "var e = 1;\nvoid f() {\n  for (var i = 0, j = 1; i < 1; i++) {\n    print(i + j);\n  }\n}",
+        );
+        assert!(
+            f.run(&one_rule("avoid_multiple_declarations_per_line"))
+                .is_empty()
+        );
+    }
+
+    /// A local multi-variable list reports.
+    #[test]
+    fn multiple_declarations_local_face() {
+        let f = Fixture::parse("void f() { var a = 1, b = 2; }");
+        assert_eq!(
+            f.run(&one_rule("avoid_multiple_declarations_per_line"))
+                .len(),
+            1
+        );
     }
 }

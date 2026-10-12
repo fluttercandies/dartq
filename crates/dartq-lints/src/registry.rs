@@ -29,12 +29,19 @@ pub enum Group {
     Diagnostic,
     /// A rule the SDK removed but still registers (`RemovedAnalysisRule`,
     /// `diagnosticCodes => const []`): the name resolves in the options
-    /// and ignore faces — no `undefined_lint`, and the uppercase name is
+    /// and ignore faces — no `undefined_lint` — and the uppercase name is
     /// in `currentLintCodeNames`
     /// (`analysis_options_parse_model.dart:82`) — while the rule never
     /// fires. Not a `package:lints` member: no include set carries it and
     /// the lint-gate freeze never judges it.
     Removed,
+    /// A registered SDK rule outside the `package:lints` sets (the rules.json
+    /// stable/deprecated/experimental states minus the 89-member union): no
+    /// include set carries it, so enablement is options-driven only
+    /// (`analysis_options` `linter.rules` or a caller-built
+    /// [`EnableSet`]) — parity plan §4.2. Unlike [`Group::Removed`] the
+    /// rule emits, so it joins the lint-gate freeze by name.
+    Standalone,
 }
 
 /// Index into [`RULES`]. Stable within one build of this crate; the machine
@@ -87,8 +94,9 @@ impl core::fmt::Debug for RuleSpec {
 
 /// All rules through the #586 standard-set completion (the full
 /// `package:lints` union: 34 core + 55 recommended-only), the #570
-/// diagnostic mirror, and the #986 removed-registry no-ops (the 14
-/// `RemovedAnalysisRule` registrations). Order is registry order
+/// diagnostic mirror, the #986 removed-registry no-ops (the 14
+/// `RemovedAnalysisRule` registrations), and the #987 W2 standalone wave
+/// (the first 11 options-driven SDK rules). Order is registry order
 /// ([`RuleId`] assignment), grouped core-first then alphabetically within
 /// each group, the mirror section, then the wave sections in wave order
 /// (the removed block first; each new wave appends its section) — keep the
@@ -205,6 +213,20 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::removed::prefer_equal_for_default_values::SPEC,
     &crate::rules::removed::super_goes_last::SPEC,
     &crate::rules::removed::unsafe_html::SPEC,
+    // —— standalone W2 (#987, options-driven SDK rules outside
+    // `package:lints`; parity-plan wave 2, alphabetical): they emit, so
+    // each joins the lint-gate freeze by name ——
+    &crate::rules::declarations::always_declare_return_types::SPEC,
+    &crate::rules::flow::always_put_control_body_on_new_line::SPEC,
+    &crate::rules::declarations::always_put_required_named_parameters_first::SPEC,
+    &crate::rules::types::avoid_annotating_with_dynamic::SPEC,
+    &crate::rules::flow::avoid_catches_without_on_clauses::SPEC,
+    &crate::rules::declarations::avoid_classes_with_only_static_members::SPEC,
+    &crate::rules::expressions::avoid_double_and_int_checks::SPEC,
+    &crate::rules::strings::avoid_escaping_inner_quotes::SPEC,
+    &crate::rules::declarations::avoid_final_parameters::SPEC,
+    &crate::rules::expressions::avoid_js_rounded_ints::SPEC,
+    &crate::rules::declarations::avoid_multiple_declarations_per_line::SPEC,
 ];
 
 /// The rule with machine name `name`, case-insensitively (linear scan; a

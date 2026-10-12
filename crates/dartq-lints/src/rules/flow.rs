@@ -3014,6 +3014,241 @@ void f(_Priv e) {
     }
 }
 
+pub(crate) mod always_put_control_body_on_new_line {
+    use super::{Check, Group, NodeKind, RuleSpec, first_child, last_child};
+
+    /// Official: `pkg/linter/lib/src/rules/always_put_control_body_on_new_line.dart:30-78`
+    /// — a control structure's body statement on the same line as the
+    /// control structure reports at the body's first token. Faces (:38-53):
+    /// the `do` body (compared against the `do` keyword's end), the
+    /// `for`/`while` bodies and the `if` then-branch (against the closing
+    /// `)`), and the `else` branch when it is not another `if` (against the
+    /// `else` keyword's end). An empty block body skips (:56).
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "always_put_control_body_on_new_line",
+        group: Group::Standalone,
+        problem: "Statement should be on a separate line.",
+        correction: "Try moving the statement to a new line.",
+        kinds: &[
+            NodeKind::IfStatement,
+            NodeKind::WhileStatement,
+            NodeKind::ForStatement,
+            NodeKind::ForIn,
+            NodeKind::DoWhileStatement,
+        ],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        match c.kind(node) {
+            NodeKind::IfStatement => {
+                // The then-branch is the direct child after the condition
+                // (collapse map §3.4 IfStatement row).
+                let kids = c.collect_direct(node);
+                if let Some(condition) = kids
+                    .iter()
+                    .position(|&kid| c.kind(kid) == NodeKind::ParenthesizedCondition)
+                    && let Some(&then) = kids.get(condition + 1)
+                {
+                    let control_end = control_end_before(c, then);
+                    check_body(c, then, control_end);
+                }
+                // The else branch (:50-53), skipped for `else if` chains.
+                let Some(else_kw) = c
+                    .payload(node)
+                    .first()
+                    .copied()
+                    .filter(|&kw| kw != super::NONE_TOKEN)
+                else {
+                    return;
+                };
+                if let Some(else_stmt) = last_child(c, node)
+                    && c.kind(else_stmt) != NodeKind::IfStatement
+                {
+                    check_body(c, else_stmt, Some(token_end(c, else_kw)));
+                }
+            }
+            NodeKind::WhileStatement | NodeKind::ForStatement | NodeKind::ForIn => {
+                if let Some(body) = last_child(c, node) {
+                    let control_end = control_end_before(c, body);
+                    check_body(c, body, control_end);
+                }
+            }
+            NodeKind::DoWhileStatement => {
+                // Compared against the `do` keyword's end (:38-40); the body
+                // is the clause's first child.
+                if let Some(body) = first_child(c, node) {
+                    check_body(c, body, Some(token_end(c, c.head_token(node))));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The end offset of the token preceding the body — the control
+    /// structure's closing `)`.
+    fn control_end_before(c: &Check<'_>, body: u32) -> Option<u32> {
+        let head = c.head_token(body);
+        (head > 0).then_some(token_end(c, head - 1))
+    }
+
+    fn token_end(c: &Check<'_>, token: u32) -> u32 {
+        let t = c.unit.tokens.get(token as usize).expect("token in table");
+        t.utf16_offset + c.lexeme(token).encode_utf16().count() as u32
+    }
+
+    /// The official `_checkNodeOnNextLine` (:55-66): an empty block skips,
+    /// the compared body offset is the block's first statement's offset,
+    /// and the report sits at the body's begin token.
+    fn check_body(c: &mut Check<'_>, body: u32, control_end: Option<u32>) {
+        let Some(control_end) = control_end else {
+            return;
+        };
+        let first = if c.kind(body) == NodeKind::Block {
+            match super::first_child(c, body) {
+                Some(first) => first,
+                // `node.statements.isEmpty` (:56).
+                None => return,
+            }
+        } else {
+            body
+        };
+        let body_offset = c
+            .unit
+            .tokens
+            .get(c.head_token(first) as usize)
+            .expect("token in table")
+            .utf16_offset;
+        let same_line = |offset: u32| c.unit.lines.line_col_utf16(c.unit.source, offset).0;
+        if same_line(control_end) == same_line(body_offset) {
+            c.report(crate::rules::utf16_token_span(c, c.head_token(body)), &[]);
+        }
+    }
+}
+
+pub(crate) mod avoid_catches_without_on_clauses {
+    use super::{Check, Group, NodeKind, RuleSpec, last_child};
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_catches_without_on_clauses.dart:30-104`
+    /// — a bare `catch` clause (no `on`) reports at the `catch` keyword
+    /// unless the caught exception has a *valid use* in the clause body:
+    /// a `rethrow` reached before any nested catch clause (:96-101, the
+    /// `_canRethrow` fence) or a `throw` expression referencing the caught
+    /// exception (:107-117). A clause without an exception parameter or
+    /// without a `catch` keyword skips (:69-73, :86-88).
+    ///
+    /// Approximation (documented): the remaining valid-use faces of the
+    /// official `_ValidUseVisitor` (:111-155) key on static types —
+    /// `Never`-typed invocations, `Future.error`, `FlutterError.reportError`,
+    /// `Completer.completeError` — and stay silent here (under-report). A
+    /// throw references the exception when an identifier of its name sits
+    /// inside the throw's subtree; a shadowing local of the same name
+    /// inside a closure body over-reports.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_catches_without_on_clauses",
+        group: Group::Standalone,
+        problem: "Catch clause should use 'on' to specify the type of exception being caught.",
+        correction: "Try adding an 'on' clause before the 'catch'.",
+        kinds: &[NodeKind::CatchClause],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `onKeyword != null` (:69-70): the on-form opens at `on`
+        // (head-when-present, collapse map §3.4 CatchClause row).
+        if c.lexeme(c.head_token(node)) == "on" {
+            return;
+        }
+        // `catchKeyword == null` (:86-88).
+        let Some(catch_kw) = c
+            .payload(node)
+            .first()
+            .copied()
+            .filter(|&kw| kw != super::NONE_TOKEN)
+        else {
+            return;
+        };
+        // `exceptionParameter == null` (:72-73): the clause's first
+        // `FormalParameter` row (the catch formals ride one
+        // `FormalParameters` child, the production probe shape).
+        let window = c.children(node);
+        let Some(exception) = window
+            .clone()
+            .find(|&row| c.kind(row) == NodeKind::FormalParameter)
+        else {
+            return;
+        };
+        let Some(name) = c
+            .payload(exception)
+            .get(1)
+            .filter(|&&tok| tok != super::NONE_TOKEN)
+            .map(|&tok| c.lexeme(tok))
+        else {
+            return;
+        };
+        let Some(body) = last_child(c, node) else {
+            return;
+        };
+        if c.kind(body) != NodeKind::Block {
+            return;
+        }
+
+        // The first nested catch clause row fences the rethrow face
+        // (:96-98 `_canRethrow` — false from the first nested `catch` on,
+        // never restored).
+        let nested_catch = window
+            .clone()
+            .filter(|&row| row != node && c.kind(row) == NodeKind::CatchClause)
+            .min();
+        // The bridge flattens a throw's operand rows as siblings completed
+        // before the width-0 `throw` row, so a throw references the
+        // exception (:107-117) when an identifier of its name sits between
+        // the throw's token and the throw row itself — the operand run.
+        // Rows after an earlier statement row cannot belong to the throw,
+        // which bounds each throw to its own statement.
+        let throws: Vec<u32> = window
+            .clone()
+            .filter(|&row| c.kind(row) == NodeKind::ThrowExpression)
+            .collect();
+        let mut valid = false;
+        for row in window.clone() {
+            // The collapse keeps one rethrow kind (the statement form
+            // covers `=> rethrow` bodies too).
+            if c.kind(row) == NodeKind::RethrowStatement
+                && nested_catch.is_none_or(|first| row < first)
+            {
+                valid = true;
+                break;
+            }
+            if c.kind(row) != NodeKind::Identifier || c.lexeme(c.head_token(row)) != name {
+                continue;
+            }
+            let head = c.head_token(row);
+            if throws.iter().any(|&throw| {
+                row < throw
+                    && head > c.head_token(throw)
+                    && window
+                        .clone()
+                        .filter(|&stmt| {
+                            stmt < throw
+                                && c.unit.ast.parent(stmt) == c.unit.ast.parent(throw)
+                                && crate::rules::is_statement_row(c, stmt)
+                        })
+                        .all(|stmt| stmt < row)
+            }) {
+                valid = true;
+                break;
+            }
+        }
+        if valid {
+            return;
+        }
+        c.report(crate::rules::utf16_token_span(c, catch_kw), &[]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -4621,6 +4856,164 @@ void f(Object o) {
         assert!(
             f.run(&one_rule("type_literal_in_constant_pattern"))
                 .is_empty()
+        );
+    }
+
+    // —— always_put_control_body_on_new_line ————————————————————————————
+
+    /// `test/rules/always_put_control_body_on_new_line.dart` — a then-body
+    /// on the control line reports at the body's first token.
+    #[test]
+    fn control_body_reports_a_same_line_then_body() {
+        let source = "void f(bool c) { if (c) x = 1; }";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("always_put_control_body_on_new_line"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Statement should be on a separate line.");
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try moving the statement to a new line.")
+        );
+        let x = tok(&f.source, &f.tokens, "x", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, x));
+    }
+
+    /// A non-empty block whose first statement shares the control line
+    /// reports; the body on its own line passes.
+    #[test]
+    fn control_body_block_faces() {
+        let f = Fixture::parse("void f(bool c) { if (c) { x = 1; } }");
+        assert_eq!(
+            f.run(&one_rule("always_put_control_body_on_new_line"))
+                .len(),
+            1
+        );
+        let f = Fixture::parse("void f(bool c) {\n  if (c) {\n    x = 1;\n  }\n}");
+        assert!(
+            f.run(&one_rule("always_put_control_body_on_new_line"))
+                .is_empty()
+        );
+    }
+
+    /// An empty block skips (:56).
+    #[test]
+    fn control_body_empty_block_passes() {
+        let f = Fixture::parse("void f(bool c) { if (c) {} }");
+        assert!(
+            f.run(&one_rule("always_put_control_body_on_new_line"))
+                .is_empty()
+        );
+    }
+
+    /// `while`, `for`, and `for-in` bodies are checked against the
+    /// closing `)`.
+    #[test]
+    fn control_body_loop_faces() {
+        let f = Fixture::parse(
+            "void f(bool c) { while (c) x = 1; }\n\
+             void g() { for (var i = 0; i < 1; i++) x = i; }\n\
+             void h() { for (var e in [1]) print(e); }",
+        );
+        assert_eq!(
+            f.run(&one_rule("always_put_control_body_on_new_line"))
+                .len(),
+            3
+        );
+    }
+
+    /// The `do` body is compared against the `do` keyword's end (:38-40).
+    #[test]
+    fn control_body_do_face() {
+        let f = Fixture::parse("void f(bool c) { int x = 0; do x += 1; while (c); }");
+        let lints = f.run(&one_rule("always_put_control_body_on_new_line"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        // The reported token is the body's first `x` (the second in the
+        // source), not the declaration's.
+        let x = tok(&f.source, &f.tokens, "x", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, x));
+    }
+
+    /// The else branch checks against the `else` keyword (:50-53) — the
+    /// report sits at the else clause's begin, the block's `{`; an
+    /// `else if` chain skips.
+    #[test]
+    fn control_body_else_faces() {
+        let f = Fixture::parse("void f(bool c) {\n  if (c) {\n    x = 1;\n  } else { y = 2; }\n}");
+        let lints = f.run(&one_rule("always_put_control_body_on_new_line"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].range.start,
+            utf16_at(&f, tok(&f.source, &f.tokens, "{", 2))
+        );
+        let f = Fixture::parse(
+            "void f(bool c, bool d) {\n  if (c) {\n    x = 1;\n  } else if (d) {\n    y = 2;\n  }\n}",
+        );
+        assert!(
+            f.run(&one_rule("always_put_control_body_on_new_line"))
+                .is_empty()
+        );
+    }
+
+    // —— avoid_catches_without_on_clauses ———————————————————————————————
+
+    /// A bare `catch` clause with no valid use reports at the catch
+    /// keyword.
+    #[test]
+    fn catch_without_on_reports_a_bare_catch() {
+        let source = "void f() { try {} catch (e) {} }";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("avoid_catches_without_on_clauses"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Catch clause should use 'on' to specify the type of exception being caught."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try adding an 'on' clause before the 'catch'.")
+        );
+        let kw = tok(&f.source, &f.tokens, "catch", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, kw));
+    }
+
+    /// `on`-clause forms skip — with or without a catch clause.
+    #[test]
+    fn catch_without_on_on_forms_pass() {
+        let f = Fixture::parse(
+            "void f() { try {} on int catch (e) {} }\nvoid g() { try {} on int {} }",
+        );
+        assert!(
+            f.run(&one_rule("avoid_catches_without_on_clauses"))
+                .is_empty()
+        );
+    }
+
+    /// `rethrow;` and `throw e;` bodies are valid uses (:96-117).
+    #[test]
+    fn catch_without_on_valid_uses_pass() {
+        let f = Fixture::parse(
+            "void f() { try {} catch (e) { rethrow; } }\n\
+             void g() { try {} catch (e) { throw e; } }",
+        );
+        assert!(
+            f.run(&one_rule("avoid_catches_without_on_clauses"))
+                .is_empty()
+        );
+    }
+
+    /// Any other body reports; the two-parameter catch form reports too.
+    /// (The :96-101 nested-catch rethrow fence is implemented but untested
+    /// here: the production parser currently mis-nests a `try` inside a
+    /// `catch` body — the builder rejects the row pairing — a parser-side
+    /// defect tracked outside this rule.)
+    #[test]
+    fn catch_without_on_other_bodies_report() {
+        let f = Fixture::parse(
+            "void f() { try {} catch (e) { print(e); } }\nvoid g() { try {} catch (e, s) {} }",
+        );
+        assert_eq!(
+            f.run(&one_rule("avoid_catches_without_on_clauses")).len(),
+            2
         );
     }
 }

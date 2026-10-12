@@ -399,6 +399,75 @@ pub(crate) mod library_private_types_in_public_api {
     }
 }
 
+pub(crate) mod avoid_annotating_with_dynamic {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// The `augment` ModSet bit (bridge `mod_bits`).
+    const AUGMENT_BIT: u16 = 1 << 1;
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_annotating_with_dynamic.dart:30-76`
+    /// — a formal parameter written with the type `dynamic` reports at the
+    /// parameter (:50-55 `type is NamedType && type.type is DynamicType`).
+    /// Parameters inside an augmentation skip (:57-63 `inAugmentation`).
+    ///
+    /// dartq face: the plain single-token `dynamic` `Type` child (a
+    /// prefixed spelling resolves elsewhere and stays silent — the
+    /// documented face); the augmentation guard walks to the first
+    /// declaration-family ancestor, false at a block boundary (:66-76).
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_annotating_with_dynamic",
+        group: Group::Standalone,
+        problem: "Unnecessary 'dynamic' type annotation.",
+        correction: "Try removing the type 'dynamic'.",
+        kinds: &[NodeKind::FormalParameter],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        if in_augmentation(c) {
+            return;
+        }
+        let Some(written) = c
+            .collect_direct(node)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Type)
+        else {
+            return;
+        };
+        if c.unit.ast.token_range(written).len() == 1
+            && c.lexeme(c.head_token(written)) == "dynamic"
+        {
+            let range = c.utf16_span(node);
+            c.report(range, &[]);
+        }
+    }
+
+    /// The official `inAugmentation` (:66-76): walk the ancestors, `false`
+    /// at a block boundary, otherwise the first declaration's augment bit.
+    fn in_augmentation(c: &Check<'_>) -> bool {
+        for &ancestor in c.path.iter().rev() {
+            match c.kind(ancestor) {
+                NodeKind::Block => return false,
+                NodeKind::Method
+                | NodeKind::TopLevelMethod
+                | NodeKind::Constructor
+                | NodeKind::Factory
+                | NodeKind::Fields
+                | NodeKind::TopLevelFields
+                | NodeKind::ClassDeclaration
+                | NodeKind::MixinDeclaration
+                | NodeKind::ExtensionDeclaration
+                | NodeKind::EnumDeclaration => {
+                    return dartq_ast::mod_flags(&c.unit.ast, ancestor) & AUGMENT_BIT != 0;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -822,5 +891,40 @@ mod tests {
         let lints = f.run(&one_rule("library_private_types_in_public_api"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].range.start, utf16_at(&f, 4));
+    }
+
+    // —— avoid_annotating_with_dynamic ——————————————————————————————————
+
+    /// `test/rules/avoid_annotating_with_dynamic_test.dart` — a parameter
+    /// annotated with bare `dynamic` reports at the annotation.
+    #[test]
+    fn annotating_with_dynamic_reports_a_dynamic_formal() {
+        let source = "void f(dynamic x) {}";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("avoid_annotating_with_dynamic"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Unnecessary 'dynamic' type annotation.");
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try removing the type 'dynamic'.")
+        );
+        let dynamic = crate::testsupport::tok(&f.source, &f.tokens, "dynamic", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, dynamic));
+    }
+
+    /// Only the `dynamic`-annotated formals report, positional or named.
+    #[test]
+    fn annotating_with_dynamic_reports_each_dynamic_formal() {
+        let f = Fixture::parse("void g(int a, dynamic b) {}\nvoid j({dynamic x}) {}");
+        let lints = f.run(&one_rule("avoid_annotating_with_dynamic"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+    }
+
+    /// Specific types pass; a nested `dynamic` type argument is a
+    /// different face and stays out.
+    #[test]
+    fn annotating_with_dynamic_valid_faces_pass() {
+        let f = Fixture::parse("void h(int a, Object b) {}\nvoid i(List<dynamic> xs) {}");
+        assert!(f.run(&one_rule("avoid_annotating_with_dynamic")).is_empty());
     }
 }

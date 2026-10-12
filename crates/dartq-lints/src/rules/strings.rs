@@ -375,6 +375,182 @@ pub(crate) mod unnecessary_string_interpolations {
     }
 }
 
+pub(crate) mod avoid_escaping_inner_quotes {
+    use super::{Check, Group, NodeKind, RuleSpec, TokenKind};
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_escaping_inner_quotes.dart:30-67`
+    /// — a non-raw, non-multiline string (plain literal or interpolation)
+    /// whose value contains the outer quote character but not the other
+    /// reports at the literal, with both quote characters as message
+    /// arguments (:58-66). The value face: the escaped-quote characters of
+    /// the literal text (`node.value`, the interpolation's concatenated
+    /// `InterpolationString` segments, :47-56).
+    ///
+    /// dartq faces: production [`NodeKind::StringLiteral`] rows anchor at
+    /// the head token (bridge `end_literal_string`), so the literal's
+    /// segments are walked from the head — `String` segments carry the
+    /// escape faces, `$id` markers contribute nothing, `${...}` groups hold
+    /// their own literals. In the value terms above this reads the
+    /// escaped-quote face exactly; a unicode escape (`\u{27}`) that
+    /// produces a quote character in the official unescape stays silent
+    /// here (documented under-report).
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_escaping_inner_quotes",
+        group: Group::Standalone,
+        problem: "Unnecessary escape of '{0}'.",
+        correction: "Try changing the outer quotes to '{1}'.",
+        kinds: &[NodeKind::StringLiteral],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let head = c.head_token(node);
+        let bytes = c.lexeme(head).as_bytes();
+        // Raw literals never report (:42/:52 — `node.isRaw`).
+        let quote_at = usize::from(bytes.first() == Some(&b'r'));
+        let Some(&quote) = bytes.get(quote_at) else {
+            return;
+        };
+        if quote != b'\'' && quote != b'"' {
+            return;
+        }
+        // Multiline literals never report (:42/:53 — `node.isMultiline`):
+        // the leading quote run is three.
+        let leading = bytes[quote_at..]
+            .iter()
+            .take_while(|&&b| b == quote)
+            .count();
+        if leading != 1 {
+            return;
+        }
+        let other = if quote == b'\'' { b'"' } else { b'\'' };
+
+        // Walk the literal's segments from the head token.
+        let tokens = c.unit.tokens;
+        let mut i = head;
+        let mut end = token_end(c, head);
+        let mut has_quote = false;
+        let mut has_other = false;
+        loop {
+            let Some(token) = tokens.get(i as usize) else {
+                break;
+            };
+            match token.kind {
+                TokenKind::String => {
+                    let lexeme = c.lexeme(i);
+                    let closing = closes_literal(lexeme, quote);
+                    scan_segment(
+                        lexeme,
+                        i == head,
+                        closing,
+                        quote,
+                        other,
+                        &mut has_quote,
+                        &mut has_other,
+                    );
+                    end = token_end(c, i);
+                    if closing {
+                        break;
+                    }
+                    i += 1;
+                }
+                // `$identifier` interpolations contribute no literal text.
+                TokenKind::StringInterpolationIdentifier => i += 1,
+                // `${...}` groups hold their own literal rows; skip whole.
+                TokenKind::StringInterpolationExpression => {
+                    let Some(close) = tokens.matching_end(i as usize) else {
+                        break;
+                    };
+                    i = close as u32 + 1;
+                }
+                _ => break,
+            }
+        }
+        // `_isChangeable` (:63-66): the value carries the outer quote but
+        // not the other.
+        if has_quote && !has_other {
+            let start = tokens
+                .get(head as usize)
+                .expect("head token in table")
+                .utf16_offset;
+            let quote_char = (quote as char).to_string();
+            let other_char = (other as char).to_string();
+            c.report(start..end, &[&quote_char, &other_char]);
+        }
+    }
+
+    fn token_end(c: &Check<'_>, token: u32) -> u32 {
+        let t = c.unit.tokens.get(token as usize).expect("token in table");
+        t.utf16_offset + c.lexeme(token).encode_utf16().count() as u32
+    }
+
+    /// Whether the segment ends the literal: its last byte is the quote and
+    /// an even number of backslashes precedes it (an escaped final quote
+    /// cannot be the closer).
+    fn closes_literal(lexeme: &str, quote: u8) -> bool {
+        let bytes = lexeme.as_bytes();
+        if bytes.last() != Some(&quote) {
+            return false;
+        }
+        let mut backslashes = 0usize;
+        let mut k = bytes.len() - 1;
+        while k > 0 && bytes[k - 1] == b'\\' {
+            backslashes += 1;
+            k -= 1;
+        }
+        backslashes % 2 == 0
+    }
+
+    /// The segment's escaped-quote faces over its contents (the opening
+    /// quote of the head segment and the closing quote of the closing
+    /// segment are stripped — both single quotes, non-multiline). A raw
+    /// other-quote character counts too (`'a"b'` carries `"` in its value).
+    fn scan_segment(
+        lexeme: &str,
+        is_first: bool,
+        closing: bool,
+        quote: u8,
+        other: u8,
+        has_quote: &mut bool,
+        has_other: &mut bool,
+    ) {
+        let bytes = lexeme.as_bytes();
+        let start = if is_first { quote_at(bytes) + 1 } else { 0 };
+        let mut end = bytes.len();
+        if closing {
+            end -= 1;
+        }
+        if start >= end {
+            return;
+        }
+        let content = &bytes[start..end];
+        let mut k = 0;
+        while k < content.len() {
+            match content[k] {
+                b'\\' if k + 1 < content.len() => {
+                    match content[k + 1] {
+                        q if q == quote => *has_quote = true,
+                        o if o == other => *has_other = true,
+                        _ => {}
+                    }
+                    k += 2;
+                }
+                o if o == other => {
+                    *has_other = true;
+                    k += 1;
+                }
+                _ => k += 1,
+            }
+        }
+    }
+
+    /// The quote character's offset (past an `r` raw prefix).
+    fn quote_at(bytes: &[u8]) -> usize {
+        usize::from(bytes.first() == Some(&b'r'))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -644,5 +820,61 @@ mod tests {
     fn raw_braces_pass() {
         // The raw literal is one token.
         assert!(interp_hits(r"r'${'y'}'", 0, 0).is_empty());
+    }
+
+    // —— avoid_escaping_inner_quotes ————————————————————————————————————
+
+    /// `test/rules/avoid_escaping_inner_quotes_test.dart` — a literal
+    /// escaping its own quote with no other escape reports over the whole
+    /// literal, offering the swapped outer quotes.
+    #[test]
+    fn escaping_inner_quotes_reports_a_single_quote_escape() {
+        let f = Fixture::parse(r#"var a = 'a\'b';"#);
+        let lints = f.run(&one_rule("avoid_escaping_inner_quotes"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Unnecessary escape of '''.");
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try changing the outer quotes to '\"'.")
+        );
+    }
+
+    /// The double-quoted face mirrors the message variants.
+    #[test]
+    fn escaping_inner_quotes_reports_a_double_quote_escape() {
+        let f = Fixture::parse(r#"var a = "a\"b";"#);
+        let lints = f.run(&one_rule("avoid_escaping_inner_quotes"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Unnecessary escape of '\"'.");
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try changing the outer quotes to '''.")
+        );
+    }
+
+    /// Both quote kinds in one value silence the rule (no better outer
+    /// quote), and swapping the outer quotes removes the need to escape.
+    #[test]
+    fn escaping_inner_quotes_both_quotes_pass() {
+        let f = Fixture::parse(r#"var a = 'a"b\'c';"#);
+        let f2 = Fixture::parse(r#"var b = "a'b";"#);
+        assert!(f.run(&one_rule("avoid_escaping_inner_quotes")).is_empty());
+        assert!(f2.run(&one_rule("avoid_escaping_inner_quotes")).is_empty());
+    }
+
+    /// Raw, multiline, and empty literals skip.
+    #[test]
+    fn escaping_inner_quotes_raw_multiline_empty_pass() {
+        let f = Fixture::parse("var a = r'a\"b';\nvar b = '''a\\'b''';\nvar c = '';");
+        assert!(f.run(&one_rule("avoid_escaping_inner_quotes")).is_empty());
+    }
+
+    /// Only the other quote character silences the rule: an unrelated
+    /// escape (`\n`) leaves the escaped quote changeable, and escaping
+    /// inside an interpolated literal reports the same way.
+    #[test]
+    fn escaping_inner_quotes_other_escape_and_interpolation_faces() {
+        let f = Fixture::parse("var a = 'a\\nb\\'c';\nvar b = 'a\\'b $a c';");
+        assert_eq!(f.run(&one_rule("avoid_escaping_inner_quotes")).len(), 2);
     }
 }

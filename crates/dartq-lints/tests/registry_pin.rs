@@ -145,6 +145,30 @@ const OFFICIAL_REMOVED: &[&str] = &[
     "unsafe_html",
 ];
 
+/// The `Standalone` rules — registered SDK rules outside the
+/// `package:lints` sets, enabled only through the options face (parity
+/// plan §4.2). One pinned list per wave in wave-registration order
+/// (alphabetical within a wave); each wave appends its block here, and the
+/// registry section must match the concatenation byte-for-byte.
+const OFFICIAL_STANDALONE_WAVE2: &[&str] = &[
+    "always_declare_return_types",
+    "always_put_control_body_on_new_line",
+    "always_put_required_named_parameters_first",
+    "avoid_annotating_with_dynamic",
+    "avoid_catches_without_on_clauses",
+    "avoid_classes_with_only_static_members",
+    "avoid_double_and_int_checks",
+    "avoid_escaping_inner_quotes",
+    "avoid_final_parameters",
+    "avoid_js_rounded_ints",
+    "avoid_multiple_declarations_per_line",
+];
+
+/// The standalone universe in wave order — the registry-section contract.
+fn official_standalone() -> Vec<&'static str> {
+    OFFICIAL_STANDALONE_WAVE2.to_vec()
+}
+
 #[test]
 fn rule_names_are_unique() {
     let mut seen: Vec<&str> = Vec::with_capacity(RULES.len());
@@ -168,6 +192,14 @@ fn every_rule_is_in_its_official_set() {
             Group::Recommended => OFFICIAL_RECOMMENDED,
             Group::Diagnostic => OFFICIAL_DIAGNOSTIC_MIRRORS,
             Group::Removed => OFFICIAL_REMOVED,
+            Group::Standalone => {
+                assert!(
+                    official_standalone().contains(&spec.name),
+                    "{} claims the standalone group but is absent from the wave lists",
+                    spec.name
+                );
+                continue;
+            }
         };
         assert!(
             official.contains(&spec.name),
@@ -209,10 +241,11 @@ fn registry_fits_the_enable_set_word_count() {
 
 /// The slice pin: 89 `package:lints` members through #586 (34 core + 55
 /// recommended-only, no member left blocked or documented-out), the #570
-/// diagnostic mirror, and the #986 removed-registry no-ops make 104.
+/// diagnostic mirror, the #986 removed-registry no-ops, and the #987 W2
+/// standalone wave make 115.
 #[test]
 fn registry_holds_the_pinned_count() {
-    assert_eq!(RULES.len(), 104);
+    assert_eq!(RULES.len(), 115);
 }
 
 /// The registry-order contract (parity-plan R8): one contiguous block per
@@ -231,6 +264,7 @@ fn registry_sections_hold_the_official_order() {
             Group::Recommended => 1,
             Group::Diagnostic => 2,
             Group::Removed => 3,
+            Group::Standalone => 4,
         })
         .collect();
     assert!(
@@ -263,6 +297,7 @@ fn registry_sections_hold_the_official_order() {
             .collect()
     };
     assert_eq!(ordered_section(Group::Removed), OFFICIAL_REMOVED);
+    assert_eq!(ordered_section(Group::Standalone), official_standalone());
 }
 
 /// The two camelCase registry spellings are the yaml/LintNames forms
