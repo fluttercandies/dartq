@@ -33,6 +33,8 @@
 #              timeout(1) exists) and full exit-code propagation:
 #                calibration pins (harness unit pins + m3_codes_pin)
 #                -> m0-gate -> m1-gate -> lint-gate -> m2-gate -> m3-gate
+#                -> M4 suites (daemon/plugin/commands/schema) + the
+#                schema-freeze sweep (+ the DARTQ_M4_LIVE live faces, opt-in)
 #                -> ci.sh -> repro-gate
 #              One PASS/FAIL line per gate; on FAIL the harness stops and
 #              names the gate and its evidence directory. Before repro-gate
@@ -330,6 +332,63 @@ phase_verify() {
         bash scripts/m2-gate.sh $gate_dry || return 1
     run_gate m3 600 8388608 "docs/audits/gate-m3/$m3_label" \
         env M3_LABEL="$m3_label" bash scripts/m3-gate.sh $gate_dry || return 1
+
+    # M4 surfaces (#945): the daemon/plugin/commands/schema suites, then the
+    # schema v1 freeze sweep (cross-face: CLI machine/json shapes + a live
+    # daemon RPC session; drives the debug dartq built by the build phase).
+    # plugin-suite intentionally carries only the lib + the 13 in-process
+    # integration targets — the six dart-spawning integration files belong
+    # to the DARTQ_M4_LIVE faces below; keep the target lists in sync when
+    # a new tests/*.rs file lands in dartq-plugin.
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "release: [verify] would run: cargo test -p dartq-daemon -- --test-threads 2   # daemon-suite"
+        echo "release: [verify] would run: cargo test -p dartq-plugin --lib --test <13 in-process targets> -- --test-threads 2   # plugin-suite"
+        echo "release: [verify] would run: cargo test -p dartq-commands -- --test-threads 2   # commands-suite"
+        echo "release: [verify] would run: cargo test -p dartq-schema -- --test-threads 2   # schema-suite"
+        echo "release: [verify] would run: scripts/schema-freeze-sweep.sh --no-build   # schema-freeze"
+        echo "verify: SKIP m4 suites (dry-run)"
+    else
+        run_gate daemon-suite 1800 8388608 "terminal output (dartq-daemon suite)" \
+            cargo test -p dartq-daemon -- --test-threads 2 || return 1
+        run_gate plugin-suite 1800 8388608 "terminal output (dartq-plugin lib + in-process integration targets)" \
+            cargo test -p dartq-plugin --lib \
+            --test analyze_clock_reopen --test analyze_timeout --test crash_restart \
+            --test handshake_timeout --test memory_budget --test protocol_violation \
+            --test reader_eof_death_attribution --test relaunch_hang --test shutdown_hang \
+            --test shutdown_timeout --test startup_stderr --test wait_dead_generation \
+            --test write_timeout -- --test-threads 2 || return 1
+        run_gate commands-suite 900 8388608 "terminal output (dartq-commands suite)" \
+            cargo test -p dartq-commands -- --test-threads 2 || return 1
+        run_gate schema-suite 900 8388608 "terminal output (dartq-schema suite)" \
+            cargo test -p dartq-schema -- --test-threads 2 || return 1
+        run_gate schema-freeze 1200 8388608 "terminal output (per-face PASS/FAIL verdicts)" \
+            bash scripts/schema-freeze-sweep.sh --no-build --label "${SCHEMA_FREEZE_LABEL:-schema-freeze-r1}" || return 1
+    fi
+    # Live host-SDK faces: real dart plugin/host processes — opt-in via
+    # DARTQ_M4_LIVE=1 (resource discipline; the same flag gates these faces
+    # in serial-gates.sh). A dry-run prints the plan either way.
+    if [ "${DARTQ_M4_LIVE:-0}" = 1 ]; then
+        if [ "$DRY_RUN" = 1 ]; then
+            echo "release: [verify] would run: cargo test -p dartq-daemon --test rpc_commands -- --ignored --test-threads 2   # daemon-live"
+            echo "release: [verify] would run: cargo test -p dartq-plugin --test <5 dart-spawning targets> -- --test-threads 2   # plugin-live"
+            echo "release: [verify] would run: cargo test -p dartq-plugin --test compat_live -- --ignored --test-threads 2   # compat-live"
+            echo "release: [verify] would run: (cd crates/dartq-plugin-host && dart pub get && dart test -j 2)   # host-live"
+        else
+            run_gate daemon-live 900 8388608 "terminal output (rpc_commands serial-phase test)" \
+                cargo test -p dartq-daemon --test rpc_commands -- --ignored --test-threads 2 || return 1
+            run_gate plugin-live 1800 8388608 "terminal output (dart-spawning plugin integration targets)" \
+                cargo test -p dartq-plugin --test callback_timeout --test e2e_round_trip \
+                --test live_host --test outbound_frame_guard --test plugin_discovery \
+                -- --test-threads 2 || return 1
+            run_gate compat-live 1800 8388608 "terminal output (#644 compat matrix, ignored tests)" \
+                cargo test -p dartq-plugin --test compat_live -- --ignored --test-threads 2 || return 1
+            run_gate host-live 1800 8388608 "terminal output (dartq_plugin_host dart test)" \
+                bash -c "cd crates/dartq-plugin-host && dart pub get && dart test -j 2" || return 1
+        fi
+    elif [ "$DRY_RUN" != 1 ]; then
+        echo "release: [verify] SKIP m4-live faces (DARTQ_M4_LIVE not set — live dart-process suites stay opt-in)"
+    fi
+
     if [ "$DRY_RUN" = 1 ]; then
         echo "release: [verify] would run: scripts/ci.sh   # no dry mode: per-crate serial fmt + clippy (15-40 min)"
         echo "verify: SKIP ci (dry-run)"

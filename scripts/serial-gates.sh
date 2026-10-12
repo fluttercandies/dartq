@@ -4,7 +4,8 @@
 # Runs the whole gate marathon as one turnkey, strictly serialized chain:
 # never two product processes at a time, every step under an RSS watchdog,
 # every step logged, first red step stops the chain. It orchestrates the
-# existing gate scripts (m1/m2/m3/lint/mega/acceptance/repro/coverage) and
+# existing gate scripts (m1/m2/m3/lint/mega/acceptance/repro/coverage +
+# the schema-freeze sweep) and
 # composes the two trend differential runs in the m0-gate.sh idiom (no
 # separate trend script exists). It NEVER executes product code outside the
 # watchdogged steps below. This script does not commit; repro-gate's
@@ -47,6 +48,29 @@
 #   semantic-suite   cargo test -p dartq-semantic -- --test-threads 2
 #   lints-suite      cargo test -p dartq-lints    -- --test-threads 2
 #   engine-suite     cargo test -p dartq-engine   -- --test-threads 2
+#   daemon-suite     cargo test -p dartq-daemon   -- --test-threads 2
+#                    (the one serial-phase #[ignore]d test in rpc_commands
+#                    belongs to daemon-live below)
+#   plugin-suite     cargo test -p dartq-plugin: lib + the 13 in-process
+#                    integration targets, -- --test-threads 2. The six
+#                    dart-spawning integration files are owned by the live
+#                    steps below — a new tests/*.rs file must be added to
+#                    the matching step or both silently skip it.
+#   commands-suite   cargo test -p dartq-commands -- --test-threads 2
+#   schema-suite     cargo test -p dartq-schema   -- --test-threads 2
+#   schema-freeze    scripts/schema-freeze-sweep.sh --no-build (the schema
+#                    v1 freeze gate, #474: 10 faces over the CLI machine/
+#                    json shapes and a live daemon RPC session; drives the
+#                    debug dartq built by debug-rebuild)
+#   daemon-live      DARTQ_M4_LIVE=1 gate: cargo test -p dartq-daemon --test
+#                    rpc_commands -- --ignored --test-threads 2 (spawns a
+#                    real dart plugin process); a clean logged skip when
+#                    the flag is unset
+#   plugin-live      DARTQ_M4_LIVE=1 gate: the five dart-spawning plugin
+#                    integration targets, then compat_live -- --ignored
+#                    (the #644 compat matrix); clean skip when unset
+#   host-live        DARTQ_M4_LIVE=1 gate: dart pub get + dart test in the
+#                    dartq-plugin-host Dart package; clean skip when unset
 #   repro            scripts/repro-gate.sh (clean tracked tree required)
 #   coverage         scripts/coverage-gate.sh --stability — the §19.5
 #                    two-run protocol (identical run-to-run totals); LAST,
@@ -80,7 +104,10 @@
 # Environment: SERIAL_TAG (label suffix), SERIAL_MEGA_SCALE (1k|10k|100k|all,
 # default 10k), SERIAL_MEGA_ORACLE_LEG (1 default, 0 drops the 1k parity
 # leg), SERIAL_COVERAGE_HTML (1 adds an html pass after the coverage
-# stability pair), RSS_LIMIT_KB (default 8388608), FVM_HOME, DARTQ_CMD /
+# stability pair), DARTQ_M4_LIVE (1 opts in to the three -live steps —
+# they spawn real dart plugin/host processes; default 0 leaves them a
+# logged skip: live product processes run only in the sanctioned serial
+# window, by explicit flag), RSS_LIMIT_KB (default 8388608), FVM_HOME, DARTQ_CMD /
 # DARTQ_ANALYZE_CMD (trend faces; defaults are the m0-gate shapes). The
 # wrapped gate scripts honor their own env overrides unchanged.
 #
@@ -129,12 +156,15 @@ LBL_LINT="lints-r1${TAG}"
 LBL_M2="m2-r1${TAG}"
 LBL_M3="m3-r1${TAG}"
 LBL_MEGA="mega-r1${TAG}"
+LBL_SCHEMA="schema-freeze-r1${TAG}"
 LBL_REPRO="serial${TAG}"
 
 STEPS=(
   release-rebuild debug-rebuild trend-w5-A trend-w5-B m1-r5 acceptance
   lint-gate m2-r1 m3-r1 mega-r1 scanner-suite flow-suite parser-suite
-  semantic-suite lints-suite engine-suite repro coverage
+  semantic-suite lints-suite engine-suite daemon-suite plugin-suite
+  commands-suite schema-suite schema-freeze daemon-live plugin-live
+  host-live repro coverage
 )
 
 usage() {
@@ -345,6 +375,16 @@ preflight() {
   for s in "${STEPS[@]}"; do
     selected "$s" || continue
     case "$s" in
+    daemon-live | plugin-live | host-live)
+      # The live faces are a clean skip without the flag — only demand the
+      # SDK when they will actually run.
+      [ "${DARTQ_M4_LIVE:-0}" = 1 ] && need_dart=1
+      ;;
+    schema-freeze)
+      need_dart=1
+      command -v python3 >/dev/null 2>&1 ||
+        die "python3 is required by the schema-freeze sweep (brew install python3)"
+      ;;
     trend-* | m1-r5 | m2-r1 | m3-r1 | lint-gate | mega-r1 | repro) need_dart=1 ;;
     esac
     case "$s" in
@@ -455,17 +495,41 @@ mega_run() { # perf + parity: 1k oracle leg (parity) + scale run (perf)
       scripts/mega-run.sh --scale 1k --oracle-leg --strict --label "${LBL_MEGA}-oracleleg" || return 1
     leg_peak="$WATCH_PEAK_KB"
   fi
+  local rc=0
   if [ "$scale" = "all" ]; then
     watchdog_run "mega-r1${TAG}" "$MEGA_CAP_KB" \
-      scripts/mega-run.sh --all --strict --label "$LBL_MEGA"
+      scripts/mega-run.sh --all --strict --label "$LBL_MEGA" || rc=1
   else
     watchdog_run "mega-r1${TAG}" "$MEGA_CAP_KB" \
-      scripts/mega-run.sh --scale "$scale" --strict --label "$LBL_MEGA"
+      scripts/mega-run.sh --scale "$scale" --strict --label "$LBL_MEGA" || rc=1
   fi
   # Peak of the step = heaviest phase (the leg's peak survives the perf run).
   if [ -n "${leg_peak:-}" ] && [ "${leg_peak:-0}" -gt "${WATCH_PEAK_KB:-0}" ]; then
     WATCH_PEAK_KB="$leg_peak"
   fi
+  # The final phase's rc is returned explicitly: step_runner runs in a
+  # guarded context (set -e suspended), so a bare fall-through after the
+  # peak-max if would mask a red perf run as PASS.
+  return "$rc"
+}
+
+m4_live_skip() { # <step> — the DARTQ_M4_LIVE=1 opt-in gate for the live
+  # host-SDK faces. Returns 1 (run the step) when the flag is set; otherwise
+  # writes the skip note as the step's log (watchdog_run log shape, trailing
+  # exit= line) and returns 0 — a clean skip the summary reports as PASS.
+  if [ "${DARTQ_M4_LIVE:-0}" = 1 ]; then
+    return 1
+  fi
+  WATCH_LOG="/tmp/serial_$1.log"
+  WATCH_PEAK_KB=0
+  {
+    echo "SKIP: DARTQ_M4_LIVE not set — live dart plugin/host process faces"
+    echo "are opt-in (resource discipline: real product processes run only"
+    echo "in the sanctioned serial window, by explicit flag)."
+    echo "exit=0"
+  } >"$WATCH_LOG"
+  echo "-- skipped: DARTQ_M4_LIVE not set (live dart-process faces are opt-in)"
+  return 0
 }
 
 # --- per-step dispatch --------------------------------------------------------
@@ -499,6 +563,59 @@ step_runner() { # <step> — runs every watchdogged phase of the step
   scanner-suite | flow-suite | parser-suite | semantic-suite | lints-suite | engine-suite)
     watchdog_run "$1" "$(cap_for_step "$1")" \
       cargo test -p "dartq-${1%-suite}" -- --test-threads 2
+    ;;
+  daemon-suite | commands-suite | schema-suite)
+    watchdog_run "$1" "$(cap_for_step "$1")" \
+      cargo test -p "dartq-${1%-suite}" -- --test-threads 2
+    ;;
+  plugin-suite)
+    # dartq-plugin's integration tests split at the dart-process boundary:
+    # the five dart-spawning files plus the #[ignore]d compat_live are owned
+    # by the flag-gated plugin-live step. When a new tests/*.rs file lands,
+    # add it to the matching step — an unlisted target is silently skipped
+    # by both.
+    watchdog_run "$1" "$(cap_for_step "$1")" \
+      cargo test -p dartq-plugin --lib \
+      --test analyze_clock_reopen --test analyze_timeout --test crash_restart \
+      --test handshake_timeout --test memory_budget --test protocol_violation \
+      --test reader_eof_death_attribution --test relaunch_hang --test shutdown_hang \
+      --test shutdown_timeout --test startup_stderr --test wait_dead_generation \
+      --test write_timeout -- --test-threads 2
+    ;;
+  schema-freeze)
+    watchdog_run "$1" "$(cap_for_step "$1")" \
+      env DARTQ_SWEEP_SDK="$SDK_ROOT" \
+      scripts/schema-freeze-sweep.sh --no-build --label "$LBL_SCHEMA"
+    ;;
+  daemon-live)
+    m4_live_skip "$1" && return 0
+    watchdog_run "$1" "$(cap_for_step "$1")" \
+      cargo test -p dartq-daemon --test rpc_commands -- --ignored --test-threads 2
+    ;;
+  plugin-live)
+    m4_live_skip "$1" && return 0
+    watchdog_run "plugin-live${TAG}" "$(cap_for_step "$1")" \
+      cargo test -p dartq-plugin --test callback_timeout --test e2e_round_trip \
+      --test live_host --test outbound_frame_guard --test plugin_discovery \
+      -- --test-threads 2 || return 1
+    local leg_peak="$WATCH_PEAK_KB" rc=0
+    watchdog_run "plugin-live-compat${TAG}" "$(cap_for_step "$1")" \
+      cargo test -p dartq-plugin --test compat_live -- --ignored --test-threads 2 || rc=1
+    # Peak of the step = heaviest phase (the first phase's peak survives).
+    [ "$leg_peak" -gt "${WATCH_PEAK_KB:-0}" ] && WATCH_PEAK_KB="$leg_peak"
+    return "$rc"
+    ;;
+  host-live)
+    m4_live_skip "$1" && return 0
+    # bash -c (not --directory): the pub/test cwd form works on every dart
+    # 3.x; the SDK comes from the chain's FVM_HOME resolution.
+    watchdog_run "host-live-pubget${TAG}" "$(cap_for_step "$1")" \
+      bash -c "cd crates/dartq-plugin-host && exec '$DART_BIN' pub get" || return 1
+    local leg_peak="$WATCH_PEAK_KB" rc=0
+    watchdog_run "host-live${TAG}" "$(cap_for_step "$1")" \
+      bash -c "cd crates/dartq-plugin-host && exec '$DART_BIN' test -j 2" || rc=1
+    [ "$leg_peak" -gt "${WATCH_PEAK_KB:-0}" ] && WATCH_PEAK_KB="$leg_peak"
+    return "$rc"
     ;;
   repro)
     watchdog_run "$1" "$(cap_for_step "$1")" scripts/repro-gate.sh --label "$LBL_REPRO"

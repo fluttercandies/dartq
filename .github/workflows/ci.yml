@@ -2,7 +2,8 @@
 #
 # scripts/ci.sh (per-crate serial fmt + clippy) is fully subsumed by the
 # workspace-wide steps of the `rust` job, so it is not re-run here. The
-# `gates` job runs the Dart differential gates (m0 / m1 / lints) and the §19.5
+# `gates` job runs the Dart differential gates (m0 / m1 / lints), the M4
+# schema-freeze sweep + plugin-host Dart suite (#945), and the §19.5
 # reproducibility gate, which scripts/ci.sh deliberately excludes, reproducing
 # their local oracle assumptions on the runner:
 #   - The gates resolve the oracle at $FVM_HOME/default/bin/cache/dart-sdk
@@ -40,6 +41,10 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
         continue-on-error: true # goal #133; flip at the terminal sweep
+      # Covers every crate's unit + integration suites, including the M4
+      # surfaces (#945: daemon/plugin/commands/schema). The dart-gated
+      # plugin fixture tests self-skip here (no dart on this job) and the
+      # #[ignore]d live faces stay opt-in (the DARTQ_M4_LIVE discipline).
       - run: cargo test --workspace
 
   gates:
@@ -75,6 +80,22 @@ jobs:
         run: bash scripts/m1-gate.sh --label ci
       - name: Lint differential gate
         run: bash scripts/lint-gate.sh --label ci
+      # M4 schema-freeze sweep (#945): the frozen v1 CLI/RPC surface
+      # end-to-end — CLI machine/json faces plus a live daemon RPC session
+      # over a tiny fixture. Uses the debug dartq built above (--no-build)
+      # and the sweep's fvm-layout SDK default.
+      - name: Schema-freeze sweep
+        run: bash scripts/schema-freeze-sweep.sh --no-build --label ci
+      # M4 host suite (#945): the dartq_plugin_host package's own `dart
+      # test` suite — pure in-process tests (no plugin process spawning),
+      # so it is CI-safe by default. The Rust live faces (daemon-live /
+      # plugin-live / compat-live) spawn real dart processes and stay
+      # opt-in via DARTQ_M4_LIVE — deliberately not enabled on CI.
+      - name: Plugin-host Dart suite
+        working-directory: crates/dartq-plugin-host
+        run: |
+          dart pub get
+          dart test -j 2
       # §19.5 reproducibility gate. RUNBOOK: the first LIVE run of this gate
       # is the main-agent's serial-phase action — a clean-tree local
       # `scripts/repro-gate.sh` run validates it first, and the commit
