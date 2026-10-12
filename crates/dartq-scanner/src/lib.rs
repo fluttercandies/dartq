@@ -161,7 +161,9 @@ pub use token::{Token, TokenKind, TokenTable};
 pub struct ScanConfig {
     /// Whether `>>>` / `>>>=` form a single token (when false, `>>>` scans as `>>` + `>`).
     pub enable_triple_shift: bool,
-    /// Whether `augment` is a built-in keyword (when false, treated as a plain identifier).
+    /// Whether `augment` is a built-in keyword (when false, treated as a plain
+    /// identifier — official tokenizeKeywordOrIdentifier,
+    /// abstract_scanner.dart:2106; pinned by front_end scanner_test.dart:480-489).
     pub enable_augmentations: bool,
 }
 

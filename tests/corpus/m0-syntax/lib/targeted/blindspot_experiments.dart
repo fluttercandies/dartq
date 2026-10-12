@@ -14,10 +14,16 @@
 // was off by default is stale).
 class PrimaryPoint(final int x) {}
 
-// Augmentations: 'augment' without the feature. With the feature enabled
-// the same shape reaches extension_augmentation_has_on_clause (TSV:110;
-// fasta emit site pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart:
-// 3705, "Extension augmentations can't have 'on' clauses.").
+// Augmentations: 'augment' without the feature. The SDK scanner's lexical
+// gate (abstract_scanner.dart:2106) lexes 'augment' as a plain identifier,
+// so the oracle rides the identifier path and reports EXPECTED_TOKEN
+// ("Expected to find ';'.", anchored on 'augment'), UNDEFINED_CLASS
+// 'augment', and MISSING_IDENTIFIER (at the 'extension' token).
+// extension_augmentation_has_on_clause (TSV:110; fasta emit site
+// pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart:3705, "Extension
+// augmentations can't have 'on' clauses.") is unreachable at plain 3.13 —
+// it needs the augmentation parse path, which the lexical gate precludes
+// when the feature is off.
 augment extension AugmentedExtension on int {}
 
 // Targets extraneous_modifier_in_primary_constructor (TSV:129; fasta emit

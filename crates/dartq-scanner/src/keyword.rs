@@ -2,9 +2,15 @@
 //! `token.dart` `Keyword` table, Dart 3.15).
 //!
 //! The scanner emits [`TokenKind::Keyword`] for pseudo keywords and built-ins
-//! alike; context-based disambiguation is the parser's job. `augment` is gated
-//! by [`crate::ScanConfig::enable_augmentations`] (treated as an identifier
-//! when disabled, matching official `tokenizeKeywordOrIdentifier` :2106).
+//! alike; context-based disambiguation is the parser's job. `augment` is the
+//! one lexically gated keyword: with [`crate::ScanConfig::enable_augmentations`]
+//! disabled it lexes as an identifier, mirroring the official scanner's
+//! `tokenizeKeywordOrIdentifier` (abstract_scanner.dart:2106 —
+//! `if (!_enableAugmentations && keyword == Keyword.AUGMENT) return
+//! tokenizeIdentifier(...)`) and the SDK's own scanner test pinning
+//! identifier-when-disabled (front_end scanner_test.dart:480-489). With the
+//! feature enabled it is `Keyword.AUGMENT` (token.dart:139-145,
+//! `KeywordStyle.builtIn`).
 
 /// Keyword classification (official `KeywordStyle`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

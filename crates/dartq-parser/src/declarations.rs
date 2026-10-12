@@ -1372,17 +1372,23 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
         // implements
         clauses.implements = self.parse_implements_clause();
-        // native clause (deprecated)
+        // native clause (deprecated). The official report lives in the
+        // resolver (`visitNativeClause`, error_verifier.dart:1324-1329,
+        // `!_isInSystemLibrary`) with the clause-node span — keyword through
+        // the string when named (probed 3.13.1: `native "corpus"` len 15,
+        // bare `native` len 6); dartq reports at the parse tier, where the
+        // non-SDK gate is trivially true.
         let mut native = None;
         if self.peek_kind() == TokenKind::Keyword(Keyword::Native) {
             let native_kw = self.peek_span();
             self.cursor.advance();
             let has_name = self.peek_kind() == TokenKind::String;
+            let mut end = native_kw;
             if has_name {
-                self.parse_literal_string();
+                end = self.parse_literal_string();
             }
             self.listener.handle_native_clause(native_kw, has_name);
-            self.report(msg::native_clause_should_be_annotation(), native_kw);
+            self.report_with_end(msg::native_clause_in_non_sdk_code(), native_kw, end);
             native = Some(native_kw);
         }
         self.listener.handle_class_header(begin, class_kw, native);

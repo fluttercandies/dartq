@@ -129,13 +129,33 @@ fn keyword_styles_official() {
 
 #[test]
 fn augment_gated_by_config() {
-    // On: Keyword; off: Identifier (official tokenizeKeywordOrIdentifier :2106).
+    // On: Keyword; off: Identifier (official tokenizeKeywordOrIdentifier
+    // :2106, pinned by front_end scanner_test.dart:480-489).
     let on = scan_src("augment");
     assert_kinds(&on, &[K::Keyword(Keyword::Augment)]);
     let off = crate::scan("augment", config_off(), super::file_id());
     assert_kinds(&off, &[K::Identifier]);
     // Not treated as a keyword when followed by identifier characters (`augments`, `augment_2`).
     assert_kinds(&scan_src("augments augment_2"), &[K::Identifier; 2]);
+    // Same gate in string-interpolation position (scan_interpolated_identifier).
+    assert_kinds(
+        &scan_src("'x $augment'"),
+        &[
+            K::String,
+            K::StringInterpolationIdentifier,
+            K::Keyword(Keyword::Augment),
+            K::String,
+        ],
+    );
+    assert_kinds(
+        &crate::scan("'x $augment'", config_off(), super::file_id()),
+        &[
+            K::String,
+            K::StringInterpolationIdentifier,
+            K::Identifier,
+            K::String,
+        ],
+    );
 }
 
 #[test]

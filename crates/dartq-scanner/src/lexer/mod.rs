@@ -855,6 +855,9 @@ impl<'s> Lexer<'s> {
             |b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$'),
         );
         let lexeme = &self.src[start..self.pos];
+        // `augment` is gated on the augmentations feature (official
+        // tokenizeKeywordOrIdentifier, abstract_scanner.dart:2106: without
+        // `_enableAugmentations` the lexeme falls through to tokenizeIdentifier).
         let kind = match keyword_from_str(lexeme) {
             Some(Keyword::Augment) if !self.config.enable_augmentations => TokenKind::Identifier,
             Some(kw) => TokenKind::Keyword(kw),

@@ -543,6 +543,28 @@ fn augment_headed_declaration_name_recovery() {
     );
 }
 
+/// `augment extension E on int {}` with the feature off (engine gate +
+/// 3.13 oracle): `augment` rides the identifier path as a type, the
+/// field-name gate rejects `extension` as the name (missing_identifier,
+/// synthetic splice, keyword left for the declaration loop), the `;` check
+/// reports expected_token anchored on the consumed `augment`, and
+/// `extension E on int {}` reparses clean as a plain extension. That is
+/// exactly the 3.13.1 oracle's parser-level face for this shape
+/// (EXPECTED_TOKEN at 1|1|7, MISSING_IDENTIFIER at 1|9); the oracle's third
+/// entry, UNDEFINED_CLASS 'augment', is a compile-time code from the
+/// semantic layer, and `extension_augmentation_has_on_clause` is unreachable
+/// here (it needs the augmentation parse path, which the lexical gate
+/// precludes at plain 3.13). m0-differential target: the full oracle
+/// multiset (the semantic UNDEFINED_CLASS rides on the diagnose wave).
+#[test]
+fn augment_extension_on_int_identifier_path() {
+    assert_codes_engine(
+        "augment extension E on int {}\n",
+        &["missing_identifier", "expected_token"],
+        "augment extension rides the identifier field path",
+    );
+}
+
 /// `augment extension type ET {}`: the extension-type declaration reparses
 /// after the field fallback, so the primary-constructor pair fires —
 /// `missing_primary_constructor` anchored on the parser pointer and

@@ -22,9 +22,12 @@ extension type EmptyRepresentation() {}
 // '3.13.0'), so at the corpus language version the disabled branch is
 // unreachable. Version-gated documented gap, like the native family.
 
-// Targets representation_field_trailing_comma (TSV:263) — fasta message
-// key representationFieldTrailingComma (pkg/front_end/lib/src/codes/
-// diagnostic.g.dart): the representation field can't have a trailing comma.
+// Dead face at 3.13 (TSV:263, probed 2026-10-11): the fasta message key
+// representationFieldTrailingComma exists (pkg/front_end/lib/src/codes/
+// diagnostic.g.dart), but the analyzer has no emitter for it —
+// `extension type E(int x,) {}` and this shape are both silent in
+// `dart analyze` output at the pinned oracle. Kept as a zero-row gate face;
+// no dartq emitter (emitter-wave W1 probe verdict).
 extension type TrailingComma(int x,) {}
 
 // Targets extraneous_modifier_in_extension_type (TSV:128) — fasta emit

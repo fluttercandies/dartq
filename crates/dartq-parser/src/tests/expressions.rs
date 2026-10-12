@@ -303,6 +303,18 @@ fn multiplicative_binds_tighter_than_additive() {
 }
 
 #[test]
+fn augment_builtin_reads_as_name_in_expressions() {
+    // The harness scans with augmentations enabled, so `augment` arrives as
+    // Keyword(Augment) (with the feature off the lexical gate makes it a
+    // plain identifier, abstract_scanner.dart:2106). Either way,
+    // expression-position use is a parser-level contextual decision — the
+    // parser reads it as a name (official parsePrimary's isIdentifier
+    // fall-through, parser_impl.dart:7558-7576).
+    let c = parse("void f() { augment + 1; x.augment; }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+}
+
+#[test]
 fn equality_cannot_chain_but_is_then_equality_can() {
     let c = parse("void f() { a == b == c; }");
     assert_eq!(

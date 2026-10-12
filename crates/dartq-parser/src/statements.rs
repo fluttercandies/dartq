@@ -1820,6 +1820,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         of_function_expression: bool,
         allow_abstract: bool,
     ) -> TokenSpan {
+        // `native "name";` function body. The official report is
+        // resolver-side (`_checkForNativeFunctionBodyInNonSdkCode`,
+        // error_verifier.dart:4516-4523, `!_isInSystemLibrary`) on the
+        // NativeFunctionBody node — keyword through the semicolon (probed
+        // 3.13.1: `native "corpus";` len 16) — and fires only when the body
+        // is well-formed: without the semicolon no node is built and the
+        // oracle degrades to `missing_function_body` (probed), so the
+        // no-semicolon arm stays silent here and falls through to the
+        // ordinary body recovery. dartq reports at the parse tier, where the
+        // non-SDK gate is trivially true.
         if self.peek_kind() == TokenKind::Keyword(Keyword::Native) {
             let native = self.peek_span();
             let has_name = self.cursor.look_kind(1) == TokenKind::String;
@@ -1828,12 +1838,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 self.parse_literal_string();
             }
             self.listener.handle_native_clause(native, has_name);
-            self.report(msg::native_clause_should_be_annotation(), native);
             if self.peek_kind() == TokenKind::Semicolon {
                 let semi = self.peek_span();
                 self.cursor.advance();
                 self.listener
                     .handle_native_function_body_skipped(native, semi);
+                self.report_with_end(msg::native_function_body_in_non_sdk_code(), native, semi);
                 return semi;
             }
             self.listener

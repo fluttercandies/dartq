@@ -70,12 +70,12 @@ pub(crate) mod msg {
         MISSING_METHOD_PARAMETERS, MISSING_PRIMARY_CONSTRUCTOR,
         MISSING_PRIMARY_CONSTRUCTOR_PARAMETERS, MISSING_STAR_AFTER_SYNC,
         MISSING_TYPEDEF_PARAMETERS, MIXIN_DECLARES_CONSTRUCTOR, MODIFIER_OUT_OF_ORDER,
-        MULTIPLE_CLAUSES, MULTIPLE_EXTENDS_CLAUSES, NATIVE_CLAUSE_SHOULD_BE_ANNOTATION,
-        OUT_OF_ORDER_CLAUSES, REDIRECTING_CONSTRUCTOR_WITH_BODY,
-        REDIRECTION_IN_NON_FACTORY_CONSTRUCTOR, SEALED_ENUM, SEALED_MIXIN, SEALED_MIXIN_CLASS,
-        SETTER_CONSTRUCTOR, STATIC_CONSTRUCTOR, STATIC_OPERATOR, TOP_LEVEL_OPERATOR,
-        TYPE_BEFORE_FACTORY, TYPEDEF_IN_CLASS, UNEXPECTED_TOKEN, UNEXPECTED_TOKENS,
-        VAR_RETURN_TYPE, WITH_BEFORE_EXTENDS,
+        MULTIPLE_CLAUSES, MULTIPLE_EXTENDS_CLAUSES, NATIVE_CLAUSE_IN_NON_SDK_CODE,
+        NATIVE_FUNCTION_BODY_IN_NON_SDK_CODE, OUT_OF_ORDER_CLAUSES,
+        REDIRECTING_CONSTRUCTOR_WITH_BODY, REDIRECTION_IN_NON_FACTORY_CONSTRUCTOR, SEALED_ENUM,
+        SEALED_MIXIN, SEALED_MIXIN_CLASS, SETTER_CONSTRUCTOR, STATIC_CONSTRUCTOR, STATIC_OPERATOR,
+        TOP_LEVEL_OPERATOR, TYPE_BEFORE_FACTORY, TYPEDEF_IN_CLASS, UNEXPECTED_TOKEN,
+        UNEXPECTED_TOKENS, VAR_RETURN_TYPE, WITH_BEFORE_EXTENDS,
     };
     use dartq_diagnostics::{
         ABSTRACT_LATE_FIELD, ABSTRACT_STATIC_FIELD, ANNOTATION_SPACE_BEFORE_PARENTHESIS,
@@ -1314,10 +1314,31 @@ pub(crate) mod msg {
         )
     }
 
-    pub(crate) fn native_clause_should_be_annotation() -> Message {
-        Message::new(
-            NATIVE_CLAUSE_SHOULD_BE_ANNOTATION,
-            "Native clause in this form is deprecated.",
+    // The two native codes are resolver-side in the official pipeline
+    // (`error_verifier.dart` `visitNativeClause`/:1324 and
+    // `_checkForNativeFunctionBodyInNonSdkCode`/:4516, both gated on
+    // `!_isInSystemLibrary`), but dartq's parser only ever sees non-SDK
+    // files — the engine models `dart:*` faces synthetically — so the gate
+    // is trivially true at the parse tier and the report lives where the
+    // deprecated form is parsed. Probe-locked (dart 3.13.1 machine rows,
+    // 2026-10-11): `native "corpus"` clause → offset = `native` keyword,
+    // length through the closing quote; `native "corpus";` body → length
+    // through the semicolon. The fasta-tier `nativeClauseShouldBeAnnotation`
+    // never surfaces in `dart analyze` output at the pinned oracle (probed
+    // silent), so dartq does not emit it.
+    pub(crate) fn native_clause_in_non_sdk_code() -> Message {
+        Message::with_correction(
+            NATIVE_CLAUSE_IN_NON_SDK_CODE,
+            "Native clause can only be used in the SDK and code that is loaded through native extensions.",
+            "Try removing the native clause.",
+        )
+    }
+
+    pub(crate) fn native_function_body_in_non_sdk_code() -> Message {
+        Message::with_correction(
+            NATIVE_FUNCTION_BODY_IN_NON_SDK_CODE,
+            "Native functions can only be declared in the SDK and code that is loaded through native extensions.",
+            "Try removing the word 'native'.",
         )
     }
 

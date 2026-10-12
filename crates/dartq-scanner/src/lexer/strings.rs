@@ -342,6 +342,8 @@ impl Lexer<'_> {
             let ident_start = self.pos;
             self.bump_ascii_while(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_'));
             let lexeme = &self.src[ident_start..self.pos];
+            // Same `augment` gate as scan_identifier_or_raw
+            // (abstract_scanner.dart:2106).
             let kind = match keyword_from_str(lexeme) {
                 Some(Keyword::Augment) if !self.config.enable_augmentations => {
                     TokenKind::Identifier

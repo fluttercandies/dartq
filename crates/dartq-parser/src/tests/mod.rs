@@ -5,6 +5,7 @@ mod collector;
 mod declarations;
 mod directives;
 mod drain;
+mod emitter_w1;
 mod expressions;
 mod features;
 mod gate_351;
