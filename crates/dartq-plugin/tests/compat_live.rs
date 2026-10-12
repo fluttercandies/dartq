@@ -1,11 +1,16 @@
-//! Live compatibility-sample E2E (M4-T9): the `samples/compat` plugin of the
-//! sibling `dartq-plugin-host` package — an official `analysis_server_plugin`-
-//! shaped plugin (see that sample's `README.md` for the porting guide) —
-//! driven end to end through the runtime's contract: manifest discovery,
-//! `dart <entrypoint>` launch (the exact daemon path), the diagnostics flow
-//! over a file set, the daemon-side merge contract, the fixes face with a
-//! UTF-16 edit applied to real text, and the crash mode surfaced as the
-//! `dartq/plugin_crashed` diagnostic (PRD §14).
+//! Live compatibility-sample E2E (M4-T9 + T5): the `samples/compat` plugin
+//! of the sibling `dartq-plugin-host` package — an official
+//! `analysis_server_plugin`-shaped plugin (see that sample's `README.md` for
+//! the porting guide) — driven end to end through the runtime's contract:
+//! manifest discovery, `dart <entrypoint>` launch (the exact daemon path),
+//! the rule census in the handshake, the per-cycle config push
+//! (`notification/plugin_config`), the analyzed set riding the engine batch,
+//! the registered rule executing host-side over the overlay text, the
+//! severity override re-leveling, the daemon-side merge contract, the fixes
+//! face with a UTF-16 edit applied to real text, and the crash mode surfaced
+//! as the `dartq/plugin_crashed` diagnostic (PRD §14). The
+//! disabled-by-default face is pinned at the in-process level
+//! (`test/compat_sample_test.dart`); the live cycle always configures.
 //!
 //! Four more rows drive the real ecosystem plugin overlays
 //! (`samples/{signals,jaspr,riverpod,pyramid}` — thin packages that run the
@@ -27,14 +32,16 @@
 //! children are reaped by the runtime's own shutdown paths.
 
 use rustc_hash::FxHashSet;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
 use dartq_plugin::session::SessionError;
 use dartq_plugin::{
-    Capability, CapabilitySet, Manifest, PluginRuntime, RuntimeError, Severity as WireSeverity,
-    SpawnSpec, StdioPolicy, crash_diagnostic, discover,
+    Capability, CapabilitySet, CycleConfig, CyclePush, Manifest, OverlayEntry, PluginRuntime,
+    RuleKind, RuntimeError, Severity as WireSeverity, SpawnSpec, StdioPolicy, crash_diagnostic,
+    discover,
 };
 use dartq_source::{FileTable, LineIndex, utf16_offset_to_byte};
 
@@ -51,6 +58,14 @@ fn sample_dir() -> PathBuf {
 /// engine's resident-text role). The emoji is a surrogate pair, so UTF-16
 /// offsets past it differ from byte offsets — the position exchange's proof.
 const A_DART: &str = "import '\u{1F600}.dart';\nvoid main() {}\n";
+
+/// The open-document text pushed as the cycle's overlay: [A_DART] plus a
+/// boolean literal — the rule fires at UTF-16 offset 38, length 4 (past the
+/// emoji, where UTF-16 and byte offsets diverge).
+const FIXTURE: &str = "import '\u{1F600}.dart';\nvoid main() { print(true); }\n";
+
+/// UTF-16 offset of the fixture's `true` literal.
+const TRUE_OFFSET: u64 = 38;
 
 #[test]
 #[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
@@ -90,8 +105,19 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
         "the negotiated set is the manifest's capability list"
     );
 
+    // The rule census rode the initialize reply: the registered lint rule
+    // with its code and declared severity — the enablement resolution's
+    // input.
+    let census = runtime.rule_census();
+    assert_eq!(census.len(), 1);
+    assert_eq!(census[0].name, "boolean_literal_review");
+    assert_eq!(census[0].kind, RuleKind::Lint);
+    assert_eq!(census[0].codes.len(), 1);
+    assert_eq!(census[0].codes[0].name, "boolean_literal");
+    assert_eq!(census[0].codes[0].severity, WireSeverity::Warning);
+
     // The file set: two .dart files (resident text held by the test) and one
-    // non-Dart file the rule must skip.
+    // non-Dart file the engine row proves flows untouched.
     let mut files = FileTable::new();
     let a = files.intern(Path::new("lib/a.dart"));
     let b = files.intern(Path::new("lib/b.dart"));
@@ -155,27 +181,60 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
             None,
         ),
     ];
-    runtime.feed(&engine, &files).expect("engine feed");
+
+    // Cycle 1: the config enables the rule, the analyzed set carries both
+    // .dart files, and the overlay carries the unsaved text the host parses
+    // (the disk never sees the boolean literal). The severity override is
+    // cycle 2's face; cycle 1 proves the declared severity stands.
+    let base_config = |overrides: BTreeMap<String, WireSeverity>| CyclePush {
+        analyzed: vec![a_path.clone(), b_path.clone()],
+        config: CycleConfig {
+            enabled_rules: vec!["boolean_literal_review".to_owned()],
+            severity_overrides: overrides,
+            overlays: vec![OverlayEntry {
+                file: a_path.clone(),
+                content: Some(FIXTURE.to_owned()),
+            }],
+        },
+    };
+    runtime
+        .feed(&engine, &files, &base_config(BTreeMap::new()))
+        .expect("engine feed");
     // `Duration::from_minutes` is not stable on the pinned toolchain, so
     // seconds remain the only expressible unit for this budget.
     #[expect(clippy::duration_suboptimal_units, reason = "see above")]
     let findings = runtime
         .wait_diagnostics(Duration::from_secs(60))
         .expect("plugin findings arrive within the drain budget");
-    assert_eq!(findings.len(), 3, "the .txt row is not analyzed");
+    assert_eq!(findings.len(), 1, "the enabled rule reports the literal");
     assert_eq!(findings[0].file, a_path);
-    assert_eq!(findings[0].code, "compat/companion");
+    assert_eq!(findings[0].code, "boolean_literal");
     assert_eq!(findings[0].severity, WireSeverity::Warning);
-    assert_eq!(findings[0].message, "companion for `uri_does_not_exist`");
     assert_eq!(
-        findings[0].offset, 8,
-        "UTF-16 surrogate-pair range carried through"
+        findings[0].message,
+        "Boolean literals need a compat review."
     );
-    assert_eq!(findings[0].length, 2);
-    assert_eq!(findings[1].offset, 10);
-    assert_eq!(findings[1].length, 4);
-    assert_eq!(findings[2].file, b_path);
-    assert_eq!(findings[2].offset, 0);
+    assert_eq!(
+        findings[0].offset, TRUE_OFFSET,
+        "UTF-16 offset past the emoji carried through"
+    );
+    assert_eq!(findings[0].length, 4);
+
+    // Cycle 2: a severity override re-levels the row (the config params
+    // changed, so the runtime pushes the new config instead of deduping).
+    let mut overrides = BTreeMap::new();
+    overrides.insert("boolean_literal".to_owned(), WireSeverity::Error);
+    runtime
+        .feed(&engine, &files, &base_config(overrides))
+        .expect("engine feed");
+    #[expect(clippy::duration_suboptimal_units, reason = "see above")]
+    let findings = runtime
+        .wait_diagnostics(Duration::from_secs(60))
+        .expect("plugin findings arrive within the drain budget");
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].severity, WireSeverity::Error, "overridden");
+    assert_eq!(findings[0].code, "boolean_literal");
+    assert_eq!(findings[0].offset, TRUE_OFFSET);
 
     // The daemon-side merge contract (crates/dartq-daemon/src/plugins.rs,
     // `merge` + `to_lsp`): engine rows first in order, then plugin rows
@@ -210,9 +269,10 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
     let plugin_rows: Vec<MergedRow> = findings
         .iter()
         .map(|row| {
-            let text = if row.file == a_path { A_DART } else { B_DART };
-            let offset = u32::try_from(row.offset).expect("in-range UTF-16 offset");
-            let (line, character) = lsp_position(text, offset);
+            // The rule ran on the overlay text, so its positions live in
+            // FIXTURE's coordinate space.
+            let (line, character) =
+                lsp_position(FIXTURE, u32::try_from(row.offset).expect("in-range"));
             MergedRow {
                 file: row.file.clone(),
                 line,
@@ -226,54 +286,49 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
     let merged = merge(engine_rows, plugin_rows);
     assert_eq!(
         merged.len(),
-        7,
+        5,
         "engine + plugin rows, nothing deduped away"
     );
     assert_eq!(merged[0].offset, 8, "engine rows first, in order");
     assert_eq!(merged[3].offset, 0, "the notes.txt engine row is intact");
-    // Plugin rows sort by offset across the file set (the daemon's sort key
-    // is the offset alone): b.dart@0, a.dart@8, a.dart@10.
+    // The plugin row sorts last (offset 38).
     assert_eq!(
         (merged[4].file.as_str(), merged[4].offset),
-        (b_path.as_str(), 0)
-    );
-    assert_eq!(
-        (merged[5].file.as_str(), merged[5].offset),
-        (a_path.as_str(), 8)
-    );
-    assert_eq!(
-        (merged[6].file.as_str(), merged[6].offset),
-        (a_path.as_str(), 10)
+        (a_path.as_str(), TRUE_OFFSET)
     );
 
-    // The fixes face: the range fix anchored at the requested UTF-16 range,
-    // then the message-only suggestion.
+    // The fixes face: the rule fix anchored at the plugin's own finding
+    // (the fix context is the engine batch together with the rule's
+    // emissions), then the message-only suggestion.
     let reply = runtime
-        .request_fixes(&a_path, 10, 4)
+        .request_fixes(&a_path, TRUE_OFFSET, 4)
         .expect("fixes reply arrives within the callback budget");
     assert_eq!(reply.fixes.len(), 2);
     assert_eq!(reply.fixes[0].priority, 1);
-    assert_eq!(reply.fixes[0].message, "Replace range with a compat marker");
+    assert_eq!(
+        reply.fixes[0].message,
+        "Replace literal with a compat marker"
+    );
     assert_eq!(reply.fixes[0].edits.len(), 1);
     let edit = &reply.fixes[0].edits[0];
-    assert_eq!(edit.offset, 10);
+    assert_eq!(edit.offset, TRUE_OFFSET);
     assert_eq!(edit.length, 4);
     assert_eq!(edit.replacement, "/* compat: fixed */");
     assert_eq!(reply.fixes[1].priority, 50);
     assert_eq!(reply.fixes[1].message, "Review this location");
     assert!(reply.fixes[1].edits.is_empty());
 
-    // Applying the edit proves the UTF-16 exchange: offsets 10..4 sit past
+    // Applying the edit proves the UTF-16 exchange: offsets 38..42 sit past
     // the emoji, where UTF-16 and byte offsets diverge.
-    let start = utf16_offset_to_byte(A_DART, 10);
-    let end = utf16_offset_to_byte(A_DART, 14);
-    let mut fixed = String::with_capacity(A_DART.len());
-    fixed.push_str(&A_DART[..start]);
+    let start = utf16_offset_to_byte(FIXTURE, TRUE_OFFSET as u32);
+    let end = utf16_offset_to_byte(FIXTURE, TRUE_OFFSET as u32 + 4);
+    let mut fixed = String::with_capacity(FIXTURE.len());
+    fixed.push_str(&FIXTURE[..start]);
     fixed.push_str(&edit.replacement);
-    fixed.push_str(&A_DART[end..]);
+    fixed.push_str(&FIXTURE[end..]);
     assert_eq!(
-        fixed, "import '\u{1F600}/* compat: fixed */t';\nvoid main() {}\n",
-        "the fix applied at the UTF-16 range the plugin echoed"
+        fixed, "import '\u{1F600}.dart';\nvoid main() { print(/* compat: fixed */); }\n",
+        "the fix applied at the UTF-16 range the plugin reported"
     );
 
     let stats = runtime.stats();
@@ -559,7 +614,9 @@ fn drive_overlay(row: &OverlayRow) {
         },
         None,
     )];
-    runtime.feed(&engine, &files).expect("engine feed");
+    runtime
+        .feed(&engine, &files, &CyclePush::default())
+        .expect("engine feed");
     // `Duration::from_minutes` is not stable on the pinned toolchain, so
     // seconds remain the only expressible unit for this budget.
     #[expect(clippy::duration_suboptimal_units, reason = "see above")]

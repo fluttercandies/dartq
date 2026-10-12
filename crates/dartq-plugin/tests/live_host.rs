@@ -21,7 +21,8 @@ use dartq_diagnostics::{
     CodeInfo, Diagnostic, DiagnosticType, Severity, SourceRange, URI_DOES_NOT_EXIST,
 };
 use dartq_plugin::{
-    CapabilitySet, Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, crash_diagnostic,
+    CapabilitySet, CyclePush, Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy,
+    crash_diagnostic,
 };
 use dartq_source::FileTable;
 
@@ -108,7 +109,9 @@ fn live_plugin_round_trips_fixes_and_shuts_down_in_budget() {
             None,
         ),
     ];
-    runtime.feed(&rows, &files).expect("engine feed");
+    runtime
+        .feed(&rows, &files, &CyclePush::default())
+        .expect("engine feed");
 
     // The fixes round trip: the request names 12..14, inside the live rule's
     // span. The reply is the registered producer's compute output — one edit
@@ -190,7 +193,9 @@ fn live_plugin_mid_session_death_isolated_as_plugin_crashed() {
         },
         None,
     )];
-    runtime.feed(&rows, &files).expect("engine feed");
+    runtime
+        .feed(&rows, &files, &CyclePush::default())
+        .expect("engine feed");
 
     let path = files
         .path(file)

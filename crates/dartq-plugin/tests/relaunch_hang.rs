@@ -19,7 +19,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
-use dartq_plugin::{Manifest, PluginRuntime, SpawnSpec, StdioPolicy};
+use dartq_plugin::{CyclePush, Manifest, PluginRuntime, SpawnSpec, StdioPolicy};
 use dartq_source::FileTable;
 
 /// Answers the handshake, then on the next frame spawns `sleep 60` with the
@@ -67,7 +67,9 @@ fn relaunch_survives_a_descendant_holding_the_pipe() {
         },
         None,
     )];
-    runtime.feed(&batch, &files).expect("the feed lands");
+    runtime
+        .feed(&batch, &files, &CyclePush::default())
+        .expect("the feed lands");
 
     // The death is only observable as "no diagnostics ever arrive": the wait
     // parks out its budget, and its final alive gate performs the teardown

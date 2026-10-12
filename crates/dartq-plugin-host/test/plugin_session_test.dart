@@ -463,7 +463,7 @@ void main() {
 
     test('dispatches parsed diagnostics to the handler and queues the '
         'returned batch as notification frames, in order', () async {
-      final received = <List<PluginDiagnostic>>[];
+      final received = <EngineBatch>[];
       final session = await _ready(
         onEngineDiagnostics: (batch) {
           received.add(batch);
@@ -488,7 +488,10 @@ void main() {
         reason: 'notifications never produce a reply frame',
       );
       expect(received, hasLength(1));
-      final diagnostic = received.single.single;
+      // `files` is additive: absent means the empty analyzed set.
+      expect(received.single.files, isEmpty);
+      expect(received.single.diagnostics, hasLength(1));
+      final diagnostic = received.single.diagnostics.single;
       expect(diagnostic.file, 'lib/main.dart');
       expect(diagnostic.severity, Severity.warning);
       expect(diagnostic.code, 'my_plugin/lint');
@@ -507,6 +510,37 @@ void main() {
         'offset': 0,
         'length': 0,
       });
+    });
+
+    test('the analyzed file set parses and validates entry by entry', () async {
+      final received = <EngineBatch>[];
+      final session = await _ready(
+        onEngineDiagnostics: (batch) {
+          received.add(batch);
+          return const [];
+        },
+      );
+
+      await session.handleFrame(
+        PluginFrame.notification(methodEngineDiagnostics, {
+          'diagnostics': <Object?>[],
+          'files': ['lib/a.dart', 'lib/b.dart'],
+        }),
+      );
+      expect(received.single.files, ['lib/a.dart', 'lib/b.dart']);
+
+      final error = await _protocolError(
+        () => session.handleFrame(
+          PluginFrame.notification(methodEngineDiagnostics, {
+            'diagnostics': <Object?>[],
+            'files': ['lib/a.dart', 7],
+          }),
+        ),
+      );
+      expect(
+        error.message,
+        'engine_diagnostics `files` entries must be strings',
+      );
     });
 
     test(
@@ -581,6 +615,199 @@ void main() {
       await expectFatal({...valid, 'offset': -1}, 'non-negative integer');
       await expectFatal({...valid, 'offset': 1.5}, 'non-negative integer');
       await expectFatal({...valid, 'length': 'x'}, 'non-negative integer');
+    });
+  });
+
+  group('plugin config notification', () {
+    PluginFrame _configFrame(Map<String, Object?> params) =>
+        PluginFrame.notification(methodPluginConfig, params);
+
+    Map<String, Object?> _validParams() => {
+      'enabled_rules': ['My_Rule'],
+      'severity_overrides': {'my_plugin/lint': 'error'},
+      'overlays': [
+        {'file': 'lib/a.dart', 'content': 'void main() {}'},
+        {'file': 'lib/b.dart'},
+      ],
+    };
+
+    Future<PluginSession> _ready({PluginConfigHandler? onPluginConfig}) async {
+      final session = PluginSession(
+        config: _config(),
+        onPluginConfig: onPluginConfig,
+      );
+      await session.handleFrame(
+        PluginFrame.request(1, methodInitialize, {
+          'protocol_version': protocolVersion,
+        }),
+      );
+      return session;
+    }
+
+    test('before initialize is a fatal protocol error', () async {
+      final session = PluginSession(config: _config());
+      final error = await _protocolError(
+        () => session.handleFrame(_configFrame(_validParams())),
+      );
+      expect(
+        error.message,
+        'notification/plugin_config is only valid after initialize completes',
+      );
+    });
+
+    test('dispatches the parsed config: enablement lower-cased, overlays '
+        'with nullable content', () async {
+      final received = <PluginCycleConfig>[];
+      final session = await _ready(onPluginConfig: received.add);
+
+      final reply = await session.handleFrame(_configFrame(_validParams()));
+
+      expect(reply, isNull);
+      expect(received, hasLength(1));
+      expect(received.single.enabledRules, {'my_rule'});
+      expect(
+        received.single.severityOverrides['my_plugin/lint'],
+        Severity.error,
+      );
+      expect(received.single.overlays, hasLength(2));
+      expect(received.single.overlays[0].file, 'lib/a.dart');
+      expect(received.single.overlays[0].content, 'void main() {}');
+      // `content: null` — the file fell back to disk.
+      expect(received.single.overlays[1].file, 'lib/b.dart');
+      expect(received.single.overlays[1].content, isNull);
+      expect(received.single.overlayFor('lib/a.dart'), 'void main() {}');
+      expect(received.single.overlayFor('lib/absent.dart'), isNull);
+    });
+
+    test(
+      'a malformed payload is a fatal protocol error, field by field',
+      () async {
+        final received = <PluginCycleConfig>[];
+        final session = await _ready(onPluginConfig: received.add);
+
+        Future<String> fatal(Map<String, Object?> params) async =>
+            (await _protocolError(
+              () => session.handleFrame(_configFrame(params)),
+            )).message;
+
+        expect(
+          await fatal({}),
+          'plugin_config payload requires an `enabled_rules` array',
+        );
+        expect(
+          await fatal({'enabled_rules': 'x'}),
+          'plugin_config payload requires an `enabled_rules` array',
+        );
+        expect(
+          await fatal({
+            'enabled_rules': ['a'],
+          }),
+          'plugin_config payload requires a `severity_overrides` object',
+        );
+        expect(
+          await fatal({
+            'enabled_rules': ['a'],
+            'severity_overrides': <String, Object?>{},
+          }),
+          'plugin_config payload requires an `overlays` array',
+        );
+        expect(
+          await fatal({
+            'enabled_rules': [42],
+            'severity_overrides': <String, Object?>{},
+            'overlays': <Object?>[],
+          }),
+          'plugin_config `enabled_rules` entries must be strings',
+        );
+        expect(
+          await fatal({
+            'enabled_rules': ['a'],
+            'severity_overrides': {'c': 3},
+            'overlays': <Object?>[],
+          }),
+          'plugin_config severity for `c` must be a string',
+        );
+        expect(
+          await fatal({
+            'enabled_rules': ['a'],
+            'severity_overrides': {'c': 'catastrophic'},
+            'overlays': <Object?>[],
+          }),
+          'severity must be error/warning/info, got `catastrophic`',
+        );
+        expect(
+          await fatal({
+            'enabled_rules': ['a'],
+            'severity_overrides': <String, Object?>{},
+            'overlays': ['a.dart'],
+          }),
+          'plugin_config `overlays` entries must be objects',
+        );
+        expect(
+          await fatal({
+            'enabled_rules': ['a'],
+            'severity_overrides': <String, Object?>{},
+            'overlays': [
+              {'content': 'x'},
+            ],
+          }),
+          'plugin_config overlay field `file` must be a string',
+        );
+        expect(received, isEmpty);
+      },
+    );
+
+    test('an unknown core notification still names the method (the config '
+        'did not absorb the switch default)', () async {
+      final session = await _ready();
+      final error = await _protocolError(
+        () => session.handleFrame(
+          PluginFrame.notification('notification/exotic'),
+        ),
+      );
+      expect(
+        error.message,
+        'unknown notification `notification/exotic` in state ready',
+      );
+    });
+  });
+
+  group('census in the initialize reply', () {
+    test('the reply carries the rule census verbatim', () async {
+      final session = PluginSession(
+        config: _config(CapabilitySet([Capability.lint])),
+        ruleCensus: const [
+          RuleCensus(
+            name: 'my_rule',
+            kind: RuleKind.lint,
+            codes: [RuleCodeInfo(name: 'my_code', severity: 'warning')],
+          ),
+        ],
+      );
+      final reply = await session.handleFrame(
+        PluginFrame.request(1, methodInitialize, {
+          'protocol_version': protocolVersion,
+        }),
+      );
+      expect(reply!.params['rules'], [
+        {
+          'name': 'my_rule',
+          'kind': 'lint',
+          'codes': [
+            {'name': 'my_code', 'severity': 'warning'},
+          ],
+        },
+      ]);
+    });
+
+    test('a plugin without rules advertises an empty census', () async {
+      final session = PluginSession(config: _config());
+      final reply = await session.handleFrame(
+        PluginFrame.request(1, methodInitialize, {
+          'protocol_version': protocolVersion,
+        }),
+      );
+      expect(reply!.params['rules'], isEmpty);
     });
   });
 

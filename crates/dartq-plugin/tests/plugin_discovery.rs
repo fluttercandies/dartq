@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
 use dartq_plugin::{
-    CapabilitySet, ManifestError, PluginRuntime, Severity as WireSeverity, SpawnSpec, discover,
+    CapabilitySet, CyclePush, ManifestError, PluginRuntime, Severity as WireSeverity, SpawnSpec,
+    discover,
 };
 use dartq_source::FileTable;
 
@@ -125,7 +126,9 @@ fn discovery_spawns_the_fixture_and_round_trips_fixes() {
         },
         None,
     );
-    runtime.feed(&[engine], &files).expect("engine feed");
+    runtime
+        .feed(&[engine], &files, &CyclePush::default())
+        .expect("engine feed");
     let echoed = runtime
         .wait_diagnostics(Duration::from_mins(1))
         .expect("plugin diagnostics arrive");

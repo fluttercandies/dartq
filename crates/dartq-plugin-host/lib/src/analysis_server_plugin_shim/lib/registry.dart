@@ -3,101 +3,36 @@
 ///
 /// Mirrors `package:analysis_server_plugin/registry.dart`
 /// (`.third/dart-sdk`, `lib/registry.dart` and `lib/src/registry.dart`):
-/// `registerAssist` and `registerFixForRule` with the official names, and the
-/// official registration-time behavior — each generator is instantiated once
-/// with a stub context to validate its kind, and a null kind is an
-/// `ArgumentError` with the official message.
+/// `registerAssist`, `registerFixForRule`, `registerLintRule`, and
+/// `registerWarningRule` with the official names, and the official
+/// registration-time behavior — each generator is instantiated once with a
+/// stub context to validate its kind, and a null kind is an `ArgumentError`
+/// with the official message.
 ///
 /// Deliberate deltas, each anchored:
-/// - The official `PluginRegistry extends RegistryBase`
-///   (`package:analyzer/src/lint/registry.dart`). The shim cannot extend the
-///   analyzer's rule registry (no analyzer dependency by design), so the two
-///   rule-registration names are explicit `UnsupportedError` faces: dartq
-///   wire v1 has no rule-registry registration and carries no AST, so rule
-///   semantics are inexpressible until the engine Query API (PRD section
-///   14.2). A plugin calling them dies into the core's `dartq/plugin_crashed`
-///   containment — never a hang.
-/// - The official `registerFixForRule` takes the analyzer's `DiagnosticCode`.
-///   The shim declares its own [DiagnosticCode] with the official const
-///   constructor and name members; the registration path consumes only
-///   `lowerCaseName` (the wire's rule-code key), exactly what the official
-///   `PluginRegistryImpl` stores (`lib/src/registry.dart`).
+/// - The rule kinds register the real analyzer `AbstractAnalysisRule`
+///   objects onto the host registry (T5: the host executes them over
+///   analyzer ASTs it parses itself — the same dependency the official
+///   package carries).
+/// - The edit kinds delegate the mirrored generator shape onto the host
+///   registry (the official `CorrectionProducer` kinds validated here, then
+///   adapted to the wire session's producer face).
 library;
 
 import 'dart:async';
 
+import 'package:analyzer/analysis_rule/analysis_rule.dart'
+    show AbstractAnalysisRule;
+import 'package:analyzer/error/error.dart' show DiagnosticCode;
 import 'package:dartq_plugin_host/dartq_plugin_host.dart' as dartq;
 
 import 'edit/dart/correction_producer.dart';
 import 'plugin.dart';
 
-/// A diagnostic code, mirroring the official `DiagnosticCode`
-/// (`.third/dart-sdk`, `pkg/_fe_analyzer_shared/lib/src/base/errors.dart`):
-/// the same const constructor and the name members the registration and
-/// suppression paths consume. The official base is abstract (plugins
-/// construct `LintCode`, an analyzer type); this shim's variant is concrete
-/// so plugin code can declare its codes without the analyzer.
-///
-/// Faces that need the analyzer's severity/type vocabulary (`severity`,
-/// `type`, and the `DiagnosticSeverity`/`DiagnosticType` enums) are omitted
-/// rather than stubbed: a plugin reading them fails to compile against the
-/// shim instead of failing at runtime.
-final class DiagnosticCode {
-  /// Initializes a newly created error code; the parameter set is the
-  /// official constructor's.
-  const DiagnosticCode({
-    String? correctionMessage,
-    this.hasPublishedDocs = false,
-    this.isUnresolvedIdentifier = false,
-    required String name,
-    required String problemMessage,
-    required String uniqueName,
-  }) : _name = name,
-       _uniqueName = uniqueName,
-       _correctionMessage = correctionMessage,
-       _problemMessage = problemMessage;
-
-  final String _name;
-  final String _uniqueName;
-  final String? _correctionMessage;
-  final String _problemMessage;
-
-  /// Whether diagnostics with this code have published documentation.
-  final bool hasPublishedDocs;
-
-  /// Whether this diagnostic is caused by an unresolved identifier.
-  final bool isUnresolvedIdentifier;
-
-  /// The template used to create the correction to be displayed, or null.
-  String? get correctionMessage => _correctionMessage;
-
-  /// The name of the error code, converted to all lower case.
-  String get lowerCaseName => _name.toLowerCase();
-
-  /// The unique name of this error code, converted to all lower case.
-  String get lowerCaseUniqueName => _uniqueName.toLowerCase();
-
-  /// The name of the error code.
-  String get name => _name;
-
-  /// The template used to create the problem message to be displayed.
-  String get problemMessage => _problemMessage;
-
-  /// The unique name of this error code.
-  String get uniqueName => _uniqueName;
-
-  /// The URL of the published documentation, or null.
-  String? get url =>
-      hasPublishedDocs ? 'https://dart.dev/diagnostics/$lowerCaseName' : null;
-
-  @override
-  String toString() => lowerCaseUniqueName;
-}
-
-/// The registry a plugin registers its extensions with. The two mirrored
-/// kinds delegate onto the dartq mirror registry; the two rule kinds are
-/// explicit `UnsupportedError` faces (wire v1 carries no rule registry, PRD
-/// section 14.2).
+/// The registry a plugin registers its extensions with. The mirrored kinds
+/// delegate onto the dartq mirror registry; the two rule kinds register the
+/// real analyzer rules onto the host registry's rule surface (executed by
+/// the host's rule runner over analyzer ASTs it parses itself).
 abstract class PluginRegistry {
   /// Registers this assist [generator] with the host.
   void registerAssist(ProducerGenerator generator);
@@ -105,24 +40,14 @@ abstract class PluginRegistry {
   /// Registers this fix [generator] for the given diagnostic [code].
   void registerFixForRule(DiagnosticCode code, ProducerGenerator generator);
 
-  /// Not expressible on the dartq wire v1: there is no rule-registry
-  /// registration and no AST channel (PRD section 14.2 Query API). Throws,
-  /// tearing the plugin down into the core's `dartq/plugin_crashed`
-  /// containment.
-  void registerLintRule(Object rule) => throw UnsupportedError(
-    'analysis_server_plugin shim: registerLintRule has no dartq wire v1 '
-    'counterpart (official anchor: package:analysis_server_plugin/registry '
-    'extends RegistryBase, package:analyzer/src/lint/registry.dart; dartq '
-    'PRD section 14.2)',
-  );
+  /// Registers this lint [rule] with the host: disabled by default, enabled
+  /// via the analysis options' rule configs (official `RegistryBase`
+  /// semantics, resolved by the core against the registration census).
+  void registerLintRule(AbstractAnalysisRule rule);
 
-  /// Not expressible on the dartq wire v1; see [registerLintRule].
-  void registerWarningRule(Object rule) => throw UnsupportedError(
-    'analysis_server_plugin shim: registerWarningRule has no dartq wire v1 '
-    'counterpart (official anchor: package:analysis_server_plugin/registry '
-    'extends RegistryBase, package:analyzer/src/lint/registry.dart; dartq '
-    'PRD section 14.2)',
-  );
+  /// Registers this warning [rule] with the host: enabled by default,
+  /// disabled via the analysis options' rule configs.
+  void registerWarningRule(AbstractAnalysisRule rule);
 }
 
 /// The registry the shim hands to [Plugin.register]: delegates the mirrored
@@ -131,11 +56,8 @@ abstract class PluginRegistry {
 /// Mirrors the official `PluginRegistryImpl` behavior (`lib/src/registry.dart`):
 /// each generator is instantiated once with
 /// [StubCorrectionProducerContext.instance] and its kind is validated — a
-/// null kind is an `ArgumentError` carrying the official message.
-/// `extends` (the official shape) rather than `implements`: the two
-/// rule-registration faces are inherited as the interface's concrete
-/// throwing bodies — `implements` would take only their signatures and
-/// demand fresh bodies here.
+/// null kind is an `ArgumentError` carrying the official message. `extends`
+/// (the official shape) rather than `implements`.
 final class PluginRegistryImpl extends PluginRegistry {
   /// Builds a registry delegating onto [host].
   PluginRegistryImpl(this.host);
@@ -183,6 +105,14 @@ final class PluginRegistryImpl extends PluginRegistry {
       _AdaptedGenerator(generator, _ProducerFace.fix),
     );
   }
+
+  @override
+  void registerLintRule(AbstractAnalysisRule rule) =>
+      host.registerLintRule(rule);
+
+  @override
+  void registerWarningRule(AbstractAnalysisRule rule) =>
+      host.registerWarningRule(rule);
 }
 
 /// Which kind face an adapted generator reads off each per-request producer.

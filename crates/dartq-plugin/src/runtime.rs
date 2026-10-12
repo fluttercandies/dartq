@@ -90,14 +90,15 @@ use dartq_diagnostics::{
     DARTQ_PLUGIN_CRASHED, DARTQ_PLUGIN_TIMEOUT, Diagnostic, Severity as EngineSeverity, SourceRange,
 };
 use dartq_source::{FileId, FileTable};
+use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::capability::CapabilitySet;
 use crate::frame::{Frame, FrameDecoder, MAX_FRAME_SIZE, ProtocolError, encode_frame};
 use crate::manifest::Manifest;
 use crate::session::{
-    FixesReply, Incoming, PluginDiagnostic, Session, SessionError, SessionState, Severity,
-    engine_diagnostics_frame,
+    CycleConfig, CyclePush, FixesReply, Incoming, PluginDiagnostic, RuleCensus, Session,
+    SessionError, SessionState, Severity, engine_diagnostics_frame, plugin_config_frame,
 };
 use crate::stats::{PluginStats, PluginStatsSnapshot};
 
@@ -560,6 +561,12 @@ pub struct PluginRuntime {
     created: Instant,
     stats: Arc<PluginStats>,
     restarts_used: u32,
+
+    // Config-push dedup: the last pushed config's params and the restart
+    // count it was pushed at. A relaunched child starts with no config
+    // state, so a restart invalidates the dedup and forces a re-push.
+    pushed_config: Option<Map<String, Value>>,
+    pushed_at_restarts: u32,
 }
 
 impl PluginRuntime {
@@ -608,6 +615,8 @@ impl PluginRuntime {
             stats: Arc::new(PluginStats::default()),
             created: Instant::now(),
             restarts_used: 0,
+            pushed_config: None,
+            pushed_at_restarts: 0,
         };
         runtime.launch_with_budget()?;
         Ok(runtime)
@@ -619,9 +628,30 @@ impl PluginRuntime {
         self.negotiated
     }
 
-    /// Pushes the engine's current diagnostics to the plugin as one
-    /// `notification/engine_diagnostics` batch — its diagnostic context for
-    /// the cycle (PRD §14.2). An empty slice sends nothing.
+    /// The plugin's registration census (the `initialize` reply's `rules`
+    /// array), empty until the handshake completed. The caller resolves the
+    /// per-cycle enablement against it ([`CyclePush`]).
+    #[must_use]
+    pub fn rule_census(&self) -> Vec<RuleCensus> {
+        self.session
+            .lock()
+            .expect("session lock")
+            .rule_census()
+            .to_vec()
+    }
+
+    /// Pushes one analyze cycle to the plugin: the resolved config as
+    /// `notification/plugin_config` (only when it changed since the last
+    /// push — a relaunched child always re-receives it, its config state
+    /// died with the old generation), then the engine's current diagnostics
+    /// plus the cycle's analyzed file set as one
+    /// `notification/engine_diagnostics` batch (PRD §14.2).
+    ///
+    /// A cycle with no diagnostics and no analyzed files sends nothing: the
+    /// batch would carry no diagnostic context and the rules would have no
+    /// files to run over. A cycle with analyzed files but an empty
+    /// diagnostic set still pushes — the rules must run over clean files
+    /// too, and their findings are the cycle's whole output.
     ///
     /// A child that died since the last call is restarted here (within
     /// budget) before the push. The push opens the §14.3 analyze clock: the
@@ -636,12 +666,33 @@ impl PluginRuntime {
         &mut self,
         diagnostics: &[Diagnostic],
         files: &FileTable,
+        push: &CyclePush,
     ) -> Result<(), RuntimeError> {
-        if diagnostics.is_empty() {
+        if diagnostics.is_empty() && push.analyzed.is_empty() {
             return Ok(());
         }
         self.ensure_alive()?;
-        let frame = engine_diagnostics_frame(&wire_diagnostics(diagnostics, files));
+        // The config frame rides only real change: identical configs
+        // compare equal through their wire params, and a fresh generation
+        // (restart count moved) always re-receives the current config.
+        let config_params = if push.config.is_empty() {
+            None
+        } else {
+            Some(config_params(&push.config))
+        };
+        if config_params != self.pushed_config || self.pushed_at_restarts != self.restarts_used {
+            if let Some(params) = config_params {
+                self.write_frame(&plugin_config_frame(&push.config))?;
+                self.pushed_config = Some(params);
+                self.pushed_at_restarts = self.restarts_used;
+            } else {
+                // The config emptied: drop the cache so a later non-empty
+                // config re-pushes instead of comparing equal to the stale
+                // entry.
+                self.pushed_config = None;
+            }
+        }
+        let frame = engine_diagnostics_frame(&wire_diagnostics(diagnostics, files), &push.analyzed);
         self.write_frame(&frame)?;
         // §14.3 CPU row, analyze path: the demand's clock opens with the
         // batch on the wire and closes when the child produces diagnostics
@@ -1670,6 +1721,13 @@ fn sample_rss(_pid: u32) -> Option<u64> {
 }
 
 // --- wire conversion ---
+
+/// The config frame's `params`, in wire form — also the config-dedup key
+/// (map equality is key-independent, so identical configs compare equal
+/// whatever the iteration order).
+fn config_params(config: &CycleConfig) -> Map<String, Value> {
+    plugin_config_frame(config).params
+}
 
 /// Maps engine diagnostics onto the wire row shape, resolving file paths
 /// through the engine's file table. Diagnostics with unknown `FileId`s are

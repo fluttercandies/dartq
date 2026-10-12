@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
 use dartq_plugin::{
-    MAX_FRAME_SIZE, Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, crash_diagnostic,
+    CyclePush, MAX_FRAME_SIZE, Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy,
+    crash_diagnostic,
 };
 use dartq_source::FileTable;
 
@@ -109,16 +110,16 @@ fn pin_violation_chain(emit: &str, reason_needle: &str, expected_drops: u64) {
     )];
 
     runtime
-        .feed(&batch, &files)
+        .feed(&batch, &files, &CyclePush::default())
         .expect("batch 1 crosses; the violation lands after it");
     await_death_settled(&mut runtime, Duration::from_secs(5));
     runtime
-        .feed(&batch, &files)
+        .feed(&batch, &files, &CyclePush::default())
         .expect("the violation's death restarted within budget");
     await_death_settled(&mut runtime, Duration::from_secs(5));
 
     let terminal = runtime
-        .feed(&batch, &files)
+        .feed(&batch, &files, &CyclePush::default())
         .expect_err("a deterministically violating plugin spends the budget");
     assert!(
         matches!(&terminal, RuntimeError::Crashed { reason }

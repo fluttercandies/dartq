@@ -3,9 +3,16 @@
 A stand-in for the official `package:analysis_server_plugin` package. A
 plugin written verbatim against the official API — imports it, a top-level
 `plugin` variable, a `Plugin` subclass, `registerAssist` /
-`registerFixForRule`, `CorrectionProducer`-shaped fixes and assists —
-compiles and runs against this package unchanged, on the dartq plugin host's
-wire v1. The Rust core and the wire format are untouched.
+`registerFixForRule`, `CorrectionProducer`-shaped fixes and assists, real
+analyzer `AnalysisRule` lint/warning rules — compiles and runs against this
+package unchanged, on the dartq plugin host's wire v1. The Rust core and the
+wire format are untouched.
+
+The shim depends on `package:analyzer` (the same dependency the official
+package carries): the rule registration faces are typed against the
+analyzer's `AbstractAnalysisRule`, and the host executes registered rules
+over the analyzed files it parses itself (parse-only — the wire never
+carries an AST).
 
 ## Launch-path injection
 
@@ -65,9 +72,9 @@ Future<void> main(List<String> args) async {
 official package has no process entrypoint; the server imports the plugin's
 `lib/main.dart` and runs the top-level `plugin` over an `analyzer_plugin`
 channel). It reads `dartq_plugin.json` from the working directory and serves
-wire v1 over stdio; every failure — manifest, wire, producer — exits the
-process, which the core reports as one `dartq/plugin_crashed` diagnostic
-(PRD section 14.3).
+wire v1 over stdio; every failure — manifest, wire, producer, a throwing
+rule — exits the process, which the core reports as one
+`dartq/plugin_crashed` diagnostic (PRD section 14.3).
 
 ## API alignment
 
@@ -75,7 +82,8 @@ process, which the core reports as one `dartq/plugin_crashed` diagnostic
 | --- | --- | --- |
 | `lib/plugin.dart` `Plugin` (`name`, `register`, `start`, `shutDown`) | Same, verbatim | `_PluginAdapter` → mirror `Plugin` → `servePlugin` lifecycle |
 | `lib/registry.dart` `PluginRegistry.registerAssist(ProducerGenerator)` | Same name, shim-local `ProducerGenerator` | Kind validated (official `ArgumentError` message), generator adapted onto `dartq.PluginRegistryImpl.registerAssist` |
-| `lib/registry.dart` `PluginRegistry.registerFixForRule(DiagnosticCode, ProducerGenerator)` | Same name, shim-local `DiagnosticCode` | Keyed by `code.lowerCaseName` (what the official registry stores), adapted onto `dartq.PluginRegistryImpl.registerFixForRule` |
+| `lib/registry.dart` `PluginRegistry.registerFixForRule(DiagnosticCode, ProducerGenerator)` | Same name, the analyzer's real `DiagnosticCode` | Keyed by `code.lowerCaseName` (what the official registry stores), adapted onto `dartq.PluginRegistryImpl.registerFixForRule` |
+| `lib/src/registry.dart` `registerLintRule` / `registerWarningRule` (`RegistryBase`, `AbstractAnalysisRule`) | Same names, the analyzer's real rule type | Registered verbatim onto `dartq.PluginRegistryImpl.lintRules` / `warningRules`; the host runs them (T5) and reports the census in the `initialize` reply |
 | `lib/src/registry.dart` `PluginRegistryImpl` kind validation + `StubCorrectionProducerContext` | Same behavior | One stub instantiation per registration; null kind is an `ArgumentError` with the official text |
 | `lib/edit/dart/dart_fix_kind_priority.dart` `DartFixKindPriority` | Verbatim | Constants |
 | `lib/edit/dart/correction_producer.dart` `CorrectionApplicability` | Verbatim | Data only (wire v1 reads none of it yet) |
@@ -85,11 +93,9 @@ process, which the core reports as one `dartq/plugin_crashed` diagnostic
 
 ## Not mirrored (structural, pending the engine Query API, PRD section 14.2)
 
-These faces need `package:analyzer`'s AST/results or
-`package:analyzer_plugin`'s change-building stack, which the shim
-deliberately does not depend on. A plugin touching them fails at compile
-time against the shim (or, for the registry calls below, at registration into
-the documented crash containment):
+These faces need resolution results or `package:analyzer_plugin`'s
+change-building stack, which wire v1 does not carry. A plugin touching them
+fails at compile time against the shim:
 
 - `CorrectionProducer<T extends ParsedUnitResult>`, `ResolvedCorrectionProducer`,
   `ParsedCorrectionProducer`, `MultiCorrectionProducer`,
@@ -98,12 +104,7 @@ the documented crash containment):
 - `compute(ChangeBuilder)` and `edit/change_builder/`; `Fix`, `Assist`
   (they wrap `SourceChange`); `edit/range_factory.dart`;
   `edit/correction_utils.dart`; the fix/assist contexts.
-- `registerLintRule` / `registerWarningRule` (official `RegistryBase`):
-  explicit `UnsupportedError` — wire v1 has no rule registry; a verbatim
-  plugin calling them dies into a `dartq/plugin_crashed` diagnostic carrying
-  the exit reason. The error's anchor text is visible only when the host
-  runs the plugin with stderr inherited (the default `StdioPolicy::Null`
-  discards it).
-- Analyzer-nominal types crossing the boundary: a real analyzer `LintCode`
-  passed to `registerFixForRule` does not typecheck against the shim's
-  `DiagnosticCode` (nominal typing; no analyzer dependency to bridge it).
+
+Rule execution is parse-only (the T4/T5 boundary): a rule declaring
+`canUseParsedResult == false` is skipped by the host's runner instead of
+being resolved.

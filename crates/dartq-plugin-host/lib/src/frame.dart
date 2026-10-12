@@ -27,8 +27,18 @@ const String methodDiagnosticNotification = 'notification/diagnostic';
 
 /// Core-to-plugin notification: the engine's current diagnostics for the
 /// analyzed set, pushed once per analyze cycle as the plugin's diagnostic
-/// context (PRD section 14.2).
+/// context (PRD section 14.2). Additively carries the cycle's analyzed file
+/// set under `files` — the files a rule-executing plugin runs its enabled
+/// rules over.
 const String methodEngineDiagnostics = 'notification/engine_diagnostics';
+
+/// Core-to-plugin notification: the plugin's per-cycle execution config —
+/// the enabled rule names (resolved by the core from the governing analysis
+/// options against the plugin's registration census), the per-code severity
+/// overrides, and the open-document overlays (dirty file → unsaved text; the
+/// core owns overlays, the host parses them). Pushed before the cycle's
+/// `notification/engine_diagnostics` whenever it changed.
+const String methodPluginConfig = 'notification/plugin_config';
 
 /// Core-to-plugin: request source fixes for a location.
 const String methodRequestFixes = 'request/fixes';

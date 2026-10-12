@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
 use dartq_plugin::{
-    CapabilitySet, Manifest, PluginRuntime, Severity as WireSeverity, SpawnSpec, StdioPolicy,
+    CapabilitySet, CyclePush, Manifest, PluginRuntime, Severity as WireSeverity, SpawnSpec,
+    StdioPolicy,
 };
 use dartq_source::FileTable;
 
@@ -74,7 +75,9 @@ fn engine_diagnostics_round_trip_through_the_dart_host() {
         None,
     );
 
-    runtime.feed(&[engine], &files).expect("engine feed");
+    runtime
+        .feed(&[engine], &files, &CyclePush::default())
+        .expect("engine feed");
     let echoed = runtime
         .wait_diagnostics(Duration::from_mins(1))
         .expect("plugin diagnostics arrive");
@@ -124,7 +127,7 @@ fn empty_feed_sends_no_frame() {
     let mut runtime = spawn_echo();
     let before = runtime.stats();
     runtime
-        .feed(&[], &FileTable::new())
+        .feed(&[], &FileTable::new(), &CyclePush::default())
         .expect("empty feed is a no-op");
     let after = runtime.stats();
     assert_eq!(after.frames_out, before.frames_out);

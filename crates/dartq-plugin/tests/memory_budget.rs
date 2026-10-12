@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
 use dartq_plugin::{
-    Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, crash_diagnostic,
+    CyclePush, Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, crash_diagnostic,
 };
 use dartq_source::FileTable;
 
@@ -74,7 +74,7 @@ fn rss_over_the_memory_budget_is_killed_and_reported_as_the_memory_row() {
     let started = Instant::now();
     let mut outcome = Ok(());
     for _ in 0..400 {
-        outcome = runtime.feed(&row, &files);
+        outcome = runtime.feed(&row, &files, &CyclePush::default());
         if outcome.is_err() {
             break;
         }

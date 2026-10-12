@@ -30,11 +30,12 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 
 use crate::capability::{Capability, CapabilitySet};
 use crate::frame::{
     Frame, METHOD_DIAGNOSTIC_NOTIFICATION, METHOD_ENGINE_DIAGNOSTICS, METHOD_INITIALIZE,
-    METHOD_REQUEST_FIXES, METHOD_SHUTDOWN, PROTOCOL_VERSION,
+    METHOD_PLUGIN_CONFIG, METHOD_REQUEST_FIXES, METHOD_SHUTDOWN, PROTOCOL_VERSION,
 };
 
 /// Session lifecycle states, driven by [`Session::handle`] and the
@@ -180,13 +181,122 @@ pub enum Severity {
     Info,
 }
 
-/// Builds the core → plugin `notification/engine_diagnostics` batch carrying
-/// the engine's current diagnostics (one frame per analyze cycle). A
-/// notification: the plugin never replies to it.
+/// Registration kind of a plugin rule, mirroring the official registry
+/// split (`package:analyzer/src/lint/registry.dart`): lint rules are
+/// disabled by default and enabled via rule configs, warning rules are
+/// enabled by default and disabled via rule configs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleKind {
+    /// Disabled by default; enabled via an explicit rule config.
+    Lint,
+    /// Enabled by default; disabled via an explicit rule config.
+    Warning,
+}
+
+/// One diagnostic code of a registered rule, as the census carries it: the
+/// lower-case wire name (the identity fixes and dedup key on) and the code's
+/// declared severity (the base the core's severity-override resolution
+/// re-levels from).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleCodeInfo {
+    /// The lower-case code name (the wire's rule-code identity).
+    pub name: String,
+    /// The code's declared severity.
+    pub severity: Severity,
+}
+
+/// One rule of a plugin's registration census (the `rules` array of the
+/// `initialize` reply): what registered, in registration order. The census
+/// is what the core resolves the per-cycle enablement against — without it
+/// the `lint` capability is an uninterpretable claim.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleCensus {
+    /// The rule's name (matched case-insensitively, like the official
+    /// registry's lower-case keys).
+    pub name: String,
+    /// Registration kind (the default-enabled face).
+    pub kind: RuleKind,
+    /// The codes this rule reports, in declaration order.
+    pub codes: Vec<RuleCodeInfo>,
+}
+
+/// One unsaved-text overlay of the per-cycle config: the core owns the
+/// open-document table and pushes the client's text so the host parses the
+/// edited view, never stale disk bytes. `content: None` marks a previously
+/// overlaid file whose text now lives on disk again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverlayEntry {
+    /// Path of the overlaid file (wire form, matching the analyzed set).
+    pub file: String,
+    /// The unsaved text, or `None` to fall back to disk.
+    pub content: Option<String>,
+}
+
+/// The per-cycle execution config the core pushes as
+/// `notification/plugin_config`: which of the plugin's census rules are
+/// enabled (resolved from the governing analysis options), the per-code
+/// severity overrides, and the open-document overlays. An empty config is
+/// the official no-configuration posture: lint rules stay disabled, warning
+/// rules stay enabled, declared severities stand, files read from disk.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CycleConfig {
+    /// Enabled rule names (the plugin's own census names, lower-cased).
+    #[serde(default)]
+    pub enabled_rules: Vec<String>,
+    /// Per-code severity overrides, keyed by lower-case code name.
+    #[serde(default)]
+    pub severity_overrides: BTreeMap<String, Severity>,
+    /// Open-document overlays (dirty file → unsaved text).
+    #[serde(default)]
+    pub overlays: Vec<OverlayEntry>,
+}
+
+impl CycleConfig {
+    /// Whether nothing is configured — the frame the config-dedup skips.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.enabled_rules.is_empty()
+            && self.severity_overrides.is_empty()
+            && self.overlays.is_empty()
+    }
+}
+
+/// One analyze cycle's push material beyond the engine diagnostics
+/// themselves: the analyzed file set the host runs rules over, and the
+/// resolved config. The runtime turns this into the config frame (when it
+/// changed) plus the `files` parameter of the engine-diagnostics frame.
+#[derive(Clone, Debug, Default)]
+pub struct CyclePush {
+    /// The cycle's analyzed files (wire-form paths).
+    pub analyzed: Vec<String>,
+    /// The resolved execution config.
+    pub config: CycleConfig,
+}
+
+/// Builds the core → plugin `notification/plugin_config` frame carrying
+/// [config]. A notification: the plugin never replies to it.
 #[must_use]
-pub fn engine_diagnostics_frame(diagnostics: &[PluginDiagnostic]) -> Frame {
+pub fn plugin_config_frame(config: &CycleConfig) -> Frame {
+    let mut params = Map::new();
+    params.insert("enabled_rules".into(), json!(config.enabled_rules.clone()));
+    params.insert(
+        "severity_overrides".into(),
+        json!(config.severity_overrides.clone()),
+    );
+    params.insert("overlays".into(), json!(config.overlays.clone()));
+    Frame::notification(METHOD_PLUGIN_CONFIG, params)
+}
+
+/// Builds the core → plugin `notification/engine_diagnostics` batch carrying
+/// the engine's current diagnostics (one frame per analyze cycle) plus the
+/// cycle's analyzed file set — the files a rule-executing plugin runs its
+/// enabled rules over. A notification: the plugin never replies to it.
+#[must_use]
+pub fn engine_diagnostics_frame(diagnostics: &[PluginDiagnostic], analyzed: &[String]) -> Frame {
     let mut params = Map::new();
     params.insert("diagnostics".into(), json!(diagnostics));
+    params.insert("files".into(), json!(analyzed));
     Frame::notification(METHOD_ENGINE_DIAGNOSTICS, params)
 }
 
@@ -228,6 +338,9 @@ pub struct Session {
     state: SessionState,
     local: CapabilitySet,
     negotiated: Option<CapabilitySet>,
+    /// The plugin's registration census, parsed from the accepted
+    /// `initialize` reply (empty until the handshake completed).
+    rule_census: Vec<RuleCensus>,
     outstanding: Vec<u64>,
     next_id: u64,
 }
@@ -240,6 +353,7 @@ impl Session {
             state: SessionState::Fresh,
             local,
             negotiated: None,
+            rule_census: Vec::new(),
             outstanding: Vec::new(),
             next_id: 1,
         }
@@ -255,6 +369,14 @@ impl Session {
     #[must_use]
     pub const fn negotiated(&self) -> Option<CapabilitySet> {
         self.negotiated
+    }
+
+    /// The plugin's registration census (the `rules` array of the accepted
+    /// `initialize` reply; empty before the handshake completed). The core
+    /// resolves per-cycle rule enablement against it.
+    #[must_use]
+    pub fn rule_census(&self) -> &[RuleCensus] {
+        &self.rule_census
     }
 
     /// Builds the `initialize` request and moves to
@@ -415,6 +537,7 @@ impl Session {
         match (kind, self.state) {
             (MethodKind::Initialize, SessionState::AwaitingInitializeReply) => {
                 let effective = self.accept_initialize(&frame)?;
+                self.rule_census = parse_census(&frame)?;
                 self.outstanding.remove(pos);
                 self.negotiated = Some(effective);
                 self.state = SessionState::Ready;
@@ -463,6 +586,105 @@ impl Session {
         self.next_id += 1;
         id
     }
+}
+
+/// Parses the `initialize` reply's registration census: the optional
+/// `rules` array (absent on hosts that register no rules — an additive
+/// field), each row `{name, kind: "lint"|"warning", codes: [{name,
+/// severity}]}`. A present-but-malformed census is an [`SessionError::InvalidPayload`]
+/// (fatal): the core cannot resolve enablement against a census it cannot
+/// read, and a wrong census silently disables or enables the wrong rules.
+fn parse_census(frame: &Frame) -> Result<Vec<RuleCensus>, SessionError> {
+    let Some(value) = frame.params.get("rules") else {
+        return Ok(Vec::new());
+    };
+    let Value::Array(rows) = value else {
+        return Err(SessionError::InvalidPayload {
+            method: frame.method.clone(),
+            reason: "`rules` must be an array".to_owned(),
+        });
+    };
+    let mut census = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Value::Object(row) = row else {
+            return Err(SessionError::InvalidPayload {
+                method: frame.method.clone(),
+                reason: "each `rules` entry must be an object".to_owned(),
+            });
+        };
+        let name = match row.get("name") {
+            Some(Value::String(name)) if !name.is_empty() => name.clone(),
+            _ => {
+                return Err(SessionError::InvalidPayload {
+                    method: frame.method.clone(),
+                    reason: "census row requires a non-empty string `name`".to_owned(),
+                });
+            }
+        };
+        let kind = match row.get("kind") {
+            Some(Value::String(kind)) if kind == "lint" => RuleKind::Lint,
+            Some(Value::String(kind)) if kind == "warning" => RuleKind::Warning,
+            _ => {
+                return Err(SessionError::InvalidPayload {
+                    method: frame.method.clone(),
+                    reason: "census row `kind` must be \"lint\" or \"warning\"".to_owned(),
+                });
+            }
+        };
+        let mut codes = Vec::new();
+        match row.get("codes") {
+            Some(Value::Array(entries)) => {
+                for entry in entries {
+                    let Value::Object(entry) = entry else {
+                        return Err(SessionError::InvalidPayload {
+                            method: frame.method.clone(),
+                            reason: "each census `codes` entry must be an object".to_owned(),
+                        });
+                    };
+                    let name = match entry.get("name") {
+                        Some(Value::String(name)) if !name.is_empty() => name.clone(),
+                        _ => {
+                            return Err(SessionError::InvalidPayload {
+                                method: frame.method.clone(),
+                                reason: "census code requires a non-empty string `name`".to_owned(),
+                            });
+                        }
+                    };
+                    let severity = match entry.get("severity") {
+                        Some(Value::String(severity)) => match severity.as_str() {
+                            "error" => Severity::Error,
+                            "warning" => Severity::Warning,
+                            "info" => Severity::Info,
+                            other => {
+                                return Err(SessionError::InvalidPayload {
+                                    method: frame.method.clone(),
+                                    reason: format!(
+                                        "census code `severity` must be error/warning/info, \
+                                         got `{other}`"
+                                    ),
+                                });
+                            }
+                        },
+                        _ => {
+                            return Err(SessionError::InvalidPayload {
+                                method: frame.method.clone(),
+                                reason: "census code requires a string `severity`".to_owned(),
+                            });
+                        }
+                    };
+                    codes.push(RuleCodeInfo { name, severity });
+                }
+            }
+            _ => {
+                return Err(SessionError::InvalidPayload {
+                    method: frame.method.clone(),
+                    reason: "census row requires a `codes` array".to_owned(),
+                });
+            }
+        }
+        census.push(RuleCensus { name, kind, codes });
+    }
+    Ok(census)
 }
 
 /// Which protocol method a frame name denotes. Copy-able so state-machine
@@ -767,6 +989,136 @@ mod tests {
                 state: SessionState::Terminated.as_str(),
             }
         );
+    }
+
+    #[test]
+    fn census_round_trips_through_the_initialize_reply() {
+        let mut session = Session::new(CapabilitySet::all());
+        let init = session.send_initialize().expect("send initialize");
+        let mut params = Map::new();
+        params.insert("protocol_version".into(), json!(1));
+        params.insert(
+            "rules".into(),
+            json!([
+                {
+                    "name": "avoid_sync_io",
+                    "kind": "lint",
+                    "codes": [{"name": "avoid_sync_io", "severity": "warning"}],
+                },
+                {"name": "always_on", "kind": "warning", "codes": []},
+            ]),
+        );
+        let reply = Frame::request(init.id.expect("id"), METHOD_INITIALIZE, params);
+        session.handle(reply).expect("handshake");
+        assert_eq!(
+            session.rule_census(),
+            [
+                RuleCensus {
+                    name: "avoid_sync_io".to_owned(),
+                    kind: RuleKind::Lint,
+                    codes: vec![RuleCodeInfo {
+                        name: "avoid_sync_io".to_owned(),
+                        severity: Severity::Warning,
+                    }],
+                },
+                RuleCensus {
+                    name: "always_on".to_owned(),
+                    kind: RuleKind::Warning,
+                    codes: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn census_is_empty_when_the_reply_omits_rules() {
+        let mut session = Session::new(CapabilitySet::all());
+        let init = session.send_initialize().expect("send initialize");
+        let mut params = Map::new();
+        params.insert("protocol_version".into(), json!(1));
+        let reply = Frame::request(init.id.expect("id"), METHOD_INITIALIZE, params);
+        session.handle(reply).expect("handshake");
+        assert!(
+            session.rule_census().is_empty(),
+            "additive field: absent = none"
+        );
+    }
+
+    #[test]
+    fn malformed_census_is_a_typed_payload_error() {
+        for rules in [
+            json!("not an array"),
+            json!([{"name": "r", "kind": "mystery", "codes": []}]),
+            json!([{"name": "r", "kind": "lint"}]),
+            json!([{"name": "", "kind": "lint", "codes": []}]),
+            json!([{"name": "r", "kind": "lint", "codes": [{"name": "c"}]}]),
+            json!([{"name": "r", "kind": "lint", "codes": [{"name": "c", "severity": "hint"}]}]),
+        ] {
+            let mut session = Session::new(CapabilitySet::all());
+            let init = session.send_initialize().expect("send initialize");
+            let mut params = Map::new();
+            params.insert("protocol_version".into(), json!(1));
+            params.insert("rules".into(), rules);
+            let reply = Frame::request(init.id.expect("id"), METHOD_INITIALIZE, params);
+            assert!(
+                matches!(
+                    session.handle(reply),
+                    Err(SessionError::InvalidPayload { .. })
+                ),
+                "a census the core cannot resolve enablement against is fatal"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_config_frame_round_trips_through_json() {
+        let config = CycleConfig {
+            enabled_rules: vec!["avoid_sync_io".to_owned()],
+            severity_overrides: BTreeMap::from([
+                ("code_a".to_owned(), Severity::Error),
+                ("code_b".to_owned(), Severity::Info),
+            ]),
+            overlays: vec![OverlayEntry {
+                file: "lib/main.dart".to_owned(),
+                content: Some("void main() {}".to_owned()),
+            }],
+        };
+        let frame = plugin_config_frame(&config);
+        assert_eq!(frame.method, METHOD_PLUGIN_CONFIG);
+        assert!(frame.is_notification());
+        let line = crate::encode_frame(&frame).expect("encode");
+        let decoded = crate::decode_line(&line).expect("decode");
+        assert_eq!(decoded, frame);
+        assert_eq!(
+            decoded.params["severity_overrides"],
+            json!({"code_a": "error", "code_b": "info"})
+        );
+        // Identical configs produce identical params (the runtime's dedup
+        // key); the empty config is the no-push shape.
+        assert_eq!(plugin_config_frame(&config).params, frame.params);
+        assert!(CycleConfig::default().is_empty());
+    }
+
+    #[test]
+    fn engine_diagnostics_frame_carries_the_analyzed_set() {
+        let rows = [PluginDiagnostic {
+            file: "lib/a.dart".to_owned(),
+            severity: Severity::Warning,
+            code: "c".to_owned(),
+            message: "m".to_owned(),
+            offset: 0,
+            length: 1,
+        }];
+        let analyzed = ["lib/a.dart".to_owned(), "lib/b.dart".to_owned()];
+        let frame = engine_diagnostics_frame(&rows, &analyzed);
+        assert_eq!(frame.params["files"], json!(["lib/a.dart", "lib/b.dart"]));
+        assert_eq!(
+            frame.params["diagnostics"].as_array().expect("rows").len(),
+            1
+        );
+        // No files: the additive array is empty, the batch still well-formed.
+        let frame = engine_diagnostics_frame(&rows, &[]);
+        assert_eq!(frame.params["files"], json!([]));
     }
 
     #[test]

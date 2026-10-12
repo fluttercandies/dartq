@@ -12,15 +12,17 @@
 /// (keyed by the code's stable string) and `registerAssist` — onto a host
 /// `PluginRegistryImpl`.
 ///
-/// The adapter gap this overlay documents: `registerLintRule` and
-/// `registerWarningRule` have no host mirror (protocol v1 has no rule
-/// registry — the engine's diagnostics batch is the plugin's context, PRD
-/// section 14.2), so all sixteen warning rules are census-only. For the same
-/// reason the wire faces are deterministic bridges, not the upstream rules'
-/// semantics (they need the analyzer AST, which the v1 wire does not carry).
+/// T5 closes the registration gap the v1 wire left: `registerLintRule` and
+/// `registerWarningRule` forward the real upstream rules onto the host
+/// registry, whose rule runner executes them over the cycle's analyzed files
+/// at the parsed level (enablement resolved by the core from the census this
+/// forwarding feeds). The wire faces stay deterministic bridges for the
+/// findings and fixes census: the rules' own findings ride the rule runner,
+/// and the pushed-batch census row below remains the registration proof.
 library;
 
 import 'package:analysis_server_plugin/registry.dart' as aswp;
+import 'package:analyzer/analysis_rule/analysis_rule.dart' show AbstractAnalysisRule;
 import 'package:analyzer/error/error.dart' show DiagnosticCode;
 import 'package:dartq_plugin_host/dartq_plugin_host.dart' as dartq;
 import 'package:riverpod_lint/main.dart' as riverpod_lint;
@@ -67,11 +69,11 @@ Future<void> run({
     config,
     input: input,
     send: send,
-    onEngineDiagnostics: (engineDiagnostics) => [
+    onEngineDiagnostics: (batch) => [
       // One census row per batch: the sixteen warning rules the host has no
       // mirror for, plus the delegated fix/assist counts, expressed through
       // the wire's lint capability.
-      if (engineDiagnostics case [final first, ...])
+      if (batch.diagnostics case [final first, ...])
         dartq.PluginDiagnostic(
           file: first.file,
           severity: dartq.Severity.info,
@@ -125,10 +127,10 @@ final class RegistryBridge implements aswp.PluginRegistry {
   /// of truth the fixes face serves).
   final dartq.PluginRegistryImpl host = dartq.PluginRegistryImpl();
 
-  /// Rules registered through the mirrorless `registerLintRule`.
+  /// Rules registered through `registerLintRule` (forwarded for real).
   int lintRules = 0;
 
-  /// Rules registered through the mirrorless `registerWarningRule`.
+  /// Rules registered through `registerWarningRule` (forwarded for real).
   int warningRules = 0;
 
   /// Fix generators delegated to the host registry, in registration order.
@@ -138,10 +140,19 @@ final class RegistryBridge implements aswp.PluginRegistry {
   int assists = 0;
 
   @override
-  void registerLintRule(Object rule) => lintRules++;
+  void registerLintRule(AbstractAnalysisRule rule) {
+    lintRules++;
+    // T5: the rule registers for real — the host's rule runner executes it
+    // over the cycle's analyzed files (parsed level), enablement resolved by
+    // the core from the census this forwarding feeds.
+    host.registerLintRule(rule);
+  }
 
   @override
-  void registerWarningRule(Object rule) => warningRules++;
+  void registerWarningRule(AbstractAnalysisRule rule) {
+    warningRules++;
+    host.registerWarningRule(rule);
+  }
 
   @override
   void registerFixForRule(DiagnosticCode code, Function generator) {

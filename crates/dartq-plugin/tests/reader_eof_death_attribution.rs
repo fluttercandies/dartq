@@ -21,7 +21,7 @@ use std::time::Duration;
 use dartq_diagnostics::{
     CodeInfo, Diagnostic, DiagnosticType, Severity as EngineSeverity, SourceRange,
 };
-use dartq_plugin::{Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy};
+use dartq_plugin::{CyclePush, Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy};
 use dartq_source::{FileId, FileTable};
 
 /// The same shape the daemon feeds on the analyze path.
@@ -69,7 +69,7 @@ fn a_natural_death_keeps_its_reason_past_the_callback_budget() {
     let batch = [engine_row(anchor, "the fatal batch")];
 
     runtime
-        .feed(&batch, &files)
+        .feed(&batch, &files, &CyclePush::default())
         .expect("the batch crosses before the death");
 
     // Idle past the callback budget (+ several monitor ticks): with the clock
@@ -81,7 +81,7 @@ fn a_natural_death_keeps_its_reason_past_the_callback_budget() {
     // The next interaction is terminal (retries: 0) and must name the real
     // cause, not the analyze budget.
     let terminal = runtime
-        .feed(&batch, &files)
+        .feed(&batch, &files, &CyclePush::default())
         .expect_err("a spent restart budget surfaces the death");
     assert!(
         matches!(&terminal, RuntimeError::Crashed { reason }

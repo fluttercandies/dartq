@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
-use dartq_plugin::{Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy};
+use dartq_plugin::{CyclePush, Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy};
 use dartq_source::FileTable;
 
 #[cfg(unix)]
@@ -59,7 +59,7 @@ fn stdin_write_into_a_stopped_reader_hits_the_deadline_and_kills() {
             )
         })
         .collect();
-    let outcome = runtime.feed(&engine, &files);
+    let outcome = runtime.feed(&engine, &files, &CyclePush::default());
     let error = outcome.expect_err("a non-draining child must hit the write deadline");
     assert!(
         matches!(&error, RuntimeError::Crashed { reason } if reason.contains("input pipe")),
@@ -80,7 +80,7 @@ fn stdin_write_into_a_stopped_reader_hits_the_deadline_and_kills() {
     // the regenerated script sleeps instead of answering; Drop reaps it.)
     let single = vec![engine[0].clone()];
     runtime
-        .feed(&single, &files)
+        .feed(&single, &files, &CyclePush::default())
         .expect("a fresh generation feeds");
     assert_eq!(runtime.stats().restarts, 1);
 }

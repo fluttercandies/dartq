@@ -2069,6 +2069,13 @@ impl Session {
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Vec<plugins::PluginFinding> {
         let anchor: Option<FileId> = self.published.keys().copied().min();
+        // The governing root options file, resolved before the closure: the
+        // resolver reads the workspace root through a whole-`self` method,
+        // which would defeat the closure's disjoint field capture (the
+        // plugins' mutable borrow must stay disjoint from the engine's
+        // read). Returns an owned path, so the borrow ends here.
+        let options_file =
+            dartq_engine::analysis_options::AnalysisOptions::find_for_dir(self.workspace_root());
         // Direct field access (not `self.engine`): the plugins' mutable
         // borrow and the engine's read must stay disjoint field borrows.
         let engine = self
@@ -2081,7 +2088,48 @@ impl Session {
             if crate::probe::take_weave_panic() {
                 panic!("test-armed plugin weave panic");
             }
-            let cycle = self.plugins.cycle(diagnostics, engine.file_table(), anchor);
+            // The cycle context: the analyzed set (the context's resident
+            // libraries — the files the plugin's rules run over), the
+            // client's unsaved text for the opened documents among them
+            // (the overlays; unopened files read from disk), and the
+            // governing root options file (the `plugins:` rule configs).
+            // The enumeration runs only when a plugin set exists; the vec
+            // build is the per-cycle cost of hosting rules.
+            let analyzed: Vec<String> = engine
+                .libraries()
+                .into_iter()
+                .flat_map(|(_, files)| files)
+                .filter_map(|file| {
+                    engine
+                        .file_table()
+                        .path(file)
+                        .map(|path| path.to_string_lossy().into_owned())
+                })
+                .collect();
+            let overlays: Vec<(String, String)> = self
+                .opened
+                .keys()
+                .filter_map(|path| {
+                    let path_string = path.to_string_lossy().into_owned();
+                    let file = engine.file_table().try_file_id(path)?;
+                    let text = engine.content(file)?;
+                    Some((
+                        path_string,
+                        std::str::from_utf8(text)
+                            .expect("engine content is valid UTF-8")
+                            .to_owned(),
+                    ))
+                })
+                .collect();
+            let options = options_file.as_deref();
+            let cycle_context = plugins::CycleContext {
+                analyzed: &analyzed,
+                overlays: &overlays,
+                options_file: options,
+            };
+            let cycle =
+                self.plugins
+                    .cycle(diagnostics, engine.file_table(), anchor, &cycle_context);
             diagnostics.extend(cycle.crashes);
             plugin_findings =
                 plugins::resolve_findings(&cycle.findings, engine.file_table(), |file| {

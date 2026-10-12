@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use dartq_diagnostics::{Diagnostic, Severity as EngineSeverity, SourceRange, URI_DOES_NOT_EXIST};
 use dartq_plugin::{
-    MAX_FRAME_SIZE, Manifest, PluginRuntime, ProtocolError, RuntimeError, SpawnSpec, StdioPolicy,
+    CyclePush, MAX_FRAME_SIZE, Manifest, PluginRuntime, ProtocolError, RuntimeError, SpawnSpec,
+    StdioPolicy,
 };
 use dartq_source::{FileId, FileTable};
 
@@ -108,7 +109,7 @@ fn run_guard_scenarios(mut runtime: PluginRuntime) {
     // 16 MiB wire bound — exactly the batch a naive write would loop on.
     let oversized = [warning(&"a".repeat(MAX_FRAME_SIZE), anchor)];
     let error = runtime
-        .feed(&oversized, &files)
+        .feed(&oversized, &files, &CyclePush::default())
         .expect_err("an over-limit outbound batch must be rejected");
     assert!(
         matches!(
@@ -129,7 +130,7 @@ fn run_guard_scenarios(mut runtime: PluginRuntime) {
     // The same runtime keeps working: a small batch crosses the wire.
     let small = [warning("fits", anchor)];
     runtime
-        .feed(&small, &files)
+        .feed(&small, &files, &CyclePush::default())
         .expect("a batch under the limit still crosses");
     assert_eq!(runtime.stats().frames_out, 2);
 

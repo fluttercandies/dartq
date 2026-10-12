@@ -10,6 +10,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data' show BytesBuilder;
 
+import 'census.dart';
+import 'cycle_config.dart';
 import 'diagnostic.dart';
 import 'edits.dart';
 import 'frame.dart';
@@ -17,27 +19,34 @@ import 'plugin.dart';
 import 'plugin_config.dart';
 import 'plugin_session.dart';
 import 'registry.dart';
+import 'rule_runner.dart';
 
 /// Reads newline-delimited frames from [input], drives the session built
 /// from [config], and writes each reply line through [send] (one JSON line,
 /// without the trailing newline). Plugin-emitted diagnostics go through
 /// [onEngineDiagnostics] (its return value is sent back as
-/// `notification/diagnostic` frames); `request/fixes` is served by
-/// [onRequestFixes].
+/// `notification/diagnostic` frames); the per-cycle execution config goes
+/// through [onPluginConfig]; `request/fixes` is served by [onRequestFixes].
+/// The session's `initialize` reply advertises [ruleCensus] (the
+/// registration census the core resolves enablement against).
 ///
 /// Throws on the first wire-contract violation (malformed UTF-8/JSON,
 /// foreign schema version, oversize frame); the process must then exit —
 /// there is no resynchronization, matching the Rust codec.
 Future<void> runPluginHost(
   PluginConfig config, {
+  List<RuleCensus> ruleCensus = const <RuleCensus>[],
   required Stream<List<int>> input,
   required Future<void> Function(String line) send,
   EngineDiagnosticsHandler? onEngineDiagnostics,
+  PluginConfigHandler? onPluginConfig,
   FixesHandler? onRequestFixes,
 }) async {
   final session = PluginSession(
     config: config,
+    ruleCensus: ruleCensus,
     onEngineDiagnostics: onEngineDiagnostics,
+    onPluginConfig: onPluginConfig,
     onRequestFixes: onRequestFixes,
   );
   final buffer = BytesBuilder(copy: false);
@@ -100,21 +109,19 @@ Future<void> _serveLine(
 /// [Plugin.start], the host loop over [input]/[send], then
 /// [Plugin.shutDown] when the session ends, however it ends.
 ///
-/// `request/fixes` is served from the registry, mirroring the official
-/// `edit.getFixes` semantics: every registered assist generator runs at the
-/// requested range, and every fix generator whose rule code matches an
-/// engine diagnostic of the latest pushed batch (`onEngineDiagnostics`
-/// context) on the same file overlapping the requested range runs at that
-/// diagnostic's range — the official server matches fixes to diagnostics by
-/// line; without file content, the diagnostic's own span is the match. The
-/// changes are answered best (lowest priority) first, ties in registration
-/// order. The batch is the producers' entire context; the engine Query API
-/// (PRD section 14.2) will widen it.
-///
-/// Producer failures propagate and tear the session down: the core reports
-/// the crash (PRD section 14.3), the reply is never fabricated. A stalled
-/// producer is the core's budget to enforce (`callback_ms`); the async loop
-/// stays responsive while one computes.
+/// The registered rules execute here (the official server's role): each
+/// analyze cycle's config (`notification/plugin_config`) is recorded, and
+/// the cycle's batch runs the registry's enabled rules over the analyzed
+/// files — real analyzer ASTs the host parses itself, overlays first. The
+/// findings ride back as plugin diagnostics, and the `request/fixes` match
+/// set is the engine batch together with those own findings: a
+/// `registerFixForRule` generator fires on the plugin's own lint finding,
+/// not only on a pushed engine row. Every failure path — registration, the
+/// wire loop, a producer or a rule that throws — propagates and tears the
+/// session down: the core reports the crash (PRD section 14.3; a throwing
+/// rule mirrors the official `shouldPropagateExceptions: true`), the reply
+/// is never fabricated. A stalled producer is the core's budget to enforce
+/// (`callback_ms`); the async loop stays responsive while one computes.
 Future<void> servePlugin(
   Plugin plugin, {
   required PluginConfig config,
@@ -124,24 +131,40 @@ Future<void> servePlugin(
   final registry = PluginRegistryImpl();
   await plugin.register(registry);
   await plugin.start();
-  // Recording the latest batch is the fix context; it also validates every
-  // pushed batch, and nothing is emitted back — a plugin's own findings
-  // need the rule-registry surface (PRD section 14.1), which protocol v1's
-  // registration carries no hook for.
+  // Recording the latest batch and the rules' own findings is the fix
+  // context; the batch handler also validates every pushed cycle, and its
+  // return value (the rule findings) is emitted back as plugin-owned
+  // diagnostics — the engine batch itself is context, never an echo. A
+  // plugin that registered no rules runs nothing: the handler still records
+  // the batch, at the batch handler's own discretion.
   var engineDiagnostics = const <PluginDiagnostic>[];
+  var ownFindings = const <PluginDiagnostic>[];
+  var cycleConfig = const PluginCycleConfig();
   try {
     await runPluginHost(
       config,
+      ruleCensus: registry.census(),
       input: input,
       send: send,
+      onPluginConfig: (config) => cycleConfig = config,
       onEngineDiagnostics: (batch) {
-        engineDiagnostics = batch;
-        // The handler's return value is emitted back as plugin-owned
-        // diagnostics; the engine batch is context, never an echo.
-        return const <PluginDiagnostic>[];
+        engineDiagnostics = batch.diagnostics;
+        if (registry.lintRules.isEmpty && registry.warningRules.isEmpty) {
+          return const <PluginDiagnostic>[];
+        }
+        return ownFindings = runRules(
+          registry: registry,
+          config: cycleConfig,
+          batch: batch,
+        );
       },
-      onRequestFixes: (file, offset, length) =>
-          _serveFixes(registry, engineDiagnostics, file, offset, length),
+      onRequestFixes: (file, offset, length) => _serveFixes(
+        registry,
+        [...engineDiagnostics, ...ownFindings],
+        file,
+        offset,
+        length,
+      ),
     );
   } finally {
     await plugin.shutDown();
@@ -149,10 +172,11 @@ Future<void> servePlugin(
 }
 
 /// Serves one `request/fixes` from the registry: assists at the requested
-/// range, rule fixes at their matching diagnostic's range, best first.
+/// range, rule fixes at their matching diagnostic's range (the engine batch
+/// together with the plugin's own rule findings), best first.
 Future<List<PrioritizedChange>> _serveFixes(
   PluginRegistryImpl registry,
-  List<PluginDiagnostic> engineDiagnostics,
+  List<PluginDiagnostic> fixContext,
   String file,
   int offset,
   int length,
@@ -175,7 +199,7 @@ Future<List<PrioritizedChange>> _serveFixes(
       ProducerContext(file: file, offset: offset, length: length),
     );
   }
-  for (final diagnostic in engineDiagnostics) {
+  for (final diagnostic in fixContext) {
     // The requested and the diagnostic's UTF-16 ranges must overlap.
     if (diagnostic.file != file ||
         diagnostic.offset > offset + length ||

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use dartq_diagnostics::{
     CodeInfo, Diagnostic, DiagnosticType, Severity as EngineSeverity, SourceRange,
 };
-use dartq_plugin::{Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy};
+use dartq_plugin::{CyclePush, Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy};
 use dartq_source::{FileId, FileTable};
 
 /// The same shape the daemon feeds on the analyze path.
@@ -73,7 +73,7 @@ fn a_satisfied_demand_reopens_and_stays_enforced() {
     // Cycle 1: the batch crosses, the diagnostic closes the clock, and the
     // burst drains as the satisfied demand it is.
     runtime
-        .feed(&batch, &files)
+        .feed(&batch, &files, &CyclePush::default())
         .expect("the first batch crosses");
     let drained = runtime
         .wait_diagnostics(Duration::from_secs(5))
@@ -92,7 +92,7 @@ fn a_satisfied_demand_reopens_and_stays_enforced() {
     let mut outcome = Ok(Vec::new());
     for _ in 0..100 {
         outcome = runtime
-            .feed(&batch, &files)
+            .feed(&batch, &files, &CyclePush::default())
             .and_then(|()| runtime.wait_diagnostics(Duration::from_millis(50)));
         if outcome.is_err() {
             break;

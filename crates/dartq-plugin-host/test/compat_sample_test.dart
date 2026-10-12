@@ -4,9 +4,11 @@
 /// Everything runs in-process over in-memory streams against the sample's
 /// own `run` function — the same function `bin/compat_plugin.dart` launches:
 /// the on-disk manifest parses, the handshake advertises exactly the
-/// manifest's capabilities, the rule's diagnostics flow over a file set, the
-/// fixes face serves prioritized edits at the requested UTF-16 range, and
-/// the crash mode tears the session down before answering.
+/// manifest's capabilities plus the rule census, the enabled rule executes
+/// over the analyzed set (overlay text in, findings out), the rule is
+/// disabled by default, severity overrides re-level the row, the fixes face
+/// serves the rule fix and the assist in priority order at UTF-16 ranges,
+/// and the crash mode tears the session down before answering.
 library;
 
 import 'dart:async';
@@ -49,22 +51,30 @@ PluginFrame _initialize(int id) => PluginFrame.request(id, methodInitialize, {
 
 PluginFrame _shutdown(int id) => PluginFrame.request(id, methodShutdown);
 
-PluginFrame _engineBatch(List<Map<String, Object?>> rows) =>
-    PluginFrame.notification(methodEngineDiagnostics, {'diagnostics': rows});
+PluginFrame _config({
+  List<String> enabledRules = const ['boolean_literal_review'],
+  Map<String, String> severityOverrides = const {},
+  List<Map<String, Object?>> overlays = const [],
+}) => PluginFrame.notification(methodPluginConfig, {
+  'enabled_rules': enabledRules,
+  'severity_overrides': severityOverrides,
+  'overlays': overlays,
+});
 
-Map<String, Object?> _engineRow(
-  String file,
-  String code,
-  int offset,
-  int length,
-) => {
-  'file': file,
-  'severity': 'error',
-  'code': code,
-  'message': 'engine row',
-  'offset': offset,
-  'length': length,
-};
+PluginFrame _engineBatch({
+  List<Map<String, Object?>> diagnostics = const [],
+  List<String> files = const ['lib/a.dart'],
+}) => PluginFrame.notification(methodEngineDiagnostics, {
+  'diagnostics': diagnostics,
+  'files': files,
+});
+
+/// The analyzed fixture, pushed as an overlay (the host parses this text —
+/// no disk file involved). `true` sits at UTF-16 offset 20, length 4.
+const String fixture = 'void main() { print(true); }\n';
+
+const int trueOffset = 20;
+const int trueLength = 4;
 
 void main() {
   group('manifest', () {
@@ -92,105 +102,174 @@ void main() {
       expect(config.memoryBudgetMb, 512);
     });
 
-    test(
-      'the sample runner advertises exactly the manifest capabilities',
-      () async {
-        final sent = await _runSample([
-          _frame(_initialize(1)),
-          _frame(_shutdown(2)),
-        ]);
+    test('the handshake advertises the manifest capabilities and the rule '
+        'census', () async {
+      final sent = await _runSample([
+        _frame(_initialize(1)),
+        _frame(_shutdown(2)),
+      ]);
 
-        final init = decodeFrame(sent[0]);
-        expect(init.method, methodInitialize);
-        expect(init.params['protocol_version'], protocolVersion);
-        expect(init.params['capabilities'], ['lint', 'fix']);
-      },
-    );
+      final init = decodeFrame(sent[0]);
+      expect(init.method, methodInitialize);
+      expect(init.params['protocol_version'], protocolVersion);
+      expect(init.params['capabilities'], ['lint', 'fix']);
+      // The census: the registered lint rule with its code and declared
+      // severity — the core resolves per-cycle enablement against this.
+      expect(init.params['rules'], [
+        {
+          'name': 'boolean_literal_review',
+          'kind': 'lint',
+          'codes': [
+            {'name': 'boolean_literal', 'severity': 'warning'},
+          ],
+        },
+      ]);
+    });
   });
 
-  group('diagnostics flow', () {
+  group('rule execution', () {
+    test('the enabled rule reports the fixture boolean literal over the '
+        'overlay text', () async {
+      final sent = await _runSample([
+        _frame(_initialize(1)),
+        _frame(
+          _config(
+            overlays: [
+              {'file': 'lib/a.dart', 'content': fixture},
+            ],
+          ),
+        ),
+        _frame(_engineBatch()),
+        _frame(_shutdown(2)),
+      ]);
+
+      final diagnostics = sent
+          .map(decodeFrame)
+          .where((frame) => frame.method == methodDiagnosticNotification)
+          .toList();
+      expect(diagnostics, hasLength(1));
+      expect(
+        diagnostics.single.params,
+        PluginDiagnostic(
+          file: 'lib/a.dart',
+          severity: Severity.warning,
+          code: 'boolean_literal',
+          message: 'Boolean literals need a compat review.',
+          offset: trueOffset,
+          length: trueLength,
+        ).toJson(),
+      );
+    });
+
+    test('the rule is disabled by default: no config, no findings', () async {
+      final sent = await _runSample([
+        _frame(_initialize(1)),
+        _frame(_engineBatch()),
+        _frame(_shutdown(2)),
+      ]);
+
+      final diagnostics = sent
+          .map(decodeFrame)
+          .where((frame) => frame.method == methodDiagnosticNotification)
+          .toList();
+      expect(diagnostics, isEmpty);
+    });
+
     test(
-      'the rule reports companions for .dart engine rows, in arrival order',
+      'an empty enabled set keeps the rule off even with analyzed files',
       () async {
         final sent = await _runSample([
           _frame(_initialize(1)),
           _frame(
-            _engineBatch([
-              // Offset 8..10 spans the surrogate pair of an emoji: UTF-16
-              // positions pass through untouched.
-              _engineRow('lib/a.dart', 'uri_does_not_exist', 8, 2),
-              _engineRow('notes.txt', 'some_code', 0, 4),
-              _engineRow('lib/b.dart', 'unused_import', 10, 4),
-            ]),
+            _config(
+              enabledRules: [],
+              overlays: [
+                {'file': 'lib/a.dart', 'content': fixture},
+              ],
+            ),
           ),
+          _frame(_engineBatch()),
           _frame(_shutdown(2)),
         ]);
 
-        // The .txt row is skipped; both .dart rows emit, in arrival order,
-        // after the initialize reply and before the shutdown reply.
         final diagnostics = sent
             .map(decodeFrame)
             .where((frame) => frame.method == methodDiagnosticNotification)
             .toList();
-        expect(diagnostics, hasLength(2));
-
-        final first = diagnostics[0];
-        expect(
-          first.params,
-          PluginDiagnostic(
-            file: 'lib/a.dart',
-            severity: Severity.warning,
-            code: 'compat/companion',
-            message: 'companion for `uri_does_not_exist`',
-            offset: 8,
-            length: 2,
-          ).toJson(),
-        );
-        final second = diagnostics[1];
-        expect(second.params['file'], 'lib/b.dart');
-        expect(second.params['offset'], 10);
+        expect(diagnostics, isEmpty);
       },
     );
+
+    test('a severity override re-levels the rule row', () async {
+      final sent = await _runSample([
+        _frame(_initialize(1)),
+        _frame(
+          _config(
+            severityOverrides: {'boolean_literal': 'error'},
+            overlays: [
+              {'file': 'lib/a.dart', 'content': fixture},
+            ],
+          ),
+        ),
+        _frame(_engineBatch()),
+        _frame(_shutdown(2)),
+      ]);
+
+      final diagnostics = sent
+          .map(decodeFrame)
+          .where((frame) => frame.method == methodDiagnosticNotification)
+          .toList();
+      expect(diagnostics, hasLength(1));
+      expect(diagnostics.single.params['severity'], 'error');
+      // Only the severity moved; the rest of the row stands.
+      expect(diagnostics.single.params['code'], 'boolean_literal');
+      expect(diagnostics.single.params['offset'], trueOffset);
+    });
   });
 
   group('fix flow', () {
-    test(
-      'request/fixes serves the range fix then the suggestion, in UTF-16',
-      () async {
-        final sent = await _runSample([
-          _frame(_initialize(1)),
-          _frame(
-            PluginFrame.request(7, methodRequestFixes, {
-              'file': 'lib/a.dart',
-              'offset': 10,
-              'length': 4,
-            }),
+    test('request/fixes serves the rule fix at the finding and the assist at '
+        'the requested range, best priority first', () async {
+      final sent = await _runSample([
+        _frame(_initialize(1)),
+        _frame(
+          _config(
+            overlays: [
+              {'file': 'lib/a.dart', 'content': fixture},
+            ],
           ),
-          _frame(_shutdown(2)),
-        ]);
+        ),
+        _frame(_engineBatch()),
+        _frame(
+          PluginFrame.request(7, methodRequestFixes, {
+            'file': 'lib/a.dart',
+            'offset': trueOffset,
+            'length': trueLength,
+          }),
+        ),
+        _frame(_shutdown(2)),
+      ]);
 
-        final reply = sent
-            .map(decodeFrame)
-            .singleWhere((frame) => frame.id == 7);
-        expect(reply.method, methodRequestFixes);
-        final fixes = (reply.params['fixes'] as List).cast<Map>();
-        expect(fixes, hasLength(2));
+      final reply = sent.map(decodeFrame).singleWhere((frame) => frame.id == 7);
+      expect(reply.method, methodRequestFixes);
+      final fixes = (reply.params['fixes'] as List).cast<Map>();
+      expect(fixes, hasLength(2));
 
-        // First fix: the requested UTF-16 range replaced with the marker.
-        expect(fixes[0]['priority'], compat.CompatPlugin.fixPriority);
-        expect(fixes[0]['message'], compat.CompatPlugin.fixMessage);
-        final edits = (fixes[0]['edits'] as List).cast<Map>();
-        expect(edits, hasLength(1));
-        expect(edits[0]['offset'], 10);
-        expect(edits[0]['length'], 4);
-        expect(edits[0]['replacement'], compat.CompatPlugin.fixReplacement);
+      // First fix (priority 1): the finding's own range replaced with the
+      // marker — the rule fix fired on the plugin's own finding.
+      expect(fixes[0]['priority'], compat.CompatPlugin.fixPriority);
+      expect(fixes[0]['message'], compat.CompatPlugin.fixMessage);
+      final edits = (fixes[0]['edits'] as List).cast<Map>();
+      expect(edits, hasLength(1));
+      expect(edits[0]['offset'], trueOffset);
+      expect(edits[0]['length'], trueLength);
+      expect(edits[0]['replacement'], compat.CompatPlugin.fixReplacement);
 
-        // Second fix: a message-only suggestion (no edits).
-        expect(fixes[1]['priority'], compat.CompatPlugin.suggestionPriority);
-        expect(fixes[1]['message'], compat.CompatPlugin.suggestionMessage);
-        expect((fixes[1]['edits'] as List), isEmpty);
-      },
-    );
+      // Second (priority 50): the message-only assist.
+      expect(fixes[1]['priority'], compat.CompatPlugin.suggestionPriority);
+      expect(fixes[1]['message'], compat.CompatPlugin.suggestionMessage);
+      expect((fixes[1]['edits'] as List), isEmpty);
+    });
   });
 
   group('crash flow', () {
@@ -204,10 +283,17 @@ void main() {
         send: (line) async => sent.add(line),
       );
       controller.add(_frame(_initialize(1)));
-      // The handshake itself is answered; the engine batch is the first
-      // interaction, and the crash throws before any reply is produced.
+      // The handshake itself is answered; the fixes request is the first
+      // producer interaction, and the crash throws before any reply is
+      // produced.
       controller.add(
-        _frame(_engineBatch([_engineRow('lib/a.dart', 'c', 0, 1)])),
+        _frame(
+          PluginFrame.request(7, methodRequestFixes, {
+            'file': 'lib/a.dart',
+            'offset': 0,
+            'length': 1,
+          }),
+        ),
       );
       await controller.close();
       await expectLater(done, throwsA(isA<StateError>()));

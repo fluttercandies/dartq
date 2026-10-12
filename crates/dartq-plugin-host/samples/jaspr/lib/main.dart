@@ -68,11 +68,11 @@ Future<void> run({
     config,
     input: input,
     send: send,
-    onEngineDiagnostics: (engineDiagnostics) => [
+    onEngineDiagnostics: (batch) => [
       // One census row per batch: the rule registrations the host has no
       // mirror for, plus the delegated fix/assist counts, expressed through
       // the wire's lint capability.
-      if (engineDiagnostics case [final first, ...])
+      if (batch.diagnostics case [final first, ...])
         dartq.PluginDiagnostic(
           file: first.file,
           severity: dartq.Severity.info,

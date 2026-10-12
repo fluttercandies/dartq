@@ -21,6 +21,9 @@ dartq-source = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The `plugins:` section of the governing analysis options file (T5 rule
+# enablement) parses here, root-file-only.
+serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

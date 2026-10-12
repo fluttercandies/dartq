@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange};
-use dartq_plugin::{Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy};
+use dartq_plugin::{CyclePush, Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy};
 use dartq_source::FileTable;
 
 fn spec(script: &str, retries: u32) -> SpawnSpec {
@@ -73,20 +73,20 @@ fn mid_session_death_restarts_within_budget_then_reports_crashed() {
     // One death absorbed per sleep: each generation lives 300 ms, so the
     // waits guarantee the next feed observes a dead child and restarts.
     runtime
-        .feed(&engine, &files)
+        .feed(&engine, &files, &CyclePush::default())
         .expect("push on the first generation");
     std::thread::sleep(Duration::from_millis(400));
     runtime
-        .feed(&engine, &files)
+        .feed(&engine, &files, &CyclePush::default())
         .expect("push after the first restart");
     std::thread::sleep(Duration::from_millis(400));
     runtime
-        .feed(&engine, &files)
+        .feed(&engine, &files, &CyclePush::default())
         .expect("push after the second restart");
     std::thread::sleep(Duration::from_millis(400));
 
     // Budget spent: the next interaction is terminal, never an endless loop.
-    let outcome = runtime.feed(&engine, &files);
+    let outcome = runtime.feed(&engine, &files, &CyclePush::default());
     assert!(
         matches!(&outcome, Err(RuntimeError::Crashed { .. })),
         "post-budget failure is Crashed, got {outcome:?}"

@@ -63,11 +63,11 @@ Future<void> run({
     send: send,
     // No `onRequestFixes`: the session advertises lint only, so the core
     // never sends `request/fixes`.
-    onEngineDiagnostics: (engineDiagnostics) => [
+    onEngineDiagnostics: (batch) => [
       // One census row per batch: the bulk of the upstream registration face
       // (37 lint rules, 23 fix generators, 3 assists), expressed through the
       // wire's lint capability.
-      if (engineDiagnostics case [final first, ...])
+      if (batch.diagnostics case [final first, ...])
         dartq.PluginDiagnostic(
           file: first.file,
           severity: dartq.Severity.info,

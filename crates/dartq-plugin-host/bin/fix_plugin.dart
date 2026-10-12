@@ -24,11 +24,11 @@ Future<void> main() async {
       stdout.writeln(line);
       await stdout.flush();
     },
-    onEngineDiagnostics: (diagnostics) {
-      if (diagnostics.isEmpty) {
+    onEngineDiagnostics: (batch) {
+      if (batch.diagnostics.isEmpty) {
         return const <PluginDiagnostic>[];
       }
-      final first = diagnostics.first;
+      final first = batch.diagnostics.first;
       return <PluginDiagnostic>[
         PluginDiagnostic(
           file: first.file,

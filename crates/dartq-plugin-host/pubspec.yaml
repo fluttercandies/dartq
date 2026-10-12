@@ -2,13 +2,22 @@ name: dartq_plugin_host
 description: Host-side Dart package of the dartq plugin protocol (PRD section 14). Not part of the Cargo workspace.
 environment:
   sdk: ^3.10.0
+dependencies:
+  # The rule runner parses the analyzed files with the real analyzer parse
+  # stack (T5: `registerLintRule` execution — official rules are typed
+  # against analyzer ASTs, so the zero-dependency property ends here, the
+  # official package carries the same dependency). Parse-only: no resolver.
+  # Resolved from the existing lock (analyzer 14.5.0, all packages in the
+  # offline pub cache); the first `dart pub get --offline` refreshes the
+  # lock's dependency-kind annotation.
+  analyzer: ^13.0.0
 dev_dependencies:
   test: ^1.25.0
 dependency_overrides:
   # The analysis_server_plugin import shim: maps the official package name
   # onto the in-package shim so fixtures written verbatim in official style
   # resolve. The same line is the external plugin recipe (see
-  # lib/src/analysis_server_plugin_shim/README.md); the shim has zero
-  # dependencies of its own.
+  # lib/src/analysis_server_plugin_shim/README.md); the shim carries the
+  # same analyzer dependency the official package has.
   analysis_server_plugin:
     path: lib/src/analysis_server_plugin_shim

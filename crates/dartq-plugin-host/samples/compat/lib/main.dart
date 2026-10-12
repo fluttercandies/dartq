@@ -9,14 +9,25 @@
 /// `dartq_plugin_host` equivalent; see `README.md` for the full mapping
 /// table.
 ///
-/// The analysis surface is deliberately deterministic: without the engine
-/// Query API (PRD section 14.2) a plugin's context is the engine diagnostics
-/// batch the core pushes each cycle, so the rule reports a companion finding
-/// for every engine row on a `.dart` file, and the registered fix replaces
-/// exactly the requested UTF-16 range. Both faces pass UTF-16 offsets
-/// through untouched — the position exchange contract.
+/// The analysis surface is a real analyzer lint rule (T5): the host executes
+/// the registered rule over the cycle's analyzed files, parsing them itself
+/// — the rule code is ordinary analyzer-plugin code (`registerLintRule`
+/// with an `AbstractAnalysisRule` subclass), disabled by default and enabled
+/// by the core's per-cycle config. The registered fix matches the rule's own
+/// findings (the fix context is the engine batch together with the rule's
+/// emissions); both faces pass UTF-16 offsets — the position exchange
+/// contract. With `crash` in the launch args the producer dies on the first
+/// post-handshake interaction: the intentional-crash mode for crash
+/// surfacing.
 library;
 
+import 'package:analyzer/analysis_rule/analysis_rule.dart';
+import 'package:analyzer/analysis_rule/rule_context.dart' show RuleContext;
+import 'package:analyzer/analysis_rule/rule_visitor_registry.dart'
+    show RuleVisitorRegistry;
+import 'package:analyzer/dart/ast/ast.dart';
+import 'package:analyzer/dart/ast/visitor.dart';
+import 'package:analyzer/error/error.dart';
 import 'package:dartq_plugin_host/dartq_plugin_host.dart';
 
 /// The plugin instance the host integrates (the official convention of a
@@ -26,21 +37,21 @@ final CompatPlugin plugin = CompatPlugin();
 /// The plugin: identity, registration, and lifecycle, mirroring
 /// `package:analysis_server_plugin/plugin.dart`.
 class CompatPlugin extends Plugin {
-  /// The rule code this plugin reports and registers its fix under. The
-  /// official `registerFixForRule` takes a `DiagnosticCode`; here the rule
-  /// identity is its stable string code.
-  static const String ruleCode = 'compat/companion';
+  /// The rule code this plugin's rule reports and its fix registers under
+  /// (the official `registerFixForRule` takes a `DiagnosticCode`; the dartq
+  /// host keys the fix face by the code's lower-case name).
+  static const String ruleCode = 'compat/boolean_literal';
 
   /// Priority of the range-replacement fix (lower sorts first).
   static const int fixPriority = 1;
 
-  /// Priority of the message-only suggestion that follows the fix.
+  /// Priority of the message-only suggestion (registered as an assist).
   static const int suggestionPriority = 50;
 
   /// Title of the range-replacement fix.
-  static const String fixMessage = 'Replace range with a compat marker';
+  static const String fixMessage = 'Replace literal with a compat marker';
 
-  /// The replacement text the fix writes over the requested range.
+  /// The replacement text the fix writes over the finding's range.
   static const String fixReplacement = '/* compat: fixed */';
 
   /// Title of the message-only suggestion.
@@ -51,50 +62,74 @@ class CompatPlugin extends Plugin {
 
   @override
   void register(PluginRegistry registry) {
-    // The official API shape: one fix generator per rule code, plus any
-    // assists. The producer is computed per request context.
-    registry.registerFixForRule(ruleCode, (context) => const CompatRangeFix());
+    // The official API shape: one lint rule (disabled by default — the
+    // core's config enables it), one fix generator for the rule's code, and
+    // one assist. The host keys the fix face by the code's lower-case name
+    // (what the official registry stores).
+    registry.registerLintRule(BooleanLiteralRule());
+    registry.registerFixForRule(
+      BooleanLiteralRule.code.lowerCaseName,
+      (context) => const CompatRangeFix(),
+    );
+    registry.registerAssist((context) => const CompatSuggestion());
   }
 }
 
-/// The analysis rule, shaped like the official `AnalysisRule` (name,
-/// description, one diagnostic code, report-per-context). Protocol v1 has no
-/// AST or element access — the engine diagnostics batch pushed with
-/// `notification/engine_diagnostics` is the rule's context — so the rule
-/// reports one companion finding per engine row on a `.dart` file, at the
-/// same UTF-16 range.
-class CompanionRule {
-  /// The rule's stable name.
-  static const String name = 'companion_rule';
+/// The analysis rule: an ordinary analyzer-plugin rule (`AnalysisRule`
+/// subclass, exactly the shape the official `registerLintRule` takes). It
+/// reports one finding per boolean literal — deterministic, parse-only, and
+/// fixture-friendly: `void main() { print(true); }` yields exactly one
+/// finding at the literal.
+class BooleanLiteralRule extends AnalysisRule {
+  /// The rule's code, declared once as a `LintCode` (the concrete
+  /// `DiagnosticCode` the official one-code rule shape uses).
+  static const LintCode code = LintCode(
+    'boolean_literal',
+    'Boolean literals need a compat review.',
+    uniqueName: 'COMPAT_BOOLEAN_LITERAL',
+    severity: DiagnosticSeverity.WARNING,
+  );
 
-  /// One-line description surfaced in tooling.
-  static const String description =
-      'Reports a companion finding for every engine diagnostic on a .dart'
-      ' file, demonstrating the diagnostics flow of the plugin protocol.';
+  /// Builds the rule (the official `AnalysisRule` constructor).
+  BooleanLiteralRule()
+    : super(
+        name: 'boolean_literal_review',
+        description:
+            'Reports one finding per boolean literal, demonstrating'
+            ' the rule-execution flow of the dartq plugin host.',
+      );
 
-  /// The single diagnostic code this rule reports.
-  static const String diagnosticCode = CompatPlugin.ruleCode;
+  @override
+  DiagnosticCode get diagnosticCode => code;
 
-  /// Computes the rule's findings for one engine batch, in arrival order.
-  /// Files the rule does not analyze (anything but `.dart`) are skipped.
-  List<PluginDiagnostic> report(List<PluginDiagnostic> engineDiagnostics) => [
-    for (final row in engineDiagnostics)
-      if (row.file.endsWith('.dart'))
-        PluginDiagnostic(
-          file: row.file,
-          severity: Severity.warning,
-          code: diagnosticCode,
-          message: 'companion for `${row.code}`',
-          // UTF-16 in, UTF-16 out: the engine row's range is carried
-          // through untouched.
-          offset: row.offset,
-          length: row.length,
-        ),
-  ];
+  @override
+  bool get canUseParsedResult => true;
+
+  @override
+  void registerNodeProcessors(
+    RuleVisitorRegistry registry,
+    RuleContext context,
+  ) {
+    registry.addBooleanLiteral(this, _Visitor(this));
+  }
 }
 
-/// The fix producer, shaped like the official `CorrectionProducer`
-/// (priority, message, compute over a request context).
+/// The rule's node processor: one report per boolean literal.
+class _Visitor extends SimpleAstVisitor<void> {
+  _Visitor(this.rule);
+
+  final BooleanLiteralRule rule;
+
+  @override
+  void visitBooleanLiteral(BooleanLiteral node) {
+    rule.reportAtNode(node);
+  }
+}
+
+/// The fix producer, shaped like the official `CorrectionProducer` (priority,
+/// message, compute over a request context): it replaces the fixing
+/// diagnostic's own span — the host hands the matching finding's range to
+/// `registerFixForRule` generators, not the requested one.
 class CompatRangeFix implements Producer {
   /// Builds the fix; const so registrations can share one instance.
   const CompatRangeFix();
@@ -106,61 +141,62 @@ class CompatRangeFix implements Producer {
   String get message => CompatPlugin.fixMessage;
 
   @override
-  Future<List<SourceEdit>> compute(ProducerContext context) async => [
-    // The requested UTF-16 range, replaced verbatim: the edit's offset and
-    // length echo the request, proving the UTF-16 position exchange.
-    SourceEdit(
-      offset: context.offset,
-      length: context.length,
-      replacement: CompatPlugin.fixReplacement,
-    ),
-  ];
+  Future<List<SourceEdit>> compute(ProducerContext context) async {
+    _crashIfRequested(_crashOnFirstInteraction);
+    return [
+      SourceEdit(
+        offset: context.offset,
+        length: context.length,
+        replacement: CompatPlugin.fixReplacement,
+      ),
+    ];
+  }
 }
 
-/// Serves one `request/fixes`, best fix first: the registered range fix
-/// anchored at the requested UTF-16 range, then a message-only suggestion.
-///
-/// Protocol v1's fixes handler is synchronous, so the change set mirrors the
-/// registered producer's computation directly (the same posture as the
-/// `live_plugin` sample); the registration remains the source of truth for
-/// what this plugin fixes.
-List<PrioritizedChange> serveFixes(String file, int offset, int length) => [
-  PrioritizedChange(
-    priority: CompatPlugin.fixPriority,
-    message: CompatPlugin.fixMessage,
-    edits: [
-      // The requested UTF-16 range, replaced verbatim.
-      SourceEdit(offset: offset, length: length, replacement: CompatPlugin.fixReplacement),
-    ],
-  ),
-  const PrioritizedChange(
-    priority: CompatPlugin.suggestionPriority,
-    message: CompatPlugin.suggestionMessage,
-  ),
-];
+/// The assist producer: a message-only suggestion at the requested range
+/// (no edits) — the second face of the fixes protocol, served through the
+/// same `request/fixes` method, sorted after the fix by priority.
+class CompatSuggestion implements Producer {
+  /// Builds the suggestion; const so registrations can share one instance.
+  const CompatSuggestion();
 
-/// Runs the plugin over one stdio session: registration, host loop, and the
-/// teardown the official lifecycle implies. Used by
-/// `bin/compat_plugin.dart` (the launchable entrypoint) and by the test
-/// suite (in-memory streams).
-///
-/// With `crash` in [args] the plugin dies on the first post-handshake
-/// interaction: the handlers throw before answering, the unhandled error
-/// terminates the process, and the core must report `dartq/plugin_crashed`
-/// without following the plugin down — the intentional-crash mode for crash
-/// surfacing.
+  @override
+  int get priority => CompatPlugin.suggestionPriority;
+
+  @override
+  String get message => CompatPlugin.suggestionMessage;
+
+  @override
+  Future<List<SourceEdit>> compute(ProducerContext context) async {
+    _crashIfRequested(_crashOnFirstInteraction);
+    return const <SourceEdit>[];
+  }
+}
+
+/// Whether the intentional-crash mode is armed (set from the launch args by
+/// [runWith]).
+bool _crashOnFirstInteraction = false;
+
+/// The intentional-crash mode: throws before any reply is produced.
+void _crashIfRequested(bool requested) {
+  if (requested) {
+    throw StateError('compat: intentional crash (sample crash mode)');
+  }
+}
+
+/// Arms the crash mode from [args] and serves the plugin over one stdio
+/// session: registration, the host loop (rules included), and the teardown
+/// the official lifecycle implies. Used by `bin/compat_plugin.dart` (the
+/// launchable entrypoint) and by the test suite (in-memory streams).
 Future<void> run(
   List<String> args, {
   required Stream<List<int>> input,
   required Future<void> Function(String line) send,
-}) async {
-  final crashOnFirstInteraction = args.contains('crash');
-  final registry = PluginRegistryImpl();
-  plugin.register(registry);
-  await plugin.start();
-  final rule = CompanionRule();
-  await runPluginHost(
-    PluginConfig(
+}) {
+  _crashOnFirstInteraction = args.contains('crash');
+  return servePlugin(
+    plugin,
+    config: PluginConfig(
       name: plugin.name,
       version: '0.1.0',
       entrypoint: 'bin/compat_plugin.dart',
@@ -168,22 +204,5 @@ Future<void> run(
     ),
     input: input,
     send: send,
-    onEngineDiagnostics: (engineDiagnostics) {
-      _crashIfRequested(crashOnFirstInteraction);
-      return rule.report(engineDiagnostics);
-    },
-    onRequestFixes: (file, offset, length) {
-      _crashIfRequested(crashOnFirstInteraction);
-      return serveFixes(file, offset, length);
-    },
   );
-  // The core closed its stdin: the session is over.
-  await plugin.shutDown();
-}
-
-/// The intentional-crash mode: throws before any reply is produced.
-void _crashIfRequested(bool requested) {
-  if (requested) {
-    throw StateError('compat: intentional crash (sample crash mode)');
-  }
 }

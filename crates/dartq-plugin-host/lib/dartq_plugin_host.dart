@@ -10,6 +10,9 @@
 library;
 
 export 'src/capabilities.dart' show Capability, CapabilitySet;
+export 'src/census.dart' show RuleCodeInfo, RuleCensus, RuleKind;
+export 'src/cycle_config.dart'
+    show OverlayEntry, PluginCycleConfig, severityByName;
 export 'src/diagnostic.dart' show PluginDiagnostic, Severity;
 export 'src/edits.dart'
     show
@@ -27,6 +30,7 @@ export 'src/frame.dart'
         methodDiagnosticNotification,
         methodEngineDiagnostics,
         methodInitialize,
+        methodPluginConfig,
         methodRequestFixes,
         methodShutdown,
         protocolVersion;
@@ -42,5 +46,12 @@ export 'src/plugin_config.dart'
         defaultRequestRetries,
         defaultRequestTimeoutMs;
 export 'src/plugin_session.dart'
-    show EngineDiagnosticsHandler, FixesHandler, PluginSession, SessionState;
+    show
+        EngineBatch,
+        EngineDiagnosticsHandler,
+        FixesHandler,
+        PluginConfigHandler,
+        PluginSession,
+        SessionState;
 export 'src/registry.dart' show PluginRegistry, PluginRegistryImpl;
+export 'src/rule_runner.dart' show runRules;

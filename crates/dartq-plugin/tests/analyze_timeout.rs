@@ -12,7 +12,7 @@ use dartq_diagnostics::{
     CodeInfo, Diagnostic, DiagnosticType, Severity as EngineSeverity, SourceRange,
 };
 use dartq_plugin::{
-    Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, crash_diagnostic,
+    CyclePush, Manifest, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, crash_diagnostic,
 };
 use dartq_source::{FileId, FileTable};
 
@@ -71,7 +71,7 @@ fn analyze_demand_without_diagnostics_is_killed_at_the_callback_budget() {
     let mut outcome = Ok(Vec::new());
     for _ in 0..100 {
         outcome = runtime
-            .feed(&row, &files)
+            .feed(&row, &files, &CyclePush::default())
             .and_then(|()| runtime.wait_diagnostics(Duration::from_millis(50)));
         if outcome.is_err() {
             break;

@@ -29,13 +29,14 @@
 //! | Method | Direction | Kind | `params` |
 //! | --- | --- | --- | --- |
 //! | `initialize` | core → plugin | request | `{protocol_version, capabilities: [..]}` |
-//! | `initialize` | plugin → core | reply | `{protocol_version, capabilities: [..]}` |
+//! | `initialize` | plugin → core | reply | `{protocol_version, capabilities: [..], rules: [{name, kind, codes: [{name, severity}]}]}` — `rules` is the registration census (T5); hosts that register no rules omit it |
 //! | `shutdown` | core → plugin | request | `{}` |
 //! | `shutdown` | plugin → core | reply | `{}` |
 //! | `request/fixes` | core → plugin | request | `{file, offset, length}` (UTF-16 units) |
 //! | `request/fixes` | plugin → core | reply | `{fixes: [{priority, message, edits: [{offset, length, replacement}]}]}` |
 //! | `notification/diagnostic` | plugin → core | notification | `{file, severity, code, message, offset, length}` |
-//! | `notification/engine_diagnostics` | core → plugin | notification | `{diagnostics: [{file, severity, code, message, offset, length}]}` |
+//! | `notification/engine_diagnostics` | core → plugin | notification | `{diagnostics: [{file, severity, code, message, offset, length}], files: [path..]}` — `files` is the cycle's analyzed set, the files a rule-executing plugin runs its enabled rules over |
+//! | `notification/plugin_config` | core → plugin | notification | `{enabled_rules: [name..], severity_overrides: {code: severity}, overlays: [{file, content}]}` — the resolved per-cycle execution config; `overlays[].content` may be `null` (fall back to disk) |
 //!
 //! # Handshake and capability negotiation
 //!
@@ -128,15 +129,16 @@ pub use capability::{Capability, CapabilitySet};
 pub use discovery::{DiscoveredPlugin, DiscoveryIssue, DiscoveryReport, discover};
 pub use frame::{
     Frame, FrameDecoder, MAX_FRAME_SIZE, METHOD_DIAGNOSTIC_NOTIFICATION, METHOD_ENGINE_DIAGNOSTICS,
-    METHOD_INITIALIZE, METHOD_REQUEST_FIXES, METHOD_SHUTDOWN, PROTOCOL_VERSION, ProtocolError,
-    decode_line, encode_frame,
+    METHOD_INITIALIZE, METHOD_PLUGIN_CONFIG, METHOD_REQUEST_FIXES, METHOD_SHUTDOWN,
+    PROTOCOL_VERSION, ProtocolError, decode_line, encode_frame,
 };
 pub use manifest::{
     DEFAULT_MEMORY_BUDGET_MB, MANIFEST_FILE_NAME, Manifest, ManifestError, Timeouts,
 };
 pub use runtime::{PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, crash_diagnostic};
 pub use session::{
-    FixesReply, Incoming, PluginDiagnostic, PrioritizedChange, Session, SessionError, SessionState,
-    Severity, SourceEdit, engine_diagnostics_frame,
+    CycleConfig, CyclePush, FixesReply, Incoming, OverlayEntry, PluginDiagnostic,
+    PrioritizedChange, RuleCensus, RuleCodeInfo, RuleKind, Session, SessionError, SessionState,
+    Severity, SourceEdit, engine_diagnostics_frame, plugin_config_frame,
 };
 pub use stats::{PluginStats, PluginStatsSnapshot};
