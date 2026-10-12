@@ -21,7 +21,8 @@
 //! # Module layout (§1.6)
 //!
 //! `state` (residency + overlay + reverse edges), `l1` (apply), `pipeline`
-//! (analyze), `budget` (the §17.1 memory-budget runtime), `store` (the §17.2
+//! (analyze), `cycle` (the import-cycle condensation, PRD §11.2), `budget`
+//! (the §17.1 memory-budget runtime), `store` (the §17.2
 //! L3 content-addressed store), `event`, `cancel`, `query` (the `query
 //! symbol` face, PRD
 //! §20.3), `semdiag` (the default semantic diagnoser, #236),
@@ -44,6 +45,7 @@ pub mod analysis_options;
 mod budget;
 pub mod cancel;
 pub mod context;
+mod cycle;
 pub mod event;
 pub mod l1;
 pub mod pipeline;

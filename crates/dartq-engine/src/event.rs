@@ -22,7 +22,10 @@
 //! by [`cache_hit_rate`]). The remaining taxonomy names (`StoreHit`,
 //! `SnapshotReuse`, `SignatureUnchanged`, `ContextBuilt`,
 //! `SchedulerQueueDepth`, `PluginLatency`) land as variants with their
-//! emitters once the M1 engine produces their data.
+//! emitters once the M1 engine produces their data. Wave W1 of the L3 plan
+//! (g485) adds one additive trace-only row, `CycleRebuilt` — the
+//! condensation rebuild at the `structure_dirty` gate; deliberately no
+//! `EngineEvent` variant, so the event goldens stay byte-stable.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -186,6 +189,17 @@ impl TraceSink {
             uri,
         });
     }
+
+    /// Records the condensation rebuild (g485 W1): the cycle count after the
+    /// wholesale re-derivation at the `structure_dirty` gate. Trace-only —
+    /// deliberately no `EngineEvent` variant (g485 D3), so the event goldens
+    /// stay byte-stable.
+    pub(crate) fn cycle_rebuilt(&mut self, cycles: usize) {
+        self.write_line(&CycleRebuiltTrace {
+            event: "CycleRebuilt",
+            cycles,
+        });
+    }
 }
 
 /// Wall time as additive microseconds (integer — float durations would not
@@ -255,6 +269,12 @@ struct MemoryDegradeTrace<'a> {
     uri: &'a str,
 }
 
+#[derive(Serialize)]
+struct CycleRebuiltTrace {
+    event: &'static str,
+    cycles: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +306,7 @@ mod tests {
         sink.library_analyzed("/w/lib/a.dart", false, 1500);
         sink.cascade_invalidated(&["/w/lib/a.dart".into(), "/w/lib/b.dart".into()]);
         sink.memory_degrade("ast_cold", 2048, "/w/lib/a.dart");
+        sink.cycle_rebuilt(2);
         drop(sink);
         let capture = std::fs::read_to_string(&path).expect("capture readable");
         assert_eq!(
@@ -297,6 +318,7 @@ mod tests {
                 "{\"event\":\"LibraryAnalyzed\",\"uri\":\"/w/lib/a.dart\",\"from_cache\":false,\"duration_us\":1500}\n",
                 "{\"event\":\"CascadeInvalidated\",\"libraries\":[\"/w/lib/a.dart\",\"/w/lib/b.dart\"]}\n",
                 "{\"event\":\"MemoryDegrade\",\"tier\":\"ast_cold\",\"limit_mib\":2048,\"uri\":\"/w/lib/a.dart\"}\n",
+                "{\"event\":\"CycleRebuilt\",\"cycles\":2}\n",
             )
         );
         let _ = std::fs::remove_file(&path);

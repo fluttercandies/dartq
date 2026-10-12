@@ -856,6 +856,13 @@ pub(crate) struct EngineState {
     /// Whether residency/structure changed since the last resolution-graph
     /// build (rebuild gate for the analyze phase).
     pub structure_dirty: bool,
+    /// The library-dependency condensation (PRD §11.2, g485 W1): Tarjan SCC
+    /// over the maintained deps edges with a per-cycle blake3 fingerprint.
+    /// Derived data, rebuilt wholesale at the same [`Self::structure_dirty`]
+    /// gate that rebuilds the resolution graph (`pipeline::analyze`) —
+    /// never patched incrementally, never persisted, and retired ids answer
+    /// no cycle between rebuilds.
+    pub condensation: crate::cycle::Condensation,
 
     /// Pending overlay, insertion-ordered.
     pub pending: FxHashMap<FileId, PendingChange>,
@@ -989,6 +996,7 @@ impl EngineState {
             results: FxHashMap::default(),
             invalidated: Vec::new(),
             structure_dirty: false,
+            condensation: crate::cycle::Condensation::default(),
             pending: FxHashMap::default(),
             pending_order: Vec::new(),
             options,

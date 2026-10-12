@@ -24,6 +24,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::budget;
 use crate::cancel::{CancellationToken, Cancelled};
+use crate::cycle::Condensation;
 use crate::event::{EngineEvent, duration_us};
 use crate::l1;
 use crate::state::{
@@ -109,6 +110,17 @@ pub(crate) fn analyze(
     drain_captures(state);
 
     if state.structure_dirty || graph.is_none() {
+        // The condensation rides the same gate (PRD §11.2, g485 W1): any
+        // structure move re-derives it wholesale; a body edit under a
+        // stable face leaves it standing with zero work.
+        if state.structure_dirty {
+            state.condensation = Condensation::build(&state.libraries, |file| {
+                state.residency[&file].api_signature()
+            });
+            if let Some(sink) = state.trace.as_mut() {
+                sink.cycle_rebuilt(state.condensation.cycle_count());
+            }
+        }
         *graph = (!state.residency.is_empty()).then(|| build_library_graph(state));
         state.structure_dirty = false;
     }
