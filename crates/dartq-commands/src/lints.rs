@@ -870,15 +870,23 @@ mod tests {
         assert_eq!(bare.range.length, 0);
     }
 
-    /// The #355 activation end to end: a fixture workspace whose only
-    /// library carries an `unnecessary_new` shape produces an INFO lint row
-    /// through the full pipeline — engine pass, transient re-parse, row
-    /// mapping, oracle order — with the semantic row of the same file.
+    /// The #355 activation end to end: a fixture workspace whose governing
+    /// options enable `unnecessary_new` and whose only library carries the
+    /// shape produces an INFO lint row through the full pipeline — engine
+    /// pass, transient re-parse, row mapping, oracle order — with the
+    /// semantic row of the same file. (The options file is the fixture's
+    /// governing posture: options-less enables nothing, #936.)
     #[test]
     fn analyze_lints_rows_flow_through_the_resident_pipeline() {
         let root = crate::workspace::test_fixture::workspace(
             "lints_activation",
-            &[("lib/bad.dart", "var x = new Object();\nvar ok = unknown;\n")],
+            &[
+                (
+                    "analysis_options.yaml",
+                    "linter:\n  rules:\n    - unnecessary_new\n",
+                ),
+                ("lib/bad.dart", "var x = new Object();\nvar ok = unknown;\n"),
+            ],
         );
         let root = root.canonicalize().expect("canonical root");
         let (config, _) =
@@ -930,9 +938,10 @@ mod tests {
     }
 
     /// The per-unit version wiring end to end: a `languageVersion: "2.19"`
-    /// package's duplicate `case` values report through the full pipeline
-    /// (the legacy `SwitchCase` face), while the same shape under a 3.x
-    /// package stays silent (the `patterns` posture the AstBuilder keys).
+    /// package whose governing options enable `no_duplicate_case_values`
+    /// reports the duplicate `case` values through the full pipeline (the
+    /// legacy `SwitchCase` face), while the same shape under a 3.x package
+    /// stays silent (the `patterns` posture the AstBuilder keys).
     #[test]
     fn legacy_language_version_reports_legacy_duplicates() {
         const DUPLICATE_CASES: &str =
@@ -940,7 +949,13 @@ mod tests {
         let run_codes = |version: &str| {
             let root = crate::workspace::test_fixture::workspace(
                 "lints_version_face",
-                &[("lib/a.dart", DUPLICATE_CASES)],
+                &[
+                    (
+                        "analysis_options.yaml",
+                        "linter:\n  rules:\n    - no_duplicate_case_values\n",
+                    ),
+                    ("lib/a.dart", DUPLICATE_CASES),
+                ],
             );
             std::fs::write(
                 root.join(".dart_tool/package_config.json"),
@@ -978,9 +993,10 @@ mod tests {
     }
 
     /// The #720 seam regression pin: a `// @dart = 2.19` library inside a
-    /// 3.x package runs the lint face at the *pinned* posture — the
-    /// duplicate `case` values report through the settled per-file face
-    /// (#722) even though the package version alone would keep them silent.
+    /// 3.x package whose governing options enable `no_duplicate_case_values`
+    /// runs the lint face at the *pinned* posture — the duplicate `case`
+    /// values report through the settled per-file face (#722) even though
+    /// the package version alone would keep them silent.
     #[test]
     fn at_dart_override_closes_patterns_for_lint_face() {
         const DUPLICATE_CASES: &str =
@@ -993,7 +1009,13 @@ mod tests {
             };
             let root = crate::workspace::test_fixture::workspace(
                 "lints_at_dart_face",
-                &[("lib/a.dart", &source)],
+                &[
+                    (
+                        "analysis_options.yaml",
+                        "linter:\n  rules:\n    - no_duplicate_case_values\n",
+                    ),
+                    ("lib/a.dart", &source),
+                ],
             );
             std::fs::write(
                 root.join(".dart_tool/package_config.json"),
@@ -1088,12 +1110,19 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The pubspec pass (#434) end to end: the root `pubspec.yaml`'s
-    /// insecure URLs report at their value spans (the official value-node
-    /// anchor), the secure ones stay silent.
+    /// The pubspec pass (#434) end to end: the governing options enable
+    /// `secure_pubspec_urls`, the root `pubspec.yaml`'s insecure URLs
+    /// report at their value spans (the official value-node anchor), the
+    /// secure ones stay silent.
     #[test]
     fn pubspec_url_rows_report_at_the_value_span() {
-        let root = crate::workspace::test_fixture::workspace("lints_pubspec_urls", &[]);
+        let root = crate::workspace::test_fixture::workspace(
+            "lints_pubspec_urls",
+            &[(
+                "analysis_options.yaml",
+                "linter:\n  rules:\n    - secure_pubspec_urls\n",
+            )],
+        );
         std::fs::write(
             root.join("pubspec.yaml"),
             "name: fixture\nhomepage: http://github.com/fixture\nrepository: https://github.com/fixture\nenvironment:\n  sdk: ^3.5.0\ndependency_overrides:\n  dep:\n    git:\n      url: git://github.com/x/y.git\n",
@@ -1116,13 +1145,20 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// `package_names` over the same pass: a camel-case `name:` reports at
-    /// its value span with the official argument fill. `fooBar` is a legal
-    /// pub name, so the assembly needs the config's root entry renamed to
-    /// match (a real `pub get` writes it).
+    /// `package_names` over the same pass: the governing options enable
+    /// the rule, a camel-case `name:` reports at its value span with the
+    /// official argument fill. `fooBar` is a legal pub name, so the
+    /// assembly needs the config's root entry renamed to match (a real
+    /// `pub get` writes it).
     #[test]
     fn package_names_row_reports_the_camel_case_name() {
-        let root = crate::workspace::test_fixture::workspace("lints_pubspec_names", &[]);
+        let root = crate::workspace::test_fixture::workspace(
+            "lints_pubspec_names",
+            &[(
+                "analysis_options.yaml",
+                "linter:\n  rules:\n    - package_names\n",
+            )],
+        );
         std::fs::write(
             root.join("pubspec.yaml"),
             "name: fooBar\nenvironment:\n  sdk: ^3.5.0\n",
@@ -1164,11 +1200,18 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The YAML-face suppression (`IgnoreInfo.forYaml`): a `# ignore:`
-    /// line above the `homepage:` entry drops its row.
+    /// The YAML-face suppression (`IgnoreInfo.forYaml`): with
+    /// `secure_pubspec_urls` enabled by the governing options, a
+    /// `# ignore:` line above the `homepage:` entry drops its row.
     #[test]
     fn pubspec_ignore_line_suppresses_the_url_row() {
-        let root = crate::workspace::test_fixture::workspace("lints_pubspec_ignore", &[]);
+        let root = crate::workspace::test_fixture::workspace(
+            "lints_pubspec_ignore",
+            &[(
+                "analysis_options.yaml",
+                "linter:\n  rules:\n    - secure_pubspec_urls\n",
+            )],
+        );
         std::fs::write(
             root.join("pubspec.yaml"),
             "name: fixture\n# ignore: secure_pubspec_urls\nhomepage: http://a.dev\nrepository: https://b.dev\nenvironment:\n  sdk: ^3.5.0\n",
@@ -1194,14 +1237,18 @@ mod tests {
     }
 
     /// The package-aware directive rules ride the pipeline with the
-    /// mounted facts: a foreign import and a foreign `src/` import report
-    /// in `lib/`, the own package and the dev dependency stay silent
-    /// where the official gates hold.
+    /// mounted facts: the governing options enable them, a foreign import
+    /// and a foreign `src/` import report in `lib/`, the own package and
+    /// the dev dependency stay silent where the official gates hold.
     #[test]
     fn package_aware_directive_rules_flow_through_the_pipeline() {
         let root = crate::workspace::test_fixture::workspace(
             "lints_pub_facts",
             &[
+                (
+                    "analysis_options.yaml",
+                    "linter:\n  rules:\n    - depend_on_referenced_packages\n    - implementation_imports\n",
+                ),
                 (
                     "lib/a.dart",
                     "import 'package:foreign/foreign.dart';\nimport 'package:foreign/src/impl.dart';\nimport 'package:fixture/src/own.dart';\n",

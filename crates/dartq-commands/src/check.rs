@@ -875,45 +875,89 @@ mod tests {
         );
     }
 
-    /// The event-coded experiment gate renders on the check face (#934): a
-    /// file pinned below a shipped feature's version takes the parser's
-    /// bare `handle_experiment_not_enabled` payload (the patterns gate at
-    /// `// @dart = 2.12`), rendered through the same
-    /// `experiment_not_enabled_message` selection the engine's
-    /// `DiagCollector` uses — severity Error, anchored at the gate's begin
-    /// token. At the current version the same shape is silent.
+    /// The event-coded experiment gate renders on the check face (#934):
+    /// a file pinned below a shipped feature's version takes the parser's
+    /// bare `handle_experiment_not_enabled` payload (the
+    /// primary-constructors gate at `// @dart = 2.12`), rendered through
+    /// the same `experiment_not_enabled_message` selection the engine's
+    /// `DiagCollector` uses. Oracle probes (dart 3.13.1, machine format)
+    /// pin the mixin face exactly — `mixin M(int x);` at 2.12 is
+    /// `UNEXPECTED_TOKEN` at the `(` (`2|8|1`) plus
+    /// EXPERIMENT_NOT_ENABLED at the `;` (`2|15|1`, the parser event's
+    /// anchor), and at the current version `mixin_primary_constructor`
+    /// replaces the gate (`1|8|1`). The class head is NOT pinned here: the
+    /// parser's feature-off class arm routes clean formals
+    /// (`class C(int x);`, oracle: two gate rows, no syntax rows) into the
+    /// `class C( {}` junk recovery — a dartq-parser divergence tracked
+    /// outside this face (#956 finding). The patterns family never gates
+    /// on this face either: the official parser short-circuits the
+    /// condition's `case` branch on `isPatternsFeatureEnabled`
+    /// (`parser_impl.dart:8416`), so the pinned if-case reports the
+    /// `expected_token` syntax face at `case` (`3|9|4`) — no experiment
+    /// row; the same probe's `non_bool_condition` row is semantic, absent
+    /// on this scan+parse face by design.
     #[test]
     fn experiment_gate_renders_on_the_check_face() {
-        let pinned = "// @dart = 2.12\nvoid f(Object o) {\n  if (o case int x) {}\n}\n";
+        let pinned = "// @dart = 2.12\nmixin M(int x);\n";
         let mut set = FileSet::default();
         let file = set.push(pinned, Path::new("/c/lib/a.dart"));
         let diags = analyze_file(pinned, Path::new("/c/lib"), file);
+        let shape: Vec<(&str, u32, u32)> = diags
+            .iter()
+            .map(|d| (d.code.name.as_ref(), d.range.offset, d.range.length))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("unexpected_token", 23, 1),
+                ("experiment_not_enabled", 30, 1)
+            ],
+            "the oracle-pinned pre-feature mixin face"
+        );
         let gate = diags
             .iter()
             .find(|d| d.code.name == "experiment_not_enabled")
-            .expect("the patterns gate renders at 2.12");
+            .expect("the gate row is pinned above");
         assert_eq!(gate.severity, Severity::Error);
         assert_eq!(
             gate.message,
-            "This requires the 'patterns' language feature to be enabled."
+            "This requires the 'primary-constructors' language feature to be enabled."
         );
-        let head = pinned.find("int x").expect("pattern head") as u32;
-        assert_eq!(
-            gate.range.offset, head,
-            "anchored at the pattern's first token"
-        );
-        assert_eq!(gate.range.length, 3);
 
-        let current = "void f(Object o) {\n  if (o case int x) {}\n}\n";
+        let current = "mixin N(int y);\n";
         let mut set = FileSet::default();
         let file = set.push(current, Path::new("/c/lib/b.dart"));
         let diags = analyze_file(current, Path::new("/c/lib"), file);
+        let shape: Vec<(&str, u32, u32)> = diags
+            .iter()
+            .map(|d| (d.code.name.as_ref(), d.range.offset, d.range.length))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![("mixin_primary_constructor", 7, 1)],
+            "at the current version the gate is replaced by the mixin face"
+        );
+
+        // The patterns short-circuit: the pinned if-case takes the
+        // parser's no-case branch — the gate face is the expected-token
+        // row at `case`, never an experiment row.
+        let pinned_if_case = "// @dart = 2.12\nvoid f(Object o) {\n  if (o case int x) {}\n}\n";
+        let mut set = FileSet::default();
+        let file = set.push(pinned_if_case, Path::new("/c/lib/c.dart"));
+        let diags = analyze_file(pinned_if_case, Path::new("/c/lib"), file);
         assert!(
             diags
                 .iter()
                 .all(|d| d.code.name != "experiment_not_enabled"),
-            "patterns are shipped at the current version"
+            "the parser short-circuits the case branch pre-patterns: {diags:?}"
         );
+        let case_head = pinned_if_case.find("case").expect("case token") as u32;
+        let syntax = diags
+            .iter()
+            .find(|d| d.code.name == "expected_token")
+            .expect("the short-circuit face reports the missing `)`");
+        assert_eq!(syntax.range.offset, case_head, "anchored at `case`");
+        assert_eq!(syntax.range.length, 4, "the whole `case` lexeme");
     }
 
     /// The F11 override contract: differing override rescans; above-latest

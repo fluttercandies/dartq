@@ -166,12 +166,13 @@ pub fn run_overlaid<'a>(
 
 /// The options-file rows whose validity needs a registry the engine does
 /// not hold (#457, #936): the initial options file's own `linter.rules`
-/// names against the dartq-lints registry (`undefined_lint`;
+/// names against the dartq-lints registry plus the official registered-rule
+/// universe (`undefined_lint`;
 /// `_parseLocalRules`, analysis_options_parse_model.dart:1245-1251 — the
 /// registry check fires before the entry's value is read, so a disabled
 /// `name: false` reports too; `name:` with a null value returns before the
 /// check and does not), and the initial file's own `analyzer.errors` keys
-/// against the diagnostic universe plus that lint registry
+/// against the diagnostic universe plus the same lint universes
 /// (`unrecognized_error_code`; parse_model:558-585 — the check fires as the
 /// key is read, before the value is inspected, and a non-string scalar key
 /// reports unconditionally). The engine records the candidates and their
@@ -192,13 +193,13 @@ fn options_registry_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> 
             continue;
         };
         for rule in &options.declared_rules {
-            if dartq_lints::rule_by_name(&rule.name).is_none() {
+            if !is_known_lint_name(&rule.name) {
                 rows.push(analysis_options::OptionsIssue::undefined_lint(rule).to_diagnostic(file));
             }
         }
         for error in &options.declared_errors {
             if !analysis_options::is_known_diagnostic_code(&error.code)
-                && dartq_lints::rule_by_name(&error.code).is_none()
+                && !is_known_lint_name(&error.code)
             {
                 rows.push(
                     analysis_options::OptionsIssue::unrecognized_error_code(error)
@@ -208,6 +209,16 @@ fn options_registry_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> 
         }
     }
     rows
+}
+
+/// Whether `name` names a lint rule the official validity faces accept: a
+/// rule dartq-lints implements (`rule_by_name`), or any other registered
+/// rule of the pinned SDK's linter registry (`currentLintCodeNames`,
+/// parse_model.dart:75-83 — the full `Registry.ruleRegistry`, not the
+/// implemented subset; probed 3.13.1: `avoid_print` in `analyzer.errors`
+/// yields no row). #956.
+fn is_known_lint_name(name: &str) -> bool {
+    dartq_lints::rule_by_name(name).is_some() || crate::lint_names::is_known(name)
 }
 
 #[cfg(test)]
@@ -412,13 +423,15 @@ mod tests {
     }
 
     /// The `undefined_lint` face end to end (#457): the options file's own
-    /// `linter.rules` names validate against the dartq-lints registry at the
+    /// `linter.rules` names validate against the lint universes at the
     /// lint stage's application point (`_parseLocalRules`,
     /// analysis_options_parse_model.dart:1245-1251 — the check fires before
     /// the entry value is read, so a disabled `name: false` reports while a
     /// null `name:` does not), rows attribute to the options file itself at
     /// WARNING with the verbatim texts, and the layout resolves their
-    /// positions through the engine's options face.
+    /// positions through the engine's options face. A
+    /// registered-but-unimplemented rule (`avoid_print`, #956) joins the
+    /// known side: no row.
     #[test]
     fn run_overlaid_reports_undefined_lint_rows() {
         let root = workspace(
@@ -430,6 +443,7 @@ mod tests {
             "linter:\n",
             "  rules:\n",
             "    avoid_empty_else: true\n",
+            "    avoid_print: true\n",
             "    not_a_lint: false\n",
             "    unknown_one: false\n",
             "    null_rule:\n",
@@ -489,12 +503,14 @@ mod tests {
 
     /// The `unrecognized_error_code` face end to end (#936): the options
     /// file's own `analyzer.errors` keys validate against the diagnostic
-    /// universe plus the lint registry at the lint stage's application
+    /// universe plus the lint universes at the lint stage's application
     /// point (parse_model:558-585 — the check fires as the key is read, so
     /// the value's action never matters). An unknown code reports at its
-    /// key anchor, WARNING, no correction; a lint name, a removed-code
-    /// compat name, a known diagnostic, and a non-string scalar key
-    /// (`'123'`, reported unconditionally) pin the membership arms.
+    /// key anchor, WARNING, no correction; a registered-but-unimplemented
+    /// lint name (`avoid_print`, the #956 boundary — the oracle accepts it
+    /// silently, probed 3.13.1), a removed-code compat name, a known
+    /// diagnostic, and a non-string scalar key (`'123'`, reported
+    /// unconditionally) pin the membership arms.
     #[test]
     fn run_overlaid_reports_unrecognized_error_code_rows() {
         let root = workspace(

@@ -36,6 +36,7 @@ pub mod fix;
 pub mod impact;
 pub mod index;
 pub mod layout;
+mod lint_names;
 pub mod lints;
 pub mod query;
 pub mod workspace;
