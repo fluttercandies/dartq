@@ -604,7 +604,11 @@ fn unmatched<M: Clone + PartialEq + Eq + Hash + Debug, W: ExhaustivenessWorld<Ty
 /// `_Checker._filterByType` (exhaustive.dart:271-365): keep the rows that
 /// *must* match `ty` (their single's type is a supertype), lift every
 /// interested property into its own column, and recurse.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "parameters map 1:1 onto the official _Checker._filterByType recursion locals; \
+              grouping them would leave the port mapping"
+)]
 fn filter_by_type<M: Clone + PartialEq + Eq + Hash + Debug, W: ExhaustivenessWorld<Ty = M>>(
     world: &W,
     context_ty: &M,

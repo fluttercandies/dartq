@@ -214,7 +214,11 @@ impl ResolutionCode {
     /// (dart 3.15 main). Length is the frozen table itself — a data table, not
     /// logic.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the body is the frozen descriptor table transcribed from diagnostic.g.dart; \
+                  its length is data, not logic"
+    )]
     pub const fn info(self) -> ResolutionCodeInfo {
         match self {
             Self::UriDoesNotExist => ResolutionCodeInfo {

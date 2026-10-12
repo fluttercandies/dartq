@@ -56,9 +56,6 @@
 //!   for that warning/drop emission site (measured in
 //!   `docs/facts/version-skew.md` §1.3 T2).
 
-// Help prose inside is copied verbatim from the vendored yaml and may
-// contain URLs or camelCase words; do not lint generated docs.
-#[allow(clippy::doc_markdown)]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/feature_registry.rs"));
 }

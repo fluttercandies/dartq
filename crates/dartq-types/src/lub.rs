@@ -50,9 +50,11 @@ impl TypeSystem<'_> {
     /// `_computeLeastUpperBound` (least_upper_bound.dart:391-672) with the
     /// documented M1 fallbacks; recursion goes through [`Self::lub_step`] so
     /// every level re-enters the shared depth cell.
-    // Port of least_upper_bound.dart's recursive case analysis; the arm
-    // order is the oracle's, so the body stays one function.
-    #[expect(clippy::too_many_lines, reason = "see above")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "port of least_upper_bound.dart's recursive case analysis; the arm order is \
+                  the oracle's, so the body stays one function"
+    )]
     fn lub_compute(&self, a: TypeId, b: TypeId) -> Result<TypeId, DepthLimitExceeded> {
         // UP(T, T) = T (least_upper_bound.dart:393-395).
         if a == b {

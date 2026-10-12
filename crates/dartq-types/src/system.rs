@@ -367,9 +367,11 @@ impl<'a> TypeSystem<'a> {
     /// - `resolveToBound` on the interface/type-parameter paths is the
     ///   identity (declared bounds are M2).
     #[must_use]
-    // Port of the official subtype decision cascade (type_system.dart
-    // :157-286); the arm order is the oracle's.
-    #[expect(clippy::too_many_lines, reason = "see above")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "port of the official subtype decision cascade (type_system.dart:157-286); \
+                  the arm order is the oracle's"
+    )]
     pub fn can_be_subtype_of(&self, left: TypeId, right: TypeId) -> bool {
         let a = self.table.get(left);
         let b = self.table.get(right);
@@ -1541,9 +1543,11 @@ mod can_be_subtype_tests {
     }
 
     #[test]
-    // A flat pin table: every row is one oracle decision, and the flat
-    // form keeps the coverage list scannable against the official tests.
-    #[expect(clippy::too_many_lines, reason = "see above")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "flat pin table with one oracle decision per row; the flat form keeps the \
+                  coverage list scannable against the official tests"
+    )]
     fn can_be_subtype_of_official_pins() {
         let (table, hierarchy) = fixture();
         let sys = TypeSystem::new(&table, &hierarchy);
@@ -1722,9 +1726,11 @@ mod can_be_subtype_tests {
     /// and "the pattern never matches" mutually exclusive on the pairs the
     /// diagnostics see.
     #[test]
-    // Corpus-wide law sweep: the value is the exhaustive flat iteration;
-    // splitting it would hide which fixtures the law covers.
-    #[expect(clippy::too_many_lines, reason = "see above")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "corpus-wide law sweep whose value is the exhaustive flat iteration; \
+                  splitting it would hide which fixtures the law covers"
+    )]
     fn mutual_exclusion_law_over_fixture_corpus() {
         let (table, hierarchy) = fixture();
         let sys = TypeSystem::new(&table, &hierarchy);

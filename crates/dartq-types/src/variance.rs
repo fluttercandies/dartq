@@ -241,7 +241,6 @@ fn variance_in_type_bounded(
     let kind = sys.table().get(ty).kind();
     match kind {
         TypeKind::TypeParameter { parameter: p } if p == parameter => Variance::Covariant,
-        TypeKind::TypeParameter { .. } => Variance::Unrelated,
         TypeKind::Interface { decl, args } => {
             let mut result = Variance::Unrelated;
             let params = &sys
@@ -325,8 +324,10 @@ fn variance_in_type_bounded(
             }
             result
         }
-        // Unit kinds carry no parameter references (variance_builder.dart:118).
-        TypeKind::Never
+        // Other type parameters and unit kinds never reference the queried
+        // parameter (variance_builder.dart:118).
+        TypeKind::TypeParameter { .. }
+        | TypeKind::Never
         | TypeKind::Dynamic
         | TypeKind::Void
         | TypeKind::Invalid

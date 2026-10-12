@@ -385,9 +385,11 @@ pub(crate) mod non_constant_identifier_names {
         check,
     };
 
-    // One dispatch over the checked declaration kinds; the arms stay in one
-    // function so the shared collect-then-check pattern reads linearly.
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one dispatch over all checked declaration kinds; splitting would scatter the \
+                  shared collect-then-check pattern"
+    )]
     fn check(c: &mut Check<'_>) {
         let node = c.node();
         match c.kind(node) {
@@ -653,8 +655,11 @@ pub(crate) mod file_names {
     /// non-`.dart` names pass; a dot inside the stem (a prefixed suffix
     /// like `.g.dart`) passes; the stem itself must be `[a-z_]` with digits
     /// allowed from position 1.
-    // The official `isValidDartFileName` comparison is case-sensitive.
-    #[allow(clippy::case_sensitive_file_extension_comparisons)]
+    #[expect(
+        clippy::case_sensitive_file_extension_comparisons,
+        reason = "the official `isValidDartFileName` check is case-sensitive; matching \
+                  case-insensitively would break oracle parity"
+    )]
     fn is_valid_dart_file_name(name: &str) -> bool {
         let bytes = name.as_bytes();
         if name.len() < 6 || !name.ends_with(".dart") {

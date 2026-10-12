@@ -878,7 +878,6 @@ impl ParserListener for SharedFlow<'_> {
             .end_formal_parameter_default_value_expression(token);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn end_formal_parameter(
         &mut self,
         var_or_final: Option<Token>,
@@ -962,7 +961,6 @@ impl ParserListener for SharedFlow<'_> {
             .end_top_level_method(begin, get_or_set, end);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn end_top_level_fields(
         &mut self,
         augment_kw: Option<Token>,
@@ -1018,7 +1016,6 @@ impl ParserListener for SharedFlow<'_> {
         self.0.borrow_mut().handle_invalid_member(end);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn begin_fields(
         &mut self,
         kind: DeclarationKind,
@@ -1044,7 +1041,6 @@ impl ParserListener for SharedFlow<'_> {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn end_fields(
         &mut self,
         kind: DeclarationKind,
@@ -1074,7 +1070,6 @@ impl ParserListener for SharedFlow<'_> {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn begin_constructor(
         &mut self,
         kind: DeclarationKind,
@@ -1102,7 +1097,6 @@ impl ParserListener for SharedFlow<'_> {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn end_constructor(
         &mut self,
         kind: DeclarationKind,
@@ -1122,7 +1116,6 @@ impl ParserListener for SharedFlow<'_> {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn begin_method(
         &mut self,
         kind: DeclarationKind,
@@ -1148,7 +1141,6 @@ impl ParserListener for SharedFlow<'_> {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn end_method(
         &mut self,
         kind: DeclarationKind,
@@ -1327,7 +1319,6 @@ impl ParserListener for SharedFlow<'_> {
             .begin_class_or_mixin_or_named_mixin_application_prelude(token);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn begin_class_declaration(
         &mut self,
         begin: Token,
@@ -1357,7 +1348,6 @@ impl ParserListener for SharedFlow<'_> {
         self.0.borrow_mut().end_class_declaration(begin, end);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn begin_named_mixin_application(
         &mut self,
         begin: Token,
@@ -1750,7 +1740,6 @@ impl ParserListener for SharedFlow<'_> {
         self.0.borrow_mut().end_for_statement(end);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn handle_for_loop_parts(
         &mut self,
         for_kw: Token,
@@ -1780,7 +1769,6 @@ impl ParserListener for SharedFlow<'_> {
         self.0.borrow_mut().end_for_in(end);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn handle_for_in_loop_parts(
         &mut self,
         await_kw: Option<Token>,
@@ -1982,7 +1970,6 @@ impl ParserListener for SharedFlow<'_> {
         self.0.borrow_mut().begin_assert(token, kind);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn end_assert(
         &mut self,
         begin: Token,
@@ -2020,7 +2007,6 @@ impl ParserListener for SharedFlow<'_> {
             .begin_switch_case(label_count, expression_count, token);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn end_switch_case(
         &mut self,
         label_count: usize,

@@ -410,7 +410,11 @@ fn tile_direct(ast: &SyntaxTable, id: u32, out: &mut Vec<u32>) {
 }
 
 /// Dispatches the rules registered for the path's last node.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "dispatch threads the shared analysis context through the rule hot path; bundling \
+              it into a struct adds indirection for no gain"
+)]
 fn dispatch(
     unit: &Unit<'_>,
     comments: &Comments,

@@ -239,9 +239,11 @@ impl TypeSystem<'_> {
         self.eliminate(t, true)
     }
 
-    // Port of eliminateToGreatest's visitor; arm order mirrors
-    // replacement_visitor.dart, so the body stays one function.
-    #[expect(clippy::too_many_lines, reason = "see above")]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "port of eliminateToGreatest's visitor; the arm order mirrors \
+                  replacement_visitor.dart, so the body stays one function"
+    )]
     fn eliminate(&self, t: TypeId, covariant: bool) -> TypeId {
         let ty = self.table().get(t);
         match ty.kind() {
