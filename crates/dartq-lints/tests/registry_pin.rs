@@ -123,6 +123,28 @@ const OFFICIAL_RECOMMENDED: &[&str] = &[
 /// linter-side rule file left the tree in the Dart 3.15 main re-pin.
 const OFFICIAL_DIAGNOSTIC_MIRRORS: &[&str] = &["unnecessary_type_check"];
 
+/// The `removed` state of the published universe (`rules.json`, 14
+/// entries): the SDK still registers each as `RemovedAnalysisRule`
+/// (`pkg/analyzer/lib/src/analysis_rule/analysis_rule.dart:385`,
+/// `diagnosticCodes => const []`), pinned verbatim in the alphabetical
+/// wave-1 registration order.
+const OFFICIAL_REMOVED: &[&str] = &[
+    "always_require_non_null_named_parameters",
+    "avoid_as",
+    "avoid_returning_null",
+    "avoid_returning_null_for_future",
+    "avoid_unstable_final_fields",
+    "enable_null_safety",
+    "invariant_booleans",
+    "iterable_contains_unrelated_type",
+    "list_remove_unrelated_type",
+    "package_api_docs",
+    "prefer_bool_in_asserts",
+    "prefer_equal_for_default_values",
+    "super_goes_last",
+    "unsafe_html",
+];
+
 #[test]
 fn rule_names_are_unique() {
     let mut seen: Vec<&str> = Vec::with_capacity(RULES.len());
@@ -145,6 +167,7 @@ fn every_rule_is_in_its_official_set() {
             Group::Core => OFFICIAL_CORE,
             Group::Recommended => OFFICIAL_RECOMMENDED,
             Group::Diagnostic => OFFICIAL_DIAGNOSTIC_MIRRORS,
+            Group::Removed => OFFICIAL_REMOVED,
         };
         assert!(
             official.contains(&spec.name),
@@ -171,23 +194,75 @@ fn recommended_rules_are_not_core_rules() {
     }
 }
 
-/// [`EnableSet`] stores two 64-bit words; the registry must stay within it.
-/// Grow `WORDS` together with this bound when the set outgrows a word.
+/// [`EnableSet`] stores five 64-bit words; the registry must stay within
+/// them (five words carry the full 269-rule SDK registry plus the dartq
+/// mirror). Grow `WORDS` together with this bound when the set outgrows a
+/// word.
 #[test]
 fn registry_fits_the_enable_set_word_count() {
     assert!(
-        RULES.len() <= 128,
-        "registry holds {} rules; EnableSet has two 64-bit words",
+        RULES.len() <= 320,
+        "registry holds {} rules; EnableSet has five 64-bit words",
         RULES.len()
     );
 }
 
 /// The slice pin: 89 `package:lints` members through #586 (34 core + 55
-/// recommended-only, no member left blocked or documented-out) plus the
-/// #570 diagnostic mirror make 90.
+/// recommended-only, no member left blocked or documented-out), the #570
+/// diagnostic mirror, and the #986 removed-registry no-ops make 104.
 #[test]
 fn registry_holds_the_pinned_count() {
-    assert_eq!(RULES.len(), 90);
+    assert_eq!(RULES.len(), 104);
+}
+
+/// The registry-order contract (parity-plan R8): one contiguous block per
+/// section, sections in wave order — core, recommended-only, diagnostic
+/// mirrors, then the wave sections (the removed block first) — and each
+/// section exactly its pinned official set. The wave sections pin exact
+/// order (each new wave appends its section here); the legacy
+/// core/recommended blocks keep their historical registration order, each
+/// entry's identity pinned by `rule_by_name_round_trips`.
+#[test]
+fn registry_sections_hold_the_official_order() {
+    let ranks: Vec<u8> = RULES
+        .iter()
+        .map(|spec| match spec.group {
+            Group::Core => 0u8,
+            Group::Recommended => 1,
+            Group::Diagnostic => 2,
+            Group::Removed => 3,
+        })
+        .collect();
+    assert!(
+        ranks.windows(2).all(|pair| pair[0] <= pair[1]),
+        "registry sections must be contiguous, in wave order"
+    );
+
+    let section = |group: Group| -> BTreeSet<&'static str> {
+        RULES
+            .iter()
+            .filter(|spec| spec.group == group)
+            .map(|spec| spec.name)
+            .collect()
+    };
+    fn official<'a>(names: &[&'a str]) -> BTreeSet<&'a str> {
+        names.iter().copied().collect()
+    }
+    assert_eq!(section(Group::Core), official(OFFICIAL_CORE));
+    assert_eq!(section(Group::Recommended), official(OFFICIAL_RECOMMENDED));
+    assert_eq!(
+        section(Group::Diagnostic),
+        official(OFFICIAL_DIAGNOSTIC_MIRRORS)
+    );
+
+    let ordered_section = |group: Group| -> Vec<&'static str> {
+        RULES
+            .iter()
+            .filter(|spec| spec.group == group)
+            .map(|spec| spec.name)
+            .collect()
+    };
+    assert_eq!(ordered_section(Group::Removed), OFFICIAL_REMOVED);
 }
 
 /// The two camelCase registry spellings are the yaml/LintNames forms
@@ -280,7 +355,9 @@ const LINT_CODES_FREEZE: &str = "../../tests/harness/lint_codes.txt";
 
 /// The `kinds: &[]` set rules that still emit — through the dartq-commands
 /// pubspec pass at the #434 mounting face, not through AST dispatch (the
-/// crate docs' pubspec seam). The only legitimate empty-`kinds` members.
+/// crate docs' pubspec seam). The only legitimate empty-`kinds` members
+/// among the freeze-governed set rules (the removed no-ops are empty-kinds
+/// too, but they are registry-face registrations, not the gate's universe).
 const PUBSPEC_PASS_SEAM: &[&str] = &["package_names", "secure_pubspec_urls"];
 
 /// Set rules that cannot emit and are therefore consciously out of the
@@ -291,12 +368,13 @@ const PUBSPEC_PASS_SEAM: &[&str] = &["package_names", "secure_pubspec_urls"];
 /// is a dead seam the re-freeze must reason about.
 const STRUCTURALLY_SILENT: &[&str] = &[];
 
-/// The registered set rules the implementation can emit: non-mirror specs
-/// that dispatch on the AST or run through the pubspec pass.
+/// The registered set rules the implementation can emit: non-mirror,
+/// non-removed specs that dispatch on the AST or run through the pubspec
+/// pass.
 fn emittable_set_rules() -> BTreeSet<&'static str> {
     RULES
         .iter()
-        .filter(|spec| spec.group != Group::Diagnostic)
+        .filter(|spec| !matches!(spec.group, Group::Diagnostic | Group::Removed))
         .filter(|spec| !spec.kinds.is_empty() || PUBSPEC_PASS_SEAM.contains(&spec.name))
         .map(|spec| spec.name)
         .collect()
@@ -368,7 +446,7 @@ fn lint_codes_freeze_matches_the_registry() {
 
     let actually_silent: BTreeSet<&'static str> = RULES
         .iter()
-        .filter(|spec| spec.group != Group::Diagnostic)
+        .filter(|spec| !matches!(spec.group, Group::Diagnostic | Group::Removed))
         .filter(|spec| spec.kinds.is_empty() && !PUBSPEC_PASS_SEAM.contains(&spec.name))
         .map(|spec| spec.name)
         .collect();

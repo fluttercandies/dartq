@@ -6,7 +6,9 @@
 //! and its message templates to the generated codes in
 //! `pkg/linter/lib/src/diagnostic.g.dart` (cited in each spec). Group
 //! membership follows `.third/lints/lib/{core,recommended}.yaml` (the
-//! `package:lints` sets; recommended includes core).
+//! `package:lints` sets; recommended includes core); the removed rules
+//! follow the SDK's `RemovedAnalysisRule` registrations (the rules.json
+//! `removed` state).
 
 use dartq_ast::NodeKind;
 
@@ -25,6 +27,14 @@ pub enum Group {
     /// rule joins a run only by explicit name (`analysis_options`
     /// `linter.rules` or a caller-built [`EnableSet`]).
     Diagnostic,
+    /// A rule the SDK removed but still registers (`RemovedAnalysisRule`,
+    /// `diagnosticCodes => const []`): the name resolves in the options
+    /// and ignore faces — no `undefined_lint`, and the uppercase name is
+    /// in `currentLintCodeNames`
+    /// (`analysis_options_parse_model.dart:82`) — while the rule never
+    /// fires. Not a `package:lints` member: no include set carries it and
+    /// the lint-gate freeze never judges it.
+    Removed,
 }
 
 /// Index into [`RULES`]. Stable within one build of this crate; the machine
@@ -76,10 +86,13 @@ impl core::fmt::Debug for RuleSpec {
 }
 
 /// All rules through the #586 standard-set completion (the full
-/// `package:lints` union: 34 core + 55 recommended-only) plus the #570
-/// diagnostic mirror. Order is registry order ([`RuleId`] assignment),
-/// grouped core-first then alphabetically within each group, the mirror
-/// section last — keep the pin test in `tests/registry_pin.rs` in sync.
+/// `package:lints` union: 34 core + 55 recommended-only), the #570
+/// diagnostic mirror, and the #986 removed-registry no-ops (the 14
+/// `RemovedAnalysisRule` registrations). Order is registry order
+/// ([`RuleId`] assignment), grouped core-first then alphabetically within
+/// each group, the mirror section, then the wave sections in wave order
+/// (the removed block first; each new wave appends its section) — keep the
+/// pin test in `tests/registry_pin.rs` in sync.
 pub static RULES: &[&RuleSpec] = &[
     // —— core (`.third/lints/lib/core.yaml`) ——
     &crate::rules::empty::avoid_empty_else::SPEC,
@@ -175,6 +188,23 @@ pub static RULES: &[&RuleSpec] = &[
     // —— diagnostic mirrors (analyzer diagnostics outside `package:lints`;
     // no include set carries them, opt-in by name) ——
     &crate::rules::expressions::unnecessary_type_check::SPEC,
+    // —— removed (the `RemovedAnalysisRule` no-ops, plan W1 #986; the
+    // rules.json `removed` state, alphabetical): the names resolve in the
+    // options and ignore faces, the rules never fire ——
+    &crate::rules::removed::always_require_non_null_named_parameters::SPEC,
+    &crate::rules::removed::avoid_as::SPEC,
+    &crate::rules::removed::avoid_returning_null::SPEC,
+    &crate::rules::removed::avoid_returning_null_for_future::SPEC,
+    &crate::rules::removed::avoid_unstable_final_fields::SPEC,
+    &crate::rules::removed::enable_null_safety::SPEC,
+    &crate::rules::removed::invariant_booleans::SPEC,
+    &crate::rules::removed::iterable_contains_unrelated_type::SPEC,
+    &crate::rules::removed::list_remove_unrelated_type::SPEC,
+    &crate::rules::removed::package_api_docs::SPEC,
+    &crate::rules::removed::prefer_bool_in_asserts::SPEC,
+    &crate::rules::removed::prefer_equal_for_default_values::SPEC,
+    &crate::rules::removed::super_goes_last::SPEC,
+    &crate::rules::removed::unsafe_html::SPEC,
 ];
 
 /// The rule with machine name `name`, case-insensitively (linear scan; a
@@ -204,10 +234,12 @@ pub struct EnableSet {
     words: [u64; WORDS],
 }
 
-/// `RULES.len()` outgrew one 64-bit word at 68 rules (wave 3, #315); the
-/// word count is asserted in `tests/registry_pin.rs` so further growth is
-/// caught together with the pin.
-const WORDS: usize = 2;
+/// `RULES.len()` outgrew one 64-bit word at 68 rules (wave 3, #315) and
+/// two at 104 (the removed-registry wave, #986); five words carry the full
+/// SDK registry (269) plus the mirror. The word count is asserted in
+/// `tests/registry_pin.rs` so further growth is caught together with the
+/// pin.
+const WORDS: usize = 5;
 
 impl EnableSet {
     /// Every registered rule.

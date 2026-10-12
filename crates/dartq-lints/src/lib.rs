@@ -151,6 +151,14 @@
 //!   alias fold on `type_literal_in_constant_pattern`. The remaining
 //!   divergences are the import-resolution faces each module documents.
 //!
+//! - removed-registry tranche (2026-10-12, #986, parity-plan W1): the 14
+//!   rules the SDK still registers as `RemovedAnalysisRule`
+//!   (`diagnosticCodes => const []`) joined under [`Group::Removed`] as
+//!   registered no-ops — the names resolve in the options and ignore
+//!   faces (the oracle's `currentLintCodeNames`), the rules never fire.
+//!   The rules.json `removed` slice of the 264 universe is now covered
+//!   (104 specs; [`EnableSet`] grew to five 64-bit words).
+//!
 //! With this tranche every `package:lints` member has a terminal state:
 //! implemented (84), or documented-blocked with the exact resolution fact it
 //! waits for (below).
