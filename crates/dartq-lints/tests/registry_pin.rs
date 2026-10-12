@@ -5,6 +5,16 @@
 //! `.third/lints/lib/recommended.yaml` (the pinned `package:lints` snapshot;
 //! AGENTS.md fact-source discipline). When the snapshot re-pins, update the
 //! lists here in the same change as the registry.
+//!
+//! Also the governance pin for the frozen lint-gate universe
+//! (`tests/harness/lint_codes.txt`, the `--codes-file` of
+//! `scripts/lint-gate.sh`): the freeze must stay exactly the set of
+//! `package:lints` rules this registry can emit — no orphans (rows the
+//! implementation cannot emit), no gaps (mounted rules the gate would
+//! never judge). A stale freeze fails here with the offending rows named.
+
+use std::collections::BTreeSet;
+use std::path::Path;
 
 use dartq_lints::{EnableSet, Group, RULES, rule_by_name};
 
@@ -260,4 +270,184 @@ fn templates_are_well_formed() {
             assert_eq!(spec.render_correction(&[]), None);
         }
     }
+}
+
+// —— the frozen lint-gate universe (tests/harness/lint_codes.txt) ———
+
+/// The freeze file `scripts/lint-gate.sh` scopes the INFO x LINT run with
+/// (`--codes-file`); relative to this crate's manifest.
+const LINT_CODES_FREEZE: &str = "../../tests/harness/lint_codes.txt";
+
+/// The `kinds: &[]` set rules that still emit — through the dartq-commands
+/// pubspec pass at the #434 mounting face, not through AST dispatch (the
+/// crate docs' pubspec seam). The only legitimate empty-`kinds` members.
+const PUBSPEC_PASS_SEAM: &[&str] = &["package_names", "secure_pubspec_urls"];
+
+/// Set rules that cannot emit and are therefore consciously out of the
+/// freeze (each also needs a `lint_divergences.tsv` `excluded` row — the
+/// gate preflight's A3). Must stay exactly equal to the registered set
+/// rules that are neither AST-dispatched (`kinds` non-empty) nor
+/// pubspec-pass members; empty is the healthy state: a rule landing here
+/// is a dead seam the re-freeze must reason about.
+const STRUCTURALLY_SILENT: &[&str] = &[];
+
+/// The registered set rules the implementation can emit: non-mirror specs
+/// that dispatch on the AST or run through the pubspec pass.
+fn emittable_set_rules() -> BTreeSet<&'static str> {
+    RULES
+        .iter()
+        .filter(|spec| spec.group != Group::Diagnostic)
+        .filter(|spec| !spec.kinds.is_empty() || PUBSPEC_PASS_SEAM.contains(&spec.name))
+        .map(|spec| spec.name)
+        .collect()
+}
+
+/// The freeze file's code rows: one lowercase machine name per line, `#`
+/// comments and blanks ignored (the gate script's own reading).
+fn freeze_rows(text: &str) -> Vec<&str> {
+    text.lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
+}
+
+/// The governance pin: the freeze and the registry-derived universe must
+/// be the same set. Catches the two drift directions that matter — a
+/// retired/mis-spelled/silent row the gate would never see fire, and a
+/// mounted rule the oracle can report while the freeze keeps dartq's
+/// silence out of the denominator.
+#[test]
+fn lint_codes_freeze_matches_the_registry() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(LINT_CODES_FREEZE);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let rows = freeze_rows(&text);
+
+    let mut seen = BTreeSet::new();
+    let dupes: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|row| !seen.insert(*row))
+        .collect();
+    assert!(
+        dupes.is_empty(),
+        "{LINT_CODES_FREEZE}: duplicate entries: {dupes:?}"
+    );
+
+    let emittable = emittable_set_rules();
+    let mut orphans = Vec::new();
+    for row in &rows {
+        let Some(id) = rule_by_name(row) else {
+            orphans.push(format!("{row}: not a registered rule"));
+            continue;
+        };
+        let spec = RULES[id.0 as usize];
+        if spec.group == Group::Diagnostic {
+            orphans.push(format!(
+                "{row}: a diagnostic mirror, never in the default posture"
+            ));
+        } else if !emittable.contains(spec.name) {
+            orphans.push(format!("{row}: structurally silent (kinds: &[])"));
+        }
+    }
+    assert!(
+        orphans.is_empty(),
+        "{LINT_CODES_FREEZE}: rows the implementation cannot emit: {orphans:?}"
+    );
+
+    let frozen: BTreeSet<&str> = rows.iter().copied().collect();
+    let gaps: Vec<String> = emittable
+        .iter()
+        .filter(|name| !frozen.contains(name.to_ascii_lowercase().as_str()))
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    assert!(
+        gaps.is_empty(),
+        "{LINT_CODES_FREEZE}: mounted package:lints rules missing from the freeze (the \
+         gate would never judge them): {gaps:?} — re-freeze via regen_lint_codes_freeze \
+         and reconcile the header prose"
+    );
+
+    let actually_silent: BTreeSet<&'static str> = RULES
+        .iter()
+        .filter(|spec| spec.group != Group::Diagnostic)
+        .filter(|spec| spec.kinds.is_empty() && !PUBSPEC_PASS_SEAM.contains(&spec.name))
+        .map(|spec| spec.name)
+        .collect();
+    let silent: BTreeSet<&str> = STRUCTURALLY_SILENT.iter().copied().collect();
+    assert_eq!(
+        silent, actually_silent,
+        "STRUCTURALLY_SILENT must name exactly the set rules that cannot emit \
+         (registry holds {:?}; the pin lists {:?})",
+        actually_silent, silent
+    );
+
+    for name in PUBSPEC_PASS_SEAM {
+        let Some(id) = rule_by_name(name) else {
+            panic!("PUBSPEC_PASS_SEAM member {name} is not registered");
+        };
+        let spec = RULES[id.0 as usize];
+        assert!(
+            spec.group != Group::Diagnostic && spec.kinds.is_empty(),
+            "PUBSPEC_PASS_SEAM member {name} no longer matches the pubspec seam shape"
+        );
+    }
+}
+
+/// Regenerates the freeze file's entry block from the registry-derived
+/// universe, preserving the curated comment header verbatim. Oracle-free:
+/// the inclusion rule is mechanical (the registered set rules that can
+/// emit). Run explicitly, then reconcile the header prose with the new
+/// rows — the re-freeze is deliberate, the regen is only its mechanical
+/// half:
+///
+/// ```text
+/// cargo test -p dartq-lints --test registry_pin regen_lint_codes_freeze -- --ignored
+/// ```
+#[test]
+#[ignore = "rewrites tests/harness/lint_codes.txt; explicit re-freeze maintenance"]
+fn regen_lint_codes_freeze() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(LINT_CODES_FREEZE);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let header_end = text
+        .lines()
+        .position(|line| {
+            let line = line.trim_end_matches('\r');
+            !line.is_empty() && !line.starts_with('#')
+        })
+        .expect("the freeze file carries an entry block");
+
+    let mut entries: Vec<String> = emittable_set_rules()
+        .into_iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    entries.sort();
+
+    let old: BTreeSet<String> = freeze_rows(&text)
+        .into_iter()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let new: BTreeSet<String> = entries.iter().cloned().collect();
+    let added: Vec<&String> = new.difference(&old).collect();
+    let removed: Vec<&String> = old.difference(&new).collect();
+
+    let mut out = String::with_capacity(text.len() + entries.len() * 24);
+    for line in text.lines().take(header_end) {
+        out.push_str(line.trim_end_matches('\r'));
+        out.push('\n');
+    }
+    for entry in &entries {
+        out.push_str(entry);
+        out.push('\n');
+    }
+    std::fs::write(&path, out).unwrap_or_else(|e| panic!("writing {}: {e}", path.display()));
+
+    println!(
+        "regen_lint_codes_freeze: {} entries (was {}); reconcile the comment header",
+        entries.len(),
+        old.len()
+    );
+    println!("  added: {added:?}");
+    println!("  removed: {removed:?}");
 }

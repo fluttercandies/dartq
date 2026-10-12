@@ -21,12 +21,17 @@
 #   LC_ALL=C sed -n 's/^    - //p' tests/corpus/lints/vendor/lints/lib/*.yaml \
 #     | tr 'A-Z' 'a-z' | LC_ALL=C sort
 #
-# Exclusions (r0; 89 -> 88):
-#  - exhaustive_cases: dead seam (kinds: &[] -- the #434 element-facts
-#    wiring); the oracle reports, dartq is structurally silent, so any
-#    coverage is a permanent oracle-only denominator (audit lints-r1 F2).
-#    Return path: the wiring ticket re-adds it together with the enum-like
-#    switch fixture.
+# Exclusions: none -- the full 89-rule set is frozen. The r0 exclusion
+# (exhaustive_cases: dead seam, kinds: &[] -- audit lints-r1 F2) returned
+# in the 2026-10-12 exemption-reaudit F2 tranche: the rule mounted on its
+# enum-like seam (kinds: [SwitchStatement], the element-facts wiring), so
+# the oracle-only denominator argument is gone and the freeze carries the
+# full set again. Governance pin: crates/dartq-lints/tests/registry_pin.rs
+# (lint_codes_freeze_matches_the_registry) fails with the offending rows
+# when this table drifts from the registry; regenerate the entry block
+# with
+#   cargo test -p dartq-lints --test registry_pin regen_lint_codes_freeze -- --ignored
+# then reconcile this header (the re-freeze is deliberate).
 #
 # Deliberate stays:
 #  - no_duplicate_case_values stays in the universe (main-agent ruling on
@@ -43,7 +48,7 @@
 #    carries the row; its only validation remains the crate's inline
 #    pins).
 #
-# Wave-1 coverage: 21 of the 88 universe rules have targeted fixtures in
+# Wave-1 coverage: 21 of the 89 universe rules have targeted fixtures in
 # tests/corpus/lints/lib (the audit r1 blind/thin rows plus the ignore
 # suppression pair set and the pubspec secure_pubspec_urls face); the rest
 # join through the wave-2 kitchen files or leave with a ledger reason.
@@ -70,6 +75,7 @@ depend_on_referenced_packages
 empty_catches
 empty_constructor_bodies
 empty_statements
+exhaustive_cases
 file_names
 hash_and_equals
 implementation_imports
