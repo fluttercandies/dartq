@@ -153,9 +153,11 @@ pub fn instantiate_type_formals_to_bounds(
 /// (type_system.dart:588-600); the official alias arm
 /// (type_system.dart:596-598) has no counterpart — dartq types carry no
 /// alias kinds.
-// The workspace pins Fx hashing (rustc-hash) — generalizing over
-// `BuildHasher` would add a parameter no caller can use differently.
-#[expect(clippy::implicit_hasher, reason = "see above")]
+#[expect(
+    clippy::implicit_hasher,
+    reason = "the workspace pins Fx hashing (rustc-hash); generalizing over \
+              `BuildHasher` would add a parameter no caller can use differently"
+)]
 #[must_use]
 pub fn get_free_parameters(
     table: &TypeTable,

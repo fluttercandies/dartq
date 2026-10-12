@@ -32,7 +32,7 @@ impl<'a> UriParts<'a> {
         // path, where `:` is a regular character.
         let mut rest = s;
         let mut scheme = None;
-        if bytes.first().is_some_and(|b| b.is_ascii_alphabetic()) {
+        if bytes.first().is_some_and(u8::is_ascii_alphabetic) {
             let end = bytes
                 .iter()
                 .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))

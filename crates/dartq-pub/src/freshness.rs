@@ -302,11 +302,10 @@ impl Freshness {
                 (Some(current), Some(generator)) => {
                     current.major == generator.major && current.minor == generator.minor
                 }
-                // pub treats a missing generatorVersion as a different SDK.
-                (_, None) => false,
-                // An unparsable version cannot be shown equal either: report
-                // the mismatch rather than silently skipping the check.
-                (None, Some(_)) => false,
+                // pub treats a missing generatorVersion as a different SDK; an
+                // unparsable version cannot be shown equal either: report the
+                // mismatch rather than silently skipping the check.
+                (_, None) | (None, Some(_)) => false,
             };
             if !matches {
                 reasons.push(StaleReason::GeneratorSdkMismatch {

@@ -152,7 +152,7 @@ impl Lexer<'_> {
         let gt_idx = self.last_index();
         for i in 0..closes {
             match self.groups.last() {
-                Some(&(top, kind)) if kind == TokenKind::Lt => {
+                Some(&(top, TokenKind::Lt)) => {
                     self.groups.pop();
                     if i + 1 == closes {
                         self.record_end(top, gt_idx);

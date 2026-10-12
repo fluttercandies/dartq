@@ -183,8 +183,7 @@ fn scalar(rest: &str, abs: usize) -> (Range<usize>, String) {
     let abs = abs + (rest.len() - trimmed.len());
     let b = trimmed.as_bytes();
     match b.first() {
-        None => (abs..abs, String::new()),
-        Some(b'#') => (abs..abs, String::new()),
+        None | Some(b'#') => (abs..abs, String::new()),
         Some(b'\'') => quoted(trimmed, abs, b'\''),
         Some(b'"') => quoted(trimmed, abs, b'"'),
         _ => {

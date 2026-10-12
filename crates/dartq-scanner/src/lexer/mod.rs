@@ -968,7 +968,7 @@ impl<'s> Lexer<'s> {
 
     /// Insert posture: each begin above the match is closed by a synthetic
     /// closer at the mismatching closer and reported there (official
-    /// `insertSyntheticClosers`; oracle `var m = {[1};` → expected_token ']'
+    /// `insertSyntheticClosers`; oracle `var m = {[1};` → `expected_token` ']'
     /// @ the `}`), then the real closer closes the match.
     fn execute_insert(&mut self, close: TokenKind, start: usize, depth: usize) -> Flow {
         while self.groups.len() > depth + 1 {

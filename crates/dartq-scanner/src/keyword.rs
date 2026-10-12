@@ -5,10 +5,10 @@
 //! alike; context-based disambiguation is the parser's job. `augment` is the
 //! one lexically gated keyword: with [`crate::ScanConfig::enable_augmentations`]
 //! disabled it lexes as an identifier, mirroring the official scanner's
-//! `tokenizeKeywordOrIdentifier` (abstract_scanner.dart:2106 —
+//! `tokenizeKeywordOrIdentifier` (`abstract_scanner.dart:2106` —
 //! `if (!_enableAugmentations && keyword == Keyword.AUGMENT) return
 //! tokenizeIdentifier(...)`) and the SDK's own scanner test pinning
-//! identifier-when-disabled (front_end scanner_test.dart:480-489). With the
+//! identifier-when-disabled (`front_end` scanner_test.dart:480-489). With the
 //! feature enabled it is `Keyword.AUGMENT` (token.dart:139-145,
 //! `KeywordStyle.builtIn`).
 
