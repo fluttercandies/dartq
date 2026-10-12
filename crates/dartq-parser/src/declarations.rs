@@ -1986,7 +1986,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         if kind == DeclarationKind::Class
             && !self.features.primary_constructors_enabled
             && self.peek_kind() == TokenKind::OpenParen
+            && self.cursor.look_kind(1) == TokenKind::OpenCurly
+            && !self.peek_is_possible_record_type()
         {
+            // The probed junk shape (`class C( {}`): the `(` cannot close
+            // at a real `)` (the scanner's EOF synthetic does not count),
+            // so the oracle leaves it as skipped junk ahead of the
+            // `{}`-remnant class body. A really-paired `(` — including a
+            // named-section opener like `class C({int a})` — parses as
+            // primary-constructor formals even with the feature off.
             return self.recover_class_head_paren_off();
         }
         if self.peek_kind() == TokenKind::OpenParen || self.peek_kind() == TokenKind::Period {
@@ -2098,6 +2106,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     crate::listener::MemberKind::PrimaryConstructor,
                 );
             }
+            // AstBuilder `endPrimaryConstructor`'s non-extension-type arm
+            // (the 3.13.1 oracle): a *parsed* primary constructor is gated
+            // at the AST layer and reports `experimentNotEnabled` anchored
+            // on the begin token (`(` or `.`) when the file's language
+            // version predates the feature. The shared parser itself never
+            // gates the Class/Enum formals parse, so `class C(int x);` at
+            // 2.12 stays a clean parse whose whole face is this row plus
+            // parseClass's `;`-body row. Mixin/Extension ride the same
+            // kind-blind arm in the oracle; their extra parser-side
+            // reports above are a different anchor face.
+            if !self.features.primary_constructors_enabled
+                && !matches!(kind, DeclarationKind::ExtensionType)
+            {
+                self.report_experiment_not_enabled(begin);
+            }
             let end = self.peek_span();
             self.listener.end_primary_constructor(
                 kind,
@@ -2136,15 +2159,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         true
     }
 
-    /// Feature-off `(` face at a class head, probe-verified against the
-    /// 3.13.1 oracle at its default language version (primary constructors
-    /// disabled): the `(` is not a parameter list there — 3.15 main parses
-    /// class-head formals unconditionally (`parser_impl.dart:3782-3838`),
-    /// which our feature-on path mirrors. For `class C( {}` the oracle's
-    /// full ordered face set is `expected_token(';')` at the `{`,
-    /// `missing_identifier` + `missing_const_final_var_or_type` at the `}`
-    /// (the empty `{}`-remnant parses as a member with no type and no
-    /// name), then `expected_executable` at the pending paren's EOF
+    /// Feature-off `(` face at a class head for the probed `class C( {}`
+    /// junk shape (routed only when the `(` is scanner-unpaired — see the
+    /// caller), probe-verified against the 3.13.1 oracle at its default
+    /// language version. A scanner-paired `(` is NOT a junk shape: the
+    /// oracle parses those formals at any language version and the face is
+    /// the two-row experiment set (`class C(int x);` at 2.12). For `class
+    /// C( {}` the oracle's full ordered face set is `expected_token(';')`
+    /// at the `{`, `missing_identifier` + `missing_const_final_var_or_type`
+    /// at the `}` (the empty `{}`-remnant parses as a member with no type
+    /// and no name), then `expected_executable` at the pending paren's EOF
     /// position; the `)` face itself is carried by the scanner's
     /// unbalanced-group diagnostic (`lexer/mod.rs:908-917`), not by the
     /// parser. With a real follower token instead of EOF, the oracle
@@ -2154,10 +2178,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     /// `expected_executable` junk-member face. Returns `false`: the tail
     /// was consumed.
     fn recover_class_head_paren_off(&mut self) -> bool {
-        if self.cursor.look_kind(1) != TokenKind::OpenCurly {
-            // Not the probed shape: keep the regular header/body path.
-            return true;
-        }
         let lparen = self.peek_span();
         let lparen_lexeme = self.cursor.lexeme(lparen.id);
         self.cursor.advance(); // `(` — silent on the EOF path (see tail)

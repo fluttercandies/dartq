@@ -1050,6 +1050,75 @@ fn class_head_paren_off_matches_oracle_face_set() {
     assert_eq!(c2.errors[4], ("expected_executable".to_string(), 12, 17));
 }
 
+/// `class C(int x);` at 2.12 (#961 recorded oracle face): a scanner-paired
+/// `(` parses as primary-constructor formals even with the feature off
+/// (the shared parser never gates them — only the `class C( {}` junk
+/// shape routes to the unpaired-paren recovery), and the whole face is
+/// the two-row experiment set. Row order follows the oracle's decision
+/// order: the AST-builder gate row anchored on the `(`
+/// (`endPrimaryConstructor`'s non-extension-type arm) fires at the formals
+/// end event, before parseClass's `;`-body row on the semicolon.
+#[test]
+fn class_formal_off_parses_formals_to_two_experiment_rows() {
+    let (c, scanner) = parse_off_with_scanner("class C(int x);");
+    assert!(scanner.is_empty(), "{scanner:?}");
+    assert_eq!(
+        c.errors,
+        [
+            ("experiment_not_enabled".to_string(), 7, 7),
+            ("experiment_not_enabled".to_string(), 14, 14),
+        ],
+        "{:?}",
+        c.texts
+    );
+    c.assert_sequence(&[
+        ("begin", "class_declaration"),
+        ("handle", "no_class_body"),
+        ("end", "class_declaration"),
+    ]);
+}
+
+/// With a real body the `;`-row disappears: the single AST-builder gate
+/// row on the `(` is the whole face.
+#[test]
+fn class_formal_off_with_body_single_experiment_row() {
+    let (c, scanner) = parse_off_with_scanner("class C(int x) {}");
+    assert!(scanner.is_empty(), "{scanner:?}");
+    assert_eq!(c.errors, [("experiment_not_enabled".to_string(), 7, 7)]);
+}
+
+/// A named primary constructor anchors the gate row on the `.` (the begin
+/// token is the primary-constructor opener whichever of `.`/`(` it is).
+#[test]
+fn class_named_primary_formal_off_anchors_on_period() {
+    let (c, scanner) = parse_off_with_scanner("class C.x(int x);");
+    assert!(scanner.is_empty(), "{scanner:?}");
+    assert_eq!(
+        c.errors,
+        [
+            ("experiment_not_enabled".to_string(), 7, 7),
+            ("experiment_not_enabled".to_string(), 16, 16),
+        ]
+    );
+}
+
+/// A scanner-paired named-section opener is formals, not the junk shape:
+/// `class C({int a});` at 2.12 keeps the clean parse and the two-row
+/// experiment set (this is the collision the unpaired-paren routing
+/// clause exists for).
+#[test]
+fn class_named_section_formals_off_stay_formals() {
+    let (c, scanner) = parse_off_with_scanner("class C({int a});");
+    assert!(scanner.is_empty(), "{scanner:?}");
+    assert_eq!(
+        c.errors,
+        [
+            ("experiment_not_enabled".to_string(), 7, 7),
+            ("experiment_not_enabled".to_string(), 16, 16),
+        ]
+    );
+}
+
 /// (code, start, end) rows in emission order for `source`.
 fn rows(source: &'static str) -> Vec<(String, u32, u32)> {
     let (table, text) = scan_ok(source);
