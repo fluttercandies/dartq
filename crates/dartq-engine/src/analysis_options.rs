@@ -196,6 +196,27 @@ pub const UNRECOGNIZED_ERROR_CODE: CodeInfo = CodeInfo::new(
     true,
 );
 
+/// `'{0}' was removed in Dart '{1}'` (registry :15098-15116; `{1}` is the
+/// removal's `since` version — `"null"` for the unversioned state — and the
+/// texts render from the lint registry's removed specs at the CLI face,
+/// which owns that registry; the engine holds no lint registry).
+pub const REMOVED_LINT: CodeInfo = CodeInfo::new(
+    "removed_lint",
+    "REMOVED_LINT",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// `The lint rule '{0}' is deprecated and shouldn't be enabled.`
+/// (registry :3904-3925; emitted by the CLI face, which owns the
+/// deprecated-state data the SDK registry attaches to the rule.)
+pub const DEPRECATED_LINT: CodeInfo = CodeInfo::new(
+    "deprecated_lint",
+    "DEPRECATED_LINT",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
 /// `{0}` — the YAML error's own text (registry :13901-13910,
 /// `COMPILE_TIME_ERROR` → ERROR: the row drives the CLI's exit tier 3).
 const PARSE_ERROR: CodeInfo = CodeInfo::new(

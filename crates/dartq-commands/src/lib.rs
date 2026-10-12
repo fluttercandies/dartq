@@ -39,6 +39,7 @@ pub mod layout;
 mod lint_names;
 pub mod lints;
 pub mod query;
+mod rule_states;
 pub mod workspace;
 
 use serde::Deserialize;

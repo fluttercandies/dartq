@@ -171,7 +171,10 @@ pub fn run_overlaid<'a>(
 /// `_parseLocalRules`, analysis_options_parse_model.dart:1245-1251 — the
 /// registry check fires before the entry's value is read, so a disabled
 /// `name: false` reports too; `name:` with a null value returns before the
-/// check and does not), and the initial file's own `analyzer.errors` keys
+/// check and does not), the same names' removed/deprecated registry states
+/// (`removed_lint` / `deprecated_lint`; parse_model.dart:1288-1326 —
+/// initial-file declarations only, the included files' rows never carry
+/// them), and the initial file's own `analyzer.errors` keys
 /// against the diagnostic universe plus the same lint universes
 /// (`unrecognized_error_code`; parse_model:558-585 — the check fires as the
 /// key is read, before the value is inspected, and a non-string scalar key
@@ -192,6 +195,11 @@ fn options_registry_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> 
         let Some(file) = engine.file_table().try_file_id(&options.file_path) else {
             continue;
         };
+        // The removed/deprecated state gate reads this root's own
+        // `sdkVersionConstraint` (`PubPackage.sdkVersionConstraint`,
+        // pub.dart:516-530 — the pubspec `environment.sdk` constraint; each
+        // analysis context parses the options with its package's value).
+        let constraint_min = sdk_constraint_min(root);
         // The include chain's own declarations wrap into
         // `included_file_warning` (the official walker reports every
         // included file's findings on the initial file, before its own
@@ -215,6 +223,55 @@ fn options_registry_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> 
         for rule in &options.declared_rules {
             if !is_known_lint_name(&rule.name) {
                 rows.push(analysis_options::OptionsIssue::undefined_lint(rule).to_diagnostic(file));
+                continue;
+            }
+            // The removed/deprecated rows (#988): the official `parseRule`
+            // reports them for every initial-file name the registry
+            // resolves — enabled or disabled, the state check rides the
+            // parse, not the entry's value (parse_model.dart:1288-1326) —
+            // anchored at the name token like `undefined_lint`, and gated
+            // on the package's SDK-constraint lower bound.
+            if let Some(id) = dartq_lints::rule_by_name(&rule.name) {
+                let spec = &dartq_lints::RULES[id.0 as usize];
+                if spec.group == dartq_lints::Group::Removed
+                    && let Some(since) = crate::rule_states::removed_since(spec.name)
+                    && crate::rule_states::before_current(since, constraint_min)
+                {
+                    rows.push(
+                        analysis_options::OptionsIssue {
+                            code: analysis_options::REMOVED_LINT,
+                            message: spec.render_problem(&[
+                                &rule.name,
+                                crate::rule_states::since_arg(since),
+                            ]),
+                            correction: spec.render_correction(&[&rule.name]),
+                            offset: rule.offset,
+                            length: rule.length,
+                        }
+                        .to_diagnostic(file),
+                    );
+                }
+            } else if let Some(since) = crate::rule_states::deprecated_since(&rule.name)
+                && crate::rule_states::before_current(Some(since), constraint_min)
+            {
+                // The deprecated rules are unimplemented in dartq-lints, so
+                // no spec carries their message of record — the registry
+                // texts render here (diagnostic.g.dart:3904-3913; no
+                // `replacedBy` in the pinned set, so the
+                // `deprecated_lint_with_replacement` variant never applies).
+                rows.push(
+                    analysis_options::OptionsIssue {
+                        code: analysis_options::DEPRECATED_LINT,
+                        message: format!(
+                            "The lint rule '{}' is deprecated and shouldn't be enabled.",
+                            rule.name
+                        ),
+                        correction: Some(format!("Try removing '{}'.", rule.name)),
+                        offset: rule.offset,
+                        length: rule.length,
+                    }
+                    .to_diagnostic(file),
+                );
             }
         }
         for error in &options.declared_errors {
@@ -239,6 +296,23 @@ fn options_registry_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> 
 /// yields no row). #956.
 fn is_known_lint_name(name: &str) -> bool {
     dartq_lints::rule_by_name(name).is_some() || crate::lint_names::is_known(name)
+}
+
+/// The lower bound of the package at `root`'s `environment.sdk` constraint —
+/// the `sdkVersionConstraint` the official removed/deprecated state gate
+/// switches over (`_beforeCurrentConstraint`, parse_model.dart:1197-1205:
+/// only a `VersionRange` carries a min, so an exact-version or `any`
+/// constraint gates every versioned since off). `None` — no pubspec, an
+/// unreadable one, or no parseable `sdk` key — is the official null
+/// constraint.
+fn sdk_constraint_min(root: &std::path::Path) -> Option<(u64, u64, u64)> {
+    let text = std::fs::read_to_string(root.join("pubspec.yaml")).ok()?;
+    let spec = dartq_pub::Pubspec::parse(&text).ok()?;
+    let dartq_pub::VersionConstraint::Range(range) = spec.environment.sdk? else {
+        return None;
+    };
+    let version = range.min?;
+    Some((version.major, version.minor, version.patch))
 }
 
 #[cfg(test)]
@@ -599,6 +673,152 @@ mod tests {
             assert_eq!(row.code.dtype, DiagnosticType::StaticWarning);
             assert_eq!(row.correction, None);
         }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `removed_lint` face end to end (#988): a removed rule named
+    /// directly in the initial options file reports at its name anchor with
+    /// the registry's removed-spec texts verbatim (`parseRule`,
+    /// parse_model.dart:1308-1326), gated on the package's SDK-constraint
+    /// lower bound (`_beforeCurrentConstraint`, parse_model.dart:1197-1205 —
+    /// the fixture's `^3.5.0` admits the 3.0.0 removals and holds back the
+    /// 3.7.0 ones), and a normal name stays silent.
+    #[test]
+    fn run_overlaid_reports_removed_lint_rows() {
+        let root = workspace(
+            "analyze_removed_lint",
+            &[("lib/ok.dart", "var ok = 1;\n")],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let options_text = concat!(
+            "linter:\n",
+            "  rules:\n",
+            "    - super_goes_last\n",
+            "    - unsafe_html\n",
+            "    - avoid_empty_else\n",
+        );
+        std::fs::write(root.join("analysis_options.yaml"), options_text).expect("options");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+
+        let rows: Vec<(&str, &str, u32, u32)> = run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "removed_lint")
+            .map(|d| {
+                (
+                    d.message.as_ref(),
+                    d.correction.as_deref().expect("correction"),
+                    d.range.offset,
+                    d.range.length,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(
+                "'super_goes_last' was removed in Dart '3.0.0'",
+                "Try removing the reference to 'super_goes_last'.",
+                u32::try_from(options_text.find("super_goes_last").expect("anchor")).expect("u32"),
+                u32::try_from("super_goes_last".len()).expect("u32"),
+            )],
+            "only the removal the constraint admits reports: {rows:?}"
+        );
+        for row in run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "removed_lint")
+        {
+            assert_eq!(row.code.machine, "REMOVED_LINT");
+            assert_eq!(row.code.dtype, DiagnosticType::StaticWarning);
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `deprecated_lint` face end to end (#988): a deprecated rule
+    /// (registered in the SDK, unimplemented in dartq-lints — no
+    /// `undefined_lint`) reports with the registry texts
+    /// (diagnostic.g.dart:3904-3913) once the package's constraint reaches
+    /// the deprecation's since (3.11.0; the fixture's `^3.5.0` gates it off,
+    /// parse_model.dart:1288-1296).
+    #[test]
+    fn run_overlaid_reports_deprecated_lint_rows() {
+        let root = workspace(
+            "analyze_deprecated_lint",
+            &[("lib/ok.dart", "var ok = 1;\n")],
+        );
+        std::fs::write(
+            root.join("pubspec.yaml"),
+            "name: fixture\nversion: 0.1.0\nenvironment:\n  sdk: ^3.11.0\n",
+        )
+        .expect("pubspec");
+        let root = root.canonicalize().expect("canonical root");
+        let options_text = "linter:\n  rules:\n    - prefer_final_parameters\n";
+        std::fs::write(root.join("analysis_options.yaml"), options_text).expect("options");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+
+        let rows: Vec<(&str, Option<&str>, u32, u32)> = run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "deprecated_lint")
+            .map(|d| {
+                (
+                    d.message.as_ref(),
+                    d.correction.as_deref(),
+                    d.range.offset,
+                    d.range.length,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(
+                "The lint rule 'prefer_final_parameters' is deprecated and shouldn't be enabled.",
+                Some("Try removing 'prefer_final_parameters'."),
+                u32::try_from(options_text.find("prefer_final_parameters").expect("anchor"))
+                    .expect("u32"),
+                u32::try_from("prefer_final_parameters".len()).expect("u32"),
+            )],
+            "{rows:?}"
+        );
+        let row = run
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "deprecated_lint")
+            .expect("the row above");
+        assert_eq!(row.code.machine, "DEPRECATED_LINT");
+        assert_eq!(row.code.dtype, DiagnosticType::StaticWarning);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The dominant posture: normal rule names — implemented or
+    /// registered-but-unimplemented — carry no removed/deprecated rows
+    /// (#988's zero branch).
+    #[test]
+    fn normal_rule_names_carry_no_removed_or_deprecated_rows() {
+        let root = workspace(
+            "analyze_normal_lints",
+            &[("lib/ok.dart", "var ok = 1;\n")],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        std::fs::write(
+            root.join("analysis_options.yaml"),
+            "linter:\n  rules:\n    - avoid_empty_else\n    - avoid_print\n",
+        )
+        .expect("options");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+        assert!(
+            run.diagnostics
+                .iter()
+                .all(|d| d.code.name != "removed_lint" && d.code.name != "deprecated_lint"),
+            "no state rows for normal names: {:?}",
+            run.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }
