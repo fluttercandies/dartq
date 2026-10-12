@@ -53,21 +53,29 @@
 #                    never parallel with anything
 #
 # Watchdog (vendored from the /tmp/rss_cmd.sh pattern — /tmp is ephemeral,
-# so this script is self-contained): each step's stdout+stderr goes to
-# /tmp/serial_<step>.log with a trailing `exit=<code>` line; a 5 s poll sums
-# the step's process-group RSS and, on breach, kills the step's whole
-# process tree (descendant walk, not a group kill — the orchestrator shares
-# the group and must survive) and appends
-# `WATCHDOG_KILL rss=<KB> limit=<KB>`. Unlike the /tmp original, a watchdog
-# kill propagates: the step is judged KILLED and the chain stops. Caps: 8 GiB
-# everywhere (RSS_LIMIT_KB overrides), 12 GiB for mega-r1 (runbook cap above
-# the bench's internal 8 GiB).
+# so this script is self-contained): each step runs in its OWN session —
+# launched via `perl -MPOSIX -e 'setsid; exec @ARGV'` (perl ships with
+# macOS; bash 3.2 has no setsid) — so its process group is exactly its
+# descendant tree, with the orchestrator and every other step outside it.
+# Each step's stdout+stderr goes to /tmp/serial_<step>.log with a trailing
+# `exit=<code>` line; a 5 s poll sums the step's process-group RSS and, on
+# breach, kills the step's whole group (exact — no descendant walk; one
+# re-kill ~200 ms later catches a descendant forked inside the kill window)
+# and appends `WATCHDOG_KILL rss=<KB> limit=<KB>`. An EXIT/INT/TERM trap
+# reaps the current step's group if the orchestrator itself dies mid-step.
+# Unlike the /tmp original, a watchdog kill propagates: the step is judged
+# KILLED and the chain stops. Caps: 8 GiB everywhere (RSS_LIMIT_KB
+# overrides), 12 GiB for mega-r1 (runbook cap above the bench's internal
+# 8 GiB).
 #
 # Labels: every evidence-producing step gets a fresh default label; pass
 # SERIAL_TAG=<suffix> to namespace a rerun (e.g. SERIAL_TAG=r2 ->
 # trend-w5-r2, m1-r5-r2, mega-r1-r2). A gate whose evidence directory
 # already exists refuses to run (exit 2) — recorded evidence is never
-# overwritten; bump SERIAL_TAG or clean up consciously.
+# overwritten; bump SERIAL_TAG or clean up consciously. A FAIL/KILLED step's
+# /tmp log is additionally copied to docs/audits/serial/<step><TAG>/
+# (untracked) so an untagged rerun — which reuses the same /tmp path —
+# cannot orphan the failing run's log; the summary row names the archive.
 #
 # Environment: SERIAL_TAG (label suffix), SERIAL_MEGA_SCALE (1k|10k|100k|all,
 # default 10k), SERIAL_MEGA_ORACLE_LEG (1 default, 0 drops the 1k parity
@@ -89,8 +97,11 @@
 #   Fail-fast: first failing step aborts the chain; the end summary always
 #   prints step | status | wall | peak-RSS | log. Exit codes: 0 all selected
 #   steps green; 1 a step failed or was watchdog-killed; 2 usage or
-#   preflight error (missing jq/oracle/corpus .dart_tool, unknown step,
-#   existing evidence directory).
+#   preflight error (missing jq/oracle/corpus .dart_tool, unknown or empty
+#   step selection, dirty tracked tree with the repro step selected,
+#   missing cargo-llvm-cov, existing evidence directory). Mid-chain guard
+#   failures (missing rebuild artifact, union drift, bad SERIAL_MEGA_SCALE)
+#   mark their own step FAIL and still print the summary — exit 1.
 
 set -Eeuo pipefail
 cd "$(dirname "$0")/.." || exit 2
@@ -105,6 +116,10 @@ SDK_ROOT="$FVM_HOME/default/bin/cache/dart-sdk"
 DART_BIN="$SDK_ROOT/bin/dart"
 CHECK_CMD="${DARTQ_CMD:-./target/release/dartq check --format=machine}"
 ANALYZE_CMD="${DARTQ_ANALYZE_CMD:-./target/release/dartq analyze --format=machine --sdk $SDK_ROOT}"
+# The orchestrator's own process group: kill_tree refuses to signal it (a
+# step probed inside its pre-setsid launch window would otherwise group-kill
+# the orchestrator itself).
+ORCH_PGID="$(ps -o pgid= -p $$ | tr -d ' ')"
 
 TAG="${SERIAL_TAG:+-${SERIAL_TAG}}"
 LBL_TREND="trend-w5${TAG}"
@@ -129,6 +144,15 @@ usage() {
 die() { # <message...>  usage/preflight error
   echo "serial-gates: $*" >&2
   exit 2
+}
+
+step_fail() { # <message...> — mid-chain guard failure: reported like any red
+  # step (the chain loop records FAIL(rc=2), aborts the rest and still
+  # prints the summary) instead of a bare exit that bypasses the summary.
+  echo "serial-gates: $*" >&2
+  WATCH_LOG=""
+  WATCH_PEAK_KB=0
+  return 2
 }
 
 is_step() { # <name>
@@ -211,60 +235,101 @@ selected() { # <step> -> 0 if the step runs in this invocation
     local seen=0 s
     for s in "${STEPS[@]}"; do
       [ "$s" = "$FROM_STEP" ] && seen=1
-      [ "$s" = "$1" ] && [ "$seen" = 1 ] && return 0
+      if [ "$s" = "$1" ] && [ "$seen" = 1 ]; then
+        # --skip applies in --from mode too (this branch used to return
+        # before consulting SKIP_LIST, silently running skipped steps).
+        ! in_list "$SKIP_LIST" "$1"
+        return
+      fi
     done
     return 1
   fi
   ! in_list "$SKIP_LIST" "$1"
 }
 
+# An empty selection (--from X --skip X, or a --skip that empties --only)
+# must die here, not fall through to a triumphant "CHAIN PASSED".
+pending_steps=0
+for s in "${STEPS[@]}"; do
+  if selected "$s"; then pending_steps=$((pending_steps + 1)); fi
+done
+[ "$pending_steps" -gt 0 ] || die "empty selection: --from/--only/--skip combine to zero steps — nothing to run"
+
 # --- watchdog (vendored; self-contained, no /tmp dependency) ------------------
 
 WATCH_PEAK_KB=0
 WATCH_LOG=""
+CURRENT_STEP_PID="" # pid of the running step (own session); "" when idle
 
-kill_tree() { # <pid> — kill the step's whole descendant tree, not its group
-  local child
-  for child in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$child"; done
-  kill -9 "$1" 2>/dev/null || true
+kill_tree() { # <pid> — SIGKILL the step's whole tree. Every step runs in its
+  # own session (setsid launch below), so its process group is exactly its
+  # descendant tree and a group kill is exact — the orchestrator and every
+  # other step sit outside it. One re-kill ~200 ms later catches a
+  # descendant forked between the first kill's group scan and delivery: it
+  # inherits the group after the sweep and would otherwise outlive its
+  # killed parent.
+  local pid="$1" pgid
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [ -n "$pgid" ] || return 0
+  if [ "$pgid" = "$ORCH_PGID" ]; then
+    # Pre-setsid launch window: never signal our own group.
+    kill -9 "$pid" 2>/dev/null || true
+    return 0
+  fi
+  kill -9 "-$pgid" 2>/dev/null || true
+  sleep 0.2
+  kill -9 "-$pgid" 2>/dev/null || true
 }
 
+reap_current_step() { # EXIT/INT/TERM safety net: a step sits in its own
+  # session, so an orchestrator death mid-step would otherwise leave it
+  # running orphaned with nobody watching its RSS.
+  if [ -n "${CURRENT_STEP_PID:-}" ] && kill -0 "$CURRENT_STEP_PID" 2>/dev/null; then
+    kill_tree "$CURRENT_STEP_PID"
+  fi
+}
+trap reap_current_step EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 watchdog_run() { # <name> <rss_limit_kb> <cmd...> — sets WATCH_PEAK_KB, WATCH_LOG
-  local name="$1" limit="$2"
+  local name="$1" limit="$2" pgid rss max=0 rc=0
   shift 2
   WATCH_LOG="/tmp/serial_${name}.log"
   WATCH_PEAK_KB=0
   : >"$WATCH_LOG"
-  (
-    "$@" >>"$WATCH_LOG" 2>&1
-    printf 'exit=%s\n' "$?" >>"$WATCH_LOG"
-  ) &
-  local runner=$! max=0 rss pgid
-  while kill -0 "$runner" 2>/dev/null; do
-    pgid="$(ps -o pgid= -p "$runner" 2>/dev/null | tr -d ' ')"
+  # Own session per step: perl ships with macOS and bash 3.2 has no setsid.
+  # setsid makes the child a session leader (group id == its own pid), so
+  # the RSS poll below sums this step alone — never the orchestrator, never
+  # a previous step's orphans. exec keeps the pid, so the code waited on is
+  # the command's own. The brief pre-setsid window can only sum the tiny
+  # orchestrator group — far below any cap, never a false kill.
+  perl -MPOSIX -e 'setsid; exec @ARGV' -- "$@" >>"$WATCH_LOG" 2>&1 &
+  CURRENT_STEP_PID=$!
+  while kill -0 "$CURRENT_STEP_PID" 2>/dev/null; do
+    pgid="$(ps -o pgid= -p "$CURRENT_STEP_PID" 2>/dev/null | tr -d ' ')"
     rss=0
     if [ -n "$pgid" ]; then
       rss="$(ps -axo rss=,pgid= 2>/dev/null | awk -v g="$pgid" '$2==g {s+=$1} END {print s+0}')"
     fi
     if [ "$rss" -gt "$max" ]; then max="$rss"; fi
     if [ "$rss" -gt "$limit" ]; then
-      kill_tree "$runner"
+      kill_tree "$CURRENT_STEP_PID"
       printf 'WATCHDOG_KILL rss=%sKB limit=%sKB\n' "$rss" "$limit" >>"$WATCH_LOG"
       break
     fi
     sleep 5
   done
-  wait "$runner" 2>/dev/null || true
+  wait "$CURRENT_STEP_PID" 2>/dev/null || rc=$?
+  CURRENT_STEP_PID=""
+  printf 'exit=%s\n' "$rc" >>"$WATCH_LOG"
   WATCH_PEAK_KB="$max"
   # Kill-exit propagation (the /tmp original never propagated a breach): a
-  # watchdog kill or a missing exit line is a failure regardless of status.
+  # watchdog kill is a failure regardless of the reaped status.
   if grep -q '^WATCHDOG_KILL' "$WATCH_LOG"; then
     return 1
   fi
-  local exit_line
-  exit_line="$(sed -n 's/^exit=//p' "$WATCH_LOG" | tail -1)"
-  [ -n "$exit_line" ] || return 1
-  return "$exit_line"
+  return "$rc"
 }
 
 # --- preflight ----------------------------------------------------------------
@@ -276,7 +341,7 @@ check_corpus() { # <corpus-dir>
 
 preflight() {
   command -v jq >/dev/null 2>&1 || die "jq is required by the differential gates (brew install jq)"
-  local need_dart=0 need_release=0 need_debug=0 s
+  local need_dart=0 need_release=0 need_debug=0 count s
   for s in "${STEPS[@]}"; do
     selected "$s" || continue
     case "$s" in
@@ -295,10 +360,27 @@ preflight() {
       ;;
     m1-r5) check_corpus tests/corpus/m1-semantic ;;
     m3-r1) check_corpus tests/corpus/m3-unused ;;
+    trend-w5-B)
+      # The union universe is pinned (m0-gate contract) — drift surfaces
+      # here, not at the trend-w5-B step.
+      count="$(compose_union | wc -l | tr -d ' ')" ||
+        die "union composition failed (are the corpus code lists readable?)"
+      [ "$count" -eq "$EXPECTED_UNION_COUNT" ] ||
+        die "union code universe drifted: expected $EXPECTED_UNION_COUNT = 255 + 36 - 1 overlap, found $count (m0-gate pins this exact universe)"
+      ;;
     esac
   done
   if [ "$need_dart" = 1 ] && [ ! -x "$DART_BIN" ]; then
     die "fvm default dart not found at $DART_BIN (install the fvm default pin or set FVM_HOME)"
+  fi
+  # The repro gate refuses a dirty tracked tree — surface that BEFORE the
+  # hours of work, not at the repro step (the plan's worktree note stays).
+  if selected repro && [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    die "the repro step is selected but the tracked tree is dirty — commit the tracked waves first (repro-gate would refuse at the repro step, stranding the chain's evidence)"
+  fi
+  # Fail-closed tool probe, the coverage-gate.sh preflight contract.
+  if selected coverage && ! cargo llvm-cov --version >/dev/null 2>&1; then
+    die "cargo-llvm-cov is not installed; the coverage step cannot run (install once: cargo install cargo-llvm-cov --locked; also required: rustup component add llvm-tools-preview)"
   fi
   if [ "$need_release" = 1 ] && [ ! -x "./target/release/harness" ]; then
     echo "serial-gates: NOTE ./target/release/harness missing — release-rebuild provides it" >&2
@@ -331,9 +413,9 @@ trend_run() { # <syntax|union>
     outdir="$M0_OUT_ROOT/$LBL_TREND-union"
   fi
   trend_guard "$outdir"
-  [ -x ./target/release/harness ] || die "./target/release/harness not found — release-rebuild first (cargo build --release -p dartq-cli -p harness)"
-  [ -x "$DART_BIN" ] || die "fvm default dart not found at $DART_BIN"
-  case "$CHECK_CMD $ANALYZE_CMD" in *"./target/release/dartq"*) [ -x ./target/release/dartq ] || die "./target/release/dartq not found — release-rebuild first" ;; esac
+  [ -x ./target/release/harness ] || step_fail "./target/release/harness not found — release-rebuild first (cargo build --release -p dartq-cli -p harness)"
+  [ -x "$DART_BIN" ] || step_fail "fvm default dart not found at $DART_BIN"
+  case "$CHECK_CMD $ANALYZE_CMD" in *"./target/release/dartq"*) [ -x ./target/release/dartq ] || step_fail "./target/release/dartq not found — release-rebuild first" ;; esac
 
   harness_args=(
     run
@@ -356,7 +438,7 @@ trend_run() { # <syntax|union>
     local count
     count="$(wc -l <"$UNION_CODES" | tr -d ' ')"
     [ "$count" -eq "$EXPECTED_UNION_COUNT" ] ||
-      die "union code universe drifted: expected $EXPECTED_UNION_COUNT = 255 + 36 - 1 overlap, found $count (m0-gate pins this exact universe)"
+      step_fail "union code universe drifted: expected $EXPECTED_UNION_COUNT = 255 + 36 - 1 overlap, found $count (m0-gate pins this exact universe)"
     watchdog_run "trend-w5-B${TAG}" "$(cap_for_step trend-w5-B)" \
       ./target/release/harness "${harness_args[@]}" \
       --dartq-cmd "$ANALYZE_CMD" \
@@ -366,8 +448,8 @@ trend_run() { # <syntax|union>
 
 mega_run() { # perf + parity: 1k oracle leg (parity) + scale run (perf)
   local scale="${SERIAL_MEGA_SCALE:-10k}"
-  case "$scale" in 1k | 10k | 100k | all) ;; *) die "SERIAL_MEGA_SCALE must be 1k|10k|100k|all, got '$scale'" ;; esac
-  [ -x ./target/debug/harness ] || die "./target/debug/harness not found — debug-rebuild first"
+  case "$scale" in 1k | 10k | 100k | all) ;; *) step_fail "SERIAL_MEGA_SCALE must be 1k|10k|100k|all, got '$scale'" ;; esac
+  [ -x ./target/debug/harness ] || step_fail "./target/debug/harness not found — debug-rebuild first"
   if [ "${SERIAL_MEGA_ORACLE_LEG:-1}" = 1 ]; then
     watchdog_run "mega-r1-oracleleg${TAG}" "$MEGA_CAP_KB" \
       scripts/mega-run.sh --scale 1k --oracle-leg --strict --label "${LBL_MEGA}-oracleleg" || return 1
@@ -484,18 +566,33 @@ for s in "${STEPS[@]}"; do
   wall=$(($(date +%s) - t0))
   STEP_WALL[$i]="$(fmt_wall "$wall")"
   STEP_PEAK[$i]="$(fmt_mb "${WATCH_PEAK_KB:-0}")"
-  STEP_LOG[$i]="${WATCH_LOG:-/tmp/serial_${s}${TAG}.log}"
+  if [ -n "$WATCH_LOG" ]; then STEP_LOG[$i]="$WATCH_LOG"; else STEP_LOG[$i]="-"; fi
   if [ "$rc" -eq 0 ]; then
     STEP_STATUS[$i]="PASS"
     echo "-- [$s] PASS (wall $(fmt_wall "$wall"), peak $(fmt_mb "${WATCH_PEAK_KB:-0}"), log ${STEP_LOG[$i]})"
   else
-    if grep -q '^WATCHDOG_KILL' "${STEP_LOG[$i]}" 2>/dev/null; then
+    # "-" log = a step_fail guard fired before this step started a watchdog
+    # run; the log greps must be skipped (a bare "-" file argument would
+    # read stdin and hang).
+    if [ "${STEP_LOG[$i]}" != "-" ] && grep -q '^WATCHDOG_KILL' "${STEP_LOG[$i]}" 2>/dev/null; then
       STEP_STATUS[$i]="KILLED"
       echo "-- [$s] KILLED by the RSS watchdog (log ${STEP_LOG[$i]})" >&2
     else
       STEP_STATUS[$i]="FAIL(rc=$rc)"
       echo "-- [$s] FAILED (exit $rc, log ${STEP_LOG[$i]})" >&2
-      tail -20 "${STEP_LOG[$i]}" 2>/dev/null | sed 's/^/  | /' >&2 || true
+      if [ "${STEP_LOG[$i]}" != "-" ]; then
+        tail -20 "${STEP_LOG[$i]}" 2>/dev/null | sed 's/^/  | /' >&2 || true
+      fi
+    fi
+    # Preserve the failing run's log: /tmp is ephemeral and the next rerun
+    # overwrites the same path, so the failure evidence lands next to the
+    # recorded gate evidence (docs/audits is untracked).
+    if [ -f "${STEP_LOG[$i]}" ]; then
+      archive_dir="docs/audits/serial/$s${TAG}"
+      if mkdir -p "$archive_dir" 2>/dev/null && cp "${STEP_LOG[$i]}" "$archive_dir/" 2>/dev/null; then
+        echo "-- [$s] log archived to $archive_dir/$(basename "${STEP_LOG[$i]}")" >&2
+        STEP_LOG[$i]="${STEP_LOG[$i]} -> $archive_dir/"
+      fi
     fi
     failed_step="$s"
     break

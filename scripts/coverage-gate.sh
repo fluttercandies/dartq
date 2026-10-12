@@ -126,8 +126,9 @@
 #                   passes; pass/fail on the run-to-run stability of the
 #                   TOTAL coverage percentage (identical aggregate
 #                   lines-hit/lines-total = reproducible). Floors do not
-#                   apply. Must precede --html (see below). Mutually
-#                   exclusive with --report.
+#                   apply (--enforce/--floor/--floors are rejected). Must
+#                   precede --html (see below). Mutually exclusive with
+#                   --report.
 #   --html         write the browsable HTML report under target/coverage/html
 #                  instead of the lcov pass; prints the report pointer,
 #                  evaluates no gate. With --stability: an additional third
@@ -148,6 +149,12 @@
 # floors table, missing tool, failed coverage run, or unreadable report.
 
 set -euo pipefail
+
+# Byte-identical stability-summary contract: pin the locale process-wide so
+# sort order, awk decimal points and diff output are independent of the
+# invoking shell/environment (the per-call LC_ALL=C pins stay as
+# belt-and-braces).
+export LC_ALL=C
 
 # Coverage builds are isolated from the shared target/ (rationale in the
 # target-dir isolation section of the header): instrumented binaries must
@@ -193,7 +200,11 @@ while [ $# -gt 0 ]; do
       [ "$MODE" = "run" ] || { echo "coverage-gate: --enforce does not apply to $MODE mode (no floors gate evaluated)" >&2; exit 2; }
       ENFORCE=1; shift ;;
     --stability)
-      [ "$MODE" = "run" ] || { echo "coverage-gate: --stability cannot be combined with --html or --report" >&2; exit 2; }
+      if [ "$MODE" = "html" ]; then
+        echo "coverage-gate: --stability must precede --html to compose the post-pair html pass (use: --stability --html)" >&2
+        exit 2
+      fi
+      [ "$MODE" = "run" ] || { echo "coverage-gate: --stability cannot be combined with --report" >&2; exit 2; }
       MODE="stability"; shift ;;
     --output)
       [ $# -ge 2 ] || { echo "coverage-gate: --output needs a value" >&2; exit 2; }
@@ -216,6 +227,17 @@ while [ $# -gt 0 ]; do
       echo "coverage-gate: unknown argument: $1 (see --help)" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+# Post-parse mode coherence: the per-flag guards above run before MODE is
+# switched, so `--enforce --stability` passes them, validates the floors
+# config and then silently skips the floors gate. Stability mode judges
+# run-to-run stability only — floor policy and enforcement are rejected.
+if [ "$MODE" = "stability" ]; then
+  if [ "$ENFORCE" = 1 ] || [ "$FLOOR_EXPLICIT" = 1 ] || [ -n "$FLOORS" ]; then
+    echo "coverage-gate: --stability runs the two-run reproducibility protocol; --enforce/--floor/--floors do not apply" >&2
+    exit 2
+  fi
+fi
 
 case "$FLOOR" in
   ''|*[!0-9.]*|*.*.*) echo "coverage-gate: --floor must be a number in 0-100, got: $FLOOR" >&2; exit 2 ;;
