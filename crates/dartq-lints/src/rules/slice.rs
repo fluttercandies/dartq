@@ -351,6 +351,69 @@ pub(crate) fn receiver_implements_any(
     receiver_faces(c, pieces, name).is_none_or(|faces| faces & required != 0)
 }
 
+/// The core-family bit of a written type name: dart:core's `Iterable`
+/// implementers (`Iterable`, `List`, `Set`, and dart:collection's `Queue`,
+/// whose unshadowed written spelling resolves there), `String`, and the
+/// map family (never in a receiver family — a written `Map` answers `MAP`,
+/// which no rule's mask requests).
+fn written_family_bits(name: &str) -> u8 {
+    match name {
+        "Iterable" | "List" | "Set" | "Queue" => ITERABLE,
+        "String" => STRING,
+        "Map" | "LinkedHashMap" | "LinkedHashSet" => MAP,
+        _ => 0,
+    }
+}
+
+/// The receiver's bare-identifier row when the receiver is a plain name
+/// (the tear-off group face [`is_tear_off_group`] proves): `None` for any
+/// other receiver shape — a member chain, a call, a literal (literals read
+/// through [`receiver_faces`]).
+pub(crate) fn bare_receiver(c: &Check<'_>, pieces: &[u32], name: usize) -> Option<u32> {
+    let mut i = name.checked_sub(1)?;
+    while matches!(
+        c.kind(pieces[i]),
+        NodeKind::NoTypeArguments | NodeKind::TypeArguments
+    ) {
+        i = i.checked_sub(1)?;
+    }
+    if i >= 3 && is_tear_off_group(c, pieces, i - 3) {
+        return Some(pieces[i - 3]);
+    }
+    None
+}
+
+/// The resolution-backed receiver verdict the typed-receiver rules share
+/// (`prefer_contains` :143-149, `prefer_iterable_whereType` :40-41 — the
+/// official reads the receiver's static type and BAILS when it cannot):
+/// literal receivers decide closed through [`receiver_faces`]; a
+/// bare-identifier receiver resolves its written type over the same-file
+/// channel (the innermost binding — locals shadow fields, fields shadow
+/// nothing else) and must land on `required`; an unshadowed written family
+/// name is the library type. Any other shape — a member chain, an untyped
+/// (`var`) binding, an import-only name — carries no verdict and answers
+/// `None`, which the caller keeps silent (the official's
+/// unresolvable-receiver face).
+pub(crate) fn resolved_receiver_family(
+    c: &Check<'_>,
+    pieces: &[u32],
+    name: usize,
+    required: u8,
+) -> Option<bool> {
+    if let Some(faces) = receiver_faces(c, pieces, name) {
+        return Some(faces & required != 0);
+    }
+    let row = bare_receiver(c, pieces, name)?;
+    let receiver_name = c.lexeme(c.head_token(row));
+    let written = crate::rules::expressions::same_file::written_type(c, row, receiver_name)?;
+    if crate::rules::expressions::same_file::declares_name(c, written) {
+        // A same-file declaration owns the name — the written family
+        // spelling is not the core type.
+        return Some(false);
+    }
+    Some(written_family_bits(written) & required != 0)
+}
+
 /// The index of the member-name piece a trailing access marker names: an
 /// invocation's selector identifier shares the marker's head token; a bare
 /// property access has no selector row (the member name lives only on the

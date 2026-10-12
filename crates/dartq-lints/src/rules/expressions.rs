@@ -754,13 +754,14 @@ pub(crate) mod prefer_contains {
     /// (`_checkConstant`, :73-124): the rewrite (`==`/`!=`/`<=`/`>` at -1,
     /// `>=`/`<` at 0), the always-false and always-true judgments.
     ///
-    /// The receiver type check (`implementsAnyInterface([Iterable, String])`,
-    /// :145-149) reads through the shared literal face
-    /// ([`slice::implements_any`]) — string and collection literals decide,
-    /// an opaque receiver keeps the documented presumption (a user class
-    /// with an `indexOf` member over-reports). `getIntValue` reads int
-    /// literal pieces (decimal/hex, separators, a `-` prefix), so constant
-    /// expressions (`const k = -1`) under-report. Message: `diagnostic.g.dart`
+    /// The receiver type check (:143-149) reads through the shared
+    /// resolution-backed face ([`slice::resolved_receiver_family`]) —
+    /// string and collection literals decide, a bare-identifier receiver
+    /// resolves its written type and must land in the `Iterable`/`String`
+    /// family, and anything else stays silent like the official
+    /// `parentType == null` bail. `getIntValue` reads int literal pieces
+    /// (decimal/hex, separators, a `-` prefix), so constant expressions
+    /// (`const k = -1`) under-report. Message: `diagnostic.g.dart`
     /// `preferContainsUseContains`/`preferContainsAlwaysFalse`/`preferContainsAlwaysTrue`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_contains",
@@ -938,8 +939,11 @@ pub(crate) mod prefer_contains {
         {
             return false;
         }
-        // The receiver type check (:145-149).
-        if !slice::receiver_implements_any(c, pieces, head, slice::ITERABLE | slice::STRING) {
+        // The receiver type check (:143-149): `parentType == null` bails —
+        // a receiver without a same-file verdict stays silent.
+        if slice::resolved_receiver_family(c, pieces, head, slice::ITERABLE | slice::STRING)
+            != Some(true)
+        {
             return false;
         }
         // A two-argument form must pass start index 0 (:152-155).
@@ -1623,12 +1627,30 @@ pub(crate) mod same_file {
         }
     }
 
-    /// The written type of the identifier `use` bound to `name`: the
-    /// innermost local/parameter/field/top-level declaration carrying an
-    /// explicit type. Untyped bindings (`var`, patterns, for-in) return
-    /// `None` — the caller falls back.
+    /// The scope family of the innermost same-file value binding.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum BindingScope {
+        /// A local declared in a block before the use.
+        Local,
+        /// A formal parameter of the enclosing function.
+        Parameter,
+        /// An instance field of the enclosing class-like scope.
+        Field,
+        /// A top-level variable.
+        TopLevel,
+    }
+
+    /// The innermost value binding of `name` at use site `use_node`:
+    /// `(scope, written type row)` — the row `None` for an untyped binding,
+    /// the lookup `None` when no same-file binding exists. The order is
+    /// identifier resolution: locals declared before the use, parameters,
+    /// instance fields, top-level variables.
     #[must_use]
-    pub fn written_type<'a>(c: &Check<'a>, use_node: u32, name: &str) -> Option<&'a str> {
+    pub(crate) fn binding(
+        c: &Check<'_>,
+        use_node: u32,
+        name: &str,
+    ) -> Option<(BindingScope, Option<u32>)> {
         let use_start = c.byte_span(use_node).start;
         let len = c.path.len();
         for i in (0..len.saturating_sub(1)).rev() {
@@ -1637,13 +1659,13 @@ pub(crate) mod same_file {
                 // The production tiling keeps a block's statements flat in
                 // the owner slice — locals precede the use as pieces.
                 NodeKind::Block | NodeKind::BlockBody => {
-                    if let Some(t) = block_binding_type(c, ancestor, use_start, name) {
-                        return Some(t);
+                    if let Some(row) = block_binding(c, ancestor, use_start, name) {
+                        return Some((BindingScope::Local, row));
                     }
                 }
                 NodeKind::FormalParameters => {
-                    if let Some(t) = parameter_type(c, ancestor, name) {
-                        return Some(t);
+                    if let Some(row) = parameter_binding(c, ancestor, name) {
+                        return Some((BindingScope::Parameter, row));
                     }
                 }
                 // Class-member fields and the member's own parameters: the
@@ -1663,17 +1685,17 @@ pub(crate) mod same_file {
                         .collect_direct(ancestor)
                         .into_iter()
                         .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
-                        && let Some(t) = parameter_type(c, params, name)
+                        && let Some(row) = parameter_binding(c, params, name)
                     {
-                        return Some(t);
+                        return Some((BindingScope::Parameter, row));
                     }
-                    if let Some(t) = field_type(c, c.path[i - 1], name) {
-                        return Some(t);
+                    if let Some(row) = field_binding(c, c.path[i - 1], name) {
+                        return Some((BindingScope::Field, row));
                     }
                 }
                 NodeKind::CompilationUnit => {
-                    if let Some(t) = top_level_field_type(c, ancestor, name) {
-                        return Some(t);
+                    if let Some(row) = top_level_field_binding(c, ancestor, name) {
+                        return Some((BindingScope::TopLevel, row));
                     }
                 }
                 _ => {}
@@ -1682,30 +1704,118 @@ pub(crate) mod same_file {
         None
     }
 
+    /// The initializer range of the innermost `const` LOCAL binding of
+    /// `name` at use site `use_node`, `None` when the name binds to no
+    /// const local before the use (or carries no initializer). The
+    /// scope chain is the block walk of [`binding`]: innermost block
+    /// first, shadowing wins. (`binding` answers the same lookup for the
+    /// written type; this face keeps the initializer for the constant-
+    /// value fold the type-literal test needs.)
+    #[must_use]
+    pub(crate) fn local_const_initializer(
+        c: &Check<'_>,
+        use_node: u32,
+        name: &str,
+    ) -> Option<core::ops::Range<u32>> {
+        let use_start = c.byte_span(use_node).start;
+        let len = c.path.len();
+        let ctx = dartq_parser::IdentifierContext::LocalVariableDeclaration as u32;
+        for i in (0..len.saturating_sub(1)).rev() {
+            let ancestor = c.path[i];
+            if !matches!(c.kind(ancestor), NodeKind::Block | NodeKind::BlockBody) {
+                continue;
+            }
+            // The innermost block declaring the name decides — a non-const
+            // binding there shadows any outer const.
+            for kid in c.collect_direct(ancestor) {
+                if c.kind(kid) != NodeKind::VariablesDeclaration {
+                    continue;
+                }
+                for var in c
+                    .collect_direct(kid)
+                    .into_iter()
+                    .filter(|&var| c.kind(var) == NodeKind::InitializedIdentifier)
+                {
+                    // The name: nested inside the row (hand-built trees), or
+                    // the production tiling — the name `Identifier` is a
+                    // direct child of the declaration row and anchors the
+                    // `InitializedIdentifier` row at the same token, so the
+                    // row's span head is the name.
+                    let binds = c.collect_direct(var).into_iter().any(|piece| {
+                        c.kind(piece) == NodeKind::Identifier
+                            && c.payload(piece).first() == Some(&ctx)
+                            && c.lexeme(c.head_token(piece)) == name
+                            && c.byte_span(piece).start < use_start
+                    }) || (crate::rules::initialized_identifier_name(c, var)
+                        .is_some_and(|tok| c.lexeme(tok) == name)
+                        && c.byte_span(var).start < use_start);
+                    if binds
+                        && let Some(name_row) = crate::rules::initialized_identifier_name(c, var)
+                        && c.lexeme(name_row) == name
+                    {
+                        let const_kw = crate::rules::variables_declaration_keyword(c, kid)
+                            .is_some_and(|kw| c.lexeme(kw) == "const");
+                        return const_kw.then(|| {
+                            crate::rules::flow::exhaustive_cases::initializer_range(c, var)
+                        })?;
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The written type of the identifier `use` bound to `name`: the
+    /// innermost local/parameter/field/top-level declaration carrying an
+    /// explicit type. Untyped bindings (`var`, patterns, for-in) return
+    /// `None` — the caller falls back.
+    #[must_use]
+    pub fn written_type<'a>(c: &'a Check<'a>, use_node: u32, name: &str) -> Option<&'a str> {
+        let row = binding(c, use_node, name)?.1?;
+        Some(c.lexeme(c.head_token(row)))
+    }
+
+    /// Whether any same-file type declaration (class-like or typedef)
+    /// carries `name` — the type-namespace half of [`declares_name`].
+    #[must_use]
+    pub(crate) fn declares_type(c: &Check<'_>, name: &str) -> bool {
+        scan(c).has_type(c, name)
+    }
+
     /// The explicit type of a local declared in `block` before `use_start`.
     /// The production shape: the name identifier carries the local-variable
     /// context word inside its `VariablesDeclaration` slice, typed by the
     /// nearest preceding `Type` piece.
-    fn block_binding_type<'a>(
-        c: &Check<'a>,
+    fn block_binding(
+        c: &Check<'_>,
         block: u32,
         use_start: usize,
         name: &str,
-    ) -> Option<&'a str> {
+    ) -> Option<Option<u32>> {
         let ctx = dartq_parser::IdentifierContext::LocalVariableDeclaration as u32;
-        let mut written: Option<&'a str> = None;
+        let mut written: Option<u32> = None;
         for kid in c.collect_direct(block) {
             match c.kind(kid) {
-                NodeKind::Type => written = Some(c.lexeme(c.head_token(kid))),
+                NodeKind::Type => written = Some(kid),
                 NodeKind::VariablesDeclaration => {
+                    // The name identifier: a direct child (hand-built trees)
+                    // or nested inside an `InitializedIdentifier` row (the
+                    // production declaration tiling).
                     let binds = c.collect_direct(kid).into_iter().any(|var| {
-                        c.kind(var) == NodeKind::Identifier
+                        (c.kind(var) == NodeKind::Identifier
                             && c.payload(var).first() == Some(&ctx)
                             && c.lexeme(c.head_token(var)) == name
-                            && c.byte_span(var).start < use_start
+                            && c.byte_span(var).start < use_start)
+                            || (c.kind(var) == NodeKind::InitializedIdentifier
+                                && c.collect_direct(var).into_iter().any(|piece| {
+                                    c.kind(piece) == NodeKind::Identifier
+                                        && c.payload(piece).first() == Some(&ctx)
+                                        && c.lexeme(c.head_token(piece)) == name
+                                        && c.byte_span(piece).start < use_start
+                                }))
                     });
                     if binds {
-                        return written;
+                        return Some(written);
                     }
                 }
                 _ => {}
@@ -1715,7 +1825,7 @@ pub(crate) mod same_file {
     }
 
     /// The explicit type of a formal parameter.
-    fn parameter_type<'a>(c: &Check<'a>, params: u32, name: &str) -> Option<&'a str> {
+    fn parameter_binding(c: &Check<'_>, params: u32, name: &str) -> Option<Option<u32>> {
         for kid in c.collect_direct(params) {
             if c.kind(kid) != NodeKind::FormalParameter {
                 continue;
@@ -1729,38 +1839,38 @@ pub(crate) mod same_file {
             if !named {
                 continue;
             }
-            return c
-                .collect_direct(kid)
-                .into_iter()
-                .find(|&t| c.kind(t) == NodeKind::Type)
-                .map(|t| c.lexeme(c.head_token(t)));
+            return Some(
+                c.collect_direct(kid)
+                    .into_iter()
+                    .find(|&t| c.kind(t) == NodeKind::Type),
+            );
         }
         None
     }
 
     /// The explicit type of an instance field declared in the owner body.
-    fn field_type<'a>(c: &Check<'a>, owner: u32, name: &str) -> Option<&'a str> {
+    fn field_binding(c: &Check<'_>, owner: u32, name: &str) -> Option<Option<u32>> {
         for member in c.collect_direct(owner) {
             if c.kind(member) != NodeKind::Fields
                 || dartq_ast::mod_flags(c.unit.ast, member) & STATIC_BIT != 0
             {
                 continue;
             }
-            if let Some(t) = fields_type(c, member, name) {
-                return Some(t);
+            if let Some(row) = fields_binding(c, member, name) {
+                return Some(row);
             }
         }
         None
     }
 
     /// The explicit type of a top-level variable.
-    fn top_level_field_type<'a>(c: &Check<'a>, unit: u32, name: &str) -> Option<&'a str> {
+    fn top_level_field_binding(c: &Check<'_>, unit: u32, name: &str) -> Option<Option<u32>> {
         for top in c.collect_direct(unit) {
             for inner in c.collect_direct(top) {
                 if c.kind(inner) == NodeKind::TopLevelFields
-                    && let Some(t) = fields_type(c, inner, name)
+                    && let Some(row) = fields_binding(c, inner, name)
                 {
-                    return Some(t);
+                    return Some(row);
                 }
             }
         }
@@ -1770,21 +1880,21 @@ pub(crate) mod same_file {
     /// Shared `Fields` scan: the name identifiers carry the field context
     /// (a written type is a `TypeReference` identifier), and the type head
     /// precedes each name among the children.
-    fn fields_type<'a>(c: &Check<'a>, fields: u32, name: &str) -> Option<&'a str> {
+    fn fields_binding(c: &Check<'_>, fields: u32, name: &str) -> Option<Option<u32>> {
         let ctx = if c.kind(fields) == NodeKind::TopLevelFields {
             dartq_parser::IdentifierContext::TopLevelVariableDeclaration as u32
         } else {
             dartq_parser::IdentifierContext::FieldDeclaration as u32
         };
-        let mut written: Option<&'a str> = None;
+        let mut written: Option<u32> = None;
         for kid in c.collect_direct(fields) {
             match c.kind(kid) {
-                NodeKind::Type => written = Some(c.lexeme(c.head_token(kid))),
+                NodeKind::Type => written = Some(kid),
                 NodeKind::Identifier
                     if c.payload(kid).first() == Some(&ctx)
                         && c.lexeme(c.head_token(kid)) == name =>
                 {
-                    return written;
+                    return Some(written);
                 }
                 _ => {}
             }
@@ -4605,9 +4715,49 @@ mod tests {
             "a map literal is outside [Iterable, String]"
         );
 
-        // An opaque receiver keeps the documented presumption.
+        // A typed-parameter receiver resolves into the family.
         let f = Fixture::parse("void f(List<int> xs) { xs.indexOf(1) == -1; }");
         assert_eq!(f.run(&one_rule("prefer_contains")).len(), 1);
+    }
+
+    /// The typed-receiver gate (:143-149): a receiver without a same-file
+    /// verdict — an untyped parameter, a user-class parameter, a same-file
+    /// class owning the written `List` name — stays silent like the
+    /// official `parentType == null`/interface-miss faces (the converted
+    /// dartq-only over-report; the oracle probe confirms `g(x)`/`h(User)`
+    /// stay silent and `f(List<int>)` reports).
+    #[test]
+    fn contains_unresolved_receivers_stay_silent() {
+        let f = Fixture::parse("void g(x) { if (x.indexOf(1) == -1) { print(0); } }");
+        assert!(f.run(&one_rule("prefer_contains")).is_empty());
+
+        let f = Fixture::parse(
+            r#"
+class User {
+  int indexOf(Object e, [int s = 0]) => 0;
+}
+
+void h(User u) {
+  if (u.indexOf(1) == -1) {
+    print(0);
+  }
+}
+"#,
+        );
+        assert!(f.run(&one_rule("prefer_contains")).is_empty());
+
+        let f = Fixture::parse(
+            r#"
+class List {}
+
+void k(List<int> xs) {
+  if (xs.indexOf(1) == -1) {
+    print(0);
+  }
+}
+"#,
+        );
+        assert!(f.run(&one_rule("prefer_contains")).is_empty());
     }
 
     // —— unnecessary_const ————————————————————————————————————————————————

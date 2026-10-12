@@ -206,7 +206,13 @@ pub(crate) struct RunCaches {
 /// ancestor), so the walk extracts *direct* children with the subtree-tiling
 /// scan in [`push_direct`]: a child's whole subtree occupies
 /// `[children(child).start, child]`, contiguous, ending at the child
-/// itself — the next direct sibling starts right after.
+/// itself — the next direct sibling starts right after. The one production
+/// exception is the switch-member window (the bridge snapshots the segment
+/// start before the previous member seals, so each member's window starts AT
+/// that member's arena row); [`tile_direct`] canonicalizes it: the block
+/// level pushes the jump-landed member and skips its subtree, the borrowing
+/// member skips the snapped row, and every row still dispatches exactly
+/// once.
 #[must_use]
 pub fn run(unit: &Unit<'_>, enabled: &EnableSet) -> Vec<Lint> {
     let root = match unit.ast.root() {
@@ -318,9 +324,9 @@ fn collect_wildcard(unit: &Unit<'_>, path: &[u32], out: &mut Vec<WildcardScope>)
 
 /// Pushes the direct children of `id` onto the work stack, last child first
 /// so pops yield source order. Direct children are read off the completion
-/// window by the subtree tiling: entries descend by whole subtrees, each
-/// subtree ending at the ancestor child itself. `scratch` is the run's
-/// shared buffer (the rules borrow it through `Check` between calls).
+/// window by the canonical subtree tiling ([`tile_direct`]). `scratch` is
+/// the run's shared buffer (the rules borrow it through `Check` between
+/// calls).
 fn push_direct(
     ast: &SyntaxTable,
     id: u32,
@@ -329,17 +335,78 @@ fn push_direct(
     depth: usize,
 ) {
     let mut scratch = scratch.borrow_mut();
-    scratch.clear();
+    tile_direct(ast, id, &mut scratch);
+    // Descending (last child first); pushed as-is, the last push is the
+    // first child, so pops yield source order.
+    stack.extend(scratch.drain(..).map(|child| (child, depth)));
+}
+
+/// Tiles `id`'s completion window into its direct children, collecting them
+/// into `out` (cleared first) in descending arena order (top of the window
+/// first).
+///
+/// The plain reverse walk pushes each subtree root and jumps to
+/// `children(root).start`, relying on the tiling invariant: a child's whole
+/// subtree occupies `[children(child).start, child]`, contiguous, ending at
+/// the child itself. The switch-member windows break that invariant — the
+/// bridge snapshots the material segment before the previous member seals,
+/// so each member's window starts AT that member's arena row. Three repairs,
+/// keyed on the window start:
+///
+/// - the jump from a pushed child lands ON the previous member's row (a
+///   completed subtree root claimed as the child's own first entry). That
+///   row is this level's member: push it, then skip its subtree by
+///   descending its claimed left edge — pushing any further chained members
+///   the same way (member n's window starts at member n-1's row).
+/// - descending into a borrowing member, the snapped row sits at
+///   `window.start` with its claimed subtree poking below it: not this
+///   level's child (the block level pushed it) — skip it.
+/// - the first member's window starts one row into its material (the block
+///   head snapshot), leaving a head row claimed only by this level but
+///   parented inside the member's subtree: not this level's child either —
+///   it dispatches under its own parent chain within the member.
+///
+/// Rows at `window.start` are only ever *reached* by the decrement when one
+/// of the two head shapes sits there (a clean tiling ends at the bottom
+/// subtree's claimed start and the loop exits), so the head checks cost
+/// nothing on clean windows. For every other shape the two jump rules
+/// degenerate to the plain walk: the fire needs an unclean boundary (the
+/// landed row carries a claimed subtree) claimed by the pushed child itself,
+/// which the operand adoptions (`BinaryExpression`, `Assignment`,
+/// `ObjectPattern`, patterns) never produce — their segments start on a
+/// claimed-childless subtree bottom parented inside the operand.
+fn tile_direct(ast: &SyntaxTable, id: u32, out: &mut Vec<u32>) {
+    out.clear();
     let window = ast.children(id);
     let mut i = window.end;
     while i > window.start {
         i -= 1;
-        scratch.push(i);
-        i = ast.children(i).start;
+        if i == window.start && (ast.children(i).start < window.start || ast.parent(i) != Some(id))
+        {
+            // Head shape: dispatched through its own parent chain (or at
+            // the block level), never as this level's child.
+            i = ast.children(i).start;
+            continue;
+        }
+        out.push(i);
+        let mut s = ast.children(i).start;
+        if s > window.start && ast.children(s).start < s && ast.parent(s) == Some(i) {
+            // The jump-landed row is this level's member, not the pushed
+            // child's: push it and continue below its subtree.
+            out.push(s);
+            let mut member = s;
+            s = ast.children(s).start;
+            while s > window.start && ast.children(s).start < s {
+                if ast.parent(s) == Some(member) {
+                    // Member n-1, borrowed by member n the same way.
+                    out.push(s);
+                    member = s;
+                }
+                s = ast.children(s).start;
+            }
+        }
+        i = s;
     }
-    // Descending (last child first); pushed as-is, the last push is the
-    // first child, so pops yield source order.
-    stack.extend(scratch.drain(..).map(|child| (child, depth)));
 }
 
 /// Dispatches the rules registered for the path's last node.
@@ -402,17 +469,11 @@ pub struct Check<'a> {
     out: &'a mut Vec<Lint>,
 }
 
-/// Fills `buf` with the direct children of `id`, ascending, via the subtree
-/// tiling of the completion window (see [`run`]).
+/// Fills `buf` with the direct children of `id`, ascending, via the
+/// canonical subtree tiling of the completion window (see [`run`] and
+/// [`tile_direct`]).
 fn fill_direct(ast: &SyntaxTable, id: u32, buf: &mut Vec<u32>) {
-    buf.clear();
-    let window = ast.children(id);
-    let mut i = window.end;
-    while i > window.start {
-        i -= 1;
-        buf.push(i);
-        i = ast.children(i).start;
-    }
+    tile_direct(ast, id, buf);
     buf.reverse();
 }
 
@@ -634,6 +695,130 @@ mod tests {
     fn empty_enable_set_is_a_no_op() {
         let f = Fixture::build("if (b) ;", unit_of(|_, _| {}));
         assert!(f.run(&EnableSet::none()).is_empty());
+    }
+
+    /// Asserts the canonical dispatch set over the whole arena: walked from
+    /// the root through the tiling, every row is reached exactly once.
+    fn assert_exactly_once(ast: &SyntaxTable) {
+        let root = ast.root().expect("non-empty unit");
+        let mut kids = Vec::new();
+        let mut dispatched = vec![false; ast.len()];
+        let mut stack = vec![root];
+        dispatched[root as usize] = true;
+        let mut count = 1usize;
+        while let Some(node) = stack.pop() {
+            tile_direct(ast, node, &mut kids);
+            for &child in kids.iter() {
+                assert!(
+                    !dispatched[child as usize],
+                    "row {child} ({:?}) dispatched twice",
+                    ast.kind(child)
+                );
+                dispatched[child as usize] = true;
+                count += 1;
+                stack.push(child);
+            }
+        }
+        assert_eq!(count, ast.len(), "a row was never dispatched");
+    }
+
+    /// The switch-member windows dispatch canonically. `end_switch_case`
+    /// snapshots the next member's segment start on the previous member's
+    /// own arena row, so the plain tiling walk spills the first member's
+    /// body as block-level children and loses the member row. Pinned here:
+    /// the block level sees every member exactly once, the first member's
+    /// children are its case expression and body, the borrowing member's
+    /// children exclude the snapped row, and the whole arena tiles
+    /// exactly-once.
+    #[test]
+    fn switch_member_windows_tile_exactly_once() {
+        let f = Fixture::parse(
+            r#"
+void f(bool c) {
+  switch (c) {
+    case true:
+      continue L;
+    L:
+    case false:
+      print(1);
+  }
+}
+"#,
+        );
+        let ast = &f.ast;
+        let block = (0..ast.len() as u32)
+            .find(|&row| ast.kind(row) == NodeKind::SwitchBlock)
+            .expect("the fixture has a switch block");
+        let mut members = Vec::new();
+        fill_direct(ast, block, &mut members);
+        let kinds: Vec<NodeKind> = members.iter().map(|&row| ast.kind(row)).collect();
+        assert_eq!(kinds, [NodeKind::SwitchCase, NodeKind::SwitchCase]);
+        let [first, second] = members[..] else {
+            panic!("two members asserted above")
+        };
+        // The first member's children: its case expression and body — the
+        // rows the spill used to dispatch at block level.
+        let mut first_kids = Vec::new();
+        fill_direct(ast, first, &mut first_kids);
+        let first_kinds: Vec<NodeKind> = first_kids.iter().map(|&row| ast.kind(row)).collect();
+        assert_eq!(
+            first_kinds,
+            [
+                NodeKind::CaseExpression,
+                NodeKind::Identifier,
+                NodeKind::Continue
+            ]
+        );
+        // The second member's window starts at the first member's row: the
+        // tiling excludes that row and covers only the second member's own
+        // material (the `L:` label pair, the `false` case expression) and
+        // body.
+        let mut second_kids = Vec::new();
+        fill_direct(ast, second, &mut second_kids);
+        assert!(!second_kids.contains(&first), "{second_kids:?}");
+        assert_eq!(ast.kind(second_kids[0]), NodeKind::Identifier);
+        assert_eq!(
+            ast.kind(*second_kids.last().expect("non-empty")),
+            NodeKind::ExpressionStatement
+        );
+        assert_exactly_once(ast);
+    }
+
+    /// Three members chain the borrow (each member's window starts at the
+    /// one before it): the block level still sees all three in source order,
+    /// and the tiling stays exactly-once across the arena.
+    #[test]
+    fn three_member_switch_tiles_every_member() {
+        let f = Fixture::parse(
+            r#"
+void f(bool c) {
+  switch (c) {
+    case true:
+      print(1);
+    case false:
+      print(2);
+    default:
+      print(3);
+  }
+}
+"#,
+        );
+        let ast = &f.ast;
+        let block = (0..ast.len() as u32)
+            .find(|&row| ast.kind(row) == NodeKind::SwitchBlock)
+            .expect("the fixture has a switch block");
+        let mut members = Vec::new();
+        fill_direct(ast, block, &mut members);
+        let kinds: Vec<NodeKind> = members.iter().map(|&row| ast.kind(row)).collect();
+        assert_eq!(
+            kinds,
+            [
+                NodeKind::SwitchCase,
+                NodeKind::SwitchCase,
+                NodeKind::SwitchCase
+            ]
+        );
+        assert_exactly_once(ast);
     }
 
     #[test]

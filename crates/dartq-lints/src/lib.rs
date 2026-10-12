@@ -138,6 +138,17 @@
 //!   producer). Registered under a new [`Group::Diagnostic`] — not a
 //!   `package:lints` member, excluded from the default posture, opt-in by
 //!   name (90 specs).
+//! - approximation-conversion tranche (2026-10-12, exemption-reaudit
+//!   F2–F8): eight documented approximation faces replaced with the
+//!   official decisions over the same-file channel — `exhaustive_cases`
+//!   mounted on its enum-like seam (wave 4), the
+//!   `collection_methods_unrelated_type` index/`Queue` rows plus
+//!   shadow-correct receiver resolution, the typed-receiver gate on
+//!   `prefer_contains`/`prefer_iterable_whereType` (the official bails on
+//!   an unresolvable receiver), the forward member-label scope on
+//!   `control_flow_in_finally`, and the resolution-backed type-literal /
+//!   alias fold on `type_literal_in_constant_pattern`. The remaining
+//!   divergences are the import-resolution faces each module documents.
 //!
 //! With this tranche every `package:lints` member has a terminal state:
 //! implemented (84), or documented-blocked with the exact resolution fact it

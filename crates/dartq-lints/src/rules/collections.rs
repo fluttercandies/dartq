@@ -587,12 +587,16 @@ pub(crate) mod prefer_iterable_where_type {
     /// — `x.where((e) => e is T)` (or the single-return block form) reports
     /// at the method name.
     ///
-    /// The receiver type check (`implementsInterface('Iterable')`, :48-49)
-    /// reads through the shared literal face
-    /// ([`slice::receiver_implements_any`]) — collection literals decide (a
-    /// map literal stays silent like the official `Iterable`-only gate), an
-    /// opaque receiver keeps the documented presumption (a user class with a
-    /// `where` member over-reports). Message: `diagnostic.g.dart`
+    /// The receiver type check (`target.staticType.implementsInterface
+    /// ('Iterable')` with a `target == null` bail, :39-42) reads through
+    /// the shared resolution-backed face ([`slice::resolved_receiver_family`])
+    /// — collection literals decide, a bare-identifier receiver resolves
+    /// its written type and must land in the `Iterable` family, anything
+    /// else stays silent like the official's unresolvable-target bail. The
+    /// closure shape is the official's own lexical test (:50-71): one
+    /// parameter, an expression body (or single return) whose
+    /// unparenthesized expression is `e is T` (no `is!`) with the
+    /// parameter as the tested expression. Message: `diagnostic.g.dart`
     /// `preferIterableWheretype`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_iterable_whereType",
@@ -619,8 +623,9 @@ pub(crate) mod prefer_iterable_where_type {
         if c.kind(name) != NodeKind::Identifier || c.lexeme(c.head_token(name)) != "where" {
             return;
         }
-        // The receiver type check (:48-49).
-        if !slice::receiver_implements_any(c, &kids, head, slice::ITERABLE) {
+        // The receiver type check (:39-42): a receiver without a same-file
+        // verdict stays silent (the official `target == null` face).
+        if slice::resolved_receiver_family(c, &kids, head, slice::ITERABLE) != Some(true) {
             return;
         }
         // `args.length != 1` bails (:50-51); `arg is FunctionExpression`
@@ -740,18 +745,23 @@ pub(crate) mod prefer_iterable_where_type {
 
 pub(crate) mod prefer_for_elements_to_map_from_iterable {
     use super::{Check, Group, NodeKind, RuleSpec};
-    use crate::rules::first_child;
+    use crate::rules::{first_child, slice};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_for_elements_to_map_fromIterable.dart:31-90`
     /// — a `Map.fromIterable(a, key: …, value: …)` creation whose key and
     /// value arguments are single-parameter single-expression closures
     /// reports at the creation.
     ///
-    /// Approximation (documented): the constructor element pin
-    /// (`element.enclosingElement != typeProvider.mapElement`, :46-49) is
-    /// taken from the `Map.fromIterable` name, so a user-defined `Map` class
-    /// over-reports (the `prefer_collection_literals` precedent). Message:
-    /// `diagnostic.g.dart` `preferForElementsToMapFromiterable`.
+    /// Constructor element pin (`element.enclosingElement !=
+    /// typeProvider.mapElement`, :43-45) over the same-file channel: a
+    /// same-file declaration owning the `Map` name (class, typedef, value)
+    /// resolves the creation to user code and stays silent. Closure shape
+    /// (:71-88): a named argument whose expression (no parens) is a
+    /// function expression with `parameters.length == 1 &&
+    /// parameters.first.isRequired` — a lone direct positional row is
+    /// required, an optional/named group only when its member carries the
+    /// `required` keyword — and a single expression body (or one return).
+    /// Message: `diagnostic.g.dart` `preferForElementsToMapFromiterable`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_for_elements_to_map_fromIterable",
         group: Group::Recommended,
@@ -761,44 +771,91 @@ pub(crate) mod prefer_for_elements_to_map_from_iterable {
         check,
     };
 
+    /// The `required` modifier bit of a `FormalParameter` row (bridge
+    /// `mod_bits`; the parser lane owns the values).
+    const REQUIRED_BIT: u16 = 1 << 7;
+
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        let kids = c.collect_direct(node);
-        let Some(args_pos) = kids
-            .iter()
-            .position(|&kid| matches!(c.kind(kid), NodeKind::Arguments))
-        else {
-            return;
-        };
-        // `element.name != 'fromIterable'` through the name face: a
-        // `Map.fromIterable` callee is a `Qualified` type/constructor pair.
-        let Some(callee) = args_pos.checked_sub(1).and_then(|i| kids.get(i)) else {
-            return;
-        };
-        if c.kind(*callee) != NodeKind::Qualified {
+        // The invocation run: the production bridge keeps the send a
+        // childless leaf, so its pieces tile in the owner slice (the
+        // statement run before it) — `slice::send_parts` reads the argument
+        // list and the selector; hand-built trees nest [Qualified,
+        // Arguments] under the send row.
+        let nested = c.collect_direct(node);
+        let (kids, args_pos, matched): (Vec<u32>, usize, bool) =
+            if nested.iter().any(|&kid| c.kind(kid) == NodeKind::Arguments) {
+                let Some(args_pos) = nested
+                    .iter()
+                    .position(|&kid| c.kind(kid) == NodeKind::Arguments)
+                else {
+                    return;
+                };
+                let matched = match args_pos.checked_sub(1).and_then(|i| nested.get(i)).copied() {
+                    Some(callee) if c.kind(callee) == NodeKind::Qualified => {
+                        let qualified = c.collect_direct(callee);
+                        let (Some(type_name), Some(ctor)) =
+                            (qualified.first().copied(), qualified.last().copied())
+                        else {
+                            return;
+                        };
+                        c.kind(type_name) == NodeKind::Identifier
+                            && c.kind(ctor) == NodeKind::Identifier
+                            && c.lexeme(c.head_token(type_name)) == "Map"
+                            && c.lexeme(c.head_token(ctor)) == "fromIterable"
+                    }
+                    _ => false,
+                };
+                (nested, args_pos, matched)
+            } else {
+                let Some((owner, pos)) = slice::owner_slice(c) else {
+                    return;
+                };
+                let start = owner[..pos]
+                    .iter()
+                    .rposition(|&row| crate::rules::is_statement_row(c, row))
+                    .map_or(0, |i| i + 1);
+                let mut owner = owner;
+                owner.drain(..start);
+                let pos = pos - start;
+                if pos == 0 || c.kind(owner[pos - 1]) != NodeKind::Arguments {
+                    return;
+                }
+                let Some((head, Some(_))) = slice::send_parts(c, &owner, pos) else {
+                    return;
+                };
+                // `Map.fromIterable` through the production pieces: the
+                // selector identifier over the bare `Map` receiver.
+                let matched = c.lexeme(c.head_token(owner[head])) == "fromIterable"
+                    && matches!(
+                        slice::access_run(c, &owner[..head]).as_slice(),
+                        [only]
+                            if c.kind(*only) == NodeKind::Identifier
+                                && c.lexeme(c.head_token(*only)) == "Map"
+                    );
+                (owner, pos - 1, matched)
+            };
+        if !matched {
             return;
         }
-        let qualified = c.collect_direct(*callee);
-        let (Some(type_name), Some(ctor)) = (qualified.first().copied(), qualified.last().copied())
-        else {
-            return;
-        };
-        if c.kind(type_name) != NodeKind::Identifier
-            || c.kind(ctor) != NodeKind::Identifier
-            || c.lexeme(c.head_token(type_name)) != "Map"
-            || c.lexeme(c.head_token(ctor)) != "fromIterable"
-        {
+        // The constructor element pin: a same-file `Map` declaration is
+        // not typeProvider's map element.
+        if crate::rules::expressions::same_file::declares_name(c, "Map") {
             return;
         }
-        // `arguments.length != 3` bails (:57-59).
-        let args = c.collect_direct(kids[args_pos]);
-        if args.len() != 3 {
+        // `arguments.length != 3` bails (:57-59). The argument list's
+        // children are the arguments' subtree-end rows (a named argument is
+        // the `name :` marker row plus its value sibling), so the count and
+        // the two named markers read through the grouping helper.
+        let pieces = c.collect_direct(kids[args_pos]);
+        let groups = slice::arguments(c, &pieces);
+        if groups.len() != 3 {
             return;
         }
         // The key/value closure extraction (:61-67, the TODO's named-args-
         // anywhere face kept positional).
-        let second = args[1];
-        let third = args[2];
+        let second = pieces[groups[1].end - 1];
+        let third = pieces[groups[2].end - 1];
         let key = extract_closure(c, "key", second).or_else(|| extract_closure(c, "key", third));
         let value =
             extract_closure(c, "value", third).or_else(|| extract_closure(c, "value", second));
@@ -811,17 +868,29 @@ pub(crate) mod prefer_for_elements_to_map_from_iterable {
 
     /// `_extractClosure` (:71-88): a named argument whose expression (no
     /// parens) is a one-required-parameter function expression with a single
-    /// expression body.
+    /// expression body. The closure expression: hand-built trees nest it
+    /// under the named-argument row; production anchors the childless
+    /// `name :` marker at the value head and the value trails as the
+    /// previous sibling inside the argument list.
     fn extract_closure(c: &Check<'_>, name: &str, argument: u32) -> Option<()> {
         if c.kind(argument) != NodeKind::NamedArgument {
             return None;
         }
-        let kids = c.collect_direct(argument);
-        let label = kids.first().copied()?;
-        if c.kind(label) != NodeKind::Identifier || c.lexeme(c.head_token(label)) != name {
-            return None;
-        }
-        let mut expression = *kids.get(1)?;
+        let nested = c.collect_direct(argument);
+        let mut expression = if nested.first().is_some_and(|&label| {
+            c.kind(label) == NodeKind::Identifier && c.lexeme(c.head_token(label)) == name
+        }) {
+            *nested.get(1)?
+        } else {
+            let parent = c.unit.ast.parent(argument)?;
+            let pieces = c.collect_direct(parent);
+            let i = pieces.iter().position(|&p| p == argument)?;
+            let name_pos = slice::named_arg_name(c, &pieces, i)?;
+            if c.lexeme(c.head_token(pieces[name_pos])) != name {
+                return None;
+            }
+            *pieces.get(i.checked_sub(1)?)?
+        };
         while c.kind(expression) == NodeKind::ParenthesizedExpression {
             expression = first_child(c, expression)?;
         }
@@ -829,14 +898,12 @@ pub(crate) mod prefer_for_elements_to_map_from_iterable {
             return None;
         }
         let kids = c.collect_direct(expression);
-        // One parameter, required (not inside the optional wrapper — the
-        // official `parameters.first.isRequired`; a required-named closure
-        // parameter under-reports through this face).
+        // `parameters.length == 1 && parameters.first.isRequired` (:77-80).
         let params = kids
             .iter()
             .find(|&&kid| c.kind(kid) == NodeKind::FormalParameters)
             .copied()?;
-        if c.collect_direct(params).len() != 1 {
+        if !one_required_parameter(c, params) {
             return None;
         }
         // `hasSingleExpressionBody`: an expression body, or one return.
@@ -858,11 +925,41 @@ pub(crate) mod prefer_for_elements_to_map_from_iterable {
             };
         has_expression_body.then_some(())
     }
+
+    /// The single-required-parameter gate (:77-80): exactly one formal
+    /// parameter, and it is required. Direct rows are positional (always
+    /// required — their leaked interior rows are other kinds); an
+    /// optional/named group member is required only with the `required`
+    /// keyword, so a bare `[e]`/`{e}` member bails like the official.
+    fn one_required_parameter(c: &Check<'_>, params: u32) -> bool {
+        let is_param = |row: u32| {
+            matches!(
+                c.kind(row),
+                NodeKind::FormalParameter | NodeKind::FunctionTypedFormalParameter
+            )
+        };
+        let mut count = 0usize;
+        let mut required = 0usize;
+        for kid in c.collect_direct(params) {
+            if is_param(kid) {
+                count += 1;
+                required += 1;
+            } else if c.kind(kid) == NodeKind::OptionalFormalParameters {
+                for member in c.collect_direct(kid).into_iter().filter(|&m| is_param(m)) {
+                    count += 1;
+                    if dartq_ast::mod_flags(c.unit.ast, member) & REQUIRED_BIT != 0 {
+                        required += 1;
+                    }
+                }
+            }
+        }
+        count == 1 && required == 1
+    }
 }
 
 pub(crate) mod collection_methods_unrelated_type {
     use super::{Check, Group, NodeKind, RuleSpec};
-    use crate::rules::{slice, type_face_of_field};
+    use crate::rules::{TypeFace, slice, type_face_of_field, written_type_face};
 
     /// Official: `pkg/linter/lib/src/rules/collection_methods_unrelated_type.dart`
     /// — a single-argument invocation of a collection method whose argument
@@ -873,31 +970,59 @@ pub(crate) mod collection_methods_unrelated_type {
     /// `E`, `Map.[]` → `K`, `Map.containsKey`/`Map.remove` → `K`,
     /// `Map.containsValue` → `V`.
     ///
-    /// Approximation (documented): the receiver type is the same-class
-    /// field's written type, read off `this.<field>` (bare `<field>`
-    /// inside instance scope over-reports under shadowing — the user-
-    /// shadowed family; a top-level or sibling-class name of the same
-    /// spelling over-reports too). The written type arguments stand in
-    /// for the resolved ones; an omitted argument list (raw `List`) carries
-    /// no verdict. The argument type is the scalar-literal face (`int`,
-    /// `double`, `String`, `bool`, `null`); unknown arguments stay silent.
-    /// The relation (`typesAreUnrelated`) ports as: equal names, `num`
-    /// against `int`/`double`, `Object`/`dynamic` against everything,
-    /// nullable-`?` against `Null`, and `Comparable`/`Pattern` (the core
-    /// supertypes the scalars implement) are comparable — everything else
-    /// reports. The index-operator face (`Map.[]`, :180-200) and the
-    /// cross-file `Queue` row stay unported (no written receiver face).
+    /// Receiver resolution over the same-file channel: a `this.<field>`
+    /// receiver reads the same-class field's written type
+    /// ([`type_face_of_field`] — `this` is unshadowable); a bare-name
+    /// receiver resolves the innermost binding
+    /// ([`written_type_face`] — a local/parameter shadows the field, the
+    /// official `target.staticType` face). The written type must carry the
+    /// row's name unshadowed ([`crate::rules::expressions::same_file::
+    /// declares_name`] — a same-file `class List` is not the core type, the
+    /// official `collectionTypeFor` miss), and the written type arguments
+    /// stand in for the resolved ones (an omitted argument list — raw
+    /// `List` — carries no verdict). The argument type is the
+    /// scalar-literal face (`int`, `double`, `String`, `bool`, `null`);
+    /// unknown arguments stay silent. The relation (`typesAreUnrelated`)
+    /// ports as: equal names, `num` against `int`/`double`,
+    /// `Object`/`dynamic` against everything, nullable-`?` against `Null`,
+    /// and `Comparable`/`Pattern` (the core supertypes the scalars
+    /// implement) are comparable — everything else reports.
+    ///
+    /// The index face (:180-200) dispatches on the `Indexed` handle: the
+    /// receiver reads through the same resolution, the key argument is the
+    /// single piece inside the `[...]` extent, and both the read (`m[k]`)
+    /// and the write (`m[k] = v` — the write's `Assignment` container
+    /// adopts the `Indexed` row as its first child, so the piece run reads
+    /// at the assignment's owner) check the key against `K`.
+    ///
+    /// Known silences (each the documented fallback of the same-file
+    /// channel): a receiver whose written type leaves the file (an
+    /// untyped/inferred binding, a member chain, an import) — the
+    /// official's unresolvable-or-imported faces; a prefixed collection
+    /// spelling (`collection.Queue`) — the `Type` row's head is the prefix,
+    /// no slot matches; a same-file supertype of a collection
+    /// (`class MyList extends List<int>`) — the supertype's own type
+    /// arguments are a substitution the written type does not carry.
     /// Message: `diagnostic.g.dart` `collectionMethodsUnrelatedType`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "collection_methods_unrelated_type",
         group: Group::Core,
         problem: "The argument type '{0}' isn't related to '{1}'.",
         correction: "Try changing the argument or element type to match.",
-        kinds: &[NodeKind::Send],
+        kinds: &[NodeKind::Send, NodeKind::Indexed],
         check,
     };
 
     fn check(c: &mut Check<'_>) {
+        if c.kind(c.node()) == NodeKind::Indexed {
+            check_index(c);
+        } else {
+            check_send(c);
+        }
+    }
+
+    /// The method-invocation face (`visitMethodInvocation`, :203-238).
+    fn check_send(c: &mut Check<'_>) {
         let Some((kids, pos)) = slice::owner_slice(c) else {
             return;
         };
@@ -928,53 +1053,164 @@ pub(crate) mod collection_methods_unrelated_type {
             end -= 1;
         }
         let trimmed = slice::access_run(c, &kids[..end]);
-        let field = match trimmed.as_slice() {
-            [target, field] if c.kind(*target) == NodeKind::ThisExpression => {
-                c.lexeme(c.head_token(*field))
-            }
-            [field] if c.kind(*field) == NodeKind::Identifier => c.lexeme(c.head_token(*field)),
-            _ => return,
-        };
-        let Some(face) = type_face_of_field(c, field) else {
+        let Some(face) = receiver_face(c, &trimmed) else {
             return;
         };
-        let Some((index, _)) = expected_slot(name, face.name.unwrap_or("")) else {
+        // The single scalar-literal argument (:203-205): the argument is the
+        // `Arguments` container's lone child row.
+        let args = c.collect_direct(arguments);
+        let [arg] = args.as_slice() else {
             return;
         };
-        if face.type_arguments.len() <= index {
-            return; // raw or argument-less written type: no verdict
+        if let Some((arg_type, expected)) = verdict(c, name, &face, *arg) {
+            let range = c.utf16_span(*arg);
+            c.report(range, &[&arg_type, &expected]);
         }
-        // The single scalar-literal argument (:203-205).
-        let arg_rows = c.collect_direct(arguments);
-        let [arg] = arg_rows.as_slice() else {
+    }
+
+    /// The index-operator face (`visitIndexExpression`, :180-200): the
+    /// receiver is the access run ending at the `[`, the key argument the
+    /// single piece inside the extent. A `[]=` write adopts the `Indexed`
+    /// row as the `Assignment` container's first child while its receiver
+    /// and key pieces stay owner-level siblings below the container — the
+    /// piece run then reads at the assignment's owner (the statement run
+    /// before it). The receiver matches the run's trailing pieces, so an
+    /// assignment's left-hand spill (`x = m[k]`) stays out of the face.
+    fn check_index(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(parent) = c.ancestor(1) else {
             return;
         };
-        let Some(arg_type) = literal_type_name(c, *arg) else {
+        let write = c.kind(parent) == NodeKind::Assignment && c.children(parent).start == node;
+        let (host, dispatched) = if write {
+            let Some(grand) = c.ancestor(2) else {
+                return;
+            };
+            (grand, parent)
+        } else {
+            (parent, node)
+        };
+        let kids = c.collect_direct(host);
+        let Some(pos) = kids.iter().position(|&kid| kid == dispatched) else {
             return;
         };
+        // The statement's own run: expression rows tile flat in the
+        // enclosing block (the span-only statement leaf trails them).
+        let start = kids[..pos]
+            .iter()
+            .rposition(|&row| crate::rules::is_statement_row(c, row))
+            .map_or(0, |i| i + 1);
+        let kids = &kids[start..pos];
+        // The extent: the span head is the `?` of `a?[k]` (payload word 0)
+        // or the `[`; the `]` is the span's last token. The byte offsets
+        // bound the key scan.
+        let range = c.unit.ast.token_range(node);
+        let open = if c.payload(node).first().copied() != Some(crate::rules::NONE_TOKEN) {
+            range.start + 1
+        } else {
+            range.start
+        };
+        let close = range.end - 1;
+        let open_byte = crate::rules::byte_span_of_token(c, open).start;
+        let close_byte = crate::rules::byte_span_of_token(c, close).end;
+        // The key: every piece before the host whose span sits inside the
+        // brackets; the scalar face needs exactly one (a nested expression
+        // tiles several and stays unknown). The receiver's bare-name send
+        // group leaks a width-0 `NoArguments` marker anchored at the key
+        // head (parse_send emits the group for every bare name), so the
+        // group's marker pieces stay out of the count.
+        let mut key = None;
+        let mut key_pos = 0;
+        let mut key_count = 0;
+        for (i, &kid) in kids.iter().enumerate() {
+            if slice::is_send_group_piece(c, kid) {
+                continue;
+            }
+            let span = c.byte_span(kid);
+            if span.start > open_byte && span.end <= close_byte {
+                key = Some(kid);
+                key_pos = i;
+                key_count += 1;
+            }
+        }
+        if key_count != 1 {
+            return;
+        }
+        // The receiver: the access run before the key piece, matched on its
+        // trailing `[ThisExpression, name]` / `[name]` face.
+        let trimmed = slice::access_run(c, &kids[..key_pos]);
+        let tail = trimmed.len().saturating_sub(2);
+        let Some(face) = receiver_face(c, &trimmed[tail..]) else {
+            return;
+        };
+        if let Some((arg_type, expected)) = verdict(c, "[]", &face, key.expect("counted above")) {
+            let range = c.utf16_span(key.expect("counted above"));
+            c.report(range, &[&arg_type, &expected]);
+        }
+    }
+
+    /// The resolved receiver's written type: `this.<field>` reads the
+    /// same-class field (unshadowable), a bare name the innermost binding
+    /// (the official `target.staticType`; `_getTargetType`'s implicit-
+    /// receiver walk, :284-306, over the same-file channel).
+    fn receiver_face<'a>(c: &'a Check<'_>, trimmed: &[u32]) -> Option<TypeFace<'a>> {
+        match trimmed {
+            [target, field] if c.kind(*target) == NodeKind::ThisExpression => {
+                type_face_of_field(c, c.lexeme(c.head_token(*field)))
+            }
+            [field] if c.kind(*field) == NodeKind::Identifier => {
+                let name = c.lexeme(c.head_token(*field));
+                written_type_face(c, *field, name)
+            }
+            _ => None,
+        }
+    }
+
+    /// The verdict body (:243-265): the method's expected slot keyed on
+    /// the written type name, the single scalar-literal argument, the
+    /// unrelated-type relation — `(argument type, expected type)` when the
+    /// report fires, `None` otherwise.
+    fn verdict(
+        c: &Check<'_>,
+        method: &str,
+        face: &TypeFace<'_>,
+        argument: u32,
+    ) -> Option<(String, String)> {
+        let written = face.name?;
+        // A same-file declaration owns the written name — the
+        // `collectionTypeFor` lookup misses the core type.
+        if crate::rules::expressions::same_file::declares_name(c, written) {
+            return None;
+        }
+        let (index, ()) = expected_slot(method, written)?;
+        if face.type_arguments.len() <= index {
+            return None; // raw or argument-less written type: no verdict
+        }
+        let arg_type = literal_type_name(c, argument)?;
         let (element, element_nullable) = face.type_arguments[index];
         if comparable(element, element_nullable, arg_type) {
-            return;
+            return None;
         }
         let mut expected = element.to_owned();
         if element_nullable {
             expected.push('?');
         }
-        let range = c.utf16_span(*arg);
-        c.report(range, &[arg_type, &expected]);
+        Some((arg_type.to_owned(), expected))
     }
 
     /// The method's expected slot: `(type-argument index, declaring
-    /// containers)` — `None` when the method is outside the table. `String`
-    /// joins `contains` through its `Iterable<String>` face.
+    /// containers)` — `None` when the method is outside the table.
+    /// `String` joins `contains` through its `Iterable<String>` face;
+    /// `Queue.remove` declares on dart:collection's `Queue` (:158-164).
     fn expected_slot(method: &str, written: &str) -> Option<(usize, ())> {
         match (method, written) {
-            ("contains", "List" | "Set" | "Iterable" | "String") => Some((0, ())),
-            ("remove", "List" | "Set") => Some((0, ())),
+            ("contains", "List" | "Set" | "Iterable" | "String" | "Queue") => Some((0, ())),
+            ("remove", "List" | "Set" | "Queue") => Some((0, ())),
             ("remove", "Map") => Some((0, ())),
             ("lookup", "Set") => Some((0, ())),
             ("containsKey", "Map") => Some((0, ())),
             ("containsValue", "Map") => Some((1, ())),
+            ("[]", "Map") => Some((0, ())),
             _ => None,
         }
     }
@@ -1142,6 +1378,12 @@ mod tests {
         assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
 
         let f = Fixture::parse("typedef Map = List;\nvoid f() { Map(); }");
+        assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
+
+        // An extension type named like the core collection constructs
+        // through its own representation — the element-identity face
+        // resolves to user code, never the core type.
+        let f = Fixture::parse("extension type Map(int i) {}\nvoid f() { Map(1); }");
         assert!(f.run(&one_rule("prefer_collection_literals")).is_empty());
     }
 
@@ -1472,6 +1714,183 @@ mod tests {
         );
         assert!(
             f.run(&one_rule("collection_methods_unrelated_type"))
+                .is_empty()
+        );
+    }
+
+    // —— the converted audit faces (exemption-reaudit F2/F6/F7): the
+    // production-bridge pins for the resolution-backed decisions ——
+
+    /// The `Map.[]` index row (:180-200): both the read and the `[]=`
+    /// write check the key against `K` — the oracle probe reports
+    /// `this.map['k']` and `this.map['k'] = 'v'`, and stays silent on the
+    /// related key.
+    #[test]
+    fn collection_methods_index_faces() {
+        let f = Fixture::parse(
+            r#"
+class C {
+  Map<int, String> map = <int, String>{};
+
+  void m() {
+    this.map[1];
+    this.map['k'];
+    this.map['k'] = 'v';
+  }
+}
+"#,
+        );
+        let lints = f.run(&one_rule("collection_methods_unrelated_type"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'String' isn't related to 'int'."
+        );
+        assert_eq!(
+            lints[1].message,
+            "The argument type 'String' isn't related to 'int'."
+        );
+    }
+
+    /// The `Queue.remove` row (:158-164): the unshadowed written
+    /// dart:collection spelling keys the table.
+    #[test]
+    fn collection_methods_queue_remove_row() {
+        let f = Fixture::parse(
+            r#"
+class C {
+  Queue<String> queue = Queue<String>();
+
+  void m() {
+    this.queue.remove(1);
+    this.queue.remove('x');
+  }
+}
+"#,
+        );
+        let lints = f.run(&one_rule("collection_methods_unrelated_type"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'int' isn't related to 'String'."
+        );
+    }
+
+    /// The receiver resolution: a bare name resolves through the
+    /// innermost binding (a local shadows the field — the local's type
+    /// decides), and a same-file class owning the written collection name
+    /// stays silent (the `collectionTypeFor` miss, the oracle probe's
+    /// shadow face).
+    #[test]
+    fn collection_methods_receiver_resolution_faces() {
+        // A local `List<int>` shadows the `List<String>` field — the
+        // element is int, so `'x'` reports against int.
+        let f = Fixture::parse(
+            r#"
+class C {
+  List<String> list = <String>[];
+
+  void m() {
+    List<int> list = <int>[];
+    list.remove('x');
+  }
+}
+"#,
+        );
+        let lints = f.run(&one_rule("collection_methods_unrelated_type"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The argument type 'String' isn't related to 'int'."
+        );
+
+        // A same-file `class List` owns the written name — silent.
+        let f = Fixture::parse(
+            r#"
+class List {
+  void remove(Object? x) {}
+}
+
+class D {
+  List<int> list = <int>[];
+
+  void m() {
+    list.remove('x');
+  }
+}
+"#,
+        );
+        assert!(
+            f.run(&one_rule("collection_methods_unrelated_type"))
+                .is_empty()
+        );
+    }
+
+    /// The typed-receiver gate on `where` (:39-42): an untyped parameter
+    /// and a user-class receiver carry no same-file Iterable verdict and
+    /// stay silent like the official unresolvable-target bail; the typed
+    /// `List` parameter (the corpus fixture face) still reports.
+    #[test]
+    fn where_type_unresolved_receivers_pass() {
+        let f = Fixture::parse("void f(xs) { xs.where((e) => e is int); }");
+        assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+
+        let f = Fixture::parse(
+            r#"
+class User {
+  void where(bool Function(dynamic) test) {}
+}
+
+void f(User u) {
+  u.where((e) => e is int);
+}
+"#,
+        );
+        assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+
+        let f = Fixture::parse("void f(List<int> xs) { xs.where((e) => e is int); }");
+        assert_eq!(f.run(&one_rule("prefer_iterable_whereType")).len(), 1);
+    }
+
+    /// The closure requiredness gate (:77-80): an optional positional or
+    /// a bare named parameter bails; `{required e}` reports; a same-file
+    /// `Map` declaration stays silent (the constructor element pin).
+    #[test]
+    fn map_from_iterable_requiredness_and_shadow_faces() {
+        let f =
+            Fixture::parse("void f(x) { Map.fromIterable(x, key: ([e]) => e, value: (e) => e); }");
+        assert!(
+            f.run(&one_rule("prefer_for_elements_to_map_fromIterable"))
+                .is_empty()
+        );
+
+        let f =
+            Fixture::parse("void f(x) { Map.fromIterable(x, key: ({e}) => e, value: (e) => e); }");
+        assert!(
+            f.run(&one_rule("prefer_for_elements_to_map_fromIterable"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse(
+            "void f(x) { Map.fromIterable(x, key: ({required e}) => e, value: (e) => e); }",
+        );
+        assert_eq!(
+            f.run(&one_rule("prefer_for_elements_to_map_fromIterable"))
+                .len(),
+            1
+        );
+
+        let f = Fixture::parse(
+            r#"
+class Map {}
+
+void f(x) {
+  Map.fromIterable(x, key: (e) => e, value: (e) => e);
+}
+"#,
+        );
+        assert!(
+            f.run(&one_rule("prefer_for_elements_to_map_fromIterable"))
                 .is_empty()
         );
     }

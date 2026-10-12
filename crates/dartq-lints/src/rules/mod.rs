@@ -906,6 +906,20 @@ pub(crate) fn type_face_of_field<'a>(c: &'a Check<'_>, name: &str) -> Option<Typ
     Some(type_face(c, type_row))
 }
 
+/// The full [`TypeFace`] of the identifier `use` bound to `name` —
+/// [`expressions::same_file::written_type`]'s shadow-correct innermost
+/// binding walk with the written type row kept, so the rule reads the type
+/// arguments, not just the head name. `None` over the same contract (no
+/// same-file binding, or an untyped one).
+pub(crate) fn written_type_face<'a>(
+    c: &'a Check<'a>,
+    use_node: u32,
+    name: &str,
+) -> Option<TypeFace<'a>> {
+    let row = crate::rules::expressions::same_file::binding(c, use_node, name)?.1?;
+    Some(type_face(c, row))
+}
+
 /// The instance-field index of `class_row`, built once per run on first
 /// query and cached in the run's [`RunCaches`][crate::engine::RunCaches]:
 /// the class's non-static `Fields` members as `(name token, written type

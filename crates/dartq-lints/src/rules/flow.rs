@@ -139,11 +139,10 @@ pub(crate) mod control_flow_in_finally {
     /// function body, :224). Message: `diagnostic.g.dart`
     /// `controlFlowInFinally`.
     ///
-    /// Approximation (documented): the switch's member labels scope across
-    /// the whole statement officially (`scope_analyzer.dart:847-850`), so a
-    /// forward `continue L` to a later member resolves there but not in
-    /// this lexical walk — a member label matches only when the member
-    /// encloses the jump.
+    /// Approximation (documented): the switch's member-label scope walk
+    /// reads the members over the production tiling (the same rows the
+    /// `exhaustive_cases` member walk collects); a label declared inside a
+    /// case BODY (a labeled statement within a member) scopes normally.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "control_flow_in_finally",
         group: Group::Recommended,
@@ -190,15 +189,25 @@ pub(crate) mod control_flow_in_finally {
         {
             return;
         }
+        // The switch-member tiling overlaps windows (each member's window
+        // starts at the previous member's arena row), which spills the
+        // member's body rows both at the switch-block level and under the
+        // member row the next member's window adopts — the try's subtree
+        // can dispatch twice. Keep only the canonical (`ast.parent`)
+        // descent; the spilled one bails.
+        if c.unit.ast.parent(try_node) != c.path.get(try_idx - 1).copied() {
+            return;
+        }
         let report = match c.kind(node) {
             NodeKind::Break | NodeKind::Continue => match jump_target(c, node, node_idx) {
-                // `target.thisOrAncestorMatching(n == tryStatement)` (:79-91):
-                // the enabler (the target's own chain contains the try) keeps
-                // the jump local — `thisOrAncestorMatching` includes the
-                // target itself, so a label bound onto the try (`a: try …`)
-                // also counts as within. Outside it the jump crosses the
-                // finally and reports.
-                Some(target_idx) => target_idx < try_idx,
+                // `enablerNode = target.thisOrAncestorMatching(n ==
+                // tryStatement)` (:79-91): the target's own ancestor chain
+                // containing the try keeps the jump local —
+                // `thisOrAncestorMatching` includes the target itself, so a
+                // label bound onto the try (`a: try …`) also counts as
+                // within. Outside it the jump crosses the finally and
+                // reports.
+                Some(target) => !chain_contains(c, target, try_node),
                 // Unresolved target (`target == null`): the closure exemption
                 // decides (the `ancestor == null` branch, :69-77).
                 None => !closure_wraps(c, try_idx + 1, node_idx),
@@ -211,10 +220,10 @@ pub(crate) mod control_flow_in_finally {
         }
     }
 
-    /// The resolved jump target's path index, `None` for the official
+    /// The resolved jump target's row, `None` for the official
     /// `target == null` face (`_lookupBreakOrContinueTarget`,
     /// `scope_analyzer.dart:1042-1093`).
-    fn jump_target(c: &Check<'_>, node: u32, node_idx: usize) -> Option<usize> {
+    fn jump_target(c: &Check<'_>, node: u32, node_idx: usize) -> Option<u32> {
         // The payload carries only the `has_target` bit (collapse map §3.4
         // BreakStatementHandle); the label identifier is the token after the
         // `break`/`continue` keyword, and a synthetic recovery token never
@@ -225,19 +234,27 @@ pub(crate) mod control_flow_in_finally {
                 return None;
             }
             let label = c.lexeme(label_token);
-            let Some(binding) = c.path[..node_idx].iter().rposition(|&n| {
-                matches!(c.kind(n), NodeKind::LabeledStatement | NodeKind::SwitchCase)
-                    && declares_label(c, n, label)
-            }) else {
-                return None;
-            };
-            // `visitLabeledStatement` (:631-639): a statement's label binds
-            // the statement after the labels — the next path node; a switch
-            // member's label binds the member itself.
-            return Some(match c.kind(c.path[binding]) {
-                NodeKind::LabeledStatement => binding + 1,
-                _ => binding,
-            });
+            // The label scope chain, innermost first: a labeled statement's
+            // labels bind the statement after the labels
+            // (`visitLabeledStatement`, scope_analyzer.dart:631-639); a
+            // switch statement pre-nests EVERY member's labels over the
+            // whole statement (scope_analyzer.dart:846-850), so a forward
+            // `continue L` to a later member resolves there — the members
+            // walk in reverse source order, a later duplicate shadowing.
+            for (idx, &ancestor) in c.path[..node_idx].iter().enumerate().rev() {
+                match c.kind(ancestor) {
+                    NodeKind::LabeledStatement if declares_label(c, ancestor, label) => {
+                        return Some(c.path[idx + 1]);
+                    }
+                    NodeKind::SwitchStatement => {
+                        if let Some(member) = switch_member_with_label(c, ancestor, label) {
+                            return Some(member);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return None;
         }
         let is_continue = c.kind(node) == NodeKind::Continue;
         for (idx, &ancestor) in c.path[..node_idx].iter().enumerate().rev() {
@@ -245,10 +262,10 @@ pub(crate) mod control_flow_in_finally {
                 NodeKind::WhileStatement
                 | NodeKind::ForStatement
                 | NodeKind::ForIn
-                | NodeKind::DoWhileStatement => return Some(idx),
+                | NodeKind::DoWhileStatement => return Some(c.path[idx]),
                 // An untargeted `continue` never binds a switch
                 // (scope.dart:336-341).
-                NodeKind::SwitchStatement if !is_continue => return Some(idx),
+                NodeKind::SwitchStatement if !is_continue => return Some(c.path[idx]),
                 // The context chain resets at every function body (:224) —
                 // the jump cannot bind past a closure (`target == null`).
                 NodeKind::FunctionExpression
@@ -260,13 +277,49 @@ pub(crate) mod control_flow_in_finally {
         None
     }
 
+    /// The switch member whose label prefix declares `label`, later members
+    /// first (the official scope chain nests member labels in source order,
+    /// so the last declared wins); `None` when no member carries it. The
+    /// members read over the production tiling — the plain child walk loses
+    /// members (the `exhaustive_cases` member walk's documented wrinkle).
+    fn switch_member_with_label(c: &Check<'_>, switch_row: u32, label: &str) -> Option<u32> {
+        let block = c
+            .collect_direct(switch_row)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::SwitchBlock)?;
+        super::exhaustive_cases::switch_case_rows(c, block)
+            .into_iter()
+            .rev()
+            .find(|&member| declares_label(c, member, label))
+    }
+
+    /// Whether `try_row` sits on `target`'s ancestor chain — the official
+    /// `target.thisOrAncestorMatching((n) => n == tryStatement)` (the
+    /// target itself counts). The walk ascends strictly to the root.
+    fn chain_contains(c: &Check<'_>, target: u32, try_row: u32) -> bool {
+        let mut current = target;
+        loop {
+            if current == try_row {
+                return true;
+            }
+            match c.unit.ast.parent(current) {
+                Some(parent) => current = parent,
+                None => return false,
+            }
+        }
+    }
+
     /// Whether a labeled statement / switch member declares `label` among
-    /// its `Label` children prefix (collapse map §3.4: the label count is
-    /// the Label-children prefix length).
+    /// its label-prefix children. The production tiling emits each label as
+    /// an `Identifier` (the name) + `Label` (the colon) leaf pair — the
+    /// collapse map's `2·label_count` adoption — while hand-built trees
+    /// carry a bare `Label` row spanning `name:`; the prefix is the
+    /// leading run of both shapes, and the name reads off whichever row
+    /// anchors at the identifier token.
     fn declares_label(c: &Check<'_>, node: u32, label: &str) -> bool {
         c.collect_direct(node)
             .into_iter()
-            .take_while(|&kid| c.kind(kid) == NodeKind::Label)
+            .take_while(|&kid| matches!(c.kind(kid), NodeKind::Identifier | NodeKind::Label))
             .any(|kid| c.lexeme(c.head_token(kid)) == label)
     }
 
@@ -853,23 +906,28 @@ pub(crate) mod type_literal_in_constant_pattern {
     use super::{Check, Group, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/type_literal_in_constant_pattern.dart:40-63`
-    /// — a constant pattern whose expression is a type literal reports at
-    /// the pattern. The official bails for a `const`-marked pattern (:45-47)
-    /// and for a `Type`-typed matched value (:50-59, the raw-type
-    /// exemption); `case int:`-style built-in names report.
+    /// — a constant pattern whose expression's static type is the `Type`
+    /// type reports at the pattern. The official bails for a
+    /// `const`-marked pattern (:45-47) and for a `Type`-typed matched
+    /// value (:50-59, the raw-type exemption).
     ///
-    /// Approximations (documented): the type-literal test
-    /// (`expression.staticType.isDartCoreType`, :61-63) is a resolution
-    /// question. The lexical face reports a bare identifier whose lexeme is
-    /// a built-in Dart type name — a set that can never be a type literal
-    /// miss (`int`, `String`, ...), while the over-report faces stay inside
-    /// the user-shadowed family: a user constant named like a built-in type
-    /// (`const String = 'x'; case String:`) over-reports, and user type
-    /// literals (`case MyType:` — indistinguishable from a capitalized
-    /// constant without resolution) under-report. The `Type`-matched-value
-    /// exemption (:50-59) reads through the syntactic face below; a
-    /// type-parameter scrutinee (`T case int`) and an object-pattern field
-    /// face (`A(type: int)`) stay over-reports. Message: `diagnostic.g.dart`
+    /// The type-literal test (`expression.staticType.isDartCoreType`,
+    /// :57-63) resolves over the same-file channel: a bare name answers
+    /// through the innermost value binding first (a value is never a type
+    /// literal — the `const String = 'x'` shadow over-report is dead), a
+    /// top-level `const` folds its initializer through the alias channel
+    /// (`const t = int; case t:` — a Type-valued constant — reports like
+    /// the official static type), a typed binding reports only when
+    /// written `Type`, and a name with no value binding is a type literal:
+    /// a same-file type declaration (`case MyType:` — the user-type
+    /// under-report is dead) or an unshadowed built-in type name. A
+    /// two-segment name folds a same-file class-static alias (`A.t`);
+    /// anything else there (an enum member, a prefixed spelling — the
+    /// `Type` row's head is the prefix) stays silent, the prefixed type
+    /// literal being the documented under-report. Known corner: a
+    /// class-scope `static const` shadowing a type name is invisible to
+    /// the binding walk (statics are not instance bindings) and keeps the
+    /// type reading. Message: `diagnostic.g.dart`
     /// `typeLiteralInConstantPattern`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "type_literal_in_constant_pattern",
@@ -882,7 +940,10 @@ pub(crate) mod type_literal_in_constant_pattern {
 
     /// The built-in type names a bare constant-pattern identifier can spell
     /// (`dynamic` included; `void` is a keyword and never reaches an
-    /// identifier). The official test corpus exercises the dart:core names.
+    /// identifier) — the unshadowed fallback the same-file channel cannot
+    /// resolve better (dart:core is auto-imported, so an unshadowed
+    /// spelling of these IS the library type). The official test corpus
+    /// exercises the dart:core names.
     fn is_builtin_type_name(lexeme: &str) -> bool {
         matches!(
             lexeme,
@@ -934,7 +995,7 @@ pub(crate) mod type_literal_in_constant_pattern {
         ) {
             return;
         }
-        if !is_builtin_type_name(c.lexeme(c.head_token(expression))) {
+        if !constant_is_type_literal(c, expression) {
             return;
         }
         // OK to use raw types if the matched value is of type `Type`
@@ -1026,6 +1087,97 @@ pub(crate) mod type_literal_in_constant_pattern {
         }
         false
     }
+
+    /// The static-type question over the expression's name segments (the
+    /// module doc carries the decision table).
+    fn constant_is_type_literal(c: &Check<'_>, expression: u32) -> bool {
+        let range = c.unit.ast.token_range(expression);
+        let Some((leading_dot, names)) =
+            super::exhaustive_cases::segments(c, super::exhaustive_cases::strip_const(c, range))
+        else {
+            return false;
+        };
+        if leading_dot {
+            return false;
+        }
+        match names.as_slice() {
+            [name] => bare_name_is_type_literal(c, expression, name),
+            [.., class, field] => super::exhaustive_cases::class_const_init(c, class, field)
+                .is_some_and(|init| folds_to_type(c, init, &mut Vec::new(), 0)),
+            _ => false,
+        }
+    }
+
+    /// The bare-name face: the innermost value binding first, then the
+    /// type reading.
+    fn bare_name_is_type_literal(c: &Check<'_>, use_row: u32, name: &str) -> bool {
+        use crate::rules::expressions::same_file::BindingScope;
+        match crate::rules::expressions::same_file::binding(c, use_row, name) {
+            Some((scope, typed)) => match scope {
+                // A `const` binding folds its initializer through the alias
+                // channel (a Type-valued constant); any other value ends
+                // the reading off the type family.
+                BindingScope::TopLevel => super::exhaustive_cases::top_level_const_init(c, name)
+                    .map_or(typed_face_is_type(c, typed), |init| {
+                        folds_to_type(c, init, &mut Vec::new(), 0)
+                    }),
+                BindingScope::Local => {
+                    crate::rules::expressions::same_file::local_const_initializer(c, use_row, name)
+                        .is_some_and(|init| folds_to_type(c, init, &mut Vec::new(), 0))
+                }
+                BindingScope::Parameter | BindingScope::Field => typed_face_is_type(c, typed),
+            },
+            // No same-file value binding: a type literal — a same-file type
+            // declaration or an unshadowed built-in type name.
+            None => {
+                crate::rules::expressions::same_file::declares_type(c, name)
+                    || is_builtin_type_name(name)
+            }
+        }
+    }
+
+    /// A typed value binding is a type literal only when written `Type`
+    /// (the constant's static type follows the written annotation).
+    fn typed_face_is_type(c: &Check<'_>, typed: Option<u32>) -> bool {
+        typed.is_some_and(|row| crate::rules::type_face(c, row).name == Some("Type"))
+    }
+
+    /// The alias fold over a top-level/class-static const initializer
+    /// chain: the chain landing on a type name (a same-file type or an
+    /// unshadowed built-in) makes the constant Type-valued. `seen` breaks
+    /// alias cycles, `depth` bounds them.
+    fn folds_to_type(
+        c: &Check<'_>,
+        init: core::ops::Range<u32>,
+        seen: &mut Vec<u32>,
+        depth: usize,
+    ) -> bool {
+        if depth > super::exhaustive_cases::MAX_ALIAS_DEPTH || seen.contains(&init.start) {
+            return false;
+        }
+        let init = super::exhaustive_cases::strip_const(c, init);
+        let Some((false, names)) = super::exhaustive_cases::segments(c, init.clone()) else {
+            return false;
+        };
+        match names.as_slice() {
+            // Within a top-level initializer only top-level names resolve:
+            // a const alias recurses, a non-const value ends the chain off
+            // the type family.
+            [name] => match super::exhaustive_cases::top_level_const_init(c, name) {
+                Some(next) => {
+                    seen.push(init.start);
+                    folds_to_type(c, next, seen, depth + 1)
+                }
+                None => {
+                    crate::rules::expressions::same_file::declares_type(c, name)
+                        || is_builtin_type_name(name)
+                }
+            },
+            [.., class, field] => super::exhaustive_cases::class_const_init(c, class, field)
+                .is_some_and(|next| folds_to_type(c, next, seen, depth + 1)),
+            _ => false,
+        }
+    }
 }
 
 pub(crate) mod exhaustive_cases {
@@ -1089,7 +1241,7 @@ pub(crate) mod exhaustive_cases {
 
     /// The alias-hop cap: a legitimate constant alias chain is a few names
     /// deep; past this it is pathological and computes to nothing.
-    const MAX_ALIAS_DEPTH: usize = 8;
+    pub(super) const MAX_ALIAS_DEPTH: usize = 8;
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -1173,8 +1325,9 @@ pub(crate) mod exhaustive_cases {
     /// that row and the decrement-first walk skips it as window-start
     /// interior — a two-case switch surfaces only the last case. The
     /// jump-landed row is this block's member, not the case's child: the
-    /// walk pushes it and continues below it.
-    fn switch_case_rows(c: &Check<'_>, block: u32) -> Vec<u32> {
+    /// walk pushes it and continues below it. Shared with the
+    /// `control_flow_in_finally` member-label walk.
+    pub(super) fn switch_case_rows(c: &Check<'_>, block: u32) -> Vec<u32> {
         let window = c.children(block);
         let mut cases: Vec<u32> = Vec::new();
         let mut i = window.end;
@@ -1490,7 +1643,7 @@ pub(crate) mod exhaustive_cases {
     /// initializer (function literals are not const; a string literal's
     /// semicolons ride inside the string token), so it terminates at any
     /// depth.
-    fn initializer_range(c: &Check<'_>, var: u32) -> Option<core::ops::Range<u32>> {
+    pub(crate) fn initializer_range(c: &Check<'_>, var: u32) -> Option<core::ops::Range<u32>> {
         let range = c.unit.ast.token_range(var);
         let mut token = range.start + 1;
         while token < range.end {
@@ -1638,7 +1791,10 @@ pub(crate) mod exhaustive_cases {
     /// The token range past a leading `const` introducer — `const` heads
     /// and initializers carry their constant through the same expression
     /// as the bare spelling.
-    fn strip_const(c: &Check<'_>, range: core::ops::Range<u32>) -> core::ops::Range<u32> {
+    pub(super) fn strip_const(
+        c: &Check<'_>,
+        range: core::ops::Range<u32>,
+    ) -> core::ops::Range<u32> {
         if range.start < range.end && c.lexeme(range.start) == "const" {
             return range.start + 1..range.end;
         }
@@ -1650,7 +1806,7 @@ pub(crate) mod exhaustive_cases {
     /// `(false, ["prefix", "E", "e"])`, `.e` → `(true, ["e"])`. `None` for
     /// any other expression (a non-name token inside a segment — the
     /// literal/creation/interpolation faces).
-    fn segments<'a>(
+    pub(super) fn segments<'a>(
         c: &'a Check<'_>,
         range: core::ops::Range<u32>,
     ) -> Option<(bool, Vec<&'a str>)> {
@@ -1768,7 +1924,11 @@ pub(crate) mod exhaustive_cases {
     /// The initializer of the `static const` field `field` of the same-file
     /// class-like `class` — the `E.e` head face and the `Class.member`
     /// alias target.
-    fn class_const_init(c: &Check<'_>, class: &str, field: &str) -> Option<core::ops::Range<u32>> {
+    pub(super) fn class_const_init(
+        c: &Check<'_>,
+        class: &str,
+        field: &str,
+    ) -> Option<core::ops::Range<u32>> {
         let (row, _) = class_like_named(
             c,
             class,
@@ -1785,7 +1945,7 @@ pub(crate) mod exhaustive_cases {
 
     /// The initializer of the same-file top-level `const` named `name` —
     /// the bare-name alias target outside class scope.
-    fn top_level_const_init(c: &Check<'_>, name: &str) -> Option<core::ops::Range<u32>> {
+    pub(super) fn top_level_const_init(c: &Check<'_>, name: &str) -> Option<core::ops::Range<u32>> {
         let root = c.unit.ast.root()?;
         for top in c.collect_direct(root) {
             if c.kind(top) != NodeKind::TopLevelDeclaration {
@@ -4246,6 +4406,219 @@ mod tests {
             f.run(&one_rule("type_literal_in_constant_pattern"))
                 .is_empty(),
             "a const-marked pattern bails (:45-47)"
+        );
+    }
+
+    // —— the converted audit faces (exemption-reaudit F4/F5): the
+    // production-bridge pins for the resolution-backed decisions ——
+
+    /// The forward `continue L` to a LATER switch member resolves through
+    /// the member-label scope (scope_analyzer.dart:846-850); the target
+    /// member's chain contains the try, so the finally jump stays local
+    /// and stays silent (the oracle probe face).
+    #[test]
+    fn finally_forward_continue_member_label_passes() {
+        assert!(
+            Fixture::parse(
+                r#"
+void f(bool c) {
+  try {
+    print(0);
+  } finally {
+    switch (c) {
+      case true:
+        continue L;
+      L:
+      case false:
+        print(1);
+    }
+  }
+}
+"#
+            )
+            .run(&one_rule("control_flow_in_finally"))
+            .is_empty()
+        );
+    }
+
+    /// The same forward jump with the target member OUTSIDE the try: the
+    /// target's chain misses the try and the jump reports (the oracle
+    /// probe reports `break L` at the same shape).
+    #[test]
+    fn finally_forward_continue_outside_try_reports() {
+        let f = Fixture::parse(
+            r#"
+void f(bool c) {
+  switch (c) {
+    case true:
+      try {
+        print(0);
+      } finally {
+        continue L;
+      }
+    L:
+    case false:
+      print(1);
+  }
+}
+"#,
+        );
+        let lints = f.run(&one_rule("control_flow_in_finally"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Use of 'continue' in a 'finally' clause.");
+    }
+
+    /// A forward `continue L` to a LATER labeled statement (no switch)
+    /// stays undefined officially (LABEL_UNDEFINED — labeled statements
+    /// bind only within their statement) — the unresolved-target face
+    /// reports.
+    #[test]
+    fn finally_forward_continue_to_later_labeled_statement_reports() {
+        let f = Fixture::parse(
+            r#"
+void f(bool c) {
+  try {
+    print(0);
+  } finally {
+    if (c) {
+      continue L;
+    }
+    L:
+    while (c) {
+      print(1);
+    }
+  }
+}
+"#,
+        );
+        let lints = f.run(&one_rule("control_flow_in_finally"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+    }
+
+    /// `continue L` onto the try statement itself (`L2: try … finally {
+    /// continue L2; }`): the target IS the try — the enabler matches and
+    /// the jump stays silent (the oracle probe face).
+    #[test]
+    fn finally_continue_onto_labeled_try_passes() {
+        assert!(
+            Fixture::parse(
+                r#"
+void f(bool c) {
+  L:
+  try {
+    print(0);
+  } finally {
+    if (c) {
+      continue L;
+    }
+  }
+}
+"#
+            )
+            .run(&one_rule("control_flow_in_finally"))
+            .is_empty()
+        );
+    }
+
+    /// The resolution-backed type-literal test: a same-file user type
+    /// reports (the under-report face is dead), a same-file value shadow
+    /// of a built-in name stays silent (the over-report face is dead).
+    #[test]
+    fn type_literal_resolution_backed_faces() {
+        // `case MyType` on a same-file class reports.
+        let f = Fixture::parse(
+            r#"
+class MyType {}
+
+void f(Object o) {
+  if (o case MyType) {
+    print(0);
+  }
+}
+"#,
+        );
+        let lints = f.run(&one_rule("type_literal_in_constant_pattern"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+
+        // `const String = 'x';` shadows the built-in — the pattern is the
+        // String constant, not a type literal.
+        let f = Fixture::parse(
+            r#"
+const String = 'x';
+
+void f(Object o) {
+  if (o case String) {
+    print(0);
+  }
+}
+"#,
+        );
+        assert!(
+            f.run(&one_rule("type_literal_in_constant_pattern"))
+                .is_empty()
+        );
+
+        // A local `var int` shadow — the name resolves to the value.
+        let f = Fixture::parse("void f(Object o) { var int = 5; if (o case int) { print(int); } }");
+        assert!(
+            f.run(&one_rule("type_literal_in_constant_pattern"))
+                .is_empty()
+        );
+    }
+
+    /// The const-alias fold: a Type-valued constant reports like the
+    /// official static type (`case t` where `t` is `int`) — top-level,
+    /// local, and qualified-class spellings; a value alias stays silent.
+    #[test]
+    fn type_literal_const_alias_faces() {
+        // Top-level `const t = int;` reports.
+        let f = Fixture::parse(
+            r#"
+const t = int;
+
+void f(Object o) {
+  if (o case t) {
+    print(0);
+  }
+}
+"#,
+        );
+        assert_eq!(
+            f.run(&one_rule("type_literal_in_constant_pattern")).len(),
+            1
+        );
+
+        // Local `const t = int;` reports (the oracle probe face).
+        let f = Fixture::parse(
+            r#"
+void f(Object o) {
+  const t = int;
+  if (o case t) {
+    print(0);
+  }
+}
+"#,
+        );
+        assert_eq!(
+            f.run(&one_rule("type_literal_in_constant_pattern")).len(),
+            1
+        );
+
+        // A value alias (`const s = 'x';`) stays silent.
+        let f = Fixture::parse(
+            r#"
+const s = 'x';
+
+void f(Object o) {
+  if (o case s) {
+    print(0);
+  }
+}
+"#,
+        );
+        assert!(
+            f.run(&one_rule("type_literal_in_constant_pattern"))
+                .is_empty()
         );
     }
 }
