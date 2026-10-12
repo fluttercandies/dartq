@@ -154,3 +154,157 @@ fn legacy_switch_case_constants_parse_clean() {
         .listener
         .assert_sequence(&[("begin", "switch_statement"), ("end", "switch_statement")]);
 }
+
+// —— #839 r5/r6-triage batch: single-point re-verification pins ————————————
+//
+// Each shape was re-probed live against `dart analyze --format=machine`
+// 3.13.1 before pinning (probe rows in docs/audits/p839-r6-triage.md); the
+// r5 gate-caliber table predates the W3/W4 listener work, so several of its
+// rows were stale. A face that already matched the oracle is pinned here to
+// keep it matched; no production code changed for a dead divergence.
+
+/// The `keyword_named_*_methods_2.dart` face: a statement keyword in
+/// EXPRESSION position (`return break(x-1) + 1;`) routes through
+/// `ExpressionIdentifierContext.ensureIdentifier` — `looksLikeStatementStart`
+/// splices a synthetic name in front of the keyword (`missing_identifier`)
+/// and the keyword survives to the statement loop, which re-parses it as a
+/// break/continue/try statement (`break_outside_of_loop` via the loop guard,
+/// `missing_catch_or_finally` via `only_try`, `expected_body` via
+/// `ensureBlock(TryStatement)`; probed rows 28:10/53:10/313:10 in
+/// `keyword_named_top_level_methods_2.dart`).
+#[test]
+fn expression_position_statement_keywords_reparse_as_statements() {
+    assert_codes(
+        "void f() {\n  return break(x-1) + 1;\n}\n",
+        &[
+            "break_outside_of_loop",
+            "expected_token",
+            "expected_token",
+            "missing_identifier",
+        ],
+        "break in expression position",
+    );
+    assert_codes(
+        "void f() {\n  return continue(x-1) + 1;\n}\n",
+        &[
+            "continue_outside_of_loop",
+            "expected_token",
+            "expected_token",
+            "missing_identifier",
+        ],
+        "continue in expression position",
+    );
+    assert_codes(
+        "void f() {\n  return try(x-1) + 1;\n}\n",
+        &[
+            "expected_body",
+            "expected_token",
+            "missing_catch_or_finally",
+            "missing_identifier",
+        ],
+        "try in expression position",
+    );
+}
+
+/// `set s;` — the missing-`(` recovery splices a SYNTHETIC empty group, and
+/// the official setter arity check suppresses the row when the group's `(` is
+/// synthetic (`ast_builder.dart:6475 !leftParenthesis.isSynthetic`). The
+/// stale-count hazard is pinned with a two-parameter predecessor: the
+/// synthetic group must reset the count AND suppress, not ride the stale
+/// value. Both arms mirror each other (top-level `ast_builder.dart:6257`,
+/// class member :6457). `set s() {}` — real empty parens — still reports.
+#[test]
+fn setter_missing_formals_suppress_arity_on_synthetic_group() {
+    assert_codes(
+        "void a(int x, int y) {}\n\nset s;\n",
+        &["missing_function_body", "missing_function_parameters"],
+        "top-level `set s;` after a two-parameter member",
+    );
+    assert_codes(
+        "class C {\n  void m(int x, int y) {}\n  set s2;\n}\n",
+        &["missing_method_parameters"],
+        "class `set s2;` after a two-parameter method",
+    );
+    assert_codes(
+        "class D {\n  set s3() {}\n}\n",
+        &["wrong_number_of_parameters_for_setter"],
+        "class `set s3() {}` real empty parens still report",
+    );
+}
+
+/// Doubled `required` reports `extraneous_modifier` on the FIRST keyword
+/// even inside a named group, plus `duplicated_modifier` on the repeat
+/// (probed 3.13.1 rows 1:9+1:18 named, 3:8+3:17 positional); a lone
+/// `required` in a named group stays silent.
+#[test]
+fn doubled_required_reports_extraneous_on_first_in_named_group() {
+    assert_codes(
+        "void a({required required x}) {}\n",
+        &["duplicated_modifier", "extraneous_modifier"],
+        "named doubled required",
+    );
+    assert_codes(
+        "void c(required required x) {}\n",
+        &["duplicated_modifier", "extraneous_modifier"],
+        "positional doubled required",
+    );
+    assert_codes(
+        "void d({required x}) {}\n",
+        &[],
+        "lone named required stays silent",
+    );
+}
+
+/// A function-typed formal with a `var`/`final` prefix reports BOTH
+/// `extraneous_modifier` and `function_typed_parameter_var` on the keyword
+/// (probed 3.13.1: `void g(var g()) {}` rows 8:8 len3 twice).
+#[test]
+fn function_typed_parameter_var_also_reports_extraneous_modifier() {
+    assert_codes(
+        "void g(var g()) {}\n",
+        &["extraneous_modifier", "function_typed_parameter_var"],
+        "var function-typed formal",
+    );
+    assert_codes(
+        "void h(final g()) {}\n",
+        &["extraneous_modifier", "function_typed_parameter_var"],
+        "final function-typed formal",
+    );
+}
+
+/// #891: top-level `factory Foo.bar();` — the `factory` arm reports
+/// `factory_top_level_declaration` and hands the stream back at `Foo`
+/// (`force_advance` = the official consume-on-invalidation posture), and the
+/// unit loop re-parses the cascade: `Foo.bar` rides the missing-`(`
+/// synthetic group (`missing_function_parameters` on the name), the `.`-led
+/// junk body reports `missing_function_body`, the `.` re-enters as an
+/// invalid declaration (`expected_executable`), and `bar();` parses as a
+/// fresh member whose `;` body reports the second `missing_function_body`
+/// (probed 3.13.1: 5 rows for the `;` shape, 4 with a real `{}` body).
+#[test]
+fn top_level_factory_cascade_reparses_the_tail() {
+    // (expectations in the helper's sorted order; dartq's emission order —
+    // the factory row first, then the re-parse cascade — matches the
+    // oracle's machine-output order, probed 3.13.1.)
+    assert_codes(
+        "factory Foo.bar();\n",
+        &[
+            "expected_executable",
+            "factory_top_level_declaration",
+            "missing_function_body",
+            "missing_function_body",
+            "missing_function_parameters",
+        ],
+        "top-level factory with `;` tail",
+    );
+    assert_codes(
+        "factory Foo.bar() {}\n",
+        &[
+            "expected_executable",
+            "factory_top_level_declaration",
+            "missing_function_body",
+            "missing_function_parameters",
+        ],
+        "top-level factory with `{}` tail",
+    );
+}

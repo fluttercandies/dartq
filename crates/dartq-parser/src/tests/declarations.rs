@@ -597,7 +597,9 @@ fn required_modifier_walk_matches_official_order() {
     // the first token after the walk (modifier_context.dart:212-221); a
     // repeat reports `duplicatedModifier` inside the walk (:594) — walk
     // order first, walk-end second. Named formals stay silent; a doubled
-    // named `required` only duplicates.
+    // named `required` duplicates AND reports `extraneous_modifier` at the
+    // first keyword (probed 3.13.1: `void a({required required x}) {}` →
+    // EXTRANEOUS_MODIFIER@1:9 + DUPLICATED_MODIFIER@1:18).
     let c = parse("class C { void m(required required int x) {} }");
     assert_eq!(
         c.error_codes(),
@@ -613,7 +615,12 @@ fn required_modifier_walk_matches_official_order() {
     assert!(c.errors.is_empty(), "{:?}", c.errors);
 
     let c = parse("class C { void m({required required x}) {} }");
-    assert_eq!(c.error_codes(), ["duplicated_modifier"], "{:?}", c.errors);
+    assert_eq!(
+        c.error_codes(),
+        ["duplicated_modifier", "extraneous_modifier"],
+        "{:?}",
+        c.errors
+    );
 }
 
 #[test]

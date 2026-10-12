@@ -354,6 +354,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         let mut required: Option<TokenSpan> = None;
         let mut covariant: Option<TokenSpan> = None;
         let mut var_final_or_const: Option<TokenSpan> = None;
+        // A repeat `required` was seen in the walk: the oracle then reports
+        // `extraneous_modifier` on the FIRST `required` even in a named
+        // group (`{required required x}` → extraneous@first +
+        // duplicated@second, probed 3.13.1), where a lone `required` stays
+        // silent.
+        let mut duplicate_required = false;
         // Modifier walk (official parseFormalParameter head +
         // `parseFormalParameterModifiers` recovery).
         loop {
@@ -417,6 +423,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     let t = self.peek_span();
                     self.cursor.advance();
                     self.report(msg::duplicated_modifier("required"), t);
+                    duplicate_required = true;
                 }
                 TokenKind::Keyword(Keyword::Required) => {
                     // Recorded silently; the walk-end gate reports it once
@@ -432,6 +439,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         // `extraneous_modifier` at the first `required` when the formal's
         // kind never named it; repeats already reported `duplicated_modifier`
         // inside the walk. Primary constructors tolerate it on named formals.
+        // A repeated `required` reports at the first one even in a named
+        // group (probed 3.13.1: `{required required x}` → extraneous@first +
+        // duplicated@second; a lone `required` stays silent).
         if let Some(t) = required {
             let kind_named = matches!(
                 original_parameter_kind,
@@ -440,7 +450,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             let gate = if member_kind == MemberKind::PrimaryConstructor {
                 !kind_named
             } else {
-                original_parameter_kind != FormalParameterKind::OptionalNamed
+                original_parameter_kind != FormalParameterKind::OptionalNamed || duplicate_required
             };
             if gate {
                 self.report(msg::extraneous_modifier("required"), t);
@@ -571,6 +581,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     if let Some(t) = var_final_or_const
                         && member_kind != MemberKind::PrimaryConstructor
                     {
+                        // Probed 3.13.1: `void g(var g()) {}` reports BOTH
+                        // `extraneous_modifier` and
+                        // `function_typed_parameter_var` on the `var`/`final`
+                        // token.
+                        let lexeme = self.cursor.lexeme(t.id).to_owned();
+                        self.report(msg::extraneous_modifier(&lexeme), t);
                         self.report(msg::function_typed_parameter_var(), t);
                     }
                     inline_name = Some(name);
@@ -582,6 +598,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 if let Some(t) = var_final_or_const
                     && member_kind != MemberKind::PrimaryConstructor
                 {
+                    // Same probed pair as the type-led shape above.
+                    let lexeme = self.cursor.lexeme(t.id).to_owned();
+                    self.report(msg::extraneous_modifier(&lexeme), t);
                     self.report(msg::function_typed_parameter_var(), t);
                 }
                 before_inline_function_type = Some(self.peek_span());

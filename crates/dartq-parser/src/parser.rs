@@ -97,6 +97,12 @@ pub struct Parser<'s, 't, L: ParserListener> {
     /// `endFormalParameters` count); read by the setter's exactly-one-check
     /// (`AstBuilder` `_ensureSetterFormalParameter`, `ast_builder.dart:6457`).
     pub(crate) last_parameter_count: usize,
+    /// The most recent formal-parameter group came from the missing-`(`
+    /// recovery's synthetic empty list. The official setter check suppresses
+    /// the arity row when the group's `(` is synthetic
+    /// (`ast_builder.dart:6475` — `set s;` stays silent), so the check reads
+    /// this alongside [`Self::last_parameter_count`].
+    pub(crate) synthetic_formals: bool,
     /// Set while an extension type's representation formals parse; the
     /// accumulated shape drives the representation-field error codes
     /// (analyzer `error_verifier` `_checkForExtensionTypeRepresentationErrorCodes`,
@@ -160,6 +166,7 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             external_ctor_field_formals: false,
             in_constructor_formals: false,
             last_parameter_count: 0,
+            synthetic_formals: false,
             rep_field_check: None,
             spill_after: None,
             spill_scan_floor: 0,
@@ -401,6 +408,7 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             external_ctor_field_formals: self.external_ctor_field_formals,
             in_constructor_formals: self.in_constructor_formals,
             last_parameter_count: self.last_parameter_count,
+            synthetic_formals: self.synthetic_formals,
             rep_field_check: None,
             spill_after: self.spill_after,
             spill_scan_floor: self.spill_scan_floor,

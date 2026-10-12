@@ -368,8 +368,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         // `AstBuilder` `_ensureSetterFormalParameter` guards the top-level
         // setter arm too (ast_builder.dart:6257/:6289): exactly one required
         // positional parameter, anchored on the setter name (measured f18:
-        // `set topSetter() => 1;` fires at the identifier).
+        // `set topSetter() => 1;` fires at the identifier). A synthetic
+        // empty group (`set s;`) suppresses the row (:6475
+        // `!leftParenthesis.isSynthetic`).
         if !is_getter
+            && !self.synthetic_formals
             && let Some(setter_name) = declared_name
             && self.last_parameter_count != 1
         {
@@ -1255,10 +1258,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         self.in_constructor_formals = false;
         // `AstBuilder` `_ensureSetterFormalParameter` (ast_builder.dart:6457):
         // a setter takes exactly one required positional parameter; the
-        // report anchors on the setter name.
+        // report anchors on the setter name. A synthetic empty group
+        // (`set s;`) suppresses the row (:6475 `!leftParenthesis.isSynthetic`).
         if !is_constructor
             && !is_considered_getter
             && get_or_set.is_some_and(|t| self.cursor.lexeme(t.id) == "set")
+            && !self.synthetic_formals
             && self.last_parameter_count != 1
         {
             self.report(msg::wrong_number_of_parameters_for_setter(), name);
@@ -1865,6 +1870,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         is_getter: bool,
         kind: MemberKind,
     ) -> TokenSpan {
+        self.synthetic_formals = false;
         if self.peek_kind() == TokenKind::OpenParen {
             if is_getter {
                 self.report(msg::getter_with_formals(), self.peek_span());
@@ -1879,8 +1885,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             // The official `insertSyntheticToken` pair splices into the
             // stream and the parser moves past it (`parseGetterOrFormalParameters`
             // recovery, :5560); drain the queue so the body-section reads
-            // see the real follower, not the queued synthetics.
+            // see the real follower, not the queued synthetics. The group
+            // counts as empty (not a stale predecessor's count) and carries
+            // the synthetic-`(` marker the official setter check keys on
+            // (`ast_builder.dart:6475`).
             self.report(msg::missing_parameters(kind), name);
+            self.last_parameter_count = 0;
+            self.synthetic_formals = true;
             let at = self.peek_span();
             let open = self.synthetic(TokenKind::OpenParen, at.range.offset);
             let close = self.synthetic(TokenKind::CloseParen, at.range.offset);
