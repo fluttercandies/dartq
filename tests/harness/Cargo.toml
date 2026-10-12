@@ -23,6 +23,10 @@ dartq-source = { workspace = true }
 # truth for the rate's semantics.
 dartq-engine = { workspace = true }
 
+# incremental-p95-resident: the resident arm opens the same workspace
+# assembly the `dartq analyze` face runs (dartq_commands::workspace).
+dartq-commands = { workspace = true }
+
 # POSIX process-group kill for timed-out drivers (see oracle.rs kill_driver).
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

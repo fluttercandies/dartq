@@ -19,7 +19,14 @@
 //!   `crates/dartq-engine/tests/incremental_oracle.rs`: per step, a batch of
 //!   `{path -> content | remove}` edits). Reports P50/P95/P99 (nearest-rank).
 //!   The oracle comparison column (`oracle_duration_ms`, one full
-//!   `dart analyze` per step) is captured only with `--with-oracle`.
+//!   `dart analyze` per step) is captured only with `--with-oracle`. This is
+//!   the *batch* arm: one full driver process per step.
+//! - `incremental-p95-resident`: the same edit manifest driven through one
+//!   in-process engine that stays warm across steps (the resident face
+//!   PRD §1.5's incremental target describes — edits land as in-memory
+//!   overlays, the daemon edit shape, and each step is one `analyze` pass,
+//!   no process restart). Reports the same P50/P95/P99 shape over the same
+//!   step set, comparable against the batch arm.
 //! - `token-cost`: `dartq check --format=machine` stdout vs
 //!   `dart analyze --format=machine` stdout on the same corpus, tokenized
 //!   with a pluggable [`Tokenizer`] (v1: the `chars-per-4` heuristic; a real
@@ -108,9 +115,10 @@ const DEFAULT_RSS_INTERVAL_MS: u64 = 50;
 /// `/bin/ps`, absolute: the sampler must not depend on PATH (a hijacked or
 /// missing ps would silently produce zero samples and a fake low peak).
 const PS: &str = "/bin/ps";
-const METRICS: [&str; 8] = [
+const METRICS: [&str; 9] = [
     "rss-100k",
     "incremental-p95",
+    "incremental-p95-resident",
     "token-cost",
     "plugin-overhead",
     "cold",
@@ -165,6 +173,21 @@ the same corpus sharing one fresh cache root (XDG_CACHE_HOME pinned to an \
 empty scratch dir): run 1 untraced (cold, populates the cross-session \
 cache), run 2 with --trace-events; the rate aggregates run 2's \
 LibraryAnalyzed lines (from_cache=true over all of them)";
+
+/// The verbatim resident-arm definition riding every
+/// `incremental-p95-resident` report (the number is meaningless without the
+/// run shape and the assembly that produced it).
+const RESIDENT_DEFINITION: &str = "one in-process engine that stays warm \
+across the whole manifest (the dartq_commands workspace assembly the \
+`dartq analyze` face opens: same pub faces, package table, SDK snapshot, \
+semdiag diagnoser included), no process restart per step: discovery plus \
+one full analyze pass as the timed baseline, then per manifest step the \
+edits applied as in-memory overlays (engine set_content/remove_file — the \
+daemon edit shape; edits never touch the fixture on disk) immediately \
+followed by one timed analyze. Step wall time = overlay application + the \
+incremental pass (edit -> diagnostics). The batch sibling \
+(incremental-p95) times a full driver process per step over the same \
+manifest instead.";
 
 /// The verbatim cache-path definition riding every `snapshot-size` report.
 const CACHE_PATH_DEFINITION: &str = "`$XDG_CACHE_HOME/dartq` when \
@@ -224,6 +247,11 @@ pub(crate) struct BenchOptions {
     startup_cmd: String,
     /// startup: measured spawns (median + P95 over the sample set).
     startup_runs: usize,
+    /// incremental-p95-resident: the Dart SDK root the in-process engine
+    /// analyzes against. Explicit `--sdk` wins; otherwise derived from
+    /// `--oracle-dart`'s `<sdk-root>/bin/dart` layout; otherwise
+    /// `DART_SDK` (resolved inside the workspace assembly).
+    sdk: Option<PathBuf>,
 }
 
 impl BenchOptions {
@@ -242,6 +270,7 @@ impl BenchOptions {
             analyze_cmd: DEFAULT_ANALYZE_CMD.to_string(),
             startup_cmd: DEFAULT_STARTUP_CMD.to_string(),
             startup_runs: DEFAULT_STARTUP_RUNS,
+            sdk: None,
         };
         let mut i = 0;
         while i < args.len() {
@@ -275,6 +304,7 @@ impl BenchOptions {
                         })?;
                 }
                 "--analyze-cmd" => opts.analyze_cmd = crate::value(args, &mut i)?.to_string(),
+                "--sdk" => opts.sdk = Some(crate::value(args, &mut i)?.into()),
                 "--startup-cmd" => opts.startup_cmd = crate::value(args, &mut i)?.to_string(),
                 "--startup-runs" => {
                     opts.startup_runs = crate::value(args, &mut i)?
@@ -634,6 +664,36 @@ fn validate_edit_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The SDK root implied by a `dart` binary path: `<sdk-root>/bin/dart` is the
+/// stock and fvm layout, so `.../bin/dart` derives `...`. Pure path
+/// arithmetic — a bare command name (`dart` on PATH) yields `None`, and a
+/// derived root that is not actually an SDK fails loudly downstream
+/// (`SdkSnapshot::load` refuses it). Degenerate roots are refused here
+/// rather than emitted: `bin/dart` has no parent at all (empty), and
+/// `./bin/dart` would derive the cwd-relative `.` — neither is an SDK-root
+/// identity. The `--sdk` flag overrides.
+fn sdk_root_from_dart_path(dart: &str) -> Option<PathBuf> {
+    let bin = Path::new(dart).parent()?;
+    if bin.file_name()? != "bin" {
+        return None;
+    }
+    let root = bin.parent()?;
+    if root.as_os_str().is_empty() || root == Path::new(".") {
+        return None;
+    }
+    Some(root.to_path_buf())
+}
+
+/// The resident arm's SDK resolution: explicit `--sdk`, else the
+/// `--oracle-dart` derivation (both faces should analyze against the same
+/// SDK), else `None` — the workspace assembly then consults `DART_SDK`
+/// itself and its error names both remaining options.
+fn resolve_sdk_root(opts: &BenchOptions) -> Option<PathBuf> {
+    opts.sdk
+        .clone()
+        .or_else(|| sdk_root_from_dart_path(&opts.oracle_dart))
+}
+
 // ---------------------------------------------------------------------------
 // Report schema (schema_version 1; every metric records its full input set,
 // PRD §19.5)
@@ -704,6 +764,40 @@ struct StepTiming {
     /// Full `dart analyze` wall time for the same step; captured only with
     /// `--with-oracle` (null otherwise).
     oracle_duration_ms: Option<f64>,
+}
+
+/// The resident incremental arm (same step shape and percentiles as
+/// [`IncrementalReport`], one warm engine instead of a driver process per
+/// step). Separate report under `incremental-p95-resident/` so the batch
+/// metric's report shape and the mega ladder's consumers stay untouched.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct IncrementalResidentReport {
+    meta: IncrementalResidentMeta,
+    /// Discovery plus the first full analyze pass over the fixture, one
+    /// clock (the batch arm's baseline times a driver cold start, which
+    /// also discovers from scratch).
+    baseline_duration_ms: f64,
+    steps: Vec<StepTiming>,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+struct IncrementalResidentMeta {
+    schema_version: u32,
+    metric: String,
+    corpus_dir: String,
+    epoch_seconds: u64,
+    manifest: String,
+    steps: usize,
+    /// Whether the oracle comparison column was captured.
+    with_oracle: bool,
+    /// The SDK root the in-process engine analyzed against (empty = the
+    /// workspace assembly resolved `DART_SDK` itself).
+    sdk_root: String,
+    /// The verbatim resident-arm definition ([`RESIDENT_DEFINITION`]).
+    resident_definition: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -1297,9 +1391,13 @@ fn first_stdout_byte_ms(
 pub(crate) fn bench_entry(args: &[String]) -> Result<(String, bool), Outcome> {
     let opts = BenchOptions::parse(args)?;
     let metrics = opts.resolved_metrics();
-    if metrics.contains(&"incremental-p95") && opts.manifest.is_none() {
+    let wants_manifest = metrics
+        .iter()
+        .any(|m| *m == "incremental-p95" || *m == "incremental-p95-resident");
+    if wants_manifest && opts.manifest.is_none() {
         return Err(Outcome::Error(
-            "--metric incremental-p95 requires --manifest PATH (the edit manifest)".into(),
+            "--metric incremental-p95[-resident] requires --manifest PATH (the edit manifest)"
+                .into(),
         ));
     }
     // plugin-overhead drives a plugin process, not the corpus: the corpus
@@ -1317,6 +1415,9 @@ pub(crate) fn bench_entry(args: &[String]) -> Result<(String, bool), Outcome> {
         let line = match metric {
             "rss-100k" => metric_rss(&opts, corpus.as_ref().expect("preflighted"))?,
             "incremental-p95" => metric_incremental(&opts, corpus.as_ref().expect("preflighted"))?,
+            "incremental-p95-resident" => {
+                metric_incremental_resident(&opts, corpus.as_ref().expect("preflighted"))?
+            }
             "token-cost" => metric_tokens(&opts, corpus.as_ref().expect("preflighted"))?,
             "plugin-overhead" => metric_plugin_overhead(&opts)?,
             "cold" => metric_cold(&opts, corpus.as_ref().expect("preflighted"))?,
@@ -1468,6 +1569,119 @@ fn metric_incremental(opts: &BenchOptions, corpus: &Path) -> Result<String, Outc
     let path = write_report("incremental-p95", &opts.out, &report)?;
     Ok(format!(
         "incremental-p95: {} steps | p50 {:.1}ms p95 {:.1}ms p99 {:.1}ms \
+         (baseline {:.1}ms) -> {}",
+        report.meta.steps,
+        report.p50_ms,
+        report.p95_ms,
+        report.p99_ms,
+        baseline_duration_ms,
+        path.display()
+    ))
+}
+
+/// `incremental-p95-resident`: the same manifest driven through one
+/// in-process engine that stays warm across steps — no process restart, the
+/// resident face PRD §1.5's incremental target describes. The engine is the
+/// `dartq analyze` face's own workspace assembly (semdiag included); edits
+/// land as in-memory overlays (the daemon edit shape) and each step is one
+/// timed `analyze` pass ([`RESIDENT_DEFINITION`] rides the report).
+fn metric_incremental_resident(opts: &BenchOptions, corpus: &Path) -> Result<String, Outcome> {
+    let manifest_path = opts
+        .manifest
+        .as_ref()
+        .expect("bench_entry validates the manifest flag for incremental-p95-resident");
+    let text = fs::read_to_string(manifest_path).map_err(|e| {
+        Outcome::Error(format!(
+            "reading --manifest {}: {e}",
+            manifest_path.display()
+        ))
+    })?;
+    let manifest = parse_manifest(&text)?;
+
+    let fixture = BenchFixture::new("dq_bench_fixture_resident");
+    fixture
+        .materialize(corpus, &manifest, &opts.oracle_dart)
+        .map_err(Outcome::Error)?;
+    let timeout = driver_timeout_from_env().map_err(Outcome::Error)?;
+    let sdk_root = resolve_sdk_root(opts);
+    // The returned dir is canonicalized by the assembly; edit paths are
+    // built from it so overlays address the spellings discovery interned.
+    let (mut engine, fixture_dir) =
+        dartq_commands::workspace::open_engine(&fixture.dir, sdk_root.as_deref())
+            .map_err(|e| Outcome::Error(e.0))?;
+
+    // Baseline: discovery plus the first full pass, one clock.
+    let baseline_started = Instant::now();
+    engine
+        .discover_workspace()
+        .map_err(|e| Outcome::Error(format!("discovering the fixture workspace: {e}")))?;
+    engine
+        .analyze(
+            &[],
+            &mut |_| {},
+            &dartq_engine::CancellationToken::default(),
+        )
+        .map_err(|e| Outcome::Error(format!("baseline analyze: {e:?}")))?;
+    let baseline_duration_ms = baseline_started.elapsed().as_secs_f64() * 1000.0;
+
+    let mut steps = Vec::with_capacity(manifest.steps.len());
+    for (index, step) in manifest.steps.iter().enumerate() {
+        let started = Instant::now();
+        apply_step_overlays(&mut engine, &fixture_dir, step).map_err(Outcome::Error)?;
+        engine
+            .analyze(
+                &[],
+                &mut |_| {},
+                &dartq_engine::CancellationToken::default(),
+            )
+            .map_err(|e| {
+                Outcome::Error(format!("incremental analyze (step {}): {e:?}", index + 1))
+            })?;
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let oracle_duration_ms = if opts.with_oracle {
+            Some(
+                timed_oracle_run(
+                    "bench-incremental-resident-oracle",
+                    &opts.oracle_dart,
+                    &fixture_dir,
+                    timeout,
+                )
+                .map_err(Outcome::Error)?,
+            )
+        } else {
+            None
+        };
+        steps.push(StepTiming {
+            index: index + 1,
+            duration_ms,
+            oracle_duration_ms,
+        });
+    }
+
+    let durations: Vec<f64> = steps.iter().map(|s| s.duration_ms).collect();
+    let report = IncrementalResidentReport {
+        meta: IncrementalResidentMeta {
+            schema_version: SCHEMA_VERSION,
+            metric: "incremental-p95-resident".to_string(),
+            corpus_dir: corpus.display().to_string(),
+            epoch_seconds: epoch_seconds(),
+            manifest: manifest_path.display().to_string(),
+            steps: steps.len(),
+            with_oracle: opts.with_oracle,
+            sdk_root: sdk_root
+                .as_deref()
+                .map_or_else(String::new, |root| root.display().to_string()),
+            resident_definition: RESIDENT_DEFINITION.to_string(),
+        },
+        baseline_duration_ms,
+        p50_ms: percentile(durations.clone(), 50.0).unwrap_or_default(),
+        p95_ms: percentile(durations.clone(), 95.0).unwrap_or_default(),
+        p99_ms: percentile(durations, 99.0).unwrap_or_default(),
+        steps,
+    };
+    let path = write_report("incremental-p95-resident", &opts.out, &report)?;
+    Ok(format!(
+        "incremental-p95-resident: {} steps | p50 {:.1}ms p95 {:.1}ms p99 {:.1}ms \
          (baseline {:.1}ms) -> {}",
         report.meta.steps,
         report.p50_ms,
@@ -2052,6 +2266,30 @@ fn apply_step(fixture_dir: &Path, step: &ManifestStep) -> Result<(), String> {
     Ok(())
 }
 
+/// Apply one manifest step as in-memory overlays (the resident arm): the
+/// daemon edit shape — `set_content` / `remove_file`, the fixture on disk
+/// stays at its materialized state. Paths are built from the assembly's
+/// canonicalized package dir so overlays address the spellings discovery
+/// interned (`remove_file` on a differently spelled twin would be an
+/// unknown path).
+fn apply_step_overlays(
+    engine: &mut dartq_engine::Engine,
+    fixture_dir: &Path,
+    step: &ManifestStep,
+) -> Result<(), String> {
+    for edit in &step.edits {
+        let target = fixture_dir.join(&edit.path);
+        if edit.remove {
+            engine
+                .remove_file(&target)
+                .map_err(|e| format!("removing {}: {e}", target.display()))?;
+        } else if let Some(content) = &edit.content {
+            engine.set_content(&target, content.as_bytes());
+        }
+    }
+    Ok(())
+}
+
 /// Plain recursive copy (dirs and files; corpora carry no symlinks — corpus
 /// assembly drops them, see `corpus::copy_tree`'s skip rule).
 fn copy_tree(src: &Path, dest: &Path) -> Result<(), String> {
@@ -2374,6 +2612,7 @@ mod tests {
         assert_eq!(defaults.analyze_cmd, DEFAULT_ANALYZE_CMD);
         assert_eq!(defaults.startup_cmd, DEFAULT_STARTUP_CMD);
         assert_eq!(defaults.startup_runs, DEFAULT_STARTUP_RUNS);
+        assert_eq!(defaults.sdk, None);
 
         let opts = BenchOptions::parse(&args(&[
             "--metric",
@@ -2399,6 +2638,8 @@ mod tests {
             "dartq check --format=json",
             "--startup-runs",
             "5",
+            "--sdk",
+            "/sdk/root",
         ]))
         .expect("flags");
         assert_eq!(
@@ -2413,6 +2654,7 @@ mod tests {
         assert_eq!(opts.analyze_cmd, "dartq analyze");
         assert_eq!(opts.startup_cmd, "dartq check --format=json");
         assert_eq!(opts.startup_runs, 5);
+        assert_eq!(opts.sdk, Some(PathBuf::from("/sdk/root")));
 
         assert!(
             BenchOptions::parse(&args(&["--metric", "nope"])).is_err(),
@@ -2434,6 +2676,62 @@ mod tests {
             bench_entry(&args(&["--corpus-dir", "/nonexistent", "--metric", "incremental-p95"])),
             Err(Outcome::Error(msg)) if msg.contains("--manifest")
         ));
+        assert!(matches!(
+            bench_entry(&args(&[
+                "--corpus-dir",
+                "/nonexistent",
+                "--metric",
+                "incremental-p95-resident"
+            ])),
+            Err(Outcome::Error(msg)) if msg.contains("--manifest")
+        ));
+    }
+
+    // -- resident arm: SDK resolution ----------------------------------------
+
+    #[test]
+    fn sdk_root_derives_from_bin_dart_layout_only() {
+        // The stock and fvm layouts: <sdk-root>/bin/dart.
+        assert_eq!(
+            sdk_root_from_dart_path("/home/u/fvm/default/bin/dart"),
+            Some(PathBuf::from("/home/u/fvm/default"))
+        );
+        assert_eq!(
+            sdk_root_from_dart_path("/usr/lib/dart/bin/dart"),
+            Some(PathBuf::from("/usr/lib/dart"))
+        );
+        // A bare command name (no path) derives nothing — DART_SDK or --sdk
+        // must speak up instead.
+        assert_eq!(sdk_root_from_dart_path("dart"), None);
+        assert_eq!(sdk_root_from_dart_path(""), None);
+        // Not under bin/: no derivation.
+        assert_eq!(sdk_root_from_dart_path("/some/dart"), None);
+        // Degenerate roots: "bin/dart" has no parent (empty), "./bin/dart"
+        // derives the cwd-relative "." — neither is an SDK-root identity.
+        assert_eq!(sdk_root_from_dart_path("bin/dart"), None);
+        assert_eq!(sdk_root_from_dart_path("./bin/dart"), None);
+    }
+
+    #[test]
+    fn sdk_root_resolution_prefers_explicit_flag_over_derivation() {
+        let mut opts = BenchOptions::parse(&args(&[
+            "--oracle-dart",
+            "/fvm/default/bin/dart",
+            "--sdk",
+            "/explicit/sdk",
+        ]))
+        .expect("flags");
+        assert_eq!(
+            resolve_sdk_root(&opts),
+            Some(PathBuf::from("/explicit/sdk")),
+            "--sdk wins over the --oracle-dart derivation"
+        );
+        // No --sdk: derive from the oracle dart's layout.
+        opts.sdk = None;
+        assert_eq!(resolve_sdk_root(&opts), Some(PathBuf::from("/fvm/default")));
+        // Neither: None — the workspace assembly consults DART_SDK itself.
+        opts.oracle_dart = "dart".to_string();
+        assert_eq!(resolve_sdk_root(&opts), None);
     }
 
     // -- report schema round trip ---------------------------------------------
@@ -2713,10 +3011,41 @@ mod tests {
             p50_ms: 2.5,
             p95_ms: 9.0,
         };
+        let resident = IncrementalResidentReport {
+            meta: IncrementalResidentMeta {
+                schema_version: SCHEMA_VERSION,
+                metric: "incremental-p95-resident".to_string(),
+                corpus_dir: "/corpus".to_string(),
+                epoch_seconds: 1_700_000_000,
+                manifest: "m.json".to_string(),
+                steps: 2,
+                with_oracle: true,
+                sdk_root: "/fvm/default".to_string(),
+                resident_definition: RESIDENT_DEFINITION.to_string(),
+            },
+            baseline_duration_ms: 90.0,
+            steps: vec![
+                StepTiming {
+                    index: 1,
+                    duration_ms: 3.5,
+                    oracle_duration_ms: Some(880.0),
+                },
+                StepTiming {
+                    index: 2,
+                    duration_ms: 2.25,
+                    oracle_duration_ms: None,
+                },
+            ],
+            p50_ms: 3.5,
+            p95_ms: 3.5,
+            p99_ms: 3.5,
+        };
 
         let rate_path = write_report("cache-hit-rate", &out, &hit_rate).expect("rate report");
         let size_path = write_report("snapshot-size", &out, &snapshot).expect("size report");
         let startup_path = write_report("startup", &out, &startup).expect("startup report");
+        let resident_path =
+            write_report("incremental-p95-resident", &out, &resident).expect("resident report");
 
         // cache-hit-rate: typed round trip + the warm-run definition riding
         // the input set.
@@ -2749,6 +3078,18 @@ mod tests {
         assert_eq!(value["meta"]["schema_version"], SCHEMA_VERSION);
         assert_eq!(value["first_byte_ms"].as_array().map(Vec::len), Some(3));
         assert_eq!(value["p95_ms"], 9.0);
+
+        // incremental-p95-resident: typed round trip + the resident-arm
+        // definition and SDK root riding the input set.
+        let text = fs::read_to_string(&resident_path).expect("report file");
+        let parsed: IncrementalResidentReport = serde_json::from_str(&text).expect("res parse");
+        assert_eq!(parsed, resident);
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(value["meta"]["schema_version"], SCHEMA_VERSION);
+        assert_eq!(value["meta"]["sdk_root"], "/fvm/default");
+        assert_eq!(value["meta"]["resident_definition"], RESIDENT_DEFINITION);
+        assert_eq!(value["steps"][0]["oracle_duration_ms"], 880.0);
+        assert!(value["steps"][1]["oracle_duration_ms"].is_null());
 
         fs::remove_dir_all(&out).ok();
     }

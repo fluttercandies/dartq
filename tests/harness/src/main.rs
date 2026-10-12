@@ -178,13 +178,13 @@ fn print_usage() {
   harness bench [--metric NAME]... [--corpus-dir DIR] [--out DIR]
                 [--manifest PATH] [--dartq-cmd TEMPLATE] [--oracle-dart PATH]
                 [--rss-interval-ms MS] [--with-oracle] [--plugin-dir DIR]
-                [--plugin-cycles N]
+                [--plugin-cycles N] [--sdk PATH]
       §19.3 benchmark metric collectors (PRD §1.5), one JSON report per
       metric under <out>/<metric>/report.json (schema_version 1; every
       report records its inputs for reproducibility). --metric is
-      repeatable (rss-100k | incremental-p95 | token-cost |
-      plugin-overhead | cold); default = all five, in that order. Default
-      corpus: {DEFAULT_TARGET}; default out: docs/audits/bench.
+      repeatable (rss-100k | incremental-p95 | incremental-p95-resident |
+      token-cost | plugin-overhead | cold); default = all nine, in that
+      order. Default corpus: {DEFAULT_TARGET}; default out: docs/audits/bench.
       rss-100k: peak tree-RSS of one full dartq analysis over the corpus
       (/bin/ps polling at --rss-interval-ms, default 50ms, process-group
       tree walk; an 8 GiB tree-RSS watchdog kills the sampled group),
@@ -198,7 +198,16 @@ fn print_usage() {
       content | remove}}]}}]}}; initial present = fresh package from it,
       absent = a copy of the corpus). Reports P50/P95/P99 (nearest-rank)
       over the edit steps; --with-oracle additionally captures one full
-      `dart analyze` wall time per step into the oracle column.
+      `dart analyze` wall time per step into the oracle column. This is the
+      batch arm: one full driver process per step.
+      incremental-p95-resident: the same --manifest driven through one
+      in-process engine that stays warm across steps (no process restart;
+      the resident face PRD §1.5's incremental target describes). Edits
+      land as in-memory overlays (the daemon edit shape); each step is one
+      timed `analyze` pass over the `dartq analyze` face's own workspace
+      assembly. Reports the same P50/P95/P99 shape, comparable against the
+      batch arm. SDK root: --sdk PATH > <root>/bin/dart derived from
+      --oracle-dart > DART_SDK.
       token-cost: `dartq check --format=machine` stdout vs `dart analyze
       --format=machine` stdout on the same corpus, tokenized with the
       chars-per-4 heuristic (pluggable tokenizer trait; cl100k slots in
