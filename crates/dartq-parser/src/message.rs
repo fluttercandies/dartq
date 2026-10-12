@@ -11,6 +11,7 @@
 //! the official templates (`_fe_analyzer_shared/messages.yaml`), matching the
 //! (code, file) oracle differential of PRD §19.
 
+use crate::listener::ExperimentalFlag;
 use dartq_diagnostics::CodeInfo;
 
 /// One recoverable-error report: registry code plus problem text.
@@ -46,6 +47,25 @@ impl Message {
             text: text.into(),
             correction: Some(correction.into()),
         }
+    }
+}
+
+/// `getExperimentNotEnabledMessage`
+/// (`_fe_analyzer_shared/experiments/errors.dart:12`): the message the
+/// analyzer renders for a parser feature-gate report — a shipped flag
+/// (`enabledIn`, `isEnabledByDefault`) takes the `experimentNotEnabled`
+/// wording, an off-by-default flag takes the `experimentNotEnabledOffByDefault`
+/// one; both parameterize the yaml flag name. The engine's diagnostic face
+/// renders the bare
+/// [`ParserListener::handle_experiment_not_enabled`](crate::ParserListener::handle_experiment_not_enabled)
+/// payload through this, so event and message faces share one selection.
+#[must_use]
+pub fn experiment_not_enabled_message(flag: ExperimentalFlag) -> Message {
+    let meta = flag.feature().meta();
+    if meta.enabled_in.is_some() {
+        msg::experiment_not_enabled(meta.name)
+    } else {
+        msg::experiment_not_enabled_off_by_default(meta.name)
     }
 }
 
@@ -102,16 +122,16 @@ pub(crate) mod msg {
         EMPTY_RECORD_TYPE_NAMED_FIELDS_LIST, EMPTY_RECORD_TYPE_WITH_COMMA,
         EQUALITY_CANNOT_BE_EQUALITY_OPERAND, EXPECTED_ELSE_OR_COMMA,
         EXPECTED_IDENTIFIER_BUT_GOT_KEYWORD, EXPECTED_TOKEN, EXPECTED_TYPE_NAME,
-        EXPERIMENT_NOT_ENABLED_OFF_BY_DEFAULT, ILLEGAL_PATTERN_ASSIGNMENT_VARIABLE_NAME,
-        ILLEGAL_PATTERN_IDENTIFIER_NAME, ILLEGAL_PATTERN_VARIABLE_NAME,
-        INITIALIZED_VARIABLE_IN_FOR_EACH, INVALID_AWAIT_IN_FOR, INVALID_CONSTANT_CONST_PREFIX,
-        INVALID_CONSTANT_PATTERN_BINARY, INVALID_INSIDE_UNARY_PATTERN,
-        LATE_PATTERN_VARIABLE_DECLARATION, LITERAL_WITH_CLASS, LITERAL_WITH_CLASS_AND_NEW,
-        LITERAL_WITH_NEW, MISSING_ASSIGNABLE_SELECTOR, MISSING_ASSIGNMENT_IN_INITIALIZER,
-        MISSING_CATCH_OR_FINALLY, MISSING_EXPRESSION_IN_THROW, MISSING_IDENTIFIER,
-        MISSING_INITIALIZER, MULTIPLE_VARIANCE_MODIFIERS, NAMED_FUNCTION_EXPRESSION,
-        NULL_AWARE_CASCADE_OUT_OF_ORDER, PATTERN_ASSIGNMENT_DECLARES_VARIABLE,
-        RECORD_LITERAL_ONE_POSITIONAL_NO_TRAILING_COMMA,
+        EXPERIMENT_NOT_ENABLED, EXPERIMENT_NOT_ENABLED_OFF_BY_DEFAULT,
+        ILLEGAL_PATTERN_ASSIGNMENT_VARIABLE_NAME, ILLEGAL_PATTERN_IDENTIFIER_NAME,
+        ILLEGAL_PATTERN_VARIABLE_NAME, INITIALIZED_VARIABLE_IN_FOR_EACH, INVALID_AWAIT_IN_FOR,
+        INVALID_CONSTANT_CONST_PREFIX, INVALID_CONSTANT_PATTERN_BINARY,
+        INVALID_INSIDE_UNARY_PATTERN, LATE_PATTERN_VARIABLE_DECLARATION, LITERAL_WITH_CLASS,
+        LITERAL_WITH_CLASS_AND_NEW, LITERAL_WITH_NEW, MISSING_ASSIGNABLE_SELECTOR,
+        MISSING_ASSIGNMENT_IN_INITIALIZER, MISSING_CATCH_OR_FINALLY, MISSING_EXPRESSION_IN_THROW,
+        MISSING_IDENTIFIER, MISSING_INITIALIZER, MULTIPLE_VARIANCE_MODIFIERS,
+        NAMED_FUNCTION_EXPRESSION, NULL_AWARE_CASCADE_OUT_OF_ORDER,
+        PATTERN_ASSIGNMENT_DECLARES_VARIABLE, RECORD_LITERAL_ONE_POSITIONAL_NO_TRAILING_COMMA,
         RECORD_TYPE_ONE_POSITIONAL_NO_TRAILING_COMMA, STACK_OVERFLOW,
         SWITCH_HAS_CASE_AFTER_DEFAULT_CASE, SWITCH_HAS_MULTIPLE_DEFAULT_CASES, VAR_AND_TYPE,
         VARIABLE_PATTERN_KEYWORD_IN_DECLARATION_CONTEXT, VOID_WITH_TYPE_ARGUMENTS,
@@ -324,6 +344,17 @@ pub(crate) mod msg {
         Message::new(
             EXPERIMENT_NOT_ENABLED_OFF_BY_DEFAULT,
             format!("This requires the experimental '{feature}' language feature to be enabled."),
+        )
+    }
+
+    /// `experimentNotEnabled` (`diag.experimentNotEnabled`, shared
+    /// diagnostic.g.dart:980): the shipped-feature wording — the template's
+    /// `enabledVersion` parameter rides only its correctionMessage, which the
+    /// registry row and the machine face drop.
+    pub(crate) fn experiment_not_enabled(feature: &str) -> Message {
+        Message::new(
+            EXPERIMENT_NOT_ENABLED,
+            format!("This requires the '{feature}' language feature to be enabled."),
         )
     }
 

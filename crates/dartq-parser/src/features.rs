@@ -14,6 +14,7 @@
 //! the ordinary grammar paths do the right thing. `patterns` and `variance`
 //! are **syntactic** gates owned here.
 
+use crate::listener::ExperimentalFlag;
 use dartq_language::FeatureSet;
 
 /// Grammar variants decided once at parser construction (mirrors the
@@ -46,6 +47,12 @@ pub struct ParserFeatures {
     /// `directive_context.dart:63-67`) — with the feature on, directives
     /// after `part of` are admitted instead of reported.
     pub enhanced_parts_enabled: bool,
+    /// The dot-shorthand gate (`enabledIn: 3.10`, shipped — the shared
+    /// parser has no flag for it; the analyzer's `AstBuilder` reports from
+    /// its own `enabledDotShorthands`, `ast_builder.dart:135`). The parser
+    /// always parses the shorthand shape; when off, the head anchors report
+    /// `experiment_not_enabled` (`Parser::report_dot_shorthands_gate`).
+    pub dot_shorthands_enabled: bool,
 }
 
 impl ParserFeatures {
@@ -63,6 +70,25 @@ impl ParserFeatures {
                 .is_enabled(dartq_language::Feature::PrimaryConstructors),
             augmentations_enabled: features.is_enabled(dartq_language::Feature::Augmentations),
             enhanced_parts_enabled: features.is_enabled(dartq_language::Feature::EnhancedParts),
+            dot_shorthands_enabled: features.is_enabled(dartq_language::Feature::DotShorthands),
+        }
+    }
+}
+
+impl ExperimentalFlag {
+    /// The yaml-registry entry this parser flag mirrors — the same
+    /// [`dartq_language::Feature`] the gate fields above fold. The
+    /// experiment-message selection reads the entry's metadata (`enabledIn`
+    /// separates the shipped wording from the off-by-default one,
+    /// `errors.dart:12`).
+    #[must_use]
+    pub(crate) fn feature(self) -> dartq_language::Feature {
+        match self {
+            Self::TripleShift => dartq_language::Feature::TripleShift,
+            Self::Patterns => dartq_language::Feature::Patterns,
+            Self::Variance => dartq_language::Feature::Variance,
+            Self::Augmentations => dartq_language::Feature::Augmentations,
+            Self::PrimaryConstructors => dartq_language::Feature::PrimaryConstructors,
         }
     }
 }

@@ -947,11 +947,14 @@ fn parse_diagnostics(
         .into_inner()
 }
 
-/// Collects `handle_recoverable_error` events into engine diagnostics.
-/// `handle_experiment_not_enabled` stays a no-op: its payload is a bare
-/// feature flag without a code+text pair, and inventing wording here would
-/// break oracle text parity — the message-capable path lands with the
-/// diagnostic tickets.
+/// Collects parse events into engine diagnostics. `handle_recoverable_error`
+/// rides the parser's registry messages; `handle_experiment_not_enabled`
+/// renders its bare feature flag through the parser's
+/// `experiment_not_enabled_message` selection (the analyzer's
+/// `getExperimentNotEnabledMessage` face: shipped flags take
+/// `experiment_not_enabled`, off-by-default flags the `_off_by_default`
+/// wording, both parameterized with the yaml flag name and anchored at the
+/// report's begin token).
 struct DiagCollector {
     file: FileId,
     diags: Rc<RefCell<Vec<Diagnostic>>>,
@@ -965,6 +968,23 @@ impl ParserListener for DiagCollector {
             message.text,
             self.file,
             start.range,
+            message.correction,
+        ));
+    }
+
+    fn handle_experiment_not_enabled(
+        &mut self,
+        flag: dartq_parser::ExperimentalFlag,
+        begin: TokenSpan,
+        _end: TokenSpan,
+    ) {
+        let message = dartq_parser::experiment_not_enabled_message(flag);
+        self.diags.borrow_mut().push(Diagnostic::new(
+            Severity::Error,
+            message.code,
+            message.text,
+            self.file,
+            begin.range,
             message.correction,
         ));
     }
@@ -2855,6 +2875,34 @@ mod tests {
             diagnostic.correction.as_deref(),
             Some("Try removing the keyword 'base'."),
         );
+    }
+
+    /// The feature-gate face renders the parser's bare
+    /// `handle_experiment_not_enabled` payload (#908): the fixture package
+    /// sits at 3.5, below dot-shorthands' 3.10, so a `.a` shorthand reports
+    /// the shipped-feature wording once, anchored at the dot (the analyzer's
+    /// deduped head+context anchor; probed 3.13.1 against a `// @dart=3.9`
+    /// file — same selection, `getExperimentNotEnabledMessage`).
+    #[test]
+    fn experiment_gate_reports_at_the_shorthand_dot() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let source = "enum E { a }\nvoid main() { var x = E.a == .a; }\n";
+        let main = set(&mut state, &fixture.root.join("lib/main.dart"), source);
+        apply(&mut state, &mut |_| {});
+        let facts = &state.residency[&main];
+        let dot = source.rfind(".a").expect("shorthand dot") as u32;
+        let gate = facts
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "experiment_not_enabled")
+            .expect("the dot-shorthands gate fires at 3.5");
+        assert_eq!(
+            gate.message,
+            "This requires the 'dot-shorthands' language feature to be enabled."
+        );
+        assert_eq!(gate.range.offset, dot);
+        assert_eq!(gate.range.length, 1);
     }
 
     /// Bounded canonical-URI memo (audit #398 F10): a file leaving residency

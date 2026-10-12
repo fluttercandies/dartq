@@ -15,7 +15,7 @@
 //! `unexpected_token`) that we do not replicate — dartq's bounded-depth
 //! bailout is the contract, not the oracle's unbounded crash recovery.
 
-use super::collector::setup;
+use super::collector::{Collector, setup};
 
 /// Parses `source` with the latest feature set and returns the sorted
 /// diagnostic code multiset.
@@ -307,5 +307,79 @@ fn top_level_factory_cascade_reparses_the_tail() {
             "missing_function_parameters",
         ],
         "top-level factory with `{}` tail",
+    );
+}
+
+// —— dot-shorthands gate (#908) ———————————————————————————————————————————
+//
+// The feature ships in 3.10 (`enabledIn: '3.10.0'`); the shared parser has no
+// flag for it, the analyzer's `AstBuilder` reports `experiment_not_enabled`
+// from its listener handlers (`ast_builder.dart:4129`/`4143`/`1456`). Head
+// and context share the dot token and the analyzer dedupes identical
+// same-offset errors, so the probed 3.13.1 oracle face (files pinned below
+// 3.10 via `// @dart`) is one report per head anchor plus one at the `const`
+// keyword of a const shorthand.
+
+/// Parses `source` at language version `major.minor` and returns the
+/// diagnostic (code, start, end) rows in report order.
+fn rows_at(source: &'static str, major: u32, minor: u32) -> Vec<(String, u32, u32)> {
+    let (table, text) = super::collector::scan_ok(source);
+    let features =
+        crate::ParserFeatures::from_feature_set(dartq_language::FeatureSet::for_language_version(
+            dartq_language::LanguageVersion::new(major, minor),
+        ));
+    let mut parser = crate::Parser::new(text, table, features, Collector::default());
+    parser.parse_unit();
+    parser
+        .listener
+        .errors
+        .iter()
+        .map(|(c, s, e)| (c.clone(), *s, *e))
+        .collect()
+}
+
+/// The default (latest) face stays silent: every existing dot-shorthand pin
+/// runs at >= 3.10, so the gate must not perturb it.
+#[test]
+fn dot_shorthand_gate_is_silent_at_latest_version() {
+    assert_eq!(
+        rows_at("enum E { a }\nvoid f() { var x = E.a == .a; }\n", 3, 15),
+        []
+    );
+    assert_eq!(rows_at("enum E { a }\nfinal x = const .a;\n", 3, 15), []);
+    // Plain selectors are never shorthand heads at any version.
+    assert_eq!(rows_at("void f() { var x = foo.bar; }\n", 3, 9), []);
+}
+
+/// `.a` at 3.9: exactly one `experiment_not_enabled` report, anchored at the
+/// dot token (the deduped head+context anchor, oracle probe 3.13.1:
+/// `ERROR|SYNTACTIC_ERROR|EXPERIMENT_NOT_ENABLED|…|4|14|1`).
+#[test]
+fn dot_shorthand_gate_reports_once_at_the_dot_below_3_10() {
+    let source = "enum E { a }\nvoid f() {\n  if (E.a == .a) {}\n}\n";
+    let dot = source.rfind(".a").expect("shorthand dot") as u32;
+    assert_eq!(
+        rows_at(source, 3, 9),
+        vec![("experiment_not_enabled".to_string(), dot, dot + 1)],
+        "one report at the dot, nothing else"
+    );
+}
+
+/// `const .a` at 3.9: the head anchor at the dot plus the const-keyword
+/// anchor (`endConstDotShorthand`, `ast_builder.dart:1456`; oracle probe:
+/// `…|3|11|5|This requires the 'dot-shorthands' language feature to be
+/// enabled.` + `…|3|17|1|` same text).
+#[test]
+fn const_dot_shorthand_gate_reports_dot_and_const_below_3_10() {
+    let source = "enum E { a }\nfinal x = const .a;\n";
+    let const_kw = source.find("const").expect("const keyword") as u32;
+    let dot = source.rfind(".a").expect("shorthand dot") as u32;
+    assert_eq!(
+        rows_at(source, 3, 9),
+        vec![
+            ("experiment_not_enabled".to_string(), dot, dot + 1),
+            ("experiment_not_enabled".to_string(), const_kw, const_kw + 5),
+        ],
+        "dot head anchor + const keyword anchor"
     );
 }

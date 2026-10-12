@@ -111,7 +111,7 @@ pub use listener::{
     DeclarationHeaderKind, DeclarationKind, ExperimentalFlag, FormalParameterKind,
     IdentifierContext, MemberKind, NullListener, ParserListener, PatternContext,
 };
-pub use message::Message;
+pub use message::{Message, experiment_not_enabled_message};
 pub use parser::Parser;
 pub use token_id::{TokenId, TokenSpan};
 pub use types::{TypeInfo, TypeParamOrArg};

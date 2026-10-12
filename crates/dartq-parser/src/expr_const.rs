@@ -520,7 +520,9 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 // Dot-shorthand head in pattern position: parsePrimaryPattern's
                 // fallthrough reaches parsePrecedenceExpression, whose
                 // `_isDotShorthand` entry check (:7042-7053) admits `.` +
-                // identifier/`new` (shipped 3.10, expired flag — no gate). The
+                // identifier/`new` (shipped 3.10 — the gate lives in the
+                // analyzer's listener, which this reports through
+                // `report_dot_shorthands_gate`). The
                 // head/context events bracket the shorthand (:7146-7198); no
                 // `!` capture — in pattern context the bang stays for the
                 // pattern loop (null-assert pattern), like every other
@@ -553,12 +555,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         self.ensure_identifier(IdentifierContext::ExpressionContinuation)
                     };
                     self.listener.handle_dot_shorthand_head(dot);
+                    self.report_dot_shorthands_gate(dot);
                     let end = self.parse_selector_chain(member, context);
                     self.listener.handle_dot_shorthand_context(dot);
                     end
                 } else {
                     let end = self.ensure_identifier(IdentifierContext::ExpressionContinuation);
                     self.listener.handle_dot_shorthand_head(dot);
+                    self.report_dot_shorthands_gate(dot);
                     self.listener.handle_dot_shorthand_context(dot);
                     self.parse_selector_chain(end, context)
                 }
@@ -1020,6 +1024,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         // `_tryRewriteNewToIdentifier`, :8510).
                         let end = self.parse_primary(IdentifierContext::ExpressionContinuation);
                         self.listener.handle_dot_shorthand_head(dot);
+                        self.report_dot_shorthands_gate(dot);
                         self.listener.handle_dot_shorthand_context(dot);
                         end
                     } else {
@@ -1041,9 +1046,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         self.report(msg::missing_identifier(), at);
                         let synthetic = self.synthetic(TokenKind::Identifier, dot.range.offset);
                         self.listener.handle_dot_shorthand_head(dot);
+                        self.report_dot_shorthands_gate(dot);
                         self.listener.handle_dot_shorthand_context(dot);
                         synthetic
                     };
+                    self.report_dot_shorthands_gate(const_keyword);
                     self.listener.end_const_dot_shorthand(const_keyword);
                     return end;
                 }

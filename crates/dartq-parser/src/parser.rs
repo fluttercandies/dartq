@@ -370,6 +370,24 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
         }
     }
 
+    /// The dot-shorthands gate (`enabledIn: 3.10`). The shared parser has no
+    /// flag for the feature; the analyzer's `AstBuilder` reports
+    /// `experiment_not_enabled` from its listener handlers — head, context
+    /// (`ast_builder.dart:4129`/`4143`) and const-end (`:1456`). Head and
+    /// context share the dot token, and the analyzer dedupes identical
+    /// same-offset errors, so the observable face is one report per head
+    /// anchor plus one at the `const` keyword when the shorthand closes one.
+    /// This helper reports that deduped face; call it at each head anchor and
+    /// at `end_const_dot_shorthand`.
+    pub(crate) fn report_dot_shorthands_gate(&mut self, at: TokenSpan) {
+        if !self.features.dot_shorthands_enabled {
+            self.report(
+                crate::message::msg::experiment_not_enabled("dot-shorthands"),
+                at,
+            );
+        }
+    }
+
     /// Parses a full pattern at the cursor in `context` (official
     /// `parsePattern`, `parser_impl.dart:11582`).
     pub fn parse_pattern_entry(&mut self, context: crate::listener::PatternContext) -> TokenSpan {

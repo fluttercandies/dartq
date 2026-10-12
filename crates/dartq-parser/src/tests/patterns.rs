@@ -121,6 +121,7 @@ fn patterns_disabled_reports_experiment() {
         primary_constructors_enabled: true,
         augmentations_enabled: false,
         enhanced_parts_enabled: false,
+        dot_shorthands_enabled: false,
     };
     let mut p = crate::Parser::new(
         text,

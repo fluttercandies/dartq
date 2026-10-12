@@ -247,6 +247,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             self.cursor.advance();
             left = self.ensure_identifier(IdentifierContext::ExpressionContinuation);
             self.listener.handle_dot_shorthand_head(dot);
+            self.report_dot_shorthands_gate(dot);
             self.listener.handle_dot_shorthand_context(dot);
             let end = self.precedence_loop(precedence, allow_cascades, type_arg, left, false);
             self.leave_depth();
@@ -425,6 +426,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         }
                         if is_dot_shorthand {
                             self.listener.handle_dot_shorthand_head(dot);
+                            self.report_dot_shorthands_gate(dot);
                             is_dot_shorthand = false;
                         } else {
                             self.listener.handle_dot_access(
