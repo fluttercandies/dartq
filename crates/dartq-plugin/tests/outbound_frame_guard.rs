@@ -42,6 +42,7 @@ fn warning(message: &str, file: FileId) -> Diagnostic {
 /// rejected batch left a working plugin behind (the crate's echo fixture,
 /// shared with `e2e_round_trip.rs`).
 #[test]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn dart_host_survives_an_over_limit_outbound_batch() {
     if !dart_available() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");
@@ -68,6 +69,7 @@ fn dart_host_survives_an_over_limit_outbound_batch() {
 /// answer `shutdown` only.
 #[cfg(unix)]
 #[test]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn sh_host_survives_an_over_limit_outbound_batch() {
     let script = concat!(
         r#"read line; "#,

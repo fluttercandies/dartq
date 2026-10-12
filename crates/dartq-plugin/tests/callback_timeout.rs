@@ -21,6 +21,7 @@ fn host_package_dir() -> PathBuf {
 }
 
 #[test]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn dart_plugin_over_callback_budget_is_killed_and_restarted() {
     if !dart_available() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");
@@ -79,6 +80,7 @@ fn dart_plugin_over_callback_budget_is_killed_and_restarted() {
 /// for a Dart VM per generation.
 #[cfg(unix)]
 #[test]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn repeated_callback_overruns_exhaust_the_budget_into_a_terminal_crash() {
     let script = concat!(
         r#"read line; "#,

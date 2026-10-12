@@ -51,11 +51,13 @@
 #   daemon-suite     cargo test -p dartq-daemon   -- --test-threads 2
 #                    (the one serial-phase #[ignore]d test in rpc_commands
 #                    belongs to daemon-live below)
-#   plugin-suite     cargo test -p dartq-plugin: lib + the 13 in-process
-#                    integration targets, -- --test-threads 2. The six
-#                    dart-spawning integration files are owned by the live
-#                    steps below — a new tests/*.rs file must be added to
-#                    the matching step or both silently skip it.
+#   plugin-suite     cargo test -p dartq-plugin -- --test-threads 2 (lib +
+#                    every integration target, doctests included). The six
+#                    dart-spawning integration files opt out of this face
+#                    via #[ignore = ...] and are owned by plugin-live below
+#                    — exclusion is annotation-driven: a new tests/*.rs is
+#                    in this face by default and must carry the #[ignore] if
+#                    it spawns dart.
 #   commands-suite   cargo test -p dartq-commands -- --test-threads 2
 #   schema-suite     cargo test -p dartq-schema   -- --test-threads 2
 #   schema-freeze    scripts/schema-freeze-sweep.sh --no-build (the schema
@@ -66,9 +68,11 @@
 #                    rpc_commands -- --ignored --test-threads 2 (spawns a
 #                    real dart plugin process); a clean logged skip when
 #                    the flag is unset
-#   plugin-live      DARTQ_M4_LIVE=1 gate: the five dart-spawning plugin
-#                    integration targets, then compat_live -- --ignored
-#                    (the #644 compat matrix); clean skip when unset
+#   plugin-live      DARTQ_M4_LIVE=1 gate: cargo test -p dartq-plugin --
+#                    --ignored --test-threads 2 (wakes every #[ignore]d
+#                    test in the crate — the five dart-spawning integration
+#                    files plus the #644 compat_live matrix, the crate's
+#                    only ignores); clean skip when unset
 #   host-live        DARTQ_M4_LIVE=1 gate: dart pub get + dart test in the
 #                    dartq-plugin-host Dart package; clean skip when unset
 #   repro            scripts/repro-gate.sh (clean tracked tree required)
@@ -569,18 +573,13 @@ step_runner() { # <step> — runs every watchdogged phase of the step
       cargo test -p "dartq-${1%-suite}" -- --test-threads 2
     ;;
   plugin-suite)
-    # dartq-plugin's integration tests split at the dart-process boundary:
-    # the five dart-spawning files plus the #[ignore]d compat_live are owned
-    # by the flag-gated plugin-live step. When a new tests/*.rs file lands,
-    # add it to the matching step — an unlisted target is silently skipped
-    # by both.
+    # dartq-plugin's integration tests split at the dart-process boundary
+    # via #[ignore] annotations: the six dart-spawning files opt out of this
+    # default face and are owned by the flag-gated plugin-live step. A new
+    # tests/*.rs file is in this face automatically — it must carry
+    # #[ignore = "spawns real dart processes; ..."] if it spawns dart.
     watchdog_run "$1" "$(cap_for_step "$1")" \
-      cargo test -p dartq-plugin --lib \
-      --test analyze_clock_reopen --test analyze_timeout --test crash_restart \
-      --test handshake_timeout --test memory_budget --test protocol_violation \
-      --test reader_eof_death_attribution --test relaunch_hang --test shutdown_hang \
-      --test shutdown_timeout --test startup_stderr --test wait_dead_generation \
-      --test write_timeout -- --test-threads 2
+      cargo test -p dartq-plugin -- --test-threads 2
     ;;
   schema-freeze)
     watchdog_run "$1" "$(cap_for_step "$1")" \
@@ -594,16 +593,11 @@ step_runner() { # <step> — runs every watchdogged phase of the step
     ;;
   plugin-live)
     m4_live_skip "$1" && return 0
+    # --ignored wakes exactly the crate's #[ignore]d tests: the five
+    # dart-spawning integration files plus compat_live (the #644 compat
+    # matrix) — there are no other ignores in dartq-plugin.
     watchdog_run "plugin-live${TAG}" "$(cap_for_step "$1")" \
-      cargo test -p dartq-plugin --test callback_timeout --test e2e_round_trip \
-      --test live_host --test outbound_frame_guard --test plugin_discovery \
-      -- --test-threads 2 || return 1
-    local leg_peak="$WATCH_PEAK_KB" rc=0
-    watchdog_run "plugin-live-compat${TAG}" "$(cap_for_step "$1")" \
-      cargo test -p dartq-plugin --test compat_live -- --ignored --test-threads 2 || rc=1
-    # Peak of the step = heaviest phase (the first phase's peak survives).
-    [ "$leg_peak" -gt "${WATCH_PEAK_KB:-0}" ] && WATCH_PEAK_KB="$leg_peak"
-    return "$rc"
+      cargo test -p dartq-plugin -- --ignored --test-threads 2
     ;;
   host-live)
     m4_live_skip "$1" && return 0

@@ -74,6 +74,7 @@ fn fixture_manifest() -> String {
 }
 
 #[test]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn discovery_spawns_the_fixture_and_round_trips_fixes() {
     if !dart_available() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");
@@ -166,6 +167,7 @@ fn discovery_spawns_the_fixture_and_round_trips_fixes() {
 }
 
 #[test]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn overrides_load_directories_and_report_missing_paths() {
     let workspace = Workspace::new("overrides");
     workspace.write_fixture("fixer", &fixture_manifest());

@@ -65,6 +65,7 @@ fn spawn_live(args: &[&str]) -> PluginRuntime {
 }
 
 #[test]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn live_plugin_round_trips_fixes_and_shuts_down_in_budget() {
     if !dart_available() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");
@@ -159,6 +160,7 @@ fn live_plugin_round_trips_fixes_and_shuts_down_in_budget() {
 }
 
 #[test]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn live_plugin_mid_session_death_isolated_as_plugin_crashed() {
     if !dart_available() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");

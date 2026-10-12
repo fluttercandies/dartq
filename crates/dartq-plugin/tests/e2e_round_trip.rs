@@ -46,6 +46,7 @@ fn spawn_echo() -> PluginRuntime {
 }
 
 #[test]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn engine_diagnostics_round_trip_through_the_dart_host() {
     if !dart_available() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");
@@ -114,6 +115,7 @@ fn engine_diagnostics_round_trip_through_the_dart_host() {
 }
 
 #[test]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn empty_feed_sends_no_frame() {
     if !dart_available() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");

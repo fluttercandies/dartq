@@ -336,13 +336,13 @@ phase_verify() {
     # M4 surfaces (#945): the daemon/plugin/commands/schema suites, then the
     # schema v1 freeze sweep (cross-face: CLI machine/json shapes + a live
     # daemon RPC session; drives the debug dartq built by the build phase).
-    # plugin-suite intentionally carries only the lib + the 13 in-process
-    # integration targets — the six dart-spawning integration files belong
-    # to the DARTQ_M4_LIVE faces below; keep the target lists in sync when
-    # a new tests/*.rs file lands in dartq-plugin.
+    # plugin-suite runs the whole dartq-plugin default face — the six
+    # dart-spawning integration files opt out via #[ignore] and belong to
+    # the DARTQ_M4_LIVE plugin-live face below (which wakes every
+    # #[ignore]d test in the crate); no target list to keep in sync.
     if [ "$DRY_RUN" = 1 ]; then
         echo "release: [verify] would run: cargo test -p dartq-daemon -- --test-threads 2   # daemon-suite"
-        echo "release: [verify] would run: cargo test -p dartq-plugin --lib --test <13 in-process targets> -- --test-threads 2   # plugin-suite"
+        echo "release: [verify] would run: cargo test -p dartq-plugin -- --test-threads 2   # plugin-suite"
         echo "release: [verify] would run: cargo test -p dartq-commands -- --test-threads 2   # commands-suite"
         echo "release: [verify] would run: cargo test -p dartq-schema -- --test-threads 2   # schema-suite"
         echo "release: [verify] would run: scripts/schema-freeze-sweep.sh --no-build   # schema-freeze"
@@ -350,13 +350,8 @@ phase_verify() {
     else
         run_gate daemon-suite 1800 8388608 "terminal output (dartq-daemon suite)" \
             cargo test -p dartq-daemon -- --test-threads 2 || return 1
-        run_gate plugin-suite 1800 8388608 "terminal output (dartq-plugin lib + in-process integration targets)" \
-            cargo test -p dartq-plugin --lib \
-            --test analyze_clock_reopen --test analyze_timeout --test crash_restart \
-            --test handshake_timeout --test memory_budget --test protocol_violation \
-            --test reader_eof_death_attribution --test relaunch_hang --test shutdown_hang \
-            --test shutdown_timeout --test startup_stderr --test wait_dead_generation \
-            --test write_timeout -- --test-threads 2 || return 1
+        run_gate plugin-suite 1800 8388608 "terminal output (dartq-plugin default face; dart-spawning suites #[ignore]d out)" \
+            cargo test -p dartq-plugin -- --test-threads 2 || return 1
         run_gate commands-suite 900 8388608 "terminal output (dartq-commands suite)" \
             cargo test -p dartq-commands -- --test-threads 2 || return 1
         run_gate schema-suite 900 8388608 "terminal output (dartq-schema suite)" \
@@ -370,18 +365,13 @@ phase_verify() {
     if [ "${DARTQ_M4_LIVE:-0}" = 1 ]; then
         if [ "$DRY_RUN" = 1 ]; then
             echo "release: [verify] would run: cargo test -p dartq-daemon --test rpc_commands -- --ignored --test-threads 2   # daemon-live"
-            echo "release: [verify] would run: cargo test -p dartq-plugin --test <5 dart-spawning targets> -- --test-threads 2   # plugin-live"
-            echo "release: [verify] would run: cargo test -p dartq-plugin --test compat_live -- --ignored --test-threads 2   # compat-live"
+            echo "release: [verify] would run: cargo test -p dartq-plugin -- --ignored --test-threads 2   # plugin-live (all #[ignore]d suites incl. the #644 compat matrix)"
             echo "release: [verify] would run: (cd crates/dartq-plugin-host && dart pub get && dart test -j 2)   # host-live"
         else
             run_gate daemon-live 900 8388608 "terminal output (rpc_commands serial-phase test)" \
                 cargo test -p dartq-daemon --test rpc_commands -- --ignored --test-threads 2 || return 1
-            run_gate plugin-live 1800 8388608 "terminal output (dart-spawning plugin integration targets)" \
-                cargo test -p dartq-plugin --test callback_timeout --test e2e_round_trip \
-                --test live_host --test outbound_frame_guard --test plugin_discovery \
-                -- --test-threads 2 || return 1
-            run_gate compat-live 1800 8388608 "terminal output (#644 compat matrix, ignored tests)" \
-                cargo test -p dartq-plugin --test compat_live -- --ignored --test-threads 2 || return 1
+            run_gate plugin-live 1800 8388608 "terminal output (all #[ignore]d dart-spawning plugin suites incl. the #644 compat matrix)" \
+                cargo test -p dartq-plugin -- --ignored --test-threads 2 || return 1
             run_gate host-live 1800 8388608 "terminal output (dartq_plugin_host dart test)" \
                 bash -c "cd crates/dartq-plugin-host && dart pub get && dart test -j 2" || return 1
         fi

@@ -20,9 +20,9 @@
 //!
 //! Distinct from `live_host.rs` (the `bin/live_plugin` fixture): this drives
 //! on-disk samples with their real `dartq_plugin.json` manifests. All tests
-//! spawn a real `dart` process: `#[ignore]`d here so the serial verification
-//! phase owns them — run with
-//! `cargo test -p dartq-plugin --test compat_live -- --ignored`.
+//! spawn a real `dart` process: `#[ignore]`d here so the flag-gated
+//! plugin-live serial face owns them — run with
+//! `cargo test -p dartq-plugin -- --ignored` (DARTQ_M4_LIVE=1).
 //! A missing `dart` skips at runtime (CI without the SDK must not go red);
 //! children are reaped by the runtime's own shutdown paths.
 
@@ -53,7 +53,7 @@ fn sample_dir() -> PathBuf {
 const A_DART: &str = "import '\u{1F600}.dart';\nvoid main() {}\n";
 
 #[test]
-#[ignore = "spawns a live `dart` process; serial verification phase: cargo test -p dartq-plugin --test compat_live -- --ignored"]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 // One linear end-to-end scenario (discovery → spawn → feed → merge → fixes
 // → teardown) whose value is the uninterrupted sequence; carving it into
 // helpers would thread six Arcs of context for no reader benefit.
@@ -283,7 +283,7 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
 }
 
 #[test]
-#[ignore = "spawns a live `dart` process; serial verification phase: cargo test -p dartq-plugin --test compat_live -- --ignored"]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn compat_sample_crash_mode_surfaces_as_plugin_crashed() {
     if !dart_available() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");
@@ -371,7 +371,7 @@ struct OverlayRow {
 }
 
 #[test]
-#[ignore = "spawns a live `dart` process; serial verification phase: cargo test -p dartq-plugin --test compat_live -- --ignored"]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn signals_overlay_minimal_custom_lint_plugin_registers_and_applies_utf16_edits() {
     // Minimal deps (custom_lint, no analyzer registry); its five producers
     // are `DartAssist` subclasses served through `request/fixes`.
@@ -389,7 +389,7 @@ fn signals_overlay_minimal_custom_lint_plugin_registers_and_applies_utf16_edits(
 }
 
 #[test]
-#[ignore = "spawns a live `dart` process; serial verification phase: cargo test -p dartq-plugin --test compat_live -- --ignored"]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn jaspr_overlay_all_three_capabilities_with_assist_round_trip() {
     // 3 lint + 2 warning rules (census only: no host mirror), 4 fix
     // generators + 14 assists delegated to the host registry.
@@ -407,7 +407,7 @@ fn jaspr_overlay_all_three_capabilities_with_assist_round_trip() {
 }
 
 #[test]
-#[ignore = "spawns a live `dart` process; serial verification phase: cargo test -p dartq-plugin --test compat_live -- --ignored"]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn riverpod_overlay_bulk_registrations_over_a_live_process() {
     // The bulk row: 16 warning rules (census only) + 6 fix generators + 12
     // assists, all registered inside the child before the handshake.
@@ -425,7 +425,7 @@ fn riverpod_overlay_bulk_registrations_over_a_live_process() {
 }
 
 #[test]
-#[ignore = "spawns a live `dart` process; serial verification phase: cargo test -p dartq-plugin --test compat_live -- --ignored"]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
 fn pyramid_overlay_lint_only() {
     // The lint-only row: the bulk of the upstream registration face (37
     // rules + 23 fix generators + 3 assists) with `request/fixes` gated off
