@@ -1,0 +1,63 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/nnbd/issue_40267_case_04.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "expected_token",
+      "line": 5,
+      "column": 23,
+      "length": 1,
+      "message": "Expected to find ':'."
+    },
+    {
+      "code": "non_constant_case_expression",
+      "line": 5,
+      "column": 10,
+      "length": 1,
+      "message": "Case expressions must be constant."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 3,
+      "column": 10,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 5,
+      "column": 10,
+      "length": 1,
+      "message": "Undefined name 'x'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 5,
+      "column": 10,
+      "length": 1,
+      "message": "Expected to find ':'."
+    }
+  ],
+  "source": "// @dart=2.19\nmain() {\n  switch(a) {\n    // Parse as conditional (with missing colon for the case).\n    case x?[4]:{{{2}}}; // as case (x?[4]:{{{2}}}) [missing :]\n  }\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/0c4d2b9d.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

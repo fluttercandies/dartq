@@ -18,13 +18,19 @@
 
 use crate::keyword::Keyword;
 use crate::token::{TokenKind, TokenTable};
+use dartq_source::LineIndex;
 
 /// The recovery start: the byte offset of the last misaligned `{`/`${`
 /// between the unclosed `{` at `begin_idx` and EOF, or `None` when the walk
-/// finds none (no re-scan — mirrors the official null return).
-pub(crate) fn recovery_offset(src: &str, table: &TokenTable, begin_idx: u32) -> Option<usize> {
+/// finds none (no re-scan — mirrors the official null return). Line starts
+/// come from the first pass's own [`LineIndex`] (`ScanResult.line_index`) —
+/// the same line model the walk needs, already built when the result exists.
+pub(crate) fn recovery_offset(
+    line_index: &LineIndex,
+    table: &TokenTable,
+    begin_idx: u32,
+) -> Option<usize> {
     let tokens = table.as_slice();
-    let line_starts = line_starts(src);
     let mut last_mismatch = None;
     for idx in begin_idx as usize + 1..tokens.len() - 1 {
         let kind = tokens[idx].kind;
@@ -41,47 +47,24 @@ pub(crate) fn recovery_offset(src: &str, table: &TokenTable, begin_idx: u32) -> 
         let Some(end_idx) = table.matching_end(idx) else {
             continue;
         };
-        if line_of(&line_starts, tokens[idx].byte_offset)
-            == line_of(&line_starts, tokens[end_idx].byte_offset)
+        if line_of(line_index, tokens[idx].byte_offset)
+            == line_of(line_index, tokens[end_idx].byte_offset)
         {
             continue;
         }
-        let indent = spaces_at_start_of_logical_line(table, &line_starts, idx);
-        if indent >= 0 && indent != spaces_at_start_of_logical_line(table, &line_starts, end_idx) {
+        let indent = spaces_at_start_of_logical_line(table, line_index, idx);
+        if indent >= 0 && indent != spaces_at_start_of_logical_line(table, line_index, end_idx) {
             last_mismatch = Some(idx);
         }
     }
     last_mismatch.map(|idx| tokens[idx].byte_offset as usize)
 }
 
-/// Byte offsets of the line starts (`\n`, and a lone `\r` — the same line
-/// model as `LineIndex`). Error-path only: one linear byte scan.
-fn line_starts(src: &str) -> Vec<u32> {
-    let bytes = src.as_bytes();
-    let mut starts = vec![0u32];
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\n' => {
-                starts.push(i as u32 + 1);
-                i += 1;
-            }
-            b'\r' => {
-                i += 1;
-                if bytes.get(i) != Some(&b'\n') {
-                    starts.push(i as u32);
-                }
-            }
-            _ => i += 1,
-        }
-    }
-    starts
-}
-
-/// 0-based line of a byte offset (greatest start `<= offset`; index 0 always
-/// qualifies — official `_getLineOf` binary search).
-fn line_of(line_starts: &[u32], offset: u32) -> usize {
-    line_starts.partition_point(|&start| start <= offset) - 1
+/// Line of a byte offset (`LineIndex` lookup — 1-based; used only for
+/// equality). Token offsets never exceed the source length, so the indexed
+/// lookup's range assertion cannot trip.
+fn line_of(line_index: &LineIndex, offset: u32) -> u32 {
+    line_index.byte_to_line_col(offset).0
 }
 
 /// Official `_spacesAtStartOfLogicalLineOf` (:416-493): the indentation of
@@ -93,7 +76,11 @@ fn line_of(line_starts: &[u32], offset: u32) -> usize {
 /// `else`/`try`/`finally` directly, or `x = {` / `x = const {` — and declines
 /// for anything else (plain statement/block braces return `-1`, so a `-1`
 /// never mismatches and never blames).
-fn spaces_at_start_of_logical_line(table: &TokenTable, line_starts: &[u32], mut idx: usize) -> i64 {
+fn spaces_at_start_of_logical_line(
+    table: &TokenTable,
+    line_index: &LineIndex,
+    mut idx: usize,
+) -> i64 {
     let tokens = table.as_slice();
     if tokens[idx].kind == TokenKind::OpenCurly {
         if idx == 0 {
@@ -160,17 +147,20 @@ fn spaces_at_start_of_logical_line(table: &TokenTable, line_starts: &[u32], mut 
             return -1;
         }
     }
-    let line = line_of(line_starts, tokens[idx].byte_offset);
-    if line == 0 {
+    let (line, col) = line_index.byte_to_line_col(tokens[idx].byte_offset);
+    if line == 1 {
         // Official :477: the first token's offset is its own indentation.
         return i64::from(tokens[0].byte_offset);
     }
-    let line_start = line_starts[line];
+    // The byte column counts from the line start (1-based), so the line
+    // begins `col - 1` bytes back — the exact inverse of the index's column
+    // arithmetic (its raw start table is not exposed).
+    let line_start = tokens[idx].byte_offset - (col - 1);
     let mut first = idx;
     while first > 0 && tokens[first - 1].byte_offset >= line_start {
         first -= 1;
     }
-    // `line >= 1` puts the first token of the file above `line_start`, so the
+    // `line >= 2` puts the first token of the file above `line_start`, so the
     // walk always stops on the line's first token (official
     // `candidate.next.offset - lineStart`).
     i64::from(tokens[first].byte_offset - line_start)

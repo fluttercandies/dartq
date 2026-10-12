@@ -1,0 +1,252 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/primary_constructors/enum_primary_constructor_body_error.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "const_with_non_constant_argument",
+      "line": 6,
+      "column": 12,
+      "length": 1,
+      "message": "Arguments of a constant creation must be constant expressions."
+    },
+    {
+      "code": "const_with_non_constant_argument",
+      "line": 14,
+      "column": 12,
+      "length": 1,
+      "message": "Arguments of a constant creation must be constant expressions."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 2,
+      "column": 3,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 6,
+      "column": 3,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 10,
+      "column": 3,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 14,
+      "column": 3,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 18,
+      "column": 3,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 22,
+      "column": 3,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 10,
+      "length": 1,
+      "message": "Expected to find '}'."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 12,
+      "length": 1,
+      "message": "Expected to find ','."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 15,
+      "length": 1,
+      "message": "Expected to find '}'."
+    },
+    {
+      "code": "expected_token",
+      "line": 14,
+      "column": 12,
+      "length": 1,
+      "message": "Expected to find ','."
+    },
+    {
+      "code": "expected_token",
+      "line": 14,
+      "column": 15,
+      "length": 1,
+      "message": "Expected to find '}'."
+    },
+    {
+      "code": "expected_token",
+      "line": 18,
+      "column": 8,
+      "length": 1,
+      "message": "Expected to find '}'."
+    },
+    {
+      "code": "expected_token",
+      "line": 22,
+      "column": 8,
+      "length": 1,
+      "message": "Expected to find '}'."
+    },
+    {
+      "code": "extra_positional_arguments",
+      "line": 6,
+      "column": 8,
+      "length": 3,
+      "message": "Too many positional arguments: 0 expected, but 2 found."
+    },
+    {
+      "code": "extra_positional_arguments",
+      "line": 14,
+      "column": 8,
+      "length": 3,
+      "message": "Too many positional arguments: 0 expected, but 2 found."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 6,
+      "column": 12,
+      "length": 1,
+      "message": "Undefined name 'x'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 14,
+      "column": 12,
+      "length": 1,
+      "message": "Undefined name 'x'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 2,
+      "column": 3,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 6,
+      "column": 3,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 10,
+      "column": 3,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 14,
+      "column": 3,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 18,
+      "column": 3,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 22,
+      "column": 3,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 10,
+      "length": 1,
+      "message": "Expected '}' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 12,
+      "length": 1,
+      "message": "Expected ',' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 15,
+      "length": 1,
+      "message": "Expected '}' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 14,
+      "column": 12,
+      "length": 1,
+      "message": "Expected ',' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 14,
+      "column": 15,
+      "length": 1,
+      "message": "Expected '}' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 18,
+      "column": 8,
+      "length": 1,
+      "message": "Expected '}' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 22,
+      "column": 8,
+      "length": 1,
+      "message": "Expected '}' before this."
+    }
+  ],
+  "source": "enum const E1() {\n  this() {}\n}\n\nenum const E2() {\n  this(int x) : assert(1 > 2) {}\n}\n\nenum const E3() {\n  this();\n}\n\nenum const E4() {\n  this(int x) : assert(1 > 2);\n}\n\nenum const E5() { // missing constants\n  this : assert(1 > 2);\n}\n\nenum const E6() { // missing constants\n  this {}\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/652d8966.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/invalid_operator_questionmark_period_for_super.dart","length":175,"line":1,"new_text":"// Targets invalid_operator_questionmark_period_for_super: the operator '?.'\n// cannot be used with 'super' because 'super' cannot be null.\nclass C {\n  int m() => super?.x;\n}\n"}

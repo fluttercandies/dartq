@@ -1,0 +1,112 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/issue_39060.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 6,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 9,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 3,
+      "column": 1,
+      "length": 1,
+      "message": "Expected to find '['."
+    },
+    {
+      "code": "expected_type_name",
+      "line": 2,
+      "column": 8,
+      "length": 1,
+      "message": "Expected a type name."
+    },
+    {
+      "code": "undefined_class",
+      "line": 2,
+      "column": 4,
+      "length": 1,
+      "message": "Undefined class 's'."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 2,
+      "column": 6,
+      "length": 1,
+      "message": "The value of the local variable 'A' isn't used."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 6,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 8,
+      "length": 0,
+      "message": "Expected ',' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 8,
+      "length": 1,
+      "message": "Expected '[' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 9,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_type_name",
+      "line": 2,
+      "column": 8,
+      "length": 1,
+      "message": "Expected a type name."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 3,
+      "column": 1,
+      "length": 1,
+      "message": "Expected an identifier, but got '}'."
+    }
+  ],
+  "source": "main() {\n  {s A<}>\n}",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/f7b83d61.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

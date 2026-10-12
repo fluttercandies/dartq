@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/src/error_recovery/issue_48411_prime_1.dart","length":187,"line":1,"new_text":"// From https://dart-review.googlesource.com/c/sdk/+/113126\n\nclass C {\n  C() : assert = 0;\n}\n\nclass C {\n  C() : null = 0;\n}\n\nclass C {\n  C() : super = 0;\n}\n\nclass C {\n  C() : this = 0;\n}\n"}

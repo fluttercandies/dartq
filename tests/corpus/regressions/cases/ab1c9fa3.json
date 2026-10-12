@@ -1,0 +1,336 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/issue_48411_prime_1.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "duplicate_definition",
+      "line": 7,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 11,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 15,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 4,
+      "column": 18,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 4,
+      "column": 19,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 8,
+      "column": 9,
+      "length": 4,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 8,
+      "column": 16,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 8,
+      "column": 17,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_token",
+      "line": 4,
+      "column": 16,
+      "length": 1,
+      "message": "Expected to find '('."
+    },
+    {
+      "code": "expected_token",
+      "line": 4,
+      "column": 16,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 16,
+      "column": 14,
+      "length": 1,
+      "message": "Expected to find '.'."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 8,
+      "column": 9,
+      "length": 0,
+      "message": "'' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 16,
+      "column": 9,
+      "length": 8,
+      "message": "'' isn't a field in the enclosing class."
+    },
+    {
+      "code": "invalid_initializer",
+      "line": 12,
+      "column": 9,
+      "length": 9,
+      "message": "Not a valid initializer."
+    },
+    {
+      "code": "invalid_operator",
+      "line": 8,
+      "column": 14,
+      "length": 1,
+      "message": "The string '=' isn't a user-definable operator."
+    },
+    {
+      "code": "invalid_reference_to_this",
+      "line": 16,
+      "column": 9,
+      "length": 4,
+      "message": "Invalid reference to 'this' expression."
+    },
+    {
+      "code": "missing_assignable_selector",
+      "line": 12,
+      "column": 9,
+      "length": 5,
+      "message": "Missing selector such as '.identifier' or '[0]'."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 16,
+      "column": 9,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 8,
+      "column": 9,
+      "length": 4,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 8,
+      "column": 16,
+      "length": 1,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 4,
+      "column": 18,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_initializer",
+      "line": 8,
+      "column": 7,
+      "length": 1,
+      "message": "Expected an initializer."
+    },
+    {
+      "code": "missing_keyword_operator",
+      "line": 8,
+      "column": 14,
+      "length": 1,
+      "message": "Operator declarations must be preceded by the keyword 'operator'."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 8,
+      "column": 14,
+      "length": 1,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 4,
+      "column": 16,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_class_member",
+      "line": 4,
+      "column": 18,
+      "length": 1,
+      "message": "Expected a class member, but got '0'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 4,
+      "column": 19,
+      "length": 1,
+      "message": "Expected a class member, but got ';'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 8,
+      "column": 9,
+      "length": 4,
+      "message": "Expected a class member, but got 'null'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 8,
+      "column": 16,
+      "length": 1,
+      "message": "Expected a class member, but got '0'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 8,
+      "column": 17,
+      "length": 1,
+      "message": "Expected a class member, but got ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 4,
+      "column": 16,
+      "length": 1,
+      "message": "Expected '(' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 4,
+      "column": 16,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 16,
+      "column": 14,
+      "length": 1,
+      "message": "Expected '.' before this."
+    },
+    {
+      "code": "invalid_initializer",
+      "line": 12,
+      "column": 9,
+      "length": 5,
+      "message": "Not a valid initializer."
+    },
+    {
+      "code": "invalid_operator",
+      "line": 8,
+      "column": 14,
+      "length": 1,
+      "message": "The string '=' isn't a user-definable operator."
+    },
+    {
+      "code": "missing_assignable_selector",
+      "line": 12,
+      "column": 9,
+      "length": 5,
+      "message": "Missing selector such as '.identifier' or '[0]'."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 16,
+      "column": 9,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 8,
+      "column": 9,
+      "length": 4,
+      "message": "Expected a function body, but got 'null'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 8,
+      "column": 16,
+      "length": 1,
+      "message": "Expected a function body, but got '0'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 4,
+      "column": 18,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_initializer",
+      "line": 8,
+      "column": 7,
+      "length": 1,
+      "message": "Expected an initializer."
+    },
+    {
+      "code": "missing_keyword_operator",
+      "line": 8,
+      "column": 14,
+      "length": 1,
+      "message": "Operator declarations must be preceded by the keyword 'operator'."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 8,
+      "column": 14,
+      "length": 1,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 4,
+      "column": 16,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    }
+  ],
+  "source": "// From https://dart-review.googlesource.com/c/sdk/+/113126\n\nclass C {\n  C() : assert = 0;\n}\n\nclass C {\n  C() : null = 0;\n}\n\nclass C {\n  C() : super = 0;\n}\n\nclass C {\n  C() : this = 0;\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/ab1c9fa3.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

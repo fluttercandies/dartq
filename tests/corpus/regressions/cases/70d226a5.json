@@ -1,0 +1,1617 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/patterns/const_patterns.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 50,
+      "column": 12,
+      "length": 6,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'bool'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 56,
+      "column": 12,
+      "length": 10,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'bool'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 57,
+      "column": 12,
+      "length": 10,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Null'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 59,
+      "column": 12,
+      "length": 11,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'String'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 60,
+      "column": 12,
+      "length": 8,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Symbol'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 71,
+      "column": 12,
+      "length": 12,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'bool'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 74,
+      "column": 12,
+      "length": 13,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Class'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 75,
+      "column": 12,
+      "length": 14,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Class'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 76,
+      "column": 12,
+      "length": 20,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'GenericClass<dynamic>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 77,
+      "column": 12,
+      "length": 24,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'GenericClass<dynamic>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 78,
+      "column": 12,
+      "length": 25,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'GenericClass<int>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 79,
+      "column": 12,
+      "length": 29,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'GenericClass<int>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 80,
+      "column": 12,
+      "length": 29,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'GenericClass<int>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 81,
+      "column": 12,
+      "length": 33,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'GenericClass<int>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 82,
+      "column": 12,
+      "length": 8,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'List<dynamic>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 83,
+      "column": 12,
+      "length": 13,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'List<int>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 84,
+      "column": 12,
+      "length": 8,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Map<dynamic, dynamic>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 85,
+      "column": 12,
+      "length": 21,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Map<int, String>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 86,
+      "column": 12,
+      "length": 19,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Class'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 87,
+      "column": 12,
+      "length": 20,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Class'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 88,
+      "column": 12,
+      "length": 26,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'GenericClass<dynamic>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 89,
+      "column": 12,
+      "length": 30,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'GenericClass<dynamic>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 90,
+      "column": 12,
+      "length": 31,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'GenericClass<int>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 91,
+      "column": 12,
+      "length": 35,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'GenericClass<int>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 92,
+      "column": 12,
+      "length": 14,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'List<dynamic>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 93,
+      "column": 12,
+      "length": 19,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'List<int>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 94,
+      "column": 12,
+      "length": 14,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Map<dynamic, dynamic>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 95,
+      "column": 12,
+      "length": 27,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Map<int, String>'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 105,
+      "column": 12,
+      "length": 17,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Type'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 106,
+      "column": 12,
+      "length": 24,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Type'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 109,
+      "column": 12,
+      "length": 23,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Type'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 110,
+      "column": 12,
+      "length": 30,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Type'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 111,
+      "column": 12,
+      "length": 25,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Type'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 112,
+      "column": 12,
+      "length": 32,
+      "message": "The matched value type 'int' can never be equal to this constant of type 'Type'."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 24,
+      "column": 12,
+      "length": 4,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 25,
+      "column": 12,
+      "length": 6,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 47,
+      "column": 12,
+      "length": 13,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 48,
+      "column": 12,
+      "length": 24,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 49,
+      "column": 12,
+      "length": 7,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 52,
+      "column": 14,
+      "length": 8,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 67,
+      "column": 26,
+      "length": 5,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 68,
+      "column": 18,
+      "length": 13,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 69,
+      "column": 18,
+      "length": 24,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 70,
+      "column": 18,
+      "length": 7,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 73,
+      "column": 20,
+      "length": 8,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 96,
+      "column": 18,
+      "length": 11,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 97,
+      "column": 12,
+      "length": 11,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "dead_code",
+      "line": 47,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 48,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 49,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 50,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 51,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 52,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 53,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 54,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 55,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 56,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 57,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 58,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 59,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 60,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 61,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 62,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 63,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 64,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 65,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 66,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 67,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 68,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 69,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 70,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 71,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 72,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 73,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 74,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 75,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 76,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 77,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 78,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 79,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 80,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 81,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 82,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 83,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 84,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 85,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 86,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 87,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 88,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 89,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 90,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 91,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 92,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 93,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 94,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 95,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 96,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 97,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 98,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 99,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 100,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 101,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 102,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 103,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 104,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 105,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 106,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 107,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 108,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 109,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 110,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 111,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 112,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 113,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 114,
+      "column": 7,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 115,
+      "column": 8,
+      "length": 9,
+      "message": "Dead code."
+    },
+    {
+      "code": "expected_token",
+      "line": 46,
+      "column": 20,
+      "length": 1,
+      "message": "Expected to find ':'."
+    },
+    {
+      "code": "expected_token",
+      "line": 46,
+      "column": 24,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 53,
+      "column": 18,
+      "length": 1,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 54,
+      "column": 18,
+      "length": 3,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 55,
+      "column": 18,
+      "length": 3,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 56,
+      "column": 18,
+      "length": 4,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 57,
+      "column": 18,
+      "length": 4,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 58,
+      "column": 18,
+      "length": 1,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 59,
+      "column": 18,
+      "length": 5,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 60,
+      "column": 18,
+      "length": 1,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 61,
+      "column": 18,
+      "length": 5,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 62,
+      "column": 18,
+      "length": 5,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 63,
+      "column": 25,
+      "length": 5,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 64,
+      "column": 18,
+      "length": 1,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 65,
+      "column": 31,
+      "length": 5,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 66,
+      "column": 18,
+      "length": 1,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_binary",
+      "line": 44,
+      "column": 14,
+      "length": 1,
+      "message": "The binary operator + is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_binary",
+      "line": 45,
+      "column": 14,
+      "length": 1,
+      "message": "The binary operator * is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 86,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 87,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 88,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 89,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 90,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 91,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 92,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 93,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 94,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 95,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 99,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_empty_record_literal",
+      "line": 98,
+      "column": 18,
+      "length": 1,
+      "message": "The empty record literal is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_generic",
+      "line": 105,
+      "column": 24,
+      "length": 1,
+      "message": "This expression is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_generic",
+      "line": 106,
+      "column": 31,
+      "length": 1,
+      "message": "This expression is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_generic",
+      "line": 107,
+      "column": 24,
+      "length": 1,
+      "message": "This expression is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_generic",
+      "line": 108,
+      "column": 31,
+      "length": 1,
+      "message": "This expression is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_generic",
+      "line": 109,
+      "column": 30,
+      "length": 1,
+      "message": "This expression is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_generic",
+      "line": 110,
+      "column": 37,
+      "length": 1,
+      "message": "This expression is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_negation",
+      "line": 37,
+      "column": 13,
+      "length": 5,
+      "message": "Only negation of a numeric literal is supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_negation",
+      "line": 39,
+      "column": 13,
+      "length": 5,
+      "message": "Only negation of a numeric literal is supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_negation",
+      "line": 42,
+      "column": 13,
+      "length": 6,
+      "message": "Only negation of a numeric literal is supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_negation",
+      "line": 42,
+      "column": 20,
+      "length": 5,
+      "message": "Only negation of a numeric literal is supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_unary",
+      "line": 50,
+      "column": 12,
+      "length": 1,
+      "message": "The unary operator ! is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_unary",
+      "line": 51,
+      "column": 12,
+      "length": 1,
+      "message": "The unary operator ~ is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_unary",
+      "line": 71,
+      "column": 18,
+      "length": 1,
+      "message": "The unary operator ! is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_unary",
+      "line": 72,
+      "column": 18,
+      "length": 1,
+      "message": "The unary operator ~ is not supported as a constant pattern."
+    },
+    {
+      "code": "invocation_of_non_function_expression",
+      "line": 26,
+      "column": 12,
+      "length": 5,
+      "message": "The expression doesn't evaluate to a function, so it can't be invoked."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 46,
+      "column": 25,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "named_function_expression",
+      "line": 67,
+      "column": 23,
+      "length": 3,
+      "message": "Function expressions can't be named."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 47,
+      "column": 12,
+      "length": 6,
+      "message": "Undefined name 'assert'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 68,
+      "column": 18,
+      "length": 6,
+      "message": "Undefined name 'assert'."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 46,
+      "column": 25,
+      "length": 1,
+      "message": "Unexpected text ':'."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 46,
+      "column": 17,
+      "length": 3,
+      "message": "The value of the local variable 'fun' isn't used."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 46,
+      "column": 20,
+      "length": 1,
+      "message": "Expected to find ':'."
+    },
+    {
+      "code": "expected_token",
+      "line": 46,
+      "column": 24,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 46,
+      "column": 24,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 47,
+      "column": 12,
+      "length": 6,
+      "message": "Expected to find ':'."
+    },
+    {
+      "code": "expected_token",
+      "line": 47,
+      "column": 24,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 47,
+      "column": 24,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 68,
+      "column": 18,
+      "length": 6,
+      "message": "Expected to find ':'."
+    },
+    {
+      "code": "expected_token",
+      "line": 68,
+      "column": 30,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 68,
+      "column": 30,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 53,
+      "column": 18,
+      "length": 1,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 54,
+      "column": 18,
+      "length": 3,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 55,
+      "column": 18,
+      "length": 3,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 56,
+      "column": 18,
+      "length": 4,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 57,
+      "column": 18,
+      "length": 4,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 58,
+      "column": 18,
+      "length": 1,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 59,
+      "column": 18,
+      "length": 5,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 60,
+      "column": 18,
+      "length": 1,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 61,
+      "column": 18,
+      "length": 5,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 62,
+      "column": 18,
+      "length": 5,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 64,
+      "column": 18,
+      "length": 1,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 66,
+      "column": 18,
+      "length": 1,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 66,
+      "column": 18,
+      "length": 1,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
+      "line": 70,
+      "column": 24,
+      "length": 1,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_binary",
+      "line": 44,
+      "column": 14,
+      "length": 1,
+      "message": "The binary operator + is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_binary",
+      "line": 45,
+      "column": 14,
+      "length": 1,
+      "message": "The binary operator * is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 86,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 87,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 88,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 89,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 90,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 91,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 92,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 93,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 94,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 95,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_duplicate_const",
+      "line": 99,
+      "column": 18,
+      "length": 5,
+      "message": "Duplicate 'const' keyword in constant expression."
+    },
+    {
+      "code": "invalid_constant_pattern_empty_record_literal",
+      "line": 98,
+      "column": 18,
+      "length": 1,
+      "message": "The empty record literal is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_empty_record_literal",
+      "line": 99,
+      "column": 24,
+      "length": 1,
+      "message": "The empty record literal is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_generic",
+      "line": 105,
+      "column": 24,
+      "length": 1,
+      "message": "This expression is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_generic",
+      "line": 106,
+      "column": 31,
+      "length": 1,
+      "message": "This expression is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_generic",
+      "line": 107,
+      "column": 24,
+      "length": 1,
+      "message": "This expression is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_generic",
+      "line": 108,
+      "column": 31,
+      "length": 1,
+      "message": "This expression is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_generic",
+      "line": 109,
+      "column": 30,
+      "length": 1,
+      "message": "This expression is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_generic",
+      "line": 110,
+      "column": 37,
+      "length": 1,
+      "message": "This expression is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_negation",
+      "line": 37,
+      "column": 13,
+      "length": 5,
+      "message": "Only negation of a numeric literal is supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_negation",
+      "line": 39,
+      "column": 13,
+      "length": 5,
+      "message": "Only negation of a numeric literal is supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_negation",
+      "line": 42,
+      "column": 13,
+      "length": 6,
+      "message": "Only negation of a numeric literal is supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_unary",
+      "line": 50,
+      "column": 12,
+      "length": 1,
+      "message": "The unary operator ! is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_unary",
+      "line": 51,
+      "column": 12,
+      "length": 1,
+      "message": "The unary operator ~ is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_unary",
+      "line": 71,
+      "column": 18,
+      "length": 1,
+      "message": "The unary operator ! is not supported as a constant pattern."
+    },
+    {
+      "code": "invalid_constant_pattern_unary",
+      "line": 72,
+      "column": 18,
+      "length": 1,
+      "message": "The unary operator ~ is not supported as a constant pattern."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 46,
+      "column": 25,
+      "length": 1,
+      "message": "Expected an identifier, but got ':'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 47,
+      "column": 12,
+      "length": 6,
+      "message": "Expected an identifier, but got 'assert'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 47,
+      "column": 25,
+      "length": 1,
+      "message": "Expected an identifier, but got ':'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 68,
+      "column": 18,
+      "length": 6,
+      "message": "Expected an identifier, but got 'assert'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 68,
+      "column": 31,
+      "length": 1,
+      "message": "Expected an identifier, but got ':'."
+    },
+    {
+      "code": "named_function_expression",
+      "line": 67,
+      "column": 23,
+      "length": 3,
+      "message": "A function expression can't have a name."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 46,
+      "column": 25,
+      "length": 1,
+      "message": "Unexpected text ':'."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 47,
+      "column": 25,
+      "length": 1,
+      "message": "Unexpected text ':'."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 68,
+      "column": 31,
+      "length": 1,
+      "message": "Unexpected text ':'."
+    }
+  ],
+  "source": "// Copyright (c) 2023, the Dart project authors.  Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\nimport 'const_patterns.dart' as prefix;\n\nconst int value = 42;\n\nvoid func() {}\n\nclass Class {\n  const Class([a]);\n\n  const Class.named();\n\n  call() {}\n\n  test(o) async {\n    const dynamic local = 0;\n    dynamic variable = 0;\n    switch (o) {\n      case true: // Ok\n      case null: // Ok\n      case this: // Error\n      case this(): // Error\n      case super(): // Error\n      case 42: // Ok\n      case -42: // Ok\n      case 42.5: // Ok\n      case -42.5: // Ok\n      case 'foo': // Ok\n      case 'foo' 'bar': // Ok\n      case value: // Ok\n      case value!: // Ok\n      case value?: // Ok\n      case value as int: // Ok\n      case -value: // Error\n      case local: // Ok\n      case -local: // Error\n      case func: // Ok\n      case prefix.value: // Ok\n      case -prefix.value: // Error\n      case prefix.Class.named: // Ok\n      case 1 + 2: // Error\n      case 1 * 2: // Error\n      case void fun() {}: // Error\n      case assert(false): // Error\n      case switch (o) { _ => true }: // Error\n      case await 0: // Error\n      case !false: // Error\n      case ~0: // Error\n      case ++variable: // Error\n      case const 0: // Error\n      case const 0x0: // Error\n      case const 0.5: // Error\n      case const true: // Error\n      case const null: // Error\n      case const -0: // Error\n      case const 'foo': // Error\n      case const #a: // Error\n      case const value: // Error\n      case const local: // Error\n      case const prefix.value: // Error\n      case const -prefix.value: // Error\n      case const prefix.Class.named: // Error\n      case const 1 + 2: // Error\n      case const void fun() {}: // Error\n      case const assert(false): // Error\n      case const switch (o) { _ => true }: // Error\n      case const await 0: // Error\n      case const !false: // Error\n      case const ~0: // Error\n      case const ++variable: // Error\n      case const Class(): // Ok\n      case const Class(0): // Ok\n      case const GenericClass(): // Ok\n      case const GenericClass(a: 0): // Ok\n      case const GenericClass<int>(): // Ok\n      case const GenericClass<int>(a: 0): // Ok\n      case const GenericClass<int>.new(): // Ok\n      case const GenericClass<int>.new(a: 1): // Ok\n      case const []: // Ok\n      case const <int>[]: // Ok\n      case const {}: // Ok\n      case const <int, String>{}: // Ok\n      case const const Class(): // Error\n      case const const Class(0): // Error\n      case const const GenericClass(): // Error\n      case const const GenericClass(a: 0): // Error\n      case const const GenericClass<int>(): // Error\n      case const const GenericClass<int>(a: 0): // Error\n      case const const []: // Error\n      case const const <int>[]: // Error\n      case const const {}: // Error\n      case const const <int, String>{}: // Error\n      case const new Class(): // Error\n      case new Class(): // Error\n      case const (): // Error\n      case const const (): // Error\n      case const (1): // Ok\n      case const (-1): // Ok\n      case const (value): // Ok\n      case const (-value): // Ok\n      case const (1 + 2): // Ok\n      case GenericClass<int>: // Error\n      case prefix.GenericClass<int>: // Error\n      case GenericClass<int>.new: // Error\n      case prefix.GenericClass<int>.new: // Error\n      case const GenericClass<int>: // Error\n      case const prefix.GenericClass<int>: // Error\n      case const (GenericClass<int>): // Ok\n      case const (prefix.GenericClass<int>): // Ok\n      case const (GenericClass<int>.new): // Ok\n      case const (prefix.GenericClass<int>.new): // Ok\n       print(0);\n    }\n  }\n}\n\nclass GenericClass<T> {\n  const GenericClass({a});\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/70d226a5.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

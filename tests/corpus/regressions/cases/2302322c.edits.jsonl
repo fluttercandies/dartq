@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/src/patterns/constant_identifier_namedWhen.dart","length":48,"line":1,"new_text":"void f(x) {\n  switch (x) {\n    case when:\n  }\n}\n"}

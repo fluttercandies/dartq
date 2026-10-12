@@ -1,0 +1,56 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/missing_identifier_in_type_argument_bad_2.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "expected_type_name",
+      "line": 2,
+      "column": 12,
+      "length": 1,
+      "message": "Expected a type name."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 2,
+      "column": 14,
+      "length": 1,
+      "message": "The value of the local variable 'c' isn't used."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 12,
+      "length": 0,
+      "message": "Expected '>' after this."
+    },
+    {
+      "code": "expected_type_name",
+      "line": 2,
+      "column": 12,
+      "length": 1,
+      "message": "Expected a type name."
+    }
+  ],
+  "source": "foo(bar) {\n  Map<int, > c = {};\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/20ea62eb.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

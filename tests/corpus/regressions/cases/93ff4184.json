@@ -1,0 +1,154 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/issue_42267.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "missing_identifier",
+      "line": 4,
+      "column": 16,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 5,
+      "column": 39,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 6,
+      "column": 17,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 7,
+      "column": 40,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "undefined_function",
+      "line": 3,
+      "column": 3,
+      "length": 9,
+      "message": "The function 'FilterSet' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 5,
+      "column": 3,
+      "length": 9,
+      "message": "The function 'FilterSet' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 7,
+      "column": 3,
+      "length": 9,
+      "message": "The function 'FilterSet' isn't defined."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 2,
+      "column": 3,
+      "length": 7,
+      "message": "Undefined name 'builder'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 2,
+      "column": 16,
+      "length": 3,
+      "message": "Undefined name 'bar'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 3,
+      "column": 39,
+      "length": 3,
+      "message": "Undefined name 'bar'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 4,
+      "column": 3,
+      "length": 7,
+      "message": "Undefined name 'builder'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 6,
+      "column": 3,
+      "length": 7,
+      "message": "Undefined name 'builder'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 4,
+      "column": 15,
+      "length": 0,
+      "message": "Expected ']' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 5,
+      "column": 38,
+      "length": 0,
+      "message": "Expected ']' before this."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 4,
+      "column": 15,
+      "length": 0,
+      "message": "Expected an identifier, but got ']'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 5,
+      "column": 38,
+      "length": 0,
+      "message": "Expected an identifier, but got ']'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 6,
+      "column": 17,
+      "length": 1,
+      "message": "Expected an identifier, but got ']'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 7,
+      "column": 40,
+      "length": 1,
+      "message": "Expected an identifier, but got ']'."
+    }
+  ],
+  "source": "void main() {\n  builder..foo[bar];\n  FilterSet((builder) => builder..foo[bar]);\n  builder..foo[];\n  FilterSet((builder) => builder..foo[]);\n  builder..foo[ ];\n  FilterSet((builder) => builder..foo[ ]);\n}",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/93ff4184.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

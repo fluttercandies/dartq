@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/src/patterns/object_recovery_missingClosingParen.dart","length":75,"line":1,"new_text":"void f(x) {\n  switch (x) {\n    case dynamic(foo: int():\n      break;\n  }\n}\n"}

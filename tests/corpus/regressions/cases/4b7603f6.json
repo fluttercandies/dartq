@@ -1,0 +1,518 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/primary_constructors/extension_type_primary_constructor_error.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "duplicate_definition",
+      "line": 3,
+      "column": 16,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 4,
+      "column": 16,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 5,
+      "column": 22,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 6,
+      "column": 16,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 8,
+      "column": 22,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 9,
+      "column": 16,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 10,
+      "column": 16,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 11,
+      "column": 22,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 12,
+      "column": 22,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 13,
+      "column": 16,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 14,
+      "column": 16,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 15,
+      "column": 22,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 3,
+      "column": 17,
+      "length": 0,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 4,
+      "column": 19,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 5,
+      "column": 24,
+      "length": 0,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 8,
+      "column": 23,
+      "length": 0,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 9,
+      "column": 20,
+      "length": 0,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 10,
+      "column": 22,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 11,
+      "column": 26,
+      "length": 0,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 12,
+      "column": 28,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 13,
+      "column": 20,
+      "length": 0,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 14,
+      "column": 27,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 15,
+      "column": 26,
+      "length": 0,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 1,
+      "length": 9,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "expected_token",
+      "line": 7,
+      "column": 1,
+      "length": 9,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 1,
+      "column": 20,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 3,
+      "column": 19,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 4,
+      "column": 18,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 6,
+      "column": 23,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 9,
+      "column": 22,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 10,
+      "column": 21,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 11,
+      "column": 28,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 12,
+      "column": 27,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_primary_constructor",
+      "line": 5,
+      "column": 22,
+      "length": 1,
+      "message": "An extension type declaration must have a primary constructor declaration."
+    },
+    {
+      "code": "missing_primary_constructor",
+      "line": 8,
+      "column": 25,
+      "length": 1,
+      "message": "An extension type declaration must have a primary constructor declaration."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 3,
+      "column": 19,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 9,
+      "column": 22,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 11,
+      "column": 28,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 13,
+      "column": 21,
+      "length": 5,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 15,
+      "column": 27,
+      "length": 5,
+      "message": "A primary constructor declaration must have formal parameters."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_representation_field",
+      "line": 1,
+      "column": 19,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 3,
+      "column": 19,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 4,
+      "column": 21,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 5,
+      "column": 24,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 6,
+      "column": 22,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 8,
+      "column": 27,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 9,
+      "column": 22,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 10,
+      "column": 24,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 11,
+      "column": 28,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 12,
+      "column": 30,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 13,
+      "column": 27,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 14,
+      "column": 29,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 15,
+      "column": 33,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 1,
+      "length": 9,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "expected_token",
+      "line": 7,
+      "column": 1,
+      "length": 9,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 1,
+      "column": 20,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 3,
+      "column": 19,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 4,
+      "column": 18,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 6,
+      "column": 23,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 9,
+      "column": 22,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 10,
+      "column": 21,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 11,
+      "column": 28,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 12,
+      "column": 27,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_primary_constructor",
+      "line": 5,
+      "column": 22,
+      "length": 1,
+      "message": "An extension type declaration must have a primary constructor declaration."
+    },
+    {
+      "code": "missing_primary_constructor",
+      "line": 8,
+      "column": 25,
+      "length": 1,
+      "message": "An extension type declaration must have a primary constructor declaration."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 3,
+      "column": 19,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 9,
+      "column": 22,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 11,
+      "column": 28,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 13,
+      "column": 27,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 15,
+      "column": 33,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    }
+  ],
+  "source": "extension type E( {}\nextension type E) {}\nextension type E. {}\nextension type E.() {}\nextension type const E {}\nextension type E<T>( {}\nextension type E<T>) {}\nextension type const E<T> {}\nextension type E<T>. {}\nextension type E<T>.() {}\nextension type const E<T>. {}\nextension type const E<T>.() {}\nextension type E<T>.named {}\nextension type E<T>.named() {}\nextension type const E<T>.named {}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/4b7603f6.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

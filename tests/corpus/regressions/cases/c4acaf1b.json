@@ -1,0 +1,98 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/nnbd/issue_39723_prime.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "invalid_null_aware_operator",
+      "line": 7,
+      "column": 7,
+      "length": 2,
+      "message": "The receiver can't be null, so the null-aware operator '?.' is unnecessary."
+    },
+    {
+      "code": "invalid_null_aware_operator",
+      "line": 8,
+      "column": 7,
+      "length": 2,
+      "message": "The receiver can't be null, so the null-aware operator '?.' is unnecessary."
+    },
+    {
+      "code": "invalid_null_aware_operator",
+      "line": 9,
+      "column": 7,
+      "length": 2,
+      "message": "The receiver can't be null, so the null-aware operator '?[' is unnecessary."
+    },
+    {
+      "code": "invalid_null_aware_operator",
+      "line": 10,
+      "column": 8,
+      "length": 3,
+      "message": "The receiver can't be null, so the null-aware operator '?[' is unnecessary."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 8,
+      "column": 9,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "undefined_getter",
+      "line": 8,
+      "column": 9,
+      "length": 1,
+      "message": "The getter '[' isn't defined for the type 'A'."
+    },
+    {
+      "code": "unnecessary_non_null_assertion",
+      "line": 8,
+      "column": 5,
+      "length": 1,
+      "message": "The '!' will have no effect because the receiver can't be null."
+    },
+    {
+      "code": "unnecessary_non_null_assertion",
+      "line": 9,
+      "column": 5,
+      "length": 1,
+      "message": "The '!' will have no effect because the receiver can't be null."
+    },
+    {
+      "code": "unnecessary_non_null_assertion",
+      "line": 10,
+      "column": 5,
+      "length": 1,
+      "message": "The '!' will have no effect because the receiver can't be null."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "missing_identifier",
+      "line": 8,
+      "column": 9,
+      "length": 1,
+      "message": "Expected an identifier."
+    }
+  ],
+  "source": "class A {\n  operator [](int index) => index;\n}\n\nmain() {\n  A? a = null;\n  (a!)?.toString();\n  (a!)?.[42];\n  (a!)?[42];\n  (a!) ? [42];\n}",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/c4acaf1b.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

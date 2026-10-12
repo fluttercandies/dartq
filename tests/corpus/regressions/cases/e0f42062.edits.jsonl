@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/src/coverage/string4.dart","length":78,"line":1,"new_text":"void foo() {\n  return r\"\"\"\næbler\næbler\"\"\";\n}\n\nvoid bar() {\n  return r\"\"\"\næbler"}

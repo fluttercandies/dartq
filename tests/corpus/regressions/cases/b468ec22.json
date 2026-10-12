@@ -1,0 +1,70 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/nnbd/issue_41597.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "duplicate_definition",
+      "line": 6,
+      "column": 6,
+      "length": 1,
+      "message": "The name 'x' is already defined."
+    },
+    {
+      "code": "invalid_initializer",
+      "line": 16,
+      "column": 12,
+      "length": 8,
+      "message": "Not a valid initializer."
+    },
+    {
+      "code": "not_initialized_non_nullable_variable",
+      "line": 5,
+      "column": 6,
+      "length": 1,
+      "message": "The non-nullable variable 'x' must be initialized."
+    },
+    {
+      "code": "not_initialized_non_nullable_variable",
+      "line": 6,
+      "column": 6,
+      "length": 1,
+      "message": "The non-nullable variable 'x' must be initialized."
+    },
+    {
+      "code": "unnecessary_non_null_assertion",
+      "line": 10,
+      "column": 10,
+      "length": 1,
+      "message": "The '!' will have no effect because the receiver can't be null."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "invalid_initializer",
+      "line": 16,
+      "column": 12,
+      "length": 5,
+      "message": "Not a valid initializer."
+    }
+  ],
+  "source": "// Copyright (c) 2020, the Dart project authors. Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\nbool x;\nbool x;\n\nerrors() {\n  print(x);\n  print(x!);\n  print(!x);\n}\n\nclass C {\n  C.c0() : super();\n  C.c1() : super()!;\n}\n\nmain() {}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/b468ec22.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

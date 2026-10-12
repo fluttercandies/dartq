@@ -1,0 +1,336 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/blindspot_library_directives.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "directive_after_declaration",
+      "line": 12,
+      "column": 1,
+      "length": 6,
+      "message": "Directives must appear before any declarations."
+    },
+    {
+      "code": "directive_after_declaration",
+      "line": 26,
+      "column": 1,
+      "length": 6,
+      "message": "Directives must appear before any declarations."
+    },
+    {
+      "code": "directive_after_declaration",
+      "line": 32,
+      "column": 1,
+      "length": 6,
+      "message": "Directives must appear before any declarations."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 32,
+      "column": 42,
+      "length": 4,
+      "message": "The name 'dart' is already defined."
+    },
+    {
+      "code": "expected_executable",
+      "line": 8,
+      "column": 12,
+      "length": 1,
+      "message": "Expected a method, getter, setter or operator declaration."
+    },
+    {
+      "code": "expected_executable",
+      "line": 32,
+      "column": 41,
+      "length": 1,
+      "message": "Expected a method, getter, setter or operator declaration."
+    },
+    {
+      "code": "expected_string_literal",
+      "line": 8,
+      "column": 8,
+      "length": 4,
+      "message": "Expected a string literal."
+    },
+    {
+      "code": "expected_string_literal",
+      "line": 32,
+      "column": 40,
+      "length": 1,
+      "message": "Expected a string literal."
+    },
+    {
+      "code": "expected_token",
+      "line": 8,
+      "column": 1,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 8,
+      "column": 8,
+      "length": 4,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 26,
+      "column": 8,
+      "length": 8,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 32,
+      "column": 38,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "invalid_literal_in_configuration",
+      "line": 12,
+      "column": 41,
+      "length": 2,
+      "message": "The literal in a configuration can't contain interpolation."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 8,
+      "column": 8,
+      "length": 4,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 8,
+      "column": 13,
+      "length": 4,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 32,
+      "column": 42,
+      "length": 4,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 32,
+      "column": 41,
+      "length": 1,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_function_parameters",
+      "line": 32,
+      "column": 40,
+      "length": 1,
+      "message": "Functions must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 5,
+      "column": 9,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "unterminated_string_literal",
+      "line": 26,
+      "column": 15,
+      "length": 1,
+      "message": "Unterminated string literal."
+    },
+    {
+      "code": "unused_import",
+      "line": 8,
+      "column": 8,
+      "length": 0,
+      "message": "Unused import: ''."
+    },
+    {
+      "code": "uri_does_not_exist",
+      "line": 12,
+      "column": 8,
+      "length": 8,
+      "message": "Target of URI doesn't exist: 'a.dart'."
+    },
+    {
+      "code": "uri_does_not_exist",
+      "line": 26,
+      "column": 8,
+      "length": 8,
+      "message": "Target of URI doesn't exist: 'a.dart;'."
+    },
+    {
+      "code": "uri_does_not_exist",
+      "line": 32,
+      "column": 8,
+      "length": 8,
+      "message": "Target of URI doesn't exist: 'c.dart'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "directive_after_declaration",
+      "line": 12,
+      "column": 1,
+      "length": 6,
+      "message": "Directives must appear before any declarations."
+    },
+    {
+      "code": "directive_after_declaration",
+      "line": 26,
+      "column": 1,
+      "length": 6,
+      "message": "Directives must appear before any declarations."
+    },
+    {
+      "code": "directive_after_declaration",
+      "line": 32,
+      "column": 1,
+      "length": 6,
+      "message": "Directives must appear before any declarations."
+    },
+    {
+      "code": "expected_executable",
+      "line": 8,
+      "column": 12,
+      "length": 1,
+      "message": "Expected a declaration, but got ':'."
+    },
+    {
+      "code": "expected_executable",
+      "line": 32,
+      "column": 41,
+      "length": 1,
+      "message": "Expected a declaration, but got '.'."
+    },
+    {
+      "code": "expected_string_literal",
+      "line": 8,
+      "column": 8,
+      "length": 4,
+      "message": "Expected a String, but got 'dart'."
+    },
+    {
+      "code": "expected_string_literal",
+      "line": 32,
+      "column": 40,
+      "length": 1,
+      "message": "Expected a String, but got 'd'."
+    },
+    {
+      "code": "expected_token",
+      "line": 8,
+      "column": 1,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 8,
+      "column": 8,
+      "length": 4,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 26,
+      "column": 1,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 32,
+      "column": 38,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "invalid_literal_in_configuration",
+      "line": 12,
+      "column": 41,
+      "length": 2,
+      "message": "The literal in a configuration can't contain interpolation."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 8,
+      "column": 8,
+      "length": 4,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 8,
+      "column": 13,
+      "length": 4,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 32,
+      "column": 42,
+      "length": 4,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 32,
+      "column": 41,
+      "length": 1,
+      "message": "Expected a function body, but got '.'."
+    },
+    {
+      "code": "missing_function_parameters",
+      "line": 32,
+      "column": 40,
+      "length": 1,
+      "message": "Functions must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 5,
+      "column": 9,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "unterminated_string_literal",
+      "line": 26,
+      "column": 15,
+      "length": 1,
+      "message": "Unterminated string literal."
+    },
+    {
+      "code": "uri_does_not_exist",
+      "line": 12,
+      "column": 8,
+      "length": 8,
+      "message": "Target of URI doesn't exist: 'a.dart'."
+    }
+  ],
+  "source": "// Targets the library-directive / URI family (analyzer ParserErrorCode,\n// pinned snapshot syntax-codes.tsv; the analyzer sources are not vendored\n// in .third).\n// Targets non_identifier_library_name (TSV:246).\nlibrary 1;\n\n// Targets non_string_literal_as_uri (TSV:248).\nimport dart:core;\n\n// Targets invalid_literal_in_configuration (TSV:175): the configuration\n// value literal can't contain interpolation.\nimport 'a.dart' if (dart.library.io == '$x') 'b.dart';\n\n// Never-fires face (pre-review reclassification): missing_quote (TSV:219,\n// \"Expected quote (' or \\\").\") has no emit site anywhere in the SDK — it\n// exists only as a generated diagnostic definition\n// (pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart) — and dartq has no\n// emit site for it either. No shape can surface it; documented gap by\n// construction, like the native family.\n//\n// The scanner-tier face of the quote family is unterminated_string_literal\n// (TSV:288): an unterminated literal is closed at end of line, and both\n// sides report the same scanner code (fasta UnterminatedString ->\n// analyzer unterminated_string_literal; dartq scanner strings.rs emits the\n// same recovery code).\nimport 'a.dart;\n\n// The non-quoted default URI below plausibly yields\n// non_string_literal_as_uri (TSV:248) from the oracle — the same face as\n// the 'import dart:core;' shape above. Kept as overlap documentation; the\n// pre-review label targeting missing_quote on this shape was wrong.\nexport 'c.dart' if (dart.library.html) d.dart;\n\nvoid f() {}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/6716c102.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

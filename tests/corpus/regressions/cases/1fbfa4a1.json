@@ -1,0 +1,63 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/missing_statement.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 4,
+      "column": 3,
+      "length": 5,
+      "message": "'class' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "missing_statement",
+      "line": 4,
+      "column": 3,
+      "length": 5,
+      "message": "Expected a statement."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 4,
+      "column": 3,
+      "length": 5,
+      "message": "Undefined name 'class'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 4,
+      "column": 3,
+      "length": 5,
+      "message": "'class' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "missing_statement",
+      "line": 4,
+      "column": 3,
+      "length": 5,
+      "message": "Expected a statement."
+    }
+  ],
+  "source": "// Targets missing_statement: expected a statement (a reserved keyword in\n// expression-statement position is recovered as an identifier).\nvoid f() {\n  class;\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/1fbfa4a1.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

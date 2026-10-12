@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/src/patterns/constant_identifier_namedAs.dart","length":46,"line":1,"new_text":"void f(x) {\n  switch (x) {\n    case as:\n  }\n}\n"}

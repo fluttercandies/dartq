@@ -1,0 +1,56 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/patterns/wildcard_inPatternAssignment_usingType.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "pattern_assignment_declares_variable",
+      "line": 2,
+      "column": 11,
+      "length": 1,
+      "message": "Variable '_' can't be declared in a pattern assignment."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 2,
+      "column": 4,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 2,
+      "column": 16,
+      "length": 1,
+      "message": "Undefined name 'y'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "pattern_assignment_declares_variable",
+      "line": 2,
+      "column": 11,
+      "length": 1,
+      "message": "Variable '_' can't be declared in a pattern assignment."
+    }
+  ],
+  "source": "void f() {\n  [a, int _] = y;\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/0406ea20.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

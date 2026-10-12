@@ -1,0 +1,210 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/issue_26073.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "expected_token",
+      "line": 3,
+      "column": 16,
+      "length": 1,
+      "message": "Expected to find 'Function'."
+    },
+    {
+      "code": "expected_token",
+      "line": 5,
+      "column": 19,
+      "length": 1,
+      "message": "Expected to find 'Function'."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 13,
+      "length": 1,
+      "message": "Expected to find 'Function'."
+    },
+    {
+      "code": "expected_token",
+      "line": 7,
+      "column": 31,
+      "length": 1,
+      "message": "Expected to find 'Function'."
+    },
+    {
+      "code": "expected_token",
+      "line": 8,
+      "column": 13,
+      "length": 1,
+      "message": "Expected to find 'Function'."
+    },
+    {
+      "code": "expected_token",
+      "line": 9,
+      "column": 13,
+      "length": 1,
+      "message": "Expected to find 'Function'."
+    },
+    {
+      "code": "missing_typedef_parameters",
+      "line": 9,
+      "column": 27,
+      "length": 1,
+      "message": "Typedefs must have an explicit list of parameters."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 5,
+      "column": 17,
+      "length": 1,
+      "message": "The name 'F' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 7,
+      "column": 17,
+      "length": 1,
+      "message": "The name 'F' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 7,
+      "column": 20,
+      "length": 1,
+      "message": "The name 'G' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 7,
+      "column": 23,
+      "length": 1,
+      "message": "The name 'H' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 7,
+      "column": 26,
+      "length": 1,
+      "message": "The name 'I' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 7,
+      "column": 29,
+      "length": 1,
+      "message": "The name 'J' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "record_type_one_positional_no_trailing_comma",
+      "line": 4,
+      "column": 19,
+      "length": 1,
+      "message": "A record type with exactly one positional field requires a trailing comma."
+    },
+    {
+      "code": "undefined_class",
+      "line": 1,
+      "column": 13,
+      "length": 3,
+      "message": "Undefined class 'foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 3,
+      "column": 13,
+      "length": 3,
+      "message": "Undefined class 'foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 5,
+      "column": 13,
+      "length": 3,
+      "message": "Undefined class 'foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 7,
+      "column": 13,
+      "length": 3,
+      "message": "Undefined class 'foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 13,
+      "column": 13,
+      "length": 3,
+      "message": "Undefined class 'foo'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 3,
+      "column": 16,
+      "length": 1,
+      "message": "Expected to find 'Function'."
+    },
+    {
+      "code": "expected_token",
+      "line": 5,
+      "column": 19,
+      "length": 1,
+      "message": "Expected to find 'Function'."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 13,
+      "length": 1,
+      "message": "Expected to find 'Function'."
+    },
+    {
+      "code": "expected_token",
+      "line": 7,
+      "column": 31,
+      "length": 1,
+      "message": "Expected to find 'Function'."
+    },
+    {
+      "code": "expected_token",
+      "line": 8,
+      "column": 13,
+      "length": 1,
+      "message": "Expected to find 'Function'."
+    },
+    {
+      "code": "missing_typedef_parameters",
+      "line": 9,
+      "column": 27,
+      "length": 1,
+      "message": "Typedefs must have an explicit list of parameters."
+    },
+    {
+      "code": "record_type_one_positional_no_trailing_comma",
+      "line": 4,
+      "column": 19,
+      "length": 1,
+      "message": "A record type with exactly one positional field requires a trailing comma."
+    }
+  ],
+  "source": "typedef a = foo Function(int x); // OK.\ntypedef b = Function(int x); // OK.\ntypedef c = foo(int x); // error.\ntypedef d = (int x); // error.\ntypedef e = foo<F>(int x); // error.\ntypedef f = <F>(int x); // error.\ntypedef g = foo<F, G, H, I, J>(int x); // error.\ntypedef h = <F, G, H, I, J>(int x); // error.\ntypedef i = <F, G, H, I, J>; // error.\n\n// These should be error cases according to the spec, but are valid with the\n// experimental generalized typedef.\ntypedef j = foo;\ntypedef k = List<int>;\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/51e564d6.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/dot_shorthands/const_no_identifier_recovery.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "const_with_undefined_constructor",
+      "line": 6,
+      "column": 20,
+      "length": 0,
+      "message": "The class 'Color' doesn't have a constant constructor ''."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 19,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 6,
+      "column": 20,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 6,
+      "column": 9,
+      "length": 1,
+      "message": "The value of the local variable 'c' isn't used."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 20,
+      "length": 1,
+      "message": "Expected to find ';'."
+    }
+  ],
+  "source": "class Color {\n  final int x;\n  const Color.red(this.x);\n}\nvoid main() {\n  Color c = const .;\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/edea67ff.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

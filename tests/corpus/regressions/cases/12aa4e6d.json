@@ -1,0 +1,62 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/flow_analysis/assigned_variables/data/switch.dart",
+  "corpus": "m0",
+  "oracle": [],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 10,
+      "column": 10,
+      "length": 1,
+      "message": "Expected to find ':'."
+    },
+    {
+      "code": "expected_token",
+      "line": 10,
+      "column": 10,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 10,
+      "column": 10,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 10,
+      "column": 11,
+      "length": 1,
+      "message": "Expected an identifier, but got ':'."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 10,
+      "column": 11,
+      "length": 1,
+      "message": "Unexpected text ':'."
+    }
+  ],
+  "source": "// Copyright (c) 2019, the Dart project authors. Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\n// @dart=2.19\n\n/*member: switchStatement:declared={a, b, c}, assigned={a, b, c}*/\nswitchStatement(int a, int b, int c) {\n  /*assigned={b, c}*/ switch (a = 0) {\n    case 1:\n      b = 0;\n      break;\n    default:\n      c = 0;\n      break;\n  }\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0",
+    "--edits",
+    "tests/corpus/regressions/cases/12aa4e6d.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

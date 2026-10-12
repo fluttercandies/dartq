@@ -1,0 +1,133 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/blindspot_type_literals.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "expected_executable",
+      "line": 6,
+      "column": 31,
+      "length": 1,
+      "message": "Expected a method, getter, setter or operator declaration."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 29,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 31,
+      "length": 1,
+      "message": "Expected to find '['."
+    },
+    {
+      "code": "expected_type_name",
+      "line": 11,
+      "column": 36,
+      "length": 1,
+      "message": "Expected a type name."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 6,
+      "column": 32,
+      "length": 1,
+      "message": "Unexpected text ';'."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 11,
+      "column": 36,
+      "length": 1,
+      "message": "Unexpected text '3'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_body",
+      "line": 11,
+      "column": 25,
+      "length": 10,
+      "message": "A class declaration must have a body, even if it is empty."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 11,
+      "column": 36,
+      "length": 1,
+      "message": "Expected a class member, but got '3'."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 31,
+      "length": 1,
+      "message": "Expected '[' before this."
+    },
+    {
+      "code": "expected_type_name",
+      "line": 11,
+      "column": 36,
+      "length": 1,
+      "message": "Expected a type name."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 11,
+      "column": 36,
+      "length": 1,
+      "message": "Expected a function body, but got '3'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 11,
+      "column": 36,
+      "length": 0,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 11,
+      "column": 38,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 11,
+      "column": 36,
+      "length": 0,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 11,
+      "column": 38,
+      "length": 0,
+      "message": "Methods must have an explicit list of parameters."
+    }
+  ],
+  "source": "// Targets the type-literal family (analyzer ParserErrorCode, pinned\n// snapshot syntax-codes.tsv; the analyzer sources are not vendored in\n// .third).\n// Targets expected_list_or_map_literal (TSV:100): type arguments not\n// followed by a list or map literal.\nvar expectedListOrMap = <int> 3;\n\n// Targets expected_named_type (TSV:101, \"Expected a class name.\"): a\n// literal where an identifier (class name) is required. The oracle may\n// report expected_type_name for the same shape; both are gate codes.\nclass ImplementsLiteral implements 3 {}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/0cfa6c7f.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

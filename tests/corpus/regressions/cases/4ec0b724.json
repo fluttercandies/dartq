@@ -1,0 +1,84 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/patterns/patternVariableDeclarationStatement_disallowsConst.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "illegal_assignment_to_non_assignable",
+      "line": 2,
+      "column": 3,
+      "length": 9,
+      "message": "Illegal assignment to non-assignable expression."
+    },
+    {
+      "code": "missing_assignable_selector",
+      "line": 2,
+      "column": 3,
+      "length": 9,
+      "message": "Missing selector such as '.identifier' or '[0]'."
+    },
+    {
+      "code": "non_constant_record_field",
+      "line": 2,
+      "column": 10,
+      "length": 1,
+      "message": "The fields in a const record literal must be constants."
+    },
+    {
+      "code": "record_literal_one_positional_no_trailing_comma",
+      "line": 2,
+      "column": 11,
+      "length": 1,
+      "message": "A record literal with exactly one positional field requires a trailing comma."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 2,
+      "column": 10,
+      "length": 1,
+      "message": "Undefined name '_'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "illegal_assignment_to_non_assignable",
+      "line": 2,
+      "column": 11,
+      "length": 1,
+      "message": "Illegal assignment to non-assignable expression."
+    },
+    {
+      "code": "missing_assignable_selector",
+      "line": 2,
+      "column": 11,
+      "length": 1,
+      "message": "Missing selector such as '.identifier' or '[0]'."
+    },
+    {
+      "code": "record_literal_one_positional_no_trailing_comma",
+      "line": 2,
+      "column": 11,
+      "length": 1,
+      "message": "A record literal with exactly one positional field requires a trailing comma."
+    }
+  ],
+  "source": "f(x) {\n  const (_) = x;\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/4ec0b724.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

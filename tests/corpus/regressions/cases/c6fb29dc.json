@@ -1,0 +1,63 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/patterns/declaredVariable_inPatternAssignment_usingVar.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "pattern_assignment_declares_variable",
+      "line": 2,
+      "column": 11,
+      "length": 1,
+      "message": "Variable 'd' can't be declared in a pattern assignment."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 2,
+      "column": 4,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 2,
+      "column": 16,
+      "length": 1,
+      "message": "Undefined name 'y'."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 2,
+      "column": 11,
+      "length": 1,
+      "message": "The value of the local variable 'd' isn't used."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "pattern_assignment_declares_variable",
+      "line": 2,
+      "column": 11,
+      "length": 1,
+      "message": "Variable 'd' can't be declared in a pattern assignment."
+    }
+  ],
+  "source": "void f() {\n  [a, var d] = y;\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/c6fb29dc.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

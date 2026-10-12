@@ -1,0 +1,105 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/inline_class/inline_class.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "duplicate_definition",
+      "line": 2,
+      "column": 1,
+      "length": 6,
+      "message": "The name 'inline' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 2,
+      "column": 14,
+      "length": 5,
+      "message": "The name 'Class' is already defined."
+    },
+    {
+      "code": "expected_token",
+      "line": 1,
+      "column": 1,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 1,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 1,
+      "column": 1,
+      "length": 6,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 2,
+      "column": 1,
+      "length": 6,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "mixin_of_non_class",
+      "line": 2,
+      "column": 34,
+      "length": 5,
+      "message": "Classes can only mix in mixins and classes."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 1,
+      "column": 1,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 1,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 1,
+      "column": 1,
+      "length": 6,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 2,
+      "column": 1,
+      "length": 6,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    }
+  ],
+  "source": "inline class Class {}\ninline class Class = Object with Mixin;",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/36c5241b.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

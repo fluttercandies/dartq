@@ -1,0 +1,84 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/coverage/string4.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "expected_token",
+      "line": 8,
+      "column": 10,
+      "length": 10,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 9,
+      "column": 6,
+      "length": 1,
+      "message": "Expected to find '}'."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 2,
+      "column": 10,
+      "length": 19,
+      "message": "A value of type 'String' can't be returned from the function 'foo' because it has a return type of 'void'."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 8,
+      "column": 10,
+      "length": 10,
+      "message": "A value of type 'String' can't be returned from the function 'bar' because it has a return type of 'void'."
+    },
+    {
+      "code": "unterminated_string_literal",
+      "line": 9,
+      "column": 5,
+      "length": 1,
+      "message": "Unterminated string literal."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 8,
+      "column": 3,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 9,
+      "column": 6,
+      "length": 0,
+      "message": "Expected to find '}'."
+    },
+    {
+      "code": "unterminated_string_literal",
+      "line": 9,
+      "column": 5,
+      "length": 1,
+      "message": "Unterminated string literal."
+    }
+  ],
+  "source": "void foo() {\n  return r\"\"\"\næbler\næbler\"\"\";\n}\n\nvoid bar() {\n  return r\"\"\"\næbler",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/e0f42062.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

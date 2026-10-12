@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/src/primary_constructors/initializing_declaring.dart","length":148,"line":1,"new_text":"class C(var this.str);\nclass C(final this.str);\nclass C(const this.str);\nclass C(var super.str);\nclass C(final super.str);\nclass C(const super.str);"}

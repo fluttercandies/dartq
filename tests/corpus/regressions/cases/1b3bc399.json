@@ -1,0 +1,168 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/issue_45251_list.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "list_element_type_not_assignable",
+      "line": 18,
+      "column": 48,
+      "length": 4,
+      "message": "The element type 'Null' can't be assigned to the list type 'List<int>'."
+    },
+    {
+      "code": "list_element_type_not_assignable",
+      "line": 24,
+      "column": 44,
+      "length": 4,
+      "message": "The element type 'Null' can't be assigned to the list type 'List<int>'."
+    },
+    {
+      "code": "literal_with_class",
+      "line": 3,
+      "column": 32,
+      "length": 4,
+      "message": "A list literal can't be prefixed by 'List'."
+    },
+    {
+      "code": "literal_with_class",
+      "line": 9,
+      "column": 32,
+      "length": 4,
+      "message": "A list literal can't be prefixed by 'List'."
+    },
+    {
+      "code": "literal_with_class",
+      "line": 18,
+      "column": 32,
+      "length": 4,
+      "message": "A list literal can't be prefixed by 'List'."
+    },
+    {
+      "code": "new_with_undefined_constructor_default",
+      "line": 12,
+      "column": 32,
+      "length": 15,
+      "message": "The class 'List' doesn't have an unnamed constructor."
+    },
+    {
+      "code": "new_with_undefined_constructor_default",
+      "line": 15,
+      "column": 32,
+      "length": 4,
+      "message": "The class 'List' doesn't have an unnamed constructor."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 3,
+      "column": 14,
+      "length": 9,
+      "message": "The name 'Undefined' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 6,
+      "column": 14,
+      "length": 9,
+      "message": "The name 'Undefined' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 9,
+      "column": 14,
+      "length": 9,
+      "message": "The name 'Undefined' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 12,
+      "column": 14,
+      "length": 9,
+      "message": "The name 'Undefined' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 15,
+      "column": 14,
+      "length": 9,
+      "message": "The name 'Undefined' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 18,
+      "column": 14,
+      "length": 9,
+      "message": "The name 'Undefined' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 21,
+      "column": 14,
+      "length": 9,
+      "message": "The name 'Undefined' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 24,
+      "column": 14,
+      "length": 9,
+      "message": "The name 'Undefined' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 27,
+      "column": 14,
+      "length": 9,
+      "message": "The name 'Undefined' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 21,
+      "column": 36,
+      "length": 6,
+      "message": "The operator '[]' isn't defined for the type 'Type'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "literal_with_class",
+      "line": 3,
+      "column": 32,
+      "length": 4,
+      "message": "A list literal can't be prefixed by 'List'."
+    },
+    {
+      "code": "literal_with_class",
+      "line": 9,
+      "column": 32,
+      "length": 4,
+      "message": "A list literal can't be prefixed by 'List'."
+    },
+    {
+      "code": "literal_with_class",
+      "line": 18,
+      "column": 32,
+      "length": 4,
+      "message": "A list literal can't be prefixed by 'List'."
+    }
+  ],
+  "source": "class F {\n  /* notice the bracket at the end instead of parenthesis! */\n  final List<Undefined> foo1 = List<List<int>>[];\n\n  // variation #1: OK.\n  final List<Undefined> foo2 = <List<int>>[];\n\n  // variation #2: Bad.\n  final List<Undefined> foo3 = List[];\n\n  // variation #3: OK.\n  final List<Undefined> foo4 = List<List<int>>();\n\n  // variation #4: OK.\n  final List<Undefined> foo5 = List();\n\n  // variation #5: Bad.\n  final List<Undefined> foo6 = List<List<int>>[null];\n\n  // variation #6: This is actually just an indexed expression.\n  final List<Undefined> foo7 = List[null];\n\n  // variation #7: OK.\n  final List<Undefined> foo8 = <List<int>>[null];\n\n  // variation #8: OK.\n  final List<Undefined> foo9 = [null];\n}",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/1b3bc399.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

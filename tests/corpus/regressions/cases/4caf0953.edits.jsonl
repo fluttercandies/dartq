@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/scanner_goldens/101_illegal_cyrillic_multiple.dart","length":17,"line":1,"new_text":"a = ShcheгlovЩx;\n"}

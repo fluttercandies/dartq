@@ -1,0 +1,69 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/exhaustiveness/data/empty.dart",
+  "corpus": "m0",
+  "oracle": [
+    {
+      "code": "non_exhaustive_switch_expression",
+      "line": 11,
+      "column": 6,
+      "length": 6,
+      "message": "The type 'bool' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'true'."
+    },
+    {
+      "code": "non_exhaustive_switch_expression",
+      "line": 20,
+      "column": 6,
+      "length": 6,
+      "message": "The type 'num' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'double()'."
+    },
+    {
+      "code": "non_exhaustive_switch_expression",
+      "line": 27,
+      "column": 6,
+      "length": 6,
+      "message": "The type 'int' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'int()'."
+    },
+    {
+      "code": "non_exhaustive_switch_expression",
+      "line": 38,
+      "column": 6,
+      "length": 6,
+      "message": "The type 'E' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'E.a'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 52,
+      "column": 3,
+      "length": 10,
+      "message": "Undefined class 'Unresolved'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 56,
+      "column": 3,
+      "length": 10,
+      "message": "Undefined class 'Unresolved'."
+    }
+  ],
+  "dartq": [],
+  "source": "// Copyright (c) 2023, the Dart project authors.  Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\nemptyBool(bool b) {\n  return /*\n   checkingOrder={bool,true,false},\n   error=non-exhaustive:true;false,\n   subtypes={true,false},\n   type=bool\n  */ switch (b) {};\n}\n\nemptyNum(num n) {\n  return /*\n   checkingOrder={num,double,int},\n   error=non-exhaustive:double();int(),\n   subtypes={double,int},\n   type=num\n  */ switch (n) {};\n}\n\nemptyInt(int i) {\n  return /*\n   error=non-exhaustive:int(),\n   type=int\n  */ switch (i) {};\n}\n\nenum E { a, b }\n\nemptyEnum(E e) {\n  return /*\n   checkingOrder={E,E.a,E.b},\n   error=non-exhaustive:E.a;E.b,\n   subtypes={E.a,E.b},\n   type=E\n  */ switch (e) {};\n}\n\nsealed class Empty {}\n\nemptySealed(Empty empty) => /*\n checkingOrder={Empty},\n type=Empty\n*/\n    switch (empty) {};\n\nemptyNever(Never never) => /*type=Never*/ switch (never) {};\n\nemptyUnresolved(\n  Unresolved unresolved,\n) => /*cfe.type=Never*/ /*analyzer.type=InvalidType*/ switch (unresolved) {};\n\nnonEmptyUnresolved(\n  Unresolved unresolved,\n) => /*cfe.type=Never*/ /*analyzer.type=InvalidType*/ switch (unresolved) {\n  _ /*cfe.space=∅*/ /*analyzer.space=InvalidType*/ => 0,\n};\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0",
+    "--edits",
+    "tests/corpus/regressions/cases/2b04c0db.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

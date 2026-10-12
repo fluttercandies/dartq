@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/unsupported_operator.dart","length":169,"line":1,"new_text":"// Targets unsupported_operator: the triple-character '!==' operator is not\n// supported in the Dart language (the scanner still emits a token for it).\nvar b = 1 !== 2;\n"}

@@ -1,0 +1,133 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/blindspot_function_types.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 18,
+      "column": 8,
+      "length": 2,
+      "message": "'in' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_token",
+      "line": 3,
+      "column": 29,
+      "length": 4,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 37,
+      "length": 1,
+      "message": "Expected to find 'Function'."
+    },
+    {
+      "code": "expected_token",
+      "line": 18,
+      "column": 8,
+      "length": 2,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 18,
+      "column": 11,
+      "length": 2,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 3,
+      "column": 37,
+      "length": 1,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "non_bool_condition",
+      "line": 18,
+      "column": 11,
+      "length": 2,
+      "message": "Conditions must have a static type of 'bool'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 18,
+      "column": 8,
+      "length": 2,
+      "message": "Undefined name 'in'."
+    },
+    {
+      "code": "wrong_number_of_type_arguments",
+      "line": 13,
+      "column": 3,
+      "length": 7,
+      "message": "The type 'T' is declared with 0 type parameters, but 1 type arguments were given."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 18,
+      "column": 8,
+      "length": 2,
+      "message": "'in' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_token",
+      "line": 3,
+      "column": 29,
+      "length": 4,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 37,
+      "length": 1,
+      "message": "Expected to find 'Function'."
+    },
+    {
+      "code": "expected_token",
+      "line": 18,
+      "column": 8,
+      "length": 2,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 18,
+      "column": 11,
+      "length": 2,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 3,
+      "column": 37,
+      "length": 1,
+      "message": "A function body must be provided."
+    }
+  ],
+  "source": "// Targets named_function_type (syntax-codes.tsv:240): a general function\n// type alias can't name the function.\ntypedef NamedFunctionType = void g();\n// Targets missing_function_keyword (TSV:205): a general function type alias\n// must use the 'Function' keyword before the parameter list.\ntypedef MissingFunctionKeyword = int(String s);\n// Targets invalid_generic_function_type (TSV:171): a function-typed formal\n// parameter can't declare its own type parameters.\nvoid genericFunctionTypedParameter(int g<T>(int x)) {}\n// Targets type_arguments_on_type_variable (TSV:277): type arguments on a\n// type variable.\nclass TypeArgsOnTypeVariable<T> {\n  T<int>? member;\n}\n// Targets missing_variable_in_for_each (TSV:223): no loop variable before\n// 'in'.\nvoid forEachWithoutVariable(List<int> xs) {\n  for (in xs) {\n    break;\n  }\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/a49cceb1.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

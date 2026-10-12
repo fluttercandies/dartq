@@ -1,0 +1,49 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/invalid_operator_questionmark_period_for_super.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "invalid_operator_questionmark_period_for_super",
+      "line": 4,
+      "column": 19,
+      "length": 2,
+      "message": "The operator '?.' cannot be used with 'super' because 'super' cannot be null."
+    },
+    {
+      "code": "undefined_super_member",
+      "line": 4,
+      "column": 21,
+      "length": 1,
+      "message": "The getter 'x' isn't defined in a superclass of 'C'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "invalid_operator_questionmark_period_for_super",
+      "line": 4,
+      "column": 19,
+      "length": 2,
+      "message": "The operator '?.' cannot be used with 'super' because 'super' cannot be null."
+    }
+  ],
+  "source": "// Targets invalid_operator_questionmark_period_for_super: the operator '?.'\n// cannot be used with 'super' because 'super' cannot be null.\nclass C {\n  int m() => super?.x;\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/8cb4636f.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

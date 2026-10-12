@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/abstract_final_base_class.dart","length":139,"line":1,"new_text":"// Targets abstract_final_base_class: an 'abstract' class cannot be declared\n// as both 'final' and 'base'.\nabstract final base class C {}\n"}

@@ -1,0 +1,245 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/blindspot_factory_constructors.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "body_might_complete_normally",
+      "line": 7,
+      "column": 11,
+      "length": 23,
+      "message": "The body might complete normally, causing 'null' to be returned, but the return type, 'FactoryWithInitializers', is a potentially non-nullable type."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 7,
+      "column": 39,
+      "length": 1,
+      "message": "The name 'x' is already defined."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 7,
+      "column": 37,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_token",
+      "line": 7,
+      "column": 43,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 33,
+      "column": 41,
+      "length": 1,
+      "message": "Expected to find '('."
+    },
+    {
+      "code": "expected_token",
+      "line": 49,
+      "column": 13,
+      "length": 1,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "invalid_initializer",
+      "line": 33,
+      "column": 36,
+      "length": 12,
+      "message": "Not a valid initializer."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 7,
+      "column": 39,
+      "length": 1,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 7,
+      "column": 37,
+      "length": 1,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 16,
+      "column": 31,
+      "length": 1,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 7,
+      "column": 45,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 43,
+      "column": 42,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 7,
+      "column": 45,
+      "length": 1,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "unused_element",
+      "line": 5,
+      "column": 7,
+      "length": 0,
+      "message": "The declaration '<unnamed>' isn't referenced."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_class_member",
+      "line": 7,
+      "column": 37,
+      "length": 1,
+      "message": "Expected a class member, but got ':'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 33,
+      "column": 36,
+      "length": 5,
+      "message": "Expected a class member, but got 'super'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 50,
+      "column": 1,
+      "length": 0,
+      "message": "Expected a class member, but got ''."
+    },
+    {
+      "code": "expected_token",
+      "line": 7,
+      "column": 43,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 33,
+      "column": 41,
+      "length": 1,
+      "message": "Expected '(' after this."
+    },
+    {
+      "code": "expected_token",
+      "line": 50,
+      "column": 1,
+      "length": 1,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 7,
+      "column": 39,
+      "length": 1,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 7,
+      "column": 37,
+      "length": 1,
+      "message": "Expected a function body, but got ':'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 16,
+      "column": 31,
+      "length": 1,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 33,
+      "column": 36,
+      "length": 5,
+      "message": "Expected a function body, but got 'super'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 33,
+      "column": 42,
+      "length": 3,
+      "message": "Expected a function body, but got 'int'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 7,
+      "column": 45,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 43,
+      "column": 42,
+      "length": 1,
+      "message": "Expected an identifier, but got ';'."
+    },
+    {
+      "code": "missing_keyword_operator",
+      "line": 33,
+      "column": 41,
+      "length": 1,
+      "message": "Operator declarations must be preceded by the keyword 'operator'."
+    },
+    {
+      "code": "missing_keyword_operator",
+      "line": 33,
+      "column": 45,
+      "length": 1,
+      "message": "Operator declarations must be preceded by the keyword 'operator'."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 7,
+      "column": 45,
+      "length": 0,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 33,
+      "column": 41,
+      "length": 1,
+      "message": "Methods must have an explicit list of parameters."
+    }
+  ],
+  "source": "// Targets the factory/initializer family (analyzer ParserErrorCode, pinned\n// snapshot syntax-codes.tsv).\n// Targets factory_with_initializers (TSV:131): a factory constructor can't\n// have an initializer list.\nclass FactoryWithInitializers {\n  int x = 0;\n  factory FactoryWithInitializers() : x = 1 {\n    return FactoryWithInitializers._();\n  }\n  FactoryWithInitializers._();\n}\n\n// Targets factory_without_body (TSV:132): a non-redirecting factory must\n// have a body.\nclass FactoryWithoutBody {\n  factory FactoryWithoutBody();\n}\n\n// Targets non_constructor_factory (TSV:245): 'factory' on a member whose\n// name isn't the enclosing class's constructor name.\nclass NonConstructorFactory {\n  factory other() => NonConstructorFactory._();\n  NonConstructorFactory._();\n}\n\n// Targets constructor_with_type_arguments (TSV:72): type arguments after\n// the constructor name in an initializer invocation. Fasta emit site:\n// pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart:8895\n// (\"A constructor invocation can't have type arguments after the\n// constructor name.\", pkg/_fe_analyzer_shared/lib/src/messages/\n// diagnostic.g.dart, codeConstructorWithTypeArguments).\nclass ConstructorWithTypeArguments extends Base {\n  ConstructorWithTypeArguments() : super<int>();\n}\n\nclass Base {\n  Base();\n}\n\n// Targets missing_expression_in_initializer (TSV:202).\nclass MissingExpressionInInitializer {\n  int x;\n  MissingExpressionInInitializer() : x = ;\n}\n\n// Targets missing_closing_parenthesis (TSV:198): the '(' group is never\n// closed before the member's semicolon.\nclass MissingClosingParenthesis {\n  int y = (1;\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/b6add5e8.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

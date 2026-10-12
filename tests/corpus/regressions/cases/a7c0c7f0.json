@@ -1,0 +1,49 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/patterns/issue50591_example2.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 1,
+      "length": 1,
+      "message": "Expected to find '}'."
+    },
+    {
+      "code": "undefined_function",
+      "line": 3,
+      "column": 11,
+      "length": 1,
+      "message": "The function 'A' isn't defined."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 1,
+      "length": 0,
+      "message": "Expected to find '}'."
+    }
+  ],
+  "source": "void f(Object? x) {\n  (switch (x) {\n    const A() => 0,\n    _ => 1,\n  });\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/a7c0c7f0.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

@@ -1,0 +1,1414 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/general/function_reference_following_token.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "creation_with_non_type",
+      "line": 24,
+      "column": 40,
+      "length": 1,
+      "message": "The name 'f' isn't a class."
+    },
+    {
+      "code": "equality_cannot_be_equality_operand",
+      "line": 64,
+      "column": 29,
+      "length": 1,
+      "message": "A comparison expression can't be an operand of another comparison expression."
+    },
+    {
+      "code": "equality_cannot_be_equality_operand",
+      "line": 79,
+      "column": 46,
+      "length": 1,
+      "message": "A comparison expression can't be an operand of another comparison expression."
+    },
+    {
+      "code": "expected_token",
+      "line": 64,
+      "column": 33,
+      "length": 1,
+      "message": "Expected to find '['."
+    },
+    {
+      "code": "expected_token",
+      "line": 91,
+      "column": 51,
+      "length": 8,
+      "message": "Expected to find ','."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 38,
+      "column": 35,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 44,
+      "column": 34,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 56,
+      "column": 29,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 57,
+      "column": 31,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 58,
+      "column": 29,
+      "length": 2,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 85,
+      "column": 33,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 86,
+      "column": 39,
+      "length": 2,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 87,
+      "column": 30,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 88,
+      "column": 35,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 89,
+      "column": 58,
+      "length": 2,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 90,
+      "column": 66,
+      "length": 2,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 91,
+      "column": 48,
+      "length": 3,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 92,
+      "column": 56,
+      "length": 2,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 93,
+      "column": 44,
+      "length": 2,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 94,
+      "column": 31,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 95,
+      "column": 37,
+      "length": 2,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "non_bool_negation_expression",
+      "line": 50,
+      "column": 43,
+      "length": 3,
+      "message": "A negation operand must have a static type of 'bool'."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 10,
+      "column": 30,
+      "length": 1,
+      "message": "The name 'a' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 10,
+      "column": 33,
+      "length": 1,
+      "message": "The name 'b' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 11,
+      "column": 32,
+      "length": 1,
+      "message": "The name 'a' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 11,
+      "column": 35,
+      "length": 1,
+      "message": "The name 'b' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 12,
+      "column": 31,
+      "length": 1,
+      "message": "The name 'a' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 12,
+      "column": 34,
+      "length": 1,
+      "message": "The name 'b' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 13,
+      "column": 25,
+      "length": 1,
+      "message": "The name 'a' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 13,
+      "column": 28,
+      "length": 1,
+      "message": "The name 'b' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 14,
+      "column": 25,
+      "length": 1,
+      "message": "The name 'a' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 14,
+      "column": 28,
+      "length": 1,
+      "message": "The name 'b' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 15,
+      "column": 25,
+      "length": 1,
+      "message": "The name 'a' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 15,
+      "column": 28,
+      "length": 1,
+      "message": "The name 'b' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 16,
+      "column": 29,
+      "length": 1,
+      "message": "The name 'a' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 16,
+      "column": 32,
+      "length": 1,
+      "message": "The name 'b' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 20,
+      "column": 28,
+      "length": 1,
+      "message": "The name 'a' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 20,
+      "column": 31,
+      "length": 1,
+      "message": "The name 'b' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 24,
+      "column": 42,
+      "length": 1,
+      "message": "The name 'a' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 24,
+      "column": 45,
+      "length": 1,
+      "message": "The name 'b' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 26,
+      "column": 50,
+      "length": 1,
+      "message": "The name 'a' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 26,
+      "column": 53,
+      "length": 1,
+      "message": "The name 'b' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 26,
+      "column": 60,
+      "length": 1,
+      "message": "The name 'c' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 27,
+      "column": 40,
+      "length": 1,
+      "message": "The name 'a' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 27,
+      "column": 43,
+      "length": 1,
+      "message": "The name 'b' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 29,
+      "column": 28,
+      "length": 1,
+      "message": "The name 'a' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 29,
+      "column": 31,
+      "length": 1,
+      "message": "The name 'b' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 64,
+      "column": 31,
+      "length": 1,
+      "message": "The name 'b' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "non_type_as_type_argument",
+      "line": 90,
+      "column": 72,
+      "length": 1,
+      "message": "The name 'c' isn't a type, so it can't be used as a type argument."
+    },
+    {
+      "code": "undefined_function",
+      "line": 12,
+      "column": 27,
+      "length": 1,
+      "message": "The function 'g' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 20,
+      "column": 26,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 38,
+      "column": 27,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 42,
+      "column": 20,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 44,
+      "column": 26,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 50,
+      "column": 34,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 54,
+      "column": 28,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 56,
+      "column": 21,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 57,
+      "column": 23,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 58,
+      "column": 20,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 68,
+      "column": 23,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 72,
+      "column": 29,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 79,
+      "column": 35,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 83,
+      "column": 41,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 85,
+      "column": 25,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 86,
+      "column": 31,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 87,
+      "column": 22,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 88,
+      "column": 26,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 89,
+      "column": 50,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 90,
+      "column": 58,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 91,
+      "column": 40,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 91,
+      "column": 51,
+      "length": 8,
+      "message": "The function 'toString' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 92,
+      "column": 48,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 93,
+      "column": 35,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 94,
+      "column": 23,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 95,
+      "column": 29,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 10,
+      "column": 28,
+      "length": 1,
+      "message": "Undefined name 'f'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 11,
+      "column": 30,
+      "length": 1,
+      "message": "Undefined name 'f'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 12,
+      "column": 29,
+      "length": 1,
+      "message": "Undefined name 'f'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 13,
+      "column": 23,
+      "length": 1,
+      "message": "Undefined name 'f'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 14,
+      "column": 23,
+      "length": 1,
+      "message": "Undefined name 'f'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 15,
+      "column": 23,
+      "length": 1,
+      "message": "Undefined name 'f'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 16,
+      "column": 27,
+      "length": 1,
+      "message": "Undefined name 'f'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 26,
+      "column": 48,
+      "length": 1,
+      "message": "Undefined name 'f'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 27,
+      "column": 38,
+      "length": 1,
+      "message": "Undefined name 'f'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 29,
+      "column": 26,
+      "length": 1,
+      "message": "Undefined name 'f'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 38,
+      "column": 29,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 38,
+      "column": 31,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 38,
+      "column": 33,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 38,
+      "column": 36,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 42,
+      "column": 22,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 42,
+      "column": 24,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 42,
+      "column": 26,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 42,
+      "column": 28,
+      "length": 2,
+      "message": "Undefined name 'as'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 44,
+      "column": 28,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 44,
+      "column": 30,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 44,
+      "column": 32,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 44,
+      "column": 35,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 50,
+      "column": 36,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 50,
+      "column": 38,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 50,
+      "column": 40,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 50,
+      "column": 44,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 54,
+      "column": 30,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 54,
+      "column": 32,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 54,
+      "column": 34,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 54,
+      "column": 38,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 56,
+      "column": 23,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 56,
+      "column": 25,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 56,
+      "column": 27,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 56,
+      "column": 30,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 57,
+      "column": 25,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 57,
+      "column": 27,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 57,
+      "column": 29,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 57,
+      "column": 32,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 58,
+      "column": 22,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 58,
+      "column": 24,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 58,
+      "column": 26,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 64,
+      "column": 26,
+      "length": 1,
+      "message": "Undefined name 'f'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 64,
+      "column": 28,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 68,
+      "column": 25,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 68,
+      "column": 27,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 68,
+      "column": 29,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 68,
+      "column": 32,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 72,
+      "column": 31,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 72,
+      "column": 33,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 72,
+      "column": 35,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 72,
+      "column": 38,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 79,
+      "column": 37,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 79,
+      "column": 39,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 79,
+      "column": 41,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 79,
+      "column": 44,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 79,
+      "column": 47,
+      "length": 1,
+      "message": "Undefined name 'e'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 83,
+      "column": 43,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 83,
+      "column": 45,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 83,
+      "column": 47,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 83,
+      "column": 50,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 83,
+      "column": 53,
+      "length": 1,
+      "message": "Undefined name 'e'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 85,
+      "column": 27,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 85,
+      "column": 29,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 85,
+      "column": 31,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 85,
+      "column": 34,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 86,
+      "column": 33,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 86,
+      "column": 35,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 86,
+      "column": 37,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 87,
+      "column": 24,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 87,
+      "column": 26,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 87,
+      "column": 28,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 87,
+      "column": 31,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 88,
+      "column": 28,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 88,
+      "column": 30,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 88,
+      "column": 32,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 89,
+      "column": 52,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 89,
+      "column": 54,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 89,
+      "column": 56,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 90,
+      "column": 60,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 90,
+      "column": 62,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 90,
+      "column": 64,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 91,
+      "column": 42,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 91,
+      "column": 44,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 91,
+      "column": 46,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 92,
+      "column": 50,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 92,
+      "column": 52,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 92,
+      "column": 54,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 93,
+      "column": 37,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 93,
+      "column": 39,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 93,
+      "column": 41,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 93,
+      "column": 47,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 94,
+      "column": 25,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 94,
+      "column": 27,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 94,
+      "column": 29,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 94,
+      "column": 32,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 95,
+      "column": 31,
+      "length": 1,
+      "message": "Undefined name 'a'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 95,
+      "column": 33,
+      "length": 1,
+      "message": "Undefined name 'b'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 95,
+      "column": 35,
+      "length": 1,
+      "message": "Undefined name 'c'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 95,
+      "column": 39,
+      "length": 1,
+      "message": "Undefined name 'd'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "equality_cannot_be_equality_operand",
+      "line": 64,
+      "column": 29,
+      "length": 1,
+      "message": "A comparison expression can't be an operand of another comparison expression."
+    },
+    {
+      "code": "equality_cannot_be_equality_operand",
+      "line": 79,
+      "column": 46,
+      "length": 1,
+      "message": "A comparison expression can't be an operand of another comparison expression."
+    },
+    {
+      "code": "expected_token",
+      "line": 64,
+      "column": 33,
+      "length": 1,
+      "message": "Expected '[' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 64,
+      "column": 33,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 86,
+      "column": 41,
+      "length": 8,
+      "message": "Expected ',' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 87,
+      "column": 31,
+      "length": 1,
+      "message": "Expected ',' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 91,
+      "column": 51,
+      "length": 8,
+      "message": "Expected ',' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 93,
+      "column": 47,
+      "length": 1,
+      "message": "Expected ',' before this."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 38,
+      "column": 35,
+      "length": 1,
+      "message": "Expected an identifier, but got '&'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 44,
+      "column": 34,
+      "length": 1,
+      "message": "Expected an identifier, but got '*'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 56,
+      "column": 29,
+      "length": 1,
+      "message": "Expected an identifier, but got '|'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 57,
+      "column": 31,
+      "length": 1,
+      "message": "Expected an identifier, but got '^'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 58,
+      "column": 29,
+      "length": 2,
+      "message": "Expected an identifier, but got 'is'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 85,
+      "column": 33,
+      "length": 1,
+      "message": "Expected an identifier, but got '%'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 86,
+      "column": 39,
+      "length": 2,
+      "message": "Expected an identifier, but got '..'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 87,
+      "column": 30,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 88,
+      "column": 35,
+      "length": 1,
+      "message": "Expected an identifier, but got '?'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 89,
+      "column": 58,
+      "length": 2,
+      "message": "Expected an identifier, but got '?.'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 90,
+      "column": 66,
+      "length": 2,
+      "message": "Expected an identifier, but got '?.'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 91,
+      "column": 48,
+      "length": 3,
+      "message": "Expected an identifier, but got '?..'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 92,
+      "column": 56,
+      "length": 2,
+      "message": "Expected an identifier, but got '?.'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 93,
+      "column": 44,
+      "length": 2,
+      "message": "Expected an identifier, but got '??'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 94,
+      "column": 31,
+      "length": 1,
+      "message": "Expected an identifier, but got '/'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 95,
+      "column": 37,
+      "length": 2,
+      "message": "Expected an identifier, but got '~/'."
+    }
+  ],
+  "source": "// Copyright (c) 2021, the Dart project authors. Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\n// The test cases called `typeArgs_...` verify that `<` and `>` are treated as\n// delimiting type arguments when the `>` is followed by one of the tokens:\n//\n//     ( . == != ) ] } ; : ,\n\nvar typeArgs_closeBrace = {f<a, b>};\nvar typeArgs_closeBracket = [f<a, b>];\nvar typeArgs_closeParen = g(f<a, b>);\nvar typeArgs_colon = {f<a, b>: null};\nvar typeArgs_comma = [f<a, b>, null];\nvar typeArgs_equals = f<a, b> == null;\nvar typeArgs_not_equals = f<a, b> != null;\n\n// This is a special case because when a `(` follows `<typeArguments>` it is\n// parsed as a MethodInvocation rather than a GenericInstantiation.\nvar typeArgs_openParen = f<a, b>();\n\n// This is a special case because `f<a, b>.methodName(...)` is parsed as an\n// InstanceCreationExpression.\nvar typeArgs_period_methodInvocation = f<a, b>.toString();\n\nvar typeArgs_period_methodInvocation_generic = f<a, b>.foo<c>();\nvar typeArgs_period_propertyAccess = f<a, b>.hashCode;\n\nvar typeArgs_semicolon = f<a, b>;\n\n// The test cases called `operators_...` verify that `<` and `>` are treated as\n// operators when the `>` is not followed by one of the tokens:\n//\n//     ( . == != ) ] } ; : ,\n//\n// Except as noted, these test cases should result in parse errors.\n\nvar operators_ampersand = f(a<b,c>&d);\n\n// Note: this should not be a parse error since it is allowed to have an\n// identifier called `as`.\nvar operators_as = f(a<b,c>as);\n\nvar operators_asterisk = f(a<b,c>*d);\n\n// Note: this could never be a valid expression because the thing to the right\n// of `!` is required to have type `bool`, and the type of `[d]` will always be\n// a list type.  But it is not the responsibility of the parser to report an\n// error here; that should be done by type analysis.\nvar operators_bang_openBracket = f(a<b,c>![d]);\n\n// Note: this should not be a parse error since `c` could have a type that\n// defines a `>` operator that accepts `bool`.\nvar operators_bang_paren = f(a<b,c>!(d));\n\nvar operators_bar = f(a<b,c>|d);\nvar operators_caret = f(a<b,c>^d);\nvar operators_is = f(a<b,c> is int);\n\n// Note: in principle we could parse this as a generic instantiation of a\n// generic instantiation, but since `<` is not one of the tokens that signals\n// `<` and `>` to be treated as type argument delimiters, the first pair of `<`\n// and `>` is treated as operators, and this results in a parse error.\nvar operators_lessThan = f<a><b>;\n\n// Note: this should not be a parse error (indeed, this is valid if `a`, `b`,\n// `c`, and `d` are all of type `num`).\nvar operators_minus = f(a<b,c>-d);\n\n// Note: this should not be a parse error since `c` could have a type that\n// defines a `>` operator that accepts `List`.\nvar operators_openBracket = f(a<b,c>[d]);\n\n// Note: in principle we could parse `<b, c>` as type arguments, `[d]` as an\n// index operation, and the final `>` as a greater-than operator, but since `[`\n// is not one of the tokens that signals `<` and `>` to be treated as argument\n// delimiters, the pair of `<` and `>` is treated as operators, and this results\n// in a parse error.\nvar operators_openBracket_error = f(a<b,c>[d]>e);\n\n// Note: this should not be a parse error since `c` could have a type that\n// defines a `>` operator that accepts `List`.\nvar operators_openBracket_unambiguous = f(a<b,c>[d, e]);\n\nvar operators_percent = f(a<b,c>%d);\nvar operators_period_period = f(a<b,c>..toString());\nvar operators_plus = f(a<b,c>+d);\nvar operators_question = f(a<b,c> ? null : null);\nvar operators_question_period_methodInvocation = f(a<b,c>?.toString());\nvar operators_question_period_methodInvocation_generic = f(a<b,c>?.foo<c>());\nvar operators_question_period_period = f(a<b,c>?..toString());\nvar operators_question_period_propertyAccess = f(a<b,c>?.hashCode);\nvar operators_question_question = f(a<b,c> ?? d);\nvar operators_slash = f(a<b,c>/d);\nvar operators_tilde_slash = f(a<b,c>~/d);\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/7bb9b1bc.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

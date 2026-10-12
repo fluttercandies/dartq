@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/blindspot_library_directive.dart","length":257,"line":1,"new_text":"// Targets missing_name_in_library_directive (syntax-codes.tsv:214): a\n// 'library' directive with no name must still end with a semicolon; a\n// reserved word can't be the library name, so the directive is left\n// nameless without one.\nlibrary\n\nvoid f() {}\n"}

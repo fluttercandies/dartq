@@ -1,0 +1,777 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/primary_constructors/declaring_parameter_error.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "duplicate_constructor",
+      "line": 30,
+      "column": 3,
+      "length": 2,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 7,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 8,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 9,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 10,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 11,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 12,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 13,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 14,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 15,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 16,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 19,
+      "column": 6,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 20,
+      "column": 6,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 21,
+      "column": 6,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 22,
+      "column": 6,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 23,
+      "column": 6,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 24,
+      "column": 6,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 25,
+      "column": 6,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 26,
+      "column": 6,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 27,
+      "column": 6,
+      "length": 1,
+      "message": "The name 'E' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 33,
+      "column": 16,
+      "length": 2,
+      "message": "The name 'ET' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 34,
+      "column": 16,
+      "length": 2,
+      "message": "The name 'ET' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 35,
+      "column": 16,
+      "length": 2,
+      "message": "The name 'ET' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 36,
+      "column": 16,
+      "length": 2,
+      "message": "The name 'ET' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 37,
+      "column": 16,
+      "length": 2,
+      "message": "The name 'ET' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 38,
+      "column": 16,
+      "length": 2,
+      "message": "The name 'ET' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 39,
+      "column": 16,
+      "length": 2,
+      "message": "The name 'ET' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 40,
+      "column": 16,
+      "length": 2,
+      "message": "The name 'ET' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 41,
+      "column": 16,
+      "length": 2,
+      "message": "The name 'ET' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 42,
+      "column": 16,
+      "length": 2,
+      "message": "The name 'ET' is already defined."
+    },
+    {
+      "code": "enum_without_constants",
+      "line": 18,
+      "column": 6,
+      "length": 1,
+      "message": "The enum must have at least one enum constant."
+    },
+    {
+      "code": "enum_without_constants",
+      "line": 19,
+      "column": 6,
+      "length": 1,
+      "message": "The enum must have at least one enum constant."
+    },
+    {
+      "code": "enum_without_constants",
+      "line": 20,
+      "column": 6,
+      "length": 1,
+      "message": "The enum must have at least one enum constant."
+    },
+    {
+      "code": "enum_without_constants",
+      "line": 21,
+      "column": 6,
+      "length": 1,
+      "message": "The enum must have at least one enum constant."
+    },
+    {
+      "code": "enum_without_constants",
+      "line": 22,
+      "column": 6,
+      "length": 1,
+      "message": "The enum must have at least one enum constant."
+    },
+    {
+      "code": "enum_without_constants",
+      "line": 23,
+      "column": 6,
+      "length": 1,
+      "message": "The enum must have at least one enum constant."
+    },
+    {
+      "code": "enum_without_constants",
+      "line": 24,
+      "column": 6,
+      "length": 1,
+      "message": "The enum must have at least one enum constant."
+    },
+    {
+      "code": "enum_without_constants",
+      "line": 25,
+      "column": 6,
+      "length": 1,
+      "message": "The enum must have at least one enum constant."
+    },
+    {
+      "code": "enum_without_constants",
+      "line": 26,
+      "column": 6,
+      "length": 1,
+      "message": "The enum must have at least one enum constant."
+    },
+    {
+      "code": "enum_without_constants",
+      "line": 27,
+      "column": 6,
+      "length": 1,
+      "message": "The enum must have at least one enum constant."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 1,
+      "column": 3,
+      "length": 3,
+      "message": "Can't have modifier 'var' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 4,
+      "column": 5,
+      "length": 3,
+      "message": "Can't have modifier 'var' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 13,
+      "column": 9,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 14,
+      "column": 9,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 15,
+      "column": 9,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 16,
+      "column": 9,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 24,
+      "column": 8,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 25,
+      "column": 8,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 26,
+      "column": 8,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 27,
+      "column": 8,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 30,
+      "column": 6,
+      "length": 3,
+      "message": "Can't have modifier 'var' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 39,
+      "column": 19,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 40,
+      "column": 19,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 41,
+      "column": 19,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 42,
+      "column": 19,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "final_not_initialized_constructor",
+      "line": 30,
+      "column": 3,
+      "length": 2,
+      "message": "All final variables must be initialized, but 'i' isn't."
+    },
+    {
+      "code": "invalid_covariant_modifier_in_primary_constructor",
+      "line": 7,
+      "column": 9,
+      "length": 9,
+      "message": "The 'covariant' modifier can only be used on non-final declaring parameters."
+    },
+    {
+      "code": "invalid_covariant_modifier_in_primary_constructor",
+      "line": 8,
+      "column": 9,
+      "length": 9,
+      "message": "The 'covariant' modifier can only be used on non-final declaring parameters."
+    },
+    {
+      "code": "invalid_covariant_modifier_in_primary_constructor",
+      "line": 10,
+      "column": 9,
+      "length": 9,
+      "message": "The 'covariant' modifier can only be used on non-final declaring parameters."
+    },
+    {
+      "code": "invalid_covariant_modifier_in_primary_constructor",
+      "line": 12,
+      "column": 9,
+      "length": 9,
+      "message": "The 'covariant' modifier can only be used on non-final declaring parameters."
+    },
+    {
+      "code": "invalid_covariant_modifier_in_primary_constructor",
+      "line": 18,
+      "column": 8,
+      "length": 9,
+      "message": "The 'covariant' modifier can only be used on non-final declaring parameters."
+    },
+    {
+      "code": "invalid_covariant_modifier_in_primary_constructor",
+      "line": 19,
+      "column": 8,
+      "length": 9,
+      "message": "The 'covariant' modifier can only be used on non-final declaring parameters."
+    },
+    {
+      "code": "invalid_covariant_modifier_in_primary_constructor",
+      "line": 21,
+      "column": 8,
+      "length": 9,
+      "message": "The 'covariant' modifier can only be used on non-final declaring parameters."
+    },
+    {
+      "code": "invalid_covariant_modifier_in_primary_constructor",
+      "line": 23,
+      "column": 8,
+      "length": 9,
+      "message": "The 'covariant' modifier can only be used on non-final declaring parameters."
+    },
+    {
+      "code": "invalid_covariant_modifier_in_primary_constructor",
+      "line": 33,
+      "column": 19,
+      "length": 9,
+      "message": "The 'covariant' modifier can only be used on non-final declaring parameters."
+    },
+    {
+      "code": "invalid_covariant_modifier_in_primary_constructor",
+      "line": 34,
+      "column": 19,
+      "length": 9,
+      "message": "The 'covariant' modifier can only be used on non-final declaring parameters."
+    },
+    {
+      "code": "invalid_covariant_modifier_in_primary_constructor",
+      "line": 36,
+      "column": 19,
+      "length": 9,
+      "message": "The 'covariant' modifier can only be used on non-final declaring parameters."
+    },
+    {
+      "code": "invalid_covariant_modifier_in_primary_constructor",
+      "line": 38,
+      "column": 19,
+      "length": 9,
+      "message": "The 'covariant' modifier can only be used on non-final declaring parameters."
+    },
+    {
+      "code": "non_final_field_in_enum",
+      "line": 20,
+      "column": 22,
+      "length": 1,
+      "message": "Enums can only declare final fields."
+    },
+    {
+      "code": "non_final_field_in_enum",
+      "line": 22,
+      "column": 24,
+      "length": 1,
+      "message": "Enums can only declare final fields."
+    },
+    {
+      "code": "representation_field_modifier",
+      "line": 35,
+      "column": 29,
+      "length": 3,
+      "message": "Representation fields can't have the modifier 'var'."
+    },
+    {
+      "code": "representation_field_modifier",
+      "line": 37,
+      "column": 29,
+      "length": 3,
+      "message": "Representation fields can't have the modifier 'var'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 1,
+      "column": 7,
+      "length": 1,
+      "message": "Undefined class 'a'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 4,
+      "column": 9,
+      "length": 1,
+      "message": "Undefined class 'a'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 8,
+      "column": 19,
+      "length": 1,
+      "message": "Undefined class 'a'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 11,
+      "column": 23,
+      "length": 1,
+      "message": "Undefined class 'a'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 12,
+      "column": 25,
+      "length": 1,
+      "message": "Undefined class 'a'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 19,
+      "column": 18,
+      "length": 1,
+      "message": "Undefined class 'a'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 22,
+      "column": 22,
+      "length": 1,
+      "message": "Undefined class 'a'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 23,
+      "column": 24,
+      "length": 1,
+      "message": "Undefined class 'a'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 30,
+      "column": 10,
+      "length": 1,
+      "message": "Undefined class 'a'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 34,
+      "column": 29,
+      "length": 1,
+      "message": "Undefined class 'a'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 37,
+      "column": 33,
+      "length": 1,
+      "message": "Undefined class 'a'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 38,
+      "column": 35,
+      "length": 1,
+      "message": "Undefined class 'a'."
+    },
+    {
+      "code": "var_and_type",
+      "line": 1,
+      "column": 3,
+      "length": 3,
+      "message": "Variables can't be declared using both 'var' and a type name."
+    },
+    {
+      "code": "var_and_type",
+      "line": 4,
+      "column": 5,
+      "length": 3,
+      "message": "Variables can't be declared using both 'var' and a type name."
+    },
+    {
+      "code": "var_and_type",
+      "line": 30,
+      "column": 6,
+      "length": 3,
+      "message": "Variables can't be declared using both 'var' and a type name."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "extraneous_modifier",
+      "line": 13,
+      "column": 9,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 14,
+      "column": 9,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 15,
+      "column": 9,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 16,
+      "column": 9,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 24,
+      "column": 8,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 25,
+      "column": 8,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 26,
+      "column": 8,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 27,
+      "column": 8,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 39,
+      "column": 19,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 40,
+      "column": 19,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 41,
+      "column": 19,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "extraneous_modifier",
+      "line": 42,
+      "column": 19,
+      "length": 5,
+      "message": "Can't have modifier 'const' here."
+    },
+    {
+      "code": "representation_field_modifier",
+      "line": 35,
+      "column": 29,
+      "length": 3,
+      "message": "Representation fields can't have the modifier 'var'."
+    },
+    {
+      "code": "representation_field_modifier",
+      "line": 37,
+      "column": 29,
+      "length": 3,
+      "message": "Representation fields can't have the modifier 'var'."
+    },
+    {
+      "code": "var_and_type",
+      "line": 1,
+      "column": 3,
+      "length": 3,
+      "message": "Variables can't be declared using both 'var' and a type name."
+    },
+    {
+      "code": "var_and_type",
+      "line": 4,
+      "column": 5,
+      "length": 3,
+      "message": "Variables can't be declared using both 'var' and a type name."
+    },
+    {
+      "code": "var_and_type",
+      "line": 11,
+      "column": 19,
+      "length": 3,
+      "message": "Variables can't be declared using both 'var' and a type name."
+    },
+    {
+      "code": "var_and_type",
+      "line": 22,
+      "column": 18,
+      "length": 3,
+      "message": "Variables can't be declared using both 'var' and a type name."
+    },
+    {
+      "code": "var_and_type",
+      "line": 30,
+      "column": 6,
+      "length": 3,
+      "message": "Variables can't be declared using both 'var' and a type name."
+    },
+    {
+      "code": "var_and_type",
+      "line": 37,
+      "column": 29,
+      "length": 3,
+      "message": "Variables can't be declared using both 'var' and a type name."
+    }
+  ],
+  "source": "m(var a b) {}\n\nclass C {\n  C(var a b) {}\n}\n\nclass C(covariant a) {}\nclass C(covariant a b) {}\nclass C(covariant var a) {}\nclass C(covariant final a) {}\nclass C(covariant var a b) {}\nclass C(covariant final a b) {}\nclass C(const f()) {}\nclass C(const f<T>()) {}\nclass C(const void f()) {}\nclass C(const void f<T>()) {}\n\nenum E(covariant a) {}\nenum E(covariant a b) {}\nenum E(covariant var a) {}\nenum E(covariant final a) {}\nenum E(covariant var a b) {}\nenum E(covariant final a b) {}\nenum E(const f()) {}\nenum E(const f<T>()) {}\nenum E(const void f()) {}\nenum E(const void f<T>()) {}\n\nextension type ET(int i) {\n  ET(var a b) {}\n}\n\nextension type ET(covariant a) {}\nextension type ET(covariant a b) {}\nextension type ET(covariant var a) {}\nextension type ET(covariant final a) {}\nextension type ET(covariant var a b) {}\nextension type ET(covariant final a b) {}\nextension type ET(const f()) {}\nextension type ET(const f<T>()) {}\nextension type ET(const void f()) {}\nextension type ET(const void f<T>()) {}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/c01a55d8.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

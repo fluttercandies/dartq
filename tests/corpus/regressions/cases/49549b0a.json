@@ -1,0 +1,56 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/issue_22314.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "annotation_on_type_argument",
+      "line": 11,
+      "column": 16,
+      "length": 11,
+      "message": "Type arguments can't have annotations because they aren't declarations."
+    },
+    {
+      "code": "annotation_on_type_argument",
+      "line": 11,
+      "column": 28,
+      "length": 19,
+      "message": "Type arguments can't have annotations because they aren't declarations."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "annotation_on_type_argument",
+      "line": 11,
+      "column": 16,
+      "length": 11,
+      "message": "Type arguments can't have annotations because they aren't declarations."
+    },
+    {
+      "code": "expected_token",
+      "line": 11,
+      "column": 28,
+      "length": 1,
+      "message": "Expected '>' after this."
+    }
+  ],
+  "source": "const annotation = null;\n\nclass Annotation {\n  final String message;\n  const Annotation(this.message);\n}\n\nclass A<E> {}\n\nclass C {\n  m() => new A<@annotation @Annotation(\"test\") C>();\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/49549b0a.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

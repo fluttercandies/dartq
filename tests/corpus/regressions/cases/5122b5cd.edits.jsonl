@@ -1,0 +1,1 @@
+{"column": 1, "file": "lib/nested_unclosed.dart", "length": 13, "line": 1, "new_text": "f('${f('${')\n"}

@@ -1,0 +1,447 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/flow_analysis/why_not_promoted/data/argument_type_not_assignable_nullability_error.dart",
+  "corpus": "m0",
+  "oracle": [
+    {
+      "code": "argument_type_not_assignable",
+      "line": 17,
+      "column": 5,
+      "length": 100,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 31,
+      "column": 5,
+      "length": 100,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 45,
+      "column": 8,
+      "length": 100,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 59,
+      "column": 8,
+      "length": 100,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 73,
+      "column": 5,
+      "length": 100,
+      "message": "The argument type 'List<int>?' can't be assigned to the parameter type 'List<int>'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 87,
+      "column": 5,
+      "length": 100,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 101,
+      "column": 5,
+      "length": 100,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 114,
+      "column": 7,
+      "length": 104,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'num'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 132,
+      "column": 7,
+      "length": 10,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 462,
+      "column": 8,
+      "length": 97,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'num'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 473,
+      "column": 10,
+      "length": 97,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 484,
+      "column": 10,
+      "length": 105,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 496,
+      "column": 10,
+      "length": 105,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 508,
+      "column": 10,
+      "length": 105,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 520,
+      "column": 12,
+      "length": 97,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 523,
+      "column": 12,
+      "length": 97,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 534,
+      "column": 10,
+      "length": 97,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 537,
+      "column": 10,
+      "length": 97,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 569,
+      "column": 9,
+      "length": 109,
+      "message": "The argument type 'int?' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "dead_code",
+      "line": 384,
+      "column": 5,
+      "length": 2,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 392,
+      "column": 7,
+      "length": 362,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 425,
+      "column": 5,
+      "length": 2,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 433,
+      "column": 7,
+      "length": 354,
+      "message": "Dead code."
+    },
+    {
+      "code": "extension_override_argument_not_assignable",
+      "line": 553,
+      "column": 5,
+      "length": 101,
+      "message": "The type of the argument to the extension override 'int?' isn't assignable to the extended type 'int'."
+    },
+    {
+      "code": "field_initializer_not_assignable",
+      "line": 368,
+      "column": 11,
+      "length": 105,
+      "message": "The initializer type 'int?' can't be assigned to the field type 'int'."
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 346,
+      "column": 7,
+      "length": 97,
+      "message": "A value of type 'int?' can't be assigned to a variable of type 'int'."
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 357,
+      "column": 11,
+      "length": 97,
+      "message": "A value of type 'int?' can't be assigned to a variable of type 'int'."
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 380,
+      "column": 13,
+      "length": 101,
+      "message": "A value of type 'int?' can't be assigned to a variable of type 'int'."
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 387,
+      "column": 15,
+      "length": 105,
+      "message": "A value of type 'int?' can't be assigned to a variable of type 'int'."
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 396,
+      "column": 15,
+      "length": 105,
+      "message": "A value of type 'int?' can't be assigned to a variable of type 'int'."
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 405,
+      "column": 15,
+      "length": 105,
+      "message": "A value of type 'int?' can't be assigned to a variable of type 'int'."
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 421,
+      "column": 9,
+      "length": 101,
+      "message": "A value of type 'int?' can't be assigned to a variable of type 'int'."
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 428,
+      "column": 11,
+      "length": 105,
+      "message": "A value of type 'int?' can't be assigned to a variable of type 'int'."
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 437,
+      "column": 11,
+      "length": 105,
+      "message": "A value of type 'int?' can't be assigned to a variable of type 'int'."
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 446,
+      "column": 11,
+      "length": 105,
+      "message": "A value of type 'int?' can't be assigned to a variable of type 'int'."
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 581,
+      "column": 10,
+      "length": 97,
+      "message": "A value of type 'int?' can't be assigned to a variable of type 'int'."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 159,
+      "column": 5,
+      "length": 109,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 166,
+      "column": 9,
+      "length": 109,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 180,
+      "column": 5,
+      "length": 109,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 187,
+      "column": 9,
+      "length": 109,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 200,
+      "column": 5,
+      "length": 101,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 211,
+      "column": 9,
+      "length": 109,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 225,
+      "column": 6,
+      "length": 101,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 240,
+      "column": 5,
+      "length": 101,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 247,
+      "column": 7,
+      "length": 105,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 256,
+      "column": 7,
+      "length": 105,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 265,
+      "column": 7,
+      "length": 105,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 281,
+      "column": 5,
+      "length": 109,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 295,
+      "column": 16,
+      "length": 97,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 306,
+      "column": 7,
+      "length": 97,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 310,
+      "column": 9,
+      "length": 101,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 316,
+      "column": 9,
+      "length": 101,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 322,
+      "column": 9,
+      "length": 101,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 335,
+      "column": 10,
+      "length": 97,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 357,
+      "column": 7,
+      "length": 1,
+      "message": "The value of the local variable 'i' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 380,
+      "column": 9,
+      "length": 1,
+      "message": "The value of the local variable 'i' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 387,
+      "column": 11,
+      "length": 1,
+      "message": "The value of the local variable 'i' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 396,
+      "column": 11,
+      "length": 1,
+      "message": "The value of the local variable 'i' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 405,
+      "column": 11,
+      "length": 1,
+      "message": "The value of the local variable 'i' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 460,
+      "column": 7,
+      "length": 1,
+      "message": "The value of the local variable 'n' isn't used."
+    }
+  ],
+  "dartq": [],
+  "source": "// Copyright (c) 2021, the Dart project authors. Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\n// This test contains a test case for each condition that can lead to the front\n// end's `ArgumentTypeNotAssignableNullability` error, for which we wish to\n// report \"why not promoted\" context information.\n\nclass C1 {\n  int? bad;\n  f(int i) {}\n}\n\nrequired_unnamed(C1 c) {\n  if (c.bad == null) return;\n  c.f(\n    c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C1.bad))*/ bad,\n  );\n}\n\nclass C2 {\n  int? bad;\n  f([int i = 0]) {}\n}\n\noptional_unnamed(C2 c) {\n  if (c.bad == null) return;\n  c.f(\n    c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C2.bad))*/ bad,\n  );\n}\n\nclass C3 {\n  int? bad;\n  f({required int i}) {}\n}\n\nrequired_named(C3 c) {\n  if (c.bad == null) return;\n  c.f(\n    i: c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C3.bad))*/ bad,\n  );\n}\n\nclass C4 {\n  int? bad;\n  f({int i = 0}) {}\n}\n\noptional_named(C4 c) {\n  if (c.bad == null) return;\n  c.f(\n    i: c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C4.bad))*/ bad,\n  );\n}\n\nclass C5 {\n  List<int>? bad;\n  f<T>(List<T> x) {}\n}\n\ntype_inferred(C5 c) {\n  if (c.bad == null) return;\n  c.f(\n    c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C5.bad))*/ bad,\n  );\n}\n\nclass C6 {\n  int? bad;\n  C6(int i);\n}\n\nC6? constructor_with_implicit_new(C6 c) {\n  if (c.bad == null) return null;\n  return C6(\n    c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C6.bad))*/ bad,\n  );\n}\n\nclass C7 {\n  int? bad;\n  C7(int i);\n}\n\nC7? constructor_with_explicit_new(C7 c) {\n  if (c.bad == null) return null;\n  return new C7(\n    c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C7.bad))*/ bad,\n  );\n}\n\nclass C8 {\n  int? bad;\n}\n\nuserDefinableBinaryOpRhs(C8 c) {\n  if (c.bad == null) return;\n  1 +\n      c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C8.bad))*/ bad;\n}\n\nclass C9 {\n  int? bad;\n  f(int i) {}\n}\n\nquestionQuestionRhs(C9 c, int? i) {\n  // Note: \"why not supported\" functionality is currently not supported for the\n  // RHS of `??` because it requires more clever reasoning than we currently do:\n  // we would have to understand that the reason `i ?? c.bad` has a type of\n  // `int?` rather than `int` is because `c.bad` was not promoted.  We currently\n  // only support detecting non-promotion when the expression that had the wrong\n  // type *is* the expression that wasn't promoted.\n  if (c.bad == null) return;\n  c.f(i ?? c.bad);\n}\n\nclass C10 {\n  D10? bad;\n  f(bool b) {}\n}\n\nclass D10 {\n  bool operator ==(covariant D10 other) => true;\n}\n\nequalRhs(C10 c, D10 d) {\n  if (c.bad == null) return;\n  // Note: we don't report an error here because `==` always accepts `null`.\n  c.f(d == c.bad);\n  c.f(d != c.bad);\n}\n\nclass C11 {\n  bool? bad;\n  f(bool b) {}\n}\n\nandOperand(C11 c, bool b) {\n  if (c.bad == null) return;\n  c.f(\n    c\n            .\n            /*notPromoted(propertyNotPromotedForInherentReason(target: member:C11.bad))*/ bad &&\n        b,\n  );\n  c.f(\n    b &&\n        c\n            .\n            /*notPromoted(propertyNotPromotedForInherentReason(target: member:C11.bad))*/ bad,\n  );\n}\n\nclass C12 {\n  bool? bad;\n  f(bool b) {}\n}\n\norOperand(C12 c, bool b) {\n  if (c.bad == null) return;\n  c.f(\n    c\n            .\n            /*notPromoted(propertyNotPromotedForInherentReason(target: member:C12.bad))*/ bad ||\n        b,\n  );\n  c.f(\n    b ||\n        c\n            .\n            /*notPromoted(propertyNotPromotedForInherentReason(target: member:C12.bad))*/ bad,\n  );\n}\n\nclass C13 {\n  bool? bad;\n}\n\nassertStatementCondition(C13 c) {\n  if (c.bad == null) return;\n  assert(\n    c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C13.bad))*/ bad,\n  );\n}\n\nclass C14 {\n  bool? bad;\n  C14.assertInitializerCondition(C14 c)\n    : bad = c.bad!,\n      assert(\n        c\n            .\n            /*notPromoted(propertyNotPromotedForInherentReason(target: member:C14.bad))*/ bad,\n      );\n}\n\nclass C15 {\n  bool? bad;\n  f(bool b) {}\n}\n\nnotOperand(C15 c) {\n  if (c.bad == null) return;\n  c.f(\n    !c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C15.bad))*/ bad,\n  );\n}\n\nclass C16 {\n  bool? bad;\n  f(bool b) {}\n}\n\nforLoopCondition(C16 c) {\n  if (c.bad == null) return;\n  for (\n    ;\n    c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C16.bad))*/ bad;\n  ) {}\n  [\n    for (\n      ;\n      c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C16.bad))*/ bad;\n    )\n      null,\n  ];\n  ({\n    for (\n      ;\n      c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C16.bad))*/ bad;\n    )\n      null,\n  });\n  ({\n    for (\n      ;\n      c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C16.bad))*/ bad;\n    )\n      null: null,\n  });\n}\n\nclass C17 {\n  bool? bad;\n  f(int i) {}\n}\n\nconditionalExpressionCondition(C17 c) {\n  if (c.bad == null) return;\n  c.f(\n    c\n            .\n            /*notPromoted(propertyNotPromotedForInherentReason(target: member:C17.bad))*/ bad\n        ? 1\n        : 2,\n  );\n}\n\nclass C18 {\n  bool? bad;\n}\n\ndoLoopCondition(C18 c) {\n  if (c.bad == null) return;\n  do {} while (c\n      .\n      /*notPromoted(propertyNotPromotedForInherentReason(target: member:C18.bad))*/ bad);\n}\n\nclass C19 {\n  bool? bad;\n}\n\nifCondition(C19 c) {\n  if (c.bad == null) return;\n  if (c\n      .\n      /*notPromoted(propertyNotPromotedForInherentReason(target: member:C19.bad))*/ bad) {}\n  [\n    if (c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C19.bad))*/ bad)\n      null,\n  ];\n  ({\n    if (c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C19.bad))*/ bad)\n      null,\n  });\n  ({\n    if (c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C19.bad))*/ bad)\n      null: null,\n  });\n}\n\nclass C20 {\n  bool? bad;\n}\n\nwhileCondition(C20 c) {\n  if (c.bad == null) return;\n  while (c\n      .\n      /*notPromoted(propertyNotPromotedForInherentReason(target: member:C20.bad))*/ bad) {}\n}\n\nclass C21 {\n  int? bad;\n}\n\nassignmentRhs(C21 c, int i) {\n  if (c.bad == null) return;\n  i = c\n      .\n      /*notPromoted(propertyNotPromotedForInherentReason(target: member:C21.bad))*/ bad;\n}\n\nclass C22 {\n  int? bad;\n}\n\nvariableInitializer(C22 c) {\n  if (c.bad == null) return;\n  int i = c\n      .\n      /*notPromoted(propertyNotPromotedForInherentReason(target: member:C22.bad))*/ bad;\n}\n\nclass C23 {\n  int? bad;\n  final int x;\n  final int y;\n  C23.constructorInitializer(C23 c)\n    : x = c.bad!,\n      y = c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C23.bad))*/ bad;\n}\n\nclass C24 {\n  int? bad;\n}\n\nforVariableInitializer(C24 c) {\n  if (c.bad == null) return;\n  for (\n    int i = c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C24.bad))*/ bad;\n    false;\n  ) {}\n  [\n    for (\n      int i = c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C24.bad))*/ bad;\n      false;\n    )\n      null,\n  ];\n  ({\n    for (\n      int i = c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C24.bad))*/ bad;\n      false;\n    )\n      null,\n  });\n  ({\n    for (\n      int i = c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C24.bad))*/ bad;\n      false;\n    )\n      null: null,\n  });\n}\n\nclass C25 {\n  int? bad;\n}\n\nforAssignmentInitializer(C25 c, int i) {\n  if (c.bad == null) return;\n  for (\n    i = c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C25.bad))*/ bad;\n    false;\n  ) {}\n  [\n    for (\n      i = c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C25.bad))*/ bad;\n      false;\n    )\n      null,\n  ];\n  ({\n    for (\n      i = c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C25.bad))*/ bad;\n      false;\n    )\n      null,\n  });\n  ({\n    for (\n      i = c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C25.bad))*/ bad;\n      false;\n    )\n      null: null,\n  });\n}\n\nclass C26 {\n  int? bad;\n}\n\ncompoundAssignmentRhs(C26 c) {\n  num n = 0;\n  if (c.bad == null) return;\n  n += c\n      .\n      /*notPromoted(propertyNotPromotedForInherentReason(target: member:C26.bad))*/ bad;\n}\n\nclass C27 {\n  int? bad;\n}\n\nindexGet(C27 c, List<int> values) {\n  if (c.bad == null) return;\n  values[c\n      .\n      /*notPromoted(propertyNotPromotedForInherentReason(target: member:C27.bad))*/ bad];\n}\n\nclass C28 {\n  int? bad;\n}\n\nindexSet(C28 c, List<int> values) {\n  if (c.bad == null) return;\n  values[c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C28.bad))*/ bad] =\n      0;\n}\n\nclass C29 {\n  int? bad;\n}\n\nindexSetCompound(C29 c, List<int> values) {\n  if (c.bad == null) return;\n  values[c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C29.bad))*/ bad] +=\n      1;\n}\n\nclass C30 {\n  int? bad;\n}\n\nindexSetIfNull(C30 c, List<int?> values) {\n  if (c.bad == null) return;\n  values[c\n          .\n          /*notPromoted(propertyNotPromotedForInherentReason(target: member:C30.bad))*/ bad] ??=\n      1;\n}\n\nclass C31 {\n  int? bad;\n}\n\nindexSetPreIncDec(C31 c, List<int> values) {\n  if (c.bad == null) return;\n  ++values[c\n      .\n      /*notPromoted(propertyNotPromotedForInherentReason(target: member:C31.bad))*/ bad];\n  --values[c\n      .\n      /*notPromoted(propertyNotPromotedForInherentReason(target: member:C31.bad))*/ bad];\n}\n\nclass C32 {\n  int? bad;\n}\n\nindexSetPostIncDec(C32 c, List<int> values) {\n  if (c.bad == null) return;\n  values[c\n      .\n      /*notPromoted(propertyNotPromotedForInherentReason(target: member:C32.bad))*/ bad]++;\n  values[c\n      .\n      /*notPromoted(propertyNotPromotedForInherentReason(target: member:C32.bad))*/ bad]--;\n}\n\nextension E33 on int {\n  void f() {}\n}\n\nclass C33 {\n  int? bad;\n}\n\nexplicitExtensionInvocation(C33 c) {\n  if (c.bad == null) return;\n  E33(\n    c\n        .\n        /*notPromoted(propertyNotPromotedForInherentReason(target: member:C33.bad))*/ bad,\n  ).f();\n}\n\nclass C34 {\n  int? bad;\n  C34(int value);\n}\n\nclass D34 extends C34 {\n  int other;\n  D34(C34 c)\n    : other = c.bad!,\n      super(\n        c\n            .\n            /*notPromoted(propertyNotPromotedForInherentReason(target: member:C34.bad))*/ bad,\n      );\n}\n\nclass C35 {\n  int? bad;\n}\n\nindexSetRhs(C35 c, List<int> x) {\n  if (c.bad == null) return;\n  x[0] = c\n      .\n      /*notPromoted(propertyNotPromotedForInherentReason(target: member:C35.bad))*/ bad;\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0",
+    "--edits",
+    "tests/corpus/regressions/cases/630acb14.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

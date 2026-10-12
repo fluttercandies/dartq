@@ -1,0 +1,63 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/issue_48380_1_comma.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 35,
+      "length": 1,
+      "message": "Expected to find '('."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 2,
+      "column": 35,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "undefined_enum_constructor",
+      "line": 2,
+      "column": 35,
+      "length": 0,
+      "message": "The enum doesn't have a constructor named ''."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 35,
+      "length": 0,
+      "message": "Expected '(' after this."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 2,
+      "column": 35,
+      "length": 1,
+      "message": "Expected an identifier."
+    }
+  ],
+  "source": "enum E<F> {\n  v1<int>./*about to write foo()*/,\n  v2<int>.foo();\n\n  const E();\n  const E.foo();\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/92067ab8.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/implements_before_on.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "implements_before_on",
+      "line": 3,
+      "column": 22,
+      "length": 2,
+      "message": "The on clause must be before the implements clause."
+    },
+    {
+      "code": "implements_non_class",
+      "line": 3,
+      "column": 20,
+      "length": 1,
+      "message": "Classes and mixins can only implement other classes and mixins."
+    },
+    {
+      "code": "mixin_super_class_constraint_non_interface",
+      "line": 3,
+      "column": 25,
+      "length": 1,
+      "message": "Only classes and mixins can be used as superclass constraints."
+    },
+    {
+      "code": "undefined_class",
+      "line": 3,
+      "column": 25,
+      "length": 1,
+      "message": "Undefined class 'A'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "implements_before_on",
+      "line": 3,
+      "column": 22,
+      "length": 2,
+      "message": "The on clause must be before the implements clause."
+    }
+  ],
+  "source": "// Targets implements_before_on: the on clause must be before the implements\n// clause.\nmixin M implements B on A {}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/a85be3b4.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

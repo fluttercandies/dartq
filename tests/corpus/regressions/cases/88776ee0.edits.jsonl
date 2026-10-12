@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/abstract_sealed_class.dart","length":152,"line":1,"new_text":"// Targets abstract_sealed_class: a 'sealed' class cannot be marked\n// 'abstract' because it is already implicitly abstract.\nabstract sealed class C {}\n"}

@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/src/error_recovery/issue_22314.dart","length":186,"line":1,"new_text":"const annotation = null;\n\nclass Annotation {\n  final String message;\n  const Annotation(this.message);\n}\n\nclass A<E> {}\n\nclass C {\n  m() => new A<@annotation @Annotation(\"test\") C>();\n}\n"}

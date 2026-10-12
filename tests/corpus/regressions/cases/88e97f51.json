@@ -1,0 +1,49 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/issue_48288.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "missing_identifier",
+      "line": 2,
+      "column": 5,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "undefined_function",
+      "line": 2,
+      "column": 3,
+      "length": 1,
+      "message": "The function 'g' isn't defined."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "missing_identifier",
+      "line": 2,
+      "column": 5,
+      "length": 1,
+      "message": "Expected an identifier."
+    }
+  ],
+  "source": "void f(int x) {\n  g(: 1, bbb: 0);\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/88e97f51.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

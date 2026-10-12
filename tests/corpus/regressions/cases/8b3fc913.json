@@ -1,0 +1,616 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/augmentation/top_level_declarations.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "duplicate_definition",
+      "line": 2,
+      "column": 14,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 4,
+      "column": 17,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 6,
+      "column": 1,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 6,
+      "column": 18,
+      "length": 6,
+      "message": "The name 'setter=' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 7,
+      "column": 1,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 8,
+      "column": 1,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 8,
+      "column": 15,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 9,
+      "column": 1,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 9,
+      "column": 15,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 10,
+      "column": 9,
+      "length": 3,
+      "message": "The name 'int' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 10,
+      "column": 13,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 11,
+      "column": 18,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 12,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 12,
+      "column": 20,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 13,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 13,
+      "column": 18,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 14,
+      "column": 1,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 15,
+      "column": 24,
+      "length": 5,
+      "message": "The name 'Class' is already defined."
+    },
+    {
+      "code": "expected_representation_field",
+      "line": 17,
+      "column": 38,
+      "length": 0,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 4,
+      "column": 9,
+      "length": 3,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 7,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 8,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 9,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 10,
+      "column": 9,
+      "length": 3,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 11,
+      "column": 9,
+      "length": 4,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 12,
+      "column": 9,
+      "length": 4,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 13,
+      "column": 9,
+      "length": 4,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 14,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 15,
+      "column": 9,
+      "length": 8,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 16,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 17,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "final_not_initialized",
+      "line": 12,
+      "column": 20,
+      "length": 5,
+      "message": "The final variable 'field' must be initialized."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 2,
+      "column": 1,
+      "length": 7,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 6,
+      "column": 1,
+      "length": 7,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 7,
+      "column": 1,
+      "length": 7,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 8,
+      "column": 1,
+      "length": 7,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 9,
+      "column": 1,
+      "length": 7,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 10,
+      "column": 13,
+      "length": 5,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 14,
+      "column": 1,
+      "length": 7,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 16,
+      "column": 9,
+      "length": 5,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 17,
+      "column": 9,
+      "length": 9,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_primary_constructor",
+      "line": 17,
+      "column": 24,
+      "length": 13,
+      "message": "An extension type declaration must have a primary constructor declaration."
+    },
+    {
+      "code": "non_void_return_for_setter",
+      "line": 5,
+      "column": 1,
+      "length": 7,
+      "message": "The return type of the setter must be 'void' or absent."
+    },
+    {
+      "code": "not_a_type",
+      "line": 1,
+      "column": 1,
+      "length": 7,
+      "message": "augment isn't a type."
+    },
+    {
+      "code": "not_a_type",
+      "line": 3,
+      "column": 1,
+      "length": 7,
+      "message": "augment isn't a type."
+    },
+    {
+      "code": "not_a_type",
+      "line": 4,
+      "column": 1,
+      "length": 7,
+      "message": "augment isn't a type."
+    },
+    {
+      "code": "not_a_type",
+      "line": 5,
+      "column": 1,
+      "length": 7,
+      "message": "augment isn't a type."
+    },
+    {
+      "code": "not_a_type",
+      "line": 10,
+      "column": 1,
+      "length": 7,
+      "message": "augment isn't a type."
+    },
+    {
+      "code": "not_a_type",
+      "line": 11,
+      "column": 1,
+      "length": 7,
+      "message": "augment isn't a type."
+    },
+    {
+      "code": "not_a_type",
+      "line": 12,
+      "column": 1,
+      "length": 7,
+      "message": "augment isn't a type."
+    },
+    {
+      "code": "not_a_type",
+      "line": 13,
+      "column": 1,
+      "length": 7,
+      "message": "augment isn't a type."
+    },
+    {
+      "code": "not_a_type",
+      "line": 13,
+      "column": 14,
+      "length": 3,
+      "message": "int isn't a type."
+    },
+    {
+      "code": "not_a_type",
+      "line": 15,
+      "column": 1,
+      "length": 7,
+      "message": "augment isn't a type."
+    },
+    {
+      "code": "not_a_type",
+      "line": 16,
+      "column": 1,
+      "length": 7,
+      "message": "augment isn't a type."
+    },
+    {
+      "code": "not_a_type",
+      "line": 17,
+      "column": 1,
+      "length": 7,
+      "message": "augment isn't a type."
+    },
+    {
+      "code": "unused_element",
+      "line": 1,
+      "column": 1,
+      "length": 0,
+      "message": "The declaration '<unnamed>' isn't referenced."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_representation_field",
+      "line": 17,
+      "column": 38,
+      "length": 1,
+      "message": "Expected a representation field."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 4,
+      "column": 9,
+      "length": 3,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 7,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 8,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 9,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 10,
+      "column": 9,
+      "length": 3,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 11,
+      "column": 9,
+      "length": 4,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 12,
+      "column": 9,
+      "length": 4,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 13,
+      "column": 9,
+      "length": 4,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 14,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 15,
+      "column": 9,
+      "length": 8,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 16,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 17,
+      "column": 1,
+      "length": 7,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "final_field_without_initializer",
+      "line": 12,
+      "column": 20,
+      "length": 5,
+      "message": "The final variable 'field' must be initialized."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 2,
+      "column": 1,
+      "length": 7,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 6,
+      "column": 1,
+      "length": 7,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 7,
+      "column": 1,
+      "length": 7,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 8,
+      "column": 1,
+      "length": 7,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 9,
+      "column": 1,
+      "length": 7,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 10,
+      "column": 13,
+      "length": 5,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_const_final_var_or_type",
+      "line": 14,
+      "column": 1,
+      "length": 7,
+      "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 16,
+      "column": 9,
+      "length": 5,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 17,
+      "column": 9,
+      "length": 9,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_primary_constructor",
+      "line": 17,
+      "column": 24,
+      "length": 13,
+      "message": "An extension type declaration must have a primary constructor declaration."
+    }
+  ],
+  "source": "augment method() {}\naugment void method() {}\naugment get getter => null;\naugment int get getter => 0;\naugment set setter(value) {}\naugment void set setter(value) {}\naugment var field;\naugment final field = 0;\naugment const field = 0;\naugment int field;\naugment late var field;\naugment late final field;\naugment late int field;\naugment class Class {}\naugment abstract class Class {}\naugment mixin Mixin {}\naugment extension type ExtensionType {}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/8b3fc913.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

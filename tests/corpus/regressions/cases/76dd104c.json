@@ -1,0 +1,196 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/with_outline/typing_string_interpolation_2.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "expected_token",
+      "line": 11,
+      "column": 12,
+      "length": 1,
+      "message": "Expected to find '}'."
+    },
+    {
+      "code": "expected_token",
+      "line": 12,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ','."
+    },
+    {
+      "code": "expected_token",
+      "line": 12,
+      "column": 12,
+      "length": 5,
+      "message": "Expected to find ','."
+    },
+    {
+      "code": "expected_token",
+      "line": 12,
+      "column": 18,
+      "length": 5,
+      "message": "Expected to find ','."
+    },
+    {
+      "code": "expected_token",
+      "line": 12,
+      "column": 23,
+      "length": 3,
+      "message": "Expected to find ','."
+    },
+    {
+      "code": "expected_token",
+      "line": 12,
+      "column": 23,
+      "length": 3,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 13,
+      "column": 3,
+      "length": 1,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "extra_positional_arguments",
+      "line": 12,
+      "column": 5,
+      "length": 6,
+      "message": "Too many positional arguments: 1 expected, but 5 found."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 11,
+      "column": 12,
+      "length": 4,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 12,
+      "column": 5,
+      "length": 6,
+      "message": "Undefined name 'length'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 12,
+      "column": 12,
+      "length": 5,
+      "message": "Undefined name 'hello'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 12,
+      "column": 18,
+      "length": 5,
+      "message": "Undefined name 'world'."
+    },
+    {
+      "code": "unterminated_string_literal",
+      "line": 11,
+      "column": 17,
+      "length": 1,
+      "message": "Unterminated string literal."
+    },
+    {
+      "code": "unterminated_string_literal",
+      "line": 12,
+      "column": 25,
+      "length": 1,
+      "message": "Unterminated string literal."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 11,
+      "column": 12,
+      "length": 1,
+      "message": "Expected to find '}'."
+    },
+    {
+      "code": "expected_token",
+      "line": 12,
+      "column": 5,
+      "length": 6,
+      "message": "Expected ',' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 12,
+      "column": 12,
+      "length": 5,
+      "message": "Expected ',' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 12,
+      "column": 18,
+      "length": 5,
+      "message": "Expected ',' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 12,
+      "column": 18,
+      "length": 5,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 12,
+      "column": 26,
+      "length": 0,
+      "message": "Expected ',' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 13,
+      "column": 3,
+      "length": 1,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 11,
+      "column": 12,
+      "length": 0,
+      "message": "Expected an identifier, but got ''."
+    },
+    {
+      "code": "unterminated_string_literal",
+      "line": 11,
+      "column": 17,
+      "length": 1,
+      "message": "Unterminated string literal."
+    },
+    {
+      "code": "unterminated_string_literal",
+      "line": 12,
+      "column": 25,
+      "length": 1,
+      "message": "Unterminated string literal."
+    }
+  ],
+  "source": "class A {\n  method1() {}\n  method2() {}\n}\n\nclass B {\n  method1(String foo) {\n    // was:\n    // print(\"hello world\");\n    // but then we started typing inside the quotes:\n    print(\"${foo.\n    length hello world\");\n  }\n\n  method2() {}\n}\n\nclass C {\n  method1() {}\n  method2() {}\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/76dd104c.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

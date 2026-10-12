@@ -1,0 +1,265 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/inference/inferred_type_arguments/data/static_invocation.dart",
+  "corpus": "m0",
+  "oracle": [
+    {
+      "code": "argument_type_not_assignable",
+      "line": 46,
+      "column": 59,
+      "length": 3,
+      "message": "The argument type 'double' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 47,
+      "column": 59,
+      "length": 2,
+      "message": "The argument type 'String' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 53,
+      "column": 28,
+      "length": 4,
+      "message": "The argument type 'Null' can't be assigned to the parameter type 'num'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 55,
+      "column": 28,
+      "length": 2,
+      "message": "The argument type 'String' can't be assigned to the parameter type 'num'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 64,
+      "column": 34,
+      "length": 4,
+      "message": "The argument type 'Null' can't be assigned to the parameter type 'num'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 66,
+      "column": 34,
+      "length": 2,
+      "message": "The argument type 'String' can't be assigned to the parameter type 'num'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 69,
+      "column": 61,
+      "length": 2,
+      "message": "The argument type 'String' can't be assigned to the parameter type 'num'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 72,
+      "column": 61,
+      "length": 3,
+      "message": "The argument type 'double' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 73,
+      "column": 61,
+      "length": 2,
+      "message": "The argument type 'String' can't be assigned to the parameter type 'int'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 78,
+      "column": 38,
+      "length": 4,
+      "message": "The argument type 'bool' can't be assigned to the parameter type 'String'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 78,
+      "column": 44,
+      "length": 2,
+      "message": "The argument type 'String' can't be assigned to the parameter type 'bool'. "
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 48,
+      "column": 29,
+      "length": 26,
+      "message": "A value of type 'num' can't be assigned to a variable of type 'int'."
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 74,
+      "column": 30,
+      "length": 27,
+      "message": "A value of type 'num' can't be assigned to a variable of type 'int'."
+    },
+    {
+      "code": "not_enough_positional_arguments",
+      "line": 76,
+      "column": 56,
+      "length": 1,
+      "message": "3 positional arguments expected by 'multipleArgs', but 0 found."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 34,
+      "column": 7,
+      "length": 16,
+      "message": "The value of the local variable 'unboundedReturn1' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 35,
+      "column": 7,
+      "length": 16,
+      "message": "The value of the local variable 'unboundedReturn2' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 36,
+      "column": 7,
+      "length": 16,
+      "message": "The value of the local variable 'unboundedReturn3' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 42,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg1' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 43,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg2' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 44,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg3' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 45,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg4' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 46,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg5' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 47,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg6' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 48,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg7' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 60,
+      "column": 7,
+      "length": 17,
+      "message": "The value of the local variable 'extendsNumReturn1' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 61,
+      "column": 7,
+      "length": 17,
+      "message": "The value of the local variable 'extendsNumReturn2' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 62,
+      "column": 7,
+      "length": 17,
+      "message": "The value of the local variable 'extendsNumReturn3' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 68,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg1' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 69,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg2' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 70,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg3' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 71,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg4' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 72,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg5' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 73,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg6' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 74,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg7' isn't used."
+    }
+  ],
+  "dartq": [],
+  "source": "// Copyright (c) 2021, the Dart project authors. Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\nvoid unboundedUnused<T>() {}\n\nvoid unboundedArg<T>(T t) {}\n\nT unboundedReturn<T>() => throw '';\n\nT unboundedReturnArg<T>(T t) => t;\n\nvoid extendsNumUnused<T extends num>() {}\n\nvoid extendsNumArg<T extends num>(T t) {}\n\nT extendsNumReturn<T extends num>() => throw '';\n\nT extendsNumReturnArg<T extends num>(T t) => t;\n\nvoid multipleArgs<T, U, S>(T t, S s, U u) {}\n\nstaticInvocations() {\n  unboundedUnused /*<dynamic>*/ ();\n  unboundedUnused<int>();\n\n  unboundedArg /*<Null>*/ (null);\n  unboundedArg /*<int>*/ (0);\n  unboundedArg /*<String>*/ (\"\");\n  unboundedArg<num>(0);\n\n  unboundedReturn /*<dynamic>*/ ();\n  unboundedReturn<int>();\n  var unboundedReturn1 = unboundedReturn /*<dynamic>*/ ();\n  int unboundedReturn2 = unboundedReturn /*<int>*/ ();\n  num unboundedReturn3 = unboundedReturn<int>();\n\n  unboundedReturnArg /*<Null>*/ (null);\n  unboundedReturnArg /*<int>*/ (0);\n  unboundedReturnArg /*<String>*/ (\"\");\n  unboundedReturnArg<num>(0);\n  var unboundedReturnArg1 = unboundedReturnArg /*<int>*/ (0);\n  var unboundedReturnArg2 = unboundedReturnArg /*<String>*/ (\"\");\n  num unboundedReturnArg3 = unboundedReturnArg /*<num>*/ (0);\n  int unboundedReturnArg4 = unboundedReturnArg /*<int>*/ (0);\n  int unboundedReturnArg5 = unboundedReturnArg /*<int>*/ (0.5);\n  int unboundedReturnArg6 = unboundedReturnArg /*<int>*/ (\"\");\n  int unboundedReturnArg7 = unboundedReturnArg<num>(0);\n\n  extendsNumUnused /*<num>*/ ();\n  extendsNumUnused<int>();\n\n  extendsNumArg /*<num>*/ (null);\n  extendsNumArg /*<int>*/ (0);\n  extendsNumArg /*<num>*/ (\"\");\n  extendsNumArg<num>(0);\n\n  extendsNumReturn /*<num>*/ ();\n  extendsNumReturn<int>();\n  var extendsNumReturn1 = extendsNumReturn /*<num>*/ ();\n  int extendsNumReturn2 = extendsNumReturn /*<int>*/ ();\n  num extendsNumReturn3 = extendsNumReturn<int>();\n\n  extendsNumReturnArg /*<num>*/ (null);\n  extendsNumReturnArg /*<int>*/ (0);\n  extendsNumReturnArg /*<num>*/ (\"\");\n  extendsNumReturnArg<num>(0);\n  var extendsNumReturnArg1 = extendsNumReturnArg /*<int>*/ (0);\n  var extendsNumReturnArg2 = extendsNumReturnArg /*<num>*/ (\"\");\n  num extendsNumReturnArg3 = extendsNumReturnArg /*<num>*/ (0);\n  int extendsNumReturnArg4 = extendsNumReturnArg /*<int>*/ (0);\n  int extendsNumReturnArg5 = extendsNumReturnArg /*<int>*/ (0.5);\n  int extendsNumReturnArg6 = extendsNumReturnArg /*<int>*/ (\"\");\n  int extendsNumReturnArg7 = extendsNumReturnArg<num>(0);\n\n  multipleArgs /*analyzer.<dynamic,dynamic,dynamic>*/ ();\n  multipleArgs /*<int,String,bool>*/ (0, true, \"\");\n  multipleArgs<int, bool, String>(0, true, \"\");\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0",
+    "--edits",
+    "tests/corpus/regressions/cases/5603585a.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

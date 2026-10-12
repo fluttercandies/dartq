@@ -1,0 +1,483 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/primary_constructors/class_primary_constructor_error.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "const_without_primary_constructor",
+      "line": 5,
+      "column": 7,
+      "length": 5,
+      "message": "'const' can only be used together with a primary constructor declaration."
+    },
+    {
+      "code": "const_without_primary_constructor",
+      "line": 8,
+      "column": 7,
+      "length": 5,
+      "message": "'const' can only be used together with a primary constructor declaration."
+    },
+    {
+      "code": "const_without_primary_constructor",
+      "line": 16,
+      "column": 7,
+      "length": 5,
+      "message": "'const' can only be used together with a primary constructor declaration."
+    },
+    {
+      "code": "const_without_primary_constructor",
+      "line": 17,
+      "column": 7,
+      "length": 5,
+      "message": "'const' can only be used together with a primary constructor declaration."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 3,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 4,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 5,
+      "column": 13,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 6,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 8,
+      "column": 13,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 9,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 10,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 11,
+      "column": 13,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 12,
+      "column": 13,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 13,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 14,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 15,
+      "column": 13,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 16,
+      "column": 13,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 17,
+      "column": 13,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 18,
+      "column": 7,
+      "length": 1,
+      "message": "The name 'C' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 18,
+      "column": 18,
+      "length": 1,
+      "message": "The name 'a' is already defined."
+    },
+    {
+      "code": "expected_executable",
+      "line": 18,
+      "column": 20,
+      "length": 1,
+      "message": "Expected a method, getter, setter or operator declaration."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 1,
+      "length": 5,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "expected_token",
+      "line": 7,
+      "column": 1,
+      "length": 5,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "expected_token",
+      "line": 18,
+      "column": 18,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "missing_default_value_for_parameter",
+      "line": 18,
+      "column": 18,
+      "length": 1,
+      "message": "The parameter 'a' can't have a value of 'null' because of its type, but the implicit default value is 'null'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 1,
+      "column": 11,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 3,
+      "column": 10,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 4,
+      "column": 9,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 6,
+      "column": 14,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 9,
+      "column": 13,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 10,
+      "column": 12,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 11,
+      "column": 19,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 12,
+      "column": 18,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 3,
+      "column": 10,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 9,
+      "column": 13,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 11,
+      "column": 19,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 13,
+      "column": 12,
+      "length": 5,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 15,
+      "column": 18,
+      "length": 5,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "mixin_of_non_class",
+      "line": 16,
+      "column": 24,
+      "length": 1,
+      "message": "Classes can only mix in mixins and classes."
+    },
+    {
+      "code": "mixin_of_non_class",
+      "line": 17,
+      "column": 27,
+      "length": 1,
+      "message": "Classes can only mix in mixins and classes."
+    },
+    {
+      "code": "mixin_with_non_class_superclass",
+      "line": 16,
+      "column": 17,
+      "length": 1,
+      "message": "Mixin can only be applied to class."
+    },
+    {
+      "code": "mixin_with_non_class_superclass",
+      "line": 17,
+      "column": 20,
+      "length": 1,
+      "message": "Mixin can only be applied to class."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 18,
+      "column": 8,
+      "length": 1,
+      "message": "Unexpected text '('."
+    },
+    {
+      "code": "var_and_type",
+      "line": 18,
+      "column": 10,
+      "length": 3,
+      "message": "Variables can't be declared using both 'var' and a type name."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "const_without_primary_constructor",
+      "line": 5,
+      "column": 7,
+      "length": 5,
+      "message": "'const' can only be used together with a primary constructor declaration."
+    },
+    {
+      "code": "const_without_primary_constructor",
+      "line": 8,
+      "column": 7,
+      "length": 5,
+      "message": "'const' can only be used together with a primary constructor declaration."
+    },
+    {
+      "code": "const_without_primary_constructor",
+      "line": 16,
+      "column": 7,
+      "length": 5,
+      "message": "'const' can only be used together with a primary constructor declaration."
+    },
+    {
+      "code": "const_without_primary_constructor",
+      "line": 17,
+      "column": 7,
+      "length": 5,
+      "message": "'const' can only be used together with a primary constructor declaration."
+    },
+    {
+      "code": "expected_body",
+      "line": 18,
+      "column": 20,
+      "length": 1,
+      "message": "A class declaration must have a body, even if it is empty."
+    },
+    {
+      "code": "expected_token",
+      "line": 2,
+      "column": 1,
+      "length": 5,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "expected_token",
+      "line": 7,
+      "column": 1,
+      "length": 5,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 1,
+      "column": 11,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 3,
+      "column": 10,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 4,
+      "column": 9,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 6,
+      "column": 14,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 9,
+      "column": 13,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 10,
+      "column": 12,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 11,
+      "column": 19,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 12,
+      "column": 18,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 3,
+      "column": 10,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 9,
+      "column": 13,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 11,
+      "column": 19,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 13,
+      "column": 18,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "missing_primary_constructor_parameters",
+      "line": 15,
+      "column": 24,
+      "length": 1,
+      "message": "A primary constructor declaration must have formal parameters."
+    },
+    {
+      "code": "var_and_type",
+      "line": 18,
+      "column": 10,
+      "length": 3,
+      "message": "Variables can't be declared using both 'var' and a type name."
+    }
+  ],
+  "source": "class C( {}\nclass C) {}\nclass C. {}\nclass C.() {}\nclass const C {}\nclass C<T>( {}\nclass C<T>) {}\nclass const C<T> {}\nclass C<T>. {}\nclass C<T>.() {}\nclass const C<T>. {}\nclass const C<T>.() {}\nclass C<T>.named {}\nclass C<T>.named() {}\nclass const C<T>.named {}\nclass const C = O with M;\nclass const C<T> = O with M;\nclass C({var int a})\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/b78b2157.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

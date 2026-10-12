@@ -148,7 +148,9 @@ impl<'s> Lexer<'s> {
         // the O(1) empty-diagnostics check.
         let recovery = curly_begin
             .filter(|_| !result.diagnostics.is_empty())
-            .and_then(|begin| curly_recovery::recovery_offset(self.src, &result.tokens, begin));
+            .and_then(|begin| {
+                curly_recovery::recovery_offset(&result.line_index, &result.tokens, begin)
+            });
         match recovery {
             None => result,
             Some(offset) => {

@@ -1,0 +1,2583 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/keyword_named_typedefs.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 1,
+      "column": 14,
+      "length": 8,
+      "message": "The built-in identifier 'abstract' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 2,
+      "column": 9,
+      "length": 8,
+      "message": "The built-in identifier 'abstract' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 3,
+      "column": 14,
+      "length": 2,
+      "message": "The built-in identifier 'as' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 4,
+      "column": 9,
+      "length": 2,
+      "message": "The built-in identifier 'as' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 5,
+      "column": 14,
+      "length": 6,
+      "message": "The built-in identifier 'assert' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 6,
+      "column": 9,
+      "length": 6,
+      "message": "The built-in identifier 'assert' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 11,
+      "column": 14,
+      "length": 5,
+      "message": "The built-in identifier 'break' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 12,
+      "column": 9,
+      "length": 5,
+      "message": "The built-in identifier 'break' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 13,
+      "column": 14,
+      "length": 4,
+      "message": "The built-in identifier 'case' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 14,
+      "column": 9,
+      "length": 4,
+      "message": "The built-in identifier 'case' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 15,
+      "column": 14,
+      "length": 5,
+      "message": "The built-in identifier 'catch' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 16,
+      "column": 9,
+      "length": 5,
+      "message": "The built-in identifier 'catch' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 17,
+      "column": 14,
+      "length": 5,
+      "message": "The built-in identifier 'class' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 18,
+      "column": 9,
+      "length": 5,
+      "message": "The built-in identifier 'class' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 19,
+      "column": 14,
+      "length": 5,
+      "message": "The built-in identifier 'const' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 20,
+      "column": 9,
+      "length": 5,
+      "message": "The built-in identifier 'const' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 21,
+      "column": 14,
+      "length": 8,
+      "message": "The built-in identifier 'continue' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 22,
+      "column": 9,
+      "length": 8,
+      "message": "The built-in identifier 'continue' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 23,
+      "column": 14,
+      "length": 9,
+      "message": "The built-in identifier 'covariant' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 24,
+      "column": 9,
+      "length": 9,
+      "message": "The built-in identifier 'covariant' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 25,
+      "column": 14,
+      "length": 7,
+      "message": "The built-in identifier 'default' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 26,
+      "column": 9,
+      "length": 7,
+      "message": "The built-in identifier 'default' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 27,
+      "column": 14,
+      "length": 8,
+      "message": "The built-in identifier 'deferred' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 28,
+      "column": 9,
+      "length": 8,
+      "message": "The built-in identifier 'deferred' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 29,
+      "column": 14,
+      "length": 2,
+      "message": "The built-in identifier 'do' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 30,
+      "column": 9,
+      "length": 2,
+      "message": "The built-in identifier 'do' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 31,
+      "column": 14,
+      "length": 7,
+      "message": "The built-in identifier 'dynamic' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 32,
+      "column": 9,
+      "length": 7,
+      "message": "The built-in identifier 'dynamic' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 33,
+      "column": 14,
+      "length": 4,
+      "message": "The built-in identifier 'else' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 34,
+      "column": 9,
+      "length": 4,
+      "message": "The built-in identifier 'else' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 35,
+      "column": 14,
+      "length": 4,
+      "message": "The built-in identifier 'enum' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 36,
+      "column": 9,
+      "length": 4,
+      "message": "The built-in identifier 'enum' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 37,
+      "column": 14,
+      "length": 6,
+      "message": "The built-in identifier 'export' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 38,
+      "column": 9,
+      "length": 6,
+      "message": "The built-in identifier 'export' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 39,
+      "column": 14,
+      "length": 7,
+      "message": "The built-in identifier 'extends' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 40,
+      "column": 9,
+      "length": 7,
+      "message": "The built-in identifier 'extends' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 41,
+      "column": 14,
+      "length": 9,
+      "message": "The built-in identifier 'extension' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 42,
+      "column": 9,
+      "length": 9,
+      "message": "The built-in identifier 'extension' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 43,
+      "column": 14,
+      "length": 8,
+      "message": "The built-in identifier 'external' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 44,
+      "column": 9,
+      "length": 8,
+      "message": "The built-in identifier 'external' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 45,
+      "column": 14,
+      "length": 7,
+      "message": "The built-in identifier 'factory' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 46,
+      "column": 9,
+      "length": 7,
+      "message": "The built-in identifier 'factory' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 47,
+      "column": 14,
+      "length": 5,
+      "message": "The built-in identifier 'false' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 48,
+      "column": 9,
+      "length": 5,
+      "message": "The built-in identifier 'false' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 49,
+      "column": 14,
+      "length": 5,
+      "message": "The built-in identifier 'final' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 50,
+      "column": 9,
+      "length": 5,
+      "message": "The built-in identifier 'final' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 51,
+      "column": 14,
+      "length": 7,
+      "message": "The built-in identifier 'finally' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 52,
+      "column": 9,
+      "length": 7,
+      "message": "The built-in identifier 'finally' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 53,
+      "column": 14,
+      "length": 3,
+      "message": "The built-in identifier 'for' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 54,
+      "column": 9,
+      "length": 3,
+      "message": "The built-in identifier 'for' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 55,
+      "column": 14,
+      "length": 8,
+      "message": "The built-in identifier 'Function' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 56,
+      "column": 9,
+      "length": 8,
+      "message": "The built-in identifier 'Function' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 57,
+      "column": 14,
+      "length": 3,
+      "message": "The built-in identifier 'get' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 58,
+      "column": 9,
+      "length": 3,
+      "message": "The built-in identifier 'get' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 61,
+      "column": 14,
+      "length": 2,
+      "message": "The built-in identifier 'if' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 62,
+      "column": 9,
+      "length": 2,
+      "message": "The built-in identifier 'if' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 63,
+      "column": 14,
+      "length": 10,
+      "message": "The built-in identifier 'implements' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 64,
+      "column": 9,
+      "length": 10,
+      "message": "The built-in identifier 'implements' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 65,
+      "column": 14,
+      "length": 6,
+      "message": "The built-in identifier 'import' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 66,
+      "column": 9,
+      "length": 6,
+      "message": "The built-in identifier 'import' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 67,
+      "column": 14,
+      "length": 2,
+      "message": "The built-in identifier 'in' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 68,
+      "column": 9,
+      "length": 2,
+      "message": "The built-in identifier 'in' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 71,
+      "column": 14,
+      "length": 9,
+      "message": "The built-in identifier 'interface' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 72,
+      "column": 9,
+      "length": 9,
+      "message": "The built-in identifier 'interface' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 73,
+      "column": 14,
+      "length": 2,
+      "message": "The built-in identifier 'is' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 74,
+      "column": 9,
+      "length": 2,
+      "message": "The built-in identifier 'is' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 75,
+      "column": 14,
+      "length": 4,
+      "message": "The built-in identifier 'late' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 76,
+      "column": 9,
+      "length": 4,
+      "message": "The built-in identifier 'late' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 77,
+      "column": 14,
+      "length": 7,
+      "message": "The built-in identifier 'library' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 78,
+      "column": 9,
+      "length": 7,
+      "message": "The built-in identifier 'library' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 79,
+      "column": 14,
+      "length": 5,
+      "message": "The built-in identifier 'mixin' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 80,
+      "column": 9,
+      "length": 5,
+      "message": "The built-in identifier 'mixin' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 83,
+      "column": 14,
+      "length": 3,
+      "message": "The built-in identifier 'new' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 84,
+      "column": 9,
+      "length": 3,
+      "message": "The built-in identifier 'new' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 85,
+      "column": 14,
+      "length": 4,
+      "message": "The built-in identifier 'null' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 86,
+      "column": 9,
+      "length": 4,
+      "message": "The built-in identifier 'null' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 91,
+      "column": 14,
+      "length": 8,
+      "message": "The built-in identifier 'operator' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 92,
+      "column": 9,
+      "length": 8,
+      "message": "The built-in identifier 'operator' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 95,
+      "column": 14,
+      "length": 4,
+      "message": "The built-in identifier 'part' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 96,
+      "column": 9,
+      "length": 4,
+      "message": "The built-in identifier 'part' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 99,
+      "column": 14,
+      "length": 8,
+      "message": "The built-in identifier 'required' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 100,
+      "column": 9,
+      "length": 8,
+      "message": "The built-in identifier 'required' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 101,
+      "column": 14,
+      "length": 7,
+      "message": "The built-in identifier 'rethrow' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 102,
+      "column": 9,
+      "length": 7,
+      "message": "The built-in identifier 'rethrow' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 103,
+      "column": 14,
+      "length": 6,
+      "message": "The built-in identifier 'return' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 104,
+      "column": 9,
+      "length": 6,
+      "message": "The built-in identifier 'return' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 105,
+      "column": 14,
+      "length": 3,
+      "message": "The built-in identifier 'set' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 106,
+      "column": 9,
+      "length": 3,
+      "message": "The built-in identifier 'set' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 111,
+      "column": 14,
+      "length": 6,
+      "message": "The built-in identifier 'static' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 112,
+      "column": 9,
+      "length": 6,
+      "message": "The built-in identifier 'static' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 113,
+      "column": 14,
+      "length": 5,
+      "message": "The built-in identifier 'super' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 114,
+      "column": 9,
+      "length": 5,
+      "message": "The built-in identifier 'super' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 115,
+      "column": 14,
+      "length": 6,
+      "message": "The built-in identifier 'switch' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 116,
+      "column": 9,
+      "length": 6,
+      "message": "The built-in identifier 'switch' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 119,
+      "column": 14,
+      "length": 4,
+      "message": "The built-in identifier 'this' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 120,
+      "column": 9,
+      "length": 4,
+      "message": "The built-in identifier 'this' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 121,
+      "column": 14,
+      "length": 5,
+      "message": "The built-in identifier 'throw' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 122,
+      "column": 9,
+      "length": 5,
+      "message": "The built-in identifier 'throw' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 123,
+      "column": 14,
+      "length": 4,
+      "message": "The built-in identifier 'true' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 124,
+      "column": 9,
+      "length": 4,
+      "message": "The built-in identifier 'true' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 125,
+      "column": 14,
+      "length": 3,
+      "message": "The built-in identifier 'try' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 126,
+      "column": 9,
+      "length": 3,
+      "message": "The built-in identifier 'try' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 127,
+      "column": 14,
+      "length": 7,
+      "message": "The built-in identifier 'typedef' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 128,
+      "column": 9,
+      "length": 7,
+      "message": "The built-in identifier 'typedef' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 129,
+      "column": 14,
+      "length": 3,
+      "message": "The built-in identifier 'var' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 130,
+      "column": 9,
+      "length": 3,
+      "message": "The built-in identifier 'var' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 131,
+      "column": 14,
+      "length": 4,
+      "message": "The built-in identifier 'void' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 133,
+      "column": 14,
+      "length": 5,
+      "message": "The built-in identifier 'while' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 134,
+      "column": 9,
+      "length": 5,
+      "message": "The built-in identifier 'while' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 135,
+      "column": 14,
+      "length": 4,
+      "message": "The built-in identifier 'with' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 136,
+      "column": 9,
+      "length": 4,
+      "message": "The built-in identifier 'with' can't be used as a typedef name."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 2,
+      "column": 9,
+      "length": 8,
+      "message": "The name 'abstract' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 4,
+      "column": 9,
+      "length": 2,
+      "message": "The name 'as' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 6,
+      "column": 9,
+      "length": 6,
+      "message": "The name 'assert' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 8,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'async' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 10,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'await' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 12,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'break' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 14,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'case' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 16,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'catch' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 18,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'class' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 20,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'const' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 22,
+      "column": 9,
+      "length": 8,
+      "message": "The name 'continue' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 24,
+      "column": 9,
+      "length": 9,
+      "message": "The name 'covariant' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 26,
+      "column": 9,
+      "length": 7,
+      "message": "The name 'default' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 28,
+      "column": 9,
+      "length": 8,
+      "message": "The name 'deferred' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 30,
+      "column": 9,
+      "length": 2,
+      "message": "The name 'do' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 32,
+      "column": 9,
+      "length": 7,
+      "message": "The name 'dynamic' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 34,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'else' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 36,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'enum' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 38,
+      "column": 9,
+      "length": 6,
+      "message": "The name 'export' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 40,
+      "column": 9,
+      "length": 7,
+      "message": "The name 'extends' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 42,
+      "column": 9,
+      "length": 9,
+      "message": "The name 'extension' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 44,
+      "column": 9,
+      "length": 8,
+      "message": "The name 'external' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 46,
+      "column": 9,
+      "length": 7,
+      "message": "The name 'factory' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 48,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'false' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 50,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'final' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 52,
+      "column": 9,
+      "length": 7,
+      "message": "The name 'finally' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 54,
+      "column": 9,
+      "length": 3,
+      "message": "The name 'for' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 56,
+      "column": 9,
+      "length": 8,
+      "message": "The name 'Function' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 58,
+      "column": 9,
+      "length": 3,
+      "message": "The name 'get' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 60,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'hide' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 62,
+      "column": 9,
+      "length": 2,
+      "message": "The name 'if' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 64,
+      "column": 9,
+      "length": 10,
+      "message": "The name 'implements' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 66,
+      "column": 9,
+      "length": 6,
+      "message": "The name 'import' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 68,
+      "column": 9,
+      "length": 2,
+      "message": "The name 'in' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 70,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'inout' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 72,
+      "column": 9,
+      "length": 9,
+      "message": "The name 'interface' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 74,
+      "column": 9,
+      "length": 2,
+      "message": "The name 'is' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 76,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 78,
+      "column": 9,
+      "length": 7,
+      "message": "The name 'library' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 80,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'mixin' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 82,
+      "column": 9,
+      "length": 6,
+      "message": "The name 'native' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 84,
+      "column": 9,
+      "length": 3,
+      "message": "The name 'new' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 86,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'null' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 88,
+      "column": 9,
+      "length": 2,
+      "message": "The name 'of' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 90,
+      "column": 9,
+      "length": 2,
+      "message": "The name 'on' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 92,
+      "column": 9,
+      "length": 8,
+      "message": "The name 'operator' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 94,
+      "column": 9,
+      "length": 3,
+      "message": "The name 'out' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 96,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'part' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 98,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'patch' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 100,
+      "column": 9,
+      "length": 8,
+      "message": "The name 'required' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 102,
+      "column": 9,
+      "length": 7,
+      "message": "The name 'rethrow' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 104,
+      "column": 9,
+      "length": 6,
+      "message": "The name 'return' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 106,
+      "column": 9,
+      "length": 3,
+      "message": "The name 'set' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 108,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'show' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 110,
+      "column": 9,
+      "length": 6,
+      "message": "The name 'source' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 112,
+      "column": 9,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 114,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'super' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 116,
+      "column": 9,
+      "length": 6,
+      "message": "The name 'switch' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 118,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'sync' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 120,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'this' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 122,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'throw' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 124,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'true' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 126,
+      "column": 9,
+      "length": 3,
+      "message": "The name 'try' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 128,
+      "column": 9,
+      "length": 7,
+      "message": "The name 'typedef' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 130,
+      "column": 9,
+      "length": 3,
+      "message": "The name 'var' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 132,
+      "column": 21,
+      "length": 8,
+      "message": "The name 'Function' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 134,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'while' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 136,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'with' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 138,
+      "column": 9,
+      "length": 5,
+      "message": "The name 'yield' is already defined."
+    },
+    {
+      "code": "expected_executable",
+      "line": 132,
+      "column": 14,
+      "length": 1,
+      "message": "Expected a method, getter, setter or operator declaration."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 1,
+      "column": 14,
+      "length": 8,
+      "message": "'abstract' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 2,
+      "column": 9,
+      "length": 8,
+      "message": "'abstract' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 3,
+      "column": 14,
+      "length": 2,
+      "message": "'as' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 4,
+      "column": 9,
+      "length": 2,
+      "message": "'as' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 5,
+      "column": 14,
+      "length": 6,
+      "message": "'assert' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 6,
+      "column": 9,
+      "length": 6,
+      "message": "'assert' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 11,
+      "column": 14,
+      "length": 5,
+      "message": "'break' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 12,
+      "column": 9,
+      "length": 5,
+      "message": "'break' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 13,
+      "column": 14,
+      "length": 4,
+      "message": "'case' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 14,
+      "column": 9,
+      "length": 4,
+      "message": "'case' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 15,
+      "column": 14,
+      "length": 5,
+      "message": "'catch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 16,
+      "column": 9,
+      "length": 5,
+      "message": "'catch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 17,
+      "column": 14,
+      "length": 5,
+      "message": "'class' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 18,
+      "column": 9,
+      "length": 5,
+      "message": "'class' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 19,
+      "column": 14,
+      "length": 5,
+      "message": "'const' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 20,
+      "column": 9,
+      "length": 5,
+      "message": "'const' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 21,
+      "column": 14,
+      "length": 8,
+      "message": "'continue' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 22,
+      "column": 9,
+      "length": 8,
+      "message": "'continue' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 23,
+      "column": 14,
+      "length": 9,
+      "message": "'covariant' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 24,
+      "column": 9,
+      "length": 9,
+      "message": "'covariant' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 25,
+      "column": 14,
+      "length": 7,
+      "message": "'default' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 26,
+      "column": 9,
+      "length": 7,
+      "message": "'default' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 27,
+      "column": 14,
+      "length": 8,
+      "message": "'deferred' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 28,
+      "column": 9,
+      "length": 8,
+      "message": "'deferred' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 29,
+      "column": 14,
+      "length": 2,
+      "message": "'do' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 30,
+      "column": 9,
+      "length": 2,
+      "message": "'do' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 31,
+      "column": 14,
+      "length": 7,
+      "message": "'dynamic' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 32,
+      "column": 9,
+      "length": 7,
+      "message": "'dynamic' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 33,
+      "column": 14,
+      "length": 4,
+      "message": "'else' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 34,
+      "column": 9,
+      "length": 4,
+      "message": "'else' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 35,
+      "column": 14,
+      "length": 4,
+      "message": "'enum' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 36,
+      "column": 9,
+      "length": 4,
+      "message": "'enum' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 37,
+      "column": 14,
+      "length": 6,
+      "message": "'export' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 38,
+      "column": 9,
+      "length": 6,
+      "message": "'export' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 39,
+      "column": 14,
+      "length": 7,
+      "message": "'extends' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 40,
+      "column": 9,
+      "length": 7,
+      "message": "'extends' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 41,
+      "column": 14,
+      "length": 9,
+      "message": "'extension' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 42,
+      "column": 9,
+      "length": 9,
+      "message": "'extension' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 43,
+      "column": 14,
+      "length": 8,
+      "message": "'external' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 44,
+      "column": 9,
+      "length": 8,
+      "message": "'external' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 45,
+      "column": 14,
+      "length": 7,
+      "message": "'factory' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 46,
+      "column": 9,
+      "length": 7,
+      "message": "'factory' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 47,
+      "column": 14,
+      "length": 5,
+      "message": "'false' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 48,
+      "column": 9,
+      "length": 5,
+      "message": "'false' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 49,
+      "column": 14,
+      "length": 5,
+      "message": "'final' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 50,
+      "column": 9,
+      "length": 5,
+      "message": "'final' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 51,
+      "column": 14,
+      "length": 7,
+      "message": "'finally' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 52,
+      "column": 9,
+      "length": 7,
+      "message": "'finally' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 53,
+      "column": 14,
+      "length": 3,
+      "message": "'for' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 54,
+      "column": 9,
+      "length": 3,
+      "message": "'for' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 55,
+      "column": 14,
+      "length": 8,
+      "message": "'Function' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 56,
+      "column": 9,
+      "length": 8,
+      "message": "'Function' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 57,
+      "column": 14,
+      "length": 3,
+      "message": "'get' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 58,
+      "column": 9,
+      "length": 3,
+      "message": "'get' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 61,
+      "column": 14,
+      "length": 2,
+      "message": "'if' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 62,
+      "column": 9,
+      "length": 2,
+      "message": "'if' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 63,
+      "column": 14,
+      "length": 10,
+      "message": "'implements' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 64,
+      "column": 9,
+      "length": 10,
+      "message": "'implements' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 65,
+      "column": 14,
+      "length": 6,
+      "message": "'import' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 66,
+      "column": 9,
+      "length": 6,
+      "message": "'import' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 67,
+      "column": 14,
+      "length": 2,
+      "message": "'in' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 68,
+      "column": 9,
+      "length": 2,
+      "message": "'in' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 71,
+      "column": 14,
+      "length": 9,
+      "message": "'interface' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 72,
+      "column": 9,
+      "length": 9,
+      "message": "'interface' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 73,
+      "column": 14,
+      "length": 2,
+      "message": "'is' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 74,
+      "column": 9,
+      "length": 2,
+      "message": "'is' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 75,
+      "column": 14,
+      "length": 4,
+      "message": "'late' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 76,
+      "column": 9,
+      "length": 4,
+      "message": "'late' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 77,
+      "column": 14,
+      "length": 7,
+      "message": "'library' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 78,
+      "column": 9,
+      "length": 7,
+      "message": "'library' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 79,
+      "column": 14,
+      "length": 5,
+      "message": "'mixin' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 80,
+      "column": 9,
+      "length": 5,
+      "message": "'mixin' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 83,
+      "column": 14,
+      "length": 3,
+      "message": "'new' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 84,
+      "column": 9,
+      "length": 3,
+      "message": "'new' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 85,
+      "column": 14,
+      "length": 4,
+      "message": "'null' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 86,
+      "column": 9,
+      "length": 4,
+      "message": "'null' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 91,
+      "column": 14,
+      "length": 8,
+      "message": "'operator' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 92,
+      "column": 9,
+      "length": 8,
+      "message": "'operator' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 95,
+      "column": 14,
+      "length": 4,
+      "message": "'part' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 96,
+      "column": 9,
+      "length": 4,
+      "message": "'part' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 99,
+      "column": 14,
+      "length": 8,
+      "message": "'required' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 100,
+      "column": 9,
+      "length": 8,
+      "message": "'required' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 101,
+      "column": 14,
+      "length": 7,
+      "message": "'rethrow' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 102,
+      "column": 9,
+      "length": 7,
+      "message": "'rethrow' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 103,
+      "column": 14,
+      "length": 6,
+      "message": "'return' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 104,
+      "column": 9,
+      "length": 6,
+      "message": "'return' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 105,
+      "column": 14,
+      "length": 3,
+      "message": "'set' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 106,
+      "column": 9,
+      "length": 3,
+      "message": "'set' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 111,
+      "column": 14,
+      "length": 6,
+      "message": "'static' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 112,
+      "column": 9,
+      "length": 6,
+      "message": "'static' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 113,
+      "column": 14,
+      "length": 5,
+      "message": "'super' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 114,
+      "column": 9,
+      "length": 5,
+      "message": "'super' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 115,
+      "column": 14,
+      "length": 6,
+      "message": "'switch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 116,
+      "column": 9,
+      "length": 6,
+      "message": "'switch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 119,
+      "column": 14,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 120,
+      "column": 9,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 121,
+      "column": 14,
+      "length": 5,
+      "message": "'throw' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 122,
+      "column": 9,
+      "length": 5,
+      "message": "'throw' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 123,
+      "column": 14,
+      "length": 4,
+      "message": "'true' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 124,
+      "column": 9,
+      "length": 4,
+      "message": "'true' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 125,
+      "column": 14,
+      "length": 3,
+      "message": "'try' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 126,
+      "column": 9,
+      "length": 3,
+      "message": "'try' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 127,
+      "column": 14,
+      "length": 7,
+      "message": "'typedef' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 128,
+      "column": 9,
+      "length": 7,
+      "message": "'typedef' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 129,
+      "column": 14,
+      "length": 3,
+      "message": "'var' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 130,
+      "column": 9,
+      "length": 3,
+      "message": "'var' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 131,
+      "column": 14,
+      "length": 4,
+      "message": "'void' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 133,
+      "column": 14,
+      "length": 5,
+      "message": "'while' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 134,
+      "column": 9,
+      "length": 5,
+      "message": "'while' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 135,
+      "column": 14,
+      "length": 4,
+      "message": "'with' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 136,
+      "column": 9,
+      "length": 4,
+      "message": "'with' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_token",
+      "line": 132,
+      "column": 9,
+      "length": 4,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 132,
+      "column": 31,
+      "length": 1,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 132,
+      "column": 14,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_typedef_parameters",
+      "line": 132,
+      "column": 14,
+      "length": 1,
+      "message": "Typedefs must have an explicit list of parameters."
+    },
+    {
+      "code": "unused_element",
+      "line": 1,
+      "column": 1,
+      "length": 0,
+      "message": "The declaration '<unnamed>' isn't referenced."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_executable",
+      "line": 132,
+      "column": 14,
+      "length": 1,
+      "message": "Expected a declaration, but got '='."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 5,
+      "column": 14,
+      "length": 6,
+      "message": "'assert' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 6,
+      "column": 9,
+      "length": 6,
+      "message": "'assert' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 11,
+      "column": 14,
+      "length": 5,
+      "message": "'break' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 12,
+      "column": 9,
+      "length": 5,
+      "message": "'break' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 13,
+      "column": 14,
+      "length": 4,
+      "message": "'case' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 14,
+      "column": 9,
+      "length": 4,
+      "message": "'case' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 15,
+      "column": 14,
+      "length": 5,
+      "message": "'catch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 16,
+      "column": 9,
+      "length": 5,
+      "message": "'catch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 17,
+      "column": 14,
+      "length": 5,
+      "message": "'class' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 18,
+      "column": 9,
+      "length": 5,
+      "message": "'class' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 19,
+      "column": 14,
+      "length": 5,
+      "message": "'const' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 20,
+      "column": 9,
+      "length": 5,
+      "message": "'const' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 21,
+      "column": 14,
+      "length": 8,
+      "message": "'continue' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 22,
+      "column": 9,
+      "length": 8,
+      "message": "'continue' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 25,
+      "column": 14,
+      "length": 7,
+      "message": "'default' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 26,
+      "column": 9,
+      "length": 7,
+      "message": "'default' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 29,
+      "column": 14,
+      "length": 2,
+      "message": "'do' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 30,
+      "column": 9,
+      "length": 2,
+      "message": "'do' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 33,
+      "column": 14,
+      "length": 4,
+      "message": "'else' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 34,
+      "column": 9,
+      "length": 4,
+      "message": "'else' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 35,
+      "column": 14,
+      "length": 4,
+      "message": "'enum' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 36,
+      "column": 9,
+      "length": 4,
+      "message": "'enum' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 39,
+      "column": 14,
+      "length": 7,
+      "message": "'extends' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 40,
+      "column": 9,
+      "length": 7,
+      "message": "'extends' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 47,
+      "column": 14,
+      "length": 5,
+      "message": "'false' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 48,
+      "column": 9,
+      "length": 5,
+      "message": "'false' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 49,
+      "column": 14,
+      "length": 5,
+      "message": "'final' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 50,
+      "column": 9,
+      "length": 5,
+      "message": "'final' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 51,
+      "column": 14,
+      "length": 7,
+      "message": "'finally' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 52,
+      "column": 9,
+      "length": 7,
+      "message": "'finally' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 53,
+      "column": 14,
+      "length": 3,
+      "message": "'for' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 54,
+      "column": 9,
+      "length": 3,
+      "message": "'for' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 61,
+      "column": 14,
+      "length": 2,
+      "message": "'if' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 62,
+      "column": 9,
+      "length": 2,
+      "message": "'if' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 67,
+      "column": 14,
+      "length": 2,
+      "message": "'in' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 68,
+      "column": 9,
+      "length": 2,
+      "message": "'in' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 73,
+      "column": 14,
+      "length": 2,
+      "message": "'is' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 74,
+      "column": 9,
+      "length": 2,
+      "message": "'is' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 83,
+      "column": 14,
+      "length": 3,
+      "message": "'new' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 84,
+      "column": 9,
+      "length": 3,
+      "message": "'new' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 85,
+      "column": 14,
+      "length": 4,
+      "message": "'null' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 86,
+      "column": 9,
+      "length": 4,
+      "message": "'null' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 101,
+      "column": 14,
+      "length": 7,
+      "message": "'rethrow' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 102,
+      "column": 9,
+      "length": 7,
+      "message": "'rethrow' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 103,
+      "column": 14,
+      "length": 6,
+      "message": "'return' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 104,
+      "column": 9,
+      "length": 6,
+      "message": "'return' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 113,
+      "column": 14,
+      "length": 5,
+      "message": "'super' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 114,
+      "column": 9,
+      "length": 5,
+      "message": "'super' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 115,
+      "column": 14,
+      "length": 6,
+      "message": "'switch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 116,
+      "column": 9,
+      "length": 6,
+      "message": "'switch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 119,
+      "column": 14,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 120,
+      "column": 9,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 121,
+      "column": 14,
+      "length": 5,
+      "message": "'throw' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 122,
+      "column": 9,
+      "length": 5,
+      "message": "'throw' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 123,
+      "column": 14,
+      "length": 4,
+      "message": "'true' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 124,
+      "column": 9,
+      "length": 4,
+      "message": "'true' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 125,
+      "column": 14,
+      "length": 3,
+      "message": "'try' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 126,
+      "column": 9,
+      "length": 3,
+      "message": "'try' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 129,
+      "column": 14,
+      "length": 3,
+      "message": "'var' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 130,
+      "column": 9,
+      "length": 3,
+      "message": "'var' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 131,
+      "column": 14,
+      "length": 4,
+      "message": "'void' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 133,
+      "column": 14,
+      "length": 5,
+      "message": "'while' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 134,
+      "column": 9,
+      "length": 5,
+      "message": "'while' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 135,
+      "column": 14,
+      "length": 4,
+      "message": "'with' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 136,
+      "column": 9,
+      "length": 4,
+      "message": "'with' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_token",
+      "line": 132,
+      "column": 9,
+      "length": 4,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 132,
+      "column": 31,
+      "length": 1,
+      "message": "A function body must be provided."
+    }
+  ],
+  "source": "typedef void abstract();\ntypedef abstract = void Function();\ntypedef void as();\ntypedef as = void Function();\ntypedef void assert();\ntypedef assert = void Function();\ntypedef void async();\ntypedef async = void Function();\ntypedef void await();\ntypedef await = void Function();\ntypedef void break();\ntypedef break = void Function();\ntypedef void case();\ntypedef case = void Function();\ntypedef void catch();\ntypedef catch = void Function();\ntypedef void class();\ntypedef class = void Function();\ntypedef void const();\ntypedef const = void Function();\ntypedef void continue();\ntypedef continue = void Function();\ntypedef void covariant();\ntypedef covariant = void Function();\ntypedef void default();\ntypedef default = void Function();\ntypedef void deferred();\ntypedef deferred = void Function();\ntypedef void do();\ntypedef do = void Function();\ntypedef void dynamic();\ntypedef dynamic = void Function();\ntypedef void else();\ntypedef else = void Function();\ntypedef void enum();\ntypedef enum = void Function();\ntypedef void export();\ntypedef export = void Function();\ntypedef void extends();\ntypedef extends = void Function();\ntypedef void extension();\ntypedef extension = void Function();\ntypedef void external();\ntypedef external = void Function();\ntypedef void factory();\ntypedef factory = void Function();\ntypedef void false();\ntypedef false = void Function();\ntypedef void final();\ntypedef final = void Function();\ntypedef void finally();\ntypedef finally = void Function();\ntypedef void for();\ntypedef for = void Function();\ntypedef void Function();\ntypedef Function = void Function();\ntypedef void get();\ntypedef get = void Function();\ntypedef void hide();\ntypedef hide = void Function();\ntypedef void if();\ntypedef if = void Function();\ntypedef void implements();\ntypedef implements = void Function();\ntypedef void import();\ntypedef import = void Function();\ntypedef void in();\ntypedef in = void Function();\ntypedef void inout();\ntypedef inout = void Function();\ntypedef void interface();\ntypedef interface = void Function();\ntypedef void is();\ntypedef is = void Function();\ntypedef void late();\ntypedef late = void Function();\ntypedef void library();\ntypedef library = void Function();\ntypedef void mixin();\ntypedef mixin = void Function();\ntypedef void native();\ntypedef native = void Function();\ntypedef void new();\ntypedef new = void Function();\ntypedef void null();\ntypedef null = void Function();\ntypedef void of();\ntypedef of = void Function();\ntypedef void on();\ntypedef on = void Function();\ntypedef void operator();\ntypedef operator = void Function();\ntypedef void out();\ntypedef out = void Function();\ntypedef void part();\ntypedef part = void Function();\ntypedef void patch();\ntypedef patch = void Function();\ntypedef void required();\ntypedef required = void Function();\ntypedef void rethrow();\ntypedef rethrow = void Function();\ntypedef void return();\ntypedef return = void Function();\ntypedef void set();\ntypedef set = void Function();\ntypedef void show();\ntypedef show = void Function();\ntypedef void source();\ntypedef source = void Function();\ntypedef void static();\ntypedef static = void Function();\ntypedef void super();\ntypedef super = void Function();\ntypedef void switch();\ntypedef switch = void Function();\ntypedef void sync();\ntypedef sync = void Function();\ntypedef void this();\ntypedef this = void Function();\ntypedef void throw();\ntypedef throw = void Function();\ntypedef void true();\ntypedef true = void Function();\ntypedef void try();\ntypedef try = void Function();\ntypedef void typedef();\ntypedef typedef = void Function();\ntypedef void var();\ntypedef var = void Function();\ntypedef void void();\ntypedef void = void Function();\ntypedef void while();\ntypedef while = void Function();\ntypedef void with();\ntypedef with = void Function();\ntypedef void yield();\ntypedef yield = void Function();\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/4241f7cb.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}

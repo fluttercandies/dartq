@@ -1,0 +1,1743 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/keyword_named_class_methods_2.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "break_outside_of_loop",
+      "line": 29,
+      "column": 12,
+      "length": 5,
+      "message": "A break statement can't be used outside of a loop or switch statement."
+    },
+    {
+      "code": "continue_outside_of_loop",
+      "line": 54,
+      "column": 12,
+      "length": 8,
+      "message": "A continue statement can't be used outside of a loop or switch statement."
+    },
+    {
+      "code": "dead_code",
+      "line": 29,
+      "column": 12,
+      "length": 15,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 54,
+      "column": 12,
+      "length": 18,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 74,
+      "column": 12,
+      "length": 15,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 84,
+      "column": 12,
+      "length": 14,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 124,
+      "column": 12,
+      "length": 15,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 134,
+      "column": 12,
+      "length": 13,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 154,
+      "column": 12,
+      "length": 12,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 184,
+      "column": 20,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 289,
+      "column": 24,
+      "length": 3,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 314,
+      "column": 12,
+      "length": 13,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 324,
+      "column": 12,
+      "length": 13,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 329,
+      "column": 12,
+      "length": 14,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 334,
+      "column": 12,
+      "length": 15,
+      "message": "Dead code."
+    },
+    {
+      "code": "expected_body",
+      "line": 289,
+      "column": 22,
+      "length": 1,
+      "message": "A switch expression must have a body, even if it is empty."
+    },
+    {
+      "code": "expected_body",
+      "line": 314,
+      "column": 12,
+      "length": 3,
+      "message": "A try statement must have a body, even if it is empty."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 12,
+      "column": 7,
+      "length": 6,
+      "message": "'assert' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 27,
+      "column": 7,
+      "length": 5,
+      "message": "'break' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 32,
+      "column": 7,
+      "length": 4,
+      "message": "'case' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 34,
+      "column": 12,
+      "length": 4,
+      "message": "'case' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 37,
+      "column": 7,
+      "length": 5,
+      "message": "'catch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 39,
+      "column": 12,
+      "length": 5,
+      "message": "'catch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 42,
+      "column": 7,
+      "length": 5,
+      "message": "'class' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 44,
+      "column": 12,
+      "length": 5,
+      "message": "'class' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 47,
+      "column": 7,
+      "length": 5,
+      "message": "'const' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 52,
+      "column": 7,
+      "length": 8,
+      "message": "'continue' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 62,
+      "column": 7,
+      "length": 7,
+      "message": "'default' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 64,
+      "column": 12,
+      "length": 7,
+      "message": "'default' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 72,
+      "column": 7,
+      "length": 2,
+      "message": "'do' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 82,
+      "column": 7,
+      "length": 4,
+      "message": "'else' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 87,
+      "column": 7,
+      "length": 4,
+      "message": "'enum' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 89,
+      "column": 12,
+      "length": 4,
+      "message": "'enum' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 97,
+      "column": 7,
+      "length": 7,
+      "message": "'extends' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 99,
+      "column": 12,
+      "length": 7,
+      "message": "'extends' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 117,
+      "column": 7,
+      "length": 5,
+      "message": "'false' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 122,
+      "column": 7,
+      "length": 5,
+      "message": "'final' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 127,
+      "column": 7,
+      "length": 7,
+      "message": "'finally' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 129,
+      "column": 12,
+      "length": 7,
+      "message": "'finally' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 132,
+      "column": 7,
+      "length": 3,
+      "message": "'for' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 152,
+      "column": 7,
+      "length": 2,
+      "message": "'if' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 167,
+      "column": 7,
+      "length": 2,
+      "message": "'in' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 169,
+      "column": 12,
+      "length": 2,
+      "message": "'in' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 182,
+      "column": 7,
+      "length": 2,
+      "message": "'is' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 207,
+      "column": 7,
+      "length": 3,
+      "message": "'new' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 212,
+      "column": 7,
+      "length": 4,
+      "message": "'null' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 252,
+      "column": 7,
+      "length": 7,
+      "message": "'rethrow' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 254,
+      "column": 12,
+      "length": 7,
+      "message": "'rethrow' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 257,
+      "column": 7,
+      "length": 6,
+      "message": "'return' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 282,
+      "column": 7,
+      "length": 5,
+      "message": "'super' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 287,
+      "column": 7,
+      "length": 6,
+      "message": "'switch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 297,
+      "column": 7,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 302,
+      "column": 7,
+      "length": 5,
+      "message": "'throw' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 307,
+      "column": 7,
+      "length": 4,
+      "message": "'true' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 312,
+      "column": 7,
+      "length": 3,
+      "message": "'try' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 322,
+      "column": 7,
+      "length": 3,
+      "message": "'var' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 327,
+      "column": 7,
+      "length": 4,
+      "message": "'void' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 332,
+      "column": 7,
+      "length": 5,
+      "message": "'while' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 337,
+      "column": 7,
+      "length": 4,
+      "message": "'with' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 339,
+      "column": 12,
+      "length": 4,
+      "message": "'with' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_token",
+      "line": 29,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 29,
+      "column": 12,
+      "length": 5,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 54,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 54,
+      "column": 12,
+      "length": 8,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 74,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 74,
+      "column": 23,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 75,
+      "column": 3,
+      "length": 1,
+      "message": "Expected to find '('."
+    },
+    {
+      "code": "expected_token",
+      "line": 75,
+      "column": 3,
+      "length": 1,
+      "message": "Expected to find 'while'."
+    },
+    {
+      "code": "expected_token",
+      "line": 84,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 124,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 124,
+      "column": 17,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 124,
+      "column": 20,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 134,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 134,
+      "column": 18,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 154,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 184,
+      "column": 16,
+      "length": 1,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "expected_token",
+      "line": 184,
+      "column": 18,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 282,
+      "column": 7,
+      "length": 5,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 314,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 324,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 324,
+      "column": 15,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 324,
+      "column": 18,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 329,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 329,
+      "column": 16,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 329,
+      "column": 19,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 334,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "invalid_use_of_null_value",
+      "line": 214,
+      "column": 12,
+      "length": 4,
+      "message": "An expression whose value is always 'null' can't be dereferenced."
+    },
+    {
+      "code": "invocation_of_non_function_expression",
+      "line": 119,
+      "column": 12,
+      "length": 5,
+      "message": "The expression doesn't evaluate to a function, so it can't be invoked."
+    },
+    {
+      "code": "invocation_of_non_function_expression",
+      "line": 284,
+      "column": 12,
+      "length": 5,
+      "message": "The expression doesn't evaluate to a function, so it can't be invoked."
+    },
+    {
+      "code": "invocation_of_non_function_expression",
+      "line": 299,
+      "column": 12,
+      "length": 4,
+      "message": "The expression doesn't evaluate to a function, so it can't be invoked."
+    },
+    {
+      "code": "invocation_of_non_function_expression",
+      "line": 309,
+      "column": 12,
+      "length": 4,
+      "message": "The expression doesn't evaluate to a function, so it can't be invoked."
+    },
+    {
+      "code": "missing_catch_or_finally",
+      "line": 314,
+      "column": 12,
+      "length": 3,
+      "message": "A try block must be followed by an 'on', 'catch', or 'finally' clause."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 29,
+      "column": 12,
+      "length": 5,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 54,
+      "column": 12,
+      "length": 8,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 74,
+      "column": 12,
+      "length": 2,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 75,
+      "column": 3,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 84,
+      "column": 12,
+      "length": 4,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 124,
+      "column": 12,
+      "length": 5,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 124,
+      "column": 17,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 124,
+      "column": 21,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 124,
+      "column": 23,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 134,
+      "column": 12,
+      "length": 3,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 134,
+      "column": 19,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 134,
+      "column": 21,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 154,
+      "column": 12,
+      "length": 2,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 154,
+      "column": 20,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 184,
+      "column": 12,
+      "length": 2,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 184,
+      "column": 20,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 209,
+      "column": 15,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 282,
+      "column": 12,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 314,
+      "column": 12,
+      "length": 3,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 324,
+      "column": 12,
+      "length": 3,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 324,
+      "column": 15,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 324,
+      "column": 19,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 324,
+      "column": 21,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 329,
+      "column": 12,
+      "length": 4,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 329,
+      "column": 16,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 329,
+      "column": 20,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 329,
+      "column": 22,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 334,
+      "column": 12,
+      "length": 5,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 334,
+      "column": 23,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "non_bool_condition",
+      "line": 154,
+      "column": 15,
+      "length": 3,
+      "message": "Conditions must have a static type of 'bool'."
+    },
+    {
+      "code": "non_bool_condition",
+      "line": 334,
+      "column": 18,
+      "length": 3,
+      "message": "Conditions must have a static type of 'bool'."
+    },
+    {
+      "code": "non_constant_record_field",
+      "line": 49,
+      "column": 18,
+      "length": 1,
+      "message": "The fields in a const record literal must be constants."
+    },
+    {
+      "code": "non_exhaustive_switch_expression",
+      "line": 289,
+      "column": 12,
+      "length": 6,
+      "message": "The type 'int' isn't exhaustively matched by the switch cases since it doesn't match the pattern 'int()'."
+    },
+    {
+      "code": "not_a_type",
+      "line": 184,
+      "column": 15,
+      "length": 1,
+      "message": "x isn't a type."
+    },
+    {
+      "code": "not_initialized_non_nullable_instance_field",
+      "line": 282,
+      "column": 7,
+      "length": 5,
+      "message": "Non-nullable instance field 'super' must be initialized."
+    },
+    {
+      "code": "receiver_of_type_never",
+      "line": 289,
+      "column": 12,
+      "length": 12,
+      "message": "The receiver is of type 'Never', and will never complete with a value."
+    },
+    {
+      "code": "record_literal_one_positional_no_trailing_comma",
+      "line": 49,
+      "column": 21,
+      "length": 1,
+      "message": "A record literal with exactly one positional field requires a trailing comma."
+    },
+    {
+      "code": "record_type_one_positional_no_trailing_comma",
+      "line": 184,
+      "column": 18,
+      "length": 1,
+      "message": "A record type with exactly one positional field requires a trailing comma."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 184,
+      "column": 12,
+      "length": 7,
+      "message": "A value of type 'bool' can't be returned from the method 'is' because it has a return type of 'int'."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 49,
+      "column": 23,
+      "length": 1,
+      "message": "The operator '+' isn't defined for the type '(int,)'."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 84,
+      "column": 12,
+      "length": 4,
+      "message": "Unexpected text ';'."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 124,
+      "column": 21,
+      "length": 1,
+      "message": "Unexpected text ';'."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 259,
+      "column": 12,
+      "length": 6,
+      "message": "Unexpected text 'return'."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 324,
+      "column": 19,
+      "length": 1,
+      "message": "Unexpected text ';'."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 329,
+      "column": 20,
+      "length": 1,
+      "message": "Unexpected text ';'."
+    },
+    {
+      "code": "unused_element",
+      "line": 1,
+      "column": 7,
+      "length": 0,
+      "message": "The declaration '<unnamed>' isn't referenced."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 122,
+      "column": 7,
+      "length": 0,
+      "message": "The value of the local variable '<unnamed>' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 322,
+      "column": 7,
+      "length": 0,
+      "message": "The value of the local variable '<unnamed>' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 327,
+      "column": 7,
+      "length": 0,
+      "message": "The value of the local variable '<unnamed>' isn't used."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "break_outside_of_loop",
+      "line": 29,
+      "column": 12,
+      "length": 5,
+      "message": "A break statement can't be used outside of a loop or switch statement."
+    },
+    {
+      "code": "continue_outside_of_loop",
+      "line": 54,
+      "column": 12,
+      "length": 8,
+      "message": "A continue statement can't be used outside of a loop or switch statement."
+    },
+    {
+      "code": "expected_body",
+      "line": 289,
+      "column": 22,
+      "length": 1,
+      "message": "A switch expression must have a body, even if it is empty."
+    },
+    {
+      "code": "expected_body",
+      "line": 314,
+      "column": 15,
+      "length": 1,
+      "message": "A try statement must have a body, even if it is empty."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 12,
+      "column": 7,
+      "length": 6,
+      "message": "'assert' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 27,
+      "column": 7,
+      "length": 5,
+      "message": "'break' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 32,
+      "column": 7,
+      "length": 4,
+      "message": "'case' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 34,
+      "column": 12,
+      "length": 4,
+      "message": "'case' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 37,
+      "column": 7,
+      "length": 5,
+      "message": "'catch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 39,
+      "column": 12,
+      "length": 5,
+      "message": "'catch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 42,
+      "column": 7,
+      "length": 5,
+      "message": "'class' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 44,
+      "column": 12,
+      "length": 5,
+      "message": "'class' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 47,
+      "column": 7,
+      "length": 5,
+      "message": "'const' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 52,
+      "column": 7,
+      "length": 8,
+      "message": "'continue' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 62,
+      "column": 7,
+      "length": 7,
+      "message": "'default' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 64,
+      "column": 12,
+      "length": 7,
+      "message": "'default' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 72,
+      "column": 7,
+      "length": 2,
+      "message": "'do' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 82,
+      "column": 7,
+      "length": 4,
+      "message": "'else' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 87,
+      "column": 7,
+      "length": 4,
+      "message": "'enum' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 89,
+      "column": 12,
+      "length": 4,
+      "message": "'enum' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 97,
+      "column": 7,
+      "length": 7,
+      "message": "'extends' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 99,
+      "column": 12,
+      "length": 7,
+      "message": "'extends' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 117,
+      "column": 7,
+      "length": 5,
+      "message": "'false' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 122,
+      "column": 7,
+      "length": 5,
+      "message": "'final' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 127,
+      "column": 7,
+      "length": 7,
+      "message": "'finally' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 129,
+      "column": 12,
+      "length": 7,
+      "message": "'finally' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 132,
+      "column": 7,
+      "length": 3,
+      "message": "'for' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 152,
+      "column": 7,
+      "length": 2,
+      "message": "'if' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 167,
+      "column": 7,
+      "length": 2,
+      "message": "'in' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 169,
+      "column": 12,
+      "length": 2,
+      "message": "'in' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 182,
+      "column": 7,
+      "length": 2,
+      "message": "'is' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 207,
+      "column": 7,
+      "length": 3,
+      "message": "'new' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 212,
+      "column": 7,
+      "length": 4,
+      "message": "'null' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 252,
+      "column": 7,
+      "length": 7,
+      "message": "'rethrow' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 254,
+      "column": 12,
+      "length": 7,
+      "message": "'rethrow' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 257,
+      "column": 7,
+      "length": 6,
+      "message": "'return' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 282,
+      "column": 7,
+      "length": 5,
+      "message": "'super' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 287,
+      "column": 7,
+      "length": 6,
+      "message": "'switch' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 297,
+      "column": 7,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 302,
+      "column": 7,
+      "length": 5,
+      "message": "'throw' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 307,
+      "column": 7,
+      "length": 4,
+      "message": "'true' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 312,
+      "column": 7,
+      "length": 3,
+      "message": "'try' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 322,
+      "column": 7,
+      "length": 3,
+      "message": "'var' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 327,
+      "column": 7,
+      "length": 4,
+      "message": "'void' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 332,
+      "column": 7,
+      "length": 5,
+      "message": "'while' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 337,
+      "column": 7,
+      "length": 4,
+      "message": "'with' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 339,
+      "column": 12,
+      "length": 4,
+      "message": "'with' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_token",
+      "line": 29,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 29,
+      "column": 12,
+      "length": 5,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 54,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 54,
+      "column": 12,
+      "length": 8,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 74,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 74,
+      "column": 23,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 75,
+      "column": 3,
+      "length": 1,
+      "message": "Expected '(' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 75,
+      "column": 3,
+      "length": 1,
+      "message": "Expected 'while' before this."
+    },
+    {
+      "code": "expected_token",
+      "line": 84,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 84,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 124,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 124,
+      "column": 12,
+      "length": 5,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 134,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 134,
+      "column": 18,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 134,
+      "column": 18,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 134,
+      "column": 21,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 154,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 154,
+      "column": 20,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 184,
+      "column": 16,
+      "length": 1,
+      "message": "Expected to find ')'."
+    },
+    {
+      "code": "expected_token",
+      "line": 184,
+      "column": 18,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 184,
+      "column": 20,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 282,
+      "column": 7,
+      "length": 5,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 314,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 324,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 324,
+      "column": 12,
+      "length": 3,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 329,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 329,
+      "column": 12,
+      "length": 4,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 334,
+      "column": 5,
+      "length": 6,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 334,
+      "column": 23,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "missing_catch_or_finally",
+      "line": 314,
+      "column": 12,
+      "length": 3,
+      "message": "A try block must be followed by an 'on', 'catch', or 'finally' clause."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 29,
+      "column": 12,
+      "length": 5,
+      "message": "Expected an identifier, but got 'break'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 54,
+      "column": 12,
+      "length": 8,
+      "message": "Expected an identifier, but got 'continue'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 74,
+      "column": 12,
+      "length": 2,
+      "message": "Expected an identifier, but got 'do'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 84,
+      "column": 12,
+      "length": 4,
+      "message": "Expected an identifier, but got 'else'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 84,
+      "column": 12,
+      "length": 4,
+      "message": "Expected an identifier, but got 'else'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 124,
+      "column": 12,
+      "length": 5,
+      "message": "Expected an identifier, but got 'final'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 124,
+      "column": 17,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 134,
+      "column": 12,
+      "length": 3,
+      "message": "Expected an identifier, but got 'for'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 134,
+      "column": 19,
+      "length": 1,
+      "message": "Expected an identifier, but got ')'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 134,
+      "column": 21,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 154,
+      "column": 12,
+      "length": 2,
+      "message": "Expected an identifier, but got 'if'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 154,
+      "column": 20,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 184,
+      "column": 12,
+      "length": 2,
+      "message": "Expected an identifier, but got 'is'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 184,
+      "column": 20,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 209,
+      "column": 15,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 282,
+      "column": 12,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 314,
+      "column": 12,
+      "length": 3,
+      "message": "Expected an identifier, but got 'try'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 324,
+      "column": 12,
+      "length": 3,
+      "message": "Expected an identifier, but got 'var'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 324,
+      "column": 15,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 329,
+      "column": 12,
+      "length": 4,
+      "message": "Expected an identifier, but got 'void'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 329,
+      "column": 16,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 334,
+      "column": 12,
+      "length": 5,
+      "message": "Expected an identifier, but got 'while'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 334,
+      "column": 23,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "record_literal_one_positional_no_trailing_comma",
+      "line": 49,
+      "column": 21,
+      "length": 1,
+      "message": "A record literal with exactly one positional field requires a trailing comma."
+    },
+    {
+      "code": "record_type_one_positional_no_trailing_comma",
+      "line": 184,
+      "column": 18,
+      "length": 1,
+      "message": "A record type with exactly one positional field requires a trailing comma."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 84,
+      "column": 12,
+      "length": 4,
+      "message": "Unexpected text 'else'."
+    },
+    {
+      "code": "unexpected_token",
+      "line": 259,
+      "column": 12,
+      "length": 6,
+      "message": "Unexpected text 'return'."
+    }
+  ],
+  "source": "class WrapperClass {\n  int abstract(int x) {\n    if (x == 0) return 42;\n    return abstract(x-1) + 1;\n  }\n\n  int as(int x) {\n    if (x == 0) return 42;\n    return as(x-1) + 1;\n  }\n\n  int assert(int x) {\n    if (x == 0) return 42;\n    return assert(x-1) + 1;\n  }\n\n  int async(int x) {\n    if (x == 0) return 42;\n    return async(x-1) + 1;\n  }\n\n  int await(int x) {\n    if (x == 0) return 42;\n    return await(x-1) + 1;\n  }\n\n  int break(int x) {\n    if (x == 0) return 42;\n    return break(x-1) + 1;\n  }\n\n  int case(int x) {\n    if (x == 0) return 42;\n    return case(x-1) + 1;\n  }\n\n  int catch(int x) {\n    if (x == 0) return 42;\n    return catch(x-1) + 1;\n  }\n\n  int class(int x) {\n    if (x == 0) return 42;\n    return class(x-1) + 1;\n  }\n\n  int const(int x) {\n    if (x == 0) return 42;\n    return const(x-1) + 1;\n  }\n\n  int continue(int x) {\n    if (x == 0) return 42;\n    return continue(x-1) + 1;\n  }\n\n  int covariant(int x) {\n    if (x == 0) return 42;\n    return covariant(x-1) + 1;\n  }\n\n  int default(int x) {\n    if (x == 0) return 42;\n    return default(x-1) + 1;\n  }\n\n  int deferred(int x) {\n    if (x == 0) return 42;\n    return deferred(x-1) + 1;\n  }\n\n  int do(int x) {\n    if (x == 0) return 42;\n    return do(x-1) + 1;\n  }\n\n  int dynamic(int x) {\n    if (x == 0) return 42;\n    return dynamic(x-1) + 1;\n  }\n\n  int else(int x) {\n    if (x == 0) return 42;\n    return else(x-1) + 1;\n  }\n\n  int enum(int x) {\n    if (x == 0) return 42;\n    return enum(x-1) + 1;\n  }\n\n  int export(int x) {\n    if (x == 0) return 42;\n    return export(x-1) + 1;\n  }\n\n  int extends(int x) {\n    if (x == 0) return 42;\n    return extends(x-1) + 1;\n  }\n\n  int extension(int x) {\n    if (x == 0) return 42;\n    return extension(x-1) + 1;\n  }\n\n  int external(int x) {\n    if (x == 0) return 42;\n    return external(x-1) + 1;\n  }\n\n  int factory(int x) {\n    if (x == 0) return 42;\n    return factory(x-1) + 1;\n  }\n\n  int false(int x) {\n    if (x == 0) return 42;\n    return false(x-1) + 1;\n  }\n\n  int final(int x) {\n    if (x == 0) return 42;\n    return final(x-1) + 1;\n  }\n\n  int finally(int x) {\n    if (x == 0) return 42;\n    return finally(x-1) + 1;\n  }\n\n  int for(int x) {\n    if (x == 0) return 42;\n    return for(x-1) + 1;\n  }\n\n  int Function(int x) {\n    if (x == 0) return 42;\n    return Function(x-1) + 1;\n  }\n\n  int get(int x) {\n    if (x == 0) return 42;\n    return get(x-1) + 1;\n  }\n\n  int hide(int x) {\n    if (x == 0) return 42;\n    return hide(x-1) + 1;\n  }\n\n  int if(int x) {\n    if (x == 0) return 42;\n    return if(x-1) + 1;\n  }\n\n  int implements(int x) {\n    if (x == 0) return 42;\n    return implements(x-1) + 1;\n  }\n\n  int import(int x) {\n    if (x == 0) return 42;\n    return import(x-1) + 1;\n  }\n\n  int in(int x) {\n    if (x == 0) return 42;\n    return in(x-1) + 1;\n  }\n\n  int inout(int x) {\n    if (x == 0) return 42;\n    return inout(x-1) + 1;\n  }\n\n  int interface(int x) {\n    if (x == 0) return 42;\n    return interface(x-1) + 1;\n  }\n\n  int is(int x) {\n    if (x == 0) return 42;\n    return is(x-1) + 1;\n  }\n\n  int late(int x) {\n    if (x == 0) return 42;\n    return late(x-1) + 1;\n  }\n\n  int library(int x) {\n    if (x == 0) return 42;\n    return library(x-1) + 1;\n  }\n\n  int mixin(int x) {\n    if (x == 0) return 42;\n    return mixin(x-1) + 1;\n  }\n\n  int native(int x) {\n    if (x == 0) return 42;\n    return native(x-1) + 1;\n  }\n\n  int new(int x) {\n    if (x == 0) return 42;\n    return new(x-1) + 1;\n  }\n\n  int null(int x) {\n    if (x == 0) return 42;\n    return null(x-1) + 1;\n  }\n\n  int of(int x) {\n    if (x == 0) return 42;\n    return of(x-1) + 1;\n  }\n\n  int on(int x) {\n    if (x == 0) return 42;\n    return on(x-1) + 1;\n  }\n\n  int operator(int x) {\n    if (x == 0) return 42;\n    return operator(x-1) + 1;\n  }\n\n  int out(int x) {\n    if (x == 0) return 42;\n    return out(x-1) + 1;\n  }\n\n  int part(int x) {\n    if (x == 0) return 42;\n    return part(x-1) + 1;\n  }\n\n  int patch(int x) {\n    if (x == 0) return 42;\n    return patch(x-1) + 1;\n  }\n\n  int required(int x) {\n    if (x == 0) return 42;\n    return required(x-1) + 1;\n  }\n\n  int rethrow(int x) {\n    if (x == 0) return 42;\n    return rethrow(x-1) + 1;\n  }\n\n  int return(int x) {\n    if (x == 0) return 42;\n    return return(x-1) + 1;\n  }\n\n  int set(int x) {\n    if (x == 0) return 42;\n    return set(x-1) + 1;\n  }\n\n  int show(int x) {\n    if (x == 0) return 42;\n    return show(x-1) + 1;\n  }\n\n  int source(int x) {\n    if (x == 0) return 42;\n    return source(x-1) + 1;\n  }\n\n  int static(int x) {\n    if (x == 0) return 42;\n    return static(x-1) + 1;\n  }\n\n  int super(int x) {\n    if (x == 0) return 42;\n    return super(x-1) + 1;\n  }\n\n  int switch(int x) {\n    if (x == 0) return 42;\n    return switch(x-1) + 1;\n  }\n\n  int sync(int x) {\n    if (x == 0) return 42;\n    return sync(x-1) + 1;\n  }\n\n  int this(int x) {\n    if (x == 0) return 42;\n    return this(x-1) + 1;\n  }\n\n  int throw(int x) {\n    if (x == 0) return 42;\n    return throw(x-1) + 1;\n  }\n\n  int true(int x) {\n    if (x == 0) return 42;\n    return true(x-1) + 1;\n  }\n\n  int try(int x) {\n    if (x == 0) return 42;\n    return try(x-1) + 1;\n  }\n\n  int typedef(int x) {\n    if (x == 0) return 42;\n    return typedef(x-1) + 1;\n  }\n\n  int var(int x) {\n    if (x == 0) return 42;\n    return var(x-1) + 1;\n  }\n\n  int void(int x) {\n    if (x == 0) return 42;\n    return void(x-1) + 1;\n  }\n\n  int while(int x) {\n    if (x == 0) return 42;\n    return while(x-1) + 1;\n  }\n\n  int with(int x) {\n    if (x == 0) return 42;\n    return with(x-1) + 1;\n  }\n\n  int yield(int x) {\n    if (x == 0) return 42;\n    return yield(x-1) + 1;\n  }\n}\n",
+  "captured_at": 1791787153,
+  "source_run": {
+    "report": "docs/audits/gate-m0/trend-w4b-union/report.json",
+    "dartq_cmd": "./target/release/dartq check --format=machine",
+    "oracle_cmd": "/Users/iota9star/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "/Users/iota9star/Development/workspace/flutter/dartiq/tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/4093e6ac.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq check --format=machine",
+    "--daemon-cmd",
+    "./target/release/dartq daemon --dir {dir}"
+  ]
+}
