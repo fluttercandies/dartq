@@ -1360,3 +1360,73 @@ fn strict_modes_flow_from_options_to_the_semantic_gate() {
         "the off posture stays silent: {diagnostics:?}"
     );
 }
+
+/// The options `enable-experiment` flags reach the per-file feature gates
+/// (#936, probed on the 3.13.1 oracle): a grant-free package file at the
+/// SDK version lifts the `variance` parse gate and runs the semantic
+/// variance check (`WRONG_TYPE_PARAMETER_VARIANCE_POSITION`, the `out T`
+/// field's implicit-setter face); without the options the gate row fires
+/// as always, and the same request at a pre-release package version stays
+/// gated — the flags re-restrict at the file's own version, the contract
+/// the whitelist grants ride.
+#[test]
+fn options_experiments_lift_the_variance_gates() {
+    use common::Fixture;
+
+    const VARIANCE_SRC: &str = "class Box<out T> {\n  T x;\n}\n";
+    const GATE: &str = "experiment_not_enabled_off_by_default";
+    const SEMANTIC: &str = "wrong_type_parameter_variance_position";
+
+    let codes = |options: Option<&str>, language_version: &str| {
+        let fixture =
+            Fixture::with_language_version(&[("lib/main.dart", VARIANCE_SRC)], language_version);
+        if let Some(text) = options {
+            std::fs::write(fixture.path("analysis_options.yaml"), text).expect("options");
+        }
+        let mut engine = fixture.engine();
+        engine.discover_workspace().expect("discovery");
+        let diagnostics = engine
+            .analyze(&[], &mut |_| {}, &dartq_engine::CancellationToken::new())
+            .expect("analyze");
+        let codes: Vec<String> = diagnostics.iter().map(|d| d.code.name.to_owned()).collect();
+        std::fs::remove_dir_all(&fixture.root).ok();
+        codes
+    };
+
+    let off = codes(None, "3.13");
+    assert!(
+        off.iter().any(|name| name == GATE),
+        "no options: the parse gate fires: {off:?}"
+    );
+
+    let on = codes(Some("analyzer:\n  enable-experiment: [variance]\n"), "3.13");
+    assert!(
+        on.iter().all(|name| name != GATE),
+        "the options lift the parse gate: {on:?}"
+    );
+    assert!(
+        on.iter().any(|name| name == SEMANTIC),
+        "the semantic variance check runs: {on:?}"
+    );
+
+    let old = codes(Some("analyzer:\n  enable-experiment: [variance]\n"), "3.5");
+    assert!(
+        old.iter().any(|name| name == GATE),
+        "the flags re-restrict at the file's version: {old:?}"
+    );
+}
+
+/// The `unrecognized_error_code` membership universe (#936): the pinned
+/// diagnostic-name table answers for the registry codes, the removed-code
+/// compat set keeps the retired names accepted
+/// (`removedCodeNames`, parse_model:66-76), and unknown names miss.
+#[test]
+fn the_diagnostic_name_universe_answers_membership() {
+    use dartq_engine::analysis_options::is_known_diagnostic_code;
+
+    assert!(is_known_diagnostic_code("unrecognized_error_code"));
+    assert!(is_known_diagnostic_code("UNDEFINED_IDENTIFIER"));
+    assert!(is_known_diagnostic_code("missing_return"));
+    assert!(is_known_diagnostic_code("undefined_annotation"));
+    assert!(!is_known_diagnostic_code("not_a_real_code"));
+}

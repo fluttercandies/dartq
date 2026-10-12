@@ -2,7 +2,7 @@
 # include chain under test. package:lints resolves through
 # .dart_tool/package_config.json to the vendored copy in vendor/lints —
 # both dart analyze and dartq resolve_include land on the same on-disk
-# yaml, producing the name-for-name same 89-rule nominal universe as
-# dartq's no-options default posture. No local linter section: the
-# effective set is the include chain alone (official replace semantics).
+# yaml, producing the name-for-name same 89-rule nominal universe. No
+# local linter section: the effective set is the include chain alone
+# (official replace semantics).
 include: package:lints/recommended.yaml

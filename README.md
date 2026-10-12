@@ -377,9 +377,8 @@ Honest state of the 0.1.0 tree:
   and -type-arguments, the part/part-of family, dead code); its parity is
   what the frozen-code M1/M2/M3 differential gates assert, and the
   recorded evidence is refreshed by the release gate chain.
-- Without an `analysis_options.yaml`, dartq enables the whole
-  `package:lints` core + recommended slice — a deliberate divergence from
-  the oracle, which enables nothing without an `include:`.
+- Without an `analysis_options.yaml`, dartq enables no lints — the oracle
+  posture; the rule set is entirely options-driven.
 - pub faces consume pub's resolution artifacts; there is no version
   solving — run `dart pub get` to produce
   `.dart_tool/package_config.json` first.

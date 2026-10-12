@@ -10,12 +10,10 @@
 //! merged options ([`AnalysisOptions::lint_rules`], the include-chain
 //! merge):
 //!
-//! * No options file in the root's ancestry (`None`) — the default
-//!   posture is the whole `package:lints` slice dartq-lints implements
-//!   (core plus recommended; every registered rule carries one of the two
-//!   groups, so the default set is the full registry). Deliberate
-//!   divergence from the oracle, which enables nothing without an
-//!   `include:`: the slice is this product's release gate.
+//! * No options file in the root's ancestry (`None`) — the empty set: no
+//!   lint runs. The official posture (`context_builder.dart:225-232` — an
+//!   options-less package resolves to the default `AnalysisOptionsImpl`,
+//!   whose lints are empty; probed zero lint rows on the 3.13.1 oracle).
 //! * Options present — their effective rule list is the run's set,
 //!   verbatim (the official replace semantics: the merged `linter.rules`
 //!   section *is* the set; `name: false` drops the name before it reaches
@@ -72,38 +70,22 @@ use dartq_engine::Engine;
 use dartq_engine::analysis_options::AnalysisOptions;
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
 use dartq_lints::{
-    EnableSet, Features, Group, Lint, RULES, RuleId, WorkspaceFacts, check_name, check_url,
-    parse_unit, rule_by_name, run,
+    EnableSet, Features, Lint, RULES, RuleId, WorkspaceFacts, check_name, check_url, parse_unit,
+    rule_by_name, run,
 };
 use dartq_package::PackageIdentity;
 use dartq_pub::pubspec_facts::scan as scan_pubspec;
 use dartq_pub::{Pubspec, pubspec_facts::Scalar};
 use dartq_source::{ContentId, FileId, LineIndex};
 
-/// The default posture: the `package:lints` slice (core + recommended,
-/// recommended includes core), enabled by group so a rule outside the sets
-/// — a diagnostic mirror — cannot silently join it.
-fn default_set() -> EnableSet {
-    let mut set = EnableSet::none();
-    for (index, spec) in RULES.iter().enumerate() {
-        // The registry's growth is bounded by the pin test; `RuleId` is u16.
-        let id = RuleId(u16::try_from(index).expect("registry fits u16"));
-        if matches!(spec.group, Group::Core | Group::Recommended) {
-            set.add(id);
-        }
-    }
-    set
-}
-
 /// The enable set one governing entry selects: `None` (no options file in
-/// the governed file's ancestry) selects the default `package:lints`
-/// posture, a present options file's effective rule list replaces it. See
-/// the module docs for the selection semantics.
+/// the governed file's ancestry) selects nothing — the official
+/// options-less posture — and a present options file's effective rule list
+/// replaces it. See the module docs for the selection semantics.
 #[must_use]
 pub fn enable_set(rules: Option<&[String]>) -> EnableSet {
-    static DEFAULT: LazyLock<EnableSet> = LazyLock::new(default_set);
     match rules {
-        None => *DEFAULT,
+        None => EnableSet::none(),
         Some(names) => EnableSet::resolve(names.iter().map(String::as_str)).0,
     }
 }
@@ -738,8 +720,7 @@ fn yaml_ignore_entry<'a>(line: &'a str, marker: &str) -> Option<(&'a str, Vec<St
 /// assembly registered ([`AnalysisOptions::for_roots`]). An options file
 /// above the package root (the repository-wide shape) carries no key of
 /// its own; its entry is the containing root's, which loaded it. `None` —
-/// no options file in the ancestry — is the default `package:lints`
-/// posture.
+/// no options file in the ancestry — is the empty (no-lints) posture.
 fn governing_options<'a>(
     engine: &'a Engine,
     dir: &Path,
@@ -783,24 +764,17 @@ mod tests {
 
     use super::*;
 
-    /// The no-options default is the `package:lints` slice — 34 core + 55
-    /// recommended-only; diagnostic mirrors join only by name.
+    /// The no-options default is the official empty posture: nothing is
+    /// enabled, whatever the registry carries (`context_builder.dart`
+    /// :225-232 — the default `AnalysisOptionsImpl` lints are empty).
     #[test]
-    fn absent_options_default_to_the_package_lints_slice() {
-        assert_eq!(
-            RULES
-                .iter()
-                .filter(|spec| matches!(spec.group, Group::Core | Group::Recommended))
-                .count(),
-            89,
-            "the package:lints slice size changed",
-        );
+    fn absent_options_default_to_no_lints() {
         let set = enable_set(None);
-        for (index, spec) in RULES.iter().enumerate() {
-            assert_eq!(
-                set.is_enabled(RuleId(index as u16)),
-                matches!(spec.group, Group::Core | Group::Recommended),
-                "the default posture is exactly the package:lints slice",
+        assert_eq!(set, EnableSet::none(), "no options file, no lints");
+        for index in 0..RULES.len() {
+            assert!(
+                !set.is_enabled(RuleId(index as u16)),
+                "the default posture enables nothing"
             );
         }
     }

@@ -326,16 +326,34 @@ pub struct FeatureGrants {
     any: bool,
     sdk_lib_root: Box<Path>,
     sdk_library_dirs: FxHashMap<Box<Path>, Box<str>>,
+    /// The options-file `enable-experiment` flags per governing directory
+    /// (#936): every directory the workspace assembly registered an options
+    /// entry for, mapped to its decoded flag list (empty = the entry
+    /// governs but enables nothing — a nested options file without the
+    /// section suppresses the farther list for its subtree, the official
+    /// per-context resolution). Flags decode once here — unknown names
+    /// (`unsupported_option` rows) and expired ones (dropped by the
+    /// official decode) never reach the set; the per-file release gate
+    /// applies at merge time, against the file's own version.
+    options_experiments: FxHashMap<Box<Path>, Box<[dartq_language::Feature]>>,
+    /// Whether any options entry carries a non-empty flag list — the merge
+    /// fast path for the dominant no-experiments workspace.
+    experiments_any: bool,
     memo: Mutex<FxHashMap<(GrantOwner, LanguageVersion), FeatureSet>>,
 }
 
 impl FeatureGrants {
     /// Derives the grant faces from the loaded SDK snapshot, the target
-    /// segment, and the package table. Only owners that can actually win a
-    /// file's attribution are scanned: the table's packages and the target
-    /// segment's libraries (a grant for an unknown package or another
-    /// segment can never fire).
-    pub(crate) fn new(sdk: &SdkSnapshot, target: &str, packages: &IdentityTable) -> Self {
+    /// segment, the package table, and the resolved options table. Only
+    /// owners that can actually win a file's attribution are scanned: the
+    /// table's packages and the target segment's libraries (a grant for an
+    /// unknown package or another segment can never fire).
+    pub(crate) fn new(
+        sdk: &SdkSnapshot,
+        target: &str,
+        packages: &IdentityTable,
+        options: &FxHashMap<PathBuf, Arc<crate::analysis_options::AnalysisOptions>>,
+    ) -> Self {
         let lib_root: Box<Path> = Box::from(sdk.dart_sdk_root().join("lib"));
         let mut sdk_library_dirs = FxHashMap::default();
         let mut any = false;
@@ -359,23 +377,62 @@ impl FeatureGrants {
                 .for_package(package.name.as_str())
                 .is_some_and(|set| !set.is_empty())
         });
+        let mut options_experiments = FxHashMap::default();
+        let mut experiments_any = false;
+        for (dir, entry) in options {
+            let mut flags = Vec::new();
+            for name in entry.experiments.iter().flatten() {
+                // `no-` requests never reach the set: a disable only bites
+                // version-shipped features, every one of which is expired
+                // (the decode drops it, and `experiment_flag_issues` rows
+                // it), and an off-by-default feature is already off — the
+                // merged set is the official union outcome either way.
+                let flag = name.strip_prefix("no-").unwrap_or(name);
+                if let Ok(feature) = dartq_language::Feature::try_from(flag)
+                    && !feature.is_expired()
+                {
+                    flags.push(feature);
+                }
+            }
+            experiments_any |= !flags.is_empty();
+            options_experiments.insert(Box::from(dir.as_path()), flags.into_boxed_slice());
+        }
         Self {
             any,
             sdk_lib_root: lib_root,
             sdk_library_dirs,
+            options_experiments,
+            experiments_any,
             memo: Mutex::new(FxHashMap::default()),
         }
     }
 
     /// The feature set `file` analyzes under at `version`: the version
-    /// baseline with the owning owner's whitelist grants merged in.
+    /// baseline with the owning owner's whitelist grants merged in, plus —
+    /// for package files whose owner carries no whitelist entry — the
+    /// governing options file's `enable-experiment` flags (#936).
+    ///
+    /// The options flags ride the *replace* posture, probed on the 3.13.1
+    /// oracle (probe corpus: a grants-bearing package keeps its gate row
+    /// with the flag requested, a grant-free one lifts): an
+    /// `allowed_experiments.json` entry for the package replaces the
+    /// options experiments outright, and `dart:` libraries and ownerless
+    /// files never read them. The vendored 3.15-main provider
+    /// (`feature_set_provider.dart:59-79`) agrees — grants or context
+    /// features, never both — so the pinned choice is uncontested. Flags
+    /// re-restrict at the file's own version
+    /// ([`FeatureSet::with_experiment_for_version`] — probed: the same
+    /// flag request that lifts at the SDK version stays gated at 3.5), the
+    /// same contract the whitelist grants ride.
     ///
     /// An unattributable file (no package, not under the SDK's `lib/`) and
     /// a no-grant engine both get the plain baseline. An SDK whitelist
     /// naming an experiment the vendored feature registry does not know is
     /// a version skew that must surface (`UnknownExperiments`), not
     /// silently disable the grant — it fails loudly here, once per
-    /// unresolvable `(owner, version)`.
+    /// unresolvable `(owner, version)`. The options merge runs after the
+    /// memo on purpose: it is per-directory, so it can never ride the
+    /// `(owner, version)` key.
     pub(crate) fn granted(
         &self,
         experiments: &AllowedExperiments,
@@ -384,24 +441,91 @@ impl FeatureGrants {
         file: FileId,
         version: LanguageVersion,
     ) -> FeatureSet {
-        if !self.any {
-            return FeatureSet::for_language_version(version);
-        }
-        let Some(owner) = self.owner_for(packages, files, file) else {
-            return FeatureSet::for_language_version(version);
+        let set = if !self.any {
+            FeatureSet::for_language_version(version)
+        } else {
+            match self.owner_for(packages, files, file) {
+                Some(owner) => {
+                    let mut memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(set) = memo.get(&(owner.clone(), version)) {
+                        return self.with_options_experiments(
+                            experiments,
+                            packages,
+                            files,
+                            file,
+                            version,
+                            *set,
+                        );
+                    }
+                    let set = match &owner {
+                        GrantOwner::Package(name) => {
+                            experiments.feature_set_for_package(name, version)
+                        }
+                        GrantOwner::SdkLibrary(name) => {
+                            experiments.feature_set_for_sdk_library(name, version)
+                        }
+                    }
+                    .unwrap_or_else(|unknown| {
+                        panic!(
+                            "allowed-experiments grant for `{owner:?}` cannot be applied: {unknown}"
+                        )
+                    });
+                    memo.insert((owner, version), set);
+                    set
+                }
+                None => FeatureSet::for_language_version(version),
+            }
         };
-        let mut memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(set) = memo.get(&(owner.clone(), version)) {
-            return *set;
+        self.with_options_experiments(experiments, packages, files, file, version, set)
+    }
+
+    /// The options-flag merge tail of [`Self::granted`]: the deepest
+    /// governing options entry's decoded flags, applied only where the
+    /// oracle reads them (a package file with no whitelist entry; the
+    /// probe-pinned replace posture). No-op without options experiments —
+    /// the dominant workspace shape pays one boolean test.
+    fn with_options_experiments(
+        &self,
+        experiments: &AllowedExperiments,
+        packages: &IdentityTable,
+        files: &FileTable,
+        file: FileId,
+        version: LanguageVersion,
+        mut set: FeatureSet,
+    ) -> FeatureSet {
+        if !self.experiments_any {
+            return set;
         }
-        let set = match &owner {
-            GrantOwner::Package(name) => experiments.feature_set_for_package(name, version),
-            GrantOwner::SdkLibrary(name) => experiments.feature_set_for_sdk_library(name, version),
+        let Some(path) = files.path(file) else {
+            return set;
+        };
+        // `dart:`-owned files answer from their library's whitelist; a file
+        // outside every package keeps the plain baseline — the oracle reads
+        // context features only through the package branch.
+        if path.starts_with(self.sdk_lib_root.as_ref()) {
+            return set;
         }
-        .unwrap_or_else(|unknown| {
-            panic!("allowed-experiments grant for `{owner:?}` cannot be applied: {unknown}")
-        });
-        memo.insert((owner, version), set);
+        let Some(identity) = packages.containing(path) else {
+            return set;
+        };
+        if experiments.for_package(identity.name.as_str()).is_some() {
+            return set;
+        }
+        let mut best: Option<(usize, &[dartq_language::Feature])> = None;
+        for (dir, flags) in &self.options_experiments {
+            if path.starts_with(dir.as_ref()) {
+                let depth = dir.components().count();
+                if best.is_none_or(|(depth_so_far, _)| depth > depth_so_far) {
+                    best = Some((depth, flags));
+                }
+            }
+        }
+        let Some((_, flags)) = best else {
+            return set;
+        };
+        for &feature in flags {
+            set = set.with_experiment_for_version(version, feature);
+        }
         set
     }
 
@@ -803,12 +927,11 @@ impl EngineState {
         declared_variables: FxHashMap<String, String>,
     ) -> Result<Self, crate::EngineError> {
         let uri_packages = UriPackageTable::new(pub_config, config_dir)?;
-        // The grant faces read the tables before they move into the state.
-        let feature_grants = FeatureGrants::new(&sdk, &target, &packages);
         // Options are a context field: the include chains merge once here,
         // keyed by governing directory — package roots plus the nested
         // options directories inside them (cold path, workspace-assembly
-        // time).
+        // time). Built before the grant faces, which read the options
+        // experiments (#936).
         let mut roots: Vec<PathBuf> = packages
             .iter()
             .map(|package| package.root.clone())
@@ -817,6 +940,8 @@ impl EngineState {
         roots.dedup();
         let options =
             crate::analysis_options::AnalysisOptions::for_roots(&roots, pub_config, config_dir);
+        // The grant faces read the tables before they move into the state.
+        let feature_grants = FeatureGrants::new(&sdk, &target, &packages, &options);
         Ok(Self {
             packages,
             uri_packages,

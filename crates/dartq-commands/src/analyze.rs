@@ -141,12 +141,13 @@ pub fn run_overlaid<'a>(
         let lint_rows =
             crate::lints::analyze_lints(engine, roots, &mut crate::lints::LintMemo::default());
         diagnostics.extend(engine.apply_severity_options(lint_rows));
-        // The `undefined_lint` rows ride the same face: the lint registry
-        // lives in dartq-lints (the engine holds no registry), so validity
-        // is resolved here, at the lint stage's application point.
-        let undefined_rows = undefined_lint_rows(engine, roots);
-        if !undefined_rows.is_empty() {
-            diagnostics.extend(engine.apply_severity_options(undefined_rows));
+        // The `undefined_lint` and `unrecognized_error_code` rows ride the
+        // same face: the lint registry lives in dartq-lints and the engine
+        // holds no diagnostic-name universe either, so validity is resolved
+        // here, at the lint stage's application point.
+        let registry_rows = options_registry_rows(engine, roots);
+        if !registry_rows.is_empty() {
+            diagnostics.extend(engine.apply_severity_options(registry_rows));
         }
     }
     let layout = EngineLayout::over(engine, diagnostics.iter().map(|d| d.file));
@@ -163,23 +164,28 @@ pub fn run_overlaid<'a>(
     })
 }
 
-/// The `undefined_lint` rows (#457): every lint name an options file's own
-/// `linter.rules` declares that the dartq-lints registry does not know
-/// (`_parseLocalRules`, analysis_options_parse_model.dart:1245-1251 — the
+/// The options-file rows whose validity needs a registry the engine does
+/// not hold (#457, #936): the initial options file's own `linter.rules`
+/// names against the dartq-lints registry (`undefined_lint`;
+/// `_parseLocalRules`, analysis_options_parse_model.dart:1245-1251 — the
 /// registry check fires before the entry's value is read, so a disabled
 /// `name: false` reports too; `name:` with a null value returns before the
-/// check and does not). The engine records the candidates and their anchors
-/// at load; this face validates them against `rule_by_name` and emits rows
-/// attributed to the options file itself. Distinct loaded files yield once
-/// (two roots sharing one options file are one parse, officially too).
-fn undefined_lint_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
+/// check and does not), and the initial file's own `analyzer.errors` keys
+/// against the diagnostic universe plus that lint registry
+/// (`unrecognized_error_code`; parse_model:558-585 — the check fires as the
+/// key is read, before the value is inspected, and a non-string scalar key
+/// reports unconditionally). The engine records the candidates and their
+/// anchors at load; this face validates and emits rows attributed to the
+/// options file itself. Distinct loaded files yield once (two roots sharing
+/// one options file are one parse, officially too).
+fn options_registry_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
     let mut seen = FxHashSet::default();
     let mut rows = Vec::new();
     for root in roots {
         let Some(options) = engine.options_for_root(root) else {
             continue;
         };
-        if options.declared_rules.is_empty() || !seen.insert(options.file_path.clone()) {
+        if !seen.insert(options.file_path.clone()) {
             continue;
         }
         let Some(file) = engine.file_table().try_file_id(&options.file_path) else {
@@ -188,6 +194,16 @@ fn undefined_lint_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
         for rule in &options.declared_rules {
             if dartq_lints::rule_by_name(&rule.name).is_none() {
                 rows.push(analysis_options::OptionsIssue::undefined_lint(rule).to_diagnostic(file));
+            }
+        }
+        for error in &options.declared_errors {
+            if !analysis_options::is_known_diagnostic_code(&error.code)
+                && dartq_lints::rule_by_name(&error.code).is_none()
+            {
+                rows.push(
+                    analysis_options::OptionsIssue::unrecognized_error_code(error)
+                        .to_diagnostic(file),
+                );
             }
         }
     }
@@ -467,6 +483,85 @@ mod tests {
                 row.correction.as_deref(),
                 Some("Try using the name of a recognized lint rule.")
             );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `unrecognized_error_code` face end to end (#936): the options
+    /// file's own `analyzer.errors` keys validate against the diagnostic
+    /// universe plus the lint registry at the lint stage's application
+    /// point (parse_model:558-585 — the check fires as the key is read, so
+    /// the value's action never matters). An unknown code reports at its
+    /// key anchor, WARNING, no correction; a lint name, a removed-code
+    /// compat name, a known diagnostic, and a non-string scalar key
+    /// (`'123'`, reported unconditionally) pin the membership arms.
+    #[test]
+    fn run_overlaid_reports_unrecognized_error_code_rows() {
+        let root = workspace(
+            "analyze_unrecognized_error_code",
+            &[("lib/ok.dart", "var ok = 1;\n")],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let options_text = concat!(
+            "analyzer:\n",
+            "  errors:\n",
+            "    not_a_real_code: ignore\n",
+            "    avoid_print: ignore\n",
+            "    missing_return: ignore\n",
+            "    undefined_identifier: ignore\n",
+            "    123: ignore\n",
+        );
+        std::fs::write(root.join("analysis_options.yaml"), options_text).expect("options");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+
+        let expected_path = root
+            .join("analysis_options.yaml")
+            .to_string_lossy()
+            .into_owned();
+        let rows: Vec<(String, &str, Severity, u32, u32)> = run
+            .diagnostics
+            .iter()
+            .map(|d| {
+                (
+                    run.layout.file_path(d.file).to_string_lossy().into_owned(),
+                    d.message.as_ref(),
+                    d.severity,
+                    d.range.offset,
+                    d.range.length,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    expected_path.clone(),
+                    "'not_a_real_code' isn't a recognized diagnostic code.",
+                    Severity::Warning,
+                    u32::try_from(options_text.find("not_a_real_code").expect("anchor"))
+                        .expect("u32"),
+                    15,
+                ),
+                (
+                    expected_path,
+                    "'123' isn't a recognized diagnostic code.",
+                    Severity::Warning,
+                    u32::try_from(options_text.find("123").expect("anchor")).expect("u32"),
+                    3,
+                ),
+            ],
+            "only the unknown code name and the non-string scalar report: {rows:?}"
+        );
+        for row in run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unrecognized_error_code")
+        {
+            assert_eq!(row.code.machine, "UNRECOGNIZED_ERROR_CODE");
+            assert_eq!(row.code.dtype, DiagnosticType::StaticWarning);
+            assert_eq!(row.correction, None);
         }
         std::fs::remove_dir_all(&root).ok();
     }
