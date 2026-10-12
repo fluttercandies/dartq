@@ -1302,6 +1302,12 @@ struct DeclSite {
     /// discarded-invocation pass; `unless` carries the
     /// `parameterDefined` value + written span.
     use_result: Option<UrFace>,
+    /// The declaration carried the `const` modifier (constructors and
+    /// factories only — the latch is clear elsewhere). The
+    /// literal-constructor pass's const face reads it: the oracle's
+    /// `canBeConst` opens with `!element.isConst → false`
+    /// (ast.dart:13743-13744), so a non-const constructor never reports.
+    const_ctor: bool,
 }
 
 /// The package:meta `@UseResult` face of one declaration.
@@ -1518,12 +1524,14 @@ struct Engine<'a> {
     /// type-argument group is matched to its head through this state
     /// instead of the row stack. Cleared at `end_constructor_reference`.
     creation_ref: Option<(StringId, Option<StringId>)>,
-    /// The open literal-constructor candidate windows (#749): the facts
-    /// each argument list was armed against, paired LIFO with the
-    /// capture's [`crate::const_eval::WindowKind::LiteralCtor`] windows.
-    /// Armed at `begin_arguments`, drained into the stash at
-    /// `end_arguments`.
-    literal_ctor_arms: Vec<LiteralCtorArm>,
+    /// One literal-constructor slot per open argument list (#749): `Some`
+    /// when the list armed a candidate — the facts the send adjudicates,
+    /// paired LIFO with the capture's
+    /// [`crate::const_eval::WindowKind::LiteralCtor`] windows — `None` for
+    /// every other list. The unconditional slot keys each close to its own
+    /// list's `end_arguments`: a non-candidate nested list can never steal
+    /// the candidate's arm.
+    literal_ctor_arms: Vec<Option<LiteralCtorArm>>,
     /// Closed candidate argument lists awaiting their send: the callee row
     /// index, the captured argument trees, and the whole-invocation span.
     /// Adjudicated (and popped) at the send's `consume_send`.
@@ -4768,6 +4776,10 @@ impl<'a> Engine<'a> {
             annotated,
             annotations,
             use_result,
+            // The const latch rides onto the site at creation; the named
+            // selector's in-place rewrite keeps it (`begin_constructor` /
+            // `begin_factory` set it before any site of theirs exists).
+            const_ctor: self.in_const_ctor,
         });
         self.decl_sites.len() - 1
     }
@@ -12276,22 +12288,21 @@ impl<'a> Engine<'a> {
     /// reference shapes — the twin code is out of the frozen universe, so
     /// the `new` shape stays silent), no const context may own the
     /// position, and the capture's nesting rule must accept another
-    /// non-const window.
-    fn arm_literal_ctor_args(&mut self) {
+    /// non-const window. Returns the arm for the list's per-list slot —
+    /// `None` leaves the slot empty.
+    fn arm_literal_ctor_args(&mut self) -> Option<LiteralCtorArm> {
         if self.ctor_pos != 0
             || self.annotation_at.is_some()
             || self.default_value_depth != 0
             || (self.initializer_depth != 0 && self.in_const_ctor)
         {
-            return;
+            return None;
         }
-        let Some((callee, head)) = self.literal_ctor_callee_face() else {
-            return;
-        };
+        let (callee, head) = self.literal_ctor_callee_face()?;
         if !self.const_capture.open_literal_ctor() {
-            return;
+            return None;
         }
-        self.literal_ctor_arms.push(LiteralCtorArm { callee, head });
+        Some(LiteralCtorArm { callee, head })
     }
 
     /// The candidate face of the argument list's callee rows: the unnamed
@@ -12332,16 +12343,17 @@ impl<'a> Engine<'a> {
 
     /// Closes the armed candidate window at the argument list's close: the
     /// captured argument trees join the stash under the callee row's
-    /// identity, awaiting the send's adjudication.
+    /// identity, awaiting the send's adjudication. Exactly one slot pops —
+    /// the list's own; only an armed list closes a window (the
+    /// `top_is_literal_ctor` probe keeps a desynced slot from stashing an
+    /// empty-args entry, which would adjudicate feasible).
     fn close_literal_ctor_args(&mut self, end: SourceRange) {
-        if !self
-            .literal_ctor_arms
-            .last()
-            .is_some_and(|_| self.const_capture.top_is_literal_ctor())
-        {
+        let Some(arm) = self.literal_ctor_arms.pop().flatten() else {
+            return;
+        };
+        if !self.const_capture.top_is_literal_ctor() {
             return;
         }
-        let arm = self.literal_ctor_arms.pop().expect("paired arm");
         let span = SourceRange {
             offset: arm.head.offset,
             length: end.end().saturating_sub(arm.head.offset),
@@ -12351,11 +12363,13 @@ impl<'a> Engine<'a> {
     }
 
     /// The send-side adjudication (the oracle's decision order): the
-    /// constructor must resolve, the constructor declaration must carry
-    /// the meta `@literal` annotation, and every argument must
-    /// constant-evaluate. Reported at the whole-invocation span with the
-    /// written constructor-reference text (`{0}`); `isConst` and the
-    /// `new` twin never reach this face (their parse shapes never arm).
+    /// constructor must resolve, the constructor must be declared `const`
+    /// (`canBeConst`'s opening guard, ast.dart:13743-13744), the
+    /// constructor declaration must carry the meta `@literal` annotation,
+    /// and every argument must constant-evaluate. Reported at the
+    /// whole-invocation span with the written constructor-reference text
+    /// (`{0}`); `isConst` and the `new` twin never reach this face (their
+    /// parse shapes never arm).
     fn check_literal_ctor_invocation(
         &mut self,
         callee: usize,
@@ -12409,26 +12423,35 @@ impl<'a> Engine<'a> {
         if !resolves {
             return;
         }
-        // The `@literal` face: the CONSTRUCTOR declaration's collected
-        // annotations resolve to meta's `literal` (an annotation on the
-        // class header is inert — the official reads the constructor's own
-        // metadata). Resolution routes through the import faces
-        // (`crate::annotation`), never a foreign `Ty`.
+        // The declaration-side faces read one constructor site: the const
+        // gate first (the oracle's `canBeConst` opening guard — a
+        // constructor-level fact, not the container-level const-ctor set:
+        // a `@literal` non-const constructor stays silent while its const
+        // sibling reports), then the `@literal` face (the CONSTRUCTOR
+        // declaration's collected annotations resolve to meta's `literal`
+        // — an annotation on the class header is inert, the official reads
+        // the constructor's own metadata). Resolution routes through the
+        // import faces (`crate::annotation`), never a foreign `Ty`.
         let ctor_name = selector.unwrap_or(container);
-        let has_literal = self.decl_sites.iter().any(|site| {
+        let Some(site) = self.decl_sites.iter().find(|site| {
             matches!(&site.kind, DeclKind::Constructor { container: c } if *c == container)
                 && site.name == ctor_name
-                && site.annotations.iter().any(|a| {
-                    crate::annotation::is_meta_literal(
-                        &crate::model::Annotation {
-                            name: *a,
-                            range: site.range,
-                        },
-                        self.strings,
-                        self.graph,
-                        self.lib,
-                    )
-                })
+        }) else {
+            return;
+        };
+        if !site.const_ctor {
+            return;
+        }
+        let has_literal = site.annotations.iter().any(|a| {
+            crate::annotation::is_meta_literal(
+                &crate::model::Annotation {
+                    name: *a,
+                    range: site.range,
+                },
+                self.strings,
+                self.graph,
+                self.lib,
+            )
         });
         if !has_literal {
             return;
@@ -14086,8 +14109,11 @@ impl ParserListener for DiagnoseListener<'_> {
         );
 
         let mut engine = self.engine.borrow_mut();
-        // A `const` factory is a const-constructor target.
-        if const_keyword.is_some() {
+        // A `const` factory is a const-constructor target; the latch also
+        // rides onto its declaration site (the literal-constructor pass's
+        // const face; `end_factory` clears it).
+        engine.in_const_ctor = const_keyword.is_some();
+        if engine.in_const_ctor {
             engine.note_const_ctor();
         }
         // Factories have no `this`.
@@ -15294,7 +15320,11 @@ impl ParserListener for DiagnoseListener<'_> {
         // The #749 candidate window: arms on a plain-send class-container
         // head outside every const context (before the capture opens its
         // own level — the head node must stay below the window's base).
-        engine.arm_literal_ctor_args();
+        // Every list pushes exactly one slot — `Some` when armed, `None`
+        // otherwise — so each close pops its own list's slot and a
+        // non-candidate nested list can never steal the candidate's.
+        let arm = engine.arm_literal_ctor_args();
+        engine.literal_ctor_arms.push(arm);
         // The watermark: only pendings registered inside the list seal used
         // at the close (the official `ArgumentList` parent arm); the
         // callee's own candidate predates it.
@@ -26866,6 +26896,83 @@ mod literal_constructor_tests {
         let rep = literal_report(src, true);
         assert!(
             !code_names(&rep).contains(&"non_const_call_to_literal_constructor"),
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// A non-const constructor annotated `@literal` stays silent: the
+    /// oracle's `canBeConst` opens with `element == null ||
+    /// !element.isConst → false` (ast.dart:13743-13744), so the annotation
+    /// alone never reports. The gate is constructor-level — the const
+    /// sibling in the same class still reports (the container-level
+    /// const-ctor fact would wrongly pass both, #279's imprecision).
+    #[test]
+    fn non_const_literal_constructor_stays_silent() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class C {\n  final int v;\n  @literal\n  C(this.v);\n\n  @literal\n  const C.named(this.v);\n}\n\
+                   final a = C(1);\n\
+                   final b = C.named(2);\n";
+        let rep = literal_report(src, true);
+        assert_eq!(
+            code_names(&rep),
+            ["non_const_call_to_literal_constructor"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let at = src.find("C.named(2)").expect("named invocation");
+        let d = rep
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "non_const_call_to_literal_constructor")
+            .expect("named reports");
+        assert_eq!(d.range.offset, u32::try_from(at).unwrap());
+    }
+
+    /// A non-candidate nested argument list must not steal the candidate's
+    /// pairing: the plain call `foo(2)` closes its own (empty) per-list
+    /// slot, the candidate stays armed until the creation's own `)`, and
+    /// the nested call's node makes `canBeConst` false — the oracle is
+    /// silent (a runtime call inside a would-be-const creation).
+    #[test]
+    fn nested_plain_call_keeps_candidate_pairing() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class Point {\n  final int x, y;\n  @literal\n  const Point(this.x, this.y);\n}\n\
+                   final r = Point(1, foo(2));\n";
+        let rep = literal_report(src, true);
+        assert!(
+            !code_names(&rep).contains(&"non_const_call_to_literal_constructor"),
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// Candidate-in-candidate pairing: each list's slot closes its own
+    /// window — the inner creation reports at its own invocation, the
+    /// outer's close consumes its own arm and adjudicates on the nested
+    /// placeholder (the outer stays silent there; the oracle would report
+    /// it too — the under-report is the standing posture,
+    /// `close_literal_ctor`).
+    #[test]
+    fn nested_candidate_reports_inner_once() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class Point {\n  final int x, y;\n  @literal\n  const Point(this.x, this.y);\n}\n\
+                   final r = Point(Point(1, 2), 3);\n";
+        let rep = literal_report(src, true);
+        let at = src.find("Point(1, 2)").expect("inner invocation");
+        let d = rep
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "non_const_call_to_literal_constructor")
+            .expect("inner reports");
+        assert_eq!(d.range.offset, u32::try_from(at).unwrap());
+        assert_eq!(d.range.length, 11);
+        assert_eq!(
+            code_names(&rep)
+                .iter()
+                .filter(|name| **name == "non_const_call_to_literal_constructor")
+                .count(),
+            1,
             "{:?}",
             code_names(&rep)
         );

@@ -1038,12 +1038,15 @@ impl ConstCapture {
 
     /// Closes a literal-constructor candidate window, returning its
     /// captured argument trees (empty without such a window on top). A
-    /// candidate nested in an enclosing candidate or dup literal leaves the
+    /// candidate nested in an enclosing candidate or dup literal leaves a
     /// non-constant placeholder on the parent stack
     /// ([`Self::non_const_dup_placeholder`]'s shape widened to both
-    /// non-const kinds): the parent's `canBeConst`/dup face must read the
-    /// nested creation as not constant-evaluatable, never as a deferring
-    /// constant.
+    /// non-const kinds). The dup face needs the non-constant reading. The
+    /// candidate parent is a known under-report against the oracle there:
+    /// its `canBeConst` probe re-wraps the whole creation in `const`, the
+    /// nested creation re-evaluates as const inside it, and the official
+    /// reports the outer creation too when the inner one is const-valid —
+    /// where the placeholder keeps dartq's outer face silent.
     pub fn close_literal_ctor(&mut self, span: SourceRange) -> Vec<Node> {
         if !self.top_is_literal_ctor() {
             return Vec::new();
