@@ -1071,6 +1071,32 @@ fn labeled_case_group_terminates() {
     assert!(read_facts_of(source).is_empty());
 }
 
+/// A labeled group's close joins every write in the switch block: a write
+/// in one labeled group demotes the entry promotion for every later group.
+/// The block effect set is cached on the switch frame at the first labeled
+/// close (#919) — the second group's close joins from the cache and must
+/// demote `x` identically, so `x.isEven` reads it un-promoted and no
+/// promoted-read fact surfaces. The switch scrutinizes `z` so the only
+/// candidate read is the in-group one (an `int?` scrutinee read would emit
+/// its own promotion fact regardless of labels). The contrast pins
+/// sensitivity: without the write the entry promotion survives into `l2`
+/// and the read emits.
+#[test]
+fn labeled_group_write_demotes_entry_promotion_in_later_groups() {
+    let with_write = concat!(
+        "void f(int? x, int z) { if (x != null) { switch (z) { ",
+        "l1: case 1: x = 1; break; ",
+        "l2: case 2: x.isEven; } } }"
+    );
+    assert!(promoted_tys(with_write).is_empty());
+    let without_write = concat!(
+        "void f(int? x, int z) { if (x != null) { switch (z) { ",
+        "l1: case 1: break; ",
+        "l2: case 2: x.isEven; } } }"
+    );
+    assert_eq!(promoted_tys(without_write).len(), 1);
+}
+
 /// An arrow body's value is consumed by the function and the function
 /// expression leaves its own value at `ExecEnd`: `InitializerEnd` finds a
 /// right-hand side even when the body itself leaves nothing (a `throw`

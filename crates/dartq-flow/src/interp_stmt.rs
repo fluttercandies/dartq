@@ -6,7 +6,9 @@ use dartq_parser::TokenSpan;
 
 use crate::ev::{BlockKind, Ev};
 use crate::facts::FlowFact;
-use crate::interp::{DeclCtx, Effects, Expr, Frame, Interp, PatternKind, Scope, VarMeta};
+use crate::interp::{
+    DeclCtx, Effects, Expr, Frame, Interp, LabeledEffects, PatternKind, Scope, VarMeta,
+};
 use crate::model::{NIL, State, attach_finally_model};
 use crate::ty::Ty;
 
@@ -513,6 +515,7 @@ impl Interp<'_> {
                     dead_default: None,
                     reported_kw: None,
                     block,
+                    labeled_effects: None,
                 });
             }
             Ev::CaseBegin {
@@ -654,6 +657,7 @@ impl Interp<'_> {
                     dead_default: None,
                     reported_kw: None,
                     block: i..i,
+                    labeled_effects: None,
                 });
             }
             Ev::SwitchExprCaseBegin => {
@@ -1026,13 +1030,54 @@ impl Interp<'_> {
         if labeled {
             // Labeled case bodies can be jumped into from anywhere in the
             // switch: conservatively join every write in the block.
-            let effects = self.collect_ranges(events, block.start..block.end, match_of);
-            let previous = match &self.stack[frame_index] {
-                Frame::Switch { previous, .. } => previous.clone(),
+            //
+            // The block's effect set is computed once at the first close
+            // and cached on the frame (#919 release-readiness audit:
+            // re-collecting per close costs O(g*n) for g groups over n
+            // block events — the official analyzer computes the switch's
+            // `AssignedVariables` once per node and reuses it). Byte-level
+            // equivalence of the cached join: every close would re-step
+            // the same block events from the same snapshot, so membership
+            // for ids below the variable count at collect time is
+            // identical at every close (ids are monotonic and stable below
+            // it); collect-run declarations allocate ids at/above that
+            // count, the rollback erases them, and their join effects land
+            // only on dead slots — reads past a state's models fall back
+            // to fresh models, re-declaration overwrites, and joins
+            // truncate to the live count. The cache therefore keeps
+            // exactly the live-id projection, and each close joins the
+            // same per-variable demotions in the same sequence as a fresh
+            // collection would.
+            if matches!(
+                self.stack[frame_index],
+                Frame::Switch {
+                    labeled_effects: None,
+                    ..
+                }
+            ) {
+                let effects = self.collect_ranges(events, block.start..block.end, match_of);
+                // Drop collect-run-declared ids: only ids live at collect
+                // time are observable at any close (see above).
+                let live = self.vars.len() as u32;
+                let written = effects.written.into_iter().filter(|&v| v < live).collect();
+                let captured = effects.captured.into_iter().filter(|&v| v < live).collect();
+                if let Frame::Switch {
+                    labeled_effects, ..
+                } = &mut self.stack[frame_index]
+                {
+                    *labeled_effects = Some(LabeledEffects { written, captured });
+                }
+            }
+            let (written, captured, previous) = match &self.stack[frame_index] {
+                Frame::Switch {
+                    labeled_effects: Some(effects),
+                    previous,
+                    ..
+                } => (&effects.written, &effects.captured, previous.clone()),
                 _ => return,
             };
-            let finals = self.finals_of(&effects.written);
-            let joined = previous.conservative_join(&effects.written, &effects.captured, &finals);
+            let finals = self.finals_of(written);
+            let joined = previous.conservative_join(written, captured, &finals);
             self.current = joined;
         } else {
             // Official `switch_endAlternatives`

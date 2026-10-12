@@ -54,6 +54,15 @@ pub(crate) struct Effects {
     pub captured: FxHashSet<u32>,
 }
 
+/// Labeled case-group close joins, projected to the variables live when
+/// the switch block's effect set was computed (see
+/// `maybe_close_case_group`): writes and closure captures only — the
+/// labeled close reads no other member of [`Effects`].
+pub(crate) struct LabeledEffects {
+    pub written: FxHashSet<u32>,
+    pub captured: FxHashSet<u32>,
+}
+
 /// What a step tells the driver.
 pub(crate) enum Control {
     Continue,
@@ -195,6 +204,10 @@ pub(crate) enum Frame {
         /// re-reported by its group's close.
         reported_kw: Option<u32>,
         block: Range<usize>,
+        /// The block's effect set for labeled closes, computed once at the
+        /// first labeled close (see `maybe_close_case_group`); `None` until
+        /// then — a switch with no labeled group never pays for it.
+        labeled_effects: Option<LabeledEffects>,
     },
     /// A labeled statement: a labeled break's target. `label` is the
     /// first label's interned id (`None` only when a recovered label
