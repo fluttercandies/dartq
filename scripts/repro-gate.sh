@@ -32,9 +32,9 @@
 #
 # Environment overrides: REPRO_CORPUS (corpus dir; default tests/corpus/m0,
 # point it at the full mega/1k face for the heavy run), FVM_HOME (default
-# ~/fvm), DARTQ_CMD (the dartq side of the harness; default the m1-gate
-# shape `./target/debug/dartq analyze --format=machine --sdk <fvm default
-# dart-sdk>`).
+# ~/fvm), DARTQ_CMD (the dartq side of the harness; default the m0-gate
+# shape `./target/release/dartq analyze --format=machine --sdk <fvm default
+# dart-sdk>` — the release face the m0 corpus was e2e-verified with).
 #
 # Exit codes: 0 gate met (all runs byte-identical, seal written); 1
 # divergence (harness repro exit 1 — the report names the first divergent
@@ -47,7 +47,7 @@ cd "$(dirname "$0")/.." || exit 2
 CORPUS="${REPRO_CORPUS:-tests/corpus/m0}"
 RUNS=2
 OUT_ROOT="docs/audits/repro"
-HARNESS="./target/debug/harness"
+HARNESS="./target/release/harness"
 DEFAULT_LABEL="default"
 
 usage() {
@@ -93,7 +93,7 @@ command -v jq >/dev/null 2>&1 || { echo "repro-gate: jq is required for the seal
 
 FVM_HOME="${FVM_HOME:-$HOME/fvm}"
 sdk_root="$FVM_HOME/default/bin/cache/dart-sdk"
-DEFAULT_DARTQ_CMD="./target/debug/dartq analyze --format=machine --sdk $sdk_root"
+DEFAULT_DARTQ_CMD="./target/release/dartq analyze --format=machine --sdk $sdk_root"
 DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
 
 # --- plan --------------------------------------------------------------------
@@ -105,7 +105,7 @@ printf '  %-16s %s\n' "corpus" "$CORPUS"
 printf '  %-16s %s\n' "dartq" "$DARTQ_CMD"
 printf '  %-16s %s fresh-process runs, byte-identical normalized digest\n' "runs" "$RUNS"
 printf '  %-16s %s\n' "guard" "clean tracked tree (git status --porcelain --untracked-files=no)"
-printf '  %-16s %s\n' "build" "cargo build -p dartq-cli -p harness"
+printf '  %-16s %s\n' "build" "cargo build --release -p dartq-cli -p harness"
 printf '  %-16s harness repro --corpus-dir %s --dartq-cmd "%s" --runs %s --out %s\n' \
   "command" "$CORPUS" "$DARTQ_CMD" "$RUNS" "$outdir"
 printf '  %-16s scripts/repro-tuple.sh --output %s -> %s\n' "seal" "$report" "$seal"
@@ -127,8 +127,8 @@ fi
 
 # --- build ---------------------------------------------------------------------
 echo
-echo "== build: cargo build -p dartq-cli -p harness"
-if ! cargo build -q -p dartq-cli -p harness; then
+echo "== build: cargo build --release -p dartq-cli -p harness"
+if ! cargo build -q --release -p dartq-cli -p harness; then
   echo "repro-gate: build FAILED (dartq-cli / harness)" >&2
   exit 2
 fi
@@ -143,14 +143,16 @@ fi
 echo
 echo "== [$label] repro gate"
 mkdir -p "$outdir"
-if "$HARNESS" repro --corpus-dir "$CORPUS" --dartq-cmd "$DARTQ_CMD" --runs "$RUNS" --out "$outdir"; then
+# Capture the harness exit status at invocation: a scored FAIL (exit 1) must
+# never be misread as 0 — the idiom m0-gate fixed after the else-less-if bug.
+rc=0
+"$HARNESS" repro --corpus-dir "$CORPUS" --dartq-cmd "$DARTQ_CMD" --runs "$RUNS" --out "$outdir" || rc=$?
+if [ "$rc" -eq 0 ]; then
   echo "-- [$label] $RUNS/$RUNS runs byte-identical"
+elif [ "$rc" -eq 1 ]; then
+  echo "repro-gate: VERDICT FAIL — runs diverged (harness exit 1); first divergent row in: $report" >&2
+  exit 1
 else
-  rc=$?
-  if [ "$rc" -eq 1 ]; then
-    echo "repro-gate: VERDICT FAIL — runs diverged (harness exit 1); first divergent row in: $report" >&2
-    exit 1
-  fi
   echo "repro-gate: ERRORED (harness exit $rc, harness-own failure)" >&2
   exit 2
 fi
