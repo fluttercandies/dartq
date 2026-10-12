@@ -591,6 +591,7 @@ mod tests {
             semdiag: None,
             target: crate::DEFAULT_TARGET.to_owned(),
             declared_variables: FxHashMap::default(),
+            experiments: Vec::new(),
         }
     }
 

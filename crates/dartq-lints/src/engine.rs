@@ -227,7 +227,11 @@ pub(crate) struct RunCaches {
 /// member skips the snapped row, and every row still dispatches exactly
 /// once.
 #[must_use]
-pub fn run(unit: &Unit<'_>, enabled: &EnableSet) -> Vec<Lint> {
+pub fn run(
+    unit: &Unit<'_>,
+    enabled: &EnableSet,
+    unignorable: &rustc_hash::FxHashSet<String>,
+) -> Vec<Lint> {
     let root = match unit.ast.root() {
         Some(root) if enabled != &EnableSet::none() => root,
         _ => return Vec::new(),
@@ -262,7 +266,16 @@ pub fn run(unit: &Unit<'_>, enabled: &EnableSet) -> Vec<Lint> {
         body_member_rows: core::cell::RefCell::new(FxHashMap::default()),
     };
     dispatch(
-        unit, &comments, &ignore, &path, enabled, &direct, &caches, &wildcards, &mut out,
+        unit,
+        &comments,
+        &ignore,
+        unignorable,
+        &path,
+        enabled,
+        &direct,
+        &caches,
+        &wildcards,
+        &mut out,
     );
     push_direct(unit.ast, root, &mut stack, &direct, path.len());
 
@@ -273,7 +286,16 @@ pub fn run(unit: &Unit<'_>, enabled: &EnableSet) -> Vec<Lint> {
             collect_wildcard(unit, &path, &mut wildcards);
         }
         dispatch(
-            unit, &comments, &ignore, &path, enabled, &direct, &caches, &wildcards, &mut out,
+            unit,
+            &comments,
+            &ignore,
+            unignorable,
+            &path,
+            enabled,
+            &direct,
+            &caches,
+            &wildcards,
+            &mut out,
         );
         push_direct(unit.ast, node, &mut stack, &direct, path.len());
     }
@@ -432,6 +454,7 @@ fn dispatch(
     unit: &Unit<'_>,
     comments: &Comments,
     ignore: &IgnoreInfo,
+    unignorable: &rustc_hash::FxHashSet<String>,
     path: &[u32],
     enabled: &EnableSet,
     direct: &core::cell::RefCell<Vec<u32>>,
@@ -451,6 +474,7 @@ fn dispatch(
             unit,
             comments,
             ignore,
+            unignorable,
             path,
             wildcards,
             rule: RuleId(rule),
@@ -470,6 +494,12 @@ pub struct Check<'a> {
     pub unit: &'a Unit<'a>,
     pub comments: &'a Comments,
     pub ignore: &'a IgnoreInfo,
+    /// The governing `analyzer.cannot-ignore` set (lowercased): names in it
+    /// survive every ignore comment (`_filterIgnoredDiagnostics`,
+    /// library_analyzer.dart:552-563) and report `unignorable_ignore`
+    /// through the standalone validator face. Empty for the dominant
+    /// workspace.
+    pub unignorable: &'a rustc_hash::FxHashSet<String>,
     /// Ancestor path, root first, current node last.
     pub path: &'a [u32],
     /// The wildcard local/parameter declaration table (`no_wildcard_variable_
@@ -641,7 +671,10 @@ impl<'a> Check<'a> {
             .unit
             .lines
             .line_col_utf16(self.unit.source, range.start);
-        if self.ignore.ignored(line, name) {
+        // The suppression gate with the `cannot-ignore` override: a code in
+        // the set survives every ignore comment (library_analyzer.dart
+        // :552-563 — "don't allow un-ignorable codes to be ignored").
+        if self.ignore.ignored(line, name) && !self.unignorable.contains(name) {
             return;
         }
         self.out.push(Lint {
@@ -711,7 +744,7 @@ mod tests {
         let id = rule_by_name("avoid_empty_else").unwrap();
         let mut enabled = EnableSet::none();
         enabled.add(id);
-        let lints = run(&unit, &enabled);
+        let lints = run(&unit, &enabled, &rustc_hash::FxHashSet::default());
         assert_eq!(lints.len(), 1, "the suppressed else must not report");
         assert_eq!(lints[0].rule, id);
         // The surviving hit is the FIRST if's else (`;` at token 6):
@@ -721,6 +754,56 @@ mod tests {
 
     fn utf16_offset(tokens: &TokenTable, index: usize) -> u32 {
         tokens.get(index).expect("token").utf16_offset
+    }
+
+    #[test]
+    fn unignorable_names_survive_the_ignore_gate() {
+        // The same suppressed second hit, with the name in the unignorable
+        // set: the row emits anyway (`_filterIgnoredDiagnostics`,
+        // library_analyzer.dart:547-563 — unignorable codes survive every
+        // ignore suppression).
+        let source = "if (b) ; else ;\n// ignore: avoid_empty_else\nif (b) ; else ;\n";
+        let f = Fixture::build(
+            source,
+            unit_of(|b, _| {
+                // if #1: if(0)((1)b(2))(3);(4)else(5);(6)
+                b.begin(NodeKind::IfStatement, 0);
+                b.patch(0, 5);
+                b.begin(NodeKind::ParenthesizedCondition, 1);
+                b.patch(0, 1);
+                b.patch(1, 3);
+                b.end(NodeKind::ParenthesizedCondition, 4);
+                b.leaf(NodeKind::EmptyStatement, 4);
+                b.leaf(NodeKind::EmptyStatement, 6);
+                b.end(NodeKind::IfStatement, 7);
+                // if #2: if(7)((8)b(9))(10);(11)else(12);(13)
+                b.begin(NodeKind::IfStatement, 7);
+                b.patch(0, 12);
+                b.begin(NodeKind::ParenthesizedCondition, 8);
+                b.patch(0, 8);
+                b.patch(1, 10);
+                b.end(NodeKind::ParenthesizedCondition, 11);
+                b.leaf(NodeKind::EmptyStatement, 11);
+                b.leaf(NodeKind::EmptyStatement, 13);
+                b.end(NodeKind::IfStatement, 14);
+            }),
+        );
+        let unit = Unit {
+            source: &f.source,
+            tokens: &f.tokens,
+            ast: &f.ast,
+            lines: &f.lines,
+            path: Some(&f.path),
+            features: f.features,
+            workspace: None,
+        };
+        let id = rule_by_name("avoid_empty_else").unwrap();
+        let mut enabled = EnableSet::none();
+        enabled.add(id);
+        let unignorable = rustc_hash::FxHashSet::from_iter(["avoid_empty_else".to_owned()]);
+        let lints = run(&unit, &enabled, &unignorable);
+        assert_eq!(lints.len(), 2, "the ignore no longer suppresses: {lints:?}");
+        assert!(lints.iter().all(|lint| lint.rule == id));
     }
 
     #[test]

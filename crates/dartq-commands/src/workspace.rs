@@ -139,10 +139,69 @@ pub fn open_engine_with_advisory(
     dir: &Path,
     sdk: Option<&Path>,
 ) -> Result<(Engine, PathBuf, Option<WorkspaceAdvisory>), WorkspaceError> {
-    let (config, dir, stale_advisory) = engine_config_with_advisory(dir, sdk)?;
+    open_engine_with_overrides(dir, sdk, &AnalyzeOverrides::default())
+}
+
+/// The analyze face's CLI overrides (#938): `--packages` and
+/// `--enable-experiment`. Every field defaults to the undiscoverable-flag
+/// posture — the plain assembly.
+#[derive(Debug, Default, Clone)]
+pub struct AnalyzeOverrides {
+    /// The package resolution configuration file (`--packages PATH`): the
+    /// resolution input in place of the workspace's
+    /// `.dart_tool/package_config.json` (the official `packagesFile`), its
+    /// directory the `rootUri` resolution base. A missing file is the
+    /// usage-tier refusal the oracle ships (`The file doesn't exist: {path}`).
+    pub packages: Option<PathBuf>,
+    /// The CLI experiment flags (`--enable-experiment`, repeatable,
+    /// comma-split): the context-level feature base every package file's
+    /// feature set starts from; an options chain declaring its own
+    /// `enable-experiment` section replaces it for that subtree (the
+    /// official `_applyEnableExperiments` assignment). Unknown names are the
+    /// usage error the dartdev CLI ships (`Unknown experiment(s): 'x'`,
+    /// `no-` stripped before the known-feature test).
+    pub experiments: Vec<String>,
+}
+
+/// [`open_engine_with_advisory`] with the analyze face's CLI overrides
+/// (#938).
+///
+/// # Errors
+///
+/// [`WorkspaceError`] when the SDK, the package directory, the pub faces,
+/// or an override value is unusable.
+pub fn open_engine_with_overrides(
+    dir: &Path,
+    sdk: Option<&Path>,
+    overrides: &AnalyzeOverrides,
+) -> Result<(Engine, PathBuf, Option<WorkspaceAdvisory>), WorkspaceError> {
+    let (config, dir, stale_advisory) = engine_config_with_overrides(dir, sdk, overrides)?;
     let engine = Engine::new(config)
         .map_err(|error| WorkspaceError(format!("engine context unusable: {error}")))?;
     Ok((engine, dir, stale_advisory))
+}
+
+/// The `no-`-stripped known-feature check the dartdev CLI runs before any
+/// analysis (`Unknown experiment(s): 'a', 'b'`).
+fn validate_experiments(experiments: &[String]) -> Result<(), WorkspaceError> {
+    let unknown: Vec<String> = experiments
+        .iter()
+        .filter_map(|flag| {
+            let name = flag.strip_prefix("no-").unwrap_or(flag);
+            dartq_language::Feature::try_from(name)
+                .is_err()
+                .then(|| name.to_owned())
+        })
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let listed = unknown
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(WorkspaceError(format!("Unknown experiment(s): {listed}")))
 }
 
 /// The assembled [`EngineConfig`] behind [`open_engine`], plus the
@@ -178,6 +237,22 @@ pub fn engine_config_with_advisory(
     dir: &Path,
     sdk: Option<&Path>,
 ) -> Result<(EngineConfig, PathBuf, Option<WorkspaceAdvisory>), WorkspaceError> {
+    engine_config_with_overrides(dir, sdk, &AnalyzeOverrides::default())
+}
+
+/// [`engine_config_with_advisory`] with the analyze face's CLI overrides
+/// (#938).
+///
+/// # Errors
+///
+/// [`WorkspaceError`] when the SDK, the package directory, the pub faces,
+/// or an override value is unusable.
+pub fn engine_config_with_overrides(
+    dir: &Path,
+    sdk: Option<&Path>,
+    overrides: &AnalyzeOverrides,
+) -> Result<(EngineConfig, PathBuf, Option<WorkspaceAdvisory>), WorkspaceError> {
+    validate_experiments(&overrides.experiments)?;
     let sdk_root = sdk
         .map(Path::to_path_buf)
         .or_else(|| env::var_os("DART_SDK").map(PathBuf::from));
@@ -188,7 +263,8 @@ pub fn engine_config_with_advisory(
     };
     // The stale-config advisory rides `package_assembly`; the engine-backed
     // faces surface it through their output plumbing.
-    let (packages, config, config_dir, dir, stale_advisory) = package_assembly(dir)?;
+    let (packages, config, config_dir, dir, stale_advisory) =
+        package_assembly_with(dir, overrides.packages.as_deref())?;
     let sdk_snapshot = SdkSnapshot::load(&sdk_root, None).map_err(|error| {
         WorkspaceError(format!(
             "Dart SDK at {} unusable: {error}",
@@ -207,6 +283,7 @@ pub fn engine_config_with_advisory(
             semdiag: Some(semdiag::diagnoser()),
             target: dartq_engine::DEFAULT_TARGET.to_owned(),
             declared_variables: rustc_hash::FxHashMap::default(),
+            experiments: overrides.experiments.clone(),
         },
         dir,
         stale_advisory,
@@ -251,6 +328,46 @@ pub(crate) fn package_assembly(
     ),
     WorkspaceError,
 > {
+    package_assembly_with(dir, None)
+}
+
+/// [`package_assembly`] with the analyze face's `--packages` override
+/// (#938): `packages_override` names the resolution config in place of
+/// `workspace.root/.dart_tool/package_config.json` (the official
+/// `packagesFile`); its directory is the `rootUri` resolution base. A
+/// missing file is the usage-tier refusal the dartdev CLI ships
+/// (`The file doesn't exist: {path}`); an override without any pubspec on
+/// the walk is refused (dartq's package table is workspace-assembled).
+pub(crate) fn package_assembly_with(
+    dir: &Path,
+    packages_override: Option<&Path>,
+) -> Result<
+    (
+        PackageTable,
+        Arc<PackageConfig>,
+        PathBuf,
+        PathBuf,
+        Option<WorkspaceAdvisory>,
+    ),
+    WorkspaceError,
+> {
+    let override_config = packages_override
+        .map(|given| {
+            let path = std::path::absolute(given)
+                .map_err(|error| WorkspaceError(format!("--packages: {error}")))?;
+            if !path.is_file() {
+                return Err(WorkspaceError(format!(
+                    "The file doesn't exist: {}",
+                    given.display()
+                )));
+            }
+            let parent = path
+                .parent()
+                .expect("an absolute path always has a parent")
+                .to_path_buf();
+            Ok((path, parent))
+        })
+        .transpose()?;
     // Canonicalize up front so the printed paths are symlink-resolved (the
     // oracle convention) and package roots derived from `config_dir` inherit
     // the canonical form.
@@ -267,11 +384,22 @@ pub(crate) fn package_assembly(
     // error that means "no pubspec on the chain".
     let workspace = match find_workspace_root(&dir) {
         Ok(workspace) => workspace,
-        Err(PubError::NoRoot(_)) => return bare_assembly(&dir),
+        Err(PubError::NoRoot(_)) if override_config.is_none() => return bare_assembly(&dir),
+        Err(PubError::NoRoot(_)) => {
+            return Err(WorkspaceError(format!(
+                "--packages requires a package directory (no pubspec above {})",
+                dir.display()
+            )));
+        }
         Err(error) => return Err(WorkspaceError(error.to_string())),
     };
-    let config_dir = workspace.root.join(".dart_tool");
-    let config_path = config_dir.join("package_config.json");
+    let (config_path, config_dir) = override_config
+        .map(|(path, parent)| (path, parent))
+        .unwrap_or_else(|| {
+            let config_dir = workspace.root.join(".dart_tool");
+            let config_path = config_dir.join("package_config.json");
+            (config_path, config_dir)
+        });
     // Known divergence: the oracle's PackageConfigWorkspaceFindSession walks
     // ancestors, so a config ABOVE the pubspec root wins there; dartq checks
     // only `workspace.root/.dart_tool` and degrades.
@@ -284,7 +412,7 @@ pub(crate) fn package_assembly(
         return degraded_assembly(&workspace.root, &config_path, &dir);
     }
     let (config, lock, pubspec) =
-        load_workspace_faces(&workspace.root, &config_dir).map_err(WorkspaceError)?;
+        load_workspace_faces(&workspace.root, &config_path).map_err(WorkspaceError)?;
     let (extra_pubspecs, member_names) = assemble_extra_pubspecs(&workspace, &pubspec);
     // `workspace_members: None` outside a pub workspace — the standalone
     // package table must stay byte-identical to the pre-workspace shape.
@@ -317,7 +445,7 @@ pub(crate) fn package_assembly(
     let stale_advisory = (!reasons.is_empty()).then(|| {
         WorkspaceAdvisory::Stale(StaleConfigAdvisory {
             reasons,
-            config_path: config_dir.join("package_config.json"),
+            config_path: config_path.clone(),
         })
     });
     Ok((packages, config, config_dir, dir, stale_advisory))
@@ -402,12 +530,12 @@ type Assembly = (
 /// A human-readable message naming the missing or malformed face.
 pub fn load_workspace_faces(
     dir: &Path,
-    config_dir: &Path,
+    config_path: &Path,
 ) -> Result<(Arc<PackageConfig>, LockFile, Pubspec), String> {
-    let config_text = fs::read_to_string(config_dir.join("package_config.json")).map_err(|_| {
+    let config_text = fs::read_to_string(config_path).map_err(|_| {
         format!(
-            "no .dart_tool/package_config.json under {} (run `dart pub get`)",
-            dir.display()
+            "no package config at {} (run `dart pub get`)",
+            config_path.display()
         )
     })?;
     let config = PackageConfig::parse(&config_text).map_err(|error| error.to_string())?;
@@ -779,6 +907,113 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The `--packages` override seam (#938): a missing file is the
+    /// usage-tier refusal the dartdev CLI ships (`The file doesn't exist:
+    /// {path}`, analyze.dart's packagesFile check); an override over a
+    /// pubspec-less directory is refused (dartq's package table is
+    /// workspace-assembled); a real override supplies the resolution input
+    /// in place of `.dart_tool/package_config.json`, its directory the
+    /// `rootUri` base.
+    #[test]
+    fn packages_override_pins_usage_and_resolution_faces() {
+        let root = workspace("pkgs_override", &[]);
+
+        // Missing file: the usage error, verbatim.
+        let missing = root.join("absent.json");
+        let error = package_assembly_with(&root, Some(&missing)).expect_err("missing");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("The file doesn't exist: {}", missing.display())),
+            "{error}"
+        );
+
+        // An override with no pubspec anywhere: refused, not degraded.
+        let bare = std::env::temp_dir().join(format!("dq_cmd_pkgs_bare_{}", std::process::id()));
+        fs::create_dir_all(&bare).expect("bare dir");
+        let config = bare.join("custom.json");
+        fs::write(
+            &config,
+            r#"{"configVersion": 2, "packages": [], "generator": "pub"}"#,
+        )
+        .expect("config");
+        let error = package_assembly_with(&bare, Some(&config)).expect_err("no pubspec");
+        assert!(error.to_string().contains("no pubspec above"), "{error}");
+
+        // A real override: the config comes from the given path (the
+        // workspace's own `.dart_tool` config is not consulted) and the
+        // entry roots resolve against the override's directory.
+        let other = root.join("other");
+        fs::create_dir_all(&other).expect("other dir");
+        let config = other.join("custom.json");
+        fs::write(
+            &config,
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+        )
+        .expect("config");
+        let (packages, _, config_dir, _, advisory) =
+            package_assembly_with(&root, Some(&config)).expect("override assembly");
+        assert_eq!(config_dir, other, "the override's directory");
+        assert!(packages.get("fixture").is_some(), "the override's entries");
+        assert!(
+            advisory.is_none(),
+            "no stale advisory without pubspec.lock staleness: {advisory:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&bare).ok();
+    }
+
+    /// The `--enable-experiment` known-check (#938): `no-` prefixes strip
+    /// before the known-feature test, known flags pass through, and unknown
+    /// names are the usage error the dartdev CLI ships
+    /// (`Unknown experiment(s): 'x', 'y'`).
+    #[test]
+    fn unknown_experiments_are_usage_errors() {
+        let root = workspace("experiments", &[]);
+        let overrides = AnalyzeOverrides {
+            packages: None,
+            experiments: vec!["variance".to_owned(), "no-wildcard-variables".to_owned()],
+        };
+        // The known flags pass the check and the full config builds over
+        // the fixture's synthetic SDK — including the flags in the config
+        // (the CLI context base, #936's replace posture consumes them).
+        let (config, _, _) =
+            engine_config_with_overrides(&root, Some(&root.join("sdk")), &overrides)
+                .expect("known flags");
+        assert_eq!(config.experiments, overrides.experiments);
+
+        let unknown = AnalyzeOverrides {
+            packages: None,
+            experiments: vec!["not-a-real-flag".to_owned()],
+        };
+        let Err(error) = engine_config_with_overrides(&root, None, &unknown) else {
+            panic!("unknown flag");
+        };
+        assert_eq!(
+            error.to_string(),
+            "Unknown experiment(s): 'not-a-real-flag'"
+        );
+
+        let mixed = AnalyzeOverrides {
+            packages: None,
+            experiments: vec![
+                "variance".to_owned(),
+                "nope-one".to_owned(),
+                "nope-two".to_owned(),
+            ],
+        };
+        let Err(error) = engine_config_with_overrides(&root, None, &mixed) else {
+            panic!("mixed flags");
+        };
+        assert_eq!(
+            error.to_string(),
+            "Unknown experiment(s): 'nope-one', 'nope-two'"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// The advisory's code is the reserved registry row, TOOL-typed — the
     /// `dartq/*` namespace sits outside the official value set, so emitting
     /// it cannot move the differential Jaccard.
@@ -816,7 +1051,9 @@ mod tests {
             "the graph carries the member set"
         );
 
-        let (_, _, pubspec) = load_workspace_faces(&root, &root.join(".dart_tool")).expect("faces");
+        let (_, _, pubspec) =
+            load_workspace_faces(&root, &root.join(".dart_tool/package_config.json"))
+                .expect("faces");
         assert!(
             pubspec.dependency_overrides.contains_key("ext"),
             "the root pubspec is overrides-aware"
@@ -835,7 +1072,8 @@ mod tests {
         let workspace = find_workspace_root(&member).expect("layout");
         let config_dir = workspace.root.join(".dart_tool");
         let (config, lock, pubspec) =
-            load_workspace_faces(&workspace.root, &config_dir).expect("faces");
+            load_workspace_faces(&workspace.root, &config_dir.join("package_config.json"))
+                .expect("faces");
         let (extra_pubspecs, member_names) = assemble_extra_pubspecs(&workspace, &pubspec);
         let graph = build_graph(
             &config,
@@ -968,14 +1206,15 @@ mod tests {
         let root = workspace("ws_pubget", &[]);
         fs::remove_file(root.join(".dart_tool/package_config.json")).expect("drop config");
         let root = root.canonicalize().expect("root");
-        let Err(error) = load_workspace_faces(&root, &root.join(".dart_tool")) else {
+        let Err(error) = load_workspace_faces(&root, &root.join(".dart_tool/package_config.json"))
+        else {
             panic!("compat's config requirement must hold")
         };
         assert_eq!(
             error,
             format!(
-                "no .dart_tool/package_config.json under {} (run `dart pub get`)",
-                root.display()
+                "no package config at {} (run `dart pub get`)",
+                root.join(".dart_tool/package_config.json").display()
             )
         );
         fs::remove_dir_all(&root).ok();

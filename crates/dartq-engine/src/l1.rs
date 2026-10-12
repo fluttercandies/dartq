@@ -2697,6 +2697,7 @@ mod tests {
                 crate::memory_store(),
                 "vm".to_owned(),
                 declared,
+                Vec::new(),
             )
             .expect("engine state")
         }

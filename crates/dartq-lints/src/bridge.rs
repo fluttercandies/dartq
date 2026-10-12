@@ -98,6 +98,12 @@ const SCAN_CONFIG: ScanConfig = ScanConfig {
     enable_augmentations: true,
 };
 
+/// The scan-only half of [`parse_unit`]: the token table the comment faces
+/// read (the `unignorable_ignore` validator needs comments, never an AST).
+pub(crate) fn scan_tokens(source: &str, file: dartq_source::FileId) -> TokenTable {
+    scan(source, SCAN_CONFIG, file).tokens
+}
+
 /// Production parse posture: Dart 3.15 — patterns (3.0) and primary
 /// constructors (3.13) shipped, variance and enhanced parts unshipped.
 const PARSE_FEATURES: ParserFeatures = ParserFeatures {
@@ -2985,7 +2991,7 @@ mod tests {
         let unit = parsed.unit(None);
         let (set, unknown) = EnableSet::resolve([rule]);
         assert!(unknown.is_empty(), "unknown rule {rule}");
-        run(&unit, &set)
+        run(&unit, &set, &rustc_hash::FxHashSet::default())
     }
 
     /// Walks the arena collecting (kind, utf16 start) pairs.

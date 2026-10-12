@@ -83,7 +83,7 @@ impl Fixture {
             features: self.features,
             workspace: None,
         };
-        run(&unit, rules)
+        run(&unit, rules, &rustc_hash::FxHashSet::default())
     }
 
     /// [`Fixture::run`] with the containing-package facts mounted — the
@@ -98,7 +98,7 @@ impl Fixture {
             features: self.features,
             workspace: Some(facts),
         };
-        run(&unit, rules)
+        run(&unit, rules, &rustc_hash::FxHashSet::default())
     }
 }
 

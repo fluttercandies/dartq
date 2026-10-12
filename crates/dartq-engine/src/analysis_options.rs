@@ -79,27 +79,42 @@
 //!   :121-151 — a missing include reports `include_file_not_found` and stops
 //!   that edge; a parsed include resolving back to the initial file reports
 //!   `recursive_include_file`, :161-171; a chain cycle not through the initial
-//!   file is `included_file_warning`, a wrapping face dartq has not built),
-//!   while the initial file's local shape problems report their raw codes
-//!   (`invalid_section_format`, `unsupported_option`, `undefined_lint`,
-//!   `analysis_options_parse_model.dart`) and *included* files' local problems
-//!   are wrapped the same way — so local rows are recorded for the initial
-//!   file only. Codes and message templates are verbatim from the pinned
-//!   registry (`diagnostic.g.dart`), all `STATIC_WARNING` → WARNING. `serde_yaml`
-//!   keeps no spans, so rows anchor at the token text's first occurrence in
-//!   the initial file (`anchor_span`); the `(code, file)` differential face is
-//!   exact regardless. `undefined_lint` needs the lint registry, which lives
-//!   in dartq-lints (an engine dependency would cycle) — the engine records
-//!   the initial file's declared rule names ([`AnalysisOptions::declared_rules`])
-//!   and the CLI face (dartq-commands) validates them against
-//!   `rule_by_name`. Rows ride the same severity face as every other output
-//!   row (`Engine::analyze` appends them before `apply_severity_options`), and
-//!   the options file — never resident as Dart — resolves its rows' positions
-//!   through the engine's layout fallback (`Engine::content`/`line_index` over
-//!   the text + [`LineIndex`] captured at load).
-//! - Unreadable or malformed files are tolerated — the official reports them
-//!   (`included_file_parse_error` / YAML errors, faces dartq has not built)
-//!   and still produces effective options (missing include → skipped).
+//!   file is the `included_file_warning` row "The file includes itself
+//!   recursively.", :173-188), while the initial file's local shape problems
+//!   report their raw codes (`invalid_section_format`, `unsupported_option`,
+//!   `undefined_lint`, `analysis_options_parse_model.dart`) and *included*
+//!   files' local problems wrap into `included_file_warning` — "Warning in
+//!   the included options file {path}({start}..{end}): {message}",
+//!   `include_walker.dart:210-248` (the inner offsets inclusive, the
+//!   correction dropped). A malformed YAML file reports `parse_error` when
+//!   initial — the registry `COMPILE_TIME_ERROR`, message = the YAML error's
+//!   own text, exit tier 3 through the CLI severity arithmetic — and
+//!   `included_file_parse_error` ("{message} in {path}({start}..{end})")
+//!   when included (`include_walker.dart:48-66`). Codes and message templates
+//!   are verbatim from the pinned registry (`diagnostic.g.dart`). `serde_yaml`
+//!   keeps no spans, so rows anchor at the token text's occurrence in the
+//!   initial file: a section's *value* tokens (include URIs, error actions,
+//!   flag and rule names) search from their section key onward
+//!   (`anchor_in_section`), keys at their first occurrence (`anchor_span`);
+//!   the `(code, file)` differential face is exact regardless.
+//!   `undefined_lint` needs the lint registry, which lives in dartq-lints (an
+//!   engine dependency would cycle) — the engine records the declared rule
+//!   names per file (the initial file in
+//!   [`AnalysisOptions::declared_rules`], each included file in a
+//!   [`DeclarationGroup`]) and the CLI face (dartq-commands) validates them
+//!   against `rule_by_name`, wrapping the included files' rows. Rows ride the
+//!   same severity face as every other output row (`Engine::analyze` appends
+//!   them before `apply_severity_options`), and the options file — never
+//!   resident as Dart — resolves its rows' positions through the engine's
+//!   layout fallback (`Engine::content`/`line_index` over the text +
+//!   [`LineIndex`] captured at load).
+//! - The top-level `plugins:` section reports `invalid_section_format`
+//!   (probed on the 3.13.1 oracle — the section's only CLI-observable faces
+//!   are that row plus stderr load noise) and dartq loads no plugins: any
+//!   declared section is the row, silent only when absent or null.
+//! - Unreadable files are tolerated — the official reports unresolvable
+//!   includes and still produces effective options (missing include →
+//!   skipped).
 //!
 //! The whole face is pure functions over paths + YAML: testable without the
 //! CLI, and cold-path (workspace assembly), so clarity beats micro-cost.
@@ -178,6 +193,34 @@ pub const UNRECOGNIZED_ERROR_CODE: CodeInfo = CodeInfo::new(
     "unrecognized_error_code",
     "UNRECOGNIZED_ERROR_CODE",
     DiagnosticType::StaticWarning,
+    true,
+);
+
+/// `{0}` — the YAML error's own text (registry :13901-13910,
+/// `COMPILE_TIME_ERROR` → ERROR: the row drives the CLI's exit tier 3).
+const PARSE_ERROR: CodeInfo = CodeInfo::new(
+    "parse_error",
+    "PARSE_ERROR",
+    DiagnosticType::CompileTimeError,
+    true,
+);
+
+/// `Warning in the included options file {0}({1}..{2}): {3}` (registry
+/// :7728-7746). `{1}..{2}` is the inner row's inclusive span; the correction
+/// is dropped (the official wrap carries the message only).
+const INCLUDED_FILE_WARNING: CodeInfo = CodeInfo::new(
+    "included_file_warning",
+    "INCLUDED_FILE_WARNING",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// `{3} in {0}({1}..{2})` — the YAML error text, then the included file and
+/// its failure span (registry :7696-7712, `COMPILE_TIME_ERROR` → ERROR).
+const INCLUDED_FILE_PARSE_ERROR: CodeInfo = CodeInfo::new(
+    "included_file_parse_error",
+    "INCLUDED_FILE_PARSE_ERROR",
+    DiagnosticType::CompileTimeError,
     true,
 );
 
@@ -266,6 +309,53 @@ pub struct DeclaredError {
     pub length: u32,
 }
 
+/// One included options file's registry-candidate declarations: the file's
+/// `linter.rules` names and `analyzer.errors` keys, with the inner-file
+/// anchors and the precomputed initial-file span their wrapped rows anchor
+/// at (the branch's first include directive — `initialIncludeSpan`,
+/// `include_walker.dart:90`). The CLI face validates the names against its
+/// registries and wraps every row into `included_file_warning`; the engine
+/// holds no registry to do it at load.
+#[derive(Debug, Clone)]
+pub struct DeclarationGroup {
+    /// The included file's normalized path (the wrapped message's `{0}`).
+    pub file: PathBuf,
+    /// The row anchor in the initial file's text: the branch's first include
+    /// directive URI token, resolved to its `(offset, length)` (UTF-16).
+    pub anchor_span: (u32, u32),
+    /// The file's own `linter.rules` names (`undefined_lint` candidates,
+    /// anchored in the included file's text).
+    pub rules: Vec<DeclaredRule>,
+    /// The file's own `analyzer.errors` keys (`unrecognized_error_code`
+    /// candidates, anchored in the included file's text).
+    pub errors: Vec<DeclaredError>,
+}
+
+impl DeclarationGroup {
+    /// The official wrap face for one of this group's inner rows
+    /// (`include_walker.dart:210-248`): the wrapped row anchors at the
+    /// branch's first include directive in the initial file, the message
+    /// names the included file and the inner span's inclusive end
+    /// (`offset+length-1`), and the inner correction never survives the
+    /// wrap (the official listener carries the message only).
+    #[must_use]
+    pub fn wrap_row(&self, inner: &OptionsIssue) -> OptionsIssue {
+        OptionsIssue {
+            code: INCLUDED_FILE_WARNING,
+            message: format!(
+                "Warning in the included options file {}({}..{}): {}",
+                self.file.display(),
+                inner.offset,
+                inner.offset + inner.length.saturating_sub(1),
+                inner.message
+            ),
+            correction: None,
+            offset: self.anchor_span.0,
+            length: self.anchor_span.1,
+        }
+    }
+}
+
 /// One governing directory's fully merged analysis options (the
 /// `ResolvedAnalysisOptions` slice PRD §12.1 names, limited to the sections
 /// this engine consumes: the lint rule set, the exclude globs, the
@@ -326,6 +416,10 @@ pub struct AnalysisOptions {
     /// declaration order, original spellings (`unrecognized_error_code`
     /// candidates; validity is the caller's registry seam).
     pub declared_errors: Vec<DeclaredError>,
+    /// Per-included-file registry candidates, in walk order — the CLI face's
+    /// `undefined_lint`/`unrecognized_error_code` candidates for the files
+    /// whose rows wrap into `included_file_warning`.
+    pub included_groups: Vec<DeclarationGroup>,
 }
 
 /// One compiled exclude pattern plus the directory it is relative to
@@ -418,6 +512,16 @@ impl AnalysisOptions {
         !self.unignorable.contains(code)
     }
 
+    /// The lowercased `analyzer.cannot-ignore` set — the suppression-gate
+    /// membership test the lint stage runs per file (`_filterIgnoredDiagnostics`)
+    /// and the ignore-comment validator matches names against
+    /// (`IgnoreValidator`, ignore_validator.dart:89, 113). Empty for the
+    /// dominant workspace: the whole face short-circuits on it.
+    #[must_use]
+    pub fn unignorable(&self) -> &FxHashSet<String> {
+        &self.unignorable
+    }
+
     /// Whether any `analyzer.errors` override merged in (the
     /// severity-application fast path decides with this: without overrides
     /// the application is the identity).
@@ -465,8 +569,8 @@ impl AnalysisOptions {
             context_root: normalized.parent().unwrap_or(Path::new("")).to_path_buf(),
             ..MergeState::default()
         };
-        let mut chain = FxHashSet::default();
-        merge.apply_file(&normalized, &mut chain, packages, config_dir);
+        let mut chain = FxHashMap::default();
+        merge.apply_file(&normalized, None, None, &mut chain, packages, config_dir);
         merge.build()
     }
 
@@ -602,17 +706,33 @@ struct MergeState {
     /// single-package shape the options file sits at the context root, so
     /// this matches the official argument exactly.
     context_root: PathBuf,
+    /// Every parsed file's text, keyed by normalized path — the included
+    /// files' inner spans (wrapped rows' `{start}..{end}`, the cycle row's
+    /// include directive) anchor against their owning file's text.
+    texts: FxHashMap<PathBuf, Arc<str>>,
     issues: Vec<OptionsIssue>,
     declared_rules: Vec<DeclaredRule>,
     declared_errors: Vec<DeclaredError>,
+    included_groups: Vec<DeclarationGroup>,
+    /// Each parsed file's first include URI — the cycle row's inner-span
+    /// source (the official `spanInChain` = the repeated file's own
+    /// outgoing directive, walker :170-188).
+    first_includes: FxHashMap<PathBuf, String>,
 }
 
 impl MergeState {
-    /// Records one row, anchored at `token`'s first occurrence in the
-    /// initial file (the span stand-in — `serde_yaml` keeps no node spans;
-    /// see the module docs).
-    fn record(&mut self, code: CodeInfo, token: &str, message: String, correction: Option<String>) {
-        let (offset, length) = anchor_span(&self.initial_text, token);
+    /// Records one row attributed to the initial file, anchored at `token`
+    /// scoped to its `section` (the span stand-in — `serde_yaml` keeps no
+    /// node spans; see the module docs).
+    fn record(
+        &mut self,
+        code: CodeInfo,
+        section: &str,
+        token: &str,
+        message: String,
+        correction: Option<String>,
+    ) {
+        let (offset, length) = anchor_in_section(&self.initial_text, section, token);
         self.issues.push(OptionsIssue {
             code,
             message,
@@ -622,27 +742,118 @@ impl MergeState {
         });
     }
 
+    /// Records one `included_file_warning` row: the wrapped message names the
+    /// included file and the inner row's inclusive span (`{start}..{end}`,
+    /// `include_walker.dart:238-245`), the row itself anchors at the branch's
+    /// first include directive in the initial file, and the correction never
+    /// survives the wrap (the official listener carries the message only).
+    fn record_wrapped(
+        &mut self,
+        anchor: &str,
+        included: &Path,
+        inner_start: u32,
+        inner_end: u32,
+        inner: &str,
+    ) {
+        let (offset, length) = anchor_span(&self.initial_text, anchor);
+        self.issues.push(OptionsIssue {
+            code: INCLUDED_FILE_WARNING,
+            message: format!(
+                "Warning in the included options file {}({inner_start}..{inner_end}): {inner}",
+                included.display()
+            ),
+            correction: None,
+            offset,
+            length,
+        });
+    }
+
     /// The official `_applyParsedFiles`: apply every resolvable include
     /// first, then this file's own data — depth-first, near data last.
+    ///
+    /// `included_from` carries the including file and the include URI for the
+    /// cycle row's inner span (`None` for the initial file); `anchor` is the
+    /// branch's first include directive URI token — every row this subtree
+    /// records anchors at its initial-file occurrence (`initialIncludeSpan`,
+    /// walker :90), the initial file's own edges at their own URI
+    /// (`state.initialIncludeSpan ?? includeSpan`, :90).
     fn apply_file(
         &mut self,
         file: &Path,
-        chain: &mut FxHashSet<PathBuf>,
+        included_from: Option<(&Path, &str)>,
+        anchor: Option<&str>,
+        // The visited set: one contribution per file (the cycle row's span
+        // comes from `first_includes`/`texts`, not this map).
+        chain: &mut FxHashMap<PathBuf, ()>,
         packages: &PackageConfig,
         config_dir: &Path,
     ) {
-        if !chain.insert(file.to_path_buf()) {
-            return; // chain cycle not through the initial file: contributes
-            // once (parser:395); the official row is
-            // `included_file_warning`, a face dartq has not built.
+        if included_from.is_some() && chain.insert(file.to_path_buf(), ()).is_some() {
+            // Chain cycle not through the initial file: contributes once,
+            // and the official wraps it naming the repeated file and the
+            // span of its own outgoing include directive (`spanInChain`,
+            // walker :173-188).
+            let inner = match (self.first_includes.get(file), self.texts.get(file)) {
+                (Some(first_uri), Some(text)) => anchor_in_section(text, "include", first_uri),
+                _ => (0, 0),
+            };
+            let inner_start = inner.0;
+            let inner_end = inner.0.saturating_add(inner.1.saturating_sub(1));
+            let included = file.to_path_buf();
+            let anchor = anchor.expect("a cycle row only exists under an include branch");
+            self.record_wrapped(
+                anchor,
+                &included,
+                inner_start,
+                inner_end,
+                "The file includes itself recursively.",
+            );
+            return;
         }
         let Ok(text) = std::fs::read_to_string(file) else {
             chain.remove(file);
             return;
         };
-        let Ok(yaml) = serde_yaml::from_str::<Value>(&text) else {
-            chain.remove(file);
-            return;
+        self.texts
+            .insert(file.to_path_buf(), Arc::from(text.as_str()));
+        let yaml = match serde_yaml::from_str::<Value>(&text) {
+            Ok(yaml) => {
+                if let Some(first_uri) = include_uris(&yaml).into_iter().next() {
+                    self.first_includes.insert(file.to_path_buf(), first_uri);
+                }
+                yaml
+            }
+            Err(error) => {
+                // The YAML failure face: `parse_error` on the initial file
+                // (its message drives the CLI's exit tier),
+                // `included_file_parse_error` wrapped at the branch anchor
+                // for an included one (walker :48-66). `serde_yaml` yields
+                // one failure point, so the wrapped span shows it at both
+                // ends; `yaml_failure` already converted it to UTF-16.
+                let (message, at) = yaml_failure(&text, &error);
+                if file == self.initial {
+                    self.issues.push(OptionsIssue {
+                        code: PARSE_ERROR,
+                        message,
+                        correction: None,
+                        offset: at,
+                        length: 0,
+                    });
+                } else {
+                    let included = file.to_path_buf();
+                    let anchor = anchor.expect("a wrapped row only exists under an include branch");
+                    let (offset, length) = anchor_span(&self.initial_text, anchor);
+                    self.issues.push(OptionsIssue {
+                        code: INCLUDED_FILE_PARSE_ERROR,
+                        message: format!("{message} in {}({at}..{at})", included.display()),
+                        correction: None,
+                        offset,
+                        length,
+                    });
+                }
+                chain.remove(file);
+                return;
+            }
         };
         let is_initial = file == self.initial;
 
@@ -655,11 +866,13 @@ impl MergeState {
                 // `recursive_include_file` and stops it too (:161-171 —
                 // missing wins for unresolvable edges because recursion is
                 // only reached for parsed ones); anything else recurses.
+                // Every row anchors at the branch's initial include span.
                 Some(included) if included.is_file() => {
                     if included == self.initial {
                         self.record(
                             RECURSIVE_INCLUDE_FILE,
-                            &uri,
+                            "include",
+                            anchor.unwrap_or(&uri),
                             format!(
                                 "The URI '{uri}' included in '{}' includes '{}', \
                                  creating a circular reference.",
@@ -672,12 +885,20 @@ impl MergeState {
                             ),
                         );
                     } else {
-                        self.apply_file(&included, chain, packages, config_dir);
+                        self.apply_file(
+                            &included,
+                            Some((file, uri.as_str())),
+                            Some(anchor.unwrap_or(uri.as_str())),
+                            chain,
+                            packages,
+                            config_dir,
+                        );
                     }
                 }
                 _ => self.record(
                     INCLUDE_FILE_NOT_FOUND,
-                    &uri,
+                    "include",
+                    anchor.unwrap_or(&uri),
                     format!(
                         "The URI '{uri}' included in '{}' can't be found when analyzing '{}'.",
                         file.display(),
@@ -689,7 +910,7 @@ impl MergeState {
         }
 
         let declaring_dir = file.parent().unwrap_or(Path::new("")).to_path_buf();
-        self.apply_local(&yaml, &declaring_dir, is_initial);
+        self.apply_local(&yaml, &text, &declaring_dir, file, is_initial, anchor);
         chain.remove(file);
     }
 
@@ -697,13 +918,36 @@ impl MergeState {
     /// `_ApplyState.apply`, the sections this engine consumes). The section
     /// order mirrors `_applyAnalyzer` (parser:164-171) where it matters:
     /// `errors` before `cannot-ignore`, so the severity arms see this
-    /// file's re-levels. Local shape problems record for the initial file
-    /// only (an included file's rows are officially wrapped — see the
-    /// module docs).
-    fn apply_local(&mut self, yaml: &Value, declaring_dir: &Path, is_initial: bool) {
+    /// file's re-levels.
+    ///
+    /// Local shape problems record raw for the initial file; an included
+    /// file's wrap into `included_file_warning` at the branch anchor
+    /// (`_IncludedDiagnosticListener`, walker :210-248), and its registry
+    /// candidates land in a [`DeclarationGroup`] for the CLI face.
+    fn apply_local(
+        &mut self,
+        yaml: &Value,
+        text: &str,
+        declaring_dir: &Path,
+        file: &Path,
+        is_initial: bool,
+        anchor: Option<&str>,
+    ) {
         let Some(map) = yaml.as_mapping() else {
             return;
         };
+        // The included file's registry group registers up front: the linter
+        // arm below fills its `rules` in place.
+        if !is_initial {
+            let group_anchor =
+                anchor_span(&self.initial_text, anchor.expect("included under a branch"));
+            self.included_groups.push(DeclarationGroup {
+                file: file.to_path_buf(),
+                anchor_span: group_anchor,
+                rules: Vec::new(),
+                errors: Vec::new(),
+            });
+        }
         match map.get(Value::from("linter")) {
             // `linter:` absent or null: inherit what the includes merged.
             None | Some(Value::Null) => {}
@@ -716,8 +960,12 @@ impl MergeState {
                 {
                     apply_rules(rules, &mut self.rules);
                     if is_initial {
-                        self.declared_rules
-                            .extend(declared_rule_names(rules, &self.initial_text));
+                        self.declared_rules.extend(declared_rule_names(rules, text));
+                    } else {
+                        self.included_groups
+                            .last_mut()
+                            .expect("the group registered above")
+                            .rules = declared_rule_names(rules, text);
                     }
                 }
             }
@@ -746,9 +994,20 @@ impl MergeState {
             self.experiments = Some(experiments);
         }
         if is_initial {
-            self.issues.extend(local_issues(map, &self.initial_text));
-            self.declared_errors
-                .extend(declared_error_codes(map, &self.initial_text));
+            self.issues.extend(local_issues(map, text));
+            self.declared_errors.extend(declared_error_codes(map, text));
+        } else {
+            self.included_groups
+                .last_mut()
+                .expect("the group registered above")
+                .errors = declared_error_codes(map, text);
+            for issue in local_issues(map, text) {
+                let inner_start = issue.offset;
+                let inner_end = inner_start.saturating_add(issue.length.saturating_sub(1));
+                let included = file.to_path_buf();
+                let anchor = anchor.expect("included under a branch");
+                self.record_wrapped(anchor, &included, inner_start, inner_end, &issue.message);
+            }
         }
     }
 
@@ -777,6 +1036,7 @@ impl MergeState {
             issues: self.issues,
             declared_rules: self.declared_rules,
             declared_errors: self.declared_errors,
+            included_groups: self.included_groups,
         }
     }
 }
@@ -1117,17 +1377,19 @@ fn experiment_flags(map: &serde_yaml::Mapping) -> Option<Vec<String>> {
 /// ("no longer required" when the request matches the hardcoded state,
 /// "unconditionally enabled" otherwise), and an opposite second request for
 /// an already-requested feature reports the conflict. Anchors at the flag
-/// token's first occurrence.
+/// token's first occurrence after the `enable-experiment` key
+/// ([`anchor_in_section`]).
 fn experiment_flag_issues(flags: &[String], text: &str) -> Vec<OptionsIssue> {
     let mut issues = Vec::new();
     let mut requested: FxHashMap<&str, bool> = FxHashMap::default();
+    let anchored = |text: &str, flag: &str| anchor_in_section(text, "enable-experiment", flag);
     for flag in flags {
         let (feature, value) = match flag.strip_prefix("no-") {
             Some(feature) => (feature, false),
             None => (flag.as_str(), true),
         };
         if !KNOWN_EXPERIMENTS.contains(&feature) {
-            let (offset, length) = anchor_span(text, flag);
+            let (offset, length) = anchored(text, flag);
             issues.push(OptionsIssue {
                 code: UNSUPPORTED_OPTION,
                 message: format!("The option '{flag}' isn't supported by 'enable-experiment'."),
@@ -1144,7 +1406,7 @@ fn experiment_flag_issues(flags: &[String], text: &str) -> Vec<OptionsIssue> {
                      unconditionally enabled."
                 )
             };
-            let (offset, length) = anchor_span(text, flag);
+            let (offset, length) = anchored(text, flag);
             issues.push(OptionsIssue {
                 code: INVALID_OPTION,
                 message: format!("Invalid option specified for 'enable-experiment': {detail}"),
@@ -1158,7 +1420,7 @@ fn experiment_flag_issues(flags: &[String], text: &str) -> Vec<OptionsIssue> {
             } else {
                 feature.to_owned()
             };
-            let (offset, length) = anchor_span(text, flag);
+            let (offset, length) = anchored(text, flag);
             issues.push(OptionsIssue {
                 code: INVALID_OPTION,
                 message: format!(
@@ -1360,13 +1622,22 @@ fn local_issues(map: &serde_yaml::Mapping, text: &str) -> Vec<OptionsIssue> {
         }
         Some(_) => push_invalid_section(&mut issues, text, "linter", "linter"),
     }
+    // The top-level `plugins:` section: the 3.13.1 oracle's only
+    // CLI-observable faces for it are the `invalid_section_format` row and
+    // stderr plugin-load noise (probe, #930), and dartq loads no plugins —
+    // any declared section is the row, silent only when absent or null.
+    match map.get(Value::from("plugins")) {
+        None | Some(Value::Null) => {}
+        Some(_) => push_invalid_section(&mut issues, text, "plugins", "plugins"),
+    }
     issues
 }
 
 /// Records one `invalid_section_format` row (`Invalid format for the '{0}'
-/// section.`, registry :9708-9722), anchored at `token`.
+/// section.`, registry :9708-9722), anchored at `token` (section-scoped —
+/// [`anchor_in_section`]).
 fn push_invalid_section(issues: &mut Vec<OptionsIssue>, text: &str, section: &str, token: &str) {
-    let (offset, length) = anchor_span(text, token);
+    let (offset, length) = anchor_in_section(text, section, token);
     issues.push(OptionsIssue {
         code: INVALID_SECTION_FORMAT,
         message: format!("Invalid format for the '{section}' section."),
@@ -1379,7 +1650,8 @@ fn push_invalid_section(issues: &mut Vec<OptionsIssue>, text: &str, section: &st
 /// Records one `unsupported_option` row (`The option '{1}' isn't supported
 /// by '{0}'.`, registry :17832-17905) with the correction matching the
 /// legal-value count — singular (`unsupportedOptionWithLegalValue`) or the
-/// `quotedAndCommaSeparatedWithAnd` proposal (`…WithLegalValues`).
+/// `quotedAndCommaSeparatedWithAnd` proposal (`…WithLegalValues`). The
+/// anchor is section-scoped ([`anchor_in_section`]).
 fn push_unsupported(
     issues: &mut Vec<OptionsIssue>,
     text: &str,
@@ -1394,7 +1666,7 @@ fn push_unsupported(
             proposal(legal)
         ),
     };
-    let (offset, length) = anchor_span(text, option);
+    let (offset, length) = anchor_in_section(text, section, option);
     issues.push(OptionsIssue {
         code: UNSUPPORTED_OPTION,
         message: format!("The option '{option}' isn't supported by '{section}'."),
@@ -1442,7 +1714,7 @@ fn yaml_scalar_text(value: &Value) -> Option<String> {
 fn declared_rule_names(rules: &Value, text: &str) -> Vec<DeclaredRule> {
     let mut names = Vec::new();
     let mut push = |name: &str| {
-        let (offset, length) = anchor_span(text, name);
+        let (offset, length) = anchor_in_section(text, "rules", name);
         names.push(DeclaredRule {
             name: name.to_owned(),
             offset,
@@ -1498,7 +1770,7 @@ fn declared_error_codes(map: &serde_yaml::Mapping, text: &str) -> Vec<DeclaredEr
             // `local_issues`), never code candidates.
             Value::Mapping(_) | Value::Sequence(_) | Value::Tagged(_) => continue,
         };
-        let (offset, length) = anchor_span(text, &code);
+        let (offset, length) = anchor_in_section(text, "errors", &code);
         codes.push(DeclaredError {
             code,
             offset,
@@ -1515,6 +1787,42 @@ fn anchor_span(text: &str, token: &str) -> (u32, u32) {
     match text.find(token) {
         Some(byte) => (byte_offset_to_utf16(text, byte), utf16_len_of(token)),
         None => (0, 0),
+    }
+}
+
+/// `anchor_span` scoped to one section: the token searches from the section
+/// key's first occurrence onward, so a value token (`info`, a flag name, a
+/// URI) anchors inside its own section instead of at an earlier homograph in
+/// a comment or another section — the anchoring convention for every
+/// section's rows (a token equal to the key anchors at the key itself).
+/// Falls back to the whole-text search (and then to `(0, 0)`) when either
+/// miss.
+fn anchor_in_section(text: &str, section: &str, token: &str) -> (u32, u32) {
+    let from = text.find(section).unwrap_or(0);
+    match text[from..].find(token) {
+        Some(relative) => (
+            byte_offset_to_utf16(text, from + relative),
+            utf16_len_of(token),
+        ),
+        None => anchor_span(text, token),
+    }
+}
+
+/// The `parse_error` face of one `serde_yaml` failure: the error's own text
+/// with the located form's " at line L column C" suffix stripped (the
+/// position rides the row's span, not the message — the oracle's
+/// `error - analysis_options.yaml:3:1 - Expected node content. - parse_error`),
+/// plus the failure point as a UTF-16 offset (`(0, 0)` when unlocated).
+fn yaml_failure(text: &str, error: &serde_yaml::Error) -> (String, u32) {
+    let display = error.to_string();
+    match error.location() {
+        Some(location) => {
+            let suffix = format!(" at line {} column {}", location.line(), location.column());
+            let message = display.strip_suffix(&suffix).unwrap_or(&display);
+            let byte = location.index().min(text.len());
+            (message.to_owned(), byte_offset_to_utf16(text, byte))
+        }
+        None => (display, 0),
     }
 }
 

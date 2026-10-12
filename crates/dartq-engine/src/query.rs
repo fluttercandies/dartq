@@ -230,6 +230,7 @@ mod tests {
             semdiag: None,
             target: DEFAULT_TARGET.to_owned(),
             declared_variables: rustc_hash::FxHashMap::default(),
+            experiments: Vec::new(),
         })
         .expect("engine")
     }

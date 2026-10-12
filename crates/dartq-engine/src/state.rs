@@ -335,9 +335,15 @@ pub struct FeatureGrants {
     /// (`unsupported_option` rows) and expired ones (dropped by the
     /// official decode) never reach the set; the per-file release gate
     /// applies at merge time, against the file's own version.
-    options_experiments: FxHashMap<Box<Path>, Box<[dartq_language::Feature]>>,
-    /// Whether any options entry carries a non-empty flag list — the merge
-    /// fast path for the dominant no-experiments workspace.
+    options_experiments: FxHashMap<Box<Path>, Option<Box<[dartq_language::Feature]>>>,
+    /// The CLI `--enable-experiment` flags, decoded once — the context-level
+    /// base every package file's feature set starts from
+    /// (`FeatureSet.fromEnableFlags2` over the context builder's flags);
+    /// an options chain declaring its own section replaces it for that
+    /// subtree, the official `_applyEnableExperiments` assignment.
+    cli_experiments: Box<[dartq_language::Feature]>,
+    /// Whether any options entry or the CLI base carries a non-empty flag
+    /// list — the merge fast path for the dominant no-experiments workspace.
     experiments_any: bool,
     memo: Mutex<FxHashMap<(GrantOwner, LanguageVersion), FeatureSet>>,
 }
@@ -353,6 +359,7 @@ impl FeatureGrants {
         target: &str,
         packages: &IdentityTable,
         options: &FxHashMap<PathBuf, Arc<crate::analysis_options::AnalysisOptions>>,
+        experiments: &[String],
     ) -> Self {
         let lib_root: Box<Path> = Box::from(sdk.dart_sdk_root().join("lib"));
         let mut sdk_library_dirs = FxHashMap::default();
@@ -377,16 +384,13 @@ impl FeatureGrants {
                 .for_package(package.name.as_str())
                 .is_some_and(|set| !set.is_empty())
         });
-        let mut options_experiments = FxHashMap::default();
-        let mut experiments_any = false;
-        for (dir, entry) in options {
+        // The flags decode is shared by the options entries and the CLI
+        // base (`no-` requests never reach a set: a disable only bites
+        // version-shipped features, every one of which is expired — the
+        // decode drops it — and an off-by-default feature is already off).
+        let decode = |names: &[String]| {
             let mut flags = Vec::new();
-            for name in entry.experiments.iter().flatten() {
-                // `no-` requests never reach the set: a disable only bites
-                // version-shipped features, every one of which is expired
-                // (the decode drops it, and `experiment_flag_issues` rows
-                // it), and an off-by-default feature is already off — the
-                // merged set is the official union outcome either way.
+            for name in names {
                 let flag = name.strip_prefix("no-").unwrap_or(name);
                 if let Ok(feature) = dartq_language::Feature::try_from(flag)
                     && !feature.is_expired()
@@ -394,14 +398,32 @@ impl FeatureGrants {
                     flags.push(feature);
                 }
             }
-            experiments_any |= !flags.is_empty();
-            options_experiments.insert(Box::from(dir.as_path()), flags.into_boxed_slice());
+            flags
+        };
+        // `None` = no `enable-experiment` section anywhere in that entry's
+        // chain: the subtree keeps the CLI context base. `Some` (an empty
+        // list included) replaces it — the official per-context
+        // `_applyEnableExperiments` assignment.
+        let mut options_experiments = FxHashMap::default();
+        let mut experiments_any = false;
+        for (dir, entry) in options {
+            let flags = entry
+                .experiments
+                .as_ref()
+                .map(|names| decode(names).into_boxed_slice());
+            if let Some(flags) = &flags {
+                experiments_any |= !flags.is_empty();
+            }
+            options_experiments.insert(Box::from(dir.as_path()), flags);
         }
+        let cli_experiments = decode(experiments).into_boxed_slice();
+        experiments_any |= !cli_experiments.is_empty();
         Self {
             any,
             sdk_lib_root: lib_root,
             sdk_library_dirs,
             options_experiments,
+            cli_experiments,
             experiments_any,
             memo: Mutex::new(FxHashMap::default()),
         }
@@ -511,17 +533,20 @@ impl FeatureGrants {
         if experiments.for_package(identity.name.as_str()).is_some() {
             return set;
         }
-        let mut best: Option<(usize, &[dartq_language::Feature])> = None;
+        let mut best: Option<(usize, Option<&[dartq_language::Feature]>)> = None;
         for (dir, flags) in &self.options_experiments {
             if path.starts_with(dir.as_ref()) {
                 let depth = dir.components().count();
                 if best.is_none_or(|(depth_so_far, _)| depth > depth_so_far) {
-                    best = Some((depth, flags));
+                    best = Some((depth, flags.as_deref()));
                 }
             }
         }
-        let Some((_, flags)) = best else {
-            return set;
+        // A declaring options chain replaces the CLI context base; no
+        // section anywhere in the subtree's chain keeps the base.
+        let flags = match best {
+            Some((_, Some(flags))) => flags,
+            _ => self.cli_experiments.as_ref(),
         };
         for &feature in flags {
             set = set.with_experiment_for_version(version, feature);
@@ -917,6 +942,7 @@ impl EngineState {
     /// [`crate::EngineError::PackageConfig`] when the pub package config
     /// cannot back the URI-resolution table (the shared `resolve` face
     /// rejected it).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         packages: IdentityTable,
         pub_config: &PackageConfig,
@@ -925,6 +951,7 @@ impl EngineState {
         store: Box<dyn SourceStore + Send + Sync>,
         target: String,
         declared_variables: FxHashMap<String, String>,
+        experiments: Vec<String>,
     ) -> Result<Self, crate::EngineError> {
         let uri_packages = UriPackageTable::new(pub_config, config_dir)?;
         // Options are a context field: the include chains merge once here,
@@ -941,7 +968,7 @@ impl EngineState {
         let options =
             crate::analysis_options::AnalysisOptions::for_roots(&roots, pub_config, config_dir);
         // The grant faces read the tables before they move into the state.
-        let feature_grants = FeatureGrants::new(&sdk, &target, &packages, &options);
+        let feature_grants = FeatureGrants::new(&sdk, &target, &packages, &options, &experiments);
         Ok(Self {
             packages,
             uri_packages,

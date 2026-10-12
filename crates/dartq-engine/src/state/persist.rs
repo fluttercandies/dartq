@@ -1215,6 +1215,7 @@ mod tests {
                 semdiag: None,
                 target: "vm".to_owned(),
                 declared_variables: FxHashMap::default(),
+                experiments: Vec::new(),
             })
             .expect("engine")
         };
@@ -1684,6 +1685,7 @@ mod tests {
                 semdiag: None,
                 target: "vm".to_owned(),
                 declared_variables: FxHashMap::default(),
+                experiments: Vec::new(),
             })
             .expect("engine")
         };
@@ -1963,6 +1965,7 @@ mod tests {
                 semdiag: None,
                 target: "vm".to_owned(),
                 declared_variables: FxHashMap::default(),
+                experiments: Vec::new(),
             })
             .expect("engine")
         };

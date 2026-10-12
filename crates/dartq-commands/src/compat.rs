@@ -94,7 +94,8 @@ pub fn compat(
     // reused by every axis's engine assembly.
     let config_dir = canonical_dir.join(".dart_tool");
     let (config, lock, pubspec) =
-        load_workspace_faces(&canonical_dir, &config_dir).map_err(CompatError::Usage)?;
+        load_workspace_faces(&canonical_dir, &config_dir.join("package_config.json"))
+            .map_err(CompatError::Usage)?;
     let graph = build_graph(
         &config,
         &lock,
@@ -156,6 +157,7 @@ fn analyze_axis(
         semdiag: Some(semdiag::diagnoser()),
         target: dartq_engine::DEFAULT_TARGET.to_owned(),
         declared_variables: rustc_hash::FxHashMap::default(),
+        experiments: Vec::new(),
     })
     .map_err(|error| CompatError::Usage(format!("engine context unusable: {error}")))?;
 

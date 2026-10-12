@@ -296,6 +296,7 @@ mod tests {
             semdiag: Some(semdiag),
             target: crate::DEFAULT_TARGET.to_owned(),
             declared_variables: rustc_hash::FxHashMap::default(),
+            experiments: Vec::new(),
         })
         .expect("engine");
         let main_file = engine.set_content(&root.join("lib/main.dart"), main.as_bytes());

@@ -138,6 +138,7 @@ impl Fixture {
             semdiag: Some(dartq_engine::semdiag::diagnoser()),
             target: dartq_engine::DEFAULT_TARGET.to_owned(),
             declared_variables: rustc_hash::FxHashMap::default(),
+            experiments: Vec::new(),
         })
         .expect("engine")
     }

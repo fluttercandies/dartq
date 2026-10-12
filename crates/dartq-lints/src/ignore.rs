@@ -19,15 +19,18 @@
 //!   case-insensitive against the code name. `plugin/name` entries match only
 //!   their plugin; wave 1 has no plugins, so they match nothing.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::comments::Comments;
 
 /// What one suppression entry matches.
 #[derive(Debug)]
 enum Entry {
-    /// A diagnostic name; matches case-insensitively.
-    Name(String),
+    /// A diagnostic name; matches case-insensitively. The byte span is the
+    /// name token's source-absolute range — the `unignorable_ignore` row's
+    /// anchor (`IgnoreValidator`, ignore_validator.dart:170: offset of the
+    /// ignored element, length of the name).
+    Name { name: String, start: usize },
     /// A `plugin/name` entry; wave 1 has no plugins, matches nothing
     /// (ignore_info.dart:40-42 requires pluginName equality).
     PluginName,
@@ -39,7 +42,7 @@ enum Entry {
 impl Entry {
     fn matches(&self, name: &str) -> bool {
         match self {
-            Entry::Name(n) => n.eq_ignore_ascii_case(name),
+            Entry::Name { name: entry, .. } => entry.eq_ignore_ascii_case(name),
             Entry::PluginName => false,
             Entry::Type(t) => t.eq_ignore_ascii_case("lint"),
         }
@@ -79,9 +82,10 @@ impl IgnoreInfo {
                 info.on_line
                     .entry(target)
                     .or_default()
-                    .extend(elements_of(lexeme));
+                    .extend(elements_of(lexeme, comment.range.start as usize));
             } else if lexeme.contains("ignore_for_file:") {
-                info.for_file.extend(elements_of(lexeme));
+                info.for_file
+                    .extend(elements_of(lexeme, comment.range.start as usize));
             }
         }
         info
@@ -132,18 +136,20 @@ fn is_ignore_for_file_comment(s: &str) -> bool {
 }
 
 /// `CommentTokenExtension.ignoredElements` (ignore_info.dart:295-471):
-/// parse the list after the first `:` of the lexeme.
-fn elements_of(lexeme: &str) -> Vec<Entry> {
+/// parse the list after the first `:` of the lexeme. `base` is the lexeme's
+/// source-absolute byte offset — the name spans it produces are absolute.
+fn elements_of(lexeme: &str, base: usize) -> Vec<Entry> {
     match lexeme.find(':') {
-        Some(colon) => parse_element_list(&lexeme[colon + 1..]),
+        Some(colon) => parse_element_list(&lexeme[colon + 1..], base + colon + 1),
         None => Vec::new(),
     }
 }
 
 /// The word/`type=`/`plugin/name` list parser, mirroring
 /// `ignoredElements`'s `skipPastWhitespace`/`readWord` structure
-/// (ignore_info.dart:299-321).
-fn parse_element_list(rest: &str) -> Vec<Entry> {
+/// (ignore_info.dart:299-321). `base` is the list text's source-absolute
+/// byte offset.
+fn parse_element_list(rest: &str, base: usize) -> Vec<Entry> {
     let mut entries = Vec::new();
     let bytes = rest.as_bytes();
     let n = bytes.len();
@@ -215,7 +221,10 @@ fn parse_element_list(rest: &str) -> Vec<Entry> {
             if !list_continues(offset) {
                 return entries;
             }
-            entries.push(Entry::Name(word.to_owned()));
+            entries.push(Entry::Name {
+                name: word.to_owned(),
+                start: base + word_start,
+            });
         }
         if offset == n {
             return entries;
@@ -228,6 +237,75 @@ fn parse_element_list(rest: &str) -> Vec<Entry> {
         }
         offset += 1;
     }
+}
+
+/// One `unignorable_ignore` hit: the ignore-comment name the options'
+/// `cannot-ignore` set claims, with its UTF-16 anchor
+/// (`IgnoreValidator._reportUnignorableAndDuplicateIgnores`,
+/// ignore_validator.dart:164-174 — the row sits on the name token, and the
+/// name leaves the suppression list so it can never suppress).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnignorableIgnore {
+    /// The name as written in the comment (the message's `{0}`).
+    pub name: String,
+    /// The name token's UTF-16 offset.
+    pub offset: u32,
+    /// The name token's UTF-16 length.
+    pub length: u32,
+}
+
+/// The `IgnoreValidator` face over one file's comments (dart 3.15 main,
+/// ignore_validator.dart:73-131): every ignore-comment *name* — file-level
+/// first in comment order, then line-level in line order — that the options'
+/// `cannot-ignore` set contains reports once. The membership test is the
+/// official case-sensitive `.contains(name)` against the lowercased set
+/// (ignore_validator.dart:89, 113; the assert at :69 pins the set
+/// lowercase), so a differently-cased spelling never hits. Suppression
+/// itself is the [`IgnoreInfo`] consumer's gate (`run`'s `unignorable`
+/// parameter) — the validator only reports.
+///
+/// Empty `unignorable` returns immediately: the dominant workspace pays
+/// nothing.
+#[must_use]
+pub fn unignorable_ignores(
+    source: &str,
+    unignorable: &FxHashSet<String>,
+) -> Vec<UnignorableIgnore> {
+    if unignorable.is_empty() {
+        return Vec::new();
+    }
+    // The comments come from the scan alone — no parse; the face runs under
+    // the lint stage's per-file job.
+    let mut files = dartq_source::FileTable::default();
+    let file = files.intern(std::path::Path::new("unit.dart"));
+    let scanned = crate::bridge::scan_tokens(source, file);
+    let comments = Comments::extract(source, &scanned);
+    let info = IgnoreInfo::parse(source, &comments);
+    let mut hits = Vec::new();
+    let mut push = |entry: &Entry| {
+        if let Entry::Name { name, start, .. } = entry
+            && unignorable.contains(name)
+        {
+            hits.push(UnignorableIgnore {
+                name: name.clone(),
+                offset: dartq_source::byte_offset_to_utf16(source, *start),
+                length: dartq_source::utf16_len_of(name),
+            });
+        }
+    };
+    for entry in &info.for_file {
+        push(entry);
+    }
+    // Dart's map iterates in insertion order (first-seen line); the Rust
+    // table sorts by line for the same deterministic order.
+    let mut lines: Vec<u32> = info.on_line.keys().copied().collect();
+    lines.sort_unstable();
+    for line in lines {
+        for entry in &info.on_line[&line] {
+            push(entry);
+        }
+    }
+    hits
 }
 
 /// 1-based line number of a byte offset.
@@ -257,7 +335,7 @@ mod tests {
     use super::*;
 
     fn parse(lexeme: &'static str) -> Vec<Entry> {
-        elements_of(lexeme)
+        elements_of(lexeme, 0)
     }
 
     fn names(lexeme: &'static str) -> Vec<String> {
@@ -265,7 +343,7 @@ mod tests {
         parse(lexeme)
             .into_iter()
             .filter_map(|e| match e {
-                Entry::Name(n) => Some(n),
+                Entry::Name { name, .. } => Some(name),
                 _ => None,
             })
             .collect()
@@ -305,7 +383,10 @@ mod tests {
     fn matching_is_case_insensitive_name_only() {
         let info = crate::IgnoreInfo {
             on_line: Default::default(),
-            for_file: vec![Entry::Name("Empty_Statements".to_owned())],
+            for_file: vec![Entry::Name {
+                name: "Empty_Statements".to_owned(),
+                start: 0,
+            }],
         };
         assert!(info.ignored(1, "empty_statements"));
         assert!(!info.ignored(1, "avoid_empty_else"));
@@ -323,6 +404,61 @@ mod tests {
             for_file: vec![Entry::Type("hint".to_owned())],
         };
         assert!(!info.ignored(7, "empty_statements"));
+    }
+
+    #[test]
+    fn unignorable_hits_pin_names_with_spans() {
+        use crate::testsupport::Fixture;
+        let set = rustc_hash::FxHashSet::from_iter(["empty_statements".to_owned()]);
+        // The hit names the comment's name token: trailing `// ignore: a,
+        // empty_statements` — the name starts after the comment head.
+        let f = Fixture::build("var x = 1; // ignore: a, empty_statements\n", |_, _| {});
+        let hits = unignorable_ignores(&f.source, &set);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].name, "empty_statements");
+        // `var x = 1; // ignore: a, ` = 25 UTF-16 units.
+        assert_eq!(hits[0].offset, 25);
+        assert_eq!(hits[0].length, 16);
+
+        // File-level entries report first, then per-line in line order.
+        let f = Fixture::build(
+            "// ignore_for_file: empty_statements\n// ignore: empty_statements\nvar x = 1;\n",
+            |_, _| {},
+        );
+        let hits = unignorable_ignores(&f.source, &set);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].offset, 20, "the for_file name token");
+        assert_eq!(hits[1].offset, 48, "the line entry's name token");
+    }
+
+    #[test]
+    fn unignorable_matching_is_case_sensitive_on_comment_names() {
+        use crate::testsupport::Fixture;
+        // The official set is lowercased (assert at ignore_validator.dart:69)
+        // and the comment name matches verbatim (:89, :113) — a
+        // differently-cased spelling never hits.
+        let set = rustc_hash::FxHashSet::from_iter(["empty_statements".to_owned()]);
+        let f = Fixture::build("// ignore: Empty_Statements\nvar x = 1;\n", |_, _| {});
+        assert!(unignorable_ignores(&f.source, &set).is_empty());
+
+        // Non-member names and the empty set report nothing.
+        let f = Fixture::build("// ignore: avoid_print\nvar x = 1;\n", |_, _| {});
+        assert!(unignorable_ignores(&f.source, &set).is_empty());
+        assert!(unignorable_ignores(&f.source, &rustc_hash::FxHashSet::default()).is_empty());
+    }
+
+    #[test]
+    fn unignorable_spans_count_utf16_units() {
+        use crate::testsupport::Fixture;
+        let set = rustc_hash::FxHashSet::from_iter(["empty_statements".to_owned()]);
+        // `\u{1F600}` is one UTF-16 unit pair... two units (a surrogate
+        // pair) over four UTF-8 bytes: the name offset counts units, not
+        // bytes.
+        let f = Fixture::build("// \u{1F600}\n// ignore: empty_statements\n", |_, _| {});
+        let hits = unignorable_ignores(&f.source, &set);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        // Line 1 = `// ` + 2 units + `\n` = 6 units; `// ignore: ` = 11.
+        assert_eq!(hits[0].offset, 6 + 11);
     }
 
     #[test]

@@ -209,7 +209,7 @@ mod testsupport;
 pub use bridge::{ParsedUnit, parse_unit};
 pub use comments::{Comment, CommentKind, Comments};
 pub use engine::{Check, Features, Lint, Unit, WorkspaceFacts, run};
-pub use ignore::IgnoreInfo;
+pub use ignore::{IgnoreInfo, UnignorableIgnore, unignorable_ignores};
 pub use registry::{EnableSet, Group, RULES, RuleId, RuleSpec, rule_by_name};
 // The pubspec-pass verdicts (#434): the mounting face (dartq-commands'
 // `analyze_lints`) walks the scanned pubspec facts through these — the

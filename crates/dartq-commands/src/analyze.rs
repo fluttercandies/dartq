@@ -192,6 +192,26 @@ fn options_registry_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> 
         let Some(file) = engine.file_table().try_file_id(&options.file_path) else {
             continue;
         };
+        // The include chain's own declarations wrap into
+        // `included_file_warning` (the official walker reports every
+        // included file's findings on the initial file, before its own
+        // parse rows — `_applyParsedFiles` applies includes first).
+        for group in &options.included_groups {
+            for rule in &group.rules {
+                if !is_known_lint_name(&rule.name) {
+                    let inner = analysis_options::OptionsIssue::undefined_lint(rule);
+                    rows.push(group.wrap_row(&inner).to_diagnostic(file));
+                }
+            }
+            for error in &group.errors {
+                if !analysis_options::is_known_diagnostic_code(&error.code)
+                    && !is_known_lint_name(&error.code)
+                {
+                    let inner = analysis_options::OptionsIssue::unrecognized_error_code(error);
+                    rows.push(group.wrap_row(&inner).to_diagnostic(file));
+                }
+            }
+        }
         for rule in &options.declared_rules {
             if !is_known_lint_name(&rule.name) {
                 rows.push(analysis_options::OptionsIssue::undefined_lint(rule).to_diagnostic(file));

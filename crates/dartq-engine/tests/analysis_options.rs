@@ -664,11 +664,13 @@ fn missing_include_reports_include_file_not_found() {
 /// :121-151) and `_walkParsedInclude` (:153-188): a parsed include resolving
 /// back to the *initial* file reports `recursive_include_file` (:161-171,
 /// registry diagnostic.g.dart:14675-14697) and stops the edge; a chain cycle
-/// that does not pass through the initial file is `included_file_warning` —
-/// a wrapping face dartq has not built — so it stays silent; missing wins
-/// for unresolvable edges because recursion is only reached for parsed ones.
+/// that does not pass through the initial file wraps into
+/// `included_file_warning` naming the repeated file and the inclusive span
+/// of its own outgoing include directive (`spanInChain`, walker :173-188);
+/// missing wins for unresolvable edges because recursion is only reached for
+/// parsed ones.
 #[test]
-fn recursive_include_reports_back_to_initial_and_chain_cycles_stay_silent() {
+fn recursive_include_reports_back_to_initial_and_chain_cycles_wrap() {
     let dir = TempDir::new("recursive");
     dir.write("a.yaml", "include: b.yaml\n");
     dir.write("b.yaml", "include: a.yaml\n");
@@ -692,18 +694,33 @@ fn recursive_include_reports_back_to_initial_and_chain_cycles_stay_silent() {
     );
 
     // The indirect cycle b → c → b never passes through the initial file:
-    // the official row would be `includedFileWarning` (walker :176-188),
-    // silent here, and the walk still terminates.
+    // the official row is the `included_file_warning` wrap (walker :176-188)
+    // — the message names b (the repeated file) and the inclusive span of
+    // b's own outgoing directive (`c.yaml` in b.yaml: 9..14), and the row
+    // anchors at the branch's first directive (`b.yaml` in a.yaml: 9, len 7).
     let deep = TempDir::new("chain_cycle");
     deep.write("a.yaml", "include: b.yaml\n");
     deep.write("b.yaml", "include: c.yaml\n");
     deep.write("c.yaml", "include: b.yaml\n");
     let options = AnalysisOptions::load(&deep.path("a.yaml"), &empty_config(), &deep.0);
-    assert!(
-        options.issues.is_empty(),
-        "chain cycles are the wrapped face, not built: {:?}",
-        options.issues
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    let issue = &options.issues[0];
+    assert_eq!(issue.code.name, "included_file_warning");
+    assert_eq!(issue.code.machine, "INCLUDED_FILE_WARNING");
+    assert_eq!(
+        issue.code.dtype,
+        dartq_diagnostics::DiagnosticType::StaticWarning
     );
+    let b = deep.path("b.yaml").display().to_string();
+    assert_eq!(
+        issue.message,
+        format!(
+            "Warning in the included options file {b}(9..14): The file includes itself recursively."
+        )
+    );
+    assert_eq!(issue.correction, None, "the wrap drops the correction");
+    assert_eq!(issue.offset, 9, "the b.yaml URI token in a.yaml");
+    assert_eq!(issue.length, 6);
 }
 
 /// Include-chain rows attribute to the *initial* file at every depth (the
@@ -736,23 +753,33 @@ fn include_chain_rows_attribute_to_the_initial_file() {
     assert_eq!(options.file_path, dir.path("near.yaml"));
 }
 
-/// An included file's local shape problems are officially wrapped into
-/// `included_file_warning` (include_walker.dart:236-247) — a face dartq has
-/// not built — so they stay silent through the includer's load, while the
-/// included file's own load reports them (`_walk` reports local diagnostics
-/// directly for the initial file, walker :74-76).
+/// An included file's local shape problems wrap into `included_file_warning`
+/// (`_IncludedDiagnosticListener`, include_walker.dart:236-247): the message
+/// names the included file and the inner row's inclusive span, the wrapped
+/// row anchors at the branch's first directive, and the correction never
+/// survives. The included file's own load still reports the row raw (`_walk`
+/// reports local diagnostics directly for the initial file, walker :74-76).
 #[test]
-fn included_file_local_problems_stay_silent_for_the_includer() {
+fn included_file_local_problems_wrap_to_the_includer() {
     let dir = TempDir::new("wrapped");
     dir.write("near.yaml", "include: far.yaml\n");
     dir.write("far.yaml", "linter: 42\n");
 
     let near = AnalysisOptions::load(&dir.path("near.yaml"), &empty_config(), &dir.0);
-    assert!(
-        near.issues.is_empty(),
-        "wrapped faces are not built: {:?}",
-        near.issues
+    assert_eq!(near.issues.len(), 1, "{:?}", near.issues);
+    let issue = &near.issues[0];
+    assert_eq!(issue.code.name, "included_file_warning");
+    // The inner invalid-section row anchors at `linter` (0, 6) in far.yaml —
+    // the inclusive end folds to 5.
+    let far = dir.path("far.yaml").display().to_string();
+    assert_eq!(
+        issue.message,
+        format!(
+            "Warning in the included options file {far}(0..5): Invalid format for the 'linter' section."
+        )
     );
+    assert_eq!(issue.offset, 9, "the branch's first include directive");
+    assert_eq!(issue.length, 8, "the far.yaml URI token");
 
     let far = AnalysisOptions::load(&dir.path("far.yaml"), &empty_config(), &dir.0);
     assert_eq!(far.issues.len(), 1);
@@ -1111,9 +1138,20 @@ fn experiments_parse_merge_and_validate_rows() {
         .iter()
         .map(|issue| (issue.code.name, issue.message.clone()))
         .collect();
+    let far = dir.path("far.yaml").display().to_string();
     assert_eq!(
         actual,
         [
+            // The included file's own expired flag wraps first (the walker
+            // reports includes before the initial file's own rows): inner
+            // anchor `patterns` at 45..52 inclusive in far.yaml.
+            (
+                "included_file_warning",
+                format!(
+                    "Warning in the included options file {far}(45..52): Invalid option \
+                     specified for 'enable-experiment': Flag \"patterns\" is no longer required."
+                )
+            ),
             (
                 "invalid_section_format",
                 "Invalid format for the 'enable-experiment' section.".to_owned()
@@ -1429,4 +1467,211 @@ fn the_diagnostic_name_universe_answers_membership() {
     assert!(is_known_diagnostic_code("missing_return"));
     assert!(is_known_diagnostic_code("undefined_annotation"));
     assert!(!is_known_diagnostic_code("not_a_real_code"));
+}
+/// The YAML failure faces (#938): the initial file's broken YAML is one
+/// `parse_error` row — COMPILE_TIME_ERROR (the CLI's severity exit maps it
+/// to the errors tier), the raw failure point as a zero-length span, the
+/// message the located error text with its ` at line L column C` suffix
+/// stripped; an included file's failure wraps into
+/// `included_file_parse_error` (`{message} in {file}({start}..{end})`,
+/// walker :48-66) at the branch anchor. `serde_yaml` yields one failure
+/// point, so the wrapped span shows it at both ends.
+#[test]
+fn yaml_failures_report_parse_error_faces() {
+    let dir = TempDir::new("parse_error");
+    let broken = "linter:\n  rules:\n    - [\n";
+    dir.write("analysis_options.yaml", broken);
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    let issue = &options.issues[0];
+    assert_eq!(issue.code.name, "parse_error");
+    assert_eq!(issue.code.machine, "PARSE_ERROR");
+    assert_eq!(
+        issue.code.dtype,
+        dartq_diagnostics::DiagnosticType::CompileTimeError
+    );
+    assert!(issue.code.has_published_docs);
+    // The message is `serde_yaml`'s verbatim (its phrasing embeds the
+    // location differently per failure kind; the row span carries the
+    // position the oracle face reports). This failure points at the end of
+    // the input: byte offset 25 = UTF-16 25.
+    assert_eq!(
+        issue.message,
+        "did not find expected node content at line 4 column 1, while parsing a flow node"
+    );
+    assert_eq!(issue.offset, 25);
+    assert_eq!(issue.length, 0, "the failure point, not a range");
+    assert!(issue.correction.is_none());
+
+    // The included variant wraps at the branch anchor.
+    let near = TempDir::new("included_parse_error");
+    near.write("near.yaml", "include: far.yaml\n");
+    near.write("far.yaml", "linter:\n  rules:\n    - [\n");
+    let options = AnalysisOptions::load(&near.path("near.yaml"), &empty_config(), &near.0);
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    let issue = &options.issues[0];
+    assert_eq!(issue.code.name, "included_file_parse_error");
+    assert_eq!(issue.code.machine, "INCLUDED_FILE_PARSE_ERROR");
+    assert_eq!(
+        issue.code.dtype,
+        dartq_diagnostics::DiagnosticType::CompileTimeError
+    );
+    let far = near.path("far.yaml").display().to_string();
+    // `{message} in {file}({at}..{at})` — same broken text, same failure
+    // point (25).
+    assert!(
+        issue
+            .message
+            .starts_with("did not find expected node content")
+            && issue.message.ends_with(&format!(" in {far}(25..25)")),
+        "{:?}",
+        issue.message
+    );
+    assert_eq!(issue.offset, 9, "the branch's first include directive");
+    assert_eq!(issue.length, 8, "the far.yaml URI token");
+}
+
+/// The top-level `plugins:` section is one blanket
+/// `invalid_section_format` row on the 3.13.1 oracle (`Invalid format for
+/// the 'plugins' section.`, probed o13): any non-null section shape
+/// reports, absent or null stays silent, and the merged options degrade
+/// exactly as if the section were absent (dartq loads no plugins).
+#[test]
+fn plugins_section_reports_one_invalid_section_row() {
+    let dir = TempDir::new("plugins");
+    let text =
+        "plugins:\n  some_plugin:\n    is_initialized: true\nlinter:\n  rules:\n    - kept_rule\n";
+    dir.write("analysis_options.yaml", text);
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    assert_eq!(options.lint_rules, vec!["kept_rule"]);
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    let issue = &options.issues[0];
+    assert_eq!(issue.code.name, "invalid_section_format");
+    assert_eq!(issue.message, "Invalid format for the 'plugins' section.");
+    assert_eq!(issue.offset, 0, "the section key token");
+    assert_eq!(
+        issue.length,
+        "plugins".chars().map(char::len_utf16).sum::<usize>() as u32
+    );
+
+    // Null and absent stay silent.
+    let null_text = "plugins:\nlinter:\n  rules:\n    - kept_rule\n";
+    dir.write("analysis_options.yaml", null_text);
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+    assert!(options.issues.is_empty(), "{:?}", options.issues);
+}
+
+/// The included files' registry candidates land in
+/// [`dartq_engine::analysis_options::DeclarationGroup`]s — each with the
+/// included file's anchors and the precomputed initial-file anchor span —
+/// and the CLI face's wrap (`DeclarationGroup::wrap_row`) shapes the
+/// official `included_file_warning` text over any inner row (inclusive
+/// inner end, correction dropped).
+#[test]
+fn included_groups_carry_registry_candidates_with_wrap_anchors() {
+    use dartq_engine::analysis_options::OptionsIssue;
+
+    let dir = TempDir::new("groups");
+    dir.write(
+        "near.yaml",
+        "include: far.yaml\nlinter:\n  rules:\n    - near_rule\n",
+    );
+    dir.write(
+        "far.yaml",
+        "linter:\n  rules:\n    - no_such_rule_here\nanalyzer:\n  errors:\n    not_a_code: ignore\n",
+    );
+
+    let options = AnalysisOptions::load(&dir.path("near.yaml"), &empty_config(), &dir.0);
+
+    assert_eq!(
+        options.included_groups.len(),
+        1,
+        "{:?}",
+        options.included_groups
+    );
+    let group = &options.included_groups[0];
+    assert_eq!(group.file, dir.path("far.yaml"));
+    assert_eq!(group.anchor_span, (9, 8), "the branch's first directive");
+    assert_eq!(group.rules.len(), 1);
+    assert_eq!(group.rules[0].name, "no_such_rule_here");
+    assert_eq!(group.errors.len(), 1);
+    assert_eq!(group.errors[0].code, "not_a_code");
+
+    // The wrap face over the inner undefined_lint row: inclusive inner end,
+    // correction dropped, row span = the group anchor.
+    let inner = OptionsIssue::undefined_lint(&group.rules[0]);
+    let wrapped = group.wrap_row(&inner);
+    assert_eq!(wrapped.code.name, "included_file_warning");
+    let far = dir.path("far.yaml").display().to_string();
+    let inner_end = inner.offset + inner.length - 1;
+    assert_eq!(
+        wrapped.message,
+        format!(
+            "Warning in the included options file {far}({}..{inner_end}): {}",
+            inner.offset, inner.message
+        )
+    );
+    assert_eq!(wrapped.correction, None);
+    assert_eq!((wrapped.offset, wrapped.length), group.anchor_span);
+}
+
+/// The `cannot-ignore` names feed the engine's unignorable set (#938): the
+/// plain names store lowercased (the official `IgnoreValidator` builds its
+/// set lowercased and matches comment names case-sensitively), and the
+/// severity-arm names contribute every registry code of that family.
+#[test]
+fn cannot_ignore_names_feed_the_unignorable_set() {
+    let dir = TempDir::new("cannot_ignore");
+    dir.write(
+        "analysis_options.yaml",
+        "analyzer:\n  errors:\n    unused_import: ignore\n  cannot-ignore:\n    - UNUSED_IMPORT\n    - dead_code\n",
+    );
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    assert!(
+        options.unignorable().contains("unused_import"),
+        "{:?}",
+        options.unignorable()
+    );
+    assert!(options.unignorable().contains("dead_code"));
+    assert!(
+        !options.unignorable().contains("UNUSED_IMPORT"),
+        "the set is lowercased"
+    );
+    assert!(!options.unignorable().contains("not_listed"));
+}
+
+/// The section-scoped anchor convention (#938): a declaration token that
+/// also appears earlier in the file (an include URI) anchors at its
+/// occurrence inside its own section, not at the first text hit.
+#[test]
+fn declaration_anchors_scope_to_their_section() {
+    let dir = TempDir::new("scoped");
+    dir.write(
+        "analysis_options.yaml",
+        "include: nope_rule.yaml\nlinter:\n  rules:\n    - nope_rule\n",
+    );
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    let uri_len = "nope_rule.yaml".chars().map(char::len_utf16).sum::<usize>() as u32;
+    assert_eq!(options.declared_rules.len(), 1);
+    assert_eq!(options.declared_rules[0].name, "nope_rule");
+    // `include: nope_rule.yaml\n` = 24 units, `linter:\n` = 8, `  rules:\n` = 9,
+    // `    - ` = 6 — the rules-section occurrence starts at 47.
+    assert_eq!(options.declared_rules[0].offset, 47);
+    assert_eq!(
+        options.declared_rules[0].length,
+        "nope_rule".chars().map(char::len_utf16).sum::<usize>() as u32
+    );
+    assert_eq!(uri_len, 14);
 }

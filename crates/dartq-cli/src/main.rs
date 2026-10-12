@@ -58,7 +58,8 @@ use dartq_commands::discover::{DiscoverError, discover};
 use dartq_commands::explain::ExplainError;
 use dartq_commands::query::{BatchQuery, DependencyRow, QueryKind, decl_kind_name, ref_kind_name};
 use dartq_commands::workspace::{
-    WorkspaceAdvisory, engine_config_with_advisory, open_engine, open_engine_with_advisory,
+    AnalyzeOverrides, WorkspaceAdvisory, engine_config_with_advisory, open_engine,
+    open_engine_with_overrides,
 };
 use dartq_diagnostics::{
     AnalysisOutput, Diagnostic, FileLayoutProvider, Severity, SourceRange, write_json,
@@ -263,6 +264,35 @@ struct AnalyzeArgs {
     /// Dart SDK root; defaults to $DART_SDK.
     #[arg(long)]
     sdk: Option<PathBuf>,
+    /// Package resolution configuration file (the dartdev `--packages`):
+    /// analyzed in place of `<dir>/.dart_tool/package_config.json`, its
+    /// directory the `rootUri` resolution base. A missing file is the
+    /// usage error the oracle ships.
+    #[arg(long, value_name = "PATH")]
+    packages: Option<PathBuf>,
+    /// Enable one or more language experiments (the dartdev
+    /// `--enable-experiment`): repeatable, comma-separated names accepted;
+    /// a `no-` prefix is stripped before the known-feature test. Unknown
+    /// names are the usage error `Unknown experiment(s): 'x'`. The flags
+    /// are the context-level feature base; a package's analysis options
+    /// declaring its own `enable-experiment` section replaces them for
+    /// that subtree (the official assignment posture).
+    #[arg(
+        long = "enable-experiment",
+        value_name = "NAME[,NAME...]",
+        value_delimiter = ','
+    )]
+    enable_experiments: Vec<String>,
+    /// Load analysis plugins (the dartdev `--[no-]plugins`, default on).
+    /// dartq loads no plugins — the flag is accepted for CLI parity and is
+    /// a no-op beyond the parse (the official CLI face keeps plugin rows on
+    /// a separate channel dartq does not consume). Both spellings parse:
+    /// `--plugins` (default) and `--no-plugins`.
+    #[arg(long)]
+    plugins: bool,
+    /// The `--no-plugins` spelling — see `plugins`.
+    #[arg(long = "no-plugins", hide = true)]
+    no_plugins: bool,
     /// On by default (`--no-fatal-warnings` clears it) — mirrors the oracle.
     #[arg(long)]
     no_fatal_warnings: bool,
@@ -649,17 +679,30 @@ fn under_crash_tier<T>(
     }
 }
 
+/// The analyze face's CLI overrides (#938): `--packages` and the
+/// `--enable-experiment` list. `--plugins`/`--no-plugins` are parse-only
+/// (dartq loads none), so they carry no override state.
+fn analyze_overrides(args: &AnalyzeArgs) -> AnalyzeOverrides {
+    AnalyzeOverrides {
+        packages: args.packages.clone(),
+        experiments: args.enable_experiments.clone(),
+    }
+}
+
 /// The plain path: the shared run, byte-pinned.
 fn analyze_plain(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     let started = Instant::now();
-    let (mut engine, dir, stale_advisory) =
-        match open_engine_with_advisory(&args.dir, args.sdk.as_deref()) {
-            Ok(faces) => faces,
-            Err(error) => {
-                eprintln!("error: {error}");
-                return exit::USAGE;
-            }
-        };
+    let (mut engine, dir, stale_advisory) = match open_engine_with_overrides(
+        &args.dir,
+        args.sdk.as_deref(),
+        &analyze_overrides(args),
+    ) {
+        Ok(faces) => faces,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
+    };
     engine.set_memory_limit(args.memory_limit);
     engine.set_trace_sink(match &args.trace_events {
         Some(path) => match dartq_engine::event::TraceSink::create(path) {
@@ -708,14 +751,17 @@ fn arm_content_store(engine: &mut dartq_engine::Engine, size_limit: Option<u64>)
 /// renders and tiers like every sibling.
 fn analyze_overlaid(args: &AnalyzeArgs, out: &mut impl Write) -> u8 {
     let started = Instant::now();
-    let (mut engine, dir, stale_advisory) =
-        match open_engine_with_advisory(&args.dir, args.sdk.as_deref()) {
-            Ok(faces) => faces,
-            Err(error) => {
-                eprintln!("error: {error}");
-                return exit::USAGE;
-            }
-        };
+    let (mut engine, dir, stale_advisory) = match open_engine_with_overrides(
+        &args.dir,
+        args.sdk.as_deref(),
+        &analyze_overrides(args),
+    ) {
+        Ok(faces) => faces,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return exit::USAGE;
+        }
+    };
     engine.set_memory_limit(args.memory_limit);
     engine.set_trace_sink(match &args.trace_events {
         Some(path) => match dartq_engine::event::TraceSink::create(path) {

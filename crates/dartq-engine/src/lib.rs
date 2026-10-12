@@ -134,6 +134,14 @@ pub struct EngineConfig {
     /// resolves its primary URI; the per-context value forks both the
     /// context key and the snapshot generation salt.
     pub declared_variables: FxHashMap<String, String>,
+    /// The CLI `--enable-experiment` flags (#938) — the context-level
+    /// feature base every package file's feature set starts from; an
+    /// options chain declaring its own `enable-experiment` section replaces
+    /// it for that subtree (the official `_applyEnableExperiments`
+    /// assignment). Raw spellings; unknown names are the CLI's usage tier,
+    /// expired ones decode to nothing (the official expiry posture). Empty
+    /// by default — the no-flag oracle context.
+    pub experiments: Vec<String>,
 }
 
 /// Engine construction and explicit-API failures.
@@ -182,6 +190,7 @@ impl Engine {
             config.store,
             config.target,
             config.declared_variables,
+            config.experiments,
         )?;
         Ok(Self {
             state,
@@ -1207,6 +1216,7 @@ mod tests {
             semdiag: None,
             target: DEFAULT_TARGET.to_owned(),
             declared_variables: FxHashMap::default(),
+            experiments: Vec::new(),
         })
         .expect("engine");
         (root, engine)
