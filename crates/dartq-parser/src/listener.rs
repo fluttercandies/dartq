@@ -505,6 +505,12 @@ pub trait ParserListener {
         right: Token,
     ) {
     }
+    /// A set/map literal opened: fires right after the `{` is consumed,
+    /// before any element expression event. No official counterpart — the
+    /// semantic face opens its non-const duplicate-detection window here
+    /// (#747), which needs the literal's const keyword before the elements
+    /// fold.
+    fn begin_literal_set_or_map(&mut self, left: Token, const_keyword: Option<Token>) {}
     fn handle_literal_set_or_map(
         &mut self,
         count: usize,
@@ -568,6 +574,21 @@ pub trait ParserListener {
     fn begin_conditional_expression(&mut self, question: Token) {}
     fn handle_conditional_expression_colon(&mut self) {}
     fn end_conditional_expression(&mut self, question: Token, colon: Token, end: Token) {}
+    /// Flow-face extension fired immediately before
+    /// [`ParserListener::handle_conditional_expression_colon`]: the then
+    /// arm's first token and the colon-adjacent end. The official
+    /// dead-arm rows span the arm's own range
+    /// (`flowEnd(thenExpression)`, type_analyzer.dart:2588), which the
+    /// argless colon call cannot carry. No official counterpart; existing
+    /// listeners ignore it.
+    fn end_conditional_expression_then_arm(
+        &mut self,
+        _question: Token,
+        _then_begin: Token,
+        _colon: Token,
+        _then_end: Token,
+    ) {
+    }
     /// Prefix `++`/`--` (`handleUnaryPrefixAssignmentExpression`); the plain
     /// unary prefixes `-`/`!`/`~` use [`ParserListener::handle_unary_prefix_expression`].
     fn handle_unary_prefix_assignment_expression(&mut self, operator: Token) {}

@@ -347,6 +347,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     ) -> TokenSpan {
         let left = self.peek_span();
         self.cursor.advance();
+        self.listener.begin_literal_set_or_map(left, const_keyword);
         let mut count = 0usize;
         // Official `hasSetEntry ??=` (:7926): FIRST-wins, and only the
         // simple (non-control-flow) entries decide — the unified-collection
@@ -639,6 +640,10 @@ mod tests {
         int_literals: usize,
         map_entries: usize,
         set_or_map: Vec<bool>,
+        /// The `begin_literal_set_or_map` const keyword per literal, in
+        /// open order, with the int-literal count at the event (the
+        /// begin-before-elements order pin).
+        begins: Vec<(bool, usize)>,
         no_name: usize,
         named_record_fields: usize,
         spreads: usize,
@@ -649,6 +654,10 @@ mod tests {
     }
 
     impl crate::listener::ParserListener for LiteralLog {
+        fn begin_literal_set_or_map(&mut self, _: TokenSpan, const_keyword: Option<TokenSpan>) {
+            self.begins
+                .push((const_keyword.is_some(), self.int_literals));
+        }
         fn handle_recoverable_error(&mut self, message: Message, _: TokenSpan, _: TokenSpan) {
             self.errors.push(message.code.name.to_owned());
         }
@@ -804,6 +813,36 @@ mod tests {
         let mut p = literal_parser("[for (final x in xs) x]");
         let _ = p.parse_list_literal(None);
         assert_eq!(p.listener.for_control_flow, 0);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
+
+    #[test]
+    fn begin_set_or_map_fires_once_before_elements() {
+        // #747: the begin event fires right after `{`, before any element
+        // event (the semantic window must open before the elements fold),
+        // once per literal — nested literals begin their own.
+        let mut p = literal_parser("{1, 1}");
+        let _ = p.parse_set_or_map_literal(None);
+        assert_eq!(p.listener.begins, vec![(false, 0)]);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+
+        let mut p = literal_parser("{{1}, {2}}");
+        let _ = p.parse_set_or_map_literal(None);
+        // Three literals, three begins, each before its own elements: the
+        // outer (0 ints), `{1}` (still 0 — its begin precedes its int), and
+        // `{2}` (1 int, from `{1}`'s element).
+        assert_eq!(p.listener.begins, vec![(false, 0), (false, 0), (false, 1)]);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
+
+    #[test]
+    fn begin_set_or_map_carries_const_keyword() {
+        // `const {1, 1}` (official `parseConstExpression` :9043): the begin
+        // event carries the const keyword so the semantic face can scope
+        // the duplicate window to non-const literals only.
+        let mut p = literal_parser("const {1, 1}");
+        let _ = p.parse_const_expression();
+        assert_eq!(p.listener.begins, vec![(true, 0)]);
         assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
     }
 

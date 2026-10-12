@@ -930,12 +930,19 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     // ------------------------------------------------------------------
 
     /// Official `parseConditionalExpressionRest`; the cursor sits on the `?`.
+    /// The then-arm boundary rides [`ParserListener::end_conditional_expression_then_arm`]
+    /// (the official dead-arm rows span the arm's own range); the else arm's
+    /// start is derivable at `endConditionalExpression` from the colon.
     fn parse_conditional_expression_rest(&mut self) -> TokenSpan {
         let question = self.peek_span();
         self.cursor.advance();
         self.listener.begin_conditional_expression(question);
+        let then_begin = self.peek_span();
         let _ = self.parse_expression_without_cascade();
+        let then_end = self.last_consumed_span();
         let colon = self.expect_lexeme_but_got(":");
+        self.listener
+            .end_conditional_expression_then_arm(question, then_begin, colon, then_end);
         self.listener.handle_conditional_expression_colon();
         let end = self.parse_expression_without_cascade();
         self.listener
