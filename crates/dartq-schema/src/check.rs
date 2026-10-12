@@ -2,7 +2,7 @@
 //! the RPC `schema_version` stamp. Each row is `check_row`
 //! (`crates/dartq-daemon/src/commands.rs:957-983`): compact mirrors the CLI
 //! machine line's field set (severity / type / code / file / position /
-//! length / message, code in dartq's stable snake_case spelling) as JSON;
+//! length / message, code in dartq's stable `snake_case` spelling) as JSON;
 //! the minimal tier keeps the red line (`code` + the file locator). The
 //! envelope is the shared `session_answer` shape (commands.rs:1008, 1045):
 //! `schema_version` (the daemon stamps `dartq_commands::SCHEMA_VERSION`,

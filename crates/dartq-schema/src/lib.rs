@@ -218,9 +218,9 @@
 //! short-id table over the rows' file paths). The two views (disk
 //! pipeline, agent overlay) emit the same row shape.
 //!
-//! Analyze answer entries (the daemon's `dartq/analyze`; the entry's code
-//! + locator are the red line — LSP positions, zero-based, unlike the CLI
-//! faces' 1-based rows):
+//! Analyze answer entries (the daemon's `dartq/analyze`; the entry's
+//! code + locator are the red line — LSP positions, zero-based, unlike
+//! the CLI faces' 1-based rows):
 //!
 //! | field                    | minimal | compact | full |
 //! |--------------------------|---------|---------|------|

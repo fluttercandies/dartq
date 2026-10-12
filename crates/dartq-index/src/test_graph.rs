@@ -46,6 +46,11 @@ use std::path::Path;
 /// The basename suffix that marks a test file (PRD §15.4's fallback signal).
 const TEST_SUFFIX: &str = "_test.dart";
 
+/// The basename index behind the naming fallback: basename -> each
+/// candidate's (defining directory, library id), borrowed from the caller's
+/// identity table through `'a`.
+type BasenameIndex<'a> = FxHashMap<&'a str, Vec<(Option<&'a Path>, u32)>>;
+
 /// The inverted `test_of` edges: which test libraries test each library.
 ///
 /// Storage is the dependency-subgraph CSR form — `offsets[lib] ..
@@ -87,7 +92,7 @@ impl TestGraph {
         // does). Keys borrow the caller's table through 'a — no copies;
         // values pair each candidate's defining directory with its id (the
         // sibling rule resolves against the directory).
-        let mut by_basename: Option<FxHashMap<&'a str, Vec<(Option<&'a Path>, u32)>>> = None;
+        let mut by_basename: Option<BasenameIndex<'a>> = None;
         // Per-tested-library rows, inverted from per-test edges.
         let mut rows: Vec<Vec<u32>> = vec![Vec::new(); library_count];
         for lib in 0..count {
@@ -108,8 +113,7 @@ impl TestGraph {
             targets.dedup();
             if targets.is_empty() && !stem.is_empty() {
                 let index = by_basename.get_or_insert_with(|| {
-                    let mut map: FxHashMap<&'a str, Vec<(Option<&'a Path>, u32)>> =
-                        FxHashMap::default();
+                    let mut map: BasenameIndex<'a> = FxHashMap::default();
                     for other in 0..count {
                         if let Some(identity) = identity_of(other) {
                             let path = Path::new(identity);

@@ -20,7 +20,7 @@
 //!   workspace and references of a declaration — the `query symbol` CLI
 //!   pair (#123).
 //! * **Test graph** ([`TestGraph`]): the inverted `test_of` edges from test
-//!   files to the libraries they test (PRD §15.4) — the AffectedTests join
+//!   files to the libraries they test (PRD §15.4) — the `AffectedTests` join
 //!   of the impact query, in the same CSR posture over the caller's library
 //!   id space.
 //!

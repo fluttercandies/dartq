@@ -322,10 +322,10 @@ impl PluginHosts {
     /// teardown quality does not affect the run's outcome.
     pub fn shutdown(self) {
         for host in self.hosts {
-            if let Some(runtime) = host.runtime {
-                if let Err(error) = runtime.shutdown() {
-                    eprintln!("dartq: plugin `{}` shutdown failed: {error}", host.name);
-                }
+            if let Some(runtime) = host.runtime
+                && let Err(error) = runtime.shutdown()
+            {
+                eprintln!("dartq: plugin `{}` shutdown failed: {error}", host.name);
             }
         }
     }
@@ -419,12 +419,12 @@ pub fn collect_set(
         };
         let parsed = parse_unit(&text, unit_features(table.as_ref(), path));
         let hits: Vec<Lint> = run(&parsed.unit(Some(path)), set);
-        let fixes = from_lints(&hits, &text, &parsed.lines);
+        let patches = from_lints(&hits, &text, &parsed.lines);
         let plugin = dispatch_fixes(hosts, path, &text, &parsed.lines, &hits);
-        if !fixes.is_empty() || !plugin.is_empty() {
+        if !patches.is_empty() || !plugin.is_empty() {
             out.push(FileFixSet {
                 path: path.display().to_string(),
-                fixes,
+                fixes: patches,
                 plugin,
             });
         }
@@ -452,8 +452,10 @@ fn unit_features(table: Option<&PackageTable>, path: &Path) -> Features {
     let version = table
         .and_then(|table| table.containing(&normalize_path(path)))
         .and_then(|identity| identity.language_version)
-        .map(dartq_pub::LanguageVersion::into_inner)
-        .unwrap_or(DEFAULT_LANGUAGE_VERSION);
+        .map_or(
+            DEFAULT_LANGUAGE_VERSION,
+            dartq_pub::LanguageVersion::into_inner,
+        );
     features_for(version)
 }
 
@@ -890,6 +892,12 @@ pub fn patch_json(set: &FileFixSet, verbosity: Verbosity) -> serde_json::Value {
 /// anchored edits (the anchor drops at the minimal tier); the hosts that
 /// could not serve the request answer in `errors` (omitted when empty,
 /// §15.7).
+///
+/// # Panics
+///
+/// Panics if a constructed assist row is not a JSON object — impossible
+/// by construction (`json!` builds the object literal); the expect pins
+/// that invariant.
 #[must_use]
 pub fn assists_json(answer: &AssistAnswer, verbosity: Verbosity) -> serde_json::Value {
     let anchored = verbosity != Verbosity::Minimal;

@@ -117,7 +117,7 @@ pub(crate) fn validate_analyze(value: &Value) -> Result<(), SchemaViolation> {
         if let Some(severity) = obj.get("severity") {
             let sp = join(&p, "severity");
             let value = integer(severity, &sp)?;
-            if !matches!(value, 1 | 2 | 3) {
+            if !matches!(value, 1..=3) {
                 return Err(violation(sp, "the integer 1, 2, or 3", value.to_string()));
             }
         }

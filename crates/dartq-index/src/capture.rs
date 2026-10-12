@@ -990,7 +990,7 @@ impl ParserListener for Capturer<'_, '_> {
         };
         match context {
             C::TopLevelVariableDeclaration => {
-                builder.commit(name, DeclKind::TopLevelVar, token.range)
+                builder.commit(name, DeclKind::TopLevelVar, token.range);
             }
             C::FieldDeclaration | C::EnumValueDeclaration => {
                 builder.commit(name, DeclKind::Field, token.range);
