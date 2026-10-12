@@ -170,6 +170,114 @@ fn pairing_rejects_mismatched_end() {
 }
 
 #[test]
+fn nested_try_catch_deferred_seal_pairs() {
+    // #991: the deferred-seal listener shape — `endCatchClause` closes only
+    // the catch parameters, the CatchClause node spans the body block and
+    // seals at `handleCatchBlock` (official fasta ordering). The builder
+    // stack must pair through a try statement nested in the catch body:
+    // each clause's payload patches land while that clause is top-of-stack
+    // (innermost first), and the outer statement seals only after its
+    // clause. The reported panic came from a listener that lost the outer
+    // clause to shared flag state, never from this stack.
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    // Token indices follow the real source: 0 try, 1{ 2}, 3 catch, 4( 5e
+    // 6), 7{ 8 try, 9{ 10}, 11 catch, 12( 13e2 14), 15{ 16 rethrow 17;
+    // 18}, 19}, 20 EOF.
+    b.begin(NodeKind::TryStatement, 0);
+    b.begin(NodeKind::Block, 1); // try body
+    b.end(NodeKind::Block, 3);
+    b.begin(NodeKind::CatchClause, 3); // seal deferred; body parses open
+    b.begin(NodeKind::Block, 7); // catch body
+    b.begin(NodeKind::TryStatement, 8); // the nested try
+    b.begin(NodeKind::Block, 9); // inner try body
+    b.end(NodeKind::Block, 11);
+    b.begin(NodeKind::CatchClause, 11); // seal deferred
+    b.begin(NodeKind::Block, 15); // inner catch body
+    b.begin(NodeKind::RethrowStatement, 16);
+    b.end(NodeKind::RethrowStatement, 18);
+    b.end(NodeKind::Block, 19);
+    // Innermost seal first: inner clause patches + seals while top-of-stack.
+    b.patch(0, 11); // `catch` keyword
+    b.patch(1, TOKEN_NONE); // no stack-trace comma
+    b.end(NodeKind::CatchClause, 19); // end_last: the body block's end
+    b.patch(0, TOKEN_NONE); // no `finally`
+    b.end(NodeKind::TryStatement, 19); // end_incl: inner body's `}`
+    b.end(NodeKind::Block, 20);
+    // Then the outer clause: its patches land with it top-of-stack.
+    b.patch(0, 3);
+    b.patch(1, TOKEN_NONE);
+    b.end(NodeKind::CatchClause, 20);
+    b.patch(0, TOKEN_NONE);
+    b.end(NodeKind::TryStatement, 20);
+    b.end(NodeKind::CompilationUnit, 20);
+    let ast = b.finish();
+
+    // Post-order: try-body Block 0, inner chain 1..5, outer body Block 6,
+    // outer CatchClause 7, outer TryStatement 8, unit 9.
+    assert_eq!(ast.len(), 10);
+    assert_eq!(ast.root(), Some(9));
+    assert_eq!(ast.kind(0), NodeKind::Block);
+    assert_eq!(ast.kind(1), NodeKind::Block);
+    assert_eq!(ast.kind(2), NodeKind::RethrowStatement);
+    assert_eq!(ast.kind(3), NodeKind::Block);
+    assert_eq!(ast.kind(4), NodeKind::CatchClause);
+    assert_eq!(ast.kind(5), NodeKind::TryStatement);
+    assert_eq!(ast.kind(6), NodeKind::Block);
+    assert_eq!(ast.kind(7), NodeKind::CatchClause);
+    assert_eq!(ast.kind(8), NodeKind::TryStatement);
+
+    // Contiguous child ranges through the nesting.
+    assert_eq!(ast.children(9), 0..9);
+    assert_eq!(ast.children(8), 0..8);
+    assert_eq!(ast.children(7), 1..7, "the clause spans its whole body");
+    assert_eq!(ast.children(6), 1..6);
+    assert_eq!(ast.children(5), 1..5);
+    assert_eq!(ast.children(4), 2..4);
+
+    // Spans and payload words patched at the right stack depth.
+    assert_eq!(ast.token_range(0), 1..3);
+    assert_eq!(ast.token_range(2), 16..18);
+    assert_eq!(ast.token_range(4), 11..19);
+    assert_eq!(ast.token_range(5), 8..19);
+    assert_eq!(ast.token_range(8), 0..20);
+    assert!(ast.payload(2).is_empty(), "rethrow is width-0");
+    assert_eq!(ast.payload(4), &[11, TOKEN_NONE]);
+    assert_eq!(ast.payload(5), &[TOKEN_NONE]);
+    assert_eq!(ast.payload(7), &[3, TOKEN_NONE]);
+    assert_eq!(ast.payload(8), &[TOKEN_NONE]);
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn unsealed_catch_clause_rejects_try_statement_end() {
+    // The exact #991 mispairing as seen at the builder boundary: a listener
+    // that tracks the deferred CatchClause seal in shared state loses the
+    // outer clause when a nested catch clears it, so the enclosing
+    // TryStatement end fires while the outer CatchClause is still open.
+    // The pairing table must refuse this loudly — the repair belongs in the
+    // listener, and this tripwire keeps the builder from ever papering over
+    // such listener bugs with a silent tolerance.
+    let result = std::panic::catch_unwind(|| {
+        let mut b = AstBuilder::new();
+        b.begin(NodeKind::CompilationUnit, 0);
+        b.begin(NodeKind::TryStatement, 0);
+        b.begin(NodeKind::CatchClause, 3); // seal deferred, never delivered
+        b.patch(0, 3);
+        b.patch(1, TOKEN_NONE);
+        b.end(NodeKind::TryStatement, 20);
+    });
+    let message = result
+        .err()
+        .and_then(|payload| payload.downcast_ref::<String>().cloned())
+        .expect("the mispaired end must panic");
+    assert!(
+        message.contains("does not pair with open CatchClause"),
+        "unexpected panic: {message}"
+    );
+}
+
+#[test]
 fn pairing_table_shape() {
     use NodeKind::*;
     // Same-kind pairing is the default.

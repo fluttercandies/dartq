@@ -591,6 +591,17 @@ impl ParserListener for Collector {
     fn end_catch_clause(&mut self, _: Token) {
         self.log.push(("end", "catch_clause"));
     }
+    fn handle_catch_block(
+        &mut self,
+        _: Option<Token>,
+        _: Option<Token>,
+        _: Option<Token>,
+    ) {
+        self.log.push(("handle", "catch_block"));
+    }
+    fn handle_finally_block(&mut self, _: Token) {
+        self.log.push(("handle", "finally_block"));
+    }
     fn begin_switch_statement(&mut self, _: Token) {
         self.log.push(("begin", "switch_statement"));
     }

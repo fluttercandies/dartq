@@ -194,6 +194,153 @@ fn try_catch_on_finally() {
 }
 
 #[test]
+fn nested_try_inside_catch_body() {
+    // #991 regression anchor: the well-formed input that tripped a pairing
+    // panic in a deferred-seal listener. The event contract the listener
+    // must implement: `end_catch_clause` closes only the parameters, the
+    // catch body parses between it and `handle_catch_block`, and every
+    // nested statement's events interleave strictly inside that window —
+    // so each `handle_catch_block` lands while its own CatchClause is the
+    // innermost open node, innermost clause first.
+    let c = parse("void f() { try {} catch (e) { try {} catch (e2) { rethrow; } } }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "try_statement"),
+        ("begin", "catch_clause"),
+        ("end", "catch_clause"),
+        ("begin", "block"),
+        ("begin", "try_statement"),
+        ("begin", "catch_clause"),
+        ("end", "catch_clause"),
+        ("begin", "block"),
+        ("begin", "rethrow_statement"),
+        ("end", "rethrow_statement"),
+        ("end", "block"),
+        ("handle", "catch_block"),
+        ("end", "try_statement"),
+        ("end", "block"),
+        ("handle", "catch_block"),
+        ("end", "try_statement"),
+    ]);
+}
+
+#[test]
+fn triple_nested_try_inside_catch_bodies() {
+    // Depth 3 of the #991 shape: each level's `handle_catch_block` seals
+    // its own clause before the enclosing level's, with the events of the
+    // innermost statement fully contained by every enclosing window.
+    let c = parse(
+        "void f() { try {} catch (a) { try {} catch (b) { try {} catch (c) { rethrow; } } } }",
+    );
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "try_statement"),
+        ("begin", "catch_clause"),
+        ("end", "catch_clause"),
+        ("begin", "block"),
+        ("begin", "try_statement"),
+        ("begin", "catch_clause"),
+        ("end", "catch_clause"),
+        ("begin", "block"),
+        ("begin", "try_statement"),
+        ("begin", "catch_clause"),
+        ("end", "catch_clause"),
+        ("begin", "block"),
+        ("begin", "rethrow_statement"),
+        ("end", "rethrow_statement"),
+        ("end", "block"),
+        ("handle", "catch_block"),
+        ("end", "try_statement"),
+        ("handle", "catch_block"),
+        ("end", "try_statement"),
+        ("end", "block"),
+        ("handle", "catch_block"),
+        ("end", "try_statement"),
+    ]);
+}
+
+#[test]
+fn nested_catch_with_stack_trace_parameter() {
+    // The `catch (e, s)` form at both nesting levels: the comma-bearing
+    // parameter list must not disturb the clause window or the rethrow
+    // inside the inner body.
+    let c = parse("void f() { try {} catch (e, s) { try {} catch (e2, s2) { rethrow; } } }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "try_statement"),
+        ("begin", "catch_clause"),
+        ("end", "catch_clause"),
+        ("begin", "block"),
+        ("begin", "try_statement"),
+        ("begin", "catch_clause"),
+        ("end", "catch_clause"),
+        ("begin", "block"),
+        ("begin", "rethrow_statement"),
+        ("end", "rethrow_statement"),
+        ("end", "block"),
+        ("handle", "catch_block"),
+        ("end", "try_statement"),
+        ("end", "block"),
+        ("handle", "catch_block"),
+        ("end", "try_statement"),
+    ]);
+}
+
+#[test]
+fn nested_try_inside_finally_body() {
+    // Same-shape risk probe: a try statement nested in the finally body.
+    // The nested statement completes entirely inside the finally block's
+    // events; `handle_finally_block` fires after that block parses and
+    // before the enclosing statement seals.
+    let c = parse("void f() { try {} finally { try {} catch (e) {} } }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "try_statement"),
+        ("begin", "block"),
+        ("begin", "try_statement"),
+        ("begin", "catch_clause"),
+        ("end", "catch_clause"),
+        ("end", "block"),
+        ("handle", "catch_block"),
+        ("end", "try_statement"),
+        ("end", "block"),
+        ("handle", "finally_block"),
+        ("end", "try_statement"),
+    ]);
+}
+
+#[test]
+fn rethrow_inside_nested_catch_parses_clean() {
+    // W2 rethrow fence, legal side: `rethrow` inside a (nested) catch body
+    // builds the statement node with zero diagnostics at the parser layer.
+    let c = parse("void f() { try {} catch (e) { try {} catch (e2) { rethrow; } } }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "catch_clause"),
+        ("end", "catch_clause"),
+        ("begin", "block"),
+        ("begin", "rethrow_statement"),
+        ("end", "rethrow_statement"),
+        ("end", "block"),
+        ("handle", "catch_block"),
+    ]);
+}
+
+#[test]
+fn rethrow_outside_catch_is_not_a_parser_error() {
+    // W2 rethrow fence, boundary side: the catch-only restriction is a
+    // resolver (semantic) check — the official `parseRethrowStatement`
+    // carries no clause context, so the parser builds the node and reports
+    // nothing here either.
+    let c = parse("void f() { rethrow; }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[
+        ("begin", "rethrow_statement"),
+        ("end", "rethrow_statement"),
+    ]);
+}
+
+#[test]
 fn switch_statement_with_pattern_cases() {
     let c = parse("void f() { switch (o) { case 1: a; case int x when x > 0: b; default: c; } }");
     assert!(c.errors.is_empty(), "{:?}", c.errors);
