@@ -626,6 +626,7 @@ const DART_CORE_FACE: &[&str] = &[
     "Map",
     "MapEntry",
     "Match",
+    "Never",
     "NoSuchMethodError",
     "Null",
     "Object",

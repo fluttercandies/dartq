@@ -1091,6 +1091,12 @@ struct Engine<'a> {
     guard: UndefinedGuard<'a>,
     report: FileReport,
     rows: Vec<Row>,
+    /// Unresolved-name rows a creation fold removed from `rows` (the fold
+    /// truncates the stack above the callee so the folded receiver owns it).
+    /// The oracle resolves an instance creation's arguments regardless of the
+    /// fold, so their undefined-family verdicts still owe a pass-2 report —
+    /// merged back into [`Engine::resolve_rows`] by offset.
+    deferred_miss_rows: Vec<Row>,
     frames: Vec<Frame>,
     /// In-scope type parameters, outermost first (truncated per frame).
     type_params: Vec<StringId>,
@@ -1099,6 +1105,14 @@ struct Engine<'a> {
     /// after the type variables, official `parseClassOrNamedMixinApplication`),
     /// so they park here and drain into the frame that owns them.
     pending_type_params: Vec<StringId>,
+    /// Row-stack height when the current header's `begin_type_variables`
+    /// fired: the span holding the header's own bound rows. A bound can
+    /// reference a parameter declared *after* it (`T extends U, U extends
+    /// num` — the whole list is in scope, official element building binds
+    /// every name before the deferred bound types resolve), so the rows
+    /// parked parameters justify on frame open truncate back to here, never
+    /// to the frame's own mark.
+    pending_rows_mark: usize,
     /// The armed declared type: `handle_type`/`handle_void_keyword` arm,
     /// `handle_no_type` disarms. Consumed by declaration bindings and by the
     /// executable return-type latches.
@@ -2035,6 +2049,8 @@ impl<'a> Engine<'a> {
             frames: Vec::new(),
             type_params: Vec::new(),
             pending_type_params: Vec::new(),
+            pending_rows_mark: 0,
+            deferred_miss_rows: Vec::new(),
             bounds: Bounds::new(),
             pending_bounded_checks: Vec::new(),
             raw_type_sites: Vec::new(),
@@ -2412,6 +2428,24 @@ impl<'a> Engine<'a> {
         let type_mark = self.type_params.len();
         let row_mark = self.rows.len();
         let pending = std::mem::take(&mut self.pending_type_params);
+        // The header's bound rows parse before their variables' frame opens
+        // and can name a parameter declared after them (`T extends U, U
+        // extends num` — the whole list is in scope in every bound, official
+        // element building binds all names before the deferred bound types
+        // resolve). A still-missing type use of a now-joined parameter was
+        // the parameter all along, not an undefined class — the same
+        // rewrite `push_type_parameter` runs for frames already open,
+        // bounded to this header's own rows.
+        let header_mark = self.pending_rows_mark.min(row_mark);
+        for name in &pending {
+            for row in &mut self.rows[header_mark..] {
+                if row.name == *name
+                    && matches!(row.shape, RowShape::TypeUse(TypeVerdict::Missing, false))
+                {
+                    row.shape = RowShape::Value;
+                }
+            }
+        }
         self.type_params.extend(pending);
         self.frames.push(Frame {
             kind,
@@ -3174,8 +3208,11 @@ impl<'a> Engine<'a> {
             || self.non_type_pos > 0
             || self.pattern_depth > 0
             // An in-scope type parameter shadows any container of the same
-            // name; a parameter is never a raw generic use.
+            // name; a parameter is never a raw generic use (a header's
+            // parked parameters included — its bound parses inside the
+            // header).
             || self.type_params.contains(&name)
+            || self.pending_type_params.contains(&name)
         {
             return;
         }
@@ -5785,7 +5822,10 @@ impl<'a> Engine<'a> {
                 ty: self.typed_local(name).unwrap_or(Ty::UNKNOWN),
             };
         }
-        if self.type_params.contains(&name) {
+        if self.type_params.contains(&name) || self.pending_type_params.contains(&name) {
+            // A still-parked parameter belongs to the header being parsed:
+            // its own bound and its later siblings' bounds are in scope from
+            // its declaration (`class C<T extends A<T>>`).
             return BareInfo::Plain {
                 ty: Ty::named(name),
             };
@@ -8365,7 +8405,21 @@ impl<'a> Engine<'a> {
             self.rows.get(callee).map(|r| r.shape.clone()),
             Some(RowShape::Bare(BareInfo::Container { .. }))
         ) {
-            self.rows.truncate(callee + 1);
+            // The fold drops the rows above the callee (the folded receiver
+            // must own the stack for a following `.member` / operator
+            // merge), but an unresolved-name row in the dropped span still
+            // owes its report: the oracle resolves an instance creation's
+            // arguments regardless of the fold, so its bare/type misses
+            // (`B(x)`, `new Missing<int>(x)`) defer to pass 2 instead of
+            // dying here.
+            for row in self.rows.drain(callee + 1..) {
+                if matches!(
+                    row.shape,
+                    RowShape::Bare(BareInfo::Missing { .. }) | RowShape::TypeUse(..)
+                ) {
+                    self.deferred_miss_rows.push(row);
+                }
+            }
             let folded = self.rows.get(callee).and_then(|row| match &row.shape {
                 RowShape::Bare(BareInfo::Container { name, kind }) => {
                     Some((*name, *kind, row.range))
@@ -8809,9 +8863,13 @@ impl<'a> Engine<'a> {
     /// A type head's declared type-parameter count: `dynamic` and type
     /// parameters declare none, a container keeps its own count, a
     /// typedef/function keeps its declaration's; anything unresolved is
-    /// `None` (suppress — `undefined_class` already reports).
+    /// `None` (suppress — `undefined_class` already reports). A header's
+    /// parked parameters count as none while their header parses.
     fn declared_type_params(&self, name: StringId) -> Option<u16> {
-        if self.builtin_types.contains(&name) || self.type_params.contains(&name) {
+        if self.builtin_types.contains(&name)
+            || self.type_params.contains(&name)
+            || self.pending_type_params.contains(&name)
+        {
             return Some(0);
         }
         match self.resolve_bare(name) {
@@ -9978,14 +10036,32 @@ impl<'a> Engine<'a> {
     fn resolve_rows(&mut self) {
         self.build_ur_sites();
         let rows = std::mem::take(&mut self.rows);
+        let mut deferred = std::mem::take(&mut self.deferred_miss_rows);
+        deferred.sort_by_key(|row| row.range.offset);
+        // The fold-deferred rows interleave by offset: their emissions keep
+        // the report's source order (later merges assume it).
+        let mut index = 0usize;
         for row in &rows {
-            match &row.shape {
-                RowShape::Bare(info) => self.resolve_bare_row(row, *info),
-                RowShape::Member { recv } => self.resolve_member_row(row, *recv),
-                RowShape::Receiver(recv) => self.resolve_receiver_row(row, *recv),
-                RowShape::TypeUse(..) => self.resolve_type_row(row),
-                RowShape::Value => {}
+            while index < deferred.len() && deferred[index].range.offset <= row.range.offset {
+                self.resolve_row(&deferred[index]);
+                index += 1;
             }
+            self.resolve_row(row);
+        }
+        for deferred_row in &deferred[index..] {
+            self.resolve_row(deferred_row);
+        }
+    }
+
+    /// One row's pass-2 dispatch (shared by the main stack and the
+    /// fold-deferred rows).
+    fn resolve_row(&mut self, row: &Row) {
+        match &row.shape {
+            RowShape::Bare(info) => self.resolve_bare_row(row, *info),
+            RowShape::Member { recv } => self.resolve_member_row(row, *recv),
+            RowShape::Receiver(recv) => self.resolve_receiver_row(row, *recv),
+            RowShape::TypeUse(..) => self.resolve_type_row(row),
+            RowShape::Value => {}
         }
     }
 
@@ -13156,7 +13232,10 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_type_variables(&mut self, _token: Token) {
         let mut engine = self.engine.borrow_mut();
         // A new header started: a previous declaration's parked variables
-        // never met their frame (a typedef's, say) — drop them.
+        // never met their frame (a typedef's, say) — drop them. The header's
+        // own row span opens with it (its bounds' rows justify against the
+        // parked parameters at frame open).
+        engine.pending_rows_mark = engine.rows.len();
         engine.pending_type_params.clear();
         // The header's bound counts open with it.
         engine.open_type_variables();
@@ -17105,6 +17184,41 @@ mod tests {
         assert_eq!(report.diagnostics[0].message, "Undefined name 'nose'.");
     }
 
+    /// An unresolved identifier inside a creation's argument list still
+    /// reports: the oracle resolves an instance creation's arguments
+    /// (`ArgumentList`'s expressions) regardless of the fold, so `B(x)` with
+    /// a defined const-constructible `B` co-fires the undefined name with
+    /// the creation's own const rows (3.13.1 oracle probe,
+    /// /tmp probe package: only `UNDEFINED_IDENTIFIER` at the `x`; the
+    /// const-eval rows at `o.length`/`x` — `CONST_EVAL_TYPE_STRING`,
+    /// `CONST_WITH_NON_CONSTANT_ARGUMENT` — sit outside the undefined
+    /// family).
+    ///
+    /// Hand-trace: `B` resolves as a `BareInfo::Container` callee, so
+    /// `consume_send` folds the creation and drops the rows above the
+    /// callee — the argument's `BareInfo::Missing` read defers to pass 2
+    /// instead of dying with the fold. `class int {}`/`class String {}`
+    /// follow the harness convention (core names are modeled through
+    /// concrete declarations — `BUILTIN_TYPES` carries only `dynamic`);
+    /// the member keeps the `o.length` initializer's walk silent, since a
+    /// local declaration shadows the external-primitive member face.
+    #[test]
+    fn creation_argument_miss_reports_undefined_identifier() {
+        let report = report(
+            "class int {} class String { final int length = 0; } \
+             class B { final l; const B(String o) : l = o.length; } const y = B(x);",
+        );
+        assert_eq!(code_names(&report), ["undefined_identifier"]);
+        let d = &report.diagnostics[0];
+        assert_eq!(d.message, "Undefined name 'x'.");
+        let prefix = "class int {} class String { final int length = 0; } \
+             class B { final l; const B(String o) : l = o.length; } const y = B(";
+        assert_eq!(d.range.offset, u32::try_from(prefix.len()).unwrap());
+        assert_eq!(d.range.length, 1);
+        assert_eq!(report.names[0].use_kind, NameUse::Read);
+        assert!(!report.names[0].qualified);
+    }
+
     /// An invocation-callee miss is `undefined_function`; a bare read stays
     /// `undefined_identifier` (`foo;` never opens an argument group).
     ///
@@ -17150,6 +17264,47 @@ mod tests {
         assert_eq!(code_names(&report), ["undefined_class"]);
         assert_eq!(report.diagnostics[0].message, "Undefined class 'Missing'.");
         assert_eq!(report.names[0].use_kind, NameUse::Type);
+    }
+
+    /// A declaration header's type parameters scope over its own bounds:
+    /// the parameter's own bound (`T extends A<T>` — the pinned 3.13.1
+    /// oracle on enum_instantiated_to_bounds_is_not_well_bounded.dart fires
+    /// no `undefined_class`) and a parameter declared after the reference
+    /// (`T extends U, U extends num` — the whole list is in scope in every
+    /// bound). Neither the bound's type argument nor the enum element's
+    /// explicit arguments report here.
+    ///
+    /// Hand-trace: `T` parks in `pending_type_params` while its header
+    /// parses (no frame is open yet), so `resolve_bare` answers `Plain` for
+    /// `A<T>`'s argument; `U`'s row — pushed `Missing` before `U`'s own
+    /// `begin_type_variable` — rewrites to `Value` when the frame joins the
+    /// parked parameters. `Never` and `int` are modeled through concrete
+    /// declarations (the harness convention): the enum element's explicit
+    /// type arguments walk file-local classes, and the 3.13.1 oracle probe
+    /// fires no undefined-family row on either case — its only rows on the
+    /// enum case are the bounded-ness pair
+    /// (`ENUM_INSTANTIATED_TO_BOUNDS_IS_NOT_WELL_BOUNDED` at `v`,
+    /// `TYPE_ARGUMENT_NOT_MATCHING_BOUNDS` at the `Never` argument), which
+    /// sit outside the undefined family; the forward-reference case is
+    /// oracle-clean.
+    #[test]
+    fn header_bounds_scope_their_own_parameters() {
+        let enum_case = report(
+            "class int {} typedef A<X> = X Function(X); class Never {} \
+             enum E<T extends A<T>, U> { v<Never, int>() }",
+        );
+        assert!(
+            code_names(&enum_case).is_empty(),
+            "{:?}",
+            code_names(&enum_case)
+        );
+
+        let forward = report("class num {} class C<T extends U, U extends num> {}");
+        assert!(
+            code_names(&forward).is_empty(),
+            "{:?}",
+            code_names(&forward)
+        );
     }
 
     /// `new C()` on a defined class is silent; `new Missing()` is the
