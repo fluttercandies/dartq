@@ -188,21 +188,28 @@ impl Ty {
                     nullable: false, ..
                 },
             ) => Some(false),
-            // Same name, both non-nullable: assignable modulo type
-            // arguments. The arguments are now *represented*
-            // ([`Ty::Named`]'s slot) but still not consulted: invariance
-            // stays the suppression direction until the consumption ticket
-            // wires the hierarchy in (`List<int>` vs `List<num>` is `None`,
-            // never a decidable `false`).
+            // Same name, both non-nullable: assignable when the written
+            // argument lists coincide — canonical interning makes the slot
+            // comparison structural (`List<int>` vs `List<int>` across
+            // interning orders), and the argument-less fast path is the
+            // reserved-slot constant. Differing arguments need the pool to
+            // compare element-wise; this pool-less method hands the pair to
+            // the caller — [`crate::diagnose`]'s `Engine::assignable` runs
+            // the covariant element rule through the boundary pool — and
+            // every other caller gets the under-report direction.
             (
-                Ty::Named { name: a, .. },
+                Ty::Named {
+                    name: a,
+                    args: a_args,
+                    ..
+                },
                 Ty::Named {
                     name: b,
                     nullable: false,
-                    ..
+                    args: b_args,
                 },
             ) => {
-                if a == b {
+                if a == b && a_args == b_args {
                     Some(true)
                 } else {
                     None
@@ -280,7 +287,7 @@ impl ArgPool {
     /// Interns one list and returns its canonical slot. The empty list is
     /// the reserved slot `0` and never interns; a dedup hit reuses the
     /// stored slot without appending.
-    fn intern(&mut self, args: &[Ty]) -> ArgListId {
+    pub(crate) fn intern(&mut self, args: &[Ty]) -> ArgListId {
         if args.is_empty() {
             return ArgListId::EMPTY;
         }
@@ -895,5 +902,39 @@ mod tests {
         assert_eq!(fix.render(nullable_list), "List<int>?");
         assert_eq!(fix.render(Ty::Dynamic), "dynamic");
         assert_eq!(fix.render(Ty::Unknown), "");
+    }
+
+    /// The same-name assignability face consults the slot: identical
+    /// written arguments answer `Some(true)` regardless of interning
+    /// order (canonical ids), differing arguments defer to the
+    /// pool-owning caller (`None` here — never a decidable false), and
+    /// every nullability verdict is unchanged.
+    #[test]
+    fn same_name_assignability_compares_the_argument_slot() {
+        let mut fix = Fix::new();
+        let (int, string) = (Ty::named(fix.int), Ty::named(fix.string));
+        let list_int = fix.pool.named(fix.list, false, &[int]);
+        // A second intern of the same written list lands on one slot.
+        let list_int_again = fix.pool.named(fix.list, false, &[int]);
+        let list_string = fix.pool.named(fix.list, false, &[string]);
+        let list_intq = fix.pool.named(fix.list, true, &[int]);
+
+        assert_eq!(list_int_again.assignable_from(list_int), Some(true));
+        assert_eq!(list_int.assignable_from(list_int_again), Some(true));
+        assert_eq!(list_string.assignable_from(list_int), None);
+        assert_eq!(list_int.assignable_from(list_string), None);
+
+        // Nullability still decides on its own, arguments aside.
+        assert_eq!(list_intq.assignable_from(list_int), Some(true));
+        assert_eq!(list_int.assignable_from(list_intq), Some(false));
+        // Argument-less named pairs keep the pre-slot identity.
+        assert_eq!(Ty::named(fix.list).assignable_from(Ty::named(fix.list)), Some(true));
+
+        // Nested arguments compare through their own canonical slots.
+        let nested_a = fix.pool.named(fix.map, false, &[string, list_int]);
+        let nested_b = fix.pool.named(fix.map, false, &[string, list_int_again]);
+        assert_eq!(nested_b.assignable_from(nested_a), Some(true));
+        let nested_c = fix.pool.named(fix.map, false, &[string, list_string]);
+        assert_eq!(nested_c.assignable_from(nested_a), None);
     }
 }

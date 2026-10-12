@@ -28,10 +28,11 @@
 //!
 //! # The capture
 //!
-//! The semantic model is name-level (`model::Ty` carries no type
-//! arguments), so the structures this face needs — the written bound of
-//! each declared type parameter and the written type arguments at each
-//! explicit site — are captured as [`TypeTree`]s from the parse events
+//! The model's declared-type slots carry canonical argument lists (#611),
+//! but the structures this face needs — the written *bound* of each
+//! declared type parameter, the per-site argument subtrees it checks, and
+//! the shapes the slot cannot represent (function types, record types,
+//! a headless group) — are captured as [`TypeTree`]s from the parse events
 //! while a bound window (a `<...>` type-variables group) or a container
 //! header window (extends/with/implements clauses) is open. The engine
 //! routes `handle_type` and the group events into the open sink; any

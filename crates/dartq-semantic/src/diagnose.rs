@@ -225,6 +225,7 @@
 //!
 //! * Assignability trio: literals carry their final-primitive types and
 //!   [`Engine::assignable`] extends [`Ty::assignable_from`] with the
+//!   covariant written-argument rule and the
 //!   final-primitive table (a value of one final primitive never fits
 //!   another; `int`/`double` fit `num`; `int`→`double` is the oracle's
 //!   literal conversion — `analyzeIntLiteral`'s `convertToDouble`, decided
@@ -1091,6 +1092,16 @@ impl<'a> Boundary<'a> {
             .borrow_mut()
             .insert((owner, name), projected.clone());
         projected
+    }
+
+    /// Interns one written argument list into the diagnosing pool. The
+    /// unit capture freezes at collect time, so the pass's own written
+    /// arguments (#611 consumption — the armed-head fold) intern here: the
+    /// same pool every comparison and render resolves through, keeping the
+    /// slots single-universe. Elements carry their slots already (trees
+    /// fold bottom-up), matching the collector's intern order.
+    fn intern_list(&self, args: &[Ty]) -> crate::model::ArgListId {
+        self.args.borrow_mut().intern(args)
     }
 }
 
@@ -5768,19 +5779,27 @@ impl<'a> Engine<'a> {
 
     /// One written argument subtree as a body-level [`Ty`]: the head
     /// canonicalizes like the annotation head (`dynamic`/`void`/`Null`),
-    /// deeper arguments stay unrepresented (the pool is capture-immutable;
-    /// the null-argument face only needs the argument's identity and
-    /// nullability).
-    fn tree_arg_ty(strings: &StringTable, tree: &crate::capture::TypeTree) -> Ty {
-        match strings.resolve(tree.head) {
-            "dynamic" => Ty::Dynamic,
-            "void" => Ty::Void,
-            "Null" => Ty::Null,
-            _ => Ty::Named {
-                name: tree.head,
-                nullable: tree.nullable,
-                args: ArgListId::EMPTY,
-            },
+    /// and the subtree interns bottom-up into the boundary pool (#611) so
+    /// nested written arguments compare structurally. A poisoned subtree
+    /// keeps the name-only shape — its deeper structure is recovery
+    /// residue, never a written fact.
+    fn tree_ty(&self, tree: &crate::capture::TypeTree) -> Ty {
+        match self.strings.resolve(tree.head) {
+            "dynamic" => return Ty::Dynamic,
+            "void" => return Ty::Void,
+            "Null" => return Ty::Null,
+            _ => {}
+        }
+        let args = if tree.poisoned {
+            ArgListId::EMPTY
+        } else {
+            let args: Vec<Ty> = tree.args.iter().map(|arg| self.tree_ty(arg)).collect();
+            self.boundary.intern_list(&args)
+        };
+        Ty::Named {
+            name: tree.head,
+            nullable: tree.nullable,
+            args,
         }
     }
 
@@ -6515,7 +6534,7 @@ impl<'a> Engine<'a> {
             {
                 continue;
             }
-            if Self::override_broken(entry, &inherited) {
+            if self.override_broken(entry, &inherited) {
                 broken_seen.push(inherited.clone());
                 let display = self.strings.resolve(spelling);
                 let display = display.strip_suffix('=').unwrap_or(display);
@@ -7882,7 +7901,7 @@ impl<'a> Engine<'a> {
         let has_valid = list.iter().enumerate().any(|(i, a)| {
             list.iter()
                 .enumerate()
-                .all(|(j, b)| i == j || !Self::override_broken(&a.entry, &b.entry))
+                .all(|(j, b)| i == j || !self.override_broken(&a.entry, &b.entry))
         });
         if has_valid {
             return false;
@@ -8148,7 +8167,7 @@ impl<'a> Engine<'a> {
                     h.name == bare && h.entry.kind == MemberKind::Field && !h.entry.is_final
                 }));
             }
-            let Some(specific) = Self::most_specific(&hits) else {
+            let Some(specific) = self.most_specific(&hits) else {
                 continue;
             };
             let Some(concrete) = self.inherited_concrete_implementation(decl, view, *name) else {
@@ -8163,7 +8182,7 @@ impl<'a> Engine<'a> {
             if concrete.entry.ptr() == specific.entry.ptr() {
                 continue;
             }
-            if !Self::override_broken(&concrete.entry, &specific.entry) {
+            if !self.override_broken(&concrete.entry, &specific.entry) {
                 continue;
             }
             let display = self.strings.resolve(*name);
@@ -8193,11 +8212,11 @@ impl<'a> Engine<'a> {
     /// validly overrides every other hit (the oracle's interface-map
     /// selection at name level). `None` when the candidates do not
     /// linearize — conflict territory.
-    fn most_specific<'e>(hits: &[&'e FaceEntry<'e>]) -> Option<&'e FaceEntry<'e>> {
+    fn most_specific<'e>(&self, hits: &[&'e FaceEntry<'e>]) -> Option<&'e FaceEntry<'e>> {
         hits.iter().copied().find(|candidate| {
             hits.iter().all(|other| {
                 std::ptr::eq(*candidate, *other)
-                    || !Self::override_broken(&candidate.entry, &other.entry)
+                    || !self.override_broken(&candidate.entry, &other.entry)
             })
         })
     }
@@ -8534,11 +8553,14 @@ impl<'a> Engine<'a> {
     /// The name-level signature verdict: `true` only when the equal-kind
     /// members are decuably incompatible — a positional-arity mismatch, a
     /// named-parameter set mismatch, or a nullability-decidable type
-    /// conflict. An incomparable type pair ([`Ty::assignable_from`]'s
-    /// `None`) suppresses: two distinct named types could still relate
-    /// through an unseen subclass edge, and an untyped shape declares
-    /// nothing to compare.
-    fn override_broken(declared: &MemberEntry, inherited: &MemberEntry) -> bool {
+    /// conflict. The type faces run the full M1 assignability
+    /// ([`Engine::assignable`]: covariant written arguments, the
+    /// final-primitive edges — the inherited member was boundary-projected,
+    /// so both sides compare through one pool). An incomparable type pair
+    /// (`None`) suppresses: two types a subclass relation could still
+    /// relate never report, and an untyped shape declares nothing to
+    /// compare.
+    fn override_broken(&self, declared: &MemberEntry, inherited: &MemberEntry) -> bool {
         // A field's face is its declared type; every executable's is its
         // return type.
         let member_ty = |e: &MemberEntry| {
@@ -8578,7 +8600,7 @@ impl<'a> Engine<'a> {
                 // Parameter types are contravariant: the declared parameter
                 // must accept the inherited parameter's values.
                 for (d, i) in a.positional.iter().zip(&b.positional) {
-                    match d.ty.assignable_from(i.ty) {
+                    match self.assignable(i.ty, d.ty, false) {
                         Some(false) => return true,
                         Some(true) => {}
                         None => return false,
@@ -8588,7 +8610,7 @@ impl<'a> Engine<'a> {
                     let Some(i) = b.named_formal(d.name) else {
                         return false;
                     };
-                    match d.ty.assignable_from(i.ty) {
+                    match self.assignable(i.ty, d.ty, false) {
                         Some(false) => return true,
                         Some(true) => {}
                         None => return false,
@@ -8602,7 +8624,7 @@ impl<'a> Engine<'a> {
         // The result type is covariant: the declared result must fit the
         // inherited one.
         matches!(
-            member_ty(inherited).assignable_from(member_ty(declared)),
+            self.assignable(member_ty(declared), member_ty(inherited), false),
             Some(false)
         )
     }
@@ -9029,6 +9051,21 @@ impl<'a> Engine<'a> {
         // getter/field read discards here (`_check`'s property-extraction
         // face, the accessor unwrap included).
         self.ur_register(member.range.offset);
+        // The merged read's declared type (#611 consumption): an instance
+        // field read through a classified receiver carries the field's
+        // written type — the same member face `resolve_bare` types the
+        // implicit-`this` bare name with, boundary-projected so the slot
+        // stays single-pool (`super.` skips the own member map). Getters,
+        // statics, and unresolvable chains stay `Unknown` (under-report).
+        let ty = match &recv {
+            Receiver::This { container, .. } => self.member_declared_ty(*container, member.name),
+            Receiver::Super { container, .. } => match self.walk_super(*container, member.name) {
+                Walk::Found(entry) if entry.kind == MemberKind::Field => entry.var_ty,
+                _ => Ty::UNKNOWN,
+            },
+            Receiver::Typed { type_name, .. } => self.member_declared_ty(*type_name, member.name),
+            _ => Ty::UNKNOWN,
+        };
         self.push_row(Row {
             name: member.name,
             range: member.range,
@@ -9036,7 +9073,7 @@ impl<'a> Engine<'a> {
             shape: RowShape::Member { recv },
             intent: member.intent,
             write_op: member.write_op,
-            ty: Ty::UNKNOWN,
+            ty,
         });
     }
 
@@ -9857,7 +9894,7 @@ impl<'a> Engine<'a> {
             let args = tree
                 .args
                 .iter()
-                .map(|arg| Self::tree_arg_ty(self.strings, arg))
+                .map(|arg| self.tree_ty(arg))
                 .collect();
             self.completed_group = Some((tree.head, tree.range.offset, args));
             self.pending_bounded_checks.push(PendingBoundedCheck::Site {
@@ -10764,8 +10801,10 @@ impl<'a> Engine<'a> {
     /// `double`), so `from_literal` — whether the source row is a
     /// primitive literal — decides: `double d = 1;` is clean, `double d =
     /// intVar;` reports (a non-literal expression keeps type `int`; the
-    /// conversion keys on the literal, never the value). `None` suppresses
-    /// (under-report).
+    /// conversion keys on the literal, never the value). Same-head pairs
+    /// with differing written arguments run the covariant element rule
+    /// through the boundary pool ([`Engine::covariant_args`]). `None`
+    /// suppresses (under-report).
     fn assignable(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
         if let Some(verdict) = to.assignable_from(from) {
             // The strict-casts overlay (`type_system.dart:891-930`: with
@@ -10783,21 +10822,23 @@ impl<'a> Engine<'a> {
             Ty::Named {
                 name: from_name,
                 nullable: false,
-                ..
+                args: from_args,
             },
             Ty::Named {
                 name: to_name,
                 nullable: false,
-                ..
+                args: to_args,
             },
         ) = (from, to)
         else {
             return None;
         };
-        if from_name == to_name
-            || !self.primitive_ids.contains(&from_name)
-            || !self.primitive_ids.contains(&to_name)
-        {
+        if from_name == to_name {
+            // Same head, differing written arguments: the covariant
+            // interface rule decides through the boundary pool.
+            return self.covariant_args(from_args, to_args);
+        }
+        if !self.primitive_ids.contains(&from_name) || !self.primitive_ids.contains(&to_name) {
             return None;
         }
         let (int, double, num) = (
@@ -10814,6 +10855,37 @@ impl<'a> Engine<'a> {
             return Some(from_literal);
         }
         Some(false)
+    }
+
+    /// The covariant interface rule for one generic head —
+    /// `<C<S…>> C <: <C<T…>> C` needs every `S` to fit its `T`
+    /// (`subtype.dart`'s interface case): `List<int>` fits `List<num>`,
+    /// `List<num>` does not fit `List<int>`. The two slots reached here
+    /// through one boundary pool (own types intern in the seeded pool,
+    /// foreign ones project), so unequal ids mean genuinely differing
+    /// written arguments, and each element verdict re-enters
+    /// [`Engine::assignable`] — nested heads recurse, the primitive edges
+    /// and the strict-casts overlay apply to elements unchanged. One
+    /// decidable mismatch breaks the pair; one undecidable element (a
+    /// distinct-name pair an unseen subclass edge could still relate)
+    /// suppresses the whole — the under-report direction. An arity
+    /// mismatch is the wrong_number family's written residue; the
+    /// assignability face stays silent on it.
+    fn covariant_args(&self, from: ArgListId, to: ArgListId) -> Option<bool> {
+        let pool = self.boundary.pool();
+        let (from, to) = (pool.get(from), pool.get(to));
+        if from.len() != to.len() {
+            return None;
+        }
+        let mut unknown = false;
+        for (&f, &t) in from.iter().zip(to.iter()) {
+            match self.assignable(f, t, false) {
+                Some(false) => return Some(false),
+                Some(true) => {}
+                None => unknown = true,
+            }
+        }
+        (!unknown).then_some(true)
     }
 
     /// A primitive-literal row: [`Engine::push_primitive_row`] is the only
@@ -14921,6 +14993,17 @@ impl ParserListener for DiagnoseListener<'_> {
             Some((group_head, group_offset, args))
                 if group_head == leaf_id && group_offset == name.range.offset =>
             {
+                // The written arguments join the armed head (#611): the
+                // list interns into the boundary pool and the just-armed
+                // name-only head carries the canonical slot, so every
+                // downstream face (return latches, parameter bindings,
+                // cast targets) compares the written shape instead of a
+                // bare name. The same list keeps feeding the
+                // written-argument channel.
+                let slot = engine.boundary.intern_list(&args);
+                if let Some(Ty::Named { args: armed, .. }) = &mut engine.armed_ty {
+                    *armed = slot;
+                }
                 engine.pending_type_args = args;
             }
             other => {
@@ -21903,7 +21986,16 @@ mod tests {
             "class int {} class String {} class A { String f() => 'x'; } \
              class B extends A { int f() => 1; }",
         );
-        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        // The result-covariance face runs the full M1 assignability: two
+        // final primitives are decidable (`int` is no subtype of `String`),
+        // so this reports — the oracle's verdict — instead of suppressing
+        // the way the pool-less `Ty::assignable_from` did.
+        assert_eq!(
+            code_names(&rep),
+            ["invalid_override"],
+            "{:?}",
+            code_names(&rep)
+        );
     }
 
     /// Static members take no part in overriding: a static inherited
@@ -25944,6 +26036,132 @@ mod tests {
             ["unnecessary_no_such_method"],
             "{:?}",
             code_names(&rep)
+        );
+    }
+
+    // —— #611 consumption: written type arguments join the verdicts ————
+    // The harness has no dart:core, so every source declares the core
+    // stubs its shapes use — otherwise the undefined-class noise drowns
+    // the face under test.
+
+    /// The assignment face consults written arguments: `List<num>` does not
+    /// fit `List<int>` (the `num`→`int` element is a decidable
+    /// final-primitive mismatch), so the member-read source reports against
+    /// the declared target.
+    #[test]
+    fn argument_mismatch_reports_invalid_assignment() {
+        let report = report(
+            "class int {} class num {} class List<T> {} \
+             class A { List<num> a = []; } \
+             class B { List<int> b = []; } \
+             void f(A x, B y) { y.b = x.a; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["invalid_assignment"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The covariant direction stays clean: `List<int>` fits `List<num>`.
+    #[test]
+    fn covariant_arguments_stay_clean() {
+        let report = report(
+            "class int {} class num {} class List<T> {} \
+             class A { List<int> a = []; } \
+             class B { List<num> b = []; } \
+             void f(A x, B y) { y.b = x.a; }",
+        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// Distinct non-primitive arguments suppress: an unseen subclass edge
+    /// could still relate `T1` and `T2`, so the element verdict is `None`
+    /// and the face keeps the under-report direction.
+    #[test]
+    fn unseen_hierarchy_arguments_suppress() {
+        let report = report(
+            "class List<T> {} class T1 {} class T2 {} \
+             class A { List<T1> a = []; } \
+             class B { List<T2> b = []; } \
+             void f(A x, B y) { y.b = x.a; }",
+        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// The return face runs the same rule.
+    #[test]
+    fn argument_mismatch_reports_return_of_invalid_type() {
+        let report = report(
+            "class int {} class num {} class List<T> {} \
+             class A { List<num> a = []; } \
+             List<int> f(A x) { return x.a; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["return_of_invalid_type"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The argument face runs the same rule.
+    #[test]
+    fn argument_mismatch_reports_argument_type_not_assignable() {
+        let report = report(
+            "class int {} class num {} class List<T> {} \
+             class A { List<num> a = []; } \
+             void g(List<int> x) {} \
+             void f(A y) { g(y.a); }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["argument_type_not_assignable"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The override face's contravariance consults arguments: a declared
+    /// `List<int>` parameter does not accept the inherited `List<num>`
+    /// values. The covariant declaration (`List<num>` over `List<int>`)
+    /// stays clean.
+    #[test]
+    fn argument_mismatch_breaks_override_contravariance() {
+        let broken = report(
+            "class int {} class num {} class List<T> {} \
+             class S { void m(List<num> x) {} } \
+             class C extends S { void m(List<int> x) {} }",
+        );
+        assert_eq!(
+            code_names(&broken),
+            ["invalid_override"],
+            "{:?}",
+            code_names(&broken)
+        );
+        let clean = report(
+            "class int {} class num {} class List<T> {} \
+             class S { void m(List<int> x) {} } \
+             class C extends S { void m(List<num> x) {} }",
+        );
+        assert!(code_names(&clean).is_empty(), "{:?}", code_names(&clean));
+    }
+
+    /// The cast faces see structural equality: the identical written type
+    /// is an unnecessary cast, the mismatched one is live.
+    #[test]
+    fn unnecessary_cast_stays_argument_exact() {
+        let report = report(
+            "class int {} class num {} class List<T> {} \
+             class A { List<int> a = []; } \
+             void f(A x) { x.a as List<int>; x.a as List<num>; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["unnecessary_cast"],
+            "{:?}",
+            code_names(&report)
         );
     }
 }
