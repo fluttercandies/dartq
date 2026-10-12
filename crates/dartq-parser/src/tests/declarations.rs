@@ -1049,3 +1049,159 @@ fn class_head_paren_off_matches_oracle_face_set() {
     assert_eq!(c2.texts[3], "Unexpected text '('.");
     assert_eq!(c2.errors[4], ("expected_executable".to_string(), 12, 17));
 }
+
+/// (code, start, end) rows in emission order for `source`.
+fn rows(source: &'static str) -> Vec<(String, u32, u32)> {
+    let (table, text) = scan_ok(source);
+    let mut p = Parser::new(
+        text,
+        table,
+        latest_features(),
+        super::collector::Collector::default(),
+    );
+    p.parse_unit();
+    p.listener.errors.clone()
+}
+
+/// Top-level name-slot synthetic identifier cascade (#949). When a member
+/// parse commits a type (type arguments force commitment;
+/// `computeType(required: false)` alone only commits when an identifier
+/// follows) or carries a `var`/`final`/`const` keyword, a junk token at the
+/// name slot reports `missing_identifier` and a zero-width synthetic name
+/// splices in before the junk (official `insertSyntheticIdentifier`,
+/// parser_impl.dart:4056/:4367). The member parse then cascades against the
+/// junk follower: `ensureSemicolon` anchors `expected_token ';'` on the
+/// previous non-zero-width token (findPreviousNonZeroLengthToken over the
+/// zero-width synthetic), the unit loop restarts on the leftover junk
+/// (`expected_executable`, consumed), and the tail parses as a no-type
+/// field (`missing_const_final_var_or_type` on its name).
+///
+/// The dart analyze printer sorts ties by message text (dartdev
+/// analyze.dart:681-705: severity, file, line, character, message), so the
+/// same-offset `expected_executable` ("Expected a method, ...") always
+/// prints before `missing_identifier` ("Expected an identifier."); the
+/// emission order below is the parser's natural cascade order and the
+/// engine's oracle sort (analyze.rs) reproduces the printed face.
+///
+/// 3.13.1 oracle rows, machine format (0-based offsets below):
+///
+/// * `void<int>? y;` — 5 rows (ticket #949 face): the 4-row pre-cascade
+///   face plus `missing_identifier` (9|10) at the `?`.
+/// * `void<int> ;` — the cascade terminates in-member: `missing_identifier`
+///   (10|11) at the `;`, which then completes the field; no restart rows.
+/// * `void<int>?? y;` — the `??` token spans both cascade rows
+///   (`missing_identifier` 9|11 and `expected_executable` 9|11).
+/// * `void<int> x, ?y;` — comma-list junk name: the context recovery
+///   consumes the `?` in doubt and splices the synthetic after it
+///   (TopLevelDeclarationIdentifierContext, identifier_context_impl.dart:
+///   1338-1345), so `missing_identifier` (13|14) and the walked-back
+///   `expected_token` (13|14) both anchor on the `?` and no restart fires.
+/// * `void<int>?;` — `unexpected_token` (10|11) on the `;` restart.
+#[test]
+fn top_level_name_slot_synthetic_identifier_cascade() {
+    assert_eq!(
+        rows("void<int>? y;\n"),
+        vec![
+            ("missing_identifier".to_string(), 9, 10),
+            ("void_with_type_arguments".to_string(), 4, 5),
+            ("expected_token".to_string(), 8, 9),
+            ("expected_executable".to_string(), 9, 10),
+            ("missing_const_final_var_or_type".to_string(), 11, 12),
+        ],
+        "void<int>? y; cascade face"
+    );
+    assert_eq!(
+        rows("void<int> ;\n"),
+        vec![
+            ("missing_identifier".to_string(), 10, 11),
+            ("void_with_type_arguments".to_string(), 4, 5),
+        ],
+        "void<int> ; terminates in-member"
+    );
+    assert_eq!(
+        rows("void<int>?? y;\n"),
+        vec![
+            ("missing_identifier".to_string(), 9, 11),
+            ("void_with_type_arguments".to_string(), 4, 5),
+            ("expected_token".to_string(), 8, 9),
+            ("expected_executable".to_string(), 9, 11),
+            ("missing_const_final_var_or_type".to_string(), 12, 13),
+        ],
+        "void<int>?? y; spans both rows on the ?? token"
+    );
+    assert_eq!(
+        rows("void<int> x, ?y;\n"),
+        vec![
+            ("void_with_type_arguments".to_string(), 4, 5),
+            ("missing_identifier".to_string(), 13, 14),
+            ("expected_token".to_string(), 13, 14),
+            ("missing_const_final_var_or_type".to_string(), 14, 15),
+        ],
+        "void<int> x, ?y; comma-list junk name consumes the ?"
+    );
+    assert_eq!(
+        rows("void<int>?;\n"),
+        vec![
+            ("missing_identifier".to_string(), 9, 10),
+            ("void_with_type_arguments".to_string(), 4, 5),
+            ("expected_token".to_string(), 8, 9),
+            ("expected_executable".to_string(), 9, 10),
+            ("unexpected_token".to_string(), 10, 11),
+        ],
+        "void<int>?; restart face"
+    );
+}
+
+/// Boundary faces of the cascade: without a committed type or a
+/// `var`/`final`/`const` keyword the name-slot insert stays silent (the
+/// junk becomes the fields face's type-position anchor); without a type
+/// attempt at all the member dispatcher handles the junk without reaching
+/// the insert arm; and the class-member parser owns its own recovery —
+/// the top-level cascade must not leak into it.
+///
+/// 3.13.1 oracle rows, machine format (0-based offsets below):
+///
+/// * `late ;` / `int;` — `missing_const_final_var_or_type` is the only row.
+/// * `var ;` — the keyword arm reports `missing_identifier` (4|5) at the
+///   `;` and `parseFields` skips the missing-type face (keyword present).
+/// * `? y;` — the dispatcher's invalid-declaration recovery reports
+///   `expected_executable` (0|1) and consumes the `?`; no insert fires.
+/// * `class C { void<int>? m; }` — the class-member face (five rows at the
+///   `?`/body) is unaffected by the top-level cascade.
+#[test]
+fn top_level_name_slot_cascade_boundaries() {
+    assert_eq!(
+        rows("late ;\n"),
+        vec![("missing_const_final_var_or_type".to_string(), 0, 4)],
+        "late ; silent insert"
+    );
+    assert_eq!(
+        rows("int;\n"),
+        vec![("missing_const_final_var_or_type".to_string(), 0, 3)],
+        "int; silent insert"
+    );
+    assert_eq!(
+        rows("var ;\n"),
+        vec![("missing_identifier".to_string(), 4, 5)],
+        "var ; keyword arm reports"
+    );
+    assert_eq!(
+        rows("? y;\n"),
+        vec![
+            ("expected_executable".to_string(), 0, 1),
+            ("missing_const_final_var_or_type".to_string(), 2, 3),
+        ],
+        "? y; dispatcher recovery, no insert"
+    );
+    assert_eq!(
+        rows("class C { void<int>? m; }\n"),
+        vec![
+            ("missing_keyword_operator".to_string(), 19, 20),
+            ("invalid_operator".to_string(), 19, 20),
+            ("missing_method_parameters".to_string(), 19, 20),
+            ("missing_function_body".to_string(), 21, 22),
+            ("missing_const_final_var_or_type".to_string(), 21, 22),
+        ],
+        "class member face unaffected by the top-level cascade"
+    );
+}

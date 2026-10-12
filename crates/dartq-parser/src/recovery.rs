@@ -268,9 +268,6 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         // leave posture so the caller's cascade stands (oracle
         // `class C { new = 42; }`: two rows at the `42`).
         self.report(msg::missing_identifier(), peek.span);
-        let id = self
-            .cursor
-            .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
         let leave_for_grammar = matches!(
             peek.kind,
             TokenKind::Comma
@@ -286,6 +283,32 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                 | TokenKind::CloseCurly
                 | TokenKind::Eof
         ) || self.looks_like_statement_start_at(0);
+        // Branch 3 for the variable-name contexts
+        // (TopLevelDeclarationIdentifierContext:1338-1345 and
+        // FieldDeclarationIdentifierContext:493-501): non-keep-set junk is
+        // consumed in doubt and the synthetic splices in AFTER it
+        // (`rewriter.insertSyntheticIdentifier(identifier)` — the junk lands
+        // behind the parse pointer), so a following ensureSemicolon's
+        // findPreviousNonZeroLengthToken walk-back anchors on the junk token
+        // itself (oracle `void<int> x, ?y;`: the `?` is absorbed by the
+        // member and `expected_token ';'` anchors at the `?`).
+        if !leave_for_grammar
+            && matches!(
+                context,
+                crate::listener::IdentifierContext::TopLevelVariableDeclaration
+                    | crate::listener::IdentifierContext::FieldDeclaration
+            )
+        {
+            let junk_end = peek.span.range.offset + peek.span.range.length;
+            self.cursor.advance();
+            let id = self
+                .cursor
+                .insert_synthetic(TokenKind::Identifier, junk_end);
+            return self.span_of(id);
+        }
+        let id = self
+            .cursor
+            .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
         if leave_for_grammar {
             // Branch 2: the official `insertSyntheticIdentifier(token)`
             // (token_stream_rewriter.dart:238) inserts after the anchor and

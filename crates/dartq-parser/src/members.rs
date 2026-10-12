@@ -161,14 +161,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     // insertSyntheticIdentifier then fall-through — the
                     // synthetic flows into parseFields as the name token,
                     // parser_impl.dart:4367/:4398, so the name slot must not
-                    // re-report). The report follows the probed oracle split:
-                    // with a `var`/`final`/`const` modifier the face is the
-                    // inserted-name `missing_identifier` (`var ;` probe), and
-                    // without one (`late ;`, `int ;`) the member-level insert
-                    // stays silent — `parseFields`' missing-type face is the
-                    // only row.
+                    // re-report). The report fires exactly when the
+                    // declaration will carry a type or a `var`/`final`/`const`
+                    // keyword (official insertSyntheticIdentifier,
+                    // parser_impl.dart:4056, is unconditional at this arm;
+                    // the probe-pinned 3.13.1 table splits on the fields face:
+                    // `var ;`/`final ;` (keyword, no type) and every
+                    // committed-type shape (`void<int>? y;`, `void<int> ;`)
+                    // report `missing_identifier` at the junk token, while
+                    // `late ;`/`int ;` (neither keyword nor committed type —
+                    // `computeType(required: false)` only commits when an
+                    // identifier follows) stay silent because the junk
+                    // becomes the fields face's type-position anchor:
+                    // missingConstFinalVarOrType is the only row.
                     let at = self.peek_span();
-                    if mods.var_final_or_const.is_some() {
+                    if mods.var_final_or_const.is_some() || !matches!(type_info, TypeInfo::NoType) {
                         self.report(msg::missing_identifier(), at);
                     }
                     let id = self

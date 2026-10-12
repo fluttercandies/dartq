@@ -39,9 +39,13 @@ pub struct ComplexTypeParamOrArg {
     /// group (the official parser splits it there, `splitCloser`,
     /// `type_info_impl.dart:1772`): the successor of `end` reads the split
     /// remainder, never a real token. `false` when the compound is shared
-    /// with enclosing groups (its *last* closer closes this group, so the
+    /// with enclosing groups (its *last* `>` closes this group, so the
     /// real successor follows).
     pub end_raw_compound: bool,
+    /// The official `inDeclaration` field: it gates the missing-comma
+    /// continuations (`looksLikeTypeParamOrArg`,
+    /// `type_info_impl.dart:512-521`) in both the scan and the parse.
+    pub in_declaration: bool,
 }
 
 impl TypeParamOrArg {
@@ -215,21 +219,32 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if let Some(closer) = simple1_closer(self, self.cursor.real_pos() + n) {
             return TypeParamOrArg::Simple1 { closer };
         }
-        // `<(`: only a group when the parenthesized content is a record
-        // type (type_info.dart:454-468).
+        // `<(`: only a group when `computeType(required: false)` commits an
+        // unrecovered record shape (type_info.dart:454-468) — the
+        // `computeRecordType` `!required` follower veto
+        // (`type_info_impl.dart:771-860`) is what keeps `<(int, int)>[]` a
+        // typed list literal while `<(int, int) x>[]` / `<(int, int)
+        // async>[]` / `<(int, int) Function>[]` are not type arguments at
+        // all (the follower `>` never accepts those shapes).
         if self.cursor.look_kind(n + 1) == TokenKind::OpenParen {
             let paren_id = self.real_id(self.cursor.real_pos() + n + 1);
-            let paired = self
+            let record = self
                 .cursor
                 .table_matching_end(paren_id)
                 .filter(|end| !self.cursor.resolve(*end).1)
-                .is_some_and(|end| {
-                    RecordProbe {
-                        open: self.offset_of(paren_id),
-                    }
-                    .looks_like_record_type(self, self.offset_of(end))
+                .is_some_and(|_| {
+                    let before = self.cursor.mark();
+                    self.cursor.jump_to(paren_id);
+                    let verdict = match self.compute_type(false, false) {
+                        TypeInfo::Complex(c) => {
+                            (c.is_record_type || c.gft_return_type_has_record_type) && !c.recovered
+                        }
+                        _ => false,
+                    };
+                    self.cursor.reset(before);
+                    verdict
                 });
-            if !paired {
+            if !record {
                 return TypeParamOrArg::None;
             }
         }
@@ -241,6 +256,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     end,
                     recovered,
                     end_raw_compound,
+                    in_declaration,
                 })
             }
             None => TypeParamOrArg::None,
@@ -444,6 +460,27 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     ));
                 }
                 _ => {
+                    // Official missing-comma continuation
+                    // (type_info_impl.dart:1399-1404): in a declaration an
+                    // identifier followed by another identifier, `,`, or a
+                    // closer reads as a missing comma — the junk is stepped
+                    // over as its own argument and the scan stays clean (no
+                    // recovered flag; `looksLikeTypeParamOrArg`,
+                    // :512-521, reads the raw IDENTIFIER kind, so
+                    // pseudo-keyword junk like `async` never qualifies).
+                    if in_declaration
+                        && self.kind_at(scan) == TokenKind::Identifier
+                        && (matches!(
+                            self.kind_at(scan + 1),
+                            TokenKind::Identifier | TokenKind::Comma
+                        ) || is_closer(self.kind_at(scan + 1)))
+                    {
+                        let len = self.skip_type_len(scan);
+                        if len > 0 {
+                            scan += len;
+                            continue;
+                        }
+                    }
                     // Recovery: declaration-style content missing commas —
                     // stop at the first non-member shape.
                     recovered = true;
@@ -826,6 +863,33 @@ impl ComplexTypeParamOrArg {
                     parser.listener.end_type_arguments(count, begin, end);
                     parser.leave_depth();
                     return end;
+                }
+                // Official `looksLikeTypeParamOrArg` + `parseMissingComma`
+                // (type_info_impl.dart:1462-1467, :512-521, :1595-1604): a
+                // real identifier followed by another identifier, `,`, or a
+                // closer reads as a missing comma — the report anchors on
+                // the junk token itself, a synthetic comma splices in, and
+                // the loop keeps parsing arguments.
+                if self.in_declaration
+                    && parser.peek_kind() == TokenKind::Identifier
+                    && (matches!(
+                        parser.cursor.look_kind(1),
+                        TokenKind::Identifier | TokenKind::Comma
+                    ) || is_closer(parser.cursor.look_kind(1)))
+                {
+                    let at = parser.peek_span();
+                    parser.report(msg::expected_but_got(","), at);
+                    parser.synthetic(TokenKind::Comma, at.range.offset);
+                    while parser.cursor.peek_id() as usize >= parser.table.len() {
+                        parser.cursor.advance();
+                    }
+                    if parser.cursor.at_eof() {
+                        end = parser.peek_span();
+                        parser.listener.end_type_arguments(count, begin, end);
+                        parser.leave_depth();
+                        return end;
+                    }
+                    continue;
                 }
                 // Recovery: jump to the scanner-paired closer of this group.
                 // Official anchor: `token` — the last consumed type

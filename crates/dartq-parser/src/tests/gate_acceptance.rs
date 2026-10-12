@@ -322,6 +322,146 @@ fn gft_chain_function_arm_group_scan_clean() {
     );
 }
 
+// —— `<(` literal type-argument family: computeRecordType's `!required`
+// follower veto at the group guard + the missing-comma continuations
+// (#941) ————————————————————————————————————————————————————————————————————
+
+/// The `<(` guard runs `computeType(required: false)` and commits the group
+/// only for an unrecovered record/GFT-record shape (type_info.dart:454-468).
+/// The `computeRecordType` `!required` follower veto
+/// (type_info_impl.dart:771-860) rejects a record whose follower after `)`
+/// (and an optional `?`) is an identifier not followed by a declaration
+/// boundary — `>`, the type-arg closer, is never in the acceptance set — so
+/// `<(...)` with junk shapes is not type arguments at all and `<` derails
+/// into the typed-literal recovery (expectedButGot('[') at the `<`, the
+/// live-probed `parenthesized_type_as_literal_type_arg_reports` sibling).
+/// Each shape then rides the relational/record-literal cascade below.
+///
+/// Faces are machinery-derived (every row from a live-validated link; the
+/// decision order mirrors _fe_analyzer_shared-91.0.0 == 3.15-main byte for
+/// byte); the serial-window oracle probe re-confirms them end to end.
+///
+/// * A `<(int, int) x>` — veto; `[<`-derail, walk-back `;` at `)`, junk
+///   member `x` (no-type field + walk-back), unit restarts on `>`, `[]`, `;`.
+/// * B `<(int, int) async>` — veto; the paren-group follower `async` reads
+///   as a function literal (`parseParenthesizedExpression...`: async arm),
+///   the body is missing at `>` and the comparison-chain row lands there.
+/// * C `<(int, int) Function>` — veto (pseudo-keyword `Function` is not the
+///   raw-identifier kind `looksLikeTypeParamOrArg` reads); record literal,
+///   then the junk-member restart cascade.
+#[test]
+fn lt_paren_follower_veto_derailed_faces() {
+    assert_eq!(
+        parse_rows("var x = <(int, int) x>[];\n"),
+        vec![
+            ("expected_token".to_string(), 8, 9),
+            ("expected_token".to_string(), 18, 19),
+            ("missing_const_final_var_or_type".to_string(), 20, 21),
+            ("expected_token".to_string(), 20, 21),
+            ("expected_executable".to_string(), 21, 22),
+            ("expected_executable".to_string(), 22, 24),
+            ("unexpected_token".to_string(), 24, 25),
+        ],
+        "veto shape A: junk identifier x after the record"
+    );
+    assert_eq!(
+        parse_rows("var x = <(int, int) async>[];\n"),
+        vec![
+            ("expected_token".to_string(), 8, 9),
+            ("missing_function_body".to_string(), 25, 26),
+            ("equality_cannot_be_equality_operand".to_string(), 25, 26),
+        ],
+        "veto shape B: async follower reads as a function literal"
+    );
+    assert_eq!(
+        parse_rows("var x = <(int, int) Function>[];\n"),
+        vec![
+            ("expected_token".to_string(), 8, 9),
+            ("expected_token".to_string(), 18, 19),
+            ("missing_const_final_var_or_type".to_string(), 20, 28),
+            ("expected_token".to_string(), 20, 28),
+            ("expected_executable".to_string(), 28, 29),
+            ("expected_executable".to_string(), 29, 31),
+            ("unexpected_token".to_string(), 31, 32),
+        ],
+        "veto shape C: bare Function follower"
+    );
+}
+
+/// A record-return GFT with a real identifier follower commits through the
+/// guard (computeRest's `!required` veto reads the token after the `()?`
+/// suffix), so D parses as type arguments and the junk `x` is a missing
+/// comma: `looksLikeTypeParamOrArg` (raw IDENTIFIER kind + identifier/`,`
+/// /closer follower) routes parseUnexpectedEnd's entry into parseMissingComma
+/// (type_info_impl.dart:1462-1467), which anchors expectedButGot(',') on the
+/// junk token and keeps parsing `x, int` as arguments. The scan-side twin
+/// (type_info_impl.dart:1399-1404) keeps the group unrecovered, so
+/// `f<...>(...)` method-type-args acceptance stays available.
+#[test]
+fn record_gft_missing_comma_anchors_on_the_junk() {
+    assert_eq!(
+        parse_rows("var x = <(int, int) Function() x, int>[];\n"),
+        vec![("expected_token".to_string(), 31, 32)],
+        "veto shape D: missing comma at x, then x and int parse as args"
+    );
+}
+
+/// Guard-rejection controls. n4 `(int) Function()?`: the single positional
+/// field without a comma fails the record content probe (the recovered flag
+/// of the official `_checkIfRecordTypeParenthesisAreRecovered` tail), so the
+/// group is rejected and `<` derails into the shared cascade. F6
+/// `List<(int) Function()>?`: the inner `<(` is rejected the same way, the
+/// outer group's lone argument is bare `List`, and parseUnexpectedEnd walks
+/// to the scanner-paired real outer `>` (start.endGroup is non-null) — one
+/// expectedAfterButGot('>') row anchored on the last consumed argument, then
+/// a clean `[]` literal; F6c shows the tail row when the derailed remainder
+/// reaches the statement end. V4/V5/V6 stay clean: real record shapes with
+/// `,`/`>`/`?` followers pass the veto.
+#[test]
+fn record_type_args_guard_rejection_controls() {
+    assert_eq!(
+        parse_rows("var x = <(int) Function()?>[];\n"),
+        vec![
+            ("expected_token".to_string(), 8, 9),
+            ("expected_token".to_string(), 13, 14),
+            ("missing_function_body".to_string(), 25, 26),
+            ("expected_executable".to_string(), 25, 26),
+            ("expected_executable".to_string(), 26, 27),
+            ("expected_executable".to_string(), 27, 29),
+            ("unexpected_token".to_string(), 29, 30),
+        ],
+        "n4: single-field record derails the literal"
+    );
+    assert_eq!(
+        parse_rows("var x = <List<(int) Function()>?>[];\n"),
+        vec![("expected_token".to_string(), 9, 13)],
+        "F6: inner rejection leaves one walk-to-endGroup row"
+    );
+    assert_eq!(
+        parse_rows("var x = <List<(int, int)>[]>;\n"),
+        vec![
+            ("expected_token".to_string(), 24, 25),
+            ("expected_token".to_string(), 28, 29),
+        ],
+        "F6b: valid inner record, junk [ tail after the outer group"
+    );
+    assert_eq!(
+        parse_rows("var x = <List<(int) Function()>[]>;\n"),
+        vec![
+            ("expected_token".to_string(), 9, 13),
+            ("expected_token".to_string(), 34, 35),
+        ],
+        "F6c: derailed tail reports the missing [ at the ;"
+    );
+    assert_eq!(parse_rows("var x = <(int, int)>[];\n"), vec![], "V4");
+    assert_eq!(
+        parse_rows("var x = <(int, int), String>[];\n"),
+        vec![],
+        "V5"
+    );
+    assert_eq!(parse_rows("var x = <(int, int)?>[];\n"), vec![], "V6");
+}
+
 /// The `void` arm rides the same computeRest chain through its
 /// `skip_type_len` delegation to the Function arm. 3.13.1 oracle probes:
 /// s3a/s3c zero rows; s3b's only row is the compile-time-tier
@@ -352,12 +492,10 @@ fn gft_chain_void_arm_group_scan_clean() {
 /// argument's end (parseUnexpectedEnd, type_info_impl.dart:1607-1730).
 /// 3.13.1 oracle rows, machine format:
 ///
-/// * `void<int>? y;` — VOID_WITH_TYPE_ARGUMENTS (1|5|1) at the `<`; the
+/// * `void<int>? y;` — MISSING_IDENTIFIER (1|10|1) at the `?` from the
+///   member-name slot, VOID_WITH_TYPE_ARGUMENTS (1|5|1) at the `<`, the
 ///   adjacent EXPECTED_TOKEN ';' (1|9|1), EXPECTED_EXECUTABLE (1|10|1) and
-///   MISSING_CONST_FINAL_VAR_OR_TYPE (1|12|1) row anchors match too. The
-///   oracle additionally reports MISSING_IDENTIFIER at the `?` from the
-///   member-name slot (a recovery cascade outside this family — not pinned
-///   here).
+///   MISSING_CONST_FINAL_VAR_OR_TYPE (1|12|1) row anchors match too.
 /// * `var x = <void<int>?, int>[];` — VOID_WITH_TYPE_ARGUMENTS (1|14|1) at
 ///   the inner `<` plus EXPECTED_TOKEN (1|18|1) on the inner `>`.
 #[test]
@@ -365,6 +503,7 @@ fn void_with_type_arguments_rows_anchor_after_void() {
     assert_eq!(
         parse_rows("void<int>? y;\n"),
         vec![
+            ("missing_identifier".to_string(), 9, 10),
             ("void_with_type_arguments".to_string(), 4, 5),
             ("expected_token".to_string(), 8, 9),
             ("expected_executable".to_string(), 9, 10),
