@@ -138,6 +138,15 @@ pub enum Ev {
     ForBegin {
         span: TokenSpan,
     },
+    /// `handle_for_initializer_*`: the C-style header's init/cond boundary —
+    /// the init's end, recorded when the initializer finishes. The index
+    /// boundary the header partition needs: an expression's events precede
+    /// its `ExprStmt` wrapper (the wrapper fires at the statement's end),
+    /// so a literal condition's value event sits BEFORE the wrapper the
+    /// offset scan keys on and is otherwise lost to the init region.
+    /// Deliberately unspanned: the partition takes it as a pure index
+    /// boundary, the offset scan stays wrapper-driven.
+    ForInit,
     /// `handle_for_loop_parts`: the C-style header separators; fires after
     /// the updaters have been recorded (source order).
     ForParts {
@@ -263,7 +272,13 @@ pub enum Ev {
     },
     NonNullAssert,
     UnaryPrefixAssign,
-    UnaryPostfixAssign,
+    /// Postfix `++`/`--` (`handleUnaryPostfixAssignmentExpression`): the
+    /// operator's end is the updater expression's end — the anchor the
+    /// dead-updater row needs (the part has no `ExprStmt`/`StmtEnd`
+    /// wrapper: the header parses bare `parse_expression` lists).
+    UnaryPostfixAssign {
+        end: u32,
+    },
     BinaryBegin {
         op: BinOp,
         /// The operator token: a dead right operand's row re-anchors at it

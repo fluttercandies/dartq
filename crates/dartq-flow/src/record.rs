@@ -1162,6 +1162,31 @@ impl ParserListener for Flow<'_> {
         });
     }
 
+    fn handle_unary_postfix_assignment_expression(&mut self, operator: Token) {
+        // The operator's end is the updater expression's end — the anchor
+        // the dead-updater row needs (header parts carry no statement
+        // wrapper, dead_code_verifier.dart:361-365's `updaters.endToken`).
+        self.record(Ev::UnaryPostfixAssign {
+            end: operator.range.end(),
+        });
+    }
+
+    fn handle_for_initializer_local_variable_declaration(&mut self, _end: Token, _for_in: bool) {
+        // The init/cond index boundary: the condition's expression events
+        // precede their `ExprStmt` wrapper (the wrapper fires at the
+        // statement's end), so a literal condition's value would fall into
+        // the init region of the offset-based header partition.
+        self.record(Ev::ForInit);
+    }
+
+    fn handle_for_initializer_expression_statement(&mut self, _end: Token, _for_in: bool) {
+        self.record(Ev::ForInit);
+    }
+
+    fn handle_for_initializer_empty_statement(&mut self, _at: Token) {
+        self.record(Ev::ForInit);
+    }
+
     fn handle_pattern_assignment(&mut self, _equals: Token) {
         self.record(Ev::PatternAssign);
     }

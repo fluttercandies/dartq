@@ -217,19 +217,29 @@ pub(crate) struct ForBounds {
     pub cond: Range<usize>,
     pub upd: Range<usize>,
     pub body: Range<usize>,
+    /// The right separator's end: the header/body containment boundary
+    /// for the loop's body close (an anchor past it is a body descendant,
+    /// one at or before it belongs to the header).
+    pub header_end: u32,
 }
 
 impl ForBounds {
-    /// Partitions the header. The buffer records all three header parts
-    /// BEFORE the `ForParts` marker (initializers, condition, updaters —
-    /// source-ordered), so the two separators' offsets slice them; the
-    /// body is everything between `ForParts` and `ForEnd`.
+    /// Partitions the header. The offset scan keys on the parts' spanned
+    /// wrapper events, but an expression's events PRECEDE its `ExprStmt`
+    /// wrapper (the wrapper fires at the statement's end), so a literal
+    /// condition's value event sits before anything spanned in its region.
+    /// The `ForInit` marker — recorded when the initializer finishes — is
+    /// therefore the init/cond index boundary and overrides the scan; the
+    /// cond/upd boundary stays offset-based (the right separator is the
+    /// first updater's token, and updater events carry its offset or a
+    /// postfix end at or after it).
     pub(crate) fn build(
         events: &[Ev],
         begin: usize,
         parts: usize,
         left: u32,
         right: u32,
+        header_end: u32,
         end: usize,
     ) -> Self {
         let mut cond_start = parts;
@@ -243,11 +253,18 @@ impl ForBounds {
                 }
             }
         }
+        for j in begin + 1..parts {
+            if matches!(events[j], Ev::ForInit) {
+                cond_start = j + 1;
+                break;
+            }
+        }
         Self {
             init: begin + 1..cond_start,
             cond: cond_start..upd_start,
             upd: upd_start..parts,
             body: parts + 1..end,
+            header_end,
         }
     }
 }
@@ -808,9 +825,36 @@ impl<'o> Interp<'o> {
             Covered::Body => window.depth >= self.stack.len(),
             Covered::Exec => true,
         };
+        self.close_covered(covers);
+    }
+
+    /// The C-style `for`'s body close (official `visitForStatement`'s
+    /// `flowEnd(node.body)`): `Covered::Strict` containment plus an anchor
+    /// AT the loop's own depth when it sits past the header end — the body
+    /// block's `{` and a non-block body statement carry the loop's frame
+    /// depth (the body keeps no frame of its own), while the condition's
+    /// anchor (same depth, before the separator) is not a body descendant
+    /// (dead_code_verifier.dart:453-459).
+    fn flow_end_body(&mut self, header_end: u32) {
+        let Some(window) = self.dead else {
+            return;
+        };
+        let covers = window.depth > self.stack.len()
+            || (window.depth == self.stack.len() && window.anchor.range.offset > header_end);
+        self.close_covered(covers);
+    }
+
+    /// Emits and clears the open dead-code interval when `covers` holds
+    /// (the shared tail of the close gates): a do-while split emits the
+    /// `while (c);` part first and the tail second, anything else one row
+    /// from the anchor to the interval's end.
+    fn close_covered(&mut self, covers: bool) {
         if !covers {
             return;
         }
+        let Some(window) = self.dead.take() else {
+            return;
+        };
         if let Some(while_part) = window.split {
             self.emit(FlowFact::DeadCode {
                 span: TokenSpan {
@@ -843,7 +887,6 @@ impl<'o> Interp<'o> {
                 },
             });
         }
-        self.dead = None;
     }
 
     /// Reads of definitely-unassigned locals (official `isUnassigned`). A
@@ -1334,6 +1377,7 @@ impl Interp<'_> {
             parts,
             left_sep.range.offset,
             right_sep.range.offset,
+            right_sep.range.end(),
             end,
         );
         self.replay_c_for(&bounds, events, match_of, false);
@@ -1379,8 +1423,29 @@ impl Interp<'_> {
             *cond_false = Some(if_false);
         }
         self.current = if_true;
+        // The official `for_conditionEnd` latch (dead_code_verifier.dart
+        // :344-354): whether a dead interval was already open when the
+        // condition ended. An interval anchored at the `for` itself (or at
+        // the header) keeps owning the reporting — the updaters never fire
+        // their own row (probe u5).
+        let had_dead = self.dead.is_some();
         // Body.
         self.run_range(events, bounds.body.clone(), match_of);
+        if !collection {
+            // The loop statement's close covers body intervals (official
+            // `visitForStatement`'s `flowEnd(node.body)`,
+            // type_analyzer.dart:3192, containment per
+            // dead_code_verifier.dart:453-459): an anchor inside the
+            // body's extent — the body block's `{` or a statement within —
+            // reports here, a wholly dead body block spanning its full
+            // extent `}` included; an anchor in the header or at the `for`
+            // itself is not a body descendant and the interval stays open
+            // for the outer covering close. The close runs BEFORE the
+            // updaters: the official row ends at the body's own end, so an
+            // updater's statement end never folds into a body row and a
+            // live tail after the loop stays row-free (probes u1/u6).
+            self.flow_end_body(bounds.header_end);
+        }
         // Updaters run on the back-edge state: join pending continues
         // first (official `forStatement_updaterBegin`).
         let continue_model = match &self.stack[frame] {
@@ -1388,14 +1453,52 @@ impl Interp<'_> {
             _ => None,
         };
         self.current = self.join(Some(self.current.clone()), continue_model);
+        // Official `for_updaterBegin` (dead_code_verifier.dart:357-375):
+        // updaters entered unreachable fire their own immediate row — from
+        // the first updater's begin token to the last one's end. The part
+        // carries no statement wrapper (the header parses a bare
+        // `parse_expression` list), so the begin comes from the first
+        // spanned event (an updater identifier's token) and the end from
+        // the postfix operators' ends. The row is independent of the
+        // body's: the official reports it without opening an interval, so
+        // the loop's exit path is unaffected (a live condition keeps the
+        // tail row-free, probe u3) and a wholly dead loop folds the
+        // updaters into its own row instead (probe u5).
+        if !self.reachable() && !had_dead {
+            let mut begin: Option<TokenSpan> = None;
+            let mut last: Option<u32> = None;
+            for event in &events[bounds.upd.clone()] {
+                if begin.is_none()
+                    && let Some(span) = event.span()
+                {
+                    begin = Some(span);
+                }
+                match *event {
+                    Ev::StmtEnd { end: stmt_end } | Ev::UnaryPostfixAssign { end: stmt_end } => {
+                        last = Some(last.map_or(stmt_end, |current| current.max(stmt_end)));
+                    }
+                    _ => {}
+                }
+            }
+            if let (Some(begin), Some(last)) = (begin, last)
+                && last > begin.range.offset
+            {
+                self.emit(FlowFact::DeadCode {
+                    span: TokenSpan {
+                        id: begin.id,
+                        range: SourceRange {
+                            offset: begin.range.offset,
+                            length: last - begin.range.offset,
+                        },
+                    },
+                });
+            }
+        }
         self.for_header_depth += 1;
         self.run_range(events, bounds.upd.clone(), match_of);
         self.for_header_depth = self.for_header_depth.saturating_sub(1);
         self.exprs.truncate(base);
         if !collection {
-            // The loop statement's end covers body intervals (official
-            // `visitForStatement`'s `flowEnd` on the body).
-            self.flow_end(Covered::Strict);
             // Exit: condition-false joined with breaks (no back-edge join).
             self.pop_loop_and_exit(frame);
         }
@@ -1476,6 +1579,7 @@ impl Interp<'_> {
                 parts,
                 left_sep.range.offset,
                 right_sep.range.offset,
+                right_sep.range.end(),
                 end,
             );
             self.replay_c_for(&bounds, events, match_of, true);

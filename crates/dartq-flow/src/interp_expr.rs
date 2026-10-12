@@ -148,7 +148,7 @@ impl Interp<'_> {
                         .push(Expr::trivial(self.ops.promote_to_non_null(operand.ty)));
                 }
             }
-            Ev::UnaryPrefixAssign | Ev::UnaryPostfixAssign => {
+            Ev::UnaryPrefixAssign | Ev::UnaryPostfixAssign { .. } => {
                 // `++x` / `x++`: the target reference was pushed; the write
                 // stores a non-null value of the declared type.
                 let target = self.pop_value();

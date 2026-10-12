@@ -2552,6 +2552,314 @@ fn dead_interval_dead_branch_block_reports_full_extent() {
     assert_eq!(dead_snippets(source), ["{ return; 1; }"]);
 }
 
+// —— dead for-loop updaters (official `for_updaterBegin`, probe table J) ——
+
+/// Probe u1 (oracle rows `2|26|3` = `i++`, `2|31|2` = `{}`): a
+/// constant-false condition with an updater fires the updater's own row
+/// AND the wholly dead body block's row — two independent rows — while
+/// the tail after the loop stays row-free (the condition-false exit path
+/// is reachable). The body row closes before the updaters replay, so the
+/// updater's statement end never folds into it.
+#[test]
+fn dead_updater_dual_rows_constant_false_condition() {
+    let source = "void f() {\n  for (var i = 0; false; i++) {}\n  print('tail');\n}\n";
+    assert_eq!(dead_snippets(source), ["i++", "{}"]);
+}
+
+/// Probe u2 (oracle rows `2|26|3` = `i++`, `4|5|14` = `print('dead');`):
+/// a break followed by a dead statement anchors the interval inside the
+/// body (reported at the body close, trimmed to the statement), and the
+/// updaters — unreachable on the back edge — fire their own row.
+#[test]
+fn dead_updater_dual_rows_break_then_statement() {
+    let source =
+        "void f() {\n  for (var i = 0; i < 1; i++) {\n    break;\n    print('dead');\n  }\n}\n";
+    assert_eq!(dead_snippets(source), ["i++", "print('dead');"]);
+}
+
+/// Probe u4: no updaters, no row (the official `beginToken != null` guard,
+/// dead_code_verifier.dart:366-369) — only the body block reports.
+#[test]
+fn dead_updater_row_needs_updaters() {
+    let source = "void f() {\n  for (var i = 0; false;) {}\n  print('tail');\n}\n";
+    assert_eq!(dead_snippets(source), ["{}"]);
+}
+
+/// Probe u5: a wholly dead loop anchors at the `for` itself, so the
+/// `for_conditionEnd` latch (`hadFirstDeadNode`) suppresses the updater's
+/// own row — the interval rides the covering close as one row.
+#[test]
+fn dead_updater_row_suppressed_when_the_loop_is_dead() {
+    let source = "void f() {\n  return;\n  for (var i = 0; i < 1; i++) {}\n}\n";
+    assert_eq!(dead_snippets(source), ["for (var i = 0; i < 1; i++) {}"]);
+}
+
+/// Probe u6 (oracle rows `2|26|3` = `i++`, `2|31|52` = the whole body
+/// block): a dead multi-statement body reports the full block extent
+/// (anchor at `{`, `}` included) next to the updater's own row.
+#[test]
+fn dead_updater_dual_rows_whole_dead_body_block() {
+    let source = "void f() {\n  for (var i = 0; false; i++) {\n    print('dead body');\n    print('dead too');\n  }\n  print('tail');\n}\n";
+    assert_eq!(
+        dead_snippets(source),
+        [
+            "i++",
+            "{\n    print('dead body');\n    print('dead too');\n  }"
+        ]
+    );
+}
+
+/// official `test_flowEnd_nestedBlock_forStatement_updaters` shape (probe
+/// table D): the row is the length-8 updaters list `i++, i++` ONLY — the
+/// body's `return` kills the back edge but the condition is not constant,
+/// so the loop exit stays reachable and the tail never reports.
+#[test]
+fn dead_updater_row_spans_the_whole_updaters_list() {
+    let source = "void f() {\n  for (var i = 0; i < 1; i++, i++) {\n    return;\n  }\n  print('dead tail');\n}\n";
+    assert_eq!(dead_snippets(source), ["i++, i++"]);
+}
+
+/// Probe u3 (engine-driven): a Never-typed call in the body makes the
+/// back edge unreachable, so the updaters fire their own row while the
+/// tail stays row-free. Hand-driven: only the engine can resolve a
+/// subexpression's type to Never, so the parser pipeline cannot produce
+/// this buffer (the Exit lands where the engine fires `handle_exit`,
+/// after the call's arguments). The updater grammar mirrors the real
+/// recorder: a bare expression list — an `Ident` read then the postfix
+/// operator's end — no `ExprStmt`/`StmtEnd` wrapper.
+#[test]
+fn never_call_in_body_kills_the_updaters_not_the_tail() {
+    use crate::facts::FlowFact;
+    // `void f() { for (; c; i++) { boom(); } 1; }` — offsets: the `for`
+    // at 11, the left `;` at 16, `c` at 18, the right `;` at 19, the
+    // updaters `i++` at 21-23, the body `{ boom(); }` at 26-36, the tail
+    // `1;` at 38-39.
+    let events: Vec<crate::ev::Ev> = [
+        vec![
+            crate::ev::Ev::ExecBegin { is_closure: false },
+            crate::ev::Ev::BlockBodyBegin,
+            crate::ev::Ev::ForBegin { span: tspan(11) },
+        ],
+        // Condition `c;`.
+        vec![
+            crate::ev::Ev::ExprStmt { span: tspan(18) },
+            crate::ev::Ev::StmtEnd { end: 20 },
+            crate::ev::Ev::OtherExpr { span: tspan(18) },
+        ],
+        // Updaters `i++` (bare expression: the read, then the operator's
+        // end).
+        vec![
+            crate::ev::Ev::Ident {
+                name: 1,
+                token: tspan(21),
+                context: dartq_parser::IdentifierContext::Expression,
+            },
+            crate::ev::Ev::UnaryPostfixAssign { end: 24 },
+        ],
+        vec![crate::ev::Ev::ForParts {
+            left_sep: tspan(16),
+            right_sep: tspan(21),
+        }],
+        // Body `{ boom(); }` — the call's type resolves to Never, the
+        // engine appends Exit after the arguments.
+        vec![
+            crate::ev::Ev::Block {
+                kind: crate::ev::BlockKind::Statement,
+                span: tspan(26),
+            },
+            crate::ev::Ev::ExprStmt { span: tspan(28) },
+            crate::ev::Ev::StmtEnd { end: 35 },
+            crate::ev::Ev::OtherExpr { span: tspan(28) },
+            crate::ev::Ev::Exit { end: tspan(34) },
+            crate::ev::Ev::EndBlock { end: 37 },
+        ],
+        vec![crate::ev::Ev::ForEnd, crate::ev::Ev::StmtEnd { end: 37 }],
+        // Tail `1;` — reachable through the condition-false exit.
+        vec![
+            crate::ev::Ev::ExprStmt { span: tspan(38) },
+            crate::ev::Ev::StmtEnd { end: 40 },
+            crate::ev::Ev::OtherExpr { span: tspan(38) },
+        ],
+        vec![
+            crate::ev::Ev::BlockBodyEnd,
+            crate::ev::Ev::ExecEnd {
+                is_expr: false,
+                end: tspan(41),
+            },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(&events);
+    let dead: Vec<_> = interp
+        .facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::DeadCode { span } => Some((span.range.offset, span.range.length)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dead, [(21, 3)], "the updaters row only: {:?}", interp.facts);
+    // Control: the same buffer without Exit keeps the back edge (and the
+    // whole loop) reachable — no row.
+    let live: Vec<crate::ev::Ev> = events
+        .iter()
+        .copied()
+        .filter(|ev| !matches!(ev, crate::ev::Ev::Exit { .. }))
+        .collect();
+    let interp = interp_of(&live);
+    assert!(
+        interp
+            .facts
+            .iter()
+            .all(|fact| !matches!(fact, FlowFact::DeadCode { .. })),
+        "{:?}",
+        interp.facts
+    );
+}
+
+// —— engine-driven Never exits (official `handleExit`, probe table I) ————
+
+/// Probe g9 (oracle row `4|3|52`): after a Never-typed call the NEXT
+/// statement anchors the interval, the following `if` folds in, and the
+/// row closes at the covering body's last statement — one wide row, the
+/// statement after the call as the anchor, never the Never expression
+/// itself. Hand-driven: only the engine can resolve a subexpression's
+/// type to Never (the Exit lands right after the call's arguments).
+#[test]
+fn never_call_exit_folds_through_the_covering_statements() {
+    use crate::facts::FlowFact;
+    // `void f() { boom(); 1; if (c) 2; }` — offsets: `boom();` at 11-17,
+    // `1;` at 19-20, `if (c) 2;` at 22-30. The Exit is spliced INSIDE the
+    // boom statement's events, right after the expression's own (the
+    // engine fires `handle_exit` mid-buffer, past the call's arguments).
+    let events: Vec<crate::ev::Ev> = [
+        vec![
+            crate::ev::Ev::ExecBegin { is_closure: false },
+            crate::ev::Ev::BlockBodyBegin,
+        ],
+        // `boom();` — the call's type resolves to Never.
+        vec![
+            crate::ev::Ev::ExprStmt { span: tspan(11) },
+            crate::ev::Ev::StmtEnd { end: 18 },
+            crate::ev::Ev::OtherExpr { span: tspan(11) },
+            crate::ev::Ev::Exit { end: tspan(18) },
+        ],
+        // `1;` — unreachable from here.
+        vec![
+            crate::ev::Ev::ExprStmt { span: tspan(19) },
+            crate::ev::Ev::StmtEnd { end: 21 },
+            crate::ev::Ev::OtherExpr { span: tspan(19) },
+        ],
+        // `if (c) 2;` — folds into the same interval.
+        vec![
+            crate::ev::Ev::IfBegin { span: tspan(22) },
+            crate::ev::Ev::OtherExpr { span: tspan(26) },
+            crate::ev::Ev::ThenBegin,
+            crate::ev::Ev::ExprStmt { span: tspan(29) },
+            crate::ev::Ev::StmtEnd { end: 31 },
+            crate::ev::Ev::OtherExpr { span: tspan(29) },
+            crate::ev::Ev::IfEnd { has_else: false },
+            crate::ev::Ev::StmtEnd { end: 31 },
+        ],
+        vec![
+            crate::ev::Ev::BlockBodyEnd,
+            crate::ev::Ev::ExecEnd {
+                is_expr: false,
+                end: tspan(32),
+            },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(&events);
+    let dead: Vec<_> = interp
+        .facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::DeadCode { span } => Some((span.range.offset, span.range.length)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dead,
+        [(19, 12)],
+        "one row: `1; if (c) 2;` — {:?}",
+        interp.facts
+    );
+    // Control: the same buffer without Exit stays live — no row.
+    let live: Vec<crate::ev::Ev> = events
+        .iter()
+        .copied()
+        .filter(|ev| !matches!(ev, crate::ev::Ev::Exit { .. }))
+        .collect();
+    let interp = interp_of(&live);
+    assert!(
+        interp
+            .facts
+            .iter()
+            .all(|fact| !matches!(fact, FlowFact::DeadCode { .. })),
+        "{:?}",
+        interp.facts
+    );
+}
+
+/// An Exit inside a nested send's arguments (`f(boom());`) leaves the
+/// value stack balanced — the Exit never pops (the official call site
+/// fires with the subexpression still on the stack,
+/// type_analyzer.dart:815-819), the arguments' own close consumes the
+/// value, and the statement after the send still anchors its row.
+#[test]
+fn never_call_exit_inside_arguments_keeps_the_stack() {
+    use crate::facts::FlowFact;
+    // `void f() { g(boom()); 1; }` — offsets: `g(boom());` at 11-20,
+    // `boom()` at 13-18, `1;` at 22-23.
+    let events: Vec<crate::ev::Ev> = [
+        vec![
+            crate::ev::Ev::ExecBegin { is_closure: false },
+            crate::ev::Ev::BlockBodyBegin,
+        ],
+        // `g(boom());` — the argument's type resolves to Never.
+        vec![
+            crate::ev::Ev::ExprStmt { span: tspan(11) },
+            crate::ev::Ev::StmtEnd { end: 21 },
+            crate::ev::Ev::OtherExpr { span: tspan(11) },
+            crate::ev::Ev::Send,
+            crate::ev::Ev::ArgumentsBegin,
+            crate::ev::Ev::OtherExpr { span: tspan(13) },
+            crate::ev::Ev::Exit { end: tspan(19) },
+            crate::ev::Ev::ArgumentsEnd { count: 1 },
+        ],
+        // `1;` — unreachable from here.
+        vec![
+            crate::ev::Ev::ExprStmt { span: tspan(22) },
+            crate::ev::Ev::StmtEnd { end: 24 },
+            crate::ev::Ev::OtherExpr { span: tspan(22) },
+        ],
+        vec![
+            crate::ev::Ev::BlockBodyEnd,
+            crate::ev::Ev::ExecEnd {
+                is_expr: false,
+                end: tspan(25),
+            },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(&events);
+    let dead: Vec<_> = interp
+        .facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::DeadCode { span } => Some((span.range.offset, span.range.length)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dead,
+        [(22, 2)],
+        "the row anchors at `1;`: {:?}",
+        interp.facts
+    );
+}
+
 /// A live try/finally block produces no fact: its `begin_block` fires with
 /// the try kind, which scopes but never dead-checks (the `try` keyword's
 /// own dead check rides `TryBegin`).
