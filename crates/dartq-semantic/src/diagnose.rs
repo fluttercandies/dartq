@@ -264,6 +264,19 @@
 //! the oracle fires it from the parser: dartq's parser does not emit the code
 //! yet, and when it does, the collector-side emission must be removed or the
 //! code double-reports. Every deferral under-reports.
+//!
+//! # The use-face substrate (#767)
+//!
+//! The pass's use sets (`used_names`/`read_names`, plus resolved
+//! annotation names and the import/export directive faces) are the unit's
+//! observable-use record: [`diagnose_unit`] moves them into a
+//! [`crate::use_face::UnitUseFace`] alongside the report, and the caller
+//! folds the library's units through
+//! [`crate::use_face::LibraryUsages::close_library_usage`] into the
+//! per-library consumed set — the official gather-per-file /
+//! merge-per-library pair (library_analyzer.dart:305-315). The recording
+//! rides the sets the pass already kept (zero hot-path cost); the
+//! per-file diagnostic behavior is unchanged.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -303,6 +316,7 @@ use crate::model::{
     ArgListId, ArgPool, ArityViolation, Container, ContainerKind, ExtensionFace, FileElements,
     Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
 };
+use crate::use_face::{ExportUseFace, ImportUseFace, UnitUseFace};
 use dartq_types::{
     Case, Exhaustiveness, ExhaustivenessWorld, Key, Single, Space, Variance,
     Witness as EngineWitness, compute,
@@ -626,6 +640,19 @@ enum Intent {
     Operator(StringId, SourceRange),
 }
 
+/// The `handleExit` face a completed send fired (the listener maps each to
+/// its token: the callee name's begin, or the send's end). The faces are
+/// exclusive in practice — a bottom callee read resolves through locals,
+/// whose declared return type suppresses — so one value carries the send.
+enum SendExit {
+    /// The callee read's own static type is `Never` (`Never f; f()`;
+    /// `method_invocation_resolver.dart:129/:351/:489/:547`).
+    Callee,
+    /// The send's own static type is `Never` — the callee's declared return
+    /// type (`type_analyzer.dart:815-819`).
+    Result,
+}
+
 /// The write form an assignment applied to an operator row (`a[i] = v`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpWrite {
@@ -938,6 +965,14 @@ enum LocalKind {
     LocalFunction,
 }
 
+/// One annotation in flight: the written name plus, when captured, the
+/// `UseResult.unless` `parameterDefined` face (the constant the oracle
+/// reads and the written literal's span, quotes included).
+struct PendingAnnotation {
+    name: StringId,
+    unless: Option<(StringId, SourceRange)>,
+}
+
 /// One library-level declaration site of this file (the usage cluster's
 /// library-level side), captured at the declaration events with the name
 /// token's span.
@@ -954,6 +989,17 @@ struct DeclSite {
     /// The annotation names themselves (the `@mustCallSuper` /
     /// `@mustBeOverridden` / `@override` inheritance gates read these).
     annotations: Box<[StringId]>,
+    /// The package:meta `@UseResult` face (`_getUseResultMetadata`,
+    /// use_result_verifier.dart): the declaration-level input of the
+    /// discarded-invocation pass; `unless` carries the
+    /// `parameterDefined` value + written span.
+    use_result: Option<UrFace>,
+}
+
+/// The package:meta `@UseResult` face of one declaration.
+#[derive(Clone, Copy)]
+struct UrFace {
+    unless: Option<(StringId, SourceRange)>,
 }
 
 /// The library-level declaration kinds the usage cluster reports on.
@@ -988,6 +1034,10 @@ struct ImportSite {
     /// The URI literal's span (the diagnostic anchor).
     uri_range: SourceRange,
     prefix: Option<StringId>,
+    /// The `show`-combinator names with their token spans, in written
+    /// order (`generateUnusedShownNameHints` walks the same list; `hide`
+    /// names have no hint of their own and don't join).
+    shown: Vec<(StringId, SourceRange)>,
 }
 
 /// One label scope (`_LabelTracker`): the labels declared in it and their
@@ -1172,8 +1222,9 @@ struct Engine<'a> {
     /// lives in the disabled arm only).
     primary_constructors_enabled: bool,
     /// The `variance` experiment grant (`FeatureSet::is_enabled(Feature::
-    /// Variance)`): without it the #612 capture never opens and the family
-    /// is one branch — default programs stay byte-identical.
+    /// Variance)`): the #612 capture runs regardless of it (#742 — the
+    /// legacy superinterface face answers in the default posture), so the
+    /// grant now scopes only the explicit-keyword faces.
     variance_enabled: bool,
     /// The open type-variables window's captured parameters `(name,
     /// declared keyword, name range)` — the container-begin event adopts
@@ -1250,6 +1301,11 @@ struct Engine<'a> {
     /// own locals) — those close on the local face regardless (`#511`'s
     /// misroute guard).
     init_frame_depth: usize,
+    /// Whether an initializer is open (`begin_variable_initializer` /
+    /// `end_variable_initializer`): the as-cast flow-tail check keys on
+    /// this besides [`Self::init_frame_depth`], whose last value would
+    /// otherwise read stale outside initializers.
+    in_initializer: bool,
     /// The const group's declared names, in initializer order.
     const_group_names: Vec<StringId>,
     /// The next const-group name an initializer window consumes.
@@ -1312,17 +1368,67 @@ struct Engine<'a> {
     decl_sites: Vec<DeclSite>,
     /// The open field group's static bit (`begin_fields` arms it, the
     /// group's `FieldDeclaration` identifiers read it).
-    /// Metadata names of the declaration in flight (`MetadataReference`
-    /// collects; a declaration site consumes them into its `annotated`
-    /// exemption bit — any annotation exempts, the official pragma/JS
-    /// gates' under-report superset).
-    pending_annotations: Vec<StringId>,
+    /// Metadata of the declaration in flight (`MetadataReference`
+    /// collects the name; `end_metadata` attaches the captured
+    /// `UseResult.unless` face; a declaration site consumes the entries
+    /// into its `annotated` exemption bit — any annotation exempts, the
+    /// official pragma/JS gates' under-report superset — and its
+    /// [`DeclSite::use_result`] face).
+    pending_annotations: Vec<PendingAnnotation>,
+    /// The discarded-value machine (the `_isUsed` parent-chain mirror,
+    /// use_result_verifier.dart): completed UseResult-candidate
+    /// expressions awaiting a sealing context event, keyed by their name
+    /// token's offset. The registration points are the send/selector
+    /// completions; the seals are the context events that answer the
+    /// parent-chain walk (argument groups, literals, assignments, binary
+    /// operands, cascade targets, statement ends).
+    ur_pending: Vec<u32>,
+    /// Offsets the machine sealed as used (`_isUsed` true): the value
+    /// flows somewhere observable.
+    ur_used: FxHashSet<u32>,
+    /// Report-span overrides for the candidates whose official anchor is
+    /// wider than the name token — the creation fold's whole-`A()` span
+    /// (`nodeToAnnotate`, use_result_verifier.dart).
+    ur_spans: FxHashMap<u32, SourceRange>,
+    /// The creation folds (`A()` → `Receiver::Created`) with their head
+    /// token offset, whole-invocation report span, and container: the
+    /// unnamed-constructor candidates the resolve pass walks.
+    ur_creations: Vec<(u32, SourceRange, StringId)>,
+    /// The open for-parts windows: 1 = the statement form, 2 = the
+    /// collection-element form. While a window tops the stack, an
+    /// expression statement is the for-condition (the official
+    /// `ForParts` condition arm — used); the updaters' leftovers discard
+    /// at `handle_for_loop_parts`. Pops are type-conditional (each form's
+    /// pop-sites are mutually exclusive) so nesting never steals an
+    /// enclosing window.
+    in_for_parts: Vec<u8>,
+    /// UseResult-carrying declaration sites keyed `(container, spelling)`
+    /// — `None` for top-level — built once at resolve time from the
+    /// face-bearing sites; the resolve arms fold up against it.
+    ur_sites: FxHashMap<(Option<StringId>, StringId), usize>,
+    /// The `ur_pending` watermark at each open argument list (`begin_`
+    /// arguments / `end_arguments` bracket): the list seals only the
+    /// pendings registered INSIDE it used (the official `ArgumentList`
+    /// parent arm) — the callee's own candidate registered before the
+    /// bracket opens and stays pending for the enclosing context.
+    ur_arg_base: Vec<usize>,
+    /// Selector-row offsets merged at the `..` event (`f()..g()`): the
+    /// official walk answers the section send itself
+    /// (`CascadeExpression.cascadeSections`), so its discarded value
+    /// reports at the selector even when the target's type is unknown to
+    /// the model. Consulted only in the unknown-receiver resolve arm —
+    /// known receivers reach the member faces anyway.
+    cascade_sections: FxHashSet<u32>,
     /// Library-level reference index: every name some reference resolved
     /// to in this file (locals included — shadowing only ever suppresses).
     used_names: FxHashSet<StringId>,
     /// Names a READ-shaped member access resolved to (the `unused_field`
     /// read-only rule: writes never spare a field).
     read_names: FxHashSet<StringId>,
+    /// Resolved annotation names this unit referenced (the use-face's
+    /// annotation uses; `check_annotation` inserts on the resolved side
+    /// only — an unresolved annotation is its own error and never counts).
+    annotation_uses: FxHashSet<StringId>,
     /// `(callee spelling, named argument)` pairs some invocation gave (the
     /// `_addParametersForArguments` face of the official use index).
     named_given: FxHashSet<(StringId, StringId)>,
@@ -1336,6 +1442,21 @@ struct Engine<'a> {
     /// The import directives of this file, parse order: the written URI
     /// and the prefix (`ImportPrefixDeclaration` identifier).
     imports: Vec<ImportSite>,
+    /// Whether the identifier in flight sits in a `show` list (the
+    /// `begin_show`/`end_show` bracket); only `show` names join
+    /// [`ImportSite::shown`].
+    in_show: bool,
+    /// Whether the directive in flight is an import (`begin_import` /
+    /// `end_import`): `export` directives carry show lists too, and their
+    /// names must not join the last import's site.
+    in_import: bool,
+    /// Whether the directive in flight is an export (`begin_export` /
+    /// `end_export`): its show names join the use-face's re-export record.
+    in_export: bool,
+    /// The export directives' show faces so far, declaration order (the
+    /// use-face's re-export record; `C::Combinator` appends the in-flight
+    /// entry).
+    exports: Vec<ExportUseFace>,
     /// Open label scopes (`_LabelTracker`, dead_code_verifier.dart:
     /// 618-661): labeled statements and switch member label groups.
     label_scopes: Vec<LabelScope>,
@@ -1487,12 +1608,13 @@ struct TvWindow {
     unbounded: u16,
 }
 
-// —— #612: the variance-family capture (the `variance` experiment only) ————
+// —— #612: the variance-family capture —————————————————————————————————————
 // Written-type trees captured from the same parse events the #610 bounds
 // capture consumes, scoped to a container's header (from the container-begin
 // event, where the capture opens, to the body-begin event). The consuming
-// check runs in [`Engine::finalize_variance`]; without the experiment the
-// capture never opens and every hook is one `None`/`false` check.
+// check runs in [`Engine::finalize_variance`]; the capture opens regardless
+// of the experiment (#742 — the legacy superinterface face answers in the
+// default posture) and the trees drop at the finalize's take.
 
 /// One written type inside a container header's clause region
 /// (`extends A<F<T>>`, `implements void Function(T)` shapes included — the
@@ -1929,6 +2051,7 @@ impl<'a> Engine<'a> {
             field_group_open: false,
             field_group_depth: 0,
             init_frame_depth: 0,
+            in_initializer: false,
             const_group_names: Vec::new(),
             const_group_cursor: 0,
             nonconst_top_level: FxHashSet::default(),
@@ -1960,12 +2083,25 @@ impl<'a> Engine<'a> {
             open_exec_site: None,
             decl_sites: Vec::new(),
             pending_annotations: Vec::new(),
+            ur_pending: Vec::new(),
+            ur_used: FxHashSet::default(),
+            ur_spans: FxHashMap::default(),
+            ur_creations: Vec::new(),
+            in_for_parts: Vec::new(),
+            ur_sites: FxHashMap::default(),
+            ur_arg_base: Vec::new(),
+            cascade_sections: FxHashSet::default(),
             used_names: FxHashSet::default(),
             read_names: FxHashSet::default(),
+            annotation_uses: FxHashSet::default(),
             named_given: FxHashSet::default(),
             positional_given: FxHashMap::default(),
             site_param_uses: FxHashMap::default(),
             imports: Vec::new(),
+            in_show: false,
+            in_import: false,
+            in_export: false,
+            exports: Vec::new(),
             label_scopes: Vec::new(),
             catch_on_type: None,
             catch_on_nullable: None,
@@ -2480,6 +2616,38 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The as-cast flow tail (probed: dart analyze 3.13.1 — `var a = f()
+    /// as int;` with a Never-typed `f()` reports DEAD_CODE anchored at the
+    /// cast type's head token, `Dead code.`: the operand's exit left the
+    /// flow unreachable, so the cast type is the first node visited dead,
+    /// dead_code_verifier.dart:253-279). Only the initializer face fires
+    /// here — an expression-statement wrapper's dead interval is the flow
+    /// window's (`ExprStmt`), and a nested executable owns its own. The
+    /// row anchors at the type's head token; the oracle's trailing-`;`
+    /// trim and interval merge with following statements stay the flow
+    /// window's business.
+    fn check_dead_cast_tail(&mut self, operator: Token, operand: Ty) {
+        if !self.is_never_ty(operand)
+            || !self.in_initializer
+            || self.frames.len() != self.init_frame_depth
+        {
+            return;
+        }
+        // The cast type's head follows `as` (`parse_as_operator_rest`
+        // opens the type bracket right after the operator).
+        if let Some(head) = self.tokens.get(operator.id as usize + 1) {
+            let raw = &self.source[head.byte_range()];
+            self.stage_usage(
+                SemanticCode::DeadCode,
+                SourceRange {
+                    offset: head.utf16_offset,
+                    length: raw.chars().map(char::len_utf16).sum::<usize>() as u32,
+                },
+                "",
+            );
+        }
+    }
+
     /// The `is`/`is!` verdict walk (`_checkAllTypeChecks`,
     /// best_practices_verifier.dart:987-1041, mirrored from
     /// `TypeSystem::type_check_verdict`): unresolved sides are informative;
@@ -2544,6 +2712,18 @@ impl<'a> Engine<'a> {
         self.stage_usage(code, at, "");
     }
 
+    /// The operand's static type at a postfix junction: the row's
+    /// push-time type, or an invoked callee's declared return type (a
+    /// completed send's row type is `Unknown` — its static type IS the
+    /// callee's return type, the same face [`Self::receiver_static_ty`]
+    /// reads at the junctions).
+    fn operand_static_ty(&self, row: &Row) -> Ty {
+        if row.ty != Ty::UNKNOWN || !matches!(row.intent, Intent::Invoke) {
+            return row.ty;
+        }
+        self.callee_return_ty(row)
+    }
+
     /// The `e!` pair (`visitNullAssertionExpression`,
     /// best_practices_verifier.dart:795-799, and the
     /// `_checkForUnnecessaryNullAware` gate, error_verifier.dart:
@@ -2553,9 +2733,10 @@ impl<'a> Engine<'a> {
     /// the `Null` class fails the assertion.
     fn check_null_assert(&mut self, at: SourceRange) {
         let Some(row) = self.rows.last() else { return };
-        if row.ty == Ty::Null {
+        let ty = self.operand_static_ty(row);
+        if ty == Ty::Null {
             self.stage_usage(SemanticCode::NullCheckAlwaysFails, at, "");
-        } else if row.ty.is_strictly_non_nullable() {
+        } else if ty.is_strictly_non_nullable() {
             self.stage_usage(SemanticCode::UnnecessaryNonNullAssertion, at, "");
         }
     }
@@ -2988,10 +3169,11 @@ impl<'a> Engine<'a> {
         if let Some(id) = name.and_then(|token| self.name_of(token)) {
             self.bounds.open_header(id);
             // The #612 capture opens with the header (params adopt below,
-            // clause trees capture from here to the body).
-            if self.variance_enabled {
-                self.var_header = Some(VarHeader::new(id));
-            }
+            // clause trees capture from here to the body) — unconditionally:
+            // the legacy superinterface face answers in the default posture
+            // too (#742; error_verifier.dart:7999-8054 is not
+            // experiment-gated).
+            self.var_header = Some(VarHeader::new(id));
         }
         let Some((unbounded, window_end)) = self.pending_tv.take() else {
             return;
@@ -3015,8 +3197,7 @@ impl<'a> Engine<'a> {
         );
         // The type-variable window just closed is this container's: adopt
         // its captured parameters (name, keyword, anchor).
-        if self.variance_enabled
-            && let Some(header) = self.var_header.as_mut()
+        if let Some(header) = self.var_header.as_mut()
             && header.name == id
         {
             header.params = std::mem::take(&mut self.var_tv_window);
@@ -3031,11 +3212,9 @@ impl<'a> Engine<'a> {
     /// `end_type_variable`: one declared parameter `(name, keyword, anchor)`
     /// joins the open window. The keyword's text is the official spelling
     /// (`out`/`in`/`inout`, `shared_type.dart:28-47`); anything else reads
-    /// as the legacy default.
+    /// as the legacy default. The window collects regardless of the
+    /// experiment (#742) — the legacy face reads the same capture.
     fn var_type_variable(&mut self, name: StringId, variance: Option<Token>, range: SourceRange) {
-        if !self.variance_enabled {
-            return;
-        }
         let declared = variance.and_then(|token| match self.text_of(token) {
             Some("out") => Some(Variance::Covariant),
             Some("in") => Some(Variance::Contravariant),
@@ -3049,10 +3228,8 @@ impl<'a> Engine<'a> {
     /// stale window never met its container — drop it, with any paired
     /// names of an abandoned group).
     fn var_reset_type_variables(&mut self) {
-        if self.variance_enabled {
-            self.var_tv_window.clear();
-            self.var_name_stack.clear();
-        }
+        self.var_tv_window.clear();
+        self.var_name_stack.clear();
     }
 
     /// `handle_type`: a simple type head completed inside the open header.
@@ -3279,11 +3456,18 @@ impl<'a> Engine<'a> {
     /// against the whole-file capture. Runs after the parse, staged into
     /// the usage rows for the teardown's source-ordered merge.
     ///
-    /// Gate posture (#612 adjudication): the whole family answers nothing
-    /// without the `variance` experiment, keeping default programs
-    /// byte-identical — the oracle's legacy superinterface code does fire
-    /// without the experiment, so that face is a recorded under-report
-    /// outside the experiment.
+    /// Gate posture (#742): the legacy superinterface face
+    /// (`wrong_type_parameter_variance_in_superinterface`) answers in the
+    /// default posture — the oracle's walk runs unconditionally
+    /// (error_verifier.dart:7999-8054, dispatching on `isLegacyCovariant`)
+    /// and its default-corpus expectations fire the legacy code with no
+    /// experiment grant
+    /// (wrong_type_parameter_variance_in_superinterface_test.dart,
+    /// e.g. `test_class_extends_function_parameterType`). The
+    /// explicit-keyword faces keep the experiment gate: a parameter
+    /// carrying a written keyword answers
+    /// `wrong_explicit_type_parameter_variance_in_superinterface` here and
+    /// drives the `_position` member faces only under the grant.
     ///
     /// Model edges (documented divergences, all under-report except the
     /// noted face): generic typedefs in superinterfaces answer unrelated
@@ -3293,7 +3477,7 @@ impl<'a> Engine<'a> {
     /// unmodeled; a method's type-parameter-bound face (:7943-7956) is
     /// unmodeled; the method-formal/return anchors sit at the member name.
     fn finalize_variance(&mut self) {
-        if !self.variance_enabled || self.var_containers.is_empty() {
+        if self.var_containers.is_empty() {
             return;
         }
         let strings = self.strings;
@@ -3356,6 +3540,11 @@ impl<'a> Engine<'a> {
                     }
                     let display = self.var_tree_display(tree);
                     let code = match declared {
+                        // A keyword without the grant keeps its face gated
+                        // (#742): the keyword parses unconditionally (the
+                        // header always allows variance), so the capture
+                        // sees it and the gate is the only suppression.
+                        Some(_) if !self.variance_enabled => continue,
                         Some(_) => SemanticCode::WrongExplicitTypeParameterVarianceInSuperinterface,
                         None => SemanticCode::WrongTypeParameterVarianceInSuperinterface,
                     };
@@ -3384,11 +3573,14 @@ impl<'a> Engine<'a> {
             }
             // —— the member faces ———————————————————————————————————————
             // Only explicit keywords are checked (`!isLegacyCovariant`,
-            // :7918/:7945): an all-legacy container can never fire.
-            if container
-                .params
-                .iter()
-                .all(|(_, declared, _)| declared.is_none())
+            // :7918/:7945): an all-legacy container can never fire. The
+            // faces keep the experiment gate (#742): a parsed keyword
+            // without the grant answers nothing.
+            if !self.variance_enabled
+                || container
+                    .params
+                    .iter()
+                    .all(|(_, declared, _)| declared.is_none())
             {
                 continue;
             }
@@ -3915,9 +4107,14 @@ impl<'a> Engine<'a> {
         let used: Vec<StringId> = self.used_names.iter().copied().collect();
         for (index, edge) in edges.iter().enumerate() {
             // Copied first: the emit below mutates the report.
-            let (uri_text, uri_range, prefix) = {
+            let (uri_text, uri_range, prefix, shown) = {
                 let site = &self.imports[index];
-                (site.uri_text.clone(), site.uri_range, site.prefix)
+                (
+                    site.uri_text.clone(),
+                    site.uri_range,
+                    site.prefix,
+                    site.shown.clone(),
+                )
             };
             let Some(target) = edge.target else {
                 continue;
@@ -3933,17 +4130,71 @@ impl<'a> Engine<'a> {
             };
             if !is_used {
                 self.stage_usage(SemanticCode::UnusedImport, uri_range, &uri_text);
+                continue;
+            }
+            // The shown-name face (`generateUnusedShownNameHints`,
+            // imports_verifier.dart:270-324): runs only when the whole
+            // import is used — a wholly unused import keeps its single
+            // `unused_import` row — and reports each shown name this
+            // import's namespace resolved but never credited. The
+            // resolution gate (the official `element == null` skip) leaves
+            // an undefined shown name to its own code.
+            for (name, range) in shown {
+                if self.graph.exported(target, name).is_none() {
+                    continue;
+                }
+                let name_used = self.used_names.contains(&name) && edge.combinators.allows(name);
+                if !name_used {
+                    let text = self.strings.resolve(name).to_string();
+                    self.stage_usage(SemanticCode::UnusedShownName, range, &text);
+                }
             }
         }
     }
 
-    /// The `_`-wildcard test: the name consists entirely of underscores
-    /// (the official fallback rule, unused_local_elements_verifier.dart:
-    /// 985-994 — the wildcard-variables feature's `isWildcardVariable`
-    /// answers the same for `_`).
+    /// Moves the pass's accumulated use sets into the unit's use-face
+    /// (the M3 U1 substrate, `use_face` module). Runs after
+    /// [`Self::finalize_usage`] — the per-file consumers above have read
+    /// the sets by then — so the hot path pays nothing: the face re-homes
+    /// the sets the diagnosis already kept. The directive faces map the
+    /// diagnostic-side import sites (spans dropped: the face is the use
+    /// index, not the report).
+    fn take_use_face(&mut self) -> UnitUseFace {
+        UnitUseFace {
+            used: std::mem::take(&mut self.used_names),
+            reads: std::mem::take(&mut self.read_names),
+            annotations: std::mem::take(&mut self.annotation_uses),
+            imports: self
+                .imports
+                .drain(..)
+                .map(|site| ImportUseFace {
+                    prefix: site.prefix,
+                    shown: site.shown.into_iter().map(|(name, _)| name).collect(),
+                })
+                .collect(),
+            exports: std::mem::take(&mut self.exports),
+        }
+    }
+
+    /// The `_`-wildcard test (`_wildCardVariablesEnabled` +
+    /// `_isNamedWildcard`, unused_local_elements_verifier.dart:690-698,
+    /// 986-995): with the wildcard-variables feature (`enabledIn: 3.7.0`,
+    /// tools/experimental_features.yaml) only the exact name `_` is a
+    /// wildcard — `__`/`___` report; the all-underscores fallback is the
+    /// feature-off branch, live only below 3.7. dartq's supported universe
+    /// runs the modern posture (the same modern-library default
+    /// [`Self::library_facts`] documents for class-modifiers): a pre-3.7
+    /// `// @dart=` library under-reports its `__`-shaped bindings — a
+    /// documented divergence, unreachable in the oracle corpus.
+    const WILDCARD_VARIABLES_ENABLED: bool = true;
+
     fn is_wildcard(&self, name: StringId) -> bool {
         let text = self.strings.resolve(name);
-        !text.is_empty() && text.bytes().all(|b| b == b'_')
+        if Self::WILDCARD_VARIABLES_ENABLED {
+            text == "_"
+        } else {
+            !text.is_empty() && text.bytes().all(|b| b == b'_')
+        }
     }
 
     /// The enclosing executable's lookup spelling once its name has fired
@@ -3970,25 +4221,79 @@ impl<'a> Engine<'a> {
             || self.container_context().is_some_and(|(c, _)| c == name)
     }
 
-    /// Drains the pending annotation latch: the annotation names since the
-    /// last declaration site (`@override`-family gates compare these;
-    /// non-empty marks the pragma/JS exemption gates' under-report
-    /// superset).
-    fn take_annotations(&mut self) -> Box<[StringId]> {
-        std::mem::take(&mut self.pending_annotations).into_boxed_slice()
+    /// Drains the pending annotation latch: the annotations since the last
+    /// declaration site, each with its captured `UseResult.unless` face
+    /// (the `@override`-family gates compare names; non-empty marks the
+    /// pragma/JS exemption gates' under-report superset).
+    fn take_annotations(&mut self) -> Vec<PendingAnnotation> {
+        std::mem::take(&mut self.pending_annotations)
     }
 
     /// Pushes one library-level declaration site (the usage cluster's
     /// library-level side) and returns its index.
     fn note_decl_site(&mut self, name: StringId, range: SourceRange, kind: DeclKind) -> usize {
-        let annotations = self.take_annotations();
-        let annotated = !annotations.is_empty();
+        let pending = self.take_annotations();
+        let annotated = !pending.is_empty();
+        // The `@UseResult` face (`isUseResult`, element.dart:2014-2019):
+        // the meta getter (`@useResult`) or the class face (`@UseResult`,
+        // whose `unless` selector carries the `parameterDefined` value).
+        // The first recognized annotation wins (the official walk returns
+        // the first isUseResult entry); the resolution walks run once per
+        // annotation — metadata is rare and the graph lookups are set
+        // probes.
+        let mut use_result = None;
+        for annotation in &pending {
+            let face = crate::model::Annotation {
+                name: annotation.name,
+                range,
+            };
+            // The unless value rode the latch (the `end_metadata` source
+            // walk); re-shaping it as the helper's argument face keeps the
+            // selector + meta-import resolution in one place.
+            let args = annotation
+                .unless
+                .map(|(value, span)| crate::annotation::AnnotationArg {
+                    label: Some(self.strings.intern("parameterDefined")),
+                    string: Some((value, span)),
+                });
+            let args = args.as_slice();
+            if let Some((param, span)) = crate::annotation::use_result_unless(
+                &face,
+                args,
+                self.strings,
+                self.graph,
+                self.lib,
+            ) {
+                use_result = Some(UrFace {
+                    unless: Some((param, span)),
+                });
+                break;
+            }
+            if crate::annotation::is_meta_getter(
+                &face,
+                "useResult",
+                self.strings,
+                self.graph,
+                self.lib,
+            ) || crate::annotation::is_meta_class(
+                &face,
+                "UseResult",
+                self.strings,
+                self.graph,
+                self.lib,
+            ) {
+                use_result = Some(UrFace { unless: None });
+                break;
+            }
+        }
+        let annotations = pending.iter().map(|a| a.name).collect();
         self.decl_sites.push(DeclSite {
             name,
             range,
             kind,
             annotated,
             annotations,
+            use_result,
         });
         self.decl_sites.len() - 1
     }
@@ -3998,7 +4303,415 @@ impl<'a> Engine<'a> {
     fn pending_annotation_is(&self, spelling: &str) -> bool {
         self.pending_annotations
             .iter()
-            .any(|a| self.strings.resolve(*a) == spelling)
+            .any(|a| self.strings.resolve(a.name) == spelling)
+    }
+
+    // —— the discarded-value machine (`use_result_verifier.dart`) ————————
+
+    /// Registers one completed expression whose value may be discarded:
+    /// the send callee's or selector's name token offset. The expression
+    /// stays pending until a context event answers its parent-chain walk.
+    fn ur_register(&mut self, offset: u32) {
+        self.ur_pending.push(offset);
+    }
+
+    /// Registers a creation fold: the official anchor spans the whole
+    /// invocation (`nodeToAnnotate` — the `A()` shape), not just the head
+    /// token.
+    fn ur_register_creation(&mut self, offset: u32, span: SourceRange, container: StringId) {
+        self.ur_spans.insert(offset, span);
+        self.ur_creations.push((offset, span, container));
+        self.ur_pending.push(offset);
+    }
+
+    /// Seals every pending expression as used (`_isUsed` true — the value
+    /// flows somewhere observable).
+    fn ur_seal_used(&mut self) {
+        self.ur_used.extend(self.ur_pending.drain(..));
+    }
+
+    /// Seals every pending expression as discarded (statement end, cascade
+    /// sections, for updaters): the offsets simply stay absent from the
+    /// used set, and the resolve arms emit against them.
+    fn ur_seal_discard(&mut self) {
+        self.ur_pending.clear();
+    }
+
+    /// `end_arguments`: seals only the pendings registered inside the
+    /// closing argument list used (the official `ArgumentList` parent arm)
+    /// — the callee's own candidate predates the bracket watermark and
+    /// stays pending for the enclosing context to answer.
+    fn ur_seal_used_within(&mut self) {
+        if let Some(base) = self.ur_arg_base.pop() {
+            let tail = self.ur_pending.split_off(base.min(self.ur_pending.len()));
+            self.ur_used.extend(tail);
+        }
+    }
+
+    /// `handle_expression_statement`: outside for-parts, the statement's
+    /// value is discarded (the official parent, `ExpressionStatement`, is
+    /// absent from both `_isUsed` sets); the for-condition arm fires here,
+    /// while the updaters drain at `handle_for_loop_parts`.
+    fn ur_expression_statement(&mut self) {
+        if self.in_for_parts.last() == Some(&1) || self.in_for_parts.last() == Some(&2) {
+            self.ur_seal_used();
+        } else {
+            self.ur_seal_discard();
+        }
+    }
+
+    /// Registers the non-invoked identifier expression completing at
+    /// `begin` (the read row sits on the row stack): the
+    /// `checkNameExpression` candidate face.
+    fn ur_register_bare_read(&mut self, begin: Token) {
+        if let Some(row) = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.range.offset == begin.range.offset)
+        {
+            let offset = row.range.offset;
+            self.ur_register(offset);
+        }
+    }
+
+    /// `end_metadata`: captures the `parameterDefined:` face of the
+    /// annotation that just closed — a source-level walk of the annotation
+    /// span finding `parameterDefined` `:` string-literal at argument
+    /// depth. A literal argument is the only face the corpus pins; a
+    /// reference argument under-captures (`None`), under-reporting.
+    fn note_metadata_args(&mut self, begin: Token, end: Token) {
+        let start = begin.range.offset as usize;
+        let stop = (end.range.offset + end.range.length) as usize;
+        let Some(open) = self.pending_annotations.last_mut() else {
+            return;
+        };
+        if open.unless.is_some() {
+            return;
+        }
+        let text = self.source.get(start..stop).unwrap_or_default();
+        let bytes = text.as_bytes();
+        let label = b"parameterDefined";
+        let mut cursor = 0usize;
+        while let Some(rel) = bytes[cursor.min(bytes.len())..]
+            .windows(label.len())
+            .position(|w| w == label)
+        {
+            let at = cursor + rel;
+            cursor = at + label.len();
+            // The label must start an argument: preceded by `(` or `,`
+            // (whitespace between), so a mention inside another string
+            // never matches.
+            let head = text[..at].trim_end();
+            if !matches!(head.as_bytes().last(), Some(b'(' | b',')) {
+                continue;
+            }
+            // Between label and value sits exactly a `:` (whitespace
+            // around); anything else is a different argument shape.
+            let tail = &text[cursor..];
+            let Some(colon) = tail.find(':') else {
+                continue;
+            };
+            if !tail[..colon].bytes().all(|b| b.is_ascii_whitespace()) {
+                continue;
+            }
+            let body = tail[colon + 1..].trim_start();
+            let Some((_, quote, triple)) = Self::string_literal_at(body) else {
+                continue;
+            };
+            let Some(value_len) = Self::string_literal_len(body, quote, triple) else {
+                continue;
+            };
+            let raw = &body[..value_len];
+            let inner = raw
+                .trim_start_matches('r')
+                .trim_start_matches('#')
+                .trim_matches(|c| c == '\'' || c == '"');
+            let cooked = inner.replace("\\'", "'").replace("\\\"", "\"");
+            let range = SourceRange {
+                offset: (start + text.len() - body.len()) as u32,
+                length: value_len as u32,
+            };
+            open.unless = Some((self.strings.intern(&cooked), range));
+            return;
+        }
+    }
+
+    /// The string literal starting at `text[0]`, if any: its quote byte
+    /// and whether it is the triple-quoted shape. A raw marker (`r`)
+    /// before the quote is admitted (the len walk then takes the body
+    /// verbatim).
+    fn string_literal_at(text: &str) -> Option<(usize, u8, bool)> {
+        let bytes = text.as_bytes();
+        let mut at = 0usize;
+        if bytes.first() == Some(&b'r') {
+            at = 1;
+        }
+        match bytes.get(at)? {
+            b'\'' | b'"' => {
+                let quote = bytes[at];
+                let triple = bytes.get(at + 1) == Some(&quote) && bytes.get(at + 2) == Some(&quote);
+                Some((at, quote, triple))
+            }
+            _ => None,
+        }
+    }
+
+    /// The full literal length at `body[0]` for `quote`/`triple`,
+    /// terminator included. Escapes (`\x`) never end the literal; an
+    /// unterminated literal yields `None` (recovery — the under-report).
+    fn string_literal_len(body: &str, quote: u8, triple: bool) -> Option<usize> {
+        let bytes = body.as_bytes();
+        let close: &[u8] = if triple {
+            &[quote, quote, quote]
+        } else {
+            &[quote]
+        };
+        let mut at = if triple { 3 } else { 1 };
+        while at < bytes.len() {
+            if bytes[at] == b'\\' {
+                at += 2;
+                continue;
+            }
+            if bytes[at..].starts_with(close) {
+                return Some(at + close.len());
+            }
+            at += 1;
+        }
+        None
+    }
+
+    /// Builds the face lookup (the face-bearing sites keyed by their
+    /// declaring container) once, at resolve time.
+    fn build_ur_sites(&mut self) {
+        for index in 0..self.decl_sites.len() {
+            if self.decl_sites[index].use_result.is_some() {
+                let (container, spelling) = match &self.decl_sites[index].kind {
+                    DeclKind::Member { container, .. } | DeclKind::Constructor { container } => {
+                        (Some(*container), self.decl_sites[index].name)
+                    }
+                    _ => (None, self.decl_sites[index].name),
+                };
+                self.ur_sites.insert((container, spelling), index);
+            }
+        }
+    }
+
+    /// The face-bearing site of `member` on `container`'s chain (the
+    /// resolution's same-file walk; a hop into another file's index
+    /// chain-breaks, under-reporting).
+    fn ur_member_site(&self, container: StringId, member: StringId) -> Option<usize> {
+        let mut current = Some(container);
+        while let Some(c) = current {
+            if let Some(&site) = self.ur_sites.get(&(Some(c), member)) {
+                return Some(site);
+            }
+            current = self
+                .index
+                .get(self.file)
+                .and_then(|f| f.container(c))
+                .and_then(|x| x.superclass);
+        }
+        None
+    }
+
+    /// The `unless(parameterDefined: 'p')` bypass (`_passesUsingParam`):
+    /// the invocation supplies an argument that maps to a formal named
+    /// `p` — a named argument spelled `p`, or a positional argument whose
+    /// mapped formal is `p` (the official walk reads the argument list's
+    /// resolved static parameters). Reads and constructor invocations
+    /// carry no argument list the official switch accepts — their callers
+    /// pass `None` formals.
+    fn unless_bypassed(
+        &self,
+        callee: StringId,
+        unless: StringId,
+        formals: Option<&Formals>,
+    ) -> bool {
+        let Some(formals) = formals else {
+            return false;
+        };
+        if self.named_given.contains(&(callee, unless)) && formals.named_formal(unless).is_some() {
+            return true;
+        }
+        self.positional_given.get(&callee).is_some_and(|count| {
+            formals
+                .positional
+                .get(..(*count as usize))
+                .is_some_and(|given| given.iter().any(|formal| formal.name == unless))
+        })
+    }
+
+    /// The member-row emission (`_check`): `row` resolved against
+    /// `container`'s chain — or, for a constructor selector, against the
+    /// container's own constructor set. The `unless` bypass reads the
+    /// invocation's supplied-argument faces on the invoke intent only
+    /// (constructor invocations pass no argument list to the official
+    /// switch; a selector row anchors at the selector token — the
+    /// whole-invocation span needs the receiver extent the row fold
+    /// dropped, a documented under-length).
+    fn check_member_unused_result(
+        &mut self,
+        row: &Row,
+        container: StringId,
+        recv: &Receiver,
+        selector: bool,
+    ) {
+        let site_index = if selector {
+            self.ur_sites.get(&(Some(container), row.name)).copied()
+        } else {
+            self.ur_member_site(container, row.name)
+        };
+        let Some(site_index) = site_index else {
+            return;
+        };
+        let bypassed = matches!(row.intent, Intent::Invoke)
+            && !selector
+            && self.decl_sites[site_index].use_result.is_some_and(|face| {
+                face.unless.is_some_and(|(param, _)| {
+                    let formals = self.member_formals_full(recv, row.name);
+                    self.unless_bypassed(row.name, param, formals)
+                })
+            });
+        let display = self.strings.resolve(row.name).to_string();
+        self.check_unused_result(row.range.offset, row.range, site_index, &display, bypassed);
+    }
+
+    /// Emits the discarded-use row for a resolved reference unless its
+    /// context sealed it used or its `unless` bypass applied (`_check`'s
+    /// final gates; the anchor is the name token, or the whole invocation
+    /// for the creation folds).
+    fn check_unused_result(
+        &mut self,
+        offset: u32,
+        span: SourceRange,
+        _site_index: usize,
+        display: &str,
+        bypassed: bool,
+    ) {
+        if bypassed || self.ur_used.contains(&offset) {
+            return;
+        }
+        let span = self.ur_spans.get(&offset).copied().unwrap_or(span);
+        self.stage_usage(SemanticCode::UnusedResult, span, display);
+    }
+
+    /// The discarded-value face of a name resolved by scope (the
+    /// `checkNameExpression` arm, and the cascade section whose target type
+    /// the model cannot name): an invocation or bare read of a
+    /// UseResult-carrying top-level declaration, not sealed used. The
+    /// `unless` bypass reads the declaration's own formals.
+    fn check_top_level_unused_result(&mut self, row: &Row) {
+        let Some(&site_index) = self.ur_sites.get(&(None, row.name)) else {
+            return;
+        };
+        let bypassed = matches!(row.intent, Intent::Invoke)
+            && self.decl_sites[site_index].use_result.is_some_and(|face| {
+                face.unless.is_some_and(|(param, _)| {
+                    let formals = self
+                        .top_level_decl(row.name)
+                        .and_then(|d| d.formals.as_deref());
+                    self.unless_bypassed(row.name, param, formals)
+                })
+            });
+        let display = self.strings.resolve(row.name).to_string();
+        self.check_unused_result(row.range.offset, row.range, site_index, &display, bypassed);
+    }
+
+    /// The creation-fold emissions (`checkConstructorInvocation`): a
+    /// folded `A()` whose unnamed-constructor site carries the face. The
+    /// display name is the class name (the unnamed constructor's
+    /// `displayName`), and the anchor the whole `A()` span.
+    fn finalize_unused_result(&mut self) {
+        for (offset, span, container) in std::mem::take(&mut self.ur_creations) {
+            if self.ur_used.contains(&offset) {
+                continue;
+            }
+            let Some(&site) = self.ur_sites.get(&(Some(container), container)) else {
+                continue;
+            };
+            if self.decl_sites[site].use_result.is_none() {
+                continue;
+            }
+            let text = self.strings.resolve(container).to_string();
+            self.stage_usage(SemanticCode::UnusedResult, span, &text);
+        }
+    }
+
+    /// The `_findUndefinedUseResultParameter` co-row
+    /// (`annotation_verifier.dart:669-731`): a
+    /// `@UseResult.unless(parameterDefined: 'p')` on a top-level function
+    /// or method whose formal list names no `p` reports at the written
+    /// value expression (`{0}` the parameter, `{1}` the member). Getters
+    /// carry no parameter list and constructors are not `MethodDeclaration`
+    /// parents — both stay silent; local functions are out of the
+    /// declaration-site walk.
+    fn finalize_undefined_use_result_params(&mut self) {
+        // `(site name, member container — `None` for top-level — param,
+        // written value span)` per `unless`-carrying function/method site.
+        let flagged: Vec<(StringId, Option<StringId>, StringId, SourceRange)> = self
+            .decl_sites
+            .iter()
+            .filter_map(|site| {
+                let (param, span) = site.use_result.as_ref().and_then(|face| face.unless)?;
+                match &site.kind {
+                    DeclKind::TopLevelFn => Some((site.name, None, param, span)),
+                    DeclKind::Member {
+                        kind: MemberKind::Method | MemberKind::Setter,
+                        container,
+                        ..
+                    } => Some((site.name, Some(*container), param, span)),
+                    _ => None,
+                }
+            })
+            .collect();
+        for (name, container, param, span) in flagged {
+            let formals: Option<&Formals> = match container {
+                None => self
+                    .top_level_decl(name)
+                    .and_then(|decl| decl.formals.as_deref()),
+                Some(container) => {
+                    let entry = resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        container,
+                    )
+                    .and_then(|(resolved, _)| resolved.members.get(&name));
+                    match entry {
+                        Some(entry)
+                            if matches!(entry.kind, MemberKind::Method | MemberKind::Setter) =>
+                        {
+                            entry.formals.as_deref()
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            // The official predicate requires a parent declaration WITH a
+            // formal parameter list: the null `parameterList` arm returns —
+            // getters carry none, and a list the walk cannot fetch
+            // (cross-file container) stays silent the same way. A known
+            // list that names no `p` reports.
+            let Some(formals) = formals else {
+                continue;
+            };
+            let defined = formals.positional.iter().any(|formal| formal.name == param)
+                || formals.named.iter().any(|formal| formal.name == param);
+            if defined {
+                continue;
+            }
+            let param_text = self.strings.resolve(param).to_string();
+            let member_text = self.strings.resolve(name).to_string();
+            self.stage_typed(
+                SemanticCode::UndefinedReferencedParameter,
+                span,
+                &param_text,
+                &member_text,
+            );
+        }
     }
 
     /// Whether the already-collected declaration site of `member` in
@@ -4115,6 +4828,7 @@ impl<'a> Engine<'a> {
                 length: raw.chars().map(char::len_utf16).sum::<usize>() as u32,
             },
             prefix: None,
+            shown: Vec::new(),
         });
     }
 
@@ -7207,6 +7921,10 @@ impl<'a> Engine<'a> {
             });
             return;
         }
+        // The extraction itself is a candidate: a UseResult-carrying
+        // getter/field read discards here (`_check`'s property-extraction
+        // face, the accessor unwrap included).
+        self.ur_register(member.range.offset);
         self.push_row(Row {
             name: member.name,
             range: member.range,
@@ -7438,18 +8156,31 @@ impl<'a> Engine<'a> {
     /// invocation. A send without arguments never opened a group, so a bare
     /// read stays a read (`foo;` vs `foo()`). An explicit type-argument group
     /// on the callee checks its arity (`_element`, or `_extension` for an
-    /// extension override).
+    /// extension override). `end` is the send's last consumed token (the
+    /// argument group's closer) — the creation fold's whole-invocation
+    /// report anchor.
     ///
-    /// A container-name callee (`E('x')` the explicit extension application,
-    /// `C()` the implicit creation) folds into a receiver row carrying the
-    /// container: the argument rows belong to the send (truncated away), and
+    /// A container-name callee (`E('x')`, `C()`) folds into a receiver row
+    /// carrying the container: the argument rows belong to the send (truncated away), and
     /// a following `.member` / operator merge must resolve against the
     /// container's face, not the last argument's row. Member callees
     /// (`C.named()`, methods) are not folds — their own rows stand.
-    fn consume_send(&mut self) {
+    ///
+    /// Returns the `handleExit` face when the send resolves bottom: the
+    /// listener records `Flow::handle_exit` for it (official decision order —
+    /// the resolver's bottom-callee check at the name's end, then the
+    /// expression-level bottom check at the expression's end).
+    fn consume_send(&mut self, end: Token) -> Option<SendExit> {
         let Some(callee) = self.pending_send.take() else {
-            return;
+            return None;
         };
+        if let Some(row) = self.rows.get(callee) {
+            // The discarded-value machine: every completed send is a
+            // candidate until its context seals it.
+            self.ur_register(row.range.offset);
+        } else {
+            return None;
+        }
         if let Some(row) = self.rows.get_mut(callee)
             && row.intent == Intent::Read
         {
@@ -7458,13 +8189,23 @@ impl<'a> Engine<'a> {
         // The function-position face (`function_expression_invocation_
         // resolver.dart:131`): the invoked expression's own static type —
         // pre-invocation, so no callee-result enrichment here.
-        if let Some(row) = self.rows.get(callee)
+        let exit = if let Some(row) = self.rows.get(callee)
             && let RowShape::Bare(BareInfo::Plain { ty }) = &row.shape
             && self.is_never_ty(*ty)
         {
             let at = row.range;
             self.stage_receiver_of_type_never(at, *ty);
-        }
+            Some(SendExit::Callee)
+        } else {
+            // The expression-level face: the completed send's static type is
+            // the callee's declared return type, so a `Never` return makes
+            // the flow state die at the send's end.
+            let ret = self
+                .rows
+                .get(callee)
+                .map_or(Ty::UNKNOWN, |row| self.callee_return_ty(row));
+            (self.is_never_ty(ret)).then_some(SendExit::Result)
+        };
         if let Some(pos) = self
             .deferred_args
             .iter()
@@ -7478,18 +8219,33 @@ impl<'a> Engine<'a> {
             Some(RowShape::Bare(BareInfo::Container { .. }))
         ) {
             self.rows.truncate(callee + 1);
-            if let Some(row) = self.rows.get_mut(callee)
-                && let RowShape::Bare(BareInfo::Container { name, kind }) = row.shape
-            {
+            let folded = self.rows.get(callee).and_then(|row| match &row.shape {
+                RowShape::Bare(BareInfo::Container { name, kind }) => {
+                    Some((*name, *kind, row.range))
+                }
+                _ => None,
+            });
+            if let Some((name, kind, range)) = folded {
                 // The creation's head reference uses the class (the official
                 // `visitNamedType`/identifier face): the row folds into a
                 // receiver in place, so pass 2 never resolves it.
-                if !self.self_scope_rows.contains(&row.range.offset) {
+                if !self.self_scope_rows.contains(&range.offset) {
                     self.used_names.insert(name);
                 }
-                *row = Row {
+                // The creation fold is an unnamed-constructor invocation
+                // candidate (`checkConstructorInvocation`); extensions have
+                // no constructors. The anchor spans the whole `A()`
+                // (`nodeToAnnotate`).
+                if kind != ContainerKind::Extension {
+                    let span = SourceRange {
+                        offset: range.offset,
+                        length: end.range.offset + end.range.length - range.offset,
+                    };
+                    self.ur_register_creation(range.offset, span, name);
+                }
+                self.rows[callee] = Row {
                     name,
-                    range: row.range,
+                    range,
                     qualified: false,
                     shape: RowShape::Receiver(Receiver::Created { name, kind }),
                     intent: Intent::Read,
@@ -7498,6 +8254,7 @@ impl<'a> Engine<'a> {
                 };
             }
         }
+        exit
     }
 
     /// An implicit creation ended (`g<int>(...)`): the oracle rewrites the
@@ -8901,6 +9658,14 @@ impl<'a> Engine<'a> {
         }
         if missing {
             self.record_miss(name, range, false, NameUse::Annotation);
+        } else {
+            // A resolved annotation is a use of the annotation name (the
+            // official `lookupResult` on the metadata resolution's scope
+            // lookup — scope.dart:292-306): it credits the import that
+            // provided it (`unused_import`'s used set) and joins the
+            // use-face, never the §8 miss table.
+            self.used_names.insert(name);
+            self.annotation_uses.insert(name);
         }
     }
 
@@ -8993,6 +9758,7 @@ impl<'a> Engine<'a> {
 
     /// Resolves the recorded rows in source order and emits.
     fn resolve_rows(&mut self) {
+        self.build_ur_sites();
         let rows = std::mem::take(&mut self.rows);
         for row in &rows {
             match &row.shape {
@@ -9104,6 +9870,18 @@ impl<'a> Engine<'a> {
                 // parse-time self-reference exclusions skip their rows.
                 if !self.self_scope_rows.contains(&row.range.offset) {
                     self.used_names.insert(row.name);
+                }
+                // The discarded-value face (`_check` + `checkNameExpression`,
+                // use_result_verifier.dart): an invocation or bare read of a
+                // UseResult-carrying top-level declaration, not sealed used.
+                // A local shadowing the name resolves to the local here —
+                // the model carries no local annotations, so the face
+                // lookup answers from the outer declaration and may
+                // over-report that shadow (documented divergence).
+                if matches!(row.intent, Intent::Invoke | Intent::Read)
+                    && !self.self_scope_rows.contains(&row.range.offset)
+                {
+                    self.check_top_level_unused_result(row);
                 }
                 // A non-write resolution of a field name is the implicit
                 // getter's read (writes never spare a field).
@@ -9237,7 +10015,21 @@ impl<'a> Engine<'a> {
         }
         let name_text = self.strings.resolve(row.name);
         match recv {
-            Receiver::Unknown => {}
+            Receiver::Unknown => {
+                // The cascade-section face (`f()..g()`): the official walk
+                // answers the section send itself, so the discarded value
+                // reports at the selector when the name carries the face —
+                // with the target type unknown to the model, the section
+                // resolves by scope (the top-level site). Other unknown
+                // receivers keep the under-report (`dyn.foo()` dispatches
+                // dynamically, no element to check).
+                if !self_named
+                    && matches!(row.intent, Intent::Invoke | Intent::Read)
+                    && self.cascade_sections.contains(&row.range.offset)
+                {
+                    self.check_top_level_unused_result(row);
+                }
+            }
             Receiver::Prefix { name: prefix } => {
                 if self.prefixed_hit(prefix, row.name) || self.guard.ignore(Some(prefix), row.name)
                 {
@@ -9339,9 +10131,19 @@ impl<'a> Engine<'a> {
             // A named-constructor selector (`C.named`) resolves through the
             // creation face — the constructor is the class's own
             // declaration, never an undefined member.
+            self.check_member_unused_result(row, container, &Receiver::Unknown, true);
             return;
         }
         if defined {
+            self.check_member_unused_result(
+                row,
+                container,
+                &Receiver::Container {
+                    name: container,
+                    kind,
+                },
+                false,
+            );
             return;
         }
         let name_text = self.strings.resolve(row.name);
@@ -9422,6 +10224,15 @@ impl<'a> Engine<'a> {
             }
         }
         if self.member_defined(container, row, false) {
+            self.check_member_unused_result(
+                row,
+                container,
+                &Receiver::Typed {
+                    type_name: container,
+                    ty: Ty::UNKNOWN,
+                },
+                false,
+            );
             return;
         }
         if matches!(self.walk_members(container, row.name), Walk::ChainBroken) {
@@ -9516,6 +10327,15 @@ impl<'a> Engine<'a> {
             return;
         }
         if self.member_defined(container, row, true) {
+            self.check_member_unused_result(
+                row,
+                container,
+                &Receiver::Super {
+                    container,
+                    kind: ContainerKind::Class,
+                },
+                false,
+            );
             return;
         }
         if matches!(self.walk_super(container, row.name), Walk::ChainBroken) {
@@ -10265,6 +11085,62 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The `_checkForDuplications` face (`best_practices_verifier.dart`
+    /// :1077-1109) over a closed NON-const set/map literal: each
+    /// top-level element (map: each entry's KEY) constant-evaluates; a
+    /// value an earlier element already produced reports
+    /// `equal_elements_in_set` / `equal_keys_in_map` at the later
+    /// element's own span, in element order, one row per repeat. Any
+    /// verdict but [`Verdict::Value`] is silent (the oracle skips the
+    /// element when `computeConstantValue` fails), and a literal holding
+    /// spread/if/for elements skips wholesale — the oracle's
+    /// `whereType<Expression>` excludes those elements and their folded
+    /// operands cannot be told apart here (under-report, the capture's
+    /// deferral posture). Value equality is the const kernel's
+    /// [`ConstantValue`] equality: ints and doubles never unify
+    /// (`{1, 1.0}` is silent).
+    fn check_equal_duplicates(
+        &mut self,
+        shape: crate::const_eval::SetOrMap,
+        has_ctl_elements: bool,
+    ) {
+        use crate::const_eval::SetOrMap;
+        if has_ctl_elements {
+            return;
+        }
+        let (code, parts): (SemanticCode, Vec<crate::const_eval::Node>) = match shape {
+            SetOrMap::Set(elements) => (SemanticCode::EqualElementsInSet, elements),
+            SetOrMap::Map(entries) => (
+                SemanticCode::EqualKeysInMap,
+                entries.into_iter().map(|(key, _)| key).collect(),
+            ),
+        };
+        let mut seen: Vec<ConstantValue> = Vec::new();
+        for part in &parts {
+            if let Verdict::Value(v) = eval(part, self) {
+                if seen.contains(&v) {
+                    self.emit_with_correction(code, part.span);
+                } else {
+                    seen.push(v);
+                }
+            }
+        }
+    }
+
+    /// Emits with the row's oracle `correctionMessage` (the plain
+    /// [`Engine::emit`] passes none).
+    fn emit_with_correction(&mut self, code: SemanticCode, range: SourceRange) {
+        let correction = code.correction_message("");
+        self.report.diagnostics.push(Diagnostic::new(
+            code.severity(),
+            code.code_info(),
+            code.message("", ""),
+            self.file,
+            range,
+            correction,
+        ));
+    }
+
     // —— capture event forwards (cheap no-ops with no window) ———
 
     pub fn const_int_literal(&mut self, token: Token) {
@@ -10595,7 +11471,6 @@ pub fn diagnose(
 /// Panics if the parser still holds the listener at teardown — impossible
 /// by construction (`parser` is dropped above), asserted with `expect`.
 #[allow(clippy::too_many_arguments)] // the analysis context, one field each
-#[allow(clippy::too_many_lines)] // one linear pipeline: parse, resolve, fold, merge
 pub fn diagnose_with(
     source: &str,
     tokens: &TokenTable,
@@ -10608,6 +11483,36 @@ pub fn diagnose_with(
     index: &ElementIndex,
     strict: StrictModes,
 ) -> FileReport {
+    diagnose_unit(
+        source, tokens, features, strings, file, lib, graph, namespaces, index, strict,
+    )
+    .0
+}
+
+/// [`diagnose_with`], plus the unit's use-face (the M3 U1 substrate,
+/// [`use_face::UnitUseFace`]): every observable use the pass recorded,
+/// for the caller to fold into its per-library consumed set
+/// ([`use_face::LibraryUsages::close_library_usage`]). The report side is
+/// byte-identical to [`diagnose_with`].
+///
+/// # Panics
+///
+/// Panics if the parser still holds the listener at teardown — impossible
+/// by construction (`parser` is dropped above), asserted with `expect`.
+#[allow(clippy::too_many_arguments)] // the analysis context, one field each
+#[allow(clippy::too_many_lines)] // one linear pipeline: parse, resolve, fold, merge
+pub fn diagnose_unit(
+    source: &str,
+    tokens: &TokenTable,
+    features: ParserFeatures,
+    strings: &StringTable,
+    file: FileId,
+    lib: LibraryId,
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    strict: StrictModes,
+) -> (FileReport, UnitUseFace) {
     let engine = Rc::new(RefCell::new(Engine::new(
         graph,
         namespaces,
@@ -10711,6 +11616,12 @@ pub fn diagnose_with(
         .expect("the parser released its listener")
         .into_inner();
     engine.resolve_rows();
+    // The discarded-value folds (`checkConstructorInvocation`) and the
+    // `unless` parameter co-row (`_findUndefinedUseResultParameter`) run
+    // after the resolve arms: the folds read the final used set, the co-row
+    // reads the settled formal tables.
+    engine.finalize_unused_result();
+    engine.finalize_undefined_use_result_params();
     // The #610 boundedness faces run after the parse — the snapshot must
     // see every in-file container — folding the deferred sites, the enum
     // values-field checks, and the `strict_raw_type` displays.
@@ -10723,6 +11634,10 @@ pub fn diagnose_with(
     // declaration sites and import directives walk the index, staging into
     // the report; the staged emissions merge source-ordered into the tail.
     engine.finalize_usage();
+    // The use-face extraction (#767): the per-file consumers have read
+    // their sets; the sets re-home into the face for the caller's
+    // per-library close.
+    let face = engine.take_use_face();
     let mut report = std::mem::take(&mut engine.report);
     // The staged assignability verdicts re-decide against the promotions
     // and merge ahead of the flow rows: the assignability families are
@@ -10807,7 +11722,7 @@ pub fn diagnose_with(
     }
     diagnostics.append(&mut report.diagnostics);
     report.diagnostics = diagnostics;
-    report
+    (report, face)
 }
 
 /// One planned class-modifier emission: the code and its filled message
@@ -11814,7 +12729,11 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_for_statement(&mut self, _token: Token) {
         self.flow.borrow_mut().begin_for_statement(_token);
 
-        self.engine.borrow_mut().push_block_frame();
+        let mut engine = self.engine.borrow_mut();
+        engine.push_block_frame();
+        // The condition/updater window (classic for) or the iterable window
+        // (for-in) opens at the keyword — the statement form (1).
+        engine.in_for_parts.push(1);
     }
 
     fn end_for_statement(&mut self, _end: Token) {
@@ -11892,6 +12811,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let mut engine = self.engine.borrow_mut();
         engine.init_frame_depth = engine.frames.len();
+        engine.in_initializer = true;
         engine.init_mark = Some(engine.rows.len());
         engine.open_const_initializer();
     }
@@ -11900,6 +12820,9 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow.borrow_mut().end_variable_initializer(_token);
 
         let mut engine = self.engine.borrow_mut();
+        // `VariableDeclaration` is in the official used set.
+        engine.ur_seal_used();
+        engine.in_initializer = false;
         // The const close face: a member field group's own initializers
         // (began at the group's frame depth) and file-scope initializers
         // close on the field face — the value joins `const_field_values` /
@@ -11931,9 +12854,7 @@ impl ParserListener for DiagnoseListener<'_> {
             // The #612 capture pairs the parameter's name here: the Simple1
             // fast path completes the variable at `end_type_variable` with
             // the group's closer token, whose text is not the name.
-            if engine.variance_enabled {
-                engine.var_name_stack.push((name, token.range));
-            }
+            engine.var_name_stack.push((name, token.range));
         }
     }
 
@@ -12131,8 +13052,29 @@ impl ParserListener for DiagnoseListener<'_> {
                     // The annotated-declaration exemption latch (the
                     // pragma/JS entry-point gates' superset) plus the
                     // annotation-arity check.
-                    engine.pending_annotations.push(name);
+                    engine
+                        .pending_annotations
+                        .push(PendingAnnotation { name, unless: None });
                     engine.check_annotation(name, token.range);
+                }
+            }
+            C::MetadataContinuation | C::MetadataContinuationAfterTypeArguments => {
+                // The selector segment of a qualified annotation
+                // (`@UseResult.unless`): joins the head segment in the
+                // latch (`head.selector`), the shape
+                // `use_result_unless` matches.
+                if let Some(name) = name {
+                    let selector = engine.strings.resolve(name);
+                    let head = engine
+                        .pending_annotations
+                        .last()
+                        .map(|open| engine.strings.resolve(open.name));
+                    if let Some(head) = head {
+                        let joined = engine.strings.intern(&format!("{head}.{selector}"));
+                        if let Some(open) = engine.pending_annotations.last_mut() {
+                            open.name = joined;
+                        }
+                    }
                 }
             }
             C::TopLevelFunctionDeclaration => {
@@ -12240,6 +13182,26 @@ impl ParserListener for DiagnoseListener<'_> {
                         }
                     } else {
                         engine.note_decl_site(name, token.range, DeclKind::TopLevelVar);
+                    }
+                }
+            }
+            // A `show`-list name joins the current import's shown set with
+            // its token span (`generateUnusedShownNameHints`'s walk); a
+            // `hide` name has no hint of its own. An `export`'s show names
+            // belong to no import site — they join the use-face's
+            // re-export record.
+            C::Combinator => {
+                if let Some(name) = name
+                    && engine.in_show
+                {
+                    if engine.in_import
+                        && let Some(site) = engine.imports.last_mut()
+                    {
+                        site.shown.push((name, token.range));
+                    } else if engine.in_export
+                        && let Some(export) = engine.exports.last_mut()
+                    {
+                        export.shown.push(name);
                     }
                 }
             }
@@ -12402,15 +13364,20 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_initializers(&mut self, _count: usize, _begin: Token, _end: Token) {
-        self.engine.borrow_mut().initializer_depth -= 1;
+        let mut engine = self.engine.borrow_mut();
+        // `ConstructorFieldInitializer` is in the official used set.
+        engine.ur_seal_used();
+        engine.initializer_depth -= 1;
     }
 
     fn begin_metadata(&mut self, token: Token) {
         self.engine.borrow_mut().annotation_at = Some(token.range);
     }
 
-    fn end_metadata(&mut self, _begin: Token, _period_before_name: Option<Token>, _end: Token) {
-        self.engine.borrow_mut().annotation_at = None;
+    fn end_metadata(&mut self, begin: Token, _period_before_name: Option<Token>, end: Token) {
+        let mut engine = self.engine.borrow_mut();
+        engine.note_metadata_args(begin, end);
+        engine.annotation_at = None;
     }
 
     // —— receivers and selectors ——————————————————————————————————————
@@ -12445,6 +13412,10 @@ impl ParserListener for DiagnoseListener<'_> {
             .borrow_mut()
             .handle_dot_access(token, end, is_null_aware);
 
+        // The receiver's value flows into the extraction: every pending
+        // candidate under it seals used (`_isUsed`'s `PropertyExtraction`
+        // parent arm).
+        self.engine.borrow_mut().ur_seal_used();
         self.engine.borrow_mut().merge_member(is_null_aware);
         self.engine
             .borrow_mut()
@@ -12458,13 +13429,32 @@ impl ParserListener for DiagnoseListener<'_> {
             .borrow_mut()
             .handle_cascade_access(_operator, _end, is_null_aware);
 
-        self.engine.borrow_mut().merge_member(is_null_aware);
+        let mut engine = self.engine.borrow_mut();
+        engine.merge_member(is_null_aware);
+        // The merged row is the section's selector: its discarded value
+        // reports at this token even when the target's type is unknown to
+        // the model (the official walk answers on the section node).
+        if let Some(row) = engine.rows.last().map(|row| row.range.offset) {
+            engine.cascade_sections.insert(row);
+        }
     }
 
-    fn handle_send(&mut self, _begin: Token, _end: Token) {
-        self.flow.borrow_mut().handle_send(_begin, _end);
+    fn handle_send(&mut self, begin: Token, end: Token) {
+        self.flow.borrow_mut().handle_send(begin, end);
 
-        self.engine.borrow_mut().consume_send();
+        // The engine resolves the send during the parse (the index is
+        // complete), so a bottom face's `handleExit` lands in the open
+        // buffer before the executable replays — the parser listener alone
+        // cannot know it. Faces: the resolver's bottom-callee check at the
+        // name's end (`method_invocation_resolver.dart:129/:351/:489/:547`),
+        // then the expression-level bottom check at the expression's end
+        // (`type_analyzer.dart:815-819`).
+        let exit = self.engine.borrow_mut().consume_send(end);
+        match exit {
+            Some(SendExit::Callee) => self.flow.borrow_mut().handle_exit(begin),
+            Some(SendExit::Result) => self.flow.borrow_mut().handle_exit(end),
+            None => {}
+        }
     }
 
     fn handle_assignment_expression(&mut self, operator: Token, _end: Token) {
@@ -12473,6 +13463,9 @@ impl ParserListener for DiagnoseListener<'_> {
             .handle_assignment_expression(operator, _end);
 
         let mut engine = self.engine.borrow_mut();
+        // `DirectAssignment`/`IfNullAssignment` are in the official used
+        // set (the assignment's value flows somewhere).
+        engine.ur_seal_used();
         engine.const_capture.assignment(operator.range);
         engine.mark_assignment(operator);
         engine.check_assignment(operator);
@@ -12519,6 +13512,9 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow.borrow_mut().end_binary_expression(_operator, end);
 
         let mut engine = self.engine.borrow_mut();
+        // `BinaryOperatorInvocation`/`IfNull` are in the official used set
+        // (both operands).
+        engine.ur_seal_used();
         engine.const_capture.end_binary(end.range);
         match engine.text_of(_operator) {
             Some("??") => engine.end_if_null(),
@@ -12654,6 +13650,14 @@ impl ParserListener for DiagnoseListener<'_> {
             // (type_analyzer.dart:2107-2126): stages the nullable-cast
             // candidate for the teardown's `UnassignedRead` join.
             engine.check_cast_from_nullable(simple_local, operand, cast_ty);
+            // The Never-operand face: the operand's exit leaves the cast
+            // type dead inside an initializer (`check_dead_cast_tail`);
+            // the send row's raw type is `Unknown`, the junction reads the
+            // callee's return type.
+            let dead_operand = engine
+                .operand_row()
+                .map_or(Ty::Unknown, |row| engine.operand_static_ty(row));
+            engine.check_dead_cast_tail(operator, dead_operand);
         }
         engine.const_capture.opaque_leaf(operator.range);
     }
@@ -12729,8 +13733,14 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_arguments(&mut self, _token: Token) {
         self.flow.borrow_mut().begin_arguments(_token);
 
-        self.engine.borrow_mut().const_capture.begin_arguments();
-        self.engine.borrow_mut().open_arguments();
+        let mut engine = self.engine.borrow_mut();
+        // The watermark: only pendings registered inside the list seal used
+        // at the close (the official `ArgumentList` parent arm); the
+        // callee's own candidate predates it.
+        let base = engine.ur_pending.len();
+        engine.ur_arg_base.push(base);
+        engine.const_capture.begin_arguments();
+        engine.open_arguments();
     }
 
     fn end_arguments(&mut self, count: usize, _begin: Token, end: Token) {
@@ -12784,6 +13794,8 @@ impl ParserListener for DiagnoseListener<'_> {
             }
         }
         engine.close_arguments(u16::try_from(count).unwrap_or(u16::MAX));
+        // The list's own expressions were uses (`ArgumentList`).
+        engine.ur_seal_used_within();
     }
 
     fn handle_positional_argument(&mut self, _token: Token) {
@@ -12810,6 +13822,8 @@ impl ParserListener for DiagnoseListener<'_> {
             .end_return_statement(has_expression, _begin, end);
 
         let mut engine = self.engine.borrow_mut();
+        // `ReturnStatement` is in the official used set.
+        engine.ur_seal_used();
         let mark = engine.return_mark.take();
         if !has_expression {
             // Bare `return;` is a `void` expression in the oracle's matrix.
@@ -12829,6 +13843,8 @@ impl ParserListener for DiagnoseListener<'_> {
             .handle_expression_function_body(_arrow, _end);
 
         let mut engine = self.engine.borrow_mut();
+        // `ExpressionFunctionBody` is in the official used set.
+        engine.ur_seal_used();
         let Some(mark) = engine.body_mark.take() else {
             return;
         };
@@ -12856,6 +13872,10 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow.borrow_mut().begin_cascade(operator);
 
         let mut engine = self.engine.borrow_mut();
+        // The cascade target completed before the `..`: it is a use (the
+        // official `CascadeExpression` target arm); the sections' pendings
+        // discard at the close.
+        engine.ur_seal_used();
         engine.in_cascade = true;
         engine.const_capture.begin_opaque_group();
         let _ = operator;
@@ -12865,6 +13885,9 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow.borrow_mut().end_cascade();
 
         let mut engine = self.engine.borrow_mut();
+        // The sections are not uses (the official `CascadeExpression` arm
+        // spares only the target).
+        engine.ur_seal_discard();
         engine.in_cascade = false;
         engine.const_capture.end_opaque_group(SourceRange {
             offset: 0,
@@ -12878,6 +13901,9 @@ impl ParserListener for DiagnoseListener<'_> {
             .handle_indexed_expression(question, open, close);
 
         let mut engine = self.engine.borrow_mut();
+        // `IndexExpression`/`IndexAssignmentTarget` are in the official
+        // used set.
+        engine.ur_seal_used();
         // The oracle anchors index-access reports on the bracket pair
         // (`property_element_resolver.dart`, `_reportUnresolvedIndex`).
         let bracket = SourceRange {
@@ -13367,6 +14393,8 @@ impl ParserListener for DiagnoseListener<'_> {
             .end_switch_expression_case(_begin, when, arrow, _end);
 
         let mut engine = self.engine.borrow_mut();
+        // `SwitchExpression` is in the official used set.
+        engine.ur_seal_used();
         let space = engine
             .switches
             .last_mut()
@@ -13552,6 +14580,8 @@ impl ParserListener for DiagnoseListener<'_> {
             .end_literal_string(interpolation_count, end);
 
         let mut engine = self.engine.borrow_mut();
+        // `InterpolationExpression` is in the official used set.
+        engine.ur_seal_used();
         // The begin span arrives via the capture's own string marks (the
         // engine latched it at `begin_literal_string` — carried on the
         // event's `end` counterpart below).
@@ -13595,6 +14625,8 @@ impl ParserListener for DiagnoseListener<'_> {
             .handle_literal_list(count, left, _const_keyword, right);
 
         let mut engine = self.engine.borrow_mut();
+        // `ListLiteral` is in the official used set.
+        engine.ur_seal_used();
         if let Some(elements) = engine.const_capture.literal_list(count, left.range) {
             // Implicit const literals in a const context check per element
             // with the element code too (the oracle evaluates the literal
@@ -13606,6 +14638,16 @@ impl ParserListener for DiagnoseListener<'_> {
             );
         }
         engine.push_value_row(right);
+    }
+
+    fn begin_literal_set_or_map(&mut self, _left: Token, const_keyword: Option<Token>) {
+        // The non-const duplicate window (#747): only literals without a
+        // `const` keyword qualify; the capture skips anything already
+        // inside a const window (implicitly const literals are the ERROR
+        // const twins' business).
+        if const_keyword.is_none() {
+            self.engine.borrow_mut().const_capture.open_non_const_dup();
+        }
     }
 
     fn handle_literal_set_or_map(
@@ -13626,7 +14668,16 @@ impl ParserListener for DiagnoseListener<'_> {
 
         use crate::const_eval::{InstanceKind, SetOrMap};
         let mut engine = self.engine.borrow_mut();
-        if let Some(shape) =
+        // `SetOrMapLiteral`/`MapLiteralEntry` are in the official used set.
+        engine.ur_seal_used();
+        if let Some((shape, has_ctl)) =
+            engine
+                .const_capture
+                .close_non_const_dup(count, left.range, has_set_entry)
+        {
+            // The `_checkForDuplications` face (WARNING tier).
+            engine.check_equal_duplicates(shape, has_ctl);
+        } else if let Some(shape) =
             engine
                 .const_capture
                 .literal_set_or_map(count, left.range, has_set_entry)
@@ -13680,6 +14731,8 @@ impl ParserListener for DiagnoseListener<'_> {
             .end_record_literal(token, count, _const_keyword);
 
         let mut engine = self.engine.borrow_mut();
+        // `RecordLiteral` is in the official used set.
+        engine.ur_seal_used();
         if let Some(fields) = engine.const_capture.record_literal(count, token.range) {
             engine.check_const_elements(SemanticCode::NonConstantRecordField, &fields);
             engine.const_capture.push_value(
@@ -13699,7 +14752,31 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— #505: directives ———————————————————————————————————————————————
 
     fn begin_import(&mut self, import_keyword: Token) {
-        self.engine.borrow_mut().begin_import_site(import_keyword);
+        let mut engine = self.engine.borrow_mut();
+        engine.in_import = true;
+        engine.begin_import_site(import_keyword);
+    }
+
+    fn end_import(&mut self, _import_keyword: Token, _semicolon: Option<Token>) {
+        self.engine.borrow_mut().in_import = false;
+    }
+
+    fn begin_export(&mut self, _export_keyword: Token) {
+        let mut engine = self.engine.borrow_mut();
+        engine.in_export = true;
+        engine.exports.push(ExportUseFace::default());
+    }
+
+    fn end_export(&mut self, _export_keyword: Token, _semicolon: Token) {
+        self.engine.borrow_mut().in_export = false;
+    }
+
+    fn begin_show(&mut self, _token: Token) {
+        self.engine.borrow_mut().in_show = true;
+    }
+
+    fn end_show(&mut self, _token: Token) {
+        self.engine.borrow_mut().in_show = false;
     }
 
     // —— #279: const contexts ————————————————————————————————————————
@@ -13815,6 +14892,9 @@ impl ParserListener for DiagnoseListener<'_> {
     fn handle_throw_expression(&mut self, throw: Token, _end: Token) {
         self.flow.borrow_mut().handle_throw_expression(throw, _end);
 
+        // `ThrowExpression` is in the official used set (the event fires
+        // after the operand parsed).
+        self.engine.borrow_mut().ur_seal_used();
         self.engine
             .borrow_mut()
             .const_capture
@@ -13864,16 +14944,30 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_else_statement(&mut self, token: Token) {
         self.flow.borrow_mut().begin_else_statement(token);
+        // Insurance: the condition sealed at `begin_then_statement`.
+        self.engine.borrow_mut().ur_seal_used();
     }
 
     fn begin_for_control_flow(&mut self, await_kw: Option<Token>, for_kw: Token) {
         self.flow
             .borrow_mut()
             .begin_for_control_flow(await_kw, for_kw);
+        let mut engine = self.engine.borrow_mut();
+        // The collection-element form's window (2): its condition is an
+        // expression statement like the statement form's; its window closes
+        // at the control-flow end.
+        engine.in_for_parts.push(2);
+        engine.const_capture.begin_ctl_element();
     }
 
     fn begin_for_in_body(&mut self, token: Token) {
         self.flow.borrow_mut().begin_for_in_body(token);
+        // The iterable window closes at the body (statement form only —
+        // the collection form pops at `end_for_in_control_flow`).
+        let mut engine = self.engine.borrow_mut();
+        if engine.in_for_parts.last() == Some(&1) {
+            engine.in_for_parts.pop();
+        }
     }
 
     fn begin_for_in_expression(&mut self, token: Token) {
@@ -13886,6 +14980,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_if_control_flow(&mut self, token: Token) {
         self.flow.borrow_mut().begin_if_control_flow(token);
+        self.engine.borrow_mut().const_capture.begin_ctl_element();
     }
 
     fn begin_if_statement(&mut self, token: Token) {
@@ -13925,6 +15020,8 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_then_statement(&mut self, token: Token) {
         self.flow.borrow_mut().begin_then_statement(token);
+        // `IfStatement` is in the official used set (the condition).
+        self.engine.borrow_mut().ur_seal_used();
     }
 
     fn begin_try_statement(&mut self, token: Token) {
@@ -13940,6 +15037,8 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_while_statement_body(&mut self, token: Token) {
         self.flow.borrow_mut().begin_while_statement_body(token);
+        // `WhileStatement` is in the official used set (the condition).
+        self.engine.borrow_mut().ur_seal_used();
     }
 
     fn end_assert(
@@ -13953,6 +15052,9 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow
             .borrow_mut()
             .end_assert(begin, kind, left_paren, comma, end);
+        // `AssertStatement`/`AssertInitializer` are in the official used
+        // set (condition and message).
+        self.engine.borrow_mut().ur_seal_used();
     }
 
     fn end_block(&mut self, count: usize, begin: Token, end: Token, kind: BlockKind) {
@@ -13974,6 +15076,8 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow
             .borrow_mut()
             .end_do_while_statement(token, while_kw, end);
+        // `DoStatement` is in the official used set (the while condition).
+        self.engine.borrow_mut().ur_seal_used();
     }
 
     fn end_do_while_statement_body(&mut self, end: Token) {
@@ -13982,6 +15086,10 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_for_control_flow(&mut self, token: Token) {
         self.flow.borrow_mut().end_for_control_flow(token);
+        let mut engine = self.engine.borrow_mut();
+        if engine.in_for_parts.last() == Some(&2) {
+            engine.in_for_parts.pop();
+        }
     }
 
     fn end_for_in_body(&mut self, end: Token) {
@@ -13990,10 +15098,16 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_for_in_control_flow(&mut self, token: Token) {
         self.flow.borrow_mut().end_for_in_control_flow(token);
+        let mut engine = self.engine.borrow_mut();
+        if engine.in_for_parts.last() == Some(&2) {
+            engine.in_for_parts.pop();
+        }
     }
 
     fn end_for_in_expression(&mut self, end: Token) {
         self.flow.borrow_mut().end_for_in_expression(end);
+        // `ForEachParts` is in the official used set (the iterable).
+        self.engine.borrow_mut().ur_seal_used();
     }
 
     fn end_for_statement_body(&mut self, end: Token) {
@@ -14049,6 +15163,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_if_statement(&mut self, token: Token, else_kw: Option<Token>, end: Token) {
         self.flow.borrow_mut().end_if_statement(token, else_kw, end);
+        self.engine.borrow_mut().ur_seal_used();
     }
 
     fn end_initialized_identifier(&mut self, name: Token) {
@@ -14113,6 +15228,8 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_yield_statement(&mut self, begin: Token, star: Option<Token>, end: Token) {
         self.flow.borrow_mut().end_yield_statement(begin, star, end);
+        // `YieldStatement` is in the official used set.
+        self.engine.borrow_mut().ur_seal_used();
     }
 
     fn handle_assigned_variable_pattern(&mut self, variable: Token) {
@@ -14165,6 +15282,11 @@ impl ParserListener for DiagnoseListener<'_> {
             .borrow_mut()
             .handle_expression_statement(begin, end);
 
+        // The discarded-value verdict: `ExpressionStatement` is absent from
+        // both official `_isUsed` sets (the value is dropped), except the
+        // for-condition arm whose statement seals used (the updaters drain
+        // at `handle_for_loop_parts`).
+        self.engine.borrow_mut().ur_expression_statement();
         self.engine.borrow_mut().check_statement_use(begin, end);
     }
 
@@ -14197,6 +15319,16 @@ impl ParserListener for DiagnoseListener<'_> {
             right_separator,
             expression_count,
         );
+        // The updaters fired no events: their leftovers are discarded (the
+        // official `ForParts` arm spares only the condition, which sealed
+        // used at its expression statement), and the window closes — the
+        // statement form's own (the collection form pops at its control
+        // -flow end).
+        let mut engine = self.engine.borrow_mut();
+        engine.ur_seal_discard();
+        if engine.in_for_parts.last() != Some(&2) {
+            engine.in_for_parts.pop();
+        }
     }
 
     fn handle_invalid_function_body(&mut self, token: Token) {
@@ -14223,6 +15355,9 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_pattern_assignment(&mut self, equals: Token) {
         self.flow.borrow_mut().handle_pattern_assignment(equals);
+        // `PatternAssignment` is in the official used set (the event fires
+        // after the RHS parsed).
+        self.engine.borrow_mut().ur_seal_used();
     }
 
     fn handle_pattern_variable_declaration_statement(
@@ -14235,6 +15370,9 @@ impl ParserListener for DiagnoseListener<'_> {
             .borrow_mut()
             .handle_pattern_variable_declaration_statement(keyword, equals, semicolon);
 
+        // `PatternVariableDeclaration` is in the official used set (the
+        // event fires after the initializer parsed).
+        self.engine.borrow_mut().ur_seal_used();
         // The statement boundary closes the group window (the next
         // declaration is its own all-or-nothing set).
         self.engine.borrow_mut().pattern_group_open = None;
@@ -14250,16 +15388,37 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow
             .borrow_mut()
             .handle_send_without_arguments(begin, end, next);
+
+        // A non-invoked identifier expression is a bare-read candidate
+        // (the official `checkNameExpression` face): the read of a
+        // UseResult-carrying declaration discards here unless its context
+        // seals it.
+        self.engine.borrow_mut().ur_register_bare_read(begin);
     }
 
     fn handle_spread_expression(&mut self, operator: Token) {
         self.flow.borrow_mut().handle_spread_expression(operator);
+        self.engine.borrow_mut().const_capture.begin_ctl_element();
     }
 
     fn handle_switch_case_no_when_clause(&mut self, token: Token) {
         self.flow
             .borrow_mut()
             .handle_switch_case_no_when_clause(token);
+        // `SwitchStatement` is in the official used set (the case head's
+        // constants); the body statements answer through their own events.
+        self.engine.borrow_mut().ur_seal_used();
+    }
+
+    fn end_switch_case_when_clause(&mut self, _token: Token) {
+        // `WhenClause` is in the official used set (the guard expression).
+        self.engine.borrow_mut().ur_seal_used();
+    }
+
+    fn handle_for_initializer_expression_statement(&mut self, _token: Token, _for_in: bool) {
+        // `ForLoopParts` is in the official used set (the initializer
+        // position).
+        self.engine.borrow_mut().ur_seal_used();
     }
 
     fn handle_then_control_flow(&mut self, token: Token) {
@@ -15027,14 +16186,15 @@ mod tests {
         report_with(source, strict, |_| None)
     }
 
-    /// [`report`] with the `variance` experiment granted (#612): the only
-    /// path that can emit the family.
+    /// [`report`] with the `variance` experiment granted (#612): the
+    /// explicit-keyword faces additionally arm.
     fn report_variance(source: &str) -> FileReport {
         report_granted(source, true)
     }
 
     /// [`report`] with the `variance` experiment explicitly withheld — the
-    /// byte-identical-default pin (#612).
+    /// legacy superinterface face still answers; the explicit-keyword faces
+    /// stay gated (#742).
     fn report_ungranted(source: &str) -> FileReport {
         report_granted(source, false)
     }
@@ -18135,6 +19295,129 @@ mod tests {
         );
     }
 
+    // —— #747: equal_elements_in_set / equal_keys_in_map ————————————————
+
+    /// A repeated constant element reports `equal_elements_in_set` at the
+    /// LATER element's own span, once per repeat, with the verbatim oracle
+    /// message (`best_practices_verifier.dart:1077-1109`, messages.yaml
+    /// :26907).
+    #[test]
+    fn duplicate_set_element_reports_at_the_later_element() {
+        let rep = report("var s = {1, 1};");
+        assert_eq!(
+            code_names(&rep),
+            ["equal_elements_in_set"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let d = &rep.diagnostics[0];
+        assert_eq!(
+            d.message,
+            "Two elements in a set literal shouldn't be equal."
+        );
+        assert_eq!(d.range.offset, u32::try_from("var s = {1, ".len()).unwrap());
+        assert_eq!(d.range.length, 1);
+        // Multiple repeats each report, in element order.
+        let rep = report("var s = {1, 1, 1};");
+        let at: Vec<u32> = rep.diagnostics.iter().map(|d| d.range.offset).collect();
+        assert_eq!(
+            at,
+            [
+                u32::try_from("var s = {1, ".len()).unwrap(),
+                u32::try_from("var s = {1, 1, ".len()).unwrap(),
+            ]
+        );
+    }
+
+    /// A repeated constant KEY reports `equal_keys_in_map` at the later
+    /// key's own span with the verbatim oracle message and correction
+    /// (messages.yaml :26954); equal VALUES under distinct keys never
+    /// report (map values are not participants).
+    #[test]
+    fn duplicate_map_key_reports_at_the_later_key() {
+        let rep = report("var m = {'a': 1, 'a': 2};");
+        assert_eq!(
+            code_names(&rep),
+            ["equal_keys_in_map"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let d = &rep.diagnostics[0];
+        assert_eq!(d.message, "Two keys in a map literal shouldn't be equal.");
+        assert_eq!(
+            d.correction.as_deref(),
+            Some("Change or remove the duplicate key.")
+        );
+        assert_eq!(
+            d.range.offset,
+            u32::try_from("var m = {'a': 1, ".len()).unwrap()
+        );
+        assert_eq!(d.range.length, 3);
+
+        let rep = report("var m = {'a': 1, 'b': 1};");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// The silent faces: a const literal's duplicate face is the
+    /// ERROR-tier const twins (explicitly `const` or implicitly const in
+    /// a const context — never this wave's row); evaluation failure is
+    /// silence (`computeConstantValue` fails); ints and doubles never
+    /// unify.
+    #[test]
+    fn const_and_non_constant_duplicates_stay_silent() {
+        let rep = report("const s = {1, 1};");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        let rep = report("const c = [{1, 1}];");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        let rep = report("var x = 0; var s = {x, x};");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        let rep = report("var s = {1, 1.0};");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// Spread/if/for elements skip the whole literal's duplicate check —
+    /// the capture cannot tell their folded operands apart from plain
+    /// elements (the documented under-report posture; the oracle excludes
+    /// only those elements themselves).
+    #[test]
+    fn control_flow_elements_skip_the_duplicate_check() {
+        let rep = report("var y = [1]; var s = {1, ...y, 1};");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// A literal nested inside a dup-checked literal leaves its opaque
+    /// placeholder on the parent stack, keeping the parent's element and
+    /// entry pairing aligned: a nested map as a VALUE keeps its entry (so
+    /// its key participates), and a nested literal as an ELEMENT never
+    /// reports (the oracle's `computeConstantValue` fails on it).
+    #[test]
+    fn nested_literals_keep_parent_pairing_aligned() {
+        // Without the placeholder the first key would lose its entry and
+        // this repeat would go unreported.
+        let rep = report("var m = {1: {2: 3}, 1: 4};");
+        assert_eq!(
+            code_names(&rep),
+            ["equal_keys_in_map"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].range.offset,
+            u32::try_from("var m = {1: {2: 3}, ".len()).unwrap()
+        );
+        let rep = report("var s = {1, {2: 3}, 1};");
+        assert_eq!(
+            code_names(&rep),
+            ["equal_elements_in_set"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].range.offset,
+            u32::try_from("var s = {1, {2: 3}, ".len()).unwrap()
+        );
+    }
+
     /// Unknown names defer: the M1 row reports, no const verdict fires
     /// (under-report discipline — use-before-decl stays suppressed).
     #[test]
@@ -18333,7 +19616,11 @@ mod tests {
         );
         // Clean elements stay silent, including the fault-deciding lazy
         // shapes (`false && l` never evaluates its right operand); the
-        // const locals `e`/`f`/`g` are unread.
+        // const locals `e`/`f`/`g` are unread. The constant-false `&&`
+        // left does make the right operand run dead (the official
+        // `LogicalAnd` arm re-anchors `dead_code` at the operator spanning
+        // the operand, dead_code_verifier.dart:311-322) — a separate lane
+        // from the const-eval laziness above.
         let rep = report(
             "void m() { var l = 1; const e = [0, 1]; const f = {0: 1}; const g = false && l == 1; }",
         );
@@ -18343,6 +19630,7 @@ mod tests {
                 "unused_local_variable",
                 "unused_local_variable",
                 "unused_local_variable",
+                "dead_code",
             ],
             "{:?}",
             code_names(&rep)
@@ -18432,6 +19720,130 @@ mod tests {
             "{:?}",
             code_names(&rep)
         );
+    }
+
+    // —— #747: the non-const duplicate faces (the
+    // `_checkForDuplications` sites) ———————————————————————————————————
+
+    /// A duplicate element (map: key) in a NON-const literal reports at
+    /// the later part's own span with the verbatim texts and correction;
+    /// map values never participate, and equal-in-type-but-not-value
+    /// parts stay silent.
+    #[test]
+    fn equal_duplicates_report_at_the_later_part() {
+        let rep = report("var s = {1, 1};");
+        assert_eq!(code_names(&rep), ["equal_elements_in_set"]);
+        let d = &rep.diagnostics[0];
+        assert_eq!(
+            d.message,
+            "Two elements in a set literal shouldn't be equal."
+        );
+        assert_eq!(
+            d.correction.as_deref(),
+            Some("Change or remove the duplicate element.")
+        );
+        assert_eq!(d.range.offset, u32::try_from("var s = {1, ".len()).unwrap());
+        assert_eq!(d.range.length, 1);
+
+        let rep = report("var m = {'a': 1, 'a': 2};");
+        assert_eq!(code_names(&rep), ["equal_keys_in_map"]);
+        let d = &rep.diagnostics[0];
+        assert_eq!(d.message, "Two keys in a map literal shouldn't be equal.");
+        assert_eq!(
+            d.correction.as_deref(),
+            Some("Change or remove the duplicate key.")
+        );
+        assert_eq!(
+            d.range.offset,
+            u32::try_from("var m = {'a': 1, ".len()).unwrap()
+        );
+        assert_eq!(d.range.length, 3);
+
+        // Distinct keys with equal values: values are not participants.
+        let rep = report("var m = {'a': 1, 'b': 1};");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+
+        // Ints and doubles never unify (`{1, 1.0}` is silent).
+        let rep = report("var s = {1, 1.0};");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// The silent faces: const literals early-return in the oracle (their
+    /// duplicate face is the ERROR-tier const twins), and an element
+    /// whose constant evaluation fails never reports.
+    #[test]
+    fn non_const_duplicate_silences() {
+        // `const` literal — the ERROR twins' business, silent here.
+        let rep = report("const s = {1, 1};");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        // An implicitly const literal inside a const context.
+        let rep = report("const c = [{1, 1}];");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        // A non-constant variable's evaluation fails — silent.
+        let rep = report("var x = 0; var s = {x, x};");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+    }
+
+    /// Constant-evaluation equality, not syntactic identity: distinct
+    /// spellings of the same constant report; the oracle's `null` value
+    /// participates (its `value != null` guard is the failed-evaluation
+    /// wrapper, not a value exclusion).
+    #[test]
+    fn const_eval_equal_elements_report() {
+        // The official test_constant_constant shape.
+        let rep = report("const a = 1; const b = 1; var s = {a, b};");
+        assert_eq!(code_names(&rep), ["equal_elements_in_set"]);
+        assert_eq!(
+            rep.diagnostics[0].range.offset,
+            u32::try_from("const a = 1; const b = 1; var s = {a, ".len()).unwrap()
+        );
+        let rep = report("var s = {null, null};");
+        assert_eq!(code_names(&rep), ["equal_elements_in_set"]);
+    }
+
+    /// Spread/if/for elements are structurally excluded in the oracle
+    /// (`whereType<Expression>`); their folded operands cannot be told
+    /// apart here, so a literal holding any skips the check wholesale
+    /// (under-report, the capture's deferral posture). A nested non-const
+    /// set literal is its own literal: its own window runs its own check.
+    /// The skipping itself stays silent, but the target variable `s` is
+    /// never read, so the oracle's `unused_local_variable` row is the only
+    /// report (probed: dart analyze 3.13.1, one row on `s`; the spread- or
+    /// condition-read `l`/`b` never report).
+    #[test]
+    fn control_flow_elements_skip_and_nested_literals_own_their_check() {
+        // Two equal const list spreads: the dup check is silent (each
+        // spread excluded); `s` is unread.
+        let rep = report("void m() { const l = [1]; var s = {...l, ...l}; }");
+        assert_eq!(
+            code_names(&rep),
+            ["unused_local_variable"],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "The value of the local variable 's' isn't used."
+        );
+        // An if-element plus a duplicate plain element: the dup check is
+        // silent; `s` is unread.
+        let rep = report("void m() { const b = true; var s = {if (b) 1, 1}; }");
+        assert_eq!(
+            code_names(&rep),
+            ["unused_local_variable"],
+            "{:?}",
+            code_names(&rep)
+        );
+        // Nested non-const collections are foreign elements — the dup
+        // check skips them, and the inner set reports as its own literal.
+        let rep = report("var s = {{1, 1}, 2};");
+        assert_eq!(code_names(&rep), ["equal_elements_in_set"]);
+        assert_eq!(
+            rep.diagnostics[0].range.offset,
+            u32::try_from("var s = {{1, ".len()).unwrap()
+        );
+        let rep = report("var s = {[1], [1]};");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
     }
 
     /// A clean const variable's type folds from its initializer: `const
@@ -20345,6 +21757,175 @@ mod tests {
         );
     }
 
+    /// The #768 rig: `source` imports `other.dart`, which declares
+    /// `other_names`; each import is a `(prefix, show list)` pair — an
+    /// empty prefix is the unprefixed face, an empty show list is the
+    /// unfiltered edge.
+    fn report_with_imports(
+        source: &str,
+        other_names: &[&str],
+        imports: &[(&str, &[&str])],
+    ) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty());
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let other = builder.intern("package:t/other.dart");
+        for name in other_names {
+            builder.declare(other, strings.intern(*name), file);
+        }
+        for (prefix, show) in imports {
+            let combinators = if show.is_empty() {
+                Combinators::unfiltered()
+            } else {
+                Combinators::new(
+                    [CombinatorClause::Show(
+                        show.iter()
+                            .map(|name| strings.intern(name))
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
+                    )],
+                    &strings,
+                )
+            };
+            builder.import(
+                lib,
+                ImportEdge {
+                    target: Some(other),
+                    prefix: (!prefix.is_empty()).then(|| strings.intern(prefix)),
+                    deferred: false,
+                    combinators,
+                },
+            );
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        diagnose(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+        )
+    }
+
+    /// A partially used `show` list reports each unused name at its own
+    /// token (probed: dart analyze 3.13.1 — `UNUSED_SHOWN_NAME` on the name
+    /// lexeme, `The name max is shown, but isn't used.`).
+    #[test]
+    fn unused_shown_name_reports_at_the_name_token() {
+        let source = "import 'other.dart' show alpha, beta; void main() { beta; }";
+        let r = report_with_imports(source, &["alpha", "beta"], &[("", &["alpha", "beta"])]);
+        assert_eq!(
+            code_names(&r),
+            ["unused_shown_name"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The name alpha is shown, but isn't used."
+        );
+        assert_eq!(
+            r.diagnostics[0].range.offset,
+            offset_of(source, "alpha"),
+            "{:?}",
+            r.diagnostics[0].range
+        );
+        assert_eq!(
+            r.diagnostics[0].correction.as_deref(),
+            Some("Try removing the name from the list of shown members.")
+        );
+    }
+
+    /// A wholly unused import keeps its single `unused_import` row — the
+    /// oracle skips the per-name hints for it (imports_verifier.dart:283:
+    /// `if (_unusedImports.contains(importDirective)) { continue; }`).
+    #[test]
+    fn wholly_unused_show_import_keeps_one_unused_import_row() {
+        let source = "import 'other.dart' show alpha, beta; void main() {}";
+        let r = report_with_imports(source, &["alpha", "beta"], &[("", &["alpha", "beta"])]);
+        assert_eq!(code_names(&r), ["unused_import"], "{:?}", code_names(&r));
+    }
+
+    /// Every shown name used — silent (the oracle's both-used face).
+    #[test]
+    fn fully_used_show_list_stays_silent() {
+        let source = "import 'other.dart' show alpha, beta; void main() { alpha; beta; }";
+        let r = report_with_imports(source, &["alpha", "beta"], &[("", &["alpha", "beta"])]);
+        assert!(code_names(&r).is_empty(), "{:?}", code_names(&r));
+    }
+
+    /// A prefixed import's show list runs the same per-name check, and a
+    /// prefix-qualified use (`m.alpha`) credits the member name (probed:
+    /// `import 'dart:math' as m show max, min; m.max(1, 2);` reports `min`).
+    #[test]
+    fn prefixed_shown_name_reports_on_the_partially_used_prefix() {
+        let source = "import 'other.dart' as m show alpha, beta; void main() { m.alpha; }";
+        let r = report_with_imports(source, &["alpha", "beta"], &[("m", &["alpha", "beta"])]);
+        assert_eq!(
+            code_names(&r),
+            ["unused_shown_name"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(r.diagnostics[0].range.offset, offset_of(source, "beta"));
+    }
+
+    /// A name's use credits every import that provides it: two imports of
+    /// one library, the used `alpha` shown by both, leaves only the first
+    /// import's `beta` (probed: the `max`-shown-twice face — the shared
+    /// import reports its other shown name, the fully-used one is silent).
+    #[test]
+    fn shown_name_use_credits_every_import_that_provides_it() {
+        let source = "import 'other.dart' show alpha, beta; \
+                      import 'other.dart' show alpha; void main() { alpha; }";
+        let r = report_with_imports(
+            source,
+            &["alpha", "beta"],
+            &[("", &["alpha", "beta"]), ("", &["alpha"])],
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unused_shown_name"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(r.diagnostics[0].range.offset, offset_of(source, "beta"));
+    }
+
+    /// An undefined shown name is not the unused face: the resolution gate
+    /// skips it (probed: the oracle reports `undefined_shown_name` there
+    /// and no `unused_shown_name`; that undefined row is the engine
+    /// pipeline's face — `dartq-engine` l1.rs — so the semantic pass is
+    /// silent on the name).
+    #[test]
+    fn undefined_shown_name_is_not_the_unused_face() {
+        let source = "import 'other.dart' show gone, alpha; void main() { alpha; }";
+        let r = report_with_imports(source, &["alpha"], &[("", &["gone", "alpha"])]);
+        assert!(code_names(&r).is_empty(), "{:?}", code_names(&r));
+    }
+
     /// The catch-variable routing: `on T catch (e)` without a stack trace
     /// reports the clause; a stack trace variable always reports when
     /// unread; a plain `catch (e)` auto-uses its exception.
@@ -20782,8 +22363,10 @@ mod tests {
     /// `receiver_of_type_never` (messages.yaml :29566, the
     /// property-access face of the thirteen collapsed into the receiver
     /// junction): `f()`'s result type is `f`'s declared return type, so
-    /// the `.foo` access on it reports at the receiver. A `Never`
-    /// receiver under `as` is a different code's business — nothing here.
+    /// the `.foo` access on it reports at the receiver, and the receiver's
+    /// flow exit leaves the call tail dead (probed: dart analyze 3.13.1
+    /// emits `dead_code` after the receiver row — the dead interval trims
+    /// to the argument list through the statement's `;`).
     /// `class Never {}` follows the harness convention (core names are
     /// modeled through concrete declarations; the never-identity keys on
     /// the name — see `never_promotion_does_not_clean_the_row`), without
@@ -20795,7 +22378,7 @@ mod tests {
         );
         assert_eq!(
             code_names(&r),
-            ["receiver_of_type_never"],
+            ["receiver_of_type_never", "dead_code"],
             "{:?}",
             code_names(&r)
         );
@@ -20807,18 +22390,24 @@ mod tests {
             r.diagnostics[0].correction.as_deref(),
             Some("Try checking for throw expressions or type errors in the receiver")
         );
-        // The `as` operand face keys on `Null`, not `Never` — and the
-        // discarded initializer only leaves the oracle's
+        assert_eq!(r.diagnostics[1].message, "Dead code.");
+        // The `as` operand face keys on `Null`, not `Never` — no receiver
+        // row; the Never operand still leaves the cast type dead inside
+        // the initializer (probed: `DEAD_CODE` anchored at the cast type,
+        // `Dead code.` — the oracle's row trims through the statement's
+        // `;`, a trailing-span fidelity the flow window owns) and the
+        // discarded initializer leaves the oracle's
         // `unused_local_variable`.
         let r = report(
             "class Object {} class Never {} Never f() => throw Object(); void main() { var a = f() as int; }",
         );
         assert_eq!(
             code_names(&r),
-            ["unused_local_variable"],
+            ["unused_local_variable", "dead_code"],
             "{:?}",
             code_names(&r)
         );
+        assert_eq!(r.diagnostics[1].message, "Dead code.");
     }
 
     // —— #746: the W2b flow-fact consumers ——————————————————————————————————
@@ -21420,21 +23009,55 @@ mod tests {
         assert!(report(src).diagnostics.is_empty());
     }
 
-    // —— #612: the variance family (the `variance` experiment only) ————————
+    // —— #612: the variance family ——————————————————————————————————————————
     // Oracle anchors: error_verifier.dart:7999-8088 (the superinterface
     // walk and `_checkForWrongVariancePosition`), :7910-7996 (the member
     // faces); texts from diagnostic.g.dart:18498-18519/:18771-18783/
-    // :18809-18825.
+    // :18809-18825. Gate posture (#742): the legacy superinterface face
+    // answers in the default posture (official default-corpus expectations:
+    // wrong_type_parameter_variance_in_superinterface_test.dart); the
+    // explicit-keyword faces keep the experiment gate.
 
-    /// The byte-identical default: the very program the experiment fires
-    /// on emits nothing without the grant — the legacy superinterface
-    /// shape included (the oracle fires it there; the gate is the
-    /// recorded #612 under-report posture).
+    /// The legacy superinterface face fires in the default posture (#742):
+    /// the oracle's walk is not experiment-gated and its default-corpus
+    /// expectation anchors the row —
+    /// wrong_type_parameter_variance_in_superinterface_test.dart
+    /// `test_class_extends_function_parameterType` (`typedef F<X> = void
+    /// Function(X); class B<X> extends A<F<X>> {}` reports at the
+    /// parameter's name with the verbatim text). The alias-expansion edge
+    /// (generic typedefs answer by declared variance, a recorded
+    /// divergence) leaves the modeled shape writing the function type
+    /// inline — same code, same message template, span on `X`.
     #[test]
-    fn variance_family_stays_silent_without_the_experiment() {
+    fn variance_superinterface_legacy_face_fires_by_default() {
         let src = "class A<X> {} \
                    class B<X> extends A<void Function(X)> {}";
-        assert!(report_ungranted(src).diagnostics.is_empty());
+        let report = report(src);
+        assert_eq!(
+            code_names(&report),
+            ["wrong_type_parameter_variance_in_superinterface"]
+        );
+        let row = &report.diagnostics[0];
+        assert_eq!(
+            row.message,
+            "'X' can't be used contravariantly or invariantly in 'A<void Function(X)>'."
+        );
+        assert_eq!(
+            &src[row.range.offset as usize..][..row.range.length as usize],
+            "X"
+        );
+    }
+
+    /// The explicit-keyword faces keep the experiment gate (#742): a
+    /// keyword-carrying parameter answers nothing without the grant — the
+    /// keyword itself parses unconditionally (the header always allows
+    /// variance), so the capture sees it and the gate is the only
+    /// suppression.
+    #[test]
+    fn variance_explicit_faces_stay_gated_without_the_experiment() {
+        let explicit = "class B<T> {} \
+                        class A<out T> implements B<void Function(T)> {}";
+        assert!(report_ungranted(explicit).diagnostics.is_empty());
     }
 
     /// The legacy-covariant superinterface face: a class type parameter
@@ -21661,6 +23284,31 @@ mod tests {
              'B<void Function()>'."
         );
     }
+
+    // —— #769: the wildcard gate —————————————————————————————————————————
+
+    /// At the modern posture the exact `_` is exempt while `__` still
+    /// reports (`_isNamedWildcard`).
+    #[test]
+    fn wildcard_underscore_exempt_double_underscore_reports() {
+        let report = report("void main() {\n  var _ = 1;\n  var __ = 2;\n}");
+        assert_eq!(code_names(&report), ["unused_local_variable"]);
+    }
+
+    /// The catch clause follows the same gate on the clause the official
+    /// walk reports: an `on`-typed catch's unread exception variable
+    /// reports `unused_catch_clause` with the exact `_` exempt and `__`
+    /// still reporting (`_isNamedWildcard` — the exemption lives in the
+    /// catch arm of `_visitLocalVariableElement`). A plain `catch (e)`
+    /// never reaches the gate: its auto-use (visitCatchClause's
+    /// `onKeyword == null` arm marks the element used) fires first.
+    #[test]
+    fn wildcard_catch_clause_follows_the_gate() {
+        let exempt = report("class int {} void main() { try {} on int catch (_) {} }");
+        assert!(exempt.diagnostics.is_empty(), "{:?}", code_names(&exempt));
+        let flagged = report("class int {} void main() { try {} on int catch (__) {} }");
+        assert_eq!(code_names(&flagged), ["unused_catch_clause"]);
+    }
 }
 
 /// The W6 `@sealed` supertype-contract producer tests (#702). Kept as a
@@ -21877,5 +23525,255 @@ mod sealed_contract_tests {
             code_names(&report),
             ["subtype_of_sealed_class", "subtype_of_sealed_class"]
         );
+    }
+
+    // —— #769: the discarded-value machine (unused_result) ——————————————
+
+    /// The meta stand-in the rig analyzes like any dependency: the
+    /// `UseResult` class the annotation resolves through (`check_annotation`'s
+    /// namespace face, the import-use credit, the exported probe). The
+    /// corpus's vendored stand-in (`tests/corpus/real/meta/lib/meta.dart`)
+    /// carries the full class; the rig needs the declaration face only —
+    /// the meta-face lanes key the uri, and the `unless` value rides the
+    /// source walk, never the element shapes.
+    const META_STANDIN: &str = "class UseResult {\n\
+                                \x20 const UseResult();\n\
+                                \x20 const UseResult.unless({required String parameterDefined});\n\
+                                }";
+
+    /// The meta rig: `source` is the sole file of a library with one
+    /// import edge to the analyzed `package:meta/meta.dart` node — the
+    /// `imports_meta` face `@UseResult` resolves through.
+    fn use_result_report(source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let meta_file = files.intern(Path::new("meta.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let meta_scanned = dartq_scanner::scan(
+            META_STANDIN,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            meta_file,
+        );
+        assert!(
+            meta_scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {META_STANDIN:?}"
+        );
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let meta_elements = collect(META_STANDIN, &meta_scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let meta = builder.intern("package:meta/meta.dart");
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        for (name, decl) in meta_elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(meta, name, meta_file);
+        }
+        builder.import(
+            lib,
+            ImportEdge {
+                target: Some(meta),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        diagnose_with(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+        )
+    }
+
+    /// A bare discarded `f()` fires at the callee's name token; the same
+    /// result consumed as an argument, an assignment RHS, or a variable
+    /// initializer stays silent (`_isUsed`'s parent sets; the
+    /// `ArgumentList` seal covers only the list's own expressions — the
+    /// callee's candidate predates the watermark).
+    #[test]
+    fn unused_result_bare_call_fires_used_shapes_silent() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class int {}\n\
+                   @UseResult()\nint f() => 1;\n\
+                   int use(int x) => x;\n\
+                   int? sink;\n\
+                   void main() {\n  f();\n  use(f());\n  sink = f();\n  var y = f();\n  sink = y;\n}";
+        let report = use_result_report(src);
+        assert_eq!(code_names(&report), ["unused_result"]);
+        let d = &report.diagnostics[0];
+        assert_eq!(d.message, "The value of 'f' should be used.");
+        let head = src.find("void main() {\n  f();").unwrap() + "void main() {\n  ".len();
+        assert_eq!(d.range.offset, head as u32);
+        assert_eq!(d.range.length, 1);
+    }
+
+    /// The constructor face anchors the WHOLE `A()` (`nodeToAnnotate`)
+    /// with the class name as the display (`A.new` would be the main-branch
+    /// drift).
+    #[test]
+    fn unused_result_constructor_anchors_whole_invocation() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class A {\n  @UseResult()\n  A();\n}\n\
+                   void main() {\n  A();\n}";
+        let report = use_result_report(src);
+        assert_eq!(code_names(&report), ["unused_result"]);
+        let d = &report.diagnostics[0];
+        assert_eq!(d.message, "The value of 'A' should be used.");
+        let head = src.find("void main() {\n  A();").unwrap() + "void main() {\n  ".len();
+        assert_eq!(d.range.offset, head as u32);
+        assert_eq!(d.range.length, 3);
+    }
+
+    /// `await`, parentheses, and `!` recurse to the inner call (`_isUsed`'s
+    /// transparent arms — all three fire); the null assert co-fires its own
+    /// diagnostic.
+    #[test]
+    fn unused_result_transparent_wrappers_still_fire() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class int {}\n\
+                   @UseResult()\nint f() => 1;\n\
+                   void main() async {\n  await f();\n  (f());\n  f()!;\n}";
+        let report = use_result_report(src);
+        let mut codes = code_names(&report);
+        codes.sort_unstable();
+        assert_eq!(
+            codes,
+            [
+                "unnecessary_non_null_assertion",
+                "unused_result",
+                "unused_result",
+                "unused_result",
+            ]
+        );
+    }
+
+    /// The `unless` faces: `g(x: 1)` satisfies `parameterDefined: 'x'` and
+    /// stays silent; `f()` (no argument) fires; f's annotation also
+    /// co-reports `undefined_referenced_parameter` at the written `'x'`
+    /// value expression — quotes included (`_findUndefinedUseResultParameter`
+    /// anchors at the expression) — while g's parameter exists and never
+    /// co-reports.
+    #[test]
+    fn unless_bypass_and_undefined_parameter_corow() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class int {}\n\
+                   @UseResult.unless(parameterDefined: 'x')\nvoid g({required int x}) {}\n\
+                   @UseResult.unless(parameterDefined: 'x')\nvoid f({required int y}) {}\n\
+                   void main() {\n  g(x: 1);\n  f();\n}";
+        let report = use_result_report(src);
+        assert_eq!(
+            code_names(&report),
+            ["undefined_referenced_parameter", "unused_result"]
+        );
+        let corow = &report.diagnostics[0];
+        assert_eq!(corow.message, "The parameter 'x' isn't defined by 'f'.");
+        let at = src.find("'x')\nvoid f").unwrap();
+        assert_eq!(corow.range.offset, at as u32);
+        assert_eq!(corow.range.length, 3);
+    }
+
+    /// The for-parts split: the initializer and the condition are uses
+    /// (`ForLoopParts`, `ForParts.condition`), the updater is not — exactly
+    /// the third `f` reports.
+    #[test]
+    fn for_initializer_and_condition_silent_updater_fires() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class int {}\n\
+                   @UseResult()\nint f() => 1;\n\
+                   void main() {\n  for (f(); f(); f()) {}\n}";
+        let report = use_result_report(src);
+        assert_eq!(code_names(&report), ["unused_result"]);
+        let d = &report.diagnostics[0];
+        let head = src.find("for (").unwrap();
+        assert_eq!(d.range.offset as usize, head + "for (f(); f(); ".len());
+    }
+
+    /// The cascade split: the target is a use, the section is not.
+    #[test]
+    fn cascade_target_silent_section_fires() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class int {}\n\
+                   @UseResult()\nint f() => 1;\n\
+                   @UseResult()\nint g() => 2;\n\
+                   void main() {\n  f()..g();\n}";
+        let report = use_result_report(src);
+        assert_eq!(code_names(&report), ["unused_result"]);
+        let head = src.find("f()..g()").unwrap();
+        assert_eq!(
+            report.diagnostics[0].range.offset as usize,
+            head + "f()..".len()
+        );
+    }
+
+    /// The member faces fire at the selector token: instance method,
+    /// getter, and field-read rows (the field's implicit getter unwraps to
+    /// the annotated variable). The receiver carries a declared type — the
+    /// model deliberately under-reports `var`-inferred receivers (the M1
+    /// posture), so the inferred shape can never reach the member walk.
+    #[test]
+    fn unused_result_member_faces_fire() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class int {}\n\
+                   class C {\n  @UseResult()\n  int get g => 1;\n\
+                   @UseResult()\n  int m() => 2;\n\
+                   @UseResult()\n  int field = 3;\n}\n\
+                   void main() {\n  C c = C();\n  c.g;\n  c.m;\n  c.field;\n}";
+        let report = use_result_report(src);
+        assert_eq!(
+            code_names(&report),
+            ["unused_result", "unused_result", "unused_result"]
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The value of 'g' should be used."
+        );
+    }
+
+    /// An `unless` face on a getter never co-reports (the official walk's
+    /// null `parameterList` arm) while the discarded read itself fires.
+    /// The receiver carries a declared type (the model under-reports
+    /// `var`-inferred receivers).
+    #[test]
+    fn unless_on_getter_never_reports_parameter_corow() {
+        let src = "import 'package:meta/meta.dart';\n\
+                   class int {}\n\
+                   class C {\n  @UseResult.unless(parameterDefined: 'x')\n  int get g => 1;\n}\n\
+                   void main() {\n  C c = C();\n  c.g;\n}";
+        let report = use_result_report(src);
+        assert_eq!(code_names(&report), ["unused_result"]);
     }
 }

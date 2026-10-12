@@ -1,9 +1,11 @@
-//! package:meta getter recognition (#705): whether a declaration's
-//! annotation is one of package:meta's top-level-getter annotations — the
-//! `@sealed` face (W6's `mixin_on_sealed_class` / `subtype_of_sealed_class`
-//! producers) and the `@literal` face (W7's
-//! `non_const_call_to_literal_constructor` producer) — so those lanes are
-//! pure verdict logic over the captured [`crate::model::Container::annotations`].
+//! package:meta annotation recognition (#705, #880): whether a
+//! declaration's annotation is one of package:meta's own — the top-level
+//! getter face (`@sealed`, W6's `mixin_on_sealed_class` /
+//! `subtype_of_sealed_class` producers), the class face (`@literal` on a
+//! constructor, W7's `non_const_call_to_literal_constructor` producer),
+//! and the named-constructor face (`UseResult.unless`, W7's
+//! `undefined_referenced_parameter` producer) — so those lanes are pure
+//! verdict logic over the captured [`crate::model::Container::annotations`].
 //!
 //! # The official decision, mirrored
 //!
@@ -32,13 +34,22 @@
 //! 4. the import's combinators allow the getter name (a `show`/`hide`
 //!    filters the oracle's namespace build too).
 //!
+//! A class-based annotation is the same mirror with the class name in the
+//! denoted slot (`@literal`); a named-constructor annotation adds one
+//! selector segment — `@UseResult.unless`, or `@meta.UseResult.unless`
+//! prefixed — where the head resolves through the import faces and the
+//! selector names the constructor as written. The `unless` argument walk
+//! mirrors `annotation_verifier.dart:706-710`: the string value is the
+//! caller's const-eval capture, the report anchor is the written
+//! expression under the `parameterDefined` label.
+//!
 //! Known limit (under-report direction, no fixture face): a getter
 //! re-exported through a barrel library is not recognized — the import
 //! target's uri must itself be `package:meta/…`, not merely transitively
 //! export it.
 
 use dartq_resolution::{LibraryGraph, LibraryId, LocalLookup};
-use dartq_source::{StringId, StringTable};
+use dartq_source::{SourceRange, StringId, StringTable};
 
 use crate::model::Annotation;
 
@@ -51,20 +62,149 @@ pub fn is_meta_getter(
     graph: &LibraryGraph,
     lib: LibraryId,
 ) -> bool {
+    meta_face(
+        strings.resolve(annotation.name),
+        getter,
+        strings,
+        graph,
+        lib,
+    )
+}
+
+/// Whether `annotation` is package:meta's `literal` class for `lib` —
+/// the `@literal` constructor annotation, bare or prefixed as written —
+/// per the import faces of `graph`.
+pub fn is_meta_literal(
+    annotation: &Annotation,
+    strings: &StringTable,
+    graph: &LibraryGraph,
+    lib: LibraryId,
+) -> bool {
+    meta_face(
+        strings.resolve(annotation.name),
+        "literal",
+        strings,
+        graph,
+        lib,
+    )
+}
+
+/// Whether `annotation` is the package:meta class named `class` for `lib`
+/// — the unnamed- and named-constructor annotation face (`@UseResult`,
+/// `@UseResult.unless`), bare or prefixed as written — per the import
+/// faces of `graph`.
+pub fn is_meta_class(
+    annotation: &Annotation,
+    class: &str,
+    strings: &StringTable,
+    graph: &LibraryGraph,
+    lib: LibraryId,
+) -> bool {
+    meta_face(strings.resolve(annotation.name), class, strings, graph, lib)
+}
+
+/// One written argument of an annotation invocation, as captured by the
+/// declaration pass.
+pub struct AnnotationArg {
+    /// The written label (`parameterDefined:`), `None` for a positional
+    /// argument.
+    pub label: Option<StringId>,
+    /// The string face: the value the argument evaluates to (a string
+    /// literal's cooked text, or the const value of a reference) plus the
+    /// written expression's own span (a literal's span includes the
+    /// quotes) — the official report anchor. `None` when the value is
+    /// absent or not a string.
+    pub string: Option<(StringId, SourceRange)>,
+}
+
+/// The written `parameterDefined` face of `@UseResult.unless` from
+/// package:meta: `Some((value, span))` when `annotation` resolves to the
+/// named constructor `unless` of meta's `UseResult` class for `lib` and
+/// `args` carries a string-valued `parameterDefined` argument — the value
+/// is the constant the oracle's `computeConstantValue` reads, the span
+/// the written expression (a literal's span includes the quotes), the
+/// official report anchor. `None` for every other shape: an unresolved
+/// import, a non-meta same-name resolution, the unnamed `UseResult` face,
+/// another selector, a missing or non-string `parameterDefined`.
+pub fn use_result_unless(
+    annotation: &Annotation,
+    args: &[AnnotationArg],
+    strings: &StringTable,
+    graph: &LibraryGraph,
+    lib: LibraryId,
+) -> Option<(StringId, SourceRange)> {
+    // The written name is head + selector (`UseResult.unless`) behind an
+    // optional prefix (`meta.UseResult.unless`); a selector-less spelling
+    // is the unnamed face and never carries `unless`.
     let spelling = strings.resolve(annotation.name);
+    let (head, selector, prefix) = match spelling.rsplit_once('.') {
+        None => return None,
+        Some((rest, selector)) => match rest.rsplit_once('.') {
+            None => (rest, selector, None),
+            Some((prefix, head)) => (head, selector, Some(prefix)),
+        },
+    };
+    if selector != "unless" || head != "UseResult" {
+        return None;
+    }
+    let head_id = strings.intern(head);
+    let resolved = match prefix {
+        None => {
+            matches!(graph.local(lib, head_id), LocalLookup::Absent)
+                && imports_meta(graph, lib, None, head_id)
+        }
+        Some(prefix) => imports_meta(graph, lib, Some(strings.intern(prefix)), head_id),
+    };
+    if !resolved {
+        return None;
+    }
+    // The official walk takes the written expression under the
+    // `parameterDefined` label (`annotation_verifier.dart:706-710`); the
+    // string value itself is the caller's const-eval capture.
+    let label = strings.intern("parameterDefined");
+    args.iter().find_map(|arg| match (arg.label, &arg.string) {
+        (Some(l), Some((value, range))) if l == label => Some((*value, *range)),
+        _ => None,
+    })
+}
+
+/// [`use_result_unless`] without the value: the written expression's span
+/// only.
+pub fn use_result_unless_parameter_defined(
+    annotation: &Annotation,
+    args: &[AnnotationArg],
+    strings: &StringTable,
+    graph: &LibraryGraph,
+    lib: LibraryId,
+) -> Option<SourceRange> {
+    use_result_unless(annotation, args, strings, graph, lib).map(|(_, range)| range)
+}
+
+/// The shared name-level resolution mirror: whether `spelling` denotes
+/// the package:meta symbol `name` for `lib` — bare (`@sealed`): `lib`
+/// declares no local under the name (a local shadows the import) and has
+/// an unprefixed meta import; prefixed (`@meta.sealed`): an import whose
+/// prefix matches; the combinators allow `name` on both paths.
+fn meta_face(
+    spelling: &str,
+    name: &str,
+    strings: &StringTable,
+    graph: &LibraryGraph,
+    lib: LibraryId,
+) -> bool {
     match spelling.split_once('.') {
         None => {
-            spelling == getter
-                && matches!(graph.local(lib, annotation.name), LocalLookup::Absent)
-                && imports_meta(graph, lib, None, annotation.name)
+            spelling == name
+                && matches!(graph.local(lib, strings.intern(name)), LocalLookup::Absent)
+                && imports_meta(graph, lib, None, strings.intern(name))
         }
         Some((prefix, rest)) => {
-            rest == getter
+            rest == name
                 && imports_meta(
                     graph,
                     lib,
                     Some(strings.intern(prefix)),
-                    strings.intern(getter),
+                    strings.intern(name),
                 )
         }
     }
@@ -171,12 +311,60 @@ mod tests {
                 self.lib,
             )
         }
+
+        fn meta_literal(&self, spelling: &str) -> bool {
+            is_meta_literal(&self.ann(spelling), &self.strings, &self.graph, self.lib)
+        }
+
+        fn unless_span(&self, spelling: &str, args: &[AnnotationArg]) -> Option<SourceRange> {
+            use_result_unless_parameter_defined(
+                &self.ann(spelling),
+                args,
+                &self.strings,
+                &self.graph,
+                self.lib,
+            )
+        }
+
+        fn ann(&self, spelling: &str) -> Annotation {
+            Annotation {
+                name: self.strings.intern(spelling),
+                range: SourceRange {
+                    offset: 0,
+                    length: 8,
+                },
+            }
+        }
+
+        /// A `parameterDefined:` argument with (or without) its string face.
+        fn param_defined(&self, value: Option<(&'static str, SourceRange)>) -> AnnotationArg {
+            self.labeled("parameterDefined", value)
+        }
+
+        fn labeled(
+            &self,
+            label: &'static str,
+            value: Option<(&'static str, SourceRange)>,
+        ) -> AnnotationArg {
+            AnnotationArg {
+                label: Some(self.strings.intern(label)),
+                string: value.map(|(v, range)| (self.strings.intern(v), range)),
+            }
+        }
+
+        fn positional(&self, value: Option<(&'static str, SourceRange)>) -> AnnotationArg {
+            AnnotationArg {
+                label: None,
+                string: value.map(|(v, range)| (self.strings.intern(v), range)),
+            }
+        }
     }
 
     struct Import {
         uri: &'static str,
         prefix: Option<&'static str>,
         show: Option<&'static [&'static str]>,
+        hide: Option<&'static [&'static str]>,
     }
 
     impl Import {
@@ -185,6 +373,7 @@ mod tests {
                 uri,
                 prefix: None,
                 show: None,
+                hide: None,
             }
         }
 
@@ -193,18 +382,26 @@ mod tests {
                 uri,
                 prefix: Some(prefix),
                 show: None,
+                hide: None,
             }
         }
 
         fn combinators(&self, strings: &mut StringTable) -> Combinators {
-            match self.show {
-                None => Combinators::unfiltered(),
-                Some(names) => Combinators::new(
-                    [CombinatorClause::Show(
-                        names.iter().map(|n| strings.intern(n)).collect(),
-                    )],
-                    strings,
-                ),
+            let mut clauses = Vec::new();
+            if let Some(names) = self.show {
+                clauses.push(CombinatorClause::Show(
+                    names.iter().map(|n| strings.intern(n)).collect(),
+                ));
+            }
+            if let Some(names) = self.hide {
+                clauses.push(CombinatorClause::Hide(
+                    names.iter().map(|n| strings.intern(n)).collect(),
+                ));
+            }
+            if clauses.is_empty() {
+                Combinators::unfiltered()
+            } else {
+                Combinators::new(clauses, strings)
             }
         }
     }
@@ -266,10 +463,249 @@ mod tests {
                 uri: "package:meta/meta.dart",
                 prefix: None,
                 show: Some(&["literal"]),
+                hide: None,
             }],
             &[],
         );
         assert!(!rig.recognizes("sealed", "sealed"));
         assert!(rig.recognizes("literal", "literal"));
+    }
+
+    // ---- is_meta_literal (the `@literal` class face) ----
+
+    /// A bare `@literal` under an unprefixed meta import recognizes;
+    /// another meta name on the same spelling does not.
+    #[test]
+    fn bare_literal_recognizes() {
+        let rig = Rig::new(&[Import::unprefixed("package:meta/meta.dart")], &[]);
+        assert!(rig.meta_literal("literal"));
+        assert!(!rig.meta_literal("sealed"));
+    }
+
+    /// A prefixed spelling recognizes through its prefix (`@meta.literal`
+    /// under `import ... as meta;`); the bare spelling never crosses a
+    /// prefixed import, and a wrong prefix stays unresolved.
+    #[test]
+    fn prefixed_literal_recognizes_by_prefix() {
+        let rig = Rig::new(&[Import::prefixed("package:meta/meta.dart", "meta")], &[]);
+        assert!(rig.meta_literal("meta.literal"));
+        assert!(!rig.meta_literal("literal"));
+        assert!(!rig.meta_literal("p.literal"));
+    }
+
+    /// `show literal` keeps `@literal` recognizing while filtering
+    /// `@sealed`; `hide literal` drops the face.
+    #[test]
+    fn literal_respects_combinators() {
+        let shown = Rig::new(
+            &[Import {
+                uri: "package:meta/meta.dart",
+                prefix: None,
+                show: Some(&["literal"]),
+                hide: None,
+            }],
+            &[],
+        );
+        assert!(shown.meta_literal("literal"));
+        assert!(!shown.meta_literal("sealed"));
+
+        let hid = Rig::new(
+            &[Import {
+                uri: "package:meta/meta.dart",
+                prefix: None,
+                show: None,
+                hide: Some(&["literal"]),
+            }],
+            &[],
+        );
+        assert!(!hid.meta_literal("literal"));
+    }
+
+    /// No import: unresolved, no meta face, no panic.
+    #[test]
+    fn literal_without_import_does_not_recognize() {
+        let rig = Rig::new(&[], &[]);
+        assert!(!rig.meta_literal("literal"));
+    }
+
+    /// A same-name declaration outside meta is rejected by the uri test.
+    #[test]
+    fn same_named_literal_outside_meta_does_not_recognize() {
+        let rig = Rig::new(&[Import::unprefixed("package:other/other.dart")], &[]);
+        assert!(!rig.meta_literal("literal"));
+    }
+
+    /// A local top-level declaration shadows the import.
+    #[test]
+    fn local_literal_shadow_suppresses_recognition() {
+        let rig = Rig::new(
+            &[Import::unprefixed("package:meta/meta.dart")],
+            &["literal"],
+        );
+        assert!(!rig.meta_literal("literal"));
+    }
+
+    // ---- use_result_unless_parameter_defined (the `UseResult.unless` face) ----
+
+    /// The anchor span asserted throughout: any literal span the caller
+    /// captured comes back untouched.
+    const SPAN: SourceRange = SourceRange {
+        offset: 40,
+        length: 3,
+    };
+
+    /// The canonical face: bare `@UseResult.unless(parameterDefined: 'p')`
+    /// under an unprefixed meta import returns the written literal's span.
+    #[test]
+    fn bare_unless_resolves_parameter_defined_span() {
+        let rig = Rig::new(&[Import::unprefixed("package:meta/meta.dart")], &[]);
+        assert_eq!(
+            rig.unless_span("UseResult.unless", &[rig.param_defined(Some(("p", SPAN)))]),
+            Some(SPAN)
+        );
+    }
+
+    /// Prefixed: `@meta.UseResult.unless` through `import ... as meta;`.
+    #[test]
+    fn prefixed_unless_resolves_parameter_defined_span() {
+        let rig = Rig::new(&[Import::prefixed("package:meta/meta.dart", "meta")], &[]);
+        assert_eq!(
+            rig.unless_span(
+                "meta.UseResult.unless",
+                &[rig.param_defined(Some(("p", SPAN)))]
+            ),
+            Some(SPAN)
+        );
+    }
+
+    /// `show UseResult` allows the face; `show literal` (UseResult
+    /// filtered out) and `hide UseResult` both drop it.
+    #[test]
+    fn unless_respects_combinators() {
+        let shown = Rig::new(
+            &[Import {
+                uri: "package:meta/meta.dart",
+                prefix: None,
+                show: Some(&["UseResult"]),
+                hide: None,
+            }],
+            &[],
+        );
+        assert_eq!(
+            shown.unless_span(
+                "UseResult.unless",
+                &[shown.param_defined(Some(("p", SPAN)))]
+            ),
+            Some(SPAN)
+        );
+
+        let filtered = Rig::new(
+            &[Import {
+                uri: "package:meta/meta.dart",
+                prefix: None,
+                show: Some(&["literal"]),
+                hide: None,
+            }],
+            &[],
+        );
+        assert_eq!(
+            filtered.unless_span(
+                "UseResult.unless",
+                &[filtered.param_defined(Some(("p", SPAN)))]
+            ),
+            None
+        );
+
+        let hid = Rig::new(
+            &[Import {
+                uri: "package:meta/meta.dart",
+                prefix: None,
+                show: None,
+                hide: Some(&["UseResult"]),
+            }],
+            &[],
+        );
+        assert_eq!(
+            hid.unless_span("UseResult.unless", &[hid.param_defined(Some(("p", SPAN)))]),
+            None
+        );
+    }
+
+    /// Every unresolved face is `None`, never a panic: no import at all,
+    /// a same-name `UseResult` outside meta, a local `UseResult` shadow.
+    #[test]
+    fn unless_unresolved_faces_are_none() {
+        let absent = Rig::new(&[], &[]);
+        assert_eq!(
+            absent.unless_span(
+                "UseResult.unless",
+                &[absent.param_defined(Some(("p", SPAN)))]
+            ),
+            None
+        );
+
+        let other = Rig::new(&[Import::unprefixed("package:other/other.dart")], &[]);
+        assert_eq!(
+            other.unless_span(
+                "UseResult.unless",
+                &[other.param_defined(Some(("p", SPAN)))]
+            ),
+            None
+        );
+
+        let shadowed = Rig::new(
+            &[Import::unprefixed("package:meta/meta.dart")],
+            &["UseResult"],
+        );
+        assert_eq!(
+            shadowed.unless_span(
+                "UseResult.unless",
+                &[shadowed.param_defined(Some(("p", SPAN)))]
+            ),
+            None
+        );
+    }
+
+    /// The unnamed face (`@UseResult('reason')`), another selector, and a
+    /// foreign head never fire.
+    #[test]
+    fn unless_requires_selector_and_head() {
+        let rig = Rig::new(&[Import::unprefixed("package:meta/meta.dart")], &[]);
+        assert_eq!(
+            rig.unless_span("UseResult", &[rig.param_defined(Some(("p", SPAN)))]),
+            None
+        );
+        assert_eq!(
+            rig.unless_span("UseResult.foo", &[rig.param_defined(Some(("p", SPAN)))]),
+            None
+        );
+        assert_eq!(
+            rig.unless_span("Literal.unless", &[rig.param_defined(Some(("p", SPAN)))]),
+            None
+        );
+    }
+
+    /// A recognized annotation still needs its `parameterDefined` string:
+    /// no argument, a positional argument, a non-matching label, and a
+    /// non-string value all return `None`.
+    #[test]
+    fn unless_requires_string_parameter_defined() {
+        let rig = Rig::new(&[Import::unprefixed("package:meta/meta.dart")], &[]);
+        assert_eq!(rig.unless_span("UseResult.unless", &[]), None);
+        assert_eq!(
+            rig.unless_span("UseResult.unless", &[rig.positional(Some(("p", SPAN)))]),
+            None
+        );
+        assert_eq!(
+            rig.unless_span(
+                "UseResult.unless",
+                &[rig.labeled("reason", Some(("r", SPAN)))]
+            ),
+            None
+        );
+        assert_eq!(
+            rig.unless_span("UseResult.unless", &[rig.param_defined(None)]),
+            None
+        );
     }
 }

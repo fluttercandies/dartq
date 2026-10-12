@@ -52,7 +52,7 @@ use std::cell::Cell;
 
 use dartq_diagnostics::Diagnostic;
 use dartq_parser::ParserFeatures;
-use dartq_semantic::ElementIndex;
+use dartq_semantic::{ElementIndex, LibraryUsages};
 use dartq_source::FileId;
 use rustc_hash::FxHashMap;
 
@@ -103,6 +103,15 @@ pub struct Diagnoser;
 impl SemanticDiagnoser for Diagnoser {
     fn diagnose_library(&self, library: LibraryView<'_>, out: &mut Vec<Diagnostic>) {
         let duplicate = duplicate_definition_name();
+        // The M3 U1 use-face substrate (#767): every fold emits its unit's
+        // face alongside the report, and the library's faces close into the
+        // per-library consumed set once the member loop ends — the
+        // gather-per-file/merge-per-library pair
+        // (library_analyzer.dart:305-315), live in every full analysis.
+        // The consumed set's consumers mount with the M3 incremental layer
+        // (the unused-element/unused-import families close over it); today
+        // the run exercises the substrate hot.
+        let mut usages = LibraryUsages::default();
         for &file in library.files {
             let facts = &library.facts[&file];
             let bytes = library.store.get(facts.content).expect("resident content");
@@ -125,7 +134,7 @@ impl SemanticDiagnoser for Diagnoser {
                 local = face;
                 (feature_set, &local.tokens)
             };
-            let report = dartq_semantic::diagnose_with(
+            let (report, face) = dartq_semantic::diagnose_unit(
                 text,
                 tokens,
                 ParserFeatures::from_feature_set(feature_set),
@@ -143,6 +152,7 @@ impl SemanticDiagnoser for Diagnoser {
                 // the view build, all-off without any.
                 library.strict,
             );
+            usages.add_unit(library.graph_library, face);
             out.extend(
                 report
                     .diagnostics
@@ -150,6 +160,7 @@ impl SemanticDiagnoser for Diagnoser {
                     .filter(|diagnostic| diagnostic.code.name != duplicate),
             );
         }
+        let _consumed = usages.close_library_usage(library.graph_library);
     }
 }
 

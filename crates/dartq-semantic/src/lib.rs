@@ -43,6 +43,12 @@
 //!   reports the untyped-declaration face of `inference_failure_on_*`, and
 //!   `strict-raw-types` reports `strict_raw_type` — all off by default, the
 //!   official posture.
+//! * [`use_face`] — the library-scope use-face substrate (#767): the
+//!   per-unit observable-use record ([`use_face::UnitUseFace`],
+//!   [`diagnose::diagnose_unit`]) and the per-library fold
+//!   ([`use_face::LibraryUsages::close_library_usage`]) the
+//!   unused-element/unused-import consumers and the M3 incremental layer
+//!   close over.
 //!
 //! # What the `undefined_*` / `wrong_number_*` tickets (#120/#121) can
 //!   assume
@@ -121,9 +127,12 @@ pub mod library;
 pub mod model;
 pub mod persisted;
 pub mod signature;
+pub mod use_face;
 
 pub use collector::{collect, container_modifiers};
-pub use diagnose::{FileReport, NameRow, NameUse, StrictModes, diagnose, diagnose_with};
+pub use diagnose::{
+    FileReport, NameRow, NameUse, StrictModes, diagnose, diagnose_unit, diagnose_with,
+};
 pub use library::{
     ElementIndex, LibraryScopes, ScopeFace, ScopeKind, ScopedHit, lookup_scoped, member_lookup,
 };
@@ -132,3 +141,4 @@ pub use model::{
     TopDecl,
 };
 pub use signature::{ApiSignature, SIGNATURE_VERSION};
+pub use use_face::{ExportUseFace, ImportUseFace, LibraryUsages, LibraryUseSet, UnitUseFace};

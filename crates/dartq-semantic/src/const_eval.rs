@@ -828,12 +828,24 @@ pub enum WindowKind {
     /// An explicit `const [...]` / `{...}` / `(...)`: each element reports
     /// `non_constant_list_element` / `_set_element` / `_map_element`.
     ExplicitLiteral,
+    /// A NON-const set/map literal (#747): its elements constant-evaluate
+    /// for duplicate detection (`equal_elements_in_set` / `equal_keys_in_map`,
+    /// `best_practices_verifier.dart:1077-1109`). Never opens inside a const
+    /// window — an implicitly const literal's duplicate face is the
+    /// ERROR-tier const twins, not this wave's.
+    NonConstDup,
 }
 
 struct Window {
     kind: WindowKind,
     /// Operand-stack length at open — every pop/truncate clamps here.
     base: usize,
+    /// Spread/if/for elements seen inside the window (only the
+    /// [`WindowKind::NonConstDup`] consumer reads it: the oracle's
+    /// `whereType<Expression>` excludes those elements, and their folded
+    /// operands cannot be told apart here — the dup check skips the whole
+    /// literal instead, under-reporting by design).
+    ctl_elements: u32,
 }
 
 /// One open argument list: the callee node latched at `begin_arguments`
@@ -894,6 +906,26 @@ pub enum SetOrMap {
     Map(Vec<(Node, Node)>),
 }
 
+/// Splits the popped operands into entries vs bare elements; the
+/// parser's `has_set_entry` is the official `hasSetEntry`: true when the
+/// first simple entry had NO colon (a set), false with a colon, and
+/// false-for-empty `{}` — the official `isMap` default is map.
+fn split_set_or_map(staged: Vec<Node>, has_set_entry: bool) -> SetOrMap {
+    let mut entries = Vec::new();
+    let mut elements = Vec::new();
+    for node in staged {
+        match node.expr {
+            Expr::Entry(k, v) => entries.push((*k, *v)),
+            _ => elements.push(node),
+        }
+    }
+    if has_set_entry {
+        SetOrMap::Set(elements)
+    } else {
+        SetOrMap::Map(entries)
+    }
+}
+
 impl ConstCapture {
     /// `identical_id` is the interned `identical` spelling — the one
     /// invocation the subset evaluates.
@@ -948,10 +980,39 @@ impl ConstCapture {
         self.open_window(WindowKind::ExplicitLiteral);
     }
 
+    /// Opens a non-const duplicate window for a set/map literal WITHOUT a
+    /// `const` keyword. Nested non-const set/map literals each get their
+    /// own window (the oracle's visitor checks every literal node);
+    /// inside a const window the literal is implicitly const and the
+    /// const path owns it — nothing opens.
+    pub fn open_non_const_dup(&mut self) {
+        match self.windows.last() {
+            None
+            | Some(Window {
+                kind: WindowKind::NonConstDup,
+                ..
+            }) => {
+                self.open_window(WindowKind::NonConstDup);
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// A spread/if/for element opened inside the innermost window (the
+    /// dup check's wholesale-skip latch; no other window kind reads it).
+    pub fn begin_ctl_element(&mut self) {
+        if let Some(window) = self.windows.last_mut() {
+            if window.kind == WindowKind::NonConstDup {
+                window.ctl_elements += 1;
+            }
+        }
+    }
+
     fn open_window(&mut self, kind: WindowKind) {
         self.windows.push(Window {
             kind,
             base: self.stack.len(),
+            ctl_elements: 0,
         });
     }
 
@@ -978,9 +1039,60 @@ impl ConstCapture {
     /// Closes an explicit-const literal: its (already element-checked)
     /// value node stays on the stack for the parent window.
     pub fn close_explicit_literal(&mut self) {
-        self.apply_unaries();
+        self.apply_unaries_at(self.depth);
         self.keep_top_above_base();
         self.windows.pop();
+    }
+
+    /// Closes a non-const duplicate window: the literal's parts return
+    /// (bare operands are set elements, staged `Entry` nodes are map
+    /// entries, `{}` is a map) with a flag telling whether spread/if/for
+    /// elements occurred — the dup check skips those literals wholesale.
+    /// `None` unless a [`WindowKind::NonConstDup`] window is on top (the
+    /// const windows close through [`Self::literal_set_or_map`]). A
+    /// literal nested in an enclosing dup literal leaves an opaque
+    /// placeholder on the parent stack ([`Self::non_const_dup_placeholder`]).
+    pub fn close_non_const_dup(
+        &mut self,
+        count: usize,
+        span: SourceRange,
+        has_set_entry: bool,
+    ) -> Option<(SetOrMap, bool)> {
+        if !self.top_is_non_const_dup() {
+            return None;
+        }
+        let has_ctl = self.windows.last().is_some_and(|w| w.ctl_elements > 0);
+        self.apply_unaries_at(self.depth);
+        let staged = self.pop_operands(count);
+        let shape = split_set_or_map(staged, has_set_entry);
+        self.discard_window();
+        self.non_const_dup_placeholder(span);
+        Some((shape, has_ctl))
+    }
+
+    /// Leaves the opaque element a drained foreign literal (a nested
+    /// set/map/list/record literal) contributes to an enclosing
+    /// [`WindowKind::NonConstDup`] stack: without it the parent's
+    /// element/entry pairing would drift (a map value slot would swallow
+    /// the next key). The dup check skips the node — the oracle's
+    /// `computeConstantValue` fails on the same shapes. No-op unless a
+    /// NonConstDup window is on top.
+    fn non_const_dup_placeholder(&mut self, span: SourceRange) {
+        if self.top_is_non_const_dup() {
+            self.push(
+                Node {
+                    expr: Expr::Other,
+                    span,
+                },
+                false,
+            );
+        }
+    }
+
+    fn top_is_non_const_dup(&self) -> bool {
+        self.windows
+            .last()
+            .is_some_and(|w| w.kind == WindowKind::NonConstDup)
     }
 
     /// The root node above the window base, clamping recovery debris.
@@ -1367,8 +1479,17 @@ impl ConstCapture {
     /// A list literal (explicit `const [...]` or implicit in a const
     /// context): its elements return for per-element checking; the caller
     /// pushes the opaque value node afterwards. `None` with no window.
+    /// Under a non-const duplicate window the literal is a foreign element
+    /// of the enclosing dup literal, not a const-checked face: its
+    /// operands drain and nothing checks.
     pub fn literal_list(&mut self, count: usize, _span: SourceRange) -> Option<Vec<Node>> {
         if !self.open() {
+            return None;
+        }
+        if self.top_is_non_const_dup() {
+            self.apply_unaries_at(self.depth);
+            self.pop_operands(count);
+            self.non_const_dup_placeholder(_span);
             return None;
         }
         self.apply_unaries_at(self.depth);
@@ -1378,36 +1499,21 @@ impl ConstCapture {
     /// A set-or-map literal (explicit or implicit const): staged `Entry`
     /// pseudo-operands are map entries, bare operands set elements; the
     /// parts return for per-element checking. `{}` is a map (the official
-    /// `isMap` default).
+    /// `isMap` default). Non-const duplicate windows never reach here —
+    /// [`Self::close_non_const_dup`] owns them (the engine's literal
+    /// handler tries it first).
     pub fn literal_set_or_map(
         &mut self,
         count: usize,
         _span: SourceRange,
         has_set_entry: bool,
     ) -> Option<SetOrMap> {
-        if !self.open() {
+        if !self.open() || self.top_is_non_const_dup() {
             return None;
         }
         self.apply_unaries_at(self.depth);
         let staged = self.pop_operands(count);
-        let mut entries = Vec::new();
-        let mut elements = Vec::new();
-        for node in staged {
-            match node.expr {
-                Expr::Entry(k, v) => entries.push((*k, *v)),
-                _ => elements.push(node),
-            }
-        }
-        // The parser's `has_set_entry` is the official `hasSetEntry`:
-        // true when the first simple entry had NO colon (a set), false
-        // with a colon, and false-for-empty `{}` — the official `isMap`
-        // default is map.
-        let is_map = !has_set_entry;
-        Some(if is_map {
-            SetOrMap::Map(entries)
-        } else {
-            SetOrMap::Set(elements)
-        })
+        Some(split_set_or_map(staged, has_set_entry))
     }
 
     /// A map entry: stages key and value as one pseudo-operand.
@@ -1435,9 +1541,17 @@ impl ConstCapture {
     }
 
     /// A record literal (explicit or implicit const): its fields return
-    /// for per-element checking.
+    /// for per-element checking. Under a non-const duplicate window the
+    /// record is a foreign element of the enclosing dup literal: its
+    /// operands drain and nothing checks.
     pub fn record_literal(&mut self, count: usize, _span: SourceRange) -> Option<Vec<Node>> {
         if !self.open() {
+            return None;
+        }
+        if self.top_is_non_const_dup() {
+            self.apply_unaries_at(self.depth);
+            self.pop_operands(count);
+            self.non_const_dup_placeholder(_span);
             return None;
         }
         self.apply_unaries_at(self.depth);

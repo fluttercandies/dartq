@@ -456,6 +456,31 @@ pub enum SemanticCode {
     /// (`generateUnusedImportWarnings`, imports_verifier.dart:228-268);
     /// `{0}` is the URI as written.
     UnusedImport,
+    /// `The name {0} is shown, but isn't used.` — a `show`-combinator
+    /// name the import resolved but never credited, on an import that at
+    /// least one name did use (wholly unused imports keep their single
+    /// `unused_import` row; `generateUnusedShownNameHints`,
+    /// imports_verifier.dart:270-324); `{0}` is the shown name.
+    UnusedShownName,
+    /// `The value of '{0}' should be used.` — an invocation of a
+    /// `@UseResult`/`@useResult` declaration (package:meta) whose value
+    /// the enclosing expression discards (`_check` +
+    /// `_isUsed`, use_result_verifier.dart); `{0}` is the element display
+    /// name — the class name for an unnamed constructor, whose row spans
+    /// the whole `A()` invocation. The annotation's reason never renders
+    /// (the verifier reads constant field `message`; meta's field is
+    /// named `reason`), and the `unused_result_with_message` registry
+    /// sibling (same printed name, `uniqueName` split) is unreachable
+    /// with package:meta — the plain variant only.
+    UnusedResult,
+    /// `The parameter '{0}' isn't defined by '{1}'.` — a
+    /// `@UseResult.unless(parameterDefined: 'p')` annotation on a
+    /// function or method whose formal parameters omit `p`
+    /// (`_checkUseResult` + `_findUndefinedUseResultParameter`,
+    /// annotation_verifier.dart:519-541, 671+); anchored on the written
+    /// `parameterDefined` value, `{1}` the declaring callable's simple
+    /// name.
+    UndefinedReferencedParameter,
     /// `The left operand can't be null, so the right operand is never
     /// executed.` — an `e1 ?? e2` / `e1 ??= e2` whose left side's static
     /// type is strictly non-nullable (`_checkForDeadNullCoalesce`,
@@ -691,6 +716,21 @@ pub enum SemanticCode {
     /// code's business and is never sent from this consumer.
     /// `messages.yaml` :25633.
     BodyMightCompleteNormallyNullable,
+    // —— #747: the W4 const-duplicate pair (all `STATIC_WARNING`) ———————————
+    /// `Two elements in a set literal shouldn't be equal.` — a non-const
+    /// set literal whose later top-level element constant-evaluates to a
+    /// value an earlier element already produced
+    /// (`_checkForDuplications`, best_practices_verifier.dart:1077-1109,
+    /// reported at the later element). Const literals early-return there —
+    /// their duplicate face is the ERROR-tier
+    /// `equal_elements_in_const_set`, never sent from this producer.
+    /// `messages.yaml` :26904.
+    EqualElementsInSet,
+    /// `Two keys in a map literal shouldn't be equal.` — the same
+    /// predicate over the KEY of each `MapLiteralEntry` of a non-const
+    /// map literal (same verifier site, reported at the later key); map
+    /// values never participate. `messages.yaml` :26951.
+    EqualKeysInMap,
 }
 
 /// The executable-kind word the per-host oracle templates pick: the return
@@ -958,6 +998,12 @@ impl SemanticCode {
             Self::UnusedCatchClause => ("unused_catch_clause", "UNUSED_CATCH_CLAUSE"),
             Self::UnusedCatchStack => ("unused_catch_stack", "UNUSED_CATCH_STACK"),
             Self::UnusedImport => ("unused_import", "UNUSED_IMPORT"),
+            Self::UnusedShownName => ("unused_shown_name", "UNUSED_SHOWN_NAME"),
+            Self::UnusedResult => ("unused_result", "UNUSED_RESULT"),
+            Self::UndefinedReferencedParameter => (
+                "undefined_referenced_parameter",
+                "UNDEFINED_REFERENCED_PARAMETER",
+            ),
             Self::DeadNullAwareExpression => {
                 ("dead_null_aware_expression", "DEAD_NULL_AWARE_EXPRESSION")
             }
@@ -1069,6 +1115,10 @@ impl SemanticCode {
                 "body_might_complete_normally_nullable",
                 "BODY_MIGHT_COMPLETE_NORMALLY_NULLABLE",
             ),
+            // The #747 W4 pair (messages.yaml :26904 and :26951 — both
+            // `hasPublishedDocs: true`).
+            Self::EqualElementsInSet => ("equal_elements_in_set", "EQUAL_ELEMENTS_IN_SET"),
+            Self::EqualKeysInMap => ("equal_keys_in_map", "EQUAL_KEYS_IN_MAP"),
         };
         let dtype = self.dtype();
         // Unpublished rows: the function variant is the only wrong-number
@@ -1124,7 +1174,9 @@ impl SemanticCode {
             | Self::UnusedCatchClause
             | Self::UnusedCatchStack
             | Self::UnusedImport
-            | Self::DeadNullAwareExpression
+            | Self::UnusedShownName
+            | Self::UnusedResult
+            | Self::UndefinedReferencedParameter
             | Self::DeadCodeCatchFollowingCatch
             | Self::UnusedLabel
             | Self::UnnecessaryCast
@@ -1182,7 +1234,12 @@ impl SemanticCode {
             // bodyMightCompleteNormallyNullable :25633 — both `type:
             // staticWarning`).
             | Self::CastFromNullableAlwaysFails
-            | Self::BodyMightCompleteNormallyNullable => DiagnosticType::StaticWarning,
+            | Self::BodyMightCompleteNormallyNullable
+            // The #747 W4 pair (`messages.yaml`, the StaticWarningCode
+            // block: equalElementsInSet :26904, equalKeysInMap :26951 —
+            // both `type: staticWarning`).
+            | Self::EqualElementsInSet
+            | Self::EqualKeysInMap => DiagnosticType::StaticWarning,
             _ => DiagnosticType::CompileTimeError,
         }
     }
@@ -1225,6 +1282,11 @@ impl SemanticCode {
             }
             Self::UnusedLabel => format!("The label '{a0}' isn't used."),
             Self::UnusedImport => format!("Unused import: '{a0}'."),
+            Self::UnusedShownName => format!("The name {a0} is shown, but isn't used."),
+            Self::UnusedResult => format!("The value of '{a0}' should be used."),
+            Self::UndefinedReferencedParameter => {
+                format!("The parameter '{a0}' isn't defined by '{a1}'.")
+            }
             Self::DeadNullAwareExpression => {
                 "The left operand can't be null, so the right operand is never executed."
                     .to_string()
@@ -1573,6 +1635,14 @@ impl SemanticCode {
             Self::BodyMightCompleteNormallyNullable => {
                 format!("This function has a nullable return type of '{a0}', but ends without returning a value.")
             }
+            // The #747 W4 pair: no-argument rows, verbatim
+            // (messages.yaml :26907 and :26954).
+            Self::EqualElementsInSet => {
+                "Two elements in a set literal shouldn't be equal.".to_string()
+            }
+            Self::EqualKeysInMap => {
+                "Two keys in a map literal shouldn't be equal.".to_string()
+            }
         }
     }
 
@@ -1726,6 +1796,11 @@ impl SemanticCode {
             // The #505 import/flow rows: the URI names the import; the two
             // flow rows carry no arguments.
             Self::UnusedImport => format!("Unused import: '{a0}'."),
+            Self::UnusedShownName => format!("The name {a0} is shown, but isn't used."),
+            Self::UnusedResult => format!("The value of '{a0}' should be used."),
+            Self::UndefinedReferencedParameter => {
+                format!("The parameter '{a0}' isn't defined by '{a1}'.")
+            }
             Self::DeadNullAwareExpression => {
                 "The left operand can't be null, so the right operand is never executed."
                     .to_string()
@@ -1811,6 +1886,17 @@ impl SemanticCode {
                 Some("Try removing the stack trace variable, or using it.".to_string())
             }
             Self::UnusedImport => Some("Try removing the import directive.".to_string()),
+            Self::UnusedShownName => {
+                Some("Try removing the name from the list of shown members.".to_string())
+            }
+            // The plain-variant registry correctionMessage
+            // (diagnostic.g.dart:18115-18117); the with-message sibling's
+            // text is identical and unreachable with package:meta.
+            Self::UnusedResult => Some(
+                "Try using the result by invoking a member, passing it to a function, \
+                 or returning it from this function."
+                    .to_string(),
+            ),
             Self::DeadNullAwareExpression => {
                 Some("Try removing the operator and the right operand.".to_string())
             }
@@ -1913,6 +1999,12 @@ impl SemanticCode {
                 "Try adding a return statement, or if no value is ever returned, try changing the return type to 'void'."
                     .to_string(),
             ),
+            // The #747 W4 pair's verbatim oracle correctionMessages
+            // (messages.yaml :26908 and :26955).
+            Self::EqualElementsInSet => {
+                Some("Change or remove the duplicate element.".to_string())
+            }
+            Self::EqualKeysInMap => Some("Change or remove the duplicate key.".to_string()),
             _ => None,
         }
     }
@@ -2080,6 +2172,7 @@ mod tests {
             SemanticCode::UnusedCatchStack,
             SemanticCode::UnusedLabel,
             SemanticCode::UnusedImport,
+            SemanticCode::UnusedShownName,
             SemanticCode::DeadNullAwareExpression,
             SemanticCode::DeadCodeCatchFollowingCatch,
             // The #506 provably-check cluster and the #507 disjointness
@@ -2112,6 +2205,9 @@ mod tests {
             // The #746 W2b pair.
             SemanticCode::CastFromNullableAlwaysFails,
             SemanticCode::BodyMightCompleteNormallyNullable,
+            // The #747 W4 pair.
+            SemanticCode::EqualElementsInSet,
+            SemanticCode::EqualKeysInMap,
         ];
         for code in codes {
             let info = code.code_info();
@@ -2176,6 +2272,7 @@ mod tests {
         SemanticCode::UnusedCatchStack,
         SemanticCode::UnusedLabel,
         SemanticCode::UnusedImport,
+        SemanticCode::UnusedShownName,
         SemanticCode::DeadNullAwareExpression,
         SemanticCode::DeadCodeCatchFollowingCatch,
         // The #743 W1-micro cluster.
@@ -2192,6 +2289,9 @@ mod tests {
         // The #746 W2b pair.
         SemanticCode::CastFromNullableAlwaysFails,
         SemanticCode::BodyMightCompleteNormallyNullable,
+        // The #747 W4 pair.
+        SemanticCode::EqualElementsInSet,
+        SemanticCode::EqualKeysInMap,
         SemanticCode::DuplicateDefinition,
         SemanticCode::UndefinedAnnotation,
         SemanticCode::UndefinedClass,
