@@ -73,6 +73,27 @@
 #   html/           browsable report (--html; llvm-cov emits one format per
 #                   run, so --html replaces the lcov pass and evaluates no
 #                   gate)
+#
+# == --stability: the §19.5 two-run reproducibility protocol ==
+# PRD §19.5 pins reproducibility on the full ContextId tuple: identical
+# (Source, SDK, PackageGraph, LanguageVersions, Options, Target,
+# ConditionalEnv, EngineVersion) ⇒ identical analysis output. The coverage
+# face of that contract is run-to-run stability of the instrumented suite
+# itself: two consecutive `cargo llvm-cov --workspace --tests` passes over
+# the same committed tree and toolchain must deliver an identical TOTAL
+# line-coverage percentage. Both passes run under the identical posture
+# above (sccache bypass, isolated target dir, --test-threads=1), so any
+# difference is real nondeterminism, not measurement noise. The criterion is
+# exact: the aggregate (lines-hit, lines-total) of both runs must be equal —
+# the integer-exact form of "identical percentage" (no rounding tolerance).
+# Outputs: target/coverage/stability-run1.lcov, stability-run2.lcov and
+# stability-summary.txt (banner + git stamp + both totals + verdict, sealed
+# as stability-tuple.json). --html composes: a third pass writes the
+# browsable report after the pair (each pass re-runs the full suite — plan
+# wall clock accordingly). Verdict: identical totals = reproducible (exit 0);
+# any difference = exit 1 with both runs' totals printed. Floors do not
+# apply in this mode (the gate criterion is stability, not thresholds).
+#
 # §19.5 seal: a run-mode summary.txt carries `git_head` and
 # `worktree_patch_sha256` lines (via scripts/repro-tuple.sh — the single
 # source of the identity computation, so the stamp and tuple.json agree
@@ -84,6 +105,7 @@
 #
 # Usage:
 #   scripts/coverage-gate.sh [--floors FILE | --floor N] [--enforce] [--html] [--dry-run]
+#   scripts/coverage-gate.sh --stability [--html] [--dry-run]
 #   scripts/coverage-gate.sh --report FILE [--floors FILE | --floor N] [--enforce]
 #   scripts/coverage-gate.sh --help
 #
@@ -100,9 +122,16 @@
 #                  Default: advisory — below-floor rows are reported on
 #                  stderr, exit stays 0; flip once the measured baseline is
 #                  committed (docs/plans/coverage-gate.md section 6).
+#   --stability     the §19.5 two-run protocol: two consecutive llvm-cov
+#                   passes; pass/fail on the run-to-run stability of the
+#                   TOTAL coverage percentage (identical aggregate
+#                   lines-hit/lines-total = reproducible). Floors do not
+#                   apply. Must precede --html (see below). Mutually
+#                   exclusive with --report.
 #   --html         write the browsable HTML report under target/coverage/html
 #                  instead of the lcov pass; prints the report pointer,
-#                  evaluates no gate.
+#                  evaluates no gate. With --stability: an additional third
+#                  pass after the pair (every pass re-runs the full suite).
 #   --dry-run      resolve every path, validate the floors table, print the
 #                  plan and the exact command; runs nothing but the
 #                  cargo-llvm-cov presence probe.
@@ -113,10 +142,10 @@
 #   --output FILE  override the lcov destination (default:
 #                  target/coverage/coverage.lcov).
 #
-# Exit codes: 0 = gate met (or advisory mode, dry run, help);
-# 1 = enforcing gate red (a crate row below its floor); 2 = usage error,
-# invalid floors table, missing tool, failed coverage run, or unreadable
-# report.
+# Exit codes: 0 = gate met (or advisory mode, dry run, help, or a stability
+# run with identical totals); 1 = enforcing gate red (a crate row below its
+# floor) or a stability run whose totals diverged; 2 = usage error, invalid
+# floors table, missing tool, failed coverage run, or unreadable report.
 
 set -euo pipefail
 
@@ -130,6 +159,9 @@ export CARGO_TARGET_DIR="target/coverage-build"
 FLOOR_DEFAULT="0.0"
 REPORT_DEFAULT="target/coverage/coverage.lcov"
 HTML_DIR_DEFAULT="target/coverage/html"
+STAB_RUN1="target/coverage/stability-run1.lcov"
+STAB_RUN2="target/coverage/stability-run2.lcov"
+STAB_SUMMARY="target/coverage/stability-summary.txt"
 
 usage() {
   sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
@@ -139,10 +171,11 @@ FLOOR="$FLOOR_DEFAULT"
 REPORT="$REPORT_DEFAULT"
 HTML_DIR="$HTML_DIR_DEFAULT"
 FLOORS=""
-MODE="run" # run (lcov + gate) | html (browsable, no gate) | report (re-gate)
+MODE="run" # run (lcov + gate) | html (browsable, no gate) | report (re-gate) | stability (two-run §19.5)
 DRY_RUN=0
 ENFORCE=0
 FLOOR_EXPLICIT=0
+STABILITY_HTML=0
 
 while [ $# -gt 0 ]; do
   # Termination invariant: every arm consumes its tokens (>=1 per iteration)
@@ -154,21 +187,25 @@ while [ $# -gt 0 ]; do
       FLOOR="$2"; FLOOR_EXPLICIT=1; shift 2 ;;
     --floors)
       [ $# -ge 2 ] || { echo "coverage-gate: --floors needs a value" >&2; exit 2; }
-      [ "$MODE" != "html" ] || { echo "coverage-gate: --floors does not apply to --html (no gate evaluated)" >&2; exit 2; }
+      [ "$MODE" = "run" ] || { echo "coverage-gate: --floors does not apply to $MODE mode (no floors gate evaluated)" >&2; exit 2; }
       FLOORS="$2"; shift 2 ;;
     --enforce)
-      [ "$MODE" != "html" ] || { echo "coverage-gate: --enforce does not apply to --html (no gate evaluated)" >&2; exit 2; }
+      [ "$MODE" = "run" ] || { echo "coverage-gate: --enforce does not apply to $MODE mode (no floors gate evaluated)" >&2; exit 2; }
       ENFORCE=1; shift ;;
+    --stability)
+      [ "$MODE" = "run" ] || { echo "coverage-gate: --stability cannot be combined with --html or --report" >&2; exit 2; }
+      MODE="stability"; shift ;;
     --output)
       [ $# -ge 2 ] || { echo "coverage-gate: --output needs a value" >&2; exit 2; }
       [ "$MODE" = "run" ] || { echo "coverage-gate: --output only applies to the lcov run mode" >&2; exit 2; }
       REPORT="$2"; shift 2 ;;
     --html)
-      [ "$MODE" = "run" ] || { echo "coverage-gate: --html cannot be combined with --report" >&2; exit 2; }
-      MODE="html"; shift ;;
+      [ "$MODE" != "report" ] || { echo "coverage-gate: --html cannot be combined with --report" >&2; exit 2; }
+      if [ "$MODE" = "run" ]; then MODE="html"; else STABILITY_HTML=1; fi
+      shift ;;
     --report)
       [ $# -ge 2 ] || { echo "coverage-gate: --report needs a value" >&2; exit 2; }
-      [ "$MODE" = "run" ] || { echo "coverage-gate: --report cannot be combined with --html" >&2; exit 2; }
+      [ "$MODE" = "run" ] || { echo "coverage-gate: --report cannot be combined with --html or --stability" >&2; exit 2; }
       MODE="report"; REPORT="$2"; shift 2 ;;
     --dry-run)
       [ "$MODE" != "report" ] || { echo "coverage-gate: --dry-run does not apply to --report mode" >&2; exit 2; }
@@ -218,7 +255,7 @@ NR==FNR && gfloor < 0 {
 }
 '
 resolve_floors() {
-  if [ "$MODE" = "html" ]; then return 0; fi
+  if [ "$MODE" = "html" ] || [ "$MODE" = "stability" ]; then return 0; fi
   if [ "$FLOOR_EXPLICIT" = 1 ]; then return 0; fi
   FLOORS="${FLOORS:-$SCRIPT_DIR/coverage-floors.tsv}"
   [ -f "$FLOORS" ] || { echo "coverage-gate: floors table not found: $FLOORS" >&2; exit 2; }
@@ -251,27 +288,41 @@ if [ "$MODE" != "report" ]; then
   fi
 
   resolve_floors
-  if [ "$ENFORCE" = 1 ]; then
-    gate_note="enforcing (below-floor crate row fails, exit 1)"
-  else
-    gate_note="advisory (below-floor rows reported, exit 0; flip with --enforce)"
-  fi
   echo "== coverage-gate plan"
-  if [ "$FLOOR_EXPLICIT" = 1 ]; then
-    printf '  %-14s %s\n' "floors" "global override $FLOOR (TOTAL advisory)"
+  if [ "$MODE" = "stability" ]; then
+    printf '  %-14s %s\n' "mode" "stability — the §19.5 two-run reproducibility protocol"
+    printf '  %-14s %s\n' "gate" "identical aggregate (lines-hit, lines-total) across both runs"
+    printf '  %-14s %s\n' "runs" "2 x cargo llvm-cov --workspace --tests (consecutive, same posture)"
+    printf '  %-14s %s\n' "outputs" "$STAB_RUN1 , $STAB_RUN2 , $STAB_SUMMARY"
+    if [ "$STABILITY_HTML" = 1 ]; then
+      printf '  %-14s %s\n' "html" "$HTML_DIR/ (a third pass after the pair)"
+    fi
   else
-    printf '  %-14s %s\n' "floors" "$FLOORS (TOTAL advisory)"
+    if [ "$ENFORCE" = 1 ]; then
+      gate_note="enforcing (below-floor crate row fails, exit 1)"
+    else
+      gate_note="advisory (below-floor rows reported, exit 0; flip with --enforce)"
+    fi
+    if [ "$FLOOR_EXPLICIT" = 1 ]; then
+      printf '  %-14s %s\n' "floors" "global override $FLOOR (TOTAL advisory)"
+    else
+      printf '  %-14s %s\n' "floors" "$FLOORS (TOTAL advisory)"
+    fi
+    printf '  %-14s %s\n' "gate" "$gate_note"
+    printf '  %-14s %s crates: %s\n' "members" "$(printf '%s\n' $members | wc -l | tr -d ' ')" "$(printf '%s ' $members)"
+    if [ "$MODE" = "html" ]; then
+      printf '  %-14s %s\n' "output" "$HTML_DIR/ (browsable; no lcov, no gate)"
+      printf '  %-14s %s\n' "command" "RUSTC_WRAPPER='' cargo llvm-cov --workspace --tests --offline --html --output-dir $HTML_DIR -- --test-threads=1"
+    else
+      printf '  %-14s %s\n' "output" "$REPORT (+ summary.txt alongside)"
+      printf '  %-14s %s\n' "command" "RUSTC_WRAPPER='' cargo llvm-cov --workspace --tests --offline --lcov --output-path $REPORT -- --test-threads=1"
+    fi
   fi
-  printf '  %-14s %s\n' "gate" "$gate_note"
-  printf '  %-14s %s crates: %s\n' "members" "$(printf '%s\n' $members | wc -l | tr -d ' ')" "$(printf '%s ' $members)"
-  if [ "$MODE" = "html" ]; then
-    printf '  %-14s %s\n' "output" "$HTML_DIR/ (browsable; no lcov, no gate)"
-    printf '  %-14s %s\n' "command" "RUSTC_WRAPPER='' cargo llvm-cov --workspace --tests --offline --html --output-dir $HTML_DIR -- --test-threads=1"
+  if [ "$MODE" = "stability" ]; then
+    printf '  %-14s %s\n' "suite" "2 x cargo llvm-cov --workspace --tests (lib + integration tests; benches excluded)"
   else
-    printf '  %-14s %s\n' "output" "$REPORT (+ summary.txt alongside)"
-    printf '  %-14s %s\n' "command" "RUSTC_WRAPPER='' cargo llvm-cov --workspace --tests --offline --lcov --output-path $REPORT -- --test-threads=1"
+    printf '  %-14s %s\n' "suite" "cargo llvm-cov --workspace --tests (lib + integration tests; benches excluded)"
   fi
-  printf '  %-14s %s\n' "suite" "cargo llvm-cov --workspace --tests (lib + integration tests; benches excluded)"
   printf '  %-14s %s\n' "threads" "-- --test-threads=1 (serial, deterministic traces)"
   printf '  %-14s %s\n' "wrapper" "RUSTC_WRAPPER='' for this invocation (sccache bypassed — see header)"
   printf '  %-14s %s\n' "target-dir" "target/coverage-build (isolated from the shared target/ — see header)"
@@ -281,15 +332,22 @@ if [ "$MODE" != "report" ]; then
     exit 0
   fi
 
-  # Serial execution: one workspace pass, test binaries pinned to a single
-  # thread via the forwarded arg (see the serial-phase note in the header).
-  # RUSTC_WRAPPER="" unsets the workspace's sccache wrapper for this
-  # invocation only (see the sccache section in the header). --offline
-  # assumes a dev host with a warm cargo registry: on a machine with no
-  # populated registry the run fails (accepted — serial-phase,
-  # dev-host-only tooling).
+  # Serial execution: one workspace pass per llvm-cov invocation, test
+  # binaries pinned to a single thread via the forwarded arg (see the
+  # serial-phase note in the header). RUSTC_WRAPPER="" unsets the
+  # workspace's sccache wrapper for this invocation only (see the sccache
+  # section in the header). --offline assumes a dev host with a warm cargo
+  # registry: on a machine with no populated registry the run fails
+  # (accepted — serial-phase, dev-host-only tooling).
   rc=0
-  if [ "$MODE" = "html" ]; then
+  if [ "$MODE" = "stability" ]; then
+    mkdir -p "$(dirname "$STAB_RUN1")"
+    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --lcov --output-path "$STAB_RUN1" -- --test-threads=1 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      rc=0
+      RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --lcov --output-path "$STAB_RUN2" -- --test-threads=1 || rc=$?
+    fi
+  elif [ "$MODE" = "html" ]; then
     mkdir -p "$HTML_DIR"
     RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --html --output-dir "$HTML_DIR" -- --test-threads=1 || rc=$?
   else
@@ -299,6 +357,14 @@ if [ "$MODE" != "report" ]; then
   if [ "$rc" -ne 0 ]; then
     echo "coverage-gate: coverage run FAILED (exit $rc); if the llvm tools are missing: rustup component add llvm-tools-preview" >&2
     exit 2
+  fi
+  if [ "$MODE" = "stability" ] && [ "$STABILITY_HTML" = 1 ]; then
+    # Browsing pass after the pair (llvm-cov emits one format per run).
+    mkdir -p "$HTML_DIR"
+    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --html --output-dir "$HTML_DIR" -- --test-threads=1 || {
+      echo "coverage-gate: the html pass FAILED (the stability pair itself is already judged below)" >&2
+      exit 2
+    }
   fi
 
   banner="$(rustc --version) / $(cargo llvm-cov --version)"
@@ -321,12 +387,11 @@ if [ "$MODE" = "html" ]; then
   exit 0
 fi
 
-[ -f "$REPORT" ] || { echo "coverage-gate: coverage report not found: $REPORT" >&2; exit 2; }
-resolve_floors
-
-# Fold the tracefile into per-crate (lines-hit, lines-total) pairs. SF paths
-# are matched by substring so absolute and relative traces both parse.
-ROWS="$(awk '
+# Trace folding shared by every judged path: per-crate (lines-hit,
+# lines-total) pairs. SF paths are matched by substring so absolute and
+# relative traces both parse.
+fold_rows() { # <lcov> -> "crate hit total" rows, LC_ALL=C sorted
+  awk '
   /^SF:/ {
     path = substr($0, 5)
     crate = "other"
@@ -340,7 +405,75 @@ ROWS="$(awk '
   /^LH:/ { lh[cur] += substr($0, 4) }
   /^LF:/ { lf[cur] += substr($0, 4) }
   END { for (c in lf) if (lf[c] > 0) printf "%s %d %d\n", c, lh[c], lf[c] }
-' "$REPORT" | LC_ALL=C sort)"
+' "$1" | LC_ALL=C sort
+}
+
+sum_rows() { # <rows> -> "hit total" aggregate
+  printf '%s\n' "$1" | awk '{h += $2; t += $3} END {printf "%d %d", h + 0, t + 0}'
+}
+
+pct_of() { # <hit> <total> -> percentage, one decimal
+  awk -v h="$1" -v t="$2" 'BEGIN { printf "%.1f", (t > 0) ? h * 100 / t : 100 }'
+}
+
+# --- stability verdict (§19.5 two-run protocol) --------------------------------
+# The gate criterion is run-to-run stability of the TOTAL coverage
+# percentage, judged integer-exact: both runs' aggregate (lines-hit,
+# lines-total) must be identical. Per-crate churn with equal totals is
+# reported informationally, never scored. This block always exits; the
+# floors path below is the other modes' business.
+if [ "$MODE" = "stability" ]; then
+  for trace in "$STAB_RUN1" "$STAB_RUN2"; do
+    [ -f "$trace" ] || { echo "coverage-gate: coverage report not found: $trace" >&2; exit 2; }
+  done
+  ROWS1="$(fold_rows "$STAB_RUN1")"
+  ROWS2="$(fold_rows "$STAB_RUN2")"
+  if [ -z "$ROWS1" ] || [ -z "$ROWS2" ]; then
+    echo "coverage-gate: no coverage records parsed from the stability traces (not lcov tracefiles?)" >&2
+    exit 2
+  fi
+  T1="$(sum_rows "$ROWS1")"
+  T2="$(sum_rows "$ROWS2")"
+  HIT1="${T1%% *}"; TOT1="${T1##* }"
+  HIT2="${T2%% *}"; TOT2="${T2##* }"
+  P1="$(pct_of "$HIT1" "$TOT1")"
+  P2="$(pct_of "$HIT2" "$TOT2")"
+  echo
+  echo "== coverage-gate stability summary"
+  printf '  %-14s %s %% (%s/%s lines)\n' "run 1 total" "$P1" "$HIT1" "$TOT1"
+  printf '  %-14s %s %% (%s/%s lines)\n' "run 2 total" "$P2" "$HIT2" "$TOT2"
+  if [ "$ROWS1" != "$ROWS2" ]; then
+    echo "  per-crate rows differ between the runs (informational):"
+    diff <(printf '%s\n' "$ROWS1") <(printf '%s\n' "$ROWS2") | sed 's/^/  /' || true
+  fi
+  if [ "$T1" = "$T2" ]; then
+    verdict="STABLE"
+    echo "coverage-gate: VERDICT STABLE (identical totals across both runs — reproducible)"
+  else
+    verdict="DIVERGED"
+    echo "coverage-gate: VERDICT DIVERGED (run 1 $P1% = $HIT1/$TOT1, run 2 $P2% = $HIT2/$TOT2 — nondeterminism)" >&2
+  fi
+  {
+    printf '%s\n' "$banner"
+    printf 'git_head %s\n' "$GIT_HEAD"
+    printf 'worktree_patch_sha256 %s\n' "$PATCH_SHA"
+    printf 'run1_total %s %s (%s%%)\n' "$HIT1" "$TOT1" "$P1"
+    printf 'run2_total %s %s (%s%%)\n' "$HIT2" "$TOT2" "$P2"
+    printf 'verdict %s\n' "$verdict"
+    printf '%s\n' "$ROWS1" | awk '{ printf "%-24s %10d %12d\n", $1, $2, $3 }'
+  } > "$STAB_SUMMARY"
+  "$SCRIPT_DIR/repro-tuple.sh" --output "$STAB_SUMMARY" \
+    > "$(dirname "$STAB_SUMMARY")/stability-tuple.json"
+  if [ "$verdict" = "STABLE" ]; then
+    exit 0
+  fi
+  exit 1
+fi
+
+[ -f "$REPORT" ] || { echo "coverage-gate: coverage report not found: $REPORT" >&2; exit 2; }
+resolve_floors
+
+ROWS="$(fold_rows "$REPORT")"
 
 [ -n "$ROWS" ] || { echo "coverage-gate: no coverage records parsed from $REPORT (not an lcov tracefile?)" >&2; exit 2; }
 
