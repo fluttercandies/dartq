@@ -284,13 +284,15 @@ impl CodeRegistry {
 mod tests {
     use super::*;
 
-    /// Table shape: 255 syntax codes + 3 language-version codes (the 7
-    /// measured-dead rows were pruned from the snapshot, #222), globally
+    /// Table shape: 255 registry-gated syntax codes + 4 supplemental rows
+    /// (the 3-code language-version family plus
+    /// invalid_covariant_modifier_in_primary_constructor; the 7 measured-dead
+    /// rows were pruned from the snapshot, #222), globally
     /// unique names, machine forms are the uppercase names, and every row is
     /// reachable through the registry next to the hand-written own codes.
     #[test]
     fn generated_table_is_complete_and_wellformed() {
-        assert_eq!(OFFICIAL_CODES.len(), 258);
+        assert_eq!(OFFICIAL_CODES.len(), 259);
         assert_eq!(OFFICIAL_CODE_DATA.len(), OFFICIAL_CODES.len());
         let registry = CodeRegistry::builtin();
         for code in OFFICIAL_CODES {
@@ -498,7 +500,7 @@ mod tests {
         assert_eq!(message_template("dartq/internal_error"), None);
     }
 
-    /// Audit F1: exactly 15 published codes among the 258 table rows — the 13
+    /// Audit F1: exactly 15 published codes among the 259 table rows — the 13
     /// `hasPublishedDocs: true` syntax codes (captured from analyzer-8.4.1
     /// `syntactic_errors.g.dart`, re-verified in the pinned live registry
     /// `diagnostic.g.dart`, which absorbed the syntactic and scanner rows)

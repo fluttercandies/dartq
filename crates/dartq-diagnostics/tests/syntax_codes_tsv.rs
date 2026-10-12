@@ -5,8 +5,9 @@ use std::path::Path;
 /// blake3 digest of the pinned TSV snapshot (dart 3.13.1 oracle;
 /// analyzer-8.4.1 + _fe_analyzer_shared-91.0.0 registries; 2026-10-08
 /// capture, 7 measured-dead rows pruned 2026-10-09 — #222). The surviving
-/// table is byte-audited against those pinned registries (258/258 rows
-/// verified).
+/// table is 259 data rows: 255 registry-gated codes + 4 supplemental rows
+/// (the 3-code language-version family plus
+/// invalid_covariant_modifier_in_primary_constructor).
 ///
 /// Any content edit changes the generated registry: re-verify the full table
 /// against the pinned registry sources first, then re-pin this digest

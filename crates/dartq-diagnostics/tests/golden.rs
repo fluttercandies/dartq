@@ -664,7 +664,7 @@ fn code_registry_looks_up_official_and_dartq_codes() {
         assert_eq!(code.machine, code.name.to_uppercase());
         count += 1;
     }
-    // 258 official table codes (7 measured-dead rows pruned, #222) + 15
+    // 259 official table codes (7 measured-dead rows pruned, #222) + 15
     // hand-written codes.
-    assert_eq!(count, 273);
+    assert_eq!(count, 274);
 }
