@@ -2,7 +2,11 @@
 # m3-gate.sh — the M3 unused-family differential gate (goal #764).
 #
 # One harness run over tests/corpus/m3-unused with the frozen M3 code set
-# (tests/harness/m3_unused_codes.txt), WARNING severity, bar 0.95, against
+# (tests/harness/m3_unused_codes.txt), WARNING severity, bar 1.0 — full
+# parity like every differential gate (2026-10-12 ruling,
+# docs/facts/adr-2026-10-12-full-parity-bars.md; supersedes the PRD-era
+# numeric bars; residuals pass only via individually adjudicated pinned
+# exemptions, never a numeric budget) — against
 # the same single oracle of record as M1/M2: the fvm default install. All
 # ten codes are registry STATIC_WARNING (see the codes-file header), so the
 # WARNING tier carries the whole family and the codes file scopes the run.
@@ -26,7 +30,7 @@
 # directory name under docs/audits/gate-m3/, default m3-r1; an existing
 # report directory is refused — a rerun never overwrites recorded evidence).
 #
-# Exit codes: 0 gate met (WARNING-tier Jaccard >= 0.95); 1 below the bar;
+# Exit codes: 0 gate met (WARNING-tier Jaccard >= 1.0); 1 below the bar;
 # 2 usage or environment error, or the harness's own error tier (dartq
 # crash, corpus preflight failure) — never scored as a Jaccard result.
 
@@ -35,7 +39,7 @@ cd "$(dirname "$0")/.." || exit 2
 
 CORPUS="tests/corpus/m3-unused"
 CODES_FILE="tests/harness/m3_unused_codes.txt"
-THRESHOLD="0.95"
+THRESHOLD="1.0"
 EXPECTED_VERSION="3.13.1"
 OUT_ROOT="docs/audits/gate-m3"
 HARNESS="./target/debug/harness"
@@ -107,11 +111,12 @@ EOF
 # file, a wrong corpus, or an oracle that silently produced nothing).
 [ "$((inter + oonly))" -gt 0 ] || { echo "m3-gate: ERRORED — no oracle-side WARNING entries post-filter; the gate would pass without judging anything" >&2; exit 2; }
 echo "== m3-gate [$label]: intersection=$inter oracle_only=$oonly dartq_only=$donly report=$outdir/report.json"
-# Exact decision on the raw counts: i/u >= 0.95 with u = intersection +
-# oracle-only + dartq-only (the Jaccard union) is 20*i >= 19*u — integer,
-# no rounding.
+# Exact decision on the raw counts: i/u >= 1.0 with u = intersection +
+# oracle-only + dartq-only (the Jaccard union) means zero residuals —
+# intersection == union, i.e. oracle-only + dartq-only == 0; integer, no
+# rounding.
 union=$((inter + oonly + donly))
-if [ "$((20 * inter))" -ge "$((19 * union))" ]; then
+if [ "$inter" -ge "$union" ]; then
   echo "m3-gate: VERDICT PASS (WARNING-tier Jaccard meets the $THRESHOLD bar)"
   exit 0
 fi

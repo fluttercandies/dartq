@@ -5,12 +5,17 @@
 #
 #   Run A (syntax caliber): tests/corpus/m0 + tests/corpus/m0-syntax over the
 #   255-code syntax universe (tests/corpus/syntax-codes.txt), ERROR severity,
-#   bar 0.99.
+#   bar 1.0.
 #
 #   Run B (union caliber): the same corpora over the union of the syntax
 #   universe with the frozen M1 code universe (tests/harness/m1_codes.txt),
 #   pinned at exactly 290 codes = 255 + 36 - 1 overlap (the shared
-#   wrong_number_of_parameters_for_setter), ERROR severity, bar 0.95.
+#   wrong_number_of_parameters_for_setter), ERROR severity, bar 1.0.
+#
+#   Both bars are 1.0 — full parity (2026-10-12 ruling,
+#   docs/facts/adr-2026-10-12-full-parity-bars.md; supersedes the PRD
+#   section 20.3 numeric bars). Residuals pass only via individually
+#   adjudicated pinned exemptions, never a numeric budget.
 #
 # Neither run passes --type-filter: the M0 gates are code-scoped, never
 # type-scoped.
@@ -57,8 +62,8 @@ SYNTAX_CODES="tests/corpus/syntax-codes.txt"
 M1_CODES="tests/harness/m1_codes.txt"
 UNION_CODES="target/gate/union-codes.txt"
 EXPECTED_UNION_COUNT="290" # 255 (syntax) + 36 (M1) - 1 overlap
-SYNTAX_THRESHOLD="0.99"
-UNION_THRESHOLD="0.95"
+SYNTAX_THRESHOLD="1.0"
+UNION_THRESHOLD="1.0"
 OUT_ROOT="docs/audits/gate-m0"
 HARNESS="./target/release/harness"
 PERSIST_DIR="tests/corpus/regressions/cases"
@@ -221,12 +226,14 @@ run_gate() { # <threshold> <codes-file> <outdir> <title>
   )
   echo
   echo "== [$label] m0 gate: $4 (bar $1)"
-  if "$HARNESS" "${run_args[@]}"; then
+  # Capture the harness exit status at invocation: `if harness; then ... fi`
+  # without an `else` exits 0 when the condition fails (the if statement's own
+  # status), so a scored FAIL (exit 1) would be misread as 0 here.
+  rc=0
+  "$HARNESS" "${run_args[@]}" || rc=$?
+  if [ "$rc" -eq 0 ]; then
     echo "-- [$label] $4 PASSED the bar; report: $3/report.json"
-    return 0
-  fi
-  rc=$?
-  if [ "$rc" -eq 1 ]; then
+  elif [ "$rc" -eq 1 ]; then
     verdict=FAIL
     echo "-- [$label] $4 FAILED below the bar (harness exit 1); report: $3/report.json"
   else

@@ -33,7 +33,7 @@
 #     judgment face: the manifest's injections MUST reach the oracle side
 #     (no --allow-vacuous; a vacuous oracle side here means the injections
 #     never landed and fails the leg).
-# A9 asserts ERROR (code,file) Jaccard >= 0.95 on both faces via the
+# A9 asserts ERROR (code,file) Jaccard >= 1.0 on both faces via the
 # harness's own threshold gate (harness exit 0). The leg also measures the
 # A7 cold pair (#798): tests/bench/oracle_baseline.sh driven twice over the
 # clean 1k tree — the oracle side (oracle-of-record dart,
@@ -112,7 +112,7 @@
 # MEGA_RSS_100K_LIMIT_KIB (A1, KiB), MEGA_INC_P95_1K_MS
 # / MEGA_INC_P95_10K_MS / MEGA_INC_P95_100K_MS (A4/A5/A6, ms). Oracle-leg
 # bar override (decimal in [0.0, 1.0]): MEGA_ORACLE_JACCARD_MIN (A9,
-# default 0.95).
+# default 1.0).
 #
 # Exit codes: 0 every requested scale completed with both reports — and,
 # under --strict, every asserted acceptance face passed; 1 a --strict
@@ -158,10 +158,13 @@ INC_P95_100K_MS=60000
 # consumption note and the #546 ledger's deferred note).
 DISK_HEADROOM_100K_MIB=800
 # A9 (oracle leg, 1k only): ERROR (code,file) Jaccard bar, docs/plans/
-# mega-corpus.md §4 A9 (M1-gate-convention anchor, PRD.md:1289). The
-# harness enforces it as its own --threshold; this script classifies the
+# mega-corpus.md §4 A9. Bar 1.0 — full parity like every differential gate
+# (2026-10-12 ruling, docs/facts/adr-2026-10-12-full-parity-bars.md;
+# supersedes the PRD-era numeric bars; residuals pass only via individually
+# adjudicated pinned exemptions, never a numeric budget). The harness
+# enforces it as its own --threshold; this script classifies the
 # harness exit. Env override: MEGA_ORACLE_JACCARD_MIN (decimal in [0,1]).
-ORACLE_JACCARD_MIN=0.95
+ORACLE_JACCARD_MIN=1.0
 # Oracle leg inputs: the injector + the checked-in injection manifest (the
 # seeded tree's single source of truth) and the derived tree it produces.
 SEED_SCRIPT="scripts/mega-seed-errors.sh"

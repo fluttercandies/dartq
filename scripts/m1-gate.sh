@@ -2,8 +2,11 @@
 # m1-gate.sh — the M1 frozen-code differential gate (PRD section 20.3, M1 row).
 #
 # Runs the harness once over tests/corpus/m1-semantic with the frozen M1 code
-# universe (tests/harness/m1_codes.txt), ERROR severity, threshold 0.95 — the
-# M1 bar, deliberately below the M0 0.99 — against a single oracle of record:
+# universe (tests/harness/m1_codes.txt), ERROR severity, threshold 1.0 — the
+# M1 bar, full parity like every differential gate (2026-10-12 ruling,
+# docs/facts/adr-2026-10-12-full-parity-bars.md; supersedes the PRD section
+# 20.3 numeric bars; residuals pass only via individually adjudicated pinned
+# exemptions, never a numeric budget) — against a single oracle of record:
 # the fvm default install (Dart 3.13.1, the gate-caliber-r5 baseline). No
 # matrix: M1 acceptance is defined on one caliber. The report lands under
 # docs/audits/gate-m1/<label>/ (label: --label or M1_LABEL, default m1-r4;
@@ -42,7 +45,7 @@
 # dart-sdk>` — the recorded baseline-r2 shape), DARTQ_HARNESS_ORACLE_TIMEOUT_MS
 # (forwarded to the harness drivers).
 #
-# Exit codes: 0 gate met (ERROR-tier Jaccard >= 0.95); 1 below the bar;
+# Exit codes: 0 gate met (ERROR-tier Jaccard >= 1.0); 1 below the bar;
 # 2 usage or environment error — missing binaries, fvm default missing, jq
 # missing, unreadable report — and the harness's own error tier (exit 2:
 # violated vacuity guard, dartq crash, corpus preflight failure), which is
@@ -55,7 +58,7 @@ cd "$(dirname "$0")/.." || exit 2
 
 CORPUS="tests/corpus/m1-semantic"
 CODES_FILE="tests/harness/m1_codes.txt"
-THRESHOLD="0.95"
+THRESHOLD="1.0"
 EXPECTED_VERSION="3.13.1"
 OUT_ROOT="docs/audits/gate-m1"
 HARNESS="./target/debug/harness"

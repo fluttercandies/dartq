@@ -3,8 +3,12 @@
 #
 # Runs the harness once over tests/corpus/m2-warning with the frozen M2 code
 # universe (tests/harness/m2_warning_codes.txt), WARNING severity, threshold
-# 0.95 — the M2 bar — against the same single oracle of record as M1: the fvm
-# default install (Dart 3.13.1, the gate-caliber-r5 baseline). The WARNING
+# 1.0 — the M2 bar, full parity like every differential gate (2026-10-12
+# ruling, docs/facts/adr-2026-10-12-full-parity-bars.md; supersedes the PRD
+# section 20.3 numeric bars; residuals pass only via individually adjudicated
+# pinned exemptions, never a numeric budget) — against the same single oracle
+# of record as M1: the fvm default install (Dart 3.13.1, the gate-caliber-r5
+# baseline). The WARNING
 # tier scores only semantic STATIC_WARNING codes; lint rules are INFO and
 # excluded by design (the M2 audit's tier split). The 43-code frozen set's
 # derivation lives in the codes-file header.
@@ -44,7 +48,7 @@
 # dart-sdk>`), DARTQ_HARNESS_ORACLE_TIMEOUT_MS (forwarded to the harness
 # drivers).
 #
-# Exit codes: 0 gate met (WARNING-tier Jaccard >= 0.95); 1 below the bar;
+# Exit codes: 0 gate met (WARNING-tier Jaccard >= 1.0); 1 below the bar;
 # 2 usage or environment error — missing binaries, fvm default missing, jq
 # missing, unreadable report, violated vacuity guard — and the harness's own
 # error tier (dartq crash, corpus preflight failure), which is never scored
@@ -55,7 +59,7 @@ cd "$(dirname "$0")/.." || exit 2
 
 CORPUS="tests/corpus/m2-warning"
 CODES_FILE="tests/harness/m2_warning_codes.txt"
-THRESHOLD="0.95"
+THRESHOLD="1.0"
 EXPECTED_VERSION="3.13.1"
 OUT_ROOT="docs/audits/gate-m2"
 HARNESS="./target/debug/harness"
@@ -230,12 +234,13 @@ printf '  %-16s %s (bar %s)\n' "warning_jaccard" "$jac" "$THRESHOLD"
 printf '  %-16s %s oracle | %s dartq (post-filter instances)\n' "diags" "$ototal" "$dtotal"
 printf '  %-16s %s oracle-only, %s dartq-only entries (attribution: report.json)\n' "diffs" "$oonly" "$donly"
 printf '  %-16s %s\n' "report" "$outdir/report.json"
-# Exact decision on the raw counts: i/u >= 0.95 with u = intersection +
-# oracle-only + dartq-only (the Jaccard union) is 20*i >= 19*u — integer,
-# no rounding. The 3-decimal `jac` above is display-only: a true Jaccard in
-# [0.9495, 0.95) rounds to 0.95 and must not pass.
+# Exact decision on the raw counts: i/u >= 1.0 with u = intersection +
+# oracle-only + dartq-only (the Jaccard union) means zero residuals —
+# intersection == union, i.e. oracle-only + dartq-only == 0; integer, no
+# rounding. The 3-decimal `jac` above is display-only: a true Jaccard in
+# [0.9995, 1.0) rounds to 1.0 and must not pass.
 union=$((inter + oonly + donly))
-if [ "$((20 * inter))" -ge "$((19 * union))" ]; then
+if [ "$inter" -ge "$union" ]; then
   echo "m2-gate: VERDICT PASS (WARNING-tier Jaccard meets the $THRESHOLD bar)"
   exit 0
 fi

@@ -30,7 +30,7 @@ use oracle::OracleDriver;
 const DEFAULT_SOURCE: &str = ".third/dart-sdk/pkg/_fe_analyzer_shared/test";
 const DEFAULT_TARGET: &str = "tests/corpus/m0";
 const DEFAULT_OUT: &str = "target/harness-report";
-const DEFAULT_THRESHOLD: f64 = 0.99;
+const DEFAULT_THRESHOLD: f64 = 1.0;
 
 #[derive(Debug)]
 enum Outcome {

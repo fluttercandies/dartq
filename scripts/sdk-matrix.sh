@@ -3,7 +3,9 @@
 #
 # Runs the existing gate caliber — the gate-caliber-r5 shape: `harness run`
 # over tests/corpus/m0 + tests/corpus/m0-syntax, ERROR severity, threshold
-# 0.99, the full syntax-codes TSV — once per supported Dart SDK oracle, then
+# 1.0 (full parity like every differential gate; 2026-10-12 ruling,
+# docs/facts/adr-2026-10-12-full-parity-bars.md), the full syntax-codes
+# TSV — once per supported Dart SDK oracle, then
 # prints a per-version summary (version / Jaccard / verdict) and
 # pre-classifies one-sided (code,file) entries through the version-skew
 # attribution rules (docs/facts/version-skew.md §5: the 7 `removedIn` codes
@@ -74,7 +76,7 @@ VENDORED_LABEL="dart-main-3.15" # .third/dart-sdk (main 3.15.0-dev anchor)
 
 CORPORA=(tests/corpus/m0 tests/corpus/m0-syntax)
 CODES_FILE="crates/dartq-diagnostics/data/syntax-codes.tsv"
-THRESHOLD="0.99"
+THRESHOLD="1.0"
 OUT_ROOT="docs/audits/sdk-matrix"
 HARNESS="./target/debug/harness"
 DEFAULT_DARTQ_CMD="./target/debug/dartq check --format=machine"
@@ -230,7 +232,7 @@ if [ "$resolved" -eq 0 ]; then
 fi
 
 # --- run the gate per version ------------------------------------------------
-# Gate caliber = gate-caliber-r5: ERROR severity, threshold 0.99, full syntax
+# Gate caliber = gate-caliber-r5: ERROR severity, threshold 1.0, full syntax
 # codes TSV, m0 + m0-syntax corpora. Harness exit codes: 0 PASS (or SKIPPED
 # verdict), 1 below gate (the report is still written), 2 harness error.
 results=()

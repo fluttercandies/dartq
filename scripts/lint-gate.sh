@@ -4,9 +4,12 @@
 #
 # Runs the harness once over tests/corpus/lints with the frozen r0 lint
 # universe (tests/harness/lint_codes.txt, 88 names), INFO severity filtered
-# to the LINT type, threshold 0.95 — the M1/M2 bar — against the same single
-# oracle of record: the fvm default install (Dart 3.13.1, the gate-of-record
-# banner check). Every package:lints rule emits at default severity INFO,
+# to the LINT type, threshold 1.0 — full parity like every differential gate
+# (2026-10-12 ruling, docs/facts/adr-2026-10-12-full-parity-bars.md;
+# supersedes the PRD-era numeric bars; residuals pass only via individually
+# adjudicated pinned exemptions, never a numeric budget) — against the same
+# single oracle of record: the fvm default install (Dart 3.13.1, the
+# gate-of-record banner check). Every package:lints rule emits at default severity INFO,
 # so the lint face is exactly the INFO x LINT intersection of the machine
 # rows.
 #
@@ -47,7 +50,7 @@
 # `./target/debug/dartq analyze --format=machine --sdk <fvm default
 # dart-sdk>`), DARTQ_HARNESS_ORACLE_TIMEOUT_MS (forwarded).
 #
-# Exit codes: 0 gate met (INFO-tier Jaccard >= 0.95); 1 below the bar —
+# Exit codes: 0 gate met (INFO-tier Jaccard >= 1.0); 1 below the bar —
 # the ratchet rule applies (fix the rule or exit it from lint_codes.txt
 # with a ledger reason; never lower the bar); 2 usage or environment error
 # — missing binaries, fvm default missing, jq missing, unreadable report,
@@ -61,7 +64,7 @@ cd "$(dirname "$0")/.." || exit 2
 CORPUS="tests/corpus/lints"
 CODES_FILE="tests/harness/lint_codes.txt"
 LEDGER="tests/harness/lint_divergences.tsv"
-THRESHOLD="0.95"
+THRESHOLD="1.0"
 EXPECTED_VERSION="3.13.1"
 OUT_ROOT="docs/audits/gate-lints"
 HARNESS="./target/debug/harness"
@@ -335,7 +338,13 @@ printf '  %-16s %s (bar %s)\n' "info_jaccard" "$jac" "$THRESHOLD"
 printf '  %-16s %s oracle | %s dartq (post-filter LINT instances)\n' "diags" "$ototal" "$dtotal"
 printf '  %-16s %s oracle-only, %s dartq-only entries (attribution: report.json; triage against %s)\n' "diffs" "$oonly" "$donly" "$LEDGER"
 printf '  %-16s %s\n' "report" "$outdir/report.json"
-if awk -v j="$jac" -v t="$THRESHOLD" 'BEGIN { exit !(j + 0 >= t + 0) }'; then
+# Exact decision on the raw counts: i/u >= 1.0 with u = intersection +
+# oracle-only + dartq-only (the Jaccard union) means zero residuals —
+# intersection == union; integer, no rounding. The 3-decimal `jac` above is
+# display-only: a true Jaccard in [0.9995, 1.0) rounds to 1.0 and must not
+# pass.
+union=$((inter + oonly + donly))
+if [ "$inter" -ge "$union" ]; then
   echo "lint-gate: VERDICT PASS (INFO-tier Jaccard meets the $THRESHOLD bar)"
   exit 0
 fi
