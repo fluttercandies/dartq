@@ -47,7 +47,10 @@
 //! ([`Session::complete_fix`] → `absorb_fix`) is the one mutation point
 //! for fix state: the worker only mails its [`FixMail`]; a cancel or the
 //! [`FIX_TIME_BUDGET`] expiry only flags the in-flight run, and a flagged
-//! run's late mail drops without answering. Ordering caveat: the epoch
+//! run's late mail drops without answering. The worker body is itself a
+//! panic boundary (#947 F5): a panicking job answers `INTERNAL_ERROR`,
+//! logs, and still mails — the slot frees and the host set comes home.
+//! Ordering caveat: the epoch
 //! pins staging order, not worker execution — a running dispatch reads the
 //! workspace from disk through the plugin hosts, so its reads can
 //! interleave with the overlay writes of later batches; the answer
@@ -157,7 +160,7 @@
 use std::collections::hash_map::Entry;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -224,6 +227,20 @@ const GC_CONTENTS_THRESHOLD: usize = 64;
 /// `overlay.clear`, session end — evict deterministically; the cap only
 /// stops a client from growing the table without bound.
 const MAX_AGENTS: usize = 256;
+
+/// One agent's staged-overlay file ceiling (#947 F3): `overlay.set` merging
+/// an agent past it is rejected `INVALID_PARAMS`. 64 files — a whole
+/// package's worth of simultaneous agent edits is far below; the bound keeps
+/// one agent's staged table (and the commit's clone) small regardless of
+/// what the RPC declares.
+const MAX_OVERLAY_FILES: usize = 64;
+
+/// One agent's staged-overlay byte ceiling (#947 F3): the sum of staged
+/// `file.bytes` past it is rejected `INVALID_PARAMS`. 64 MiB — an order of
+/// magnitude above real document traffic (the wire frame cap is 16 MiB per
+/// message); the bound caps the staged set and makes `commit_overlay`'s
+/// clone-then-write transient provably small.
+const MAX_OVERLAY_BYTES: usize = 64 << 20;
 
 /// The repeat-offender ladder (#690): unattributable panics on the
 /// plugin-bearing group (the default context's base view) tolerate this
@@ -349,6 +366,13 @@ pub(crate) enum FixJob {
         length: u64,
         verbosity: Verbosity,
     },
+    /// Test-only (the #947 F5 containment pin): a job that panics inside
+    /// the worker. A panicking job cannot be conjured deterministically
+    /// from RPC input, and the probe's thread-local trigger seams cannot
+    /// reach a worker thread — the job payload itself is the deterministic,
+    /// race-free seam.
+    #[cfg(test)]
+    Panics,
 }
 
 impl FixJob {
@@ -357,6 +381,8 @@ impl FixJob {
         match self {
             Self::Fix { .. } => "dartq/fix",
             Self::Assists { .. } => "dartq/assists",
+            #[cfg(test)]
+            Self::Panics => "dartq/fix",
         }
     }
 }
@@ -397,6 +423,8 @@ pub(crate) struct FixMail {
 /// dispatch ran inline before the staging moved them off the main loop.
 fn run_fix_job(job: FixJob, hosts: &mut PluginHosts) -> Result<serde_json::Value, SessionError> {
     match job {
+        #[cfg(test)]
+        FixJob::Panics => panic!("test-armed fix panic"),
         FixJob::Fix { paths, verbosity } => commands::fix_answer(&paths, verbosity, hosts),
         FixJob::Assists {
             path,
@@ -412,6 +440,28 @@ fn run_fix_job(job: FixJob, hosts: &mut PluginHosts) -> Result<serde_json::Value
                 DiscoverError::Io(io) => SessionError::Io(io),
             }),
     }
+}
+
+/// The fix worker's body (#947 F5): the job runs inside the same
+/// panic-boundary contract as every engine call — a panic answers an
+/// internal error and is logged, never kills the thread with the dispatch
+/// slot occupied and the host set unmailed. The completion mail goes out in
+/// every case, so the slot frees and the hosts come home (ownership of
+/// `hosts` stays outside the guarded closure — only its `&mut` borrows in —
+/// so even a panic cannot lose the set; a panicking set is torn down
+/// kill-only by its `Drop` on the mail's eventual consumption).
+fn fix_worker_body(job: FixJob, mut hosts: PluginHosts, done: &Sender<FixMail>) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_fix_job(job, &mut hosts)
+    }))
+    .unwrap_or_else(|payload| {
+        eprintln!(
+            "dartq-daemon: fix worker panicked: {}",
+            panic_message(&payload)
+        );
+        Err(SessionError::Internal("the fix dispatch panicked".into()))
+    });
+    let _ = done.send(FixMail { hosts, outcome });
 }
 
 /// The wire form of a request id (the progress notice carries it, so a
@@ -995,10 +1045,18 @@ impl Session {
     /// deltas. Lazy — no analysis runs here; the next request naming the
     /// agent materializes the view. Bumps the delta cursor once.
     ///
+    /// Every path is confined to the workspace root before anything lands
+    /// ([`confine_to_workspace`] — the write-face trust boundary, #947 F4),
+    /// and the agent's post-merge staged set is bounded
+    /// ([`MAX_OVERLAY_FILES`] / [`MAX_OVERLAY_BYTES`], #947 F3). A rejection
+    /// is atomic: nothing stages, and a new agent's table entry is not
+    /// created.
+    ///
     /// # Errors
     ///
     /// [`SessionError::InvalidParams`] when the agent would exceed
-    /// [`MAX_AGENTS`] (clear one first).
+    /// [`MAX_AGENTS`] (clear one first), a path escapes the workspace root,
+    /// or the merged staged set would exceed the per-agent file/byte caps.
     pub fn set_overlay(
         &mut self,
         agent: &str,
@@ -1012,9 +1070,49 @@ impl Session {
         if files.is_empty() {
             return Ok(());
         }
+        let staged: Vec<(PathBuf, Vec<u8>)> = files
+            .into_iter()
+            .map(|(path, bytes)| Ok((confine_to_workspace(&self.workspace_root, &path)?, bytes)))
+            .collect::<Result<_, SessionError>>()?;
+        // The per-agent bounds, computed over the merged view (an incoming
+        // path overwrites its staged entry) before anything is inserted.
+        let existing = self.agents.get(agent);
+        let (mut count, mut total) = existing.map_or((0usize, 0usize), |overlay| {
+            (
+                overlay.files.len(),
+                overlay
+                    .files
+                    .values()
+                    .fold(0usize, |sum, file| sum.saturating_add(file.bytes.len())),
+            )
+        });
+        for (path, bytes) in &staged {
+            match existing.and_then(|overlay| overlay.files.get(path)) {
+                Some(prev) => {
+                    total = total
+                        .saturating_sub(prev.bytes.len())
+                        .saturating_add(bytes.len());
+                }
+                None => {
+                    count += 1;
+                    total = total.saturating_add(bytes.len());
+                }
+            }
+        }
+        if count > MAX_OVERLAY_FILES {
+            return Err(SessionError::InvalidParams(format!(
+                "agent overlay exceeds the {MAX_OVERLAY_FILES}-file cap ({count}); clear or commit first"
+            )));
+        }
+        if total > MAX_OVERLAY_BYTES {
+            return Err(SessionError::InvalidParams(format!(
+                "agent overlay exceeds the {} MiB byte cap ({total}); clear or commit first",
+                MAX_OVERLAY_BYTES >> 20
+            )));
+        }
         let entry = self.agents.entry(agent.to_owned()).or_default();
         self.cursor += 1;
-        for (path, bytes) in files {
+        for (path, bytes) in staged {
             entry.files.insert(
                 path,
                 OverlayFile {
@@ -1073,7 +1171,9 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// [`SessionError::InvalidParams`] for an unknown agent;
+    /// [`SessionError::InvalidParams`] for an unknown agent, or when a
+    /// staged path fails the commit-time canonical confinement (#947 F4 —
+    /// e.g. a symlink in the worktree now points outside the root);
     /// [`SessionError::Io`] when a disk write fails — files already written
     /// stay written (the write-back is not transactional; the base view
     /// catches up through the next sync), nothing merges, and the agent's
@@ -1093,11 +1193,20 @@ impl Session {
         if overlay.files.is_empty() {
             return Ok(0);
         }
+        // The clone is bounded by the per-agent byte cap (#947 F3), so the
+        // 2× staged-bytes transient peak is small by construction.
         let committed: Vec<(PathBuf, Vec<u8>)> = overlay
             .files
             .iter()
             .map(|(path, file)| (path.clone(), file.bytes.clone()))
             .collect();
+        // The write boundary re-checks the confinement canonically (#947
+        // F4): staging validated the paths lexically, but a symlink planted
+        // in the worktree since could aim a write outside the root.
+        let canonical_root = fs::canonicalize(&self.workspace_root)?;
+        for (path, _) in &committed {
+            ensure_canonical_child(&canonical_root, path)?;
+        }
         // Write-back first: nothing merges until every file is on disk.
         for (path, bytes) in &committed {
             fs::write(path, bytes)?;
@@ -1452,9 +1561,11 @@ impl Session {
         let spawned = thread::Builder::new()
             .name("dartq-fix".into())
             .spawn(move || {
-                let mut hosts = hosts.unwrap_or_else(|| PluginHosts::launch(&root));
-                let outcome = run_fix_job(job, &mut hosts);
-                let _ = done.send(FixMail { hosts, outcome });
+                fix_worker_body(
+                    job,
+                    hosts.unwrap_or_else(|| PluginHosts::launch(&root)),
+                    &done,
+                )
             });
         match spawned {
             Ok(_) => {
@@ -2357,6 +2468,88 @@ fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
         .unwrap_or("opaque panic payload")
 }
 
+/// Confines an RPC-supplied write path to the workspace root (#947 F4):
+/// relative paths join the root, then the root prefix is stripped
+/// component-wise and the remainder resolved lexically — any path outside
+/// the root (an absolute path elsewhere, or enough `..` to climb out) is
+/// rejected. The overlay stores the returned normalized absolute path, so
+/// the commit-side check ([`ensure_canonical_child`]) never sees a `..`
+/// component.
+fn confine_to_workspace(root: &Path, path: &Path) -> Result<PathBuf, SessionError> {
+    let escape = || {
+        SessionError::InvalidParams(format!(
+            "overlay path escapes the workspace root: {}",
+            path.display()
+        ))
+    };
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    // Component-wise prefix strip, so a sibling directory can never pass by
+    // sharing a textual prefix with the root.
+    let Ok(rest) = joined.strip_prefix(root) else {
+        return Err(escape());
+    };
+    // Resolve the remainder lexically; a `..` at its floor is the escape.
+    let mut stack: Vec<Component<'_>> = Vec::new();
+    for component in rest.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if stack.pop().is_none() {
+                    return Err(escape());
+                }
+            }
+            component => stack.push(component),
+        }
+    }
+    let mut confined = root.to_path_buf();
+    for component in stack {
+        confined.push(component.as_os_str());
+    }
+    Ok(confined)
+}
+
+/// The commit-time half of the write confinement (#947 F4, belt and
+/// braces): staging validated the path lexically, but a symlink planted in
+/// the worktree between staging and commit could aim the write outside.
+/// Canonicalizes the deepest existing ancestor of `path` (following
+/// symlinks), re-joins the not-yet-existing tail (staged paths carry no
+/// `..`, so the tail cannot re-enter an escape), and requires the result to
+/// stay under the already-canonicalized `canonical_root`.
+fn ensure_canonical_child(canonical_root: &Path, path: &Path) -> Result<(), SessionError> {
+    let mut ancestor = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let canonical = loop {
+        match fs::canonicalize(&ancestor) {
+            Ok(canonical) => break canonical,
+            Err(error) => {
+                let Some(name) = ancestor.file_name() else {
+                    return Err(SessionError::Io(error));
+                };
+                tail.push(name.to_os_string());
+                if !ancestor.pop() {
+                    return Err(SessionError::Io(error));
+                }
+            }
+        }
+    };
+    let mut full = canonical;
+    for name in tail.into_iter().rev() {
+        full.push(name);
+    }
+    if full.starts_with(canonical_root) {
+        Ok(())
+    } else {
+        Err(SessionError::InvalidParams(format!(
+            "overlay path escapes the workspace root: {}",
+            path.display()
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2789,6 +2982,65 @@ mod tests {
         assert!(answer["files"].is_array(), "the patch document: {answer}");
         assert!(session.fix_running.is_none(), "the mail freed the slot");
         assert!(session.fix_hosts.is_some(), "the host set came home");
+    }
+
+    /// A panic inside the fix worker (#947 F5) answers an internal error
+    /// through the completion mail instead of killing the thread with the
+    /// slot occupied: the slot frees, the host set comes home, and the next
+    /// dispatch runs clean — the crate's containment contract applied to
+    /// the off-loop dispatch.
+    #[test]
+    fn fix_worker_panic_answers_internal_error_and_frees_the_slot() {
+        let (workspace, mut session) = fixture("fix-panic-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        session.queue_fix(RequestId::Num(2), FixJob::Panics);
+        let turn = session.service();
+        assert_eq!(
+            turn.notifications.len(),
+            1,
+            "the dispatch left the loop: {:?}",
+            turn.notifications
+        );
+        assert!(session.fix_running.is_some(), "the slot is owned");
+
+        let turn = wait_fix(&mut session);
+        let [(id, answer)] = turn.answers.as_slice() else {
+            panic!("one answer: {:?}", turn.answers);
+        };
+        assert_eq!(*id, RequestId::Num(2));
+        assert!(
+            matches!(answer, Err(SessionError::Internal(message)) if message.contains("panicked")),
+            "the panic answered an internal error: {answer:?}"
+        );
+        assert!(
+            session.fix_running.is_none(),
+            "the panic mail freed the slot"
+        );
+        assert!(
+            session.fix_hosts.is_some(),
+            "the host set came home through the panic mail"
+        );
+
+        // The session survives: the next fix dispatches and answers clean.
+        session.queue_fix(
+            RequestId::Num(3),
+            FixJob::Fix {
+                paths: vec![main],
+                verbosity: Verbosity::Compact,
+            },
+        );
+        let _ = session.service();
+        let turn = wait_fix(&mut session);
+        assert_eq!(turn.answers.len(), 1);
+        assert!(
+            turn.answers[0].1.is_ok(),
+            "the follow-up fix ran clean: {:?}",
+            turn.answers[0]
+        );
     }
 
     /// Cancelling a staged fix voids it like a read (the epoch bump is the
@@ -4719,6 +4971,176 @@ mod tests {
         session
             .set_overlay("overflow", vec![(main, CLEAN_MAIN.as_bytes().to_vec())])
             .expect("a cleared slot frees room");
+    }
+
+    /// The per-agent file ceiling (#947 F3): merging past
+    /// [`MAX_OVERLAY_FILES`] files is rejected atomically — nothing stages,
+    /// and an overwrite that keeps the count at the cap still fits.
+    #[test]
+    fn agent_overlay_file_count_is_capped() {
+        let (workspace, mut session) = fixture("agent-files-cap-unit");
+        let files: Vec<(PathBuf, Vec<u8>)> = (0..MAX_OVERLAY_FILES)
+            .map(|index| {
+                (
+                    workspace.path(&format!("lib/f{index}.dart")),
+                    b"var x = 1;\n".to_vec(),
+                )
+            })
+            .collect();
+        session
+            .set_overlay("A", files)
+            .expect("the cap fits exactly");
+
+        // One more file rejects; the staged set is untouched.
+        let error = session
+            .set_overlay(
+                "A",
+                vec![(workspace.path("lib/extra.dart"), b"var y = 2;\n".to_vec())],
+            )
+            .expect_err("the cap rejects growth");
+        assert!(
+            matches!(error, SessionError::InvalidParams(ref message) if message.contains("file cap")),
+            "{error}"
+        );
+        assert_eq!(
+            session.agents["A"].files.len(),
+            MAX_OVERLAY_FILES,
+            "the rejection staged nothing"
+        );
+
+        // Overwriting an already-staged path does not grow the count.
+        session
+            .set_overlay(
+                "A",
+                vec![(workspace.path("lib/f0.dart"), b"var z = 3;\n".to_vec())],
+            )
+            .expect("an overwrite stays at the cap");
+        assert_eq!(session.agents["A"].files.len(), MAX_OVERLAY_FILES);
+    }
+
+    /// The per-agent byte ceiling (#947 F3): staged bytes past
+    /// [`MAX_OVERLAY_BYTES`] are rejected `INVALID_PARAMS`; exactly the cap
+    /// fits.
+    #[test]
+    fn agent_overlay_bytes_are_capped() {
+        let (workspace, mut session) = fixture("agent-bytes-cap-unit");
+        let full = vec![0u8; MAX_OVERLAY_BYTES];
+        session
+            .set_overlay("A", vec![(workspace.path("lib/big.dart"), full)])
+            .expect("exactly the byte cap fits");
+
+        let error = session
+            .set_overlay("A", vec![(workspace.path("lib/one.dart"), b"x".to_vec())])
+            .expect_err("one byte past the cap rejects");
+        assert!(
+            matches!(error, SessionError::InvalidParams(ref message) if message.contains("byte cap")),
+            "{error}"
+        );
+        // The rejection is atomic: only the first file staged.
+        assert_eq!(session.agents["A"].files.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-face path confinement (#947 F4): overlay staging + commit are
+    // the only RPC faces that put bytes on disk, so their paths must stay
+    // inside the workspace root. The read faces keep CLI parity.
+    // -----------------------------------------------------------------------
+
+    /// Staging rejects any path whose normalized form escapes the workspace
+    /// root — absolute or relative — and normalizes in-root detours.
+    #[test]
+    fn overlay_staging_rejects_paths_outside_the_workspace() {
+        let (workspace, mut session) = fixture("overlay-confine-unit");
+        let main = workspace.path("lib/main.dart");
+
+        // Absolute escape.
+        let error = session
+            .set_overlay(
+                "A",
+                vec![(PathBuf::from("/etc/dartq-escape"), b"x".to_vec())],
+            )
+            .expect_err("an absolute path outside the root rejects");
+        assert!(
+            matches!(error, SessionError::InvalidParams(ref message) if message.contains("escapes")),
+            "{error}"
+        );
+        // Relative `..` escape.
+        let outside = session.set_overlay(
+            "A",
+            vec![(workspace.path("../../outside.dart"), b"x".to_vec())],
+        );
+        assert!(
+            matches!(outside, Err(SessionError::InvalidParams(ref message)) if message.contains("escapes")),
+            "{outside:?}"
+        );
+        // Nothing staged by either rejection — the agent table stayed empty.
+        assert!(!session.has_agent("A"), "a rejected set stages nothing");
+
+        // An in-root `..` detour normalizes and stages under its real path.
+        session
+            .set_overlay(
+                "A",
+                vec![(
+                    workspace.path("lib/../lib/main.dart"),
+                    CLEAN_MAIN.as_bytes().to_vec(),
+                )],
+            )
+            .expect("an in-root detour stages");
+        assert_eq!(session.agents["A"].files.len(), 1);
+        assert!(
+            session.agents["A"].files.contains_key(&main),
+            "the staged path normalized: {:?}",
+            session.agents["A"].files.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The commit-time canonical check (#947 F4, belt and braces): a symlink
+    /// planted in the worktree between staging and commit must not aim the
+    /// write outside the root, even though staging's lexical pass saw it
+    /// inside. The refusal leaves the staged view intact and writes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn overlay_commit_rejects_a_symlink_escape() {
+        let (workspace, mut session) = fixture("commit-symlink-unit");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // A directory outside the workspace, reachable through an in-root
+        // symlink.
+        let outside = std::env::temp_dir().join(format!(
+            "dartq-commit-escape-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
+        fs::create_dir_all(&outside).expect("outside dir");
+        let link = workspace.path("link");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+
+        session
+            .set_overlay(
+                "A",
+                vec![(link.join("x.dart"), CLEAN_MAIN.as_bytes().to_vec())],
+            )
+            .expect("staging is lexical: the symlink is not followed yet");
+
+        let error = session
+            .commit_overlay("A")
+            .expect_err("the canonical check rejects the escape");
+        assert!(
+            matches!(error, SessionError::InvalidParams(ref message) if message.contains("escapes")),
+            "{error}"
+        );
+        assert!(
+            !outside.join("x.dart").exists(),
+            "nothing was written outside the root"
+        );
+        assert_eq!(
+            session.agents["A"].files.len(),
+            1,
+            "the staged view stays intact on refusal"
+        );
+        let _ = fs::remove_dir_all(&outside);
     }
 
     // -----------------------------------------------------------------------

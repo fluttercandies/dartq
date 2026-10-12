@@ -225,7 +225,8 @@ impl Drop for Watcher {
 
 /// The poll loop: baseline scan, then one sleep-walk-diff-debounce cycle per
 /// interval. Batches ride the reader channel as main-loop intake; a dead
-/// receiver ends the thread.
+/// receiver ends the thread, and a full bounded queue blocks the send until
+/// the main loop drains (the same backpressure the reader takes — #947 F2).
 fn watch_loop(options: &WatchOptions, sender: Sender<Vec<Incoming>>, stop: &AtomicBool) {
     let Some(mut previous) = scan(&options.root) else {
         return;

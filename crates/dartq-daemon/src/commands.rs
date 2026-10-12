@@ -623,6 +623,16 @@ pub(crate) fn parse_overlay_commit(params: &Value) -> Result<String, String> {
 }
 
 /// Relative request paths resolve against the session workspace root.
+///
+/// Path trust is deliberately split by face (#947 F4). The READ faces
+/// (check/explain/compat/impact/sdk) keep CLI parity and accept absolute
+/// paths anywhere: a daemon session runs inside the operator's own
+/// workspace trust domain and these faces only read. The WRITE faces are
+/// confined to the workspace root — `Session::set_overlay` rejects any
+/// staged path whose normalized form escapes it, and `Session::commit_overlay`
+/// re-checks a canonical (symlink-following) prefix before a byte lands on
+/// disk. The daemon fix face is dry by contract (it reports patch
+/// documents, never writes), so it stays on the read side.
 fn resolve(root: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path

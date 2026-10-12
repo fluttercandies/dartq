@@ -2,12 +2,22 @@
 //! (LSP 3.17 §baseProtocol). Hand-written because the shell carries no Dart
 //! semantics; the format is ~40 lines and pinned by the tests below.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
-/// Upper bound for one message body. A client is also bounded by this when
-/// sending documents; unbounded `Content-Length` values would let a broken
-/// peer allocate without limit.
-pub const MAX_FRAME_BYTES: usize = 256 << 20;
+/// Upper bound for one header line (#947 F1): LSP headers are tiny, and
+/// without a ceiling a peer streaming newline-free bytes would grow the
+/// line buffer without limit and take the process down before any framing
+/// check fires. 16 KiB is the industry-standard ceiling; it counts the
+/// physical line including its terminator, so a CRLF-terminated line
+/// carries one byte less of content.
+const MAX_HEADER_LINE: usize = 16 * 1024;
+
+/// Upper bound for one message body (#947 F2): 16 MiB, the same wire cap
+/// the plugin transport enforces (`dartq-plugin`'s `MAX_FRAME_SIZE`) —
+/// bodies carry whole documents and real Dart sources sit far below this.
+/// Unbounded `Content-Length` values would let a broken peer allocate
+/// without limit.
+pub const MAX_FRAME_BYTES: usize = 16 << 20;
 
 /// One frame read failure.
 #[derive(Debug)]
@@ -40,13 +50,28 @@ pub fn read_frame(input: &mut impl BufRead) -> Result<Option<Vec<u8>>, FrameErro
     let mut content_length: Option<usize> = None;
     loop {
         let mut line = Vec::new();
-        let read = input.read_until(b'\n', &mut line).map_err(FrameError::Io)?;
+        // The `take` bounds the read so a newline-free peer stream cannot
+        // grow the buffer without limit (#947 F1); the +1 lets a terminator
+        // land, so an exactly-maximal legal line is still recognized. The
+        // reader is reborrowed (fully qualified call), so bytes beyond the
+        // cap stay buffered in `input` for the following reads.
+        let read = Read::take(&mut *input, MAX_HEADER_LINE as u64 + 1)
+            .read_until(b'\n', &mut line)
+            .map_err(FrameError::Io)?;
         if read == 0 {
             return match content_length {
                 // EOF exactly at a message boundary.
                 None => Ok(None),
                 Some(_) => Err(FrameError::Protocol("truncated header block".into())),
             };
+        }
+        if line.len() > MAX_HEADER_LINE && line.last() != Some(&b'\n') {
+            // The cap filled with no terminator in sight: the peer is
+            // streaming an unbounded header line. Byte alignment is lost —
+            // the session ends.
+            return Err(FrameError::Protocol(
+                "header line exceeds the 16 KiB limit".into(),
+            ));
         }
         // Accept both CRLF and bare LF line endings.
         if line.last() == Some(&b'\n') {
@@ -76,7 +101,7 @@ pub fn read_frame(input: &mut impl BufRead) -> Result<Option<Vec<u8>>, FrameErro
                 .map_err(|_| FrameError::Protocol("invalid Content-Length".into()))?;
             if length > MAX_FRAME_BYTES {
                 return Err(FrameError::Protocol(
-                    "Content-Length exceeds the 256 MiB limit".into(),
+                    "Content-Length exceeds the 16 MiB limit".into(),
                 ));
             }
             content_length = Some(length);
@@ -212,6 +237,37 @@ mod tests {
             read_frame(&mut input),
             Err(FrameError::Protocol(_))
         ));
+    }
+
+    /// A newline-free peer stream must hit the header-line ceiling and end
+    /// as a protocol error, never grow the line buffer without bound
+    /// (#947 F1 — the OOM shape).
+    #[test]
+    fn oversized_header_line_is_protocol_error() {
+        let mut input = io::Cursor::new(vec![b'x'; MAX_HEADER_LINE * 2]);
+        match read_frame(&mut input) {
+            Err(FrameError::Protocol(message)) => {
+                assert!(message.contains("16 KiB"), "{message}");
+            }
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    /// Header lines at the ceiling are legal: the ceiling counts the
+    /// physical line including its terminator, so a bare-LF line carries
+    /// cap content bytes and a CRLF line one fewer (the +1 in the bounded
+    /// read must be able to see the terminator to tell legal from overflow).
+    #[test]
+    fn header_line_at_the_cap_is_accepted() {
+        // "Content-Length: 2" is 17 bytes; pad the value with spaces (the
+        // parser trims) to pin the exact length.
+        let bare_lf = format!("Content-Length: 2{:1$}\n\nok", "", MAX_HEADER_LINE - 17);
+        let mut input = io::Cursor::new(bare_lf.into_bytes());
+        assert_eq!(read_frame(&mut input).unwrap().unwrap(), b"ok");
+
+        let crlf = format!("Content-Length: 2{:1$}\r\n\r\nok", "", MAX_HEADER_LINE - 18);
+        let mut input = io::Cursor::new(crlf.into_bytes());
+        assert_eq!(read_frame(&mut input).unwrap().unwrap(), b"ok");
     }
 
     #[test]

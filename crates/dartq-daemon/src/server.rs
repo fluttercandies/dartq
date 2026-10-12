@@ -5,10 +5,12 @@
 //!
 //! # Turn shape
 //!
-//! One turn = block on the next frames, then drain everything already queued
-//! into one batch (the rust-analyzer main-loop posture): the reader forwards
+//! One turn = block on the next frames, then drain everything already
+//! queued into one batch (the rust-analyzer main-loop posture): the reader forwards
 //! each buffered chunk as one item, so frames the client wrote together are
-//! one turn's intake. N overlay edits and M requests staged by the batch
+//! one turn's intake — capped per turn ([`MAX_TURN_INTAKE`], #947 F2; the
+//! channel itself is bounded, so a fast peer backpressures at the
+//! transport). N overlay edits and M requests staged by the batch
 //! execute at a single [`Session::service`] drain, in the scheduler's
 //! writer-priority order — every write applies before any read analyzes. The
 //! snapshot debounce is checked at the same turn boundary; while a save is
@@ -38,6 +40,20 @@ use crate::watch::{WatchOptions, Watcher, is_config_input};
 pub const EXIT_CLEAN: u8 = 0;
 /// Exit code for `exit` without a prior `shutdown` (LSP §lifeCycleMessages).
 pub const EXIT_WITHOUT_SHUTDOWN: u8 = 1;
+
+/// The intake channel's bound (#947 F2): at most this many batch items may
+/// sit queued while the CPU-bound main loop works. A fast peer outrunning
+/// the loop used to stage unbounded decoded messages (each a JSON value
+/// holding a whole document — the prior OOM shape); now the reader blocks
+/// on a full queue and the transport applies the backpressure.
+const MAX_QUEUED_BATCHES: usize = 64;
+
+/// The per-turn intake cap (#947 F2): one loop iteration stages at most
+/// this many messages before draining (the extension may overshoot by one
+/// reader batch — never drops). The loop starts its next turn immediately,
+/// so latency is unaffected; the staged fixes/requests vectors just stay
+/// bounded within any single turn.
+const MAX_TURN_INTAKE: usize = 64;
 
 /// What the reader thread hands to the main loop — plus the watch thread's
 /// debounced batches, which ride the same channel (one receiver, no select).
@@ -87,7 +103,7 @@ where
     R: Read + Send + 'static,
     W: Write + 'static,
 {
-    let (sender, receiver) = crossbeam_channel::unbounded::<Vec<Incoming>>();
+    let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(MAX_QUEUED_BATCHES);
     // Held for the session's lifetime: dropping it at return stops and
     // joins the watch thread. A send past a dead receiver ends the thread
     // on its own, too.
@@ -155,11 +171,9 @@ where
         // The batch window: the reader forwards each buffered chunk as one
         // item (frames the client wrote together), and anything that landed
         // in the channel since joins the same turn's single drain (PRD
-        // §16.5 writer priority).
-        let mut batch = first;
-        while let Ok(queued) = receiver.try_recv() {
-            batch.extend(queued);
-        }
+        // §16.5 writer priority) — up to the per-turn cap (#947 F2); the
+        // rest stay queued for the next turn.
+        let batch = assemble_batch(&receiver, first);
 
         let mut end = false;
         for incoming in batch {
@@ -233,7 +247,11 @@ where
 /// Everything decoded from one buffered chunk is forwarded as one channel
 /// item: frames the client wrote together reach the main loop as one turn's
 /// batch, decided by the transport's read granularity instead of a race
-/// between this thread's per-frame sends and the main loop's drain.
+/// between this thread's per-frame sends and the main loop's drain. The
+/// channel is bounded (#947 F2): a full queue blocks this thread until the
+/// main loop catches up — that backpressure is the point, and the reader
+/// owns nothing else, so blocking costs nothing; a send past a dead
+/// receiver ends the thread.
 #[allow(clippy::needless_pass_by_value)]
 fn reader_loop<R: Read>(mut input: BufReader<R>, sender: crossbeam_channel::Sender<Vec<Incoming>>) {
     loop {
@@ -266,6 +284,24 @@ fn reader_loop<R: Read>(mut input: BufReader<R>, sender: crossbeam_channel::Send
             return;
         }
     }
+}
+
+/// Assembles one turn's batch: `first` plus everything already queued in
+/// the channel, up to [`MAX_TURN_INTAKE`] messages (#947 F2). The final
+/// extension may overshoot the cap by one reader batch item — nothing is
+/// ever dropped; the surplus waits for the next turn, which starts
+/// immediately.
+fn assemble_batch(
+    receiver: &crossbeam_channel::Receiver<Vec<Incoming>>,
+    first: Vec<Incoming>,
+) -> Vec<Incoming> {
+    let mut batch = first;
+    while batch.len() < MAX_TURN_INTAKE
+        && let Ok(queued) = receiver.try_recv()
+    {
+        batch.extend(queued);
+    }
+    batch
 }
 
 /// Decodes one well-framed body into what the main loop consumes.
@@ -779,6 +815,38 @@ mod tests {
             );
         }
         assert_eq!(result["serverInfo"]["name"], "dartq");
+    }
+
+    /// One turn stages at most [`MAX_TURN_INTAKE`] messages (#947 F2) and
+    /// drops none: the surplus stays queued for the next turn.
+    #[test]
+    fn turn_intake_is_capped_and_never_drops() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let total = MAX_TURN_INTAKE + 10;
+        for _ in 0..total {
+            sender.send(vec![Incoming::Eof]).expect("send");
+        }
+        let batch = assemble_batch(
+            &receiver,
+            vec![Incoming::Watch {
+                touched: Vec::new(),
+            }],
+        );
+        assert_eq!(
+            batch.len(),
+            MAX_TURN_INTAKE,
+            "the turn staged exactly the cap (one Watch + {MAX_TURN_INTAKE} - 1 Eof)"
+        );
+        // Nothing dropped: the surplus is still in the channel.
+        let mut remaining = 0usize;
+        while receiver.try_recv().is_ok() {
+            remaining += 1;
+        }
+        assert_eq!(
+            batch.len() + remaining,
+            total + 1,
+            "every message accounted for"
+        );
     }
 
     /// A ranged content event violates the advertised full-sync contract
