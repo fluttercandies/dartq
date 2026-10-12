@@ -19,13 +19,19 @@
 //!   one hop. Unnamed extensions keep capturing: their members surface with
 //!   no container anchor and the [`DeclRow::unnamed_extension_member`] bit
 //!   set, which keeps them out of the library faces.
-//! * Superclass name edges (`extends S`, a named mixin application's head
-//!   type; `p.S` keeps `S`) are recorded as [`SuperEdge`]s against the
-//!   open container and resolved at library-build time. Type events
-//!   buffer the clause's candidate names and the completion event commits
-//!   the clause's first one — under comma recovery (`extends B, D`) the
-//!   official keeps the first type — and a container commits at most one
-//!   edge; an extension type's recovery `extends` commits none.
+//! * Supertype name edges are clause-typed: every header clause's target
+//!   names (`extends S`, `with M, N`, `implements I, J`, `mixin ... on A`;
+//!   a named mixin application's head type; `p.S` keeps `S`) are recorded
+//!   as [`SuperEdge`]s against the open container and resolved at
+//!   library-build time. Type events buffer the clause's candidate names
+//!   and the clause completion events commit them — the extends event
+//!   keeps one type (under comma recovery (`extends B, D`) the official
+//!   keeps the first), the with/implements/on events commit the whole
+//!   clause list — and an extension type commits nothing. The one gap:
+//!   an extension's `on T` has no completion event
+//!   (`end_extension_declaration` carries only the keyword), so `T` is
+//!   not recorded — an extension's applied type is no supertype relation
+//!   anyway; a parser-side completion event is the seam if it ever must be.
 //! * Constructors, factories, and named formals are **not** declaration
 //!   rows: the kind set has no constructor kind and the formals table is
 //!   #119's (`undefined_named_parameter` consumes it there). Operators
@@ -149,15 +155,38 @@ impl DeclRow {
     }
 }
 
-/// A direct superclass **name** edge from the parse (`extends S`, a named
-/// mixin application's head type; `p.S` keeps `S`). Resolved against the
-/// owning library at build time ([`crate::LibraryBuilder`]).
+/// The supertype clause an edge came from, ordered so every declaration
+/// shape's clause sort key equals its source order — a class header
+/// (`extends` < `with` < `implements`), a mixin header (`on` <
+/// `implements`; the other two absent), an enum header (`with` <
+/// `implements`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum SuperClause {
+    /// `extends B` — the superclass, or a named mixin application's head
+    /// type (`class C = A with B;` names `A`).
+    Extends = 0,
+    /// `with M, N` — the with-clause mixins of a class, enum, or named
+    /// mixin application.
+    With = 1,
+    /// `on A, B` — a mixin's superclass constraint.
+    On = 2,
+    /// `implements I, J` — the interface clause of a class, mixin, enum,
+    /// or named mixin application.
+    Implements = 3,
+}
+
+/// A direct supertype **name** edge from the parse: the clause it came
+/// from plus the clause's target name (`p.S` keeps `S`). Resolved against
+/// the owning library at build time ([`crate::LibraryBuilder`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SuperEdge {
     /// Row index of the subtype container.
     pub container: u32,
     /// The supertype's bare name.
     pub name: StringId,
+    /// The clause the name was written in.
+    pub clause: SuperClause,
 }
 
 /// The unlinked declaration surface of one file, built by [`capture`].
@@ -215,7 +244,8 @@ impl FileIndex {
         &self.decls
     }
 
-    /// Every direct superclass name edge, ascending by container row.
+    /// Every direct supertype name edge, ascending by `(container row,
+    /// clause)`.
     #[must_use]
     pub fn supers(&self) -> &[SuperEdge] {
         &self.supers
@@ -362,13 +392,14 @@ struct Builder<'src, 'tab> {
 }
 
 /// An open container: its decl row ([`DeclRow::NONE`] for unnamed
-/// extensions), its family, and whether a supertype edge already committed
+/// extensions), its family, and whether an extends edge already committed
 /// for it (duplicate-extends recovery fires the clause event again — the
-/// container commits one edge).
+/// container commits one extends edge; the other clauses commit every
+/// event's own types and need no guard).
 struct Container {
     row: u32,
     kind: DeclKind,
-    super_committed: bool,
+    extends_committed: bool,
 }
 
 struct PendingMember {
@@ -470,7 +501,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.containers.push(Container {
             row,
             kind,
-            super_committed: false,
+            extends_committed: false,
         });
         self.super_candidates.clear();
         self.super_head_armed = false;
@@ -482,13 +513,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.containers.pop();
     }
 
-    /// Consumes the supertype candidates into one edge for the open
-    /// container: `from_end` names which candidate survives, counting from
-    /// the buffer's end — `1` (the last) for the shapes the parser commits
-    /// right after a single type parse, and the clause's type count for
-    /// `handle_class_extends`, whose comma-recovery parses several types
-    /// before the event arrives (the official listener pops `typeCount - 1`
-    /// and keeps the first).
+    /// Consumes the supertype candidates into one extends edge for the
+    /// open container: `from_end` names which candidate survives, counting
+    /// from the buffer's end — `1` (the last) for the shapes the parser
+    /// commits right after a single type parse, and the clause's type count
+    /// for `handle_class_extends`, whose comma-recovery parses several
+    /// types before the event arrives (the official keeps the first type).
     ///
     /// The name is stored where the parser hands it over — `handle_type`
     /// for a plain name, the `TypeReferenceContinuation` identifier for a
@@ -515,7 +545,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             return;
         };
         if container.kind == DeclKind::ExtensionType
-            || container.super_committed
+            || container.extends_committed
             || container.row == DeclRow::NONE
         {
             return;
@@ -524,9 +554,44 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             self.supers.push(SuperEdge {
                 container: container.row,
                 name,
+                clause: SuperClause::Extends,
             });
-            container.super_committed = true;
+            container.extends_committed = true;
         }
+    }
+
+    /// Consumes the supertype candidates into `clause` edges for the open
+    /// container — the with/implements/on shape of
+    /// [`Builder::commit_superclass`]. `tail` selects the candidates that
+    /// belong to the clause, counting from the buffer's end: `Some(count)`
+    /// for the comma-list completion events (`handle_implements` /
+    /// `handle_mixin_on`, whose `count` is the clause's type count), `None`
+    /// for the with clause, whose completion event carries no count and
+    /// whose buffer holds exactly the clause's list (the preceding clause's
+    /// event cleared it, and no other types parse in between).
+    ///
+    /// Nothing commits for an unnamed container (no row to anchor edges
+    /// to) or for an extension type (its recovery `with`/`implements` are
+    /// representation-adjacent errors, matching the extends posture). The
+    /// buffer clears either way — the clause is over; recovery re-fires
+    /// (duplicate out-of-order clauses) legitimately add more rows.
+    fn commit_clause_supers(&mut self, clause: SuperClause, tail: Option<usize>) {
+        let Some(container) = self.containers.last_mut() else {
+            self.super_candidates.clear();
+            return;
+        };
+        let start = tail.map_or(0, |count| self.super_candidates.len().saturating_sub(count));
+        let end = self.super_candidates.len();
+        if container.row != DeclRow::NONE && container.kind != DeclKind::ExtensionType {
+            for candidate in start..end {
+                self.supers.push(SuperEdge {
+                    container: container.row,
+                    name: self.super_candidates[candidate],
+                    clause,
+                });
+            }
+        }
+        self.super_candidates.clear();
     }
 
     /// Resolves a method's member name and kind from its get-or-set token.
@@ -595,7 +660,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 edge
             })
             .collect::<Vec<SuperEdge>>();
-        supers.sort_by_key(|edge| edge.container);
+        supers.sort_by_key(|edge| (edge.container, edge.clause));
         FileCapture {
             file: self.file,
             index: FileIndex { decls, supers },
@@ -704,6 +769,8 @@ impl ParserListener for Capturer<'_, '_> {
         _implements: Option<Token>,
         _end: Token,
     ) {
+        // The implements targets already came through `handle_implements`
+        // (the keyword Option here is header residue); close the container.
         self.builder.borrow_mut().close_container();
     }
 
@@ -793,6 +860,49 @@ impl ParserListener for Capturer<'_, '_> {
         // pops `typeCount - 1`).
         if extends.is_some() {
             self.builder.borrow_mut().commit_superclass(count);
+        }
+    }
+
+    fn handle_class_with_clause(&mut self, _with: Token) {
+        // The event follows the with list (`parse_type_list` put every
+        // mixin name in the candidates); the buffer holds exactly the
+        // clause's types — the preceding extends commit cleared it.
+        self.builder
+            .borrow_mut()
+            .commit_clause_supers(SuperClause::With, None);
+    }
+
+    fn handle_enum_with_clause(&mut self, _with: Token) {
+        self.builder
+            .borrow_mut()
+            .commit_clause_supers(SuperClause::With, None);
+    }
+
+    fn handle_named_mixin_application_with_clause(&mut self, _with: Token) {
+        // The head type committed as extends at the list's `begin_type_list`
+        // (see `begin_type_list`), so the buffer holds the with-clause
+        // mixins alone.
+        self.builder
+            .borrow_mut()
+            .commit_clause_supers(SuperClause::With, None);
+    }
+
+    fn handle_implements(&mut self, implements: Option<Token>, count: usize) {
+        // The event follows the interface list; `count` is its type count
+        // (absent clause: `handle_implements(None, 0)` — nothing parsed,
+        // nothing to clear).
+        if implements.is_some() {
+            self.builder
+                .borrow_mut()
+                .commit_clause_supers(SuperClause::Implements, Some(count));
+        }
+    }
+
+    fn handle_mixin_on(&mut self, on: Option<Token>, count: usize) {
+        if on.is_some() {
+            self.builder
+                .borrow_mut()
+                .commit_clause_supers(SuperClause::On, Some(count));
         }
     }
 
@@ -1329,8 +1439,10 @@ mod tests {
     /// Superclass name edges across the supertype's shapes: a plain name,
     /// a qualified name (the continuation tail wins, not the prefix), a
     /// generic name (the type argument is not the edge), a named mixin
-    /// application's head type — and the shapes that must not fabricate
-    /// edges (no extends clause; an enum's with-clause list).
+    /// application's head type — and the clause column: extends edges stay
+    /// one per container, a with-clause mixin records a `with` edge (the
+    /// enum's with-list included), and a shape with no clause records
+    /// nothing.
     #[test]
     fn captures_superclass_name_edges() {
         let strings = StringTable::new();
@@ -1343,7 +1455,7 @@ mod tests {
              class C5 {}";
         let captured = build(source, &strings);
         let index = &captured.index;
-        let edge_for = |name: &str| -> Option<StringId> {
+        let supers_of = |name: &str| -> Vec<(StringId, SuperClause)> {
             let row = index
                 .decls()
                 .iter()
@@ -1357,32 +1469,160 @@ mod tests {
             index
                 .supers()
                 .iter()
-                .find(|edge| edge.container as usize == position)
-                .map(|edge| edge.name)
+                .filter(|edge| edge.container as usize == position)
+                .map(|edge| (edge.name, edge.clause))
+                .collect()
         };
-        assert_eq!(edge_for("C1"), Some(id(&strings, "B")), "plain extends");
         assert_eq!(
-            edge_for("C2"),
-            Some(id(&strings, "Q")),
+            supers_of("C1"),
+            vec![(id(&strings, "B"), SuperClause::Extends)],
+            "plain extends"
+        );
+        assert_eq!(
+            supers_of("C2"),
+            vec![(id(&strings, "Q"), SuperClause::Extends)],
             "qualified keeps the continuation tail"
         );
         assert_eq!(
-            edge_for("C3"),
-            Some(id(&strings, "G")),
+            supers_of("C3"),
+            vec![(id(&strings, "G"), SuperClause::Extends)],
             "generic: the type argument is not the edge"
         );
         assert_eq!(
-            edge_for("C4"),
-            Some(id(&strings, "H")),
-            "mixin application head"
+            supers_of("C4"),
+            vec![
+                (id(&strings, "H"), SuperClause::Extends),
+                (id(&strings, "M"), SuperClause::With),
+            ],
+            "mixin application: head type extends, with-list mixins follow"
         );
-        assert_eq!(edge_for("C5"), None, "no extends clause, no edge");
+        assert!(supers_of("C5").is_empty(), "no extends clause, no edge");
         assert_eq!(
-            edge_for("E"),
-            None,
-            "an enum's with-list is not a supertype"
+            supers_of("E"),
+            vec![(id(&strings, "M"), SuperClause::With)],
+            "an enum's with-list is a with edge"
         );
-        assert_eq!(index.supers().len(), 4, "no edges beyond the four shapes");
+        assert_eq!(index.supers().len(), 6, "no edges beyond the six shapes");
+    }
+
+    /// All four clause kinds record clause-typed edges, sorted by
+    /// `(container, clause)` with the parse order inside one clause: a
+    /// class's extends/with/implements chain, a mixin's on/implements
+    /// pair, an enum's with/implements pair, and a named mixin
+    /// application's head/with/implements trio.
+    #[test]
+    fn captures_clause_typed_edges_for_all_four_clauses() {
+        let strings = StringTable::new();
+        let source = "class B {} mixin M1 {} mixin M2 {} class I1 {} class I2 {} class A1 {} \
+             class C extends B with M1, M2 implements I1, I2 {} \
+             mixin MX on A1 implements I2 {} \
+             enum E with M1 implements I1 { x } \
+             class N = B with M2 implements I1;";
+        let captured = build(source, &strings);
+        let index = &captured.index;
+        let supers_of = |name: &str| -> Vec<(StringId, SuperClause)> {
+            let row = index
+                .decls()
+                .iter()
+                .find(|row| row.name == id(&strings, name))
+                .unwrap_or_else(|| panic!("{name} row"));
+            let position = index
+                .decls()
+                .iter()
+                .position(|candidate| candidate == row)
+                .expect("row position");
+            index
+                .supers()
+                .iter()
+                .filter(|edge| edge.container as usize == position)
+                .map(|edge| (edge.name, edge.clause))
+                .collect()
+        };
+        assert_eq!(
+            supers_of("C"),
+            vec![
+                (id(&strings, "B"), SuperClause::Extends),
+                (id(&strings, "M1"), SuperClause::With),
+                (id(&strings, "M2"), SuperClause::With),
+                (id(&strings, "I1"), SuperClause::Implements),
+                (id(&strings, "I2"), SuperClause::Implements),
+            ],
+            "the class carries all three class clauses, list order kept"
+        );
+        assert_eq!(
+            supers_of("MX"),
+            vec![
+                (id(&strings, "A1"), SuperClause::On),
+                (id(&strings, "I2"), SuperClause::Implements),
+            ],
+            "the mixin carries its on constraint and interfaces"
+        );
+        assert_eq!(
+            supers_of("E"),
+            vec![
+                (id(&strings, "M1"), SuperClause::With),
+                (id(&strings, "I1"), SuperClause::Implements),
+            ],
+            "the enum carries its with-list and interfaces"
+        );
+        assert_eq!(
+            supers_of("N"),
+            vec![
+                (id(&strings, "B"), SuperClause::Extends),
+                (id(&strings, "M2"), SuperClause::With),
+                (id(&strings, "I1"), SuperClause::Implements),
+            ],
+            "the named mixin application splits head (extends) from mixins (with)"
+        );
+    }
+
+    /// Body and member-signature type names share the candidate buffer
+    /// with clause targets but never fabricate edges: only clause
+    /// completion events commit, and the container close clears the rest —
+    /// a member/field/param/local named like a real supertype yields no
+    /// edge, and a type-argument name is guarded as before.
+    #[test]
+    fn body_type_names_do_not_fabricate_edges() {
+        let strings = StringTable::new();
+        let source = "class B {} class I {} class L {} \
+             class D extends B { \
+               I f; \
+               void m(L x) { \
+                 I y; \
+                 L z; \
+               } \
+             } \
+             class Plain { B other; List<B> many; }";
+        let captured = build(source, &strings);
+        let index = &captured.index;
+        let supers_of = |name: &str| -> Vec<(StringId, SuperClause)> {
+            let row = index
+                .decls()
+                .iter()
+                .find(|row| row.name == id(&strings, name))
+                .unwrap_or_else(|| panic!("{name} row"));
+            let position = index
+                .decls()
+                .iter()
+                .position(|candidate| candidate == row)
+                .expect("row position");
+            index
+                .supers()
+                .iter()
+                .filter(|edge| edge.container as usize == position)
+                .map(|edge| (edge.name, edge.clause))
+                .collect()
+        };
+        assert_eq!(
+            supers_of("D"),
+            vec![(id(&strings, "B"), SuperClause::Extends)],
+            "same-named body/member types add no edge to D"
+        );
+        assert!(
+            supers_of("Plain").is_empty(),
+            "the member's B and List<B> must not shadow into edges"
+        );
+        assert_eq!(index.supers().len(), 1, "exactly the extends edge");
     }
 
     /// Comma recovery in an extends clause (the parser reports

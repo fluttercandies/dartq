@@ -40,7 +40,7 @@
 use dartq_resolution::{LibraryGraph, LibraryId, Lookup, NamespaceEntry, Namespaces};
 use dartq_source::{FileId, SourceRange, StringId};
 
-use crate::capture::{Family, FileCapture, FileIndex};
+use crate::capture::{Family, FileCapture, FileIndex, SuperClause};
 
 /// The relation kind of a reference or name row — the §8 M1 subset.
 /// Constructor-reference specials, named-argument references, and comment
@@ -131,8 +131,9 @@ pub enum TargetRef {
     Name(StringId),
 }
 
-/// One resolved supertype edge: the subtype `(file, name)` and its direct
-/// supertype.
+/// One resolved supertype edge: the subtype `(file, name)`, its direct
+/// supertype, and the clause the supertype was written in (`extends`,
+/// `with`, `implements`, or a mixin's `on`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubtypeEdge {
     /// The subtype's file.
@@ -141,6 +142,8 @@ pub struct SubtypeEdge {
     pub name: StringId,
     /// The direct supertype.
     pub supertype: TargetRef,
+    /// The clause the supertype was written in.
+    pub clause: SuperClause,
 }
 
 /// The reference surface of one library (defining unit plus parts), built
@@ -150,7 +153,8 @@ pub struct SubtypeEdge {
 /// Invariants (the §5 sorted-column discipline): `refs` ascend by
 /// `(target, use file, offset)` with [`Self::runs`] holding each
 /// distinct-target run's start — a CSR offsets array over the rows; `names`
-/// ascend by `(name, offset)`; `supers` ascend by `(subtype file, name)`.
+/// ascend by `(name, offset)`; `supers` ascend by
+/// `(subtype file, name, clause)`.
 /// Every probe is a binary search plus an equal-run scan.
 #[derive(Debug, Default)]
 pub struct LibraryIndex {
@@ -192,7 +196,8 @@ impl LibraryIndex {
         )
     }
 
-    /// The direct supertypes of `(file, name)`.
+    /// The direct supertypes of `(file, name)`, every clause kind included
+    /// (`extends`, `with`, `implements`, a mixin's `on`).
     #[must_use]
     pub fn supertypes_of(&self, file: FileId, name: StringId) -> Option<&[SubtypeEdge]> {
         let key = |edge: &SubtypeEdge| (edge.file, edge.name);
@@ -340,6 +345,7 @@ impl<'a> LibraryBuilder<'a> {
                 file: capture.file,
                 name: container.name,
                 supertype,
+                clause: edge.clause,
             });
         }
     }
@@ -379,7 +385,8 @@ impl<'a> LibraryBuilder<'a> {
             }
         }
         self.names.sort_by_key(|row| (row.name, row.range.offset));
-        self.supers.sort_by_key(|edge| (edge.file, edge.name));
+        self.supers
+            .sort_by_key(|edge| (edge.file, edge.name, edge.clause));
         LibraryIndex {
             refs: self.refs,
             runs,
@@ -1007,6 +1014,95 @@ pub(crate) mod tests {
         assert!(
             members.iter().all(|&(file, _)| file != file_d),
             "the use file is the library member, never the target's file"
+        );
+    }
+
+    /// Clause-typed supers through the fold: every clause kind resolves by
+    /// name the way extends did and carries its clause column through, and
+    /// a same-named member (not a library face) does not shadow a clause
+    /// target into a fabricated declaration.
+    #[test]
+    fn clause_typed_supers_fold_with_targets_and_clauses() {
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut files = FileTable::new();
+        let dep = capture_one(
+            strings,
+            &mut files,
+            "d.dart",
+            "class A {}\nmixin M {}\nclass I {}\n",
+        );
+        let main = capture_one(
+            strings,
+            &mut files,
+            "m.dart",
+            "import 'd.dart';\nclass K {\n  I not_a_face;\n}\nclass C extends A with M implements I {}\n",
+        );
+
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib_m = builder.intern("package:t/m.dart");
+        let lib_d = builder.intern("package:t/d.dart");
+        let file_m = files.try_file_id(Path::new("m.dart")).unwrap();
+        let file_d = files.try_file_id(Path::new("d.dart")).unwrap();
+        for (lib, file, cap) in [(lib_m, file_m, &main.index), (lib_d, file_d, &dep.index)] {
+            for row in cap.decls() {
+                if row.is_library_face() {
+                    builder.declare(lib, row.name, file);
+                }
+            }
+        }
+        builder.import(
+            lib_m,
+            ImportEdge {
+                target: Some(lib_d),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+
+        let mut builder = LibraryBuilder::new(lib_m, &graph, &namespaces);
+        builder.add_file(&main);
+        let surface = builder.finish();
+
+        // All three clause kinds resolve cross-file, in `(name, clause)`
+        // order, each carrying its clause.
+        let edges = surface
+            .supertypes_of(file_m, strings.intern("C"))
+            .expect("C supertype edges");
+        assert_eq!(
+            edges
+                .iter()
+                .map(|edge| (edge.supertype, edge.clause))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    TargetRef::Decl(file_d, strings.intern("A")),
+                    SuperClause::Extends
+                ),
+                (
+                    TargetRef::Decl(file_d, strings.intern("M")),
+                    SuperClause::With
+                ),
+                (
+                    TargetRef::Decl(file_d, strings.intern("I")),
+                    SuperClause::Implements
+                ),
+            ]
+        );
+        // The member row `I not_a_face` is no library face: the implements
+        // edge resolved to d.dart's I, not to m.dart (the shadowing
+        // negative at fold level).
+        assert!(
+            edges
+                .iter()
+                .all(|edge| edge.supertype != TargetRef::Decl(file_m, strings.intern("I"))),
+            "a member must not shadow a clause target"
+        );
+        assert!(
+            surface.supertypes_of(file_m, strings.intern("K")).is_none(),
+            "a container without clauses carries no edges"
         );
     }
 

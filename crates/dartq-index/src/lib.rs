@@ -14,7 +14,8 @@
 //!   [`Namespaces`](dartq_resolution::Namespaces) (a [`RefRow`] naming its
 //!   target declaration), every use that does not (a [`NameRow`] in the
 //!   unresolved-names table — the §8 recovery surface), and the direct
-//!   supertype name edges resolved to the same target shape.
+//!   supertype name edges (clause-typed: `extends`/`with`/`implements`/`on`)
+//!   resolved to the same target shape.
 //! * **Query faces** ([`SymbolIndex`]): declarations by name across the
 //!   workspace and references of a declaration — the `query symbol` CLI
 //!   pair (#123).
@@ -59,7 +60,7 @@ mod capture;
 mod library;
 mod test_graph;
 
-pub use capture::{DeclKind, DeclRow, FileCapture, FileIndex, SuperEdge, capture};
+pub use capture::{DeclKind, DeclRow, FileCapture, FileIndex, SuperClause, SuperEdge, capture};
 pub use library::{LibraryBuilder, LibraryIndex, NameRow, RefKind, RefRow, TargetRef};
 pub use test_graph::TestGraph;
 
