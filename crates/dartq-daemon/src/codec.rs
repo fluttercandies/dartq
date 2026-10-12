@@ -7,9 +7,8 @@ use std::io::{self, BufRead, Read, Write};
 /// Upper bound for one header line (#947 F1): LSP headers are tiny, and
 /// without a ceiling a peer streaming newline-free bytes would grow the
 /// line buffer without limit and take the process down before any framing
-/// check fires. 16 KiB is the industry-standard ceiling; it counts the
-/// physical line including its terminator, so a CRLF-terminated line
-/// carries one byte less of content.
+/// check fires. 16 KiB is the industry-standard ceiling; it bounds the
+/// content, with the line terminator on top of the cap.
 const MAX_HEADER_LINE: usize = 16 * 1024;
 
 /// Upper bound for one message body (#947 F2): 16 MiB, the same wire cap

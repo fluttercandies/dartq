@@ -261,7 +261,7 @@ where
 /// main loop catches up — that backpressure is the point, and the reader
 /// owns nothing else, so blocking costs nothing; a send past a dead
 /// receiver ends the thread.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)] // the reader thread owns the stream for its whole life; a borrow cannot cross the spawn
 fn reader_loop<R: Read>(mut input: BufReader<R>, sender: crossbeam_channel::Sender<Vec<Incoming>>) {
     loop {
         let mut batch = Vec::new();

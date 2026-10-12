@@ -97,7 +97,6 @@ pub const DEFAULT_TARGET: &str = "vm";
 //
 // The declared-variables map is the face (its FxHasher is part of the
 // engine's identity, not a generalization axis).
-#[allow(clippy::implicit_hasher)]
 pub struct EngineConfig {
     /// Content-addressed byte storage. The engine takes ownership of the
     /// store handle; byte-level sharing across engines/contexts is opt-in

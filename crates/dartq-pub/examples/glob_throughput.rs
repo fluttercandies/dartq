@@ -56,7 +56,7 @@ const PATHS: &[&str] = &[
 ];
 
 /// Average nanoseconds per call across one timed round.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)] // display-only benchmark math; precision loss cannot affect the measurement
 fn nanos_per_call(round: Duration, calls: usize) -> f64 {
     round.as_secs_f64() * 1e9 / calls as f64
 }

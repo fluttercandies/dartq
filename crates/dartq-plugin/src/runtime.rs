@@ -446,11 +446,13 @@ impl StderrCapture {
         }
         let mut text = String::new();
         if buf.dropped_front > 0 {
-            text.push_str(&format!(
-                "[{} earlier bytes truncated; showing the last {}]\n",
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                text,
+                "[{} earlier bytes truncated; showing the last {}]",
                 buf.dropped_front,
                 buf.bytes.len()
-            ));
+            );
         }
         text.push_str(&String::from_utf8_lossy(&buf.bytes));
         Some(text)
@@ -1432,7 +1434,7 @@ fn spawn_stderr_drain(stderr: ChildStderr, capture: Arc<StderrCapture>) -> JoinH
                 match stderr.read(&mut chunk) {
                     Ok(0) => return, // EOF: the host's stderr is closed
                     Ok(n) => capture.push(&chunk[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => return, // pipe gone with the host
                 }
             }
@@ -1625,7 +1627,7 @@ fn sample_rss(pid: u32) -> Option<u64> {
     /// `struct rusage_info_v0` (`sys/resource.h`): 16 UUID bytes then ten
     /// `uint64_t` fields; `ri_resident_size` is field 8. Field names are the
     /// SDK header's, pinned by the ABI — not a naming choice.
-    #[allow(clippy::struct_field_names)]
+    #[expect(clippy::struct_field_names)] // field names are the SDK header's, pinned by the ABI
     #[repr(C)]
     struct RUsageInfoV0 {
         ri_uuid: [u8; 16],
@@ -1712,7 +1714,7 @@ pub fn crash_diagnostic(plugin: &str, error: &RuntimeError, anchor: FileId) -> D
             DARTQ_PLUGIN_TIMEOUT,
             format!(
                 "handshake did not complete within {ms} ms{}",
-                stderr_note(&stderr)
+                stderr_note(stderr)
             ),
         ),
         RuntimeError::ShutdownTimeout { ms } => (

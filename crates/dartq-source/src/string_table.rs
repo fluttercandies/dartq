@@ -102,6 +102,11 @@ impl StringTable {
 
     /// How many distinct strings the table holds — the count the session
     /// ceiling's memory bound scales with (~93 B/entry, ast-layout-spec §5).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the table lock is poisoned by a panic in an earlier
+    /// call (a program bug).
     #[must_use]
     pub fn len(&self) -> usize {
         self.inner
@@ -112,6 +117,11 @@ impl StringTable {
     }
 
     /// Whether the table holds no strings.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the table lock is poisoned by a panic in an earlier
+    /// call (a program bug).
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.inner

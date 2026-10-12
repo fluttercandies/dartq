@@ -54,7 +54,7 @@ impl CodeInfo {
 
 // Per-code doc comments embed verbatim oracle message text — data, not
 // prose we may reformat, so doc-text lints are exempt.
-#[allow(clippy::doc_markdown, clippy::doc_link_with_quotes)]
+#[expect(clippy::doc_markdown, clippy::doc_link_with_quotes)]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/syntax_codes_generated.rs"));
 }
@@ -176,7 +176,7 @@ pub const DARTQ_PACKAGE_CONFIG_OUT_OF_DATE: CodeInfo = CodeInfo::new(
     false,
 );
 /// No `package_config.json` was found; analysis runs degraded on the
-/// BasicWorkspace floor with every `package:` import unresolved (the
+/// `BasicWorkspace` floor with every `package:` import unresolved (the
 /// oracle's no-config posture — it analyzes, it does not refuse).
 pub const DARTQ_PACKAGE_CONFIG_MISSING: CodeInfo = CodeInfo::new(
     "dartq/package_config_missing",

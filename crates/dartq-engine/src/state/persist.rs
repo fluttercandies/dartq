@@ -128,7 +128,7 @@ pub fn sdk_identity(sdk: &SdkSnapshot, target: &str) -> String {
 /// engine's own loader analyzed (empty bytes).
 // The engine's declared-variables map is the face (its FxHasher is part
 // of the engine's identity, not a generalization axis).
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)] // FxHashMap is part of the digest's identity, not a generalization axis
 #[must_use]
 pub fn context_salt(
     target: &str,

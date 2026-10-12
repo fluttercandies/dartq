@@ -119,7 +119,7 @@ fn usage() {
 }
 
 /// Throughput in MB/s, using the 10^6-byte convention.
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)] // display-only benchmark math; precision loss cannot affect the measurement
 fn mb_per_s(bytes: u64, secs: f64) -> f64 {
     bytes as f64 / 1_000_000.0 / secs
 }

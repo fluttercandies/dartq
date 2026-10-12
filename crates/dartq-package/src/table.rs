@@ -465,7 +465,7 @@ impl PackageTable {
     /// build. There is deliberately no `is_empty` query: emptiness is a
     /// config-shape fact the caller already knows, not a table state worth
     /// an API.
-    #[allow(clippy::len_without_is_empty)]
+    #[expect(clippy::len_without_is_empty)] // emptiness is a config-shape fact the caller knows, not table state worth an API
     #[must_use]
     pub fn len(&self) -> usize {
         self.packages.len()

@@ -316,7 +316,7 @@ pub(crate) mod flags {
 /// Exhaustive over the enum on purpose: adding a variant without declaring
 /// its payload width is a compile error (R4 tables-lockstep guard).
 #[must_use]
-#[allow(clippy::too_many_lines)] // a 193-kind table, not logic
+#[expect(clippy::too_many_lines)] // a 193-kind table, not logic
 pub(crate) fn payload_len(kind: NodeKind) -> u8 {
     use NodeKind::*;
     match kind {

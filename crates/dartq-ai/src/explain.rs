@@ -311,7 +311,7 @@ pub fn ref_kind_name(kind: RefKind) -> &'static str {
 // One argument per borrowed face: the report is the join, and the faces
 // are what the commands layer wires — bundling them behind a struct would
 // only move the count.
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)] // one argument per borrowed face; bundling them would only move the count
 pub fn explain<'d, 's, 'l, 'f>(
     symbol: &str,
     verbosity: Verbosity,
