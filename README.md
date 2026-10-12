@@ -82,8 +82,10 @@ binaries (`dartq-cli`, `harness`). Concurrent cargo invocations share
 
 ```bash
 # Scan + parse a directory tree (the differential face): syntax
-# diagnostics in the oracle's machine format by default.
+# diagnostics in the oracle's machine format by default — one
+# SEVERITY|TYPE|CODE|FILE|LINE|COL|LENGTH|MESSAGE row per diagnostic.
 dartq check lib/ test/
+# ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|lib/broken.dart|2|11|1|Expected to find ';'.
 dartq check lib/ --format=json
 
 # Full engine over a package directory (needs pubspec.yaml and
@@ -92,8 +94,10 @@ dartq check lib/ --format=json
 dartq analyze ~/src/my_app
 dartq analyze ~/src/my_app --format=human
 
-# Symbol index: declarations of one name plus resolved references to them.
+# Symbol index: declarations of one name plus resolved references to them —
+# machine rows (DECL/REF, stable field order) or one-line JSON.
 dartq query symbol Foo
+# DECL|lib/models/user.dart|-|class|Foo|3|7|24
 dartq query symbol Foo --format=json
 dartq query callers Foo
 dartq query implementations Foo
@@ -104,6 +108,10 @@ dartq query batch --symbol Foo --symbol Bar --kinds callers
 
 # Explain: the one-stop JSON report for one symbol.
 dartq explain Foo
+
+# Index: build the symbol index over the analyzed workspace and report
+# what it built (one single-line JSON object).
+dartq index ~/src/my_app
 
 # Impact: what depends on one file's API surface (a hypothetical change —
 # a CLI run holds no edit baseline; the daemon passes real diffs).
@@ -119,6 +127,10 @@ dartq compat lib/api.dart --context beta
 # apply in place (drift-corrected through their anchors).
 dartq fix lib/ --dry-run
 dartq fix lib/
+
+# Assists: plugin hosts' proposals for one file location (report-only;
+# --offset/--length are UTF-16, defaulting to the file start).
+dartq assists lib/ui/form.dart --offset 512 --length 16
 
 # The daemon: an LSP server over stdin/stdout (see "Daemon" below); add
 # --watch to re-analyze after on-disk changes settle.
@@ -192,6 +204,12 @@ Content-Length: 71
 
 {"jsonrpc":"2.0","id":1,"method":"dartq/query","params":{"name":"Foo"}}
 ```
+
+Every session runs inside fixed budgets: a message body past 16 MiB is
+rejected at the frame reader, and the multi-agent overlay store is capped
+per agent — at most 256 live agents, each staging at most 64 files and
+64 MiB of content. A request past any cap answers `INVALID_PARAMS`
+instead of growing the session.
 
 ## Workspace Config: dartq.yaml
 
