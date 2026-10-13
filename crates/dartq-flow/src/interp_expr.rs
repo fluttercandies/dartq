@@ -60,11 +60,11 @@ impl Interp<'_> {
                             // Promotion fact (bounded to real promotions:
                             // `promoted_type_of` returns the declared type
                             // when unpromoted, so only a chain head emits).
-                            // Arg-bearing promotions are suppressed (the
-                            // recorder erased their type arguments, #611),
-                            // and dead reads carry no row (their
-                            // unreachable region is already reported as
-                            // dead code). Invariant with the plain-assign
+                            // Arg-bearing promotions stay out (the fact
+                            // row carries only the bare spelling,
+                            // #611 step 4), and dead reads carry no row
+                            // (their unreachable region is already reported
+                            // as dead code). Invariant with the plain-assign
                             // retraction below: an assignment TARGET read
                             // under an active promotion emits here, so the
                             // retraction removes this fact too — the
@@ -90,26 +90,22 @@ impl Interp<'_> {
             Ev::Type {
                 base,
                 nullable,
-                had_type_args,
+                args,
             } => {
                 let ty = Ty {
                     base: *base,
                     nullable: *nullable,
                 };
-                // Route the arg-bearing latch beside the type: only the
-                // test/cast sinks promote from a row (#611).
-                if self.in_type_test {
-                    self.tested_had_args = *had_type_args;
-                } else if self.in_as_cast {
-                    self.as_cast_had_args = *had_type_args;
-                }
-                self.sink_type(ty);
+                self.sink_type(ty, *args);
             }
-            Ev::NoType | Ev::FunctionType => self.sink_type(Ty::UNKNOWN),
-            Ev::VoidType => self.sink_type(Ty {
-                base: crate::ty::Base::Void,
-                nullable: false,
-            }),
+            Ev::NoType | Ev::FunctionType => self.sink_type(Ty::UNKNOWN, crate::ty::EMPTY_ARGS),
+            Ev::VoidType => self.sink_type(
+                Ty {
+                    base: crate::ty::Base::Void,
+                    nullable: false,
+                },
+                crate::ty::EMPTY_ARGS,
+            ),
             Ev::Bool { value } => {
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
                 expr.bool_value = Some(*value);
@@ -326,23 +322,24 @@ impl Interp<'_> {
             Ev::IsBegin => self.in_type_test = true,
             Ev::IsOperator { is_not } => {
                 // The tested type arrived through Type events (before the
-                // operator event).
+                // operator event); its written arguments latch beside it.
                 let tested = self.tested_ty.take().unwrap_or(Ty::UNKNOWN);
-                self.type_test_pending = Some((*is_not, tested));
+                let tested_args = self.tested_args;
+                self.type_test_pending = Some((*is_not, tested, tested_args));
             }
             Ev::IsEnd => {
                 self.in_type_test = false;
-                let Some((is_not, tested)) = self.type_test_pending.take() else {
+                let Some((is_not, tested, tested_args)) = self.type_test_pending.take() else {
                     return true;
                 };
                 let operand = self.pop_value();
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
                 if let Some(var) = operand.reference {
-                    let promoted = self.promotion_candidate(var, tested);
-                    // A real promotion from an arg-bearing tested type is
-                    // bare-named at this seam: latch the variable so its
-                    // reads stay out of the fact face (#611).
-                    if self.tested_had_args && promoted.is_some() {
+                    let promoted = self.promotion_candidate(var, tested, tested_args);
+                    // An arg-bearing promotion presents bare-named at the
+                    // fact face: latch the variable so its reads stay out
+                    // of the facts (#611 step 4).
+                    if tested_args != crate::ty::EMPTY_ARGS && promoted.is_some() {
                         self.mark_arg_promotion(var);
                     }
                     let (matched, unmatched) = self.branch_type_test(var, tested, promoted);
@@ -387,7 +384,7 @@ impl Interp<'_> {
                         .and_then(|p| p.pending_decls.last().copied())
                         && let Some(var) = self.resolve(name)
                     {
-                        if self.as_cast_had_args {
+                        if self.as_cast_args != crate::ty::EMPTY_ARGS {
                             self.mark_arg_promotion(var);
                         }
                         self.current = self.current.clone().finish_type_test(
@@ -402,10 +399,10 @@ impl Interp<'_> {
                 }
                 let operand = self.pop_value();
                 if let Some(var) = operand.reference {
-                    let promoted = self.promotion_candidate(var, cast_ty);
+                    let promoted = self.promotion_candidate(var, cast_ty, self.as_cast_args);
                     if let Some(promoted) = promoted {
-                        // Arg-bearing cast promotion: latch (#611).
-                        if self.as_cast_had_args {
+                        // Arg-bearing cast promotion: latch (#611 step 4).
+                        if self.as_cast_args != crate::ty::EMPTY_ARGS {
                             self.mark_arg_promotion(var);
                         }
                         self.current = self.current.clone().finish_type_test(
@@ -748,11 +745,21 @@ impl Interp<'_> {
     /// without a class hierarchy) and the oracle pins require the
     /// promotion on (`num n`, `is int`), so the undecided case promotes
     /// optimistically; a resolved back-end re-tightens the gate through
-    /// [`crate::ty::TypeOps::try_promote_to`].
-    fn promotion_candidate(&mut self, var: u32, tested: Ty) -> Option<Ty> {
+    /// [`crate::ty::TypeOps::try_promote_to`]. The written-argument face
+    /// of the same question IS decidable here (#611 step 4): the test is
+    /// refused when the tested arguments cannot be a subtype of the
+    /// declared ones — the official lattice refuses it too.
+    fn promotion_candidate(&mut self, var: u32, tested: Ty, tested_args: u32) -> Option<Ty> {
         match tested.base {
             Base::Unknown | Base::Dynamic | Base::Void => None,
             _ => {
+                let declared_args = self
+                    .vars
+                    .get(var as usize)
+                    .map_or(crate::ty::EMPTY_ARGS, |meta| meta.args);
+                if !self.args_admit(tested, tested_args, declared_args) {
+                    return None;
+                }
                 let model = self.current.model(var);
                 let previous = self.promoted_type_of(var, &model);
                 let mut candidate = tested;
@@ -768,18 +775,75 @@ impl Interp<'_> {
         }
     }
 
+    /// The argument face of the promotion gate: whether a test spelled
+    /// with `tested_args` can promote a variable declared with
+    /// `declared_args`. Both argument-less is the name-level fast path
+    /// (the ops seam decides, zero arena traffic); a written tested list
+    /// over an argument-less declaration admits (raw `List` spells
+    /// `List<dynamic>`, whose entries admit everything); the reverse
+    /// refuses (`List<dynamic>` is no subtype of `List<int>`) — except
+    /// `Never`, a subtype of every instantiation. Two written lists
+    /// compare element-wise below.
+    fn args_admit(&self, tested: Ty, tested_args: u32, declared_args: u32) -> bool {
+        match (tested_args, declared_args) {
+            (0, 0) | (_, 0) => true,
+            (0, _) => tested.base == Base::Never,
+            (t, d) => self.args_subtype(t, d),
+        }
+    }
+
+    /// Element-wise covariance (`List<int>` is a subtype of
+    /// `List<int?>`): every entry pair must be a subtype. Distinct entry
+    /// names are undecidable at this seam and refuse — the official
+    /// lattice would refuse too unless a real subclass relation holds,
+    /// which the name level cannot see. Equal arena ids short-circuit
+    /// (canonical interning makes id equality tree equality).
+    fn args_subtype(&self, t: u32, d: u32) -> bool {
+        let (Some(ts), Some(ds)) = (self.args.get(t as usize), self.args.get(d as usize)) else {
+            return false;
+        };
+        ts.len() == ds.len()
+            && ts
+                .iter()
+                .zip(ds)
+                .all(|(a, b)| a.args == b.args || self.entry_subtype(a, b))
+    }
+
+    /// The name-level subtype question for one argument-tree entry
+    /// (mirrors [`crate::ty::NameTypeOps::is_subtype`]'s decidable arms,
+    /// recursing into written arguments).
+    fn entry_subtype(&self, a: &crate::ty::ArgTy, b: &crate::ty::ArgTy) -> bool {
+        match (a.base, b.base) {
+            (Base::Dynamic | Base::Unknown | Base::Void, _)
+            | (_, Base::Dynamic | Base::Unknown | Base::Void) => true,
+            (Base::Null, _) => b.nullable,
+            (_, Base::Null) => false,
+            _ => {
+                a.base == b.base
+                    && (!a.nullable || b.nullable)
+                    && (a.args == b.args || self.args_subtype(a.args, b.args))
+            }
+        }
+    }
+
     /// Routes a declared type to its consumer: the open variable
     /// declaration, the pending formal, the open `is`-test, or the open
-    /// `as`-cast.
-    fn sink_type(&mut self, ty: Ty) {
+    /// `as`-cast. The written-argument id rides beside the type (#611
+    /// step 4) — every type row passes through here, so each sink sees
+    /// the pair as one fact.
+    fn sink_type(&mut self, ty: Ty, args: u32) {
         if self.in_decl {
             self.decl.ty = ty;
+            self.decl.args = args;
         } else if self.in_type_test {
             self.tested_ty = Some(ty);
+            self.tested_args = args;
         } else if self.in_as_cast {
             self.as_cast_pending = Some(ty);
+            self.as_cast_args = args;
         } else {
             self.pending_ty = Some(ty);
+            self.pending_ty_args = args;
         }
     }
 

@@ -85,13 +85,11 @@ pub enum Ev {
         /// time.
         base: crate::ty::Base,
         nullable: bool,
-        /// Whether the type spelled type arguments (`List<int>`): the
-        /// recorder records only the bare name, so a promotion tested
-        /// against this type must not surface as a fact carrying the
-        /// erased spelling (#611). Latched from the parser's
-        /// `end_type_arguments` / `handle_no_type_arguments`, which fire
-        /// immediately before the row (`type_info_impl.dart:1158/1191`).
-        had_type_args: bool,
+        /// The type's written argument list, interned in the recorder's
+        /// arena ([`crate::ty::EMPTY_ARGS`] when argument-less — the fast
+        /// path). The promotion gate compares these trees for real instead
+        /// of suppressing every arg-bearing test outright (#611 step 4).
+        args: u32,
     },
     NoType,
     FunctionType,

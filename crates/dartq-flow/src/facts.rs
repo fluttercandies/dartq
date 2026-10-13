@@ -34,11 +34,13 @@ pub enum FlowFact {
     /// A read of a local variable (or parameter) whose flow-promoted type
     /// differs from its declared type — the promotion facts a type-check
     /// consumer needs to see the promoted type at the read. Emitted only
-    /// for real promotions (unpromoted and demoted reads carry no row),
-    /// and suppressed when the promotion's tested type carried type
-    /// arguments (the recorder erases them, so the fact would present the
-    /// promotion as a bare named type and a consumer could wrongly clean
-    /// rows against arg-bearing targets — #611).
+    /// for real promotions (unpromoted and demoted reads carry no row).
+    /// Promotions whose type derives from an arg-bearing spelling stay
+    /// out: the row carries only the bare named type, so the consumer
+    /// stage — which re-interns promoted spellings argument-less — could
+    /// clean rows against written-argument targets on a fiction (#611
+    /// step 4; the row gains the arguments once the consumer face reads
+    /// them).
     PromotedRead {
         /// Span of the read's identifier token.
         span: TokenSpan,

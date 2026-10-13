@@ -3200,3 +3200,125 @@ fn redundant_is_checks_do_not_promote() {
         );
     }
 }
+
+// —— written-argument capture and the promotion gate (#611 step 4) ——————
+
+/// A named-type event with written arguments (arena id).
+fn ty_with_args(args: u32, nullable: bool) -> crate::ev::Ev {
+    crate::ev::Ev::Type {
+        base: crate::ty::Base::Name(0),
+        nullable,
+        args,
+    }
+}
+
+/// Arena for the gate tests: `0` reserved, `1` = `<int>`, `2` =
+/// `<String>`, `3` = `List<int>`, `4` = `List<String>` (head name 0).
+/// Leaked like the token tables above: the interpreter borrows it for its
+/// whole (test-scoped) life.
+fn arg_arena() -> &'static [Vec<crate::ty::ArgTy>] {
+    let entry = |name: u32, args: u32| crate::ty::ArgTy {
+        base: crate::ty::Base::Name(name),
+        nullable: false,
+        args,
+    };
+    Box::leak(Box::new(vec![
+        vec![],
+        vec![entry(1, crate::ty::EMPTY_ARGS)],
+        vec![entry(2, crate::ty::EMPTY_ARGS)],
+        vec![entry(0, 1)],
+        vec![entry(0, 2)],
+    ]))
+}
+
+/// The recorder interns written argument trees bottom-up and dedups them
+/// structurally: `Map<String, List<int>>` yields one `[String, List<int>]`
+/// list whose nested `<int>` is the same entry the standalone `List<int>`
+/// annotation interns — the arena the promotion gate compares (#611
+/// step 4).
+#[test]
+fn written_argument_trees_intern_bottom_up_and_dedup() {
+    let (flow, _) = analyze("void f(Map<String, List<int>> a, List<int> b) {}");
+    let flow = flow.0.borrow();
+    let args = &flow.type_args;
+    assert_eq!(args.len(), 3, "reserved + <int> + <String, List<int>>");
+    assert!(args[0].is_empty(), "index 0 is the reserved empty list");
+    let base_name = |entry: &crate::ty::ArgTy| match entry.base {
+        crate::ty::Base::Name(id) => flow.name_lexeme(id).to_string(),
+        _ => panic!("every interned entry here is a named type"),
+    };
+    let [nested] = &args[1][..] else {
+        panic!("the shared `<int>` list has one entry");
+    };
+    assert_eq!(base_name(nested), "int");
+    assert_eq!(nested.args, crate::ty::EMPTY_ARGS);
+    let [key, value] = &args[2][..] else {
+        panic!("the map's list has two entries");
+    };
+    assert_eq!(base_name(key), "String");
+    assert_eq!(key.args, crate::ty::EMPTY_ARGS);
+    assert_eq!(base_name(value), "List");
+    // Bottom-up folding: the nested List entry carries the shared <int>.
+    assert_eq!(value.args, 1);
+}
+
+/// `List<int> x; x is List<String>` refuses the promotion: the written
+/// arguments differ and the official lattice refuses `List<String> <:
+/// List<int>` (invariant entries), so no promotion — and no
+/// arg-bearing mark — exists at all.
+#[test]
+fn mismatched_written_args_refuse_promotion() {
+    let events: Vec<crate::ev::Ev> = [
+        declared(7, ty_with_args(3, false)),
+        is_test(7, ty_with_args(4, false), false),
+    ]
+    .concat();
+    let mut interp =
+        crate::interp::Interp::new(&crate::ty::NameTypeOps, arg_arena());
+    interp.run(&events);
+    assert!(
+        interp.arg_promotions.is_empty(),
+        "a refused promotion marks nothing"
+    );
+    assert_eq!(
+        interp.current.model(0).promoted,
+        crate::model::NIL,
+        "the mismatched test leaves the variable at its declared type"
+    );
+}
+
+/// `List<int>? x; x is List<int>` promotes (equal arguments, nullable
+/// narrowed — official `tryPromoteToType` admits `List<int> <: List<int>?`)
+/// and the promotion is arg-bearing, so the variable is marked and its
+/// reads stay out of the bare-named fact face.
+#[test]
+fn equal_written_args_promote_and_mark() {
+    let events: Vec<crate::ev::Ev> = [
+        declared(7, ty_with_args(3, true)),
+        is_test(7, ty_with_args(3, false), false),
+    ]
+    .concat();
+    let mut interp =
+        crate::interp::Interp::new(&crate::ty::NameTypeOps, arg_arena());
+    interp.run(&events);
+    assert!(interp.arg_promotions.contains(&0));
+    let model = interp.current.model(0);
+    assert_eq!(interp.lists.head(model.promoted).nullable, false);
+}
+
+/// `List<int> x; x is List` — a raw tested type against a written
+/// declaration — refuses: raw `List` spells `List<dynamic>`, which is no
+/// subtype of `List<int>` (`type_system.dart` top-type instantiation).
+#[test]
+fn raw_tested_against_written_declaration_refuses() {
+    let events: Vec<crate::ev::Ev> = [
+        declared(7, ty_with_args(3, false)),
+        is_test(7, ty_with_args(crate::ty::EMPTY_ARGS, false), false),
+    ]
+    .concat();
+    let mut interp =
+        crate::interp::Interp::new(&crate::ty::NameTypeOps, arg_arena());
+    interp.run(&events);
+    assert!(interp.arg_promotions.is_empty());
+    assert_eq!(interp.current.model(0).promoted, crate::model::NIL);
+}

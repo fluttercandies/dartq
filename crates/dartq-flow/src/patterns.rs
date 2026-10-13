@@ -91,6 +91,7 @@ impl Interp<'_> {
                 // back-end's promotion gate keys on it.
                 let meta = VarMeta {
                     ty: self.pending_ty.take().unwrap_or(Ty::UNKNOWN),
+                    args: std::mem::take(&mut self.pending_ty_args),
                     late: false,
                     is_final: *is_final,
                     decl_span: None,
@@ -111,6 +112,7 @@ impl Interp<'_> {
                 // leak into the next consumer (`Formal`,
                 // `DeclaredVarPattern`).
                 self.pending_ty = None;
+                self.pending_ty_args = crate::ty::EMPTY_ARGS;
             }
             Ev::GuardBegin => {
                 // Snapshot the pre-guard state: the guard's own events run

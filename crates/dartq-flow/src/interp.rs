@@ -23,6 +23,10 @@ use crate::ty::{Ty, TypeOps};
 pub(crate) struct VarMeta {
     /// Declared type (name-level).
     pub ty: Ty,
+    /// The declared type's written argument list (arena index;
+    /// [`crate::ty::EMPTY_ARGS`] when argument-less) — the promotion
+    /// gate's declared face (#611 step 4).
+    pub args: u32,
     pub late: bool,
     pub is_final: bool,
     /// Span of the declaration's name token, when declared locally.
@@ -287,6 +291,9 @@ pub(crate) struct DeclCtx {
     pub late: bool,
     pub is_final: bool,
     pub ty: Ty,
+    /// The declared type's written arguments (arena index), beside
+    /// [`DeclCtx::ty`].
+    pub args: u32,
 }
 
 impl Default for DeclCtx {
@@ -295,6 +302,7 @@ impl Default for DeclCtx {
             late: false,
             is_final: false,
             ty: Ty::UNKNOWN,
+            args: crate::ty::EMPTY_ARGS,
         }
     }
 }
@@ -457,11 +465,15 @@ pub(crate) enum Covered {
 #[expect(
     clippy::struct_excessive_bools,
     reason = "flow state machine: the declaration/type-test/cast contexts and \
-              the arg-bearing latches are independent phases of one walk, not \
-              a state encoding"
+              the cast-pattern/as-base phases are independent phases of one \
+              walk, not a state encoding"
 )]
 pub(crate) struct Interp<'o> {
     pub(crate) ops: &'o dyn TypeOps,
+    /// The recorder's written-argument arena (index 0 reserved empty):
+    /// `Ev::Type` rows carry ids into it and the promotion gate compares
+    /// the trees structurally (#611 step 4).
+    pub(crate) args: &'o [Vec<crate::ty::ArgTy>],
     pub(crate) reach: ReachArena,
     pub(crate) lists: Lists,
     pub(crate) current: State,
@@ -489,19 +501,28 @@ pub(crate) struct Interp<'o> {
     /// switch-expression cases pre-announce; everything else defaults to
     /// a declaration context).
     pub(crate) pattern_kind_hint: PatternKind,
-    pub(crate) type_test_pending: Option<(bool, Ty)>,
+    pub(crate) type_test_pending: Option<(bool, Ty, u32)>,
     pub(crate) as_cast_pending: Option<Ty>,
     /// The type currently being parsed (test/cast/formal consumers).
     pub(crate) tested_ty: Option<Ty>,
-    /// Whether the tested type's row spelled type arguments: such a
-    /// promotion presents as a bare named type, so its reads must not
-    /// surface as facts (#611).
-    pub(crate) tested_had_args: bool,
-    /// Same latch for the open `as`-cast's type row.
-    pub(crate) as_cast_had_args: bool,
-    /// Variables whose current promotion chain derives (in part) from a
-    /// type whose arguments were erased: reads of these must not surface
-    /// as [`FlowFact::PromotedRead`] facts (#611). Insert-only: the
+    /// The open `is`-test's written arguments, latched with the type into
+    /// the pending tuple at `IsOperator`.
+    pub(crate) tested_args: u32,
+    /// The open `as`-cast's written arguments, beside
+    /// [`Interp::as_cast_pending`].
+    pub(crate) as_cast_args: u32,
+    /// The pending declared type's written arguments (formal, pattern
+    /// variable consumers), beside [`Interp::pending_ty`].
+    pub(crate) pending_ty_args: u32,
+    /// Variables whose current promotion chain derives (in part) from an
+    /// arg-bearing type: reads of these must not surface as
+    /// [`FlowFact::PromotedRead`] facts — the fact row carries only the
+    /// name-level spelling and the consumer stage re-interns it bare, so
+    /// a bare fact for an arg-bearing promotion could clean rows against
+    /// written-argument targets (#611 step 4; retired once the consumer
+    /// face reads real arguments). The promotion gate upstream refuses
+    /// mismatched-argument tests outright, so the set only covers
+    /// genuinely compatible arg-bearing promotions. Insert-only: the
     /// arg-bearing provenance survives writes (the kept promotion suffix
     /// and the tested-types pool feed later re-promotions) and joins, so
     /// a stale mark can only suppress, never fabricate, a fact.
@@ -545,9 +566,13 @@ struct Snapshot {
 }
 
 impl<'o> Interp<'o> {
-    pub(crate) fn new(ops: &'o dyn TypeOps) -> Self {
+    pub(crate) fn new(
+        ops: &'o dyn TypeOps,
+        args: &'o [Vec<crate::ty::ArgTy>],
+    ) -> Self {
         Self {
             ops,
+            args,
             reach: ReachArena::new(),
             lists: Lists::default(),
             current: State::new(0),
@@ -569,8 +594,9 @@ impl<'o> Interp<'o> {
             type_test_pending: None,
             as_cast_pending: None,
             tested_ty: None,
-            tested_had_args: false,
-            as_cast_had_args: false,
+            tested_args: crate::ty::EMPTY_ARGS,
+            as_cast_args: crate::ty::EMPTY_ARGS,
+            pending_ty_args: crate::ty::EMPTY_ARGS,
             arg_promotions: FxHashSet::default(),
             in_decl: false,
             in_type_test: false,
@@ -747,9 +773,9 @@ impl<'o> Interp<'o> {
         }
     }
 
-    /// Latches that a real promotion derived from a type whose arguments
-    /// were erased (#611): the variable's reads stay out of the fact
-    /// face. Collect runs mutate flow state for effect purposes only, so
+    /// Latches that a real promotion derived from an arg-bearing type
+    /// (#611 step 4): the variable's reads stay out of the fact face.
+    /// Collect runs mutate flow state for effect purposes only, so
     /// they mark nothing (marks are not part of the rollback snapshot).
     pub(crate) fn mark_arg_promotion(&mut self, var: u32) {
         if self.collect.is_none() {

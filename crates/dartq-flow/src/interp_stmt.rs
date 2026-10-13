@@ -819,6 +819,7 @@ impl Interp<'_> {
                     // The type events follow the keyword; the sink fills
                     // this in (default for `var`).
                     ty: Ty::UNKNOWN,
+                    args: crate::ty::EMPTY_ARGS,
                 };
                 self.in_decl = true;
                 // Paired with `VarDeclEnd`: declarations nested inside an
@@ -830,6 +831,7 @@ impl Interp<'_> {
             Ev::InitializedIdent { name } => {
                 let meta = VarMeta {
                     ty: self.decl.ty,
+                    args: self.decl.args,
                     late: self.decl.late,
                     is_final: self.decl.is_final,
                     decl_span: None,
@@ -856,8 +858,10 @@ impl Interp<'_> {
             }
             Ev::Formal { name, .. } => {
                 let ty = self.pending_ty.take().unwrap_or(Ty::UNKNOWN);
+                let args = std::mem::take(&mut self.pending_ty_args);
                 let meta = VarMeta {
                     ty,
+                    args,
                     late: false,
                     is_final: false,
                     decl_span: None,

@@ -35,13 +35,23 @@ pub struct Flow<'t> {
     /// order (dense, one push per intern), so a later stage can recover
     /// `Base::Name(id)` spellings through [`Flow::name_lexeme`].
     names_by_id: Vec<Box<str>>,
-    /// Whether the type currently being parsed spelled type arguments:
-    /// `end_type_arguments` sets it, `handle_no_type_arguments` clears
-    /// it, and both fire immediately before the type's own row (official
-    /// `parseArguments`, `type_info_impl.dart:1158/1191`). Stamped on the
-    /// row so promotions tested against arg-bearing types can be kept
-    /// out of the fact face (#611).
-    type_had_args: bool,
+    /// Open type-argument groups (nested annotations stack). Each group
+    /// collects the argument rows recorded inside it; the parser fires
+    /// `begin_type_arguments` at `<` and `end_type_arguments` immediately
+    /// before the head's own row (`type_info_impl.dart`), so the group's
+    /// entries are complete when it closes.
+    type_arg_groups: Vec<Vec<crate::ty::ArgTy>>,
+    /// Interned written-argument lists; index 0 is the reserved
+    /// argument-less list ([`crate::ty::EMPTY_ARGS`]). Deduplicated
+    /// structurally, so equal spellings share one entry and the promotion
+    /// gate's id comparison is tree equality (#611 step 4).
+    pub(crate) type_args: Vec<Vec<crate::ty::ArgTy>>,
+    /// The interned argument list of the type row that fires next:
+    /// `end_type_arguments` sets it, `handle_type` consumes it,
+    /// `handle_no_type_arguments` clears it — all three fire immediately
+    /// before the row (official `parseArguments`,
+    /// `type_info_impl.dart:1158/1191`).
+    pending_type_args: u32,
     /// The most recent label-reference identifier (a break/continue
     /// target's name, consumed by the next break/continue event).
     pending_label_ref: Option<u32>,
@@ -81,7 +91,9 @@ impl<'t> Flow<'t> {
             source,
             names: FxHashMap::default(),
             names_by_id: Vec::new(),
-            type_had_args: false,
+            type_arg_groups: Vec::new(),
+            type_args: vec![Vec::new()],
+            pending_type_args: crate::ty::EMPTY_ARGS,
             pending_label_ref: None,
             pending_labels: Vec::new(),
             pending_label_token: None,
@@ -114,6 +126,37 @@ impl<'t> Flow<'t> {
                 },
             }
         })
+    }
+
+    /// Interns a written-argument list structurally: equal trees share one
+    /// arena entry, so the interpreter's id equality is tree equality.
+    /// Lists are tiny (the unit's distinct generic spellings) and
+    /// argument-less types never reach here, so the linear scan is bounded
+    /// by unit size, not corpus size.
+    fn intern_args(&mut self, entries: Vec<crate::ty::ArgTy>) -> u32 {
+        if entries.is_empty() {
+            return crate::ty::EMPTY_ARGS;
+        }
+        if let Some(index) = self
+            .type_args
+            .iter()
+            .position(|existing| *existing == entries)
+        {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "arena index; a unit with 2^32 distinct generic \
+                          spellings cannot parse"
+            )]
+            return index as u32;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "arena index; a unit with 2^32 distinct generic \
+                      spellings cannot parse"
+        )]
+        let id = self.type_args.len() as u32;
+        self.type_args.push(entries);
+        id
     }
 
     /// Interns a name token's lexeme to a dense id. Synthetic tokens
@@ -245,7 +288,7 @@ impl<'t> Flow<'t> {
             return;
         };
         let ops = NameTypeOps;
-        let mut interp = Interp::new(&ops);
+        let mut interp = Interp::new(&ops, &self.type_args);
         interp.run(&events);
         // The outermost body's fall-through completion: after `run` the
         // interpreter's current state IS the body's exit state (official
@@ -597,19 +640,33 @@ impl ParserListener for Flow<'_> {
             Some("Never") => crate::ty::Base::Never,
             _ => crate::ty::Base::Name(id),
         };
-        self.record(Ev::Type {
-            base,
-            nullable: question.is_some(),
-            had_type_args: self.type_had_args,
-        });
+        // Consumed per row, so the pending list can never leak across
+        // types; an argument row nested in an open group joins it.
+        let args = std::mem::take(&mut self.pending_type_args);
+        let nullable = question.is_some();
+        if let Some(group) = self.type_arg_groups.last_mut() {
+            group.push(crate::ty::ArgTy {
+                base,
+                nullable,
+                args,
+            });
+        }
+        self.record(Ev::Type { base, nullable, args });
+    }
+
+    fn begin_type_arguments(&mut self, _token: Token) {
+        self.type_arg_groups.push(Vec::new());
     }
 
     fn handle_no_type_arguments(&mut self, _token: Token) {
-        self.type_had_args = false;
+        self.pending_type_args = crate::ty::EMPTY_ARGS;
     }
 
     fn end_type_arguments(&mut self, _count: usize, _begin: Token, _end: Token) {
-        self.type_had_args = true;
+        // The group is complete (every argument row fired before the
+        // close, nested groups folded bottom-up); the head row follows.
+        let entries = self.type_arg_groups.pop().unwrap_or_default();
+        self.pending_type_args = self.intern_args(entries);
     }
 
     fn handle_no_type(&mut self, _last_consumed: Token) {
