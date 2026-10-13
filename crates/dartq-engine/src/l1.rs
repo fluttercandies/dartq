@@ -1648,6 +1648,9 @@ impl UnitFace {
 ///    untouched libraries keep theirs byte-exact. Identity comparison of
 ///    old against new drives the dirty set, replacing the full rebuild's
 ///    workspace-wide result scan.
+/// 6. Every identity-moved library's cached result drops (g485 W2): a
+///    recorded run survives only while the identity that produced it
+///    stands, which is the survival half of the post-closure reuse gate.
 ///
 /// Formation semantics are unchanged from the full rebuild: defining files
 /// own libraries keyed on their canonical URI, part files join the
@@ -2083,6 +2086,16 @@ fn maintain_and_close(
         &identity_moved,
         &targets_moved,
     );
+    // The reuse-survival half of the fingerprint key (g485 W2): a cached
+    // result stays reusable only while the library's identity has stood
+    // since it was recorded, so every identity move drops the record
+    // outright — the post-closure gate then never has to re-derive identity
+    // freshness. Running after `close` keeps its result-presence tests (the
+    // resultless touched channel, the targets_moved propagation gate)
+    // reading the pre-drop facts they were specified against.
+    for library in &identity_moved {
+        state.results.remove(library);
+    }
     (invalidated, !retired.is_empty())
 }
 
@@ -3225,6 +3238,40 @@ mod tests {
             state.invalidated,
             vec![owner],
             "the owning library still invalidates through its moved content identity"
+        );
+    }
+
+    /// The survival half of the fingerprint reuse key (g485 W2): a recorded
+    /// result drops at the very apply that moves its library's identity —
+    /// including the body-edit case the L2 gate keeps cascade-clean — so
+    /// the post-closure gate never sees a record whose member contents
+    /// moved underneath it.
+    #[test]
+    fn identity_move_drops_the_recorded_result_at_the_apply() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let a = set(&mut state, &lib.join("a.dart"), "int a() => 1;\n");
+        apply(&mut state, &mut |_| {});
+        let mut graph: Option<crate::pipeline::ResolvedGraph> = None;
+        let cancel = crate::cancel::CancellationToken::new();
+        crate::pipeline::analyze(&mut state, &mut graph, None, &[], &mut |_| {}, &cancel)
+            .expect("cold analyze");
+        let owner = state.library_of_file[&a];
+        assert!(state.results.contains_key(&owner), "the run is recorded");
+
+        // A body edit: the content moves, the API face stands, the library
+        // invalidates alone — and the record goes with the identity move.
+        set(&mut state, &lib.join("a.dart"), "int a() => 2;\n");
+        apply(&mut state, &mut |_| {});
+        assert_eq!(
+            state.invalidated,
+            vec![owner],
+            "the owning library still invalidates"
+        );
+        assert!(
+            !state.results.contains_key(&owner),
+            "the identity move dropped the recorded run"
         );
     }
 

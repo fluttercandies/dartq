@@ -1247,4 +1247,101 @@ mod tests {
             "the unpinned 3.5 package keeps the baseline posture"
         );
     }
+
+    /// The fingerprint-keyed reuse gate (g485 W2), end to end: an API-face
+    /// edit that lands *without* an analyze carries its closure forward as
+    /// invalidated, and the undo restores every face the closure was
+    /// about to serve — so the gated analyze recomputes only the edited
+    /// library (its record dropped with its identity move) and keeps the
+    /// importer's recorded run (its cycle fingerprint returned). A face
+    /// that stays moved recomputes its whole downstream instead: the gate
+    /// never fires, the trace stays silent.
+    #[test]
+    fn undo_restores_the_recorded_run_through_the_fingerprint_gate() {
+        let (root, mut engine) = facade_engine();
+        let lib = root.join("lib");
+        let a_src = "int a() => 1;\n";
+        let a_moved = "int a() => 1;\nint extra() => 2;\n";
+        let b_src = "import 'a.dart';\nint b() => a();\n";
+        let events = &mut |_: EngineEvent| {};
+        let cancel = CancellationToken::new();
+
+        engine.set_content(&lib.join("a.dart"), a_src.as_bytes());
+        engine.set_content(&lib.join("b.dart"), b_src.as_bytes());
+        let baseline = engine.analyze(&[], &mut |_: EngineEvent| {}, &cancel).expect("cold");
+        assert!(baseline.is_empty(), "the fixture analyzes clean");
+
+        // The face move lands as bare applies (no analyze): the closure
+        // carries forward, the edited library's record drops with its
+        // identity, the importer's record survives untouched.
+        engine.set_content(&lib.join("a.dart"), a_moved.as_bytes());
+        engine.apply_pending(&mut |_: EngineEvent| {});
+        engine.set_content(&lib.join("a.dart"), a_src.as_bytes());
+        engine.apply_pending(events);
+
+        // The gated analyze: one recompute (the edited library), one reuse.
+        let trace = std::env::temp_dir().join(format!(
+            "dartq-engine-w2-undo-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&trace);
+        engine.set_trace_sink(Some(event::TraceSink::create(&trace).expect("sink opens")));
+        let undone = engine.analyze(&[], events, &cancel).expect("undo analyze");
+        engine.set_trace_sink(None);
+        assert_eq!(undone, baseline, "the undo serves the recorded runs");
+        drop(engine);
+        let capture = std::fs::read_to_string(&trace).expect("capture readable");
+        assert_eq!(
+            capture
+                .lines()
+                .filter(|line| line.contains("\"event\":\"CycleReused\""))
+                .count(),
+            1,
+            "the standing fingerprint fired once: {capture}"
+        );
+        assert!(
+            capture.contains("\"event\":\"CycleReused\",\"libraries\":1"),
+            "exactly the importer's run stood: {capture}"
+        );
+        assert_eq!(
+            capture
+                .lines()
+                .filter(|line| line.contains("\"event\":\"LibraryAnalyzed\""))
+                .filter(|line| line.contains("\"from_cache\":false"))
+                .count(),
+            1,
+            "only the edited library recomputed: {capture}"
+        );
+
+        // The negative control: a face that stays moved flips the whole
+        // downstream — the importer's recorded digest no longer matches, so
+        // both libraries recompute and no reuse row fires.
+        let mut engine = facade_engine().1;
+        engine.set_content(&lib.join("a.dart"), a_src.as_bytes());
+        engine.set_content(&lib.join("b.dart"), b_src.as_bytes());
+        engine.analyze(&[], &mut |_: EngineEvent| {}, &cancel).expect("cold");
+        engine.set_content(&lib.join("a.dart"), a_moved.as_bytes());
+        engine.apply_pending(events);
+        let trace2 = trace.with_extension("moved.jsonl");
+        engine.set_trace_sink(Some(event::TraceSink::create(&trace2).expect("sink opens")));
+        engine.analyze(&[], events, &cancel).expect("moved analyze");
+        engine.set_trace_sink(None);
+        drop(engine);
+        let capture2 = std::fs::read_to_string(&trace2).expect("capture readable");
+        assert!(
+            !capture2.contains("\"event\":\"CycleReused\""),
+            "a moved dependency face never reuses: {capture2}"
+        );
+        assert_eq!(
+            capture2
+                .lines()
+                .filter(|line| line.contains("\"event\":\"LibraryAnalyzed\""))
+                .filter(|line| line.contains("\"from_cache\":false"))
+                .count(),
+            2,
+            "the face move recomputed the whole downstream: {capture2}"
+        );
+        let _ = std::fs::remove_file(&trace);
+        let _ = std::fs::remove_file(&trace2);
+    }
 }

@@ -22,10 +22,12 @@
 //! by [`cache_hit_rate`]). The remaining taxonomy names (`StoreHit`,
 //! `SnapshotReuse`, `SignatureUnchanged`, `ContextBuilt`,
 //! `SchedulerQueueDepth`, `PluginLatency`) land as variants with their
-//! emitters once the M1 engine produces their data. Wave W1 of the L3 plan
-//! (g485) adds one additive trace-only row, `CycleRebuilt` — the
-//! condensation rebuild at the `structure_dirty` gate; deliberately no
-//! `EngineEvent` variant, so the event goldens stay byte-stable.
+//! emitters once the M1 engine produces their data. Waves W1/W2 of the L3
+//! plan (g485) add two additive trace-only rows, `CycleRebuilt` — the
+//! condensation rebuild at the `structure_dirty` gate — and `CycleReused` —
+//! the libraries whose cycle fingerprint stood at the post-closure reuse
+//! gate; deliberately no `EngineEvent` variants, so the event goldens stay
+//! byte-stable.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -200,6 +202,17 @@ impl TraceSink {
             cycles,
         });
     }
+
+    /// Records the fingerprint-keyed reuse (g485 W2): the library count
+    /// whose recorded cycle fingerprint stood at the post-closure gate,
+    /// keeping the recorded run instead of recomputing it. Trace-only — no
+    /// `EngineEvent` variant (g485 D3), the event goldens stay byte-stable.
+    pub(crate) fn cycle_reused(&mut self, libraries: usize) {
+        self.write_line(&CycleReusedTrace {
+            event: "CycleReused",
+            libraries,
+        });
+    }
 }
 
 /// Wall time as additive microseconds (integer — float durations would not
@@ -275,6 +288,12 @@ struct CycleRebuiltTrace {
     cycles: usize,
 }
 
+#[derive(Serialize)]
+struct CycleReusedTrace {
+    event: &'static str,
+    libraries: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +340,21 @@ mod tests {
                 "{\"event\":\"CycleRebuilt\",\"cycles\":2}\n",
             )
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The W2 reuse row's wire contract (g485 W2): exact bytes, stable
+    /// field order, same additive-row discipline as `CycleRebuilt` — pinned
+    /// separately so the W1 capture pin above stays byte-frozen. The gate
+    /// emits the row only when reuse fired, so the zero shape never occurs
+    /// and is not pinned.
+    #[test]
+    fn cycle_reused_row_is_pinned() {
+        let (mut sink, path) = temp_sink("reused");
+        sink.cycle_reused(3);
+        drop(sink);
+        let capture = std::fs::read_to_string(&path).expect("capture readable");
+        assert_eq!(capture, "{\"event\":\"CycleReused\",\"libraries\":3}\n");
         let _ = std::fs::remove_file(&path);
     }
 

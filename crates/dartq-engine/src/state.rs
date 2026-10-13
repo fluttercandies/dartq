@@ -19,7 +19,7 @@ use dartq_resolution::{
 };
 use dartq_scanner::TokenTable;
 use dartq_sdk::{AllowedExperiments, SdkSnapshot};
-use dartq_semantic::FileElements;
+use dartq_semantic::{ApiSignature, FileElements};
 use dartq_source::{
     ContentId, FileId, FileTable, LineIndex, SourceRange, SourceStore, StringId, StringTable,
 };
@@ -614,8 +614,9 @@ pub(crate) struct LibraryInfo {
 
 /// The per-library cached result (incremental-l1-spec §3.1 last row): the
 /// merged diagnostic set. Invalidation is explicit (the apply phase's dirty
-/// marking, derived from the graph delta) — never key comparison, so the
-/// entry carries only the diagnostics.
+/// marking, derived from the graph delta); the L3 fingerprint gate (g485 W2)
+/// then refines the recompute set by comparing this entry's key, so the
+/// entry also carries the cycle fingerprint its run was computed under.
 #[derive(Debug)]
 pub(crate) struct LibraryResult {
     /// The library's diagnostics in canonical order (path bytes, offset,
@@ -623,6 +624,16 @@ pub(crate) struct LibraryResult {
     /// compare_canonical`): sorted once per recompute at store time, so the
     /// analyze-time merge interleaves the runs without re-sorting the cache.
     pub diagnostics: Vec<Diagnostic>,
+    /// The condensation fingerprint of the library's cycle at store time —
+    /// the reuse key the post-closure gate compares (PRD §11.2, g485 W2).
+    /// The digest folds the member signatures and the dependency-cycle
+    /// fingerprint set, so `recorded == current` means every member face and
+    /// every transitive dependency face is byte-identical to this run's
+    /// inputs. The apply drops the entry on every identity move, so a
+    /// present result is identity-fresh by construction: the pair of halves
+    /// is exactly the reuse condition, and any doubt (a `None` mapping, a
+    /// moved digest) recomputes — monotone versus the L2 behavior.
+    pub cycle_fingerprint: ApiSignature,
 }
 
 /// Cache key of the per-file facts cache: the `AstKey{content, feature_set,

@@ -8,9 +8,10 @@
 //! discards the previous mapping wholesale, and retired ids never enter a
 //! cycle — the freelist-recycling aliasing hazard (#230/#374) cannot reach
 //! a fingerprint because values are content-derived and the mapping is
-//! never incrementally maintained. Wave W1 lands the shapes and the
-//! rebuild; the wave-2 member-reuse rule and the wave-3 condensation
-//! ordering consume them.
+//! never incrementally maintained. Wave W1 landed the shapes and the
+//! rebuild; wave W2 consumes the fingerprints as the product-reuse key
+//! (the post-closure gate in `pipeline`), and wave W3 consumes the cycle
+//! mapping for the condensation ordering.
 
 use blake3::Hasher;
 use dartq_semantic::ApiSignature;
@@ -41,9 +42,12 @@ pub(crate) struct Condensation {
 }
 
 /// One strongly-connected component of the library graph.
-// W1 pins the shapes; the wave-2 member-reuse rule reads `members`/`deps`
-// — landing them consumed would unfulfill this and force its removal. The
-// unit tests read everything, so the expectation is non-test-only.
+// W2 consumes `fingerprint` (the reuse gate); `members`/`deps` stay pinned
+// for the wave-3 condensation ordering, which reads the member set for
+// adjacency and the dependency edges for the cycle DAG — removing the
+// expectation before that consumer lands would turn them into dead-code
+// errors. The unit tests read everything, so the expectation is
+// non-test-only.
 #[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug)]
 pub(crate) struct CycleInfo {
@@ -66,13 +70,19 @@ impl Condensation {
     /// The cycle covering `id`, or `None` when the id is retired or the
     /// mapping predates the id's current tenant (the wholesale rebuild at
     /// the structure gate keeps a stale answer from ever being served).
-    // The wave-3 condensation ordering consumes this; see [`CycleInfo`].
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn cycle_of(&self, id: LibraryId) -> Option<u32> {
         match self.cycle_of.get(id.index() as usize) {
             Some(&cycle) if cycle != NO_CYCLE => Some(cycle),
             _ => None,
         }
+    }
+
+    /// The fingerprint of the cycle covering `id` — the reuse key the
+    /// post-closure gate compares against a recorded result (g485 W2),
+    /// `None` under the same conditions as [`Self::cycle_of`].
+    pub(crate) fn fingerprint_of(&self, id: LibraryId) -> Option<ApiSignature> {
+        let cycle = self.cycle_of(id)?;
+        Some(self.cycles[cycle as usize].fingerprint)
     }
 
     /// Derives the condensation from the live library graph: iterative
@@ -447,5 +457,36 @@ mod tests {
         // The derivation is stateless: a second build reproduces the shape.
         let again = Condensation::build(&table, |_| sig(0));
         assert_eq!(again.cycles[0].members.as_ref(), &[a, fresh]);
+    }
+
+    /// The reuse-key accessor (g485 W2): a live id answers its cycle's
+    /// fingerprint (the exact digest the gate compares a recorded result
+    /// against), and a retired id — no cycle — answers nothing, so the gate
+    /// treats the mapping gap as a moved fingerprint and recomputes.
+    #[test]
+    fn fingerprint_of_answers_the_covering_cycle_or_nothing() {
+        let (mut table, ids) = graph(&[
+            ("package:a/a.dart", &["package:b/b.dart"]),
+            ("package:b/b.dart", &["package:a/a.dart"]),
+        ]);
+        let [a, b] = ids[..] else {
+            unreachable!()
+        };
+        let condensation = Condensation::build(&table, |_| sig(5));
+        let cycle = condensation.cycle_of(a).expect("a is live");
+        assert_eq!(
+            condensation.fingerprint_of(a),
+            Some(condensation.cycles[cycle as usize].fingerprint)
+        );
+        assert_eq!(condensation.fingerprint_of(b), condensation.fingerprint_of(a));
+        let pair_fingerprint = condensation.fingerprint_of(a);
+
+        table.retire(b);
+        let condensation = Condensation::build(&table, |_| sig(5));
+        assert_eq!(condensation.fingerprint_of(b), None, "retired: no cycle");
+        // The survivor's cycle re-shaped (the member multiset shrank), so a
+        // result recorded under the pair's digest can never alias the
+        // singleton's: the gate sees a moved fingerprint.
+        assert_ne!(condensation.fingerprint_of(a), pair_fingerprint);
     }
 }

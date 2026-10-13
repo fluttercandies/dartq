@@ -86,9 +86,10 @@ pub(crate) fn flush_l3(state: &mut EngineState, changed: &[FileId]) {
 
 /// The analyze driver (engine-api-spec §1.3): phase 1 is always
 /// [`l1::apply`] (an explicit earlier apply sees an empty queue and emits
-/// nothing); phase 2 recomputes the dirty libraries in import-edge
-/// topological order and returns the merged diagnostic set of every live
-/// library, canonically sorted. Clean libraries keep their cached results.
+/// nothing); phase 2 recomputes the dirty libraries that fail the
+/// fingerprint reuse gate (g485 W2) in import-edge topological order and
+/// returns the merged diagnostic set of every live library, canonically
+/// sorted. Clean libraries keep their cached results.
 pub(crate) fn analyze(
     state: &mut EngineState,
     graph: &mut Option<ResolvedGraph>,
@@ -125,7 +126,35 @@ pub(crate) fn analyze(
         state.structure_dirty = false;
     }
 
-    let dirty = std::mem::take(&mut state.invalidated);
+    // The fingerprint-keyed reuse gate (PRD §11.2, g485 W2): the closure's
+    // candidates whose recorded cycle fingerprint stands keep their product
+    // instead of recomputing it. The key is the W1 digest — member
+    // signatures folded with the dependency-cycle fingerprint set — so
+    // `recorded == current` means every member face and every transitive
+    // dependency face is byte-identical to the recorded run's inputs; the
+    // apply drops a result on every identity move, so a present result is
+    // identity-fresh by construction, and any doubt (a mapping gap, a moved
+    // digest) recomputes. Within one apply the gate never fires — every
+    // seed the closure propagated from moved a face, and that move flips
+    // every downstream cycle fingerprint — so it decides exactly the
+    // cancelled-leftover carry-forward (#428): an invalidated library whose
+    // cycle face returned (an undo) keeps its recorded run.
+    let candidates = std::mem::take(&mut state.invalidated);
+    let mut dirty = Vec::with_capacity(candidates.len());
+    let mut reused = 0usize;
+    for library in candidates {
+        let stands = state.results.get(&library).is_some_and(|recorded| {
+            state.condensation.fingerprint_of(library) == Some(recorded.cycle_fingerprint)
+        });
+        if stands {
+            reused += 1;
+        } else {
+            dirty.push(library);
+        }
+    }
+    if reused > 0 && let Some(sink) = state.trace.as_mut() {
+        sink.cycle_reused(reused);
+    }
     let order = topo_order(state, &dirty);
 
     // Phase-boundary budget poll (PRD §17.1): the ladder's first chance to
@@ -212,9 +241,20 @@ pub(crate) fn analyze(
         };
         let resolved = resolved.expect("graph exists when libraries exist");
         diagnostics.sort_by(|a, b| compare_canonical(&state.files, a, b));
-        state
-            .results
-            .insert(*library, LibraryResult { diagnostics });
+        // The reuse key rides the record (g485 W2): the condensation is
+        // fresh for this analyze (rebuilt above under the structure gate,
+        // else standing over unchanged signatures), so every live dirty
+        // library answers a cycle.
+        state.results.insert(
+            *library,
+            LibraryResult {
+                diagnostics,
+                cycle_fingerprint: state
+                    .condensation
+                    .fingerprint_of(*library)
+                    .expect("a live library sits in the current condensation"),
+            },
+        );
         let info = state.libraries.info(*library).expect("live library");
         let defining = info.defining;
         let surface = library_surface(state, resolved, *library, info);
