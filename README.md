@@ -387,8 +387,12 @@ Honest state of the 1.0.0 tree:
   newer SDKs ship behind experiment flags are diagnosed, never silently
   accepted.
 - Incremental L3 fine-grained invalidation lands post-1.0.0.
-- The supported daemon/LSP shell lands post-1.0.0; the 1.0.0 differential
-  gates cover the `check` and `analyze` faces (see
+- The daemon serves dartq's own faces over LSP 3.17 (lifecycle, overlay
+  edits, diagnostic pushes, the `dartq/*` methods — see
+  [Daemon](#daemon)); it is not a full language server — standard
+  `textDocument/*` language features (completion, hover, definition, and
+  peers) are out of scope.
+- The 1.0.0 differential gates cover the `check` and `analyze` faces (see
   [Differential Testing](#differential-testing)).
 - The semantic diagnostic tier is scoped to the families the diagnoser
   implements (undefined identifiers and members, wrong-number-of-arguments

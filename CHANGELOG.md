@@ -138,7 +138,10 @@ analyze-face numbers pending the 1.0.0 gate run:
   newer SDKs ship behind experiment flags are diagnosed, never silently
   accepted.
 - Incremental L3 fine-grained invalidation lands post-1.0.0.
-- The supported daemon/LSP shell lands post-1.0.0; the 1.0.0 differential
-  gates cover the `check` and `analyze` faces.
+- The daemon is not a full language server: it serves lifecycle, overlay
+  edits, diagnostic pushes, and the `dartq/*` methods; standard
+  `textDocument/*` language features (completion, hover, definition, and
+  peers) are out of scope. The 1.0.0 differential gates cover the
+  `check` and `analyze` faces.
 
 [1.0.0]: https://github.com/fluttercandies/dartq/releases/tag/v1.0.0
