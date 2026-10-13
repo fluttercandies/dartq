@@ -537,11 +537,20 @@ fn compat_sample_query_mode_serves_reverse_queries_over_a_live_process() {
                 if file == "lib/gone.dart" {
                     return Err(format!("unknown file `{file}`"));
                 }
+                // The anchor match uses `a_path`, not the literal spelling:
+                // FileTable interning canonicalizes to the longest existing
+                // ancestor, so `lib/a.dart` traveled to the plugin as the
+                // absolute test-crate form (the gone-file arm below rides the
+                // raw request string, which never interns, and stays literal).
                 let element = match (file, request.offset) {
-                    ("lib/a.dart", Some(offset)) if offset == QUERY_PRINT.0 => {
+                    (_, Some(offset))
+                        if file == a_path && offset == QUERY_PRINT.0 =>
+                    {
                         Some(&print_element)
                     }
-                    ("lib/a.dart", Some(offset)) if offset == QUERY_UNUSED.0 => {
+                    (_, Some(offset))
+                        if file == a_path && offset == QUERY_UNUSED.0 =>
+                    {
                         Some(&unused_element)
                     }
                     _ => None,
@@ -604,7 +613,7 @@ fn compat_sample_query_mode_serves_reverse_queries_over_a_live_process() {
         .expect("fixes reply arrives within the callback budget");
     assert_eq!(
         reply.fixes[0].message,
-        "compat query: nothing resolved at lib/a.dart:29"
+        format!("compat query: nothing resolved at {a_path}:{}", QUERY_MISS.0)
     );
 
     // An unknown file rides the error channel into a QueryError and degrades

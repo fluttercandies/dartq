@@ -66,10 +66,14 @@ impl Drop for Workspace {
 
 fn fixture_manifest() -> String {
     let entrypoint = host_package_dir().join("bin/fix_plugin.dart");
+    // 1024MB for the same reason as the other live spawns: the analyzer
+    // parse stack's JIT baseline sits at ~555MB, past the 512MB default —
+    // a budget, not a leak.
     format!(
         r#"{{"name": "fixer", "version": "0.1.0", "entrypoint": "{}",
             "capabilities": ["lint", "fix"],
-            "timeouts": {{"callback_ms": 30000, "request_ms": {REQUEST_MS}}}}}"#,
+            "timeouts": {{"callback_ms": 30000, "request_ms": {REQUEST_MS}}},
+            "memory_budget_mb": 1024}}"#,
         entrypoint.display()
     )
 }
