@@ -398,6 +398,15 @@ impl Interp<'_> {
                     return true;
                 }
                 let operand = self.pop_value();
+                // The guaranteed-fail face (official `asExpression_end`'s
+                // `_isTypeCheckGuaranteedToFailWithSoundNullSafety` →
+                // `_typesAreDisjointDueToNullability`): a null-or-equivalent
+                // operand under a non-nullable cast target — or the reverse —
+                // always throws, so the flow state goes unreachable and the
+                // block tail is dead (`Null n; n as int; print(x);`).
+                if self.disjoint_by_nullability(operand.ty, cast_ty) {
+                    self.unreachable_cur();
+                }
                 if let Some(var) = operand.reference {
                     let promoted = self.promotion_candidate(var, cast_ty, self.as_cast_args);
                     if let Some(promoted) = promoted {

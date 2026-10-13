@@ -17,7 +17,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::ev::Ev;
 use crate::facts::FlowFact;
 use crate::model::{Lists, NIL, ReachArena, State};
-use crate::ty::{Ty, TypeOps};
+use crate::ty::{Classification, Ty, TypeOps};
 
 /// Metadata of one local variable (or parameter).
 pub(crate) struct VarMeta {
@@ -118,6 +118,10 @@ pub(crate) enum Frame {
         /// demotion); empty for non-closure executables.
         reads: FxHashSet<u32>,
         declared: FxHashSet<u32>,
+        /// The enclosing began-dead snapshot, restored at the executable's
+        /// end: a closure body's own statement boundaries must not rewrite
+        /// what the enclosing statement began in.
+        began_dead: bool,
     },
     Block {
         scopes_base: usize,
@@ -550,6 +554,15 @@ pub(crate) struct Interp<'o> {
     /// close, so their intervals run out to the enclosing construct.
     pub(crate) dead: Option<DeadWindow>,
 
+    /// Statement-boundary reachability snapshot: whether the statement now
+    /// beginning entered dead. Post-order statement wrappers
+    /// (`ExprStmt`/`ReturnBegin`/`YieldBegin`/`PatternVarDeclStmt` fire at
+    /// the statement's end) read it instead of the live state, so a
+    /// statement that began live but terminated flow itself (`throw 0;`)
+    /// does not self-anchor the dead row — the official's first dead node
+    /// is the next visited node (`_visitNode`).
+    pub(crate) stmt_began_dead: bool,
+
     pub(crate) collect: Option<Vec<Effects>>,
     snapshot: Option<Snapshot>,
 }
@@ -606,6 +619,7 @@ impl<'o> Interp<'o> {
             header_cond_depth: 0,
             anywhere: Effects::default(),
             dead: None,
+            stmt_began_dead: false,
             collect: None,
             snapshot: None,
         }
@@ -759,6 +773,18 @@ impl<'o> Interp<'o> {
     /// Marks the current state unreachable in place.
     pub(crate) fn unreachable_cur(&mut self) {
         self.current = self.current.clone().set_unreachable(&mut self.reach);
+    }
+
+    /// Official `_typesAreDisjointDueToNullability`: one side is
+    /// null-or-equivalent (`classifyType` → nullOrEquivalent) while the
+    /// other is non-nullable — every value of either lies outside the
+    /// other, so a type check between them always fails.
+    pub(crate) fn disjoint_by_nullability(&self, a: Ty, b: Ty) -> bool {
+        let (a_class, b_class) = (self.ops.classify(a), self.ops.classify(b));
+        (a_class == Classification::NullOrEquivalent
+            && b_class == Classification::NonNullable)
+            || (b_class == Classification::NullOrEquivalent
+                && a_class == Classification::NonNullable)
     }
 
     /// Whether a collect run (effect pre-pass) is in progress.
@@ -1257,9 +1283,17 @@ impl Interp<'_> {
                 saved: self.current.clone(),
                 reads: FxHashSet::default(),
                 declared: FxHashSet::default(),
+                began_dead: self.stmt_began_dead,
             });
             return;
         }
+        // A nested executable re-roots statement-boundary reachability
+        // (official flow analysis walks each function body reachable): the
+        // enclosing statement-boundary snapshot must not leak in, and the
+        // body's own boundaries must not leak out (restored at
+        // [`Interp::exec_end`]).
+        let began_dead = self.stmt_began_dead;
+        self.stmt_began_dead = false;
         if !is_closure {
             self.stack.push(Frame::Exec {
                 is_closure: false,
@@ -1267,6 +1301,7 @@ impl Interp<'_> {
                 saved: self.current.clone(),
                 reads: FxHashSet::default(),
                 declared: FxHashSet::default(),
+                began_dead,
             });
             return;
         }
@@ -1283,6 +1318,7 @@ impl Interp<'_> {
                 saved: self.current.clone(),
                 reads: FxHashSet::default(),
                 declared: FxHashSet::default(),
+                began_dead,
             });
             return;
         }
@@ -1299,6 +1335,7 @@ impl Interp<'_> {
             saved,
             reads: effects.read.clone(),
             declared: effects.declared.clone(),
+            began_dead,
         });
     }
 
@@ -1318,6 +1355,7 @@ impl Interp<'_> {
             is_closure,
             scopes_base,
             saved,
+            began_dead,
             ..
         } = frame
         else {
@@ -1325,6 +1363,9 @@ impl Interp<'_> {
             return;
         };
         self.scopes.truncate(scopes_base);
+        // The enclosing statement boundaries resume: the body's own
+        // boundaries never rewrite them.
+        self.stmt_began_dead = began_dead;
         if collecting {
             self.collect_pop(is_closure);
             return;
@@ -1450,6 +1491,12 @@ impl Interp<'_> {
         self.run_range(events, bounds.init.clone(), match_of);
         self.for_header_depth = self.for_header_depth.saturating_sub(1);
         self.exprs.truncate(base);
+        // The init→condition part boundary: header parts carry no statement
+        // wrapper (the header parses a bare `parse_expression` list), so
+        // this refresh is what lets the condition's wrapper anchor when the
+        // init exited (`for (throw 0; c;)` — the official's first dead node
+        // there is the condition).
+        self.stmt_began_dead = !self.reachable();
         // Condition (empty condition = `true`).
         let cond = self.run_header_expr(events, bounds.cond.clone(), match_of, base);
         let (if_true, if_false) = if let Some(expr) = cond {

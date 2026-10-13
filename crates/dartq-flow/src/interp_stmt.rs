@@ -14,13 +14,35 @@ use crate::ty::Ty;
 
 impl Interp<'_> {
     /// Handles one statement-layer event; `false` means the event belongs
-    /// to another layer.
+    /// to another layer. Statement-boundary bookkeeping wraps the arm:
+    /// every non-wrapper arm refreshes [`Interp::stmt_began_dead`] after it
+    /// runs (the reachability then is the state the NEXT statement begins
+    /// in), while the post-order wrapper arms read it instead.
     #[expect(
         clippy::too_many_lines,
         reason = "single port of the official statement decision order; splitting the \
                   match would scatter the per-event documentation"
     )]
     pub(crate) fn stmt_step(&mut self, ev: &Ev, events: &[Ev], i: usize, match_of: &[u32]) -> bool {
+        // The wrapper arms fire at the statement's END (post-order): they
+        // must observe the state the statement BEGAN in, so only the other
+        // arms refresh the snapshot.
+        let wrapper = matches!(
+            ev,
+            Ev::ExprStmt { .. }
+                | Ev::ReturnBegin { .. }
+                | Ev::YieldBegin { .. }
+                | Ev::PatternVarDeclStmt { .. }
+        );
+        let handled = self.stmt_step_arm(ev, events, i, match_of);
+        if handled && !wrapper && !self.collecting() {
+            self.stmt_began_dead = !self.reachable();
+        }
+        handled
+    }
+
+    /// The statement decision order proper (see [`Interp::stmt_step`]).
+    fn stmt_step_arm(&mut self, ev: &Ev, events: &[Ev], i: usize, match_of: &[u32]) -> bool {
         match ev {
             Ev::ExprStmt { span } => {
                 self.header_dead_check(*span);
@@ -42,10 +64,14 @@ impl Interp<'_> {
                 }
             }
             Ev::IfBegin { span }
-            | Ev::ReturnBegin { span }
-            | Ev::YieldBegin { span }
             | Ev::SwitchBegin { span }
             | Ev::SwitchExprBegin { span } => self.dead_code(*span),
+            // `end_return_statement`/`end_yield_statement` record these at
+            // the statement's END: gate on the began-dead snapshot, never
+            // the live state (`return throw 1;` must not self-anchor).
+            Ev::ReturnBegin { span } | Ev::YieldBegin { span } => {
+                self.wrapper_dead_check(*span);
+            }
             Ev::ThenBegin => {
                 // If-case: the pattern context holds the branch states.
                 if let Some(pattern) = self.pattern.as_mut() {
@@ -938,8 +964,29 @@ impl Interp<'_> {
     /// does not cover it (the body block is not an ancestor of the
     /// condition, dead_code_verifier.dart:453-459). Equal depths mean no
     /// init/updater slice encloses — body level or inside a condition.
+    ///
+    /// Body-level wrappers anchor only when the statement BEGAN dead
+    /// ([`Interp::stmt_began_dead`]): one that began live and terminated
+    /// flow itself stays silent — the next node anchors.
     fn header_dead_check(&mut self, span: TokenSpan) {
         if self.for_header_depth == self.header_cond_depth {
+            self.wrapper_dead_check(span);
+        } else {
+            // A header part boundary (`for (throw 0; c;)`): the wrapper is
+            // a parsing artifact that never self-anchors, and the part's
+            // end is the next part's statement boundary — the init's exit
+            // makes the condition the first dead node.
+            self.stmt_began_dead = !self.reachable();
+        }
+    }
+
+    /// The post-order statement wrapper's dead check: the row opens only
+    /// when the statement began dead. A statement that began live but
+    /// terminated flow itself (`throw 0;`, `return throw 1;`) must not
+    /// self-anchor — the official's first dead node is the next visited
+    /// node (dead_code_verifier `_visitNode`).
+    fn wrapper_dead_check(&mut self, span: TokenSpan) {
+        if self.stmt_began_dead {
             self.dead_code(span);
         }
     }

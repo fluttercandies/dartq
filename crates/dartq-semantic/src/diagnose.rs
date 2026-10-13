@@ -8992,6 +8992,22 @@ impl<'a> Engine<'a> {
                     self.used_names.insert(popped.name);
                 }
                 match popped.shape {
+                    // A dart:core primitive spelled as the receiver
+                    // (`double.nan`, `int.parse`): no indexed container
+                    // answers the bare name, but it IS the class-static face
+                    // the member resolves against — the official reads the
+                    // resolved getter's enclosing element
+                    // (`isDoubleNan`, best_practices_verifier.dart:2264-2277).
+                    // The unresolvable-container dispatch stays silent, so
+                    // the row only feeds type-shape faces.
+                    RowShape::Bare(BareInfo::Missing { .. })
+                        if self.primitive_ids.contains(&popped.name) =>
+                    {
+                        Receiver::Container {
+                            name: popped.name,
+                            kind: ContainerKind::Class,
+                        }
+                    }
                     RowShape::Bare(info) => Engine::receiver_of_bare(info),
                     RowShape::Receiver(recv) => recv,
                     _ => Receiver::Unknown,
@@ -24081,13 +24097,23 @@ mod tests {
 
     /// A `??` whose left operand is strictly non-nullable anchors the
     /// report at the right operand; `??=` anchors at the value. Both reads
-    /// count (the assignment target never loses its use).
+    /// count (the assignment target never loses its use). The m2 corpus
+    /// face writes the operand types as bare core-type parameters: the
+    /// written type's nullability is syntactic, no core-library
+    /// declaration needed.
     #[test]
     fn dead_null_aware_right_operands_report() {
         let r = report("class int {} void main() { int x = 1; int y = 2; x ?? y; y ??= x; }");
         assert_eq!(
             code_names(&r),
             ["dead_null_aware_expression", "dead_null_aware_expression"],
+            "{:?}",
+            code_names(&r)
+        );
+        let r = report("void f(int x, int y) { x ?? y; }");
+        assert_eq!(
+            code_names(&r),
+            ["dead_null_aware_expression"],
             "{:?}",
             code_names(&r)
         );
@@ -24388,6 +24414,27 @@ mod tests {
         assert_eq!(
             r.diagnostics[1].message,
             "A double can't equal 'double.nan', so the condition is always 'true'."
+        );
+    }
+
+    /// The m2 corpus face: the receiver is a bare dart:core primitive
+    /// with no in-file declaration — no indexed container answers `double`,
+    /// but the getter read still resolves against the class-static face
+    /// (`isDoubleNan` reads the resolved getter's enclosing element). The
+    /// report may carry unresolved-name error rows alongside (core
+    /// library names are deliberately absent here), so only the two
+    /// comparison rows are counted.
+    #[test]
+    fn unnecessary_nan_comparison_primitive_receiver() {
+        let r = report("void f(double x) { if (x == double.nan) {} if (x != double.nan) {} }");
+        assert_eq!(
+            code_names(&r)
+                .into_iter()
+                .filter(|name| *name == "unnecessary_nan_comparison")
+                .count(),
+            2,
+            "{:?}",
+            code_names(&r)
         );
     }
 
@@ -26227,6 +26274,7 @@ mod tests {
 /// standalone module so the shared `tests` rig stays untouched: the faces
 /// here need a second analyzed library and the meta stand-in node, which
 /// the single-file rig cannot express.
+
 #[cfg(test)]
 mod sealed_contract_tests {
     use super::Receiver;

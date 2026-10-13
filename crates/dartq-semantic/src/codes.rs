@@ -1228,6 +1228,9 @@ impl SemanticCode {
             | Self::UnreachableSwitchCase
             | Self::UnreachableSwitchDefault
             | Self::DeadCode
+            // The dead-coalesce row (`type: DiagnosticType.STATIC_WARNING`,
+            // diagnostic.g.dart:3619-3628).
+            | Self::DeadNullAwareExpression
             | Self::UnusedLocalVariable
             | Self::UnusedElement
             | Self::UnusedField

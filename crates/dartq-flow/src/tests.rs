@@ -405,11 +405,12 @@ void f(int x) {
 fn never_typed_subexpression_exit_kills_the_rest() {
     use crate::facts::FlowFact;
     // `void f() { never(); 1; }` — offsets: `never()` at 11-17, the `;` at
-    // 18, `1;` at 20-21. The recorded grammar per expression statement:
-    // `ExprStmt` + `StmtEnd` at the statement's begin, then the body
-    // expression's events (record.rs `handle_expression_statement`); the
-    // engine appends Exit after resolving the call's type (official call
-    // site fires with the expression still on the stack).
+    // 18, `1;` at 20-21. The recorded grammar per expression statement: the
+    // body expression's events first, then `ExprStmt` + `StmtEnd` at the
+    // statement's end (statements.rs `parse_expression_statement` fires
+    // `handle_expression_statement` after `parse_expression`); the engine
+    // appends Exit after resolving the call's type (official call site fires
+    // with the expression still on the stack).
     let events: Vec<crate::ev::Ev> = [
         vec![
             crate::ev::Ev::ExecBegin { is_closure: false },
@@ -417,16 +418,16 @@ fn never_typed_subexpression_exit_kills_the_rest() {
         ],
         // `never();` — the call's type resolves to Never.
         vec![
-            crate::ev::Ev::ExprStmt { span: tspan(11) },
-            crate::ev::Ev::StmtEnd { end: 19 },
             crate::ev::Ev::OtherExpr { span: tspan(11) },
             crate::ev::Ev::Exit { end: tspan(18) },
+            crate::ev::Ev::ExprStmt { span: tspan(11) },
+            crate::ev::Ev::StmtEnd { end: 19 },
         ],
         // `1;` — unreachable from here.
         vec![
+            crate::ev::Ev::OtherExpr { span: tspan(20) },
             crate::ev::Ev::ExprStmt { span: tspan(20) },
             crate::ev::Ev::StmtEnd { end: 22 },
-            crate::ev::Ev::OtherExpr { span: tspan(20) },
         ],
         vec![
             crate::ev::Ev::BlockBodyEnd,
@@ -2835,27 +2836,29 @@ fn never_call_exit_folds_through_the_covering_statements() {
             crate::ev::Ev::ExecBegin { is_closure: false },
             crate::ev::Ev::BlockBodyBegin,
         ],
-        // `boom();` — the call's type resolves to Never.
+        // `boom();` — the call's type resolves to Never. The wrapper events
+        // follow the expression's (statements.rs fires
+        // `handle_expression_statement` after `parse_expression`).
         vec![
-            crate::ev::Ev::ExprStmt { span: tspan(11) },
-            crate::ev::Ev::StmtEnd { end: 18 },
             crate::ev::Ev::OtherExpr { span: tspan(11) },
             crate::ev::Ev::Exit { end: tspan(18) },
+            crate::ev::Ev::ExprStmt { span: tspan(11) },
+            crate::ev::Ev::StmtEnd { end: 18 },
         ],
         // `1;` — unreachable from here.
         vec![
+            crate::ev::Ev::OtherExpr { span: tspan(19) },
             crate::ev::Ev::ExprStmt { span: tspan(19) },
             crate::ev::Ev::StmtEnd { end: 21 },
-            crate::ev::Ev::OtherExpr { span: tspan(19) },
         ],
         // `if (c) 2;` — folds into the same interval.
         vec![
             crate::ev::Ev::IfBegin { span: tspan(22) },
             crate::ev::Ev::OtherExpr { span: tspan(26) },
             crate::ev::Ev::ThenBegin,
+            crate::ev::Ev::OtherExpr { span: tspan(29) },
             crate::ev::Ev::ExprStmt { span: tspan(29) },
             crate::ev::Ev::StmtEnd { end: 31 },
-            crate::ev::Ev::OtherExpr { span: tspan(29) },
             crate::ev::Ev::IfEnd { has_else: false },
             crate::ev::Ev::StmtEnd { end: 31 },
         ],
@@ -2915,22 +2918,24 @@ fn never_call_exit_inside_arguments_keeps_the_stack() {
             crate::ev::Ev::ExecBegin { is_closure: false },
             crate::ev::Ev::BlockBodyBegin,
         ],
-        // `g(boom());` — the argument's type resolves to Never.
+        // `g(boom());` — the argument's type resolves to Never. The wrapper
+        // events follow the send's (statements.rs fires
+        // `handle_expression_statement` after `parse_expression`).
         vec![
-            crate::ev::Ev::ExprStmt { span: tspan(11) },
-            crate::ev::Ev::StmtEnd { end: 21 },
             crate::ev::Ev::OtherExpr { span: tspan(11) },
             crate::ev::Ev::Send,
             crate::ev::Ev::ArgumentsBegin,
             crate::ev::Ev::OtherExpr { span: tspan(13) },
             crate::ev::Ev::Exit { end: tspan(19) },
             crate::ev::Ev::ArgumentsEnd { count: 1 },
+            crate::ev::Ev::ExprStmt { span: tspan(11) },
+            crate::ev::Ev::StmtEnd { end: 21 },
         ],
         // `1;` — unreachable from here.
         vec![
+            crate::ev::Ev::OtherExpr { span: tspan(22) },
             crate::ev::Ev::ExprStmt { span: tspan(22) },
             crate::ev::Ev::StmtEnd { end: 24 },
-            crate::ev::Ev::OtherExpr { span: tspan(22) },
         ],
         vec![
             crate::ev::Ev::BlockBodyEnd,
@@ -3321,4 +3326,76 @@ fn raw_tested_against_written_declaration_refuses() {
     interp.run(&events);
     assert!(interp.arg_promotions.is_empty());
     assert_eq!(interp.current.model(0).promoted, crate::model::NIL);
+}
+
+// —— #1013 m2 dead-code faces ————————————————————————————————————————
+
+/// A statement that began live and terminated flow itself (`throw 0;`,
+/// `return throw 1;`, `rethrow`) never anchors its own dead row: the
+/// post-order statement wrappers read the statement's began-dead
+/// snapshot, and the official's first dead node is the next visited node
+/// (`_visitNode`, upstream Dart SDK dead_code_verifier.dart).
+#[test]
+fn flow_terminating_statement_does_not_anchor_itself() {
+    assert!(dead_snippets("void f() { throw 0; }").is_empty());
+    assert_eq!(
+        dead_snippets("void f() { throw 0; print(1); }"),
+        ["print(1);"]
+    );
+    assert_eq!(dead_snippets("void f() { return; print(2); }"), ["print(2);"]);
+    assert_eq!(
+        dead_snippets("void f() { return throw 1; print(2); }"),
+        ["print(2);"]
+    );
+    assert_eq!(
+        dead_snippets("void f() { rethrow; print(3); }"),
+        ["print(3);"]
+    );
+}
+
+/// The catch-clause family (m2 over-marking): a try body whose flow dies
+/// (`throw`) leaves every clause reachable — each catch clause enters on
+/// its own exception path seeded from the pre-try state — so the flow
+/// engine emits no dead row for any clause shape; the official's
+/// catch-clause rows (`dead_code_catch_following_catch`,
+/// `dead_code_on_catch_subtype`, `nullable_type_in_catch_clause`) are the
+/// semantic layer's clause verifier, not flow facts.
+#[test]
+fn try_body_terminator_leaves_catch_clauses_reachable() {
+    for src in [
+        "void f() { try { throw 'x'; } catch (e) { print(e); } on Exception { print(1); } }",
+        "class A {}\nclass B extends A {}\nvoid f() { try { throw B(); } on B { print(1); } on A { print(2); } }",
+        "void f() { try { throw 'x'; } on Exception? catch (e) { print(e); } }",
+    ] {
+        assert!(dead_snippets(src).is_empty(), "{src:?}");
+    }
+}
+
+/// A cast whose operand type and target are disjoint by nullability
+/// always throws (official `asExpression_end`:
+/// `_isTypeCheckGuaranteedToFailWithSoundNullSafety` sets unreachable,
+/// then still promotes): the block tail is dead from the next statement,
+/// and the cast's own declaration statement does not self-anchor. The
+/// written `Null` type names the core null type, the null literal is its
+/// own — both sides of the disjointness rule.
+#[test]
+fn cast_from_null_type_kills_the_following_statement() {
+    assert_eq!(
+        dead_snippets("void f(Null n) { var x = n as int; print(x); }"),
+        ["print(x);"]
+    );
+    assert_eq!(
+        dead_snippets("void f() { var x = null as int; print(x); }"),
+        ["print(x);"]
+    );
+}
+
+/// A statement dead boundary never leaks OUT of a nested executable: a
+/// closure body that terminates its own flow rewrites the snapshot only
+/// within its own boundaries — the enclosing value is saved at
+/// `ExecBegin` and restored at `ExecEnd`, so the enclosing statement's
+/// wrapper reads what IT began in.
+#[test]
+fn closure_body_termination_does_not_leak_out() {
+    assert!(dead_snippets("void f() { h(() { throw 1; }); print(2); }").is_empty());
 }

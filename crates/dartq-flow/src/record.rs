@@ -638,6 +638,12 @@ impl ParserListener for Flow<'_> {
             Some("dynamic") => crate::ty::Base::Dynamic,
             Some("void") => crate::ty::Base::Void,
             Some("Never") => crate::ty::Base::Never,
+            // The written `Null` type name IS the core null type (upstream
+            // Dart SDK flow analysis `_isNullType`'s `isDartCoreNull`): the
+            // null-literal-equivalent classification that drives
+            // disjointness (`_typesAreDisjointDueToNullability`) and
+            // promotion faces.
+            Some("Null") => crate::ty::Base::Null,
             _ => crate::ty::Base::Name(id),
         };
         // Consumed per row, so the pending list can never leak across
