@@ -1,7 +1,8 @@
 //! The directive family (the #300 parser milestone face):
 //! `avoid_relative_lib_imports`, `library_annotations`, `library_prefixes`,
 //! `no_leading_underscores_for_library_prefixes`, `unnecessary_library_name`,
-//! `use_string_in_part_of_directives`.
+//! `use_string_in_part_of_directives`, `library_names`,
+//! `package_prefixed_library_names`, `directives_ordering`.
 //!
 //! The payload contracts are collapse map §3.1: `Import.as/deferred`
 //! (`ImportPrefixHandle` back-fill), `LibraryName.has_name`,
@@ -20,7 +21,11 @@ use crate::registry::{Group, RuleSpec};
 /// aggregated tail — adding a rule touches only this file. Batch close
 /// promotes the block into the registry's frozen skeleton together with
 /// the pin-test wave list (`tests/registry_pin.rs`).
-pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
+pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[
+    &directives_ordering::SPEC,
+    &library_names::SPEC,
+    &package_prefixed_library_names::SPEC,
+];
 
 /// The node behind a directive prelude wrapper —
 /// `begin_uncategorized_top_level_declaration` opens `TopLevelDeclaration`
@@ -484,6 +489,357 @@ pub(crate) mod use_string_in_part_of_directives {
         let range = c.utf16_span(c.node());
         c.report(range, &[]);
     }
+}
+
+pub(crate) mod directives_ordering {
+    use super::{Check, Group, NodeKind, RuleSpec, written_uri};
+
+    /// Official: `pkg/linter/lib/src/rules/directives_ordering.dart:120-268`
+    /// — four checks over the unit's directives, each node reporting at
+    /// most once across all of them (the `lintedNodes` set): `dart:` URIs
+    /// go before other directives of their kind (`withDartUrisSkipping
+    /// TheFirstSet`, :259-268), `package:` URIs go before relative ones
+    /// after the first run of absolute URIs (:270-280), exports come after
+    /// all imports (:196-210 — trailing `part`s then trailing exports
+    /// skipped from the end), and the dart:/relative/package sections are
+    /// each neighbor-sorted by [`compare_directives`] (:180-194 over
+    /// :212-257). URIs are the cooked adjacent-string `stringValue`; a
+    /// null value (interpolation) excludes the directive from the
+    /// dart/package sections and pauses the alphabetical comparison while
+    /// staying in the relative one (`isRelativeDirective` is the
+    /// not-absolute face). The `@docImport` faces (:136-155) are outside
+    /// this slice: doc imports are doc-comment directives the dartq parser
+    /// does not model (an analyzer-only feature, off by default), so the
+    /// oracle's default-config parity is unaffected. Message variants:
+    /// `diagnostic.g.dart` `directivesOrderingDart`,
+    /// `directivesOrderingPackageBeforeRelative`,
+    /// `directivesOrderingExports`, `directivesOrderingAlphabetical` (the
+    /// nominal spec face; every report carries its own texts).
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "directives_ordering",
+        group: Group::Standalone,
+        problem: "Sort directive sections alphabetically.",
+        correction: "Try sorting the directives.",
+        kinds: &[NodeKind::CompilationUnit],
+        check,
+    };
+
+    const DART_PROBLEM: &str = "Place 'dart:' {0} before other {0}.";
+    const PACKAGE_PROBLEM: &str = "Place 'package:' {0} before relative {0}.";
+    const EXPORTS_PROBLEM: &str = "Specify exports in a separate section after all imports.";
+    const CORRECTION: &str = "Try sorting the directives.";
+
+    fn check(c: &mut Check<'_>) {
+        let directives: Vec<u32> = c
+            .collect_direct(c.node())
+            .into_iter()
+            .map(|kid| super::behind_prelude(c, kid))
+            .filter(|&kid| {
+                matches!(
+                    c.kind(kid),
+                    NodeKind::Import
+                        | NodeKind::Export
+                        | NodeKind::Part
+                        | NodeKind::PartOf
+                        | NodeKind::LibraryName
+                )
+            })
+            .collect();
+        let mut linted: Vec<u32> = Vec::new();
+        check_dart_first(c, &directives, &mut linted);
+        check_package_before_relative(c, &directives, &mut linted);
+        check_exports_after_imports(c, &directives, &mut linted);
+        check_sections_alphabetical(c, &directives, &mut linted);
+    }
+
+    fn report(
+        c: &mut Check<'_>,
+        directive: u32,
+        problem: &str,
+        args: &[&str],
+    ) {
+        let span = c.utf16_span(directive);
+        c.report_texts(span, problem, CORRECTION, args);
+    }
+
+    /// The marks of the `lintedNodes` set: `true` when `directive` reports.
+    fn mark(linted: &mut Vec<u32>, directive: u32) -> bool {
+        if linted.contains(&directive) {
+            return false;
+        }
+        linted.push(directive);
+        true
+    }
+
+    fn section(c: &Check<'_>, directives: &[u32], kind: NodeKind) -> Vec<u32> {
+        directives
+            .iter()
+            .copied()
+            .filter(|&d| c.kind(d) == kind)
+            .collect()
+    }
+
+    fn check_dart_first(c: &mut Check<'_>, directives: &[u32], linted: &mut Vec<u32>) {
+        for kind in [NodeKind::Import, NodeKind::Export] {
+            let label = kind_label(kind);
+            // `withDartUrisSkippingTheFirstSet`: skip the leading dart: run,
+            // then every further dart: directive reports.
+            let mut past_run = false;
+            for directive in section(c, directives, kind) {
+                let uri = super::written_uri(c, directive).map(|(_, value)| value);
+                if !past_run {
+                    if is_dart(&uri) {
+                        continue;
+                    }
+                    past_run = true;
+                }
+                if is_dart(&uri) && mark(linted, directive) {
+                    report(c, directive, DART_PROBLEM, &[label, label]);
+                }
+            }
+        }
+    }
+
+    fn check_package_before_relative(
+        c: &mut Check<'_>,
+        directives: &[u32],
+        linted: &mut Vec<u32>,
+    ) {
+        for kind in [NodeKind::Import, NodeKind::Export] {
+            let label = kind_label(kind);
+            // `withPackageUrisSkippingAbsoluteUris`: drop dart:, skip the
+            // leading absolute run, then every package: directive reports.
+            let mut past_run = false;
+            for directive in section(c, directives, kind) {
+                let uri = super::written_uri(c, directive).map(|(_, value)| value);
+                if is_dart(&uri) {
+                    continue;
+                }
+                if !past_run {
+                    if is_absolute(&uri) {
+                        continue;
+                    }
+                    past_run = true;
+                }
+                if is_package(&uri) && mark(linted, directive) {
+                    report(c, directive, PACKAGE_PROBLEM, &[label, label]);
+                }
+            }
+        }
+    }
+
+    fn check_exports_after_imports(
+        c: &mut Check<'_>,
+        directives: &[u32],
+        linted: &mut Vec<u32>,
+    ) {
+        // `reversed.skipWhile(isPart).skipWhile(isExport)`: trailing parts
+        // then trailing exports are exempt; every export before them
+        // reports.
+        let mut end = directives.len();
+        while end > 0 && c.kind(directives[end - 1]) == NodeKind::Part {
+            end -= 1;
+        }
+        while end > 0 && c.kind(directives[end - 1]) == NodeKind::Export {
+            end -= 1;
+        }
+        for &directive in &directives[..end] {
+            if c.kind(directive) == NodeKind::Export && mark(linted, directive) {
+                report(c, directive, EXPORTS_PROBLEM, &[]);
+            }
+        }
+    }
+
+    fn check_sections_alphabetical(
+        c: &mut Check<'_>,
+        directives: &[u32],
+        linted: &mut Vec<u32>,
+    ) {
+        // The section walk order (:219-253): dart, relative, then package —
+        // imports before exports within each. All projects count as "not
+        // pub" upstream (`DartProject` removal, :201-208), so package
+        // directives form one section.
+        for (predicate, kind) in [
+            (is_dart as UriPredicate, NodeKind::Import),
+            (is_dart as UriPredicate, NodeKind::Export),
+            (is_relative as UriPredicate, NodeKind::Import),
+            (is_relative as UriPredicate, NodeKind::Export),
+            (is_package as UriPredicate, NodeKind::Import),
+            (is_package as UriPredicate, NodeKind::Export),
+        ] {
+            let nodes: Vec<u32> = section(c, directives, kind)
+                .into_iter()
+                .filter(|&d| predicate(&uri_of(c, d)))
+                .collect();
+            let mut previous = nodes.first().and_then(|&d| uri_of(c, d));
+            for directive in nodes.into_iter().skip(1) {
+                let current = uri_of(c, directive);
+                if let (Some(prev), Some(cur)) = (previous.as_deref(), current.as_deref()) {
+                    if compare_directives(prev, cur) == core::cmp::Ordering::Greater
+                        && mark(linted, directive)
+                    {
+                        report(c, directive, SPEC.problem, &[]);
+                    }
+                }
+                previous = current;
+            }
+        }
+    }
+
+    type UriPredicate = fn(&Option<String>) -> bool;
+
+    fn uri_of(c: &Check<'_>, directive: u32) -> Option<String> {
+        written_uri(c, directive).map(|(_, value)| value)
+    }
+
+    fn kind_label(kind: NodeKind) -> &'static str {
+        if kind == NodeKind::Import {
+            "imports"
+        } else {
+            "exports"
+        }
+    }
+
+    fn is_dart(uri: &Option<String>) -> bool {
+        uri.as_deref().is_some_and(|value| value.starts_with("dart:"))
+    }
+
+    /// `_isAbsoluteDirective`: a readable URI containing `:` — a null value
+    /// (`stringValue` on interpolation) is never absolute.
+    fn is_absolute(uri: &Option<String>) -> bool {
+        uri.as_deref().is_some_and(|value| value.contains(':'))
+    }
+
+    fn is_package(uri: &Option<String>) -> bool {
+        uri.as_deref()
+            .is_some_and(|value| value.starts_with("package:"))
+    }
+
+    /// `_isRelativeDirective` is the not-absolute face: a null URI joins
+    /// the relative section.
+    fn is_relative(uri: &Option<String>) -> bool {
+        !is_absolute(uri)
+    }
+
+    /// `compareDirectives` (:36-50): package-to-package (or any pair
+    /// involving a `/`-absolute path) compares the package segment first
+    /// and the remainder second; every other pair compares whole. The
+    /// string order is code-unit order (`String.compareTo`), which the
+    /// `str` order mirrors for the ASCII URIs directives carry.
+    fn compare_directives(a: &str, b: &str) -> core::cmp::Ordering {
+        if !a.starts_with("package:") || !b.starts_with("package:") {
+            if !a.starts_with('/') && !b.starts_with('/') {
+                return a.cmp(b);
+            }
+        }
+        let (Some(index_a), Some(index_b)) = (a.find('/'), b.find('/')) else {
+            return a.cmp(b);
+        };
+        a[..index_a]
+            .cmp(&b[..index_b])
+            .then_with(|| a[index_a + 1..].cmp(&b[index_b + 1..]))
+    }
+}
+
+pub(crate) mod library_names {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/library_names.dart:28-46` — a
+    /// named `library` directive whose name is not
+    /// `lowercase_with_underscores` reports at the whole name (dotted
+    /// names report across every segment, `library one.Two.three` in the
+    /// official corpus). The validator is `utils.dart:35`
+    /// `_lowerCaseUnderScoreWithDots`: `^_?[_a-z\d]*(?:\.[a-z][_a-z\d]*)*$`.
+    /// Message: `diagnostic.g.dart` `libraryNames`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "library_names",
+        group: Group::Standalone,
+        problem: "The library name '{0}' isn't a lower_case_with_underscores identifier.",
+        correction: "Try changing the name to follow the lower_case_with_underscores style.",
+        kinds: &[NodeKind::LibraryName],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        if !super::payload_flag(c, c.node(), 0) {
+            return;
+        }
+        // The name pieces are the node's children — the identifiers plus
+        // the childless `Qualified` markers between them — so the dotted
+        // text and the report anchor are the children's envelope (the
+        // official `name.toString()` face; `library one.Two.three` in the
+        // official corpus reports across every segment).
+        let children = c.collect_direct(c.node());
+        let Some(&head) = children.first() else {
+            return;
+        };
+        let mut bytes = c.byte_span(head);
+        let mut utf16 = c.utf16_span(head);
+        for &kid in &children[1..] {
+            let kid_bytes = c.byte_span(kid);
+            bytes.start = bytes.start.min(kid_bytes.start);
+            bytes.end = bytes.end.max(kid_bytes.end);
+            let kid_utf16 = c.utf16_span(kid);
+            utf16.start = utf16.start.min(kid_utf16.start);
+            utf16.end = utf16.end.max(kid_utf16.end);
+        }
+        let text = &c.unit.source[bytes];
+        if is_lower_case_under_score_with_dots(text) {
+            return;
+        }
+        c.report(utf16, &[text]);
+    }
+
+    /// `utils.dart:35` — one optional leading underscore, a
+    /// `[_a-z\d]*` run, then dot-separated `[a-z][_a-z\d]*` segments.
+    fn is_lower_case_under_score_with_dots(id: &str) -> bool {
+        let b = id.as_bytes();
+        let mut i = usize::from(b.first() == Some(&b'_'));
+        while i < b.len() && (b[i] == b'_' || b[i].is_ascii_lowercase() || b[i].is_ascii_digit())
+        {
+            i += 1;
+        }
+        while i < b.len() {
+            if b[i] != b'.' {
+                return false;
+            }
+            i += 1;
+            if !b.get(i).is_some_and(|&c| c.is_ascii_lowercase()) {
+                return false;
+            }
+            i += 1;
+            while i < b.len()
+                && (b[i] == b'_' || b[i].is_ascii_lowercase() || b[i].is_ascii_digit())
+            {
+                i += 1;
+            }
+        }
+        true
+    }
+}
+
+pub(crate) mod package_prefixed_library_names {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/package_prefixed_library_names.dart`
+    /// — registered but permanently silent: the upstream visitor body is
+    /// `return;` ("Project info is not being set", the `DartProject`
+    /// removal tracked as dart-lang/linter#3395; the intended prefix walk
+    /// survives only as a comment). The oracle emits nothing for this rule,
+    /// so parity is the no-op — a live reimplementation would fire where
+    /// `dart analyze` stays silent. The spec carries the registered texts
+    /// (`diagnostic.g.dart` `packagePrefixedLibraryNames`) for the listing
+    /// face.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "package_prefixed_library_names",
+        group: Group::Standalone,
+        problem: "The library name is not a dot-separated path prefixed by the package name.",
+        correction: "Try changing the name to '{0}'.",
+        kinds: &[NodeKind::LibraryName],
+        check,
+    };
+
+    fn check(_c: &mut Check<'_>) {}
 }
 
 pub(crate) mod provide_deprecation_message {
@@ -1719,5 +2075,129 @@ mod w3_pins {
             "{:?}",
             f.run(&one_rule("migrate_design_widgets"))
         );
+    }
+}
+
+/// The W5 (#1026) production-bridge pins: the directive-wave rules over real
+/// parser trees, against the upstream corpora
+/// (`pkg/linter/test/rules/<name>_test.dart`).
+#[cfg(test)]
+mod w5_pins {
+    use crate::testsupport::{Fixture, one_rule};
+
+    // —— library_names ———————————————————————————————————————————————————
+
+    /// `test_titlecase` — a name off `lower_case_with_underscores` reports
+    /// at the whole name with the cited text.
+    #[test]
+    fn library_names_reports_a_malformed_name() {
+        let f = Fixture::parse("library Foo;\n");
+        let lints = f.run(&one_rule("library_names"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The library name 'Foo' isn't a lower_case_with_underscores identifier."
+        );
+        assert_eq!(lints[0].range, 8..11);
+    }
+
+    /// `test_lowercase` and `test_libraryWithoutName` — a compliant name
+    /// and an unnamed `library;` pass.
+    #[test]
+    fn library_names_compliant_and_unnamed_pass() {
+        let f = Fixture::parse("library foo;\n");
+        assert!(f.run(&one_rule("library_names")).is_empty());
+
+        let f = Fixture::parse("library;\n");
+        assert!(f.run(&one_rule("library_names")).is_empty());
+    }
+
+    /// `test_uppercaseInDots` — a dotted name reports across every segment
+    /// (the validator faces the whole dotted text).
+    #[test]
+    fn library_names_dotted_name_reports_once_over_all_segments() {
+        let f = Fixture::parse("library one.Two.three;\n");
+        let lints = f.run(&one_rule("library_names"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The library name 'one.Two.three' isn't a lower_case_with_underscores identifier."
+        );
+        assert_eq!(lints[0].range, 8..21);
+    }
+
+    // —— package_prefixed_library_names ——————————————————————————————————
+
+    /// Registered but permanently silent upstream (`_Visitor` body is
+    /// `return;` — "Project info is not being set", dart-lang/linter#3395):
+    /// parity is the no-op, named or not.
+    #[test]
+    fn package_prefixed_library_names_is_a_parity_noop() {
+        let f = Fixture::parse("library foo.bar;\n");
+        assert!(f.run(&one_rule("package_prefixed_library_names")).is_empty());
+
+        let f = Fixture::parse("library Foo;\n");
+        assert!(f.run(&one_rule("package_prefixed_library_names")).is_empty());
+    }
+
+    // —— directives_ordering —————————————————————————————————————————————
+
+    /// `test_dartDirectivesGoFirst_imports` — every `dart:` directive after
+    /// the leading dart: run reports; the alphabetical walk adds nothing
+    /// (already-linted nodes are marked).
+    #[test]
+    fn directives_ordering_dart_uris_go_first() {
+        let f = Fixture::parse(
+            "import 'dart:math';\nimport 'a.dart';\nimport 'dart:html';\nimport 'dart:isolate';\n",
+        );
+        let lints = f.run(&one_rule("directives_ordering"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(lints[0].range.start, 37);
+        assert_eq!(lints[1].range.start, 57);
+        assert_eq!(lints[0].message, "Place 'dart:' imports before other imports.");
+    }
+
+    /// `test_importsGoBeforeExports` — exports before a later import
+    /// report; the trailing export run is exempt.
+    #[test]
+    fn directives_ordering_exports_come_after_imports() {
+        let f = Fixture::parse(
+            "import 'a.dart';\n\nexport 'a.dart';\n\nimport 'b.dart';\n\nexport 'b.dart';\n\nimport 'c.dart';\n\nexport 'c.dart';\n",
+        );
+        let lints = f.run(&one_rule("directives_ordering"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(lints[0].range.start, 18);
+        assert_eq!(lints[1].range.start, 54);
+        assert_eq!(
+            lints[0].message,
+            "Specify exports in a separate section after all imports."
+        );
+    }
+
+    /// `test_reportOneNodeOnlyOnce` — a directive violating two checks at
+    /// once reports exactly once (the `lintedNodes` set).
+    #[test]
+    fn directives_ordering_reports_one_node_only_once() {
+        let f = Fixture::parse(
+            "import 'package:meta/meta.dart';\nimport 'a.dart';\nimport 'package:foo/foo.dart';\n",
+        );
+        let lints = f.run(&one_rule("directives_ordering"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range.start, 50);
+        assert_eq!(
+            lints[0].message,
+            "Place 'package:' imports before relative imports."
+        );
+    }
+
+    /// `test_multipleSchemaImportsSortedByPath` — a fully sorted
+    /// multi-section file passes; `http:` URIs are absolute (the `:` face)
+    /// and join no section.
+    #[test]
+    fn directives_ordering_sorted_sections_pass() {
+        let f = Fixture::parse(
+            "library lib;\n\nimport 'dart:aaa';\nimport 'dart:bbb';\n\nimport 'package:aaa/aaa.dart';\nimport 'package:bbb/bbb.dart';\n\nimport 'http://aaa.com';\nimport 'http://bbb.com';\n\nimport 'aaa/aaa.dart';\nimport 'bbb/bbb.dart';\n\nexport 'dart:aaa';\nexport 'dart:bbb';\n\nexport 'package:aaa/aaa.dart';\nexport 'package:bbb/bbb.dart';\n\nexport 'http://aaa.com';\nexport 'http://bbb.com';\n\nexport 'aaa/aaa.dart';\nexport 'bbb/bbb.dart';\n\npart 'aaa/aaa.dart';\npart 'bbb/bbb.dart';\n\nmain() {}\n",
+        );
+        assert!(f.run(&one_rule("directives_ordering")).is_empty());
     }
 }

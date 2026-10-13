@@ -1,5 +1,7 @@
 //! The doc-comment family: `slash_for_doc_comments`,
-//! `unintended_html_in_doc_comment`, `dangling_library_doc_comments`.
+//! `unintended_html_in_doc_comment`, `dangling_library_doc_comments`,
+//! `document_ignores`, `flutter_style_todos`,
+//! `missing_code_block_language_in_doc_comment`.
 //!
 //! Doc comments are the suffix run of doc-form comments (`///`-line or
 //! `/**`-block) attached to a node's span-head token — the syntax-level
@@ -23,7 +25,11 @@ use crate::registry::{Group, RuleSpec};
 /// aggregated tail — adding a rule touches only this file. Batch close
 /// promotes the block into the registry's frozen skeleton together with
 /// the pin-test wave list (`tests/registry_pin.rs`).
-pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
+pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[
+    &document_ignores::SPEC,
+    &flutter_style_todos::SPEC,
+    &missing_code_block_language_in_doc_comment::SPEC,
+];
 
 /// The declaration kinds whose doc comments the doc-comment rules face —
 /// the official registry of `slash_for_doc_comments.dart:59-82`
@@ -667,6 +673,502 @@ pub(crate) mod dangling_library_doc_comments {
     }
 }
 
+pub(crate) mod document_ignores {
+    use super::{Check, Group, NodeKind, RuleSpec, comment_lexeme};
+
+    /// Official: `pkg/linter/lib/src/rules/document_ignores.dart:59-104` —
+    /// an `// ignore:`/`// ignore_for_file:` comment citing at least one
+    /// diagnostic with no trailing free text reports unless the line above
+    /// is itself a comment (the documentation face). The element walk is
+    /// the analyzer's `CommentTokenExtension.ignoredElements`
+    /// (`pkg/analyzer/lib/src/ignore_comments/ignore_info.dart`): a
+    /// comma-separated diagnostic-name list whose unstructured remainder —
+    /// the trailing [`IgnoredDiagnosticComment`] — documents the ignore.
+    /// An empty citation (`// ignore:` or `// ignore: 42`) never reports.
+    /// Message: `diagnostic.g.dart` `documentIgnores`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "document_ignores",
+        group: Group::Standalone,
+        problem: "Missing documentation explaining why the diagnostic is ignored.",
+        correction: "Try adding a comment immediately above the ignore comment.",
+        kinds: &[NodeKind::CompilationUnit],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        for comment in c.comments.all() {
+            let lexeme = comment_lexeme(c, comment);
+            if !is_ignore_comment(lexeme) && !is_ignore_for_file_comment(lexeme) {
+                continue;
+            }
+            // `ignoredElements` empty (`// ignore:` with nothing cited) is
+            // the analyzer's continue face; trailing free text (the last
+            // element being an `IgnoredDiagnosticComment`) documents the
+            // ignore in place (:66-71). An empty citation
+            // (`ignoredElements.isEmpty`, :66-67) has nothing to document.
+            let Some((cited, trailing_text)) = ignored_elements(lexeme) else {
+                continue;
+            };
+            if !cited || trailing_text {
+                continue;
+            }
+            // Only look at the line above when the ignore comment is not on
+            // the first line (:80-95).
+            let line = c.unit.lines.byte_to_line_col(comment.range.start).0;
+            if line > 1 {
+                let before = &c.unit.source[..comment.range.start as usize];
+                if let Some(previous_line) = previous_line(before) {
+                    if starts_with_line_comment(previous_line) {
+                        continue;
+                    }
+                }
+            }
+            let span = super::comment_span_utf16(c, comment);
+            c.report(span, &[]);
+        }
+    }
+
+    /// The start of the line preceding the text ending at `before`'s end —
+    /// the `getOffsetOfLine(ignoreCommentLine - 2)` face. `None` when the
+    /// ignore comment sits on the first line.
+    fn previous_line(before: &str) -> Option<&str> {
+        let line_end = before.rfind('\n')?;
+        let start = before[..line_end].rfind('\n').map_or(0, |p| p + 1);
+        Some(&before[start..line_end])
+    }
+
+    /// Optional whitespace then `//` — the
+    /// `_startsWithEndOfLineComment` face (`isSpace` = space or tab).
+    fn starts_with_line_comment(line: &str) -> bool {
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        trimmed.starts_with("//")
+    }
+
+    /// `//`+slashes, then spaces, then `ignore:` — `IgnoreInfo
+    /// .isIgnoreComment` (the space skip is `0x20` only there).
+    fn is_ignore_comment(lexeme: &str) -> bool {
+        ignore_marker(lexeme, "ignore:")
+    }
+
+    /// The `ignore_for_file:` shape of [`is_ignore_comment`].
+    fn is_ignore_for_file_comment(lexeme: &str) -> bool {
+        ignore_marker(lexeme, "ignore_for_file:")
+    }
+
+    fn ignore_marker(lexeme: &str, marker: &str) -> bool {
+        let body = lexeme.trim_start_matches('/');
+        if lexeme.len() - body.len() < 2 {
+            return false;
+        }
+        let body = body.trim_start_matches(' ');
+        body.starts_with(marker)
+    }
+
+    /// The citation walk of `CommentTokenExtension.ignoredElements`: the
+    /// first element kind is irrelevant here, so the walk answers `(any
+    /// element cited, last element is trailing text)`. `None` when the
+    /// lexeme carries no citation list at all (no `:` — unreachable behind
+    /// the marker gate, kept for totality).
+    fn ignored_elements(lexeme: &str) -> Option<(bool, bool)> {
+        let bytes = lexeme.as_bytes();
+        let mut offset = lexeme.find(':')? + 1;
+        let mut has_element = false;
+
+        let skip_whitespace = |mut o: usize| -> usize {
+            while o < bytes.len() && matches!(bytes[o], b' ' | b'\t' | b'\r' | b'\n') {
+                o += 1;
+            }
+            o
+        };
+        let read_word = |mut o: usize| -> usize {
+            if !bytes
+                .get(o)
+                .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_')
+            {
+                return o;
+            }
+            o += 1;
+            while o < bytes.len()
+                && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_')
+            {
+                o += 1;
+            }
+            o
+        };
+
+        loop {
+            offset = skip_whitespace(offset);
+            if offset == bytes.len() {
+                return Some((has_element, false));
+            }
+            let word_start = offset;
+            offset = read_word(offset);
+            if word_start == offset {
+                // A non-word at the citation position: trailing text when
+                // anything was cited before it, otherwise nothing.
+                return Some((has_element, has_element));
+            }
+            let word = &lexeme[word_start..offset];
+            if word.eq_ignore_ascii_case("type") {
+                offset = skip_whitespace(offset);
+                if offset == bytes.len() || bytes[offset] != b'=' {
+                    return Some((has_element, false));
+                }
+                offset = skip_whitespace(offset + 1);
+                if offset == bytes.len() {
+                    return Some((has_element, false));
+                }
+                let type_start = offset;
+                offset = read_word(offset);
+                if type_start == offset {
+                    return Some((has_element, has_element));
+                }
+                if offset < bytes.len()
+                    && !matches!(bytes[offset], b' ' | b'\t' | b'\r' | b'\n' | b',')
+                {
+                    return Some((has_element, has_element));
+                }
+            } else {
+                // A plugin-name-prefixed code (`plugin/code`) reads its
+                // second word; either way the word must end at a space or
+                // comma (`ignore: http://…` cites nothing).
+                if bytes.get(offset) == Some(&b'/') {
+                    offset = skip_whitespace(offset + 1);
+                    if offset == bytes.len() {
+                        return Some((has_element, false));
+                    }
+                    let name_start = offset;
+                    offset = read_word(offset);
+                    if name_start == offset {
+                        return Some((has_element, has_element));
+                    }
+                }
+                if offset < bytes.len()
+                    && !matches!(bytes[offset], b' ' | b'\t' | b'\r' | b'\n' | b',')
+                {
+                    return Some((has_element, has_element));
+                }
+            }
+            has_element = true;
+            if offset == bytes.len() {
+                return Some((has_element, false));
+            }
+            offset = skip_whitespace(offset);
+            if offset == bytes.len() {
+                return Some((has_element, false));
+            }
+            if bytes[offset] != b',' {
+                // Unstructured comment text follows the citations.
+                return Some((has_element, true));
+            }
+            offset += 1;
+        }
+    }
+}
+
+pub(crate) mod flutter_style_todos {
+    use super::{Check, Group, NodeKind, RuleSpec, comment_lexeme};
+
+    /// Official: `pkg/linter/lib/src/rules/flutter_style_todos.dart:24-84`
+    /// — a comment whose lexeme starts with the trigger face (`//+`, one
+    /// regex-`\s` run, `TODO` case-insensitive, word boundary) but not the
+    /// expected face (`//`, one `\s` run, `TODO`, `(<username>)`, `: `)
+    /// reports at the whole comment. Both regexes anchor at index 0
+    /// (`String.startsWith`), so a `TODO` after other text never fires and
+    /// `/// TODO(…)…` reports (the expected `//` cannot cross the third
+    /// slash). Message: `diagnostic.g.dart` `flutterStyleTodos`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "flutter_style_todos",
+        group: Group::Standalone,
+        problem: "To-do comment doesn't follow the Flutter style.",
+        correction: "Try following the Flutter style for to-do comments.",
+        kinds: &[NodeKind::CompilationUnit],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        for comment in c.comments.all() {
+            let lexeme = comment_lexeme(c, comment);
+            if invalid_todo(lexeme) {
+                let span = super::comment_span_utf16(c, comment);
+                c.report(span, &[]);
+            }
+        }
+    }
+
+    /// The official `invalidTodo` (:41-43): the trigger matches and the
+    /// expected shape does not.
+    fn invalid_todo(content: &str) -> bool {
+        matches_trigger(content) && !matches_expected(content)
+    }
+
+    /// `_todoRegExp = //+\s*TODO\b`, case-insensitive. The greedy
+    /// slash/space runs need no backtracking: `TODO` starts with neither
+    /// character, so the maximal-run assignment is the only candidate.
+    fn matches_trigger(content: &str) -> bool {
+        let slash_run = content.len() - content.trim_start_matches('/').len();
+        if slash_run < 2 {
+            return false;
+        }
+        let rest = &content[slash_run..];
+        let ws = rest.find(|ch: char| !is_regex_space(ch)).unwrap_or(rest.len());
+        let rest = &rest[ws..];
+        if rest.len() < 4 || !rest[..4].eq_ignore_ascii_case("todo") {
+            return false;
+        }
+        // The `\b` tail: any following word character re-joins `TODO`.
+        rest[4..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
+    }
+
+    /// `_todoExpectedRegExp = //\s*TODO\([a-zA-Z0-9][-a-zA-Z0-9\.]*\): `,
+    /// case-sensitive.
+    fn matches_expected(content: &str) -> bool {
+        let Some(rest) = content.strip_prefix("//") else {
+            return false;
+        };
+        let ws = rest.find(|ch: char| !is_regex_space(ch)).unwrap_or(rest.len());
+        let rest = &rest[ws..];
+        let Some(rest) = rest.strip_prefix("TODO") else {
+            return false;
+        };
+        let Some(rest) = rest.strip_prefix('(') else {
+            return false;
+        };
+        let mut chars = rest.char_indices();
+        if !chars.next().is_some_and(|(_, ch)| ch.is_ascii_alphanumeric()) {
+            return false;
+        }
+        let end = rest
+            .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '-' || ch == '.'))
+            .unwrap_or(rest.len());
+        let rest = &rest[end..];
+        rest.starts_with("): ")
+    }
+
+    /// The ECMA-262 `\s` set behind the two regexes.
+    fn is_regex_space(ch: char) -> bool {
+        matches!(
+            ch,
+            ' ' | '\t'
+                | '\n'
+                | '\r'
+                | '\u{0B}'
+                | '\u{0C}'
+                | '\u{A0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+        )
+    }
+}
+
+pub(crate) mod missing_code_block_language_in_doc_comment {
+    use super::{Check, Comment, Group, NodeKind, RuleSpec, is_doc_form};
+
+    /// Official: `pkg/linter/lib/src/rules/missing_code_block_language_in_doc_comment.dart:24-58`
+    /// — every FENCED doc-comment code block whose info string is missing
+    /// reports at its opening fence line. The block model is the analyzer's
+    /// `doc_comment_builder` (`pkg/analyzer/lib/src/fasta/
+    /// doc_comment_builder.dart`): a fence line is whitespace then a ` ```
+    /// run (the tick run counts; a run of four or more can never close,
+    /// `substring(index, index + 3)` vs the longer run — mirrored); the
+    /// info string is everything after the ticks, `null` when only
+    /// whitespace remains; indented blocks (four-space runs after an empty
+    /// line) never report and shadow fence parsing while they last. The
+    /// report anchor is the opening line's content span (marker and one
+    /// space stripped), whose length covers the whole line. Lines inside a
+    /// markdown code region never open blocks. Message:
+    /// `diagnostic.g.dart` `missingCodeBlockLanguageInDocComment`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "missing_code_block_language_in_doc_comment",
+        group: Group::Standalone,
+        problem: "The code block is missing a specified language.",
+        correction: "Try adding a language to the code block.",
+        kinds: &[NodeKind::CompilationUnit],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The official face is per documentation comment (`registry
+        // .addComment`): the run of consecutive doc-form comments attached
+        // to one token, its code-region state spanning every line.
+        let comments = c.comments.all();
+        let mut idx = 0;
+        while idx < comments.len() {
+            if !is_doc_form(c, &comments[idx]) {
+                idx += 1;
+                continue;
+            }
+            let run_token = comments[idx].token;
+            let run_start = idx;
+            idx += 1;
+            while idx < comments.len()
+                && comments[idx].token == run_token
+                && is_doc_form(c, &comments[idx])
+            {
+                idx += 1;
+            }
+            scan_run(c, &comments[run_start..idx]);
+        }
+    }
+
+    /// One doc-comment run's line walk: the `_parseDocComment` dispatch
+    /// order (indented block only after an empty line, then fence state)
+    /// with the fenced-only report face.
+    fn scan_run(c: &mut Check<'_>, run: &[Comment]) {
+        // A copy of the source reference — decoupled from the `&mut`
+        // borrow, so line slices never hold `c` across a report.
+        let source = c.unit.source;
+        let mut in_block_ticks: Option<usize> = None;
+        let mut in_indented = false;
+        // `isPreviousLineEmpty` starts true; a `/**` opening line counts as
+        // empty so an indented block may start on the next line.
+        let mut prev_empty = true;
+        for comment in run {
+            for (offset, content) in comment_lines(source, comment) {
+                let ws_end = whitespace_end(content);
+                if let Some(ticks) = in_block_ticks {
+                    // The closing fence needs a run of the opener's tick
+                    // count; four or more never closes (see SPEC doc).
+                    if ticks <= 3 && fenced_delimiter(content, ticks).is_some() {
+                        in_block_ticks = None;
+                    }
+                    continue;
+                }
+                if prev_empty && ws_end >= 4 {
+                    in_indented = true;
+                    prev_empty = false;
+                    continue;
+                }
+                if in_indented {
+                    if ws_end >= 4 {
+                        continue;
+                    }
+                    // The terminating line is re-dispatched as a normal
+                    // line (`_parseIndentedCodeBlock` returning it).
+                    in_indented = false;
+                }
+                if let Some(at) = fenced_delimiter(content, 3) {
+                    let ticks = content[at..].bytes().take_while(|&b| b == b'`').count();
+                    let info = content[at + ticks..].trim();
+                    if info.is_empty() {
+                        // The anchor is the opening line's whole content span
+                        // (`MdCodeBlockLine.offset/length`), whitespace
+                        // included — the official corpus marks `  ``` `.
+                        let from = c.unit.lines.byte_to_utf16(c.unit.source, offset as u32);
+                        let to = from + utf16_len(content);
+                        c.report(from..to, &[]);
+                    }
+                    in_block_ticks = Some(ticks);
+                    prev_empty = false;
+                    continue;
+                }
+                prev_empty = content.is_empty();
+            }
+        }
+    }
+
+    fn utf16_len(text: &str) -> u32 {
+        text.chars().map(|ch| ch.len_utf16() as u32).sum()
+    }
+
+    /// Whitespace then a ` ``` ` run — `_fencedCodeBlockDelimiter`. The
+    /// tick-run comparison is always three code units wide, so a required
+    /// count above three can never match (the documented never-closing
+    /// face); `minimum_tick` is the opener's count.
+    fn fenced_delimiter(content: &str, minimum_tick: usize) -> Option<usize> {
+        if minimum_tick > 3 {
+            return None;
+        }
+        let ws = whitespace_end(content);
+        if content.len() < ws + 3 {
+            return None;
+        }
+        content
+            .as_bytes()[ws..]
+            .starts_with(b"```")
+            .then_some(ws)
+    }
+
+    fn whitespace_end(content: &str) -> usize {
+        content
+            .find(|ch: char| !matches!(ch, ' ' | '\t' | '\r' | '\n'))
+            .unwrap_or(content.len())
+    }
+
+    /// The `(content offset, content)` lines of one comment — the
+    /// `_CharacterSequence` faces. Line comments strip `///` and one
+    /// optional space; block comments strip leading whitespace, the `*`/
+    /// `* ` markers, the `/**`/`*/` delimiters, and drop lines that are
+    /// only the end-of-comment marker.
+    fn comment_lines<'a>(
+        source: &'a str,
+        comment: &Comment,
+    ) -> Vec<(usize, &'a str)> {
+        let base = comment.range.start as usize;
+        let lexeme = &source[base..comment.range.end as usize];
+        match comment.kind {
+            crate::comments::CommentKind::Line => {
+                let lexeme = lexeme.strip_suffix('\r').unwrap_or(lexeme);
+                let prefix = usize::from(lexeme.starts_with("/// ")) + 3;
+                vec![(base + prefix, &lexeme[prefix..])]
+            }
+            crate::comments::CommentKind::Block => {
+                let mut lines = Vec::new();
+                let raw_lines: Vec<&str> = lexeme.split('\n').collect();
+                let last = raw_lines.len() - 1;
+                let mut byte_at = base;
+                for (nth, raw) in raw_lines.iter().enumerate() {
+                    let mut line = if nth == last {
+                        raw.strip_suffix('\r').unwrap_or(raw)
+                    } else {
+                        raw
+                    };
+                    let mut start = byte_at;
+                    if nth == 0 {
+                        line = line.strip_prefix("/**").unwrap_or(line);
+                        start += 3;
+                    }
+                    if nth == last {
+                        if let Some(stripped) = line.strip_suffix("*/") {
+                            line = stripped;
+                        }
+                    }
+                    // Leading whitespace, then the `* `/`*` marker — the
+                    // star-space walk of `_CharacterSequenceFromMultiLine
+                    // Comment`.
+                    let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+                    let line = &line[indent..];
+                    let marker = if let Some(rest) = line.strip_prefix("* ") {
+                        start += indent + 2;
+                        rest
+                    } else if line == "*" {
+                        start += indent + 1;
+                        ""
+                    } else {
+                        start += indent;
+                        line
+                    };
+                    let empty_marker_only = marker.is_empty();
+                    if !(empty_marker_only && (nth == 0 || nth == last)) {
+                        lines.push((start, marker));
+                    }
+                    byte_at += raw.len() + 1;
+                }
+                lines
+            }
+        }
+    }
+}
+
 fn blank_between(c: &Check<'_>, a: &Comment, b: &Comment) -> bool {
     line_of(c, b.range.start as usize) > line_of(c, a.range.end as usize) + 1
 }
@@ -1051,5 +1553,167 @@ mod tests {
         let lints = f.run(&one_rule("dangling_library_doc_comments"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].range, 0..7);
+    }
+}
+
+/// The W5 (#1026) production-bridge pins over real parser trees, against
+/// the upstream corpora (`pkg/linter/test/rules/<name>_test.dart`).
+#[cfg(test)]
+mod w5_pins {
+    use crate::testsupport::{Fixture, one_rule};
+
+    // —— document_ignores ——————————————————————————————————————————————
+
+    /// `test_precedingDeclaration_notDocumented` — an undocumented ignore
+    /// comment reports at itself.
+    #[test]
+    fn document_ignores_undocumented_reports() {
+        let f = Fixture::parse("int x = 0;\n\n// ignore: unused_element\nint _y = 0;\n");
+        let lints = f.run(&one_rule("document_ignores"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Missing documentation explaining why the diagnostic is ignored."
+        );
+        // The comment lexeme spans 12..37 (`int x = 0;` + two newlines).
+        assert_eq!(lints[0].range, 12..37);
+    }
+
+    /// `test_precedingLine_documented` — a `//` comment on the line above
+    /// documents the ignore.
+    #[test]
+    fn document_ignores_documented_above_passes() {
+        let f = Fixture::parse("// Text.\n// ignore: unused_element\nint _y = 0;\n");
+        assert!(f.run(&one_rule("document_ignores")).is_empty());
+    }
+
+    /// `test_sameComment_comma_documented` and
+    /// `test_sameComment_whitespace_documented` — trailing free text in
+    /// the ignore comment itself documents it (`IgnoredDiagnosticComment`
+    /// as the last element).
+    #[test]
+    fn document_ignores_trailing_text_documents() {
+        let f = Fixture::parse("// ignore: unused_element, I need this\nint _y = 0;\n");
+        assert!(f.run(&one_rule("document_ignores")).is_empty());
+
+        let f = Fixture::parse("// ignore: unused_element http://linter-bug\nint _y = 0;\n");
+        assert!(f.run(&one_rule("document_ignores")).is_empty());
+    }
+
+    /// `test_precedingLine_multiple_notDocumented` with the
+    /// `ignore_for_file:` shape — the file-level form needs the same
+    /// documentation, and an empty citation never reports.
+    #[test]
+    fn document_ignores_for_file_and_empty_citation_faces() {
+        let f = Fixture::parse(
+            "// Text.\n// ignore_for_file: unused_element\n\n// ignore_for_file: unnecessary_cast\nint _y = 0 as int;\n",
+        );
+        let lints = f.run(&one_rule("document_ignores"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range.start, 45);
+
+        // `// ignore:` citing nothing has no elements to document.
+        let f = Fixture::parse("int x = 0;\n\n// ignore:\nint _y = 0;\n");
+        assert!(f.run(&one_rule("document_ignores")).is_empty());
+    }
+
+    // —— flutter_style_todos ————————————————————————————————————————————
+
+    /// `test_badPatterns` (the `// TODO something` line) — a malformed
+    /// to-do comment reports at the whole comment.
+    #[test]
+    fn flutter_style_todos_malformed_reports() {
+        let f = Fixture::parse("// TODO something\nvar x = 1;\n");
+        let lints = f.run(&one_rule("flutter_style_todos"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "To-do comment doesn't follow the Flutter style.");
+        // The comment lexeme opens the unit at 0..17.
+        assert_eq!(lints[0].range, 0..17);
+    }
+
+    /// `test_properFormat_simpleUsername` — the `// TODO(name): message`
+    /// shape passes, and a non-to-do comment never fires.
+    #[test]
+    fn flutter_style_todos_proper_format_passes() {
+        let f = Fixture::parse("// TODO(username): bla\nvar x = 1;\n");
+        assert!(f.run(&one_rule("flutter_style_todos")).is_empty());
+
+        let f = Fixture::parse("// comment TODO(user): bla\nvar x = 1;\n");
+        assert!(f.run(&one_rule("flutter_style_todos")).is_empty());
+    }
+
+    /// `test_docComment`, `test_properFormat_multipleSeriesOfSlashes`, and
+    /// `test_slashStar` — the trigger anchors at index 0: `/// TODO(…)`
+    /// reports (the expected `//` cannot cross the third slash), a later
+    /// `// TODO` after other slashes stays silent, block comments never
+    /// trigger, and the trigger is case-insensitive while the expected
+    /// shape is not.
+    #[test]
+    fn flutter_style_todos_anchor_and_case_faces() {
+        let f = Fixture::parse("/// TODO(user): bla\nvar x = 1;\n");
+        assert_eq!(f.run(&one_rule("flutter_style_todos")).len(), 1);
+
+        let f = Fixture::parse("// // TODO(somebody): something\nvar x = 1;\n");
+        assert!(f.run(&one_rule("flutter_style_todos")).is_empty());
+
+        let f = Fixture::parse("/* TODO bla */\nvar x = 1;\n");
+        assert!(f.run(&one_rule("flutter_style_todos")).is_empty());
+
+        let f = Fixture::parse("// Todo(somebody): something\nvar x = 1;\n");
+        assert_eq!(f.run(&one_rule("flutter_style_todos")).len(), 1);
+    }
+
+    // —— missing_code_block_language_in_doc_comment —————————————————————
+
+    /// `test_missingLanguage` — an un-language fenced block reports at its
+    /// opening fence line.
+    #[test]
+    fn missing_code_block_language_reports_the_opening_fence() {
+        let f = Fixture::parse("/// ```\n/// test\n/// ```\nclass A {}\n");
+        let lints = f.run(&one_rule("missing_code_block_language_in_doc_comment"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "The code block is missing a specified language.");
+        assert_eq!(lints[0].range, 4..7);
+    }
+
+    /// `test_hasLanguage` and `test_indentedCodeBlock` — an info string
+    /// (even with leading fence whitespace) and an indented block pass.
+    #[test]
+    fn missing_code_block_language_compliant_passes() {
+        let f = Fixture::parse("/// ```dart\n/// test\n/// ```\nclass A {}\n");
+        assert!(
+            f.run(&one_rule(
+                "missing_code_block_language_in_doc_comment"
+            ))
+            .is_empty()
+        );
+
+        let f = Fixture::parse(
+            "/// Example:\n///\n///     var printer = Printer();\n///     printer.printToStdout();\n///\nclass A {}\n",
+        );
+        assert!(
+            f.run(&one_rule(
+                "missing_code_block_language_in_doc_comment"
+            ))
+            .is_empty()
+        );
+    }
+
+    /// `test_missingLanguage_noEndingFence` and
+    /// `test_missingLanguage_leadingWhitespace` — an unterminated block
+    /// reports once, and the anchor is the fence line's content span
+    /// (marker plus one separator space stripped, indentation included —
+    /// the upstream markup marks `[!  ```!]`).
+    #[test]
+    fn missing_code_block_language_unterminated_and_indent_faces() {
+        let f = Fixture::parse("/// ```\n/// test\n/// more test\nclass A {}\n");
+        let lints = f.run(&one_rule("missing_code_block_language_in_doc_comment"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range, 4..7);
+
+        let f = Fixture::parse("///   ```\n/// test\n/// ```\nclass A {}\n");
+        let lints = f.run(&one_rule("missing_code_block_language_in_doc_comment"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range, 4..9);
     }
 }

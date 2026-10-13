@@ -1,5 +1,7 @@
 //! The string-literal family: `unnecessary_brace_in_string_interps`,
-//! `unnecessary_string_escapes`.
+//! `unnecessary_string_escapes`, `eol_at_end_of_file`,
+//! `lines_longer_than_80_chars`, `prefer_single_quotes`,
+//! `unnecessary_raw_strings`, `use_raw_strings`.
 //!
 //! Dartq models string literals as one span-only [`NodeKind::StringLiteral`]
 //! node over the segment tokens; interpolation is a token-layer fact
@@ -26,7 +28,13 @@ use crate::registry::{Group, RuleSpec};
 /// aggregated tail — adding a rule touches only this file. Batch close
 /// promotes the block into the registry's frozen skeleton together with
 /// the pin-test wave list (`tests/registry_pin.rs`).
-pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
+pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[
+    &eol_at_end_of_file::SPEC,
+    &lines_longer_than_80_chars::SPEC,
+    &prefer_single_quotes::SPEC,
+    &unnecessary_raw_strings::SPEC,
+    &use_raw_strings::SPEC,
+];
 
 pub(crate) mod unnecessary_brace_in_string_interps {
     use super::{Check, Group, NodeKind, RuleSpec, TokenKind};
@@ -1045,6 +1053,636 @@ pub(crate) mod no_adjacent_strings_in_list {
     }
 }
 
+/// The UTF-16 span of a literal's whole token extent (the report anchor for
+/// the rules that face the full spelling, not just the head segment).
+fn extent_utf16_span(c: &Check<'_>, extent: core::ops::Range<u32>) -> core::ops::Range<u32> {
+    let start = c
+        .unit
+        .tokens
+        .get(extent.start as usize)
+        .map_or(0, |t| t.utf16_offset);
+    let last = extent.end - 1;
+    let end = c.unit.tokens.get(last as usize).map_or(start, |t| {
+        t.utf16_offset + c.lexeme(last).encode_utf16().count() as u32
+    });
+    start..end
+}
+
+/// Whether the lexeme opens a multiline literal (`'''` / `"""` after the
+/// optional `r` raw prefix — the `StringLexemeHelper` face).
+fn is_multiline_lexeme(lexeme: &str) -> bool {
+    let body = lexeme.strip_prefix('r').unwrap_or(lexeme);
+    body.starts_with("'''") || body.starts_with("\"\"\"")
+}
+
+/// Whether the lexeme is single-quoted (`'` / `'''` after the optional `r`).
+fn is_single_quoted_lexeme(lexeme: &str) -> bool {
+    lexeme
+        .strip_prefix('r')
+        .unwrap_or(lexeme)
+        .starts_with('\'')
+}
+
+/// The contents of a simple (one-token) literal lexeme: the raw text between
+/// the opening and closing quote runs (`r` prefix stripped, escapes intact).
+fn string_contents(lexeme: &str) -> Option<&str> {
+    let body = lexeme.strip_prefix('r').unwrap_or(lexeme);
+    let quote = *body.as_bytes().first()?;
+    let leading = body.bytes().take_while(|&b| b == quote).count();
+    let rest = &body[leading..];
+    let trailing = rest.bytes().rev().take_while(|&b| b == quote).count();
+    Some(&rest[..rest.len() - trailing.min(rest.len())])
+}
+
+/// Whether `head`'s literal sits inside another literal's `${...}` group —
+/// the official `isNestedString` guard (`parent.thisOrAncestorOfType<
+/// StringInterpolation>()`). The production rows carry no nesting links (a
+/// string row anchors at its head token), so the face is a bounded backward
+/// group scan: any `${` group open whose close lies at or after `head` (the
+/// depth-0 test over `(`/`[`/`{`/`${` pairs) contains the literal; a depth-0
+/// `;` can never occur inside an interpolation and stops the scan.
+fn nested_in_interpolation(c: &Check<'_>, head: u32) -> bool {
+    let tokens = c.unit.tokens;
+    let mut depth = 0i32;
+    let mut t = head;
+    while t > 0 {
+        t -= 1;
+        let Some(token) = tokens.get(t as usize) else {
+            return false;
+        };
+        match token.kind {
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth += 1;
+            }
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                if depth == 0 {
+                    // The group spans the literal; the `${` carrying it may
+                    // still sit further back.
+                    continue;
+                }
+                depth -= 1;
+            }
+            TokenKind::StringInterpolationExpression => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            TokenKind::Semicolon if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether any string token sits strictly inside a `${...}` group of the
+/// literal's extent — the official `containsString` face (any nested string
+/// literal among the interpolation's elements).
+fn contains_nested_string_token(c: &Check<'_>, extent: core::ops::Range<u32>) -> bool {
+    let tokens = c.unit.tokens;
+    let mut t = extent.start;
+    while t < extent.end {
+        let kind = tokens.get(t as usize).map_or(TokenKind::Eof, |tok| tok.kind);
+        match kind {
+            TokenKind::StringInterpolationExpression => {
+                let Some(close) = tokens.matching_end(t as usize) else {
+                    return false;
+                };
+                if ((t + 1) as usize..close).any(|k| {
+                    tokens.get(k).is_some_and(|tok| tok.kind == TokenKind::String)
+                }) {
+                    return true;
+                }
+                t = close as u32 + 1;
+            }
+            TokenKind::StringInterpolationIdentifier => t += 2,
+            _ => t += 1,
+        }
+    }
+    false
+}
+
+pub(crate) mod eol_at_end_of_file {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/eol_at_end_of_file.dart:36-58` —
+    /// a non-empty file ends in exactly one newline: several trailing
+    /// newlines report the too-many code at the trimmed end, none reports
+    /// the missing code. The two codes share the machine name; both message
+    /// pairs are carried verbatim (`diagnostic.g.dart`
+    /// `eolAtEndOfFileMissing` / `eolAtEndOfFileTooMany`), so
+    /// [`Check::report_texts`] selects per shape.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "eol_at_end_of_file",
+        group: Group::Standalone,
+        problem: "Missing a newline at the end of the file.",
+        correction: "Try adding a newline at the end of the file.",
+        kinds: &[NodeKind::CompilationUnit],
+        check,
+    };
+
+    const TOO_MANY_PROBLEM: &str = "Too many newlines at the end of the file.";
+    const TOO_MANY_CORRECTION: &str = "Try removing the extra newlines at the end of the file.";
+
+    fn check(c: &mut Check<'_>) {
+        let content = c.unit.source;
+        if content.is_empty() {
+            return;
+        }
+        // `content.trimRight().length` (:48, :55) — the trimmed end, in code
+        // units, where the length-1 report sits.
+        let trimmed = dart_trim_right_len(content);
+        if ends_with_multiple_newlines(content) {
+            c.report_texts(
+                trimmed..trimmed + 1,
+                TOO_MANY_PROBLEM,
+                TOO_MANY_CORRECTION,
+                &[],
+            );
+        } else if !(content.ends_with('\n') || content.ends_with('\r')) {
+            c.report(trimmed..trimmed + 1, &[]);
+        }
+    }
+
+    /// The `endsWithMultipleNewlines` extension (:66-72): `\n\n`, `\r\r`, or
+    /// `\r\n\r\n`.
+    fn ends_with_multiple_newlines(content: &str) -> bool {
+        ["\n\n", "\r\r", "\r\n\r\n"].iter().any(|e| content.ends_with(e))
+    }
+
+    /// `String.trimRight` over the Dart whitespace set, answering the
+    /// trimmed length in code units.
+    fn dart_trim_right_len(content: &str) -> u32 {
+        content
+            .trim_end_matches(is_dart_whitespace)
+            .encode_utf16()
+            .count() as u32
+    }
+
+    fn is_dart_whitespace(ch: char) -> bool {
+        matches!(
+            ch,
+            '\u{09}'..='\u{0D}'
+                | '\u{20}'
+                | '\u{85}'
+                | '\u{A0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+        )
+    }
+}
+
+pub(crate) mod lines_longer_than_80_chars {
+    use super::{Check, Group, NodeKind, RuleSpec, TokenKind};
+
+    /// Official: `pkg/linter/lib/src/rules/lines_longer_than_80_chars.dart:139-186`
+    /// — every line longer than 80 code units (terminators excluded, a
+    /// `\r\n` tail additionally dropped only past the limit) reports from
+    /// column 81 to the line end, unless the line is exempted: a multiline
+    /// string covers all its lines, a single-line string or interpolation
+    /// whose composed value contains `/` or `\` covers its own line, and a
+    /// comment covers a line for every one of its content lines containing
+    /// `/` or `\` (a `// ignore:` comment's own line is always covered,
+    /// :33-40). Message: `diagnostic.g.dart` `linesLongerThan80Chars`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "lines_longer_than_80_chars",
+        group: Group::Standalone,
+        problem: "The line length exceeds the 80-character limit.",
+        correction: "Try breaking the line across multiple lines.",
+        kinds: &[NodeKind::CompilationUnit],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let lines = LineTable::new(c.unit.source);
+        let mut allowed: Vec<u32> = Vec::new();
+        allowed_string_lines(c, &lines, &mut allowed);
+        allowed_comment_lines(c, &lines, &mut allowed);
+        allowed.sort_unstable();
+        for i in 0..lines.count() {
+            let start = lines.start(i);
+            let mut end = if i + 1 == lines.count() {
+                lines.utf16_len
+            } else {
+                lines.start(i + 1) - 1
+            };
+            // The `\r\n` tail drops only once the line already measures long
+            // (:160-164) — a line whose 81st unit is the `\r` falls back to
+            // exactly 80 and passes.
+            let mut len = end - start;
+            if len > 80 && lines.crlf_terminated(i) {
+                end -= 1;
+                len -= 1;
+            }
+            if len <= 80 || allowed.binary_search(&(i as u32)).is_ok() {
+                continue;
+            }
+            // Column 81 anchors the caret where the line needs to wrap
+            // (:177-178).
+            c.report(start + 80..end, &[]);
+        }
+    }
+
+    /// The `/` or `\` probe (`_looksLikeUriOrPath`, :29-38).
+    fn looks_like_uri_or_path(value: &str) -> bool {
+        value.bytes().any(|b| b == b'/' || b == b'\\')
+    }
+
+    /// The string-literal exemptions (`_AllowedLongLineVisitor`, :66-127):
+    /// the whole arena's `StringLiteral` rows, extent walk included.
+    fn allowed_string_lines(c: &Check<'_>, lines: &LineTable, allowed: &mut Vec<u32>) {
+        for row in 0..c.unit.ast.len() as u32 {
+            if c.kind(row) != NodeKind::StringLiteral {
+                continue;
+            }
+            let extent = super::literal_token_extent(c, row);
+            let span = super::extent_utf16_span(c, extent.clone());
+            if super::is_multiline_lexeme(c.lexeme(extent.start)) {
+                // `_handleMultilines` (:113-120): every line the literal
+                // touches is exempt.
+                let first = lines.line_of(span.start);
+                let last = lines.line_of(span.end);
+                allowed.extend(first..=last);
+            } else if let Some(value) = literal_value(c, row, &extent) {
+                // `_handleSingleLine` (:122-127): a URI-or-path value covers
+                // its own line.
+                if looks_like_uri_or_path(&value) {
+                    allowed.push(lines.line_of(span.start));
+                }
+            }
+        }
+    }
+
+    /// The composed value of one literal: the cooked segment texts with one
+    /// space per interpolation-expression code unit (`visitStringInterpolation`,
+    /// :82-98 — `' ' * e.length`), or [`crate::rules::directives::string_value`]
+    /// for a simple literal. `None` when a segment is malformed.
+    fn literal_value(
+        c: &Check<'_>,
+        row: u32,
+        extent: &core::ops::Range<u32>,
+    ) -> Option<String> {
+        if extent.len() == 1 {
+            return crate::rules::directives::string_value(c, row);
+        }
+        let mut value = String::new();
+        let mut prev_end = c
+            .unit
+            .tokens
+            .get(extent.start as usize)?
+            .utf16_offset;
+        let segment_indices = extent
+            .clone()
+            .filter(|&t| {
+                c.unit
+                    .tokens
+                    .get(t as usize)
+                    .is_some_and(|tok| tok.kind == TokenKind::String)
+            })
+            .collect::<Vec<u32>>();
+        let (first, last) = (*segment_indices.first()?, *segment_indices.last()?);
+        for position in 0..segment_indices.len() {
+            let t = segment_indices[position];
+            let token = c.unit.tokens.get(t as usize)?;
+            let spaces = token.utf16_offset.saturating_sub(prev_end);
+            value.extend(core::iter::repeat_n(' ', spaces as usize));
+            let lexeme = c.lexeme(t);
+            let text = if t == first {
+                strip_quote_prefix(lexeme)
+            } else {
+                lexeme
+            };
+            let text = if t == last {
+                strip_quote_suffix(text)
+            } else {
+                text
+            };
+            value.push_str(&crate::rules::directives::cook_string_body(text)?);
+            prev_end = token.utf16_offset + lexeme.encode_utf16().count() as u32;
+        }
+        let end = super::extent_utf16_span(c, extent.clone()).end;
+        value.extend(core::iter::repeat_n(' ', (end - prev_end) as usize));
+        Some(value)
+    }
+
+    /// The `r`-prefixed opening quote run of the literal's first segment.
+    fn strip_quote_prefix(lexeme: &str) -> &str {
+        let body = lexeme.strip_prefix('r').unwrap_or(lexeme);
+        let quote = body.as_bytes().first().copied().unwrap_or(b'\'');
+        let run = body.bytes().take_while(|&b| b == quote).count();
+        &body[run..]
+    }
+
+    /// The closing quote run of the literal's last segment.
+    fn strip_quote_suffix(lexeme: &str) -> &str {
+        let quote = lexeme.as_bytes().last().copied().unwrap_or(b'\'');
+        let run = lexeme.bytes().rev().take_while(|&b| b == quote).count();
+        &lexeme[..lexeme.len() - run]
+    }
+
+    /// The comment exemptions (`_AllowedCommentVisitor`, :42-63): each
+    /// comment content line containing `/` or `\` covers its line; a
+    /// `// ignore:` comment's own line is always covered.
+    fn allowed_comment_lines(c: &Check<'_>, lines: &LineTable, allowed: &mut Vec<u32>) {
+        for comment in c.comments.all() {
+            let lexeme = &c.unit.source[comment.range.start as usize..comment.range.end as usize];
+            let base = lines.line_of(
+                c.unit
+                    .lines
+                    .byte_to_utf16(c.unit.source, comment.range.start),
+            );
+            match comment.kind {
+                crate::comments::CommentKind::Line => {
+                    if let Some(rest) = lexeme.strip_prefix("///") {
+                        cover(rest, base, allowed);
+                    } else if let Some(content) = lexeme.strip_prefix("//") {
+                        if content.trim_start().starts_with("ignore:") {
+                            allowed.push(base);
+                        } else {
+                            cover(content, base, allowed);
+                        }
+                    }
+                }
+                crate::comments::CommentKind::Block => {
+                    if lexeme.len() >= 4 {
+                        // `content.substring(2, length - 2)` split on every
+                        // terminator shape (:55-61).
+                        let body = &lexeme[2..lexeme.len() - 2];
+                        for (nth, part) in body
+                            .split("\r\n")
+                            .flat_map(|s| s.split('\r'))
+                            .flat_map(|s| s.split('\n'))
+                            .enumerate()
+                        {
+                            cover(part, base + nth as u32, allowed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn cover(value: &str, line: u32, allowed: &mut Vec<u32>) {
+        if looks_like_uri_or_path(value) {
+            allowed.push(line);
+        }
+    }
+
+    /// The unit's line table in code-unit offsets — the `LineInfo` face:
+    /// lines terminate at `\r\n`, `\r`, or `\n`, and a trailing terminator
+    /// opens a final empty line.
+    struct LineTable {
+        starts: Vec<u32>,
+        crlf: Vec<bool>,
+        utf16_len: u32,
+    }
+
+    impl LineTable {
+        fn new(source: &str) -> Self {
+            let chars: Vec<char> = source.chars().collect();
+            let mut starts = vec![0u32];
+            let mut crlf = Vec::new();
+            let mut utf16 = 0u32;
+            let mut i = 0;
+            while i < chars.len() {
+                let ch = chars[i];
+                utf16 += ch.len_utf16() as u32;
+                if ch == '\r' {
+                    if chars.get(i + 1) == Some(&'\n') {
+                        utf16 += 1;
+                        i += 1;
+                        crlf.push(true);
+                    } else {
+                        crlf.push(false);
+                    }
+                    starts.push(utf16);
+                } else if ch == '\n' {
+                    crlf.push(false);
+                    starts.push(utf16);
+                }
+                i += 1;
+            }
+            Self {
+                starts,
+                crlf,
+                utf16_len: utf16,
+            }
+        }
+
+        fn count(&self) -> usize {
+            self.starts.len()
+        }
+
+        fn start(&self, line: usize) -> u32 {
+            self.starts[line]
+        }
+
+        fn crlf_terminated(&self, line: usize) -> bool {
+            self.crlf.get(line).copied().unwrap_or(false)
+        }
+
+        /// The 0-based line containing `offset` (the `getLocation` face; an
+        /// offset at the very end belongs to the last line).
+        fn line_of(&self, offset: u32) -> u32 {
+            self.starts.partition_point(|&s| s <= offset) as u32 - 1
+        }
+    }
+}
+
+pub(crate) mod prefer_single_quotes {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/prefer_single_quotes.dart:73-106`
+    /// — a double-quoted literal (simple or interpolated, `r` included)
+    /// reports at the literal unless the value carries a single quote (the
+    /// cooked segments' face for interpolations, :95-100), unless a nested
+    /// string sits inside one of its `${...}` groups (`containsString`,
+    /// :75-83), or unless the literal is itself nested inside an
+    /// interpolation (`isNestedString`, :85-88). Single-quoted literals
+    /// never report; the `prefer_double_quotes` counterpart is a later
+    /// wave and shares these three guards through this module's helpers.
+    /// Message: `diagnostic.g.dart` `preferSingleQuotes`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_single_quotes",
+        group: Group::Standalone,
+        problem: "Unnecessary use of double quotes.",
+        correction: "Try using single quotes unless the string contains single quotes.",
+        kinds: &[NodeKind::StringLiteral],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let extent = super::literal_token_extent(c, node);
+        if super::is_single_quoted_lexeme(c.lexeme(extent.start)) {
+            return;
+        }
+        if super::nested_in_interpolation(c, extent.start) {
+            return;
+        }
+        if extent.len() == 1 {
+            // The simple face (:91-99): the cooked value decides.
+            if crate::rules::directives::string_value(c, node).is_some_and(|v| v.contains('\'')) {
+                return;
+            }
+        } else {
+            // The interpolation face (:101-116): the literal segments'
+            // cooked values decide, then the nested-string bail.
+            if segments_contain_single_quote(c, &extent) {
+                return;
+            }
+            if super::contains_nested_string_token(c, extent.clone()) {
+                return;
+            }
+        }
+        c.report(super::extent_utf16_span(c, extent), &[]);
+    }
+
+    /// Whether any interpolation segment's cooked value carries a `'` — the
+    /// official `elements.any((e) => e is InterpolationString &&
+    /// e.value.contains("'"))` (:105-110).
+    fn segments_contain_single_quote(c: &Check<'_>, extent: &core::ops::Range<u32>) -> bool {
+        let segments: Vec<u32> = extent
+            .clone()
+            .filter(|&t| {
+                c.unit
+                    .tokens
+                    .get(t as usize)
+                    .is_some_and(|tok| tok.kind == dartq_scanner::TokenKind::String)
+            })
+            .collect();
+        let Some(&first) = segments.first() else {
+            return false;
+        };
+        let last = *segments.last().expect("first checked above");
+        for &t in &segments {
+            let lexeme = c.lexeme(t);
+            let text = if t == first {
+                strip_segment_prefix(lexeme)
+            } else {
+                lexeme
+            };
+            let text = if t == last {
+                strip_segment_suffix(text)
+            } else {
+                text
+            };
+            if crate::rules::directives::cook_string_body(text).is_some_and(|v| v.contains('\'')) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn strip_segment_prefix(lexeme: &str) -> &str {
+        let body = lexeme.strip_prefix('r').unwrap_or(lexeme);
+        let quote = body.as_bytes().first().copied().unwrap_or(b'\'');
+        let run = body.bytes().take_while(|&b| b == quote).count();
+        &body[run..]
+    }
+
+    fn strip_segment_suffix(lexeme: &str) -> &str {
+        let quote = lexeme.as_bytes().last().copied().unwrap_or(b'\'');
+        let run = lexeme.bytes().rev().take_while(|&b| b == quote).count();
+        &lexeme[..lexeme.len() - run]
+    }
+}
+
+pub(crate) mod unnecessary_raw_strings {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/unnecessary_raw_strings.dart:29-34`
+    /// — a raw simple string whose lexeme carries neither `\` nor `$`
+    /// reports at the literal. Only simple literals enter (`registry
+    /// .addSimpleStringLiteral`): a raw string never interpolates, so the
+    /// raw head lexeme is the whole literal — an interpolated literal's
+    /// middle segment can still open with an `r` (`"${x}rest"`) and must
+    /// stay silent. Message: `diagnostic.g.dart` `unnecessaryRawStrings`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_raw_strings",
+        group: Group::Standalone,
+        problem: "Unnecessary use of a raw string.",
+        correction: "Try using a normal string.",
+        kinds: &[NodeKind::StringLiteral],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let extent = super::literal_token_extent(c, c.node());
+        if extent.len() != 1 {
+            return;
+        }
+        let lexeme = c.lexeme(extent.start);
+        if !lexeme.starts_with('r') {
+            return;
+        }
+        if lexeme.contains('\\') || lexeme.contains('$') {
+            return;
+        }
+        c.report(c.utf16_span(c.node()), &[]);
+    }
+}
+
+pub(crate) mod use_raw_strings {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/use_raw_strings.dart:29-56` — a
+    /// non-raw simple string whose every escape is `\\` or `\$` reports at
+    /// the literal (those are exactly the escapes a raw string preserves;
+    /// any other escape bails). Interpolated literals are not simple and
+    /// never enter. Message: `diagnostic.g.dart` `useRawStrings`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "use_raw_strings",
+        group: Group::Standalone,
+        problem: "Use a raw string to avoid using escapes.",
+        correction: "Try making the string a raw string and removing the escapes.",
+        kinds: &[NodeKind::StringLiteral],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let extent = super::literal_token_extent(c, c.node());
+        // Only simple literals enter (`registry.addSimpleStringLiteral`):
+        // an interpolated literal's segments carry `\\`/`\$` spellings of
+        // their own that a raw string could not preserve.
+        if extent.len() != 1 {
+            return;
+        }
+        let lexeme = c.lexeme(extent.start);
+        if lexeme.starts_with('r') {
+            return;
+        }
+        let Some(contents) = super::string_contents(lexeme) else {
+            return;
+        };
+        // The official scan (:40-52): a backslash enters an escape; only
+        // `\\` and `\$` may follow; the final code unit is never examined.
+        let bytes = contents.as_bytes();
+        let mut has_escape = false;
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'\\' {
+                has_escape = true;
+                i += 1;
+                let current = bytes[i];
+                if current != b'\\' && current != b'$' {
+                    return;
+                }
+            }
+            i += 1;
+        }
+        if has_escape {
+            c.report(c.utf16_span(c.node()), &[]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -1551,5 +2189,198 @@ mod w3_pins {
             "{:?}",
             f.run(&one_rule("no_adjacent_strings_in_list"))
         );
+    }
+}
+
+/// The W5 (#1026) production-bridge pins: the string-wave rules over real
+/// parser trees, against the upstream corpora
+/// (`pkg/linter/test/rules/<name>_test.dart`).
+#[cfg(test)]
+mod w5_pins {
+    use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
+
+    // —— eol_at_end_of_file ————————————————————————————————————————————
+
+    /// `test_hasEol` — a file without a trailing newline reports one unit
+    /// at the trimmed end.
+    #[test]
+    fn eol_missing_reports_at_the_trimmed_end() {
+        let f = Fixture::parse("class A {}");
+        let lints = f.run(&one_rule("eol_at_end_of_file"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Missing a newline at the end of the file.");
+        assert_eq!(
+            lints[0].correction,
+            Some("Try adding a newline at the end of the file.".to_owned())
+        );
+        assert_eq!(lints[0].range, 10..11);
+    }
+
+    /// `test_hasNoEol` — a single trailing newline passes.
+    #[test]
+    fn eol_single_trailing_newline_passes() {
+        let f = Fixture::parse("class A {}\n");
+        assert!(f.run(&one_rule("eol_at_end_of_file")).is_empty());
+    }
+
+    /// `test_hasMultipleNewlines_message` — several trailing newlines
+    /// report the too-many texts at the trimmed end.
+    #[test]
+    fn eol_too_many_newlines_report() {
+        let f = Fixture::parse("class A {}\n\n");
+        let lints = f.run(&one_rule("eol_at_end_of_file"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Too many newlines at the end of the file.");
+        assert_eq!(
+            lints[0].correction,
+            Some("Try removing the extra newlines at the end of the file.".to_owned())
+        );
+        assert_eq!(lints[0].range, 10..11);
+    }
+
+    // —— lines_longer_than_80_chars —————————————————————————————————————
+
+    /// `test_longerThan80Characters` — the report anchors at column 81 and
+    /// runs to the line end (`start + 80..end`).
+    #[test]
+    fn lines_over_80_report_from_column_81() {
+        let source = format!("var p =\n    '{}';\n", " ".repeat(81));
+        let f = Fixture::parse(&source);
+        let lints = f.run(&one_rule("lines_longer_than_80_chars"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "The line length exceeds the 80-character limit.");
+        // Line 2 starts at 8 and is 88 units long (`    '` + 81 + `';`).
+        assert_eq!(lints[0].range, 88..96);
+    }
+
+    /// `test_exactly80Characters` — an 80-unit line passes.
+    #[test]
+    fn lines_exactly_80_pass() {
+        let source = format!("var p =\n    '{}';\n", " ".repeat(73));
+        let f = Fixture::parse(&source);
+        assert!(f.run(&one_rule("lines_longer_than_80_chars")).is_empty());
+    }
+
+    /// `test_multilineString` and `test_stringContainsForwardSlash` — a
+    /// multiline literal covers all its lines and a URI-or-path value
+    /// covers its own.
+    #[test]
+    fn lines_multiline_and_uri_exemptions() {
+        let source = "var p = \"\"\"\nThis line is a long, very long, very very long, \
+                      very very very long, very very very very long\n\"\"\";\n";
+        let f = Fixture::parse(source);
+        assert!(f.run(&one_rule("lines_longer_than_80_chars")).is_empty());
+
+        let source = format!("var p =\n    '/{}';\n", "x".repeat(90));
+        let f = Fixture::parse(&source);
+        assert!(f.run(&one_rule("lines_longer_than_80_chars")).is_empty());
+    }
+
+    // —— prefer_single_quotes ———————————————————————————————————————————
+
+    /// `test_doubleQuotes` — a double-quoted literal reports at itself.
+    #[test]
+    fn prefer_single_quotes_double_quotes_report() {
+        let f = Fixture::parse("var x = \"no quote\";");
+        let lints = f.run(&one_rule("prefer_single_quotes"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Unnecessary use of double quotes.");
+        assert_eq!(
+            lints[0].correction,
+            Some(
+                "Try using single quotes unless the string contains single quotes."
+                    .to_owned()
+            )
+        );
+        let literal = tok(&f.source, &f.tokens, "\"no quote\"", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, literal));
+    }
+
+    /// `test_singleQuote` and `test_doubleQuotes_innerSingleQuote` —
+    /// single quotes and a contained `'` pass.
+    #[test]
+    fn prefer_single_quotes_compliant_values_pass() {
+        let f = Fixture::parse("var x = 'uses single';");
+        assert!(f.run(&one_rule("prefer_single_quotes")).is_empty());
+
+        let f = Fixture::parse("var x = \"has quote '\";");
+        assert!(f.run(&one_rule("prefer_single_quotes")).is_empty());
+    }
+
+    /// `test_doubleQuotes_interpolationWithSingleQuote` — a nested string
+    /// inside `${...}` silences the rule; the interpolation face itself
+    /// reports (`test_doubleQuotes_interpolation`).
+    #[test]
+    fn prefer_single_quotes_nested_string_and_interpolation_faces() {
+        let f = Fixture::parse("var x = \"foo ${1 == 'x'} bar\";");
+        assert!(f.run(&one_rule("prefer_single_quotes")).is_empty());
+
+        let f = Fixture::parse("void f(String p) {\n  \"no quote $p\";\n}\n");
+        assert_eq!(f.run(&one_rule("prefer_single_quotes")).len(), 1);
+    }
+
+    // —— unnecessary_raw_strings ————————————————————————————————————————
+
+    /// `test_singleQuote_raw` — a raw string without `\` or `$` reports.
+    #[test]
+    fn unnecessary_raw_strings_reports_a_plain_raw_string() {
+        let f = Fixture::parse("var s = r'a b c d';");
+        let lints = f.run(&one_rule("unnecessary_raw_strings"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Unnecessary use of a raw string.");
+        let literal = tok(&f.source, &f.tokens, "r'a b c d'", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, literal));
+    }
+
+    /// `test_singleQuote_raw_containsBackslash` and `test_singleQuote` — a
+    /// `\`/`$`-carrying raw string and a non-raw string pass.
+    #[test]
+    fn unnecessary_raw_strings_escapes_and_plain_pass() {
+        let f = Fixture::parse("var s = r'a b c\\d';");
+        assert!(f.run(&one_rule("unnecessary_raw_strings")).is_empty());
+
+        let f = Fixture::parse("var s = 'a b c d';");
+        assert!(f.run(&one_rule("unnecessary_raw_strings")).is_empty());
+    }
+
+    /// Only simple literals enter (`registry.addSimpleStringLiteral`): an
+    /// interpolated literal's middle segment opens with `r` in
+    /// `"${x}rest"` and must stay silent.
+    #[test]
+    fn unnecessary_raw_strings_interpolated_literal_is_inert() {
+        let f = Fixture::parse("var x = 1;\nvar s = \"${x}rest\";");
+        assert!(f.run(&one_rule("unnecessary_raw_strings")).is_empty());
+    }
+
+    // —— use_raw_strings ————————————————————————————————————————————————
+
+    /// `test_escapedBackslash` — a literal whose every escape is raw-safe
+    /// reports.
+    #[test]
+    fn use_raw_strings_reports_raw_safe_escapes() {
+        let f = Fixture::parse(r"var f = '\\';");
+        let lints = f.run(&one_rule("use_raw_strings"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Use a raw string to avoid using escapes.");
+    }
+
+    /// `test_escapedMultiple_withNewline` and `test_raw_escapedBackslash`
+    /// — any other escape bails; raw strings never enter.
+    #[test]
+    fn use_raw_strings_other_escapes_and_raw_pass() {
+        let f = Fixture::parse(r"var f = '\$ and \\ and \n';");
+        assert!(f.run(&one_rule("use_raw_strings")).is_empty());
+
+        let f = Fixture::parse(r"var f = r'\\';");
+        assert!(f.run(&one_rule("use_raw_strings")).is_empty());
+    }
+
+    /// `test_escapedMultiple_withInterpolation` — an interpolated literal
+    /// is not a simple string and never enters (`registry
+    /// .addSimpleStringLiteral`), even with only raw-safe escapes.
+    #[test]
+    fn use_raw_strings_interpolated_literal_is_inert() {
+        let f = Fixture::parse("var x = 1;\nvar f = '\\$ and \\\\ and $x';");
+        assert!(f.run(&one_rule("use_raw_strings")).is_empty());
     }
 }
