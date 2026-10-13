@@ -21,7 +21,8 @@
 //!
 //! # Selection and coverage
 //!
-//! Drawn from `.third/lints/lib/{core,recommended}.yaml`. The base criterion:
+//! Drawn from the core and recommended sets of upstream `package:lints`.
+//! The base criterion:
 //! the rule's behavior must be fully determined by the syntax-level
 //! substrate — no flow analysis (#278), no type inference, no element model —
 //! with resolution-bound faces replaced by documented lexical approximations
@@ -215,9 +216,9 @@
 //! argued inside the discipline; `avoid_print` and `prefer_final_locals`
 //! are not `package:lints` members and never were.)
 //!
-//! Era note: behavior aligns to the Dart 3.15 main linter in
-//! `.third/dart-sdk` (the fact source per AGENTS.md), with rule lists from
-//! the pinned `package:lints` in `.third/lints`.
+//! Era note: behavior aligns to the Dart 3.15 main linter in upstream Dart
+//! SDK source (the fact source for all rule behavior), with rule lists from
+//! the pinned upstream `package:lints`.
 
 mod bridge;
 mod comments;

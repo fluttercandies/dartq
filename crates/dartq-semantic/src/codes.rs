@@ -4,7 +4,7 @@
 //!
 //! One variant per implemented frozen row. Every row was transcribed from
 //! the analyzer-8.4.1 registry and re-verified verbatim against the pinned
-//! live registry (`.third/dart-sdk`
+//! live registry (upstream Dart SDK source,
 //! `pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`, dart 3.15 main,
 //! analyzer 14.6.0-dev) — that
 //! unified registry is also the line-anchor source for the per-variant doc
@@ -28,8 +28,9 @@
 //!   (`diagnostic.g.dart`).
 //!
 //! The second batch's use-site split for the type-argument family follows
-//! the pinned oracle registry (`.third/dart-sdk` `pkg/analyzer/lib/src/
-//! diagnostic/diagnostic.g.dart`): type annotations and instance-creation
+//! the pinned oracle registry (upstream Dart SDK source,
+//! `pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`): type annotations
+//! and instance-creation
 //! type references report the base code, named-constructor references
 //! report `_constructor`, enum-constant type arguments report `_enum`,
 //! explicit extension overrides report `_extension`, and every resolved

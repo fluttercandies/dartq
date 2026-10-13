@@ -3,7 +3,7 @@
 //! [`ParsedUnit`] entry the consumption faces drive.
 //!
 //! Every node-producing event maps 1:1 onto the collapse-map verdict
-//! (`docs/facts/ast-collapse-map.md` §3): Begin events open the End-kind
+//! (the #31 adjudication, §3): Begin events open the End-kind
 //! container (R1), Handle events emit childless leaf/Fielded nodes, End
 //! events seal. Events whose official node is dropped by the map (D1-D4
 //! derivable, diagnostic-only) are explicit documented no-ops — never

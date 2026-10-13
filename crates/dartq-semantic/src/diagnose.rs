@@ -24,7 +24,7 @@
 //!
 //! The type-argument family keys off `begin/end_type_arguments`, with the
 //! code chosen by the use-site shape (the pinned oracle registry,
-//! `.third/dart-sdk` `diagnostic.g.dart`):
+//! upstream Dart SDK source `diagnostic.g.dart`):
 //! a pending *type head* (a `TypeReference` identifier that has not seen
 //! its `handle_type` yet) makes the group an annotation or a
 //! creation type reference → the base code; a head consumed inside an
@@ -132,8 +132,8 @@
 //! `duplicate_definition`) plus the batch-2 member family cover the frozen
 //! set's live triggers. Every member emission keys off the access intent and
 //! the receiver domain, mirroring the oracle's single-point dispatch
-//! (`.third/dart-sdk` `lookup_failure_reporter.dart`, domains × read/write ×
-//! read-syntax):
+//! (upstream Dart SDK source `lookup_failure_reporter.dart`, domains ×
+//! read/write × read-syntax):
 //!
 //! * instance receivers (`c.m` on a `C c`, `this.m`) report
 //!   `undefined_method` / `undefined_getter` / `undefined_setter`
@@ -6453,7 +6453,7 @@ impl<'a> Engine<'a> {
     // —— invalid_override (#453: the inheritance-override family) ——————
 
     /// Checks one instance-member declaration against the container's direct
-    /// super-faces (`.third/dart-sdk`
+    /// super-faces (upstream Dart SDK source,
     /// `pkg/analyzer/lib/src/error/inheritance_override.dart:498-546`
     /// `_checkDeclaredMember`): for each face, the nearest same-named
     /// non-static member; kind mismatches skip (other checks own them), and
@@ -21348,9 +21348,9 @@ mod tests {
 
     // —— #279: the constant-evaluation family ———————————————————————————
     //
-    // Anchors: the reporting sites in
-    // `.third/dart-sdk/pkg/analyzer/lib/src/dart/constant/
-    // constant_verifier.dart` (`visitVariableDeclaration` :552, the
+    // Anchors: the reporting sites in upstream Dart SDK source,
+    // `pkg/analyzer/lib/src/dart/constant/constant_verifier.dart`
+    // (`visitVariableDeclaration` :552, the
     // `_reportError` allow-list :717+), the operator matrix in
     // `.../constant/value.dart`, the invocation faults in
     // `.../constant/evaluation.dart` (`_invalidConstantForMethodInvocation`

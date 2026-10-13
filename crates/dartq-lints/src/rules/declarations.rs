@@ -154,8 +154,8 @@ pub(crate) mod prefer_typing_uninitialized_variables {
     /// variable reports at the variable; fields and locals carry different
     /// message texts (`...ForField` / `...ForLocalVariable`,
     /// `diagnostic.g.dart:2839/2852`). The type is the child before the
-    /// first variable (`NoType` = absent, collapse map §3.3). Core set
-    /// (`.third/lints/lib/core.yaml`).
+    /// first variable (`NoType` = absent, collapse map §3.3). Core set of
+    /// upstream `package:lints` (`lib/core.yaml`).
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_typing_uninitialized_variables",
         group: Group::Core,
