@@ -81,7 +81,11 @@ impl Interp<'_> {
                     }
                 }
             }
-            Ev::DeclaredVarPattern { name, is_final } => {
+            Ev::DeclaredVarPattern {
+                name,
+                is_final,
+                token,
+            } => {
                 // Pattern variables are assigned exactly when the pattern
                 // matched — declared initialized on the matched path
                 // (official `declare(initialized: true)` on the pattern's
@@ -96,7 +100,7 @@ impl Interp<'_> {
                     args: std::mem::take(&mut self.pending_ty_args),
                     late: false,
                     is_final: *is_final,
-                    decl_span: None,
+                    decl_span: Some(token.range),
                 };
                 self.declare_var(*name, meta, true);
                 if let Some(pattern) = self.pattern.as_mut() {

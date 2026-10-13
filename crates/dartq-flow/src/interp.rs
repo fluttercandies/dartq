@@ -495,6 +495,11 @@ pub(crate) struct Interp<'o> {
     pub(crate) facts: Vec<FlowFact>,
 
     pub(crate) decl: DeclCtx,
+    /// Enclosing declaration contexts: `VarDeclBegin` swaps the single
+    /// active slot out to here, `VarDeclEnd` restores it (#1051 — a nested
+    /// list's end must not reset the enclosing list's header type),
+    /// mirroring [`Interp::pending_decl_bases`] for the pending-init list.
+    pub(crate) decl_stack: Vec<DeclCtx>,
     pub(crate) pending_ty: Option<Ty>,
     /// Pattern-assignment writes awaiting their right-hand side.
     pub(crate) pending_writes: Vec<u32>,
@@ -539,6 +544,15 @@ pub(crate) struct Interp<'o> {
     /// separates them from init/updater slices.
     pub(crate) header_cond_depth: usize,
     pub(crate) anywhere: Effects,
+    /// Observational only (the write-site face's official semantics):
+    /// variables whose declaration initializer wrote them. The official
+    /// `AssignedVariables` does not count plain initializers as writes
+    /// (`prefer_final_locals`' premise), while the flow layer's own
+    /// `write_var` at `InitializerEnd` feeds promotions and stays — the
+    /// set lets the write-site aggregation subtract them without touching
+    /// any flow decision. Ids are stable across collect runs, so no
+    /// rollback bookkeeping is needed.
+    pub(crate) initializer_writes: FxHashSet<u32>,
     /// The open dead-code interval (official
     /// `NullSafetyDeadCodeVerifier._firstDead`): the first unreachable
     /// node anchors one row; every later unreachable node continues the
@@ -591,6 +605,7 @@ impl<'o> Interp<'o> {
             vars: Vec::new(),
             facts: Vec::new(),
             decl: DeclCtx::default(),
+            decl_stack: Vec::new(),
             pending_ty: None,
             pending_writes: Vec::new(),
             pending_inits: Vec::new(),
@@ -611,6 +626,7 @@ impl<'o> Interp<'o> {
             for_header_depth: 0,
             header_cond_depth: 0,
             anywhere: Effects::default(),
+            initializer_writes: FxHashSet::default(),
             dead: None,
             stmt_began_dead: false,
             collect: None,
@@ -629,6 +645,49 @@ impl<'o> Interp<'o> {
             match control {
                 Control::Continue => i += 1,
                 Control::Jump(to) => i = to,
+            }
+        }
+        // The write-site rows (the semantic query face's family-c):
+        // aggregated from the AssignedVariables anywhere sets — `captured`
+        // holds the writes inside nested closures, `written` minus
+        // `captured` the writes outside them (declaration initializers
+        // subtract — the official sets do not count them, see
+        // [`Self::initializer_writes`]) — one row per (declaration,
+        // in-closure) pair. Emitted after the replay: the ids the
+        // pre-pass recorded are the replay's own (the declaration
+        // sequence is deterministic), so the metadata lookup cannot name
+        // the wrong variable. Stale ids (collect-rollback residue, the
+        // `cjoin` live filter's concern) and declarations without a name
+        // span emit nothing. Ids sort first because the take_facts sort
+        // is stable and equal decl-offset keys would otherwise order by
+        // hash-set iteration — nondeterministic.
+        let mut ids: Vec<u32> = self
+            .anywhere
+            .written
+            .difference(&self.anywhere.captured)
+            .copied()
+            .filter(|var| !self.initializer_writes.contains(var))
+            .collect();
+        ids.sort_unstable();
+        for &var in &ids {
+            if let Some(span) = self.vars.get(var as usize).and_then(|meta| meta.decl_span) {
+                self.emit(FlowFact::WriteSite {
+                    decl_name_span: span,
+                    in_closure: false,
+                });
+            }
+        }
+        ids.clear();
+        ids.extend(self.anywhere.captured.iter().copied());
+        ids.sort_unstable();
+        for var in ids {
+            if let Some(span) =
+                self.vars.get(var as usize).and_then(|meta| meta.decl_span)
+            {
+                self.emit(FlowFact::WriteSite {
+                    decl_name_span: span,
+                    in_closure: true,
+                });
             }
         }
         // The declaration exit for the OUTERMOST executable: the recorder
@@ -1715,7 +1774,7 @@ impl Interp<'_> {
         // written at its Ident event; a pattern head declares its
         // variables assigned on match.
         if let Some(var) = events[head_start..i].iter().find_map(|ev| match ev {
-            Ev::InitializedIdent { name } => self.resolve(*name),
+            Ev::InitializedIdent { name, .. } => self.resolve(*name),
             _ => None,
         }) {
             self.write_var(var, Ty::UNKNOWN, false);

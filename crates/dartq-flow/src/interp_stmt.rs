@@ -839,14 +839,35 @@ impl Interp<'_> {
                 span,
             } => {
                 self.header_dead_check(*span);
-                self.decl = DeclCtx {
-                    late: *late,
-                    is_final: *is_final,
-                    // The type events follow the keyword; the sink fills
-                    // this in (default for `var`).
-                    ty: Ty::UNKNOWN,
-                    args: crate::ty::EMPTY_ARGS,
-                };
+                // Nested lists swap-and-save the enclosing context (#1051,
+                // paired at `VarDeclEnd`) — an inner list's header must not
+                // discard the outer list's type for its remaining items.
+                let ty = self.pending_ty.take().unwrap_or(Ty::UNKNOWN);
+                let args = std::mem::take(&mut self.pending_ty_args);
+                let outer = std::mem::replace(
+                    &mut self.decl,
+                    DeclCtx {
+                        late: *late,
+                        is_final: *is_final,
+                        // The header's annotation arrives as `Type`/`NoType`
+                        // events immediately ahead of this event (statements
+                        // and fields both parse the type before
+                        // `begin_variables_declaration`), parked in
+                        // `pending_ty` exactly as the `Formal` and pattern
+                        // consumers read it — leaving it there declared
+                        // every typed local as unknown, which silenced
+                        // null-check promotions over it (#1011). The
+                        // `in_decl` sink path below stays as the fallback
+                        // for an annotation that follows the begin but
+                        // precedes the first identifier; that identifier
+                        // seals the slot (`InitializedIdent`), so
+                        // initializer-internal `Type` events cannot
+                        // redeclare later list items (#1037).
+                        ty,
+                        args,
+                    },
+                );
+                self.decl_stack.push(outer);
                 self.in_decl = true;
                 // Paired with `VarDeclEnd`: declarations nested inside an
                 // initializer stack their pending inits on top of the
@@ -854,14 +875,27 @@ impl Interp<'_> {
                 // clobber the enclosing pending write).
                 self.pending_decl_bases.push(self.pending_inits.len());
             }
-            Ev::InitializedIdent { name } => {
+            Ev::InitializedIdent { name, token } => {
                 let meta = VarMeta {
                     ty: self.decl.ty,
                     args: self.decl.args,
                     late: self.decl.late,
                     is_final: self.decl.is_final,
-                    decl_span: None,
+                    decl_span: Some(token.range),
                 };
+                // The declaration's type slot closes with the first variable
+                // it declares. A later `Type` event inside the list belongs
+                // to a nested construct — a closure parameter's annotation,
+                // an `is`/`as` in another item's initializer — not to the
+                // header; letting it into the sink re-declared the remaining
+                // list items with the leaked type (#1037: the closure
+                // parameter itself read unknown in the same stroke). The
+                // header annotation always precedes this event (`Type`
+                // fires before `VarDeclBegin` in the real stream, and the
+                // fallback shape parks it in the slot before the first
+                // identifier), so sealing here keeps the header type for
+                // the list's remaining items.
+                self.in_decl = false;
                 // Declared before the initializer runs (official
                 // `declare(initialized: false)` — a self-reference reads
                 // definitely unassigned).
@@ -873,16 +907,32 @@ impl Interp<'_> {
                 let rhs = self.exprs.pop();
                 if let (Some(var), Some(rhs)) = (var, rhs) {
                     self.write_var(var, rhs.ty, true);
+                    // The write-site face's observational subtraction (see
+                    // [`Interp::initializer_writes`]): the official
+                    // AssignedVariables does not count plain initializers.
+                    self.initializer_writes.insert(var);
                 }
             }
             Ev::VarDeclEnd => {
-                self.decl = DeclCtx::default();
+                // Restore the enclosing list's context (#1051); the
+                // outermost list's restore yields the default — the same
+                // value the previous unconditional reset wrote.
+                self.decl = self.decl_stack.pop().unwrap_or_default();
+                // The slot is closed with the list: a nested list can only
+                // begin inside an initializer, and every list's first
+                // identifier precedes its initializers, so the enclosing
+                // list's seal (set at its first `InitializedIdent`) is
+                // already `false` here — no per-list stacking needed.
                 self.in_decl = false;
                 if let Some(base) = self.pending_decl_bases.pop() {
                     self.pending_inits.truncate(base);
                 }
             }
-            Ev::Formal { name, .. } => {
+            Ev::Formal {
+                name,
+                this_or_super: _,
+                token,
+            } => {
                 let ty = self.pending_ty.take().unwrap_or(Ty::UNKNOWN);
                 let args = std::mem::take(&mut self.pending_ty_args);
                 let meta = VarMeta {
@@ -890,7 +940,7 @@ impl Interp<'_> {
                     args,
                     late: false,
                     is_final: false,
-                    decl_span: None,
+                    decl_span: Some(token.range),
                 };
                 self.declare_var(*name, meta, true);
             }

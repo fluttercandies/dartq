@@ -66,4 +66,36 @@ pub enum FlowFact {
         /// empty body.
         span: TokenSpan,
     },
+    /// The flow type at one identifier read: the promoted type when a
+    /// promotion stands, the declared type otherwise. Unlike
+    /// [`FlowFact::PromotedRead`] every reachable read emits a row (a
+    /// few hundred to a few thousand per file), so a consumer can ask
+    /// for the static type at any read without re-running the fold.
+    /// Payloads mirror [`FlowFact::PromotedRead`]; dead reads carry no
+    /// row (their region is already the dead-code face), and a plain
+    /// assignment's target identifier is a write, not a read — its row
+    /// retracts with the target's read facts.
+    ReadType {
+        /// Span of the read's identifier token.
+        span: TokenSpan,
+        /// The flow type on this control-flow path (promoted or declared).
+        ty: Ty,
+        /// The type's written argument tree (arena index;
+        /// [`crate::ty::EMPTY_ARGS`] when argument-less).
+        args: u32,
+    },
+    /// One write-classification row of a local variable (or parameter),
+    /// aggregated from the official `AssignedVariables` anywhere sets:
+    /// at most one row per (declaration, in-closure) pair per body —
+    /// `in_closure: false` for a declaration with writes outside nested
+    /// closures, `in_closure: true` for one written inside a nested
+    /// closure. The write positions themselves are not tracked (the
+    /// sets carry variable ids only); a declaration with no row is
+    /// never written in its body.
+    WriteSite {
+        /// Span of the declaration's name token.
+        decl_name_span: dartq_source::SourceRange,
+        /// The writes sit inside a nested closure.
+        in_closure: bool,
+    },
 }

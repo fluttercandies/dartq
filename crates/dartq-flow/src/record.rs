@@ -225,7 +225,9 @@ impl<'t> Flow<'t> {
             FlowFact::DeadCode { span }
             | FlowFact::UnassignedRead { span, .. }
             | FlowFact::PromotedRead { span, .. }
+            | FlowFact::ReadType { span, .. }
             | FlowFact::BodyMayCompleteNormally { span } => span.range.offset,
+            FlowFact::WriteSite { decl_name_span, .. } => decl_name_span.offset,
         });
         facts
     }
@@ -543,16 +545,17 @@ impl ParserListener for Flow<'_> {
         this_keyword: Option<Token>,
         _super_keyword: Option<Token>,
         _period: Option<Token>,
-        name: Token,
+        name_token: Token,
         _initializer_start: Option<Token>,
         _initializer_end: Option<Token>,
         _kind: FormalParameterKind,
         _member_kind: MemberKind,
     ) {
-        let name = self.name(name);
+        let name = self.name(name_token);
         self.record(Ev::Formal {
             name,
             this_or_super: this_keyword.is_some(),
+            token: name_token,
         });
     }
 
@@ -562,6 +565,7 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::Formal {
             name,
             this_or_super: false,
+            token,
         });
     }
 
@@ -599,7 +603,7 @@ impl ParserListener for Flow<'_> {
 
     fn begin_initialized_identifier(&mut self, token: Token) {
         let name = self.name(token);
-        self.record(Ev::InitializedIdent { name });
+        self.record(Ev::InitializedIdent { name, token });
     }
 
     fn end_initialized_identifier(&mut self, _name: Token) {
@@ -1453,6 +1457,7 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::DeclaredVarPattern {
             name,
             is_final: keyword.is_some(),
+            token: variable,
         });
     }
 

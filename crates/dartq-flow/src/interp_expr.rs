@@ -9,7 +9,7 @@ pub(crate) use crate::interp::Expr;
 use crate::interp::{Frame, Interp};
 use crate::model::State;
 use crate::model::is_non_nullable;
-use crate::ty::{Base, Ty};
+use crate::ty::{Base, Classification, Ty};
 
 impl Interp<'_> {
     /// Handles one expression-layer event; `false` means the event belongs
@@ -72,6 +72,22 @@ impl Interp<'_> {
                             // target identifier is a write, not a read.
                             if self.reachable() && ty != declared {
                                 self.emit(FlowFact::PromotedRead {
+                                    span: *token,
+                                    ty,
+                                    args,
+                                });
+                            }
+                            // The read-type row (the semantic query face's
+                            // family-a): every reachable read carries its
+                            // flow type — promoted or declared — so a
+                            // consumer can ask for the static type at the
+                            // span without re-running the fold. Same
+                            // retraction invariant as the promotion fact
+                            // above: a plain assignment's target read
+                            // retracts with it (the target identifier is a
+                            // write, not a read).
+                            if self.reachable() {
+                                self.emit(FlowFact::ReadType {
                                     span: *token,
                                     ty,
                                     args,
@@ -437,6 +453,7 @@ impl Interp<'_> {
                                     fact,
                                     FlowFact::UnassignedRead { span: s, .. }
                                         | FlowFact::PromotedRead { span: s, .. }
+                                        | FlowFact::ReadType { span: s, .. }
                                         if *s == span
                                 )
                             });
@@ -845,10 +862,11 @@ impl Interp<'_> {
     }
 
     /// Routes a declared type to its consumer: the open variable
-    /// declaration, the pending formal, the open `is`-test, or the open
-    /// `as`-cast. The written-argument id rides beside the type (#611
-    /// step 4) — every type row passes through here, so each sink sees
-    /// the pair as one fact.
+    /// declaration's type slot (from `VarDeclBegin` until its first
+    /// identifier seals it — #1037), the pending formal, the open
+    /// `is`-test, or the open `as`-cast. The written-argument id rides
+    /// beside the type (#611 step 4) — every type row passes through
+    /// here, so each sink sees the pair as one fact.
     fn sink_type(&mut self, ty: Ty, args: u32) {
         if self.in_decl {
             self.decl.ty = ty;
@@ -921,26 +939,48 @@ impl Interp<'_> {
         (matched, unmatched)
     }
 
-    /// The official `_equalityCheck` at the name level: a null literal on
-    /// one side promotes (or un-promotes) the other side's reference in
-    /// the branch states.
+    /// The official `_equalityCheck` at the name level, in its decision
+    /// order (upstream Dart SDK flow_analysis): (1) both operand types
+    /// classify null-or-equivalent — a known equal result; (2)
+    /// null-or-equivalent vs non-nullable — a known not-equal result;
+    /// (3) one operand is a null *literal* — a null check promoting the
+    /// other side's reference. A `Null`-typed variable read is a
+    /// reference, not a literal, so it carries no null info and promotes
+    /// nothing; any other shape leaves both branch sides reachable.
     fn equality_check(&mut self, left: &Expr, right: &Expr, inverted: bool) {
         let mut expr = Expr::trivial(Ty::UNKNOWN);
-        let null_side = |e: &Expr| e.ty.base == crate::ty::Base::Null;
-        let reference = if null_side(right) {
-            left.reference
-        } else if null_side(left) {
-            right.reference
+        let ops = self.ops;
+        // Official `_isNullType`: `classifyType` → nullOrEquivalent —
+        // `Null` and equivalents such as `Never?`. A type question, not a
+        // literal question.
+        let null_ty = |t: Ty| ops.classify(t) == Classification::NullOrEquivalent;
+        // Official `ExpressionInfo.isNull` fires for the null literal
+        // only; in this pipeline the literal is the sole null-typed
+        // expression without a promotable reference.
+        let null_literal = |e: &Expr| e.ty.base == Base::Null && e.reference.is_none();
+        let (left_null, right_null) = (null_ty(left.ty), null_ty(right.ty));
+        if left_null && right_null {
+            // Known equal: `null == null` kills the else-branch, `null
+            // != null` the then-branch.
+            expr.bool_value = Some(!inverted);
+            expr.branches = None;
+        } else if (left_null && is_non_nullable(ops, right.ty))
+            || (right_null && is_non_nullable(ops, left.ty))
+        {
+            // Disjoint by nullability: known not-equal — `==` kills the
+            // then-branch, `!=` the else-branch.
+            expr.bool_value = Some(inverted);
+            expr.branches = None;
         } else {
-            None
-        };
-        if let Some(var) = reference {
-            let operand = if null_side(right) { left } else { right };
-            if is_non_nullable(self.ops, operand.ty) {
-                // Never null: the equality result is a known constant.
-                expr.bool_value = Some(inverted);
-                expr.branches = None;
+            let null_ref = if null_literal(right) {
+                left.reference
+            } else if null_literal(left) {
+                right.reference
             } else {
+                None
+            };
+            if let Some(var) = null_ref {
+                let operand = if null_literal(right) { left } else { right };
                 let promoted = self.ops.promote_to_non_null(operand.ty);
                 let matched = self.current.clone().finish_type_test(
                     self.ops,
@@ -959,10 +999,11 @@ impl Interp<'_> {
                 };
                 self.current = if_true.clone();
                 expr.branches = Some((if_true, if_false));
+            } else {
+                // No null information: both sides reachable, no promotion.
+                let cur = self.current.clone();
+                expr.branches = Some((cur.clone(), cur));
             }
-        } else {
-            let cur = self.current.clone();
-            expr.branches = Some((cur.clone(), cur));
         }
         self.exprs.push(expr);
     }

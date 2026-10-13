@@ -50,6 +50,9 @@ pub enum Ev {
         /// Interned name id (record time).
         name: u32,
         this_or_super: bool,
+        /// The parameter's name token (the write-site face's declaration
+        /// anchor).
+        token: TokenSpan,
     },
     VarDeclBegin {
         late: bool,
@@ -59,6 +62,9 @@ pub enum Ev {
     VarDeclEnd,
     InitializedIdent {
         name: u32,
+        /// The declared identifier's own token (the write-site face's
+        /// declaration anchor).
+        token: TokenSpan,
     },
     NoInitializer,
     InitializerBegin,
@@ -383,6 +389,9 @@ pub enum Ev {
     DeclaredVarPattern {
         name: u32,
         is_final: bool,
+        /// The declared identifier's own token (the write-site face's
+        /// declaration anchor).
+        token: TokenSpan,
     },
     AssignedVarPattern {
         name: u32,

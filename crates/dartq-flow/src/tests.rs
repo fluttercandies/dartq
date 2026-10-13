@@ -96,6 +96,8 @@ fn dead_snippets(source: &str) -> Vec<String> {
             ),
             FlowFact::UnassignedRead { .. }
             | FlowFact::PromotedRead { .. }
+            | FlowFact::ReadType { .. }
+            | FlowFact::WriteSite { .. }
             | FlowFact::BodyMayCompleteNormally { .. } => None,
         })
         .collect()
@@ -113,20 +115,30 @@ fn unassigned_snippets(source: &str) -> Vec<String> {
             ),
             FlowFact::DeadCode { .. }
             | FlowFact::PromotedRead { .. }
+            | FlowFact::ReadType { .. }
+            | FlowFact::WriteSite { .. }
             | FlowFact::BodyMayCompleteNormally { .. } => None,
         })
         .collect()
 }
 
 /// The read-face facts of a source (dead code, unassigned reads,
-/// promoted reads) without the body-completion rows: the assertion face
-/// of the tests that pin those three faces. A reachable executable
-/// emits a completion row by design (#676), so a whole-list emptiness
-/// check would observe it.
+/// promoted reads) without the completion and query-face rows: the
+/// assertion face of the tests that pin the three diagnostic faces. A
+/// reachable executable emits a completion row by design (#676), and
+/// every reachable read emits a ReadType row plus its body the write
+/// rows (#1056), so a whole-list emptiness check would observe them.
 fn read_facts_of(source: &str) -> Vec<FlowFact> {
     facts_of(source)
         .into_iter()
-        .filter(|fact| !matches!(fact, FlowFact::BodyMayCompleteNormally { .. }))
+        .filter(|fact| {
+            !matches!(
+                fact,
+                FlowFact::BodyMayCompleteNormally { .. }
+                    | FlowFact::ReadType { .. }
+                    | FlowFact::WriteSite { .. }
+            )
+        })
         .collect()
 }
 
@@ -186,7 +198,7 @@ fn decl_block(name: u32, ty: crate::ev::Ev) -> Vec<crate::ev::Ev> {
             span: tspan(0),
         },
         ty,
-        crate::ev::Ev::InitializedIdent { name },
+        crate::ev::Ev::InitializedIdent { name, token: tspan(0) },
         crate::ev::Ev::InitializerBegin,
         crate::ev::Ev::OtherExpr { span: tspan(1) },
         crate::ev::Ev::InitializerEnd,
@@ -706,6 +718,211 @@ fn null_check_promotion_emits_read_fact() {
     assert!(!promoted[0].nullable);
 }
 
+/// #1011 pin: the same `!= null` null check over a local declared with a
+/// `null` initializer (`int? x = null;`) stages the promotion the same way
+/// — the write demotes to the fresh model and the equality check re-promotes
+/// on the matched branch, so the then-branch read carries the non-null
+/// declared type. The `== null` polarity pins the else-branch arm, and the
+/// `final` twin pins that the initializer write does not block finals.
+#[test]
+fn null_check_promotes_a_null_initialized_local() {
+    let promoted_name = |source: &str| {
+        let promoted = promoted_tys(source);
+        assert_eq!(promoted.len(), 1, "{source:?}");
+        assert!(
+            matches!(promoted[0].base, crate::ty::Base::Name(_)),
+            "{source:?}"
+        );
+        assert!(!promoted[0].nullable, "{source:?}");
+    };
+    // The #1011 repro shape: then-branch read promoted.
+    promoted_name("void f() { int? x = null; if (x != null) { int y = x; } }");
+    // `== null` takes the promotion into the else branch.
+    promoted_name("void f() { int? x = null; if (x == null) { x = 1; } else { int y = x; } }");
+    // Reversed operand order is the same null check.
+    promoted_name("void f() { int? x = null; if (null != x) { int y = x; } }");
+    // The final twin: same initializer, same promotion.
+    promoted_name("void f() { final int? x = null; if (x != null) { int y = x; } }");
+}
+
+/// official `equalityOp(null != null) equivalent to false`
+/// (`flow_analysis_test.dart`): both operands null — `_equalityCheck`
+/// returns a known equal result, so the not-equal outcome is unreachable
+/// (then-branch dead) and `==` inverts the dead side to the else-branch.
+#[test]
+fn null_null_equality_is_a_known_constant() {
+    let source = "void f() { if (null != null) { print(1); } }";
+    assert_eq!(dead_snippets(source), ["{ print(1); }"]);
+    let source = "void f() { if (null == null) { print(1); } else { print(2); } }";
+    assert_eq!(dead_snippets(source), ["{ print(2); }"]);
+}
+
+/// official `equalityOp(x != <null expr>) does not promote`
+/// (`flow_analysis_test.dart`): a `Null`-typed variable read is not a
+/// null literal (official `ExpressionInfo.isNull` fires for the literal
+/// only), so the equality check carries no promotion and both branch
+/// sides keep `x` unpromoted. The literal control still promotes.
+#[test]
+fn null_typed_variable_operand_does_not_promote() {
+    let source = "void f() { Null n = null; int? x; if (x != n) { int y = x; } }";
+    assert!(promoted_tys(source).is_empty(), "{source:?}");
+    // Literal control: the same shape against `null` promotes.
+    let control = "void f() { int? x; if (x != null) { int y = x; } }";
+    let promoted = promoted_tys(control);
+    assert_eq!(promoted.len(), 1, "{control:?}");
+    assert!(!promoted[0].nullable, "{control:?}");
+}
+
+/// `Never?` classifies null-or-equivalent (official `_isNullType` via
+/// `classifyType`), so it takes the type-level arms: known-equal against
+/// `null` (`n != null` kills the then-branch — the pre-classify check
+/// would have wrongly entered the promotion arm), known-not-equal against
+/// a non-nullable operand (the distinguishability arm), and no
+/// information against a potentially-nullable one (both sides reachable,
+/// no promotion).
+#[test]
+fn never_question_takes_the_null_type_arms() {
+    // NullOrEquivalent x NullOrEquivalent: known equal.
+    let source = "void f() { Never? n = null; if (n != null) { print(1); } }";
+    assert_eq!(dead_snippets(source), ["{ print(1); }"]);
+    // NullOrEquivalent x NonNullable: known not-equal — `==` kills the
+    // then-branch, `!=` the else-branch.
+    let source = "void f() { Never? n = null; int y = 0; if (y == n) { print(1); } else { print(2); } }";
+    assert_eq!(dead_snippets(source), ["{ print(1); }"]);
+    let source = "void f() { Never? n = null; int y = 0; if (y != n) { print(1); } else { print(2); } }";
+    assert_eq!(dead_snippets(source), ["{ print(2); }"]);
+    // NullOrEquivalent x PotentiallyNullable: no information.
+    let source = "void f() { Never? n = null; int? x; if (x == n) { print(1); } else { print(2); } }";
+    assert!(dead_snippets(source).is_empty(), "{source:?}");
+    assert!(promoted_tys(source).is_empty());
+}
+
+/// #1037 pin: a closure parameter's type annotation types only that
+/// parameter — it must not re-enter the open declaration list's type slot
+/// and re-declare the list's later items. Upstream Dart SDK semantics:
+/// every variable of a declaration list is declared from its own header or
+/// initializer (`c` in `var a = (String? b) => b, c = 1;` is `int` from
+/// `1`, not the parameter's `String?`). The interp face: the parameter's
+/// `Type` events fire between `VarDeclBegin` and `VarDeclEnd` (the
+/// closure initializer runs inside the list), exactly where the declared
+/// type sink would otherwise swallow them.
+#[test]
+fn closure_parameter_type_does_not_leak_across_declaration_list() {
+    // The leak discriminator: a leaked `String?` declared type on `c`
+    // makes the then-branch read after `c != null` emit the promotion row
+    // the oracle never emits (upstream `c` is non-nullable `int` — the
+    // check is trivial and promotes nothing).
+    assert!(
+        promoted_tys("void f() { var a = (String? b) => b, c = 1; if (c != null) { int y = c; } }")
+            .is_empty(),
+        "the closure parameter's `String?` must not declare `c`"
+    );
+    // The leak reaches every later item of the list: mixed initializers
+    // each declare from themselves (`c` from `1`, `d` from `'s'`), so no
+    // follow-up null check promotes anything.
+    assert!(
+        promoted_tys(
+            "void f() { var a = (String? b) => b, c = 1, d = 's'; if (c != null) { int y = c; } if (d != null) { int z = d; } }"
+        )
+        .is_empty(),
+        "both `c` and `d` must infer from their own initializers"
+    );
+    // The green face: the parameter itself IS typed by its annotation —
+    // the closure body's null check promotes `b` to non-null `String`
+    // (pre-fix the annotation was swallowed by the open list's slot and
+    // `b` read unknown, emitting no row).
+    let promoted = promoted_tys(
+        "void f() { var a = (String? b) { if (b != null) { int y = b; } return 1; }; }",
+    );
+    assert_eq!(promoted.len(), 1, "the parameter `b` reads promoted");
+    assert!(
+        matches!(promoted[0].base, crate::ty::Base::Name(_)),
+        "{promoted:?}"
+    );
+    assert!(!promoted[0].nullable, "the promotion drops the `?`");
+}
+
+/// #1051 pin: a nested declaration list — a local function body inside an
+/// initializer — must not clobber the enclosing list's header type. Each
+/// declaration list's header declares its own variables: upstream Dart SDK
+/// semantics give `b` in `int? a = (() { var t = 1; })(), b = 3;` the outer
+/// header's type — the inner `var t` neither leaks in nor resets it. The
+/// interp face: the inner list's `VarDeclBegin`/`VarDeclEnd` bracket the
+/// outer list's remaining items, exactly where the single declaration slot
+/// was reset to the default. The header is spelled `int?` and the
+/// initializer `null` (the #1011 idiom) so the follow-up null check's
+/// then-branch read is the one promotion row; pre-fix `b` declared unknown
+/// and no row could fire.
+#[test]
+fn nested_declaration_list_keeps_the_outer_header_type() {
+    let promoted_row = |source: &str| {
+        let promoted = promoted_tys(source);
+        assert_eq!(promoted.len(), 1, "{source:?}");
+        assert!(
+            matches!(promoted[0].base, crate::ty::Base::Name(_)),
+            "{promoted:?}"
+        );
+        assert!(!promoted[0].nullable, "{promoted:?}");
+    };
+    // The canonical shape: the inner list's `VarDeclEnd` sits between the
+    // outer header and `b` — the header type must survive it.
+    promoted_row(
+        "void f() { int? a = (() { var t = 1; return 2; })(), b = null; if (b != null) { int y = b; } }",
+    );
+    // The flat twin: no nesting, same face — the restore path must not
+    // break the plain list.
+    promoted_row("void f() { int? a = null, b = null; if (b != null) { int y = b; } }");
+    // Precision: the non-nullable `int` spelling restores as exactly that —
+    // the null check is then trivial and emits no row (a wrong nullable
+    // restore would emit one; a lost header emits none, which the canonical
+    // shape above discriminates).
+    assert!(
+        promoted_tys(
+            "void f() { int a = (() { var t = 1; return 2; })(), b = 3; if (b != null) { int y = b; } }"
+        )
+        .is_empty(),
+        "`b` is declared non-nullable `int`; the check promotes nothing"
+    );
+}
+
+/// #1051 pin, two levels deep: the outermost header must survive two nested
+/// `VarDeclBegin`/`VarDeclEnd` brackets — the save/restore is a stack, not
+/// a single saved slot (one slot would drop the outermost context when the
+/// inner list saves over it).
+#[test]
+fn doubly_nested_declaration_lists_restore_transitively() {
+    let promoted = promoted_tys(
+        "void f() { int? a = (() { var t = (() { var u = 1; })(), s = 2; })(), b = null; if (b != null) { int y = b; } }",
+    );
+    assert_eq!(promoted.len(), 1, "the outermost header reaches `b`");
+    assert!(
+        matches!(promoted[0].base, crate::ty::Base::Name(_)),
+        "{promoted:?}"
+    );
+    assert!(!promoted[0].nullable, "the promotion drops the `?`");
+}
+
+/// #1051 pin with the #1037 seal in the loop: the outer header must also
+/// survive a nested list followed by a later item whose initializer carries
+/// a closure parameter's `Type` events. The parameter types only its own
+/// formal; `d` still declares from the outer header (`int?`), so its
+/// null-check read emits the row. A broken per-list seal would re-declare
+/// `d` from the parameter's non-nullable `String` (trivial check, no row);
+/// the lost header declares `d` unknown (no row either) — only the stacked
+/// restore emits exactly one.
+#[test]
+fn nested_list_then_closure_parameter_leaves_the_outer_header_intact() {
+    let promoted = promoted_tys(
+        "void f() { int? a = (() { var t = 1; return 2; })(), b = (String c) => 1, d = null; if (d != null) { int y = d; } }",
+    );
+    assert_eq!(promoted.len(), 1, "the outer header reaches `d`");
+    assert!(
+        matches!(promoted[0].base, crate::ty::Base::Name(_)),
+        "{promoted:?}"
+    );
+    assert!(!promoted[0].nullable, "the promotion drops the `?`");
+}
+
 // —— promotion facts (PromotedRead) ————————————————————————————————————————
 
 /// (a) An `x is T`-promoted read emits `PromotedRead` carrying the
@@ -826,18 +1043,22 @@ fn take_facts_stays_offset_sorted_with_promotion_reads() {
     let source = "void f() { return; 1; } void g(num x) { if (x is int) { x; } }";
     let facts = facts_of(source);
     // f ends unreachable (no completion row); g falls through — its row
-    // anchors at the unit's last token, so it sorts last.
-    assert_eq!(facts.len(), 3, "{facts:?}");
+    // anchors at the unit's last token, so it sorts last. The read emits
+    // the promotion row and its own ReadType row at the same span (#1056).
+    assert_eq!(facts.len(), 4, "{facts:?}");
     assert!(matches!(facts[0], FlowFact::DeadCode { .. }));
     assert!(matches!(facts[1], FlowFact::PromotedRead { .. }));
-    assert!(matches!(facts[2], FlowFact::BodyMayCompleteNormally { .. }));
+    assert!(matches!(facts[2], FlowFact::ReadType { .. }));
+    assert!(matches!(facts[3], FlowFact::BodyMayCompleteNormally { .. }));
     let offsets: Vec<u32> = facts
         .iter()
         .map(|fact| match fact {
             FlowFact::DeadCode { span }
             | FlowFact::UnassignedRead { span, .. }
             | FlowFact::PromotedRead { span, .. }
+            | FlowFact::ReadType { span, .. }
             | FlowFact::BodyMayCompleteNormally { span } => span.range.offset,
+            FlowFact::WriteSite { decl_name_span, .. } => decl_name_span.offset,
         })
         .collect();
     assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
@@ -1307,7 +1528,7 @@ fn c_style_collection_for_closes_its_loop_frame() {
             is_final: true,
             span: span(10),
         },
-        Ev::InitializedIdent { name: 0 },
+        Ev::InitializedIdent { name: 0, token: span(1) },
         Ev::OtherExpr { span: span(11) },
         Ev::InitializerEnd,
         Ev::VarDeclEnd,
@@ -1873,7 +2094,7 @@ fn assert_condition_write_unassigned_after() {
             is_final: false,
             span: span(1),
         },
-        Ev::InitializedIdent { name: 0 },
+        Ev::InitializedIdent { name: 0, token: span(1) },
         Ev::NoInitializer,
         Ev::VarDeclEnd,
         // assert((v = 0) >= 0, v);
@@ -1954,7 +2175,7 @@ fn pattern_assignment_writes_targets() {
             is_final: false,
             span: span(1),
         },
-        Ev::InitializedIdent { name: 0 },
+        Ev::InitializedIdent { name: 0, token: span(1) },
         Ev::NoInitializer,
         Ev::VarDeclEnd,
         Ev::VarDeclBegin {
@@ -1962,7 +2183,7 @@ fn pattern_assignment_writes_targets() {
             is_final: false,
             span: span(2),
         },
-        Ev::InitializedIdent { name: 1 },
+        Ev::InitializedIdent { name: 1, token: span(2) },
         Ev::NoInitializer,
         Ev::VarDeclEnd,
         Ev::PatternBegin,
@@ -2015,10 +2236,12 @@ fn pattern_declaration_declares_assigned() {
         Ev::DeclaredVarPattern {
             name: 0,
             is_final: false,
+            token: span(1),
         },
         Ev::DeclaredVarPattern {
             name: 1,
             is_final: false,
+            token: span(2),
         },
         Ev::PatternEnd,
         Ev::OtherExpr { span: span(1) },
@@ -2091,7 +2314,7 @@ fn closure_await_demotes_captured_reads() {
             is_final: false,
             span: span(1),
         },
-        Ev::InitializedIdent { name: 0 },
+        Ev::InitializedIdent { name: 0, token: span(1) },
         Ev::InitializerBegin,
         Ev::OtherExpr { span: span(2) },
         Ev::InitializerEnd,
@@ -2182,7 +2405,7 @@ fn for_in_statement_replay_invariants() {
             is_final: false,
             span: span(1),
         },
-        Ev::InitializedIdent { name: 0 },
+        Ev::InitializedIdent { name: 0, token: span(1) },
         Ev::NoInitializer,
         Ev::VarDeclEnd,
         Ev::ForInExprBegin,
@@ -2233,7 +2456,7 @@ fn for_in_break_joins_exit() {
             is_final: false,
             span: span(1),
         },
-        Ev::InitializedIdent { name: 0 },
+        Ev::InitializedIdent { name: 0, token: span(1) },
         Ev::NoInitializer,
         Ev::VarDeclEnd,
         Ev::ForInExprBegin,
@@ -2281,7 +2504,7 @@ fn collection_for_in_element_nets_one_value() {
             is_final: false,
             span: span(1),
         },
-        Ev::InitializedIdent { name: 0 },
+        Ev::InitializedIdent { name: 0, token: span(1) },
         Ev::InitializerBegin,
         Ev::OtherExpr { span: span(2) },
         Ev::InitializerEnd,
@@ -3426,4 +3649,81 @@ fn cast_from_null_type_kills_the_following_statement() {
 #[test]
 fn closure_body_termination_does_not_leak_out() {
     assert!(dead_snippets("void f() { h(() { throw 1; }); print(2); }").is_empty());
+}
+
+// —— read-type facts (ReadType, #1056) ———————————————————————————————————
+
+/// Every reachable read emits a `ReadType` row carrying the flow type —
+/// promoted when a promotion stands, declared otherwise; the condition
+/// read sits before the promotion, the branch read inside it. Dead reads
+/// carry no row, and a plain assignment's target read retracts with the
+/// target facts (the identifier is the write).
+#[test]
+fn read_type_rows_carry_the_flow_type_at_reads() {
+    let source = "void f(int? x) { if (x is int) { x; } }";
+    let (flow, facts) = analyze(source);
+    let read_types: Vec<crate::ty::Ty> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::ReadType { ty, .. } => Some(*ty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(read_types.len(), 2, "{facts:?}");
+    assert!(read_types[0].nullable, "the condition read is declared");
+    assert!(!read_types[1].nullable, "the branch read is promoted");
+    let crate::ty::Base::Name(id) = read_types[1].base else {
+        panic!("expected a named type, got {:?}", read_types[1]);
+    };
+    assert_eq!(flow.0.borrow().name_lexeme(id), "int");
+    // A read inside a dead tail emits no row.
+    let dead = "void f(int x) { return; x; }";
+    assert!(
+        facts_of(dead)
+            .iter()
+            .all(|fact| !matches!(fact, FlowFact::ReadType { .. })),
+        "{dead:?}"
+    );
+    // A plain assignment's target is a write, not a read.
+    let target = "void f(int x) { x = 1; }";
+    assert!(
+        facts_of(target)
+            .iter()
+            .all(|fact| !matches!(fact, FlowFact::ReadType { .. })),
+        "{target:?}"
+    );
+}
+
+// —— write-site facts (WriteSite, #1056) —————————————————————————————————
+
+/// The write-site rows aggregate the AssignedVariables anywhere sets, one
+/// row per (declaration, in-closure) pair: a reassignment outside
+/// closures rows once, a closure write rows with `in_closure: true`, and
+/// declaration initializers subtract (the official sets do not count
+/// them — the final-suggestion premise).
+#[test]
+fn write_site_rows_aggregate_the_write_sets() {
+    let source = "void f() { int a = 0; int b; b = 1; int c = 0; () { c = 2; }; int d = 0; d = 1; () { d = 2; }; }";
+    let (_, facts) = analyze(source);
+    let at = |needle: &str| source.find(needle).unwrap() as u32;
+    let rows: Vec<(u32, bool)> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::WriteSite {
+                decl_name_span,
+                in_closure,
+            } => Some((decl_name_span.offset, *in_closure)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (at("b;"), false),
+            (at("c = 0;"), true),
+            (at("d = 0;"), false),
+            (at("d = 0;"), true),
+        ],
+        "{facts:?}"
+    );
 }
