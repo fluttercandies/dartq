@@ -1588,6 +1588,117 @@ mod tests {
         );
     }
 
+    /// Derivation pin: the semantic wave-2 gate codes file
+    /// (`tests/harness/sem2_codes.txt`) must equal its documented
+    /// derivation (file header): the union of the oracle and dartq row
+    /// codes over every persisted regression nail
+    /// (`tests/corpus/regressions/cases/*.json`, schema
+    /// regression-case-v1) minus the five frozen gate universes
+    /// (`tests/corpus/syntax-codes.txt`, `m1_codes.txt`,
+    /// `m2_warning_codes.txt`, `m3_unused_codes.txt`, `lint_codes.txt`).
+    /// Unlike the m1/m2 registry pins this derivation is fully local (the
+    /// nails and the frozen files are in-repo), so it always runs: a fresh
+    /// nail carrying a new divergence code, or a frozen-file expansion
+    /// that absorbs one, fails here and forces a conscious re-freeze.
+    #[test]
+    fn sem2_codes_file_matches_derivation() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("harness lives at <repo>/tests/harness");
+        let txt = std::fs::read_to_string(root.join("tests/harness/sem2_codes.txt"))
+            .expect("gate codes file present");
+        let gate_codes = parse_codes_file(&txt).expect("gate file parses");
+
+        let mut nail_codes: BTreeSet<String> = BTreeSet::new();
+        let cases = root.join("tests/corpus/regressions/cases");
+        let mut count = 0usize;
+        for entry in std::fs::read_dir(&cases).expect("regression nails present") {
+            let path = entry.expect("readable nail entry").path();
+            // `.edits.jsonl` companions carry edit scripts, not rows; only
+            // the per-case `.json` snapshots do.
+            if path.extension().map(|e| e.to_string_lossy().into_owned()).as_deref()
+                != Some("json")
+            {
+                continue;
+            }
+            let case: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&path).expect("nail readable"),
+            )
+            .expect("nail JSON parses");
+            assert_eq!(
+                case["schema"], "regression-case-v1",
+                "unexpected nail schema in {}",
+                path.display()
+            );
+            for side in ["oracle", "dartq"] {
+                for row in case[side].as_array().unwrap_or_else(|| {
+                    panic!("nail {} carries no {side} row array", path.display())
+                }) {
+                    nail_codes.insert(
+                        row["code"]
+                            .as_str()
+                            .unwrap_or_else(|| panic!("nail row without code: {}", path.display()))
+                            .to_owned(),
+                    );
+                }
+            }
+            count += 1;
+        }
+        assert!(
+            count >= 50,
+            "regression nails largely missing ({count} cases); derivation void"
+        );
+
+        let mut frozen: BTreeSet<String> = BTreeSet::new();
+        for file in [
+            "tests/corpus/syntax-codes.txt",
+            "tests/harness/m1_codes.txt",
+            "tests/harness/m2_warning_codes.txt",
+            "tests/harness/m3_unused_codes.txt",
+            "tests/harness/lint_codes.txt",
+        ] {
+            let text = std::fs::read_to_string(root.join(file))
+                .unwrap_or_else(|e| panic!("frozen gate codes file {file} must be present: {e}"));
+            frozen.extend(parse_codes_file(&text).expect("frozen file parses"));
+        }
+
+        let expected: BTreeSet<String> = nail_codes.difference(&frozen).cloned().collect();
+
+        assert_eq!(
+            gate_codes.len(),
+            65,
+            "sem2 freezes 65 codes at the 2026-10-13 derivation"
+        );
+        // 65 raw data lines (comments/blanks excluded): a duplicated line
+        // would hide in the set comparison but still be drift.
+        assert_eq!(
+            txt.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .count(),
+            65
+        );
+        assert_eq!(
+            gate_codes, expected,
+            "gate file = nail codes minus the five frozen gate universes"
+        );
+
+        // Load-bearing dartq-only members: the two rename codes have no
+        // oracle-side nail rows (the oracle emits const_not_initialized /
+        // final_not_initialized at the same positions); their presence in
+        // the tier is the designed divergence signal (codes-file header).
+        for dartq_only in [
+            "const_field_without_initializer",
+            "final_field_without_initializer",
+        ] {
+            assert!(
+                gate_codes.contains(dartq_only),
+                "{dartq_only} must stay in the sem2 tier (dartq-only rename signal)"
+            );
+        }
+    }
+
     /// Core codes-filter semantics: out-of-set entries are dropped on both sides --
     /// oracle-only out-of-set entries never enter the denominator; the gate judges only in-set entries.
     #[test]
@@ -1848,5 +1959,369 @@ mod tests {
         assert!(canonical_corpus_dirs(&[PathBuf::from("/nonexistent/corpus")]).is_err());
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ─── Fixture-coverage manifest (tests/harness/fixture-coverage.tsv) ────
+
+    /// One frozen gate tier of the fixture-coverage manifest: its codes file,
+    /// the gate corpora the tier's run scores (the `--corpus-dir` values the
+    /// tier's gate script passes), and whether the scanner-goldens column
+    /// applies (the syntax tier only — the weaker dartq-only scanner face,
+    /// never full coverage on its own).
+    struct FixtureCoverageTier {
+        tier: &'static str,
+        codes_file: &'static str,
+        corpus_dirs: &'static [&'static str],
+        scanner_goldens: bool,
+    }
+
+    const FIXTURE_COVERAGE_TIERS: &[FixtureCoverageTier] = &[
+        FixtureCoverageTier {
+            tier: "syntax",
+            codes_file: "tests/corpus/syntax-codes.txt",
+            corpus_dirs: &["tests/corpus/m0", "tests/corpus/m0-syntax"],
+            scanner_goldens: true,
+        },
+        FixtureCoverageTier {
+            tier: "m1",
+            codes_file: "tests/harness/m1_codes.txt",
+            corpus_dirs: &["tests/corpus/m1-semantic"],
+            scanner_goldens: false,
+        },
+        FixtureCoverageTier {
+            tier: "m2",
+            codes_file: "tests/harness/m2_warning_codes.txt",
+            corpus_dirs: &["tests/corpus/m2-warning"],
+            scanner_goldens: false,
+        },
+        FixtureCoverageTier {
+            tier: "m3",
+            codes_file: "tests/harness/m3_unused_codes.txt",
+            corpus_dirs: &["tests/corpus/m3-unused"],
+            scanner_goldens: false,
+        },
+        FixtureCoverageTier {
+            tier: "lint",
+            codes_file: "tests/harness/lint_codes.txt",
+            corpus_dirs: &["tests/corpus/lints"],
+            scanner_goldens: false,
+        },
+        FixtureCoverageTier {
+            tier: "sem2",
+            codes_file: "tests/harness/sem2_codes.txt",
+            corpus_dirs: &["tests/corpus/sem2"],
+            scanner_goldens: false,
+        },
+    ];
+
+    const FIXTURE_COVERAGE_MANIFEST: &str = "tests/harness/fixture-coverage.tsv";
+    const SCANNER_GOLDENS_MANIFEST: &str = "tests/corpus/scanner-goldens/manifest.json";
+
+    /// One manifest row: tier, code, coverage, targeted, annotation,
+    /// scanner_goldens, note — `-` marks an empty cell.
+    type CoverageRow = [String; 7];
+
+    /// The lowercase whole-word set of a corpus text: maximal
+    /// `[A-Za-z0-9_$]` runs (the Dart identifier rule; every other code
+    /// point separates), lowercased. A code is "mentioned" iff it equals
+    /// one of the runs — the whole-word, case-insensitive match the
+    /// coverage-audit method note defines.
+    fn word_set(text: &str) -> BTreeSet<String> {
+        text.to_lowercase()
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Every `.dart` file under a corpus dir, sorted; `.dart_tool` subtrees
+    /// are pub-get output, not corpus content.
+    fn collect_corpus_files(root: &Path, corpus: &str) -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.file_name().map(|n| n.to_string_lossy().into_owned())
+                        != Some(".dart_tool".to_owned())
+                    {
+                        walk(&path, out);
+                    }
+                } else if path
+                    .extension()
+                    .map(|e| e.to_string_lossy().into_owned())
+                    .as_deref()
+                    == Some("dart")
+                {
+                    out.push(path);
+                }
+            }
+        }
+        let dir = root.join(corpus);
+        assert!(dir.is_dir(), "tier corpus {corpus} must exist");
+        let mut out = Vec::new();
+        walk(&dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// The live derivation of the fixture-coverage manifest: for every
+    /// frozen (tier, code), the three evidence cells — same-named targeted
+    /// fixtures (file stem == code), annotation mentions (whole-word,
+    /// case-insensitive), and (syntax tier) the scanner-goldens case ids —
+    /// plus the covered / documented_gap verdict. Rows follow the tier
+    /// table order, codes sorted within a tier; the note cell stays empty
+    /// (a gap note is deliberate prose, carried over by the regen test).
+    fn derive_fixture_coverage(root: &Path) -> Vec<CoverageRow> {
+        let goldens_raw =
+            std::fs::read(root.join(SCANNER_GOLDENS_MANIFEST)).expect("scanner-goldens manifest present");
+        let goldens_json: serde_json::Value =
+            serde_json::from_slice(&goldens_raw).expect("scanner-goldens manifest parses");
+        let mut goldens: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for case in goldens_json["cases"].as_array().expect("goldens cases array") {
+            let id = case["id"].as_str().expect("golden case id").to_string();
+            for diag in case["diagnostics"].as_array().unwrap_or(&Vec::new()) {
+                // Diagnostic rows are [code, offset, args?]; the first
+                // element is the code.
+                let code = match diag {
+                    serde_json::Value::Array(rows) => rows.first().and_then(|v| v.as_str()),
+                    serde_json::Value::String(s) => Some(s.as_str()),
+                    _ => None,
+                }
+                .unwrap_or_else(|| panic!("golden diagnostic without a code: {case:?}"));
+                goldens
+                    .entry(code.to_ascii_lowercase())
+                    .or_default()
+                    .insert(id.clone());
+            }
+        }
+
+        let mut rows = Vec::new();
+        for tier in FIXTURE_COVERAGE_TIERS {
+            let text = std::fs::read_to_string(root.join(tier.codes_file)).unwrap_or_else(|e| {
+                panic!("frozen codes file {} must be present: {e}", tier.codes_file)
+            });
+            let codes = parse_codes_file(&text).expect("frozen codes file parses");
+
+            let mut files: Vec<(String, String, BTreeSet<String>)> = Vec::new();
+            for corpus in tier.corpus_dirs {
+                for path in collect_corpus_files(root, corpus) {
+                    let rel = path
+                        .strip_prefix(root)
+                        .expect("corpus file under repo root")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let bytes = std::fs::read(&path).expect("corpus file readable");
+                    // Lossy decode: the corpus deliberately carries a
+                    // non-UTF-8 fixture (the encoding face); its ASCII
+                    // comment text must still be readable.
+                    let stem = path.file_stem().expect("file stem").to_string_lossy().into_owned();
+                    files.push((rel, stem, word_set(&String::from_utf8_lossy(&bytes))));
+                }
+            }
+            files.sort_by(|a, b| a.0.cmp(&b.0));
+
+            for code in &codes {
+                let targeted: Vec<String> = files
+                    .iter()
+                    .filter(|(_, stem, _)| stem == code)
+                    .map(|(rel, _, _)| rel.clone())
+                    .collect();
+                let annotated: Vec<String> = files
+                    .iter()
+                    .filter(|(_, _, words)| words.contains(code))
+                    .map(|(rel, _, _)| rel.clone())
+                    .collect();
+                let golden: Vec<String> = if tier.scanner_goldens {
+                    goldens.get(code).map(|s| s.iter().cloned().collect()).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let cell = |v: &[String]| if v.is_empty() { "-".to_string() } else { v.join(";") };
+                let covered = !targeted.is_empty() || !annotated.is_empty() || !golden.is_empty();
+                rows.push([
+                    tier.tier.to_string(),
+                    code.clone(),
+                    if covered { "covered" } else { "documented_gap" }.to_string(),
+                    cell(&targeted),
+                    cell(&annotated),
+                    cell(&golden),
+                    String::new(),
+                ]);
+            }
+        }
+        rows
+    }
+
+    /// The manifest's data rows (7 TSV cells each); `#` comments and blanks
+    /// skipped.
+    fn parse_coverage_manifest(text: &str) -> Vec<CoverageRow> {
+        text.lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let cells: Vec<String> = l.split('\t').map(str::to_string).collect();
+                assert_eq!(
+                    cells.len(),
+                    7,
+                    "manifest row must carry 7 TSV cells (tier, code, coverage, targeted, \
+                     annotation, scanner_goldens, note): {l}"
+                );
+                cells.try_into().expect("exactly 7 cells")
+            })
+            .collect()
+    }
+
+    fn fixture_coverage_repo_root() -> &'static Path {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("harness lives at <repo>/tests/harness")
+    }
+
+    /// Coverage-manifest pin (audit finding: no committed per-code exposure
+    /// artifact — coverage claims were prose, not pins): the committed
+    /// table must equal the live derivation over the frozen universe.
+    ///
+    /// Schema: every row carries 7 cells; `covered` rows show at least one
+    /// evidence cell and no note; `documented_gap` rows carry all-empty
+    /// evidence plus a hand-authored reason; the scanner-goldens column is
+    /// syntax-tier only. Universe: exactly one row per (tier, code) over
+    /// the six frozen codes files — the row count is fully determined by
+    /// them (521 rows at the 2026-10-13 derivation: 255 + 36 + 43 + 11 +
+    /// 111 + 65). Cells: targeted, annotation and scanner-goldens columns
+    /// must equal the corpora-derived evidence byte-for-byte, and every
+    /// derived gap must carry its manifest exclusion row. Any corpus or
+    /// frozen-file edit that moves coverage fails here and forces a
+    /// conscious re-derive (regen test below).
+    #[test]
+    fn fixture_coverage_manifest_matches_corpus_derivation() {
+        let root = fixture_coverage_repo_root();
+        let derived = derive_fixture_coverage(root);
+        let manifest_text = std::fs::read_to_string(root.join(FIXTURE_COVERAGE_MANIFEST))
+            .expect("coverage manifest present");
+        let rows = parse_coverage_manifest(&manifest_text);
+
+        for row in &rows {
+            let cell = |i: usize| row[i].as_str();
+            match row[2].as_str() {
+                "covered" => {
+                    assert!(
+                        cell(3) != "-" || cell(4) != "-" || cell(5) != "-",
+                        "covered row without evidence: {row:?}"
+                    );
+                    assert_eq!(cell(6), "-", "covered rows carry no note: {row:?}");
+                }
+                "documented_gap" => {
+                    assert_eq!(cell(3), "-", "gap row carries no targeted fixture: {row:?}");
+                    assert_eq!(cell(4), "-", "gap row carries no annotation: {row:?}");
+                    assert_eq!(cell(5), "-", "gap row carries no scanner goldens: {row:?}");
+                    assert_ne!(cell(6), "-", "documented_gap rows must state their reason");
+                }
+                other => panic!("illegal coverage value {other:?}: {row:?}"),
+            }
+            if row[0] != "syntax" {
+                assert_eq!(
+                    cell(5),
+                    "-",
+                    "scanner_goldens evidence is syntax-tier only: {row:?}"
+                );
+            }
+        }
+
+        // Universe equality: the manifest is exactly the frozen (tier, code)
+        // universe — no missing row, no duplicate, no invention.
+        let mut universe: Vec<(String, String)> = Vec::new();
+        for tier in FIXTURE_COVERAGE_TIERS {
+            let text = std::fs::read_to_string(root.join(tier.codes_file)).unwrap_or_else(|e| {
+                panic!("frozen codes file {} must be present: {e}", tier.codes_file)
+            });
+            universe.extend(
+                parse_codes_file(&text)
+                    .expect("frozen codes file parses")
+                    .into_iter()
+                    .map(|code| (tier.tier.to_string(), code)),
+            );
+        }
+        universe.sort();
+        let mut manifest_keys: Vec<(String, String)> =
+            rows.iter().map(|r| (r[0].clone(), r[1].clone())).collect();
+        manifest_keys.sort();
+        assert_eq!(
+            manifest_keys, universe,
+            "manifest rows must be exactly the frozen (tier, code) universe"
+        );
+
+        // Cell equality against the live derivation.
+        let derived_map: BTreeMap<(&str, &str), &CoverageRow> = derived
+            .iter()
+            .map(|r| (r[0].as_str(), r[1].as_str(), r))
+            .map(|(t, c, r)| ((t, c), r))
+            .collect();
+        for row in &rows {
+            let d = derived_map
+                .get(&(row[0].as_str(), row[1].as_str()))
+                .unwrap_or_else(|| {
+                panic!("derivation missing a manifest row: {}::{}", row[0], row[1])
+            });
+            let hint = "re-derive with: cargo test -p harness \
+                        regen_fixture_coverage_manifest -- --ignored";
+            assert_eq!(row[2], d[2], "coverage verdict drift for {}::{}; {}", row[0], row[1], hint);
+            for col in 3..=5 {
+                assert_eq!(
+                    row[col], d[col],
+                    "evidence drift for {}::{} column {}; {}",
+                    row[0], row[1], col, hint
+                );
+            }
+        }
+    }
+
+    /// Regen (writes the manifest; not run by default):
+    /// `cargo test -p harness regen_fixture_coverage_manifest -- --ignored`
+    /// re-derives the evidence live and rewrites the data rows, preserving
+    /// the committed header verbatim and carrying the documented_gap notes
+    /// of still-dark codes over from the current table. A new dark code
+    /// without an existing note fails here — the note is deliberate prose
+    /// (the reason a code has no fixture) and must be authored, never
+    /// derived.
+    #[test]
+    #[ignore]
+    fn regen_fixture_coverage_manifest() {
+        let root = fixture_coverage_repo_root();
+        let mut derived = derive_fixture_coverage(root);
+        let manifest_path = root.join(FIXTURE_COVERAGE_MANIFEST);
+        let old_text = std::fs::read_to_string(&manifest_path).expect("coverage manifest present");
+        let old_notes: BTreeMap<(String, String), String> = parse_coverage_manifest(&old_text)
+            .into_iter()
+            .filter(|r| r[2] == "documented_gap")
+            .map(|r| ((r[0].clone(), r[1].clone()), r[6].clone()))
+            .collect();
+        // The committed header block: every leading comment line, verbatim.
+        let header_len = old_text
+            .lines()
+            .take_while(|l| l.starts_with('#'))
+            .count();
+        let mut out: String = old_text.lines().take(header_len).map(|l| format!("{l}\n")).collect();
+
+        for row in &mut derived {
+            let row: &mut CoverageRow = row;
+            if row[2] == "documented_gap" {
+                let key = (row[0].clone(), row[1].clone());
+                match old_notes.get(&key) {
+                    Some(note) => row[6] = note.clone(),
+                    None => panic!(
+                        "new documented_gap code {}::{} needs a hand-authored note in {} \
+                         (why this code has no fixture yet)",
+                        row[0], row[1], FIXTURE_COVERAGE_MANIFEST
+                    ),
+                }
+            }
+            out.push_str(&row.join("\t"));
+            out.push('\n');
+        }
+        std::fs::write(&manifest_path, out).expect("rewrite coverage manifest");
+        println!("regenerated {} ({} data rows)", manifest_path.display(), derived.len());
     }
 }

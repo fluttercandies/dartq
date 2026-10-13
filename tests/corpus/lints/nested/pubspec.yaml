@@ -2,8 +2,10 @@ name: Lint_corpus_nested
 description: >-
   LINT-face nested sub-package (fixture wave 2): its own options file
   whose include chain walks up to the corpus root's, child-only rule
-  enable/silence fixtures, and the package_names row (the deliberately
-  invalid mixed-case name, keyed pubspec.yaml). The parent lint_corpus
+  enable/silence fixtures, and the PACKAGE_NAMES row (the deliberately
+  invalid mixed-case name `Lint_corpus_nested` — the pubspec name: entry,
+  keyed pubspec.yaml, official pub/package_names.dart
+  isValidPackageName face). The parent lint_corpus
   package deliberately does NOT declare this package as a dependency —
   the root depend_on_referenced_packages fixture imports it undeclared.
 environment:

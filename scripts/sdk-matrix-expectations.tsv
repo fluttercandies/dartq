@@ -1,0 +1,112 @@
+# sdk-matrix-expectations.tsv — per-version expectation table for the
+# multi-SDK sweep (scripts/sdk-matrix.sh). Companion to
+# scripts/sdk-feature-ladder.txt (the feature rungs this table keys from).
+#
+# WHY: the gate corpora pin `environment: sdk: ^3.13.0` and
+# `.dart_tool/package_config.json` languageVersion 3.13. An oracle below 3.13
+# reads a language version it does not know and clamps to its own max, so
+# version-gated fixture faces flip per oracle version — and the gate bar is
+# full parity (threshold 1.0), so every unattributed one-sided entry fails
+# the gate. This table is the committed record of which one-sided entries are
+# EXPECTED at which oracle version, so a probe-triaged face is distinguishable
+# from a regression. Classification in the summary (removedIn / addedIn skew)
+# stays advisory and separate; this table is documentation, checked only for
+# shape by `sdk-matrix.sh --check-expectations` (static, spawns nothing).
+#
+# Format: `<minor-or-*>|<kind>|<face>|<expectation>`, `#` comments allowed.
+#   minor       oracle language minor the row applies to (`*` = all), a
+#               bare integer from scripts/sdk-versions.txt (stable minors
+#               0-13, dev 14)
+#   kind        clamp          version-gated fixture face flips or goes
+#                              silent at this minor (feature rung above it)
+#               lint           lint-gate face whose firing is version-scoped
+#               sdk-constraint faces on the corpora's `sdk: ^3.13.0` pin
+#   face        face family name (free text, no `|`)
+#   expectation silent | fires | recodes:<comma-separated codes> |
+#               UNKNOWN-until-probed (the pre-probe marker: never guess)
+#
+# PROBE PHASE CONTRACT: every UNKNOWN-until-probed row is filled by one
+# probe run per oracle version (harness run or bare `dart analyze` over the
+# corpora), recording the measured face outcome. A row measured as "both
+# sides emit identically" is deleted, not marked fires — the table carries
+# only expected DIVERGENCES.
+#
+# Severe known direction (from the feature rungs, not yet measured per
+# version): below the extension-types rung (3.3) and the digit-separators
+# rung (3.6), dartq-only faces in those families are addedIn-skew (ladder
+# attribution); below the wildcard-variables rung (3.7) the flip is
+# ORACLE-side (a clamped language makes `_` binding again, so the oracle can
+# emit extra faces dartq never emits — a gate-visible divergence, not
+# attributable as skew); below the dot-shorthands rung (3.10) the oracle may
+# emit parser recodes on dot-shorthand fixture faces (oracle-side); below
+# the primary-constructors rung (3.13) primary-constructor faces recode or
+# go silent (dartq-side).
+
+# Lint face: no_duplicate_case_values fires only when the effective language
+# version is <= 2.19 (legacy switch-case member shape; the face is gated on
+# the patterns feature, silent iff patterns on — patterns enabledIn 3.0.0).
+# The sweep floor is Dart 3.0.7, so this is silent on every ladder oracle;
+# it becomes oracle-side fires only if the mixed-versions corpus (2.x rows)
+# ever joins a version gate.
+*|lint|no_duplicate_case_values|silent
+
+# SDK-constraint face: whether an oracle below 3.13 additionally emits an
+# SDK-constraint face on the `sdk: ^3.13.0` pubspec (refusing or warning)
+# is unpinned — measured per version by the probe phase, never guessed.
+*|sdk-constraint|pubspec-sdk-constraint-3.13|UNKNOWN-until-probed
+
+# Never-fires fixture faces (documented version-scoped in the m0-syntax
+# corpus README's blindspot accounting): per-version behavior unprobed.
+*|clamp|expected_representation_type-face|UNKNOWN-until-probed
+*|clamp|part_of_name-face|UNKNOWN-until-probed
+
+# Clamp faces below the extension-types rung (3.3): dartq-side faces recode
+# to generic parser faces or go silent on a pre-extension-types oracle.
+0|clamp|extension-type-faces|UNKNOWN-until-probed
+1|clamp|extension-type-faces|UNKNOWN-until-probed
+2|clamp|extension-type-faces|UNKNOWN-until-probed
+
+# Clamp faces below the digit-separators rung (3.6).
+0|clamp|digit-separator-faces|UNKNOWN-until-probed
+1|clamp|digit-separator-faces|UNKNOWN-until-probed
+2|clamp|digit-separator-faces|UNKNOWN-until-probed
+3|clamp|digit-separator-faces|UNKNOWN-until-probed
+4|clamp|digit-separator-faces|UNKNOWN-until-probed
+5|clamp|digit-separator-faces|UNKNOWN-until-probed
+
+# Oracle-side extra faces below the wildcard-variables rung (3.7).
+0|clamp|wildcard-faces|UNKNOWN-until-probed
+1|clamp|wildcard-faces|UNKNOWN-until-probed
+2|clamp|wildcard-faces|UNKNOWN-until-probed
+3|clamp|wildcard-faces|UNKNOWN-until-probed
+4|clamp|wildcard-faces|UNKNOWN-until-probed
+5|clamp|wildcard-faces|UNKNOWN-until-probed
+6|clamp|wildcard-faces|UNKNOWN-until-probed
+
+# Oracle-side parser recodes below the dot-shorthands rung (3.10).
+0|clamp|dot-shorthand-faces|UNKNOWN-until-probed
+1|clamp|dot-shorthand-faces|UNKNOWN-until-probed
+2|clamp|dot-shorthand-faces|UNKNOWN-until-probed
+3|clamp|dot-shorthand-faces|UNKNOWN-until-probed
+4|clamp|dot-shorthand-faces|UNKNOWN-until-probed
+5|clamp|dot-shorthand-faces|UNKNOWN-until-probed
+6|clamp|dot-shorthand-faces|UNKNOWN-until-probed
+7|clamp|dot-shorthand-faces|UNKNOWN-until-probed
+8|clamp|dot-shorthand-faces|UNKNOWN-until-probed
+9|clamp|dot-shorthand-faces|UNKNOWN-until-probed
+
+# Dartq-side primary-constructor faces recode or go silent below the
+# primary-constructors rung (3.13).
+0|clamp|primary-constructor-faces|UNKNOWN-until-probed
+1|clamp|primary-constructor-faces|UNKNOWN-until-probed
+2|clamp|primary-constructor-faces|UNKNOWN-until-probed
+3|clamp|primary-constructor-faces|UNKNOWN-until-probed
+4|clamp|primary-constructor-faces|UNKNOWN-until-probed
+5|clamp|primary-constructor-faces|UNKNOWN-until-probed
+6|clamp|primary-constructor-faces|UNKNOWN-until-probed
+7|clamp|primary-constructor-faces|UNKNOWN-until-probed
+8|clamp|primary-constructor-faces|UNKNOWN-until-probed
+9|clamp|primary-constructor-faces|UNKNOWN-until-probed
+10|clamp|primary-constructor-faces|UNKNOWN-until-probed
+11|clamp|primary-constructor-faces|UNKNOWN-until-probed
+12|clamp|primary-constructor-faces|UNKNOWN-until-probed

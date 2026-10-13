@@ -9,12 +9,28 @@
 # prints a per-version summary (version / Jaccard / verdict) and
 # pre-classifies one-sided (code,file) entries through the version-skew
 # attribution rules (the version-skew ledger §5: the 7 `removedIn` codes
-# and the language-version diagnostic family are version skew, everything
-# else is a real-defect candidate). Classification reads raw-outputs.json —
+# and the language-version diagnostic family are version skew; so is the
+# addedIn class — dartq-only entries in a feature family whose rung in
+# scripts/sdk-feature-ladder.txt postdates the oracle's language minor.
+# dartq is frozen at 3.15-main semantics, so a feature enabled by default
+# above the oracle can never be matched by it; without the addedIn class
+# every version step below a feature's release manufactures false defect
+# candidates. Everything else is a real-defect candidate). Classification
+# reads raw-outputs.json —
 # the unfiltered plane — so codes the gate's codes-file set drops (the
 # removedIn codes are pruned from the TSV) are still classified.
 # Classification is advisory; per rule the script never fixes anything —
 # attribution reads the per-version report.
+#
+# Sweep scope: the syntax/m0 caliber ONLY (m0 + m0-syntax, syntax codes
+# TSV). The lint/m2/m3 gates stay single-version at the gate of record
+# (dart 3.13.1) until a per-version rule-existence filter exists: an SDK
+# older than a rule's introduction does not know the rule name, so a lint
+# matrix run degenerates into option-validation faces and hollow
+# (both-sides-skip) gates. Per-version clamp expectations live in
+# scripts/sdk-matrix-expectations.tsv; its UNKNOWN-until-probed rows are
+# filled by the serial probe phase (see that file's header for the probe
+# contract).
 #
 # SERIAL PHASE ONLY: every matrix entry spawns real `dart analyze` and
 # `dartq check` processes over the full corpora. Never run this alongside
@@ -30,10 +46,19 @@
 #
 # Usage:
 #   scripts/sdk-matrix.sh [--dry-run] [--dart-override PATH] [--allow-skip]
+#                         [--check-expectations]
 #   scripts/sdk-matrix.sh --help
 #
 #   --dry-run           resolve every matrix entry, print the resolved dart
 #                       version, run no gate.
+#   --check-expectations
+#                       validate the committed data tables
+#                       (scripts/sdk-feature-ladder.txt +
+#                       scripts/sdk-matrix-expectations.tsv: row shape,
+#                       ascending rungs, minor cross-references, duplicate
+#                       keys) and exit 0/2. Static text validation only —
+#                       runs no oracle, no version resolution, no binaries;
+#                       needs neither the harness nor jq.
 #   --dart-override P   run a single-SDK pass with the dart executable P as
 #                       the oracle, report under target/evidence/sdk-matrix/
 #                       override. This is the fallback when fvm is absent,
@@ -78,6 +103,8 @@ VENDORED_LABEL="dart-main-3.15" # local SDK source checkout (main 3.15.0-dev anc
 
 CORPORA=(tests/corpus/m0 tests/corpus/m0-syntax)
 CODES_FILE="crates/dartq-diagnostics/data/syntax-codes.tsv"
+LADDER_FILE="scripts/sdk-feature-ladder.txt"
+EXPECT_FILE="scripts/sdk-matrix-expectations.tsv"
 THRESHOLD="1.0"
 OUT_ROOT="target/evidence/sdk-matrix"
 HARNESS="${HARNESS:-./target/debug/harness}"
@@ -92,16 +119,97 @@ DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
 # raw plane is the only place they can be classified as skew.
 SKEW_RE='^(multiple_variables_in_for_each|invalid_operator_for_super|non_user_definable_operator|missing_terminator_for_parameter_group|wrong_terminator_for_parameter_group|unexpected_terminator_for_parameter_group|unable_get_content|invalid_language_version_override.*|illegal_language_version_override.*|inconsistent_language_version_override.*|language_version_too_high_explicit|experiment_not_enabled.*)$'
 
+# addedIn attribution source: the committed feature-release ladder (rung =
+# language minor at which the feature is enabled by default). Loaded once
+# into a jq JSON array; the per-version regex union is computed inside the
+# summary's jq program from the report's oracle version banner. `-` rungs
+# become an empty regex and are dropped by the jq program. The data files
+# are shape-checked before anything runs (check_data_tables), so a malformed
+# row fails fast instead of silently degrading the classification.
+#
+# Expectation rows are keyed by oracle language minor, so they cross-check
+# against the pinned oracle snapshot (scripts/sdk-versions.txt, read-only),
+# NOT the feature rungs — clamp faces exist at every below-rung oracle minor
+# (e.g. 3.5 has no feature rung but its digit-separator faces flip).
+# stdout = the problems (empty when clean); exit status 0 clean / 1 problems.
+check_data_tables() {
+  awk -F'|' '
+    FILENAME == ARGV[1] {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      split($1, p, ".")
+      vminor[p[2]] = 1
+      next
+    }
+    FILENAME == ARGV[2] {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      if ($1 !~ /^[0-9]+$/) {
+        printf "ladder %s:%d: bad minor field (want <minor>|<feature>|<code-names-or-dash>): %s\n", FILENAME, FNR, $0
+        bad = 1
+        next
+      }
+      if (NF != 3) {
+        printf "ladder %s:%d: want exactly <minor>|<feature>|<code-names-or-dash> (code names are comma-separated): %s\n", FILENAME, FNR, $0
+        bad = 1
+        next
+      }
+      if (prev != "" && $1 + 0 < prev + 0) {
+        printf "ladder %s:%d: minors must be ascending: %s\n", FILENAME, FNR, $0
+        bad = 1
+      }
+      if ($3 != "-" && (index($3, "\"") || index($3, "\\"))) {
+        printf "ladder %s:%d: code names must not contain quotes or backslashes: %s\n", FILENAME, FNR, $0
+        bad = 1
+      }
+      prev = $1
+      next
+    }
+    {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      if (NF != 4) {
+        printf "expect %s:%d: want <minor-or-*>|<kind>|<face>|<expectation>: %s\n", FILENAME, FNR, $0
+        bad = 1
+        next
+      }
+      if ($1 != "*" && $1 !~ /^[0-9]+$/) {
+        printf "expect %s:%d: bad minor field (integer or *): %s\n", FILENAME, FNR, $0
+        bad = 1
+        next
+      }
+      if ($1 != "*" && !($1 in vminor)) {
+        printf "expect %s:%d: minor is not an oracle minor in scripts/sdk-versions.txt: %s\n", FILENAME, FNR, $0
+        bad = 1
+      }
+      if ($2 !~ /^(clamp|lint|sdk-constraint)$/) {
+        printf "expect %s:%d: bad kind (clamp|lint|sdk-constraint): %s\n", FILENAME, FNR, $0
+        bad = 1
+      }
+      if ($4 != "silent" && $4 != "fires" && $4 != "UNKNOWN-until-probed" && $4 !~ /^recodes:/) {
+        printf "expect %s:%d: bad expectation (silent|fires|recodes:<codes>|UNKNOWN-until-probed): %s\n", FILENAME, FNR, $0
+        bad = 1
+      }
+      key = $1 SUBSEP $2 SUBSEP $3
+      if (key in seen) {
+        printf "expect %s:%d: duplicate minor/kind/face row: %s\n", FILENAME, FNR, $0
+        bad = 1
+      }
+      seen[key] = 1
+    }
+    END { exit bad ? 1 : 0 }
+  ' scripts/sdk-versions.txt "$LADDER_FILE" "$EXPECT_FILE"
+}
+
 usage() {
   sed -n '2,/^set -u -o pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
 dry_run=0
 allow_skip=0
+check_expect=0
 dart_override=""
 while [ $# -gt 0 ]; do
   case "$1" in
   --dry-run) dry_run=1 ;;
+  --check-expectations) check_expect=1 ;;
   --dart-override)
     [ $# -ge 2 ] || {
       echo "sdk-matrix: --dart-override needs a path" >&2
@@ -122,6 +230,40 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# --- committed data tables (load + shape-check) -------------------------------
+# Runs before every other preflight so --check-expectations needs neither
+# the harness, dartq, fvm, nor jq — it is pure text validation.
+for f in "$LADDER_FILE" "$EXPECT_FILE"; do
+  if [ ! -f "$f" ]; then
+    echo "sdk-matrix: committed data table missing: $f (see scripts/sdk-feature-ladder.txt and scripts/sdk-matrix-expectations.tsv in a clean checkout)" >&2
+    exit 2
+  fi
+done
+if ! table_errs="$(check_data_tables)"; then
+  [ -n "$table_errs" ] && printf '%s\n' "$table_errs" >&2
+  echo "sdk-matrix: committed data tables invalid ($LADDER_FILE / $EXPECT_FILE)" >&2
+  exit 2
+fi
+if [ "$check_expect" = 1 ]; then
+  rungs=$(grep -Ev '^[[:space:]]*(#|$)' "$LADDER_FILE" | wc -l | tr -d ' ')
+  rows=$(grep -Ev '^[[:space:]]*(#|$)' "$EXPECT_FILE" | wc -l | tr -d ' ')
+  unknown=$(grep -Ev '^[[:space:]]*(#|$)' "$EXPECT_FILE" | grep -c 'UNKNOWN-until-probed' || true)
+  echo "sdk-matrix: data tables OK — $LADDER_FILE: $rungs rungs; $EXPECT_FILE: $rows rows, $unknown UNKNOWN-until-probed (serial probe phase fills them)"
+  exit 0
+fi
+# The ladder as jq input: [{"v":<minor>,"re":"<joined ERE>"}, ...]. `-` rungs
+# become an empty re and are dropped by the summary's jq program.
+ladder_json="[$(awk -F'|' '
+  /^[[:space:]]*(#|$)/ { next }
+  {
+    re = ($3 == "-") ? "" : $3
+    gsub(/[[:space:]]+/, "", re)
+    gsub(/,/, "|", re) # the column lists names comma-separated; join to ERE
+    printf "%s{\"v\":%s,\"re\":\"%s\"}", sep, $1, re
+    sep = ","
+  }
+' "$LADDER_FILE")]"
 
 # --- preflight ---------------------------------------------------------------
 if [ ! -x "$HARNESS" ]; then
@@ -297,22 +439,32 @@ EOF
       "$label" "-" "-" "SKIP" "-" "-" "$report"
     continue
   fi
-  # TSV: dart version, jaccard, "O-skew/O-total", "D-skew/D-total" — skew
-  # classified over one-sided (code,file) entries computed from the RAW plane
-  # (raw-outputs.json, all severities, unfiltered); report.json still carries
-  # the version banner and the gate metric. An ERROR row's report may be
-  # absent (harness errors exit before the comparison writes one).
+  # TSV: dart version, jaccard, "O-skew/O-total", "D-skew/D-addedIn/D-total" —
+  # skew classified over one-sided (code,file) entries computed from the RAW
+  # plane (raw-outputs.json, all severities, unfiltered); report.json still
+  # carries the version banner and the gate metric. The dartq-only addedIn
+  # regex union is the set of feature-ladder rungs strictly above the
+  # oracle's language minor (banner-derived; an unparseable banner disables
+  # addedIn attribution — conservative, keeps entries as defect candidates).
+  # An ERROR row's report may be absent (harness errors exit before the
+  # comparison writes one).
   rawfile="$(dirname "$report")/raw-outputs.json"
-  row="$(jq -rs --arg re "$SKEW_RE" '
+  row="$(jq -rs --arg re "$SKEW_RE" --argjson ladder "$ladder_json" '
     .[0] as $r | .[1] as $raw |
     ($raw.oracle | [.corpora[].diagnostics[] | {c: .code, f: .file}] | unique) as $oe |
     ($raw.dartq  | [.corpora[].diagnostics[] | {c: .code, f: .file}] | unique) as $de |
     ($oe - $de) as $oo |
     ($de - $oe) as $do |
-    [ ($r.meta.oracle_version | capture("^Dart SDK version: (?<v>[^ ]+)") | .v),
+    ($r.meta.oracle_version | capture("^Dart SDK version: (?<v>[^ ]+)") | .v) as $v |
+    (try ($v | split(".") | .[1] | tonumber) catch 999) as $min |
+    ([$ladder[] | select(.v > $min) | select(.re != "") | .re] | join("|")) as $a |
+    (if $a == "" then "^$" else $a end) as $are |
+    [ $v,
       ($r.error_jaccard * 1000 | round / 1000),
       ([$oo[].c | ascii_downcase | select(test($re))] | length | tostring) + "/" + ($oo | length | tostring),
-      ([$do[].c | ascii_downcase | select(test($re))] | length | tostring) + "/" + ($do | length | tostring)
+      ([$do[].c | ascii_downcase | select(test($re))] | length | tostring) + "/" +
+      ([$do[].c | ascii_downcase | select(test($are))] | length | tostring) + "/" +
+      ($do | length | tostring)
     ] | @tsv' "$report" "$rawfile" 2>/dev/null)"
   if [ -z "$row" ]; then
     printf '%-16s %-10s %8s %-5s %16s %16s %s\n' \
@@ -337,14 +489,19 @@ done
 
 echo
 echo "resolved=$resolved/${#plan[@]} (SKIP entries count as unresolved)"
-echo "skew columns: '<skew-classified>/<total>' per side — one-sided (code,file)"
-echo "entries computed from raw-outputs.json (all severities, unfiltered), so"
-echo "codes outside the gate's codes-file set — e.g. the removedIn codes pruned"
-echo "from the TSV — are still classified (the version-skew ledger §5 rule 3:"
-echo "removedIn codes + language-version family = version skew, not dartq"
-echo "defects; the remaining one-sided entries are real-defect candidates —"
+echo "oracle-only column: '<removedIn-skew>/<total>'; dartq-only column:"
+echo "'<removedIn-skew>/<addedIn>/<total>' — one-sided (code,file) entries"
+echo "computed from raw-outputs.json (all severities, unfiltered), so codes"
+echo "outside the gate's codes-file set — e.g. the removedIn codes pruned"
+echo "from the TSV — are still classified. removedIn codes + language-version"
+echo "family = version skew (the version-skew ledger §5 rule 3); dartq-only"
+echo "entries in a feature family whose rung in scripts/sdk-feature-ladder.txt"
+echo "postdates the oracle's language minor = addedIn skew (the oracle cannot"
+echo "emit them); the remaining one-sided entries are real-defect candidates —"
 echo "attribute each through the per-version report.json + raw-outputs.json;"
-echo "no automatic fixing)."
+echo "no automatic fixing. Per-version clamp expectations:"
+echo "scripts/sdk-matrix-expectations.tsv (UNKNOWN-until-probed rows are"
+echo "filled by the serial probe phase)."
 if [ "$any_fail" = 1 ]; then
   echo "sdk-matrix: VERDICT FAIL (at least one version below the gate)"
   exit 1

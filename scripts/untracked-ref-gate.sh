@@ -11,30 +11,13 @@
 # absolute /Users/<user> home paths. .gitignore entries and Cargo.lock are
 # out of scope (ignore rules legitimately name the paths; lockfiles are
 # generated).
-#
-# PENDING (phase-B debt): the crates in PENDING_PATHS still carry references
-# owned by in-flight purge lanes; the gate skips them and says so. Delete
-# entries as those lanes land — the gate then covers the whole tracked tree.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PATTERN='[.]third|(^|[^[:alnum:]_./])[d]ocs/|AGENTS[.]md|PRD[.]md|GOALS[.]md|REF[.]md|[.]goal/|/Users/[a-z]'
 
-PENDING_PATHS=(
-  crates/dartq-semantic
-  crates/dartq-parser
-  crates/dartq-lints
-)
-
 excludes=(':(exclude).gitignore' ':(exclude)scripts/untracked-ref-gate.sh' ':(exclude)Cargo.lock')
-if [ "${#PENDING_PATHS[@]}" -gt 0 ]; then
-  printf 'untracked-ref-gate: skipping %d pending path(s) (phase-B debt): %s\n' \
-    "${#PENDING_PATHS[@]}" "${PENDING_PATHS[*]}" >&2
-  for p in "${PENDING_PATHS[@]}"; do
-    excludes+=(":(exclude)$p")
-  done
-fi
 
 hits="$(git grep -nE "$PATTERN" -- . "${excludes[@]}" || true)"
 if [ -n "$hits" ]; then

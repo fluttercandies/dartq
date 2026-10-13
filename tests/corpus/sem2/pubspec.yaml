@@ -1,0 +1,10 @@
+name: corpus_sem2
+description: >-
+  Semantic wave-2 targeted corpus (audit finding: the nailed-but-ungated
+  divergence surface): one fixture per frozen gate code in
+  tests/harness/sem2_codes.txt, dart-verify caliber,
+  implementation-independent. Fixture shapes mirror the oracle rows
+  pinned by the regression nails the codes file was derived from;
+  companion clean faces carry the families' near-miss shapes.
+environment:
+  sdk: ^3.13.0

@@ -5,7 +5,7 @@ description: >-
   file's ancestry (design doc section 1.2 — no options-free corpus file
   on the lint face).
 # Deliberate permanent violation: the insecure homepage is the
-# secure_pubspec_urls row keyed pubspec.yaml on both sides (the gate's
+# SECURE_PUBSPEC_URLS row keyed pubspec.yaml on both sides (the gate's
 # vacuity feed). No other URL fields.
 homepage: http://lint-corpus.invalid
 environment:

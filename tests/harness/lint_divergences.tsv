@@ -11,8 +11,13 @@
 #               under-reports) | structural (cannot appear on both sides)
 #               | both (documented over- and under-report faces)
 #   gate_status excluded (absent from lint_codes.txt) | in_universe (gated;
-#               diffs are real bugs) | fixed (historical)
-#   citation    rule module + line, or audit/SDK anchor
+#               diffs are real bugs) | fixed (historical). Retirement
+#               convention for `fixed` rows (retire_when): a targeted
+#               fixture for the rule exists under tests/corpus/lints AND
+#               one full lint-gate cycle has passed green after it — until
+#               both hold, the row stays for provenance.
+#   citation    rule module (file + module name, grep-stable — no line
+#               numbers, they rot on every edit), or audit/SDK anchor
 #
 # Consistency pin: scripts/lint-gate.sh preflight asserts every `excluded`
 # row is absent from lint_codes.txt, every `in_universe` row is present in
@@ -21,16 +26,89 @@
 # Entry-level exemptions stay in tests/corpus/regressions/known-diffs.json
 # (persistence/triage-scoped; never alters gate Jaccard).
 #
-# Seed rows (the initial triage sweep + the #721
-# main-agent rulings; the sweep of the remaining approximation
-# doc-comments in crates/dartq-lints/src/rules/*.rs extends this table).
+# Spelling pin: the ledger and lint_codes.txt carry the SDK machine-name
+# lowercasings (`prefer_iterable_wheretype`,
+# `prefer_for_elements_to_map_fromiterable`) that differ from the
+# dartq-internal rule-module names (`prefer_iterable_where_type`,
+# `prefer_for_elements_to_map_from_iterable`). The rows pin the mapping
+# with "(pinned as <module name>)"; do not normalize the spellings — the
+# lint-gate preflight and the registry pin match on the SDK machine name.
+#
+# Sweep status (closed 2026-10-13): the approximation-doc sweep promised by
+# the seed rows is complete — every rule module's approximation
+# doc-comments under crates/dartq-lints/src/rules/*.rs were walked. Every
+# rule whose docs state a dartq-vs-oracle divergence face carries a row
+# (the 2026-10-13 sweep block below; the seed block keeps its original
+# order). Rules whose docs state only behavior-preserving approximations
+# or agreement carry no row (e.g. unnecessary_null_aware_assignments: the
+# setter-exclusion shape matches the official's writeElement verdict on
+# every syntax-reachable shape).
+#
+# Seed rows (the initial triage sweep + the #721 main-agent rulings).
 no_duplicate_case_values	legacy-only official rule (fires only at language version <= 2.19); dartq historically const-folded every modern `case` and over-reported; silenced at the default version by the #709 fix round, so the corpus carries no duplicate-case fixture and any diff is a real bug	dartq_only	in_universe	official linter no_duplicate_case_values.dart:41; triage finding F1; main-agent ruling on #721
 exhaustive_cases	scrutinee static type + constant values are element facts dartq-lints did not mount (kinds: &[], #434 wiring) — the oracle reported, dartq was structurally silent	oracle_only	fixed	mounted on the enum-like seam 2026-10-12 (exemption-reaudit F2, kinds: [SwitchStatement]); re-frozen into lint_codes.txt at the full 89 — lints-r1.md F2; return path was the wiring ticket
 unnecessary_type_check	structural: the rule left the linter in the Dart 3.15 main re-pin (templates live in the analyzer's diagnostic.g.dart:17640-17661), so it can never be enabled on both sides under include:; dartq keeps it as Group::Diagnostic opt-in, validated by inline pins only	structural	excluded	triage finding F5; main-agent ruling on #721
-collection_methods_unrelated_type	`Map[]=` index and cross-file `Queue.remove` rows unported (under-report); opaque-receiver presumption over-reports user `where` members	both	in_universe	crates/dartq-lints/src/rules/collections.rs:870; triage finding F6
+collection_methods_unrelated_type	`Map[]=` index and cross-file `Queue.remove` rows unported (under-report); opaque-receiver presumption over-reports user `where` members	both	in_universe	crates/dartq-lints/src/rules/collections.rs collection_methods_unrelated_type module; triage finding F6
 prefer_contains	opaque-receiver presumption over-reports dartq_only; typed receivers (the fixture face) agree	dartq_only	in_universe	crates/dartq-lints/src/rules/expressions.rs prefer_contains module; triage finding F6
 control_flow_in_finally	forward `continue L` to a later member-label unresolved (under-report)	both	in_universe	crates/dartq-lints/src/rules/flow.rs control_flow_in_finally module; triage finding F6
-type_literal_in_constant_pattern	built-in-name set: user constants named like built-in types over-report; user-type constants (`case MyType`) under-report (the oracle resolves, dartq matches lexemes)	both	in_universe	crates/dartq-lints/src/rules/flow.rs:848; triage finding F6
-prefer_iterable_wheretype	element-free written-type face (closure-parameter identity presumed)	dartq_only	in_universe	crates/dartq-lints/src/rules/collections.rs:605 (pinned as prefer_iterable_whereType); triage finding F6
-prefer_for_elements_to_map_fromiterable	element-free written-type face (closure shape presumed)	dartq_only	in_universe	crates/dartq-lints/src/rules/collections.rs:763 (pinned as prefer_for_elements_to_map_fromIterable); triage finding F6
-prefer_collection_literals	element-free written-type face (element identity presumed)	dartq_only	in_universe	triage finding F6
+type_literal_in_constant_pattern	built-in-name set: user constants named like built-in types over-report; user-type constants (`case MyType`) under-report (the oracle resolves, dartq matches lexemes)	both	in_universe	crates/dartq-lints/src/rules/flow.rs type_literal_in_constant_pattern module; triage finding F6
+prefer_iterable_wheretype	element-free written-type face (closure-parameter identity presumed)	dartq_only	in_universe	crates/dartq-lints/src/rules/collections.rs prefer_iterable_where_type module (pinned as prefer_iterable_whereType); triage finding F6
+prefer_for_elements_to_map_fromiterable	element-free written-type face (closure shape presumed)	dartq_only	in_universe	crates/dartq-lints/src/rules/collections.rs prefer_for_elements_to_map_from_iterable module (pinned as prefer_for_elements_to_map_fromIterable); triage finding F6
+prefer_collection_literals	element-free written-type face (element identity presumed)	dartq_only	in_universe	crates/dartq-lints/src/rules/collections.rs prefer_collection_literals module; triage finding F6
+# 2026-10-13 approximation-doc sweep rows (LC_ALL=C order): every rule module
+# whose doc-comments state a gate-visible divergence face; citations are the
+# grep-stable module anchors.
+always_put_required_named_parameters_first	the super-parameter ordering face resolves the super constructor's parameter positions (an element-model question); the lexical face treats named super-parameters as in-order, so the out-of-order super-parameter shape stays silent	oracle_only	in_universe	crates/dartq-lints/src/rules/declarations.rs always_put_required_named_parameters_first module
+annotate_overrides	the inherited-member lookup is the same-file written-supertype chain — cross-file ancestors (imports, the SDK) never report (the dominant face); the primary-constructor parameter face stays unported	oracle_only	in_universe	crates/dartq-lints/src/rules/declarations.rs annotate_overrides module
+avoid_bool_literals_in_conditional_expressions	the non-literal arm's bool-ness reads the same-file written type — calls, chains, dynamic and nullable-written arms stay silent (the inference-bound family)	oracle_only	excluded	crates/dartq-lints/src/rules/expressions.rs avoid_bool_literals_in_conditional_expressions module
+avoid_catches_without_on_clauses	the static-type valid-use faces (Never-typed invocations, Future.error, Completer.completeError) stay silent (under-report); a shadowing local of the exception name inside a closure body counts as a use (over-report)	both	in_universe	crates/dartq-lints/src/rules/flow.rs avoid_catches_without_on_clauses module
+avoid_classes_with_only_static_members	the inherited-instance-member skip walks the same-file ancestor chain — cross-file supertypes resolve to no instance members and the class reports	dartq_only	in_universe	crates/dartq-lints/src/rules/declarations.rs avoid_classes_with_only_static_members module
+avoid_double_and_int_checks	the binding face is the shadow-correct same-file walk — an import-bound identifier stays silent, and a prefixed or parameterized written type never resolves	oracle_only	in_universe	crates/dartq-lints/src/rules/expressions.rs avoid_double_and_int_checks module
+avoid_escaping_inner_quotes	a unicode escape (`\u{27}`) that produces a quote character in the official unescape is not seen on the raw segments (documented under-report)	oracle_only	in_universe	crates/dartq-lints/src/rules/strings.rs avoid_escaping_inner_quotes module
+avoid_function_literals_in_foreach_calls	an opaque receiver keeps the Iterable presumption (over-report); the null-aware chain bail reads the local chain only and misses exotic chains (under-report)	both	in_universe	crates/dartq-lints/src/rules/expressions.rs avoid_function_literals_in_foreach_calls module
+avoid_init_to_null	the nullable-declared-type gate is dropped — `int x = null;` (a compile error upstream) reports	dartq_only	in_universe	crates/dartq-lints/src/rules/declarations.rs avoid_init_to_null module
+avoid_private_typedef_functions	the use count is unit-local — a typedef used only in sibling part files reports (the documented cross-file family)	dartq_only	in_universe	crates/dartq-lints/src/rules/declarations.rs avoid_private_typedef_functions module
+avoid_renaming_method_parameters	the inherited concrete member is the same-file extends/with/on chain, concrete members only — cross-file inherited methods stay silent	oracle_only	in_universe	crates/dartq-lints/src/rules/declarations.rs avoid_renaming_method_parameters module
+avoid_returning_null_for_void	the async `Future<void>` branch needs the resolved declared type, and the closure face with an inferred return type has no written type — both stay silent	oracle_only	in_universe	crates/dartq-lints/src/rules/flow.rs avoid_returning_null_for_void module
+avoid_types_as_parameter_names	the name set is the dart:core built-in list, so user-declared type names stay silent; primary-constructor declaring formals report (the official's no-hit shape)	both	in_universe	crates/dartq-lints/src/rules/names.rs avoid_types_as_parameter_names module
+avoid_types_on_closure_parameters	the context type is the written-type chain — SDK callbacks and member targets resolve through the element model and stay silent (the dominant real faces)	oracle_only	in_universe	crates/dartq-lints/src/rules/declarations.rs avoid_types_on_closure_parameters module
+await_only_futures	the static-type face is the scalar-literal slice — identifiers, calls and collections are inference-bound and never report (the dominant face)	oracle_only	in_universe	crates/dartq-lints/src/rules/expressions.rs await_only_futures module
+file_names	the official checks the library's file through the element model; dartq checks each unit, so a part file's own non-conforming name reports where the official judges the library	dartq_only	in_universe	crates/dartq-lints/src/rules/names.rs file_names module
+implicit_call_tearoffs	the ported face is the written-FunctionType assignment/initializer site — argument, return and collection sites, inferred targets and cross-file `call` classes stay silent (the dominant face); a bare-field user shadow over-reports	both	in_universe	crates/dartq-lints/src/rules/expressions.rs implicit_call_tearoffs module
+invalid_runtime_check_with_js_interop_types	the interop classification is same-file `@JS` classes under a dart:js_interop import — other left expressions, cross-file interop types, the catch face and the js-side variants stay silent (the dominant face)	oracle_only	in_universe	crates/dartq-lints/src/rules/expressions.rs invalid_runtime_check_with_js_interop_types module
+library_annotations	the `targetKinds` branch needs resolved `@Target` metadata, and a prefixed `foo.pragma` never matches the written core-pragma name — both stay silent	oracle_only	in_universe	crates/dartq-lints/src/rules/directives.rs library_annotations module
+library_private_types_in_public_api	implicit field-formal/super-formal parameter types, extension `on`-clause and mixin constraint types, type-parameter bounds and prefixed (`p._Foo`) names stay silent (element-bound faces)	oracle_only	in_universe	crates/dartq-lints/src/rules/types.rs library_private_types_in_public_api module
+literal_only_boolean_expressions	every string literal counts as valued and an unresolvable `is` name stays silent (under-report); a literal condition under a case clause reports — the clause is not read on the IfStatement row (over-report)	both	excluded	crates/dartq-lints/src/rules/expressions.rs literal_only_boolean_expressions module
+no_literal_bool_comparisons	inferred-`bool` locals (`var x = true`) and `this.getter` receivers stay silent (the inference-bound family)	oracle_only	in_universe	crates/dartq-lints/src/rules/expressions.rs no_literal_bool_comparisons module
+no_wildcard_variable_uses	pattern-bound wildcard variables stay silent — their uses never enter the wildcard binding table	oracle_only	in_universe	crates/dartq-lints/src/rules/names.rs no_wildcard_variable_uses module
+noop_primitive_operations	a member-chain receiver carries no written type and stays silent, and a bare same-file `print` skips the print face	oracle_only	excluded	crates/dartq-lints/src/rules/expressions.rs noop_primitive_operations module
+null_check_on_nullable_type_parameter	the context face is the return / variable-initializer slice — argument and assignment contexts and the pattern face stay silent	oracle_only	in_universe	crates/dartq-lints/src/rules/expressions.rs null_check_on_nullable_type_parameter module
+null_closures	an opaque receiver or type matches by written name outside the file — a user class reusing a core method name reports (the documented over-report residue); chained or computed receivers bail where the official resolves (under-report)	both	in_universe	crates/dartq-lints/src/rules/expressions.rs null_closures module
+overridden_fields	the inherited concrete member is the same-file chain — cross-file ancestors stay silent; the primary-constructor parameter face stays unported	oracle_only	in_universe	crates/dartq-lints/src/rules/declarations.rs overridden_fields module
+prefer_final_fields	pattern-assignment and cascade-section writes are not scanned, and the setter-override exemption is dropped (over-report); a same-named local mutation marks the field mutated, and cross-unit declaring formals stay silent (under-report)	both	in_universe	crates/dartq-lints/src/rules/expressions.rs prefer_final_fields module
+prefer_foreach	a nested function literal shadowing the loop variable inside the invocation target keeps the lexical reference scan silent	oracle_only	excluded	crates/dartq-lints/src/rules/collections.rs prefer_foreach module
+prefer_function_declarations_over_variables	a write bound to a shadowing redeclaration still counts (the erroneous family, under-report); `++`/`--` and pattern-assignment writes are not scanned (over-report)	both	in_universe	crates/dartq-lints/src/rules/declarations.rs prefer_function_declarations_over_variables module
+prefer_initializing_formals	the subtype check is written-type lexeme equality — differing-but-subtype spellings stay silent; a same-lexeme local over-counts and skips; private fields and primary constructors stay out	oracle_only	in_universe	crates/dartq-lints/src/rules/declarations.rs prefer_initializing_formals module
+prefer_int_literals	the parameter faces need the element model — argument and named-argument positions stay silent	oracle_only	excluded	crates/dartq-lints/src/rules/expressions.rs prefer_int_literals module
+prefer_interpolation_to_compose_strings	an opaque operand keeps the String presumption — a user `operator+` class reports; multi-piece operands split piece-wise (report span only, gate-invisible)	dartq_only	in_universe	crates/dartq-lints/src/rules/expressions.rs prefer_interpolation_to_compose_strings module
+prefer_is_empty	an opaque receiver keeps the Iterable/Map/String presumption — a user `length` getter reports; `getIntValue` reads int literals only, so constant expressions stay silent	both	in_universe	crates/dartq-lints/src/rules/expressions.rs prefer_is_empty module
+prefer_is_not_empty	an opaque receiver keeps the core-family presumption — a user class with `isEmpty` but no `isNotEmpty` reports; a positional argument list carries no separators, so a later argument's access false-fires	dartq_only	in_universe	crates/dartq-lints/src/rules/expressions.rs prefer_is_not_empty module
+provide_deprecation_message	the element pin is the written name — a prefixed `foo.deprecated` never matches; the `@Deprecated` class face is unreachable on valid code on both sides	oracle_only	in_universe	crates/dartq-lints/src/rules/directives.rs provide_deprecation_message module
+recursive_getters	if-case pattern variables are not walked — a read inside the then-branch of that name reports	dartq_only	in_universe	crates/dartq-lints/src/rules/declarations.rs recursive_getters module
+secure_pubspec_urls	the extraction reads a scheme prefix where `Uri.tryParse` rejects the malformed URI (broken IPv6 literals, invalid ports) — such a value reports where the official stays silent	dartq_only	in_universe	crates/dartq-lints/src/rules/pubspec.rs secure_pubspec_urls module
+type_annotate_public_apis	the `hasInferredType` exemption reads initializer presence — a `dynamic`-typed initializer stays exempt where the official reports (the inference-bound face)	oracle_only	excluded	crates/dartq-lints/src/rules/types.rs type_annotate_public_apis module
+type_init_formals	the element re-check is dropped — a nonexistent field or a mismatched written type (compile errors upstream) reports	dartq_only	in_universe	crates/dartq-lints/src/rules/declarations.rs type_init_formals module
+unintended_html_in_doc_comment	the fenced-region toggle matches fence lines without tick-count matching — lines can flip in or out of the markdown code region either way	both	in_universe	crates/dartq-lints/src/rules/docs.rs unintended_html_in_doc_comment module
+unnecessary_constructor_name	a constructor tear-off is no instance creation (both sides silent), and prefixed or chained receivers fail the bare-receiver check — the conservative family stays silent	oracle_only	in_universe	crates/dartq-lints/src/rules/declarations.rs unnecessary_constructor_name module
+unnecessary_getters_setters	the setter's write-type agreement guard is resolution-bound and dropped — a wrap whose written types disagree reports	dartq_only	in_universe	crates/dartq-lints/src/rules/declarations.rs unnecessary_getters_setters module
+unnecessary_lambdas	the assignability gates are out of the same-file substrate — a type-mismatched tear-off reports (over-report); deferred-prefix targets stay silent at the bail (under-report)	both	excluded	crates/dartq-lints/src/rules/expressions.rs unnecessary_lambdas module
+unnecessary_nullable_for_final_variable_declarations	the initializer face is the non-null literal slice — a non-null non-literal initializer stays silent until inference lands	oracle_only	in_universe	crates/dartq-lints/src/rules/declarations.rs unnecessary_nullable_for_final_variable_declarations module
+unnecessary_overrides	the inherited member is the same-file chain (cross-file silent); the signature guard reads written shapes — subtype spellings and resolved defaults stay silent; the operator faces stay unported	oracle_only	in_universe	crates/dartq-lints/src/rules/declarations.rs unnecessary_overrides module
+unnecessary_parenthesis	the record-type exemption reads written types for variables only — parameter faces report; a TypeLiteral inner and the extension-nullable bail report (type-system faces dropped)	dartq_only	excluded	crates/dartq-lints/src/rules/expressions.rs unnecessary_parenthesis module
+unnecessary_statements	the getter and function-type faces resolve over the unit's own declarations — imported getters and core receivers stay silent (the conservative family)	oracle_only	excluded	crates/dartq-lints/src/rules/expressions.rs unnecessary_statements module
+unnecessary_string_interpolations	the String-type question is answered only for a complete plain string literal — `$identifier` and multi-token expressions stay silent (the official corpus's main family)	oracle_only	in_universe	crates/dartq-lints/src/rules/strings.rs unnecessary_string_interpolations module
+unnecessary_this	the import bail keys on the written combinator shape — an import whose library does not actually export the name still silences the report	oracle_only	in_universe	crates/dartq-lints/src/rules/expressions.rs unnecessary_this module
+unnecessary_to_list_in_spreads	the Iterable-receiver gate is a lexical name check — a user `toList` on a non-Iterable (a compile error upstream in a spread) reports	dartq_only	in_universe	crates/dartq-lints/src/rules/collections.rs unnecessary_to_list_in_spreads module
+unrelated_type_equality_checks	the operand types are the scalar-literal/`this` slice — identifiers and calls stay silent; a user `==` override returning non-bool reports where the official's bool gate silences; the pattern face stays unported	both	in_universe	crates/dartq-lints/src/rules/expressions.rs unrelated_type_equality_checks module
+use_super_parameters	the named-parameter conversion face needs the super constructor's resolved parameter list — named arguments never contribute, and a shadowing local over-counts body references (conservative, under-reports the conversion)	oracle_only	in_universe	crates/dartq-lints/src/rules/names.rs use_super_parameters module
+void_checks	the target type reads `this.<field>` only — a bare field reports under shadowing (over-report); the right side is the scalar-literal slice and the return, pattern, argument and creation branches stay unported (under-report)	both	in_universe	crates/dartq-lints/src/rules/expressions.rs void_checks module

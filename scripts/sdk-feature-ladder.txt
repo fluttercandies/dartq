@@ -1,0 +1,92 @@
+# sdk-feature-ladder.txt — authoritative feature-release ladder for the
+# multi-SDK version-skew attribution in scripts/sdk-matrix.sh (the addedIn
+# classification: a dartq-only one-sided entry whose code family belongs to a
+# feature that is enabled by default only ABOVE the oracle's language minor
+# can never be emitted by that oracle — it is version skew, not a defect
+# candidate; mirrors how the removedIn code families are excluded).
+#
+# Rung = the language minor at which the feature is enabled BY DEFAULT (the
+# `enabledIn` / experimentEnabledVersion field). `experimentalReleaseVersion`
+# (flag-enabled-by-hand) is noted in the rung's comment but never used as the
+# rung: the sweep passes no --enable-experiment flags, so a flag-available
+# but default-off oracle (e.g. dot-shorthands at 3.9, primary constructors at
+# 3.12) still cannot emit the feature's diagnostics.
+#
+# Upstream verification (2026-10-13): every rung cross-checked against TWO
+# tables in the upstream Dart SDK source, which agree on all minors:
+#   1. tools/experimental_features.yaml (enabledIn / experimentalReleaseVersion)
+#   2. pkg/_fe_analyzer_shared/lib/src/experiments/flags.dart
+#      (experimentEnabledVersion / experimentReleasedVersion)
+# The sweep floor is Dart 3.0.7 (scripts/sdk-versions.txt), so the 3.0 rungs
+# are inert for today's ladder — recorded for attribution generality if the
+# floor ever drops below 3.0.
+#
+# Format: one `<minor>|<feature>|<code-name list>` row per rung, ascending
+# by minor; `#` comment lines and blank lines allowed. Multiple rows may
+# share a minor. <minor> is the BARE language-minor integer (0 = Dart 3.0,
+# 13 = Dart 3.13) — the same integer the script derives from the oracle
+# version banner ("3.0.7" -> 0) for the rung-above-oracle comparison. <minor> is the BARE language-minor integer (0 = Dart 3.0,
+# 13 = Dart 3.13) — the same integer the script derives from the oracle
+# version banner ("3.0.7" -> 0) for the rung-above-oracle comparison. The third field is a COMMA-separated list of diagnostic
+# code names (or code-name prefixes) — the script joins them with `|` into
+# the per-rung ERE — because the row separator itself is `|`. It is matched
+# case-insensitively (codes are ascii_downcase'd first) against dartq-only
+# one-sided (code,file) entry codes from raw-outputs.json. `-` = the rung
+# has no syntax-plane code family in the gate universe (its faces are
+# semantic-plane or oracle-side; see scripts/sdk-matrix-expectations.tsv).
+# Keep code names lowercase and free of `"` and `\` (the script embeds the
+# joined ERE in a JSON string). Bias the family membership CONSERVATIVELY: a
+# code wrongly added here is excluded from defect candidates forever (a
+# masked defect); a code wrongly omitted just stays a candidate until
+# triaged.
+#
+# The language-version diagnostic family (invalid_language_version_override,
+# illegal_language_version_override, inconsistent_language_version_override,
+# language_version_too_high_explicit) is version skew by corpus pin, not by
+# a feature rung — it stays in sdk-matrix.sh's SKEW_RE (removedIn structure).
+
+# 3.0 — patterns, records, sealed-class, class-modifiers (four separate
+#       flags, all enabledIn 3.0.0). Floor-inert: every ladder oracle has
+#       them. Conservative subset: only the codes unambiguously gated on
+#       these features (pattern/record grammar, modifier-bearing enums and
+#       sealed declarations). `invalid_constant_pattern_` is a prefix.
+0|patterns-records-sealed-class-modifiers|illegal_pattern_assignment_variable_name,illegal_pattern_identifier_name,illegal_pattern_variable_name,invalid_inside_unary_pattern,variable_pattern_keyword_in_declaration_context,pattern_assignment_declares_variable,pattern_variable_declaration_outside_function_or_method,late_pattern_variable_declaration,invalid_constant_pattern_,empty_record_literal_with_comma,empty_record_type_named_fields_list,empty_record_type_with_comma,record_literal_one_positional_no_trailing_comma,record_type_one_positional_no_trailing_comma,sealed_enum,sealed_mixin,sealed_mixin_class,abstract_sealed_class,base_enum,interface_enum,final_enum
+# 3.2 — inference-update-2 (semantic plane only; no syntax codes).
+2|inference-update-2|-
+# 3.3 — extension types (upstream flag name `inline-class`; enabledIn 3.3.0,
+#       experimentalReleaseVersion 3.3.0). Representation-declaration
+#       grammar and extends/with restrictions are extension-type-gated.
+3|extension-types|extension_type_extends,extension_type_with,expected_representation_field,expected_representation_type,extraneous_modifier_in_extension_type,multiple_representation_fields,representation_field_modifier,representation_field_trailing_comma
+# 3.4 — inference-update-3 (semantic plane only; no syntax codes).
+4|inference-update-3|-
+# 3.6 — digit separators (enabledIn 3.6.0). The separator validation
+#       diagnostic is part of the feature's scanner surface; an oracle below
+#       3.6 lexes no separators and cannot emit it.
+6|digit-separators|unexpected_separator_in_number
+# 3.7 — wildcard-variables (enabledIn 3.7.0) and inference-using-bounds
+#       (semantic). No syntax-plane code family: wildcards REMOVE oracle
+#       faces below the rung (a clamped language makes `_` binding again),
+#       an oracle-side flip — expectation-table scope, not addedIn.
+7|wildcard-variables|-
+# 3.8 — null-aware elements (enabledIn 3.8.0; semantic plane).
+8|null-aware-elements|-
+# 3.9 — getter-setter-error (behavior change: stops reporting
+#       getter/setter type-mismatch faces) and sound-flow-analysis
+#       (semantic). No syntax-plane code family.
+9|getter-setter-error|-
+9|sound-flow-analysis|-
+# 3.10 — dot-shorthands (enabledIn 3.10.0, experimentalReleaseVersion 3.9.0;
+#         rung is 3.10: the sweep passes no experiment flags) and
+#         native-assets (non-parser). No syntax-plane code family in the
+#         gate universe; below-rung oracles can still emit parser recodes on
+#         dot-shorthand fixture faces (oracle-side — expectation table).
+10|dot-shorthands|-
+# 3.12 — private-named-parameters (enabledIn 3.12.0). No syntax-plane code
+#         family identified in the gate universe.
+12|private-named-parameters|-
+# 3.13 — primary-constructors (enabledIn 3.13.0, experimentalReleaseVersion
+#         3.12.0; rung is 3.13). Includes the parser's out-of-table local
+#         code mixin_primary_constructor (registry-gap code in
+#         crates/dartq-parser/src/message.rs, absent from the TSV but
+#         emitted on the raw plane the classification reads).
+13|primary-constructors|extraneous_modifier_in_primary_constructor,invalid_covariant_modifier_in_primary_constructor,missing_primary_constructor,missing_primary_constructor_parameters,mixin_primary_constructor

@@ -1,0 +1,162 @@
+# SEMANTIC WAVE-2 diagnostic gate codes (semantic wave 2 = the
+# nailed-but-ungated divergence surface): the code set for the sem2 gate,
+# scored ERROR-severity over the dedicated `tests/corpus/sem2` corpus
+# package (`--severity-filter ERROR` plus this `--codes-file`), same
+# (code, file) Jaccard caliber as the m1/m2 tiers. One code per line,
+# # comments: same format as m1_codes.txt.
+#
+# Inclusion rule (mechanical, re-derivable): the union of the oracle and
+# dartq row codes over every persisted regression nail
+# (`tests/corpus/regressions/cases/*.json`, schema regression-case-v1)
+# minus the five frozen gate universes (`tests/corpus/syntax-codes.txt`,
+# `tests/harness/m1_codes.txt`, `tests/harness/m2_warning_codes.txt`,
+# `tests/harness/m3_unused_codes.txt`, `tests/harness/lint_codes.txt`;
+# 451-code union at freeze). At the 2026-10-13 freeze the nails carried
+# 5,557 code rows over 167 distinct codes; the difference set is these 65
+# codes. The pin test sem2_codes_file_matches_derivation
+# (tests/harness/src/main.rs) derives the set live from the nails and
+# asserts set equality against this file, so a new nail code (a fresh
+# persisted regression) or a newly frozen code (a gate expansion)
+# forces a conscious re-freeze.
+#
+# 63 of the 65 codes have oracle-side nail rows (real `dart analyze`
+# emissions the targeted fixtures mirror). The two exceptions,
+# `const_field_without_initializer` and `final_field_without_initializer`,
+# appear dartq-only, at identical (line, column) positions where the
+# oracle emits `const_not_initialized` / `final_not_initialized` -- a
+# dartq-side code rename this tier is designed to expose: those fixtures
+# trigger the family on both sides, and the rename shows up as a
+# one-sided dartq-only (code, file) entry until dartq adopts the oracle
+# name.
+#
+# Included buckets (65 codes):
+#  (a) const/final initialization & non-nullable definite assignment (7):
+#      const_field_without_initializer, const_not_initialized,
+#      final_field_without_initializer, final_not_initialized,
+#      final_not_initialized_constructor,
+#      not_initialized_non_nullable_instance_field,
+#      not_initialized_non_nullable_variable.
+#  (b) primary constructors & declaring/initializing formals (8):
+#      const_without_primary_constructor, extension_primary_constructor,
+#      initializing_declaring_parameter,
+#      initializing_formal_for_non_existent_field,
+#      invalid_covariant_modifier_in_primary_constructor,
+#      mixin_primary_constructor,
+#      super_formal_parameter_without_associated_positional,
+#      super_initializing_declaring_parameter.
+#  (c) redirecting & factory constructor forms (10):
+#      deprecated_factory_method, duplicate_constructor,
+#      factory_constructor_new_name, invalid_factory_name_not_a_class,
+#      new_constructor_dot_name, new_with_undefined_constructor_default,
+#      redirect_generative_to_non_generative_constructor,
+#      redirect_to_invalid_return_type, redirect_to_non_class,
+#      redirect_to_non_const_constructor.
+#  (d) const evaluation & const member/creation forms (7):
+#      const_eval_type_string, const_instance_field, const_with_non_const,
+#      const_with_non_constant_argument, const_with_undefined_constructor,
+#      non_constant_case_expression, non_constant_record_field.
+#  (e) patterns & switch exhaustiveness (2):
+#      constant_pattern_with_non_constant_expression,
+#      non_exhaustive_switch_expression.
+#  (f) function bodies, conditions & setters (4):
+#      body_might_complete_normally, non_bool_condition,
+#      non_bool_negation_expression, non_void_return_for_setter.
+#  (g) class/mixin/enum declarations & members (7):
+#      conflicting_static_and_instance, enum_without_constants,
+#      implements_non_class, mixin_of_non_class,
+#      mixin_super_class_constraint_non_interface,
+#      mixin_with_non_class_superclass, non_final_field_in_enum.
+#  (h) non-class types in type/creation/call/catch positions (7):
+#      creation_with_non_type,
+#      enum_instantiated_to_bounds_is_not_well_bounded,
+#      extension_override_argument_not_assignable,
+#      invocation_of_non_function_expression, non_type_as_type_argument,
+#      non_type_in_catch_clause, not_a_type.
+#  (i) instance initializers & this/super references (4):
+#      field_initializer_not_assignable,
+#      initializer_for_non_existent_field, invalid_reference_to_this,
+#      super_in_invalid_context.
+#  (j) call shape & null checks (5): extra_positional_arguments,
+#      invalid_use_of_null_value, list_element_type_not_assignable,
+#      not_enough_positional_arguments, unchecked_use_of_nullable_value.
+#  (k) inference (1): could_not_infer.
+#  (l) formal-parameter defaults (2): missing_default_value_for_parameter,
+#      obsolete_colon_for_default_value.
+#  (m) built-in identifiers in declarations (1):
+#      built_in_identifier_in_declaration.
+#
+# Exclusions: none beyond the mechanical rule -- every nail code outside
+# the frozen union is included; this file IS the frozen union's
+# complement over the nail surface. The heavy syntax-recovery codes
+# (expected_token, missing_identifier, duplicate_definition, ...), the m1
+# name-resolution and nullability codes, the m2 WARNING family, the m3
+# unused_* family and the lint rules stay in their own tiers. Known
+# near-miss pairs spanning the boundary: duplicate_constructor (here) vs
+# duplicate_definition (m1); body_might_complete_normally (here) vs
+# body_might_complete_normally_nullable (m2).
+#
+body_might_complete_normally
+built_in_identifier_in_declaration
+conflicting_static_and_instance
+const_eval_type_string
+const_field_without_initializer
+const_instance_field
+const_not_initialized
+const_with_non_const
+const_with_non_constant_argument
+const_with_undefined_constructor
+const_without_primary_constructor
+constant_pattern_with_non_constant_expression
+could_not_infer
+creation_with_non_type
+deprecated_factory_method
+duplicate_constructor
+enum_instantiated_to_bounds_is_not_well_bounded
+enum_without_constants
+extension_override_argument_not_assignable
+extension_primary_constructor
+extra_positional_arguments
+factory_constructor_new_name
+field_initializer_not_assignable
+final_field_without_initializer
+final_not_initialized
+final_not_initialized_constructor
+implements_non_class
+initializer_for_non_existent_field
+initializing_declaring_parameter
+initializing_formal_for_non_existent_field
+invalid_covariant_modifier_in_primary_constructor
+invalid_factory_name_not_a_class
+invalid_reference_to_this
+invalid_use_of_null_value
+invocation_of_non_function_expression
+list_element_type_not_assignable
+missing_default_value_for_parameter
+mixin_of_non_class
+mixin_primary_constructor
+mixin_super_class_constraint_non_interface
+mixin_with_non_class_superclass
+new_constructor_dot_name
+new_with_undefined_constructor_default
+non_bool_condition
+non_bool_negation_expression
+non_constant_case_expression
+non_constant_record_field
+non_exhaustive_switch_expression
+non_final_field_in_enum
+non_type_as_type_argument
+non_type_in_catch_clause
+non_void_return_for_setter
+not_a_type
+not_enough_positional_arguments
+not_initialized_non_nullable_instance_field
+not_initialized_non_nullable_variable
+obsolete_colon_for_default_value
+redirect_generative_to_non_generative_constructor
+redirect_to_invalid_return_type
+redirect_to_non_class
+redirect_to_non_const_constructor
+super_formal_parameter_without_associated_positional
+super_in_invalid_context
+super_initializing_declaring_parameter
+unchecked_use_of_nullable_value

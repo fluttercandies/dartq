@@ -43,7 +43,8 @@
 # SERIAL PHASE ONLY: this script executes the ENTIRE workspace test suite
 # rebuilt with coverage instrumentation. Never run it alongside
 # development-phase lanes (the 80GB/90GB memory-incident discipline); run it
-# single-process with an RSS watchdog. `-- --test-threads=1` is forwarded to
+# single-process with an RSS watchdog. The test-binary thread count
+# (TEST_THREADS below, default 1) is forwarded after `--` to
 # every test binary — no internal suite parallelism, and traces stay free of
 # thread-scheduling nondeterminism. --dry-run prints the plan and runs
 # nothing but the cargo-llvm-cov presence probe (the fail-closed tool gate).
@@ -163,6 +164,15 @@ export LC_ALL=C
 # cargo call.
 export CARGO_TARGET_DIR="target/coverage-build"
 
+# Test-binary thread count, forwarded to every test binary after `--`.
+# Resource-discipline map: the workspace default is 4, heavyweight suites
+# drop to 2, and 4 is the hard cap. The instrumented whole-workspace run
+# pins 1: no internal suite parallelism, and traces stay free of
+# thread-scheduling nondeterminism — the --stability protocol's
+# identical-totals contract depends on it. Raise only with a measured
+# reason, never above 4.
+TEST_THREADS="1"
+
 FLOOR_DEFAULT="0.0"
 REPORT_DEFAULT="target/coverage/coverage.lcov"
 HTML_DIR_DEFAULT="target/coverage/html"
@@ -237,6 +247,14 @@ if [ "$MODE" = "stability" ]; then
     echo "coverage-gate: --stability runs the two-run reproducibility protocol; --enforce/--floor/--floors do not apply" >&2
     exit 2
   fi
+fi
+
+# The thread count actually executed: stability mode pins 1 structurally
+# (its criterion is run-to-run determinism, not throughput); every other
+# mode honors TEST_THREADS.
+RUN_THREADS="$TEST_THREADS"
+if [ "$MODE" = "stability" ]; then
+  RUN_THREADS=1
 fi
 
 case "$FLOOR" in
@@ -334,10 +352,10 @@ if [ "$MODE" != "report" ]; then
     printf '  %-14s %s crates: %s\n' "members" "$(printf '%s\n' $members | wc -l | tr -d ' ')" "$(printf '%s ' $members)"
     if [ "$MODE" = "html" ]; then
       printf '  %-14s %s\n' "output" "$HTML_DIR/ (browsable; no lcov, no gate)"
-      printf '  %-14s %s\n' "command" "RUSTC_WRAPPER='' cargo llvm-cov --workspace --tests --offline --html --output-dir $HTML_DIR -- --test-threads=1"
+      printf '  %-14s %s\n' "command" "RUSTC_WRAPPER='' cargo llvm-cov --workspace --tests --offline --html --output-dir $HTML_DIR -- --test-threads=$RUN_THREADS"
     else
       printf '  %-14s %s\n' "output" "$REPORT (+ summary.txt alongside)"
-      printf '  %-14s %s\n' "command" "RUSTC_WRAPPER='' cargo llvm-cov --workspace --tests --offline --lcov --output-path $REPORT -- --test-threads=1"
+      printf '  %-14s %s\n' "command" "RUSTC_WRAPPER='' cargo llvm-cov --workspace --tests --offline --lcov --output-path $REPORT -- --test-threads=$RUN_THREADS"
     fi
   fi
   if [ "$MODE" = "stability" ]; then
@@ -345,8 +363,9 @@ if [ "$MODE" != "report" ]; then
   else
     printf '  %-14s %s\n' "suite" "cargo llvm-cov --workspace --tests (lib + integration tests; benches excluded)"
   fi
-  printf '  %-14s %s\n' "threads" "-- --test-threads=1 (serial, deterministic traces)"
+  printf '  %-14s %s\n' "threads" "-- --test-threads=$RUN_THREADS (serial, deterministic traces)"
   printf '  %-14s %s\n' "wrapper" "RUSTC_WRAPPER='' for this invocation (sccache bypassed — see header)"
+  printf '  %-14s %s\n' "incremental" "off (workspace config; instrumented runs are cold rebuilds)"
   printf '  %-14s %s\n' "target-dir" "target/coverage-build (isolated from the shared target/ — see header)"
 
   if [ "$DRY_RUN" = 1 ]; then
@@ -364,17 +383,17 @@ if [ "$MODE" != "report" ]; then
   rc=0
   if [ "$MODE" = "stability" ]; then
     mkdir -p "$(dirname "$STAB_RUN1")"
-    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --lcov --output-path "$STAB_RUN1" -- --test-threads=1 || rc=$?
+    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --lcov --output-path "$STAB_RUN1" -- --test-threads=$RUN_THREADS || rc=$?
     if [ "$rc" -eq 0 ]; then
       rc=0
-      RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --lcov --output-path "$STAB_RUN2" -- --test-threads=1 || rc=$?
+      RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --lcov --output-path "$STAB_RUN2" -- --test-threads=$RUN_THREADS || rc=$?
     fi
   elif [ "$MODE" = "html" ]; then
     mkdir -p "$HTML_DIR"
-    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --html --output-dir "$HTML_DIR" -- --test-threads=1 || rc=$?
+    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --html --output-dir "$HTML_DIR" -- --test-threads=$RUN_THREADS || rc=$?
   else
     mkdir -p "$(dirname "$REPORT")"
-    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --lcov --output-path "$REPORT" -- --test-threads=1 || rc=$?
+    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --lcov --output-path "$REPORT" -- --test-threads=$RUN_THREADS || rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
     echo "coverage-gate: coverage run FAILED (exit $rc); if the llvm tools are missing: rustup component add llvm-tools-preview" >&2
@@ -383,7 +402,7 @@ if [ "$MODE" != "report" ]; then
   if [ "$MODE" = "stability" ] && [ "$STABILITY_HTML" = 1 ]; then
     # Browsing pass after the pair (llvm-cov emits one format per run).
     mkdir -p "$HTML_DIR"
-    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --html --output-dir "$HTML_DIR" -- --test-threads=1 || {
+    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --html --output-dir "$HTML_DIR" -- --test-threads=$RUN_THREADS || {
       echo "coverage-gate: the html pass FAILED (the stability pair itself is already judged below)" >&2
       exit 2
     }
@@ -479,6 +498,7 @@ if [ "$MODE" = "stability" ]; then
     printf '%s\n' "$banner"
     printf 'git_head %s\n' "$GIT_HEAD"
     printf 'worktree_patch_sha256 %s\n' "$PATCH_SHA"
+    printf 'test_threads %s\n' "$RUN_THREADS"
     printf 'run1_total %s %s (%s%%)\n' "$HIT1" "$TOT1" "$P1"
     printf 'run2_total %s %s (%s%%)\n' "$HIT2" "$TOT2" "$P2"
     printf 'verdict %s\n' "$verdict"
@@ -566,6 +586,7 @@ printf '%s\n' "$TABLE"
   if [ -n "$GIT_HEAD" ]; then
     printf 'git_head %s\n' "$GIT_HEAD"
     printf 'worktree_patch_sha256 %s\n' "$PATCH_SHA"
+    printf 'test_threads %s\n' "$RUN_THREADS"
   fi
   printf '%s\n' "$TABLE"
 } > "$(dirname "$REPORT")/summary.txt"

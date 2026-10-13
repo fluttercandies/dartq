@@ -21,21 +21,38 @@
 # concurrency comes from the workspace config (.cargo/config.toml pins
 # jobs = 2); no -j is passed anywhere.
 #
-# Usage: scripts/ci.sh [--check-only]
+# `--coverage` appends the llvm-cov line-coverage gate after the
+# calibration pins: scripts/coverage-gate.sh --enforce, scored against the
+# committed per-crate floors (scripts/coverage-floors.tsv). SERIAL PHASE
+# ONLY: the flag rebuilds the whole workspace with coverage instrumentation
+# and runs the full test suite, so a --coverage invocation IS the sanctioned
+# serial window's coverage face — never alongside development-phase lanes
+# (the 80GB/90GB memory-incident discipline). Advisory runs and the §19.5
+# two-run stability protocol remain direct calls (scripts/coverage-gate.sh,
+# scripts/coverage-run.sh). Mutually exclusive with --check-only.
+#
+# Usage: scripts/ci.sh [--check-only] [--coverage]
 
 set -u -o pipefail
 
 cd "$(dirname "$0")/.." || exit 2
 
 mode="gate"
-case "${1:-}" in
-"") ;;
---check-only) mode="check" ;;
-*)
-    echo "usage: scripts/ci.sh [--check-only]" >&2
+coverage=0
+for arg in "$@"; do
+    case "$arg" in
+    --check-only) mode="check" ;;
+    --coverage) coverage=1 ;;
+    *)
+        echo "usage: scripts/ci.sh [--check-only] [--coverage]" >&2
+        exit 2
+        ;;
+    esac
+done
+if [ "$mode" = "check" ] && [ "$coverage" = 1 ]; then
+    echo "ci: --check-only and --coverage are mutually exclusive (compile-only probe vs the serial-phase instrumented suite)" >&2
     exit 2
-    ;;
-esac
+fi
 
 # Member paths from the explicit member list (crates/* and tests/harness).
 members=$(sed -n '/^members = \[/,/^\]/p' Cargo.toml | grep -o '"[^"]*"' | tr -d '"')
@@ -84,14 +101,26 @@ if [ "$mode" = "gate" ]; then
     fi
 fi
 
-# Heavyweight phases (coverage, differential gates, test suites beyond the
+# Coverage gate (--coverage): the llvm-cov line-coverage floor gate over
+# the full instrumented suite. Serial-phase-only — see the header.
+if [ "$coverage" = 1 ]; then
+    echo "== coverage gate: scripts/coverage-gate.sh --enforce"
+    if ! bash scripts/coverage-gate.sh --enforce; then
+        echo "ci: coverage gate FAILED" >&2
+        exit 1
+    fi
+fi
+
+# Remaining heavyweight phases (differential gates, test suites beyond the
 # calibration pins above) are NOT run
 # here: they execute real processes over the whole workspace and are reserved
 # for the serial verification phase (the resource discipline after the 80GB/90GB memory incidents):
-#   scripts/coverage-gate.sh — llvm-cov coverage gate (serial phase only)
-#   scripts/m1-gate.sh       — M1 differential gate (serial phase only)
+#   scripts/m1-gate.sh         — M1 differential gate (serial phase only)
 #   scripts/acceptance-gate.sh — valid-syntax acceptance gate (serial phase only)
-#   scripts/repro-gate.sh    — §19.5 reproducibility gate (serial phase only)
+#   scripts/repro-gate.sh      — §19.5 reproducibility gate (serial phase only)
+#   scripts/serial-gates.sh    — the full serial chain, coverage included
+# The coverage face is the one exception: --coverage opts this invocation in
+# as the serial window's coverage step (the gate above).
 
 # Untracked-reference gate: no tracked file may reference never-tracked local
 # workspace material (vendored checkouts, evidence/ledger paths, home paths).
