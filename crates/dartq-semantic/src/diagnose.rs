@@ -817,13 +817,10 @@ struct Frame {
     kind: FrameKind,
     /// Names declared directly in this frame's scope.
     locals: FxHashSet<StringId>,
-    /// Declared-type bindings: name → declared type.
+    /// Declared-type bindings: name → declared type. A written annotation
+    /// interns with its arguments (#611), so the slot carries the written
+    /// shape directly — no side channel.
     var_types: FxHashMap<StringId, Ty>,
-    /// Written type arguments of a binding's declared type (name → the
-    /// annotation's arguments as written): `Ty`'s argument slots stay
-    /// argument-less at body level (the pool is capture-immutable), so the
-    /// null-argument face reads the annotation through this side channel.
-    written_args: FxHashMap<StringId, Vec<Ty>>,
     /// `type_params` length to truncate back to when this frame closes.
     type_mark: usize,
     /// The row-stack length when this frame opened: type parameters that
@@ -1599,17 +1596,13 @@ struct Engine<'a> {
     var_name_stack: Vec<(StringId, SourceRange)>,
     /// The written type arguments of the argument group that just closed on
     /// its head `(head name, head offset, arguments as written)`: the
-    /// completing `handle_type` claims the entry when it re-fires that
-    /// head, arming [`Engine::pending_type_args`] for the declaration that
-    /// binds next. The body-level pool is capture-immutable, so written
-    /// arguments of local/parameter annotations travel outside `Ty`'s
-    /// [`ArgListId`] (the null-argument face reads them).
+    /// completing `handle_type` claims the entry when it re-fires that head
+    /// and interns the arguments into the armed head's own [`ArgListId`]
+    /// slot (#611), so the declaration that binds next carries the written
+    /// shape inside its `Ty`. A non-`Named` armed head (`dynamic<int>`
+    /// recovery residue) drops the arguments — suppression, never a
+    /// fabricated shape.
     completed_group: Option<(StringId, u32, Vec<Ty>)>,
-    /// The claimed written arguments of the annotation just completed,
-    /// consumed by the declaration bind points ([`Engine::bind_declared_type`]
-    /// / [`Engine::bind_parameter_type`]); a group-less head completion
-    /// clears it.
-    pending_type_args: Vec<Ty>,
     /// The open container-header capture ([`VarHeader`]); `None` outside
     /// container headers and whenever the experiment is off.
     var_header: Option<VarHeader>,
@@ -2462,7 +2455,6 @@ impl<'a> Engine<'a> {
             var_tv_window: Vec::new(),
             var_name_stack: Vec::new(),
             completed_group: None,
-            pending_type_args: Vec::new(),
             var_header: None,
             var_containers: Vec::new(),
             owner_libs: RefCell::new(FxHashMap::default()),
@@ -2796,7 +2788,6 @@ impl<'a> Engine<'a> {
             kind,
             locals: FxHashSet::default(),
             var_types: FxHashMap::default(),
-            written_args: FxHashMap::default(),
             type_mark,
             row_mark,
         });
@@ -5755,12 +5746,8 @@ impl<'a> Engine<'a> {
     /// frame (one `parse_type` arms the group; every name in it binds).
     fn bind_declared_type(&mut self, name: StringId) {
         let ty = self.pending_decl_ty.unwrap_or(Ty::UNKNOWN);
-        let args = std::mem::take(&mut self.pending_type_args);
         if let Some(frame) = self.frames.last_mut() {
             frame.var_types.insert(name, ty);
-            if !args.is_empty() {
-                frame.written_args.insert(name, args);
-            }
         }
     }
 
@@ -5768,12 +5755,8 @@ impl<'a> Engine<'a> {
     /// parameter, not shared with a group).
     fn bind_parameter_type(&mut self, name: StringId) {
         let ty = self.armed_ty.take().unwrap_or(Ty::UNKNOWN);
-        let args = std::mem::take(&mut self.pending_type_args);
         if let Some(frame) = self.frames.last_mut() {
             frame.var_types.insert(name, ty);
-            if !args.is_empty() {
-                frame.written_args.insert(name, args);
-            }
         }
     }
 
@@ -5803,24 +5786,18 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The first written type argument of a declared-typed receiver:
-    /// pooled slots for captured declarations (member fields read through
-    /// the walk), the frame's written-argument channel for locals and
-    /// parameters whose annotation never interns. `read` is the receiver's
-    /// declaration name at the merged member row (`None` = not a simple
-    /// read, the written-argument channel is out).
-    fn receiver_first_type_arg(&self, read: Option<StringId>, ty: Ty) -> Option<Ty> {
+    /// The first written type argument of a declared-typed receiver: the
+    /// receiver type's own pooled slot. The retired written-argument side
+    /// channel kept this face alive for shapes whose annotation never
+    /// interned (poisoned groups, a `dynamic` head) — those shapes now read
+    /// argument-less and return `None` here, the same suppression the
+    /// channel's own poison rule mandated: recovery residue is never a
+    /// written fact.
+    fn receiver_first_type_arg(&self, ty: Ty) -> Option<Ty> {
         let Ty::Named { args, .. } = ty else {
             return None;
         };
-        if args != ArgListId::EMPTY {
-            return self.boundary.pool().get(args).first().copied();
-        }
-        self.frames
-            .iter()
-            .rev()
-            .find_map(|frame| frame.written_args.get(&read?).and_then(|args| args.first()))
-            .copied()
+        self.boundary.pool().get(args).first().copied()
     }
 
     /// A container head: the member face and the `this`/`super` receiver for
@@ -9533,9 +9510,6 @@ impl<'a> Engine<'a> {
         let Some(recv_row) = callee.checked_sub(1).and_then(|index| self.rows.get(index)) else {
             return;
         };
-        // The receiver read's own declaration name — the written-argument
-        // channel keys on it (the bare row is still alive; no merge hop).
-        let read = recv_row.name;
         let recv = match &recv_row.shape {
             RowShape::Bare(info) => Engine::receiver_of_bare(info.clone()),
             RowShape::Receiver(recv) => *recv,
@@ -9556,9 +9530,8 @@ impl<'a> Engine<'a> {
             return;
         }
         // `!_typeSystem.isNonNullable(type)` — the type argument decides
-        // (pooled slots for captured declarations, the written-argument
-        // channel for body-level annotations).
-        let Some(t0) = self.receiver_first_type_arg(Some(read), ty) else {
+        // (the receiver type's own pooled slot).
+        let Some(t0) = self.receiver_first_type_arg(ty) else {
             return;
         };
         if !t0.is_strictly_non_nullable() {
@@ -12953,6 +12926,16 @@ impl PromotionStaging {
 /// promotions that never stage. A named flow type recovers its spelling
 /// through [`Flow::name_lexeme`] (the S0 parallel name table) and interns
 /// into the live string table, so repeat reads share one id.
+///
+/// The written-argument face: the fact row is name-level, and every
+/// arg-bearing promotion is gated at the flow fact face (a promotion
+/// derived from a written argument spelling emits no row), so staging the
+/// spelling argument-less is the exact reading of every arriving fact —
+/// the same-name-raw spelling cannot clean a staged check against a
+/// written target (the pool compare answers by list length, `None`
+/// suppresses). When the row itself grows its arguments (#611 step 4,
+/// flow side), this is the join point: intern the written tree into the
+/// boundary pool here instead of the reserved empty slot.
 fn staged_promotion(ty: FlowTy, flow: &Flow<'_>, strings: &StringTable) -> Option<Ty> {
     Some(match ty.base {
         FlowBase::Name(id) => Ty::Named {
@@ -15022,17 +15005,14 @@ impl ParserListener for DiagnoseListener<'_> {
                 // name-only head carries the canonical slot, so every
                 // downstream face (return latches, parameter bindings,
                 // cast targets) compares the written shape instead of a
-                // bare name. The same list keeps feeding the
-                // written-argument channel.
+                // bare name.
                 let slot = engine.boundary.intern_list(&args);
                 if let Some(Ty::Named { args: armed, .. }) = &mut engine.armed_ty {
                     *armed = slot;
                 }
-                engine.pending_type_args = args;
             }
             other => {
                 engine.completed_group = other;
-                engine.pending_type_args.clear();
             }
         }
         if let Some((head_name, head_range)) = head {
@@ -18214,6 +18194,31 @@ mod tests {
             .filter(|d| d.code.name == "invalid_assignment")
             .collect();
         assert_eq!(assignments.len(), 1, "{:?}", code_names(&report));
+    }
+
+    /// The promotion face over a written-argument local (#611 step 4
+    /// consumer readiness): a written element-covariant test promotes, so
+    /// the promoted branch's `List<int> y = x;` is clean while the
+    /// identical unpromoted shape still reports against the declared
+    /// `List<int>?` — the arg-bearing promotion shape the retired
+    /// written-argument channel used to serve.
+    #[test]
+    fn promotion_over_written_args_local_cleans_the_promoted_branch() {
+        let report = report(
+            "class int {} class List<T> {} \
+             void promoted() { List<int>? x = null; if (x is List<int>) { List<int> y = x; } } \
+             void unpromoted() { List<int>? x = null; List<int> y = x; }",
+        );
+        let assignments: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "invalid_assignment")
+            .collect();
+        assert_eq!(assignments.len(), 1, "{:?}", code_names(&report));
+        assert_eq!(
+            assignments[0].message,
+            "A value of type 'List<int>?' can't be assigned to a variable of type 'List<int>'."
+        );
     }
 
     /// The conversion's drop rule at the seam: `void` and `Never` promoted
@@ -24316,6 +24321,35 @@ mod tests {
             r.diagnostics[0].correction.as_deref(),
             Some("Try adding a non-null argument.")
         );
+    }
+
+    /// The written-argument receiver faces across every binding path
+    /// (#611 step 5 retirement): parameter and local annotations carry
+    /// their arguments in the armed head's pooled slot, so the
+    /// null-argument face reads `int` off each — while the raw receiver's
+    /// argument-less slot suppresses (the retired side channel's
+    /// poison/Dynamic ruling: an argument-less shape returns `None`,
+    /// never a fabricated argument).
+    #[test]
+    fn null_argument_reads_written_args_off_every_binding_path() {
+        let r = report(
+            "class int {} class Completer<T> { void complete(int? value) {} } \
+             void parameter(Completer<int> c) { c.complete(null); } \
+             void local() { Completer<int> c; c.complete(null); } \
+             void raw() { Completer c; c.complete(null); }",
+        );
+        let rows: Vec<_> = r
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "null_argument_to_non_null_type")
+            .collect();
+        assert_eq!(rows.len(), 2, "{:?}", code_names(&r));
+        for row in rows {
+            assert_eq!(
+                row.message,
+                "'Completer.complete' shouldn't be called with a 'null' argument for the non-nullable type argument 'int'."
+            );
+        }
     }
 
     /// A nullable on-clause type reports (`_checkForNullableTypeInCatchClause`).
