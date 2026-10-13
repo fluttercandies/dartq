@@ -132,8 +132,10 @@
 //! plugin-bearing group ([`PLUGIN_PANIC_LIMIT`] strikes, never reset),
 //! disable the whole plugin set for the session through the same
 //! one-shot-crash-row degrade the transport's restart-budget exhaustion
-//! uses. Nothing is masked: every panic is logged to stderr with its
-//! payload, and the affected requests see the internal-error tier.
+//! uses. Nothing is masked: the shell's panic hook reports every panic
+//! once (payload, thread, location) and the catching boundary logs its
+//! recovery on stderr, so no payload is printed twice; the affected
+//! requests see the internal-error tier.
 //!
 //! # Tier mapping (PRD §16.5 — the one place it is defined)
 //!
@@ -253,6 +255,15 @@ const MAX_OVERLAY_FILES: usize = 64;
 /// message); the bound caps the staged set and makes `commit_overlay`'s
 /// clone-then-write transient provably small.
 const MAX_OVERLAY_BYTES: usize = 64 << 20;
+
+/// The session-wide staged-overlay byte ceiling (#962 P3-2): the sum of
+/// every live agent's staged `file.bytes` past it is rejected
+/// `INVALID_PARAMS`. The per-agent cap alone leaves a 16 GiB theoretical
+/// residency ([`MAX_AGENTS`] × [`MAX_OVERLAY_BYTES`]); 256 MiB — the order
+/// of the store's GC watermark — bounds the whole staged table to a few
+/// hundred MiB worst case, while real agent traffic (KiB-scale documents)
+/// never approaches it.
+const MAX_OVERLAY_TOTAL_BYTES: usize = 256 << 20;
 
 /// The delta-cursor table's path cap (#947 F8): `changed` grows one entry
 /// per distinct written path, and edits merge last-wins, but a session that
@@ -496,11 +507,8 @@ fn fix_worker_body(job: FixJob, mut hosts: PluginHosts, done: &Sender<FixMail>) 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_fix_job(job, &mut hosts)
     }))
-    .unwrap_or_else(|payload| {
-        eprintln!(
-            "dartq-daemon: fix worker panicked: {}",
-            panic_message(&payload)
-        );
+    .unwrap_or_else(|_| {
+        eprintln!("dartq-daemon: fix worker panicked; the dispatch answers internal error");
         Err(SessionError::Internal("the fix dispatch panicked".into()))
     });
     let _ = done.send(FixMail { hosts, outcome });
@@ -1117,7 +1125,9 @@ impl Session {
     /// Every path is confined to the workspace root before anything lands
     /// ([`confine_to_workspace`] — the write-face trust boundary, #947 F4),
     /// and the agent's post-merge staged set is bounded
-    /// ([`MAX_OVERLAY_FILES`] / [`MAX_OVERLAY_BYTES`], #947 F3). A rejection
+    /// ([`MAX_OVERLAY_FILES`] / [`MAX_OVERLAY_BYTES`], #947 F3) and every
+    /// agent's combined staging is bounded ([`MAX_OVERLAY_TOTAL_BYTES`],
+    /// #962 P3-2). A rejection
     /// is atomic: nothing stages, and a new agent's table entry is not
     /// created.
     ///
@@ -1125,7 +1135,9 @@ impl Session {
     ///
     /// [`SessionError::InvalidParams`] when the agent would exceed
     /// [`MAX_AGENTS`] (clear one first), a path escapes the workspace root,
-    /// or the merged staged set would exceed the per-agent file/byte caps.
+    /// the merged staged set would exceed the per-agent file/byte caps, or
+    /// the session-wide staged total would exceed
+    /// [`MAX_OVERLAY_TOTAL_BYTES`].
     pub fn set_overlay(
         &mut self,
         agent: &str,
@@ -1174,6 +1186,25 @@ impl Session {
             return Err(SessionError::InvalidParams(format!(
                 "agent overlay exceeds the {} MiB byte cap ({total}); clear or commit first",
                 MAX_OVERLAY_BYTES >> 20
+            )));
+        }
+        // The session-wide bound (#962 P3-2), recomputed over every live
+        // agent with this request's merged delta applied: staging grows
+        // only here, so one check gates all agents and self-heals from any
+        // clear, commit, or eviction since the last call. The walk is
+        // O(staged files) — lengths only — microseconds at the 256-agent
+        // table's cap.
+        let others: usize = self
+            .agents
+            .iter()
+            .filter(|(id, _)| id.as_str() != agent)
+            .flat_map(|(_, overlay)| overlay.files.values())
+            .fold(0usize, |sum, file| sum.saturating_add(file.bytes.len()));
+        if others.saturating_add(total) > MAX_OVERLAY_TOTAL_BYTES {
+            return Err(SessionError::InvalidParams(format!(
+                "session overlay exceeds the {} MiB total cap ({}); clear or commit first",
+                MAX_OVERLAY_TOTAL_BYTES >> 20,
+                others.saturating_add(total)
             )));
         }
         let entry = self.agents.entry(agent.to_owned()).or_default();
@@ -1239,7 +1270,9 @@ impl Session {
     ///
     /// [`SessionError::InvalidParams`] for an unknown agent, or when a
     /// staged path fails the commit-time canonical confinement (#947 F4 —
-    /// e.g. a symlink in the worktree now points outside the root);
+    /// e.g. a symlink planted in the worktree now points outside the root;
+    /// the write itself opens its leaf `O_NOFOLLOW`, so a symlink swapped
+    /// in after the check fails the write instead of being followed);
     /// [`SessionError::Io`] when a disk write fails — files already written
     /// stay written (the write-back is not transactional; the base view
     /// catches up through the next sync), nothing merges, and the agent's
@@ -1275,7 +1308,7 @@ impl Session {
         }
         // Write-back first: nothing merges until every file is on disk.
         for (path, bytes) in &committed {
-            fs::write(path, bytes)?;
+            write_committed(path, bytes)?;
         }
         let count = committed.len();
         for (path, bytes) in committed {
@@ -1516,11 +1549,10 @@ impl Session {
                         self.evict_delta_paths();
                         self.publishes_due = true;
                     }
-                    Err(payload) => {
+                    Err(_) => {
                         eprintln!(
-                            "dartq-daemon: overlay apply panicked ({}); the write did not land; \
-                             the edits are restaged for the next write task",
-                            panic_message(&payload)
+                            "dartq-daemon: overlay apply panicked; the write did not land; \
+                             the edits are restaged for the next write task"
                         );
                         // Re-stage the taken changes (last-wins merge with
                         // anything a new edit stages) WITHOUT re-enqueueing
@@ -1860,11 +1892,10 @@ impl Session {
                 // the publish plan), or the task cancelled — the next write
                 // re-arms the diff anyway.
                 Ok(()) => self.publishes_due = false,
-                Err(payload) => {
+                Err(_) => {
                     eprintln!(
-                        "dartq-daemon: base analysis panicked ({}); the publish diff retries on \
-                         the next intake",
-                        panic_message(&payload)
+                        "dartq-daemon: base analysis panicked; the publish diff retries on \
+                         the next intake"
                     );
                     self.note_plugin_path_panic(pending.context, None);
                     self.restore_base_view_contained();
@@ -1883,11 +1914,8 @@ impl Session {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.run_group(pending.context, agent.as_deref(), requests, turn);
             }));
-            if let Err(payload) = outcome {
-                eprintln!(
-                    "dartq-daemon: analysis panicked ({}); answering the group internal error",
-                    panic_message(&payload)
-                );
+            if outcome.is_err() {
+                eprintln!("dartq-daemon: analysis panicked; answering the group internal error");
                 Self::answer_panicked(turn, ids);
                 self.note_plugin_path_panic(pending.context, agent.as_deref());
                 self.restore_base_view_contained();
@@ -2147,12 +2175,8 @@ impl Session {
                     ))
                 });
         }));
-        if let Err(payload) = woven {
-            eprintln!(
-                "dartq-daemon: the plugin cycle panicked ({}); this cycle's findings are \
-                 skipped",
-                panic_message(&payload)
-            );
+        if woven.is_err() {
+            eprintln!("dartq-daemon: the plugin cycle panicked; this cycle's findings are skipped");
             self.penalize_plugins("a panic in the plugin cycle");
         }
         plugin_findings
@@ -2274,11 +2298,9 @@ impl Session {
             let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 commands::answer(drain, &request)
             }))
-            .unwrap_or_else(|payload| {
+            .unwrap_or_else(|_| {
                 eprintln!(
-                    "dartq-daemon: answer worker panicked ({}); answering the request internal \
-                     error",
-                    panic_message(&payload)
+                    "dartq-daemon: answer worker panicked; answering the request internal error"
                 );
                 Err(SessionError::Internal(
                     "internal error: analysis panicked".into(),
@@ -2677,15 +2699,6 @@ impl Session {
     }
 }
 
-/// The message of a caught panic payload (for the containment log line).
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
-    payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("opaque panic payload")
-}
-
 /// Confines an RPC-supplied write path to the workspace root (#947 F4):
 /// relative paths join the root, then the root prefix is stripped
 /// component-wise and the remainder resolved lexically — any path outside
@@ -2767,6 +2780,72 @@ fn ensure_canonical_child(canonical_root: &Path, path: &Path) -> Result<(), Sess
         )))
     }
 }
+
+/// The committed buffer's disk write (#962 P3-3): the leaf open carries
+/// `O_NOFOLLOW` where the platform defines it. The canonical confinement
+/// check and this open are separate filesystem operations, and a plain
+/// open follows a symlink swapped onto the final component between them —
+/// the buffer would land wherever it aims, inside or outside the root.
+/// `O_NOFOLLOW` moves the rejection into the open itself, closing the
+/// race the best userspace re-check could only narrow. Parent components
+/// stay under the confinement walk: a mid-path swap inside the remaining
+/// microsecond window is out of model for the local single-operator trust
+/// domain (eliminating it needs per-component `openat`, beyond std).
+#[cfg(unix)]
+fn write_committed(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(LEAF_OPEN_FLAGS)
+        .open(path)?
+        .write_all(bytes)
+}
+
+/// The non-unix fallback: a plain create-truncate write (the confinement
+/// check remains the gate).
+#[cfg(not(unix))]
+fn write_committed(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    fs::write(path, bytes)
+}
+
+/// The leaf-open flags for [`write_committed`]: `O_NOFOLLOW` where this
+/// exact value is the platform's (xnu `sys/fcntl.h`; the Linux uapi
+/// `asm-generic/fcntl.h` generic bits), zero — no extra flags — elsewhere.
+/// mips/sparc/alpha Linux define different values and get zero rather
+/// than a wrong bit.
+#[cfg(target_os = "macos")]
+const LEAF_OPEN_FLAGS: i32 = 0o100;
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "riscv64",
+        target_arch = "loongarch64"
+    )
+))]
+const LEAF_OPEN_FLAGS: i32 = 0o400000;
+#[cfg(not(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "riscv64",
+            target_arch = "loongarch64"
+        )
+    )
+)))]
+const LEAF_OPEN_FLAGS: i32 = 0;
 
 #[cfg(test)]
 mod tests {
@@ -5378,6 +5457,43 @@ mod tests {
         );
         // The rejection is atomic: only the first file staged.
         assert_eq!(session.agents["A"].files.len(), 1);
+    }
+
+    /// The session-wide staged-total ceiling (#962 P3-2): every agent may
+    /// hold its own per-agent cap, but the sum across agents is capped —
+    /// one byte past [`MAX_OVERLAY_TOTAL_BYTES`] rejects atomically for the
+    /// staging agent, and clearing an agent frees budget again.
+    #[test]
+    fn session_overlay_total_is_capped() {
+        let (workspace, mut session) = fixture("session-total-cap-unit");
+        let agents_at_cap = MAX_OVERLAY_TOTAL_BYTES / MAX_OVERLAY_BYTES;
+        for index in 0..agents_at_cap {
+            let agent = format!("A{index}");
+            let full = vec![0u8; MAX_OVERLAY_BYTES];
+            session
+                .set_overlay(&agent, vec![(workspace.path("lib/big.dart"), full)])
+                .expect("each agent holds its own cap within the session total");
+        }
+
+        // One byte past the session total rejects the staging agent only.
+        let error = session
+            .set_overlay("E", vec![(workspace.path("lib/one.dart"), b"x".to_vec())])
+            .expect_err("the session total rejects growth");
+        assert!(
+            matches!(error, SessionError::InvalidParams(ref message) if message.contains("total cap")),
+            "{error}"
+        );
+        assert!(
+            !session.agents.contains_key("E"),
+            "the rejection staged nothing"
+        );
+        assert_eq!(session.agents.len(), agents_at_cap);
+
+        // Clearing an agent frees its budget for the next stager.
+        session.clear_overlay("A0");
+        session
+            .set_overlay("E", vec![(workspace.path("lib/one.dart"), b"x".to_vec())])
+            .expect("a cleared agent frees session budget");
     }
 
     // -----------------------------------------------------------------------

@@ -19,6 +19,7 @@
 
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use std::thread;
 use std::time::Instant;
 
@@ -84,6 +85,33 @@ pub(crate) enum Incoming {
     },
 }
 
+/// The daemon's single panic-report path (#962 P3-4): installed once per
+/// process, this hook replaces the std default's multi-line report — the
+/// thread banner, the payload line, the backtrace note — with the shell's
+/// one-line `dartq-daemon:` convention. One panic is then one stderr line
+/// here plus, at a containment boundary, one recovery line; the payload is
+/// never printed twice in two formats. `RUST_BACKTRACE` still opts in to
+/// the backtrace, appended after the line.
+fn install_panic_hook() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let thread = std::thread::current();
+            eprintln!(
+                "dartq-daemon: panic in thread {} at {}: {}",
+                thread.name().unwrap_or("<unnamed>"),
+                info.location()
+                    .map_or("<unknown>".to_owned(), ToString::to_string),
+                info.payload_as_str().unwrap_or("opaque panic payload")
+            );
+            let backtrace = std::backtrace::Backtrace::capture();
+            if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+                eprintln!("{backtrace}");
+            }
+        }));
+    });
+}
+
 /// Runs one LSP session to its end and returns the process exit code.
 ///
 /// Spawns the reader thread and runs the main loop on the current thread.
@@ -115,6 +143,7 @@ where
     R: Read + Send + 'static,
     W: Write + 'static,
 {
+    install_panic_hook();
     let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(MAX_QUEUED_BATCHES);
     // Held for the session's lifetime: dropping it at return stops and
     // joins the watch thread. A send past a dead receiver ends the thread
