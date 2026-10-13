@@ -756,3 +756,13 @@ pub(crate) fn setup(source: &'static str) -> Parser<'static, 'static, Collector>
     let (table, text) = scan_ok(source);
     Parser::new(text, table, latest_features(), Collector::default())
 }
+
+/// Builds a parser over an ALREADY-SCANNED table with a fresh [`Collector`]
+/// — for fixtures the plain [`scan_ok`] assert cannot take (unmatched begins
+/// legitimately carry scanner-channel rows).
+pub(crate) fn setup_from_parts(
+    text: &'static str,
+    table: &'static TokenTable,
+) -> Parser<'static, 'static, Collector> {
+    Parser::new(text, table, latest_features(), Collector::default())
+}

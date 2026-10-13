@@ -3,7 +3,9 @@
 //! import prefixes, show/hide combinators) plus the out-of-order-clause
 //! import recovery.
 //!
-//! Anchors (`.third/dart-sdk/.../parser/parser_impl.dart`, Dart 3.15 main):
+//! Anchors (upstream Dart SDK source,
+//! `pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart`, Dart 3.15
+//! main):
 //! `parseLibraryAugmentation` :900, `parseLibraryName` :917,
 //! `parseImportPrefixOpt` :938, `parseImport` :966, `parseImportRecovery`
 //! :995, `parseConditionalUriStar` :1082, `parseConditionalUri` :1095,

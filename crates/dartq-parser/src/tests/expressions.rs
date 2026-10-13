@@ -1,7 +1,7 @@
 //! Expression engine tests (#20): precedence/associativity shapes,
 //! assignment/conditional/cascade/function-literal/switch-expression forms,
 //! collection control-flow elements through statements, the Group B
-//! do-not-emit riders (docs/facts/corpus-expansion-plan.md §7), recovery
+//! do-not-emit riders (codes with no pinned-oracle corpus surface), recovery
 //! shapes, and the expression termination bombs.
 
 use dartq_scanner::TokenKind;
@@ -875,9 +875,9 @@ fn token_kind_smoke() {
 //
 // Each pin reproduces one whole-unit corpus file whose oracle code list the
 // r5 differential run caught dartq missing or diverging on; the expected
-// multisets are the oracle outputs recorded in
-// docs/audits/gate-m0/gate-caliber-r5/report.json, cross-checked against the
-// official parser testcases under .third/dart-sdk/pkg/front_end/parser_testcases.
+// multisets are the oracle outputs recorded by the r5 gate-caliber run,
+// cross-checked against the official parser testcases (`pkg/front_end/
+// parser_testcases` in the upstream Dart SDK source).
 
 /// Sorted code multiset of one whole-unit parse (scanner-clean inputs).
 fn sorted_unit_codes(source: &'static str) -> Vec<String> {

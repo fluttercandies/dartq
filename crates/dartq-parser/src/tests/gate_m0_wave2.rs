@@ -1,5 +1,5 @@
 //! M0-gate wave-2 regression pins (#333): the r4 oracle-only gap families
-//! (`docs/audits/gate-m0/gate-caliber-r4/report.json`), each mirroring an
+//! (found by the r4 gate-caliber differential run), each mirroring an
 //! official recovery template:
 //!
 //! * extension-type representation recovery: `expectedRepresentationField`

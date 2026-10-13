@@ -1,8 +1,8 @@
 //! Statement grammar tests (#19): the full statement family — blocks,
 //! if/for/for-in/while/do/switch/try, return/yield/assert/break/continue,
 //! labels, local declarations, local functions — plus their recovery paths,
-//! the Group A do-not-emit compliance checks (docs/facts/
-//! corpus-expansion-plan.md §7), and the statement-level termination bombs.
+//! the Group A do-not-emit compliance checks (statement codes with no
+//! pinned-oracle corpus surface), and the statement-level termination bombs.
 
 use super::collector::{Collector, setup};
 

@@ -220,10 +220,10 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
         offset.min(self.table.len() - 1) as TokenId
     }
 
-    /// Current token kind.
+    /// Current token kind — kind-first read, no span materialization.
     #[inline]
     pub(crate) fn peek_kind(&self) -> TokenKind {
-        self.cursor.peek().kind
+        self.cursor.peek_kind()
     }
 
     /// Id of the current (peeked) token.
@@ -241,7 +241,7 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
 
     /// Identifier-shaped check on the current token.
     pub(crate) fn peek_is_identifier(&self) -> bool {
-        is_identifier(self.cursor.peek().kind)
+        is_identifier(self.cursor.peek_kind())
     }
 
     // --- depth + bailout guards ---------------------------------------------
@@ -265,6 +265,13 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
 
     pub(crate) fn leave_depth(&mut self) {
         self.depth -= 1;
+    }
+
+    /// Whether the structural nesting is at the cap: the expression-fuse
+    /// entry check (official `expressionDepth++ > 500`) before
+    /// [`Self::enter_depth`] would consume the slot.
+    pub(crate) fn at_depth_cap(&self) -> bool {
+        self.depth >= MAX_DEPTH
     }
 
     /// Whether the terminal bailout latched: every grammar loop checks this

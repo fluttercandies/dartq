@@ -1,6 +1,6 @@
 //! Emitter-wave W2 pins (#885): the W4 face-alignment wave, each change
-//! locked to its adjudicated probe row (docs/audits/w4-blindspot-probes.md;
-//! oracle dart analyze 3.13.1, machine format).
+//! locked to its adjudicated probe row (every row re-probed live against
+//! `dart analyze --format=machine` 3.13.1).
 //!
 //! * `invalid_literal_in_configuration` — the bundle's one missing emitter:
 //!   `endConditionalUri` (ast_builder.dart:1509-1524) checks only the `==`

@@ -637,7 +637,7 @@ fn empty_interp_then_close_paren_parse_signature_matches_control() {
     // #935, SII probe family (f-'${ insertion postures, #921): in
     // `f('${}')` the `}` closes the interpolation and the `'` right after
     // closes the string, so the string is scanner-well-formed — the oracle
-    // (dart 3.13.1, docs/audits/release-night/sii-probes) emits no scanner
+    // (dart 3.13.1, verified by live probe replay) emits no scanner
     // row, and the parse signature is exactly the well-formed control
     // `f('${x}')`'s. (The #921 lane's static prediction of
     // unterminated_string_literal + an eof expected_token for this shape was

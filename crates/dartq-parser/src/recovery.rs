@@ -16,6 +16,7 @@
 
 use dartq_scanner::{Keyword, TokenKind};
 
+use crate::listener::IdentifierContext;
 use crate::members::is_keyword_or_identifier;
 use crate::message::msg;
 use crate::parser::{AsyncModifier, Parser};
@@ -128,10 +129,15 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         // declaration is never eaten as the library name / variable name —
         // report `missing_identifier` at it, splice the synthetic name, and
         // leave the keyword current for the declaration loop (oracle
-        // `library` + `void f()` and `var class VarClass {}`; the variable
-        // directive's `;` then anchors on the walked-back head via
-        // ensureSemicolon's findPreviousNonZeroLengthToken). Built-in heads
-        // keep the template's fast path below.
+        // `library` + `void f()` and `var class VarClass {}`). The head is
+        // only a declaration head when the FOLLOWER does not continue the
+        // name — the official templates accept the keyword as the name when
+        // the next token is one of the context's continuation values
+        // (`_isOneOfFollowingValues`: `.` `;` EOF for the library name;
+        // `followingValues` `=` `,` `;` for the variable name), so
+        // `library enum;` and `int class = 42;` take the
+        // `expected_identifier_but_got_keyword` face (oracle
+        // issue_48371_prime1 / keyword_named_top_level_fields line 9).
         if matches!(
             peek.kind,
             TokenKind::Keyword(kw) if kw.style() == dartq_scanner::KeywordStyle::Reserved
@@ -140,6 +146,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             crate::listener::IdentifierContext::LibraryName
                 | crate::listener::IdentifierContext::TopLevelVariableDeclaration
         ) && self.looks_like_start_of_next_top_level_declaration_at(0)
+            && !self.name_continuation_follower(context)
         {
             self.report(msg::missing_identifier(), peek.span);
             let id = self
@@ -197,8 +204,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                     | crate::listener::IdentifierContext::TopLevelVariableDeclaration
             ) && matches!(
                 // Only non-reserved (built-in) heads reach here — `class`/
-                // `enum`/`typedef` are reserved and never pass
-                // `is_identifier`.
+                // `enum` are reserved and never pass `is_identifier`.
                 peek.kind,
                 TokenKind::Keyword(
                     Keyword::Augment
@@ -208,6 +214,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                         | Keyword::Library
                         | Keyword::Mixin
                         | Keyword::Part
+                        | Keyword::Typedef
                 )
             ) && !matches!(
                 self.cursor.look_kind(1),
@@ -461,6 +468,25 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                     | Keyword::Void
             )
         )
+    }
+
+    /// The follower keep-set that lets a declaration-head keyword be eaten
+    /// as the name: `LibraryIdentifierContext._isOneOfFollowingValues`
+    /// (identifier_context_impl.dart:953-957 — `.` `;` EOF) and the
+    /// top-level declaration context's `followingValues` (`=` `,` `;` —
+    /// oracle `int class = 42;` names the field, `var class VarClass {}`
+    /// reparses the class).
+    fn name_continuation_follower(
+        &self,
+        context: crate::listener::IdentifierContext,
+    ) -> bool {
+        let follower = self.cursor.look_kind(1);
+        match context {
+            crate::listener::IdentifierContext::LibraryName => {
+                matches!(follower, TokenKind::Period | TokenKind::Semicolon | TokenKind::Eof)
+            }
+            _ => matches!(follower, TokenKind::Eq | TokenKind::Comma | TokenKind::Semicolon),
+        }
     }
 
     /// Official `checkAsyncAwaitYieldAsIdentifier`
@@ -887,6 +913,57 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         while !self.cursor.at_eof() && self.peek_kind() != TokenKind::CloseCurly {
             self.cursor.advance();
         }
+    }
+
+    /// Official `parseExpression` stack-overflow recovery
+    /// (`parser_impl.dart:6936-6963`), the expression-depth fuse: report
+    /// once on the expression start, skip to the upcoming token's
+    /// scanner-paired group end — or, when the token carries no group, to
+    /// the next `)`/`]`/`}`/`;` — splice a synthetic identifier in front of
+    /// it (`insertSyntheticIdentifier` + `handleIdentifier(expression)`),
+    /// and return that identifier as the expression.
+    ///
+    /// Deliberately NOT a terminal bailout: the official parse keeps
+    /// running, so the enclosing frames unwind through their closers by
+    /// kind and the stranded leftovers fall to the ordinary recovery faces
+    /// (`ensureSemicolon`'s walked-back anchor, the top-level invalid
+    /// declaration). Those faces are where the oracle's post-fuse rows come
+    /// from — oracle `stack_overflow`: `expected_token ';'` on the last
+    /// adopted closer, `expected_executable` on the leftover `)`,
+    /// `unexpected_token` on the final `;`.
+    pub(crate) fn recover_stack_overflow_expression(&mut self) -> TokenSpan {
+        let at = self.peek_span();
+        self.report(msg::stack_overflow(crate::parser::MAX_DEPTH), at);
+        if let Some(end) = self.current_matching_end() {
+            self.skip_to_token(end);
+        } else {
+            while !self.cursor.at_eof()
+                && !matches!(
+                    self.peek_kind(),
+                    TokenKind::CloseParen
+                        | TokenKind::CloseSquare
+                        | TokenKind::CloseCurly
+                        | TokenKind::Semicolon
+                )
+            {
+                self.cursor.advance();
+            }
+        }
+        if self.cursor.at_eof() {
+            return self.peek_span();
+        }
+        // The synthetic head rides the queue in front of the stop token; the
+        // single advance consumes it (the missing-name splice's contract), so
+        // the cursor sits on the stop token for the unwinding frames.
+        let at = self.peek_span();
+        let id = self
+            .cursor
+            .insert_synthetic(TokenKind::Identifier, at.range.offset);
+        self.cursor.advance();
+        let span = self.span_of(id);
+        self.listener
+            .handle_identifier(span, IdentifierContext::Expression);
+        span
     }
 }
 

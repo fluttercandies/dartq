@@ -25,7 +25,8 @@
 //! `expected_list_or_map_literal`, `positional_after_named_argument`, and
 //! `constructor_with_type_arguments` are never emitted — recovery uses the
 //! `expected_token`/`missing_identifier` generic family the pinned 3.13.1
-//! oracle produces (docs/facts/corpus-expansion-plan.md §7 Group B). Codes
+//! oracle produces (the Group B do-not-emit contract: no oracle corpus row
+//! produces these codes). Codes
 //! with no pinned-oracle surface (`super_null_aware`,
 //! `set_or_map_literal_too_many_type_arguments`, `assert_as_expression`,
 //! `await_not_async`, `record_literal_zero_fields_with_trailing_comma`)
@@ -215,6 +216,18 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// constant-pattern context is always `none` here (patterns parse
     /// through `expr_const`), so the official pattern-only arms drop out.
     fn parse_precedence(&mut self, precedence: u8, allow_cascades: bool) -> TokenSpan {
+        if self.is_bailed() {
+            return self.peek_span();
+        }
+        if self.at_depth_cap() {
+            // Official `parseExpression` fuse (parser_impl.dart:6936): a
+            // LOCAL recovery — report once, splice a synthetic identifier
+            // after the group skip, and let the enclosing frames unwind
+            // through their closers by kind. The oracle's post-fuse rows
+            // ride that normal unwind, never the fuse itself (see
+            // [`Self::recover_stack_overflow_expression`]).
+            return self.recover_stack_overflow_expression();
+        }
         if !self.enter_depth() {
             return self.peek_span();
         }
@@ -294,21 +307,26 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     ) -> TokenSpan {
         // An identifier here has no precedence (`NO_PRECEDENCE`, :7079) —
         // both the `Some`-below-floor and `None` cases land in the entry
-        // recovery attempt (:6644-6659).
-        let Some(mut level) = self.precedence_of(self.peek_kind()) else {
+        // recovery attempt (:6644-6659). An accepted written-out operator
+        // re-binds `left` and re-resolves the follower's level in this
+        // frame — the official walk continues its own loop (:6901-6920).
+        // A re-entry here would deepen the native stack once per link of
+        // an unbounded `a xor 1 xor 1 ...` chain, invisible to the depth
+        // guard (the entry runs outside `enter_depth`).
+        let mut level = loop {
+            if let Some(l) = self.precedence_of(self.peek_kind())
+                && l >= precedence
+            {
+                break l;
+            }
+            // Entry-floor recovery attempt (currentLevel = -1).
             if let Some((new_left, _)) = self.attempt_written_out_operator(-1, allow_cascades) {
-                return self.precedence_loop(precedence, allow_cascades, type_arg, new_left, false);
+                left = new_left;
+                is_dot_shorthand = false;
+                continue;
             }
             return left;
         };
-        if level < precedence {
-            // Entry floor (:6644-6659), with the written-out-operator
-            // recovery attempt (currentLevel = -1).
-            if let Some((new_left, _)) = self.attempt_written_out_operator(-1, allow_cascades) {
-                return self.precedence_loop(precedence, allow_cascades, type_arg, new_left, false);
-            }
-            return left;
-        }
         let mut last_binary_level: Option<u8> = None;
         let mut last_cascade = false;
         loop {
@@ -897,29 +915,53 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 // (`parser_impl.dart:8028`), so consume `[` before the
                 // operand — otherwise `[i]` re-parses as a list literal.
                 self.cursor.advance();
-                let saved = self.may_parse_function_expressions;
-                self.may_parse_function_expressions = true;
-                let _ = self.parse_expression();
-                self.may_parse_function_expressions = saved;
-                if self.peek_kind() != TokenKind::CloseSquare {
-                    // Recovery (:7349-7366): report; the scanner pairs the
-                    // group, so jump to its closer (silently when the
-                    // scanner synthesized it).
-                    if let Some(close) = self.cursor.table_matching_end(open.id) {
-                        let (_, synthetic) = self.cursor.resolve(close);
-                        if !synthetic {
+                let mut empty_operand: Option<crate::token_id::TokenId> = None;
+                if self.peek_kind() == TokenKind::CloseSquare {
+                    // Empty index operand (`a[]`, `a[ ]`): the adjacent
+                    // bracket pair reaches here split (official
+                    // `rewriteSquareBrackets` :4743, sdk issue 42267) and the
+                    // missing operand takes the expression template's
+                    // synthetic face — one `missing_identifier` anchored on
+                    // the `]`, which then closes the index (oracle
+                    // issue_42267 lines 4-7: never an extra
+                    // `expected_token ']'`).
+                    let close = self.peek_span();
+                    self.report(msg::missing_identifier(), close);
+                    let id = self
+                        .cursor
+                        .insert_synthetic(TokenKind::Identifier, close.range.offset);
+                    empty_operand = Some(id);
+                } else {
+                    let saved = self.may_parse_function_expressions;
+                    self.may_parse_function_expressions = true;
+                    let _ = self.parse_expression();
+                    self.may_parse_function_expressions = saved;
+                    if self.peek_kind() != TokenKind::CloseSquare {
+                        // Recovery (:7349-7366): report; the scanner pairs the
+                        // group, so jump to its closer (silently when the
+                        // scanner synthesized it).
+                        if let Some(close) = self.cursor.table_matching_end(open.id) {
+                            let (_, synthetic) = self.cursor.resolve(close);
+                            if !synthetic {
+                                self.report(msg::expected_but_got("]"), self.peek_span());
+                            }
+                            self.skip_to_token(close);
+                        } else {
                             self.report(msg::expected_but_got("]"), self.peek_span());
+                            let at = self.peek_span();
+                            self.synthetic(TokenKind::CloseSquare, at.range.offset);
+                            self.cursor.advance();
                         }
-                        self.skip_to_token(close);
-                    } else {
-                        self.report(msg::expected_but_got("]"), self.peek_span());
-                        let at = self.peek_span();
-                        self.synthetic(TokenKind::CloseSquare, at.range.offset);
-                        self.cursor.advance();
                     }
                 }
                 let close = self.peek_span();
                 self.cursor.advance();
+                // The synthetic operand rides the queue behind the split
+                // closer; drain it once the `]` is consumed so it cannot
+                // resurface as a phantom operand downstream.
+                if let Some(id) = empty_operand {
+                    while self.cursor.advance() != id {}
+                }
                 self.listener
                     .handle_indexed_expression(question, open, close);
                 let (next_end, ta) = self.parse_method_type_args_block(end);

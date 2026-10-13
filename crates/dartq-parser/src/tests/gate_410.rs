@@ -1,5 +1,5 @@
-//! Ticket #410: dartq-only over-report families from the r5 M0 gate
-//! (`docs/audits/gate-m0/gate-caliber-r5/report.json`), pinned against the
+//! Ticket #410: dartq-only over-report families from the r5 M0
+//! gate-caliber differential run, pinned against the
 //! official parser's report/silence contracts.
 //!
 //! Families:

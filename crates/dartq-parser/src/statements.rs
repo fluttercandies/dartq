@@ -14,9 +14,8 @@
 //! the official control flow and calls the shared expression entry point.
 //! Patterns keep the reduced constant-expression engine (`expr_const`).
 //!
-//! Diagnostics follow the pinned-oracle emission table
-//! (docs/facts/corpus-expansion-plan.md §7): the eight Group A statement
-//! codes are oracle-dead — every recovery path here emits the generic
+//! Diagnostics follow the pinned-oracle emission table: the eight Group A
+//! statement codes are oracle-dead — every recovery path here emits the generic
 //! codes the pinned 3.13.1 oracle produces (`expected_token`,
 //! `missing_identifier`, `extraneous_modifier`, ...), never a dedicated
 //! Group A code.
@@ -88,6 +87,24 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     /// Official `parseStatementX` dispatch table.
     fn parse_statement_x(&mut self) {
         if self.is_bailed() {
+            return;
+        }
+        // A zero-width scanner-recovery closer (the parked `)`/`]`/`}` of an
+        // unmatched begin, lexer `report_unmatched_begin`) is a recovery
+        // artifact: the scanner channel already carries its expected-token
+        // face, and the official `reportRecoverableError` anchoring
+        // (`findNonZeroLengthToken`) can never pin a row on a zero-length
+        // span. Consume it silently here — the one layer that actually sees
+        // it — instead of stacking missing-identifier / unexpected-token
+        // rows on the artifact (oracle `object_recovery_missingClosingParen`
+        // / `bracket_mismatch_06`: no rows on the parked closer). The same
+        // rule governs the top-level invalid-declaration face.
+        if matches!(
+            self.peek_kind(),
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly
+        ) && self.peek_span().range.length == 0
+        {
+            self.cursor.advance();
             return;
         }
         match self.peek_kind() {
@@ -185,6 +202,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
             TokenKind::Keyword(Keyword::Set) if is_identifier(self.cursor.look_kind(1)) => {
                 // Recovery: invalid use of `set` in statement position.
+                // Recursion depth <= 1: `force_advance` consumed the `set`
+                // keyword, so the nested parse lands on the identifier arm,
+                // never back here.
                 let at = self.peek_span();
                 self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
                 self.force_advance();

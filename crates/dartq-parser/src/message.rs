@@ -74,7 +74,8 @@ pub fn experiment_not_enabled_message(flag: ExperimentalFlag) -> Message {
 pub(crate) mod msg {
     use super::{BlockKind, Message};
     use dartq_diagnostics::{
-        ABSTRACT_CLASS_MEMBER, ABSTRACT_EXTERNAL_FIELD, BASE_ENUM, CLASS_IN_CLASS,
+        ABSTRACT_CLASS_MEMBER, ABSTRACT_EXTERNAL_FIELD, ABSTRACT_FINAL_BASE_CLASS,
+        ABSTRACT_FINAL_INTERFACE_CLASS, ABSTRACT_SEALED_CLASS, BASE_ENUM, CLASS_IN_CLASS,
         CONFLICTING_MODIFIERS, CONST_AND_FINAL, CONST_METHOD, CONSTRUCTOR_WITH_RETURN_TYPE,
         COVARIANT_AND_STATIC, COVARIANT_MEMBER, DUPLICATED_MODIFIER, ENUM_IN_CLASS,
         EXPECTED_CLASS_MEMBER, EXPECTED_EXECUTABLE, EXPECTED_INSTEAD,
@@ -93,8 +94,8 @@ pub(crate) mod msg {
         MISSING_TYPEDEF_PARAMETERS, MIXIN_DECLARES_CONSTRUCTOR, MODIFIER_OUT_OF_ORDER,
         MULTIPLE_CLAUSES, MULTIPLE_EXTENDS_CLAUSES, NAMED_PARAMETER_OUTSIDE_GROUP,
         NATIVE_CLAUSE_IN_NON_SDK_CODE, NATIVE_FUNCTION_BODY_IN_NON_SDK_CODE, OUT_OF_ORDER_CLAUSES,
-        REDIRECTING_CONSTRUCTOR_WITH_BODY, REDIRECTION_IN_NON_FACTORY_CONSTRUCTOR, SEALED_ENUM,
-        SEALED_MIXIN, SEALED_MIXIN_CLASS, SETTER_CONSTRUCTOR, STATIC_CONSTRUCTOR, STATIC_OPERATOR,
+        REDIRECTING_CONSTRUCTOR_WITH_BODY, REDIRECTION_IN_NON_FACTORY_CONSTRUCTOR,
+        SEALED_ENUM, SEALED_MIXIN, SEALED_MIXIN_CLASS, SETTER_CONSTRUCTOR, STATIC_CONSTRUCTOR, STATIC_OPERATOR,
         TOP_LEVEL_OPERATOR, TYPE_BEFORE_FACTORY, TYPEDEF_IN_CLASS, UNEXPECTED_TOKEN,
         UNEXPECTED_TOKENS, VAR_RETURN_TYPE, WITH_BEFORE_EXTENDS,
     };
@@ -1203,6 +1204,33 @@ pub(crate) mod msg {
             SEALED_ENUM,
             "Enums can't be declared to be 'sealed'.",
             "Try removing the keyword 'sealed'.",
+        )
+    }
+
+    /// `parseClassOrNamedMixinApplication` modifier-trio reports
+    /// (parser_impl.dart:2975-3001); correction texts match the registry rows
+    /// (messages.yaml correctionMessage).
+    pub(crate) fn abstract_sealed_class() -> Message {
+        Message::with_correction(
+            ABSTRACT_SEALED_CLASS,
+            "A 'sealed' class can't be marked 'abstract' because it's already implicitly abstract.",
+            "Try removing the 'abstract' keyword.",
+        )
+    }
+
+    pub(crate) fn abstract_final_base_class() -> Message {
+        Message::with_correction(
+            ABSTRACT_FINAL_BASE_CLASS,
+            "An 'abstract' class can't be declared as both 'final' and 'base'.",
+            "Try removing either the 'final' or 'base' keyword.",
+        )
+    }
+
+    pub(crate) fn abstract_final_interface_class() -> Message {
+        Message::with_correction(
+            ABSTRACT_FINAL_INTERFACE_CLASS,
+            "An 'abstract' class can't be declared as both 'final' and 'interface'.",
+            "Try removing either the 'final' or 'interface' keyword.",
         )
     }
 

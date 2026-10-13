@@ -148,7 +148,13 @@ impl TypeInfo {
 }
 
 /// Reports `Expected a type name.` and emits a synthetic simple type
-/// (the `NoType` ensure path, type_info_impl.dart:117-121).
+/// (the `NoType` ensure path, type_info_impl.dart:117-121). The official
+/// path splices the synthetic identifier INTO the stream and
+/// `simpleType.parseType` consumes it as the type, leaving the offending
+/// junk current with clean lookahead — drain to the queued synthetic for
+/// the same shape (oracle `class C implements 3 {}`: the header junk-skip
+/// then sees the `{` follower and takes the unexpected-token face instead
+/// of cascading through a class-member reparse).
 fn synthetic_type_reference(parser: &mut Parser<'_, '_, impl ParserListener>) -> TokenSpan {
     let at = parser.peek_span();
     parser.report(msg::expected_type_name(), at);
@@ -157,6 +163,7 @@ fn synthetic_type_reference(parser: &mut Parser<'_, '_, impl ParserListener>) ->
         .listener
         .handle_identifier(synthetic, IdentifierContext::TypeReference);
     parser.listener.handle_type(synthetic, None);
+    while parser.cursor.advance() != synthetic.id {}
     synthetic
 }
 

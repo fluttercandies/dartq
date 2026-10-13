@@ -21,7 +21,7 @@
 //! (`token_stream_rewriter.dart:433`).
 //!
 //! * **EOF & length reads (audit #180 F9, documented route)** — `at_eof` is
-//!   a kind-only read (`peek().kind == Eof`): O(1), no span materialization,
+//!   a kind-only read (`peek_kind() == Eof`): O(1), no span materialization,
 //!   and the EOF token is always the table's last element so the answer is
 //!   stable across queue state. Token UTF-16 lengths route through
 //!   `utf16_len_of_token`'s fixed-lexeme fast path (fixed-lexeme kinds
@@ -250,16 +250,41 @@ impl<'s, 't> TokenCursor<'s, 't> {
 
     // --- core movement ----------------------------------------------------------
 
-    /// Current token without consuming.
+    /// Current token without consuming (one table access for kind, span,
+    /// and synthetic flag).
     #[inline]
     pub(crate) fn peek(&self) -> TokenView {
         let id = self.peek_id();
-        let (kind, is_synthetic) = self.resolve(id);
-        TokenView {
-            kind,
-            span: TokenSpan::new(id, self.span(id)),
-            is_synthetic,
+        let index = id as usize;
+        if index < self.table.len() {
+            let t = self.table.get(index).expect("id below table len");
+            TokenView {
+                kind: t.kind,
+                span: TokenSpan::new(
+                    id,
+                    SourceRange {
+                        offset: t.utf16_offset,
+                        length: utf16_len_of_token(self.source, t),
+                    },
+                ),
+                is_synthetic: t.is_synthetic(),
+            }
+        } else {
+            let t = &self.inserted[index - self.table.len()];
+            TokenView {
+                kind: t.kind,
+                span: TokenSpan::new(id, t.range()),
+                is_synthetic: t.synthetic,
+            }
         }
+    }
+
+    /// Kind of the current token without consuming — the parser's hottest
+    /// read (loop heads, `optional`, EOF checks). Kind-only: a single O(1)
+    /// table probe, no span materialization (no O(lexeme) length scan).
+    #[inline]
+    pub(crate) fn peek_kind(&self) -> TokenKind {
+        self.resolve(self.peek_id()).0
     }
 
     /// Kind of the token `n` positions ahead in the *real* stream (no queue
@@ -397,7 +422,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
 
     #[inline]
     pub(crate) fn at_eof(&self) -> bool {
-        self.peek().kind == TokenKind::Eof
+        self.peek_kind() == TokenKind::Eof
     }
 
     // --- optional consumption -----------------------------------------------------
@@ -420,7 +445,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     /// Consumes the current token when it has `kind`.
     #[inline]
     pub(crate) fn opt_kind(&mut self, kind: TokenKind) -> Option<TokenId> {
-        if self.peek().kind == kind {
+        if self.peek_kind() == kind {
             Some(self.advance())
         } else {
             None
@@ -432,7 +457,7 @@ impl<'s, 't> TokenCursor<'s, 't> {
     /// `isCloser` (`type_info_impl.dart:1753)`: the `>`-family tokens.
     pub(crate) fn peek_is_closer(&self) -> bool {
         matches!(
-            self.peek().kind,
+            self.peek_kind(),
             TokenKind::Gt
                 | TokenKind::GtEq
                 | TokenKind::GtGt

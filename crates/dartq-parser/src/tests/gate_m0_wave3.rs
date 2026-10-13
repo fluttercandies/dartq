@@ -1,5 +1,5 @@
 //! M0-gate wave-3 regression pins (#440): the r5 dartq-only over-report
-//! families (`docs/audits/gate-m0/gate-caliber-r5/report.json`), each
+//! families (found by the r5 gate-caliber differential run), each
 //! matching the official recovery decision order:
 //!
 //! * unnamed extensions: `extension<T> on ...` routes to the extension

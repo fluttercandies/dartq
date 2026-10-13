@@ -1,6 +1,6 @@
 //! M0-gate panic regressions (#322, #326): corpus files that crashed the
-//! dartq-vs-oracle smoke waves (docs/audits/gate-m0/smoke-141{,-r2}/
-//! report.json) must flow through `parse_unit` without panicking.
+//! dartq-vs-oracle smoke waves (the initial run and its r2 replay) must
+//! flow through `parse_unit` without panicking.
 //!
 //! Three root-cause families, pinned verbatim (the files are official SDK
 //! test corpus members, BSD-licensed, copied unmodified from tests/corpus/):
@@ -43,8 +43,8 @@ const ISSUE_26810: &str = include_str!("fixtures/gate_m0_issue_26810.dart");
 const ISSUE_26810_AND: &str = include_str!("fixtures/gate_m0_issue_26810_and.dart");
 const ISSUE_26810_OR: &str = include_str!("fixtures/gate_m0_issue_26810_or.dart");
 
-// Panic batch r2 (#326): second smoke wave (docs/audits/gate-m0/smoke-141-r2/
-// report.json). All five are valid corpus Dart; the parser used to panic in
+// Panic batch r2 (#326): surfaced by the second smoke wave. All five are
+// valid corpus Dart; the parser used to panic in
 // type-argument recovery paths instead of recovering like the official parser.
 const R2_ISSUE_60264: &str = include_str!("fixtures/gate_m0_r2_issue60264.dart");
 const R2_LIST: &str = include_str!("fixtures/gate_m0_r2_list.dart");

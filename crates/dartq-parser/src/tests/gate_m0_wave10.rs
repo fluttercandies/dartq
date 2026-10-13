@@ -3,9 +3,8 @@
 //! const-dot-shorthand terminator, the bounded stack-overflow face, and
 //! the legacy switch statement shape.
 //!
-//! The r5 gate-caliber rows that motivated this lane
-//! (docs/audits/gate-m0/gate-caliber-r5) are stale on several of these
-//! families (post-#410 statement work healed the switch shape; the
+//! The r5 gate-caliber rows that motivated this lane are stale on several
+//! of these families (post-#410 statement work healed the switch shape; the
 //! typedef-tail next.next EQ arm landed in 3b10ce3 with its own pins in
 //! tests/declarations.rs), so every family here was re-derived against the
 //! pinned oracle face before pinning. The stack-overflow pin locks the
@@ -159,7 +158,7 @@ fn legacy_switch_case_constants_parse_clean() {
 // —— #839 r5/r6-triage batch: single-point re-verification pins ————————————
 //
 // Each shape was re-probed live against `dart analyze --format=machine`
-// 3.13.1 before pinning (probe rows in docs/audits/p839-r6-triage.md); the
+// 3.13.1 before pinning (every row from a live probe replay); the
 // r5 gate-caliber table predates the W3/W4 listener work, so several of its
 // rows were stale. A face that already matched the oracle is pinned here to
 // keep it matched; no production code changed for a dead divergence.

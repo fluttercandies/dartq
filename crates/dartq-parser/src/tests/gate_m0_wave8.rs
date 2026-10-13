@@ -12,12 +12,11 @@
 //!   type-less rider is the only row, anchored on the member head — the
 //!   `late` keyword or the type-position token, never the follower `;`.
 //! * The `abstract`+`final`/`interface`/`sealed` class-modifier combination
-//!   is reported by the analyzer in the resolution phase
-//!   (`pkg/analyzer/lib/src/dart/resolver/...` — the parser-side
-//!   `parser_impl.dart` never mints these texts); in this codebase the
-//!   semantic emitter (dartq-resolution `modifiers.rs`,
-//!   `check_modifier_declaration`) is the sole owner because only it can
-//!   carry corrections — the parser must stay silent on those heads.
+//!   IS a parser face: `parseClassOrNamedMixinApplication` mints the three
+//!   texts after the type variables (`parser_impl.dart:2976-3015`, oracle
+//!   3.13.1 SYNTACTIC_ERROR rows on the keyword spans). The semantic
+//!   declaration-site twin (dartq-resolution `modifiers.rs`) is the L2
+//!   resolution face and must stay out of this parser stream.
 
 use super::collector::setup;
 
@@ -65,28 +64,186 @@ fn missing_name_head_then_declaration_parses_clean() {
     );
 }
 
-// —— family: abstract+final/interface/sealed trio ownership ————————————————
+// —— family: abstract+final/interface/sealed trio (parser face) ————————————
 
-/// `abstract sealed class` is parser-legal: the combination diagnostic is
-/// the semantic layer's (`modifiers.rs`), so the parser emits nothing.
+/// `abstract sealed class` reports `abstract_sealed_class` anchored on the
+/// `sealed` keyword (parser_impl.dart:2986; oracle 3.13.1: len-6 span on
+/// `sealed`), and nothing else in the unit.
 #[test]
-fn abstract_sealed_class_parser_silent() {
+fn abstract_sealed_class_parser_stream() {
     let mut p = setup("abstract sealed class C {}\n");
     p.parse_unit();
-    assert!(
-        p.listener.errors.is_empty(),
-        "parser must not report the modifier trio: {:?}",
+    assert_eq!(
+        p.listener.errors,
+        vec![("abstract_sealed_class".to_owned(), 9, 15)],
+        "sealed-head pin: {:?}",
         p.listener.errors
     );
 }
 
+/// `abstract final interface class` reports `abstract_final_interface_class`
+/// spanning `final interface` (parser_impl.dart:2996-2999, the
+/// `finalToken`→`interface` coverage; oracle 3.13.1: len-15 span).
 #[test]
-fn abstract_final_interface_class_parser_silent() {
+fn abstract_final_interface_class_parser_stream() {
     let mut p = setup("abstract final interface class C {}\n");
     p.parse_unit();
-    assert!(
-        p.listener.errors.is_empty(),
-        "parser must not report the modifier trio: {:?}",
+    assert_eq!(
+        p.listener.errors,
+        vec![("abstract_final_interface_class".to_owned(), 9, 24)],
+        "final+interface-head pin: {:?}",
+        p.listener.errors
+    );
+}
+
+/// `abstract final base class` reports `abstract_final_base_class` spanning
+/// `final base` (parser_impl.dart:2991-2993; oracle 3.13.1: len-10 span).
+#[test]
+fn abstract_final_base_class_parser_stream() {
+    let mut p = setup("abstract final base class C {}\n");
+    p.parse_unit();
+    assert_eq!(
+        p.listener.errors,
+        vec![("abstract_final_base_class".to_owned(), 9, 19)],
+        "final+base-head pin: {:?}",
+        p.listener.errors
+    );
+}
+
+// —— family: keyword-named top-level declarations (recovery-spelling face) —
+
+/// `int class = 42;` names the field with the keyword: the type-less
+/// declaration recovery (`parseTopLevelMemberImpl`, parser_impl.dart:4304 —
+/// noType + reserved word + `=`) takes the keyword as the name and
+/// `ensureIdentifierPotentiallyRecovered` reports it in place
+/// (`expected_identifier_but_got_keyword`, oracle 3.13.1: one row at the
+/// keyword), leaving `= 42;` to parse clean — no `missing_identifier` and
+/// no class-header reparse cascade.
+#[test]
+fn int_class_keyword_name_single_row() {
+    let mut p = setup("int class = 42;\n");
+    p.parse_unit();
+    assert_eq!(
+        p.listener.errors,
+        vec![("expected_identifier_but_got_keyword".to_owned(), 4, 9)],
+        "reserved-keyword field name with `=` follower: {:?}",
+        p.listener.errors
+    );
+}
+
+/// The same face for every top-level-keyword-flavored reserved name
+/// (`int var/void/const/final/enum = 42;` — oracle 3.13.1: exactly one
+/// `expected_identifier_but_got_keyword` per line, keyword consumed).
+#[test]
+fn reserved_keyword_field_names_single_row_each() {
+    for (kw, len) in [
+        ("var", 3),
+        ("void", 4),
+        ("const", 5),
+        ("final", 5),
+        ("enum", 4),
+    ] {
+        let src = format!("int {kw} = 42;\n");
+        let src: &'static str = Box::leak(src.into_boxed_str());
+        let mut p = setup(src);
+        p.parse_unit();
+        assert_eq!(
+            p.listener.errors,
+            vec![("expected_identifier_but_got_keyword".to_owned(), 4, 4 + len)],
+            "`int {kw} = 42;`: {:?}",
+            p.listener.errors
+        );
+    }
+}
+
+/// `library enum;` accepts the keyword as the library name: the library
+/// template's branch 2 keep-set is `.` `;` EOF
+/// (`identifier_context_impl.dart:953`), and `enum ;`'s follower `;` is in
+/// it, so the keyword is consumed with `expected_identifier_but_got_keyword`
+/// (oracle 3.13.1, issue_48371_prime1: one row, len 4 on `enum`).
+#[test]
+fn library_enum_keyword_library_name() {
+    let mut p = setup("library enum;\n");
+    p.parse_unit();
+    assert_eq!(
+        p.listener.errors,
+        vec![("expected_identifier_but_got_keyword".to_owned(), 8, 12)],
+        "`library enum;` face: {:?}",
+        p.listener.errors
+    );
+}
+
+/// `var class VarClass {}` never eats the class keyword: the follower is
+/// not a name continuation, so the synthetic-name insert reports
+/// `missing_identifier` at the keyword, `ensureSemicolon` anchors on the
+/// walked-back `var` head, and the class reparses clean (oracle 3.13.1:
+/// `expected_token ';'` at the `var` + `missing_identifier` at `class`).
+#[test]
+fn var_class_missing_name_reparse() {
+    let mut p = setup("var class VarClass {}\n");
+    p.parse_unit();
+    assert_eq!(
+        p.listener.errors,
+        vec![
+            ("missing_identifier".to_owned(), 4, 9),
+            ("expected_token".to_owned(), 0, 3),
+        ],
+        "`var class` reparse stream: {:?}",
+        p.listener.errors
+    );
+}
+
+/// `var typedef VarTypedef = void Function();`: `typedef` heads the next
+/// declaration (`isTopLevelKeyword`), so the var-declaration name slot
+/// takes the synthetic insert (`missing_identifier` at `typedef`), the
+/// semicolon anchors on `var`, and the typedef reparses clean — the
+/// type-less rider must NOT fire (the `var` modifier is present) and the
+/// rest of the line carries no rows (oracle 3.13.1,
+/// blindspot_var_declarations line 12).
+#[test]
+fn var_typedef_missing_name_reparse() {
+    let mut p = setup("var typedef VarTypedef = void Function();\n");
+    p.parse_unit();
+    assert_eq!(
+        p.listener.errors,
+        vec![
+            ("missing_identifier".to_owned(), 4, 11),
+            ("expected_token".to_owned(), 0, 3),
+        ],
+        "`var typedef` reparse stream: {:?}",
+        p.listener.errors
+    );
+}
+
+// —— family: empty index `[]` (adjacent brackets split face) ——————————————
+
+/// `b..a[];` recovers the missing index with ONE `missing_identifier`
+/// anchored on the real `]` (the scanner's adjacent-brackets `[]` token
+/// splits into `[` `]`, `rewriteSquareBrackets` :4743): no second
+/// `expected_token ']'` row (oracle 3.13.1, issue_42267 line 4).
+#[test]
+fn cascade_empty_index_single_row() {
+    let mut p = setup("void f() { b..a[]; }\n");
+    p.parse_unit();
+    assert_eq!(
+        p.listener.errors,
+        vec![("missing_identifier".to_owned(), 16, 17)],
+        "cascade `..a[]` face: {:?}",
+        p.listener.errors
+    );
+}
+
+/// The plain (non-cascade) empty index takes the same single-row face
+/// (oracle 3.13.1, issue_42267 lines 6/7: `missing_identifier` at the `]`,
+/// never an `expected_token`).
+#[test]
+fn plain_empty_index_single_row() {
+    let mut p = setup("void f() { a[]; }\n");
+    p.parse_unit();
+    assert_eq!(
+        p.listener.errors,
+        vec![("missing_identifier".to_owned(), 13, 14)],
+        "plain `a[]` face: {:?}",
         p.listener.errors
     );
 }
@@ -139,4 +296,200 @@ fn named_only_record_type_shapes_parse_clean() {
             p.listener.errors
         );
     }
+}
+
+// —— family: stack_overflow expression-depth fuse tail ————————————————————
+
+/// The expression-depth fuse is a LOCAL recovery (official `parseExpression`
+/// `parser_impl.dart:6936-6963`): report once, skip to the innermost region's
+/// scanner-paired group end, splice a synthetic identifier, and return to
+/// normal parsing. The enclosing paren frames then unwind through their
+/// closers by kind (mis-adopting one per the official no-identity check), so
+/// for `var x = (((…1…)))` at 600 deep the oracle tail is: `stack_overflow`
+/// on the fused `(`, `expected_token ';'` anchored on the last adopted
+/// closer (ensureSemicolon's walked-back anchor), `expected_executable` on
+/// the leftover `)` (top-level invalid declaration), `unexpected_token` on
+/// the final `;` (oracle 3.13.1 `stack_overflow` line 2, cols 510/1208/1209/
+/// 1210; dartq's fuse anchor sits one entry earlier, a tracked position
+/// delta only).
+#[test]
+fn stack_overflow_fuse_tail_normal_unwind() {
+    let src = format!("var x = {}1{};\n", "(".repeat(600), ")".repeat(600));
+    let src: &'static str = Box::leak(src.into_boxed_str());
+    let mut p = setup(src);
+    p.parse_unit();
+    assert_eq!(
+        p.listener.errors,
+        vec![
+            ("stack_overflow".to_owned(), 508, 509),
+            ("expected_token".to_owned(), 1207, 1208),
+            ("expected_executable".to_owned(), 1208, 1209),
+            ("unexpected_token".to_owned(), 1209, 1210),
+        ],
+        "fuse tail unwind: {:?}",
+        p.listener.errors
+    );
+}
+
+/// Just under the cap nothing reports: the fuse must not fire early.
+#[test]
+fn stack_overflow_below_cap_clean() {
+    let src = format!("var x = {}1{};\n", "(".repeat(499), ")".repeat(499));
+    let src: &'static str = Box::leak(src.into_boxed_str());
+    let mut p = setup(src);
+    p.parse_unit();
+    assert!(
+        p.listener.errors.is_empty(),
+        "499-deep parens must stay silent: {:?}",
+        p.listener.errors
+    );
+}
+
+// —— family: EOF-face zero-width artifact rows (parked scanner closers) —————
+
+/// Scans + parses `source` (latest features) and returns the MERGED
+/// diagnostic rows — scanner channel first, then parser rows as
+/// `(code, start, end)` — for fixtures whose unmatched begins legitimately
+/// park synthetic closers (`gate_m0_wave3.rs::assert_codes_with_scanner`
+/// rig family, with spans so the zero-width faces stay observable).
+fn merged_rows_with_scanner(source: &'static str) -> Vec<(String, u32, u32)> {
+    let config = dartq_scanner::ScanConfig {
+        enable_triple_shift: true,
+        enable_augmentations: true,
+    };
+    let mut files = dartq_source::FileTable::new();
+    let file = files.intern(std::path::Path::new("test.dart"));
+    let result = dartq_scanner::scan(source, config, file);
+    let table: &'static dartq_scanner::TokenTable = Box::leak(Box::new(result.tokens));
+    let text: &'static str = Box::leak(source.to_string().into_boxed_str());
+    let mut rows: Vec<(String, u32, u32)> = result
+        .diagnostics
+        .iter()
+        .map(|d| {
+            (
+                d.code.name.to_owned(),
+                d.range.offset,
+                d.range.offset + d.range.length,
+            )
+        })
+        .collect();
+    let mut p = super::collector::setup_from_parts(text, table);
+    p.parse_unit();
+    rows.extend(p.listener.errors.clone());
+    rows
+}
+
+/// `new C(;` — the unclosed argument `(` parks a zero-width synthetic `)`
+/// in front of the function's `}` (scanner `report_unmatched_begin`, which
+/// also pins the scanner's own `expected_token ')'` row on the real `}`).
+/// The parked artifact surfaces at statement position: the statement layer
+/// consumes it silently (official `findNonZeroLengthToken` anchoring can
+/// never pin a row on a zero-length span), so the parser's only row is the
+/// argument head's `missing_identifier` on the real `;` — oracle
+/// `bracket_mismatch_06` rows, no zero-length face anywhere.
+#[test]
+fn parked_closer_statement_face_silent_bracket_mismatch_06() {
+    let rows = merged_rows_with_scanner("main() {\n  new C(;\n}\n");
+    assert_eq!(
+        rows,
+        vec![
+            ("expected_token".to_owned(), 19, 20),
+            ("missing_identifier".to_owned(), 17, 18),
+        ],
+        "bracket_mismatch_06 merged rows: {:?}",
+        rows
+    );
+}
+
+/// `case dynamic(foo: int():` — the unclosed object-pattern `(` parks a
+/// zero-width synthetic `)` in front of the switch's `}` (scanner row on
+/// the real `}`). The artifact is consumed silently at statement position;
+/// the object pattern's missing-`)` recovery adopts the scanner's synthetic
+/// (official `ensureCloseParen` moveSynthetic arm, silent) and the case
+/// colon still closes on the real `:` — the oracle's single
+/// `expected_token` row, no zero-length face anywhere.
+#[test]
+fn parked_closer_statement_face_silent_object_recovery() {
+    let rows = merged_rows_with_scanner(
+        "void f(x) {\n  switch (x) {\n    case dynamic(foo: int():\n      break;\n  }\n}\n",
+    );
+    assert_eq!(
+        rows,
+        vec![("expected_token".to_owned(), 71, 72)],
+        "object_recovery_missingClosingParen merged rows: {:?}",
+        rows
+    );
+}
+
+// —— family: issue_39060 recovered type-argument tail (parseUnexpectedEnd) —
+
+/// `{s A<}>` — the var declaration `s A` ends at `<` (`expected_token ';'`
+/// anchored on the name, oracle 3.13.1 col 6); the recovered type-argument
+/// group `< } >` re-enters as a list-literal head, and the official
+/// `parseUnexpectedEnd` tail absorbs the junk `}` silently (`parseCloser`
+/// arm — the junk's follower is the real `>`), closing the group there.
+/// The list face then anchors `expected_token '['` on the block's `}` at
+/// line 3, and the statement's semicolon face anchors back on the `>` —
+/// exactly the oracle's four parser rows, no `missing_identifier` cascade.
+#[test]
+fn issue_39060_type_args_absorb_junk_tail() {
+    let mut p = setup("main() {\n  {s A<}>\n}\n");
+    p.parse_unit();
+    assert_eq!(
+        p.listener.errors,
+        vec![
+            ("expected_token".to_owned(), 14, 15),
+            ("expected_type_name".to_owned(), 16, 17),
+            ("expected_token".to_owned(), 19, 20),
+            ("expected_token".to_owned(), 17, 18),
+        ],
+        "issue_39060 stream: {:?}",
+        p.listener.errors
+    );
+}
+
+/// A well-formed type-argument group never reaches the recovered tail.
+#[test]
+fn well_formed_type_arguments_stay_clean() {
+    let mut p = setup("void f() { var x = <int>[1]; }\n");
+    p.parse_unit();
+    assert!(
+        p.listener.errors.is_empty(),
+        "typed list literal must stay silent: {:?}",
+        p.listener.errors
+    );
+}
+
+/// `case <int>(b) x:` — the recovered group's `(...)`-junk tail. The pattern
+/// literal head parses a real type (`int`), so `error_reported` is still
+/// false when the official `parseUnexpectedEnd` OPEN_PAREN arm runs
+/// (upstream Dart SDK source, `type_info_impl.dart` :1692-1706 — "only
+/// report an error if one has not already been reported"). The arm must
+/// latch the flag: the non-closer follower `x` falls through to the
+/// fallback, and a missing latch emitted a second `Expected '>' after
+/// this.` row where the oracle emits exactly one. Pinned on the two faces:
+/// a single row anchored on the type end, and no row on the skipped `)`.
+#[test]
+fn unexpected_end_open_paren_arm_reports_once() {
+    let mut p =
+        setup("void f(x) {\n  switch (x) {\n    case <int>(b) x:\n      break;\n  }\n}\n");
+    p.parse_unit();
+    assert_eq!(
+        p.listener
+            .errors
+            .iter()
+            .filter(|(_, s, e)| *s == 37 && *e == 40)
+            .count(),
+        1,
+        "exactly one group row anchored on the type end `int`: {:?}",
+        p.listener.errors
+    );
+    assert!(
+        !p.listener
+            .errors
+            .iter()
+            .any(|(_, s, e)| *s == 42 && *e == 43),
+        "no duplicate row on the skipped `)`: {:?}",
+        p.listener.errors
+    );
 }

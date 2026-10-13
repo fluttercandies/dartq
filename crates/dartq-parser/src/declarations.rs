@@ -1178,10 +1178,29 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         let type_param = self.compute_type_param_or_arg_on_lt(true);
         type_param.parse_variables(self, true);
 
-        // The abstract+final/interface/sealed modifier trio is owned by the
-        // semantic layer (dartq-resolution modifiers.rs, check_modifier_
-        // declaration) — the only emitter that can carry corrections. The
-        // parser must not re-report it.
+        // Official modifier-trio check (parser_impl.dart:2975-3001): an
+        // `abstract` class paired with `sealed`, or `final` paired with
+        // `base`/`interface`, reports here — before the mixin-application
+        // split — anchored on the pair's first keyword.
+        if abstract_kw.is_some() {
+            if let Some(sealed_tok) = sealed {
+                self.report(msg::abstract_sealed_class(), sealed_tok);
+            } else if let Some(final_tok) = final_kw {
+                if let Some(base_tok) = base {
+                    self.report_with_end(
+                        msg::abstract_final_base_class(),
+                        final_tok,
+                        base_tok,
+                    );
+                } else if let Some(interface_tok) = interface {
+                    self.report_with_end(
+                        msg::abstract_final_interface_class(),
+                        final_tok,
+                        interface_tok,
+                    );
+                }
+            }
+        }
 
         if self.peek_kind() == TokenKind::Eq {
             if let Some(c) = const_keyword {

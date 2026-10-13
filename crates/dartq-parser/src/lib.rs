@@ -7,11 +7,11 @@
 //! at crate level.
 #![allow(clippy::too_many_lines, clippy::too_many_arguments)]
 //!
-//! Behavior mirrors the official CFE parser
-//! (`.third/dart-sdk/pkg/_fe_analyzer_shared/lib/src/parser/`, Dart 3.15
-//! main). Authoritative design facts: `docs/facts/parser-core-spec.md`
-//! (#27) and `docs/facts/parser-grammar-map.md` (#32). Semantic questions
-//! are settled against the reference sources, never from memory.
+//! Behavior mirrors the official CFE parser (upstream Dart SDK source,
+//! `pkg/_fe_analyzer_shared/lib/src/parser/`, Dart 3.15 main); semantic
+//! questions are settled against those reference sources, never from
+//! memory. The authoritative design contracts are the architecture
+//! invariants documented below.
 //!
 //! # Architecture
 //!

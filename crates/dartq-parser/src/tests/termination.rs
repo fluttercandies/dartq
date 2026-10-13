@@ -85,6 +85,34 @@ fn nesting_cap_latches_on_deep_record_types() {
     );
 }
 
+/// A written-out-operator chain: every `xor` link fires the entry-floor
+/// recovery acceptance, so the walk must iterate in place. A per-link
+/// re-entry of the walk (native tail recursion, invisible to the depth
+/// guard — the entry runs outside `enter_depth`) grows the native stack
+/// linearly with the chain and overflows the process on ~40k links; the
+/// parse must instead complete with the caps bounding the diagnostics.
+#[test]
+fn written_out_operator_chain_terminates() {
+    let mut source = String::from("void f() {\n  var x = a");
+    for _ in 0..50_000 {
+        source.push_str(" xor 1");
+    }
+    source.push_str(";\n}\n");
+    let source: &'static str = Box::leak(source.into_boxed_str());
+    let (table, text) = scan_ok(source);
+    let mut listener = Collector::default();
+    {
+        let mut parser = Parser::new(text, table, latest_features(), listener);
+        parser.parse_unit();
+        listener = parser.listener;
+    }
+    assert!(
+        listener.errors.len() <= MAX_DIAGNOSTICS,
+        "the caps bound the per-link flood: {}",
+        listener.errors.len()
+    );
+}
+
 /// The reported corpus panic: `@List<int>` with no argument list tripped
 /// `debug_assert!(peek_is_closer())` because the Simple1 consume path read
 /// the name before advancing past `<`. The official event order is

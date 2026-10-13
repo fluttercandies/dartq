@@ -386,6 +386,119 @@ impl RecordProbe {
 }
 
 impl<L: ParserListener> Parser<'_, '_, L> {
+    /// Official `parseUnexpectedEnd` (`type_info_impl.dart:1607-1758`) for a
+    /// recovered type-ARGUMENT group: runs when neither a `,` nor the group
+    /// closer follows the argument type. Arms in official order; the report
+    /// anchor is the last consumed type end walked off zero-width synthetics
+    /// (the official `reportRecoverableError` `findNonZeroLengthToken`), and
+    /// `error_reported` mirrors the official `token.isSynthetic` gate (the
+    /// ensure path's `expected_type_name` row already covers the group), so
+    /// at most one `expected_after_but_got('>')` fires per group. Returns
+    /// the group-end span: the consumed `>`-family closer, or a synthesized
+    /// `>` when no real closer absorbs the junk.
+    ///
+    /// The `< } >`-shaped junk face (the pinned `issue_39060` flow): the
+    /// junk's follower is a real `>`, so the fallback's `parseCloser(next)`
+    /// arm absorbs the junk silently and the group closes on the real
+    /// closer — the oracle emits no per-junk rows, and the enclosing
+    /// statement's semicolon face anchors on the closer.
+    fn parse_type_args_unexpected_end(
+        &mut self,
+        in_declaration: bool,
+        mut error_reported: bool,
+    ) -> TokenSpan {
+        // `extends` type continuation (official :1614-1629).
+        if self.peek_kind() == TokenKind::Keyword(Keyword::Extends) {
+            if !error_reported {
+                let at = self.last_consumed_anchor();
+                self.report(msg::expected_after_but_got(">"), at);
+                error_reported = true;
+            }
+            self.cursor.advance();
+            if is_valid_non_record_type_reference(self.peek_kind(), self.cursor.look_kind(1)) {
+                let type_info = self.compute_type(true, false);
+                // Silent stream-shaping: the official re-parse runs under a
+                // ForwardingListener (events dropped); the diet skip consumes
+                // the same real span.
+                type_info.skip_type_raw(self);
+            }
+            if self.cursor.peek_is_closer() {
+                let id = self.cursor.consume_closer();
+                return self.span_of(id);
+            }
+        }
+        // dynamic / void / `Function` type continuation (official :1631-1656).
+        if matches!(
+            self.peek_kind(),
+            TokenKind::Keyword(Keyword::Dynamic | Keyword::Void | Keyword::Function)
+        ) {
+            let type_info = self.compute_type(true, false);
+            if !matches!(type_info, TypeInfo::NoType) {
+                if !error_reported {
+                    let at = self.last_consumed_anchor();
+                    self.report(msg::expected_after_but_got(">"), at);
+                    error_reported = true;
+                }
+                type_info.skip_type_raw(self);
+                if self.cursor.peek_is_closer() {
+                    let id = self.cursor.consume_closer();
+                    return self.span_of(id);
+                }
+            }
+        }
+        // A nested type-argument group continuation (official :1658-1690).
+        let nested = self.compute_type_param_or_arg(in_declaration);
+        if !matches!(nested, TypeParamOrArg::None) {
+            if !error_reported {
+                let at = self.last_consumed_anchor();
+                self.report(msg::expected_after_but_got(">"), at);
+                error_reported = true;
+            }
+            // Silent diet skip over the nested group (the official re-parse
+            // runs under a ForwardingListener).
+            let end_id = nested.skip(self.peek_id());
+            self.skip_to_token(end_id);
+            self.cursor.advance();
+            if self.cursor.peek_is_closer() {
+                let id = self.cursor.consume_closer();
+                return self.span_of(id);
+            }
+        }
+        // A `(...)` group continuation (official :1692-1706).
+        if self.peek_kind() == TokenKind::OpenParen
+            && let Some(close) = self.current_matching_end()
+        {
+            if !error_reported {
+                let at = self.last_consumed_anchor();
+                self.report(msg::expected_after_but_got(">"), at);
+                error_reported = true;
+            }
+            self.skip_to_token(close);
+            self.cursor.advance();
+            if self.cursor.peek_is_closer() {
+                let id = self.cursor.consume_closer();
+                return self.span_of(id);
+            }
+        }
+        // Fallback (official :1708-1758): one group-level row; a real closer
+        // directly after the junk absorbs it (`parseCloser(next)`), otherwise
+        // the group closes on a synthesized `>` and the junk stays current
+        // for the enclosing recovery layer.
+        if !error_reported {
+            let at = self.last_consumed_anchor();
+            self.report(msg::expected_after_but_got(">"), at);
+        }
+        if is_closer(self.cursor.look_kind(1)) {
+            self.cursor.advance();
+            let id = self.cursor.consume_closer();
+            return self.span_of(id);
+        }
+        let offset = self.peek_span().range.offset;
+        let id = self.cursor.insert_synthetic(TokenKind::Gt, offset);
+        self.cursor.advance();
+        self.span_of(id)
+    }
+
     /// Scans a `<...>` group without consuming (official
     /// `ComplexTypeParamOrArgInfo.compute`). Returns
     /// `(closer id, recovered, closer is a raw compound)`. `scan` walks the
@@ -827,20 +940,21 @@ impl ComplexTypeParamOrArg {
                 parser.leave_depth();
                 return end;
             }
-            let before = parser.cursor.progress();
             let mut type_info = parser.compute_type(true, false);
-            if matches!(type_info, TypeInfo::NoType) {
-                // Recovery: annotations over type arguments are reported and
-                // skipped without events (official skipMetadata probe; the
-                // cursor sits on the `@` — official `skipMetadata(next)`
-                // consumes `next.next!`).
-                while matches!(type_info, TypeInfo::NoType) && parser.peek_kind() == TokenKind::At {
-                    let at = parser.peek_span();
-                    parser.skip_metadata_silent();
-                    type_info = parser.compute_type(true, false);
-                    let end_span = parser.peek_span();
-                    parser.report_with_end(msg::annotation_on_type_argument(), at, end_span);
-                }
+            // Recovery: annotations over type arguments are reported and
+            // skipped without events (official skipMetadata probe; the
+            // cursor sits on the `@` — official `skipMetadata(next)`
+            // consumes `next.next!`). The bail check keeps the skip loop
+            // structurally forward when the recompute latched the cap.
+            while matches!(type_info, TypeInfo::NoType)
+                && parser.peek_kind() == TokenKind::At
+                && !parser.is_bailed()
+            {
+                let at = parser.peek_span();
+                parser.skip_metadata_silent();
+                type_info = parser.compute_type(true, false);
+                let end_span = parser.peek_span();
+                parser.report_with_end(msg::annotation_on_type_argument(), at, end_span);
             }
             type_info.ensure_type_or_void(parser);
             // Official `next = token.next!`: the NoType ensure path returns
@@ -891,48 +1005,17 @@ impl ComplexTypeParamOrArg {
                     }
                     continue;
                 }
-                // Recovery: jump to the scanner-paired closer of this group.
-                // Official anchor: `token` — the last consumed type
-                // argument's end (parseUnexpectedEnd anchors every
-                // expectedAfterButGot('>') on it,
-                // type_info_impl.dart:1607-1730), not the offending follower.
-                if let Some(group_end) = parser.cursor.table_matching_end(begin.id) {
-                    let at = parser
-                        .cursor
-                        .last_consumed_id()
-                        .map_or_else(|| parser.peek_span(), |id| parser.span_of(id));
-                    parser.report(msg::expected_after_but_got(">"), at);
-                    parser.skip_to_token(group_end);
-                    end = {
-                        let id = parser.cursor.advance();
-                        parser.span_of(id)
-                    };
-                    parser.listener.end_type_arguments(count, begin, end);
-                    parser.leave_depth();
-                    return end;
-                }
-                // Recovery: report and keep going with a synthesized comma
-                // (official). Progress guarantee: this arm runs only when no
-                // closer exists anywhere ahead, so the next iteration must
-                // examine a *new* real token — drain everything queued (the
-                // synthetics' events are already emitted) and force one real
-                // token forward when the iteration consumed none. At EOF (or
-                // when nothing was consumed and nothing is queued) there is
-                // no next real token: close the group here instead of
-                // spinning on self-fed synthetics (termination invariant —
-                // every recovery loop consumes or exits, #495).
-                parser.report(msg::expected_but_got(","), parser.peek_span());
-                parser.synthetic(TokenKind::Comma, parser.peek_span().range.offset);
-                while parser.cursor.peek_id() as usize >= parser.table.len() {
-                    parser.cursor.advance();
-                }
-                if parser.cursor.at_eof() || parser.cursor.progress() == before {
-                    end = parser.peek_span();
-                    parser.listener.end_type_arguments(count, begin, end);
-                    parser.leave_depth();
-                    return end;
-                }
-                continue;
+                // Official `parseUnexpectedEnd` (`type_info_impl.dart:1607`):
+                // the recovered-group tail, in official arm order.
+                // `error_reported` mirrors the official `token.isSynthetic`
+                // gate — the ensure path's `expected_type_name` row already
+                // covers the group — so at most one
+                // `expected_after_but_got('>')` fires.
+                let error_reported = matches!(type_info, TypeInfo::NoType);
+                end = parser.parse_type_args_unexpected_end(self.in_declaration, error_reported);
+                parser.listener.end_type_arguments(count, begin, end);
+                parser.leave_depth();
+                return end;
             }
             parser.cursor.advance();
         }
