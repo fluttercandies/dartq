@@ -821,7 +821,9 @@ fn yaml_ignore_entry<'a>(line: &'a str, marker: &str) -> Option<(&'a str, Vec<St
 /// above the package root (the repository-wide shape) carries no key of
 /// its own; its entry is the containing root's, which loaded it. `None` —
 /// no options file in the ancestry — is the empty (no-lints) posture.
-fn governing_options<'a>(
+/// `pub(crate)`: the removed_lint_use face (#1005) resolves the same
+/// per-file governing entry for its `unnecessary_ignore` gate.
+pub(crate) fn governing_options<'a>(
     engine: &'a Engine,
     dir: &Path,
     roots: &[PathBuf],
