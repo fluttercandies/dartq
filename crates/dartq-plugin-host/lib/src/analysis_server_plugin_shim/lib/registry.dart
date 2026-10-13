@@ -2,7 +2,7 @@
 /// dartq mirror registry.
 ///
 /// Mirrors `package:analysis_server_plugin/registry.dart`
-/// (`.third/dart-sdk`, `lib/registry.dart` and `lib/src/registry.dart`):
+/// (upstream Dart SDK source, `lib/registry.dart` and `lib/src/registry.dart`):
 /// `registerAssist`, `registerFixForRule`, `registerLintRule`, and
 /// `registerWarningRule` with the official names, and the official
 /// registration-time behavior — each generator is instantiated once with a

@@ -259,7 +259,7 @@ packages:
   signals_lint:
     dependency: "direct main"
     description:
-      path: "../../../../.third/aswp-samples/signals/packages/signals_lint"
+      path: "vendor/signals_lint"
       relative: true
     source: path
     version: "7.0.0"

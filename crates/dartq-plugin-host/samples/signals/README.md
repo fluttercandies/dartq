@@ -1,7 +1,8 @@
 # signals: live-compat overlay for the real `signals_lint` plugin
 
-Wires the real `rodydavis/signals.dart` `signals_lint` package (pinned clone
-under `.third/aswp-samples/signals`, read-only) onto the dartq plugin host
+Wires the real `rodydavis/signals.dart` `signals_lint` package
+(https://github.com/rodydavis/signals.dart, vendored snapshot under
+`vendor/signals_lint` — see `vendor/PROVENANCE.md`) onto the dartq plugin host
 through a thin overlay package. Companion to `samples/compat` (the
 in-repo, fully dartq-native sample).
 

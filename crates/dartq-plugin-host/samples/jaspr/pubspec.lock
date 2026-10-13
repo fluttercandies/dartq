@@ -131,7 +131,7 @@ packages:
   jaspr_lints:
     dependency: "direct main"
     description:
-      path: "../../../../.third/aswp-samples/jaspr/packages/jaspr_lints"
+      path: "vendor/jaspr_lints"
       relative: true
     source: path
     version: "0.7.2"

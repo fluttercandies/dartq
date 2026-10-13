@@ -1,7 +1,8 @@
 name: signals_compat
 description: >-
-  Live-compat overlay wiring the real signals_lint plugin (pinned clone under
-  .third/aswp-samples/signals) onto the dartq plugin host. Not published.
+  Live-compat overlay wiring the real signals_lint plugin (vendored snapshot
+  under vendor/signals_lint, see vendor/PROVENANCE.md) onto the dartq plugin
+  host. Not published.
 publish_to: none
 
 environment:
@@ -14,4 +15,4 @@ dependencies:
   dartq_plugin_host:
     path: ../..
   signals_lint:
-    path: ../../../../.third/aswp-samples/signals/packages/signals_lint
+    path: vendor/signals_lint

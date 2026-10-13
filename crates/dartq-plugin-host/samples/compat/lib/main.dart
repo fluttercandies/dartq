@@ -2,7 +2,8 @@
 /// shaped plugin running on the dartq plugin host.
 ///
 /// This file mirrors the layout of the official authoring guide
-/// (`.third/dart-sdk/pkg/analysis_server_plugin/doc/writing_a_plugin.md`):
+/// (upstream Dart SDK source,
+/// `pkg/analysis_server_plugin/doc/writing_a_plugin.md`):
 /// a `lib/main.dart` entry exposing a top-level `plugin` variable, a
 /// `Plugin` subclass registering its extensions, an analysis rule, and a
 /// `CorrectionProducer`-shaped fix. Every concept maps onto a

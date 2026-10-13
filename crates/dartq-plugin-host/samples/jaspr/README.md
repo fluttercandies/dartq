@@ -1,8 +1,9 @@
 # jaspr: live-compat overlay for the real `jaspr_lints` plugin
 
-Wires the real `schultek/jaspr` `jaspr_lints` package (pinned clone under
-`.third/aswp-samples/jaspr`, read-only) onto the dartq plugin host through a
-thin overlay package. Companion to `samples/compat` (the in-repo,
+Wires the real `schultek/jaspr` `jaspr_lints` package
+(https://github.com/schultek/jaspr, vendored snapshot under
+`vendor/jaspr_lints` — see `vendor/PROVENANCE.md`) onto the dartq plugin host
+through a thin overlay package. Companion to `samples/compat` (the in-repo,
 fully dartq-native sample).
 
 ## What is real here

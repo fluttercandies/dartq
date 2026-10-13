@@ -4,8 +4,9 @@ A real dartq plugin, shaped like an official `analysis_server_plugin`
 package, running on the dartq plugin host (`dartq_plugin_host`). This
 directory is the seed of the porting guide: it shows, on a working sample,
 how every concept of the official plugin API maps onto the dartq plugin
-surface — read it next to
-`.third/dart-sdk/pkg/analysis_server_plugin/doc/writing_a_plugin.md`.
+surface — read it next to the upstream authoring guide `writing_a_plugin.md`
+(upstream Dart SDK source,
+https://github.com/dart-lang/sdk/tree/main/pkg/analysis_server_plugin/doc).
 
 ## Layout
 

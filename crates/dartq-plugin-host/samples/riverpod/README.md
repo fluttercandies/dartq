@@ -1,7 +1,8 @@
 # riverpod: live-compat overlay for the real `riverpod_lint` plugin
 
-Wires the real `rrousselGit/riverpod` `riverpod_lint` package (pinned clone
-under `.third/aswp-samples/riverpod`, read-only) onto the dartq plugin host
+Wires the real `rrousselGit/riverpod` `riverpod_lint` package
+(https://github.com/rrousselGit/river_pod, vendored snapshot under
+`vendor/riverpod_lint` — see `vendor/PROVENANCE.md`) onto the dartq plugin host
 through a thin overlay package. Companion to `samples/compat` (the
 in-repo, fully dartq-native sample).
 

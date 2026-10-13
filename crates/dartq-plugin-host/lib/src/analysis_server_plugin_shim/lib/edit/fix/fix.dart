@@ -1,7 +1,7 @@
 /// The fix-kind vocabulary, mirrored verbatim.
 ///
 /// Mirrors `package:analysis_server_plugin/edit/fix/fix.dart`
-/// (`.third/dart-sdk`), which re-exports `FixKind` from
+/// (upstream Dart SDK source), which re-exports `FixKind` from
 /// `package:analyzer_plugin/utilities/fixes/fixes.dart` and adds the `Fix`
 /// wrapper (kind + `SourceChange`). `FixKind` is pure data and is mirrored
 /// exactly; `Fix` wraps `package:analyzer_plugin`'s `SourceChange`, an

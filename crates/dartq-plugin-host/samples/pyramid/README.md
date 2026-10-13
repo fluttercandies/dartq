@@ -1,7 +1,8 @@
 # pyramid: live-compat overlay for the real `pyramid_lint` plugin
 
-Wires the real `charlescyt/pyramid_lint` package (pinned clone under
-`.third/aswp-samples/pyramid_lint`, read-only) onto the dartq plugin host
+Wires the real `charlescyt/pyramid_lint` package
+(https://github.com/charlescyt/pyramid_lint, vendored snapshot under
+`vendor/pyramid_lint` — see `vendor/PROVENANCE.md`) onto the dartq plugin host
 through a thin overlay package. Companion to `samples/compat` (the
 in-repo, fully dartq-native sample).
 

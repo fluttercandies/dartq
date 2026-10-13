@@ -1,0 +1,6 @@
+# Keep analysis focused on this sample's own code: vendor/ holds
+# byte-identical upstream snapshots (see vendor/PROVENANCE.md) and is not
+# lint-clean against the analyzer versions this workspace pins.
+analyzer:
+  exclude:
+    - vendor/**

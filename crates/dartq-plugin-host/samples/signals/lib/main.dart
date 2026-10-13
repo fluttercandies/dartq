@@ -1,6 +1,6 @@
 /// Live-compat overlay for the real `signals_lint` plugin
-/// (`rodydavis/signals.dart` @v7.1.0, pinned under
-/// `.third/aswp-samples/signals/packages/signals_lint`).
+/// (`rodydavis/signals.dart` @v7.1.0, vendored under
+/// `vendor/signals_lint`).
 ///
 /// This upstream package is **not** `analysis_server_plugin`-shaped: it is a
 /// `custom_lint` plugin exposing `PluginBase createPlugin()` with
@@ -20,7 +20,8 @@
 /// so the manifest advertises `fix` for that face.
 library;
 
-import 'package:custom_lint_builder/custom_lint_builder.dart' show CustomLintConfigs;
+import 'package:custom_lint_builder/custom_lint_builder.dart'
+    show CustomLintConfigs;
 import 'package:dartq_plugin_host/dartq_plugin_host.dart' as dartq;
 import 'package:signals_lint/signals_lint.dart' as signals_lint;
 
@@ -39,7 +40,8 @@ final config = dartq.PluginConfig(
   name: 'signals',
   version: '7.0.0',
   entrypoint: 'bin/signals_plugin.dart',
-  capabilities: dartq.CapabilitySet([dartq.Capability.lint, dartq.Capability.fix]),
+  capabilities:
+      dartq.CapabilitySet([dartq.Capability.lint, dartq.Capability.fix]),
 );
 
 /// Runs the real signals plugin over one stdio session: the upstream plugin

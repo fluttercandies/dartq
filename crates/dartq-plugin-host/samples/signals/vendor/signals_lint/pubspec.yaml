@@ -1,0 +1,28 @@
+name: signals_lint
+description: linter and developer tool for signals
+version: 7.0.0
+repository: https://github.com/rodydavis/signals.dart
+homepage: https://dartsignals.dev/
+documentation: https://dartsignals.dev/
+topics:
+  - state-management
+  - state
+  - signals
+  - rx
+  - linter
+
+environment:
+  sdk: ^3.5.0
+
+resolution: workspace
+
+dependencies:
+  analyzer: ">=6.0.0 <13.0.0"
+  analyzer_plugin: ">=0.11.0 <0.17.0"
+  collection: ^1.17.2
+  custom_lint_builder: ^0.8.1
+
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.28.2
+  signals: ^7.0.0

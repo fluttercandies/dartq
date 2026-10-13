@@ -3,7 +3,8 @@
 ///
 /// The wire shapes mirror `SourceEdit` / `PrioritizedChange` in the Rust
 /// crate `dartq-plugin`; the producer surface mirrors
-/// `package:analysis_server_plugin` (`.third/dart-sdk`). `ProducerContext`
+/// `package:analysis_server_plugin` (upstream Dart SDK source,
+/// `pkg/analysis_server_plugin`). `ProducerContext`
 /// grows with the engine Query API (PRD section 14.2).
 library;
 

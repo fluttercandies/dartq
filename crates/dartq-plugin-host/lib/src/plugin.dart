@@ -1,7 +1,7 @@
 /// The plugin lifecycle every dartq plugin implements.
 ///
 /// Mirrors the observable contract of
-/// `package:analysis_server_plugin/plugin.dart` (`.third/dart-sdk`,
+/// `package:analysis_server_plugin/plugin.dart` (upstream Dart SDK source,
 /// `lib/plugin.dart`): a name, one registration callback, start-up, and
 /// shutdown — so an official plugin reads naturally as a dartq plugin.
 library;

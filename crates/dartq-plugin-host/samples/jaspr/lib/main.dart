@@ -1,6 +1,6 @@
 /// Live-compat overlay for the real `jaspr_lints` plugin
-/// (`schultek/jaspr` @8fd220377b7f, pinned under
-/// `.third/aswp-samples/jaspr/packages/jaspr_lints`).
+/// (`schultek/jaspr` @8fd220377b7f, vendored under
+/// `vendor/jaspr_lints`).
 ///
 /// The upstream package is official `analysis_server_plugin`-shaped: a
 /// top-level `plugin` object whose `register(PluginRegistry)` runs three
@@ -77,13 +77,15 @@ Future<void> run({
           file: first.file,
           severity: dartq.Severity.info,
           code: 'jaspr/census',
-          message: 'census lint=${bridge.lintRules}'
+          message:
+              'census lint=${bridge.lintRules}'
               ' warning=${bridge.warningRules}'
               ' fix=${bridge.fixes}'
               ' assist=${bridge.assists}',
         ),
     ],
-    onRequestFixes: (file, offset, length, queries) => serveFixes(bridge, offset, length),
+    onRequestFixes: (file, offset, length, queries) =>
+        serveFixes(bridge, offset, length),
   );
   // The core closed its stdin: the session is over.
   await plugin.shutDown();
@@ -105,7 +107,9 @@ List<dartq.PrioritizedChange> serveFixes(
       dartq.PrioritizedChange(
         priority: 1,
         message: 'jaspr fix ${entry.key}',
-        edits: [dartq.SourceEdit(offset: offset, length: length, replacement: marker)],
+        edits: [
+          dartq.SourceEdit(offset: offset, length: length, replacement: marker),
+        ],
       ),
   for (var i = 0; i < bridge.host.assists.length; i++)
     dartq.PrioritizedChange(priority: 50, message: 'jaspr assist ${i + 1}'),
@@ -180,7 +184,12 @@ final class _MarkerProducer implements dartq.Producer {
   final int priority = 1;
 
   @override
-  Future<List<dartq.SourceEdit>> compute(dartq.ProducerContext context) async => [
-    dartq.SourceEdit(offset: context.offset, length: context.length, replacement: marker),
-  ];
+  Future<List<dartq.SourceEdit>> compute(dartq.ProducerContext context) async =>
+      [
+        dartq.SourceEdit(
+          offset: context.offset,
+          length: context.length,
+          replacement: marker,
+        ),
+      ];
 }

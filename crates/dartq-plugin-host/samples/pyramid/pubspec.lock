@@ -179,7 +179,7 @@ packages:
   pyramid_lint:
     dependency: "direct main"
     description:
-      path: "../../../../.third/aswp-samples/pyramid_lint"
+      path: "vendor/pyramid_lint"
       relative: true
     source: path
     version: "3.0.0"

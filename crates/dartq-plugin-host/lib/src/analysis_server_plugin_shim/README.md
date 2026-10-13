@@ -78,7 +78,7 @@ rule — exits the process, which the core reports as one
 
 ## API alignment
 
-| Official face (`.third/dart-sdk`, `pkg/analysis_server_plugin`) | Shim | Delegation |
+| Official face (upstream Dart SDK source, `pkg/analysis_server_plugin`) | Shim | Delegation |
 | --- | --- | --- |
 | `lib/plugin.dart` `Plugin` (`name`, `register`, `start`, `shutDown`) | Same, verbatim | `_PluginAdapter` → mirror `Plugin` → `servePlugin` lifecycle |
 | `lib/registry.dart` `PluginRegistry.registerAssist(ProducerGenerator)` | Same name, shim-local `ProducerGenerator` | Kind validated (official `ArgumentError` message), generator adapted onto `dartq.PluginRegistryImpl.registerAssist` |

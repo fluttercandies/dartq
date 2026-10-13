@@ -1,8 +1,8 @@
 name: riverpod_compat
 description: >-
-  Live-compat overlay wiring the real riverpod_lint plugin (pinned clone
-  under .third/aswp-samples/riverpod) onto the dartq plugin host. Not
-  published.
+  Live-compat overlay wiring the real riverpod_lint plugin (vendored snapshot
+  under vendor/riverpod_lint, see vendor/PROVENANCE.md) onto the dartq plugin
+  host. Not published.
 publish_to: none
 
 environment:
@@ -17,4 +17,4 @@ dependencies:
   dartq_plugin_host:
     path: ../..
   riverpod_lint:
-    path: ../../../../.third/aswp-samples/riverpod/packages/riverpod_lint
+    path: vendor/riverpod_lint

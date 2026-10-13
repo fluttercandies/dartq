@@ -1,6 +1,6 @@
 /// Live-compat overlay for the real `pyramid_lint` plugin
-/// (`charlescyt/pyramid_lint` @v3.0.0, pinned under
-/// `.third/aswp-samples/pyramid_lint`).
+/// (`charlescyt/pyramid_lint` @v3.0.0, vendored under
+/// `vendor/pyramid_lint`).
 ///
 /// The upstream package is official `analysis_server_plugin`-shaped: a
 /// top-level `plugin` object whose `register(PluginRegistry)` runs 37
@@ -72,7 +72,8 @@ Future<void> run({
           file: first.file,
           severity: dartq.Severity.info,
           code: 'pyramid/census',
-          message: 'census lint=${bridge.lintRules}'
+          message:
+              'census lint=${bridge.lintRules}'
               ' warning=${bridge.warningRules}'
               ' fix=${bridge.fixes}'
               ' assist=${bridge.assists}',
@@ -151,11 +152,12 @@ final class _MarkerProducer implements dartq.Producer {
   final int priority = 1;
 
   @override
-  Future<List<dartq.SourceEdit>> compute(dartq.ProducerContext context) async => [
-    dartq.SourceEdit(
-      offset: context.offset,
-      length: context.length,
-      replacement: '/* dartq:pyramid */',
-    ),
-  ];
+  Future<List<dartq.SourceEdit>> compute(dartq.ProducerContext context) async =>
+      [
+        dartq.SourceEdit(
+          offset: context.offset,
+          length: context.length,
+          replacement: '/* dartq:pyramid */',
+        ),
+      ];
 }

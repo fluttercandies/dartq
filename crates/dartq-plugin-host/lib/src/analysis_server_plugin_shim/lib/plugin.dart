@@ -2,7 +2,7 @@
 /// face.
 ///
 /// Mirrors `package:analysis_server_plugin/plugin.dart`
-/// (`.third/dart-sdk`, `lib/plugin.dart`): [Plugin] has the same four members
+/// (upstream Dart SDK source, `lib/plugin.dart`): [Plugin] has the same four members
 /// with the same signatures, so a plugin subclass compiles against this shim
 /// unchanged.
 ///

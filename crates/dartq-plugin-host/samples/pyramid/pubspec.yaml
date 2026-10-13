@@ -1,7 +1,8 @@
 name: pyramid_compat
 description: >-
-  Live-compat overlay wiring the real pyramid_lint plugin (pinned clone under
-  .third/aswp-samples/pyramid_lint) onto the dartq plugin host. Not published.
+  Live-compat overlay wiring the real pyramid_lint plugin (vendored snapshot
+  under vendor/pyramid_lint, see vendor/PROVENANCE.md) onto the dartq plugin
+  host. Not published.
 publish_to: none
 
 environment:
@@ -16,4 +17,4 @@ dependencies:
   dartq_plugin_host:
     path: ../..
   pyramid_lint:
-    path: ../../../../.third/aswp-samples/pyramid_lint
+    path: vendor/pyramid_lint

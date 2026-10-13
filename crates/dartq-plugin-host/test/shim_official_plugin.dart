@@ -1,6 +1,6 @@
 /// The compatibility fixture plugin: written verbatim in official
 /// `analysis_server_plugin` style — the same imports and shapes as the
-/// official authoring guides (`.third/dart-sdk`,
+/// official authoring guides (upstream Dart SDK source,
 /// `pkg/analysis_server_plugin/doc/writing_a_plugin.md` and
 /// `writing_fixes.md`) — and compiled against the dartq import shim.
 ///

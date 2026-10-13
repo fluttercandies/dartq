@@ -1,7 +1,8 @@
 name: jaspr_compat
 description: >-
-  Live-compat overlay wiring the real jaspr_lints plugin (pinned clone under
-  .third/aswp-samples/jaspr) onto the dartq plugin host. Not published.
+  Live-compat overlay wiring the real jaspr_lints plugin (vendored snapshot
+  under vendor/jaspr_lints, see vendor/PROVENANCE.md) onto the dartq plugin
+  host. Not published.
 publish_to: none
 
 environment:
@@ -17,4 +18,4 @@ dependencies:
   dartq_plugin_host:
     path: ../..
   jaspr_lints:
-    path: ../../../../.third/aswp-samples/jaspr/packages/jaspr_lints
+    path: vendor/jaspr_lints

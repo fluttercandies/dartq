@@ -1,7 +1,7 @@
 /// The assist-kind vocabulary, mirrored verbatim.
 ///
 /// Mirrors `package:analysis_server_plugin/edit/assist/assist.dart`
-/// (`.third/dart-sdk`), which re-exports `AssistKind` from
+/// (upstream Dart SDK source), which re-exports `AssistKind` from
 /// `package:analyzer_plugin/utilities/assist/assist.dart` and adds the
 /// `Assist` wrapper (kind + `SourceChange`). `AssistKind` is pure data and is
 /// mirrored exactly; `Assist` wraps `package:analyzer_plugin`'s

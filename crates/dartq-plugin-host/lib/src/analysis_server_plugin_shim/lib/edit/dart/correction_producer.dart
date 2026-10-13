@@ -2,7 +2,7 @@
 ///
 /// Mirrors the names and shapes of
 /// `package:analysis_server_plugin/edit/dart/correction_producer.dart`
-/// (`.third/dart-sdk`) that the dartq wire v1 can express, and delegates them
+/// (upstream Dart SDK source) that the dartq wire v1 can express, and delegates them
 /// onto the mirror's edit types.
 ///
 /// The structural boundary, anchored: the official producer computes inside a
@@ -98,8 +98,7 @@ final class CorrectionProducerContext {
 /// (`StubCorrectionProducerContext`): used to instantiate a producer for the
 /// purpose of examining its fixed properties (the kind getters) at
 /// registration time. Every member access throws.
-final class StubCorrectionProducerContext
-    implements CorrectionProducerContext {
+final class StubCorrectionProducerContext implements CorrectionProducerContext {
   /// The singleton stub instance.
   static final instance = StubCorrectionProducerContext._();
 
