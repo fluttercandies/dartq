@@ -308,6 +308,67 @@ pub fn unignorable_ignores(
     hits
 }
 
+/// The ignore-comment *name* entries of one unit, in the official
+/// validator's walk order with its exact-duplicate removal already applied
+/// — the read-only enumeration the removed-state faces consume
+/// (`IgnoreValidator.reportErrors`, ignore_validator.dart:73-155):
+/// file-level names first in comment order, then line-level names in line
+/// order, each surviving its scope's first-occurrence test
+/// (`namesIgnoredForFile` / `namedIgnoredOnLine`, ignore_validator.dart
+/// :82-132). Duplicate detection is exact-match on the name as written: a
+/// differently-cased spelling is never a duplicate, and the same name
+/// ignored on two different lines survives twice — each line's entry
+/// reports its own row.
+///
+/// Tuple: the name as written in the comment, the name token's UTF-16
+/// offset, the name token's UTF-16 length — the report anchor
+/// (`atOffset(offset: ..., length: name.length)`,
+/// ignore_validator.dart:170, 236). `type=` and `plugin/name` entries never
+/// appear: the official walk examines `IgnoredDiagnosticName`s only
+/// (ignore_validator.dart:205-289). The `cannot-ignore` filtering stays the
+/// consumer's — it is a pure name predicate there (the official unignorable
+/// branch precedes the duplicate bookkeeping and never updates it, so
+/// filtering by name commutes with this dedup for every final row).
+#[must_use]
+pub fn ignored_name_entries(source: &str, comments: &Comments) -> Vec<(String, u32, u32)> {
+    let info = IgnoreInfo::parse(source, comments);
+    let mut out = Vec::new();
+    let mut seen_for_file: FxHashSet<&str> = FxHashSet::default();
+    for entry in &info.for_file {
+        let Entry::Name { name, start } = entry else {
+            continue;
+        };
+        if seen_for_file.insert(name.as_str()) {
+            out.push(name_entry(source, name, *start));
+        }
+    }
+    // Dart's map iterates in insertion order (first-seen line); the Rust
+    // table sorts by line for the same deterministic order.
+    let mut lines: Vec<u32> = info.on_line.keys().copied().collect();
+    lines.sort_unstable();
+    for line in lines {
+        let mut seen_on_line: FxHashSet<&str> = FxHashSet::default();
+        for entry in &info.on_line[&line] {
+            let Entry::Name { name, start } = entry else {
+                continue;
+            };
+            if !seen_for_file.contains(name.as_str()) && seen_on_line.insert(name.as_str()) {
+                out.push(name_entry(source, name, *start));
+            }
+        }
+    }
+    out
+}
+
+/// One entry's report triple: the name as written plus its UTF-16 span.
+fn name_entry(source: &str, name: &str, start: usize) -> (String, u32, u32) {
+    (
+        name.to_owned(),
+        dartq_source::byte_offset_to_utf16(source, start),
+        dartq_source::utf16_len_of(name),
+    )
+}
+
 /// 1-based line number of a byte offset.
 #[expect(
     clippy::cast_possible_truncation,
@@ -459,6 +520,52 @@ mod tests {
         assert_eq!(hits.len(), 1, "{hits:?}");
         // Line 1 = `// ` + 2 units + `\n` = 6 units; `// ignore: ` = 11.
         assert_eq!(hits[0].offset, 6 + 11);
+    }
+
+    #[test]
+    fn name_entries_walk_for_file_first_then_lines() {
+        use crate::testsupport::Fixture;
+        // File-level first in comment order, then line-level in line order
+        // (ignore_validator.dart:73-155's final walk). The same name on two
+        // different lines survives twice: the line dedup set is fresh per
+        // line and only the file-level names join `namesIgnoredForFile`.
+        let f = Fixture::build(
+            "// ignore_for_file: super_goes_last\nvar a = 1; // ignore: unsafe_html\nvar b = 2; // ignore: super_goes_last\n",
+            |_, _| {},
+        );
+        let comments = crate::comments::Comments::extract(&f.source, &f.tokens);
+        let entries = ignored_name_entries(&f.source, &comments);
+        assert_eq!(
+            entries,
+            vec![
+                ("super_goes_last".to_owned(), 20, 15),
+                ("unsafe_html".to_owned(), 58, 11),
+                ("super_goes_last".to_owned(), 92, 15),
+            ],
+            "for_file, then line 2, then line 3: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn name_entries_drop_exact_duplicates_only() {
+        use crate::testsupport::Fixture;
+        // The second same-line spelling is the walk's `duplicated` arm; the
+        // differently-cased spelling never matches (`add` is exact), and
+        // `type=` / `plugin/name` entries never export.
+        let f = Fixture::build(
+            "var a = 1; // ignore: super_goes_last, super_goes_last, Super_Goes_Last\nvar b = 2; // ignore: type=lint, plugin/x\n",
+            |_, _| {},
+        );
+        let comments = crate::comments::Comments::extract(&f.source, &f.tokens);
+        let entries = ignored_name_entries(&f.source, &comments);
+        assert_eq!(
+            entries,
+            vec![
+                ("super_goes_last".to_owned(), 22, 15),
+                ("Super_Goes_Last".to_owned(), 56, 15),
+            ],
+            "first occurrence wins, exact match only: {entries:?}"
+        );
     }
 
     #[test]

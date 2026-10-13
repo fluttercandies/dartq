@@ -5,15 +5,16 @@
 //! UTF-16 offset (line/column are monotone in it), so no line-column
 //! computation is spent on sorting.
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use dartq_diagnostics::{Diagnostic, FileLayoutProvider as _};
+use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, FileLayoutProvider as _};
 use dartq_engine::analysis_options;
 use dartq_engine::{CancellationToken, Cancelled, Engine, EngineEvent};
+use dartq_source::{FileId, SourceRange};
 use thiserror::Error;
 
 use crate::layout::{EngineLayout, path_key, severity_rank};
@@ -149,6 +150,11 @@ pub fn run_overlaid<'a>(
         if !registry_rows.is_empty() {
             diagnostics.extend(engine.apply_severity_options(registry_rows));
         }
+        // The ignore-comment removed-state rows (#1005) ride the same face.
+        let removed_rows = removed_lint_use_rows(engine, roots);
+        if !removed_rows.is_empty() {
+            diagnostics.extend(engine.apply_severity_options(removed_rows));
+        }
     }
     let layout = EngineLayout::over(engine, diagnostics.iter().map(|d| d.file));
     diagnostics.sort_by(|a, b| oracle_cmp(a, b, &layout));
@@ -283,6 +289,112 @@ fn options_registry_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> 
                         .to_diagnostic(file),
                 );
             }
+        }
+    }
+    rows
+}
+
+/// The comment faces' scan posture — the same configuration the dartq-lints
+/// bridge scans every unit with (Dart 3.15: triple shift and augmentations
+/// open), so the enumeration's comment lexemes match the lint stage's.
+const SCAN_CONFIG: dartq_scanner::ScanConfig = dartq_scanner::ScanConfig {
+    enable_triple_shift: true,
+    enable_augmentations: true,
+};
+
+/// `'{0}' was removed in Dart '{1}'` (registry:15119-15128,
+/// `STATIC_WARNING` → WARNING, published docs). The ignore-comment face's
+/// code: a comment naming a removed rule reports at the name token.
+const REMOVED_LINT_USE: CodeInfo = CodeInfo::new(
+    "removed_lint_use",
+    "REMOVED_LINT_USE",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// The `removed_lint_use` rows (#1005): an ignore comment naming a removed
+/// rule reports at its name token (`IgnoreValidator`.
+/// `_reportUnnecessaryOrRemovedOrDeprecatedIgnores`, ignore_validator.dart
+/// :199-240), gated on the file's governing options enabling the
+/// `unnecessary_ignore` lint (`_validateUnnecessaryIgnores`,
+/// ignore_validator.dart:203 — the validator's caller wires the lint's
+/// enablement through; the registry lookup matches case-insensitively).
+/// The enumeration arrives with the official exact-duplicate removal
+/// applied (`namesIgnoredForFile` / `namedIgnoredOnLine`, :82-132); the
+/// `cannot-ignore` names leave here — the validator's unignorable branch
+/// removes them from the list before this walk (:89, :113, :164-174). No
+/// SDK-constraint gate: the validator renders `state.since` verbatim
+/// (`null` for the unversioned state) where the options-file `removed_lint`
+/// face applies `_beforeCurrentConstraint` — and the replaced-by variant
+/// never applies: no pinned removed rule carries one. The validator's
+/// reported-diagnostic removal (:137-144) cannot reach this face either:
+/// no removed rule's name is a diagnostic code of the pinned SDK, so no
+/// reported error ever carries one.
+fn removed_lint_use_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
+    let mut files: Vec<FileId> = engine
+        .libraries()
+        .into_iter()
+        .flat_map(|(_, files)| files)
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    // Governance is by ancestry, so one directory always maps to one
+    // governing entry; the memo keeps the options walk off the per-file
+    // hot path.
+    let mut governing: FxHashMap<PathBuf, Option<&analysis_options::AnalysisOptions>> =
+        FxHashMap::default();
+    let mut rows = Vec::new();
+    for file in files {
+        let Some(path) = engine.file_table().path(file) else {
+            continue;
+        };
+        let dir = path.parent().unwrap_or(Path::new(""));
+        let options = *governing
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| crate::lints::governing_options(engine, dir, roots));
+        let Some(options) = options else {
+            continue;
+        };
+        if !options
+            .lint_rules
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("unnecessary_ignore"))
+        {
+            continue;
+        }
+        let unignorable = options.unignorable();
+        let Some(bytes) = engine.content(file) else {
+            continue;
+        };
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        let scanned = dartq_scanner::scan(text, SCAN_CONFIG, file);
+        let comments = dartq_lints::Comments::extract(text, &scanned.tokens);
+        for (name, offset, length) in dartq_lints::ignored_name_entries(text, &comments) {
+            if unignorable.contains(&name) {
+                continue;
+            }
+            let Some(id) = dartq_lints::rule_by_name(&name) else {
+                continue;
+            };
+            let spec = &dartq_lints::RULES[id.0 as usize];
+            if spec.group != dartq_lints::Group::Removed {
+                continue;
+            }
+            let since = crate::rule_states::removed_since(spec.name).flatten();
+            rows.push(Diagnostic::new(
+                REMOVED_LINT_USE.dtype.severity(),
+                REMOVED_LINT_USE,
+                format!(
+                    "'{}' was removed in Dart '{}'",
+                    name,
+                    crate::rule_states::since_arg(since)
+                ),
+                file,
+                SourceRange { offset, length },
+                Some(format!("Remove the reference to '{}'.", name)),
+            ));
         }
     }
     rows
@@ -818,6 +930,159 @@ mod tests {
                 .all(|d| d.code.name != "removed_lint" && d.code.name != "deprecated_lint"),
             "no state rows for normal names: {:?}",
             run.diagnostics.iter().map(|d| d.code.name).collect::<Vec<_>>()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `removed_lint_use` face end to end (#1005): with the governing
+    /// options enabling `unnecessary_ignore`, an ignore comment naming a
+    /// removed rule reports at its name token with the registry texts
+    /// (`_reportUnnecessaryOrRemovedOrDeprecatedIgnores`,
+    /// ignore_validator.dart:199-240) — the as-written spelling in the
+    /// message, the since verbatim, and no SDK-constraint gate
+    /// (`unsafe_html`'s 3.7.0 removal reports under the fixture's ^3.5.0
+    /// package), the same name on two different lines reporting twice (the
+    /// duplicate walk is scope-aware, :105-126). The gate arms: off without
+    /// the lint, case-insensitive with it, off under the `name: false`
+    /// spelling that drops the name from the merged rule list.
+    #[test]
+    fn run_overlaid_reports_removed_lint_use_rows() {
+        let source = concat!(
+            "var a = 1; // ignore: super_goes_last, unsafe_html\n",
+            "var b = 2; // ignore: super_goes_last\n",
+        );
+        let root = workspace("analyze_removed_lint_use", &[("lib/a.dart", source)]);
+        let root = root.canonicalize().expect("canonical root");
+        let rows_for = |options: &str| -> Vec<(u32, u32, String, String)> {
+            std::fs::write(root.join("analysis_options.yaml"), options).expect("options");
+            let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+            let mut engine = Engine::new(config).expect("engine");
+            let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+            run.diagnostics
+                .iter()
+                .filter(|d| d.code.name == "removed_lint_use")
+                .map(|d| {
+                    (
+                        d.range.offset,
+                        d.range.length,
+                        d.message.clone().into_owned(),
+                        d.correction.clone().expect("correction"),
+                    )
+                })
+                .collect()
+        };
+
+        assert_eq!(
+            rows_for("linter:\n  rules:\n    - unnecessary_ignore\n"),
+            vec![
+                (
+                    22,
+                    15,
+                    "'super_goes_last' was removed in Dart '3.0.0'".to_owned(),
+                    "Remove the reference to 'super_goes_last'.".to_owned(),
+                ),
+                (
+                    39,
+                    11,
+                    "'unsafe_html' was removed in Dart '3.7.0'".to_owned(),
+                    "Remove the reference to 'unsafe_html'.".to_owned(),
+                ),
+                (
+                    73,
+                    15,
+                    "'super_goes_last' was removed in Dart '3.0.0'".to_owned(),
+                    "Remove the reference to 'super_goes_last'.".to_owned(),
+                ),
+            ],
+            "both lines' entries report, the gate's lint enabled: {:?}",
+            rows_for("linter:\n  rules:\n    - unnecessary_ignore\n"),
+        );
+        assert!(
+            rows_for("linter:\n  rules:\n    - avoid_empty_else\n").is_empty(),
+            "gate off: no rows"
+        );
+        assert_eq!(
+            rows_for("linter:\n  rules:\n    - UNNECESSARY_IGNORE\n").len(),
+            3,
+            "the gate matches case-insensitively"
+        );
+        assert!(
+            rows_for("linter:\n  rules:\n    unnecessary_ignore: false\n").is_empty(),
+            "the disable spelling drops the name from the merged list"
+        );
+
+        // The row shape: WARNING, the registry code identity, attributed to
+        // the dart file the comment lives in.
+        std::fs::write(
+            root.join("analysis_options.yaml"),
+            "linter:\n  rules:\n    - unnecessary_ignore\n",
+        )
+        .expect("options");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+        let row = run
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "removed_lint_use")
+            .expect("the rows above");
+        assert_eq!(row.code.machine, "REMOVED_LINT_USE");
+        assert_eq!(row.code.dtype, DiagnosticType::StaticWarning);
+        assert_eq!(row.severity, Severity::Warning);
+        assert!(row.code.has_published_docs);
+        assert!(
+            run.layout.file_path(row.file).ends_with("a.dart"),
+            "rows attribute to the dart file: {}",
+            run.layout.file_path(row.file).to_string_lossy()
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The face's filters (#1005): a `cannot-ignore` name never reaches the
+    /// removed-state walk (the validator removes unignorable names first,
+    /// ignore_validator.dart:89, :164-174 — the `unignorable_ignore` rows
+    /// themselves are the lints stage's face), an exact duplicate reports
+    /// once, first occurrence winning (:91), and a non-removed rule's name
+    /// resolves through the registry without a row (:214-240 — only
+    /// `state.isRemoved` reports).
+    #[test]
+    fn removed_lint_use_filters_unignorable_and_duplicate_names() {
+        let source =
+            "var a = 1; // ignore: super_goes_last, super_goes_last, avoid_empty_else\n";
+        let root = workspace(
+            "analyze_removed_lint_use_filters",
+            &[("lib/a.dart", source)],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let offsets_for = |options: &str| -> Vec<u32> {
+            std::fs::write(root.join("analysis_options.yaml"), options).expect("options");
+            let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+            let mut engine = Engine::new(config).expect("engine");
+            let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+            run.diagnostics
+                .iter()
+                .filter(|d| d.code.name == "removed_lint_use")
+                .map(|d| d.range.offset)
+                .collect()
+        };
+
+        // The cannot-ignore claim silences the removed-state face entirely.
+        assert!(offsets_for(concat!(
+            "analyzer:\n",
+            "  cannot-ignore:\n",
+            "    - super_goes_last\n",
+            "linter:\n",
+            "  rules:\n",
+            "    - unnecessary_ignore\n",
+        ))
+        .is_empty());
+
+        // Without it the duplicate collapses to its first occurrence and the
+        // non-removed neighbor stays silent.
+        assert_eq!(
+            offsets_for("linter:\n  rules:\n    - unnecessary_ignore\n"),
+            vec![22],
+            "first occurrence wins, only removed names report"
         );
         std::fs::remove_dir_all(&root).ok();
     }
