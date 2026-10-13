@@ -331,12 +331,15 @@ pub(crate) mod control_flow_in_finally {
 
     /// Whether a closure (function expression / local function) sits on the
     /// path between the finally block and the statement — the official
-    /// `FunctionBody inside the finally block` exemption (:69-77).
+    /// `FunctionBody inside the finally block` exemption (:69-77); the
+    /// function-kind family is the `jump_target` boundary list below.
     fn closure_wraps(c: &Check<'_>, finally_idx: usize, node_idx: usize) -> bool {
         (finally_idx + 1..=node_idx).any(|i| {
             matches!(
                 c.kind(c.path[i]),
-                NodeKind::FunctionExpression | NodeKind::LocalFunctionDeclaration
+                NodeKind::FunctionExpression
+                    | NodeKind::NamedFunctionExpression
+                    | NodeKind::LocalFunctionDeclaration
             )
         })
     }
@@ -909,7 +912,7 @@ pub(crate) mod avoid_returning_null_for_void {
 }
 
 pub(crate) mod type_literal_in_constant_pattern {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/type_literal_in_constant_pattern.dart:40-63`
     /// — a constant pattern whose expression's static type is the `Type`
@@ -923,18 +926,26 @@ pub(crate) mod type_literal_in_constant_pattern {
     /// literal — the `const String = 'x'` shadow over-report is dead), a
     /// top-level `const` folds its initializer through the alias channel
     /// (`const t = int; case t:` — a Type-valued constant — reports like
-    /// the official static type), a typed binding reports only when
-    /// written `Type`, and a name with no value binding is a type literal:
-    /// a same-file type declaration (`case MyType:` — the user-type
+    /// the official static type), a typed binding reports when written
+    /// `Type`, and a name with no value binding is a type literal: a
+    /// same-file type declaration (`case MyType:` — the user-type
     /// under-report is dead) or an unshadowed built-in type name. A
     /// two-segment name folds a same-file class-static alias (`A.t`);
     /// anything else there (an enum member, a prefixed spelling — the
     /// `Type` row's head is the prefix) stays silent, the prefixed type
-    /// literal being the documented under-report. Known corner: a
+    /// literal being the documented under-report. The type-literal test is
+    /// the official `isDartCoreType` element read — nullability-blind, so a
+    /// `Type`-written binding reports through `Type?` too. The raw-type
+    /// exemption reads the matched value through the scrutinee face and —
+    /// for a constant nested in an object pattern (`A(field: int)`) — the
+    /// field's same-file written type, both the nullability-sensitive
+    /// `isSubtypeOf` face (`Type?` exempts nothing). Known corners: a
     /// class-scope `static const` shadowing a type name is invisible to
     /// the binding walk (statics are not instance bindings) and keeps the
-    /// type reading. Message: `diagnostic.g.dart`
-    /// `typeLiteralInConstantPattern`.
+    /// type reading; the object-pattern field face reads instance fields
+    /// only (a getter, a prefixed container, a name-less field, and
+    /// list/map element positions keep the name reading). Message:
+    /// `diagnostic.g.dart` `typeLiteralInConstantPattern`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "type_literal_in_constant_pattern",
         group: Group::Core,
@@ -1005,8 +1016,8 @@ pub(crate) mod type_literal_in_constant_pattern {
             return;
         }
         // OK to use raw types if the matched value is of type `Type`
-        // (:50-59).
-        if matched_value_is_type(c) {
+        // (:50-59) — the scrutinee face or the object-pattern field face.
+        if matched_value_is_type(c) || pattern_field_is_type(c) {
             return;
         }
         let range = c.utf16_span(node);
@@ -1078,16 +1089,15 @@ pub(crate) mod type_literal_in_constant_pattern {
                 return true;
             }
             // A bare-identifier scrutinee resolves through the same-file
-            // written-type face.
+            // written-type face — exactly `Type`, not the nullable `Type?`
+            // (the official `isSubtypeOf(matchedValueType, typeType)`).
             if let Some(&head) = scrutinee.first()
                 && c.kind(head) == NodeKind::Identifier
-                && crate::rules::expressions::same_file::written_type(
-                    c,
-                    head,
-                    c.lexeme(c.head_token(head)),
-                ) == Some("Type")
             {
-                return true;
+                let face = crate::rules::written_type_face(c, head, c.lexeme(c.head_token(head)));
+                if face.is_some_and(|face| face.name == Some("Type") && !face.nullable) {
+                    return true;
+                }
             }
             return false;
         }
@@ -1142,8 +1152,147 @@ pub(crate) mod type_literal_in_constant_pattern {
         }
     }
 
-    /// A typed value binding is a type literal only when written `Type`
-    /// (the constant's static type follows the written annotation).
+    /// The object-pattern field face of the matched-value exemption: a
+    /// constant pattern nested in an object pattern (`A(field: int)`)
+    /// matches the field's own value, whose static type is the field's
+    /// written type — a `Type`-written field exempts the nested constant
+    /// (`type_literal_in_constant_pattern_test.dart`
+    /// `test_constType_matchType_nested`). The bridge leaks the
+    /// sub-pattern rows past the field windows (the constant's tree parent
+    /// is the statement container; the `PatternField` / `ObjectPattern`
+    /// rows are span-only overlays completing right after the leak), so
+    /// the wrapping pair resolves by span containment over the container's
+    /// arena window — the innermost containing rows. The field reads
+    /// through the same-file written-type face of the object pattern's
+    /// class; a prefixed spelling (`prefix.A(...)`, payload word 1), a
+    /// name-less field (`A(: sub)`, payload word 0 is the colon), and an
+    /// unresolvable class keep the name reading.
+    fn pattern_field_is_type(c: &Check<'_>) -> bool {
+        let node = c.node();
+        let span = c.byte_span(node);
+        let contains = |row: u32| {
+            let outer = c.byte_span(row);
+            outer.start <= span.start && span.end <= outer.end
+        };
+        let Some(container) = c.path.len().checked_sub(2).map(|i| c.path[i]) else {
+            return false;
+        };
+        let window = c.children(container).start..container;
+        // Post-order rows: the innermost containing overlay completes
+        // first.
+        let Some(object) = window
+            .clone()
+            .filter(|&row| c.kind(row) == NodeKind::ObjectPattern && contains(row))
+            .min()
+        else {
+            return false;
+        };
+        let Some(field) = (c.children(container).start..object)
+            .filter(|&row| c.kind(row) == NodeKind::PatternField && contains(row))
+            .min()
+        else {
+            return false;
+        };
+        // A prefixed container (`prefix.A(...)`) resolves outside the file.
+        let words = c.payload(object);
+        let Some(&class_tok) = words.first() else {
+            return false;
+        };
+        if class_tok == NONE_TOKEN || words.get(1).copied() != Some(NONE_TOKEN) {
+            return false;
+        }
+        // The name-less field face carries the colon token, not a name.
+        let Some(&name_tok) = c.payload(field).first() else {
+            return false;
+        };
+        if name_tok == NONE_TOKEN || c.lexeme(name_tok) == ":" {
+            return false;
+        }
+        let Some(class_row) = same_file_class_named(c, c.lexeme(class_tok)) else {
+            return false;
+        };
+        instance_field_is_type(c, class_row, c.lexeme(name_tok))
+    }
+
+    /// The same-file top-level class declaration named `name` — the local
+    /// class-only face of the `exhaustive_cases::class_like_named` walk
+    /// (module-private there): the object-pattern head resolves against a
+    /// class's instance members.
+    fn same_file_class_named(c: &Check<'_>, name: &str) -> Option<u32> {
+        let root = c.unit.ast.root()?;
+        for top in c.collect_direct(root) {
+            if c.kind(top) != NodeKind::TopLevelDeclaration {
+                continue;
+            }
+            for kid in c.collect_direct(top) {
+                if c.kind(kid) == NodeKind::ClassDeclaration
+                    && crate::rules::class_declaration_name(c, kid) == Some(name)
+                {
+                    return Some(kid);
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether the instance field `field` of the same-file `class_row` is
+    /// written exactly `Type` (the non-static `Fields` walk of
+    /// `type_face_of_field`'s index builder, class-row parameterized — the
+    /// member's single written type covers all its declarators). Untyped
+    /// fields, every other written type, and the nullable `Type?` (not a
+    /// subtype of `Type`) keep the name reading; a getter or an
+    /// inferred-from-initializer type is invisible (the documented channel
+    /// face).
+    fn instance_field_is_type(c: &Check<'_>, class_row: u32, field: &str) -> bool {
+        let body = c
+            .collect_direct(class_row)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::DeclarationBody)
+            .unwrap_or(class_row);
+        for member in crate::rules::rows_with_parent(c, body) {
+            if c.kind(member) != NodeKind::Fields
+                || c.payload(member).first()
+                    != Some(&(dartq_parser::MemberKind::NonStaticField as u32))
+            {
+                continue;
+            }
+            let written = c
+                .collect_direct(member)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::Type);
+            let Some(written) = written else {
+                continue;
+            };
+            let face = crate::rules::type_face(c, written);
+            if face.name != Some("Type") || face.nullable {
+                continue;
+            }
+            for decl in c
+                .collect_direct(member)
+                .into_iter()
+                .filter(|&kid| c.kind(kid) == NodeKind::VariablesDeclaration)
+            {
+                for var in c
+                    .collect_direct(decl)
+                    .into_iter()
+                    .filter(|&var| c.kind(var) == NodeKind::InitializedIdentifier)
+                {
+                    if crate::rules::initialized_identifier_name(c, var)
+                        .is_some_and(|name| c.lexeme(name) == field)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// A typed value binding is a type literal whenever written `Type` —
+    /// nullability-blind, the official `isDartCoreType` reading the type's
+    /// element (`Type?` still names dart:core `Type`, :792-794) — while
+    /// the matched-value exemption is the nullability-sensitive
+    /// `isSubtypeOf` face.
     fn typed_face_is_type(c: &Check<'_>, typed: Option<u32>) -> bool {
         typed.is_some_and(|row| {
             c.kind(row) == dartq_ast::NodeKind::Type
@@ -5024,6 +5173,148 @@ void f(Object o) {
         assert_eq!(
             f.run(&one_rule("avoid_catches_without_on_clauses")).len(),
             2
+        );
+    }
+
+    /// The object-pattern field face of the raw-type exemption — the
+    /// official `test_constType_matchType_nested`: a constant nested in an
+    /// object pattern against a `Type`-written field stays silent (if-case
+    /// and switch-case containers); a non-`Type` field keeps the report.
+    #[test]
+    fn type_literal_object_pattern_type_field_passes() {
+        let type_field = |src: &str| {
+            let f = Fixture::parse(src);
+            assert!(
+                f.run(&one_rule("type_literal_in_constant_pattern"))
+                    .is_empty(),
+                "the matched value is the Type-typed field: {src}"
+            );
+        };
+        type_field(
+            r#"
+class A {
+  final Type type;
+  A(this.type);
+}
+
+void f(A x) {
+  if (x case A(type: int)) {}
+}
+"#,
+        );
+        type_field(
+            r#"
+class A {
+  final Type type;
+  A(this.type);
+}
+
+void f(A x) {
+  switch (x) {
+    case A(type: int):
+      break;
+  }
+}
+"#,
+        );
+        // Nested object patterns: the innermost container decides — B's
+        // `Type` field exempts, the outer field's own type is irrelevant.
+        type_field(
+            r#"
+class A {
+  final B b;
+  A(this.b);
+}
+
+class B {
+  final Type type;
+  B(this.type);
+}
+
+void f(A x) {
+  if (x case A(b: B(type: int))) {}
+}
+"#,
+        );
+
+        // A non-`Type` field keeps the name reading.
+        let f = Fixture::parse(
+            r#"
+class A {
+  final int type;
+  A(this.type);
+}
+
+void f(A x) {
+  if (x case A(type: int)) {}
+}
+"#,
+        );
+        assert_eq!(
+            f.run(&one_rule("type_literal_in_constant_pattern")).len(),
+            1,
+            "an int-typed field is no exemption"
+        );
+        // An untyped field keeps the name reading too.
+        let f = Fixture::parse(
+            r#"
+class A {
+  final type;
+  A(this.type);
+}
+
+void f(A x) {
+  if (x case A(type: int)) {}
+}
+"#,
+        );
+        assert_eq!(
+            f.run(&one_rule("type_literal_in_constant_pattern")).len(),
+            1,
+            "an untyped field is no exemption"
+        );
+        // The nullable `Type?` is not a subtype of `Type` (the official
+        // `isSubtypeOf` gate) — the nested constant reports.
+        let f = Fixture::parse(
+            r#"
+class A {
+  final Type? type;
+  A(this.type);
+}
+
+void f(A x) {
+  if (x case A(type: int)) {}
+}
+"#,
+        );
+        assert_eq!(
+            f.run(&one_rule("type_literal_in_constant_pattern")).len(),
+            1,
+            "a Type?-typed field is no exemption"
+        );
+    }
+
+    /// The matched-value exemption's nullability face on the scrutinee:
+    /// `Type x` exempts, `Type? x` reports (the official
+    /// `isSubtypeOf(matchedValueType, typeType)` — `Type?` is no subtype
+    /// of `Type`; `test_constType_matchObjectNullable` shape).
+    #[test]
+    fn type_literal_nullable_type_scrutinee_reports() {
+        let f = Fixture::parse("void f(Object x) { if (x case int) {} }");
+        assert_eq!(
+            f.run(&one_rule("type_literal_in_constant_pattern")).len(),
+            1
+        );
+        let f = Fixture::parse("void f(Type? x) { if (x case int) {} }");
+        assert_eq!(
+            f.run(&one_rule("type_literal_in_constant_pattern")).len(),
+            1,
+            "a Type? matched value is not of type Type"
+        );
+        let f = Fixture::parse("void f(Type x) { if (x case int) {} }");
+        assert!(
+            f.run(&one_rule("type_literal_in_constant_pattern"))
+                .is_empty()
         );
     }
 }
