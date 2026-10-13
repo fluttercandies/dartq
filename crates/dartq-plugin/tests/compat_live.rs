@@ -8,7 +8,10 @@
 //! the registered rule executing host-side over the overlay text, the
 //! severity override re-leveling, the daemon-side merge contract, the fixes
 //! face with a UTF-16 edit applied to real text, and the crash mode surfaced
-//! as the `dartq/plugin_crashed` diagnostic (PRD §14). The
+//! as the `dartq/plugin_crashed` diagnostic (PRD §14). A further row drives
+//! the query mode (`query` launch argument + `serve_queries: true`): the
+//! runtime serves the producer's reverse `request/query` round trips and the
+//! reply's changes state the resolution facts. The
 //! disabled-by-default face is pinned at the in-process level
 //! (`test/compat_sample_test.dart`); the live cycle always configures.
 //!
@@ -39,10 +42,11 @@ use std::time::Duration;
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
 use dartq_plugin::session::SessionError;
 use dartq_plugin::{
-    Capability, CapabilitySet, CycleConfig, CyclePush, Manifest, OverlayEntry, PluginRuntime,
-    RuleKind, RuntimeError, Severity as WireSeverity, SpawnSpec, StdioPolicy, crash_diagnostic,
-    discover,
+    Capability, CapabilitySet, CycleConfig, CyclePush, Manifest, OverlayEntry, PendingQuery,
+    PluginRuntime, QueryKind, RuleKind, RuntimeError, Severity as WireSeverity, SpawnSpec,
+    StdioPolicy, crash_diagnostic, discover,
 };
+use serde_json::{Map, Value, json};
 use dartq_source::{FileTable, LineIndex, utf16_offset_to_byte};
 
 mod support;
@@ -391,6 +395,234 @@ fn compat_sample_crash_mode_surfaces_as_plugin_crashed() {
     ));
 }
 
+/// The query-mode fixture: the Dart probe's own table
+/// (`bin/query_probe.dart`), all-ASCII so UTF-16 units are plain. Line 1
+/// carries the rule's `true` finding (offset 20); `print` sits at 14
+/// (length 5); `unused` — an unreferenced declaration — at 34 (length 6);
+/// line 1's end at 29 is the miss position.
+const QUERY_FIXTURE: &str = "void main() { print(true); }\nvoid unused() {}\n";
+
+/// The fixture table's `(offset, length)` pairs into [QUERY_FIXTURE].
+const QUERY_PRINT: (u64, u64) = (14, 5);
+const QUERY_UNUSED: (u64, u64) = (34, 6);
+/// Line 1's end: nothing resolves there (the legal empty answer).
+const QUERY_MISS: (u64, u64) = (29, 4);
+
+#[test]
+#[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
+// One linear scenario (spawn → negotiate → cycle → the four producer faces
+// → teardown) walking the query-driven producer's paths in order; helpers
+// would only thread the runtime and the fixture table through them.
+#[expect(clippy::too_many_lines, reason = "see above")]
+fn compat_sample_query_mode_serves_reverse_queries_over_a_live_process() {
+    if !dart_available() {
+        println!("skipping: no `dart` on PATH, the live fixture cannot run");
+        return;
+    }
+    // Query mode = the crash-mode row's shape: the `query` launch argument
+    // arms the sample's query-driven producer, and `serve_queries` makes
+    // this session offer the capability at the handshake — a session without
+    // a query server never advertises it, so the negotiated set honestly
+    // represents what can be served.
+    let manifest =
+        Manifest::from_path(&sample_dir().join("dartq_plugin.json")).expect("manifest parses");
+    let mut runtime = PluginRuntime::spawn(SpawnSpec {
+        program: "dart".to_owned(),
+        args: vec![manifest.entrypoint.clone(), "query".to_owned()],
+        current_dir: sample_dir(),
+        manifest,
+        stderr: StdioPolicy::Inherit,
+        serve_queries: true,
+    })
+    .expect("the query-mode sample spawns and handshakes");
+    assert_eq!(
+        runtime.negotiated().map(CapabilitySet::names),
+        Some(vec!["lint", "fix", "query"]),
+        "the launch argument advertises query and the serving session mirrors it"
+    );
+
+    // The rule census is unchanged in query mode: the extra producer is an
+    // assist, not a rule.
+    let census = runtime.rule_census();
+    assert_eq!(census.len(), 1);
+    assert_eq!(census[0].name, "boolean_literal_review");
+
+    let mut files = FileTable::new();
+    let a = files.intern(Path::new("lib/a.dart"));
+    let a_path = files
+        .path(a)
+        .expect("interned")
+        .to_string_lossy()
+        .into_owned();
+
+    // The rule face over the overlay is intact — one finding at the literal,
+    // exactly as without the `query` argument.
+    runtime
+        .feed(
+            &[],
+            &files,
+            &CyclePush {
+                analyzed: vec![a_path.clone()],
+                config: CycleConfig {
+                    enabled_rules: vec!["boolean_literal_review".to_owned()],
+                    severity_overrides: BTreeMap::new(),
+                    overlays: vec![OverlayEntry {
+                        file: a_path.clone(),
+                        content: Some(QUERY_FIXTURE.to_owned()),
+                    }],
+                },
+            },
+        )
+        .expect("engine feed");
+    #[expect(clippy::duration_suboptimal_units, reason = "see above")]
+    let findings = runtime
+        .wait_output(Duration::from_secs(60))
+        .expect("plugin findings arrive within the drain budget")
+        .diagnostics;
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].code, "boolean_literal");
+    assert_eq!(
+        findings[0].offset, 20,
+        "the rule face is unchanged in query mode"
+    );
+
+    // The fixture index the Dart probe serves (bin/query_probe.dart), played
+    // by the test through the runtime's serving seam: `element_at` resolves
+    // the two declarations (and declines the unknown file on the error
+    // channel), `references` knows two resolved uses of `print` across two
+    // files, and every other position gets the legal empty answer.
+    let print_element = json!({
+        "file": "lib/a.dart",
+        "container": null,
+        "kind": "function",
+        "name": "print",
+        "line": 1,
+        "column": QUERY_PRINT.0 + 1,
+        "length": QUERY_PRINT.1,
+    });
+    let unused_element = json!({
+        "file": "lib/a.dart",
+        "container": null,
+        "kind": "function",
+        "name": "unused",
+        "line": 2,
+        // Line 1 plus its newline ends at offset 29, so the 1-based column
+        // of the name span is 34 - 29 + 1.
+        "column": 6,
+        "length": QUERY_UNUSED.1,
+    });
+    let print_references = json!([
+        {
+            "target_file": "lib/a.dart",
+            "kind": "invoked",
+            "file": "lib/a.dart",
+            "offset": QUERY_PRINT.0,
+            "length": QUERY_PRINT.1,
+            "qualified": null,
+        },
+        {
+            "target_file": "lib/a.dart",
+            "kind": "invoked",
+            "file": "lib/b.dart",
+            "offset": 4,
+            "length": QUERY_PRINT.1,
+            "qualified": "p.print",
+        },
+    ]);
+    let mut serve = |query: &PendingQuery| -> Result<Map<String, Value>, String> {
+        let request = &query.request;
+        match request.kind {
+            QueryKind::ElementAt => {
+                let file = request.file.as_deref().unwrap_or_default();
+                if file == "lib/gone.dart" {
+                    return Err(format!("unknown file `{file}`"));
+                }
+                let element = match (file, request.offset) {
+                    ("lib/a.dart", Some(offset)) if offset == QUERY_PRINT.0 => {
+                        Some(&print_element)
+                    }
+                    ("lib/a.dart", Some(offset)) if offset == QUERY_UNUSED.0 => {
+                        Some(&unused_element)
+                    }
+                    _ => None,
+                };
+                let elements = element.map(|row| json!([row])).unwrap_or_else(|| json!([]));
+                Ok(query_reply("elements", elements))
+            }
+            QueryKind::References => {
+                let rows = if request.name.as_deref() == Some("print") {
+                    print_references.clone()
+                } else {
+                    json!([])
+                };
+                Ok(query_reply("references", rows))
+            }
+            // The producer only asks these two kinds; anything else is a
+            // decline, like the probe's table.
+            other => Err(format!("unsupported query kind `{other:?}`")),
+        }
+    };
+
+    // A referenced name: the producer round trips `element_at` +
+    // `references` and answers with a concrete edit embedding the facts.
+    let reply = runtime
+        .request_fixes_serving(&a_path, QUERY_PRINT.0, QUERY_PRINT.1, &mut serve)
+        .expect("fixes reply arrives within the callback budget");
+    assert_eq!(reply.fixes.len(), 2, "the review plus the suggestion");
+    assert_eq!(
+        reply.fixes[0].priority, 10,
+        "the sample's queryReviewPriority sorts first"
+    );
+    assert_eq!(
+        reply.fixes[0].message,
+        "compat query: `print` has 2 reference(s) across 2 file(s)"
+    );
+    assert_eq!(reply.fixes[0].edits.len(), 1);
+    let edit = &reply.fixes[0].edits[0];
+    assert_eq!(
+        (edit.offset, edit.length),
+        QUERY_PRINT,
+        "the requested UTF-16 range echoed"
+    );
+    assert_eq!(edit.replacement, "print /* compat: 2 refs */");
+    assert!(reply.fixes[1].edits.is_empty(), "the suggestion is message-only");
+
+    // An unreferenced declaration: the removal-candidate decision,
+    // message-only (a safe removal needs more than the name span).
+    let reply = runtime
+        .request_fixes_serving(&a_path, QUERY_UNUSED.0, QUERY_UNUSED.1, &mut serve)
+        .expect("fixes reply arrives within the callback budget");
+    assert_eq!(
+        reply.fixes[0].message,
+        "compat query: `unused` has no resolved references; a removal candidate"
+    );
+    assert!(reply.fixes[0].edits.is_empty());
+
+    // A miss: empty elements is a legal answer, not a failure.
+    let reply = runtime
+        .request_fixes_serving(&a_path, QUERY_MISS.0, QUERY_MISS.1, &mut serve)
+        .expect("fixes reply arrives within the callback budget");
+    assert_eq!(
+        reply.fixes[0].message,
+        "compat query: nothing resolved at lib/a.dart:29"
+    );
+
+    // An unknown file rides the error channel into a QueryError and degrades
+    // to a message-only change — the session stays up (the suggestion still
+    // rides the same reply).
+    let reply = runtime
+        .request_fixes_serving("lib/gone.dart", 0, 0, &mut serve)
+        .expect("fixes reply arrives within the callback budget");
+    assert_eq!(
+        reply.fixes[0].message,
+        "compat query failed: unknown file `lib/gone.dart`"
+    );
+    assert_eq!(reply.fixes.len(), 2, "the session survived the failed query");
+
+    assert_eq!(runtime.stats().restarts, 0);
+    runtime.shutdown().expect("graceful shutdown");
+}
+
 // The #644 compat matrix: the four real ecosystem plugin overlays. One
 // driver runs each row through the full lifecycle (discovery → spawn →
 // handshake → the upstream `register` inside the child → diagnostics batch →
@@ -695,6 +927,13 @@ fn drive_overlay(row: &OverlayRow) {
 /// plays the engine's resident-text role in the merge assertion).
 const B_DART: &str = "var x = 0;\n";
 const NOTES_TXT: &str = "notes\n";
+
+/// One query reply's params object: the answer rows under the schema's
+/// envelope key (`elements` for `element_at`, `references` for the
+/// name-keyed face).
+fn query_reply(key: &str, rows: Value) -> Map<String, Value> {
+    Map::from_iter([(key.to_owned(), rows)])
+}
 
 /// 0-based `(line, character)` for a UTF-16 offset — the daemon's `to_lsp`
 /// position mapping through the line index.
