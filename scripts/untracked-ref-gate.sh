@@ -28,7 +28,6 @@ PENDING_PATHS=(
   crates/dartq-ast
   crates/dartq-parser
   crates/dartq-lints
-  crates/dartq-engine
   crates/dartq-daemon
 )
 

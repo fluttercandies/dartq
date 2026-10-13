@@ -1,8 +1,8 @@
 //! The class-modifier restriction families end-to-end (#600, M2 T3): the
 //! resolution layer's decision set (`dartq_resolution::modifiers`) emitting
 //! through [`Engine::analyze`] with the official analyzer codes and message
-//! texts. Every pin was anchored verbatim against the pinned SDK registry
-//! (`.third/dart-sdk` `pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`,
+//! texts. Every pin was anchored verbatim against the pinned upstream SDK
+//! registry (`pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`,
 //! dart 3.15 main).
 //!
 //! Faces covered, positive and negative per verdict:

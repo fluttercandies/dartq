@@ -145,8 +145,8 @@ struct Case {
 /// keeps f's element face (`int f()`), so the L2 signature gate stops the
 /// cascade at a (step 1); step 3's b content `int g() => f() + 0;` drops the
 /// `import 'a.dart';` line, so `f` is genuinely undefined there — the
-/// identical no-import shape C3 steps 0/2 pin. Adjudicated #288 against the
-/// oracle probe (docs/facts/oracle-probes/c1/, dart analyze 3.13.1): the
+/// identical no-import shape C3 steps 0/2 pin. Adjudicated #288 against a
+/// recorded oracle probe (`dart analyze` 3.13.1 run on this exact case): the
 /// case doc's ∅ delta was the case defect; the A3 table asserts
 /// `undefined_function` on b at step 3 (∅ through steps 0-2, where b still
 /// carries the import).

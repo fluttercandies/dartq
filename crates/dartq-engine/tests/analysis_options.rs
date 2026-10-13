@@ -120,7 +120,7 @@ fn include_stacking_and_diamond_dedupe() {
 fn package_uri_include_resolves_and_expands_rule_sets() {
     let dir = TempDir::new("pkguri");
     // A miniature `package:lints`: recommended includes core, the same
-    // shape as .third/lints/lib/recommended.yaml.
+    // shape as the upstream `lints` package's lib/recommended.yaml.
     dir.write(
         "vendor/lints/lib/core.yaml",
         "linter:\n  rules:\n    - core_rule_a\n    - core_rule_b\n",

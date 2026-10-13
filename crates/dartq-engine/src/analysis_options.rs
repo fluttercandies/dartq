@@ -1,7 +1,7 @@
 //! `analysis_options.yaml` loading and include-chain merge (PRD §12.1/§12.2).
 //!
-//! Semantics are pinned to the official merge in
-//! `.third/dart-sdk/pkg/analyzer/lib/src/analysis_options/`:
+//! Semantics are pinned to the official merge in the upstream Dart SDK
+//! source (`pkg/analyzer/lib/src/analysis_options/`):
 //!
 //! - **Depth-first, far-before-near** — `_applyParsedFiles`
 //!   (analysis_options_parser.dart:384-408) applies every include

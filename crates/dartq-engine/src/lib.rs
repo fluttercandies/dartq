@@ -1112,8 +1112,9 @@ pub fn pooled_memory_store(pool: &ContentPool) -> Box<dyn SourceStore + Send + S
 }
 
 /// Drops exactly one leading UTF-8 BOM (`EF BB BF`, U+FEFF) — oracle
-/// read-layer parity (`.third/dart-sdk` `_fe_analyzer_shared` utf.dart
-/// Before-BOM state machine via the analyzer file read): the scanner runs on
+/// read-layer parity (upstream Dart SDK source, `_fe_analyzer_shared`
+/// utf.dart Before-BOM state machine via the analyzer file read): the
+/// scanner runs on
 /// BOM-less text and every span is relative to the stripped text. Exactly
 /// one is dropped; a second BOM is content.
 pub(crate) fn strip_one_bom(bytes: &[u8]) -> &[u8] {
