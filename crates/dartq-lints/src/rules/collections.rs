@@ -1,6 +1,7 @@
 //! The collection-literal family: `prefer_inlined_adds`,
 //! `prefer_spread_collections`, `prefer_collection_literals`,
-//! `unnecessary_to_list_in_spreads`.
+//! `unnecessary_to_list_in_spreads`, plus the standalone
+//! `prefer_foreach`.
 //!
 //! Cascade shape (production tiling, `rules::slice`): a [`NodeKind::Cascade`]
 //! opens at the `..` before its first section parses, so the section's
@@ -20,7 +21,7 @@ use crate::rules::slice;
 /// aggregated tail — adding a rule touches only this file. Batch close
 /// promotes the block into the registry's frozen skeleton together with
 /// the pin-test wave list (`tests/registry_pin.rs`).
-pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
+pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[&prefer_foreach::SPEC];
 
 /// The direct sibling immediately before `id` (the cascade target slot).
 fn sibling_before(c: &Check<'_>, id: u32) -> Option<u32> {
@@ -1243,6 +1244,197 @@ pub(crate) mod collection_methods_unrelated_type {
             || (element_nullable && arg == "Null")
     }
 }
+
+pub(crate) mod prefer_foreach {
+    use dartq_ast::NodeKind;
+
+    use crate::engine::Check;
+    use crate::registry::{Group, RuleSpec};
+    use crate::rules::{initialized_identifier_name, is_statement_row};
+    use crate::rules::slice;
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_foreach.dart`
+    /// — a for-each loop (`ForEachPartsWithDeclaration`, :57-64) whose body is
+    /// a single expression statement — through single-statement blocks
+    /// (:43-47) and transparent parentheses (:87-89) — invoking a function
+    /// with exactly one argument that is the loop variable itself reports at
+    /// the whole for statement (:70-84). A method invocation's target must
+    /// not reference the loop variable (`_ReferenceFinder`, :81/:92-113); a
+    /// function-expression invocation has no target and is never checked
+    /// (:68-73). The identifier form (`for (e in xs)`) is no declaration and
+    /// never fires (:57).
+    ///
+    /// dartq faces: the loop variable reads the header's lone
+    /// `VariablesDeclaration` (the declaration form; the pattern form's rows
+    /// never match). The single-argument check reads the invocation's
+    /// argument list over the production tiling — the argument is the bare
+    /// loop-variable name (`arguments.first.canonicalElement == element`
+    /// through the lexical face: at the body's top level, outside every
+    /// nested scope, a bare name equal to the loop variable resolves only to
+    /// it). The target check scans the target's tokens: a name equal to the
+    /// loop variable that is neither a member (`.name`) nor a named-argument
+    /// label (`name:`) is a reference. Residual (documented): a nested
+    /// function literal inside the target may shadow the loop variable —
+    /// the lexical scan then keeps the rule silent where the official
+    /// reports (under-report, the same posture as the element-channel
+    /// silences). Message: `diagnostic.g.dart` `preferForeach`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_foreach",
+        group: Group::Standalone,
+        problem: "Use 'forEach' and a tear-off rather than a 'for' loop to apply \
+                  a function to every element.",
+        correction: "Try using 'forEach' and a tear-off rather than a 'for' loop.",
+        kinds: &[NodeKind::Send],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The body walk inverted: the statement-level invocation climbs to
+        // its for-in through transparent parentheses (:87-89) and
+        // single-statement blocks (:43-47); anything else in between (a
+        // wrapper expression, a second statement) is not the walked shape.
+        let mut cur = c.node();
+        let forin = loop {
+            let Some(parent) = c.unit.ast.parent(cur) else {
+                return;
+            };
+            match c.kind(parent) {
+                NodeKind::ParenthesizedExpression => cur = parent,
+                NodeKind::Block => {
+                    let kids = c.collect_direct(parent);
+                    let Some(pos) = kids.iter().position(|&kid| kid == cur) else {
+                        return;
+                    };
+                    // The statement row trails its expression pieces (a
+                    // member-access marker tiles between the send and it),
+                    // and it is the first statement row after them; the
+                    // walked face is the expression-statement face only.
+                    let Some(row) = kids[pos + 1..].iter().find(|&&row| is_statement_row(c, row))
+                    else {
+                        return;
+                    };
+                    if c.kind(*row) != NodeKind::ExpressionStatement {
+                        return;
+                    }
+                    if statement_row_count(c, &kids) != 1 {
+                        return;
+                    }
+                    cur = parent;
+                }
+                NodeKind::ForIn => break parent,
+                _ => return,
+            }
+        };
+        // `loopParts is ForEachPartsWithDeclaration` (:57): the header's lone
+        // variable declaration names the loop variable; the identifier and
+        // pattern forms carry no such row.
+        let Some(loop_var) = loop_variable(c, forin) else {
+            return;
+        };
+        // The invocation face over the send's own pieces (the owner slice —
+        // the send's pieces tile flat in the enclosing container): a
+        // `NoArguments` send is a tear-off, no invocation.
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((head, Some(args))) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        if !single_bare_loop_variable(c, args, loop_var) {
+            return;
+        }
+        // The target check (:81): a method invocation whose target references
+        // the loop variable stays silent; a function-expression invocation
+        // has no target and is never checked (:68-73).
+        if references_in_target(c, &kids[..head], c.head_token(kids[head]), loop_var) {
+            return;
+        }
+        c.report(c.utf16_span(forin), &[]);
+    }
+
+    /// The statement rows of a block window (`node.statements.length`, :44).
+    fn statement_row_count(c: &Check<'_>, kids: &[u32]) -> usize {
+        kids.iter().filter(|&&row| is_statement_row(c, row)).count()
+    }
+
+    /// The loop variable's name: the header's lone `VariablesDeclaration`
+    /// with exactly one `InitializedIdentifier` (:57-64 the declaration
+    /// form), or `None`.
+    fn loop_variable<'a>(c: &'a Check<'a>, forin: u32) -> Option<&'a str> {
+        let mut declarations = c
+            .collect_direct(forin)
+            .into_iter()
+            .filter(|&row| c.kind(row) == NodeKind::VariablesDeclaration);
+        let declaration = declarations.next()?;
+        if declarations.next().is_some() {
+            return None;
+        }
+        let variables: Vec<u32> = c
+            .collect_direct(declaration)
+            .into_iter()
+            .filter(|&var| c.kind(var) == NodeKind::InitializedIdentifier)
+            .collect();
+        if variables.len() != 1 {
+            return None;
+        }
+        let name = initialized_identifier_name(c, variables[0])?;
+        Some(c.lexeme(name))
+    }
+
+    /// `arguments.length == 1 && arguments.first == element` (:70/:79): the
+    /// sole argument is the bare loop-variable name — a one-piece
+    /// `Identifier`, or the production bare-name group
+    /// (`Identifier, type arguments, NoArguments, Send`).
+    fn single_bare_loop_variable(c: &Check<'_>, args: u32, loop_var: &str) -> bool {
+        let pieces = c.collect_direct(args);
+        let groups = slice::arguments(c, &pieces);
+        let Some(group) = groups.first() else {
+            return false;
+        };
+        let bare = match group.len() {
+            1 => c.kind(pieces[group.start]) == NodeKind::Identifier,
+            4 => slice::is_tear_off_group(c, &pieces, group.start),
+            _ => false,
+        };
+        bare && c.lexeme(c.head_token(pieces[group.start])) == loop_var
+    }
+
+    /// `_ReferenceFinder.references(target)` (:97-113): a scope-resolved name
+    /// equal to the loop variable inside the target's token extent. The
+    /// target is the statement's own piece run before the selector — empty
+    /// for a bare call (no target, never checked). Member names
+    /// (`.name`) and named-argument labels (`name:`) are not scope-resolved.
+    fn references_in_target(
+        c: &Check<'_>,
+        run: &[u32],
+        selector_head: u32,
+        loop_var: &str,
+    ) -> bool {
+        // The statement's own run: expression rows tile flat in the enclosing
+        // container (earlier statements trail their own statement rows).
+        let run = slice::statement_run(c, run);
+        let Some((&first, _)) = run.split_first() else {
+            return false; // no target
+        };
+        let start = c.head_token(first);
+        for token in start..selector_head {
+            if c.lexeme(token) != loop_var {
+                continue;
+            }
+            if token > 0 && c.lexeme(token - 1) == "." {
+                continue; // member name
+            }
+            // `token + 1` stays in the table: the scan stops before the
+            // selector.
+            if c.lexeme(token + 1) == ":" {
+                continue; // named-argument label
+            }
+            return true;
+        }
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -1898,5 +2090,114 @@ void f(x) {
             f.run(&one_rule("prefer_for_elements_to_map_fromIterable"))
                 .is_empty()
         );
+    }
+    // —— prefer_foreach ——————————————————————————————————————————————————
+
+    /// `test/rules/prefer_foreach_test.dart`
+    /// `test_blockBody_singleStatement_functionCall` — the single-statement
+    /// body invoking a function with the loop variable reports at the whole
+    /// for statement.
+    #[test]
+    fn foreach_single_statement_body_reports() {
+        let f = Fixture::parse(
+            "void f(List<int> list, void Function(int) fn) {\n  for (final a in list) {\n    fn(a);\n  }\n}\n",
+        );
+        let lints = f.run(&one_rule("prefer_foreach"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Use 'forEach' and a tear-off rather than a 'for' loop to apply a function to every element."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try using 'forEach' and a tear-off rather than a 'for' loop.")
+        );
+        let for_kw = tok(&f.source, &f.tokens, "for", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, for_kw));
+    }
+
+    /// `test_blockBody_multipleStatements` — a two-statement body passes.
+    #[test]
+    fn foreach_multiple_statements_pass() {
+        let f = Fixture::parse(
+            "void f(List<int> list, void Function(int) fn) {\n  for (final a in list) {\n    fn(a);\n    fn(a);\n  }\n}\n",
+        );
+        assert!(f.run(&one_rule("prefer_foreach")).is_empty());
+    }
+
+    /// `test_blockBody_singleStatement_methodCall_explicitTarget` — a target
+    /// without a loop-variable reference still reports.
+    #[test]
+    fn foreach_explicit_target_reports() {
+        let f = Fixture::parse(
+            "void f(D d, List<int> list) {\n  for (final a in list) {\n    d.f(a);\n  }\n}\nclass D {\n  void f(int a) {}\n}\n",
+        );
+        assert_eq!(f.run(&one_rule("prefer_foreach")).len(), 1);
+    }
+
+    /// `test_blockBody_singleStatement_methodCall_forVariableIsTarget` — the
+    /// loop variable as the target keeps the rule silent (:81).
+    #[test]
+    fn foreach_loop_variable_target_passes() {
+        let f = Fixture::parse(
+            "void f(List<D> list) {\n  for (final d in list) {\n    d.f(d);\n  }\n}\nclass D {\n  void f(D d) {}\n}\n",
+        );
+        assert!(f.run(&one_rule("prefer_foreach")).is_empty());
+    }
+
+    /// `test_blockBody_singleStatement_methodCall_forVariableIsInTarget` —
+    /// the loop variable nested inside the target (an index argument)
+    /// references it (:97-113).
+    #[test]
+    fn foreach_loop_variable_nested_in_target_passes() {
+        let f = Fixture::parse(
+            "void f(List<D> list) {\n  for (final d in list) {\n    list[list.indexOf(d)].f(d);\n  }\n}\nclass D {\n  void f(D d) {}\n}\n",
+        );
+        assert!(f.run(&one_rule("prefer_foreach")).is_empty());
+    }
+
+    /// `test_blockBody_singleStatement_parenthesizedFunctionCall` — the
+    /// parenthesized face reports (:87-89).
+    #[test]
+    fn foreach_parenthesized_body_reports() {
+        let f = Fixture::parse(
+            "void f(List<int> list, void Function(int) fn) {\n  for (final a in list) {\n    (fn(a));\n  }\n}\n",
+        );
+        assert_eq!(f.run(&one_rule("prefer_foreach")).len(), 1);
+    }
+
+    /// `test_nonBlockBody_singleStatement` — the non-block body reports.
+    #[test]
+    fn foreach_non_block_body_reports() {
+        let f = Fixture::parse(
+            "void f(List<int> list, void Function(int) fn) {\n  for (final a in list) fn(a);\n}\n",
+        );
+        assert_eq!(f.run(&one_rule("prefer_foreach")).len(), 1);
+    }
+
+    /// `test_blockBody_singleStatement_functionTypedExpressionCall` — the
+    /// function-expression-invocation face has no target check (:68-73).
+    #[test]
+    fn foreach_function_expression_invocation_reports() {
+        let f = Fixture::parse(
+            "void Function(int) fn() => (int a) {};\n\nvoid f(List<int> list) {\n  for (final a in list) {\n    fn()(a);\n  }\n}\n",
+        );
+        assert_eq!(f.run(&one_rule("prefer_foreach")).len(), 1);
+    }
+
+    /// The identifier form (`for (e in xs)`) is no
+    /// `ForEachPartsWithDeclaration` and never fires (:57); a wrapped
+    /// statement expression (a variable declaration) is not the walked face.
+    #[test]
+    fn foreach_identifier_form_and_declaration_body_pass() {
+        let f = Fixture::parse(
+            "void f(List<int> list, void Function(int) fn) {\n  for (a in list) {\n    fn(a);\n  }\n}\n",
+        );
+        assert!(f.run(&one_rule("prefer_foreach")).is_empty());
+
+        let f = Fixture::parse(
+            "void f(List<int> list, void Function(int) fn) {\n  for (final a in list) {\n    var b = fn(a);\n  }\n}\n",
+        );
+        assert!(f.run(&one_rule("prefer_foreach")).is_empty());
     }
 }
