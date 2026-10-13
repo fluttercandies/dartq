@@ -66,15 +66,17 @@ impl Interp<'_> {
                     && constant.is_some_and(|e| e.ty.base == Base::Null)
                     && let Some(var) = pattern.scrutinee
                 {
-                    let declared = self.vars[var as usize].ty;
+                    let meta = &self.vars[var as usize];
+                    let declared = meta.ty;
                     let promoted = self.ops.promote_to_non_null(declared);
                     if promoted != declared {
+                        let declared_args = meta.args;
                         self.current = self.current.clone().finish_type_test(
                             self.ops,
                             &mut self.lists,
                             var,
                             None,
-                            Some(promoted),
+                            Some((promoted, declared_args)),
                         );
                     }
                 }

@@ -198,6 +198,16 @@ impl<'t> Flow<'t> {
         &self.names_by_id[index]
     }
 
+    /// The written-argument tree interned at arena `id` — the cross-crate
+    /// read face of the fact rows' `args` (#1010). [`crate::ty::EMPTY_ARGS`]
+    /// (the reserved index 0) reads as the empty slice; a fact row only
+    /// ever carries ids this recorder interned, so an out-of-range id is a
+    /// program bug, not a recoverable condition.
+    #[must_use]
+    pub fn type_args_at(&self, id: u32) -> &[crate::ty::ArgTy] {
+        &self.type_args[id as usize]
+    }
+
     /// Takes the pending label reference if one is set (break/continue
     /// with a target).
     fn take_label(&mut self, has_target: bool) -> Option<u32> {

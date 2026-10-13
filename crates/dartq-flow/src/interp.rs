@@ -315,6 +315,11 @@ impl Default for DeclCtx {
 pub(crate) struct Expr {
     /// Type of the expression (name-level).
     pub ty: Ty,
+    /// The written-argument tree of [`Expr::ty`] (arena index;
+    /// [`crate::ty::EMPTY_ARGS`] when argument-less or unknown) — the
+    /// promotion sites that refine this value's type cons the rows with
+    /// it (#1010).
+    pub args: u32,
     /// The expression reads this variable (promotable reference).
     pub reference: Option<u32>,
     /// Boolean literal truth.
@@ -331,6 +336,7 @@ impl Expr {
     pub(crate) fn trivial(ty: Ty) -> Self {
         Self {
             ty,
+            args: crate::ty::EMPTY_ARGS,
             reference: None,
             bool_value: None,
             branches: None,
@@ -338,9 +344,10 @@ impl Expr {
         }
     }
 
-    pub(crate) fn of_reference(var: u32, ty: Ty) -> Self {
+    pub(crate) fn of_reference(var: u32, ty: Ty, args: u32) -> Self {
         Self {
             ty,
+            args,
             reference: Some(var),
             bool_value: None,
             branches: None,
@@ -518,19 +525,6 @@ pub(crate) struct Interp<'o> {
     /// The pending declared type's written arguments (formal, pattern
     /// variable consumers), beside [`Interp::pending_ty`].
     pub(crate) pending_ty_args: u32,
-    /// Variables whose current promotion chain derives (in part) from an
-    /// arg-bearing type: reads of these must not surface as
-    /// [`FlowFact::PromotedRead`] facts — the fact row carries only the
-    /// name-level spelling and the consumer stage re-interns it bare, so
-    /// a bare fact for an arg-bearing promotion could clean rows against
-    /// written-argument targets (#611 step 4; retired once the consumer
-    /// face reads real arguments). The promotion gate upstream refuses
-    /// mismatched-argument tests outright, so the set only covers
-    /// genuinely compatible arg-bearing promotions. Insert-only: the
-    /// arg-bearing provenance survives writes (the kept promotion suffix
-    /// and the tested-types pool feed later re-promotions) and joins, so
-    /// a stale mark can only suppress, never fabricate, a fact.
-    pub(crate) arg_promotions: FxHashSet<u32>,
     pub(crate) in_decl: bool,
     pub(crate) in_type_test: bool,
     pub(crate) in_as_cast: bool,
@@ -610,7 +604,6 @@ impl<'o> Interp<'o> {
             tested_args: crate::ty::EMPTY_ARGS,
             as_cast_args: crate::ty::EMPTY_ARGS,
             pending_ty_args: crate::ty::EMPTY_ARGS,
-            arg_promotions: FxHashSet::default(),
             in_decl: false,
             in_type_test: false,
             in_as_cast: false,
@@ -689,15 +682,16 @@ impl<'o> Interp<'o> {
         // A stale id (a collect rollback can strand effect-set entries and
         // scope bindings past their variable) degrades to the unknown
         // declared type; the state write itself is model-bounds-safe.
-        let declared = self
-            .vars
-            .get(var as usize)
-            .map_or(Ty::UNKNOWN, |meta| meta.ty);
+        let (declared, declared_args) = match self.vars.get(var as usize) {
+            Some(meta) => (meta.ty, meta.args),
+            None => (Ty::UNKNOWN, crate::ty::EMPTY_ARGS),
+        };
         self.current = self.current.clone().write(
             self.ops,
             &mut self.lists,
             var,
             declared,
+            declared_args,
             written,
             promote_to_interest,
         );
@@ -796,16 +790,6 @@ impl<'o> Interp<'o> {
     pub(crate) fn emit(&mut self, fact: FlowFact) {
         if self.collect.is_none() {
             self.facts.push(fact);
-        }
-    }
-
-    /// Latches that a real promotion derived from an arg-bearing type
-    /// (#611 step 4): the variable's reads stay out of the fact face.
-    /// Collect runs mutate flow state for effect purposes only, so
-    /// they mark nothing (marks are not part of the rollback snapshot).
-    pub(crate) fn mark_arg_promotion(&mut self, var: u32) {
-        if self.collect.is_none() {
-            self.arg_promotions.insert(var);
         }
     }
 

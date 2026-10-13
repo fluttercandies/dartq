@@ -53,6 +53,7 @@ impl Interp<'_> {
                             self.record_read(var);
                             let model = self.current.model(var);
                             let ty = self.promoted_type_of(var, &model);
+                            let args = self.promoted_args_of(var, &model);
                             let declared = self
                                 .vars
                                 .get(var as usize)
@@ -60,22 +61,23 @@ impl Interp<'_> {
                             // Promotion fact (bounded to real promotions:
                             // `promoted_type_of` returns the declared type
                             // when unpromoted, so only a chain head emits).
-                            // Arg-bearing promotions stay out (the fact
-                            // row carries only the bare spelling,
-                            // #611 step 4), and dead reads carry no row
-                            // (their unreachable region is already reported
-                            // as dead code). Invariant with the plain-assign
+                            // The row carries the chain head's written
+                            // arguments beside the bare spelling (#1010),
+                            // and dead reads carry no row (their
+                            // unreachable region is already reported as
+                            // dead code). Invariant with the plain-assign
                             // retraction below: an assignment TARGET read
                             // under an active promotion emits here, so the
                             // retraction removes this fact too — the
                             // target identifier is a write, not a read.
-                            if self.reachable()
-                                && ty != declared
-                                && !self.arg_promotions.contains(&var)
-                            {
-                                self.emit(FlowFact::PromotedRead { span: *token, ty });
+                            if self.reachable() && ty != declared {
+                                self.emit(FlowFact::PromotedRead {
+                                    span: *token,
+                                    ty,
+                                    args,
+                                });
                             }
-                            let mut expr = Expr::of_reference(var, ty);
+                            let mut expr = Expr::of_reference(var, ty, args);
                             expr.read_span = Some(*token);
                             self.exprs.push(expr);
                         }
@@ -134,7 +136,7 @@ impl Interp<'_> {
                             &mut self.lists,
                             var,
                             None,
-                            Some(promoted),
+                            Some((promoted, operand.args)),
                         );
                     }
                     self.exprs
@@ -204,7 +206,7 @@ impl Interp<'_> {
                                     &mut self.lists,
                                     var,
                                     None,
-                                    Some(promoted),
+                                    Some((promoted, left.args)),
                                 )
                             }
                         }
@@ -336,13 +338,8 @@ impl Interp<'_> {
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
                 if let Some(var) = operand.reference {
                     let promoted = self.promotion_candidate(var, tested, tested_args);
-                    // An arg-bearing promotion presents bare-named at the
-                    // fact face: latch the variable so its reads stay out
-                    // of the facts (#611 step 4).
-                    if tested_args != crate::ty::EMPTY_ARGS && promoted.is_some() {
-                        self.mark_arg_promotion(var);
-                    }
-                    let (matched, unmatched) = self.branch_type_test(var, tested, promoted);
+                    let (matched, unmatched) =
+                        self.branch_type_test(var, tested, tested_args, promoted);
                     let (if_true, if_false) = if is_not {
                         (unmatched, matched)
                     } else {
@@ -384,15 +381,12 @@ impl Interp<'_> {
                         .and_then(|p| p.pending_decls.last().copied())
                         && let Some(var) = self.resolve(name)
                     {
-                        if self.as_cast_args != crate::ty::EMPTY_ARGS {
-                            self.mark_arg_promotion(var);
-                        }
                         self.current = self.current.clone().finish_type_test(
                             self.ops,
                             &mut self.lists,
                             var,
                             None,
-                            Some(cast_ty),
+                            Some((cast_ty, self.as_cast_args)),
                         );
                     }
                     return true;
@@ -408,18 +402,14 @@ impl Interp<'_> {
                     self.unreachable_cur();
                 }
                 if let Some(var) = operand.reference {
-                    let promoted = self.promotion_candidate(var, cast_ty, self.as_cast_args);
-                    if let Some(promoted) = promoted {
-                        // Arg-bearing cast promotion: latch (#611 step 4).
-                        if self.as_cast_args != crate::ty::EMPTY_ARGS {
-                            self.mark_arg_promotion(var);
-                        }
+                    if let Some(promoted) = self.promotion_candidate(var, cast_ty, self.as_cast_args)
+                    {
                         self.current = self.current.clone().finish_type_test(
                             self.ops,
                             &mut self.lists,
                             var,
                             None,
-                            Some(promoted),
+                            Some((promoted, self.as_cast_args)),
                         );
                     }
                 }
@@ -428,6 +418,10 @@ impl Interp<'_> {
             Ev::Assign { plain } => {
                 let rhs = self.pop_value();
                 let target = self.pop_value();
+                // The read-back value's written arguments are the right-hand
+                // side's when the write carried its type (a plain `=`), and
+                // argument-less for the compound operators' unknown face.
+                let rhs_args = if *plain { rhs.args } else { crate::ty::EMPTY_ARGS };
                 if let Some(var) = target.reference {
                     let written = if *plain { rhs.ty } else { Ty::UNKNOWN };
                     if let Some(span) = target.read_span {
@@ -450,7 +444,8 @@ impl Interp<'_> {
                     }
                     self.write_var(var, written, *plain);
                     // The assignment expression reads back the variable.
-                    self.exprs.push(Expr::of_reference(var, written));
+                    self.exprs
+                        .push(Expr::of_reference(var, written, rhs_args));
                 } else {
                     self.exprs
                         .push(Expr::trivial(if *plain { rhs.ty } else { Ty::UNKNOWN }));
@@ -553,7 +548,7 @@ impl Interp<'_> {
                             &mut self.lists,
                             var,
                             None,
-                            Some(promoted),
+                            Some((promoted, target.args)),
                         );
                         expr.branches = Some((matched, self.current.clone()));
                     }
@@ -741,6 +736,20 @@ impl Interp<'_> {
         }
     }
 
+    /// The written-argument tree of a variable read's flow type (chain
+    /// head's rows or the declared type's) — the arena-read pairing of
+    /// [`Interp::promoted_type_of`] that the [`FlowFact::PromotedRead`]
+    /// rows carry (#1010). Same stale-id degradation.
+    pub(crate) fn promoted_args_of(&self, var: u32, model: &crate::model::VarModel) -> u32 {
+        if model.promoted == crate::model::NIL {
+            self.vars
+                .get(var as usize)
+                .map_or(crate::ty::EMPTY_ARGS, |meta| meta.args)
+        } else {
+            self.lists.head_args(model.promoted)
+        }
+    }
+
     /// The promotion target for a type check (official
     /// `tryPromoteForTypeCheck`'s true branch,
     /// flow_analysis.dart:4137-4145): the tested type factored against
@@ -859,22 +868,34 @@ impl Interp<'_> {
     /// A successful type test on `var`: returns (matched, unmatched)
     /// states (official `tryPromoteForTypeCheck`,
     /// flow_analysis.dart:4118-4179). The matched branch promotes to the
-    /// gated candidate; the unmatched branch promotes to the factored
-    /// remainder `factor(previous, tested)`, and a bottom remainder marks
-    /// it unreachable (official `ifFalseIsUnreachable`, the sound arm —
+    /// gated candidate (its written arguments are the tested spelling's,
+    /// `tested_args`); the unmatched branch promotes to the factored
+    /// remainder `factor(previous, tested)` — shape-preserving at this
+    /// seam, so the remainder keeps the previous chain head's rows — and
+    /// a bottom remainder marks it unreachable (official
+    /// `ifFalseIsUnreachable`, the sound arm —
     /// `sound-flow-analysis` is enabled-by-default and expired,
     /// `experiments/flags.dart:309-315`).
-    fn branch_type_test(&mut self, var: u32, tested: Ty, promoted: Option<Ty>) -> (State, State) {
-        let previous = {
+    fn branch_type_test(
+        &mut self,
+        var: u32,
+        tested: Ty,
+        tested_args: u32,
+        promoted: Option<Ty>,
+    ) -> (State, State) {
+        let (previous, previous_args) = {
             let model = self.current.model(var);
-            self.promoted_type_of(var, &model)
+            (
+                self.promoted_type_of(var, &model),
+                self.promoted_args_of(var, &model),
+            )
         };
         let matched = self.current.clone().finish_type_test(
             self.ops,
             &mut self.lists,
             var,
-            Some(tested),
-            promoted,
+            Some((tested, tested_args)),
+            promoted.map(|ty| (ty, tested_args)),
         );
         let factored = self.ops.factor(previous, tested);
         let unmatched = if self.ops.is_bottom(factored) {
@@ -893,8 +914,8 @@ impl Interp<'_> {
                 self.ops,
                 &mut self.lists,
                 var,
-                Some(tested),
-                factored,
+                Some((tested, tested_args)),
+                factored.map(|ty| (ty, previous_args)),
             )
         };
         (matched, unmatched)
@@ -926,7 +947,7 @@ impl Interp<'_> {
                     &mut self.lists,
                     var,
                     None,
-                    Some(promoted),
+                    Some((promoted, operand.args)),
                 );
                 // `x == null`: the true-branch saw null; the
                 // false-branch saw non-null. `!=` inverts.

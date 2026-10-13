@@ -37,14 +37,15 @@ pub struct Ty {
 
 /// Reserved arena index for a written-argument-less type: the fast path
 /// (`int`, a raw `List`, `dynamic`) never touches the recorder's arena.
-pub(crate) const EMPTY_ARGS: u32 = 0;
+pub const EMPTY_ARGS: u32 = 0;
 
 /// One node of a recorded type-argument tree: the base spelling plus its
 /// own written arguments (#611 step 4). Nested lists reference the same
 /// arena by index, so the tree compares structurally without materializing
-/// per-visit nodes.
+/// per-visit nodes. The cross-crate read face of the fact rows' `args`
+/// ([`crate::Flow::type_args_at`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ArgTy {
+pub struct ArgTy {
     pub base: Base,
     pub nullable: bool,
     /// The node's own written arguments (arena index; [`EMPTY_ARGS`] when

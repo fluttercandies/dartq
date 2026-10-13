@@ -314,8 +314,8 @@ use crate::const_eval::{
 };
 use crate::library::{ElementIndex, ScopedHit, lookup_scoped, owner_library, resolve_container};
 use crate::model::{
-    ArgListId, ArityViolation, Container, ContainerKind, ExtensionFace, FileElements, Formals,
-    MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
+    ArgListId, ArgPool, ArityViolation, Container, ContainerKind, ExtensionFace, FileElements,
+    Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
 };
 use crate::use_face::{ExportUseFace, ImportUseFace, UnitUseFace};
 use dartq_types::{
@@ -12943,32 +12943,73 @@ impl PromotionStaging {
 /// through [`Flow::name_lexeme`] (the S0 parallel name table) and interns
 /// into the live string table, so repeat reads share one id.
 ///
-/// The written-argument face: the fact row is name-level, and every
-/// arg-bearing promotion is gated at the flow fact face (a promotion
-/// derived from a written argument spelling emits no row), so staging the
-/// spelling argument-less is the exact reading of every arriving fact —
-/// the same-name-raw spelling cannot clean a staged check against a
-/// written target (the pool compare answers by list length, `None`
-/// suppresses). When the row itself grows its arguments (#611 step 4,
-/// flow side), this is the join point: intern the written tree into the
-/// boundary pool here instead of the reserved empty slot.
-fn staged_promotion(ty: FlowTy, flow: &Flow<'_>, strings: &StringTable) -> Option<Ty> {
-    Some(match ty.base {
-        FlowBase::Name(id) => Ty::Named {
-            name: strings.intern(flow.name_lexeme(id)),
-            nullable: ty.nullable,
-            args: ArgListId::EMPTY,
-        },
-        FlowBase::Dynamic => Ty::Dynamic,
-        FlowBase::Null => Ty::Null,
-        FlowBase::Unknown => Ty::UNKNOWN,
+/// The written-argument face (#1010 transport): the row carries the
+/// promotion-chain head's written argument tree (`args`, an index into the
+/// recorder's arena), and this function is the join point — the tree
+/// interns bottom-up into `pool`, the diagnosing universe's argument pool,
+/// so the staged type's slots are canonical in the same universe
+/// [`Engine::filter_staged`]'s re-decision reads. A `void`/`Never`
+/// argument anywhere in the tree makes the row unrepresentable in the M1
+/// lattice and drops the whole staging (the head drop rule's argument
+/// face — staging from a fiction would decide from nothing; the join
+/// misses and the unpromoted verdict stands, the under-report direction).
+fn staged_promotion(
+    ty: FlowTy,
+    args: u32,
+    flow: &Flow<'_>,
+    strings: &StringTable,
+    pool: &mut ArgPool,
+) -> Option<Ty> {
+    let name = match ty.base {
+        FlowBase::Name(id) => strings.intern(flow.name_lexeme(id)),
+        FlowBase::Dynamic => return Some(Ty::Dynamic),
+        FlowBase::Null => return Some(Ty::Null),
+        FlowBase::Unknown => return Some(Ty::UNKNOWN),
         // The drop rule: the official promotion only subtype-narrows
         // (`type_system.dart:1729` `tryPromoteToType`), so a `void`
         // promotion cannot arise, and a `Never` promotion marks a path
         // this verifier does not reach — the M1 lattice has no such source
         // type, and staging one would decide from a fiction.
         FlowBase::Void | FlowBase::Never => return None,
+    };
+    let args = intern_flow_args(args, flow, strings, pool)?;
+    Some(Ty::Named {
+        name,
+        nullable: ty.nullable,
+        args,
     })
+}
+
+/// Interns one flow argument tree into `pool` (bottom-up: nested lists
+/// canonical before their outer list interns); `None` when a `void` or
+/// `Never` argument makes the row unrepresentable (see
+/// [`staged_promotion`]). `EMPTY_ARGS` short-circuits to the reserved
+/// empty slot.
+fn intern_flow_args(
+    args: u32,
+    flow: &Flow<'_>,
+    strings: &StringTable,
+    pool: &mut ArgPool,
+) -> Option<ArgListId> {
+    if args == dartq_flow::ty::EMPTY_ARGS {
+        return Some(ArgListId::EMPTY);
+    }
+    let mut list = Vec::with_capacity(flow.type_args_at(args).len());
+    for entry in flow.type_args_at(args) {
+        let arg = match entry.base {
+            FlowBase::Name(id) => Ty::Named {
+                name: strings.intern(flow.name_lexeme(id)),
+                nullable: entry.nullable,
+                args: intern_flow_args(entry.args, flow, strings, pool)?,
+            },
+            FlowBase::Dynamic => Ty::Dynamic,
+            FlowBase::Null => Ty::Null,
+            FlowBase::Void | FlowBase::Never => return None,
+            FlowBase::Unknown => Ty::UNKNOWN,
+        };
+        list.push(arg);
+    }
+    Some(pool.intern(&list))
 }
 
 /// The analyzer language-strictness scalars (`analysis_options.yaml`
@@ -13136,8 +13177,14 @@ pub fn diagnose_unit(
                     code.correction_message(""),
                 ));
             }
-            FlowFact::PromotedRead { span, ty } => {
-                if let Some(promoted) = staged_promotion(ty, &flow.borrow(), strings) {
+            FlowFact::PromotedRead { span, ty, args } => {
+                // The staged type joins the diagnosing universe's pool
+                // ([`Boundary::args`]) — the same universe
+                // [`Engine::filter_staged`]'s re-decision reads.
+                let engine_ref = engine.borrow();
+                let mut pool = engine_ref.boundary.args.borrow_mut();
+                if let Some(promoted) = staged_promotion(ty, args, &flow.borrow(), strings, &mut pool)
+                {
                     promotions.stage(span.range, promoted);
                 }
             }
@@ -18243,6 +18290,7 @@ mod tests {
     #[test]
     fn staged_promotion_drops_void_and_never() {
         let strings = StringTable::new();
+        let mut pool = ArgPool::default();
         let scanned = dartq_scanner::scan(
             "",
             ScanConfig {
@@ -18252,7 +18300,8 @@ mod tests {
             FileTable::new().intern(Path::new("test.dart")),
         );
         let flow = Flow::new(&scanned.tokens, "");
-        let never_stages = |ty| staged_promotion(ty, &flow, &strings).is_none();
+        let mut never_stages =
+            |ty| staged_promotion(ty, dartq_flow::ty::EMPTY_ARGS, &flow, &strings, &mut pool).is_none();
         assert!(never_stages(FlowTy {
             base: FlowBase::Void,
             nullable: false
@@ -18267,8 +18316,10 @@ mod tests {
                     base: FlowBase::Dynamic,
                     nullable: false
                 },
+                dartq_flow::ty::EMPTY_ARGS,
                 &flow,
-                &strings
+                &strings,
+                &mut pool
             ),
             Some(Ty::Dynamic)
         );
@@ -18278,8 +18329,10 @@ mod tests {
                     base: FlowBase::Null,
                     nullable: true
                 },
+                dartq_flow::ty::EMPTY_ARGS,
                 &flow,
-                &strings
+                &strings,
+                &mut pool
             ),
             Some(Ty::Null)
         );

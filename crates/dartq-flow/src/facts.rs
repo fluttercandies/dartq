@@ -35,17 +35,20 @@ pub enum FlowFact {
     /// differs from its declared type — the promotion facts a type-check
     /// consumer needs to see the promoted type at the read. Emitted only
     /// for real promotions (unpromoted and demoted reads carry no row).
-    /// Promotions whose type derives from an arg-bearing spelling stay
-    /// out: the row carries only the bare named type, so the consumer
-    /// stage — which re-interns promoted spellings argument-less — could
-    /// clean rows against written-argument targets on a fiction (#611
-    /// step 4; the row gains the arguments once the consumer face reads
-    /// them).
+    /// The row carries the promotion-chain head's written argument tree
+    /// (`args`, an index into the recorder's arena read through
+    /// [`crate::Flow::type_args_at`]; [`crate::ty::EMPTY_ARGS`] when
+    /// argument-less) — the same pairing `ty` answers on the type-name
+    /// side, so a consumer stages the promoted spelling exactly as
+    /// written (#611 step 4; #1010 transport).
     PromotedRead {
         /// Span of the read's identifier token.
         span: TokenSpan,
         /// The promoted type on this control-flow path (chain head).
         ty: Ty,
+        /// The chain head's written argument tree (arena index;
+        /// [`crate::ty::EMPTY_ARGS`] when argument-less).
+        args: u32,
     },
     /// The end of an executable body is reachable: the body can complete
     /// normally by falling off its end. The pure reachability face of the

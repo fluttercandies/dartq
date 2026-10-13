@@ -744,24 +744,52 @@ fn unpromoted_and_demoted_reads_emit_nothing() {
     assert!(read_facts_of(demoted).is_empty());
 }
 
-/// (c) The #611 suppression gate: a promotion whose tested type spelled
-/// type arguments presents as a bare name at this seam, so its reads stay
-/// out of the fact face; the arg-free twin (`x is List`) and nullability
-/// promotions stay in scope.
+/// (c) The #1010 transport: every real promotion's read emits, and the row
+/// carries the chain head's written argument tree — an arg-bearing tested
+/// type (`x is List<int>`) stages exactly as written, the arg-free twin
+/// (`x is List`) carries the reserved empty slot, and a multi-argument
+/// tested type carries its whole tree.
 #[test]
-fn arg_bearing_promotions_suppressed_arg_free_emitted() {
-    // `x is List<int>`: real promotion, erased arguments — suppressed.
-    let arg_bearing = "void f(List? x) { if (x is List<int>) { x; } }";
-    assert!(read_facts_of(arg_bearing).is_empty(), "{arg_bearing}");
-    // `x is List`: the same promotion shape, no arguments — emitted.
-    let arg_free = "void f(List? x) { if (x is List) { x; } }";
-    let promoted = promoted_tys(arg_free);
-    assert_eq!(promoted.len(), 1);
-    assert!(matches!(promoted[0].base, crate::ty::Base::Name(_)));
-    assert!(!promoted[0].nullable);
-    // A multi-argument tested type suppresses too (same latch).
-    let multi = "void f(Map? x) { if (x is Map<String, int>) { x; } }";
-    assert!(read_facts_of(multi).is_empty());
+fn promoted_reads_carry_their_written_arguments() {
+    let read_args = |source: &str| {
+        let (flow, facts) = analyze(source);
+        let flow = flow.0.borrow();
+        facts
+            .iter()
+            .filter_map(|fact| match fact {
+                FlowFact::PromotedRead { args, .. } => Some(
+                    flow.type_args_at(*args)
+                        .iter()
+                        .map(|entry| match entry.base {
+                            crate::ty::Base::Name(id) => {
+                                (flow.name_lexeme(id).to_string(), entry.args)
+                            }
+                            _ => panic!("every tested spelling here is a named type"),
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    // `x is List<int>`: real promotion, the row carries the written `<int>`.
+    let arg_bearing = read_args("void f(List? x) { if (x is List<int>) { x; } }");
+    assert_eq!(arg_bearing.len(), 1, "{arg_bearing:?}");
+    assert_eq!(arg_bearing[0], vec![("int".to_string(), crate::ty::EMPTY_ARGS)]);
+    // `x is List`: the same promotion shape, no arguments — empty slot.
+    let arg_free = read_args("void f(List? x) { if (x is List) { x; } }");
+    assert_eq!(arg_free.len(), 1, "{arg_free:?}");
+    assert!(arg_free[0].is_empty(), "{arg_free:?}");
+    // A multi-argument tested type carries its whole tree.
+    let multi = read_args("void f(Map? x) { if (x is Map<String, int>) { x; } }");
+    assert_eq!(multi.len(), 1, "{multi:?}");
+    assert_eq!(
+        multi[0],
+        vec![
+            ("String".to_string(), crate::ty::EMPTY_ARGS),
+            ("int".to_string(), crate::ty::EMPTY_ARGS),
+        ]
+    );
 }
 
 /// (d) The name-recovery face: `Base::Name(id)` round-trips through
@@ -1165,12 +1193,13 @@ fn join_promoted_intersection_keeps_deeper_common_types() {
     let (t1, t2, t3, t4, t5) = (ty(1), ty(2), ty(3), ty(4), ty(5));
     let mut lists = Lists::default();
     // Most-specific first: [t1, t3, t5] forked against [t2, t3, t4].
-    let a_mid = lists.cons(t5, NIL);
-    let a_tail = lists.cons(t3, a_mid);
-    let a = lists.cons(t1, a_tail);
-    let b_mid = lists.cons(t4, NIL);
-    let b_tail = lists.cons(t3, b_mid);
-    let b = lists.cons(t2, b_tail);
+    let no_args = crate::ty::EMPTY_ARGS;
+    let a_mid = lists.cons(t5, no_args, NIL);
+    let a_tail = lists.cons(t3, no_args, a_mid);
+    let a = lists.cons(t1, no_args, a_tail);
+    let b_mid = lists.cons(t4, no_args, NIL);
+    let b_tail = lists.cons(t3, no_args, b_mid);
+    let b = lists.cons(t2, no_args, b_tail);
     let state = |promoted| {
         let mut s = State::new(0);
         s.models.push(VarModel {
@@ -3269,8 +3298,7 @@ fn written_argument_trees_intern_bottom_up_and_dedup() {
 
 /// `List<int> x; x is List<String>` refuses the promotion: the written
 /// arguments differ and the official lattice refuses `List<String> <:
-/// List<int>` (invariant entries), so no promotion — and no
-/// arg-bearing mark — exists at all.
+/// List<int>` (invariant entries), so no promotion exists at all.
 #[test]
 fn mismatched_written_args_refuse_promotion() {
     let events: Vec<crate::ev::Ev> = [
@@ -3281,10 +3309,6 @@ fn mismatched_written_args_refuse_promotion() {
     let mut interp =
         crate::interp::Interp::new(&crate::ty::NameTypeOps, arg_arena());
     interp.run(&events);
-    assert!(
-        interp.arg_promotions.is_empty(),
-        "a refused promotion marks nothing"
-    );
     assert_eq!(
         interp.current.model(0).promoted,
         crate::model::NIL,
@@ -3294,10 +3318,11 @@ fn mismatched_written_args_refuse_promotion() {
 
 /// `List<int>? x; x is List<int>` promotes (equal arguments, nullable
 /// narrowed — official `tryPromoteToType` admits `List<int> <: List<int>?`)
-/// and the promotion is arg-bearing, so the variable is marked and its
-/// reads stay out of the bare-named fact face.
+/// and the promotion chain head carries the tested spelling's written
+/// argument tree (#1010), so the variable's reads surface in the fact face
+/// with the rows attached.
 #[test]
-fn equal_written_args_promote_and_mark() {
+fn equal_written_args_promote_with_args() {
     let events: Vec<crate::ev::Ev> = [
         declared(7, ty_with_args(3, true)),
         is_test(7, ty_with_args(3, false), false),
@@ -3306,9 +3331,13 @@ fn equal_written_args_promote_and_mark() {
     let mut interp =
         crate::interp::Interp::new(&crate::ty::NameTypeOps, arg_arena());
     interp.run(&events);
-    assert!(interp.arg_promotions.contains(&0));
     let model = interp.current.model(0);
     assert_eq!(interp.lists.head(model.promoted).nullable, false);
+    assert_eq!(
+        interp.lists.head_args(model.promoted),
+        3,
+        "the chain head carries the tested spelling's written arguments"
+    );
 }
 
 /// `List<int> x; x is List` — a raw tested type against a written
@@ -3324,7 +3353,6 @@ fn raw_tested_against_written_declaration_refuses() {
     let mut interp =
         crate::interp::Interp::new(&crate::ty::NameTypeOps, arg_arena());
     interp.run(&events);
-    assert!(interp.arg_promotions.is_empty());
     assert_eq!(interp.current.model(0).promoted, crate::model::NIL);
 }
 

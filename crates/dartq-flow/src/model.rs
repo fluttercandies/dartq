@@ -125,20 +125,30 @@ impl ReachArena {
 /// A cons-cell pool for promoted-type and tested-type chains. Chains are
 /// ordered most- to least-specific (the mirror of the official least- to
 /// most-specific list order — `add_promoted` conses onto the front), shared
-/// freely across states, and never mutated in place.
+/// freely across states, and never mutated in place. Each cell carries its
+/// type's written-argument tree beside the name-level [`Ty`] (#1010): the
+/// promotion rows read the chain head's arguments, so the rows travel with
+/// the chain through promotions, demotions, and joins exactly like the
+/// types do.
 #[derive(Default)]
 pub(crate) struct Lists {
-    cells: Vec<(Ty, u32)>,
+    cells: Vec<(Ty, u32, u32)>,
 }
 
 impl Lists {
-    pub(crate) fn cons(&mut self, ty: Ty, next: u32) -> u32 {
-        self.cells.push((ty, next));
+    pub(crate) fn cons(&mut self, ty: Ty, args: u32, next: u32) -> u32 {
+        self.cells.push((ty, args, next));
         u32::try_from(self.cells.len()).expect("tested-set cell count fits u32") - 1
     }
 
     pub(crate) fn head(&self, id: u32) -> Ty {
         self.cells[id as usize].0
+    }
+
+    /// The chain head's written-argument tree (arena index) — the
+    /// [`Ty`]-side pairing of [`Lists::head`] (#1010).
+    pub(crate) fn head_args(&self, id: u32) -> u32 {
+        self.cells[id as usize].1
     }
 
     /// The chain as a slice walk (front to back).
@@ -148,9 +158,24 @@ impl Lists {
             if cur == NIL {
                 return None;
             }
-            let (ty, next) = self.cells[cur as usize];
+            let (ty, _, next) = self.cells[cur as usize];
             cur = next;
             Some(ty)
+        })
+    }
+
+    /// The chain as a slice walk carrying each entry's argument tree (the
+    /// rebuild walks — demotion, joins, tested merges — cons the entries
+    /// back with their rows).
+    pub(crate) fn iter_entries(&self, id: u32) -> impl Iterator<Item = (Ty, u32)> + '_ {
+        let mut cur = id;
+        std::iter::from_fn(move || {
+            if cur == NIL {
+                return None;
+            }
+            let (ty, args, next) = self.cells[cur as usize];
+            cur = next;
+            Some((ty, args))
         })
     }
 }
@@ -275,13 +300,16 @@ impl State {
     /// `_tryPromoteToTypeOfInterest`): marks assigned, drops promotions the
     /// written type no longer satisfies, and re-promotes to a type of
     /// interest (the declared type's non-null form or a previously tested
-    /// type) when the written value matches.
+    /// type) when the written value matches. `declared_args` is the
+    /// declared type's written-argument tree — the declared non-null
+    /// candidate's rows (#1010).
     pub(crate) fn write(
         self,
         ops: &dyn TypeOps,
         lists: &mut Lists,
         var: u32,
         declared: Ty,
+        declared_args: u32,
         written: Ty,
         promote_to_interest: bool,
     ) -> Self {
@@ -305,11 +333,11 @@ impl State {
         // largest k with `written <: promotedTypes[k-1]`; dartq chains store
         // the mirror order — most-specific first — so the kept prefix of the
         // official list is a suffix here). Rebuild the kept suffix in order.
-        let nodes: Vec<Ty> = lists.iter(model.promoted).collect();
+        let nodes: Vec<(Ty, u32)> = lists.iter_entries(model.promoted).collect();
         let mut promoted = NIL;
-        if let Some(keep_from) = nodes.iter().position(|&ty| ops.is_subtype(written, ty)) {
-            for ty in nodes[keep_from..].iter().rev() {
-                promoted = lists.cons(*ty, promoted);
+        if let Some(keep_from) = nodes.iter().position(|&(ty, _)| ops.is_subtype(written, ty)) {
+            for (ty, args) in nodes[keep_from..].iter().rev() {
+                promoted = lists.cons(*ty, *args, promoted);
             }
         }
         if promote_to_interest && !promoted_is(lists, promoted, written) {
@@ -322,35 +350,35 @@ impl State {
             } else {
                 lists.head(promoted)
             };
-            let mut candidates: Vec<Ty> = Vec::new();
+            let mut candidates: Vec<(Ty, u32)> = Vec::new();
             let declared_non_null = ops.promote_to_non_null(declared);
             if declared_non_null != declared {
                 consider(
                     ops,
-                    lists,
                     written,
                     current,
                     declared_non_null,
+                    declared_args,
                     &mut candidates,
                 );
             }
-            for tested in lists.iter(model.tested) {
-                consider(ops, lists, written, current, tested, &mut candidates);
+            for (tested, args) in lists.iter_entries(model.tested) {
+                consider(ops, written, current, tested, args, &mut candidates);
                 let tested_non_null = ops.promote_to_non_null(tested);
                 if tested_non_null != tested {
                     consider(
                         ops,
-                        lists,
                         written,
                         current,
                         tested_non_null,
+                        args,
                         &mut candidates,
                     );
                 }
             }
             // The unique candidate that is a subtype of all the others wins.
-            if let Some(promoted_to) = unique_subtype(ops, &candidates) {
-                promoted = add_promoted(ops, lists, promoted, promoted_to);
+            if let Some((promoted_to, args)) = unique_subtype(ops, &candidates) {
+                promoted = add_promoted(ops, lists, promoted, promoted_to, args);
             }
         }
         self.with_model(
@@ -366,25 +394,28 @@ impl State {
     }
 
     /// Records a promotion to `promoted` after a successful type test of
-    /// `tested` (official `_finishTypeTest`).
+    /// `tested` (official `_finishTypeTest`). Each optional side is a
+    /// `(type, written-argument tree)` pair (#1010): the tested side joins
+    /// the types-of-interest chain, the promoted side the promotion chain,
+    /// both with their rows.
     pub(crate) fn finish_type_test(
         self,
         ops: &dyn TypeOps,
         lists: &mut Lists,
         var: u32,
-        tested: Option<Ty>,
-        promoted: Option<Ty>,
+        tested: Option<(Ty, u32)>,
+        promoted: Option<(Ty, u32)>,
     ) -> Self {
         let model = self.model(var);
         let mut new_tested = model.tested;
-        if let Some(tested) = tested
+        if let Some((tested, args)) = tested
             && !lists.iter(model.tested).any(|t| t == tested)
         {
-            new_tested = append_tested(lists, model.tested, tested);
+            new_tested = append_tested(lists, model.tested, tested, args);
         }
         let mut new_promoted = model.promoted;
-        if let Some(promoted) = promoted {
-            new_promoted = add_promoted(ops, lists, model.promoted, promoted);
+        if let Some((promoted, args)) = promoted {
+            new_promoted = add_promoted(ops, lists, model.promoted, promoted, args);
         }
         self.with_model(
             var,
@@ -498,11 +529,11 @@ impl State {
                 continue;
             }
             let mut merged = a.tested;
-            let additions: Vec<Ty> = lists.iter(b.tested).collect();
-            for ty in additions {
+            let additions: Vec<(Ty, u32)> = lists.iter_entries(b.tested).collect();
+            for (ty, args) in additions {
                 let present = lists.iter(merged).any(|t| t == ty);
                 if !present {
-                    merged = append_tested(lists, merged, ty);
+                    merged = append_tested(lists, merged, ty, args);
                 }
             }
             this = this.with_model(
@@ -558,20 +589,20 @@ fn join_promoted(a: u32, b: u32, lists: &mut Lists) -> u32 {
     if a == b {
         return a;
     }
-    let mut kept: Vec<Ty> = Vec::new();
+    let mut kept: Vec<(Ty, u32)> = Vec::new();
     let mut total = 0usize;
-    for ty in lists.iter(a) {
+    for entry in lists.iter_entries(a) {
         total += 1;
-        if lists.iter(b).any(|other| other == ty) {
-            kept.push(ty);
+        if lists.iter(b).any(|other| other == entry.0) {
+            kept.push(entry);
         }
     }
     if kept.len() == total {
         return a;
     }
     let mut rebuilt = NIL;
-    for ty in kept.into_iter().rev() {
-        rebuilt = lists.cons(ty, rebuilt);
+    for (ty, args) in kept.into_iter().rev() {
+        rebuilt = lists.cons(ty, args, rebuilt);
     }
     rebuilt
 }
@@ -580,31 +611,31 @@ fn union_tested(a: u32, b: u32, lists: &mut Lists) -> u32 {
     if a == b {
         return a;
     }
-    let additions: Vec<Ty> = lists.iter(b).collect();
+    let additions: Vec<(Ty, u32)> = lists.iter_entries(b).collect();
     let mut merged = a;
-    for ty in additions {
+    for (ty, args) in additions {
         let present = lists.iter(merged).any(|t| t == ty);
         if !present {
-            merged = append_tested(lists, merged, ty);
+            merged = append_tested(lists, merged, ty, args);
         }
     }
     merged
 }
 
-fn append_tested(lists: &mut Lists, chain: u32, ty: Ty) -> u32 {
+fn append_tested(lists: &mut Lists, chain: u32, ty: Ty, args: u32) -> u32 {
     // Append at the end to keep the official order (order is cosmetic; the
     // membership is what drives types-of-interest). Rebuild by consing onto
     // a reversed copy.
-    let mut items: Vec<Ty> = lists.iter(chain).collect();
-    items.push(ty);
+    let mut items: Vec<(Ty, u32)> = lists.iter_entries(chain).collect();
+    items.push((ty, args));
     let mut rebuilt = NIL;
-    for ty in items.into_iter().rev() {
-        rebuilt = lists.cons(ty, rebuilt);
+    for (ty, args) in items.into_iter().rev() {
+        rebuilt = lists.cons(ty, args, rebuilt);
     }
     rebuilt
 }
 
-fn add_promoted(ops: &dyn TypeOps, lists: &mut Lists, chain: u32, ty: Ty) -> u32 {
+fn add_promoted(ops: &dyn TypeOps, lists: &mut Lists, chain: u32, ty: Ty, args: u32) -> u32 {
     // The official invariant: each promoted type is a strict subtype of the
     // previous; a repeated or mutual promotion is rejected by
     // `isValidPromotionStep` before this call.
@@ -615,7 +646,7 @@ fn add_promoted(ops: &dyn TypeOps, lists: &mut Lists, chain: u32, ty: Ty) -> u32
         // New type is a supertype of the current head — not a refinement.
         return chain;
     }
-    lists.cons(ty, chain)
+    lists.cons(ty, args, chain)
 }
 
 fn promoted_is(lists: &Lists, chain: u32, ty: Ty) -> bool {
@@ -624,34 +655,33 @@ fn promoted_is(lists: &Lists, chain: u32, ty: Ty) -> bool {
 
 fn consider(
     ops: &dyn TypeOps,
-    lists: &Lists,
     written: Ty,
     current: Ty,
     candidate: Ty,
-    out: &mut Vec<Ty>,
+    args: u32,
+    out: &mut Vec<(Ty, u32)>,
 ) {
     if ops.is_subtype(written, candidate)
         && ops.is_subtype(candidate, current)
         && candidate != current
         && !ops.is_subtype(current, candidate)
-        && !out.contains(&candidate)
+        && !out.iter().any(|&(existing, _)| existing == candidate)
     {
-        let _ = lists;
-        out.push(candidate);
+        out.push((candidate, args));
     }
 }
 
-fn unique_subtype(ops: &dyn TypeOps, candidates: &[Ty]) -> Option<Ty> {
-    let mut found: Option<Ty> = None;
-    for &candidate in candidates {
+fn unique_subtype(ops: &dyn TypeOps, candidates: &[(Ty, u32)]) -> Option<(Ty, u32)> {
+    let mut found: Option<(Ty, u32)> = None;
+    for &(candidate, args) in candidates {
         if candidates
             .iter()
-            .all(|&other| other == candidate || ops.is_subtype(candidate, other))
+            .all(|&(other, _)| other == candidate || ops.is_subtype(candidate, other))
         {
             if found.is_some() {
                 return None; // not unique
             }
-            found = Some(candidate);
+            found = Some((candidate, args));
         }
     }
     found
