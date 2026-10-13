@@ -114,7 +114,12 @@ class PluginRegistryImpl implements PluginRegistry {
   static List<RuleCodeInfo> codesOf(AbstractAnalysisRule rule) => [
     for (final code in rule.diagnosticCodes)
       RuleCodeInfo(
-        name: code.lowerCaseName,
+        // `name.toLowerCase()` instead of `lowerCaseName`: the sample
+        // overlays compile this file against _fe_analyzer_shared 91.0.0,
+        // which predates that getter; its definition (93+) is exactly
+        // `_name.toLowerCase()`, so the emitted identity is unchanged.
+        // ignore: deprecated_member_use
+        name: code.name.toLowerCase(),
         severity: switch (code.severity.name) {
           'ERROR' => 'error',
           'INFO' => 'info',

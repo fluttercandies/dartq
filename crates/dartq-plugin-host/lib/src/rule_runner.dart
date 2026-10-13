@@ -144,7 +144,12 @@ PluginDiagnostic _toWire(
   PluginCycleConfig config,
   String wirePath,
 ) {
-  final code = diagnostic.diagnosticCode.lowerCaseName;
+  // `name.toLowerCase()` instead of `lowerCaseName`: the sample overlays
+  // compile this file against _fe_analyzer_shared 91.0.0, which predates
+  // that getter; its definition (93+) is exactly `_name.toLowerCase()`, so
+  // the emitted identity is unchanged.
+  // ignore: deprecated_member_use
+  final code = diagnostic.diagnosticCode.name.toLowerCase();
   return PluginDiagnostic(
     file: wirePath,
     severity:
