@@ -11,5 +11,8 @@ environment:
 dependencies:
   # The rule face (`registerLintRule`/`registerWarningRule`) is typed against
   # the analyzer's `AbstractAnalysisRule` — the same dependency the official
-  # package carries. Parse-only usage: the shim never resolves.
-  analyzer: ^13.0.0
+  # package carries. Parse-only usage: the shim never resolves. The range
+  # mirrors the host's (see the host pubspec): the sample overlays compile
+  # both against analyzer 8.4 / 12.1 / 13.x, and the shim touches only the
+  # `AbstractAnalysisRule` + `DiagnosticCode` names shared by all three.
+  analyzer: ">=8.4.0 <14.0.0"

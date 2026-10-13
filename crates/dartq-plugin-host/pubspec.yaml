@@ -7,10 +7,12 @@ dependencies:
   # stack (T5: `registerLintRule` execution — official rules are typed
   # against analyzer ASTs, so the zero-dependency property ends here, the
   # official package carries the same dependency). Parse-only: no resolver.
-  # Resolved from the existing lock (analyzer 14.5.0, all packages in the
-  # offline pub cache); the first `dart pub get --offline` refreshes the
-  # lock's dependency-kind annotation.
-  analyzer: ^13.0.0
+  # The range spans the analyzer majors the sample overlays resolve to:
+  # 8.4 (custom_lint_builder 0.8.x-based plugins such as signals_lint pin
+  # `^8.0.0` with no newer release), 12.1 (jaspr_lints pins `^12.1.0`), and
+  # 13.x (pyramid_lint / riverpod_lint and this package's own lock). The
+  # runner uses only the stable parse/rule API shared by all three lines.
+  analyzer: ">=8.4.0 <14.0.0"
 dev_dependencies:
   test: ^1.25.0
 dependency_overrides:
