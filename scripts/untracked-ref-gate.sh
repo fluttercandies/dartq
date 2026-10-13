@@ -26,7 +26,6 @@ PENDING_PATHS=(
   crates/dartq-semantic
   crates/dartq-parser
   crates/dartq-lints
-  crates/dartq-daemon
 )
 
 excludes=(':(exclude).gitignore' ':(exclude)scripts/untracked-ref-gate.sh' ':(exclude)Cargo.lock')
