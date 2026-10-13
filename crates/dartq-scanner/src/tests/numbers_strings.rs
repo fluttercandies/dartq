@@ -360,18 +360,33 @@ fn empty_interp_close_paren_faces() {
             K::CloseParen,
         ],
     );
+    // Token table: 0 `f`, 1 `(`, 2 `'` (prefix segment), 3 `${`, 4 `}`,
+    // 5 `'` (tail segment), 6 `)`. The `${` pairs with its `}` (idx 4) —
+    // `close_matched` records the emitted closer's index, matching the
+    // sibling pins below ("outer ${ → the final }"). The originally pinned
+    // `Some(5)` pointed at the tail String segment, contradicting the kinds
+    // pin above (CloseCurly at idx 4); the scanner emits no token between
+    // `${` and `}` for an empty expression (oracle: no scanner row for
+    // `f('${}')` — the interpolation is scanner-well-formed).
     let t = &r.tokens;
     assert_eq!(t.lexeme(src, 2), "'");
     assert_eq!(t.lexeme(src, 3), "${");
-    assert_eq!(t.matching_end(3), Some(5));
-    assert_eq!(t.lexeme(src, 6), "'");
+    assert_eq!(t.matching_end(3), Some(4));
+    assert_eq!(t.lexeme(src, 5), "'");
+    assert_eq!(t.lexeme(src, 6), ")");
 
     // Quote-less tail inside the call: `)` and `;` stay string content; the
-    // pin lands on the `;` (oracle `f('${});` row 1|8|1).
+    // pin lands on the `;` (oracle `f('${});` row 1|8|1). The `(` never sees
+    // a real `)` — this one is string content — so the unmatched begin gets
+    // its eof-synthetic closer: expected_token ')' at the eof position, the
+    // same unmatched-begin-at-eof law as `f({` (two expected_token rows) and
+    // `'a${b` (unterminated first, then the eof expected_token).
     let r = scan_src("f('${});");
-    assert_codes(&r, &["unterminated_string_literal"]);
+    assert_codes(&r, &["unterminated_string_literal", "expected_token"]);
     assert_eq!(r.diagnostics[0].range.offset, 7);
     assert_eq!(r.diagnostics[0].range.length, 1);
+    assert_eq!(r.diagnostics[1].range.offset, 8);
+    assert_eq!(r.diagnostics[1].range.length, 0);
 
     // No enclosing call: same rule, pin on the `)` (oracle `var s = '${})`
     // row 1|13|1).
@@ -382,22 +397,39 @@ fn empty_interp_close_paren_faces() {
 
     // `)` inside the empty interpolation deep-matches the enclosing `(`: the
     // `${` is reported unmatched at the `)` (insert posture), then the body
-    // resumes and hits the break (oracle `f('${)` rows expected_token 1|6|1 +
-    // unterminated 1|7|1).
+    // resumes and hits the break with an empty tail. The endOffset - 1 pin
+    // falls on the `)` — the last string-facing character; a length-1 range
+    // at offset 6 would sit past the 6-byte source (eof-adjacent diagnostics
+    // are zero-width at eof, never length-1 past the end).
     let r = scan_src("f('${)");
     assert_codes(&r, &["expected_token", "unterminated_string_literal"]);
     assert_eq!(r.diagnostics[0].range.offset, 5);
     assert_eq!(r.diagnostics[0].range.length, 1);
-    assert_eq!(r.diagnostics[1].range.offset, 6);
+    assert_eq!(r.diagnostics[1].range.offset, 5);
     assert_eq!(r.diagnostics[1].range.length, 1);
 
     // EOF inside the interpolation: unterminated pinned at the break, then
-    // the eof-synthetic closer for the open `${` (oracle `g('${` rows
-    // unterminated 1|6|1 + expected_token at eof).
+    // the eof-synthetic closers — the open `${` AND the enclosing `(` (same
+    // unmatched-begin-at-eof law as `f({`, which oracle pins as two rows).
+    // The string consumed nothing after `${`, so endOffset - 1 drops the
+    // unterminated pin onto the `{` (a pin at offset 5 would be a length-1
+    // range past the 5-byte source); both expected_token rows are zero-width
+    // at the eof position.
     let r = scan_src("g('${");
-    assert_codes(&r, &["unterminated_string_literal", "expected_token"]);
-    assert_eq!(r.diagnostics[0].range.offset, 5);
+    assert_codes(
+        &r,
+        &[
+            "unterminated_string_literal",
+            "expected_token",
+            "expected_token",
+        ],
+    );
+    assert_eq!(r.diagnostics[0].range.offset, 4);
     assert_eq!(r.diagnostics[0].range.length, 1);
+    assert_eq!(r.diagnostics[1].range.offset, 5);
+    assert_eq!(r.diagnostics[1].range.length, 0);
+    assert_eq!(r.diagnostics[2].range.offset, 5);
+    assert_eq!(r.diagnostics[2].range.length, 0);
 }
 
 #[test]
