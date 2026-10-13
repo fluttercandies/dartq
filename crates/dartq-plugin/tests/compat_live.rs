@@ -17,14 +17,14 @@
 //!
 //! Four more rows drive the real ecosystem plugin overlays
 //! (`samples/{signals,jaspr,riverpod,pyramid}` — thin packages that run the
-//! actual upstream plugin objects from the pinned `.third/aswp-samples`
+//! actual upstream plugin objects from the pinned `aswp-samples` source
 //! clones over the host loop): the #644 compat matrix. Each row asserts the
 //! registration census (the observable proof the upstream `register` ran),
 //! the negotiated capabilities, and the fixes face where the row exercises
 //! it. The clones are maintainer-provisioned and not part of git, and the
-//! overlays' `.third` path deps additionally require `dart pub get` to have
-//! resolved them, so a row whose overlay directory is absent or unresolved
-//! skips at runtime with a clear message.
+//! overlays' path deps on those clones additionally require `dart pub get`
+//! to have resolved them, so a row whose overlay directory is absent or
+//! unresolved skips at runtime with a clear message.
 //!
 //! Distinct from `live_host.rs` (the `bin/live_plugin` fixture): this drives
 //! on-disk samples with their real `dartq_plugin.json` manifests. All tests
@@ -641,7 +641,7 @@ struct FixesFace {
 }
 
 /// One overlay's expectations, pinning its #644 matrix row to the pinned
-/// `.third` clone revision. If a pin moves, re-count the upstream
+/// `aswp-samples` clone revision. If a pin moves, re-count the upstream
 /// `register(PluginRegistry)` calls (or `getLintRules`/`getAssists` for the
 /// custom_lint-shaped signals) and update the census/counts here — a census
 /// mismatch is the drift detector.
@@ -736,17 +736,17 @@ fn overlay_dir(name: &str) -> PathBuf {
         .join(name)
 }
 
-/// Early-skips an overlay row when it cannot run: the `.third` ecosystem
-/// clones are maintainer-provisioned (absent on fresh clones), `dart pub get`
-/// must have resolved the overlay's `.third` path deps (proof: a generated
-/// `package_config.json`), or no `dart` is on PATH. Returns the overlay
-/// directory when ready.
+/// Early-skips an overlay row when it cannot run: the `aswp-samples`
+/// ecosystem clones are maintainer-provisioned (absent on fresh clones),
+/// `dart pub get` must have resolved the overlay's path deps on those
+/// clones (proof: a generated `package_config.json`), or no `dart` is on
+/// PATH. Returns the overlay directory when ready.
 fn overlay_ready(name: &str) -> Option<PathBuf> {
     let dir = overlay_dir(name);
     if !dir.join("dartq_plugin.json").exists() {
         eprintln!(
-            "skipping: {} is absent; the ecosystem sample clones under .third/ \
-             are maintainer-provisioned and not part of git",
+            "skipping: {} is absent; the pinned `aswp-samples` ecosystem \
+             clones are maintainer-provisioned and not part of git",
             dir.display()
         );
         return None;
@@ -754,7 +754,8 @@ fn overlay_ready(name: &str) -> Option<PathBuf> {
     if !dir.join(".dart_tool/package_config.json").exists() {
         eprintln!(
             "skipping: {} is unresolved; run `dart pub get` in it first (its \
-             .third path deps are maintainer-provisioned and not part of git)",
+             path deps on the pinned `aswp-samples` clones are \
+             maintainer-provisioned and not part of git)",
             dir.display()
         );
         return None;

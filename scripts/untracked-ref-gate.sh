@@ -22,7 +22,6 @@ cd "$(dirname "$0")/.."
 PATTERN='[.]third|(^|[^[:alnum:]_./])[d]ocs/|AGENTS[.]md|PRD[.]md|GOALS[.]md|REF[.]md|[.]goal/|/Users/[a-z]'
 
 PENDING_PATHS=(
-  crates/dartq-plugin
   crates/dartq-plugin-host
   crates/dartq-semantic
   crates/dartq-parser

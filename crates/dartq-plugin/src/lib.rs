@@ -119,7 +119,8 @@
 //! # Relationship to `analysis_server_plugin`
 //!
 //! The lifecycle mirrors the official plugin system's observable contract
-//! (`.third/dart-sdk/pkg/analysis_server_plugin/lib/src/plugin_server.dart`):
+//! (upstream Dart SDK source,
+//! `pkg/analysis_server_plugin/lib/src/plugin_server.dart`):
 //! version check first, then registration/work, then shutdown, with fixes
 //! requested per location. The method names are dartq's own (the official
 //! wire protocol is pre-1.0 and dartq adapts at this layer, PRD §14.1).
