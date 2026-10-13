@@ -1,0 +1,173 @@
+# Full stable-band multi-SDK differential matrix (the §19.1 matrix face).
+#
+# One job per released Dart 3.x minor line (numerically newest patch per
+# minor, resolved live from the dart-archive bucket by
+# scripts/sdk-matrix-versions.sh). Each job runs the same gate caliber as
+# the sdk-matrix differential engine once against that SDK as the oracle
+# (`harness run` over m0 + m0-syntax, ERROR severity, threshold 1.0), so the
+# nightly result is a per-version Jaccard verdict across the whole stable
+# band, with per-version report artifacts and an aggregate Step Summary
+# table.
+#
+# Corpus resolution note: the gate corpora are pinned `sdk: ^3.13.0` by
+# design (the version-skew ledger: a lower languageVersion pin re-enables
+# the experiment_not_enabled noise class), so older SDKs cannot pub-get
+# them. Each job installs two SDKs: a fixed resolver (3.13.1, the gate
+# oracle of record) resolves the corpora once, and the matrix SDK is the
+# analyze oracle handed to sdk-matrix.sh via --dart-override — its
+# single-SDK pass channel, which needs no fvm layout.
+#
+# A red version job is the differential gate's contract (Jaccard below 1.0
+# = FAIL); the report artifacts + the version-skew classification inside
+# sdk-matrix.sh's summary attribute one-sided entries (removedIn codes and
+# the language-version family are expected skew on old oracles).
+name: sdk-stable-matrix
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *" # daily, offset from the dev matrix and bench runs
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.versions.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: versions
+        name: Resolve the stable band from the dart-archive listing
+        run: |
+          versions="$(bash scripts/sdk-matrix-versions.sh --stable \
+            | cut -d'|' -f1 | jq -R '.' | jq -sc '.')"
+          echo "stable band: $versions"
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+
+  gate:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.resolve.outputs.versions) }}
+    env:
+      VERSION: ${{ matrix.version }}
+      HARNESS: ./target/release/harness
+      DARTQ_CMD: ./target/release/dartq check --format=machine
+      GATE_OUT: target/evidence/sdk-matrix/override
+    steps:
+      - uses: actions/checkout@v4
+      - name: Strip host-discipline cargo config (sccache wrapper + jobs=2)
+        run: sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the corpus resolver SDK (3.13.1, the gate oracle of record)
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 3.13.1
+      - name: Record the resolver dart path
+        run: echo "RESOLVER_DART=$(command -v dart)" >> "$GITHUB_ENV"
+      - name: Install the matrix SDK
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ matrix.version }}
+      - name: Record the oracle dart path
+        run: echo "ORACLE_DART=$(command -v dart)" >> "$GITHUB_ENV"
+      - name: Pub-get the gate corpora (resolver SDK)
+        run: |
+          for corpus in m0 m0-syntax; do
+            (cd "tests/corpus/$corpus" && "$RESOLVER_DART" pub get)
+          done
+      - name: Build dartq and harness (release)
+        run: |
+          cargo build -p dartq-cli --release
+          cargo build -p harness --release
+      - id: gate
+        name: Differential gate (oracle dart ${{ matrix.version }})
+        run: bash scripts/sdk-matrix.sh --dart-override "$ORACLE_DART"
+      - name: Extract per-version metrics
+        if: always()
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p "$GATE_OUT"
+          report="$GATE_OUT/report.json"
+          if [ -f "$report" ]; then
+            jq -n --slurpfile r "$report" --arg v "$VERSION" '
+              $r[0] as $r |
+              {version: $v,
+               oracle: ($r.meta.oracle_version
+                        | capture("^Dart SDK version: (?<v>[^ ]+)") | .v),
+               jaccard: $r.error_jaccard,
+               verdict: (if $r.passed == true then "PASS"
+                         elif $r.passed == false then "FAIL"
+                         else "SKIPPED" end),
+               oracle_total: $r.oracle_total,
+               dartq_total: $r.dartq_total}' > "$GATE_OUT/metrics.json"
+          else
+            jq -n --arg v "$VERSION" \
+              '{version: $v, oracle: null, jaccard: null, verdict: "ERROR",
+                oracle_total: null, dartq_total: null}' > "$GATE_OUT/metrics.json"
+          fi
+          cat "$GATE_OUT/metrics.json"
+      - name: Upload the per-version report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-matrix-${{ matrix.version }}
+          path: target/evidence/sdk-matrix/override/
+          if-no-files-found: warn
+
+  summary:
+    needs: gate
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sdk-matrix-*
+          path: artifacts
+      - name: Aggregate the matrix summary
+        run: |
+          python3 - >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import glob, json
+
+          rows = []
+          for path in sorted(glob.glob("artifacts/*/metrics.json")):
+              with open(path) as f:
+                  rows.append(json.load(f))
+
+          def version_key(row):
+              parts = row.get("version", "").split(".")
+              return tuple(int(p) if p.isdigit() else 0 for p in parts[:3])
+
+          rows.sort(key=version_key)
+          lines = [
+              "## SDK stable matrix (differential gate, threshold 1.0)",
+              "",
+              "| dart SDK | oracle | jaccard | verdict | oracle entries | dartq entries |",
+              "| --- | --- | --- | --- | --- | --- |",
+          ]
+          bad = 0
+          for r in rows:
+              verdict = r.get("verdict", "ERROR")
+              if verdict != "PASS":
+                  bad += 1
+              jac = r.get("jaccard")
+              jac = "%.3f" % jac if isinstance(jac, (int, float)) else "-"
+
+              def col(value):
+                  return "-" if value is None else str(value)
+
+              lines.append(
+                  "| %s | %s | %s | %s | %s | %s |"
+                  % (r.get("version", "?"), r.get("oracle") or "-", jac,
+                     verdict, col(r.get("oracle_total")), col(r.get("dartq_total")))
+              )
+          lines.append("")
+          lines.append("%d version(s), %d below the gate or errored." % (len(rows), bad))
+          print("\n".join(lines))
+          EOF

@@ -49,7 +49,9 @@
 #
 # Environment overrides: FVM_HOME (default ~/fvm), DARTQ_CMD (the dartq side
 # of the harness; default the prebuilt debug binary used by gate-caliber-r5),
-# VENDORED_DART (see above).
+# HARNESS (default ./target/debug/harness; the release profiles built by the
+# CI matrix workflows override it to ./target/release/harness), VENDORED_DART
+# (see above).
 #
 # Exit codes: 0 every executed gate PASSes and every matrix entry resolved
 # (or --allow-skip accepted the SKIPs); 1 at least one gate FAILed below the
@@ -78,7 +80,7 @@ CORPORA=(tests/corpus/m0 tests/corpus/m0-syntax)
 CODES_FILE="crates/dartq-diagnostics/data/syntax-codes.tsv"
 THRESHOLD="1.0"
 OUT_ROOT="target/evidence/sdk-matrix"
-HARNESS="./target/debug/harness"
+HARNESS="${HARNESS:-./target/debug/harness}"
 DEFAULT_DARTQ_CMD="./target/debug/dartq check --format=machine"
 DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
 

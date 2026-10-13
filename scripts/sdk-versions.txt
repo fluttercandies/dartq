@@ -1,0 +1,35 @@
+# sdk-versions.txt — pinned Dart SDK version snapshot for the multi-SDK
+# differential matrix.
+#
+# Format: one `<version>|<channel>` line per SDK, `#` comment lines allowed.
+# The dev segment is the pinned band consumed by
+# `scripts/sdk-matrix-versions.sh --dev` (and the sdk-dev-matrix workflow,
+# which hardcodes the same pins in its matrix); the stable segment is the
+# human-readable record of what the live GCS resolution is expected to
+# return today — the authoritative stable set is always resolved live from
+# the dart-archive bucket by sdk-matrix-versions.sh.
+#
+# Refresh discipline:
+# - stable: refresh whenever Dart ships a new minor or patch — run
+#   `scripts/sdk-matrix-versions.sh --stable` and paste its output over the
+#   stable segment (one line per released 3.x minor, newest patch per minor).
+# - dev: a pin advances only when that build has gone green here or via an
+#   explicit deliberate bump. Never auto-track the dev tip: dev builds are
+#   yanked on regression (3.14.0-315.0.dev and the whole 3.15 line were
+#   yanked by 2026-10-13, so the pins below are the newest builds that
+#   actually install from the archive).
+3.0.7|stable
+3.1.5|stable
+3.2.6|stable
+3.3.4|stable
+3.4.4|stable
+3.5.4|stable
+3.6.2|stable
+3.7.3|stable
+3.8.3|stable
+3.9.4|stable
+3.10.9|stable
+3.11.6|stable
+3.12.2|stable
+3.13.5|stable
+3.14.0-296.0.dev|dev
