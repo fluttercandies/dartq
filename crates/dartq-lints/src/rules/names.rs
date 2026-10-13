@@ -12,6 +12,13 @@ use crate::rules::{
     is_upper_camel_case,
 };
 
+/// The domain's incoming registrations: a new standalone rule appends its
+/// `SPEC` reference here (name order) and joins the registry through the
+/// aggregated tail — adding a rule touches only this file. Batch close
+/// promotes the block into the registry's frozen skeleton together with
+/// the pin-test wave list (`tests/registry_pin.rs`).
+pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
+
 /// UTF-16 offset of a token's start.
 fn utf16_start_of(c: &Check<'_>, token: u32) -> u32 {
     c.unit

@@ -15,6 +15,13 @@ use dartq_ast::NodeKind;
 use crate::engine::Check;
 use crate::registry::{Group, RuleSpec};
 
+/// The domain's incoming registrations: a new standalone rule appends its
+/// `SPEC` reference here (name order) and joins the registry through the
+/// aggregated tail — adding a rule touches only this file. Batch close
+/// promotes the block into the registry's frozen skeleton together with
+/// the pin-test wave list (`tests/registry_pin.rs`).
+pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
+
 /// The node behind a directive prelude wrapper —
 /// `begin_uncategorized_top_level_declaration` opens `TopLevelDeclaration`
 /// around every directive and the five class-family preludes (collapse map

@@ -21,6 +21,13 @@ use dartq_scanner::TokenKind;
 use crate::engine::Check;
 use crate::registry::{Group, RuleSpec};
 
+/// The domain's incoming registrations: a new standalone rule appends its
+/// `SPEC` reference here (name order) and joins the registry through the
+/// aggregated tail — adding a rule touches only this file. Batch close
+/// promotes the block into the registry's frozen skeleton together with
+/// the pin-test wave list (`tests/registry_pin.rs`).
+pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
+
 pub(crate) mod unnecessary_brace_in_string_interps {
     use super::{Check, Group, NodeKind, RuleSpec, TokenKind};
 

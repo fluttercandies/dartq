@@ -10,6 +10,8 @@
 //! follow the SDK's `RemovedAnalysisRule` registrations (the rules.json
 //! `removed` state).
 
+use std::sync::LazyLock;
+
 use dartq_ast::NodeKind;
 
 use crate::engine::Check;
@@ -44,7 +46,7 @@ pub enum Group {
     Standalone,
 }
 
-/// Index into [`RULES`]. Stable within one build of this crate; the machine
+/// Index into [`rules()`]. Stable within one build of this crate; the machine
 /// name is the cross-process identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RuleId(pub u16);
@@ -92,17 +94,23 @@ impl core::fmt::Debug for RuleSpec {
     }
 }
 
-/// All rules through the #586 standard-set completion (the full
-/// `package:lints` union: 34 core + 55 recommended-only), the #570
-/// diagnostic mirror, the #986 removed-registry no-ops (the 14
-/// `RemovedAnalysisRule` registrations), the #987 W2 standalone wave (the
-/// first 11 options-driven SDK rules), and the #992 W3 declaration-shape
-/// wave (11 more). Order is registry order ([`RuleId`] assignment),
-/// grouped core-first then alphabetically within each group, the mirror
-/// section, then the wave sections in wave order (the removed block
-/// first; each new wave appends its section) — keep the pin test in
+/// The frozen registry skeleton: all rules through the #586 standard-set
+/// completion (the full `package:lints` union: 34 core + 55
+/// recommended-only), the #570 diagnostic mirror, the #986 removed-registry
+/// no-ops (the 14 `RemovedAnalysisRule` registrations), the #987 W2
+/// standalone wave (the first 11 options-driven SDK rules), and the #992 W3
+/// declaration-shape wave (11 more). Order is registry order ([`RuleId`]
+/// assignment), grouped core-first then alphabetically within each group,
+/// the mirror section, then the wave sections in wave order (the removed
+/// block first; each new wave appends its section) — keep the pin test in
 /// `tests/registry_pin.rs` in sync.
-pub static RULES: &[&RuleSpec] = &[
+///
+/// This array is write-frozen: a new registration never edits it. Rules
+/// land in the per-domain `INCOMING_RULES` slices under [`crate::rules`],
+/// aggregated in [`RULES`] below; a batch close promotes the closed block
+/// into this skeleton in the same edit that pins its wave list in the pin
+/// test.
+static BASE_RULES: &[&RuleSpec] = &[
     // —— core (`.third/lints/lib/core.yaml`) ——
     &crate::rules::empty::avoid_empty_else::SPEC,
     &crate::rules::directives::avoid_relative_lib_imports::SPEC,
@@ -242,6 +250,49 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::expressions::no_literal_bool_comparisons::SPEC,
 ];
 
+/// The registry storage: [`BASE_RULES`] followed by the domain-owned
+/// incoming slices, name-merged into the open batch's order. The aggregation
+/// is what keeps a registration a one-file edit — the slices live in the
+/// rule files, this wiring is batch-invariant, and a closed batch is
+/// promoted into the skeleton (see [`BASE_RULES`]).
+pub static RULES: LazyLock<Vec<&'static RuleSpec>> = LazyLock::new(|| {
+    // The domain seams (`rules/*.rs`); a new domain file joins here once.
+    const INCOMING: &[&[&RuleSpec]] = &[
+        &crate::rules::collections::INCOMING_RULES,
+        &crate::rules::declarations::INCOMING_RULES,
+        &crate::rules::directives::INCOMING_RULES,
+        &crate::rules::docs::INCOMING_RULES,
+        &crate::rules::empty::INCOMING_RULES,
+        &crate::rules::expressions::INCOMING_RULES,
+        &crate::rules::flow::INCOMING_RULES,
+        &crate::rules::names::INCOMING_RULES,
+        &crate::rules::pubspec::INCOMING_RULES,
+        &crate::rules::regexp::INCOMING_RULES,
+        &crate::rules::slice::INCOMING_RULES,
+        &crate::rules::strings::INCOMING_RULES,
+        &crate::rules::types::INCOMING_RULES,
+    ];
+    let tail_len: usize = INCOMING.iter().map(|slice| slice.len()).sum();
+    let mut rules = Vec::with_capacity(BASE_RULES.len() + tail_len);
+    rules.extend_from_slice(BASE_RULES);
+    let base = rules.len();
+    for slice in INCOMING {
+        rules.extend_from_slice(slice);
+    }
+    // The open batch: name order across the domain slices (the wave-order
+    // contract the pin test judges).
+    rules[base..].sort_unstable_by_key(|spec| spec.name);
+    rules
+});
+
+/// All registered rules in registry order — the registry's read face
+/// ([`RuleId`] indexes this slice; the machine name is the cross-process
+/// identity). New code reads through this; [`RULES`] is the storage.
+#[must_use]
+pub fn rules() -> &'static [&'static RuleSpec] {
+    &RULES
+}
+
 /// The rule with machine name `name`, case-insensitively (linear scan; a
 /// one-per-run lookup, not a hot path). The official registry lowercases
 /// every name (`pkg/analyzer/lib/src/lint/registry.dart:42,53,133`), so any
@@ -255,7 +306,7 @@ pub static RULES: &[&RuleSpec] = &[
 )]
 #[must_use]
 pub fn rule_by_name(name: &str) -> Option<RuleId> {
-    RULES
+    rules()
         .iter()
         .position(|spec| spec.name.eq_ignore_ascii_case(name))
         .map(|i| RuleId(i as u16))
@@ -269,7 +320,7 @@ pub struct EnableSet {
     words: [u64; WORDS],
 }
 
-/// `RULES.len()` outgrew one 64-bit word at 68 rules (wave 3, #315) and
+/// `rules().len()` outgrew one 64-bit word at 68 rules (wave 3, #315) and
 /// two at 104 (the removed-registry wave, #986); five words carry the full
 /// SDK registry (269) plus the mirror. The word count is asserted in
 /// `tests/registry_pin.rs` so further growth is caught together with the
@@ -286,7 +337,7 @@ impl EnableSet {
             reason = "rule positions come from the static registry, bounded \
                       far below u16::MAX; u16 is the RuleId payload width"
         )]
-        for i in 0..RULES.len() {
+        for i in 0..rules().len() {
             set.set(RuleId(i as u16));
         }
         set

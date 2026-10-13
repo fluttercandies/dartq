@@ -8,7 +8,7 @@
 //!
 //! - [`Unit`] — the substrate facts a run reads: source, unified token
 //!   table, arena AST, line index. One [`run`] traversal dispatches enabled
-//!   rules per node kind (a static kind→rules table built from [`RULES`]),
+//!   rules per node kind (a static kind→rules table built from [`rules`]),
 //!   and applies suppression at the sink.
 //! - [`registry::RuleSpec`] — one static entry per rule: machine name,
 //!   `package:lints` group, official message templates, dispatch kinds, and
@@ -233,7 +233,7 @@ pub use bridge::{ParsedUnit, parse_unit};
 pub use comments::{Comment, CommentKind, Comments};
 pub use engine::{Check, Features, Lint, Unit, WorkspaceFacts, run};
 pub use ignore::{IgnoreInfo, UnignorableIgnore, unignorable_ignores};
-pub use registry::{EnableSet, Group, RULES, RuleId, RuleSpec, rule_by_name};
+pub use registry::{EnableSet, Group, RULES, RuleId, RuleSpec, rule_by_name, rules};
 // The pubspec-pass verdicts (#434): the mounting face (dartq-commands'
 // `analyze_lints`) walks the scanned pubspec facts through these — the
 // rules themselves stay crate-internal (`kinds: &[]`, no AST dispatch).

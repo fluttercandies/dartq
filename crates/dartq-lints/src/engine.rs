@@ -17,7 +17,7 @@ use rustc_hash::FxHashMap;
 
 use crate::comments::Comments;
 use crate::ignore::IgnoreInfo;
-use crate::registry::{EnableSet, RULES, RuleId, rule_by_name};
+use crate::registry::{EnableSet, RuleId, rule_by_name, rules};
 use crate::rules::SupertypeClause;
 use crate::rules::expressions::same_file::Decls;
 
@@ -143,7 +143,7 @@ pub struct WildcardScope {
     pub scope: core::ops::Range<usize>,
 }
 
-/// Kind -> rule dispatch. Built once from the static table; a node whose
+/// Kind -> rule dispatch. Built once from the registry; a node whose
 /// kind has no registered rules costs one empty-Vec test.
 #[expect(
     clippy::cast_possible_truncation,
@@ -152,7 +152,7 @@ pub struct WildcardScope {
 )]
 static DISPATCH: LazyLock<[Vec<u16>; NodeKind::KIND_COUNT as usize]> = LazyLock::new(|| {
     let mut table: [Vec<u16>; NodeKind::KIND_COUNT as usize] = std::array::from_fn(|_| Vec::new());
-    for (i, spec) in RULES.iter().enumerate() {
+    for (i, spec) in rules().iter().enumerate() {
         for kind in spec.kinds {
             table[*kind as usize].push(i as u16);
         }
@@ -482,7 +482,7 @@ fn dispatch(
             caches,
             out: &mut *out,
         };
-        (RULES[rule as usize].check)(&mut check);
+        (rules()[rule as usize].check)(&mut check);
     }
 }
 
@@ -642,7 +642,7 @@ impl<'a> Check<'a> {
     /// `{n}` slots with `args`. Suppressed hits are dropped here
     /// (`IgnoreInfo.ignored`, line of the hit's start).
     pub fn report(&mut self, range: core::ops::Range<u32>, args: &[&str]) {
-        let spec = RULES[self.rule.0 as usize];
+        let spec = rules()[self.rule.0 as usize];
         self.emit(range, spec.problem, spec.correction, args);
     }
 
@@ -666,7 +666,7 @@ impl<'a> Check<'a> {
         correction: &str,
         args: &[&str],
     ) {
-        let name = RULES[self.rule.0 as usize].name;
+        let name = rules()[self.rule.0 as usize].name;
         let (line, _) = self
             .unit
             .lines

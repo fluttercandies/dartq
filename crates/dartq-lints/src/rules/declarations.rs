@@ -11,6 +11,13 @@ use crate::engine::Check;
 use crate::registry::{Group, RuleSpec};
 use crate::rules::{NONE_TOKEN, body_members, first_child, member_name, slice, type_before};
 
+/// The domain's incoming registrations: a new standalone rule appends its
+/// `SPEC` reference here (name order) and joins the registry through the
+/// aggregated tail — adding a rule touches only this file. Batch close
+/// promotes the block into the registry's frozen skeleton together with
+/// the pin-test wave list (`tests/registry_pin.rs`).
+pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
+
 pub(crate) mod avoid_return_types_on_setters {
     use super::{Check, Group, NodeKind, RuleSpec};
 

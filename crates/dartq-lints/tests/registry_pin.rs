@@ -16,7 +16,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use dartq_lints::{EnableSet, Group, RULES, rule_by_name};
+use dartq_lints::{EnableSet, Group, rule_by_name, rules};
 
 /// `.third/lints/lib/core.yaml` — the critical set, pinned verbatim.
 const OFFICIAL_CORE: &[&str] = &[
@@ -189,8 +189,8 @@ fn official_standalone() -> Vec<&'static str> {
 
 #[test]
 fn rule_names_are_unique() {
-    let mut seen: Vec<&str> = Vec::with_capacity(RULES.len());
-    for spec in RULES {
+    let mut seen: Vec<&str> = Vec::with_capacity(rules().len());
+    for spec in rules() {
         assert!(
             seen.iter().all(|s| *s != spec.name),
             "duplicate rule name {}",
@@ -204,7 +204,7 @@ fn rule_names_are_unique() {
 /// carries the wrong `Group`) breaks the crate's contract.
 #[test]
 fn every_rule_is_in_its_official_set() {
-    for spec in RULES {
+    for spec in rules() {
         let official = match spec.group {
             Group::Core => OFFICIAL_CORE,
             Group::Recommended => OFFICIAL_RECOMMENDED,
@@ -233,7 +233,7 @@ fn every_rule_is_in_its_official_set() {
 /// was registered with the wrong group.
 #[test]
 fn recommended_rules_are_not_core_rules() {
-    for spec in RULES {
+    for spec in rules() {
         if spec.group == Group::Recommended {
             assert!(
                 !OFFICIAL_CORE.contains(&spec.name),
@@ -251,9 +251,9 @@ fn recommended_rules_are_not_core_rules() {
 #[test]
 fn registry_fits_the_enable_set_word_count() {
     assert!(
-        RULES.len() <= 320,
+        rules().len() <= 320,
         "registry holds {} rules; EnableSet has five 64-bit words",
-        RULES.len()
+        rules().len()
     );
 }
 
@@ -263,7 +263,7 @@ fn registry_fits_the_enable_set_word_count() {
 /// standalone wave, and the #992 W3 wave make 126.
 #[test]
 fn registry_holds_the_pinned_count() {
-    assert_eq!(RULES.len(), 126);
+    assert_eq!(rules().len(), 126);
 }
 
 /// The registry-order contract (parity-plan R8): one contiguous block per
@@ -275,7 +275,7 @@ fn registry_holds_the_pinned_count() {
 /// entry's identity pinned by `rule_by_name_round_trips`.
 #[test]
 fn registry_sections_hold_the_official_order() {
-    let ranks: Vec<u8> = RULES
+    let ranks: Vec<u8> = rules()
         .iter()
         .map(|spec| match spec.group {
             Group::Core => 0u8,
@@ -291,7 +291,7 @@ fn registry_sections_hold_the_official_order() {
     );
 
     let section = |group: Group| -> BTreeSet<&'static str> {
-        RULES
+        rules()
             .iter()
             .filter(|spec| spec.group == group)
             .map(|spec| spec.name)
@@ -308,7 +308,7 @@ fn registry_sections_hold_the_official_order() {
     );
 
     let ordered_section = |group: Group| -> Vec<&'static str> {
-        RULES
+        rules()
             .iter()
             .filter(|spec| spec.group == group)
             .map(|spec| spec.name)
@@ -335,14 +335,14 @@ fn camel_case_rule_names_pin_their_code_strings() {
         ),
     ] {
         let id = rule_by_name(name).unwrap_or_else(|| panic!("{name} must stay registered"));
-        assert_eq!(RULES[id.0 as usize].name, name);
+        assert_eq!(rules()[id.0 as usize].name, name);
         assert_eq!(name.to_uppercase(), machine);
     }
 }
 
 #[test]
 fn rule_by_name_round_trips() {
-    for (i, spec) in RULES.iter().enumerate() {
+    for (i, spec) in rules().iter().enumerate() {
         let id = rule_by_name(spec.name).expect("registered name");
         assert_eq!(id.0 as usize, i, "{} sits at a stale index", spec.name);
     }
@@ -369,10 +369,10 @@ fn rule_by_name_is_case_insensitive() {
 #[test]
 fn enable_set_all_and_resolve_agree() {
     let all = EnableSet::all();
-    for i in 0..RULES.len() {
+    for i in 0..rules().len() {
         assert!(all.is_enabled(dartq_lints::RuleId(i as u16)));
     }
-    let (resolved, unknown) = EnableSet::resolve(RULES.iter().map(|s| s.name));
+    let (resolved, unknown) = EnableSet::resolve(rules().iter().map(|s| s.name));
     assert!(unknown.is_empty());
     assert_eq!(resolved, all);
 }
@@ -384,7 +384,7 @@ fn enable_set_all_and_resolve_agree() {
 /// unfilled `{n}` slots fail.
 #[test]
 fn templates_are_well_formed() {
-    for spec in RULES {
+    for spec in rules() {
         assert!(
             !spec.problem.is_empty(),
             "{} has no problemMessage",
@@ -425,7 +425,7 @@ const STRUCTURALLY_SILENT: &[&str] = &[];
 /// non-removed specs that dispatch on the AST or run through the pubspec
 /// pass.
 fn emittable_set_rules() -> BTreeSet<&'static str> {
-    RULES
+    rules()
         .iter()
         .filter(|spec| !matches!(spec.group, Group::Diagnostic | Group::Removed))
         .filter(|spec| !spec.kinds.is_empty() || PUBSPEC_PASS_SEAM.contains(&spec.name))
@@ -472,7 +472,7 @@ fn lint_codes_freeze_matches_the_registry() {
             orphans.push(format!("{row}: not a registered rule"));
             continue;
         };
-        let spec = RULES[id.0 as usize];
+        let spec = rules()[id.0 as usize];
         if spec.group == Group::Diagnostic {
             orphans.push(format!("{row}: a diagnostic mirror, opt-in by name only"));
         } else if !emittable.contains(spec.name) {
@@ -497,7 +497,7 @@ fn lint_codes_freeze_matches_the_registry() {
          and reconcile the header prose"
     );
 
-    let actually_silent: BTreeSet<&'static str> = RULES
+    let actually_silent: BTreeSet<&'static str> = rules()
         .iter()
         .filter(|spec| !matches!(spec.group, Group::Diagnostic | Group::Removed))
         .filter(|spec| spec.kinds.is_empty() && !PUBSPEC_PASS_SEAM.contains(&spec.name))
@@ -515,7 +515,7 @@ fn lint_codes_freeze_matches_the_registry() {
         let Some(id) = rule_by_name(name) else {
             panic!("PUBSPEC_PASS_SEAM member {name} is not registered");
         };
-        let spec = RULES[id.0 as usize];
+        let spec = rules()[id.0 as usize];
         assert!(
             spec.group != Group::Diagnostic && spec.kinds.is_empty(),
             "PUBSPEC_PASS_SEAM member {name} no longer matches the pubspec seam shape"

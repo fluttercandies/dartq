@@ -15,6 +15,13 @@ use crate::engine::Check;
 use crate::registry::{Group, RuleSpec};
 use crate::rules::slice;
 
+/// The domain's incoming registrations: a new standalone rule appends its
+/// `SPEC` reference here (name order) and joins the registry through the
+/// aggregated tail — adding a rule touches only this file. Batch close
+/// promotes the block into the registry's frozen skeleton together with
+/// the pin-test wave list (`tests/registry_pin.rs`).
+pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
+
 /// The direct sibling immediately before `id` (the cascade target slot).
 fn sibling_before(c: &Check<'_>, id: u32) -> Option<u32> {
     // `id` is always on the current ancestor path (a cascade above the

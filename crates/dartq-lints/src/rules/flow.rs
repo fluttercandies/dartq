@@ -8,6 +8,13 @@ use crate::engine::Check;
 use crate::registry::{Group, RuleSpec};
 use crate::rules::{NONE_TOKEN, first_child, last_child};
 
+/// The domain's incoming registrations: a new standalone rule appends its
+/// `SPEC` reference here (name order) and joins the registry through the
+/// aggregated tail — adding a rule touches only this file. Batch close
+/// promotes the block into the registry's frozen skeleton together with
+/// the pin-test wave list (`tests/registry_pin.rs`).
+pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
+
 /// Official: `pkg/linter/lib/src/rules/curly_braces_in_flow_control_structures.dart:36-95`
 /// — control-flow bodies must be blocks, except a single-line `if` without
 /// `else` (`if (c) return;` on one line is allowed, :59-70). Message:
