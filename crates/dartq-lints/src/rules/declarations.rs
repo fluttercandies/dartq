@@ -3604,6 +3604,804 @@ pub(crate) mod avoid_multiple_declarations_per_line {
     }
 }
 
+pub(crate) mod avoid_private_typedef_functions {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_private_typedef_functions.dart`
+    /// — a private typedef used at most once reports at its name. Both
+    /// declaration forms count: the old `typedef int _Td();` (the official
+    /// `FunctionTypeAlias`) and the new `typedef _Td = int Function();`
+    /// (`GenericTypeAlias`) — the generic form skips generic parameters
+    /// (:61) and aliased named/record types (:62-63, `typedef _Td =
+    /// List<String>` is not a function typedef). The use count is the
+    /// official `_CountVisitor` over `context.allUnits` (:68-79) — the
+    /// same-file face counts `Type` rows headed by the name in this unit,
+    /// so a typedef used only in sibling part files over-reports (the
+    /// documented cross-file divergence family). Message:
+    /// `diagnostic.g.dart` `avoidPrivateTypedefFunctions`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_private_typedef_functions",
+        group: Group::Standalone,
+        problem: "The typedef is unnecessary because it is only used in one place.",
+        correction: "Try inlining the type or using it in other places.",
+        kinds: &[NodeKind::Typedef],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // New form: the generic-parameter and named/record-type faces skip
+        // (:61-63 — the official `type is NamedType` gate; `void` is a
+        // `NamedType` upstream, so `typedef _V = void;` skips too); the
+        // old form (`=` absent) always counts.
+        if c
+            .unit
+            .ast
+            .token_range(node)
+            .any(|token| c.lexeme(token) == "=")
+        {
+            let aliased = c.collect_direct(node).into_iter().find(|&kid| {
+                matches!(
+                    c.kind(kid),
+                    NodeKind::Type
+                        | NodeKind::FunctionType
+                        | NodeKind::RecordType
+                        | NodeKind::VoidType
+                )
+            });
+            if c.kind(aliased.unwrap_or(node)) != NodeKind::FunctionType {
+                return;
+            }
+            if c
+                .collect_direct(node)
+                .into_iter()
+                .any(|kid| c.kind(kid) == NodeKind::TypeVariables)
+            {
+                return;
+            }
+        }
+        // The name row: the first direct `Identifier` whose head token is
+        // not shared with a direct type-row sibling. The old form tiles
+        // `Identifier(ret-type)` + `Type(ret-type)` at the same token before
+        // the name; the new form's name identifier stands alone before `=`.
+        let type_heads: Vec<_> = c
+            .collect_direct(node)
+            .into_iter()
+            .filter(|&kid| {
+                matches!(
+                    c.kind(kid),
+                    NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType
+                )
+            })
+            .map(|kid| c.head_token(kid))
+            .collect();
+        let Some(name) = c
+            .collect_direct(node)
+            .into_iter()
+            .find(|&kid| {
+                c.kind(kid) == NodeKind::Identifier && !type_heads.contains(&c.head_token(kid))
+            })
+        else {
+            return;
+        };
+        let name_lexeme = c.lexeme(c.head_token(name));
+        if !name_lexeme.starts_with('_') {
+            return;
+        }
+        // The use count: every `Type` row in the unit headed by the name
+        // (the `_CountVisitor` `visitNamedType` face). Uses in the
+        // declaration itself are name rows, not type rows.
+        let uses = (0..c.unit.ast.len() as u32)
+            .filter(|&row| c.kind(row) == NodeKind::Type)
+            .filter(|&row| c.lexeme(c.head_token(row)) == name_lexeme)
+            .count();
+        if uses <= 1 {
+            c.report(crate::rules::utf16_token_span(c, c.head_token(name)), &[]);
+        }
+    }
+}
+
+pub(crate) mod avoid_returning_this {
+    use super::{Check, Group, NodeKind, RuleSpec, type_before};
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_returning_this.dart:68-106`
+    /// — a class/enum/mixin method (never an extension member :91, never an
+    /// operator :71, never `@override` :77) whose written return type names
+    /// the enclosing declaration (:81-85, the `InterfaceType` element
+    /// identity) and whose body hands back `this` for a fluent interface
+    /// reports. The block-body face collects `return this;` statements in
+    /// order (:38-66): the first bare `this` return reports at its `this`
+    /// (:98), any non-`this` return before it silences the method
+    /// (:58-62), and returns inside nested function expressions are
+    /// skipped (:49-51 — their blocks are sibling rows, not the method
+    /// body's block). The expression-body face reports at the method name
+    /// (:100-104). Message: `diagnostic.g.dart` `avoidReturningThis`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_returning_this",
+        group: Group::Standalone,
+        problem: "Don't return 'this' from a method.",
+        correction: "Try changing the return type to 'void' and removing the return.",
+        kinds: &[NodeKind::Method],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // Operators skip (:71) — the `OperatorName` row names them.
+        if c
+            .collect_direct(node)
+            .into_iter()
+            .any(|kid| c.kind(kid) == NodeKind::OperatorName)
+        {
+            return;
+        }
+        // The name row: the LAST direct `Identifier` (the production tiling
+        // puts the return-type identifier first — `A add(...)` — the member
+        // name closes the header).
+        let Some(name) = c
+            .collect_direct(node)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::Identifier)
+            .next_back()
+        else {
+            return;
+        };
+        // The innermost class-like ancestor answers; an extension member
+        // bails (:91) because the extension row sits between.
+        let Some(&class_row) = c.path.iter().rev().skip(1).find(|&&ancestor| {
+            matches!(
+                c.kind(ancestor),
+                NodeKind::ClassDeclaration
+                    | NodeKind::EnumDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::ExtensionDeclaration
+            )
+        }) else {
+            return;
+        };
+        if c.kind(class_row) == NodeKind::ExtensionDeclaration {
+            return;
+        }
+        // `@override` skips (:77): the annotation rides the member row's
+        // left `MetadataStar` sibling in its body container.
+        let body = c
+            .collect_direct(class_row)
+            .into_iter()
+            .find(|&kid| matches!(c.kind(kid), NodeKind::DeclarationBody | NodeKind::EnumBody))
+            .unwrap_or(class_row);
+        if super::body_members(c, class_row).contains(&node)
+            && crate::rules::has_override_annotation(c, body, node)
+        {
+            return;
+        }
+        // The written return type must name the enclosing declaration
+        // (:81-85); unwritten (`NoType`) or any other name bails. The
+        // name-equality face is the `returnType.element == parent.element`
+        // identity over the written spelling.
+        let Some((type_row, kind)) = type_before(c, node, name) else {
+            return;
+        };
+        let Some(class_name) = crate::rules::class_declaration_name(c, class_row) else {
+            return;
+        };
+        if kind != NodeKind::Type || c.lexeme(c.head_token(type_row)) != class_name {
+            return;
+        }
+        let body_row = c.collect_direct(node).into_iter().find(|&kid| {
+            matches!(
+                c.kind(kid),
+                NodeKind::BlockBody | NodeKind::ExpressionBody | NodeKind::Block
+            )
+        });
+        let Some(body_row) = body_row else {
+            return;
+        };
+        match c.kind(body_row) {
+            NodeKind::BlockBody | NodeKind::Block => {
+                // The returns in pre-order, nested closures pruned
+                // (`visitFunctionExpression` short-circuits, :49-51): the
+                // first bare `return this;` reports at its `this`; any
+                // non-`this` return reached first clears the set and stops
+                // the walk (:55-62).
+                let mut first_this = None;
+                let mut silenced = false;
+                collect_returns(c, body_row, &mut first_this, &mut silenced);
+                if let Some(this_token) = first_this {
+                    c.report(crate::rules::utf16_token_span(c, this_token), &[]);
+                }
+            }
+            NodeKind::ExpressionBody => {
+                // `=> this;` reports at the method name (:100-104). The
+                // production `ExpressionBody` row spans the arrow through
+                // the `;`, and the expression rows tile beside it — the
+                // bare face is a `ThisExpression` sibling spanning exactly
+                // the tokens between the arrow and the `;` (`=> this.x`
+                // tiles a narrower `this` leaf and never qualifies).
+                let range = c.unit.ast.token_range(body_row);
+                let rhs = range.start + 1..range.end.saturating_sub(1);
+                let is_this = c
+                    .collect_direct(node)
+                    .into_iter()
+                    .any(|kid| {
+                        c.kind(kid) == NodeKind::ThisExpression
+                            && c.unit.ast.token_range(kid) == rhs
+                    });
+                if is_this {
+                    c.report(crate::rules::utf16_token_span(c, c.head_token(name)), &[]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The `_BodyVisitor` walk: pre-order `ReturnStatement` collection over
+    /// the body row's subtree, stopping at the first non-`this` return
+    /// (which clears the collected set, :55-62) and never descending into
+    /// nested function expressions (:49-51). Leaves the first collected
+    /// `this` token behind, `None` once silenced.
+    fn collect_returns(
+        c: &Check<'_>,
+        row: u32,
+        first_this: &mut Option<u32>,
+        silenced: &mut bool,
+    ) {
+        if *silenced {
+            return;
+        }
+        if c.kind(row) == NodeKind::ReturnStatement {
+            let range = c.unit.ast.token_range(row);
+            if range.len() == 3
+                && c.lexeme(range.start) == "return"
+                && c.lexeme(range.start + 1) == "this"
+            {
+                if first_this.is_none() {
+                    *first_this = Some(range.start + 1);
+                }
+            } else {
+                *silenced = true;
+                *first_this = None;
+            }
+            return;
+        }
+        if matches!(
+            c.kind(row),
+            NodeKind::FunctionExpression
+                | NodeKind::NamedFunctionExpression
+                | NodeKind::LocalFunctionDeclaration
+        ) {
+            return;
+        }
+        for kid in c.collect_direct(row) {
+            collect_returns(c, kid, first_this, silenced);
+        }
+    }
+}
+
+pub(crate) mod avoid_unused_constructor_parameters {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// The `external` ModSet bit (bridge `mod_bits`, member family).
+    const EXTERNAL_BIT: u16 = 1 << 2;
+    /// The `augment` ModSet bit (bridge `mod_bits`).
+    const AUGMENT_BIT: u16 = 1 << 1;
+    /// The `var`/`final`/`const` ModSet bit (bridge `mod_bits`) — a
+    /// declaring primary-constructor parameter.
+    const VAR_FINAL_OR_CONST_BIT: u16 = 1 << 6;
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_unused_constructor_parameters.dart`
+    /// — a constructor parameter that is no field/super formal (:50-51),
+    /// carries no `@deprecated` metadata (:53), is not named `_`… (:54),
+    /// and is never referenced in the body or the initializers (:100-107)
+    /// reports at the parameter. Augmented (:68), external (:70) and
+    /// redirecting-factory (`redirectedConstructor != null`) constructors
+    /// skip. The reference scan is the official
+    /// `visitSimpleIdentifier` element face over this constructor's
+    /// tokens: an identifier lexeme after the parameter list counts as a
+    /// use, so a shadowing local over-counts (the documented user-shadow
+    /// family). The primary-constructor face (:81-93) scans the primary
+    /// body (initializers and statements) and the class fields'
+    /// initializers only — method bodies never count, matching the
+    /// official. Message: `diagnostic.g.dart`
+    /// `avoidUnusedConstructorParameters`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_unused_constructor_parameters",
+        group: Group::Standalone,
+        problem: "The parameter '{0}' is not used in the constructor.",
+        correction: "Try using the parameter or removing it.",
+        kinds: &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        match c.kind(c.node()) {
+            NodeKind::Constructor => check_constructor(c),
+            NodeKind::PrimaryConstructor => check_primary(c),
+            _ => {}
+        }
+    }
+
+    fn check_constructor(c: &mut Check<'_>) {
+        let node = c.node();
+        let flags = dartq_ast::mod_flags(&c.unit.ast, node);
+        if flags & (EXTERNAL_BIT | AUGMENT_BIT) != 0 {
+            return;
+        }
+        // A redirecting factory (`factory C(int p) = C.named;`) skips —
+        // the official `node.redirectedConstructor != null` bail
+        // (`test_redirectingConstructor1` reports only the target's
+        // parameters, never the redirect's own).
+        if c.collect_direct(node)
+            .into_iter()
+            .any(|kid| c.kind(kid) == NodeKind::RedirectingFactoryBody)
+        {
+            return;
+        }
+        let Some(params) = parameter_list(c, node) else {
+            return;
+        };
+        // The reference surface: the constructor's tokens past the
+        // parameter list — the initializers and the body (:100-107).
+        let scan = crate::rules::tail_token(c, params) + 1..crate::rules::tail_token(c, node) + 1;
+        report_unused(c, parameters(c, params), &[scan]);
+    }
+
+    fn check_primary(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(&class_row) = c.path.iter().rev().find(|&&a| {
+            matches!(
+                c.kind(a),
+                NodeKind::ClassDeclaration
+                    | NodeKind::EnumDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::ExtensionTypeDeclaration
+            )
+        }) else {
+            return;
+        };
+        // The use surface: the primary body (:90) plus the class fields'
+        // initializers (:109-112).
+        let mut scans: Vec<core::ops::Range<u32>> = Vec::new();
+        for member in super::body_members(c, class_row) {
+            match c.kind(member) {
+                NodeKind::PrimaryConstructorBody => {
+                    // The whole body row: `this`, the `:` and the
+                    // initializer tails are outside the parameter list, so
+                    // the parameter names only collide with real uses.
+                    let range = c.unit.ast.token_range(member);
+                    scans.push(range.start..range.end);
+                }
+                NodeKind::Fields => collect_field_scans(c, member, &mut scans),
+                _ => {}
+            }
+        }
+        let Some(params) = parameter_list(c, node) else {
+            return;
+        };
+        report_unused(c, parameters(c, params), &scans);
+    }
+
+    /// The parameter list row of a constructor-like declaration.
+    fn parameter_list(c: &Check<'_>, node: u32) -> Option<u32> {
+        c.collect_direct(node).into_iter().find(|&kid| {
+            matches!(
+                c.kind(kid),
+                NodeKind::FormalParameters | NodeKind::OptionalFormalParameters
+            )
+        })
+    }
+
+    /// The `= …` initializer token ranges inside a `Fields` row (one per
+    /// declared variable).
+    fn collect_field_scans(c: &Check<'_>, fields: u32, out: &mut Vec<core::ops::Range<u32>>) {
+        for decl in c.collect_direct(fields) {
+            if c.kind(decl) != NodeKind::VariablesDeclaration {
+                continue;
+            }
+            for var in c.collect_direct(decl) {
+                if c.kind(var) != NodeKind::InitializedIdentifier {
+                    continue;
+                }
+                let Some(name) = crate::rules::initialized_identifier_name(c, var) else {
+                    continue;
+                };
+                let range = c.unit.ast.token_range(var);
+                // The initializer opens at the `=` — the first token after
+                // the name, when the variable carries one.
+                if range.contains(&(name + 1)) {
+                    out.push(name + 1..range.end);
+                }
+            }
+        }
+    }
+
+    /// The formal parameter rows under a parameter list (the optional
+    /// group nests one level).
+    fn parameters(c: &Check<'_>, params: u32) -> Vec<u32> {
+        let mut rows = Vec::new();
+        for kid in c.collect_direct(params) {
+            match c.kind(kid) {
+                NodeKind::FormalParameter | NodeKind::FunctionTypedFormalParameter => {
+                    rows.push(kid);
+                }
+                NodeKind::OptionalFormalParameters | NodeKind::FormalParameters => {
+                    rows.extend(parameters(c, kid));
+                }
+                _ => {}
+            }
+        }
+        rows
+    }
+
+    /// The shared verdict: the exempt faces drop out, the survivors are
+    /// token-scanned over the use surfaces, and each unused name reports
+    /// at its parameter row (:115-117).
+    fn report_unused(c: &mut Check<'_>, params: Vec<u32>, scans: &[core::ops::Range<u32>]) {
+        for param in params {
+            // The parameter's own annotation tiles beside the row: a
+            // `@Deprecated` star precedes its parameter under the formal
+            // parameter list (:53 — `element.metadata.hasDeprecated` on the
+            // parameter, never the constructor's).
+            let Some(param_parent) = c.unit.ast.parent(param) else {
+                continue;
+            };
+            let param_start = c.unit.ast.token_range(param).start;
+            let deprecated = c
+                .collect_direct(param_parent)
+                .into_iter()
+                .any(|sib| {
+                    c.kind(sib) == NodeKind::MetadataStar
+                        && c.unit.ast.token_range(sib).end == param_start
+                        && metadata_names_deprecated(c, sib)
+                });
+            if deprecated {
+                continue;
+            }
+            // Field/super formals are the initializer faces (:50-51); a
+            // declaring primary parameter (`var`/`final`) declares a field.
+            let receiver = c.payload(param).first().copied();
+            if receiver.is_some_and(|tok| tok != super::NONE_TOKEN)
+                || dartq_ast::mod_flags(&c.unit.ast, param) & VAR_FINAL_OR_CONST_BIT != 0
+            {
+                continue;
+            }
+            let Some(name_token) = c.payload(param).get(1).copied().filter(|&tok| {
+                tok != super::NONE_TOKEN
+            }) else {
+                continue;
+            };
+            let name = c.lexeme(name_token);
+            // Wildcard names exempt unconditionally (:52-54).
+            if crate::rules::is_just_underscores(name) {
+                continue;
+            }
+            let used = scans
+                .iter()
+                .flat_map(|range| range.clone())
+                .any(|token| c.lexeme(token) == name);
+            if !used {
+                c.report(c.utf16_span(param), &[name]);
+            }
+        }
+    }
+
+    /// Whether the metadata-star row carries a `Deprecated`/`deprecated`
+    /// annotation (the official `element.metadata.hasDeprecated`).
+    fn metadata_names_deprecated(c: &Check<'_>, star: u32) -> bool {
+        c.collect_direct(star).into_iter().any(|meta| {
+            c.kind(meta) == NodeKind::Metadata
+                && c.collect_direct(meta).into_iter().any(|piece| {
+                    c.kind(piece) == NodeKind::Identifier
+                        && matches!(c.lexeme(c.head_token(piece)), "Deprecated" | "deprecated")
+                })
+        })
+    }
+}
+
+pub(crate) mod avoid_types_on_closure_parameters {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/avoid_types_on_closure_parameters.dart`
+    /// — a closure whose context type is a function type reports each
+    /// parameter that carries a written `NamedType` at the type (:60-62 —
+    /// the `type is NamedType` gate leaves a generic function type
+    /// annotation silent), and a function-typed-suffix parameter at the
+    /// parameter (:54-57). The context type is the official
+    /// `approximateContextType` (extensions.dart:452) — a resolution
+    /// product. The lexical face: the closure initializes a
+    /// written-`FunctionType` variable declaration (the
+    /// `VariableDeclarationList.type` arm, extensions.dart:500-502) or is
+    /// the right side of an assignment to a written-`FunctionType` target
+    /// (the `AssignmentExpression` arm, :494-496, bare identifiers only).
+    /// The dominant real faces — SDK callbacks
+    /// (`list.map((int e) => …)`) and member targets (`c.onFoo = …`) —
+    /// resolve through the element model and under-report (the documented
+    /// resolution-bound family). Message: `diagnostic.g.dart`
+    /// `avoidTypesOnClosureParameters`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_types_on_closure_parameters",
+        group: Group::Standalone,
+        problem: "Unnecessary type annotation on a function expression parameter.",
+        correction: "Try removing the type annotation.",
+        kinds: &[NodeKind::FunctionExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        if !context_is_function_type(c, node) {
+            return;
+        }
+        let Some(params) = c
+            .collect_direct(node)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+        else {
+            return;
+        };
+        for param in c.collect_direct(params) {
+            match c.kind(param) {
+                // The function-typed suffix reports at the parameter and
+                // stops (:54-57). The production shape wraps the suffix row
+                // in a `FormalParameter` (`(int x, void g(int y))` — the
+                // wrapper spans `void g`).
+                NodeKind::FormalParameter
+                    if c
+                        .collect_direct(param)
+                        .into_iter()
+                        .any(|kid| c.kind(kid) == NodeKind::FunctionTypedFormalParameter) =>
+                {
+                    c.report(c.utf16_span(param), &[]);
+                }
+                NodeKind::FormalParameter => {
+                    // A written `NamedType` face reports at the type
+                    // (:60-62 — the `type is NamedType` gate): a generic
+                    // function type annotation (`void Function() cb`)
+                    // never qualifies, `dynamic` never qualifies.
+                    let type_row = c.collect_direct(param).into_iter().find(|&kid| {
+                        matches!(c.kind(kid), NodeKind::Type | NodeKind::VoidType)
+                    });
+                    let Some(type_row) = type_row else {
+                        continue;
+                    };
+                    if c.kind(type_row) == NodeKind::Type
+                        && c.lexeme(c.head_token(type_row)) == "dynamic"
+                    {
+                        continue;
+                    }
+                    c.report(c.utf16_span(type_row), &[]);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The lexical context face: through the transparent initializer chain,
+    /// the enclosing variable declaration's or the assignment target's
+    /// written type is a [`NodeKind::FunctionType`]. Any other intermediate
+    /// row (an argument list, a cascade section) cuts the chain — the
+    /// closure is no longer the position the written type governs.
+    fn context_is_function_type(c: &Check<'_>, closure: u32) -> bool {
+        let len = c.path.len();
+        for i in (0..len.saturating_sub(1)).rev() {
+            let ancestor = c.path[i];
+            match c.kind(ancestor) {
+                // `void Function(int) f = (…) …;` — the written type tiles
+                // in the declaring owner's slice before the declaration (the
+                // head shape, the block_binding walk); a `FunctionType` head
+                // governs every initializer (:500-502).
+                NodeKind::VariablesDeclaration => {
+                    if i == 0 {
+                        return false;
+                    }
+                    let owner = c.path[i - 1];
+                    let mut written: Option<u32> = None;
+                    for kid in c.collect_direct(owner) {
+                        if kid == ancestor {
+                            return written
+                                .is_some_and(|row| c.kind(row) == NodeKind::FunctionType);
+                        }
+                        if matches!(
+                            c.kind(kid),
+                            NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType
+                        ) {
+                            written = Some(kid);
+                        }
+                    }
+                    return false;
+                }
+                // `f = (…) …;` — the target's written type governs
+                // (:494-496, `ancestor.staticType`). The production
+                // `Assignment` row spans the right side only (the bridge
+                // opens it at the operand boundary) with the operator
+                // token in payload word 0 — the target is the identifier
+                // token immediately before it.
+                NodeKind::Assignment => {
+                    let Some(&eq) = c.payload(ancestor).first() else {
+                        return false;
+                    };
+                    // The bare-identifier target face: the token before the
+                    // operator (a compound `+=` target qualifies the same).
+                    let is_identifier_target = eq
+                        .checked_sub(1)
+                        .is_some_and(|target| {
+                            c.unit
+                                .tokens
+                                .get(target as usize)
+                                .is_some_and(|t| t.kind == dartq_scanner::TokenKind::Identifier)
+                        });
+                    if !is_identifier_target {
+                        return false;
+                    }
+                    match crate::rules::expressions::same_file::binding(
+                        c,
+                        closure,
+                        c.lexeme(eq - 1),
+                    ) {
+                        Some((_, Some(type_row))) => {
+                            return c.kind(type_row) == NodeKind::FunctionType;
+                        }
+                        _ => return false,
+                    }
+                }
+                // The transparent initializer chain (the wrappers between a
+                // closure and the declaration its position belongs to).
+                NodeKind::InitializedIdentifier
+                | NodeKind::VariableInitializer
+                | NodeKind::ParenthesizedExpression
+                | NodeKind::ConstExpression
+                | NodeKind::ConstLiteral
+                | NodeKind::Conditional => {}
+                _ => return false,
+            }
+        }
+        false
+    }
+}
+
+pub(crate) mod initialize_in_field_declaration {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// The `late` ModSet bit (bridge `mod_bits`, member family).
+    const LATE_BIT: u16 = 1 << 5;
+
+    /// Official: `pkg/linter/lib/src/rules/initialize_in_field_declaration.dart`
+    /// — a primary constructor body initializer `y = expr` whose
+    /// expression references a primary constructor parameter reports at
+    /// the field name (:66-82). The field must be a same-class instance
+    /// field (:70-75) and not `late` (:71). Message: `diagnostic.g.dart`
+    /// `initializeInFieldDeclaration`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "initialize_in_field_declaration",
+        group: Group::Standalone,
+        problem: "Field should be initialized in the field declaration.",
+        correction: "Try initializing the field where it's declared.",
+        kinds: &[NodeKind::PrimaryConstructorBody],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(&class_row) = c.path.iter().rev().find(|&&a| {
+            matches!(
+                c.kind(a),
+                NodeKind::ClassDeclaration
+                    | NodeKind::EnumDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::ExtensionTypeDeclaration
+            )
+        }) else {
+            return;
+        };
+        // The primary constructor of this class hangs beside the body (a
+        // direct `ClassDeclaration` child, `NoPrimaryConstructor` when
+        // absent); `node.declaration == null` bails (:62-64 — the parameter
+        // names come from it).
+        let Some(primary) = c
+            .collect_direct(class_row)
+            .into_iter()
+            .find(|&member| c.kind(member) == NodeKind::PrimaryConstructor)
+        else {
+            return;
+        };
+        let param_names: Vec<String> =
+            primary_formal_names(c, primary).into_iter().map(str::to_owned).collect();
+        if param_names.is_empty() {
+            return;
+        }
+        for piece in c.collect_direct(node) {
+            if c.kind(piece) != NodeKind::Initializers {
+                continue;
+            }
+            for initializer in c.collect_direct(piece) {
+                if c.kind(initializer) != NodeKind::Initializer {
+                    continue;
+                }
+                // The initializer row anchors at the field name (the row's
+                // span head); the expression trails the `=`.
+                let name_token = c.head_token(initializer);
+                let name = c.lexeme(name_token);
+                // A same-class instance field only (:70-75); `late` skips
+                // (:71).
+                let Some(is_late) = same_class_field_is_late(c, class_row, name) else {
+                    continue;
+                };
+                if is_late {
+                    continue;
+                }
+                let references = expression_references_param(c, initializer, &param_names);
+                if references {
+                    c.report(crate::rules::utf16_token_span(c, name_token), &[]);
+                }
+            }
+        }
+    }
+
+    /// The primary constructor's parameter names (payload word 1 of each
+    /// formal row).
+    fn primary_formal_names<'a>(c: &'a Check<'_>, primary: u32) -> Vec<&'a str> {
+        let mut names = Vec::new();
+        for params in c.collect_direct(primary) {
+            if !matches!(
+                c.kind(params),
+                NodeKind::FormalParameters | NodeKind::OptionalFormalParameters
+            ) {
+                continue;
+            }
+            for kid in c.collect_direct(params) {
+                if c.kind(kid) == NodeKind::FormalParameter
+                    && let Some(&name) = c.payload(kid).get(1)
+                    && name != super::NONE_TOKEN
+                {
+                    names.push(c.lexeme(name));
+                }
+            }
+        }
+        names
+    }
+
+    /// Whether a same-class instance field `name` exists, and whether it
+    /// is `late` (:70-75).
+    fn same_class_field_is_late(c: &Check<'_>, class_row: u32, name: &str) -> Option<bool> {
+        for member in super::body_members(c, class_row) {
+            if c.kind(member) != NodeKind::Fields {
+                continue;
+            }
+            for decl in c.collect_direct(member) {
+                if c.kind(decl) != NodeKind::VariablesDeclaration {
+                    continue;
+                }
+                for var in c.collect_direct(decl) {
+                    if c.kind(var) == NodeKind::InitializedIdentifier
+                        && crate::rules::initialized_identifier_name(c, var)
+                            .is_some_and(|tok| c.lexeme(tok) == name)
+                    {
+                        let flags = dartq_ast::mod_flags(&c.unit.ast, member);
+                        return Some(
+                            flags & LATE_BIT != 0 || c.lexeme(c.head_token(member)) == "late",
+                        );
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether the initializer's `= expr` tail references one of the
+    /// primary parameters by name (the `_ParameterReferenceVisitor`
+    /// `visitSimpleIdentifier` face over the expression's tokens).
+    fn expression_references_param(
+        c: &Check<'_>,
+        initializer: u32,
+        params: &[String],
+    ) -> bool {
+        let range = c.unit.ast.token_range(initializer);
+        let Some(eq) = range.clone().find(|&token| c.lexeme(token) == "=") else {
+            return false;
+        };
+        (eq + 1..range.end).any(|token| params.iter().any(|param| param == c.lexeme(token)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -6297,5 +7095,298 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    // —— avoid_private_typedef_functions (W3 #992) ————————————————————
+
+    /// The old-form private typedef used once reports at its name
+    /// (`avoid_private_typedef_functions.dart` doc example).
+    #[test]
+    fn private_typedef_old_form_used_once_reports() {
+        let f = Fixture::parse("typedef int _Td();\n_Td? f;\n");
+        let lints = f.run(&one_rule("avoid_private_typedef_functions"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The typedef is unnecessary because it is only used in one place."
+        );
+        let name = tok(&f.source, &f.tokens, "_Td", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, name));
+    }
+
+    /// The new-form function alias reports; a named-type alias, the
+    /// generic-parameter form and the `void` alias skip (:61-63 — `void`
+    /// is a `NamedType` upstream).
+    #[test]
+    fn private_typedef_new_form_and_exemptions() {
+        let f = Fixture::parse("typedef _P = void Function();\nvoid g(_P p) {}\n");
+        assert_eq!(
+            f.run(&one_rule("avoid_private_typedef_functions"))
+                .len(),
+            1
+        );
+
+        // The aliased type is not a function type (:62-63).
+        let f = Fixture::parse("typedef _L = List<String>;\nfinal _L x = [];\n");
+        assert!(f.run(&one_rule("avoid_private_typedef_functions")).is_empty());
+
+        // Generic parameters skip (:61).
+        let f = Fixture::parse("typedef _G<T> = void Function(T);\nvoid h(_G<int> g) {}\n");
+        assert!(f.run(&one_rule("avoid_private_typedef_functions")).is_empty());
+
+        // The `void` alias is a NamedType upstream (:62-63).
+        let f = Fixture::parse("typedef _V = void;\n_V? n;\n");
+        assert!(f.run(&one_rule("avoid_private_typedef_functions")).is_empty());
+    }
+
+    /// A public name and a multiply-used private name pass.
+    #[test]
+    fn private_typedef_public_and_multi_use_pass() {
+        let f = Fixture::parse("typedef int Td();\nTd? f;\n");
+        assert!(f.run(&one_rule("avoid_private_typedef_functions")).is_empty());
+
+        let f = Fixture::parse("typedef int _Td();\n_Td? a;\n_Td b() => 0;\n");
+        assert!(f.run(&one_rule("avoid_private_typedef_functions")).is_empty());
+    }
+
+    // —— avoid_returning_this (W3 #992) ————————————————————————————————
+
+    /// The block-body fluent method reports at its `this`
+    /// (`avoid_returning_this.dart` doc example).
+    #[test]
+    fn returning_this_block_body_reports() {
+        let f = Fixture::parse("class A {\n  A add(int x) {\n    return this;\n  }\n}\n");
+        let lints = f.run(&one_rule("avoid_returning_this"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Don't return 'this' from a method.");
+        let this_tok = tok(&f.source, &f.tokens, "this", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, this_tok));
+    }
+
+    /// The expression body reports at the method name (:100-104); a
+    /// non-`this` return silences the method (:58-62).
+    #[test]
+    fn returning_this_expression_and_silenced_faces() {
+        let f = Fixture::parse("class A {\n  A m() => this;\n}\n");
+        let lints = f.run(&one_rule("avoid_returning_this"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let name = tok(&f.source, &f.tokens, "m", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, name));
+
+        let f = Fixture::parse("class A {\n  A m() {\n    return A();\n  }\n}\n");
+        assert!(f.run(&one_rule("avoid_returning_this")).is_empty());
+    }
+
+    /// `@override`, operators, extension members and foreign return types
+    /// bail (:71, :77, :81-85, :91).
+    #[test]
+    fn returning_this_exemptions_pass() {
+        // @override (:77).
+        let f = Fixture::parse("class A {\n  @override\n  A m() => this;\n}\n");
+        assert!(f.run(&one_rule("avoid_returning_this")).is_empty());
+        // Operator (:71).
+        let f = Fixture::parse("class A {\n  A operator +(A other) => this;\n}\n");
+        assert!(f.run(&one_rule("avoid_returning_this")).is_empty());
+        // Extension member (:91).
+        let f = Fixture::parse("extension E on A {\n  E m() => this;\n}\n");
+        assert!(f.run(&one_rule("avoid_returning_this")).is_empty());
+        // The return type does not name the enclosing declaration (:81-85).
+        let f = Fixture::parse("class A {\n  B m() => this;\n}\nclass B {}\n");
+        assert!(f.run(&one_rule("avoid_returning_this")).is_empty());
+    }
+
+    // —— avoid_unused_constructor_parameters (W3 #992) —————————————————
+
+    /// The unused plain parameter reports with the name argument; the
+    /// used one stays silent.
+    #[test]
+    fn unused_constructor_parameter_reports() {
+        let f = Fixture::parse("class A {\n  A(int a, int b) : b = 0;\n}\n");
+        let lints = f.run(&one_rule("avoid_unused_constructor_parameters"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The parameter 'a' is not used in the constructor."
+        );
+        // The report anchors at the parameter row (`int a`).
+        let int_tok = tok(&f.source, &f.tokens, "int", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, int_tok));
+    }
+
+    /// Field/super formals, wildcards, `@Deprecated`, `external` and body
+    /// uses all keep the constructor silent (:50-54, :70, :100-107).
+    #[test]
+    fn unused_constructor_parameter_exemptions_pass() {
+        // The field formal skips; the plain unused `y` still reports
+        // (`test_fieldFormalParameter` — one exempt face in a constructor
+        // never silences the rest).
+        let f = Fixture::parse("class A {\n  int x;\n  A(this.x, int y);\n}\n");
+        let lints = f.run(&one_rule("avoid_unused_constructor_parameters"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The parameter 'y' is not used in the constructor."
+        );
+
+        let f = Fixture::parse("class A {\n  A(int _);\n}\n");
+        assert!(
+            f.run(&one_rule("avoid_unused_constructor_parameters"))
+                .is_empty()
+        );
+
+        // `@Deprecated` exempts on the PARAMETER only (`test_deprecated` —
+        // `C(@Deprecated('') int p)`); the constructor's own metadata never
+        // silences a parameter.
+        let f = Fixture::parse("class A {\n  A(@Deprecated('x') int y);\n}\n");
+        assert!(
+            f.run(&one_rule("avoid_unused_constructor_parameters"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse("class A {\n  @Deprecated('x')\n  A(int y);\n}\n");
+        assert_eq!(
+            f.run(&one_rule("avoid_unused_constructor_parameters"))
+                .len(),
+            1
+        );
+
+        let f = Fixture::parse("class A {\n  external A(int y);\n}\n");
+        assert!(
+            f.run(&one_rule("avoid_unused_constructor_parameters"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse("class A {\n  int y;\n  A(int y) {\n    this.y = y;\n  }\n}\n");
+        assert!(
+            f.run(&one_rule("avoid_unused_constructor_parameters"))
+                .is_empty()
+        );
+    }
+
+    /// The primary-constructor face scans the primary body and the field
+    /// initializers only (:81-93, :109-112); a declaring (`final`)
+    /// parameter declares a field and skips.
+    #[test]
+    fn unused_primary_constructor_parameter_faces() {
+        let f = Fixture::parse("class A(int x, int y) {\n  this : y = 0;\n  int x;\n  int y;\n}\n");
+        let lints = f.run(&one_rule("avoid_unused_constructor_parameters"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The parameter 'x' is not used in the constructor."
+        );
+
+        let f = Fixture::parse("class A(final int x) {}\n");
+        assert!(
+            f.run(&one_rule("avoid_unused_constructor_parameters"))
+                .is_empty()
+        );
+    }
+
+    /// A redirecting factory skips — only the redirect target's own
+    /// unused parameters report (`test_redirectingConstructor1`: the
+    /// `factory C(int p) = C.named;` redirect itself stays silent while
+    /// `C.named(int p)` reports).
+    #[test]
+    fn unused_constructor_parameter_redirecting_factory_skips() {
+        let f = Fixture::parse(
+            "class C {\n  C.named(int p);\n  factory C(int p) = C.named;\n}\n",
+        );
+        let lints = f.run(&one_rule("avoid_unused_constructor_parameters"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The parameter 'p' is not used in the constructor."
+        );
+        // The report anchors at C.named's parameter, not the factory's.
+        let named_int = tok(&f.source, &f.tokens, "int", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, named_int));
+    }
+
+    // —— avoid_types_on_closure_parameters (W3 #992) ———————————————————
+
+    /// A written `FunctionType` initializer context reports each typed
+    /// parameter at its type; `dynamic` skips (:60-62).
+    #[test]
+    fn types_on_closure_parameters_initializer_face() {
+        let f = Fixture::parse("void Function(int) f = (int x, dynamic y) {};\n");
+        let lints = f.run(&one_rule("avoid_types_on_closure_parameters"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary type annotation on a function expression parameter."
+        );
+        let int_tok = tok(&f.source, &f.tokens, "int", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, int_tok));
+    }
+
+    /// The function-typed suffix form reports at the parameter (:54-57).
+    #[test]
+    fn types_on_closure_parameters_suffix_form() {
+        let f = Fixture::parse("void Function(int) f = (int x, void g(int y)) => 1;\n");
+        let lints = f.run(&one_rule("avoid_types_on_closure_parameters"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        let void_tok = tok(&f.source, &f.tokens, "void", 1);
+        assert_eq!(lints[1].range.start, utf16_at(&f, void_tok));
+    }
+
+    /// An assignment to a written-`FunctionType` target reports; untyped
+    /// or non-function contexts never do (:494-502).
+    #[test]
+    fn types_on_closure_parameters_assignment_and_misses() {
+        let f =
+            Fixture::parse("void Function(int) f = (x) => 1;\nvoid g() {\n  f = (int x) => 2;\n}\n");
+        let lints = f.run(&one_rule("avoid_types_on_closure_parameters"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let int_tok = tok(&f.source, &f.tokens, "int", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, int_tok));
+
+        let f = Fixture::parse("var f = (int x) => 1;\n");
+        assert!(f.run(&one_rule("avoid_types_on_closure_parameters")).is_empty());
+
+        let f = Fixture::parse("int f = (int x) => 1;\n");
+        assert!(f.run(&one_rule("avoid_types_on_closure_parameters")).is_empty());
+    }
+
+    /// A generic function type annotation never qualifies — the official
+    /// `type is NamedType` gate (:60-62) leaves `void Function() cb`
+    /// silent while a `NamedType` parameter reports.
+    #[test]
+    fn types_on_closure_parameters_function_type_annotation_passes() {
+        let f = Fixture::parse(
+            "void Function() mk = (void Function() cb, int n) => cb;\n",
+        );
+        let lints = f.run(&one_rule("avoid_types_on_closure_parameters"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let int_tok = tok(&f.source, &f.tokens, "int", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, int_tok));
+    }
+
+    // —— initialize_in_field_declaration (W3 #992) —————————————————————
+
+    /// A primary body initializer referencing a parameter reports at the
+    /// field name; a non-reference and a late field stay silent (:66-82).
+    #[test]
+    fn initialize_in_field_declaration_faces() {
+        let f = Fixture::parse("class C(int x) {\n  this : y = x;\n  int y;\n}\n");
+        let lints = f.run(&one_rule("initialize_in_field_declaration"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Field should be initialized in the field declaration."
+        );
+        let y = tok(&f.source, &f.tokens, "y", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, y));
+
+        let f =
+            Fixture::parse("class C(int x) {\n  this : v = 0, l2 = x;\n  late int l2;\n  int v;\n}\n");
+        assert!(f.run(&one_rule("initialize_in_field_declaration")).is_empty());
+    }
+
+    /// The field must be declared in the same class (:70-75).
+    #[test]
+    fn initialize_in_field_declaration_foreign_field_passes() {
+        let f = Fixture::parse("class C(int x) {\n  this : z = x;\n}\n");
+        assert!(f.run(&one_rule("initialize_in_field_declaration")).is_empty());
     }
 }

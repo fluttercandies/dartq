@@ -931,6 +931,10 @@ pub(crate) fn written_type_face<'a>(
     name: &str,
 ) -> Option<TypeFace<'a>> {
     let row = crate::rules::expressions::same_file::binding(c, use_node, name)?.1?;
+    // A named type only: a function-type head spells the return type.
+    if c.kind(row) != dartq_ast::NodeKind::Type {
+        return None;
+    }
     Some(type_face(c, row))
 }
 

@@ -90,6 +90,14 @@ pub(crate) fn string_value(c: &Check<'_>, node: u32) -> Option<String> {
     if is_raw {
         return Some(body.to_owned());
     }
+    cook_string_body(body)
+}
+
+/// The escape-cooking walk behind [`string_value`], shared with the
+/// interpolation-segment readers (the per-segment contents of an
+/// interpolated literal carry the same escape grammar minus the
+/// interpolation markers, which never occur inside a segment).
+pub(crate) fn cook_string_body(body: &str) -> Option<String> {
     let chars: Vec<char> = body.chars().collect();
     let mut out = String::with_capacity(body.len());
     let mut i = 0;
@@ -712,6 +720,72 @@ pub(crate) mod implementation_imports {
             assert!(uri_is_same_package_as("foo", "package:foo/src/a.dart"));
             assert!(!uri_is_same_package_as("foo", "package:bar/src/a.dart"));
             assert!(!uri_is_same_package_as("foo", "file:///x/lib/src/a.dart"));
+        }
+    }
+}
+
+pub(crate) mod combinators_ordering {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/combinators_ordering.dart:35-50`
+    /// — a `show`/`hide` combinator whose names are not sorted reports at
+    /// the combinator. `isSorted` is the package:collection default —
+    /// case-sensitive code-unit order (`String.compareTo`). Message:
+    /// `diagnostic.g.dart` `combinatorsOrdering`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "combinators_ordering",
+        group: Group::Standalone,
+        problem: "Sort combinator names alphabetically.",
+        correction: "Try sorting the combinator names alphabetically.",
+        kinds: &[NodeKind::Show, NodeKind::Hide],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // The names are the combinator's `Identifier` children (collapse
+        // map §3.1 — the list delimits itself).
+        let names: Vec<&str> = c
+            .collect_direct(node)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::Identifier)
+            .map(|kid| c.lexeme(c.head_token(kid)))
+            .collect();
+        if names.windows(2).any(|pair| pair[0] > pair[1]) {
+            c.report(c.utf16_span(node), &[]);
+        }
+    }
+}
+
+pub(crate) mod migrate_design_widgets {
+    use super::{Check, Group, NodeKind, RuleSpec, written_uri};
+
+    /// Official: `pkg/linter/lib/src/rules/migrate_design_widgets.dart:34-43`
+    /// — an import of the deprecated design libraries
+    /// (`package:flutter/material.dart`,
+    /// `package:flutter/cupertino.dart`) reports at the URI with the
+    /// library spelled in the message. Message: `diagnostic.g.dart`
+    /// `migrateDesignWidgets`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "migrate_design_widgets",
+        group: Group::Standalone,
+        problem: "The '{0}' library is deprecated.",
+        correction: "Try using the Material or Cupertino package.",
+        kinds: &[NodeKind::Import],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        if let Some((span, value)) =
+            written_uri(c, node).filter(|(_, value)| {
+                matches!(
+                    value.as_str(),
+                    "package:flutter/material.dart" | "package:flutter/cupertino.dart"
+                )
+            })
+        {
+            c.report(span, &[&value]);
         }
     }
 }
@@ -1561,5 +1635,82 @@ mod tests {
 
         let f = Fixture::parse("const String deprecated = 'x';\n@deprecated int top = 0;");
         assert!(hits(&f, "provide_deprecation_message").is_empty());
+    }
+}
+
+/// The W3 (#992) production-bridge pins: combinators_ordering and
+/// migrate_design_widgets over real parser trees.
+#[cfg(test)]
+mod w3_pins {
+    use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
+
+    // —— combinators_ordering —————————————————————————————————————————
+
+    /// Unsorted show/hide combinators report at the combinator
+    /// (`combinators_ordering.dart` doc examples).
+    #[test]
+    fn combinators_ordering_unsorted_reports() {
+        let f = Fixture::parse("import 'dart:math' show min, max;\nexport 'dart:math' hide zeta, alpha;\n");
+        let lints = f.run(&one_rule("combinators_ordering"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(lints[0].message, "Sort combinator names alphabetically.");
+        let show = tok(&f.source, &f.tokens, "show", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, show));
+        let hide = tok(&f.source, &f.tokens, "hide", 0);
+        assert_eq!(lints[1].range.start, utf16_at(&f, hide));
+    }
+
+    /// Sorted combinators pass — case-sensitive code-unit order, so `B`
+    /// sorts before `a` — and a single name never violates the order.
+    #[test]
+    fn combinators_ordering_sorted_passes() {
+        let f = Fixture::parse(
+            "import 'dart:async' show Completer, Stream;\nimport 'dart:convert' hide Base64, ascii;\n",
+        );
+        assert!(f.run(&one_rule("combinators_ordering")).is_empty());
+
+        let f = Fixture::parse("import 'dart:math' show max;\n");
+        assert!(f.run(&one_rule("combinators_ordering")).is_empty());
+    }
+
+    // —— migrate_design_widgets —————————————————————————————————————————
+
+    /// The deprecated design library imports report at the URI with the
+    /// value spelled in the message (`migrate_design_widgets.dart` doc
+    /// example).
+    #[test]
+    fn migrate_design_widgets_reports_the_design_imports() {
+        let f = Fixture::parse(
+            "import 'package:flutter/material.dart';\nimport 'package:flutter/cupertino.dart';\n",
+        );
+        let lints = f.run(&one_rule("migrate_design_widgets"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The 'package:flutter/material.dart' library is deprecated."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try using the Material or Cupertino package.")
+        );
+        let uri = tok(&f.source, &f.tokens, "'package:flutter/material.dart'", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, uri));
+    }
+
+    /// Any other import passes; an adjacent-string URI reads cooked.
+    #[test]
+    fn migrate_design_widgets_other_imports_pass() {
+        let f = Fixture::parse(
+            "import 'package:flutter/widgets.dart';\nimport 'package:meta/meta.dart';\nimport 'dart:async';\n",
+        );
+        assert!(f.run(&one_rule("migrate_design_widgets")).is_empty());
+
+        let f = Fixture::parse("import 'package:flutter/' 'material.dart';\n");
+        assert_eq!(
+            f.run(&one_rule("migrate_design_widgets")).len(),
+            1,
+            "{:?}",
+            f.run(&one_rule("migrate_design_widgets"))
+        );
     }
 }

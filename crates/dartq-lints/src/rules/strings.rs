@@ -551,6 +551,493 @@ pub(crate) mod avoid_escaping_inner_quotes {
     }
 }
 
+/// The shared adjacent-concatenation face (collapse map §3.5
+/// `AdjacentStringLiteralsHandle` D1: adjacent strings = consecutive
+/// `StringLiteral` siblings). Two literals are adjacent iff no token sits
+/// between them — comments are not tokens and never break a run; the flat
+/// tiling's marker rows (`NoTypeArguments`, `ElseControlFlow`, …) tile
+/// token-adjacently but yield no string face, and a pattern-context run's
+/// last member tiles INSIDE a `ConstantPattern` row.
+///
+/// Returns the maximal run's string rows containing the current node, in
+/// source order (the singleton `[node]` when neither neighbor is adjacent).
+fn adjacent_run(c: &Check<'_>) -> Vec<u32> {
+    let node = c.node();
+    let Some(parent) = c.unit.ast.parent(node) else {
+        return vec![node];
+    };
+    let siblings = c.collect_direct(parent);
+    // The string face of a sibling: the literal row itself, or the single
+    // literal a pattern-context `ConstantPattern` wraps.
+    let face = |row: u32| -> Option<u32> {
+        match c.kind(row) {
+            NodeKind::StringLiteral => Some(row),
+            NodeKind::ConstantPattern => c
+                .collect_direct(row)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::StringLiteral),
+            _ => None,
+        }
+    };
+    let faces: Vec<u32> = siblings.iter().copied().filter_map(face).collect();
+    let Some(pos) = faces.iter().position(|&kid| kid == node) else {
+        return vec![node];
+    };
+    let adjacent = |left: u32, right: u32| {
+        c.unit.ast.token_range(left).end == c.unit.ast.token_range(right).start
+    };
+    let mut start = pos;
+    while start > 0 && adjacent(faces[start - 1], faces[start]) {
+        start -= 1;
+    }
+    let mut end = pos;
+    while end + 1 < faces.len() && adjacent(faces[end], faces[end + 1]) {
+        end += 1;
+    }
+    faces[start..=end].to_vec()
+}
+
+/// The token extent of one string literal: `[head, tail]` over the whole
+/// spelling. A production `StringLiteral` row's own token range covers only
+/// its first segment; the interpolation markers continue the spelling —
+/// `StringInterpolationIdentifier` consumes the `$` plus one identifier
+/// token, `StringInterpolationExpression` runs to the matching `}` (the
+/// nested-string-safe jump, `tokens.matching_end`), and each `String`
+/// token at depth zero extends the literal.
+fn literal_token_extent(c: &Check<'_>, node: u32) -> core::ops::Range<u32> {
+    let range = c.unit.ast.token_range(node);
+    let mut last = range.end - 1;
+    let mut i = range.end - 1;
+    loop {
+        i += 1;
+        let Some(token) = c.unit.tokens.get(i as usize) else {
+            break;
+        };
+        match token.kind {
+            TokenKind::String => last = i,
+            TokenKind::StringInterpolationIdentifier => {
+                // `$name` — the marker plus its one identifier token.
+                i += 1;
+            }
+            TokenKind::StringInterpolationExpression => {
+                let Some(close) = c.unit.tokens.matching_end(i as usize) else {
+                    break;
+                };
+                i = close as u32;
+            }
+            _ => break,
+        }
+    }
+    range.start..last + 1
+}
+
+pub(crate) mod leading_newlines_in_multiline_strings {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/leading_newlines_in_multiline_strings.dart:61-72`
+    /// — a multiline string (triple-quoted, the `isMultiline` lexeme face)
+    /// that spans a line boundary but does not start with a newline reports
+    /// at the literal. The offset past the delimiters is 3, or 4 after an
+    /// `r` raw prefix (:65-67); the leading-character face is the raw
+    /// lexeme (an escape never counts). Interpolated literals read their
+    /// first segment (:54-59 — the opening `'''…` token). Message:
+    /// `diagnostic.g.dart` `leadingNewlinesInMultilineStrings`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "leading_newlines_in_multiline_strings",
+        group: Group::Standalone,
+        problem: "Missing a newline at the beginning of a multiline string.",
+        correction: "Try adding a newline at the beginning of the string.",
+        kinds: &[NodeKind::StringLiteral],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // The whole spelling: a production row's token range covers only the
+        // first segment, so the extent walk crosses the interpolation markers.
+        let range = super::literal_token_extent(c, node);
+        let lexeme = c.lexeme(range.start);
+        let content_at = usize::from(lexeme.starts_with('r'))
+            + if lexeme.contains("'''") || lexeme.contains("\"\"\"") {
+                3
+            } else {
+                return;
+            };
+        // The line-boundary face: the literal's first and last characters
+        // sit on different lines (:63-64 — the empty and single-line
+        // multiline spellings never report).
+        let Some(first) = c.unit.tokens.get(range.start as usize) else {
+            return;
+        };
+        let Some(last) = c.unit.tokens.get(range.end as usize - 1) else {
+            return;
+        };
+        let source = c.unit.source;
+        let (start_line, _) = c
+            .unit
+            .lines
+            .line_col_utf16(source, first.utf16_offset);
+        let (end_line, _) = c.unit.lines.line_col_utf16(
+            source,
+            last.utf16_offset + c.lexeme(range.end - 1).encode_utf16().count() as u32,
+        );
+        if start_line == end_line {
+            return;
+        }
+        // The first content character must be a newline (:65-67).
+        match lexeme.as_bytes().get(content_at) {
+            Some(b'\n' | b'\r') => {}
+            _ => c.report(c.utf16_span(node), &[]),
+        }
+    }
+}
+
+pub(crate) mod missing_whitespace_between_adjacent_strings {
+    use super::{Check, Group, NodeKind, RuleSpec, TokenKind};
+
+    /// Official: `pkg/linter/lib/src/rules/missing_whitespace_between_adjacent_strings.dart:40-69`
+    /// — for each adjacent pair, when the left part carries whitespace but
+    /// neither ends nor the right begins with whitespace, the left part
+    /// reports (:56-66). Whitespace is the `[' ', '\n', '\r', '\t']` set
+    /// over the cooked values (:128-134); an interpolation at a string's
+    /// start or end counts as whitespace (:83-125, the synthesized empty
+    /// segments), and a left part without any whitespace skips (:62-64).
+    /// Strings passed to a bare `RegExp(…)`/`matches(…)` call skip
+    /// (:43-53). Message: `diagnostic.g.dart`
+    /// `missingWhitespaceBetweenAdjacentStrings`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "missing_whitespace_between_adjacent_strings",
+        group: Group::Standalone,
+        problem: "Missing whitespace between adjacent strings.",
+        correction: "Try adding whitespace between the strings.",
+        kinds: &[NodeKind::StringLiteral],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // The pair face: each left member reports its own pair (:56-66).
+        let Some(next) = adjacent_next(c, node) else {
+            return;
+        };
+        if regexp_or_matches_context(c, node, next) {
+            return;
+        }
+        let (Some(current), Some(next)) =
+            (whitespace_face(c, node), whitespace_face(c, next))
+        else {
+            return;
+        };
+        if current.1 || next.0 || !current.2 {
+            return;
+        }
+        c.report(c.utf16_span(node), &[]);
+    }
+
+    /// The run member after the current node, when one follows (the pair
+    /// face: each left member reports its own pair).
+    fn adjacent_next(c: &Check<'_>, node: u32) -> Option<u32> {
+        let run = super::adjacent_run(c);
+        let pos = run.iter().position(|&kid| kid == node)?;
+        run.get(pos + 1).copied()
+    }
+
+    /// The cooked-value whitespace face of one literal: `(starts_with,
+    /// ends_with, has)` over `[' ', '\n', '\r', '\t']`. An interpolated
+    /// literal reads its String segments (the official InterpolationString
+    /// values): an empty first/last segment — an interpolation at the
+    /// very start or end — counts as whitespace (:92-93, :118-119).
+    fn whitespace_face(c: &Check<'_>, node: u32) -> Option<(bool, bool, bool)> {
+        const WHITESPACES: [char; 4] = [' ', '\n', '\r', '\t'];
+        // The whole spelling: a production row's token range covers only the
+        // first segment, so the extent walk crosses the interpolation markers.
+        let range = super::literal_token_extent(c, node);
+        let kind_is = |token: u32, kind: TokenKind| {
+            c.unit
+                .tokens
+                .get(token as usize)
+                .is_some_and(|t| t.kind == kind)
+        };
+        let interpolated = range.clone().any(|token| {
+            kind_is(token, TokenKind::StringInterpolationExpression)
+                || kind_is(token, TokenKind::StringInterpolationIdentifier)
+        });
+        if !interpolated {
+            let value = crate::rules::directives::string_value(c, node)?;
+            return Some((
+                value.starts_with(WHITESPACES),
+                value.ends_with(WHITESPACES),
+                value.contains(WHITESPACES),
+            ));
+        }
+        // The segment contents: the opening segment drops its `r`/quote
+        // run, the closing segment its quote run, the middles stand.
+        let string_tokens: Vec<u32> = range
+            .filter(|&token| kind_is(token, TokenKind::String))
+            .collect();
+        let first = *string_tokens.first()?;
+        let last = *string_tokens.last()?;
+        fn strip_leading(text: &str) -> &str {
+            text.strip_prefix('r')
+                .unwrap_or(text)
+                .trim_start_matches(['\'', '"'])
+        }
+        fn strip_trailing(text: &str) -> &str {
+            text.trim_end_matches(['\'', '"'])
+        }
+        let segment_text = |token: u32| -> &str {
+            let text = c.lexeme(token);
+            if token == first {
+                strip_leading(text)
+            } else if token == last {
+                strip_trailing(text)
+            } else {
+                text
+            }
+        };
+        let first_value = crate::rules::directives::cook_string_body(segment_text(first))?;
+        let last_value = crate::rules::directives::cook_string_body(segment_text(last))?;
+        let has = string_tokens.iter().any(|&token| {
+            crate::rules::directives::cook_string_body(segment_text(token))
+                .is_some_and(|value| value.contains(WHITESPACES))
+        });
+        Some((
+            first_value.is_empty() || first_value.starts_with(WHITESPACES),
+            last_value.is_empty() || last_value.ends_with(WHITESPACES),
+            has,
+        ))
+    }
+
+    /// The `RegExp()` / bare `matches()` exemption (:43-53): the argument
+    /// list covering the pair belongs to a bare send (or creation) named
+    /// `RegExp` or `matches`. Both official faces are name-only — the
+    /// instance-creation arm keys on the constructor's enclosing class
+    /// NAME (`RegExp` whenever the class resolves, a same-file `RegExp`
+    /// class included), the bare-send arm on the method name
+    /// (`realTarget == null`).
+    fn regexp_or_matches_context(c: &Check<'_>, left: u32, right: u32) -> bool {
+        let group = c.byte_span(left).start..c.byte_span(right).end;
+        let covers = |row: u32| {
+            let span = c.byte_span(row);
+            span.start <= group.start && group.end <= span.end
+        };
+        // The innermost ancestor covering the group: the argument list.
+        let mut arguments = left;
+        loop {
+            match c.unit.ast.parent(arguments) {
+                Some(parent) if covers(parent) => {
+                    arguments = parent;
+                    if c.kind(arguments) == NodeKind::Arguments {
+                        break;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        // The invocation: the argument list's covering parent (the send
+        // row spans the whole call; a member access carries a trailing
+        // same-span marker).
+        let Some(call) = c.unit.ast.parent(arguments) else {
+            return false;
+        };
+        let name = match c.kind(call) {
+            NodeKind::Send => {
+                let Some(parent) = c.unit.ast.parent(call) else {
+                    return false;
+                };
+                let kids = c.collect_direct(parent);
+                let Some(pos) = kids.iter().position(|&kid| kid == call) else {
+                    return false;
+                };
+                let Some((head, _)) = crate::rules::slice::send_parts(c, &kids, pos) else {
+                    return false;
+                };
+                if c.kind(kids[head]) != NodeKind::Identifier
+                    || crate::rules::slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some()
+                {
+                    return false;
+                }
+                c.lexeme(c.head_token(kids[head])).to_owned()
+            }
+            // The creation faces (`new RegExp(…)`, `const RegExp(…)`) name
+            // the class through the constructor-reference child.
+            NodeKind::NewExpression | NodeKind::ImplicitCreation => c
+                .collect_direct(call)
+                .into_iter()
+                .filter_map(|kid| {
+                    c.collect_direct(kid)
+                        .into_iter()
+                        .find(|&piece| c.kind(piece) == NodeKind::Identifier)
+                })
+                .next()
+                .map_or(String::new(), |name| c.lexeme(c.head_token(name)).to_owned()),
+            // The flat bare-send tiling: the whole-call `Send` row tiles
+            // BESIDE its argument list under the enclosing row
+            // (`matches('a b' 'cd')` — Send 13..18, Arguments 14..18, both
+            // under the initializer).
+            _ => {
+                let kids = c.collect_direct(call);
+                let pos = if c.kind(call) == NodeKind::Send {
+                    kids.iter().position(|&kid| kid == call)
+                } else {
+                    kids.iter().position(|&kid| {
+                        c.kind(kid) == NodeKind::Send && {
+                            let send = c.byte_span(kid);
+                            let args = c.byte_span(arguments);
+                            send.start <= args.start && args.end <= send.end
+                        }
+                    })
+                };
+                let Some(pos) = pos else {
+                    return false;
+                };
+                let Some((head, _)) = crate::rules::slice::send_parts(c, &kids, pos) else {
+                    return false;
+                };
+                if c.kind(kids[head]) != NodeKind::Identifier
+                    || crate::rules::slice::access_marker(c, &kids, pos, NodeKind::DotAccess)
+                        .is_some()
+                {
+                    return false;
+                }
+                c.lexeme(c.head_token(kids[head])).to_owned()
+            }
+        };
+        if name == "matches" {
+            return true;
+        }
+        name == "RegExp"
+    }
+}
+
+pub(crate) mod no_adjacent_strings_in_list {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `pkg/linter/lib/src/rules/no_adjacent_strings_in_list.dart:38-82`
+    /// — an adjacent-strings group in a list literal, a set literal (never
+    /// a map, :67-70), a for-element body (:46-50), an if-element's then
+    /// arm when no `else` follows or its else arm (:52-59), or a list
+    /// pattern's constant elements (:73-81) reports at the whole group.
+    /// Message: `diagnostic.g.dart` `noAdjacentStringsInList`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "no_adjacent_strings_in_list",
+        group: Group::Standalone,
+        problem: "Don't use adjacent strings in a list literal.",
+        correction: "Try adding a comma between the strings.",
+        kinds: &[NodeKind::StringLiteral],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let run = super::adjacent_run(c);
+        if run.len() < 2 || run[0] != node {
+            return;
+        }
+        // The group span: first literal's head to last literal's tail.
+        let span = c.utf16_span(run[0]).start..c.utf16_span(run[run.len() - 1]).end;
+        let group_bytes = c.byte_span(run[0]).start..c.byte_span(run[run.len() - 1]).end;
+        let head_token = c.head_token(node);
+        let covers = |row: u32| {
+            let s = c.byte_span(row);
+            s.start <= group_bytes.start && group_bytes.end <= s.end
+        };
+        // The container adjudication over the production tiling: an
+        // element's rows tile BESIDE their literal row (a list literal's
+        // strings are siblings of the childless `ListLiteral` row), so each
+        // level decides on the ancestor row first — the control-flow rows
+        // keep their element runs as children — and then on the level's
+        // covering sibling rows. Anything else walks on; the official only
+        // visits the five element containers, so a walk past them all is
+        // silent.
+        let mut covering_list_patterns = 0u8;
+        let mut row = node;
+        loop {
+            let Some(parent) = c.unit.ast.parent(row) else {
+                return;
+            };
+            if !covers(parent) {
+                return;
+            }
+            row = parent;
+            match c.kind(row) {
+                // The for-element body is the row's tail (:46-50).
+                NodeKind::ForControlFlow => {
+                    if c.byte_span(row).end >= group_bytes.end {
+                        c.report(span.clone(), &[]);
+                    }
+                    return;
+                }
+                // The if-element faces (:52-59): a then arm reports
+                // only without `else`; an else arm always reports.
+                NodeKind::IfControlFlow => {
+                    let range = c.unit.ast.token_range(row);
+                    match range.clone().find(|&token| c.lexeme(token) == "else") {
+                        None => {
+                            if c.byte_span(row).end >= group_bytes.end {
+                                c.report(span.clone(), &[]);
+                            }
+                        }
+                        Some(else_token) => {
+                            if else_token < head_token
+                                && c.byte_span(row).end >= group_bytes.end
+                            {
+                                c.report(span.clone(), &[]);
+                            }
+                        }
+                    }
+                    return;
+                }
+                // The switch face (:73-81): the group sits under the case's
+                // covering list pattern(s). The officially-tested shapes
+                // both report — the direct element (`case ['a' 'b']`) and
+                // the one-level-nested constant element
+                // (`test_switchPattern`: `case [['one' 'two'], var name]`
+                // reports at the inner group) — so any covering
+                // `ListPattern` between the group and the case reports.
+                NodeKind::SwitchCase => {
+                    if covering_list_patterns >= 1 {
+                        c.report(span.clone(), &[]);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+            // The level's covering sibling rows adjudicate the literal faces.
+            for sib in c.collect_direct(row) {
+                if !covers(sib) {
+                    continue;
+                }
+                match c.kind(sib) {
+                    NodeKind::ListLiteral => {
+                        c.report(span.clone(), &[]);
+                        return;
+                    }
+                    NodeKind::SetOrMapLiteral => {
+                        // `node.isMap` (:67-70): a `MapEntry` row tiling
+                        // beside the literal whose span reaches into the
+                        // group is the map face.
+                        let map = c.collect_direct(row).into_iter().any(|piece| {
+                            c.kind(piece) == NodeKind::MapEntry && {
+                                let entry = c.byte_span(piece);
+                                entry.start < group_bytes.end && group_bytes.start < entry.end
+                            }
+                        });
+                        if !map {
+                            c.report(span.clone(), &[]);
+                        }
+                        return;
+                    }
+                    NodeKind::ListPattern => {
+                        covering_list_patterns += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_ast::NodeKind;
@@ -876,5 +1363,186 @@ mod tests {
     fn escaping_inner_quotes_other_escape_and_interpolation_faces() {
         let f = Fixture::parse("var a = 'a\\nb\\'c';\nvar b = 'a\\'b $a c';");
         assert_eq!(f.run(&one_rule("avoid_escaping_inner_quotes")).len(), 2);
+    }
+}
+
+/// The W3 (#992) production-bridge pins: the string-wave rules over real
+/// parser trees.
+#[cfg(test)]
+mod w3_pins {
+    use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
+
+    // —— leading_newlines_in_multiline_strings ————————————————————————
+
+    /// A multiline literal without a leading newline reports at the
+    /// literal (`leading_newlines_in_multiline_strings.dart` doc example).
+    #[test]
+    fn leading_newlines_without_leading_newline_reports() {
+        let f = Fixture::parse("var a = '''this\n is multiline''';\n");
+        let lints = f.run(&one_rule("leading_newlines_in_multiline_strings"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Missing a newline at the beginning of a multiline string."
+        );
+        let literal = tok(&f.source, &f.tokens, "'''this\n is multiline'''", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, literal));
+    }
+
+    /// A leading newline, a single-line multiline spelling and a raw
+    /// literal with a leading newline pass; the interpolated face reads
+    /// its first segment (:54-67).
+    #[test]
+    fn leading_newlines_compliant_spellings_pass() {
+        let f = Fixture::parse("var a = '''\nstarts right''';\n");
+        assert!(
+            f.run(&one_rule("leading_newlines_in_multiline_strings"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse("var b = '''single line''';\n");
+        assert!(
+            f.run(&one_rule("leading_newlines_in_multiline_strings"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse("var c = r'''\nraw starts right''';\n");
+        assert!(
+            f.run(&one_rule("leading_newlines_in_multiline_strings"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse("var x = 1;\nvar d = '''more $x\nthan one''';\n");
+        assert_eq!(
+            f.run(&one_rule("leading_newlines_in_multiline_strings"))
+                .len(),
+            1
+        );
+    }
+
+    // —— missing_whitespace_between_adjacent_strings ——————————————————
+
+    /// A whitespace-carrying left part at a bare seam reports at the left
+    /// part (`missing_whitespace_between_adjacent_strings.dart` doc
+    /// example family).
+    #[test]
+    fn missing_whitespace_reports_the_left_part() {
+        let f = Fixture::parse("var a = 'a long line' 'continues';\n");
+        let lints = f.run(&one_rule("missing_whitespace_between_adjacent_strings"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Missing whitespace between adjacent strings."
+        );
+        let left = tok(&f.source, &f.tokens, "'a long line'", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, left));
+    }
+
+    /// A three-part run reports once per pair (each left member).
+    #[test]
+    fn missing_whitespace_three_part_run_reports_each_left() {
+        let f = Fixture::parse("var b = 'pair one' 'pair two' 'pair three';\n");
+        assert_eq!(
+            f.run(&one_rule("missing_whitespace_between_adjacent_strings"))
+                .len(),
+            2
+        );
+    }
+
+    /// Whitespace at the seam, a whitespace-free left part, an
+    /// interpolation ending in whitespace, and the RegExp/matches
+    /// exemptions all pass (:62-64, :83-125, :43-53).
+    #[test]
+    fn missing_whitespace_compliant_and_exempt_faces_pass() {
+        let f = Fixture::parse("var a = 'one ' 'two';\n");
+        assert!(
+            f.run(&one_rule("missing_whitespace_between_adjacent_strings"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse("var b = 'ab' 'cd';\n");
+        assert!(
+            f.run(&one_rule("missing_whitespace_between_adjacent_strings"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse("var c = 'one' ' two';\n");
+        assert!(
+            f.run(&one_rule("missing_whitespace_between_adjacent_strings"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse("var y = 1;\nvar d = 'x $y ' 'tail';\n");
+        assert!(
+            f.run(&one_rule("missing_whitespace_between_adjacent_strings"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse("var e = new RegExp('a b' 'cd');\nvar g = matches('a b' 'cd');\n");
+        assert!(
+            f.run(&one_rule("missing_whitespace_between_adjacent_strings"))
+                .is_empty()
+        );
+    }
+
+    // —— no_adjacent_strings_in_list ———————————————————————————————————
+
+    /// The list, set and if-element faces report the group at its head
+    /// (no_adjacent_strings_in_list.dart:42-59, :67-70).
+    #[test]
+    fn no_adjacent_strings_list_set_and_if_faces() {
+        let f = Fixture::parse(
+            "var a = ['l one' 'l two'];\nvar b = <String>{'s one' 's two'};\nvar x = 0;\nvar d = [if (x == 0) 'i one' 'i two'];\n",
+        );
+        let lints = f.run(&one_rule("no_adjacent_strings_in_list"));
+        assert_eq!(lints.len(), 3, "{lints:?}");
+        assert_eq!(lints[0].message, "Don't use adjacent strings in a list literal.");
+        let head = tok(&f.source, &f.tokens, "'l one'", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, head));
+    }
+
+    /// The for-element body and the if-element else arm report; the then
+    /// arm with an else following stays silent (:46-59).
+    #[test]
+    fn no_adjacent_strings_for_and_else_faces() {
+        let f = Fixture::parse(
+            "var c = [for (var i in [1]) 'f one' 'f two'];\nvar x = 0;\nvar e = [if (x == 0) 't' 'u' else 'e one' 'e two'];\n",
+        );
+        assert_eq!(
+            f.run(&one_rule("no_adjacent_strings_in_list")).len(),
+            2,
+            "{:?}",
+            f.run(&one_rule("no_adjacent_strings_in_list"))
+        );
+    }
+
+    /// A map entry is never a list face (:67-70); the officially-tested
+    /// pattern shapes both report (:73-81) — the direct element and the
+    /// one-level-nested constant element (`test_switchPattern` verbatim:
+    /// `case [['one' 'two'], var name]` reports at the inner group).
+    #[test]
+    fn no_adjacent_strings_map_and_pattern_boundaries() {
+        let f = Fixture::parse("var m = <String, String>{'k': 'v one' 'v two'};\n");
+        assert!(f.run(&one_rule("no_adjacent_strings_in_list")).is_empty());
+
+        let f = Fixture::parse(
+            "void h(Object v) {\n  switch (v) {\n    case ['p one' 'p two']:\n      break;\n  }\n}\n",
+        );
+        assert_eq!(
+            f.run(&one_rule("no_adjacent_strings_in_list")).len(),
+            1,
+            "{:?}",
+            f.run(&one_rule("no_adjacent_strings_in_list"))
+        );
+
+        let f = Fixture::parse(
+            "void h(List<String?> row) {\n  switch (row) {\n    case [['one' 'two'], var name]:\n  }\n}\n",
+        );
+        assert_eq!(
+            f.run(&one_rule("no_adjacent_strings_in_list")).len(),
+            1,
+            "{:?}",
+            f.run(&one_rule("no_adjacent_strings_in_list"))
+        );
     }
 }

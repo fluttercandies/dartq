@@ -164,9 +164,27 @@ const OFFICIAL_STANDALONE_WAVE2: &[&str] = &[
     "avoid_multiple_declarations_per_line",
 ];
 
+/// The W3 declaration-shape wave (#992, parity-plan wave 3): eleven more
+/// registered SDK rules outside the `package:lints` sets, alphabetical.
+const OFFICIAL_STANDALONE_WAVE3: &[&str] = &[
+    "avoid_private_typedef_functions",
+    "avoid_returning_this",
+    "avoid_types_on_closure_parameters",
+    "avoid_unused_constructor_parameters",
+    "combinators_ordering",
+    "initialize_in_field_declaration",
+    "leading_newlines_in_multiline_strings",
+    "migrate_design_widgets",
+    "missing_whitespace_between_adjacent_strings",
+    "no_adjacent_strings_in_list",
+    "no_literal_bool_comparisons",
+];
+
 /// The standalone universe in wave order — the registry-section contract.
 fn official_standalone() -> Vec<&'static str> {
-    OFFICIAL_STANDALONE_WAVE2.to_vec()
+    let mut all = OFFICIAL_STANDALONE_WAVE2.to_vec();
+    all.extend(OFFICIAL_STANDALONE_WAVE3);
+    all
 }
 
 #[test]
@@ -241,11 +259,11 @@ fn registry_fits_the_enable_set_word_count() {
 
 /// The slice pin: 89 `package:lints` members through #586 (34 core + 55
 /// recommended-only, no member left blocked or documented-out), the #570
-/// diagnostic mirror, the #986 removed-registry no-ops, and the #987 W2
-/// standalone wave make 115.
+/// diagnostic mirror, the #986 removed-registry no-ops, the #987 W2
+/// standalone wave, and the #992 W3 wave make 126.
 #[test]
 fn registry_holds_the_pinned_count() {
-    assert_eq!(RULES.len(), 115);
+    assert_eq!(RULES.len(), 126);
 }
 
 /// The registry-order contract (parity-plan R8): one contiguous block per

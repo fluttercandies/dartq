@@ -1772,6 +1772,11 @@ pub(crate) mod same_file {
     #[must_use]
     pub fn written_type<'a>(c: &'a Check<'a>, use_node: u32, name: &str) -> Option<&'a str> {
         let row = binding(c, use_node, name)?.1?;
+        // A named type only: a function-type head spells the return type,
+        // not the variable's type name.
+        if c.kind(row) != NodeKind::Type {
+            return None;
+        }
         Some(c.lexeme(c.head_token(row)))
     }
 
@@ -1802,7 +1807,9 @@ pub(crate) mod same_file {
         let mut written: Option<u32> = None;
         for kid in c.collect_direct(block) {
             match c.kind(kid) {
-                NodeKind::Type => written = Some(kid),
+                NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType => {
+                    written = Some(kid)
+                }
                 NodeKind::VariablesDeclaration => {
                     // The name identifier: a direct child (hand-built trees)
                     // or nested inside an `InitializedIdentifier` row (the
@@ -1919,7 +1926,9 @@ pub(crate) mod same_file {
         let mut written: Option<u32> = None;
         for kid in c.collect_direct(fields) {
             match c.kind(kid) {
-                NodeKind::Type => written = Some(kid),
+                NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType => {
+                    written = Some(kid)
+                }
                 NodeKind::Identifier
                     if c.payload(kid).first() == Some(&ctx)
                         && c.lexeme(c.head_token(kid)) == name =>
@@ -3200,6 +3209,208 @@ pub(crate) mod unrelated_type_equality_checks {
             // other kind has no scalar face.
             _ => None,
         }
+    }
+}
+
+pub(crate) mod no_literal_bool_comparisons {
+    use super::{Check, Group, NodeKind, RuleSpec, same_file};
+    use crate::rules::{byte_span_of_token, slice};
+
+    /// Official: `pkg/linter/lib/src/rules/no_literal_bool_comparisons.dart:44-62`
+    /// — a boolean literal on either side of `==`/`!=`/`|`/`||`/`&`/`&&`/`^`
+    /// whose OTHER operand is a non-nullable `bool` reports at the literal
+    /// (:55-60). The other operand's type is resolution. The written-type
+    /// face over the same-file channel: a bare identifier (or its
+    /// invocation) bound to a written `bool` — parameter, local, field,
+    /// top-level variable — or to a written `bool Function(…)` (the
+    /// invocation face, the return type read), a bool literal on both
+    /// sides, and a member access `r.m` whose receiver binds to a
+    /// same-file class declaring a `bool` field or getter `m`. A written
+    /// `bool?` stays silent exactly like the official (:41, the
+    /// `isNonNullable` gate); inferred-`bool` locals (`var x = true`)
+    /// under-report, the documented type-inference family, and
+    /// `this.getter` under-reports (a receiver that is not a plain name).
+    /// Message: `diagnostic.g.dart` `noLiteralBoolComparisons`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "no_literal_bool_comparisons",
+        group: Group::Standalone,
+        problem: "Unnecessary comparison to a boolean literal.",
+        correction: "Remove the comparison and use the negation operator `!` if necessary.",
+        kinds: &[NodeKind::BinaryExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(op) = c.payload(node).first().copied() else {
+            return;
+        };
+        if !matches!(
+            c.lexeme(op),
+            "==" | "!=" | "|" | "||" | "&" | "&&" | "^"
+        ) {
+            return;
+        }
+        let Some((left, right)) = slice::binary_operands(c) else {
+            return;
+        };
+        let report = if let Some(literal) = bool_literal(c, &left) {
+            other_is_bool(c, &right).then_some(literal)
+        } else if let Some(literal) = bool_literal(c, &right) {
+            other_is_bool(c, &left).then_some(literal)
+        } else {
+            None
+        };
+        if let Some(literal) = report {
+            c.report(c.utf16_span(literal), &[]);
+        }
+    }
+
+    /// The bool-literal operand of a side, when the side is one.
+    fn bool_literal(c: &Check<'_>, rows: &[u32]) -> Option<u32> {
+        rows.iter().copied().find(|&row| c.kind(row) == NodeKind::LiteralBool)
+    }
+
+    /// The other-side verdict: a non-nullable `bool` over the written-type
+    /// faces (:41 — the `isNonNullable` gate).
+    fn other_is_bool(c: &Check<'_>, rows: &[u32]) -> bool {
+        // A bool literal on the other side is a bool (`true == true`).
+        if rows.iter().any(|&row| c.kind(row) == NodeKind::LiteralBool) {
+            return true;
+        }
+        let run = slice::access_run(c, rows);
+        match run.as_slice() {
+            // A bare name: the binding's written type (`bool`, or a
+            // function type returning `bool` — the invocation face).
+            [only] if c.kind(*only) == NodeKind::Identifier => {
+                written_is_bool(c, *only)
+            }
+            // An invocation of a bare name: the callee's written return
+            // type (`fn() == true`).
+            [callee, arguments]
+                if c.kind(*callee) == NodeKind::Identifier
+                    && c.kind(*arguments) == NodeKind::Arguments =>
+            {
+                written_is_bool(c, *callee)
+            }
+            // A member access over a bare receiver: the same-file class
+            // member's written type (`c.x == true`).
+            _ => member_face(c, rows),
+        }
+    }
+
+    /// The binding face of the identifier `name_row`: `true` when its
+    /// written type is a non-nullable `bool`, or a function type whose
+    /// return type is a non-nullable `bool`.
+    fn written_is_bool(c: &Check<'_>, name_row: u32) -> bool {
+        let name = c.lexeme(c.head_token(name_row));
+        let Some((_, type_row)) = same_file::binding(c, c.node(), name) else {
+            return false;
+        };
+        let Some(type_row) = type_row else {
+            return false;
+        };
+        non_null_bool_type(c, type_row)
+    }
+
+    /// Whether the written type row is a non-nullable `bool` (or, for
+    /// function types, has a non-nullable `bool` return type).
+    fn non_null_bool_type(c: &Check<'_>, type_row: u32) -> bool {
+        match c.kind(type_row) {
+            NodeKind::Type => {
+                let head = c.head_token(type_row);
+                c.lexeme(head) == "bool"
+                    && c.byte_span(type_row).end == byte_span_of_token(c, head).end
+            }
+            NodeKind::FunctionType => c
+                .collect_direct(type_row)
+                .into_iter()
+                .find(|&kid| matches!(c.kind(kid), NodeKind::Type | NodeKind::VoidType))
+                .is_some_and(|return_row| non_null_bool_type(c, return_row)),
+            _ => false,
+        }
+    }
+
+    /// The member face over the raw operand rows: a `DotAccess` marker's
+    /// member name against a bare-identifier receiver, resolved through
+    /// the receiver's same-file class (fields and getters).
+    fn member_face(c: &Check<'_>, rows: &[u32]) -> bool {
+        let Some(marker) = rows
+            .iter()
+            .copied()
+            .find(|&row| c.kind(row) == NodeKind::DotAccess)
+        else {
+            return false;
+        };
+        let Some(name_index) = slice::access_name_index(c, rows, marker) else {
+            return false;
+        };
+        let name = c.lexeme(c.head_token(rows[name_index]));
+        let Some(receiver) = slice::bare_receiver(c, rows, name_index) else {
+            return false;
+        };
+        let receiver_name = c.lexeme(c.head_token(receiver));
+        let Some(class_name) =
+            same_file::written_type(c, receiver, receiver_name).map(str::to_owned)
+        else {
+            return false;
+        };
+        member_is_bool(c, &class_name, name)
+    }
+
+    /// Whether the same-file class `class_name` declares a member `name`
+    /// whose written type is a non-nullable `bool` (a field or a getter).
+    fn member_is_bool(c: &Check<'_>, class_name: &str, name: &str) -> bool {
+        let Some(class_row) = crate::rules::same_file_declaration(c, class_name) else {
+            return false;
+        };
+        for member in crate::rules::body_members(c, class_row) {
+            match c.kind(member) {
+                NodeKind::Fields => {
+                    let mut written = None;
+                    for kid in c.collect_direct(member) {
+                        match c.kind(kid) {
+                            NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType => {
+                                written = Some(kid);
+                            }
+                            NodeKind::Identifier
+                                if c.payload(kid).first()
+                                    == Some(
+                                        &(dartq_parser::IdentifierContext::FieldDeclaration
+                                            as u32),
+                                    )
+                                    && c.lexeme(c.head_token(kid)) == name =>
+                            {
+                                return written
+                                    .is_some_and(|row| non_null_bool_type(c, row));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                NodeKind::Method if crate::rules::get_set_token(c, member) == Some("get") => {
+                    let Some(name_row) = c.collect_direct(member).into_iter().find(|&kid| {
+                        c.kind(kid) == NodeKind::Identifier
+                            && c.payload(kid).first()
+                                == Some(
+                                    &(dartq_parser::IdentifierContext::MethodDeclaration as u32),
+                                )
+                    }) else {
+                        continue;
+                    };
+                    if c.lexeme(c.head_token(name_row)) != name {
+                        continue;
+                    }
+                    if let Some((type_row, _)) = crate::rules::type_before(c, member, name_row)
+                        && non_null_bool_type(c, type_row)
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 }
 
@@ -6468,5 +6679,78 @@ void k(List<int> xs) {
     fn js_rounded_ints_exact_literals_pass() {
         let f = Fixture::parse("var c = 9007199254740992;\nvar d = 1;");
         assert!(f.run(&one_rule("avoid_js_rounded_ints")).is_empty());
+    }
+}
+
+/// The W3 (#992) production-bridge pins: no_literal_bool_comparisons over
+/// real parser trees.
+#[cfg(test)]
+mod w3_pins {
+    use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
+
+    /// The written-bool operand faces: local, top-level variable,
+    /// parameter, both-literal and same-file class field all report at
+    /// the literal (no_literal_bool_comparisons.dart:55-60).
+    #[test]
+    fn no_literal_bool_written_bool_faces() {
+        let f = Fixture::parse(
+            "bool flag = true;\nclass Box { bool flag = true; }\nvoid f(bool b) {\n  bool value = true;\n  Box box = Box();\n  var r1 = value && true;\n  var r2 = true && value;\n  var r3 = b == true;\n  var r4 = flag != false;\n  var r5 = true == true;\n  var r6 = box.flag || true;\n}\n",
+        );
+        let lints = f.run(&one_rule("no_literal_bool_comparisons"));
+        assert_eq!(lints.len(), 6, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary comparison to a boolean literal."
+        );
+        // In source order: the literals of r1..r6.
+        let starts = [
+            tok(&f.source, &f.tokens, "true", 3),  // value && true
+            tok(&f.source, &f.tokens, "true", 4),  // true && value
+            tok(&f.source, &f.tokens, "true", 5),  // b == true
+            tok(&f.source, &f.tokens, "false", 0), // flag != false
+            tok(&f.source, &f.tokens, "true", 6),  // true == true
+            tok(&f.source, &f.tokens, "true", 8),  // box.flag || true
+        ]
+        .map(|index| utf16_at(&f, index));
+        for (lint, start) in lints.iter().zip(starts) {
+            assert_eq!(lint.range.start, start);
+        }
+    }
+
+    /// The `bool Function()` invocation face reads the return type; the
+    /// getter member face reads the same-file class.
+    #[test]
+    fn no_literal_bool_function_and_getter_faces() {
+        let f = Fixture::parse(
+            "bool Function() probe = () => true;\nvoid f() {\n  var r = probe() && true;\n}\n",
+        );
+        let lints = f.run(&one_rule("no_literal_bool_comparisons"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let t = tok(&f.source, &f.tokens, "true", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, t));
+
+        let f = Fixture::parse(
+            "class C {\n  bool get ok => true;\n}\nvoid f(C c) {\n  var r = c.ok || true;\n}\n",
+        );
+        assert_eq!(
+            f.run(&one_rule("no_literal_bool_comparisons")).len(),
+            1,
+            "{:?}",
+            f.run(&one_rule("no_literal_bool_comparisons"))
+        );
+    }
+
+    /// Nullable, dynamic, non-bool and unknown operands, the
+    /// non-comparison `??`, and literal-free comparisons stay silent
+    /// (:41, :55-60).
+    #[test]
+    fn no_literal_bool_silent_faces() {
+        let f = Fixture::parse(
+            "void f(bool? maybe, dynamic dyn, int n, bool v) {\n  var g1 = maybe ?? true;\n  var g2 = dyn == true;\n  var g3 = v || maybe;\n  var g4 = n == true;\n  var g5 = v == maybe;\n}\n",
+        );
+        assert!(
+            f.run(&one_rule("no_literal_bool_comparisons"))
+                .is_empty()
+        );
     }
 }

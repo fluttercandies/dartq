@@ -95,12 +95,13 @@ impl core::fmt::Debug for RuleSpec {
 /// All rules through the #586 standard-set completion (the full
 /// `package:lints` union: 34 core + 55 recommended-only), the #570
 /// diagnostic mirror, the #986 removed-registry no-ops (the 14
-/// `RemovedAnalysisRule` registrations), and the #987 W2 standalone wave
-/// (the first 11 options-driven SDK rules). Order is registry order
-/// ([`RuleId`] assignment), grouped core-first then alphabetically within
-/// each group, the mirror section, then the wave sections in wave order
-/// (the removed block first; each new wave appends its section) — keep the
-/// pin test in `tests/registry_pin.rs` in sync.
+/// `RemovedAnalysisRule` registrations), the #987 W2 standalone wave (the
+/// first 11 options-driven SDK rules), and the #992 W3 declaration-shape
+/// wave (11 more). Order is registry order ([`RuleId`] assignment),
+/// grouped core-first then alphabetically within each group, the mirror
+/// section, then the wave sections in wave order (the removed block
+/// first; each new wave appends its section) — keep the pin test in
+/// `tests/registry_pin.rs` in sync.
 pub static RULES: &[&RuleSpec] = &[
     // —— core (`.third/lints/lib/core.yaml`) ——
     &crate::rules::empty::avoid_empty_else::SPEC,
@@ -227,6 +228,18 @@ pub static RULES: &[&RuleSpec] = &[
     &crate::rules::declarations::avoid_final_parameters::SPEC,
     &crate::rules::expressions::avoid_js_rounded_ints::SPEC,
     &crate::rules::declarations::avoid_multiple_declarations_per_line::SPEC,
+    // —— standalone W3 (#992, parity-plan wave 3, alphabetical) ——
+    &crate::rules::declarations::avoid_private_typedef_functions::SPEC,
+    &crate::rules::declarations::avoid_returning_this::SPEC,
+    &crate::rules::declarations::avoid_types_on_closure_parameters::SPEC,
+    &crate::rules::declarations::avoid_unused_constructor_parameters::SPEC,
+    &crate::rules::directives::combinators_ordering::SPEC,
+    &crate::rules::declarations::initialize_in_field_declaration::SPEC,
+    &crate::rules::strings::leading_newlines_in_multiline_strings::SPEC,
+    &crate::rules::directives::migrate_design_widgets::SPEC,
+    &crate::rules::strings::missing_whitespace_between_adjacent_strings::SPEC,
+    &crate::rules::strings::no_adjacent_strings_in_list::SPEC,
+    &crate::rules::expressions::no_literal_bool_comparisons::SPEC,
 ];
 
 /// The rule with machine name `name`, case-insensitively (linear scan; a

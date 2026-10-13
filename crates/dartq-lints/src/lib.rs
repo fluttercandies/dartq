@@ -159,6 +159,29 @@
 //!   The rules.json `removed` slice of the 264 universe is now covered
 //!   (104 specs; [`EnableSet`] grew to five 64-bit words).
 //!
+//! - standalone wave 2 (2026-10-13, #987, parity-plan W2) and wave 3
+//!   (#992, parity-plan W3): 22 registered SDK rules outside the
+//!   `package:lints` sets under [`Group::Standalone`] — options-driven
+//!   (no include set carries them, §4.2), each with its per-rule fixture
+//!   in the lint corpus. W2: `always_declare_return_types`,
+//!   `always_put_control_body_on_new_line`,
+//!   `always_put_required_named_parameters_first`,
+//!   `avoid_annotating_with_dynamic`, `avoid_catches_without_on_clauses`,
+//!   `avoid_classes_with_only_static_members`,
+//!   `avoid_double_and_int_checks`, `avoid_escaping_inner_quotes`,
+//!   `avoid_final_parameters`, `avoid_js_rounded_ints`,
+//!   `avoid_multiple_declarations_per_line`. W3 (the declaration-shape
+//!   wave): `avoid_private_typedef_functions`, `avoid_returning_this`,
+//!   `avoid_types_on_closure_parameters`,
+//!   `avoid_unused_constructor_parameters`, `combinators_ordering`,
+//!   `initialize_in_field_declaration`,
+//!   `leading_newlines_in_multiline_strings`, `migrate_design_widgets`,
+//!   `missing_whitespace_between_adjacent_strings`,
+//!   `no_adjacent_strings_in_list`, `no_literal_bool_comparisons` — each
+//!   module spells out its resolution-bound divergences (the
+//!   `approximateContextType`, cross-part use-count, and inferred-type
+//!   faces are the documented approximation families) (126 specs).
+//!
 //! With this tranche every `package:lints` member has a terminal state:
 //! implemented (84), or documented-blocked with the exact resolution fact it
 //! waits for (below).

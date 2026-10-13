@@ -1138,7 +1138,10 @@ pub(crate) mod type_literal_in_constant_pattern {
     /// A typed value binding is a type literal only when written `Type`
     /// (the constant's static type follows the written annotation).
     fn typed_face_is_type(c: &Check<'_>, typed: Option<u32>) -> bool {
-        typed.is_some_and(|row| crate::rules::type_face(c, row).name == Some("Type"))
+        typed.is_some_and(|row| {
+            c.kind(row) == dartq_ast::NodeKind::Type
+                && crate::rules::type_face(c, row).name == Some("Type")
+        })
     }
 
     /// The alias fold over a top-level/class-static const initializer
