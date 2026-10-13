@@ -277,7 +277,8 @@ final class _QueryAnswer implements Producer {
   @override
   final String message;
 
-  @override
+  /// Not a [Producer] member: the answer's edits are fixed at construction
+  /// time, and [compute] hands them back unchanged.
   final List<SourceEdit> edits;
 
   @override
