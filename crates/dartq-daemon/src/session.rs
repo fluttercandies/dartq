@@ -406,8 +406,8 @@ struct PendingRead {
 /// the wire parameters, paths already resolved against the workspace root.
 #[derive(Debug)]
 pub(crate) enum FixJob {
-    /// The §15.6 patch documents over the requested paths (built-in lint
-    /// rows plus the hosts' proposals).
+    /// The §15.6 patch documents over the requested paths (the built-in
+    /// lint rows, the semantic pass's rows, and the hosts' proposals).
     Fix {
         paths: Vec<PathBuf>,
         verbosity: Verbosity,
@@ -474,11 +474,17 @@ pub(crate) struct FixMail {
 
 /// The worker-side execution of one fix job — the same faces the intake
 /// dispatch ran inline before the staging moved them off the main loop.
-fn run_fix_job(job: FixJob, hosts: &mut PluginHosts) -> Result<serde_json::Value, SessionError> {
+/// `sdk` is the session's resolved SDK root, backing the fix face's
+/// semantic engine pass.
+fn run_fix_job(
+    job: FixJob,
+    hosts: &mut PluginHosts,
+    sdk: &Path,
+) -> Result<serde_json::Value, SessionError> {
     match job {
         #[cfg(test)]
         FixJob::Panics => panic!("test-armed fix panic"),
-        FixJob::Fix { paths, verbosity } => commands::fix_answer(&paths, verbosity, hosts),
+        FixJob::Fix { paths, verbosity } => commands::fix_answer(&paths, verbosity, hosts, sdk),
         FixJob::Assists {
             path,
             offset,
@@ -502,10 +508,11 @@ fn run_fix_job(job: FixJob, hosts: &mut PluginHosts) -> Result<serde_json::Value
 /// every case, so the slot frees and the hosts come home (ownership of
 /// `hosts` stays outside the guarded closure — only its `&mut` borrows in —
 /// so even a panic cannot lose the set; a panicking set is torn down
-/// kill-only by its `Drop` on the mail's eventual consumption).
-fn fix_worker_body(job: FixJob, mut hosts: PluginHosts, done: &Sender<FixMail>) {
+/// kill-only by its `Drop` on the mail's eventual consumption). `sdk` is
+/// the session's resolved SDK root (the semantic pass's engine assembly).
+fn fix_worker_body(job: FixJob, mut hosts: PluginHosts, done: &Sender<FixMail>, sdk: PathBuf) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_fix_job(job, &mut hosts)
+        run_fix_job(job, &mut hosts, &sdk)
     }))
     .unwrap_or_else(|_| {
         eprintln!("dartq-daemon: fix worker panicked; the dispatch answers internal error");
@@ -1656,6 +1663,7 @@ impl Session {
     /// closure drops, tearing its host set down kill-only, and nothing ran.
     fn dispatch_fix(&mut self, pending: PendingFix, turn: &mut Turn) {
         let root = self.workspace_root.clone();
+        let sdk = self.sdk_root.clone();
         let done = self.fix_done.0.clone();
         let id = pending.id.clone();
         let method = pending.job.method();
@@ -1668,6 +1676,7 @@ impl Session {
                     job,
                     hosts.unwrap_or_else(|| PluginHosts::launch(&root)),
                     &done,
+                    sdk,
                 );
             });
         match spawned {

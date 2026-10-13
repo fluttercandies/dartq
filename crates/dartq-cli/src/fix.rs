@@ -10,10 +10,12 @@
 //!   the edits apply in place (the machine document still prints, as the
 //!   record of what was written);
 //! - both faces dispatch the discovered plugin hosts (the `plugins/`
-//!   convention under the working directory): built-in lint rows plus the
-//!   plugins' `request/fixes` proposals, every row provenance-tagged
-//!   (`builtin-lint`, or the plugin's manifest name); a plugin's terminal
-//!   failure surfaces on stderr and in the machine document's `errors`;
+//!   convention under the working directory): built-in lint rows, the
+//!   semantic engine pass's rows, and the plugins' `request/fixes`
+//!   proposals, every row provenance-tagged (`builtin-lint`,
+//!   `builtin-semantic`, or the plugin's manifest name); a plugin's
+//!   terminal failure surfaces on stderr and in the machine document's
+//!   `errors`;
 //! - applies collect-then-write: every file's patched buffer is computed in
 //!   memory before any file changes on disk (a read or patch failure leaves
 //!   nothing mutated), and a write failing midway prints which files were
@@ -233,11 +235,13 @@ fn report_errors(hosts: &mut PluginHosts) {
 }
 
 /// One fix run: the fix source stage (`dartq_commands::fix::collect_set` —
-/// usage tier on a missing target) over the built-in rows and the plugin
-/// hosts' proposals, then the apply + report stages.
+/// usage tier on a missing target) over the built-in rows (lint plus the
+/// semantic engine pass, `None` SDK falling back to the `DART_SDK`
+/// environment) and the plugin hosts' proposals, then the apply + report
+/// stages.
 fn run(args: &FixArgs, out: &mut impl Write) -> u8 {
     let mut hosts = launch_hosts();
-    let collected = fix::collect_set(&args.paths, &mut hosts);
+    let collected = fix::collect_set(&args.paths, &mut hosts, None);
     let per_file: Vec<FileFixSet> = match collected {
         Ok(per_file) => per_file,
         Err(DiscoverError::Missing(path)) => {
@@ -456,6 +460,7 @@ mod tests {
             fixes: vec![fix::RuleFix {
                 rule: "unnecessary_new",
                 message: "Unnecessary 'new' keyword.".to_owned(),
+                source: fix::BUILTIN_SOURCE,
                 edit: fix::anchored_edit(source, &lines, 19, 4, ""),
             }],
             plugin: Vec::new(),

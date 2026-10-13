@@ -951,7 +951,7 @@ pub(crate) fn answer(drain: &Drain<'_>, request: &Request) -> Result<Value, Sess
             // The scheduler arm has no host set (the intake dispatch owns
             // the live one); the built-in rows alone answer here.
             let mut hosts = fix::PluginHosts::empty();
-            fix_answer(paths, *verbosity, &mut hosts)
+            fix_answer(paths, *verbosity, &mut hosts, drain.sdk_root)
         }
         Request::Compat {
             target,
@@ -1433,17 +1433,20 @@ fn explain_answer(
 // ---------------------------------------------------------------------------
 
 /// The fix answer over `hosts`: the §15.6 documents for the discovered
-/// files (built-in rows plus the plugin rows the hosts returned, every row
-/// provenance-tagged) and, when a host failed, the `errors` list. The fix
-/// worker (the session's off-loop dispatch) passes the live host set; the
-/// scheduler arm has no host set and answers the built-in rows alone.
+/// files (built-in lint rows, the engine check pass's semantic rows, and
+/// the plugin rows the hosts returned, every row provenance-tagged) and,
+/// when a host failed, the `errors` list. `sdk` backs the semantic pass's
+/// engine assembly — the session's resolved root. The fix worker (the
+/// session's off-loop dispatch) passes the live host set; the scheduler
+/// arm has no host set and answers the built-in rows alone.
 pub(crate) fn fix_answer(
     paths: &[PathBuf],
     verbosity: Verbosity,
     hosts: &mut fix::PluginHosts,
+    sdk: &Path,
 ) -> Result<Value, SessionError> {
     let per_file: Vec<FileFixSet> =
-        fix::collect_set(paths, hosts).map_err(|error| match error {
+        fix::collect_set(paths, hosts, Some(sdk)).map_err(|error| match error {
             DiscoverError::Missing(path) => {
                 SessionError::InvalidParams(format!("Directory or file doesn't exist: {path}"))
             }
