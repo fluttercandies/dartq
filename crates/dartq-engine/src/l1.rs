@@ -598,7 +598,8 @@ fn compute_unit(
     strings: &StringTable,
     grants: &Grants<'_>,
 ) -> (UnitFacts, ScannedFace) {
-    let (feature_set, scanned, mut diagnostics) = scan_unit(text, version, file, grants);
+    let (feature_set, settled_version, scanned, mut diagnostics) =
+        scan_unit(text, version, file, grants);
     diagnostics.extend(parse_diagnostics(file, text, &scanned.tokens, feature_set));
     // The single allocation of the element model: every later consumer
     // (duplicate bake, api signature, facts clones, the semdiag fold)
@@ -624,6 +625,7 @@ fn compute_unit(
     let scanned_face = ScannedFace {
         tokens: scanned.tokens,
         features: feature_set,
+        version: settled_version,
     };
     (facts, scanned_face)
 }
@@ -673,7 +675,10 @@ fn directive_face(text: &str, tokens: &TokenTable, region_end: usize) -> Vec<u8>
 /// and settles the `@dart` override per the scanner's consumer contract
 /// (official `source_loader.dart:1194–1209` — a differing override
 /// re-derives the config and rescans; the scanner reports only the last
-/// header-window match, so at most one rescan settles).
+/// header-window match, so at most one rescan settles). Returns the settled
+/// feature set with the settled version it was derived at — the version the
+/// lint fan-out's registration gates consult — plus the scan and the
+/// override warnings.
 ///
 /// The feature set carries the file's allowed-experiment grants on top of
 /// the version baseline (official `feature_set_provider.dart:58-77`), and
@@ -694,8 +699,9 @@ pub(crate) fn scan_unit(
     version: LanguageVersion,
     file: FileId,
     grants: &Grants<'_>,
-) -> (FeatureSet, ScanResult, Vec<Diagnostic>) {
+) -> (FeatureSet, LanguageVersion, ScanResult, Vec<Diagnostic>) {
     let mut feature_set = grants.granted(file, version);
+    let mut settled = version;
     let mut scanned = scan(text, scan_config(feature_set), file);
     let mut warnings = Vec::new();
     if let Some(over) = scanned.language_version_override {
@@ -721,11 +727,12 @@ pub(crate) fn scan_unit(
                 None,
             ));
         } else if over != version {
+            settled = over;
             feature_set = grants.granted(file, over);
             scanned = scan(text, scan_config(feature_set), file);
         }
     }
-    (feature_set, scanned, warnings)
+    (feature_set, settled, scanned, warnings)
 }
 
 /// The scanner's two lexical gates, from the feature set in force.
@@ -2963,7 +2970,7 @@ mod tests {
         let mut state = fixture.state();
         let file = state.files.intern(Path::new("/face.dart"));
         let grants = state.grants();
-        let (_, scanned, warnings) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file, &grants);
+        let (_, _, scanned, warnings) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file, &grants);
         assert!(warnings.is_empty());
         let strings = StringTable::new();
         let (_, region_end) = extract_directives(text, &scanned.tokens, &strings);
@@ -2988,7 +2995,7 @@ mod tests {
         let mut state = fixture.state();
         let file = state.files.intern(Path::new("/face.dart"));
         let grants = state.grants();
-        let (_, scanned, _) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file, &grants);
+        let (_, _, scanned, _) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file, &grants);
         let strings = StringTable::new();
         let (_, region_end) = extract_directives(text, &scanned.tokens, &strings);
         let face = directive_face(text, &scanned.tokens, region_end);
@@ -3073,7 +3080,7 @@ mod tests {
         // The override re-gates the grants (`restrictToVersion`), it does
         // not re-derive a bare baseline: enabled above the release, and a
         // pin below it lands exactly on the plain pinned baseline.
-        let (upgraded, _, warnings) = scan_unit(
+        let (upgraded, _, _, warnings) = scan_unit(
             "// @dart = 3.8\nvar y = 2;\n",
             version,
             file,
@@ -3081,7 +3088,7 @@ mod tests {
         );
         assert!(warnings.is_empty());
         assert!(upgraded.is_enabled(Feature::EnhancedParts));
-        let (pinned, _, _) = scan_unit(
+        let (pinned, _, _, _) = scan_unit(
             "// @dart = 3.5\nvar z = 3;\n",
             version,
             file,

@@ -280,6 +280,15 @@ pub struct ScannedFace {
     pub tokens: TokenTable,
     /// The feature set in force after override settlement.
     pub features: FeatureSet,
+    /// The settled version the feature set was derived at (the `@dart`
+    /// override when one applies, else the package-derived version) — the
+    /// face the lint fan-out's registration gates consult. Note the scanned
+    /// cache identity keys the face by feature fingerprint, so two versions
+    /// with byte-identical granted sets share one face; a version gate
+    /// between two such versions would need the version folded into
+    /// `FactsKey` (no current gate does — the 3.7 gate aligns with the
+    /// `wildcard_variables` fingerprint edge).
+    pub version: LanguageVersion,
 }
 
 /// The file-side owner of allowed-experiment grants — a package name from

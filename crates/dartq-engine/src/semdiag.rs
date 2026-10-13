@@ -130,7 +130,7 @@ impl SemanticDiagnoser for Diagnoser {
                     packages: library.packages,
                     files: library.file_table,
                 };
-                let (feature_set, face, _) = l1::scan_unit(text, version, file, &grants);
+                let (feature_set, _, face, _) = l1::scan_unit(text, version, file, &grants);
                 local = face;
                 (feature_set, &local.tokens)
             };

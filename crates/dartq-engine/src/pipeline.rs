@@ -586,10 +586,12 @@ fn drain_captures(state: &mut EngineState) {
                 )
             } else {
                 let version = l1::language_version_for(&state.packages, &state.files, file);
-                let (feature_set, scanned, _) = l1::scan_unit(text, version, file, &state.grants());
+                let (feature_set, settled, scanned, _) =
+                    l1::scan_unit(text, version, file, &state.grants());
                 let face = ScannedFace {
                     tokens: scanned.tokens,
                     features: feature_set,
+                    version: settled,
                 };
                 let capture = capture_surface(file, text, &face, &state.strings);
                 (file, capture, Some((key, face)))

@@ -60,7 +60,7 @@ use std::sync::Arc;
 
 use dartq_diagnostics::Diagnostic;
 use dartq_index::{FileCapture, LibraryIndex};
-use dartq_language::FeatureSet;
+use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_package::PackageTable;
 use dartq_pub::{PackageConfig, PubError};
 use dartq_sdk::SdkSnapshot;
@@ -504,6 +504,19 @@ impl Engine {
     #[must_use]
     pub fn settled_features(&self, file: FileId) -> Option<FeatureSet> {
         self.state.settled_face(file).map(|face| face.features)
+    }
+
+    /// The settled per-file language version (#1053): the version the
+    /// [`Engine::settled_features`] set was derived at — the `@dart`
+    /// override when one applies, else the package-derived version. The
+    /// lint fan-out mounts it onto the unit for the version-gated rule
+    /// registrations. `None` under the same conditions as
+    /// [`Engine::settled_features`] (not resident, or the face capped out
+    /// of the cache): the caller falls back to its own package/default
+    /// derivation.
+    #[must_use]
+    pub fn settled_version(&self, file: FileId) -> Option<LanguageVersion> {
+        self.state.settled_face(file).map(|face| face.version)
     }
 
     /// The `query symbol` face (PRD §20.3): every declaration of `name`
