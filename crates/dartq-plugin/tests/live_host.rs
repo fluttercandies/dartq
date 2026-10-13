@@ -47,10 +47,14 @@ fn host_package_dir() -> PathBuf {
 /// Spawns the fixture: `dart run bin/live_plugin.dart [args...]` inside the
 /// host package directory.
 fn spawn_live(args: &[&str]) -> PluginRuntime {
+    // Pinned above the 512 MiB default: a real Dart host's JIT startup loads
+    // the analyzer parse stack through the host package and crosses the
+    // default before the first request (calibration in `callback_timeout.rs`).
     let manifest = Manifest::parse(&format!(
         r#"{{"name": "live", "version": "0.1.0", "entrypoint": "bin/live_plugin.dart",
             "capabilities": ["lint", "fix"],
-            "timeouts": {{"callback_ms": 30000, "request_ms": {REQUEST_MS}}}}}"#
+            "timeouts": {{"callback_ms": 30000, "request_ms": {REQUEST_MS}}},
+            "memory_budget_mb": 1024}}"#
     ))
     .expect("manifest parses");
     PluginRuntime::spawn(SpawnSpec {

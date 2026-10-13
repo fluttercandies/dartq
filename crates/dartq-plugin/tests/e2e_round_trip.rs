@@ -31,9 +31,13 @@ fn host_package_dir() -> PathBuf {
 }
 
 fn spawn_echo() -> PluginRuntime {
+    // Pinned above the 512 MiB default: a real Dart host's JIT startup loads
+    // the analyzer parse stack through the host package and crosses the
+    // default before the first request (calibration in `callback_timeout.rs`).
     let manifest = Manifest::parse(&format!(
         r#"{{"name": "echo", "version": "0.1.0", "entrypoint": "bin/echo_plugin.dart",
-            "capabilities": ["lint"], "timeouts": {{"request_ms": {REQUEST_MS}}}}}"#
+            "capabilities": ["lint"], "timeouts": {{"request_ms": {REQUEST_MS}}},
+            "memory_budget_mb": 1024}}"#
     ))
     .expect("manifest parses");
     PluginRuntime::spawn(SpawnSpec {

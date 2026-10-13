@@ -27,10 +27,19 @@ fn dart_plugin_over_callback_budget_is_killed_and_restarted() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");
         return;
     }
+    // The memory budget is pinned above the 512 MiB default: this fixture is
+    // a real Dart host whose JIT startup loads the analyzer parse stack
+    // through the host package, a baseline observed at 554 MB before the
+    // first request — the default fired first and killed every generation
+    // during the handshake, before the callback row this test pins could be
+    // armed. 1024 keeps the memory row enforced (a real balloon still dies)
+    // while making the test orthogonal to it; the memory row's own
+    // calibration lives in `memory_budget.rs`.
     let manifest = Manifest::parse(
         r#"{"name": "slow", "version": "0.1.0", "entrypoint": "bin/slow_plugin.dart",
             "capabilities": ["lint", "fix"],
-            "timeouts": {"callback_ms": 500, "request_ms": 120000}}"#,
+            "timeouts": {"callback_ms": 500, "request_ms": 120000},
+            "memory_budget_mb": 1024}"#,
     )
     .expect("manifest parses");
     let mut runtime = PluginRuntime::spawn(SpawnSpec {

@@ -49,10 +49,14 @@ fn dart_host_survives_an_over_limit_outbound_batch() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");
         return;
     }
+    // Pinned above the 512 MiB default: a real Dart host's JIT startup loads
+    // the analyzer parse stack through the host package and crosses the
+    // default before the first request (calibration in `callback_timeout.rs`).
     let manifest = Manifest::parse(
         r#"{"name": "echo", "version": "0.1.0", "entrypoint": "bin/echo_plugin.dart",
             "capabilities": ["lint"],
-            "timeouts": {"callback_ms": 60000, "request_ms": 10000}}"#,
+            "timeouts": {"callback_ms": 60000, "request_ms": 10000},
+            "memory_budget_mb": 1024}"#,
     )
     .expect("manifest parses");
     let runtime = PluginRuntime::spawn(SpawnSpec {
