@@ -159,11 +159,6 @@ pub(crate) struct AstListener {
     /// event (recovery) overwrites — same last-wins shape as the official
     /// duplicate-clause recovery.
     import_open: bool,
-    /// `handle_catch_block` fires AFTER `end_catch_clause` (the catch body
-    /// parses between them), so the `CatchClause` seal is deferred to it —
-    /// the payload words (`catch`, `comma`) patch then, with the block as
-    /// the last child.
-    catch_open: bool,
     /// `handle_enum_elements` fires while the `EnumBody` wrapper is still
     /// open; the `EnumDeclaration` payload word 2 (`elements_end`) is
     /// stashed here and applied at `end_enum_declaration` (`None` writes
@@ -2003,7 +1998,6 @@ impl ParserListener for AstListener {
 
     fn begin_catch_clause(&mut self, token: TokenSpan) {
         self.begin(NodeKind::CatchClause, token);
-        self.catch_open = true;
     }
 
     fn end_catch_clause(&mut self, _token: TokenSpan) {
@@ -2017,12 +2011,12 @@ impl ParserListener for AstListener {
         catch_kw: Option<TokenSpan>,
         comma: Option<TokenSpan>,
     ) {
-        if !self.catch_open {
-            return;
-        }
-        self.catch_open = false;
-        // `on` is head-when-present (the span head when the on-form ran);
-        // the payload words are `catch` and `comma`.
+        // Unconditional: the parser fires exactly one `begin_catch_clause`
+        // per `handle_catch_block` (parseTryStatement's loop body always
+        // opens the clause before reaching the post-body handle event), and
+        // speculative forks swap in their own listener — so this handler
+        // always seals its own innermost open `CatchClause`, reentrantly
+        // (nested try-in-catch), with the payload words (`catch`, `comma`).
         self.patch_token(0, catch_kw);
         self.patch_token(1, comma);
         let _ = on_kw;
@@ -3074,6 +3068,40 @@ mod tests {
         let kinds: Vec<NodeKind> = walk(source).into_iter().map(|(kind, _)| kind).collect();
         assert!(kinds.contains(&NodeKind::ObjectPattern));
         assert!(!kinds.contains(&NodeKind::PatternField));
+    }
+
+    #[test]
+    fn nested_try_in_catch_seals_both_catch_clauses() {
+        // Regression (#991): the deferred `CatchClause` seal used a single
+        // non-reentrant flag — an inner try-in-catch cleared it, the outer
+        // `handle_catch_block` guard-skipped, and the outer clause never
+        // sealed (pairing assert in debug, silent mis-root in release).
+        // The seal is now unconditional, so both clauses close.
+        let source = "void f() {\n  try {\n    g();\n  } catch (e) {\n    try {\n      h();\n    } catch (e2) {\n      p();\n    }\n  }\n}\n";
+        // `children` spans whole subtrees, so dedupe by node id — each node
+        // is counted exactly once (the shared `walk` helper only serves
+        // `contains` checks).
+        let parsed = parse_unit(source, Features::default());
+        let ast = &parsed.ast;
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut stack = vec![ast.root().expect("root")];
+        let mut tries = 0u32;
+        let mut catches = 0u32;
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            match ast.kind(id) {
+                NodeKind::TryStatement => tries += 1,
+                NodeKind::CatchClause => catches += 1,
+                _ => {}
+            }
+            stack.extend(ast.children(id).rev());
+        }
+        assert_eq!(tries, 2, "both try statements present");
+        assert_eq!(catches, 2, "both catch clauses sealed");
+        // The clause-consuming rule runs over the fully sealed tree.
+        assert!(hits(source, "empty_catches").is_empty());
     }
 
     #[test]
