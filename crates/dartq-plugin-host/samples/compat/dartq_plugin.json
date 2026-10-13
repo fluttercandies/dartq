@@ -8,5 +8,5 @@
     "request_ms": 60000,
     "request_retries": 3
   },
-  "memory_budget_mb": 512
+  "memory_budget_mb": 1024
 }
