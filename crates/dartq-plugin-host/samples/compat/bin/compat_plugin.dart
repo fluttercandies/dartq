@@ -8,7 +8,9 @@ import '../lib/main.dart' as compat;
 /// and runs its top-level `plugin` over one wire session.
 ///
 /// Reads frames on stdin, writes replies and emissions on stdout; never run
-/// interactively. Pass `crash` to enable the intentional-crash mode.
+/// interactively. Pass `crash` to enable the intentional-crash mode; pass
+/// `query` to arm the T4 query face (the query-driven producer and the
+/// `query` capability — `bin/query_probe.dart` is its live probe).
 Future<void> main(List<String> args) async {
   await compat.run(
     args,

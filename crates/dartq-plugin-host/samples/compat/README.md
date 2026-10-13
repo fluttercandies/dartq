@@ -18,6 +18,9 @@ surface — read it next to
   `entrypoint`); plays the integrating-host role the official analysis
   server plays: it imports `lib/main.dart` and runs `plugin` over one wire
   session.
+- `bin/query_probe.dart` — the query face's live probe: spawns the real
+  entrypoint (`query` argument) and plays the core, answering the reverse
+  `request/query` round trips from a fixture table.
 
 The sample lives inside the `dartq_plugin_host` package (like the
 `echo`/`live`/`slow` fixtures in `bin/`), so `package:dartq_plugin_host`
@@ -41,6 +44,16 @@ Deterministic by design, so tests can pin every face of the protocol:
   own finding (the finding's range replaced with `/* compat: fixed */`)
   followed by the message-only assist — prioritized changes with concrete
   edits, best priority first.
+- **Queries (T4)**: launched with the `query` argument, the plugin also
+  registers one query-driven producer and negotiates the `query`
+  capability. The producer resolves the requested position through the
+  engine first — `elementAt`, then `references` — and shapes its change
+  from the answers: a concrete edit embedding the resolution facts for a
+  live declaration, a removal-candidate suggestion for an unreferenced
+  one, a message-only answer for a miss (empty elements is a legal
+  answer), and a degraded message-only change for a failed query (an
+  unknown file rides the error channel into a `QueryError`; the session
+  stays up).
 - **UTF-16 positions**: both faces carry offsets through untouched — a
   range after an emoji (`😀`, a surrogate pair) round-trips in UTF-16 code
   units end to end.
@@ -58,6 +71,7 @@ Deterministic by design, so tests can pin every face of the protocol:
 | `PluginRegistry.registerFixForRule(DiagnosticCode, generator)` | `PluginRegistry.registerFixForRule(String code, generator)` | The dartq face keys by the code's lower-case name (what the official registry stores); pass `myCode.lowerCaseName`. |
 | `AnalysisRule` (analyzer type): `name`/`description`/`diagnosticCode`, `registerNodeProcessors`, `reportAtNode` | The same real analyzer rule, registered via `PluginRegistry.registerLintRule` / `registerWarningRule` | The host executes the rule over the cycle's analyzed files, parsing them itself (parse-only; `canUseParsedResult` rules). Enablement flows from the analysis options through the core's `notification/plugin_config`; the census rides the `initialize` reply. |
 | `CorrectionProducer`: `priority`, `message`, `compute(FixContext)` | `Producer`: `priority`, `message`, `compute(ProducerContext)` | The context carries `(file, offset, length)` in UTF-16 units plus `queries` — the T4 Query API facade (index kinds + `element_at` over reverse `request/query`; throws `QueryError` un-negotiated). Parsed-level AST access stays host-local. |
+| Resolution-owned facts behind a producer (the official server's resolved AST, unreachable from plugin code) | `ProducerContext.queries`: `QueryApi` over reverse `request/query` (`elementAt`, `symbol`, `references`, `callers`, `implementations`, `dependencies`), gated by the `query` capability on both handshake sides | The sample arms the face with the `query` launch argument; the generator round trips before returning the producer, so the reply's message can state the resolution facts. A failed query is a typed `QueryError` the producer degrades on — never a crash. |
 | Fix kinds ordering (`DartFixKindPriority`) | `PrioritizedChange.priority` (lower sorts first) | Message-only changes (empty `edits`) are suggestions. |
 | Rule enablement via `analysis_options.yaml` (`plugins: <name>.diagnostics:`) | Handled by the core: it parses the section, resolves it against the plugin's census (lint rules disabled unless enabled, warning rules the reverse), and pushes `notification/plugin_config` | Severity overrides (`true`/`false`/severity string) re-level the rule's rows. |
 | `PluginServer` version handshake (`versionCheck`) | `initialize` request/reply: `protocol_version` + `capabilities` + `rules` census | The effective capability set is the intersection; unknown names mean "not enabled", never an error. |
@@ -82,3 +96,18 @@ Suites that exercise the sample:
 - Rust (live process, `#[ignore]`d for the serial phase):
   `crates/dartq-plugin/tests/compat_live.rs`.
 - Overhead benchmark axis: `harness bench --metric plugin-overhead`.
+
+The query face has its own live round trip that needs no Rust harness —
+`bin/query_probe.dart` spawns the real entrypoint with the `query`
+argument and plays the core, answering the reverse `request/query` frames
+from a fixture table while walking every producer path (referenced edit,
+removal candidate, miss, unknown file):
+
+```
+cd crates/dartq-plugin-host
+dart samples/compat/bin/query_probe.dart
+```
+
+A query-mode run through the Rust runtime (`PluginRuntime`) is the same
+shape as the crash-mode row: launch args `["query"]`, `serve_queries: true`,
+and `request_fixes_serving` for the fixes call.

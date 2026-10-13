@@ -37,7 +37,11 @@ contains no `Cargo.toml`, and the workspace member list in the root
   `bin/slow_plugin.dart` — test fixtures the live suites spawn.
 - `samples/compat/` — the compatibility sample plugin, shaped like an
   official `analysis_server_plugin` package; the porting guide (official-API
-  concept → dartq equivalent) lives in its `README.md`.
+  concept → dartq equivalent) lives in its `README.md`. Its `query` launch
+  argument arms the T4 query face: one more producer that resolves the
+  requested position through `ProducerContext.queries` before shaping its
+  change, with `samples/compat/bin/query_probe.dart` as the face's
+  self-contained live probe (it spawns the entrypoint and plays the core).
 
 ## Status
 
@@ -61,7 +65,9 @@ needs the type of an arbitrary expression *without* a query stays out (the
 T4 boundary); parsed-level AST context is host-local, and resolution-owned
 facts ride the Query API (`ProducerContext.queries`: the index query kinds
 plus `element_at` over reverse `request/query`, available when the `query`
-capability was negotiated). Also `registerLintRule` breadth: the
+capability was negotiated) — the compat sample arms that face behind its
+`query` launch argument, with `samples/compat/bin/query_probe.dart` as its
+live probe. Also `registerLintRule` breadth: the
 shim accepts official-style `registerAssist`/`registerFixForRule`
 registration, while `registerLintRule` throws an `UnsupportedError` naming
 the anchor (pinned by `test/shim_plugin_test.dart`).
