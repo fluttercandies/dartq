@@ -388,6 +388,10 @@ struct Builder<'src, 'tab> {
     type_arg_depth: usize,
     /// Furthest end so far of a bracket/cascade access chain; assignment
     /// candidates ending before it are inside the chain, not write targets.
+    /// The nested-assignment shape `x = a[i] = v;` is the visible
+    /// casualty: `x`'s candidate ends before the index chain's close, so
+    /// its `Written` label is suppressed — the documented M1 under-report
+    /// posture (spec §12.2), recorded here so the shape has a name.
     access_chain_end: u32,
 }
 

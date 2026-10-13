@@ -28,10 +28,11 @@
 //! The `undefined_*` family resolves identifiers as a side effect of its
 //! checks; those miss rows belong here, not in a parallel path (spec §8's
 //! recovery-surface ruling on ticket #120). [`LibraryIndex::record_unresolved`]
-//! appends to an overflow buffer served merged through
-//! [`LibraryIndex::unresolved`] — no re-sort, no allocation on the probe
-//! path. Rows recorded this way live until the library rebuilds whole, at
-//! which point the resolver that produced them regenerates them.
+//! inserts into an overflow buffer kept sorted by `(name, offset)` like the
+//! built-in table, and [`LibraryIndex::unresolved`] binary-searches both —
+//! no re-sort, no allocation on the probe path. Rows recorded this way live
+//! until the library rebuilds whole, at which point the resolver that
+//! produced them regenerates them.
 //!
 //! The `lookup_scoped` chain order is re-stated here rather than imported:
 //! keeping dartq-semantic out of this crate's dependency set (its model is
@@ -153,7 +154,8 @@ pub struct SubtypeEdge {
 /// Invariants (the §5 sorted-column discipline): `refs` ascend by
 /// `(target, use file, offset)` with [`Self::runs`] holding each
 /// distinct-target run's start — a CSR offsets array over the rows; `names`
-/// ascend by `(name, offset)`; `supers` ascend by
+/// ascend by `(name, offset)`; `names_overflow` (the #120 seam's
+/// insertions) ascend by `(name, offset)` too; `supers` ascend by
 /// `(subtype file, name, clause)`.
 /// Every probe is a binary search plus an equal-run scan.
 #[derive(Debug, Default)]
@@ -185,15 +187,17 @@ impl LibraryIndex {
     }
 
     /// The unresolved uses of `name`: built-in rows from the sorted table
-    /// plus seam rows appended after the build ([`Self::record_unresolved`]).
+    /// plus seam rows recorded after the build
+    /// ([`Self::record_unresolved`]), each table ascending by
+    /// `(name, offset)`.
     pub fn unresolved(&self, name: StringId) -> impl Iterator<Item = &NameRow> + '_ {
         let lo = self.names.partition_point(|row| row.name < name);
         let hi = self.names.partition_point(|row| row.name <= name);
-        self.names[lo..hi].iter().chain(
-            self.names_overflow
-                .iter()
-                .filter(move |row| row.name == name),
-        )
+        let overflow_lo = self.names_overflow.partition_point(|row| row.name < name);
+        let overflow_hi = self.names_overflow.partition_point(|row| row.name <= name);
+        self.names[lo..hi]
+            .iter()
+            .chain(self.names_overflow[overflow_lo..overflow_hi].iter())
     }
 
     /// The direct supertypes of `(file, name)`, every clause kind included
@@ -206,14 +210,18 @@ impl LibraryIndex {
         (start < end).then(|| &self.supers[start..end])
     }
 
-    /// Appends an unresolved-name row after the build — the #120 seam
+    /// Inserts an unresolved-name row after the build — the #120 seam
     /// (`undefined_*` lookup byproducts; see the module docs).
     ///
-    /// The row joins [`Self::unresolved`] probes immediately without
-    /// re-sorting; a library rebuild replaces the whole index, and the
-    /// resolver that produced the byproduct regenerates it.
+    /// The row slots into its `(name, offset)` position, so
+    /// [`Self::unresolved`] probes stay a binary search. A library rebuild
+    /// replaces the whole index, and the resolver that produced the
+    /// byproduct regenerates it.
     pub fn record_unresolved(&mut self, row: NameRow) {
-        self.names_overflow.push(row);
+        let at = self.names_overflow.partition_point(|existing| {
+            (existing.name, existing.range.offset) < (row.name, row.range.offset)
+        });
+        self.names_overflow.insert(at, row);
     }
 
     /// Every reference row, ordered by the table's sort (CSR source data).

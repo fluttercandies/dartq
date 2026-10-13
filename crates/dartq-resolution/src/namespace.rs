@@ -204,8 +204,8 @@ impl Namespaces {
 /// Builds one library's namespaces over `graph`'s import edges (§1: imports
 /// merge in directive source order; combinator filtering is build-time).
 fn build_library(graph: &LibraryGraph, lib: LibraryId) -> LibraryNamespaces {
-    let mut names: FxHashMap<StringId, NameEntry> = FxHashMap::default();
-    let mut prefixes: FxHashMap<StringId, FxHashMap<StringId, NameEntry>> = FxHashMap::default();
+    let mut names = MergeTable::default();
+    let mut prefixes: FxHashMap<StringId, MergeTable> = FxHashMap::default();
     let wildcard_prefix = graph.wildcard_prefix(lib);
     for edge in graph.import_edges(lib) {
         // The prefix registers unconditionally: `_buildLibraryImportPrefixes`
@@ -217,7 +217,7 @@ fn build_library(graph: &LibraryGraph, lib: LibraryId) -> LibraryNamespaces {
         // scope.dart:530-535).
         // `Option<&mut _>` is not `Copy`: reborrow through `as_deref_mut` so
         // the table survives every iteration of the name loop.
-        let mut table: Option<&mut FxHashMap<StringId, NameEntry>> = edge
+        let mut table: Option<&mut MergeTable> = edge
             .prefix
             .map(|prefix| prefixes.entry(prefix).or_default());
         let Some(target) = edge.target else {
@@ -229,42 +229,67 @@ fn build_library(graph: &LibraryGraph, lib: LibraryId) -> LibraryNamespaces {
             }
             let entry = NamespaceEntry::Decl(entry.file);
             match table.as_deref_mut() {
-                Some(table) => merge(table, name, entry),
-                None => merge(&mut names, name, entry),
+                Some(table) => table.merge(name, entry),
+                None => names.merge(name, entry),
             }
         }
     }
+    // Box each staged candidate set once, when the build ends — the merge
+    // loop grows them by append only.
     LibraryNamespaces {
-        names,
-        prefixes,
+        names: names.finish(),
+        prefixes: prefixes
+            .into_iter()
+            .map(|(prefix, table)| (prefix, table.finish()))
+            .collect(),
         wildcard_prefix,
     }
 }
 
-/// Import-merge conflict rule (Dart 18.1; `front_end`
-/// `computeAmbiguousDeclarationForImport`, spec §1): the same target through
-/// several paths is one entry; distinct targets make the name ambiguous with
-/// every candidate kept, in arrival order. Never replaces an existing
-/// candidate — the first arrival anchors the order.
-fn merge(map: &mut FxHashMap<StringId, NameEntry>, name: StringId, entry: NamespaceEntry) {
-    match map.entry(name) {
-        hash_map::Entry::Vacant(slot) => {
-            slot.insert(NameEntry::Single(entry));
-        }
-        hash_map::Entry::Occupied(slot) => {
-            let grown = match slot.get() {
-                NameEntry::Single(existing) => (*existing != entry)
-                    .then(|| NameEntry::Ambiguous(Box::from([*existing, entry]))),
-                NameEntry::Ambiguous(candidates) => (!candidates.contains(&entry)).then(|| {
-                    let mut grown = candidates.to_vec();
-                    grown.push(entry);
-                    NameEntry::Ambiguous(grown.into_boxed_slice())
-                }),
-            };
-            if let Some(grown) = grown {
-                *slot.into_mut() = grown;
+/// One merging table (the bare-name namespace or a prefix's) with the
+/// staging buffer for its conflicts: the same target through several paths
+/// is one entry; distinct targets make the name ambiguous, and the growing
+/// candidate set stages as a `Vec` so the k-th arrival neither allocates
+/// nor re-copies the earlier ones. [`Self::finish`] boxes each set once.
+#[derive(Default)]
+struct MergeTable {
+    names: FxHashMap<StringId, NameEntry>,
+    staged: FxHashMap<StringId, Vec<NamespaceEntry>>,
+}
+
+impl MergeTable {
+    /// Import-merge conflict rule (Dart 18.1; `front_end`
+    /// `computeAmbiguousDeclarationForImport`, spec §1). Never replaces an
+    /// existing candidate — the first arrival anchors the order.
+    fn merge(&mut self, name: StringId, entry: NamespaceEntry) {
+        match self.names.entry(name) {
+            hash_map::Entry::Vacant(slot) => {
+                slot.insert(NameEntry::Single(entry));
+            }
+            hash_map::Entry::Occupied(slot) => {
+                if slot.get() != &NameEntry::Single(entry) {
+                    let candidates = self.staged.entry(name).or_insert_with(|| match slot.get() {
+                        NameEntry::Single(existing) => vec![*existing],
+                        // Unreachable mid-build: `Ambiguous` is
+                        // materialized only by [`Self::finish`].
+                        NameEntry::Ambiguous(_) => Vec::new(),
+                    });
+                    if !candidates.contains(&entry) {
+                        candidates.push(entry);
+                    }
+                }
             }
         }
+    }
+
+    /// The table's final stored form: staged candidate sets boxed over
+    /// their anchor entries.
+    fn finish(self) -> FxHashMap<StringId, NameEntry> {
+        let mut names = self.names;
+        for (name, candidates) in self.staged {
+            names.insert(name, NameEntry::Ambiguous(candidates.into_boxed_slice()));
+        }
+        names
     }
 }
 

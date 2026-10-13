@@ -260,27 +260,29 @@ pub struct UriResolver<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BaseUri {
     /// `package:<package>/<path>` — the container is under a package lib dir.
-    Package { package: Box<str>, path: Box<str> },
+    Package { package: String, path: String },
     /// `file://<path>` — the container is anywhere else.
-    File(Box<str>),
+    File(String),
 }
 
 /// An absolute URI after composition, ready to be landed on a target. The
-/// parsed parts move structurally — nothing is re-joined and re-split.
-enum Composed {
+/// parts borrow the parse — nothing is re-joined and re-split; the merge
+/// paths of relative composition are the only owned strings, and landing
+/// materializes the filesystem paths.
+enum Composed<'a> {
     Package {
-        package: Box<str>,
-        rel: Box<str>,
+        package: Cow<'a, str>,
+        rel: Cow<'a, str>,
     },
-    File(Box<str>),
+    File(Cow<'a, str>),
     /// A `dart:` URI split at the library boundary: the path's first segment
     /// (`core` for both `dart:core` and `dart:core/bool.dart`; an authority
     /// form leaves it empty, which no SDK table lists) and the raw part
     /// remainder — exactly the pair [`SdkSnapshot::library_to_path`]
     /// consumes.
     Dart {
-        library: Box<str>,
-        part: Box<str>,
+        library: Cow<'a, str>,
+        part: Cow<'a, str>,
     },
     DartExt,
     /// Any other absolute scheme (`data:`, `http:`, …): parses, resolves to
@@ -356,11 +358,11 @@ fn container_base(
             .split_once('/')
             .expect("package canonical URIs carry a lib-relative path");
         return BaseUri::Package {
-            package: Box::from(package),
-            path: Box::from(rel),
+            package: String::from(package),
+            path: String::from(rel),
         };
     }
-    BaseUri::File(Box::from(
+    BaseUri::File(String::from(
         uri.strip_prefix("file://")
             .expect("canonical URIs are package: or file://"),
     ))
@@ -514,7 +516,7 @@ impl<'a> UriResolver<'a> {
             let base = container_base(&mut self.canonical, self.packages, path);
             self.bases.insert(container, base);
         }
-        let composed = compose_relative(&self.bases[&container], &raw);
+        let composed = compose_relative(&self.bases[&container], raw);
         self.land(composed)
     }
 
@@ -547,7 +549,7 @@ impl<'a> UriResolver<'a> {
 
     /// Lands a composed absolute URI on a target: scheme dispatch, existence,
     /// generated-file fallback, interning, and the §4.2 code.
-    fn land(&mut self, composed: Composed) -> UriResolution {
+    fn land(&mut self, composed: Composed<'_>) -> UriResolution {
         match composed {
             Composed::DartExt => UriResolution {
                 uri: ResolvedUri::Unresolved(UnresolvedKind::DartExt),
@@ -557,7 +559,10 @@ impl<'a> UriResolver<'a> {
             Composed::Dart { library, part } => {
                 match self.sdk.library_to_path(&self.target, &library, &part) {
                     Some(file) => UriResolution {
-                        uri: ResolvedUri::Dart { library, file },
+                        uri: ResolvedUri::Dart {
+                            library: library.into_owned().into_boxed_str(),
+                            file,
+                        },
                         target: ResolvedTarget::External,
                         code: None,
                     },
@@ -597,8 +602,10 @@ impl<'a> UriResolver<'a> {
     }
 
     /// Lands a `package:` target: lib-dir lookup, the generated-file
-    /// fallback, and the missing-file code.
-    fn land_package(&mut self, package: Box<str>, rel: &str) -> UriResolution {
+    /// fallback, and the missing-file code. The package name is cloned only
+    /// into the returned [`ResolvedUri::Package`] — an unknown package (the
+    /// lookup miss) allocates nothing.
+    fn land_package(&mut self, package: Cow<'_, str>, rel: &str) -> UriResolution {
         let unresolvable = || UriResolution {
             uri: ResolvedUri::Unresolved(UnresolvedKind::NotExist),
             target: ResolvedTarget::Missing,
@@ -629,7 +636,7 @@ impl<'a> UriResolver<'a> {
                 let id = self.files.intern(&built);
                 return UriResolution {
                     uri: ResolvedUri::Package {
-                        package,
+                        package: package.into_owned().into_boxed_str(),
                         rel: PathBuf::from(&*decoded),
                         file: built,
                     },
@@ -641,7 +648,7 @@ impl<'a> UriResolver<'a> {
             let id = self.files.intern(&file);
             return UriResolution {
                 uri: ResolvedUri::Package {
-                    package,
+                    package: package.into_owned().into_boxed_str(),
                     rel: PathBuf::from(&*decoded),
                     file,
                 },
@@ -652,7 +659,7 @@ impl<'a> UriResolver<'a> {
         let id = self.files.intern(&file);
         UriResolution {
             uri: ResolvedUri::Package {
-                package,
+                package: package.into_owned().into_boxed_str(),
                 rel: PathBuf::from(&*decoded),
                 file,
             },
@@ -694,27 +701,33 @@ pub struct InvalidUriSyntax;
 /// A directive URI string parsed under Dart `Uri.parse` validity rules
 /// (`sdk/lib/core/uri.dart` character tables). Query and fragment are
 /// validated but dropped: they never participate in file-target resolution.
+///
+/// The parts borrow `uri` — the parse allocates nothing on the common
+/// (already-lowercase scheme) shapes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RawUri {
-    /// Lowercased scheme, empty for relative URIs.
-    pub scheme: Box<str>,
+pub struct RawUri<'a> {
+    /// Lowercased scheme, empty for relative URIs. Borrowed verbatim when the
+    /// source spelling is already lowercase; only mixed-case spellings pay
+    /// the lowercase copy.
+    pub scheme: Cow<'a, str>,
     /// Raw authority text (between `//` and the next `/`, `?`, `#`), `Some("")`
     /// for an empty authority as in `file:///x`.
-    pub authority: Option<Box<str>>,
+    pub authority: Option<&'a str>,
     /// Raw path as written (percent-escapes intact).
-    pub path: Box<str>,
+    pub path: Cow<'a, str>,
 }
 
 /// Parses `uri` with Dart `Uri.tryParse` fidelity for the forms directive
 /// strings take: scheme syntax, authority shape, per-component character
 /// tables, and percent-escape well-formedness. Non-ASCII characters are
 /// accepted (Dart normalizes them to escapes; targets are decoded paths).
+/// The result borrows `uri`.
 ///
 /// # Errors
 ///
 /// [`InvalidUriSyntax`] where Dart throws `FormatException` — reported as
 /// `invalid_uri`.
-pub fn parse_directive_uri(uri: &str) -> Result<RawUri, InvalidUriSyntax> {
+pub fn parse_directive_uri<'a>(uri: &'a str) -> Result<RawUri<'a>, InvalidUriSyntax> {
     // `Uri.parse` routes any string starting with a case-insensitive `data:`
     // to `UriData._parse` before the general scanner runs (uri.dart:931-939),
     // so the path character tables never apply to it.
@@ -734,12 +747,9 @@ pub fn parse_directive_uri(uri: &str) -> Result<RawUri, InvalidUriSyntax> {
         if scheme_end == 0 || !bytes[0].is_ascii_alphabetic() {
             return Err(InvalidUriSyntax);
         }
-        (
-            uri[..scheme_end].to_ascii_lowercase().into_boxed_str(),
-            scheme_end + 1,
-        )
+        (lowered_scheme(&uri[..scheme_end]), scheme_end + 1)
     } else {
-        (Box::from(""), 0)
+        (Cow::Borrowed(""), 0)
     };
 
     // Authority: everything after `//` up to the next path/query/fragment
@@ -752,7 +762,7 @@ pub fn parse_directive_uri(uri: &str) -> Result<RawUri, InvalidUriSyntax> {
             .position(|&b| matches!(b, b'/' | b'?' | b'#'))
             .map_or(bytes.len(), |offset| start + offset);
         validate_authority(&uri[start..end])?;
-        authority = Some(Box::from(&uri[start..end]));
+        authority = Some(&uri[start..end]);
         index = end;
     }
 
@@ -779,7 +789,7 @@ pub fn parse_directive_uri(uri: &str) -> Result<RawUri, InvalidUriSyntax> {
     Ok(RawUri {
         scheme,
         authority,
-        path: Box::from(&uri[index..path_end]),
+        path: Cow::Borrowed(&uri[index..path_end]),
     })
 }
 
@@ -792,7 +802,7 @@ pub fn parse_directive_uri(uri: &str) -> Result<RawUri, InvalidUriSyntax> {
 /// (malformed escapes repaired, everything else percent-escaped), so
 /// anything after the comma is accepted as written — `?` and `#` are data,
 /// not delimiters.
-fn parse_data_uri(uri: &str) -> Result<RawUri, InvalidUriSyntax> {
+fn parse_data_uri(uri: &str) -> Result<RawUri<'_>, InvalidUriSyntax> {
     let bytes = uri.as_bytes();
     // MIME type: up to the first `,` or `;`.
     let mut index = 5;
@@ -840,10 +850,31 @@ fn parse_data_uri(uri: &str) -> Result<RawUri, InvalidUriSyntax> {
         return Err(InvalidUriSyntax); // "Invalid base64 data" / padding
     }
     Ok(RawUri {
-        scheme: Box::from("data"),
+        scheme: lowered_scheme(&uri[..5]),
         authority: None,
-        path: Box::from(&uri[5..]),
+        path: Cow::Borrowed(&uri[5..]),
     })
+}
+
+/// Splits a raw path at its first `/` — the library/part pair of a `dart:`
+/// URI and the package/rel pair of a `package:` URI. A borrowed path (the
+/// only kind [`parse_directive_uri`] produces) splits into borrowed slices;
+/// the owned variant, constructible only outside the parse, is re-spliced
+/// owned so the helper is total over the public type.
+fn split_path_cow(path: Cow<'_, str>) -> (Cow<'_, str>, Cow<'_, str>) {
+    match path {
+        Cow::Borrowed(path) => match path.split_once('/') {
+            Some((head, tail)) => (Cow::Borrowed(head), Cow::Borrowed(tail)),
+            None => (Cow::Borrowed(path), Cow::Borrowed("")),
+        },
+        Cow::Owned(path) => {
+            let (head, tail) = match path.split_once('/') {
+                Some((head, tail)) => (String::from(head), String::from(tail)),
+                None => (path, String::new()),
+            };
+            (Cow::Owned(head), Cow::Owned(tail))
+        }
+    }
 }
 
 /// The acceptance half of `base64.normalize` (base64.dart:97-189), which
@@ -906,6 +937,18 @@ enum PathOrQuery {
 
 fn is_scheme_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')
+}
+
+/// The scheme spelling Dart normalizes to: already-lowercase schemes (the
+/// overwhelmingly common directive shapes — `package`, `file`, `dart`,
+/// `data`) borrow the slice verbatim; only mixed-case spellings pay the
+/// ASCII-lowercase copy.
+fn lowered_scheme(slice: &str) -> Cow<'_, str> {
+    if slice.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(slice.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(slice)
+    }
 }
 
 fn validate_component(text: &str, component: PathOrQuery) -> Result<(), InvalidUriSyntax> {
@@ -1049,10 +1092,10 @@ fn validate_authority(text: &str) -> Result<(), InvalidUriSyntax> {
 }
 
 /// Classifies an absolute (scheme-carrying) [`RawUri`] for landing, consuming
-/// the parse — the parts move structurally into [`Composed`], never re-joined
-/// and re-split.
-fn compose_absolute(raw: RawUri) -> Composed {
-    match (raw.scheme.as_ref(), raw.authority.as_deref()) {
+/// the parse — the parts borrow the parsed slices into [`Composed`], never
+/// re-joined and re-split.
+fn compose_absolute(raw: RawUri<'_>) -> Composed<'_> {
+    match (raw.scheme.as_ref(), raw.authority) {
         ("dart-ext", _) => Composed::DartExt,
         ("dart", _) => {
             // The library name is the path's first segment (`core` for both
@@ -1060,10 +1103,7 @@ fn compose_absolute(raw: RawUri) -> Composed {
             // (`dart://x/core`) leaves it empty, which no SDK table lists.
             // One split, no re-join: the pair moves structurally into
             // `land` and on to the SDK's `library_to_path`.
-            let (library, part) = match raw.path.split_once('/') {
-                Some((name, part)) => (Box::from(name), Box::from(part)),
-                None => (raw.path, Box::from("")),
-            };
+            let (library, part) = split_path_cow(raw.path);
             Composed::Dart { library, part }
         }
         ("package", _) => {
@@ -1073,11 +1113,8 @@ fn compose_absolute(raw: RawUri) -> Composed {
             if raw.path.starts_with('/') || !raw.path.contains('/') {
                 Composed::Other
             } else {
-                let (package, rel) = raw.path.split_once('/').unwrap_or(("", ""));
-                Composed::Package {
-                    package: Box::from(package),
-                    rel: Box::from(rel),
-                }
+                let (package, rel) = split_path_cow(raw.path);
+                Composed::Package { package, rel }
             }
         }
         ("file", _) => {
@@ -1099,27 +1136,27 @@ fn compose_absolute(raw: RawUri) -> Composed {
 /// Resolves a relative [`RawUri`] against the container's canonical base
 /// (`Uri.resolveUri` for `file:`/`package:` bases). Query/fragment were
 /// already dropped by the parser.
-fn compose_relative(base: &BaseUri, reference: &RawUri) -> Composed {
+fn compose_relative<'a>(base: &BaseUri, reference: RawUri<'a>) -> Composed<'a> {
     // An empty reference is the base itself (`resolveUri` empty-path rule) —
     // `import ''` imports the containing file, as in the oracle.
     if reference.path.is_empty() {
         return match base {
             BaseUri::Package { package, path } => Composed::Package {
-                package: package.clone(),
-                rel: path.clone(),
+                package: Cow::Owned(package.clone()),
+                rel: Cow::Owned(path.clone()),
             },
-            BaseUri::File(path) => Composed::File(path.clone()),
+            BaseUri::File(path) => Composed::File(Cow::Owned(path.clone())),
         };
     }
     // A reference with its own authority keeps it under the base scheme; on a
     // package base any authority leaves a leading `/` in the path, which the
     // package resolver rejects (`slash < 1`).
-    if let Some(authority) = &reference.authority {
+    if let Some(authority) = reference.authority {
         return match base {
             BaseUri::File(_) => compose_absolute(RawUri {
-                scheme: Box::from("file"),
-                authority: Some(authority.clone()),
-                path: reference.path.clone(),
+                scheme: Cow::Borrowed("file"),
+                authority: Some(authority),
+                path: reference.path,
             }),
             BaseUri::Package { .. } => Composed::Other,
         };
@@ -1129,13 +1166,13 @@ fn compose_relative(base: &BaseUri, reference: &RawUri) -> Composed {
     // package name → unresolvable.
     if reference.path.starts_with('/') {
         return match base {
-            BaseUri::File(_) => Composed::File(reference.path.clone()),
+            BaseUri::File(_) => Composed::File(reference.path),
             BaseUri::Package { .. } => Composed::Other,
         };
     }
     match base {
         BaseUri::Package { package, path } => {
-            let merged = remove_dot_segments(&merge_paths(path, &reference.path));
+            let merged = remove_dot_segments(merge_paths(path, &reference.path));
             // Escaped the package root: the FIRST segment is exactly `..`
             // (the oracle's `pathSegments.first == '..'` equality check), so
             // no package URI can express it. A segment merely *starting* with
@@ -1144,12 +1181,12 @@ fn compose_relative(base: &BaseUri, reference: &RawUri) -> Composed {
                 Composed::Other
             } else {
                 Composed::Package {
-                    package: package.clone(),
-                    rel: Box::from(merged),
+                    package: Cow::Owned(package.clone()),
+                    rel: Cow::Owned(merged),
                 }
             }
         }
-        BaseUri::File(path) => Composed::File(Box::from(remove_dot_segments(&merge_paths(
+        BaseUri::File(path) => Composed::File(Cow::Owned(remove_dot_segments(merge_paths(
             path,
             &reference.path,
         )))),
@@ -1166,10 +1203,11 @@ fn merge_paths(base: &str, reference: &str) -> String {
 /// RFC 3986 §5.2.4 remove-dot-segments on the percent-encoded path (escapes
 /// contain no raw `/`, so segment operations are safe). `..` past the root of
 /// an absolute path clamps at the root; on a relative path leading `..`
-/// segments survive.
-fn remove_dot_segments(path: &str) -> String {
+/// segments survive. Takes the merged path by value: a path without a single
+/// `.` (the common shape) is returned as-is, with no second copy.
+fn remove_dot_segments(path: String) -> String {
     if !path.contains('.') {
-        return path.to_owned();
+        return path;
     }
     let absolute = path.starts_with('/');
     let segments: Vec<&str> = path.split('/').collect();

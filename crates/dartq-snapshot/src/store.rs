@@ -229,7 +229,10 @@ impl SnapshotStore {
     /// *complete* entry set of the generation. At save end the sweep removes
     /// every on-disk entry outside the claim, so any set shape — growing,
     /// shrinking, or changed — re-saves coherently, and a failed save
-    /// degrades to a miss, never a mixture.
+    /// degrades to a miss, never a mixture. Entries must carry distinct
+    /// keys: the manifest deduplicates and both frames would write one
+    /// path, so a duplicate key silently last-wins — a deterministic caller
+    /// bug, asserted against in debug builds.
     ///
     /// Capacity is throttled, not per-save: the bytes just written accrue
     /// into a cheap estimate, and only when the estimate crosses
@@ -257,6 +260,17 @@ impl SnapshotStore {
         let entries_dir = generation.join("entries");
         fs::create_dir_all(&entries_dir)?;
         let mut ids: Vec<[u8; 16]> = entries.iter().map(|entry| entry.key.id()).collect();
+        debug_assert_eq!(
+            ids.len(),
+            {
+                let mut unique = ids.clone();
+                unique.sort_unstable();
+                unique.dedup();
+                unique.len()
+            },
+            "duplicate EntryKey in `save`: the manifest dedups and both frames \
+             would write one path — the caller must not save one key twice"
+        );
         ids.sort_unstable();
         ids.dedup();
         let encoded_tables = serde_json::to_vec(&TablesFile {
