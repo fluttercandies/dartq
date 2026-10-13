@@ -163,6 +163,54 @@ class _LifecyclePlugin extends Plugin {
   Future<void> shutDown() async => calls.add('shutDown');
 }
 
+/// A plugin whose assist producer pulls one reverse query before shaping
+/// its change — the T4 Query API face over the real host loop.
+class _QueryPlugin extends Plugin {
+  const _QueryPlugin();
+
+  @override
+  String get name => 'query';
+
+  @override
+  void register(PluginRegistry registry) {
+    registry.registerAssist((context) async {
+      final elements = await context.queries!.elementAt(
+        context.file,
+        context.offset,
+      );
+      return _MessageProducer('elements: ${elements.length}');
+    });
+  }
+}
+
+/// The query answer as a message-only change.
+class _MessageProducer implements Producer {
+  const _MessageProducer(this.message);
+
+  @override
+  final int priority = 1;
+
+  @override
+  final String message;
+
+  @override
+  Future<List<SourceEdit>> compute(ProducerContext context) async =>
+      const <SourceEdit>[];
+}
+
+/// Waits until [condition] holds, failing with [reason] after a bounded
+/// wait — a deadlock must fail the test, not hang it.
+Future<void> _waitFor(bool Function() condition, String reason) async {
+  const budget = Duration(seconds: 10);
+  final stop = DateTime.now().add(budget);
+  while (!condition()) {
+    if (DateTime.now().isAfter(stop)) {
+      fail(reason);
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+}
+
 void main() {
   final config = PluginConfig(
     name: 'p',
@@ -324,4 +372,73 @@ void main() {
       methodInitialize,
     ], reason: 'the initialize reply went out, the fixes reply never did');
   });
+
+  test(
+    'a producer reverse query round trips while the loop keeps reading',
+    () async {
+      // The live shape: the query answer arrives on the input *while* the
+      // fixes request is being served, so the loop must not hold the input
+      // paused behind the parked handler (the query_probe deadlock).
+      final sent = <String>[];
+      final controller = StreamController<List<int>>();
+      // Not awaited: on the deadlock regression this close would hang — the
+      // paused subscription never delivers the done event.
+      addTearDown(() {
+        if (!controller.isClosed) {
+          unawaited(controller.close());
+        }
+      });
+      final done = servePlugin(
+        const _QueryPlugin(),
+        config: PluginConfig(
+          name: 'p',
+          version: '0.1.0',
+          entrypoint: 'bin/p.dart',
+          capabilities: CapabilitySet([Capability.query]),
+        ),
+        input: controller.stream,
+        send: (line) async => sent.add(line),
+      );
+      controller.add(
+        _frame(
+          PluginFrame.request(1, methodInitialize, {
+            'protocol_version': protocolVersion,
+            'capabilities': ['query'],
+          }),
+        ),
+      );
+      controller.add(_frame(_fixes(2, 'lib/a.dart', 7, 3)));
+
+      // The producer parks its fixes reply on the reverse query's answer.
+      await _waitFor(
+        () =>
+            sent.any((line) => decodeFrame(line).method == methodRequestQuery),
+        'the reverse query never reached the wire',
+      );
+      final query = sent
+          .map(decodeFrame)
+          .lastWhere((frame) => frame.method == methodRequestQuery);
+      controller.add(
+        _frame(
+          PluginFrame.request(query.id!, methodRequestQuery, {
+            'schema_version': 1,
+            'file': 'lib/a.dart',
+            'offset': 7,
+            'elements': <Object?>[],
+          }),
+        ),
+      );
+
+      await _waitFor(
+        () => sent.any((line) => decodeFrame(line).id == 2),
+        'the fixes reply never came: the loop stopped reading while the '
+        'producer was parked on its query answer',
+      );
+      await controller.close();
+      await done;
+
+      final reply = sent.map(decodeFrame).lastWhere((frame) => frame.id == 2);
+      expect((reply.params['fixes'] as List).single['message'], 'elements: 0');
+    },
+  );
 }

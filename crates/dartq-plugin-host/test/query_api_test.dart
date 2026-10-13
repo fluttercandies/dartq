@@ -47,33 +47,42 @@ Future<void> _settle() => Future<void>.delayed(Duration.zero);
 
 /// The [QueryError] matcher pinning a message part (the full text carries
 /// more context — the wire's error string, the lifecycle state).
-Matcher _queryError(Object messagePart) =>
-    isA<QueryError>().having((error) => error.message, 'message', contains(messagePart));
+Matcher _queryError(Object messagePart) => isA<QueryError>().having(
+  (error) => error.message,
+  'message',
+  contains(messagePart),
+);
 void main() {
   group('reverse query transport', () {
-    test('a negotiated query writes the request and completes on the reply',
-        () async {
-      final (session, written) = await _ready({Capability.query});
-      final answer = session.query(
-        const QueryRequest.named(QueryKind.symbol, 'Foo'),
-      );
+    test(
+      'a negotiated query writes the request and completes on the reply',
+      () async {
+        final (session, written) = await _ready({Capability.query});
+        final answer = session.query(
+          const QueryRequest.named(QueryKind.symbol, 'Foo'),
+        );
 
-      await _settle();
-      expect(written, hasLength(1), reason: 'the request went out, not queued');
-      final request = written.single;
-      expect(request.method, methodRequestQuery);
-      expect(request.params['kind'], 'symbol');
-      expect(request.params['name'], 'Foo');
+        await _settle();
+        expect(
+          written,
+          hasLength(1),
+          reason: 'the request went out, not queued',
+        );
+        final request = written.single;
+        expect(request.method, methodRequestQuery);
+        expect(request.params['kind'], 'symbol');
+        expect(request.params['name'], 'Foo');
 
-      final reply = PluginFrame.request(request.id!, methodRequestQuery, {
-        'schema_version': 1,
-        'name': 'Foo',
-        'declarations': <Object?>[],
-        'references': <Object?>[],
-      });
-      await session.handleFrame(reply);
-      expect(await answer, reply.params);
-    });
+        final reply = PluginFrame.request(request.id!, methodRequestQuery, {
+          'schema_version': 1,
+          'name': 'Foo',
+          'declarations': <Object?>[],
+          'references': <Object?>[],
+        });
+        await session.handleFrame(reply);
+        expect(await answer, reply.params);
+      },
+    );
 
     test('a fixes handler queries mid-request without deadlocking', () async {
       final (session, written) = await _ready(
@@ -140,28 +149,32 @@ void main() {
   });
 
   group('negotiation and lifecycle gates', () {
-    test('a query without the plugin-side capability throws before writing',
-        () async {
-      final (session, written) = await _ready({Capability.lint});
-      expect(
-        () => session.query(const QueryRequest.named(QueryKind.symbol, 'x')),
-        throwsA(_queryError('the `query` capability was not negotiated')),
-      );
-      await _settle();
-      expect(written, isEmpty, reason: 'nothing is written un-negotiated');
-    });
+    test(
+      'a query without the plugin-side capability throws before writing',
+      () async {
+        final (session, written) = await _ready({Capability.lint});
+        expect(
+          () => session.query(const QueryRequest.named(QueryKind.symbol, 'x')),
+          throwsA(_queryError('the `query` capability was not negotiated')),
+        );
+        await _settle();
+        expect(written, isEmpty, reason: 'nothing is written un-negotiated');
+      },
+    );
 
-    test('a query without the core-side capability throws before writing',
-        () async {
-      // The plugin declares `query`; the core advertised nothing.
-      final (session, written) = await _ready({Capability.query}, const []);
-      expect(
-        () => session.query(const QueryRequest.named(QueryKind.symbol, 'x')),
-        throwsA(_queryError('the `query` capability was not negotiated')),
-      );
-      await _settle();
-      expect(written, isEmpty);
-    });
+    test(
+      'a query without the core-side capability throws before writing',
+      () async {
+        // The plugin declares `query`; the core advertised nothing.
+        final (session, written) = await _ready({Capability.query}, const []);
+        expect(
+          () => session.query(const QueryRequest.named(QueryKind.symbol, 'x')),
+          throwsA(_queryError('the `query` capability was not negotiated')),
+        );
+        await _settle();
+        expect(written, isEmpty);
+      },
+    );
 
     test('a query before the handshake throws', () async {
       final session = PluginSession(config: _config({Capability.query}));
@@ -191,19 +204,22 @@ void main() {
       final (session, written) = await _ready({Capability.query});
       final answer = session.query(const QueryRequest.at('lib/gone.dart', 0));
       await _settle();
+      // Attach the expectation before feeding the reply: completeError
+      // propagates in a microtask, so a listener added after handleFrame
+      // returns would miss it (the error surfaces as an unhandled one).
+      final expectation = expectLater(
+        answer,
+        throwsA(_queryError('unknown file `lib/gone.dart`')),
+      );
       await session.handleFrame(
         PluginFrame.request(written.single.id!, methodRequestQuery, {
           'error': 'unknown file `lib/gone.dart`',
         }),
       );
-      await expectLater(
-        answer,
-        throwsA(_queryError('unknown file `lib/gone.dart`')),
-      );
+      await expectation;
     });
 
-    test('a reply id matching no pending query is a contract break',
-        () async {
+    test('a reply id matching no pending query is a contract break', () async {
       final (session, _) = await _ready({Capability.query});
       try {
         await session.handleFrame(
@@ -294,8 +310,9 @@ void main() {
     });
 
     test('a malformed reply array is a typed protocol exception', () async {
-      Future<Map<String, Object?>> transport(QueryRequest request) async =>
-          {'schema_version': 1};
+      Future<Map<String, Object?>> transport(QueryRequest request) async => {
+        'schema_version': 1,
+      };
       await expectLater(
         QueryApi(transport).implementations('Foo'),
         throwsA(isA<PluginProtocolException>()),

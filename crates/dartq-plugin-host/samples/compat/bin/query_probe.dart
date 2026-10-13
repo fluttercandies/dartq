@@ -109,10 +109,14 @@ Map<String, Object?> serveQuery(Map<String, Object?> params) {
       throw QueryDecline('unknown file `$file`');
     }
     if (file == 'lib/a.dart' && offset == printOffset) {
-      return {'elements': [printElement]};
+      return {
+        'elements': [printElement],
+      };
     }
     if (file == 'lib/a.dart' && offset == unusedOffset) {
-      return {'elements': [unusedElement]};
+      return {
+        'elements': [unusedElement],
+      };
     }
     // Everywhere else: nothing is resolved there — the legal empty answer.
     return {'elements': <Object?>[]};
@@ -136,11 +140,10 @@ void expect(Object? actual, Object? expected, String label) {
 
 Future<void> main(List<String> args) async {
   final sampleDir = Directory.fromUri(Platform.script.resolve('../')).path;
-  final process = await Process.start(
-    'dart',
-    const ['bin/compat_plugin.dart', 'query'],
-    workingDirectory: sampleDir,
-  );
+  final process = await Process.start('dart', const [
+    'bin/compat_plugin.dart',
+    'query',
+  ], workingDirectory: sampleDir);
   try {
     await probe(process).timeout(const Duration(minutes: 2));
   } on Object {
@@ -169,7 +172,6 @@ Future<void> probe(Process process) async {
         .transform(const LineSplitter())
         .map(decodeFrame),
   );
-  final diagnostics = <PluginFrame>[];
 
   Future<PluginFrame> readWhen(bool Function(PluginFrame frame) take) async {
     while (await frames.moveNext()) {
@@ -186,10 +188,9 @@ Future<void> probe(Process process) async {
         }
         continue;
       }
-      if (frame.method == methodDiagnosticNotification) {
-        diagnostics.add(frame);
-        continue;
-      }
+      // The predicate sees every frame the query branch leaves —
+      // diagnostics included, so a caller can wait for one to arrive.
+      // Diagnostics racing a fixes wait fall through and are skipped.
       if (take(frame)) {
         return frame;
       }
@@ -199,10 +200,12 @@ Future<void> probe(Process process) async {
 
   // Face 1: the handshake carries the query capability and the unchanged
   // rule census.
-  await send(PluginFrame.request(1, methodInitialize, {
-    'protocol_version': protocolVersion,
-    'capabilities': ['lint', 'fix', 'query'],
-  }));
+  await send(
+    PluginFrame.request(1, methodInitialize, {
+      'protocol_version': protocolVersion,
+      'capabilities': ['lint', 'fix', 'query'],
+    }),
+  );
   final init = await readWhen(
     (frame) => frame.id == 1 && frame.method == methodInitialize,
   );
@@ -219,19 +222,25 @@ Future<void> probe(Process process) async {
   );
 
   // Face 2: the rule face over the overlay — one finding at the literal.
-  await send(PluginFrame.notification(methodPluginConfig, {
-    'enabled_rules': const ['boolean_literal_review'],
-    'severity_overrides': const <String, String>{},
-    'overlays': [
-      {'file': 'lib/a.dart', 'content': fixture},
-    ],
-  }));
-  await send(PluginFrame.notification(methodEngineDiagnostics, {
-    'diagnostics': const <Object?>[],
-    'files': const ['lib/a.dart'],
-  }));
-  await readWhen((frame) => frame.method == methodDiagnosticNotification);
-  final finding = diagnostics.single.params;
+  await send(
+    PluginFrame.notification(methodPluginConfig, {
+      'enabled_rules': const ['boolean_literal_review'],
+      'severity_overrides': const <String, String>{},
+      'overlays': [
+        {'file': 'lib/a.dart', 'content': fixture},
+      ],
+    }),
+  );
+  await send(
+    PluginFrame.notification(methodEngineDiagnostics, {
+      'diagnostics': const <Object?>[],
+      'files': const ['lib/a.dart'],
+    }),
+  );
+  final diagnostic = await readWhen(
+    (frame) => frame.method == methodDiagnosticNotification,
+  );
+  final finding = diagnostic.params;
   expect(finding['code'], 'boolean_literal', 'rule face intact in query mode');
   expect(finding['offset'], 20, 'finding at the UTF-16 offset');
 
@@ -244,11 +253,13 @@ Future<void> probe(Process process) async {
     int offset,
     int length,
   ) async {
-    await send(PluginFrame.request(id, methodRequestFixes, {
-      'file': file,
-      'offset': offset,
-      'length': length,
-    }));
+    await send(
+      PluginFrame.request(id, methodRequestFixes, {
+        'file': file,
+        'offset': offset,
+        'length': length,
+      }),
+    );
     final reply = await readWhen((frame) => frame.id == id);
     return (reply.params['fixes'] as List).cast<Map<String, Object?>>();
   }

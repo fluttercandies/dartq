@@ -55,56 +55,124 @@ Future<void> runPluginHost(
     onRequestFixes: onRequestFixes,
     writeFrame: (frame) => send(frame.encode()),
   );
+  // Request and notification lines are served strictly in arrival order
+  // (each chained onto the previous), but reading never pauses behind a
+  // served frame, and inbound `request/query` frames never queue at all:
+  // a fixes producer parks its reply on a reverse-query answer (T4) that
+  // arrives through this same input, so a paused subscription (an `await
+  // for` body) or a queue slot behind the very request that pulled the
+  // answer would deadlock the round trip. A query reply always completes a
+  // pull the session itself issued (the core never issues queries), so
+  // answering out of band preserves the causal order. The first
+  // wire-contract violation stops the reading — there is no
+  // resynchronization — and is rethrown once the loop below settles.
+  var serving = Future<void>.value();
   final buffer = BytesBuilder(copy: false);
-  await for (final chunk in input) {
-    if (buffer.length + chunk.length > maxFrameBytes) {
-      buffer.clear();
-      throw PluginProtocolException(
-        'frame exceeds the $maxFrameBytes-byte frame limit',
+  final inputClosed = Completer<void>();
+  (Object, StackTrace)? failure;
+  late final StreamSubscription<List<int>> subscription;
+
+  void fail(Object error, StackTrace stackTrace) {
+    failure ??= (error, stackTrace);
+    subscription.cancel();
+    if (!inputClosed.isCompleted) {
+      inputClosed.complete();
+    }
+  }
+
+  void enqueue(List<int> raw) {
+    if (raw.isNotEmpty && raw.last == 13) {
+      raw = raw.sublist(0, raw.length - 1); // tolerate CRLF
+    }
+    if (raw.isEmpty) {
+      return;
+    }
+    // Strict UTF-8: malformed bytes throw the typed protocol error, tearing
+    // the host down (the counterpart of the Rust codec's `ProtocolError::Utf8`).
+    final String line;
+    try {
+      line = utf8.decode(raw);
+    } on FormatException catch (error) {
+      fail(
+        PluginProtocolException('frame is not valid UTF-8: ${error.message}'),
+        StackTrace.current,
       );
+      return;
     }
-    buffer.add(chunk);
-    final bytes = buffer.takeBytes();
-    var start = 0;
-    while (true) {
-      final newline = bytes.indexOf(10, start);
-      if (newline < 0) {
-        break;
-      }
-      await _serveLine(bytes.sublist(start, newline), session, send);
-      // Flush whatever the plugin emitted while this frame was served
-      // (replies and `notification/diagnostic` emissions alike), in order.
-      for (final frame in session.drainOutbound()) {
-        await send(frame.encode());
-      }
-      start = newline + 1;
+    final PluginFrame frame;
+    try {
+      frame = decodeFrame(line);
+    } on Object catch (error, stackTrace) {
+      fail(error, stackTrace);
+      return;
     }
-    buffer.add(bytes.sublist(start));
+    if (frame.method == methodRequestQuery) {
+      // The answer to a parked reverse query: dispatch out of band — it
+      // answers this loop's own in-flight request, so queueing it behind
+      // that request would wait on itself forever. The session returns no
+      // reply frame for it (the answer rides the parked completer); an
+      // unmatched id is a contract break and tears the host down.
+      unawaited(session.handleFrame(frame).catchError(fail));
+      return;
+    }
+    serving = serving.then((_) => _serveFrameAndFlush(frame, session, send));
+    unawaited(serving.catchError(fail));
+  }
+
+  subscription = input.listen(
+    (chunk) {
+      if (buffer.length + chunk.length > maxFrameBytes) {
+        buffer.clear();
+        fail(
+          PluginProtocolException(
+            'frame exceeds the $maxFrameBytes-byte frame limit',
+          ),
+          StackTrace.current,
+        );
+        return;
+      }
+      buffer.add(chunk);
+      final bytes = buffer.takeBytes();
+      var start = 0;
+      while (true) {
+        final newline = bytes.indexOf(10, start);
+        if (newline < 0) {
+          break;
+        }
+        enqueue(bytes.sublist(start, newline));
+        start = newline + 1;
+      }
+      buffer.add(bytes.sublist(start));
+    },
+    onError: fail,
+    onDone: inputClosed.complete,
+  );
+  await inputClosed.future;
+  if (failure == null) {
+    // Drain the outstanding serving; a late failure funnels through [fail].
+    await serving;
+  }
+  final recorded = failure;
+  if (recorded != null) {
+    Error.throwWithStackTrace(recorded.$1, recorded.$2);
   }
 }
 
-Future<void> _serveLine(
-  List<int> raw,
+/// Serves one inbound request or notification, then flushes whatever the
+/// plugin emitted while it was served (replies and `notification/diagnostic`
+/// emissions alike), in order. The wire's reverse-query replies never reach
+/// this path — they are dispatched out of band by the loop.
+Future<void> _serveFrameAndFlush(
+  PluginFrame frame,
   PluginSession session,
   Future<void> Function(String line) send,
 ) async {
-  if (raw.isNotEmpty && raw.last == 13) {
-    raw = raw.sublist(0, raw.length - 1); // tolerate CRLF
-  }
-  if (raw.isEmpty) {
-    return;
-  }
-  // Strict UTF-8: malformed bytes throw the typed protocol error, tearing
-  // the host down (the counterpart of the Rust codec's `ProtocolError::Utf8`).
-  final String line;
-  try {
-    line = utf8.decode(raw);
-  } on FormatException catch (error) {
-    throw PluginProtocolException('frame is not valid UTF-8: ${error.message}');
-  }
-  final reply = await session.handleFrame(decodeFrame(line));
+  final reply = await session.handleFrame(frame);
   if (reply != null) {
     await send(reply.encode());
+  }
+  for (final emitted in session.drainOutbound()) {
+    await send(emitted.encode());
   }
 }
 
@@ -206,7 +274,12 @@ Future<List<PrioritizedChange>> _serveFixes(
   for (final generator in registry.assists) {
     await run(
       generator,
-      ProducerContext(file: file, offset: offset, length: length, queries: queries),
+      ProducerContext(
+        file: file,
+        offset: offset,
+        length: length,
+        queries: queries,
+      ),
     );
   }
   for (final diagnostic in fixContext) {
