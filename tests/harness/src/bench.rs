@@ -95,7 +95,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
-use dartq_plugin::{Manifest, PluginDiagnostic, PluginRuntime, SpawnSpec};
+use dartq_plugin::{
+    CycleConfig, CyclePush, Manifest, PluginDiagnostic, PluginRuntime, SpawnSpec,
+};
 use dartq_source::{FileId, FileTable};
 use serde::{Deserialize, Serialize};
 
@@ -1810,19 +1812,33 @@ fn metric_plugin_overhead(opts: &BenchOptions) -> Result<String, Outcome> {
     let mut runtime = PluginRuntime::spawn(SpawnSpec::dart(&opts.plugin_dir, manifest))
         .map_err(|e| Outcome::Error(format!("spawning the plugin host: {e}")))?;
 
-    let (batch, files) = synthesized_batch();
+    let (batch, files, analyzed) = synthesized_batch();
+    // The bench's push: every census rule enabled (the metric measures the
+    // full feed+drain path, not a filtered one) and the batch's files as
+    // the analyzed set.
+    let push = CyclePush {
+        analyzed,
+        config: CycleConfig {
+            enabled_rules: runtime
+                .rule_census()
+                .into_iter()
+                .map(|rule| rule.name)
+                .collect(),
+            ..CycleConfig::default()
+        },
+    };
     // One unmeasured warmup cycle: the first JIT-compiled pass would skew
     // the per-cycle distribution.
     let expected_rows =
         format!("plugin emitted the wrong number of findings for a {PLUGIN_BATCH_ROWS}-row batch");
-    if drive_cycle(&mut runtime, &batch, &files)?.len() != PLUGIN_BATCH_ROWS {
+    if drive_cycle(&mut runtime, &batch, &files, &push)?.len() != PLUGIN_BATCH_ROWS {
         return Err(Outcome::Error(expected_rows));
     }
 
     let mut round_trip_ms = Vec::with_capacity(opts.plugin_cycles);
     for _ in 0..opts.plugin_cycles {
         let started = Instant::now();
-        let rows = drive_cycle(&mut runtime, &batch, &files)?;
+        let rows = drive_cycle(&mut runtime, &batch, &files, &push)?;
         round_trip_ms.push(started.elapsed().as_secs_f64() * 1000.0);
         if rows.len() != PLUGIN_BATCH_ROWS {
             return Err(Outcome::Error(expected_rows));
@@ -1876,21 +1892,27 @@ fn drive_cycle(
     runtime: &mut PluginRuntime,
     batch: &[Diagnostic],
     files: &FileTable,
+    push: &CyclePush,
 ) -> Result<Vec<PluginDiagnostic>, Outcome> {
     runtime
-        .feed(batch, files)
+        .feed(batch, files, push)
         .map_err(|e| Outcome::Error(format!("plugin feed failed: {e}")))?;
     runtime
-        .wait_diagnostics(PLUGIN_DRAIN)
+        .wait_output(PLUGIN_DRAIN)
         .map_err(|e| Outcome::Error(format!("plugin drain failed: {e}")))
+        .map(|drain| drain.diagnostics)
 }
 
 /// The deterministic engine batch: [`PLUGIN_BATCH_ROWS`] diagnostics spread
 /// round-robin over [`PLUGIN_BATCH_FILES`] `.dart` files.
-fn synthesized_batch() -> (Vec<Diagnostic>, FileTable) {
+fn synthesized_batch() -> (Vec<Diagnostic>, FileTable, Vec<String>) {
     let mut files = FileTable::new();
-    let paths: Vec<FileId> = (0..PLUGIN_BATCH_FILES)
-        .map(|i| files.intern(Path::new(&format!("lib/plugin_overhead_{i}.dart"))))
+    let analyzed: Vec<String> = (0..PLUGIN_BATCH_FILES)
+        .map(|i| format!("lib/plugin_overhead_{i}.dart"))
+        .collect();
+    let paths: Vec<FileId> = analyzed
+        .iter()
+        .map(|path| files.intern(Path::new(path)))
         .collect();
     let batch = (0..PLUGIN_BATCH_ROWS)
         .map(|i| {
@@ -1907,7 +1929,7 @@ fn synthesized_batch() -> (Vec<Diagnostic>, FileTable) {
             )
         })
         .collect();
-    (batch, files)
+    (batch, files, analyzed)
 }
 
 /// Probe the `cold` env descriptor: one `<oracle-dart> --version` spawn plus
