@@ -362,7 +362,7 @@ fn payload_width_ceiling() {
     assert_eq!(payload_len(FormalParameter), 5);
 }
 
-/// The ratified payload-width column of `docs/facts/ast-collapse-map.md`,
+/// The ratified payload-width column of the collapse map,
 /// transcribed kind for kind in the map's domain order: the §3 per-domain
 /// payload columns at final width — i.e. after the derivable-word rulings
 /// recorded in §1 (the #151 width-0 elimination list and the #174

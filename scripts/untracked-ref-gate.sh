@@ -25,7 +25,6 @@ PENDING_PATHS=(
   crates/dartq-plugin
   crates/dartq-plugin-host
   crates/dartq-semantic
-  crates/dartq-ast
   crates/dartq-parser
   crates/dartq-lints
   crates/dartq-daemon

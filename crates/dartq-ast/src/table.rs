@@ -127,7 +127,7 @@ impl SyntaxTable {
     /// The node's shared-pool payload words (empty for span-only and
     /// token-leaf kinds — a token leaf's token is its span head,
     /// [`Self::token_range`] `.start`). The per-field layout of each kind is
-    /// pinned by `docs/facts/ast-collapse-map.md` §3; words eliminated as
+    /// pinned by the collapse map's §3 payload columns; words eliminated as
     /// derivable (#174) come back through the crate-root derived accessors
     /// (`question`, `mod_flags`, `last_token`, …), not this slice. The run
     /// length is [`payload_len`] of the kind.

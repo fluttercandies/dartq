@@ -3,13 +3,14 @@
 //! [`accepts_begin`]).
 //!
 //! The variant set is the adjudicated collapse of the official 377 parser
-//! node types (111 Begin / 152 Handle / 114 End in
-//! `.third/dart-sdk/.../parser_ast_helper.dart`): Begin types never land as
+//! node types (111 Begin / 152 Handle / 114 End in upstream Dart SDK
+//! source, `parser_ast_helper.dart`): Begin types never land as
 //! variants (their payload merges into the matching End variant), Handles
 //! land as leaf variants, field back-fills, or are derivable and dropped.
-//! The per-variant mapping, payloads, and event-pairing verdicts are
-//! `docs/facts/ast-collapse-map.md` (goal #31); the header/pool split that
-//! carries those payloads is `docs/facts/ast-layout-spec.md` (goal #92):
+//! The per-variant mapping, payloads, and event-pairing verdicts were
+//! adjudicated as #31 and are embodied in this crate (the per-domain
+//! section comments below and the crate-test width transcript); the
+//! header/pool split that carries those payloads was adjudicated as #92:
 //! every node's span token pair lives in its 24-byte header, and the fields
 //! below are the *extra* payload words appended to the shared `u32` pool.
 //!
@@ -304,7 +305,7 @@ pub(crate) mod flags {
 /// payload columns minus every derivable word: the #151 span-head pass, then
 /// the #174 second pass (span-head tokens, end-of-span `;`/bracket tokens,
 /// head-when-present keywords, `ModSet` into [`flags`], the nullable `?`),
-/// each with its SDK citation in `docs/facts/ast-collapse-map.md` §1/§3. The
+/// each with its upstream SDK citation in the collapse map §1/§3. The
 /// widest kind is [`NodeKind::FormalParameter`] at 5 words, the single
 /// tolerated outlier of the ≤30 B/node average (layout spec §1.5).
 ///

@@ -31,9 +31,10 @@
 //! - Traversal is `match node.kind` + an explicit stack — deliberately no
 //!   visitor trait (ast-design-spec §7).
 //!
-//! Fact sources: `docs/facts/ast-layout-spec.md` (#92, the adjudicated
-//! layout), `docs/facts/ast-collapse-map.md` (#31, official 377 node types →
-//! [`NodeKind`] variants), `docs/facts/ast-design-spec.md` (#28, evidence).
+//! Provenance: the layout is the adjudicated #92 header/pool split, the
+//! variant set applies the #31 collapse rulings to the official 377 node
+//! types, and the design rests on the #28 evidence; each contract is
+//! stated inline where it applies.
 //! Diagnostics never enter the AST: error *presence* is one flag
 //! ([`SyntaxTable::is_error`]), messages flow through the parser's listener
 //! to the diagnostics channel.
