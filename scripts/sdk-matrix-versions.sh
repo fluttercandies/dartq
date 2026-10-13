@@ -23,7 +23,7 @@
 set -u -o pipefail
 cd "$(dirname "$0")/.."
 
-GCS_LISTING_URL="https://storage.googleapis.com/storage/v1/b/dart-archive/o?prefix=channels/stable/release/&delimiter=/&maxKeys=1000"
+GCS_LISTING_URL="https://storage.googleapis.com/storage/v1/b/dart-archive/o?prefix=channels/stable/release/&delimiter=/&maxResults=1000"
 STABLE_VERSION_URL="https://storage.googleapis.com/dart-archive/channels/stable/release/latest/VERSION"
 SNAPSHOT="scripts/sdk-versions.txt"
 

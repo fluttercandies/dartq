@@ -31,12 +31,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Strip host-discipline cargo config (sccache wrapper + jobs=2)
-        run: sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+        run: |
+          sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+          if grep -qE '^(rustc-wrapper|jobs = 2)' .cargo/config.toml; then
+            echo "::error::cargo config strip left matches behind (layout drift?)"
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       - name: Resolve the newest stable SDK
+        # pipefail + the empty check: a resolver failure must fail here with
+        # the script's stderr reason, not surface later as an opaque
+        # setup-dart 404 on an empty version string.
         run: |
+          set -euo pipefail
           version="$(bash scripts/sdk-matrix-versions.sh --stable-tip | cut -d'|' -f1)"
+          if [ -z "$version" ]; then
+            echo "::error::stable-tip resolver returned an empty version"
+            exit 1
+          fi
           echo "stable tip: $version"
           echo "STABLE_TIP=$version" >> "$GITHUB_ENV"
       - uses: dart-lang/setup-dart@v1

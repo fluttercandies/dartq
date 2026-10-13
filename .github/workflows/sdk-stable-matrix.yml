@@ -17,10 +17,13 @@
 # analyze oracle handed to sdk-matrix.sh via --dart-override — its
 # single-SDK pass channel, which needs no fvm layout.
 #
-# A red version job is the differential gate's contract (Jaccard below 1.0
-# = FAIL); the report artifacts + the version-skew classification inside
-# sdk-matrix.sh's summary attribute one-sided entries (removedIn codes and
-# the language-version family are expected skew on old oracles).
+# Alerting contract: only the stable-tip row hard-gates this workflow's
+# status — a red workflow means a regression of record or broken infra.
+# The older minor rows collect data and discover version skew: their
+# Jaccard < 1.0 is expected skew on old oracles (removedIn codes and the
+# language-version family, classified in sdk-matrix.sh's summary), so
+# they run continue-on-error and the Step Summary table stays the
+# per-version verdict surface.
 name: sdk-stable-matrix
 
 on:
@@ -36,15 +39,28 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       versions: ${{ steps.versions.outputs.versions }}
+      stable_tip: ${{ steps.versions.outputs.stable_tip }}
     steps:
       - uses: actions/checkout@v4
       - id: versions
         name: Resolve the stable band from the dart-archive listing
+        # pipefail + the empty check: a resolver failure (curl, JSON,
+        # pagination guard) must fail this step loudly. Under GHA's default
+        # `bash -e` without pipefail, a dead pipe would turn into `[]`,
+        # the gate matrix would silently skip every version, and the
+        # nightly differential gate would go green with zero coverage.
         run: |
+          set -euo pipefail
           versions="$(bash scripts/sdk-matrix-versions.sh --stable \
             | cut -d'|' -f1 | jq -R '.' | jq -sc '.')"
-          echo "stable band: $versions"
+          if [ "$versions" = "[]" ]; then
+            echo "::error::stable-band resolver returned an empty matrix"
+            exit 1
+          fi
+          tip="$(bash scripts/sdk-matrix-versions.sh --stable-tip | cut -d'|' -f1)"
+          echo "stable band: $versions (hard-gated tip: $tip)"
           echo "versions=$versions" >> "$GITHUB_OUTPUT"
+          echo "stable_tip=$tip" >> "$GITHUB_OUTPUT"
 
   gate:
     needs: resolve
@@ -62,7 +78,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Strip host-discipline cargo config (sccache wrapper + jobs=2)
-        run: sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+        run: |
+          sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+          if grep -qE '^(rustc-wrapper|jobs = 2)' .cargo/config.toml; then
+            echo "::error::cargo config strip left matches behind (layout drift?)"
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       - name: Install the corpus resolver SDK (3.13.1, the gate oracle of record)
@@ -88,6 +109,9 @@ jobs:
           cargo build -p harness --release
       - id: gate
         name: Differential gate (oracle dart ${{ matrix.version }})
+        # Non-tip rows are expected-skew discovery surface (see the header's
+        # alerting contract); only the tip row's failure fails the job.
+        continue-on-error: ${{ matrix.version != needs.resolve.outputs.stable_tip }}
         run: bash scripts/sdk-matrix.sh --dart-override "$ORACLE_DART"
       - name: Extract per-version metrics
         if: always()

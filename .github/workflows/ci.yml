@@ -35,7 +35,12 @@ jobs:
       - name: Untracked-reference gate
         run: bash scripts/untracked-ref-gate.sh
       - name: Strip host-discipline cargo config (sccache wrapper + jobs=2)
-        run: sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+        run: |
+          sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+          if grep -qE '^(rustc-wrapper|jobs = 2)' .cargo/config.toml; then
+            echo "::error::cargo config strip left matches behind (layout drift?)"
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
@@ -54,7 +59,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Strip host-discipline cargo config (sccache wrapper + jobs=2)
-        run: sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+        run: |
+          sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+          if grep -qE '^(rustc-wrapper|jobs = 2)' .cargo/config.toml; then
+            echo "::error::cargo config strip left matches behind (layout drift?)"
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       - uses: dart-lang/setup-dart@v1

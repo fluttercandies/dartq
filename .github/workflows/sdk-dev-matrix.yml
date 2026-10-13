@@ -11,6 +11,12 @@
 # pin and one SDK per job suffices (pub get, then oracle = that dart).
 # This workflow is separate from the stable matrix by design: a dev
 # regression never blocks (or is masked by) the stable band.
+#
+# Dev rows are discovery surface by the same contract as the stable
+# matrix's non-tip rows: they run continue-on-error and report through
+# the Step Summary table — a dev oracle knows diagnostics dartq has not
+# shipped yet, so Jaccard < 1.0 is the forward-skew signal, not a
+# regression of record.
 name: sdk-dev-matrix
 
 on:
@@ -40,7 +46,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Strip host-discipline cargo config (sccache wrapper + jobs=2)
-        run: sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+        run: |
+          sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+          if grep -qE '^(rustc-wrapper|jobs = 2)' .cargo/config.toml; then
+            echo "::error::cargo config strip left matches behind (layout drift?)"
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       - name: Install the pinned dev SDK
@@ -60,6 +71,9 @@ jobs:
           cargo build -p harness --release
       - id: gate
         name: Differential gate (oracle dart ${{ matrix.version }})
+        # Discovery surface only — see the header's skew note; the Step
+        # Summary table is this workflow's verdict surface.
+        continue-on-error: true
         run: bash scripts/sdk-matrix.sh --dart-override "$ORACLE_DART"
       - name: Extract per-version metrics
         if: always()
