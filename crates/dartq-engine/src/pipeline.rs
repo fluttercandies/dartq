@@ -3,8 +3,7 @@
 //! canonically-sorted diagnostic runs (incremental-l1-spec §3.2 step 6,
 //! engine-api-spec §1.3).
 
-use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
+use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
@@ -155,7 +154,7 @@ pub(crate) fn analyze(
     if reused > 0 && let Some(sink) = state.trace.as_mut() {
         sink.cycle_reused(reused);
     }
-    let order = topo_order(state, &dirty);
+    let order = state.condensation.topo_order(&dirty);
 
     // Phase-boundary budget poll (PRD §17.1): the ladder's first chance to
     // descend after the apply/capture phase. Armed engines pay one `Option`
@@ -1108,57 +1107,6 @@ fn suppresses_import_verification(diagnostics: &[Diagnostic]) -> bool {
     diagnostics
         .iter()
         .any(|diagnostic| IMPORT_VERIFICATION_SUPPRESSING.contains(&diagnostic.code.name))
-}
-
-/// Topological order over the dirty set: dependencies (import targets)
-/// before dependents, deterministic by library id, cycles broken in id
-/// order (order affects event delivery, never results).
-fn topo_order(state: &EngineState, dirty: &[LibraryId]) -> Vec<LibraryId> {
-    let dirty_set: FxHashSet<LibraryId> = dirty.iter().copied().collect();
-    let mut indegree: FxHashMap<LibraryId, usize> = FxHashMap::default();
-    let mut dependents: FxHashMap<LibraryId, Vec<LibraryId>> = FxHashMap::default();
-    for &library in dirty {
-        let info = state.libraries.info(library).expect("live library");
-        let count = info
-            .deps
-            .iter()
-            .filter(|dep| dirty_set.contains(dep))
-            .count();
-        indegree.insert(library, count);
-        for dep in &info.deps {
-            if dirty_set.contains(dep) {
-                dependents.entry(*dep).or_default().push(library);
-            }
-        }
-    }
-    let mut ready: BinaryHeap<Reverse<LibraryId>> = dirty
-        .iter()
-        .filter(|library| indegree[library] == 0)
-        .map(|&library| Reverse(library))
-        .collect();
-    let mut order = Vec::with_capacity(dirty.len());
-    while let Some(Reverse(library)) = ready.pop() {
-        order.push(library);
-        for dependent in dependents.get(&library).into_iter().flatten() {
-            let degree = indegree.get_mut(dependent).expect("dependent is dirty");
-            *degree -= 1;
-            if *degree == 0 {
-                ready.push(Reverse(*dependent));
-            }
-        }
-    }
-    if order.len() < dirty.len() {
-        // Import cycles: append the remainder in ascending id order.
-        let ordered: FxHashSet<LibraryId> = order.iter().copied().collect();
-        let mut rest: Vec<LibraryId> = dirty
-            .iter()
-            .copied()
-            .filter(|library| !ordered.contains(library))
-            .collect();
-        rest.sort_unstable();
-        order.extend(rest);
-    }
-    order
 }
 
 /// The canonical diagnostic order (engine-api-spec §1.3) as a borrowed

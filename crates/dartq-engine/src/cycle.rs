@@ -10,8 +10,11 @@
 //! a fingerprint because values are content-derived and the mapping is
 //! never incrementally maintained. Wave W1 landed the shapes and the
 //! rebuild; wave W2 consumes the fingerprints as the product-reuse key
-//! (the post-closure gate in `pipeline`), and wave W3 consumes the cycle
-//! mapping for the condensation ordering.
+//! (the post-closure gate in `pipeline`) and wave W3 the member/dependency
+//! faces as the recompute order ([`Condensation::topo_order`]).
+
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 use blake3::Hasher;
 use dartq_semantic::ApiSignature;
@@ -41,16 +44,15 @@ pub(crate) struct Condensation {
     cycles: Vec<CycleInfo>,
 }
 
-/// One strongly-connected component of the library graph.
-// W2 consumes `fingerprint` (the reuse gate); `members`/`deps` stay pinned
-// for the wave-3 condensation ordering, which reads the member set for
-// adjacency and the dependency edges for the cycle DAG — removing the
-// expectation before that consumer lands would turn them into dead-code
-// errors. The unit tests read everything, so the expectation is
-// non-test-only.
-#[cfg_attr(not(test), expect(dead_code))]
+/// One strongly-connected component of the library graph. `fingerprint` is
+/// the reuse key (the W2 gate) and `deps` the cycle-DAG face the recompute
+/// order ([`Condensation::topo_order`], W3) walks; the order derives unit
+/// membership through `cycle_of` and the dirty set, so the `members` field
+/// itself stays pinned for the tests (which read it) — removing the
+/// expectation would turn it into a dead-code warning outside them.
 #[derive(Debug)]
 pub(crate) struct CycleInfo {
+    #[cfg_attr(not(test), expect(dead_code))]
     /// Member libraries, ascending by id — deterministic across applies,
     /// unlike Tarjan's discovery order.
     pub(crate) members: Box<[LibraryId]>,
@@ -83,6 +85,85 @@ impl Condensation {
     pub(crate) fn fingerprint_of(&self, id: LibraryId) -> Option<ApiSignature> {
         let cycle = self.cycle_of(id)?;
         Some(self.cycles[cycle as usize].fingerprint)
+    }
+
+    /// The recompute order over the dirty set (g485 W3): cycle units in
+    /// Kahn order over the cycle DAG — a unit runs only after every unit it
+    /// depends on — ties among ready units broken by the smallest dirty
+    /// member id, each unit's members ascending by id. Cycle members stay
+    /// adjacent, and over an acyclic graph the order is exactly the
+    /// library-level rule this replaces (dependencies first, smallest id
+    /// among the ready), so only cyclic delivery changes shape. A pure
+    /// function of the condensation and the dirty set: one pass over the
+    /// prebuilt cycle DAG, no library-table adjacency reads, and the same
+    /// inputs reproduce the same order across rebuilds — the unit relation,
+    /// not Tarjan's discovery order, decides.
+    ///
+    /// Every dirty id answers a cycle here: the apply contract keeps the
+    /// dirty set live (`state.invalidated ⊆ live()`) and the wholesale
+    /// rebuild under the structure gate keeps the mapping current over the
+    /// live set.
+    pub(crate) fn topo_order(&self, dirty: &[LibraryId]) -> Vec<LibraryId> {
+        let mut dirty = dirty.to_vec();
+        dirty.sort_unstable();
+        let total = dirty.len();
+        // Per-unit dirty members, ascending (the input was sorted). A miss
+        // would be a retired id or a stale mapping — both excluded by the
+        // apply contract above, so a miss is an upstream bug.
+        let mut members: Vec<Vec<LibraryId>> = vec![Vec::new(); self.cycles.len()];
+        for library in dirty {
+            let cycle = self
+                .cycle_of(library)
+                .expect("dirty library is live under the current mapping");
+            members[cycle as usize].push(library);
+        }
+        // Cycle-DAG bookkeeping: a dirty unit waits on its dirty dependency
+        // units; `dependents` is the reverse edge for the release pass.
+        let mut pending = vec![0usize; self.cycles.len()];
+        let mut dependents: Vec<Vec<u32>> = vec![Vec::new(); self.cycles.len()];
+        for (index, cycle) in self.cycles.iter().enumerate() {
+            if members[index].is_empty() {
+                continue;
+            }
+            for &dep in &cycle.deps {
+                if !members[dep as usize].is_empty() {
+                    pending[index] += 1;
+                    dependents[dep as usize].push(index as u32);
+                }
+            }
+        }
+        let mut ready: BinaryHeap<Reverse<(LibraryId, u32)>> = members
+            .iter()
+            .zip(&pending)
+            .enumerate()
+            // Idle units never gain pending work, so their wait is already
+            // 0 — only dirty units may seed the heap (an empty member list
+            // has no key).
+            .filter(|&(_, (unit, &wait))| !unit.is_empty() && wait == 0)
+            .map(|(index, (unit, _))| Reverse((unit[0], index as u32)))
+            .collect();
+        let mut order = Vec::with_capacity(total);
+        while let Some(Reverse((_, cycle))) = ready.pop() {
+            let index = cycle as usize;
+            order.extend_from_slice(&members[index]);
+            for &dependent in &dependents[index] {
+                let wait = &mut pending[dependent as usize];
+                *wait -= 1;
+                if *wait == 0 {
+                    let unit = &members[dependent as usize];
+                    ready.push(Reverse((unit[0], dependent)));
+                }
+            }
+        }
+        // The cycle relation is an acyclic digraph with self-edges excluded
+        // and deduplicated at build, so every dirty unit drains; a shortfall
+        // would silently drop libraries from the recompute — surface it.
+        assert_eq!(
+            order.len(),
+            total,
+            "every dirty unit drains over the acyclic cycle relation",
+        );
+        order
     }
 
     /// Derives the condensation from the live library graph: iterative
@@ -488,5 +569,96 @@ mod tests {
         // result recorded under the pair's digest can never alias the
         // singleton's: the gate sees a moved fingerprint.
         assert_ne!(condensation.fingerprint_of(a), pair_fingerprint);
+    }
+
+    /// The recompute order (g485 W3): a cycle's members run adjacent in id
+    /// order as one unit, dependents run after the units they depend on.
+    #[test]
+    fn topo_order_delivers_cycle_members_adjacent_in_dependency_order() {
+        let (table, ids) = graph(&[
+            ("package:a/a.dart", &["package:b/b.dart"]),
+            ("package:b/b.dart", &["package:a/a.dart"]),
+            ("package:c/c.dart", &["package:a/a.dart"]),
+            ("package:d/d.dart", &[]),
+        ]);
+        let [a, b, c, d] = ids[..] else {
+            unreachable!()
+        };
+        let condensation = Condensation::build(&table, |_| sig(0));
+
+        // All dirty: the a-b unit, then its dependent c, then the
+        // independent d — regardless of the input's order.
+        assert_eq!(condensation.topo_order(&[d, c, b, a]), vec![a, b, c, d]);
+
+        // Subsets keep the shape: the cycle's dirty members adjacent, a
+        // dependent never ahead of its dependency unit.
+        assert_eq!(condensation.topo_order(&[c, b]), vec![b, c]);
+        assert_eq!(condensation.topo_order(&[a]), vec![a]);
+        assert!(condensation.topo_order(&[]).is_empty());
+    }
+
+    /// The ready-unit tiebreak is the smallest dirty member id — the unit
+    /// relation, not Tarjan's discovery order, decides. Here discovery
+    /// completes the x1-x2 cycle first, yet the canonical order runs the
+    /// independent a-b unit first and holds r behind its own dependencies
+    /// (the retired rest-bucket rule ran smallest-id-first and put r at the
+    /// very front, ahead of the cycle it imports).
+    #[test]
+    fn topo_order_ties_ready_units_by_smallest_member_not_discovery() {
+        let (table, ids) = graph(&[
+            ("package:r/r.dart", &["package:x1/x1.dart"]),
+            ("package:a/a.dart", &["package:b/b.dart"]),
+            ("package:b/b.dart", &["package:a/a.dart"]),
+            ("package:x1/x1.dart", &["package:x2/x2.dart"]),
+            ("package:x2/x2.dart", &["package:x1/x1.dart"]),
+        ]);
+        let [r, a, b, x1, x2] = ids[..] else {
+            unreachable!()
+        };
+        let expected = vec![a, b, x1, x2, r];
+        // Twice on one mapping, then a wholesale rebuild: same inputs,
+        // same order.
+        let condensation = Condensation::build(&table, |_| sig(0));
+        assert_eq!(condensation.topo_order(&ids), expected);
+        assert_eq!(condensation.topo_order(&ids), expected);
+        assert_eq!(
+            Condensation::build(&table, |_| sig(0)).topo_order(&ids),
+            expected
+        );
+    }
+
+    /// Over an acyclic graph every cycle is a singleton, so the order is
+    /// exactly the library-level rule this replaced: dependencies first,
+    /// smallest id among the ready — the property that keeps the existing
+    /// event-order goldens byte-identical.
+    #[test]
+    fn topo_order_is_the_library_rule_on_acyclic_graphs() {
+        let (table, ids) = graph(&[
+            ("package:c/c.dart", &["package:b/b.dart"]),
+            ("package:b/b.dart", &["package:a/a.dart"]),
+            ("package:a/a.dart", &[]),
+        ]);
+        let [c, b, a] = ids[..] else {
+            unreachable!()
+        };
+        assert_eq!(
+            Condensation::build(&table, |_| sig(0)).topo_order(&ids),
+            vec![a, b, c]
+        );
+
+        // Ready-singleton tie: b (independent, smaller id) before c, both
+        // before their dependent a.
+        let (table, ids) = graph(&[
+            ("package:a/a.dart", &["package:c/c.dart"]),
+            ("package:b/b.dart", &[]),
+            ("package:c/c.dart", &[]),
+        ]);
+        let [a, b, c] = ids[..] else {
+            unreachable!()
+        };
+        assert_eq!(
+            Condensation::build(&table, |_| sig(0)).topo_order(&ids),
+            vec![b, c, a]
+        );
     }
 }
