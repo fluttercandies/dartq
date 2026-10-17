@@ -1,4 +1,4 @@
-//! The `explain` query (PRD §15.3): the AI's one-stop symbol report — one
+//! The `explain` query: the AI's one-stop symbol report — one
 //! answer carrying the declaration, its supertypes, its members, its
 //! reference sites, its library's importers, and the tests exercising it.
 //!
@@ -11,26 +11,28 @@
 //! | Section           | Input face                                             |
 //! |-------------------|--------------------------------------------------------|
 //! | `declaration`     | the name's declaration hits (`SymbolDeclHit`)          |
-//! | `inheritance`     | the primary declaration's supertype targets            |
+//! | `inheritance`     | the primary declaration's `extends` supertype edges    |
+//! | `interfaces`      | the remaining clause edges (`with`/`on`/`implements`)  |
+//! | `constructors`    | the caller-rendered constructor facts of the container |
 //! | `methods`         | the declaring container's rows via the `decls_of` probe |
 //! | `references`      | resolved [`RefRow`]s targeting the primary declaration |
 //! | `dependencies`    | the declaring library's importers ([`RevImportGraph`]) |
 //! | `affected_tests`  | the declaring library's [`TestGraph`] rows             |
 //!
-//! Two sections are honest seams — the substrate cannot fill them yet, so
-//! they answer empty arrays (never placeholder rows):
-//!
-//! * `interfaces` — the capture records superclass edges only (`extends`
-//!   and a named mixin application's head); `implements`/`with` clause
-//!   edges are not captured. When they land, the rows join here.
-//! * `constructors` — the member capture mints no constructor rows (the
-//!   declaration kind set has no constructor kind). The section fills when
-//!   the capture does.
+//! The supertype split follows the clause each edge was written in (the
+//! `supertypes_of` face carries the index's resolved edges as
+//! `(target, clause)` pairs): `extends` heads (the superclass, a
+//! mixin-application head) are inheritance; every other clause is an
+//! interface row carrying its `clause` spelling. The constructor facts
+//! are the semantic element face's constructor rows — rendered
+//! caller-side (the assembler stays semantic-free) and placed, sorted,
+//! and shaped here: the unnamed constructor under the container's own
+//! name, named ones under the `A.named` selector spelling.
 //!
 //! # Provenance and ordering
 //!
 //! Internal ids (`FileId`, [`StringId`], library ids) never leave the
-//! engine boundary (PRD §15.7): every row carries stable path text through
+//! engine boundary: every row carries stable path text through
 //! the `file_label_of` / `label_of` closures and the [`StringTable`]. Every
 //! array sorts by a documented key so the output is deterministic:
 //!
@@ -41,8 +43,10 @@
 //!   target file path; unresolved rows (a supertype outside the analyzed
 //!   set, no file) sort before resolved rows of the same name.
 //! * `methods` — ascending by member name, then by range start. Fields,
-//!   getters, and setters ride the array under their own `kind` (the
-//!   §15.3 sketch has no separate member sections).
+//!   getters, and setters ride the array under their own `kind` (there are
+//!   no separate member sections).
+//! * `constructors` — ascending by constructor name (the unnamed face's
+//!   bare container name sorts before the `A.named` selectors).
 //! * `references` — ascending by use-site file path, then by range start.
 //!   Rows for same-named declarations in other files are filtered out, so
 //!   a caller may hand the whole by-name reference union.
@@ -54,7 +58,7 @@
 //!   waits for the engine's resolution faces.
 //! * `affected_tests` — ascending by test library path, deduplicated.
 //!
-//! # Verbosity (PRD §15.8)
+//! # Verbosity
 //!
 //! * `minimal` — `declaration` plus a `counts` object (one entry per
 //!   section); the section arrays are dropped, never the locators.
@@ -68,25 +72,25 @@
 //!
 //! # The kind spellings
 //!
-//! [`decl_kind_name`] / [`ref_kind_name`] map the index's enums to the
-//! frozen v1 machine spellings — the same grammar `dartq-schema`'s
-//! `DECL_KINDS`/`REF_KINDS` and the CLI's query face use. Each producer
-//! maps its own enum; the spellings are the shared contract, not shared
-//! code.
+//! [`decl_kind_name`] / [`ref_kind_name`] / [`clause_name`] map the index's
+//! enums to the frozen v1 machine spellings — the same grammar
+//! `dartq-schema`'s `DECL_KINDS`/`REF_KINDS`/clause list and the CLI's
+//! query face use. Each producer maps its own enum; the spellings are the
+//! shared contract, not shared code.
 
 use serde::{Deserialize, Serialize};
 
-use dartq_index::{DeclKind, DeclRow, RefKind, RefRow, TargetRef, TestGraph};
+use dartq_index::{DeclKind, DeclRow, RefKind, RefRow, SuperClause, TargetRef, TestGraph};
 use dartq_source::{FileId, StringId, StringTable};
 
 use crate::impact::AffectedTest;
 use crate::rev_import_graph::RevImportGraph;
 
-/// The report contract version (PRD §15.7): breaking output changes bump
+/// The report contract version: breaking output changes bump
 /// the major.
 pub const EXPLAIN_SCHEMA_VERSION: u32 = 1;
 
-/// How much detail the report carries (PRD §15.1, §15.8.1). Default
+/// How much detail the report carries. Default
 /// [`Verbosity::Compact`].
 ///
 /// Mirrors `dartq-commands`' `Verbosity` (this crate cannot see the
@@ -116,7 +120,7 @@ pub struct SymbolDeclHit<'a> {
     pub decl: &'a DeclRow,
 }
 
-/// The explain report (PRD §15.3), JSON contract `schema_version: 1`.
+/// The explain report, JSON contract `schema_version: 1`.
 ///
 /// Section arrays are `Some` at [`Verbosity::Compact`] and
 /// [`Verbosity::Full`] (empty sections included — the seam is visible),
@@ -134,14 +138,14 @@ pub struct ExplainReport {
     /// Direct supertypes (the `extends` clause / mixin application head).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inheritance: Option<Vec<SuperTypeRow>>,
-    /// Implemented/mixed-in types — the documented empty seam (module
-    /// docs, "Two sections are honest seams").
+    /// Implemented/mixed-in types: the `with`/`on`/`implements` supertype
+    /// edges, each row naming its clause.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interfaces: Option<Vec<SuperTypeRow>>,
-    /// Declared constructors — the documented empty seam (the capture
-    /// mints no constructor rows yet).
+    /// Declared constructors: the unnamed face under the container's own
+    /// name, named ones under the `A.named` selector spelling.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub constructors: Option<Vec<MemberRow>>,
+    pub constructors: Option<Vec<ConstructorRow>>,
     /// The container's members: methods, getters, setters, and fields,
     /// kind-tagged.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,7 +177,7 @@ pub struct DeclarationRow {
     /// trimmed at `minimal` (a convenience field, never a locator).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
-    /// The name token's span, `[startOffset, endOffset)` (§15.8.5).
+    /// The name token's span, `[startOffset, endOffset)`.
     pub range: [u32; 2],
 }
 
@@ -187,9 +191,41 @@ pub struct SuperTypeRow {
     /// unanalyzed dependency).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+    /// The clause the supertype was written in ([`clause_name`]); absent
+    /// only for producers that cannot attribute it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clause: Option<String>,
 }
 
-/// One member row of `methods` (constructors have no rows yet — the seam).
+/// One constructor face the caller rendered from the element model —
+/// the input row of the `constructors` face, owned text so the caller's
+/// transient map needs no borrowed lifetime of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructorFact {
+    /// The constructor's name: the container's own name for the unnamed
+    /// face, `A.named` for a named selector.
+    pub name: String,
+    /// The rendered parameter face (`A.named(int x)`, `A()` for the
+    /// implicit default).
+    pub signature: String,
+}
+
+/// One row of `constructors`. The element model carries no constructor
+/// spans (the capture mints no constructor rows), so the row has no
+/// `range` — the name and the rendered parameter face are the facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConstructorRow {
+    /// The constructor's name: the container's own name for the unnamed
+    /// face, `A.named` for a named selector.
+    pub name: String,
+    /// The member family — always [`MEMBER_KIND_CONSTRUCTOR`].
+    pub kind: String,
+    /// The rendered parameter face, the caller's [`ConstructorFact`]
+    /// signature.
+    pub signature: String,
+}
+
+/// One member row of `methods`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberRow {
     /// The member's name (lookup spelling).
@@ -214,12 +250,21 @@ pub struct ReferenceRow {
     pub qualified: bool,
 }
 
-/// One row of `dependencies`: a library that imports the declaring
-/// library.
+/// One row of `dependencies`: a library joined to the declaring library
+/// by an import edge. On the explain face the rows are the importers
+/// (reverse edges); the query face's `dependencies` kind serves the
+/// forward direction (the declaring library's import targets) and carries
+/// the optional `name` column.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DependencyRow {
-    /// The importing library's stable path.
+    /// The joined library's stable path.
     pub path: String,
+    /// The symbol this row's join consumes — the query face's forward
+    /// rows carry one per resolved use of a dependency-library
+    /// declaration; a bare import edge (no resolved use) and the explain
+    /// face's importer rows keep the key absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// The `minimal`-tier replacement for the section arrays: one entry per
@@ -240,6 +285,23 @@ pub struct SectionCounts {
     pub dependencies: u32,
     /// Rows `affected_tests` would carry.
     pub affected_tests: u32,
+}
+
+/// Stable machine spelling of the constructor family — the `constructors`
+/// section's only kind.
+pub const MEMBER_KIND_CONSTRUCTOR: &str = "constructor";
+
+/// Stable machine spelling of a supertype clause — the
+/// `inheritance`/`interfaces` rows' grammar, exhaustive over the index's
+/// [`SuperClause`].
+#[must_use]
+pub fn clause_name(clause: SuperClause) -> &'static str {
+    match clause {
+        SuperClause::Extends => "extends",
+        SuperClause::With => "with",
+        SuperClause::On => "on",
+        SuperClause::Implements => "implements",
+    }
 }
 
 /// Stable machine spelling of a declaration family — the query face's
@@ -276,7 +338,7 @@ pub fn ref_kind_name(kind: RefKind) -> &'static str {
     }
 }
 
-/// Answers the explain query for `symbol` (PRD §15.3).
+/// Answers the explain query for `symbol`.
 ///
 /// The input faces are the caller's, borrowed through `'a`:
 ///
@@ -288,9 +350,13 @@ pub fn ref_kind_name(kind: RefKind) -> &'static str {
 ///   union is a valid input.
 /// * `decls_of(file)` — the file's declaration surface (members are found
 ///   through the container anchor).
-/// * `supertypes_of(file, name)` — the declaration's resolved supertype
-///   targets ([`TargetRef`]: a `(file, name)` declaration inside the
-///   analyzed set, or a bare name outside it).
+/// * `supertypes_of(file, name)` — the declaration's clause-typed
+///   supertype edges: `(target, clause)` pairs, the [`TargetRef`] (a
+///   `(file, name)` declaration inside the analyzed set, or a bare name
+///   outside it) plus the clause the supertype was written in.
+/// * `constructors_of(file, name)` — the container's constructor facts,
+///   rendered caller-side from the element model
+///   ([`ConstructorFact`]; empty for a non-container declaration).
 /// * `importers` — the shared inverted import graph over the same library
 ///   id space as the hits.
 /// * `label_of(lib)` / `file_label_of(file)` — stable path text for the
@@ -312,13 +378,14 @@ pub fn ref_kind_name(kind: RefKind) -> &'static str {
 // are what the commands layer wires — bundling them behind a struct would
 // only move the count.
 #[expect(clippy::too_many_arguments)] // one argument per borrowed face; bundling them would only move the count
-pub fn explain<'d, 's, 'l, 'f>(
+pub fn explain<'d, 's, 'c, 'l, 'f>(
     symbol: &str,
     verbosity: Verbosity,
     decls: &[SymbolDeclHit<'d>],
     refs: &[RefRow],
     decls_of: impl Fn(FileId) -> &'d [DeclRow],
-    supertypes_of: impl Fn(FileId, StringId) -> &'s [TargetRef],
+    supertypes_of: impl Fn(FileId, StringId) -> &'s [(TargetRef, SuperClause)],
+    constructors_of: impl Fn(FileId, StringId) -> &'c [ConstructorFact],
     importers: &RevImportGraph,
     label_of: impl Fn(u32) -> &'l str,
     file_label_of: impl Fn(FileId) -> &'f str,
@@ -336,23 +403,28 @@ pub fn explain<'d, 's, 'l, 'f>(
     let primary = hits.first().copied();
 
     let declaration = primary.map(|hit| declaration_row(hit, &decls_of, &file_label_of, strings));
-    let targets: &'s [TargetRef] =
+    let edges: &'s [(TargetRef, SuperClause)] =
         primary.map_or(&[], |hit| supertypes_of(hit.file, hit.decl.name));
+    let ctors: &[ConstructorFact] =
+        primary.map_or(&[], |hit| constructors_of(hit.file, hit.decl.name));
 
     // `minimal` replaces the arrays with counts and trims the declaration's
     // container (a convenience field, never a locator); `compact`/`full`
     // carry the arrays, empty sections included. Every count mirrors its
-    // row builder's predicate exactly — the member anchor set, the
-    // primary-file reference filter, the label-deduplicated graph joins —
-    // taken straight off the faces, so the tier never materializes the
-    // per-row Strings of the arrays it drops.
+    // row builder's predicate exactly — the clause split, the member
+    // anchor set, the primary-file reference filter, the label-deduplicated
+    // graph joins — taken straight off the faces, so the tier never
+    // materializes the per-row Strings of the arrays it drops.
     let minimal = verbosity == Verbosity::Minimal;
     let counts = minimal.then(|| {
         let count =
             |rows: usize| u32::try_from(rows).expect("more than u32::MAX rows in one section");
-        // `supertype_rows` maps its targets one to one — no filter, no
-        // dedup — so the row count is the target count.
-        let inheritance = targets.len();
+        // The supertype split: `extends` edges are inheritance rows, the
+        // rest interface rows — no filter, no dedup beyond the clause cut.
+        let inheritance = edges
+            .iter()
+            .filter(|(_, clause)| *clause == SuperClause::Extends)
+            .count();
         // `member_rows`: rows anchored to a same-named surface row (Dart
         // forbids same-name containers in one file, so the anchor set
         // holds at most one row in honest input).
@@ -389,8 +461,8 @@ pub fn explain<'d, 's, 'l, 'f>(
         };
         SectionCounts {
             inheritance: count(inheritance),
-            interfaces: 0,
-            constructors: 0,
+            interfaces: count(edges.len() - inheritance),
+            constructors: count(ctors.len()),
             methods: count(methods),
             references: count(references),
             dependencies: count(match primary {
@@ -407,7 +479,23 @@ pub fn explain<'d, 's, 'l, 'f>(
     let sections = !minimal;
     let methods =
         sections.then(|| primary.map_or_else(Vec::new, |hit| member_rows(hit, &decls_of, strings)));
-    let inheritance = sections.then(|| supertype_rows(targets, &file_label_of, strings));
+    let inheritance = sections.then(|| {
+        supertype_rows(
+            edges,
+            |clause| clause == SuperClause::Extends,
+            &file_label_of,
+            strings,
+        )
+    });
+    let interfaces = sections.then(|| {
+        supertype_rows(
+            edges,
+            |clause| clause != SuperClause::Extends,
+            &file_label_of,
+            strings,
+        )
+    });
+    let constructors = sections.then(|| constructor_rows(ctors));
     let references =
         sections.then(|| reference_rows(primary.map(|hit| hit.file), refs, &file_label_of));
     let dependencies = sections.then(|| dependency_rows(primary, importers, &label_of));
@@ -427,8 +515,8 @@ pub fn explain<'d, 's, 'l, 'f>(
             }
         }),
         inheritance,
-        interfaces: sections.then_some(Vec::new()),
-        constructors: sections.then_some(Vec::new()),
+        interfaces,
+        constructors,
         methods,
         references,
         dependencies,
@@ -467,9 +555,9 @@ fn declaration_row<'d, 'f>(
 /// row named like the primary declaration (Dart forbids same-name
 /// containers in one file, so the anchor set holds at most one row in
 /// honest input; the Vec keeps even broken input's answer well-defined).
-/// Constructors are the documented empty seam — the capture mints no
-/// constructor rows, so the member split is total and every member lands
-/// here under its own kind. Sorted by (name, range start).
+/// Constructors answer in their own section — the capture mints no
+/// constructor rows, so the member split is total. Sorted by
+/// (name, range start).
 fn member_rows<'d>(
     hit: &SymbolDeclHit<'_>,
     decls_of: &impl Fn(FileId) -> &'d [DeclRow],
@@ -495,29 +583,48 @@ fn member_rows<'d>(
     rows
 }
 
-/// The supertype rows: a resolved target keeps its declaring file, a bare
-/// name outside the analyzed set keeps `file` absent. Sorted by (name,
-/// file) with unresolved rows first.
+/// The supertype rows whose clause satisfies `keep`: a resolved target
+/// keeps its declaring file, a bare name outside the analyzed set keeps
+/// `file` absent; every row names its clause. Sorted by (name, file) with
+/// unresolved rows first.
 fn supertype_rows<'f>(
-    targets: &[TargetRef],
+    edges: &[(TargetRef, SuperClause)],
+    keep: impl Fn(SuperClause) -> bool,
     file_label_of: &impl Fn(FileId) -> &'f str,
     strings: &StringTable,
 ) -> Vec<SuperTypeRow> {
-    let mut rows: Vec<SuperTypeRow> = targets
+    let mut rows: Vec<SuperTypeRow> = edges
         .iter()
-        .copied()
-        .map(|target| match target {
-            TargetRef::Decl(file, name) => SuperTypeRow {
-                name: strings.resolve(name).to_owned(),
-                file: Some(file_label_of(file).to_owned()),
+        .filter(|(_, clause)| keep(*clause))
+        .map(|(target, clause)| SuperTypeRow {
+            name: match target {
+                TargetRef::Decl(_, name) | TargetRef::Name(name) => {
+                    strings.resolve(*name).to_owned()
+                }
             },
-            TargetRef::Name(name) => SuperTypeRow {
-                name: strings.resolve(name).to_owned(),
-                file: None,
+            file: match target {
+                TargetRef::Decl(file, _) => Some(file_label_of(*file).to_owned()),
+                TargetRef::Name(_) => None,
             },
+            clause: Some(clause_name(*clause).to_owned()),
         })
         .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.file.cmp(&b.file)));
+    rows
+}
+
+/// The `constructors` rows: the caller-rendered facts placed under the
+/// section's own kind, ascending by name.
+fn constructor_rows(facts: &[ConstructorFact]) -> Vec<ConstructorRow> {
+    let mut rows: Vec<ConstructorRow> = facts
+        .iter()
+        .map(|fact| ConstructorRow {
+            name: fact.name.clone(),
+            kind: MEMBER_KIND_CONSTRUCTOR.to_owned(),
+            signature: fact.signature.clone(),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
     rows
 }
 
@@ -537,7 +644,7 @@ fn reference_rows<'f>(
                 file: file_label_of(row.file).to_owned(),
                 kind: ref_kind_name(row.kind).to_owned(),
                 range: [row.range.offset, row.range.offset + row.range.length],
-                qualified: row.qualified,
+                qualified: row.qualified(),
             })
             .collect(),
         None => Vec::new(),
@@ -559,6 +666,7 @@ fn dependency_rows<'l>(
             .iter()
             .map(|&lib| DependencyRow {
                 path: label_of(lib).to_owned(),
+                name: None,
             })
             .collect(),
         None => Vec::new(),
@@ -598,9 +706,10 @@ mod tests {
 
     use super::*;
 
-    /// One file's workspace: `a.dart` declares `Bar` and `Foo extends Bar`
-    /// (methods `area`, field `label`), `b.dart` and `c.dart` reference
-    /// `Foo`, and `a_test.dart` tests `a`. Ids: a=0, b=1, c=2, t=3.
+    /// One file's workspace: `a.dart` declares `Bar` and `Foo extends Bar
+    /// with Mix implements Remote` (methods `area`, field `label`),
+    /// `b.dart` and `c.dart` reference `Foo`, and `a_test.dart` tests `a`.
+    /// Ids: a=0, b=1, c=2, t=3.
     struct Fixture {
         strings: StringTable,
         bar: StringId,
@@ -610,6 +719,12 @@ mod tests {
         file_c: FileId,
         surface_a: Vec<DeclRow>,
         surface_b: Vec<DeclRow>,
+        /// The primary declaration's supertype edges (extends + with +
+        /// implements — the three-way split the two sections pin).
+        supers: Vec<(TargetRef, SuperClause)>,
+        /// The primary container's constructor facts, deliberately
+        /// unsorted (the builder's name sort is the pin).
+        ctors: Vec<ConstructorFact>,
     }
 
     fn row(name: StringId, kind: DeclKind, offset: u32, container: u32) -> DeclRow {
@@ -619,6 +734,8 @@ mod tests {
             unnamed_extension_member: false,
             range: SourceRange { offset, length: 3 },
             container,
+            decl_end: DeclRow::UNKNOWN,
+            body_open: DeclRow::UNKNOWN,
         }
     }
 
@@ -629,15 +746,15 @@ mod tests {
             target_name: name,
             kind,
             range: SourceRange { offset, length: 3 },
-            qualified: false,
-            qualifier: None,
+            qualifier: StringId::NONE,
         }
     }
 
     fn fixture() -> Fixture {
         let strings = StringTable::new();
         let id = |text: &str| strings.intern(text);
-        let (bar, foo) = (id("Bar"), id("Foo"));
+        let (bar, foo, mix) = (id("Bar"), id("Foo"), id("Mix"));
+        let remote = id("Remote");
         let mut files = FileTable::new();
         let file_a = files.intern(Path::new("a.dart"));
         let file_b = files.intern(Path::new("b.dart"));
@@ -651,6 +768,21 @@ mod tests {
             row(id("area"), DeclKind::Method, 90, 1),
         ];
         let surface_b = vec![];
+        let supers = vec![
+            (TargetRef::Decl(file_a, bar), SuperClause::Extends),
+            (TargetRef::Decl(file_b, mix), SuperClause::With),
+            (TargetRef::Name(remote), SuperClause::Implements),
+        ];
+        let ctors = vec![
+            ConstructorFact {
+                name: "Foo.named".to_owned(),
+                signature: "Foo.named(int x)".to_owned(),
+            },
+            ConstructorFact {
+                name: "Foo".to_owned(),
+                signature: "Foo()".to_owned(),
+            },
+        ];
         Fixture {
             strings,
             bar,
@@ -660,6 +792,8 @@ mod tests {
             file_c,
             surface_a,
             surface_b,
+            supers,
+            ctors,
         }
     }
 
@@ -700,8 +834,14 @@ mod tests {
         }]
     }
 
-    fn supertypes(fx: &Fixture) -> Vec<TargetRef> {
-        vec![TargetRef::Decl(fx.file_a, fx.bar)]
+    fn supertypes(fx: &Fixture) -> Vec<(TargetRef, SuperClause)> {
+        fx.supers.clone()
+    }
+
+    /// The constructors face: the fixture's facts, keyed by the primary
+    /// declaration's file.
+    fn ctors(fx: &Fixture) -> Vec<ConstructorFact> {
+        fx.ctors.clone()
     }
 
     /// Three reference rows in shuffled file/offset order (the caller's
@@ -720,6 +860,7 @@ mod tests {
         let fx = fixture();
         let (importers, tests) = graphs();
         let supers = supertypes(&fx);
+        let ctors = ctors(&fx);
         let refs = refs(&fx);
         let report = explain(
             "Foo",
@@ -734,6 +875,7 @@ mod tests {
                 assert_eq!(name, fx.foo);
                 &supers
             },
+            |_, _| &ctors,
             &importers,
             labels,
             file_labels,
@@ -752,9 +894,15 @@ mod tests {
                     "kind": "class",
                     "range": [40, 43],
                 },
-                "inheritance": [{"name": "Bar", "file": "a.dart"}],
-                "interfaces": [],
-                "constructors": [],
+                "inheritance": [{"name": "Bar", "file": "a.dart", "clause": "extends"}],
+                "interfaces": [
+                    {"name": "Mix", "file": "b.dart", "clause": "with"},
+                    {"name": "Remote", "clause": "implements"},
+                ],
+                "constructors": [
+                    {"name": "Foo", "kind": "constructor", "signature": "Foo()"},
+                    {"name": "Foo.named", "kind": "constructor", "signature": "Foo.named(int x)"},
+                ],
                 "methods": [
                     {"name": "area", "kind": "method", "range": [90, 93]},
                     {"name": "label", "kind": "field", "range": [70, 73]},
@@ -782,6 +930,7 @@ mod tests {
         let fx = fixture();
         let (importers, tests) = graphs();
         let supers = supertypes(&fx);
+        let ctors = ctors(&fx);
         let report = explain(
             "Foo",
             Verbosity::Minimal,
@@ -792,6 +941,7 @@ mod tests {
                 _ => &fx.surface_b,
             },
             |_, _| &supers,
+            |_, _| &ctors,
             &importers,
             labels,
             file_labels,
@@ -805,8 +955,8 @@ mod tests {
             report.counts,
             Some(SectionCounts {
                 inheritance: 1,
-                interfaces: 0,
-                constructors: 0,
+                interfaces: 2,
+                constructors: 2,
                 methods: 2,
                 references: 0,
                 dependencies: 3,
@@ -848,6 +998,7 @@ mod tests {
                     _ => &fx.surface_b,
                 },
                 |_, _| &supers,
+                |_, _| &[],
                 &importers,
                 labels,
                 file_labels,
@@ -890,6 +1041,7 @@ mod tests {
                     _ => &fx.surface_b,
                 },
                 |_, _| &supers,
+                |_, _| &[],
                 &importers,
                 labels,
                 file_labels,
@@ -914,6 +1066,7 @@ mod tests {
             &[],
             |_| &fx.surface_b,
             |_, _| &[],
+            |_, _| &[],
             &importers,
             labels,
             file_labels,
@@ -927,11 +1080,10 @@ mod tests {
         assert!(report.counts.is_none(), "counts are a minimal-tier field");
     }
 
-    /// The two documented seams: `interfaces` and `constructors` answer
-    /// empty even for a class whose source carries both — the capture has
-    /// no edges or rows for them yet.
+    /// Faces without edges or constructor facts answer empty sections —
+    /// the populated shape is the fixture's, never a placeholder.
     #[test]
-    fn interfaces_and_constructors_stay_empty_seams() {
+    fn empty_faces_answer_empty_sections() {
         let fx = fixture();
         let (importers, tests) = graphs();
         let report = explain(
@@ -944,6 +1096,7 @@ mod tests {
                 _ => &fx.surface_b,
             },
             |_, _| &[],
+            |_, _| &[],
             &importers,
             labels,
             file_labels,
@@ -951,8 +1104,8 @@ mod tests {
             &fx.strings,
         );
         assert_eq!(report.inheritance, Some(Vec::new()), "no edges, no rows");
-        assert_eq!(report.interfaces, Some(Vec::new()), "the capture seam");
-        assert_eq!(report.constructors, Some(Vec::new()), "the capture seam");
+        assert_eq!(report.interfaces, Some(Vec::new()), "no edges, no rows");
+        assert_eq!(report.constructors, Some(Vec::new()), "no facts, no rows");
         assert_eq!(report.methods.as_ref().map(Vec::len), Some(2));
     }
 
@@ -963,7 +1116,10 @@ mod tests {
         let fx = fixture();
         let (importers, tests) = graphs();
         let object = fx.strings.intern("Object");
-        let supers = vec![TargetRef::Decl(fx.file_a, fx.bar), TargetRef::Name(object)];
+        let supers = vec![
+            (TargetRef::Decl(fx.file_a, fx.bar), SuperClause::Extends),
+            (TargetRef::Name(object), SuperClause::Extends),
+        ];
         let report = explain(
             "Foo",
             Verbosity::Compact,
@@ -974,6 +1130,7 @@ mod tests {
                 _ => &fx.surface_b,
             },
             |_, _| &supers,
+            |_, _| &[],
             &importers,
             labels,
             file_labels,
@@ -986,10 +1143,12 @@ mod tests {
                 SuperTypeRow {
                     name: "Bar".to_owned(),
                     file: Some("a.dart".to_owned()),
+                    clause: Some("extends".to_owned()),
                 },
                 SuperTypeRow {
                     name: "Object".to_owned(),
                     file: None,
+                    clause: Some("extends".to_owned()),
                 },
             ])
         );
@@ -1016,6 +1175,7 @@ mod tests {
                 _ => &fx.surface_b,
             },
             |_, _| &[],
+            |_, _| &[],
             &importers,
             labels,
             file_labels,
@@ -1040,6 +1200,7 @@ mod tests {
                 0 => &fx.surface_a,
                 _ => &fx.surface_b,
             },
+            |_, _| &[],
             |_, _| &[],
             &importers,
             labels,
@@ -1089,6 +1250,7 @@ mod tests {
                 0 => &fx.surface_a,
                 _ => &fx.surface_b,
             },
+            |_, _| &[],
             |_, _| &[],
             &importers,
             labels,

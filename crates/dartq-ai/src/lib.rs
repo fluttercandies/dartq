@@ -2,13 +2,13 @@
 //!
 //! Landed faces:
 //!
-//! * [`compatibility`] — the PRD §15.5 compatibility query: the same base
+//! * [`compatibility`] — the compatibility query: the same base
 //!   code under several SDK contexts, aggregated into a per-axis ✓/✗
 //!   matrix with the first failing diagnostic per axis.
-//! * [`explain`] — the PRD §15.3 explain query: the one-stop symbol
+//! * [`explain`] — the explain query: the one-stop symbol
 //!   report (declaration, supertypes, members, references, the declaring
 //!   library's importers, and its tests) over borrowed index faces.
-//! * [`impact`] — the PRD §15.4 impact query: the changed symbols with
+//! * [`impact`] — the impact query: the changed symbols with
 //!   their signature verdicts, the reverse-dependency closure tagged
 //!   content-only vs semantic, the test-graph join, and the environment
 //!   matrix (v1: one always-compatible context).

@@ -1,4 +1,4 @@
-//! The `compatibility` query (PRD §15.5): the same base code analyzed under
+//! The `compatibility` query: the same base code analyzed under
 //! several SDK contexts, aggregated into a per-axis ✓/✗ matrix.
 //!
 //! # The query shape
@@ -10,7 +10,7 @@
 //! SDK and hands the query that axis's ERROR-severity diagnostics, or the
 //! load error when the SDK itself was unusable. Axis identity *is* the
 //! snapshot identity: Dart and Flutter SDKs are fixed pairs, never
-//! independently combined (PRD §15.5 FACT), so an axis carries one label —
+//! independently combined, so an axis carries one label —
 //! not a (dart, flutter) tuple.
 //!
 //! # The verdict rule
@@ -102,7 +102,7 @@ impl AxisError {
     pub const SDK_UNAVAILABLE: &str = "sdk_unavailable";
 }
 
-/// The compatibility report (PRD §15.5), JSON contract `schema_version: 1`.
+/// The compatibility report, JSON contract `schema_version: 1`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompatReport {
     /// The output contract version ([`COMPAT_SCHEMA_VERSION`]).
@@ -113,7 +113,7 @@ pub struct CompatReport {
     pub matrix: Vec<AxisCompat>,
 }
 
-/// Answers the compatibility query over `axes` (PRD §15.5).
+/// Answers the compatibility query over `axes`.
 ///
 /// `file` is the queried path (the report's subject label). The matrix
 /// preserves `axes` order — axis order is the caller's contract (the CLI

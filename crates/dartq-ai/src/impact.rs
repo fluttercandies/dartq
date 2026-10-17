@@ -1,7 +1,7 @@
-//! The `impact` query (PRD §15.4): what a change to one library does to the
+//! The `impact` query: what a change to one library does to the
 //! workspace — the changed symbols, the reverse-dependency closure with its
 //! content-only vs semantic tags, the tests exercising the affected code,
-//! and the environment matrix (a single context until §16 lands).
+//! and the environment matrix.
 //!
 //! # The query shape
 //!
@@ -15,7 +15,7 @@
 //!   [`FileSnapshot`] pair.
 //!
 //! Library identity is the caller's `u32` id space throughout; internal ids
-//! never leave the engine boundary (PRD §15.7) — every report row carries a
+//! never leave the engine boundary — every report row carries a
 //! stable `label|name` path string instead.
 //!
 //! # Closure mechanics
@@ -29,18 +29,19 @@
 //! arena space, so a hashed set would only add overhead). Output is
 //! deterministic: every section sorts by its path.
 //!
-//! # The signature gate (#282/#316/#338)
+//! # The signature gate (#282/#316/#338/#1561)
 //!
 //! [`FileSnapshot`] carries the content hash ([`content_hash`], blake3),
 //! the API signature digest (the engine's `ApiSignature` as raw bytes —
-//! the element face folded with the directive face, PRD §11.3), and the
-//! library-face name set. The file-level verdict ([`api_changed`]) is the
-//! signature inequality alone: the digest already folds everything a
-//! downstream library resolves against, so a body-only edit (hash moves,
-//! signature stable) stays content-only without a name-set conjunct. The
-//! per-symbol verdict ([`symbol_signature_changed`]) remains a name-presence
-//! proxy until member-level signature evidence lands (documented at its
-//! definition).
+//! the element face folded with the directive face), and the library-face
+//! names with their member-level signature digests. The file-level verdict
+//! ([`api_changed`]) is the signature inequality alone: the digest already
+//! folds everything a downstream library resolves against, so a body-only
+//! edit (hash moves, signature stable) stays content-only without a
+//! name-set conjunct. The per-symbol verdict
+//! ([`symbol_signature_changed`]) compares the member digests (v2): an
+//! added or removed declaration fires, and so does a stable name whose
+//! canonical face moved — the name-presence proxy is retired.
 
 use std::cmp::Ordering;
 
@@ -51,9 +52,12 @@ use dartq_source::{StringId, StringTable};
 
 use crate::rev_import_graph::RevImportGraph;
 
-/// The report contract version (PRD §15.7): breaking output changes bump
-/// the major.
-pub const IMPACT_SCHEMA_VERSION: u32 = 1;
+/// The report contract version: breaking output changes bump the major.
+/// v2: `signature_changed` consults the member-level signature digests
+/// instead of the name-presence proxy — the field keeps its name but the
+/// meaning underneath it changed (a stable name whose member digest moved
+/// now ships a row), the freeze discipline's reuse-the-field major.
+pub const IMPACT_SCHEMA_VERSION: u32 = 2;
 
 /// The content hash of one file's bytes — the identity [`FileSnapshot`]
 /// carries alongside the API signature. blake3: collision-resistant, fast,
@@ -81,11 +85,15 @@ pub fn fold_api_signatures(members: &[[u8; 16]]) -> [u8; 16] {
 }
 
 /// What the query sees of one library's state: the content identity, the
-/// API signature digest, and the library-face (top-level) declared names.
+/// API signature digest, and the library-face names with their member-level
+/// signature digests.
 ///
-/// The name set is the sorted, deduplicated [`StringId`]s of the library's
-/// face rows (a multi-file library folds its parts before querying). The
-/// set lives sorted so the diff and the verdicts are merge walks.
+/// The member arrays are parallel and ascending by name (deduplicated —
+/// the [`impact`] build asserts both), so the diff and the verdicts are
+/// merge walks and binary searches over one order. The digests are derived
+/// on demand from the engine's resident facts per snapshot build (one face
+/// render per member file) and never persisted — derivable in microseconds,
+/// a stored copy would be redundant state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSnapshot {
     /// The content identity ([`content_hash`] over the library's bytes).
@@ -97,8 +105,13 @@ pub struct FileSnapshot {
     /// with the directive face; `api_changed` verdicts on it alone.
     pub api_signature: [u8; 16],
     /// The library-face names, ascending, deduplicated — asserted by
-    /// [`impact`] in every build (the verdicts are merge walks over it).
-    pub top_level_names: Box<[StringId]>,
+    /// [`impact`] in every build (the verdicts are merge walks over them).
+    pub member_names: Box<[StringId]>,
+    /// The member-level signature digests (#1561), positionally parallel to
+    /// [`FileSnapshot::member_names`]: digest `i` is the blake3-128 of the
+    /// canonical element-face slice behind `member_names[i]` (a named
+    /// container's full face, or a top-level declaration's face).
+    pub member_digests: Box<[[u8; 16]]>,
 }
 
 /// One changed library: the before/after surface pair the verdicts compare.
@@ -118,9 +131,9 @@ impl LibraryChange {
     /// an API-level edit to `current` would affect — every current face
     /// name counts as changed and the API verdict is `true` (importers at
     /// every hop tag semantic). The daemon path passes real diffs instead.
-    /// The before side carries all-zero digests — no-baseline sentinels
-    /// (a real blake3 digest never answers all-zero), so the signature
-    /// verdict and the name diff both fire by construction.
+    /// The before side carries empty member arrays — no-baseline: every
+    /// after-side name is an addition, so the name diff and every
+    /// signature verdict fire by construction.
     #[must_use]
     pub fn hypothetical(library: u32, current: FileSnapshot) -> Self {
         Self {
@@ -128,14 +141,15 @@ impl LibraryChange {
             before: FileSnapshot {
                 content_hash: [0; 32],
                 api_signature: [0; 16],
-                top_level_names: Box::from([]),
+                member_names: Box::from([]),
+                member_digests: Box::from([]),
             },
             after: current,
         }
     }
 }
 
-/// The impact report (PRD §15.4), JSON contract `schema_version: 1`.
+/// The impact report, JSON contract `schema_version: 2`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactReport {
     /// The output contract version ([`IMPACT_SCHEMA_VERSION`]).
@@ -146,21 +160,26 @@ pub struct ImpactReport {
     pub affected: Vec<AffectedTarget>,
     /// The test files exercising the changed or affected libraries.
     pub affected_tests: Vec<AffectedTest>,
-    /// The environment matrix; a single always-compatible context until
-    /// §16's multi-context lands (the contracted v1 shape).
+    /// The environment matrix, answered by the caller — an environment
+    /// verdict needs engines this pure query never sees, so the query
+    /// ships the section empty and the caller that ran the analysis fills
+    /// it: one honest `default` row (the compat verdict rule over the
+    /// analysis' diagnostics) when the workspace declares no contexts, one
+    /// row per declared context otherwise, in file order.
     pub affected_environments: Vec<EnvironmentImpact>,
 }
 
 /// One changed symbol with its signature verdict.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedSymbol {
-    /// The stable path reference (`label|name`, PRD §15.7).
+    /// The stable path reference.
     pub symbol: String,
-    /// Whether the symbol's signature changed. Member-level proxy (see
-    /// [`symbol_signature_changed`]): it keys on the name's presence in the
-    /// face set, not on a per-symbol signature digest — member-level
-    /// signature evidence is deferred (#338 posture), and this flag stays
-    /// the proxy until that evidence lands.
+    /// Whether the symbol's signature changed (v2 digest semantics — see
+    /// [`symbol_signature_changed`]): an added or removed declaration, or a
+    /// stable name whose member-level digest moved (a parameter type, a
+    /// default value, a modifier — anything the canonical face folds). The
+    /// v1 name-presence proxy under-reported exactly the stable-name case;
+    /// the member digests retire it.
     pub signature_changed: bool,
 }
 
@@ -173,8 +192,8 @@ pub struct AffectedTarget {
     pub impact: ImpactLevel,
 }
 
-/// How a change reaches an affected library (PRD §15.4's
-/// "仅内容受影响 vs 语义受影响").
+/// How a change reaches an affected library (content-only reach vs
+/// semantic reach).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ImpactLevel {
@@ -192,8 +211,10 @@ pub struct AffectedTest {
     pub path: String,
 }
 
-/// One environment of the matrix (§16); v1 carries the single default
-/// context, compatible by construction.
+/// One environment of the matrix: an SDK context's label and whether the
+/// affected set analyzes clean under it (zero ERROR-severity diagnostics —
+/// the compat face's verdict rule). The v1 row is the ✓/✗ pair alone; the
+/// failure detail a row cannot carry is one `compat` run away.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentImpact {
     /// The context label.
@@ -216,55 +237,75 @@ pub fn api_changed(before: &FileSnapshot, after: &FileSnapshot) -> bool {
     before.api_signature != after.api_signature
 }
 
-/// The per-symbol signature verdict — the member-level half of the gate.
-/// Proxy until member-level signature evidence lands (#338 defers it): it
-/// keys on the name's presence, so an added or removed declaration is a
-/// signature change while a body edit under a stable name is invisible —
-/// and so is a signature-bearing edit (default value, type refinement)
-/// under a stable name. The file-level [`api_changed`] verdict carries the
-/// real signal until per-symbol digests exist.
+/// The per-symbol signature verdict — the member-level half of the gate
+/// (v2, #1561): `name` present on exactly one side is an added or removed
+/// declaration (`true`, the v1 semantics preserved); present on both sides,
+/// its member digests decide — inequality is a signature change under a
+/// stable name (a parameter type, a default value, a modifier), equality a
+/// body-only edit the face never saw. The v1 name-presence proxy — under-
+/// reporting every stable-name case — is retired.
 ///
-/// `before` and `after` must be ascending and deduplicated (the
+/// The snapshot member arrays must be ascending and deduplicated (the
 /// [`FileSnapshot`] contract) — `binary_search` on unsorted input answers
 /// arbitrarily instead of panicking.
 #[must_use]
-pub fn symbol_signature_changed(before: &[StringId], after: &[StringId], name: StringId) -> bool {
-    debug_assert!(
-        is_ascending(before) && is_ascending(after),
-        "name sets must be ascending and deduplicated"
-    );
-    before.binary_search(&name).is_ok() != after.binary_search(&name).is_ok()
+pub fn symbol_signature_changed(
+    before: &FileSnapshot,
+    after: &FileSnapshot,
+    name: StringId,
+) -> bool {
+    let Ok(i) = before.member_names.binary_search(&name) else {
+        return true;
+    };
+    let Ok(j) = after.member_names.binary_search(&name) else {
+        return true;
+    };
+    before.member_digests[i] != after.member_digests[j]
 }
 
-/// The snapshot name-set precondition the verdicts stand on: strictly
-/// ascending, which also rules out duplicates.
+/// The snapshot member-array precondition the verdicts stand on: strictly
+/// ascending names (which also rules out duplicates), positionally parallel
+/// to the digests.
+fn members_sorted_and_parallel(snapshot: &FileSnapshot) -> bool {
+    is_ascending(&snapshot.member_names)
+        && snapshot.member_names.len() == snapshot.member_digests.len()
+}
+
+/// Strictly ascending, which also rules out duplicates.
 fn is_ascending(names: &[StringId]) -> bool {
     names.windows(2).all(|pair| pair[0] < pair[1])
 }
 
-/// The names present in exactly one of the two sorted, deduplicated sets —
-/// the Changed section's rows, ascending.
-fn diff_names(before: &[StringId], after: &[StringId]) -> Vec<StringId> {
+/// The names present in exactly one of the two snapshots, plus the stable
+/// names whose digests moved — the Changed section's rows with their
+/// verdicts, ascending by name. One merge walk over the parallel member
+/// arrays: a one-sided name is an addition or removal (`true`), an
+/// equal-name pair verdicts on its digest pair.
+fn diff_members(before: &FileSnapshot, after: &FileSnapshot) -> Vec<(StringId, bool)> {
     let mut diff = Vec::new();
+    let (b, a) = (&before.member_names, &after.member_names);
     let (mut i, mut j) = (0, 0);
-    while i < before.len() && j < after.len() {
-        match before[i].cmp(&after[j]) {
+    while i < b.len() && j < a.len() {
+        match b[i].cmp(&a[j]) {
             Ordering::Less => {
-                diff.push(before[i]);
+                diff.push((b[i], true));
                 i += 1;
             }
             Ordering::Greater => {
-                diff.push(after[j]);
+                diff.push((a[j], true));
                 j += 1;
             }
             Ordering::Equal => {
+                if before.member_digests[i] != after.member_digests[j] {
+                    diff.push((b[i], true));
+                }
                 i += 1;
                 j += 1;
             }
         }
     }
-    diff.extend_from_slice(&before[i..]);
-    diff.extend_from_slice(&after[j..]);
+    diff.extend(b[i..].iter().map(|&name| (name, true)));
+    diff.extend(a[j..].iter().map(|&name| (name, true)));
     diff
 }
 
@@ -291,7 +332,7 @@ fn semantic_flood<'a>(
     semantic
 }
 
-/// Answers the impact query over `changes` (PRD §15.4).
+/// Answers the impact query over `changes`.
 ///
 /// `imports_of(lib)` yields the resolved import targets of `lib` (the
 /// caller's id space, `0..library_count`); `label_of(lib)` yields the
@@ -311,10 +352,10 @@ fn semantic_flood<'a>(
 /// Panics on out-of-contract caller data too: a [`LibraryChange`] id or an
 /// `imports_of` target at or beyond `library_count` stops on the array
 /// bounds check (debug builds assert first, naming the offending id — the
-/// import target in [`RevImportGraph::build`]), and a snapshot whose
-/// `top_level_names` are not ascending and deduplicated is rejected in
-/// every build — the merge walks behind the verdicts would silently
-/// mis-diff it otherwise.
+/// import target in [`RevImportGraph::build`]), and a snapshot whose member
+/// arrays are not ascending, deduplicated, and positionally parallel is
+/// rejected in every build — the merge walks and binary searches behind the
+/// verdicts would silently mis-diff it otherwise.
 #[must_use]
 pub fn impact<'a>(
     library_count: usize,
@@ -324,16 +365,16 @@ pub fn impact<'a>(
     strings: &StringTable,
     changes: &[LibraryChange],
 ) -> ImpactReport {
-    // The verdicts are merge walks over the snapshot name sets: an
-    // unsorted or duplicated set would silently mis-diff (arbitrary
-    // binary_search answers, dropped merge entries), so the caller
-    // contract is asserted in every build — a rejected input beats a
-    // wrong verdict.
+    // The verdicts are merge walks and binary searches over the snapshot
+    // member arrays: an unsorted, duplicated, or non-parallel set would
+    // silently mis-diff (arbitrary binary_search answers, dropped merge
+    // entries, misaligned digests), so the caller contract is asserted in
+    // every build — a rejected input beats a wrong verdict.
     for change in changes {
         assert!(
-            is_ascending(&change.before.top_level_names)
-                && is_ascending(&change.after.top_level_names),
-            "FileSnapshot.top_level_names must be ascending and deduplicated"
+            members_sorted_and_parallel(&change.before)
+                && members_sorted_and_parallel(&change.after),
+            "FileSnapshot member arrays must be ascending, deduplicated, and parallel"
         );
     }
 
@@ -379,9 +420,9 @@ pub fn impact<'a>(
         }
     }
 
-    // Changed rows: the name-set diff per change, each row's verdict from
-    // the seam. Honest no-op changes (equal snapshots) yield no rows and a
-    // content-only closure. Duplicate entries for one library
+    // Changed rows: the member-array diff per change, each row's verdict
+    // from the digest walk. Honest no-op changes (equal snapshots) yield no
+    // rows and a content-only closure. Duplicate entries for one library
     // resolve last-wins — the api marks already overwrite that way — so
     // the superseded entries ship no rows and contradictory symbol rows
     // are impossible by construction.
@@ -399,12 +440,10 @@ pub fn impact<'a>(
         if superseded[i] {
             continue;
         }
-        let before = &change.before.top_level_names;
-        let after = &change.after.top_level_names;
-        for name in diff_names(before, after) {
+        for (name, changed) in diff_members(&change.before, &change.after) {
             changed_rows.push(ChangedSymbol {
                 symbol: format!("{}|{}", label_of(change.library), strings.resolve(name)),
-                signature_changed: symbol_signature_changed(before, after, name),
+                signature_changed: changed,
             });
         }
     }
@@ -440,10 +479,10 @@ pub fn impact<'a>(
         changed: changed_rows,
         affected: affected_rows,
         affected_tests: test_rows,
-        affected_environments: vec![EnvironmentImpact {
-            label: "default".to_string(),
-            compatible: true,
-        }],
+        // The caller's section: an environment verdict needs the analysis'
+        // diagnostics, which this pure query never sees — the commands
+        // face fills it (the honest default row, or the context matrix).
+        affected_environments: Vec::new(),
     }
 }
 
@@ -467,22 +506,51 @@ mod tests {
         Fixture { strings, fa, fb }
     }
 
+    /// The blake3-128 of one member's face text.
+    fn digest(text: &str) -> [u8; 16] {
+        let hash = blake3::hash(text.as_bytes());
+        let mut digest = [0u8; 16];
+        digest.copy_from_slice(&hash.as_bytes()[..16]);
+        digest
+    }
+
     fn snapshot(strings: &StringTable, names: &[&str]) -> FileSnapshot {
-        let mut top_level_names: Vec<StringId> =
-            names.iter().map(|name| strings.intern(name)).collect();
-        top_level_names.sort_unstable();
-        top_level_names.dedup();
-        // The signature rides the face the way the real producer's does: a
-        // digest of the face itself — stable under body edits (the tests
-        // move `content_hash` alone), moving when the name set moves.
+        snapshot_with(strings, names, &[])
+    }
+
+    /// A snapshot over `names`, each member's digest derived from its name
+    /// text (stable under renames elsewhere) — plus `overrides`, the
+    /// stable-name signature edits the v2 verdicts consume.
+    fn snapshot_with(
+        strings: &StringTable,
+        names: &[&str],
+        overrides: &[(&str, [u8; 16])],
+    ) -> FileSnapshot {
+        let mut pairs: Vec<(StringId, [u8; 16])> = names
+            .iter()
+            .map(|&name| (strings.intern(name), digest(name)))
+            .collect();
+        for (name, member_digest) in overrides {
+            let at = pairs
+                .iter()
+                .position(|(candidate, _)| strings.resolve(*candidate) == *name)
+                .expect("override targets a member");
+            pairs[at].1 = *member_digest;
+        }
+        pairs.sort_unstable();
+        pairs.dedup_by(|a, b| a.0 == b.0);
+        // The file-level faces ride the name-set identity the way the real
+        // producer's do: stable under digest-only edits (the tests move
+        // `content_hash` alone), moving when the name set moves.
         let face = names.join(",");
-        let digest = blake3::hash(face.as_bytes());
-        let mut api_signature = [0u8; 16];
-        api_signature.copy_from_slice(&digest.as_bytes()[..16]);
         FileSnapshot {
             content_hash: content_hash(face.as_bytes()),
-            api_signature,
-            top_level_names: top_level_names.into_boxed_slice(),
+            api_signature: digest(&face),
+            member_names: pairs.iter().map(|(name, _)| *name).collect(),
+            member_digests: pairs
+                .into_iter()
+                .map(|(_, member_digest)| member_digest)
+                .collect(),
         }
     }
 
@@ -493,7 +561,7 @@ mod tests {
     /// Acceptance core: an API-level change in `a` floods the reverse
     /// import graph — the direct importer `b`, the transitive `c`, and the
     /// direct test import `a_test` all carry the Semantic tag (L3), and
-    /// `a_test` lists in AffectedTests.
+    /// `a_test` lists in `AffectedTests`.
     #[test]
     fn api_change_propagates_semantic_to_every_hop() {
         let fx = fixture();
@@ -548,12 +616,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a_test.dart"]
         );
-        assert_eq!(
-            report.affected_environments,
-            vec![EnvironmentImpact {
-                label: "default".to_string(),
-                compatible: true,
-            }]
+        assert!(
+            report.affected_environments.is_empty(),
+            "the environment section is the caller's to answer"
         );
     }
 
@@ -698,9 +763,9 @@ mod tests {
         assert!(!api_changed(&before, &before));
     }
 
-    /// A body-only edit (hash moves, name set stable) yields no Changed
-    /// rows and an all-content-only closure — the proxy's documented
-    /// under-report until #282.
+    /// A body-only edit (hash moves, digests stable) yields no Changed
+    /// rows and an all-content-only closure — the digest walk's silent
+    /// half, the everyday edit the verdicts must not noise.
     #[test]
     fn body_only_edit_stays_content_only() {
         let fx = fixture();
@@ -844,8 +909,8 @@ mod tests {
         assert_eq!(report.affected[0].impact, ImpactLevel::Semantic);
     }
 
-    /// The JSON contract: `schema_version: 1` round-trips, section keys are
-    /// the §15.4 names, and the impact tag spells `content-only` /
+    /// The JSON contract: `schema_version: 2` round-trips, section keys are
+    /// the names, and the impact tag spells `content-only` /
     /// `semantic`.
     #[test]
     fn json_round_trip_with_schema_version() {
@@ -868,7 +933,7 @@ mod tests {
         let back: ImpactReport = serde_json::from_str(&text).expect("deserialize");
         assert_eq!(back, report, "byte-stable round trip");
         let value: serde_json::Value = serde_json::from_str(&text).expect("json");
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert!(value["changed"].is_array());
         assert!(value["affected"].is_array());
         assert!(value["affected_tests"].is_array());
@@ -881,8 +946,8 @@ mod tests {
     }
 
     /// A no-op change (identical snapshots) answers the empty report with
-    /// the environment row still present — the section shape never
-    /// disappears.
+    /// the environment section empty — an environment verdict needs the
+    /// analysis this query never runs, so the section is the caller's.
     #[test]
     fn no_op_change_answers_the_empty_report() {
         let fx = fixture();
@@ -903,7 +968,7 @@ mod tests {
         assert!(report.changed.is_empty());
         assert!(report.affected.is_empty());
         assert!(report.affected_tests.is_empty());
-        assert_eq!(report.affected_environments.len(), 1);
+        assert!(report.affected_environments.is_empty());
     }
 
     /// An out-of-range [`LibraryChange`] id is a caller bug that panics
@@ -951,7 +1016,7 @@ mod tests {
     fn unsorted_snapshot_is_rejected_not_misdiffed() {
         let fx = fixture();
         let mut after = snapshot(&fx.strings, &["fa", "fb"]);
-        after.top_level_names = vec![fx.fb, fx.fa].into_boxed_slice();
+        after.member_names = vec![fx.fb, fx.fa].into_boxed_slice();
         let tests = TestGraph::default();
         let change = LibraryChange {
             library: 0,
@@ -959,6 +1024,112 @@ mod tests {
             after,
         };
         let _ = impact(1, imports_of, |_| "a.dart", &tests, &fx.strings, &[change]);
+    }
+
+    /// A member array that is not positionally parallel to its digests is
+    /// rejected in every build — a misaligned digest would verdict an
+    /// arbitrary symbol, exactly the silent wrong answer the contract
+    /// asserts away.
+    #[test]
+    #[should_panic(expected = "parallel")]
+    fn non_parallel_member_arrays_are_rejected() {
+        let fx = fixture();
+        let mut after = snapshot(&fx.strings, &["fa", "fb"]);
+        after.member_digests = Box::from([[0; 16]]);
+        let tests = TestGraph::default();
+        let change = LibraryChange {
+            library: 0,
+            before: snapshot(&fx.strings, &["fa"]),
+            after,
+        };
+        let _ = impact(1, imports_of, |_| "a.dart", &tests, &fx.strings, &[change]);
+    }
+
+    /// The v2 verdict pin (#1561): a signature edit under a stable name —
+    /// digests move, the name set does not — ships its Changed row with
+    /// `signature_changed: true`. The v1 name-presence proxy shipped
+    /// nothing here; the file-level digest alone carried the signal.
+    #[test]
+    fn signature_edit_under_a_stable_name_ships_the_verdict_row() {
+        let fx = fixture();
+        let imports: [&[u32]; 2] = [&[], &[0]];
+        let tests = TestGraph::default();
+        let changes = [LibraryChange {
+            library: 0,
+            before: snapshot(&fx.strings, &["fa"]),
+            after: snapshot_with(&fx.strings, &["fa"], &[("fa", digest("refined"))]),
+        }];
+        let report = impact(
+            2,
+            |lib| imports[lib as usize],
+            |lib| ["a.dart", "b.dart"][lib as usize],
+            &tests,
+            &fx.strings,
+            &changes,
+        );
+        assert_eq!(
+            report
+                .changed
+                .iter()
+                .map(|row| (row.symbol.as_str(), row.signature_changed))
+                .collect::<Vec<_>>(),
+            vec![("a.dart|fa", true)],
+            "the stable name's moved digest ships the row"
+        );
+    }
+
+    /// The silent half of the digest contract: a stable name whose digests
+    /// are equal ships no row even while the content hash moves — the
+    /// verdict is the digest comparison, never the name's presence.
+    #[test]
+    fn stable_name_with_equal_digests_stays_silent() {
+        let fx = fixture();
+        let tests = TestGraph::default();
+        let overridden = digest("refined");
+        let before = snapshot_with(&fx.strings, &["fa"], &[("fa", overridden)]);
+        let mut after = snapshot_with(&fx.strings, &["fa"], &[("fa", overridden)]);
+        after.content_hash = content_hash(b"edited body");
+        let report = impact(
+            1,
+            imports_of,
+            |_| "a.dart",
+            &tests,
+            &fx.strings,
+            &[LibraryChange {
+                library: 0,
+                before,
+                after,
+            }],
+        );
+        assert!(
+            report.changed.is_empty(),
+            "equal digests under a stable name are no change"
+        );
+    }
+
+    /// The verdict rule itself, pinned directly: absent on either side is
+    /// `true` (added or removed), present on both is the digest
+    /// comparison.
+    #[test]
+    fn symbol_verdict_keys_on_presence_then_digests() {
+        let fx = fixture();
+        let before = snapshot(&fx.strings, &["fa"]);
+        let removed = snapshot(&fx.strings, &[]);
+        let same = snapshot_with(&fx.strings, &["fa"], &[]);
+        let moved = snapshot_with(&fx.strings, &["fa"], &[("fa", digest("refined"))]);
+        assert!(
+            symbol_signature_changed(&before, &removed, fx.fa),
+            "removed"
+        );
+        assert!(symbol_signature_changed(&removed, &before, fx.fa), "added");
+        assert!(
+            !symbol_signature_changed(&before, &same, fx.fa),
+            "equal digests"
+        );
+        assert!(
+            symbol_signature_changed(&before, &moved, fx.fa),
+            "moved digest"
+        );
     }
 
     /// The other face of the sortedness contract: a contract-valid input
@@ -994,10 +1165,7 @@ mod tests {
                     impact: ImpactLevel::Semantic,
                 }],
                 affected_tests: vec![],
-                affected_environments: vec![EnvironmentImpact {
-                    label: "default".to_string(),
-                    compatible: true,
-                }],
+                affected_environments: vec![],
             },
         );
     }

@@ -1,5 +1,5 @@
 //! The reversed import graph: one shared CSR build for every consumer that
-//! asks "who imports this library" — the [`impact`] query today, the
+//! asks "who imports this library" — the [`impact`](crate::impact) query today, the
 //! amortized batch queries and the T8 explain stage after it.
 //!
 //! # Layout
