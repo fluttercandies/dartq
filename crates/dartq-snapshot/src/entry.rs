@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::blake3_128;
 
-/// Cross-process identity of one entry (PRD §5.6): the content it was
+/// Cross-process identity of one entry: the content it was
 /// computed from, the caller-defined feature fingerprint that shaped the
 /// analysis, and the engine semantic version. The on-disk filename is the
 /// blake3-128 hash of this triple.

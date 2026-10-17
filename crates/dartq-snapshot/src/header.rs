@@ -29,7 +29,7 @@ use crate::blake3_128;
 /// rebuilt.
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 5;
 
-/// Identity of one snapshot generation (PRD §5.5, §5.6). A loaded
+/// Identity of one snapshot generation. A loaded
 /// generation is used only when every field equals what the caller
 /// expects; any inequality is a miss for the whole generation, not an
 /// error.

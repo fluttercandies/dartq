@@ -14,6 +14,7 @@ categories = ["development-tools"]
 blake3 = { workspace = true }
 filetime = { workspace = true }
 hex = { workspace = true }
+rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

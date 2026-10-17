@@ -3,25 +3,49 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use filetime::{FileTime, set_file_atime, set_file_mtime};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::entry::{self, Entry};
+use crate::entry::{self, Entry, EntryKey};
 use crate::header::{GenerationHeader, SNAPSHOT_FORMAT_VERSION};
 use crate::remap::RemapTables;
 
-/// Default L2 capacity: 10 GiB (PRD §17.2 `--cache-size-limit`).
+/// Default L2 capacity: 10 GiB.
 pub const DEFAULT_CAPACITY_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// How many saves may pass before the capacity scan runs regardless of the
 /// size estimate — the bound on how far the cheap estimate can drift from
 /// reality.
 const ENFORCE_EVERY_SAVES: u32 = 32;
+
+/// Entry ids this store instance knows to be on disk, keyed by
+/// `(generation dir id, tables stamp)` — the flush-path bookkeeping
+/// (#1386). The daemon flushes every resident entry per debounce tick, and
+/// the caller pays a full facts projection plus an encode per entry for
+/// each; a recorded id lets the caller skip both, because within a
+/// generation a frame is byte-determined by its key: the payload is a pure
+/// function of the entry key (same content hash, features, semantics, and
+/// header context reanalyze identically — the determinism the
+/// deterministic path-smallest payload pick already leans on). The set
+/// only ever grows from evidence: a landed write (atomic rename, or the
+/// byte-identical read-compare skip), or a completed `load` (which proved
+/// the whole manifest is on disk under the loaded stamp). It shrinks on
+/// the matching counter-evidence: the save-end sweep unrecords every entry
+/// file it deletes, a save or load under one stamp voids sibling-stamp
+/// records for the same generation, and capacity eviction prunes whole
+/// directories. Under-recording costs redundant work; the only way to a
+/// wrong skip is external cache deletion mid-session, which is not a
+/// supported scenario — and even then the manifest gate degrades the
+/// generation to a miss, never a mixture.
+type WrittenKeys = FxHashMap<([u8; 16], [u8; 16]), FxHashSet<[u8; 16]>>;
 
 /// The per-generation load-recency marker: one file touched once per load
 /// stands in for per-entry utimes.
@@ -100,8 +124,14 @@ pub struct SnapshotStore {
     /// accrue, evictions and full scans re-anchor it. Only when it crosses
     /// `capacity_bytes` does `save` pay for a real scan.
     estimated_bytes: AtomicU64,
-    /// Saves since the last full scan; [`ENFORCE_EVERY_SAVES`] forces one.
+    /// Saves since the last full scan; `ENFORCE_EVERY_SAVES` forces one.
     saves_since_enforce: AtomicU32,
+    /// The on-disk entry bookkeeping ([`WrittenKeys`]); mutated under the
+    /// lock by `load` (seed), [`Self::save_delta`] (record + unrecord),
+    /// and [`Self::enforce_capacity`] (eviction prune), and read by
+    /// [`Self::written_keys`] — all cold, once-per-flush paths, never per
+    /// entry.
+    written: Mutex<WrittenKeys>,
 }
 
 impl SnapshotStore {
@@ -121,6 +151,7 @@ impl SnapshotStore {
             capacity_bytes: config.capacity_bytes,
             estimated_bytes: AtomicU64::new(0),
             saves_since_enforce: AtomicU32::new(0),
+            written: Mutex::new(FxHashMap::default()),
         })
     }
 
@@ -202,6 +233,17 @@ impl SnapshotStore {
             return None;
         }
         entries.sort_by_key(|entry| entry.key.id());
+        // A completed load is the strongest seeding the bookkeeping can
+        // get (#1386): the manifest equality just proved every entry file
+        // is on disk under this generation's stamp, so the next flush may
+        // skip all of them. The loaded stamp is the directory's truth;
+        // sibling-stamp records (a previous save group) are void.
+        let dir = stored.dir_id();
+        {
+            let mut written = self.lock_written();
+            written.retain(|(generation, _), _| generation != &dir);
+            written.insert((dir, tables_stamp), present.iter().copied().collect());
+        }
         touch_recency(&generation.join(RECENCY_MARKER));
         Some(Snapshot {
             header: stored,
@@ -236,7 +278,7 @@ impl SnapshotStore {
     ///
     /// Capacity is throttled, not per-save: the bytes just written accrue
     /// into a cheap estimate, and only when the estimate crosses
-    /// `capacity_bytes` or [`ENFORCE_EVERY_SAVES`] saves have passed does
+    /// `capacity_bytes` or `ENFORCE_EVERY_SAVES` saves have passed does
     /// the save pay for the full scan ([`Self::enforce_capacity`]).
     ///
     /// # Errors
@@ -250,6 +292,71 @@ impl SnapshotStore {
         tables: &RemapTables,
         entries: &[Entry<T>],
     ) -> Result<(), SaveError> {
+        // The authoritative full write: every payload passed is carried as
+        // changed, so the bookkeeping never makes `save` skip one — the
+        // entries are the truth, even (same key, different payload) when a
+        // previous save under the same stamp is already recorded.
+        let manifest: Vec<EntryKey> = entries.iter().map(|entry| entry.key).collect();
+        self.save_delta(header, tables, &manifest, entries)
+    }
+
+    /// The entry ids recorded as on disk under `tables`' stamp in
+    /// `header`'s generation, restricted to `keys` — the flush face's skip
+    /// set (#1386). Only ids this store instance wrote (or loaded) are
+    /// ever returned; an absent record means "project and write", the
+    /// conservative answer. The engine filters its facts projections
+    /// through this before calling [`Self::save_delta`], turning the
+    /// debounced daemon flush from O(residency) into O(changed).
+    ///
+    /// A serialization failure of `tables` answers empty — nothing is
+    /// vouched, so the caller does full work; the accelerator invariant
+    /// keeps this query infallible.
+    #[must_use]
+    pub fn written_keys(
+        &self,
+        header: &GenerationHeader,
+        tables: &RemapTables,
+        keys: &[EntryKey],
+    ) -> Vec<EntryKey> {
+        let Some(stamp) = stamp_of(tables) else {
+            return Vec::new();
+        };
+        let written = self.lock_written();
+        let Some(records) = written.get(&(header.dir_id(), stamp)) else {
+            return Vec::new();
+        };
+        keys.iter()
+            .filter(|key| records.contains(&key.id()))
+            .copied()
+            .collect()
+    }
+
+    /// The flush variant of [`Self::save`]: `manifest` claims the
+    /// generation's *complete* entry set exactly as `save`'s entries would
+    /// (the manifest, sweep, and atomicity contract are identical), while
+    /// only `changed` carries payloads to encode and write — the subset
+    /// the caller found unrecorded via [`Self::written_keys`]. Manifest
+    /// keys absent from `changed` must already be on disk under this
+    /// stamp, which the written-keys bookkeeping is the record of; a save
+    /// records each changed key whose write lands (or whose frame proves
+    /// byte-identical to the incumbent), and unrecords every entry the
+    /// save-end sweep deletes — so only landed state is ever vouched.
+    ///
+    /// All of [`Self::save`]'s contract applies unchanged: tables.json is
+    /// always written, the sweep removes every on-disk entry outside the
+    /// manifest claim, a torn save degrades to a miss, and capacity is
+    /// throttled as in `save`.
+    ///
+    /// # Errors
+    ///
+    /// Exactly as [`Self::save`].
+    pub fn save_delta<T: Serialize>(
+        &self,
+        header: &GenerationHeader,
+        tables: &RemapTables,
+        manifest: &[EntryKey],
+        changed: &[Entry<T>],
+    ) -> Result<(), SaveError> {
         if header.format_version != SNAPSHOT_FORMAT_VERSION {
             return Err(SaveError::UnsupportedFormatVersion {
                 requested: header.format_version,
@@ -259,20 +366,29 @@ impl SnapshotStore {
         let generation = self.generation_dir(header);
         let entries_dir = generation.join("entries");
         fs::create_dir_all(&entries_dir)?;
-        let mut ids: Vec<[u8; 16]> = entries.iter().map(|entry| entry.key.id()).collect();
+        let mut ids: Vec<[u8; 16]> = manifest.iter().map(EntryKey::id).collect();
         debug_assert_eq!(
-            ids.len(),
+            changed.len(),
             {
-                let mut unique = ids.clone();
+                let mut unique: Vec<[u8; 16]> =
+                    changed.iter().map(|entry| entry.key.id()).collect();
                 unique.sort_unstable();
                 unique.dedup();
                 unique.len()
             },
-            "duplicate EntryKey in `save`: the manifest dedups and both frames \
-             would write one path — the caller must not save one key twice"
+            "duplicate EntryKey in `save_delta`'s changed set: the manifest \
+             dedups and both frames would write one path — the caller must \
+             not carry one key twice"
         );
         ids.sort_unstable();
         ids.dedup();
+        debug_assert!(
+            changed
+                .iter()
+                .all(|entry| ids.binary_search(&entry.key.id()).is_ok()),
+            "a changed entry outside the manifest claim: `manifest` must name \
+             the complete entry set, `changed` the subset to write"
+        );
         let encoded_tables = serde_json::to_vec(&TablesFile {
             tables,
             entry_ids: &ids,
@@ -287,8 +403,18 @@ impl SnapshotStore {
         // Tables first: the entry frames below embed the tables stamp,
         // pairing each entry with the save group that wrote it.
         atomic_write(&generation.join("tables.json"), &encoded_tables)?;
-        let mut written = encoded_tables.len() as u64;
-        for entry in entries {
+        let dir = header.dir_id();
+        // This save is the generation's new truth: records from sibling
+        // stamps can no longer vouch for on-disk frames (the frames they
+        // named were overwritten or swept). Today's saves always use the
+        // default tables, so this is a no-op in practice — the #1386
+        // audit's note — but the bookkeeping keys on the stamp so a future
+        // non-default save group cannot serve stale skips.
+        let mut written = self.lock_written();
+        written.retain(|(generation_dir, _), _| generation_dir != &dir);
+        let records = written.entry((dir, tables_stamp)).or_default();
+        let mut written_bytes = encoded_tables.len() as u64;
+        for entry in changed {
             let framed = entry::encode(entry, tables_stamp)?;
             let path = entries_dir.join(format!("{}.entry", hex::encode(entry.key.id())));
             // A byte-identical frame is already on disk — the narrowed
@@ -297,28 +423,39 @@ impl SnapshotStore {
             // reading a small framed file and comparing is strictly
             // cheaper than the temp+rename write. `tables.json` above is
             // never skipped: its manifest is exactly what an entry-set
-            // delta changes.
-            if fs::read(&path).is_ok_and(|incumbent| incumbent == framed) {
-                continue;
+            // delta changes. Either way the frame is on disk under this
+            // stamp, so the key is recorded.
+            if !fs::read(&path).is_ok_and(|incumbent| incumbent == framed) {
+                written_bytes += framed.len() as u64;
+                atomic_write(&path, &framed)?;
             }
-            written += framed.len() as u64;
-            atomic_write(&path, &framed)?;
+            records.insert(entry.key.id());
         }
         // Generational sweep: the manifest claims exactly `ids`, so entry
         // files left by an earlier save with a different set are removed —
-        // the on-disk set equals the claim when this save returns.
+        // the on-disk set equals the claim when this save returns. Each
+        // removal unrecords its id: a key that later rejoins the claim
+        // (its content edited back) must project and write again, or the
+        // manifest would claim a swept file.
         if let Ok(present) = fs::read_dir(&entries_dir) {
             for file in present.flatten() {
-                if entry_file_id(&file.path()).is_some_and(|id| ids.binary_search(&id).is_err()) {
+                if let Some(id) = entry_file_id(&file.path())
+                    && ids.binary_search(&id).is_err()
+                {
                     let _ = fs::remove_file(file.path());
+                    records.remove(&id);
                 }
             }
         }
+        drop(written);
         let encoded_header = serde_json::to_vec(header)?;
-        written += encoded_header.len() as u64;
+        written_bytes += encoded_header.len() as u64;
         atomic_write(&generation.join("header.json"), &encoded_header)?;
 
-        let estimate = self.estimated_bytes.fetch_add(written, Ordering::Relaxed) + written;
+        let estimate = self
+            .estimated_bytes
+            .fetch_add(written_bytes, Ordering::Relaxed)
+            + written_bytes;
         let saves = self.saves_since_enforce.fetch_add(1, Ordering::Relaxed) + 1;
         if estimate > self.capacity_bytes || saves >= ENFORCE_EVERY_SAVES {
             self.enforce_capacity();
@@ -331,9 +468,12 @@ impl SnapshotStore {
     /// one just written or just loaded and is never evicted even when the
     /// store stays over capacity (recency beats fitting). Group eviction
     /// keeps a generation either present or absent — never half-valid
-    /// (PRD §17.2). The walk also removes leaked temp files (crash
+    ///. The walk also removes leaked temp files (crash
     /// residue) as a side pass and re-anchors the estimate `save` accrues.
-    /// Best-effort: unreadable files are skipped, never reported.
+    /// Best-effort: unreadable files are skipped, never reported. Evicted
+    /// directories leave the written-keys bookkeeping with them — a stale
+    /// record over a removed generation would make a later re-save skip
+    /// files that no longer exist.
     pub fn enforce_capacity(&self) {
         self.saves_since_enforce.store(0, Ordering::Relaxed);
         let mut total = 0u64;
@@ -353,16 +493,32 @@ impl SnapshotStore {
         if total > self.capacity_bytes {
             generations.sort_by_key(|(_, _, recency)| *recency);
             let evictable = generations.len().saturating_sub(1);
+            let mut evicted: Vec<[u8; 16]> = Vec::new();
             for (path, bytes, _) in &generations[..evictable] {
                 if total <= self.capacity_bytes {
                     break;
                 }
                 if fs::remove_dir_all(path).is_ok() {
                     total -= bytes;
+                    if let Some(dir) = decode_dir_id(path) {
+                        evicted.push(dir);
+                    }
                 }
+            }
+            if !evicted.is_empty() {
+                self.lock_written()
+                    .retain(|(dir, _), _| !evicted.contains(dir));
             }
         }
         self.estimated_bytes.store(total, Ordering::Relaxed);
+    }
+
+    /// Locks the bookkeeping map. Poison is recovered rather than
+    /// propagated: the records are plain best-effort sets, and a panic
+    /// mid-update can only under-record (a not-yet-recorded landed write),
+    /// which costs redundant work — never a wrong skip.
+    fn lock_written(&self) -> MutexGuard<'_, WrittenKeys> {
+        self.written.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn generation_dir(&self, header: &GenerationHeader) -> PathBuf {
@@ -390,6 +546,25 @@ fn entry_file_id(path: &Path) -> Option<[u8; 16]> {
     let mut id = [0u8; 16];
     hex::decode_to_slice(stem, &mut id).ok()?;
     Some(id)
+}
+
+/// The generation dir id a `snapshots/` directory entry names — the hex
+/// filename [`SnapshotStore::generation_dir`] writes — or `None` for
+/// anything else.
+#[must_use]
+fn decode_dir_id(path: &Path) -> Option<[u8; 16]> {
+    let stem = path.file_name()?.to_str()?;
+    let mut id = [0u8; 16];
+    hex::decode_to_slice(stem, &mut id).ok()?;
+    Some(id)
+}
+
+/// The tables-stamp derivation the entry frames embed (`save_delta`), shared
+/// by the written-keys bookkeeping so records key on exactly the value the
+/// frames carry. `None` on a serialization failure — the conservative
+/// answer that vouches for nothing.
+fn stamp_of(tables: &RemapTables) -> Option<[u8; 16]> {
+    Some(crate::blake3_128(&serde_json::to_vec(tables).ok()?))
 }
 
 /// Creates (or reuses) the generation's recency marker and bumps its

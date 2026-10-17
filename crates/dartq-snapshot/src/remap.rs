@@ -1,4 +1,4 @@
-//! Cross-process remap slices (PRD §10.5): the engine's internal
+//! Cross-process remap slices: the engine's internal
 //! `StringId`/`FileId` are process-local, so a snapshot carries its own id
 //! spaces and the wiring layer remaps them onto the live engine's ids at
 //! load time.

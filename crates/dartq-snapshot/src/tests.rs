@@ -1053,3 +1053,146 @@ fn relative_xdg_cache_home_is_ignored() {
     let store = SnapshotStore::open(SnapshotConfig::default()).expect("open");
     assert_eq!(store.root(), base.path.join(".cache").join("dartq"));
 }
+
+/// The written-keys bookkeeping (#1386) tracks only landed writes, voids on
+/// a stamp advance, and unrecords swept files: a delta save records exactly
+/// the entries whose frames landed, a save under different tables makes
+/// every key re-eligible (edge 1), an under-declared changed set records
+/// only what it carried (edge 2 — the failed/partial flush shape), and a
+/// shrinking re-save sweeps the unclaimed file and drops its record so a
+/// rejoining key writes again. The generation stays loadable when the
+/// manifest and the bookkeeping agree.
+#[test]
+fn written_keys_track_landed_writes_stamps_and_sweeps() {
+    let cache = TempCache::new("written-keys");
+    let store = cache.store(DEFAULT_CAPACITY_BYTES);
+    let header = test_header();
+    let first = tables();
+    let mut second = tables();
+    second
+        .strings
+        .push((SnapshotStringId(2), "extra".to_string()));
+    let keys = [key(1, 10), key(2, 10)];
+
+    // Before any write, nothing is vouched: the flush face does full work.
+    assert!(store.written_keys(&header, &first, &keys).is_empty());
+
+    // Both entries land; both are recorded.
+    store
+        .save_delta(
+            &header,
+            &first,
+            &keys,
+            &[
+                Entry {
+                    key: key(1, 10),
+                    payload: payload("main"),
+                },
+                Entry {
+                    key: key(2, 10),
+                    payload: payload("other"),
+                },
+            ],
+        )
+        .expect("delta save");
+    assert_eq!(store.written_keys(&header, &first, &keys).len(), 2);
+
+    // A stamp advance voids every record for the generation: all keys are
+    // re-eligible, and the sibling-stamp records stay void afterwards.
+    assert!(store.written_keys(&header, &second, &keys).is_empty());
+
+    // A save carrying only one entry records only it — the partial-flush
+    // shape must never vouch for a write that did not land.
+    store
+        .save_delta(
+            &header,
+            &second,
+            &keys,
+            &[Entry {
+                key: key(1, 10),
+                payload: payload("main"),
+            }],
+        )
+        .expect("partial delta save");
+    assert_eq!(
+        store.written_keys(&header, &second, &keys),
+        vec![key(1, 10)]
+    );
+    assert!(
+        store.written_keys(&header, &first, &keys).is_empty(),
+        "the second-stamp save voided the first-stamp records"
+    );
+
+    // A shrinking re-save sweeps the unclaimed file and unrecords it; the
+    // surviving entry stays vouched and the generation loads exactly.
+    let changed: Vec<Entry<TestPayload>> = Vec::new();
+    store
+        .save_delta(&header, &second, &[key(1, 10)], &changed)
+        .expect("shrinking delta save");
+    assert_eq!(
+        store.written_keys(&header, &second, &keys),
+        vec![key(1, 10)]
+    );
+    let snapshot = store.load::<TestPayload>(&header).expect("generation");
+    assert_eq!(snapshot.entries.len(), 1);
+
+    // The swept key rejoins the claim: unrecorded, so a caller must (and
+    // can) project it again — the record answers empty for it.
+    assert_eq!(store.written_keys(&header, &second, &[key(2, 10)]), vec![]);
+}
+
+/// A fresh store instance (the daemon-restart shape) vouches for nothing
+/// until it has evidence; a completed load is that evidence — the manifest
+/// equality proved every entry file is on disk under the loaded stamp, so
+/// the next flush skips all of it.
+#[test]
+fn load_seeds_the_written_keys_of_a_fresh_store() {
+    let cache = TempCache::new("written-seed");
+    let header = test_header();
+    {
+        let store = cache.store(DEFAULT_CAPACITY_BYTES);
+        store
+            .save(
+                &header,
+                &tables(),
+                &[
+                    Entry {
+                        key: key(1, 10),
+                        payload: payload("main"),
+                    },
+                    Entry {
+                        key: key(2, 10),
+                        payload: payload("other"),
+                    },
+                ],
+            )
+            .expect("save");
+    }
+    let store = cache.store(DEFAULT_CAPACITY_BYTES);
+    let keys = [key(1, 10), key(2, 10)];
+    assert!(store.written_keys(&header, &tables(), &keys).is_empty());
+    store.load::<TestPayload>(&header).expect("generation");
+    assert_eq!(store.written_keys(&header, &tables(), &keys).len(), 2);
+}
+
+/// `save` stays authoritative over the bookkeeping: a recorded key with a
+/// different payload is rewritten, never skipped — the entries passed to
+/// `save` are the truth.
+#[test]
+fn save_rewrites_even_recorded_keys() {
+    let cache = TempCache::new("written-authority");
+    let store = cache.store(DEFAULT_CAPACITY_BYTES);
+    let header = test_header();
+    let entry = |unit: &str| Entry {
+        key: key(1, 10),
+        payload: payload(unit),
+    };
+    store
+        .save(&header, &tables(), &[entry("first")])
+        .expect("save");
+    store
+        .save(&header, &tables(), &[entry("second")])
+        .expect("re-save");
+    let snapshot = store.load::<TestPayload>(&header).expect("generation");
+    assert_eq!(snapshot.entries[0].payload.unit, "second");
+}

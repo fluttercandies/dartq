@@ -1,5 +1,5 @@
-//! Persistent snapshot substrate for dartq's M3 cold-start path (PRD §12,
-//! §17.2 L2).
+//! Persistent snapshot substrate for dartq's M3 cold-start path (the L2
+//! snapshot face).
 //!
 //! # The accelerator invariant
 //!
@@ -22,7 +22,7 @@
 //! A *generation* is one [`GenerationHeader`] + its entries. The directory
 //! name is derived from the header itself, so a header mismatch is detected
 //! before any large read. Entries are per-file facts keyed by [`EntryKey`]
-//! (content hash + feature fingerprint + semantic version, PRD §5.6); each
+//!; each
 //! entry file is a blake3-128 checksum, the blake3-128 *stamp* of the
 //! generation's remap-slices serialization, then the payload JSON.
 //! `tables.json` carries the remap slices together with the entry-id
@@ -86,6 +86,20 @@
 //! stamp and manifest gates demote that to a miss, never a mixture, and
 //! the next full-set save sweeps it away.
 //!
+//! The flush face itself is [`SnapshotStore::save_delta`] (#1386): the
+//! manifest still claims the complete set, but only the `changed` subset
+//! carries payloads to encode and write. What may be left out is exact,
+//! not heuristic — the store's written-keys bookkeeping
+//! ([`SnapshotStore::written_keys`]) records only writes that landed
+//! (rename, or the byte-identical read-compare skip) and seeds from
+//! completed loads, so a manifest key absent from `changed` is one whose
+//! frame is provably on disk under the current tables stamp. The sweep
+//! unrecords what it deletes, a save or load under one stamp voids
+//! sibling-stamp records, and capacity eviction prunes whole directories;
+//! under-recording costs redundant work, never a wrong skip. `save` itself
+//! stays authoritative — every payload passed to it is written, recorded
+//! or not.
+//!
 //! # Format
 //!
 //! JSON — final form, with [`SNAPSHOT_FORMAT_VERSION`] in the header
@@ -106,7 +120,7 @@ pub use header::{GenerationHeader, SNAPSHOT_FORMAT_VERSION};
 pub use remap::{RemapTables, SnapshotFileId, SnapshotStringId};
 pub use store::{DEFAULT_CAPACITY_BYTES, SaveError, Snapshot, SnapshotConfig, SnapshotStore};
 
-/// blake3 truncated to 128 bits — the house content-id width (§10.5).
+/// blake3 truncated to 128 bits — the house content-id width.
 pub(crate) fn blake3_128(bytes: &[u8]) -> [u8; 16] {
     let digest = blake3::hash(bytes);
     let mut id = [0u8; 16];
