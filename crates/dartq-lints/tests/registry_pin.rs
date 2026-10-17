@@ -1,24 +1,28 @@
 //! Registry completeness pin: every wave-1 rule must exist in the official
 //! `package:lints` sets, with its [`Group`] matching the set it came from.
 //!
-//! The lists below are pinned verbatim from `.third/lints/lib/core.yaml` and
-//! `.third/lints/lib/recommended.yaml` (the pinned `package:lints` snapshot;
-//! AGENTS.md fact-source discipline). When the snapshot re-pins, update the
+//! The lists below are pinned verbatim from the pinned `package:lints`
+//! snapshot (`core.yaml` / `recommended.yaml`, upstream dart-lang/lints);
+//! re-pin them when the snapshot updates. When that happens, update the
 //! lists here in the same change as the registry.
 //!
 //! Also the governance pin for the frozen lint-gate universe
 //! (`tests/harness/lint_codes.txt`, the `--codes-file` of
 //! `scripts/lint-gate.sh`): the freeze must stay exactly the set of
-//! `package:lints` rules this registry can emit — no orphans (rows the
-//! implementation cannot emit), no gaps (mounted rules the gate would
-//! never judge). A stale freeze fails here with the offending rows named.
+//! `package:lints` rules this registry can emit minus the divergence
+//! ledger's `gate_status=excluded` rows (`tests/harness/lint_divergences.tsv`,
+//! the source of truth for gate exclusions) — no orphans (rows the
+//! implementation cannot emit), no gaps (mounted rules the gate would never
+//! judge and no ledger row rules out), no rot (excluded rules back in the
+//! freeze). A stale freeze fails here with the offending rows named.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use dartq_lints::{EnableSet, Group, rule_by_name, rules};
+use dartq_lints::{EnableSet, Group, emittable_rule_names, rule_by_name, rules};
 
-/// `.third/lints/lib/core.yaml` — the critical set, pinned verbatim.
+/// The pinned `package:lints` snapshot's `core.yaml` — the critical set,
+/// pinned verbatim.
 const OFFICIAL_CORE: &[&str] = &[
     "avoid_empty_else",
     "avoid_relative_lib_imports",
@@ -56,8 +60,8 @@ const OFFICIAL_CORE: &[&str] = &[
     "void_checks",
 ];
 
-/// `.third/lints/lib/recommended.yaml` — the idiom set (includes core via
-/// `include:`), pinned verbatim.
+/// The pinned `package:lints` snapshot's `recommended.yaml` — the idiom set
+/// (includes core via `include:`), pinned verbatim.
 const OFFICIAL_RECOMMENDED: &[&str] = &[
     "annotate_overrides",
     "avoid_function_literals_in_foreach_calls",
@@ -117,11 +121,21 @@ const OFFICIAL_RECOMMENDED: &[&str] = &[
 ];
 
 /// The analyzer-diagnostic mirrors — not `package:lints` members. The
-/// diagnostic registry carries the machine name
-/// (`pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`,
-/// `unnecessary_type_check_true` / `unnecessary_type_check_false`); the
-/// linter-side rule file left the tree in the Dart 3.15 main re-pin.
-const OFFICIAL_DIAGNOSTIC_MIRRORS: &[&str] = &["unnecessary_type_check"];
+/// diagnostic registry carries each machine name
+/// (`pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`):
+/// `unnecessary_type_check_true` / `unnecessary_type_check_false` (the
+/// linter-side rule file left the tree in the Dart 3.15 main re-pin) and
+/// the pubspec dependency validator's `path:` family
+/// (`path_not_posix` :14004, `path_does_not_exist` :13987,
+/// `path_pubspec_does_not_exist` :14020 — one validator, upstream Dart
+/// SDK source,
+/// `pkg/analyzer/lib/src/pubspec/validators/dependency_validator.dart`).
+const OFFICIAL_DIAGNOSTIC_MIRRORS: &[&str] = &[
+    "path_does_not_exist",
+    "path_not_posix",
+    "path_pubspec_does_not_exist",
+    "unnecessary_type_check",
+];
 
 /// The `removed` state of the published universe (`rules.json`, 14
 /// entries): the SDK still registers each as `RemovedAnalysisRule`
@@ -146,8 +160,8 @@ const OFFICIAL_REMOVED: &[&str] = &[
 ];
 
 /// The `Standalone` rules — registered SDK rules outside the
-/// `package:lints` sets, enabled only through the options face (parity
-/// plan §4.2). One pinned list per wave in wave-registration order
+/// `package:lints` sets, enabled only through the options face. One pinned
+/// list per wave in wave-registration order
 /// (alphabetical within a wave); each wave appends its block here, and the
 /// registry section must match the concatenation byte-for-byte.
 const OFFICIAL_STANDALONE_WAVE2: &[&str] = &[
@@ -180,10 +194,247 @@ const OFFICIAL_STANDALONE_WAVE3: &[&str] = &[
     "no_literal_bool_comparisons",
 ];
 
+/// The W4 expression-shape wave (parity-plan wave 4): nine registered SDK
+/// rules outside the `package:lints` sets, alphabetical.
+const OFFICIAL_STANDALONE_WAVE4: &[&str] = &[
+    "avoid_bool_literals_in_conditional_expressions",
+    "avoid_null_checks_in_equality_operators",
+    "literal_only_boolean_expressions",
+    "noop_primitive_operations",
+    "prefer_expression_function_bodies",
+    "prefer_int_literals",
+    "unnecessary_lambdas",
+    "unnecessary_parenthesis",
+    "unnecessary_statements",
+];
+
+/// The W7 name/empty/slice wave (parity-plan wave 7): eight registered SDK
+/// rules across the naming, emptiness, and assignment families,
+/// alphabetical.
+const OFFICIAL_STANDALONE_WAVE7: &[&str] = &[
+    "no_self_assignments",
+    "one_member_abstracts",
+    "prefer_asserts_with_message",
+    "sort_constructors_first",
+    "sort_unnamed_constructors_first",
+    "throw_in_finally",
+    "unnecessary_breaks",
+    "unnecessary_final",
+];
+
+/// The W8 collection wave (parity-plan wave 8): two registered SDK rules,
+/// alphabetical.
+const OFFICIAL_STANDALONE_WAVE8: &[&str] = &[
+    "prefer_foreach",
+    "prefer_if_elements_to_conditional_expressions",
+];
+
+/// The `require_trailing_commas` face (#1053): the version-gated
+/// tall-style rule — registers below 3.7, silent from 3.7 where
+/// `dart format` enforces the commas.
+const OFFICIAL_STANDALONE_REQUIRE_TRAILING_COMMAS: &[&str] = &["require_trailing_commas"];
+
+/// The strings/directives mini wave: ten registered SDK rules across the
+/// string-literal and directive families, alphabetical.
+const OFFICIAL_STANDALONE_MINI_WAVE: &[&str] = &[
+    "directives_ordering",
+    "eol_at_end_of_file",
+    "library_names",
+    "lines_longer_than_80_chars",
+    "package_prefixed_library_names",
+    "prefer_double_quotes",
+    "prefer_single_quotes",
+    "unnecessary_library_directive",
+    "unnecessary_raw_strings",
+    "use_raw_strings",
+];
+
+/// The #1094 batch close (waves A/B/C): seventeen registered SDK rules
+/// across the declaration-shape, doc-comment, expression, flow-pattern,
+/// type-reference, and collection domains, alphabetical.
+const OFFICIAL_STANDALONE_WAVES_ABC: &[&str] = &[
+    "document_ignores",
+    "empty_container_bodies",
+    "flutter_style_todos",
+    "invalid_case_patterns",
+    "missing_code_block_language_in_doc_comment",
+    "prefer_constructors_over_static_methods",
+    "prefer_final_parameters",
+    "simplify_variable_pattern",
+    "strict_top_level_inference",
+    "switch_on_type",
+    "type_annotate_public_apis",
+    "unnecessary_const_in_enum_constructor",
+    "unnecessary_type_name_in_constructor",
+    "unnecessary_underscores",
+    "use_null_aware_elements",
+    "use_primary_constructors",
+    "var_with_no_type_annotation",
+];
+
+/// The W1/W2 closeout promotion (#1108): fifty registered SDK rules across
+/// the directives, flow, pubspec, type-reference, flutter, doc-comment, and
+/// declaration domains, alphabetical.
+const OFFICIAL_STANDALONE_W1_CLOSEOUT: &[&str] = &[
+    "always_specify_types",
+    "always_use_package_imports",
+    "annotate_redeclares",
+    "async_return_with_no_await",
+    "avoid_catching_errors",
+    "avoid_equals_and_hash_code_on_mutable_classes",
+    "avoid_field_initializers_in_const_classes",
+    "avoid_futureor_void",
+    "avoid_implementing_value_types",
+    "avoid_positional_boolean_parameters",
+    "avoid_setters_without_getters",
+    "avoid_unnecessary_containers",
+    "avoid_void_async",
+    "avoid_web_libraries_in_flutter",
+    "conditional_uri_does_not_exist",
+    "deprecated_consistency",
+    "diagnostic_describe_all_properties",
+    "erase_dart_type_extension_types",
+    "join_return_with_assignment",
+    "no_default_cases",
+    "no_logic_in_create_state",
+    "no_raw_types",
+    "omit_local_variable_types",
+    "omit_obvious_local_variable_types",
+    "omit_obvious_property_types",
+    "prefer_asserts_in_initializer_lists",
+    "prefer_const_constructors_in_immutables",
+    "prefer_final_in_for_each",
+    "prefer_final_locals",
+    "prefer_relative_imports",
+    "prefer_void_to_null",
+    "public_member_api_docs",
+    "simple_directive_paths",
+    "sized_box_for_whitespace",
+    "sized_box_shrink_expand",
+    "sort_child_properties_last",
+    "sort_pub_dependencies",
+    "specify_nonobvious_local_variable_types",
+    "specify_nonobvious_property_types",
+    "test_types_in_equals",
+    "unnecessary_async",
+    "unnecessary_primary_constructor_body",
+    "use_colored_box",
+    "use_declaring_parameters",
+    "use_decorated_box",
+    "use_full_hex_values_for_flutter_colors",
+    "use_key_in_widget_constructors",
+    "use_late_for_private_fields_and_variables",
+    "use_setters_to_change_properties",
+    "use_to_and_as_if_applicable",
+];
+
+/// The W1/W2 final tail promotion (#1141): twenty-one registered SDK rules
+/// across the expression, slice, and string domains, alphabetical — the
+/// last block to ride the aggregated incoming tail before this close
+/// promoted it. The open-tail doc's forward note is closed with it:
+/// `prefer_null_aware_method_calls` re-homed here at #1141's close, as that
+/// note anticipated.
+const OFFICIAL_STANDALONE_W2_CLOSEOUT: &[&str] = &[
+    "avoid_dynamic_calls",
+    "avoid_print",
+    "avoid_type_to_string",
+    "cascade_invocations",
+    "cast_nullable_to_non_nullable",
+    "discarded_futures",
+    "do_not_use_environment",
+    "no_dynamic_casts",
+    "no_runtimetype_tostring",
+    "only_throw_errors",
+    "parameter_assignments",
+    "prefer_null_aware_method_calls",
+    "unawaited_futures",
+    "unnecessary_await_in_return",
+    "unnecessary_null_aware_operator_on_extension_on_nullable",
+    "unnecessary_null_checks",
+    "unnecessary_unawaited",
+    "use_if_null_to_convert_nulls_to_bools",
+    "use_is_even_rather_than_modulo",
+    "use_string_buffers",
+    "use_truncating_division",
+];
+
+/// The W5 closeout promotion (#1153): nineteen registered SDK rules across
+/// the collections, declarations, docs, expressions, flow, names, and type
+/// domains, alphabetical — the last block to ride the aggregated incoming
+/// tail before this close promoted it.
+const OFFICIAL_STANDALONE_W5_CLOSEOUT: &[&str] = &[
+    "avoid_redundant_argument_values",
+    "avoid_slow_async_io",
+    "cancel_subscriptions",
+    "close_sinks",
+    "comment_references",
+    "deprecated_member_use_from_same_package",
+    "future_sync_value",
+    "matching_super_parameters",
+    "prefer_const_constructors",
+    "prefer_const_declarations",
+    "prefer_const_literals_to_create_immutables",
+    "prefer_mixin",
+    "remove_deprecations_in_breaking_versions",
+    "tighten_type_of_initializing_formals",
+    "unnecessary_ignore",
+    "unnecessary_this_alias",
+    "use_enums",
+    "use_named_constants",
+    "use_test_throws_matchers",
+];
+
+/// The W6 internal wave (#1157 L1): the nine `RuleState.internal()`
+/// SDK-dogfooding rules, alphabetical. Upstream registers them
+/// unconditionally and enablement is name-only (`registry.dart:117-137`),
+/// so naming one in `analysis_options` silently enables it — registering
+/// the names honors that face. They never fire outside SDK sources
+/// (every firing path's antecedent is an SDK-internal artifact),
+/// so each also sits in `STRUCTURALLY_SILENT` with a
+/// divergence-ledger `excluded` row.
+const OFFICIAL_STANDALONE_W6_INTERNAL: &[&str] = &[
+    "analyzer_element_model_tracking_bad",
+    "analyzer_element_model_tracking_more_than_one",
+    "analyzer_element_model_tracking_zero",
+    "analyzer_public_api_bad_part_directive",
+    "analyzer_public_api_bad_type",
+    "analyzer_public_api_experimental_inconsistency",
+    "analyzer_public_api_exports_non_public_name",
+    "analyzer_public_api_impl_in_public_api",
+    "analyzer_to_be_deprecated_use",
+];
+
+/// The W6 triggerable wave (#1157, closed at #1213): the four rules that
+/// fire on user code — the two experimental variance-domain rules and the
+/// two process-adjacent stable rules — in one byte-sorted const. The sort
+/// is the pin's byte-order trap: `unreachable_from_main` sorts BEFORE
+/// `unsafe_variance` (`unr` < `uns`), so the wave list is one merged
+/// table, never a per-lane append. Both experimental rules register
+/// unconditionally upstream (`RuleState.experimental()` is registry
+/// metadata, not an enable gate) and all four enable by name only; none
+/// joins `STRUCTURALLY_SILENT`.
+const OFFICIAL_STANDALONE_W6_TRIGGERABLE: &[&str] = &[
+    "implicit_reopen",
+    "unreachable_from_main",
+    "unsafe_variance",
+    "use_build_context_synchronously",
+];
+
 /// The standalone universe in wave order — the registry-section contract.
 fn official_standalone() -> Vec<&'static str> {
     let mut all = OFFICIAL_STANDALONE_WAVE2.to_vec();
     all.extend(OFFICIAL_STANDALONE_WAVE3);
+    all.extend(OFFICIAL_STANDALONE_WAVE4);
+    all.extend(OFFICIAL_STANDALONE_WAVE7);
+    all.extend(OFFICIAL_STANDALONE_WAVE8);
+    all.extend(OFFICIAL_STANDALONE_REQUIRE_TRAILING_COMMAS);
+    all.extend(OFFICIAL_STANDALONE_MINI_WAVE);
+    all.extend(OFFICIAL_STANDALONE_WAVES_ABC);
+    all.extend(OFFICIAL_STANDALONE_W1_CLOSEOUT);
+    all.extend(OFFICIAL_STANDALONE_W2_CLOSEOUT);
+    all.extend(OFFICIAL_STANDALONE_W5_CLOSEOUT);
+    all.extend(OFFICIAL_STANDALONE_W6_INTERNAL);
+    all.extend(OFFICIAL_STANDALONE_W6_TRIGGERABLE);
     all
 }
 
@@ -259,11 +510,36 @@ fn registry_fits_the_enable_set_word_count() {
 
 /// The slice pin: 89 `package:lints` members through #586 (34 core + 55
 /// recommended-only, no member left blocked or documented-out), the #570
-/// diagnostic mirror, the #986 removed-registry no-ops, the #987 W2
-/// standalone wave, and the #992 W3 wave make 126.
+/// diagnostic mirror, the #986 removed-registry no-ops (re-enumerated at
+/// the #1025 reconciliation: rules.json `removed` holds exactly 14), the
+/// #987 W2 standalone wave, the #992 W3 wave, the batch close of the
+/// W4/W7/W8 waves, the `require_trailing_commas` face, and the
+/// strings/directives mini wave (156), and the #1094 batch close of the
+/// waves A/B/C declaration-shape, doc-comment, expression, flow-pattern,
+/// type-reference, and collection leftovers (17 more) make 173, and the
+/// W1/W2 closeout promotion (#1108) of the directives, flow, pubspec,
+/// type-reference, flutter, doc-comment, and declaration incoming slices
+/// (50 more) makes the 223-rule skeleton, and the final tail promotion
+/// (#1141) of the expressions, slice, and strings incoming slices (21 more)
+/// makes 244, and the final W5 closeout promotion (#1153) of the W5
+/// (#1124) plus #1150/#1151/#1152 incoming slices (19 more, two of them
+/// structurally silent) makes 263 with the aggregated tail empty, and the
+/// #1157 wave L1 face (#1194) lands the nine `RuleState.internal`
+/// SDK-dogfooding rules (all structurally silent) onto the declarations
+/// incoming slice, and the #1157 wave L2+L3 face (#1197) lands the two
+/// variance-domain rules — `implicit_reopen` onto the declarations slice,
+/// `unsafe_variance` onto the type-reference slice — 274, and the W6
+/// closeout (#1213) lands the final two triggerable rules —
+/// `unreachable_from_main` onto the declarations domain,
+/// `use_build_context_synchronously` onto the flow domain — and promotes
+/// the whole thirteen-name W6 block into the frozen skeleton with the
+/// aggregated tail empty again: 276, the wave's final count, and the
+/// pubspec path-validator tranche (R780 #1521) lands the analyzer
+/// dependency validator's three `path:` mirrors onto the frozen
+/// diagnostic-mirror section: 279.
 #[test]
 fn registry_holds_the_pinned_count() {
-    assert_eq!(rules().len(), 126);
+    assert_eq!(rules().len(), 279);
 }
 
 /// The registry-order contract (parity-plan R8): one contiguous block per
@@ -275,6 +551,9 @@ fn registry_holds_the_pinned_count() {
 /// entry's identity pinned by `rule_by_name_round_trips`.
 #[test]
 fn registry_sections_hold_the_official_order() {
+    fn official<'a>(names: &[&'a str]) -> BTreeSet<&'a str> {
+        names.iter().copied().collect()
+    }
     let ranks: Vec<u8> = rules()
         .iter()
         .map(|spec| match spec.group {
@@ -297,9 +576,6 @@ fn registry_sections_hold_the_official_order() {
             .map(|spec| spec.name)
             .collect()
     };
-    fn official<'a>(names: &[&'a str]) -> BTreeSet<&'a str> {
-        names.iter().copied().collect()
-    }
     assert_eq!(section(Group::Core), official(OFFICIAL_CORE));
     assert_eq!(section(Group::Recommended), official(OFFICIAL_RECOMMENDED));
     assert_eq!(
@@ -369,8 +645,8 @@ fn rule_by_name_is_case_insensitive() {
 #[test]
 fn enable_set_all_and_resolve_agree() {
     let all = EnableSet::all();
-    for i in 0..rules().len() {
-        assert!(all.is_enabled(dartq_lints::RuleId(i as u16)));
+    for i in 0..u16::try_from(rules().len()).expect("rules fit u16") {
+        assert!(all.is_enabled(dartq_lints::RuleId(i)));
     }
     let (resolved, unknown) = EnableSet::resolve(rules().iter().map(|s| s.name));
     assert!(unknown.is_empty());
@@ -380,7 +656,7 @@ fn enable_set_all_and_resolve_agree() {
 /// Every template renders: problem texts are non-empty and `{n}` slots fill
 /// (the two-variant rules pass their texts explicitly, so `report_texts`
 /// covers them — this pins the registry-level templates only). Literal
-/// braces in prose (e.g. `'{}'` in empty_constructor_bodies) are fine; only
+/// braces in prose (e.g. `'{}'` in `empty_constructor_bodies`) are fine; only
 /// unfilled `{n}` slots fail.
 #[test]
 fn templates_are_well_formed() {
@@ -392,10 +668,10 @@ fn templates_are_well_formed() {
         );
         let rendered = spec.render_problem(&["X"]);
         assert!(!rendered.contains("{0}"), "{} left a raw slot", spec.name);
-        if !spec.correction.is_empty() {
-            assert!(spec.render_correction(&["X"]).is_some());
-        } else {
+        if spec.correction.is_empty() {
             assert_eq!(spec.render_correction(&[]), None);
+        } else {
+            assert!(spec.render_correction(&["X"]).is_some());
         }
     }
 }
@@ -406,31 +682,40 @@ fn templates_are_well_formed() {
 /// (`--codes-file`); relative to this crate's manifest.
 const LINT_CODES_FREEZE: &str = "../../tests/harness/lint_codes.txt";
 
-/// The `kinds: &[]` set rules that still emit — through the dartq-commands
-/// pubspec pass at the #434 mounting face, not through AST dispatch (the
-/// crate docs' pubspec seam). The only legitimate empty-`kinds` members
-/// among the freeze-governed set rules (the removed no-ops are empty-kinds
-/// too, but they are registry-face registrations, not the gate's universe).
-const PUBSPEC_PASS_SEAM: &[&str] = &["package_names", "secure_pubspec_urls"];
+/// The divergence ledger `tests/harness/lint_divergences.tsv` — the source
+/// of truth for gate exclusions; relative to this crate's manifest.
+const LINT_DIVERGENCES: &str = "../../tests/harness/lint_divergences.tsv";
 
 /// Set rules that cannot emit and are therefore consciously out of the
 /// freeze (each also needs a `lint_divergences.tsv` `excluded` row — the
 /// gate preflight's A3). Must stay exactly equal to the registered set
-/// rules that are neither AST-dispatched (`kinds` non-empty) nor
-/// pubspec-pass members; empty is the healthy state: a rule landing here
-/// is a dead seam the re-freeze must reason about.
-const STRUCTURALLY_SILENT: &[&str] = &[];
+/// rules that no `emittable_rule_names` mount face reaches — no AST
+/// dispatch (`kinds` empty) and no membership in the pubspec-pass,
+/// run-epilogue, or late-join seams. The whole set is the nine
+/// `RuleState.internal` SDK-dogfooding rules (#1157 wave L1, #1194) —
+/// registered to honor explicit naming, with no firing path outside SDK
+/// sources. The two empty-`kinds` names the #1153 closeout once parked
+/// here have since mounted — `unnecessary_ignore` through the engine
+/// run's epilogue (#1345), `remove_deprecations_in_breaking_versions`
+/// through the shell's late-join walk — and both now derive as emittable.
+/// A further name here is a dead seam the re-freeze must reason about.
+const STRUCTURALLY_SILENT: &[&str] = &[
+    "analyzer_element_model_tracking_bad",
+    "analyzer_element_model_tracking_more_than_one",
+    "analyzer_element_model_tracking_zero",
+    "analyzer_public_api_bad_part_directive",
+    "analyzer_public_api_bad_type",
+    "analyzer_public_api_experimental_inconsistency",
+    "analyzer_public_api_exports_non_public_name",
+    "analyzer_public_api_impl_in_public_api",
+    "analyzer_to_be_deprecated_use",
+];
 
-/// The registered set rules the implementation can emit: non-mirror,
-/// non-removed specs that dispatch on the AST or run through the pubspec
-/// pass.
+/// The registered set rules the implementation can emit — the crate's
+/// single derivation ([`emittable_rule_names`], every mount seam
+/// included), collected by name for the pins below.
 fn emittable_set_rules() -> BTreeSet<&'static str> {
-    rules()
-        .iter()
-        .filter(|spec| !matches!(spec.group, Group::Diagnostic | Group::Removed))
-        .filter(|spec| !spec.kinds.is_empty() || PUBSPEC_PASS_SEAM.contains(&spec.name))
-        .map(|spec| spec.name)
-        .collect()
+    emittable_rule_names().collect()
 }
 
 /// The freeze file's code rows: one lowercase machine name per line, `#`
@@ -442,17 +727,64 @@ fn freeze_rows(text: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The governance pin: the freeze and the registry-derived universe must
-/// be the same set. Catches the two drift directions that matter — a
-/// retired/mis-spelled/silent row the gate would never see fire, and a
-/// mounted rule the oracle can report while the freeze keeps dartq's
-/// silence out of the denominator.
+/// The `gate_status` tokens the ledger's column prose defines. The TSV
+/// carries no header row (the columns live in its `#` comment block), so
+/// the status column is located by this vocabulary, not by position.
+const GATE_STATUSES: &[&str] = &["excluded", "in_universe", "fixed"];
+
+/// The ledger's `gate_status=excluded` rule names: rules consciously out of
+/// the gate universe. The ledger is the source of truth for gate
+/// exclusions — a new `excluded` row carves the rule out of this pin (and
+/// out of the freeze) automatically; there is no list here to keep in sync.
+///
+/// Row shape (the file's column prose): `rule`, `face`, `direction`,
+/// `gate_status`, `citation`, tab-separated; `#` full-line comments, no
+/// header row, the `face` prose never carries tabs. A data row without
+/// exactly one status token fails loudly — format drift surfaces here as a
+/// tutorial panic, never as a silent misparse.
+fn ledger_excluded(text: &str) -> BTreeSet<String> {
+    let mut excluded = BTreeSet::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let rule = fields.next().unwrap_or_default();
+        let statuses: Vec<&str> = fields
+            .filter(|field| GATE_STATUSES.contains(field))
+            .collect();
+        assert!(
+            statuses.len() == 1,
+            "{LINT_DIVERGENCES}: row {rule:?} carries {statuses:?} where exactly one \
+             gate_status token belongs ({GATE_STATUSES:?}) — the ledger format drifted; \
+             fix the row or this parser"
+        );
+        if statuses[0] == "excluded" {
+            excluded.insert(rule.to_ascii_lowercase());
+        }
+    }
+    excluded
+}
+
+/// The governance pin: the freeze must equal the registry-derived universe
+/// minus the divergence ledger's `excluded` rows (the ledger is the source
+/// of truth for gate exclusions — a new exclusion row carves the rule out
+/// of this pin automatically). Catches the three drift directions that
+/// matter — a retired/mis-spelled/silent row the gate would never see
+/// fire, a mounted rule missing from both the freeze and the ledger, and
+/// an excluded rule rotting back into the freeze.
 #[test]
 fn lint_codes_freeze_matches_the_registry() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(LINT_CODES_FREEZE);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     let rows = freeze_rows(&text);
+
+    let ledger_path = Path::new(env!("CARGO_MANIFEST_DIR")).join(LINT_DIVERGENCES);
+    let ledger = std::fs::read_to_string(&ledger_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", ledger_path.display()));
+    let excluded = ledger_excluded(&ledger);
 
     let mut seen = BTreeSet::new();
     let dupes: Vec<&str> = rows
@@ -485,42 +817,55 @@ fn lint_codes_freeze_matches_the_registry() {
     );
 
     let frozen: BTreeSet<&str> = rows.iter().copied().collect();
+
+    // The #1109 invariant: a ledger `excluded` row means the rule is out of
+    // the gate universe — it must not sit in the freeze. This is the
+    // carve-out's rot guard: a regen that re-adds excluded rows, or a
+    // ledger row flipped without re-freezing, fails here instead of at
+    // gate time.
+    let rot: Vec<&String> = excluded
+        .iter()
+        .filter(|name| frozen.contains(name.as_str()))
+        .collect();
+    assert!(
+        rot.is_empty(),
+        "{LINT_CODES_FREEZE}: ledger-excluded rules still in the gate universe: {rot:?} — \
+         an `excluded` row in {LINT_DIVERGENCES} rules the rule out of the gate; drop the \
+         freeze rows, or retire the ledger row (in_universe/fixed) once the divergence \
+         converged and re-freeze"
+    );
+
     let gaps: Vec<String> = emittable
         .iter()
-        .filter(|name| !frozen.contains(name.to_ascii_lowercase().as_str()))
+        .filter(|name| {
+            let machine = name.to_ascii_lowercase();
+            !frozen.contains(machine.as_str()) && !excluded.contains(machine.as_str())
+        })
         .map(|name| name.to_ascii_lowercase())
         .collect();
     assert!(
         gaps.is_empty(),
-        "{LINT_CODES_FREEZE}: mounted package:lints rules missing from the freeze (the \
-         gate would never judge them): {gaps:?} — re-freeze via regen_lint_codes_freeze \
-         and reconcile the header prose"
+        "{LINT_CODES_FREEZE}: mounted rules missing from the freeze and carrying no ledger \
+         `excluded` row (the gate would never judge them): {gaps:?} — re-freeze via \
+         regen_lint_codes_freeze and reconcile the header prose, or rule the divergence \
+         in {LINT_DIVERGENCES}"
     );
 
+    // The structurally silent set is the registered set rules minus the
+    // emittable derivation (equivalently: empty `kinds` and no mount-face
+    // seam membership — the seams live inside `emittable_rule_names`).
     let actually_silent: BTreeSet<&'static str> = rules()
         .iter()
         .filter(|spec| !matches!(spec.group, Group::Diagnostic | Group::Removed))
-        .filter(|spec| spec.kinds.is_empty() && !PUBSPEC_PASS_SEAM.contains(&spec.name))
+        .filter(|spec| !emittable.contains(spec.name))
         .map(|spec| spec.name)
         .collect();
     let silent: BTreeSet<&str> = STRUCTURALLY_SILENT.iter().copied().collect();
     assert_eq!(
         silent, actually_silent,
         "STRUCTURALLY_SILENT must name exactly the set rules that cannot emit \
-         (registry holds {:?}; the pin lists {:?})",
-        actually_silent, silent
+         (registry holds {actually_silent:?}; the pin lists {silent:?})"
     );
-
-    for name in PUBSPEC_PASS_SEAM {
-        let Some(id) = rule_by_name(name) else {
-            panic!("PUBSPEC_PASS_SEAM member {name} is not registered");
-        };
-        let spec = rules()[id.0 as usize];
-        assert!(
-            spec.group != Group::Diagnostic && spec.kinds.is_empty(),
-            "PUBSPEC_PASS_SEAM member {name} no longer matches the pubspec seam shape"
-        );
-    }
 }
 
 /// Regenerates the freeze file's entry block from the registry-derived
@@ -549,7 +894,7 @@ fn regen_lint_codes_freeze() {
 
     let mut entries: Vec<String> = emittable_set_rules()
         .into_iter()
-        .map(|name| name.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .collect();
     entries.sort();
 

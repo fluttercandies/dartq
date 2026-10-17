@@ -9,10 +9,11 @@
 use std::path::{Path, PathBuf};
 
 use dartq_ast::{AstBuilder, NodeKind, TOKEN_NONE};
+use dartq_language::LanguageVersion;
 use dartq_scanner::{ScanConfig, TokenTable, scan};
 use dartq_source::{FileTable, LineIndex};
 
-use crate::engine::{Features, Lint, Unit, run};
+use crate::engine::{Features, Lint, Unit, narrow_u32, run};
 use crate::registry::EnableSet;
 
 pub const CONFIG: ScanConfig = ScanConfig {
@@ -30,14 +31,17 @@ pub struct Fixture {
     /// `file_names` tests overwrite it).
     pub path: PathBuf,
     pub features: Features,
+    /// The settled language version the run gates on (`None` = no version
+    /// face; the version-gated rules' tests set it per case).
+    pub version: Option<LanguageVersion>,
     _files: FileTable,
 }
 
 impl Fixture {
     /// Parses `source` through the production bridge (scanner → parser →
     /// arena, one transient [`crate::ParsedUnit`]). The path defaults to the
-    /// fixture name; overwrite `path`/`features` after construction for the
-    /// path/feature-dependent rules.
+    /// fixture name; overwrite `path`/`features`/`version` after
+    /// construction for the path/feature/version-dependent rules.
     #[must_use]
     pub fn parse(source: &str) -> Self {
         let parsed = crate::parse_unit(source, Features::default());
@@ -48,6 +52,7 @@ impl Fixture {
             lines: parsed.lines,
             path: PathBuf::from("lint_fixture.dart"),
             features: parsed.features,
+            version: None,
             _files: FileTable::default(),
         }
     }
@@ -68,21 +73,33 @@ impl Fixture {
             lines,
             path: PathBuf::from("lint_fixture.dart"),
             features: Features::default(),
+            version: None,
             _files: files,
         }
     }
 
-    /// Runs `rules` over the fixture.
-    pub fn run(&self, rules: &EnableSet) -> Vec<Lint> {
-        let unit = Unit {
+    /// The unit the run helpers build — the shell faces' direct consumers
+    /// (`run_breaking_version_annotations`,
+    /// `unnecessary_ignore_late_rows`) mount their own runs over it.
+    pub fn unit(&self) -> Unit<'_> {
+        Unit {
             source: &self.source,
             tokens: &self.tokens,
             ast: &self.ast,
             lines: &self.lines,
             path: Some(&self.path),
             features: self.features,
+            version: self.version,
             workspace: None,
-        };
+            reachability: None,
+            async_context_uses: None,
+            library_type_uses: None,
+        }
+    }
+
+    /// Runs `rules` over the fixture.
+    pub fn run(&self, rules: &EnableSet) -> Vec<Lint> {
+        let unit = self.unit();
         run(&unit, rules, &rustc_hash::FxHashSet::default())
     }
 
@@ -96,9 +113,124 @@ impl Fixture {
             lines: &self.lines,
             path: Some(&self.path),
             features: self.features,
+            version: self.version,
             workspace: Some(facts),
+            reachability: None,
+            async_context_uses: None,
+            library_type_uses: None,
         };
         run(&unit, rules, &rustc_hash::FxHashSet::default())
+    }
+
+    /// [`Fixture::run`] with the cross-library faces mounted — the #1157 W6
+    /// closeout rules' consumption seams (`reachability` for
+    /// `unreachable_from_main`, `async_uses` for
+    /// `use_build_context_synchronously`); `workspace` rides along because
+    /// the async rule's test-directory exemption reads it. A `None` face
+    /// keeps its rule silent.
+    pub fn run_with(
+        &self,
+        rules: &EnableSet,
+        workspace: Option<&crate::WorkspaceFacts>,
+        reachability: Option<&crate::engine::ReachabilityFace<'_>>,
+        async_uses: Option<&[crate::engine::AsyncContextUse]>,
+    ) -> Vec<Lint> {
+        let unit = Unit {
+            source: &self.source,
+            tokens: &self.tokens,
+            ast: &self.ast,
+            lines: &self.lines,
+            path: Some(&self.path),
+            features: self.features,
+            version: self.version,
+            workspace,
+            reachability: reachability.map(|face| crate::engine::ReachabilityFace {
+                has_entry: face.has_entry,
+                flags: face.flags,
+            }),
+            async_context_uses: async_uses,
+            library_type_uses: None,
+        };
+        run(&unit, rules, &rustc_hash::FxHashSet::default())
+    }
+
+    /// [`Fixture::run`] with the semantic face mounted: the source folded
+    /// as the sole analyzed file of `package:t` (the driver's per-file
+    /// build shape), so rules answering through `Check::semantics` run
+    /// resolved. The context tables leak (`'static`); tests are one-shot
+    /// processes.
+    #[must_use]
+    pub fn run_semantic(&self, rules: &EnableSet) -> Vec<Lint> {
+        self.run_semantic_inner(rules, true)
+    }
+
+    /// [`Fixture::run_semantic`] for scanner-dirty sources: the identical
+    /// run, minus the scanner-clean gate — recovery fixtures (e.g. the
+    /// #1956 unterminated block doc) carry a scanner diagnostic by design.
+    #[must_use]
+    pub fn run_semantic_scanner_dirty(&self, rules: &EnableSet) -> Vec<Lint> {
+        self.run_semantic_inner(rules, false)
+    }
+
+    fn run_semantic_inner(&self, rules: &EnableSet, require_scanner_clean: bool) -> Vec<Lint> {
+        let strings: &'static dartq_source::StringTable =
+            Box::leak(Box::new(dartq_source::StringTable::new()));
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("lint_semantic.dart"));
+        let features = dartq_parser::ParserFeatures::from_feature_set(
+            dartq_language::FeatureSet::for_language_version(LanguageVersion::new(3, 15)),
+        );
+        let scanned = scan(&self.source, CONFIG, file);
+        if require_scanner_clean {
+            assert!(
+                scanned.diagnostics.is_empty(),
+                "scanner diagnostics: {:?}",
+                self.source
+            );
+        }
+        let elements = dartq_semantic::collect(&self.source, &scanned.tokens, features, strings);
+        let mut builder = dartq_resolution::LibraryGraphBuilder::new(strings);
+        let lib = builder.intern("package:t/lint_semantic.dart");
+        builder.unit(lib, file);
+        for (name, declaration) in elements.declarations() {
+            if declaration.kind == dartq_semantic::MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let mut index = dartq_semantic::ElementIndex::default();
+        index.insert(file, elements);
+        let graph: &'static dartq_resolution::LibraryGraph = Box::leak(Box::new(builder.finish()));
+        let namespaces: &'static dartq_resolution::Namespaces =
+            Box::leak(Box::new(dartq_resolution::Namespaces::build(graph)));
+        let index: &'static dartq_semantic::ElementIndex = Box::leak(Box::new(index));
+        let analysis = dartq_semantic::analyze_unit(
+            &self.source,
+            &scanned.tokens,
+            features,
+            strings,
+            file,
+            lib,
+            graph,
+            namespaces,
+            index,
+            dartq_semantic::StrictModes::default(),
+            &dartq_resolution::LibraryClassModifiers::default(),
+        );
+        let unit = Unit {
+            source: &self.source,
+            tokens: &self.tokens,
+            ast: &self.ast,
+            lines: &self.lines,
+            path: Some(&self.path),
+            features: self.features,
+            version: self.version,
+            workspace: None,
+            reachability: None,
+            async_context_uses: None,
+            library_type_uses: None,
+        };
+        unit.run_with_semantics(rules, &rustc_hash::FxHashSet::default(), Some(&analysis))
     }
 }
 
@@ -109,7 +241,7 @@ pub fn unit_of(
     |b: &mut AstBuilder, t: &TokenTable| {
         b.begin(NodeKind::CompilationUnit, 0);
         tree(b, t);
-        b.end(NodeKind::CompilationUnit, t.len() as u32);
+        b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
     }
 }
 
@@ -143,7 +275,7 @@ pub fn tok(source: &str, tokens: &TokenTable, needle: &str, nth: usize) -> u32 {
     for i in 0..tokens.as_slice().len() {
         if tokens.lexeme(source, i) == needle {
             if seen == nth {
-                return i as u32;
+                return narrow_u32(i);
             }
             seen += 1;
         }
@@ -175,6 +307,33 @@ mod parse_tests {
         assert_eq!(
             lints[0].rule,
             rule_by_name("avoid_empty_else").expect("wired")
+        );
+    }
+
+    /// The double-case switch regression: `end_switch_case` snapshots the
+    /// next case's material start AFTER its own seal. A pre-seal snapshot
+    /// pointed at the just-sealed `SwitchCase` row itself, so the second
+    /// case's `begin_switch_case` anchored strictly inside the first case's
+    /// subtree — tripping the builder's well-nestedness assert in debug
+    /// builds and nesting the cases in release builds. Single-case switches
+    /// never consume the stale snapshot, which is why parser-only suites
+    /// stayed green.
+    #[test]
+    fn parse_fixture_double_case_switch_builds_sibling_cases() {
+        let fixture = Fixture::parse(
+            "void f(int x) {\n  switch (x) {\n    case 1: break;\n    case 2: break;\n  }\n}\n",
+        );
+        let ast = &fixture.ast;
+        let cases: Vec<u32> = (0..ast.len())
+            .filter(|&row| ast.kind(row as u32) == dartq_ast::NodeKind::SwitchCase)
+            .map(|row| row as u32)
+            .collect();
+        assert_eq!(cases.len(), 2, "two switch cases: {cases:?}");
+        let first = ast.children(cases[0]);
+        let second = ast.children(cases[1]);
+        assert!(
+            first.end <= second.start,
+            "case 2 must not adopt case 1: {first:?} vs {second:?}"
         );
     }
 }

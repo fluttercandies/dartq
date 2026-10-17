@@ -3,7 +3,7 @@
 //! [`ParsedUnit`] entry the consumption faces drive.
 //!
 //! Every node-producing event maps 1:1 onto the collapse-map verdict
-//! (the #31 adjudication, §3): Begin events open the End-kind
+//! (the #31 adjudication): Begin events open the End-kind
 //! container (R1), Handle events emit childless leaf/Fielded nodes, End
 //! events seal. Events whose official node is dropped by the map (D1-D4
 //! derivable, diagnostic-only) are explicit documented no-ops — never
@@ -34,7 +34,7 @@ use dartq_source::LineIndex;
 
 use crate::engine::{Features, Unit};
 
-/// Modifier-set bit assignments (collapse map §1 families; the parser lane
+/// Modifier-set bit assignments (the two families; the parser lane
 /// owns the values, `NodeHeader.flags` bits 1..=7). A node carries exactly
 /// one family — class-like declarations or members — so the two families
 /// share positions. In every case the FIRST modifier in source order is the
@@ -57,7 +57,7 @@ mod mod_bits {
     pub(super) const REQUIRED: u16 = 1 << 7;
 }
 
-/// `RecoverDeclarationHeader.kind` discriminants (collapse map §3.2).
+/// `RecoverDeclarationHeader.kind` discriminants.
 const HEADER_KIND_CLASS: u32 = 0;
 const HEADER_KIND_EXTENSION_TYPE: u32 = 1;
 const HEADER_KIND_MIXIN: u32 = 2;
@@ -74,9 +74,12 @@ pub struct ParsedUnit {
 }
 
 impl ParsedUnit {
-    /// Borrows the unit substrate for one lint run. The workspace facts
-    /// mount by assignment after the call (`Unit::workspace`) — the bridge
-    /// itself carries no pubspec face.
+    /// Borrows the unit substrate for one lint run. The workspace facts and
+    /// the settled language version mount by assignment after the call
+    /// (`Unit::workspace` / `Unit::version`) — the bridge itself carries
+    /// neither face. The semantic query face mounts at the call it serves
+    /// ([`Unit::run_with_semantics`]): it borrows the driver-built context
+    /// tables, none of which this transient substrate holds.
     #[must_use]
     pub fn unit<'a>(&'a self, path: Option<&'a Path>) -> Unit<'a> {
         Unit {
@@ -86,7 +89,11 @@ impl ParsedUnit {
             lines: &self.lines,
             path,
             features: self.features,
+            version: None,
             workspace: None,
+            reachability: None,
+            async_context_uses: None,
+            library_type_uses: None,
         }
     }
 }
@@ -128,8 +135,8 @@ pub fn parse_unit(source: &str, features: Features) -> ParsedUnit {
     let scanned = scan(source, SCAN_CONFIG, file);
     let mut tokens = scanned.tokens;
     let base = tokens.len() as u32;
-    let (listener, inserted) =
-        dartq_parser::parse_unit_with(source, &tokens, PARSE_FEATURES, AstListener::new(base));
+    let mut listener = AstListener::new(base);
+    let inserted = dartq_parser::parse_unit_with(source, &tokens, PARSE_FEATURES, &mut listener);
     tokens.append_inserted(inserted);
     let ast = listener.finish();
     let lines = LineIndex::new(source);
@@ -157,48 +164,94 @@ pub(crate) struct AstListener {
     base: u32,
     /// `Import` prefix patches land while the node is open; a second prefix
     /// event (recovery) overwrites — same last-wins shape as the official
-    /// duplicate-clause recovery.
+    /// duplicate-clause recovery. No nesting: directives are sequential and
+    /// a URI is a string token, so imports never interleave.
     import_open: bool,
     /// `handle_enum_elements` fires while the `EnumBody` wrapper is still
     /// open; the `EnumDeclaration` payload word 2 (`elements_end`) is
     /// stashed here and applied at `end_enum_declaration` (`None` writes
-    /// the `TOKEN_NONE` sentinel for element-less enums).
+    /// the `TOKEN_NONE` sentinel for element-less enums). No nesting: enum
+    /// declarations do not nest and the event fires once per body.
     enum_elements_end: Option<u32>,
     /// Arena-tail snapshot at the previous `SwitchCase` boundary: the case's
     /// labels/expressions/guards complete BEFORE `begin_switch_case` fires,
-    /// in a mix no sibling count can walk (collapse map §4 keeps
+    /// in a mix no sibling count can walk (the payload keeps
     /// `expression_count` precisely because the children are flat), so the
-    /// listener tracks the segment start itself.
+    /// listener tracks the segment start itself. Nested switches are safe:
+    /// the enclosing case's `end_switch_case` fires after its body (nested
+    /// switch included) and re-anchors the snapshot before the next case.
     switch_material_start: u32,
     /// `MetadataStar` opens with an anchor token and may seal empty (the
     /// recovery path fires the pair back-to-back); the anchor and the arena
-    /// length at begin decide the exclusive end.
-    metadata_star: Option<(u32, u32)>,
+    /// length at begin decide the exclusive end. Pairs NEST on legal Dart:
+    /// an annotated star's window spans its annotations' argument parses
+    /// (the full expression engine), and any re-entry — a generic function
+    /// literal's type variables, a record-type cast's fields, annotated
+    /// formals — fires the pair again, so the frames live on a stack. One
+    /// `Vec` reused across the unit keeps the hot path allocation-free
+    /// (pushed/popped per pair; the listener drops with the unit).
+    metadata_star_stack: Vec<(u32, u32)>,
     /// Whether a `TopLevelDeclaration` wrapper is open (the recovery path in
     /// `parse_unit` fires `end_top_level_declaration` without a prelude).
+    /// No nesting: top-level declarations are sequential by grammar.
     tld_open: bool,
     /// Which class-like declaration is open — `handle_implements`/
     /// `handle_class_extends`/`handle_mixin_on` patch only the kinds whose
-    /// payload carries their word.
+    /// payload carries their word. No nesting: class-like declarations do
+    /// not nest (no local classes), and the patch events fire only in the
+    /// open declaration's header.
     class_decl: ClassDecl,
-    /// The last `handle_async_modifier` words: both function-body kinds
+    /// The `handle_async_modifier` words in flight: both function-body kinds
     /// absorb them into their payload, but the modifier event fires BEFORE
     /// the body node opens (the grammar consumes `async` before `{`/`=>`).
-    async_pending: (Option<u32>, Option<u32>),
+    /// Every body carries exactly one modifier event (the parser fires the
+    /// sentinel pair for sync bodies too, mirroring the official
+    /// `parseAsyncModifierOpt`), so the frames sit on a stack: an arrow
+    /// body's window spans its whole expression, and a nested literal's
+    /// modifier/body events would clobber a single slot (`f() async =>
+    /// g(() async => 1);` lost the outer `async`). Bodies that absorb no
+    /// words (redirecting factories, `native`, invalid/empty bodies) leave
+    /// their frame unpopped — it stays buried below later frames under LIFO,
+    /// never misattributed, and is bounded by the unit.
+    async_pending_stack: Vec<(Option<u32>, Option<u32>)>,
     /// `ConstantPattern` deferral: the operand parses between the events and
     /// `const` (when present) is the span head, so the node seals at the end
-    /// event with the operand adopted.
+    /// event with the operand adopted. No nesting: constant patterns occur
+    /// only in pattern position and the window holds a single operand
+    /// expression, which fires no pattern events.
     pending_constant_pattern: Option<u32>,
     /// `ObjectPattern` fields-first deferral: the fields parse and seal
     /// BEFORE `handle_object_pattern` fires (official order,
     /// parser_impl.dart:11847-11848), so the fields event stashes the child
     /// window start (arena tail) and exclusive end; the object-pattern event
     /// pops the marker and reassembles, exactly the official builder's
-    /// `_ObjectPatternFields` pop (ast_builder.dart:5362-5410).
+    /// `_ObjectPatternFields` pop (ast_builder.dart:5362-5410). No nesting:
+    /// a nested object pattern completes its own fields/event pair before
+    /// the enclosing fields event fires.
     object_pattern_pending: Option<(u32, u32)>,
     /// `IsExpression`/`AsExpression` defer their seal to the operator handle
     /// event that immediately follows the end event and carries the word.
+    /// No nesting: the deferred window holds only the type parse, which
+    /// fires no is/as events.
     deferred_seal: Option<NodeKind>,
+    /// First parser↔bridge pairing miss this unit saw, as the violated
+    /// invariant's text (`None` while the stream is healthy). The
+    /// structured fallback ledger for the [`AstListener::expect_paired`]
+    /// contract: two words of fixed capacity, dropped with the unit, read
+    /// by nothing on the lint-row path.
+    pairing_miss: Option<&'static str>,
+    /// The unified-table head index per open string literal. The parser's
+    /// `end_literal_string` event carries the literal's LAST String segment
+    /// (upstream `endLiteralString`'s endToken), but the production tiling
+    /// anchors `StringLiteral` at its head token (D4 token-layer carry —
+    /// interpolation segments produce no child nodes), so the head latched
+    /// at begin decides the seal. Strings nest through interpolations
+    /// (`"$a${'b'}"`), so the frames stack LIFO like
+    /// [`AstListener::metadata_star_stack`].
+    string_heads: Vec<u32>,
+    /// Total pairing misses, saturating — the bounded count face of the
+    /// ledger (repeated mismatches never grow anything past this word).
+    pairing_miss_count: u32,
 }
 
 /// The open class-like declaration family (payload-word routing).
@@ -224,6 +277,37 @@ impl AstListener {
         if id >= self.base { id - 1 } else { id }
     }
 
+    /// The pairing contract behind every audited anchor read and
+    /// pending-state pop: the parser emits well-formed event streams, so
+    /// `found` is always `Some` on healthy input and the fallback below is
+    /// observably unreachable. `None` is only-on-parser-bug; the miss is
+    /// recorded (bounded — see [`AstListener::pairing_miss`]) and the
+    /// caller degrades the affected event (skip its remainder, or seal
+    /// with the documented fallback) instead of panicking the lint pass.
+    /// `what` is the invariant text the former `.expect` carried, kept
+    /// verbatim so field debugging retains the context.
+    fn expect_paired<T>(&mut self, what: &'static str, found: Option<T>) -> Option<T> {
+        if found.is_none() {
+            self.pairing_miss(what);
+        }
+        found
+    }
+
+    /// Records one pairing miss into the fixed-capacity ledger: the first
+    /// miss's invariant text is retained, later misses only bump the
+    /// saturating count. Release builds stay silent — the miss only
+    /// degrades the affected event, never the lint rows; debug builds note
+    /// the first miss once on stderr (the crate has no log facade and none
+    /// is added for this).
+    fn pairing_miss(&mut self, what: &'static str) {
+        if self.pairing_miss.is_none() {
+            self.pairing_miss = Some(what);
+            #[cfg(debug_assertions)]
+            eprintln!("dartq bridge: parser/bridge pairing miss: {what}");
+        }
+        self.pairing_miss_count = self.pairing_miss_count.saturating_add(1);
+    }
+
     /// Consumes the listener into the sealed table.
     #[must_use]
     pub(crate) fn finish(self) -> SyntaxTable {
@@ -245,9 +329,16 @@ impl AstListener {
     }
 
     /// Seals right after the most recently completed child (for end events
-    /// that carry no end token).
+    /// that carry no end token). An `end_last` seal always follows a
+    /// completed child node; the no-completed-node face is only-on-parser-bug
+    /// and seals zero-width at the stream head — the seal itself must still
+    /// happen (the node is already open; skipping it would desynchronize
+    /// the builder's open stack).
     fn end_last(&mut self, kind: NodeKind) {
-        let end = self.b.last_end_token().expect("end_last before any node");
+        let end = match self.expect_paired("end_last before any node", self.b.last_end_token()) {
+            Some(end) => end,
+            None => 0,
+        };
         self.b.end(kind, end);
     }
 
@@ -263,9 +354,14 @@ impl AstListener {
 
     /// Emits the `RecoverDeclarationHeader` sentinel: a zero-width Fielded
     /// node at the current position (a recovery-pass marker, no extent of
-    /// its own).
+    /// its own). The sentinel fires after some node completed; on the
+    /// pairing-miss face the marker emission is skipped entirely (it is
+    /// one atomic begin+end, so skipping keeps the builder balanced).
     fn recover_header(&mut self, kind_discriminant: u32) {
-        let anchor = self.b.last_end_token().expect("recover header anchor");
+        let Some(anchor) = self.expect_paired("recover header anchor", self.b.last_end_token())
+        else {
+            return;
+        };
         self.b.begin(NodeKind::RecoverDeclarationHeader, anchor);
         self.b.patch(0, kind_discriminant);
         self.b.end(NodeKind::RecoverDeclarationHeader, anchor);
@@ -371,16 +467,20 @@ impl ParserListener for AstListener {
     }
 
     fn handle_recover_import(&mut self, semicolon: Option<TokenSpan>) {
-        // Recovery-pass sentinel (collapse map §3.1): anchored at the `;`
+        // Recovery-pass sentinel: anchored at the `;`
         // when the pass found one, zero-width at the current position
-        // otherwise.
+        // otherwise. The anchor-miss face (no completed node to anchor at)
+        // skips the marker emission (one atomic begin+end).
         if let Some(semicolon) = semicolon {
             self.b.begin(NodeKind::RecoverImport, self.t(semicolon.id));
             self.b.patch(0, self.t(semicolon.id));
             self.b
                 .end(NodeKind::RecoverImport, self.t(semicolon.id) + 1);
         } else {
-            let anchor = self.b.last_end_token().expect("recover import anchor");
+            let Some(anchor) = self.expect_paired("recover import anchor", self.b.last_end_token())
+            else {
+                return;
+            };
             self.b.begin(NodeKind::RecoverImport, anchor);
             self.b.patch(0, TOKEN_NONE);
             self.b.end(NodeKind::RecoverImport, anchor);
@@ -388,8 +488,8 @@ impl ParserListener for AstListener {
     }
 
     fn begin_conditional_uris(&mut self, _token: TokenSpan) {
-        // Combinators/ConditionalUris/TypeList wrappers are dropped (collapse
-        // map §3.1: End types D1 — the children delimit themselves).
+        // Combinators/ConditionalUris/TypeList wrappers are dropped
+        // (derivable: the children delimit themselves).
     }
 
     fn end_conditional_uris(&mut self, _count: usize) {
@@ -421,7 +521,7 @@ impl ParserListener for AstListener {
 
     fn handle_dotted_name(&mut self, count: usize, first_identifier: TokenSpan) {
         // The chain's Identifiers completed before the event (children of the
-        // enclosing directive); adopt them (collapse map §3.1 DottedName row).
+        // enclosing directive); adopt them.
         self.b.begin_adopting(
             NodeKind::DottedName,
             self.t(first_identifier.id),
@@ -489,14 +589,27 @@ impl ParserListener for AstListener {
 
     // —— metadata ————————————————————————————————————————————————————
     fn begin_metadata_star(&mut self, token: TokenSpan) {
-        self.metadata_star = Some((self.t(token.id), self.b.len() as u32));
+        self.metadata_star_stack
+            .push((self.t(token.id), self.b.len() as u32));
         self.begin(NodeKind::MetadataStar, token);
     }
 
     fn end_metadata_star(&mut self, _count: usize) {
-        let (anchor, len_at_begin) = self.metadata_star.take().expect("metadata star pair");
+        // Unpaired end (only-on-parser-bug): the star node never opened, so
+        // sealing here would pop an unrelated open node — the event's
+        // remainder is skipped instead.
+        let popped = self.metadata_star_stack.pop();
+        let Some((anchor, len_at_begin)) = self.expect_paired("metadata star pair", popped) else {
+            return;
+        };
         let end = if self.b.len() > len_at_begin as usize {
-            self.b.last_end_token().expect("metadata star child")
+            match self.expect_paired("metadata star child", self.b.last_end_token()) {
+                Some(end) => end,
+                // Unreachable while the pair held (a grown star implies a
+                // completed node); skipping the seal keeps the degrade
+                // bounded.
+                None => return,
+            }
         } else {
             // Empty star (the recovery path fires the pair back-to-back).
             anchor
@@ -512,10 +625,13 @@ impl ParserListener for AstListener {
         &mut self,
         _begin: TokenSpan,
         period_before_name: Option<TokenSpan>,
-        _end: TokenSpan,
+        end: TokenSpan,
     ) {
         self.patch_token(0, period_before_name);
-        self.end_last(NodeKind::Metadata);
+        // Seal at the parser-supplied end (last consumed: the `)` or the
+        // annotation name) — `end_last` would trust `last_end_token`,
+        // polluted by `NoTypeArguments`/`NoArguments` sentinel leaves.
+        self.end_incl(NodeKind::Metadata, end);
     }
 
     // —— types ————————————————————————————————————————————————————————
@@ -538,9 +654,12 @@ impl ParserListener for AstListener {
 
     fn handle_qualified(&mut self, period: TokenSpan) {
         // Both Identifiers completed before the event; the marker's span
-        // opens at the chain head and closes past the period (Handle =
-        // childless, collapse map §3.5).
-        let first = self.b.last_first_token().expect("qualified anchor");
+        // opens at the chain head and closes past the period (a childless
+        // Handle node). The anchor-miss face skips the marker emission
+        // (one atomic begin+end; the identifiers remain as siblings).
+        let Some(first) = self.expect_paired("qualified anchor", self.b.last_first_token()) else {
+            return;
+        };
         self.b.begin(NodeKind::Qualified, first);
         self.b.patch(0, self.t(period.id));
         self.b.end(NodeKind::Qualified, self.t(period.id) + 1);
@@ -650,7 +769,7 @@ impl ParserListener for AstListener {
     fn handle_void_keyword_with_type_arguments(&mut self, _token: TokenSpan) {
         // `void<T>` is always an error: the VoidType leaf plus the sibling
         // TypeArguments carry the shape; the diagnostic goes through the
-        // recovery channel (collapse map §3.8 D3).
+        // recovery channel.
     }
 
     fn handle_experiment_not_enabled(
@@ -688,7 +807,7 @@ impl ParserListener for AstListener {
 
     fn begin_uncategorized_top_level_declaration(&mut self, token: TokenSpan) {
         // Any of the five preludes opens the `TopLevelDeclaration` name
-        // wrapper (collapse map §2 #1-5); the prelude begin itself is R1.
+        // wrapper; the prelude begin itself is R1.
         self.begin(NodeKind::TopLevelDeclaration, token);
         self.tld_open = true;
     }
@@ -739,9 +858,9 @@ impl ParserListener for AstListener {
         _begin: TokenSpan,
         end: TokenSpan,
     ) {
-        // Shared `Fields` begin (collapse map §2 #6): the word exists for
-        // slot hygiene even though the narrower seal cannot read it.
-        self.b.patch(0, DeclarationKind::TopLevel as u32);
+        // No member-kind word here: the width-0 `TopLevelFields` seal cannot
+        // read one (the ModSet lives in the header bits, #174), and patching
+        // anyway materialized a dead pool word + undo entry per declaration.
         self.end_incl(NodeKind::TopLevelFields, end);
     }
 
@@ -793,7 +912,7 @@ impl ParserListener for AstListener {
         var_final_or_const: Option<TokenSpan>,
         last_consumed: TokenSpan,
     ) {
-        // Canonical open of the shared `Fields` group (§2 #6): the wider
+        // Canonical open of the shared `Fields` group: the wider
         // `Fields` kind, sealed as `TopLevelFields` for top-level fields.
         let _ = kind;
         self.begin(NodeKind::Fields, last_consumed);
@@ -821,7 +940,7 @@ impl ParserListener for AstListener {
         _begin: TokenSpan,
         end: TokenSpan,
     ) {
-        // Word 0 is the `MemberKind` discriminant (collapse map §3.3; the
+        // Word 0 is the `MemberKind` discriminant (the
         // official builder derives it the same way from the event's
         // declaration family + the static modifier, member_kind.dart —
         // fields only have the static/instance pair here; top-level fields
@@ -954,7 +1073,7 @@ impl ParserListener for AstListener {
 
     fn handle_operator_name(&mut self, operator: TokenSpan, name: TokenSpan) {
         // `operator` is the span head (head-when-present, #174); the words
-        // are the name token and the invalid flag (§3.5 OperatorName).
+        // are the name token and the invalid flag (the OperatorName payload).
         self.b.begin(NodeKind::OperatorName, self.t(operator.id));
         self.b.patch(0, self.t(name.id));
         self.b.patch(1, 0);
@@ -1003,16 +1122,22 @@ impl ParserListener for AstListener {
     fn handle_async_modifier(&mut self, async_kw: Option<TokenSpan>, star: Option<TokenSpan>) {
         // The modifier event fires before the body node opens (the grammar
         // consumes `async` before `{`/`=>`), so the words ride to whichever
-        // body kind absorbs them (`AsyncModifierHandle` F→, §3.9).
-        self.async_pending = (async_kw.map(|t| self.t(t.id)), star.map(|t| self.t(t.id)));
+        // body kind absorbs them (see the field: LIFO frames — the sentinel
+        // pair fires for sync bodies too).
+        self.async_pending_stack
+            .push((async_kw.map(|t| self.t(t.id)), star.map(|t| self.t(t.id))));
     }
 
     fn begin_block_function_body(&mut self, token: TokenSpan) {
         self.begin(NodeKind::BlockBody, token);
-        // The contract writes both words even when the modifier event never
-        // fired (a sync body) — absent is the explicit sentinel.
-        let (async_kw, star) = self.async_pending;
-        self.async_pending = (None, None);
+        // The contract writes both words even when the modifier words are
+        // absent (a sync body's sentinel frame) — absent is the explicit
+        // sentinel. The unpaired face (only-on-parser-bug) patches the same
+        // absent sentinels, so the body node itself is unaffected.
+        let popped = self.async_pending_stack.pop();
+        let (async_kw, star) = self
+            .expect_paired("async modifier pair", popped)
+            .unwrap_or((None, None));
         self.b.patch(0, async_kw.unwrap_or(TOKEN_NONE));
         self.b.patch(1, star.unwrap_or(TOKEN_NONE));
     }
@@ -1052,10 +1177,14 @@ impl ParserListener for AstListener {
         self.b.begin(NodeKind::ExpressionBody, self.t(arrow.id));
         self.b.patch(0, self.t(arrow.id));
         self.patch_token(1, end);
-        self.b
-            .patch(2, self.async_pending.0.take().unwrap_or(TOKEN_NONE));
-        self.b
-            .patch(3, self.async_pending.1.take().unwrap_or(TOKEN_NONE));
+        // Unpaired face (only-on-parser-bug) rides the absent sentinels,
+        // same as `begin_block_function_body`.
+        let popped = self.async_pending_stack.pop();
+        let (async_kw, star) = self
+            .expect_paired("async modifier pair", popped)
+            .unwrap_or((None, None));
+        self.b.patch(2, async_kw.unwrap_or(TOKEN_NONE));
+        self.b.patch(3, star.unwrap_or(TOKEN_NONE));
         match end {
             Some(end) => self.end_incl(NodeKind::ExpressionBody, end),
             None => self.b.end(NodeKind::ExpressionBody, self.t(arrow.id) + 1),
@@ -1113,7 +1242,7 @@ impl ParserListener for AstListener {
 
     fn handle_enum_with_clause(&mut self, _with_keyword: TokenSpan) {
         // Enums have no with clause; the event exists only for the grammar
-        // error — diagnostic face (collapse map §3.2 D3).
+        // error — diagnostic face only.
     }
 
     fn handle_enum_no_with_clause(&mut self) {
@@ -1171,7 +1300,7 @@ impl ParserListener for AstListener {
 
     fn handle_recover_mixin_header(&mut self) {
         // `RecoverMixinHeaderHandle` merges into `RecoverDeclarationHeader`
-        // with the Mixin kind (collapse map §3.2).
+        // with the Mixin kind.
         self.recover_header(HEADER_KIND_MIXIN);
     }
 
@@ -1487,7 +1616,7 @@ impl ParserListener for AstListener {
 
     fn handle_mixin_with_clause(&mut self, with_keyword: TokenSpan) {
         // Invalid mixin with-clause recovery: the `MixinDeclaration` with
-        // word back-fills (collapse map §3.2 MixinWithClauseHandle F→).
+        // word back-fills the `MixinWithClauseHandle` slot.
         if self.class_decl == ClassDecl::Mixin {
             self.b.patch(2, self.t(with_keyword.id));
         }
@@ -1619,6 +1748,7 @@ impl ParserListener for AstListener {
     fn end_formal_parameter(
         &mut self,
         _var_or_final: Option<TokenSpan>,
+        _covariant_kw: Option<TokenSpan>,
         this_keyword: Option<TokenSpan>,
         super_keyword: Option<TokenSpan>,
         _period_after_this_or_super: Option<TokenSpan>,
@@ -1723,7 +1853,7 @@ impl ParserListener for AstListener {
     }
 
     fn begin_for_statement(&mut self, token: TokenSpan) {
-        // Canonical open of the shared for/for-in group (§2 #7): a for-in
+        // Canonical open of the shared for/for-in group: a for-in
         // body seals the same node as `ForIn`.
         self.begin(NodeKind::ForStatement, token);
     }
@@ -1796,7 +1926,7 @@ impl ParserListener for AstListener {
     }
 
     fn end_for_in(&mut self, end: TokenSpan) {
-        // Seals the shared begin opened as `ForStatement` (§2 #7).
+        // Seals the shared begin opened as `ForStatement`.
         self.end_at(NodeKind::ForIn, self.t(end.id));
     }
 
@@ -1886,7 +2016,7 @@ impl ParserListener for AstListener {
         star: Option<TokenSpan>,
         end: TokenSpan,
     ) {
-        // The error code is resolution-domain, not an AST fact (§2 #11).
+        // The error code is resolution-domain, not an AST fact.
         self.patch_token(0, star);
         self.end_incl(NodeKind::InvalidYieldStatement, end);
     }
@@ -2037,9 +2167,10 @@ impl ParserListener for AstListener {
 
     fn begin_switch_block(&mut self, token: TokenSpan) {
         self.begin(NodeKind::SwitchBlock, token);
-        // The first case's material (labels/expressions) starts right after
-        // this node's own arena row.
-        self.switch_material_start = self.b.len() as u32 + 1;
+        // Rows land at seal time (post-order), so the arena tail here is
+        // already the first member's first material row — the same face the
+        // `end_switch_case` re-anchor below snapshots.
+        self.switch_material_start = self.b.len() as u32;
     }
 
     fn end_switch_block(&mut self, _count: usize, _begin: TokenSpan, end: TokenSpan) {
@@ -2089,10 +2220,15 @@ impl ParserListener for AstListener {
         self.patch_token(1, colon_after_default);
         self.b
             .patch(2, expression_count.min(u32::MAX as usize) as u32);
-        self.switch_material_start = self.b.len() as u32;
         // The bound is the token after the case's statements (peek) — the
         // next case's head or the block's `}`.
         self.end_at(NodeKind::SwitchCase, self.t(end.id));
+        // Snapshot AFTER the seal: rows land at seal time (post-order), so
+        // the next case's first material row is one past the just-sealed
+        // SwitchCase row. A pre-seal snapshot named the SwitchCase row
+        // itself, anchoring the next case strictly inside its predecessor
+        // (the builder's well-nestedness assert; nested cases in release).
+        self.switch_material_start = self.b.len() as u32;
     }
 
     fn begin_switch_case_when_clause(&mut self, token: TokenSpan) {
@@ -2224,6 +2360,7 @@ impl ParserListener for AstListener {
     }
 
     fn begin_literal_string(&mut self, token: TokenSpan) {
+        self.string_heads.push(self.t(token.id));
         self.begin(NodeKind::StringLiteral, token);
     }
 
@@ -2231,11 +2368,17 @@ impl ParserListener for AstListener {
         // Interpolation is carried by the token layer's string segments (D4).
     }
 
-    fn end_literal_string(&mut self, _interpolation_count: usize, begin: TokenSpan) {
-        // The event carries only the literal's head token, and interpolation
-        // segments produce no child nodes (D4 token-layer carry) — the span
-        // anchors at the head; report ranges key off the head offset.
-        self.b.end(NodeKind::StringLiteral, self.t(begin.id) + 1);
+    fn end_literal_string(&mut self, _interpolation_count: usize, _end: TokenSpan) {
+        // The event's token is the literal's last String segment (upstream
+        // `endLiteralString`'s endToken contract); the head latched at begin
+        // seals the node — interpolation segments produce no child nodes
+        // (D4 token-layer carry), so the span anchors at the head and
+        // report ranges key off the head offset.
+        let popped = self.string_heads.pop();
+        let head = self
+            .expect_paired("end_literal_string without begin", popped)
+            .unwrap_or(0);
+        self.b.end(NodeKind::StringLiteral, head + 1);
     }
 
     fn handle_adjacent_string_literals(&mut self, _start: TokenSpan, _literal_count: usize) {
@@ -2271,7 +2414,7 @@ impl ParserListener for AstListener {
 
     fn handle_unary_prefix_expression(&mut self, operator: TokenSpan) {
         // Token leaf over the operator; the operand is the preceding sibling
-        // (Handle = childless, collapse map §3.5 / kind.rs TokenLeaf set).
+        // (a childless Handle node, the `TokenLeaf` kind set).
         self.b.leaf(NodeKind::UnaryPrefix, self.t(operator.id));
     }
 
@@ -2279,14 +2422,22 @@ impl ParserListener for AstListener {
         self.b.leaf(NodeKind::NonNullAssert, self.t(bang.id));
     }
 
-    fn begin_binary_expression(&mut self, _operator: TokenSpan) {
-        // The left operand completed before the event (operands×2 contract,
-        // collapse map §3.5); the node opens adopting it, anchored at its
-        // head token.
-        let first = self.b.last_first_token().expect("binary left operand");
-        let start = self.b.last_subtree_start().expect("binary left operand");
-        self.b
-            .begin_with_first_child(NodeKind::BinaryExpression, first, start);
+    fn begin_binary_expression(&mut self, operator: TokenSpan) {
+        // The left operand completed before the event (operands×2 contract);
+        // the node opens adopting it, anchored at its
+        // head token. The anchor-miss face (only-on-parser-bug) opens the
+        // node at the operator with no adopted child — the begin/end
+        // pairing with the later seal stays balanced, the span degrades.
+        match (
+            self.expect_paired("binary left operand", self.b.last_first_token()),
+            self.expect_paired("binary left operand", self.b.last_subtree_start()),
+        ) {
+            (Some(first), Some(start)) => {
+                self.b
+                    .begin_with_first_child(NodeKind::BinaryExpression, first, start);
+            }
+            _ => self.begin(NodeKind::BinaryExpression, operator),
+        }
     }
 
     fn end_binary_expression(&mut self, operator: TokenSpan, end: TokenSpan) {
@@ -2320,7 +2471,7 @@ impl ParserListener for AstListener {
         right: TokenSpan,
     ) {
         // The const word survives elimination (the bracket is the official
-        // span head — `const` sits outside it, collapse map §3.5).
+        // span head — `const` sits outside it).
         self.b.begin(NodeKind::ListLiteral, self.t(left.id));
         self.patch_token(0, const_keyword);
         self.b.end(NodeKind::ListLiteral, self.t(right.id) + 1);
@@ -2348,7 +2499,25 @@ impl ParserListener for AstListener {
         null_aware_value: Option<TokenSpan>,
     ) {
         // Childless Handle: key/value expressions are preceding siblings.
-        let first = self.b.last_first_token().expect("map entry anchor");
+        // The anchor-miss face skips the entry emission (one atomic
+        // begin+end; the expressions remain siblings of the literal).
+        //
+        // Span contract: the row covers `[value-head, follower-inclusive]`
+        // — `last_first_token` is the VALUE's head (the last expression to
+        // complete before the entry event), while the key always stays a
+        // preceding sibling and never enters the covered span. The colon
+        // payload word (`payload[0]`) is therefore the only reliable cut
+        // between the two sides: a consumer splitting key from value must
+        // walk off the colon, never off the covered start (a member or
+        // send value's head is itself a tile anchor — `k: a.b` opens at
+        // `b`'s selector completion). This differs from the
+        // `NamedArgument`/`NamedRecordField` markers, which emit
+        // zero-width at colon+1 (the value head itself, `handle_*`
+        // below): those rows carry no coverage at all, while this row
+        // carries the value side's whole extent.
+        let Some(first) = self.expect_paired("map entry anchor", self.b.last_first_token()) else {
+            return;
+        };
         self.b.begin(NodeKind::MapEntry, first);
         self.b.patch(0, self.t(colon.id));
         self.patch_token(1, null_aware_key);
@@ -2366,7 +2535,7 @@ impl ParserListener for AstListener {
     }
 
     fn begin_parenthesized_expression_or_record_literal(&mut self, token: TokenSpan) {
-        // Canonical open of the shared group (§2 #12/#13): the wider
+        // Canonical open of the shared group: the wider
         // `RecordLiteral` kind.
         self.begin(NodeKind::RecordLiteral, token);
     }
@@ -2387,14 +2556,21 @@ impl ParserListener for AstListener {
     }
 
     fn handle_named_record_field(&mut self, colon: TokenSpan) {
-        // Childless Handle anchored at the value head (the event fires
-        // after the field's value parses; same anchor face as
-        // `handle_named_argument`). The colon payload and the name token
-        // sit immediately before the anchor.
-        let first = self.b.last_first_token().expect("record field anchor");
-        self.b.begin(NodeKind::NamedRecordField, first);
+        // Childless Handle over `name :`; the value expression follows as a
+        // sibling inside `RecordLiteral` (no end event exists to nest it).
+        // The event fires AFTER the value parse (literals.rs:514-516), so
+        // `last_first_token` is the value's last-completed node — anchoring
+        // there inverted the span on selector-chain values (`x: a.b` seals
+        // a `DotAccess` at the selector `b`, past the colon) and on cascade
+        // values (`x: a..b` opens `Cascade` at `..`). The marker contract
+        // anchors at the value head — the token right after the colon —
+        // with the name token at colon-1 (names.rs:576-585), so the
+        // emission is zero-width there (one atomic begin+end). Same defect
+        // shape and fix as `handle_named_argument`.
+        let head = self.t(colon.id) + 1;
+        self.b.begin(NodeKind::NamedRecordField, head);
         self.b.patch(0, self.t(colon.id));
-        self.b.end(NodeKind::NamedRecordField, self.t(colon.id) + 1);
+        self.b.end(NodeKind::NamedRecordField, head);
     }
 
     fn handle_positional_record_field(&mut self, _token: TokenSpan) {
@@ -2410,21 +2586,33 @@ impl ParserListener for AstListener {
     }
 
     fn handle_no_arguments(&mut self, _token: TokenSpan) {
-        // Distinguishes `x` from `x()` (collapse map §3.5: a real sentinel).
-        self.b.leaf_span(
-            NodeKind::NoArguments,
-            self.b.last_end_token().unwrap_or(0),
-            self.b.last_end_token().unwrap_or(0),
-        );
+        // Distinguishes `x` from `x()` (a real sentinel):
+        // a zero-width leaf anchored just past the expression that completed
+        // before the empty argument list. No completed anchor is a bridge
+        // bug, not token 0 — the event always follows a parsed receiver; the
+        // miss face skips the sentinel leaf.
+        let Some(anchor) = self.expect_paired(
+            "NoArguments without a completed anchor node",
+            self.b.last_end_token(),
+        ) else {
+            return;
+        };
+        self.b.leaf_span(NodeKind::NoArguments, anchor, anchor);
     }
 
     fn handle_named_argument(&mut self, colon: TokenSpan) {
         // Childless Handle over `name :`; the value expression follows as a
-        // sibling inside `Arguments` (no end event exists to nest it).
-        let first = self.b.last_first_token().expect("named argument anchor");
-        self.b.begin(NodeKind::NamedArgument, first);
+        // sibling inside `Arguments` (no end event exists to nest it). The
+        // event fires AFTER the value parse (:9211), so `last_first_token`
+        // is the value's last-completed node — anchoring there inverted the
+        // span on send-chain values (`x: a.b` seals a `DotAccess` at the
+        // dot). The marker contract anchors at the value head — the token
+        // right after the colon — so the emission is zero-width there (one
+        // atomic begin+end).
+        let head = self.t(colon.id) + 1;
+        self.b.begin(NodeKind::NamedArgument, head);
         self.b.patch(0, self.t(colon.id));
-        self.b.end(NodeKind::NamedArgument, self.t(colon.id) + 1);
+        self.b.end(NodeKind::NamedArgument, head);
     }
 
     fn handle_positional_argument(&mut self, _token: TokenSpan) {
@@ -2432,8 +2620,15 @@ impl ParserListener for AstListener {
     }
 
     fn handle_send(&mut self, begin: TokenSpan, end: TokenSpan) {
-        self.b
-            .leaf_span(NodeKind::Send, self.t(begin.id), self.t(end.id) + 1);
+        // A well-formed send spans forward; the case-head recovery shapes
+        // (`case true ? 1 : 2:`, `case {1}:`) fire the event with the end
+        // token behind the begin — the degenerate face skips the emission
+        // (one atomic begin+end), mirroring the anchor-miss skips.
+        let (begin_token, end_token) = (self.t(begin.id), self.t(end.id));
+        if end_token < begin_token {
+            return;
+        }
+        self.b.leaf_span(NodeKind::Send, begin_token, end_token + 1);
     }
 
     fn handle_send_without_arguments(
@@ -2443,13 +2638,21 @@ impl ParserListener for AstListener {
         _next: TokenSpan,
     ) {
         // Merged into `Send` (argument presence reads from the children).
-        self.b
-            .leaf_span(NodeKind::Send, self.t(begin.id), self.t(end.id) + 1);
+        // The same degenerate face as `handle_send` skips the emission.
+        let (begin_token, end_token) = (self.t(begin.id), self.t(end.id));
+        if end_token < begin_token {
+            return;
+        }
+        self.b.leaf_span(NodeKind::Send, begin_token, end_token + 1);
     }
 
     fn handle_dot_access(&mut self, token: TokenSpan, end: TokenSpan, is_null_aware: bool) {
         // Childless Handle over the selector extent (`token` = the dot).
-        let first = self.b.last_first_token().expect("dot access anchor");
+        // The anchor-miss face skips the node emission (one atomic
+        // begin+end; the receiver remains a sibling).
+        let Some(first) = self.expect_paired("dot access anchor", self.b.last_first_token()) else {
+            return;
+        };
         self.b.begin(NodeKind::DotAccess, first);
         self.b.patch(0, self.t(token.id));
         self.b.patch(1, u32::from(is_null_aware));
@@ -2505,7 +2708,7 @@ impl ParserListener for AstListener {
     }
 
     fn end_invalid_await_expression(&mut self, _begin: TokenSpan, end: TokenSpan) {
-        // Shared begin with `AwaitExpression` (§2 #10); the error code is
+        // Shared begin with `AwaitExpression`; the error code is
         // resolution-domain.
         self.end_incl(NodeKind::InvalidAwaitExpression, end);
     }
@@ -2516,11 +2719,20 @@ impl ParserListener for AstListener {
     }
 
     fn handle_assignment_expression(&mut self, operator: TokenSpan, end: TokenSpan) {
-        // Both operands completed before the event (operands×2).
-        let first = self.b.last_first_token().expect("assignment lhs");
-        let start = self.b.last_subtree_start().expect("assignment lhs");
-        self.b
-            .begin_with_first_child(NodeKind::Assignment, first, start);
+        // Both operands completed before the event (operands×2). The
+        // anchor-miss face (only-on-parser-bug) opens the node at the
+        // operator with no adopted child and seals the same way — the
+        // emission stays balanced, the span degrades.
+        match (
+            self.expect_paired("assignment lhs", self.b.last_first_token()),
+            self.expect_paired("assignment lhs", self.b.last_subtree_start()),
+        ) {
+            (Some(first), Some(start)) => {
+                self.b
+                    .begin_with_first_child(NodeKind::Assignment, first, start);
+            }
+            _ => self.begin(NodeKind::Assignment, operator),
+        }
         self.b.patch(0, self.t(operator.id));
         self.b.end(NodeKind::Assignment, self.t(end.id) + 1);
     }
@@ -2530,7 +2742,12 @@ impl ParserListener for AstListener {
     }
 
     fn handle_cascade_access(&mut self, operator: TokenSpan, end: TokenSpan, is_null_aware: bool) {
-        let first = self.b.last_first_token().expect("cascade access anchor");
+        // The anchor-miss face skips the node emission (one atomic
+        // begin+end; the cascade target remains a sibling).
+        let Some(first) = self.expect_paired("cascade access anchor", self.b.last_first_token())
+        else {
+            return;
+        };
         self.b.begin(NodeKind::CascadeAccess, first);
         self.b.patch(0, self.t(operator.id));
         self.b.patch(1, u32::from(is_null_aware));
@@ -2631,11 +2848,13 @@ impl ParserListener for AstListener {
 
     fn handle_pattern_assignment(&mut self, equals: TokenSpan) {
         // Childless Handle over the `=` (the pattern precedes, the assigned
-        // expression follows as siblings).
-        let first = self
-            .b
-            .last_first_token()
-            .expect("pattern assignment anchor");
+        // expression follows as siblings). The anchor-miss face skips the
+        // node emission (one atomic begin+end).
+        let Some(first) =
+            self.expect_paired("pattern assignment anchor", self.b.last_first_token())
+        else {
+            return;
+        };
         self.b.begin(NodeKind::PatternAssignment, first);
         self.b.patch(0, self.t(equals.id));
         self.b
@@ -2654,7 +2873,7 @@ impl ParserListener for AstListener {
     fn handle_is_operator(&mut self, _is_operator: TokenSpan, not: Option<TokenSpan>) {
         if self.deferred_seal == Some(NodeKind::IsExpression) {
             self.deferred_seal = None;
-            // The payload word is the `not` flag (collapse map §3.5).
+            // The payload word is the `not` flag.
             self.b.patch(0, u32::from(not.is_some()));
             self.end_last(NodeKind::IsExpression);
         }
@@ -2670,7 +2889,8 @@ impl ParserListener for AstListener {
     }
 
     fn handle_as_operator(&mut self, operator: TokenSpan) {
-        // Merged with end_as_operator_type (§3.5: End+Handle double source).
+        // Merged with end_as_operator_type (the End event and the Handle
+        // event seal through this one path).
         if self.deferred_seal == Some(NodeKind::AsExpression) {
             self.deferred_seal = None;
             self.b.patch(0, self.t(operator.id));
@@ -2679,8 +2899,13 @@ impl ParserListener for AstListener {
     }
 
     fn handle_type_argument_application(&mut self, open_angle: TokenSpan) {
-        // `f<int>()` marker leaf over the applied type arguments.
-        let first = self.b.last_first_token().expect("type application anchor");
+        // `f<int>()` marker leaf over the applied type arguments. The
+        // anchor-miss face skips the marker emission (one atomic
+        // begin+end).
+        let Some(first) = self.expect_paired("type application anchor", self.b.last_first_token())
+        else {
+            return;
+        };
         self.b.begin(NodeKind::TypeApplication, first);
         self.b.patch(0, self.t(open_angle.id));
         self.b
@@ -2689,7 +2914,7 @@ impl ParserListener for AstListener {
 
     // —— patterns ——————————————————————————————————————————————————————
     fn begin_pattern(&mut self, _token: TokenSpan) {
-        // Pattern wrapper dropped (collapse map §3.7 D1): pattern nodes land
+        // Pattern wrapper dropped (derivable): pattern nodes land
         // directly.
     }
 
@@ -2708,32 +2933,49 @@ impl ParserListener for AstListener {
         let pending = self.pending_constant_pattern.take();
         let head = pending.or(const_keyword.map(|t| self.t(t.id)));
         if let Some(head) = head {
-            let start = self
-                .b
-                .last_subtree_start()
-                .expect("constant pattern operand");
+            // The anchor-miss face skips the pattern emission (one atomic
+            // begin+end).
+            let Some(start) =
+                self.expect_paired("constant pattern operand", self.b.last_subtree_start())
+            else {
+                return;
+            };
             self.b
                 .begin_with_first_child(NodeKind::ConstantPattern, head, start);
         } else {
-            let first = self.b.last_first_token().expect("constant pattern operand");
+            // Same miss face; reached only with a completed node (the
+            // adoption below requires one).
+            let Some(first) =
+                self.expect_paired("constant pattern operand", self.b.last_first_token())
+            else {
+                return;
+            };
             self.b.begin_adopting(NodeKind::ConstantPattern, first, 1);
         }
         self.end_last(NodeKind::ConstantPattern);
     }
 
     fn handle_relational_pattern(&mut self, operator: TokenSpan) {
-        // Fires after the operand parsed (childless Handle; `op` word).
-        let first = self
-            .b
-            .last_first_token()
-            .expect("relational pattern anchor");
+        // Fires after the operand parsed (childless Handle; `op` word). The
+        // anchor-miss face skips the pattern emission (one atomic
+        // begin+end).
+        let Some(first) =
+            self.expect_paired("relational pattern anchor", self.b.last_first_token())
+        else {
+            return;
+        };
         self.b.begin(NodeKind::RelationalPattern, first);
         self.b.patch(0, self.t(operator.id));
         self.end_last(NodeKind::RelationalPattern);
     }
 
     fn handle_cast_pattern(&mut self, operator: TokenSpan) {
-        let first = self.b.last_first_token().expect("cast pattern anchor");
+        // The anchor-miss face skips the pattern emission (one atomic
+        // begin+end).
+        let Some(first) = self.expect_paired("cast pattern anchor", self.b.last_first_token())
+        else {
+            return;
+        };
         self.b.begin(NodeKind::CastPattern, first);
         self.b.patch(0, self.t(operator.id));
         self.end_last(NodeKind::CastPattern);
@@ -2747,12 +2989,21 @@ impl ParserListener for AstListener {
         self.b.leaf(NodeKind::NullCheckPattern, self.t(question.id));
     }
 
-    fn begin_binary_pattern(&mut self, _operator: TokenSpan) {
-        // The left operand completed before the event (operands×2).
-        let first = self.b.last_first_token().expect("binary pattern lhs");
-        let start = self.b.last_subtree_start().expect("binary pattern lhs");
-        self.b
-            .begin_with_first_child(NodeKind::BinaryPattern, first, start);
+    fn begin_binary_pattern(&mut self, operator: TokenSpan) {
+        // The left operand completed before the event (operands×2). The
+        // anchor-miss face (only-on-parser-bug) opens the node at the
+        // operator with no adopted child — the begin/end pairing with the
+        // later seal stays balanced, the span degrades.
+        match (
+            self.expect_paired("binary pattern lhs", self.b.last_first_token()),
+            self.expect_paired("binary pattern lhs", self.b.last_subtree_start()),
+        ) {
+            (Some(first), Some(start)) => {
+                self.b
+                    .begin_with_first_child(NodeKind::BinaryPattern, first, start);
+            }
+            _ => self.begin(NodeKind::BinaryPattern, operator),
+        }
     }
 
     fn end_binary_pattern(&mut self, operator: TokenSpan) {
@@ -2773,7 +3024,12 @@ impl ParserListener for AstListener {
     }
 
     fn handle_map_pattern_entry(&mut self, colon: TokenSpan, end: TokenSpan) {
-        let first = self.b.last_first_token().expect("map pattern entry anchor");
+        // The anchor-miss face skips the entry emission (one atomic
+        // begin+end).
+        let Some(first) = self.expect_paired("map pattern entry anchor", self.b.last_first_token())
+        else {
+            return;
+        };
         self.b.begin(NodeKind::MapPatternEntry, first);
         self.b.patch(0, self.t(colon.id));
         self.b.end(NodeKind::MapPatternEntry, self.t(end.id) + 1);
@@ -2805,7 +3061,12 @@ impl ParserListener for AstListener {
     }
 
     fn handle_pattern_field(&mut self, colon: Option<TokenSpan>) {
-        let first = self.b.last_first_token().expect("pattern field anchor");
+        // The anchor-miss face skips the field emission (one atomic
+        // begin+end).
+        let Some(first) = self.expect_paired("pattern field anchor", self.b.last_first_token())
+        else {
+            return;
+        };
         self.b.begin(NodeKind::PatternField, first);
         self.patch_token(0, colon);
         self.end_last(NodeKind::PatternField);
@@ -2821,11 +3082,17 @@ impl ParserListener for AstListener {
         // parser_impl.dart:11848 fires it after parseObjectPatternRest);
         // reassemble the node over the stashed field window — the official
         // builder pops its `_ObjectPatternFields` marker here
-        // (ast_builder.dart:5362-5397).
-        let (first_child, end) = self
-            .object_pattern_pending
-            .take()
-            .expect("handle_object_pattern without a preceding fields event");
+        // (ast_builder.dart:5362-5397). The unpaired face (only-on-parser-bug:
+        // no fields event preceded) skips the node emission entirely — the
+        // reassembly window is exactly what is missing, so there is no
+        // bounded seal to fabricate, and nothing was begun to leave open.
+        let pending = self.object_pattern_pending.take();
+        let Some((first_child, end)) = self.expect_paired(
+            "handle_object_pattern without a preceding fields event",
+            pending,
+        ) else {
+            return;
+        };
         self.b.begin_with_first_child(
             NodeKind::ObjectPattern,
             self.t(first_identifier.id),
@@ -2887,7 +3154,7 @@ impl ParserListener for AstListener {
 
     fn end_if_else_control_flow(&mut self, token: TokenSpan) {
         // Same kind seal — the else segment reads from the ElseControlFlow
-        // sentinel child (§2 #9).
+        // sentinel child.
         self.end_incl(NodeKind::IfControlFlow, token);
     }
 
@@ -2965,7 +3232,7 @@ impl ParserListener for AstListener {
     ) {
         // Diagnostics flow through the parser's own channel; the bridge
         // emits the official `RecoverableError` sentinel node and marks the
-        // error bit on the enclosing nodes (collapse map §3.9 — the
+        // error bit on the enclosing nodes (the
         // sentinel is the differential-parity face of the error).
         self.b.leaf(NodeKind::RecoverableError, self.t(start.id));
         self.b.mark_error();
@@ -2988,12 +3255,18 @@ mod tests {
         run(&unit, &set, &rustc_hash::FxHashSet::default())
     }
 
-    /// Walks the arena collecting (kind, utf16 start) pairs.
+    /// Walks the arena collecting (kind, utf16 start) pairs. `children`
+    /// spans whole subtrees, so dedupe by node id — each node is visited
+    /// exactly once.
     fn walk(source: &str) -> Vec<(NodeKind, u32)> {
         let parsed = parse_unit(source, Features::default());
         let mut out = Vec::new();
+        let mut seen = rustc_hash::FxHashSet::default();
         let mut stack = vec![parsed.ast.root().expect("root")];
         while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
             out.push((
                 parsed.ast.kind(id),
                 utf16_span(&parsed.source, &parsed.tokens, &parsed.ast, id).start,
@@ -3071,6 +3344,66 @@ mod tests {
     }
 
     #[test]
+    fn collection_for_bare_identifier_element_nests_the_loop_variable() {
+        // The collection-for element face under a top-level field: the loop
+        // variable's `VariablesDeclaration` row must nest inside the
+        // `ForControlFlow` container — a row landing directly under the
+        // `TopLevelFields` wrapper would read as a ghost top-level variable
+        // (the #1993/#2013 face).
+        let parsed = parse_unit("var c = [for (var i in [1]) i];\n", Features::default());
+        let ast = &parsed.ast;
+        let mut top_level_decls = Vec::new();
+        let mut loop_var_parent = None;
+        for row in 0..ast.len() as u32 {
+            if ast.kind(row) != NodeKind::VariablesDeclaration {
+                continue;
+            }
+            match ast.parent(row).map(|p| (p, ast.kind(p))) {
+                Some((_, NodeKind::TopLevelFields)) => top_level_decls.push(row),
+                Some((p, NodeKind::ForControlFlow)) => loop_var_parent = Some(p),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            top_level_decls.len(),
+            1,
+            "exactly the `c` row under TopLevelFields"
+        );
+        assert!(
+            loop_var_parent.is_some(),
+            "loop variable nests in ForControlFlow"
+        );
+    }
+
+    #[test]
+    fn for_in_bare_identifier_body_keeps_one_declaration_row() {
+        // The statement face with a bare-identifier body statement: exactly
+        // one `VariablesDeclaration` row (the loop variable), nested in the
+        // for container — no recovery artifact under the enclosing block.
+        let parsed = parse_unit(
+            "void f(List<int> l) {\n  for (final s in l) {\n    s;\n  }\n}\n",
+            Features::default(),
+        );
+        let ast = &parsed.ast;
+        let decls: Vec<u32> = (0..ast.len() as u32)
+            .filter(|&row| ast.kind(row) == NodeKind::VariablesDeclaration)
+            .collect();
+        assert_eq!(decls.len(), 1, "exactly the loop variable: {decls:?}");
+        let parent_kind = decls
+            .first()
+            .copied()
+            .and_then(|row| ast.parent(row))
+            .map(|p| ast.kind(p));
+        assert!(
+            matches!(
+                parent_kind,
+                Some(NodeKind::ForIn) | Some(NodeKind::ForControlFlow)
+            ),
+            "loop variable nests in the for container: {parent_kind:?}"
+        );
+    }
+
+    #[test]
     fn nested_try_in_catch_seals_both_catch_clauses() {
         // Regression (#991): the deferred `CatchClause` seal used a single
         // non-reentrant flag — an inner try-in-catch cleared it, the outer
@@ -3117,8 +3450,12 @@ mod tests {
         // through the appended table are the sequencing contract.
         let source = "void f() {\n  List<List<int>> x = const [];\n}\n";
         let parsed = parse_unit(source, Features::default());
+        let mut seen = rustc_hash::FxHashSet::default();
         let mut stack = vec![parsed.ast.root().expect("root")];
         while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
             let _ = dartq_ast::byte_span(&parsed.tokens, &parsed.ast, id);
             let _ = utf16_span(&parsed.source, &parsed.tokens, &parsed.ast, id);
             stack.extend(parsed.ast.children(id).rev());
@@ -3170,5 +3507,431 @@ mod tests {
         let id = rule_by_name("avoid_empty_else").expect("wired");
         let hits = hits("void f() {\n  if (b) ; else ;\n}\n", "avoid_empty_else");
         assert_eq!(hits[0].rule, id);
+    }
+
+    // —— metadata-star / async-marker nesting pins ———————————————————————
+    // The star pair and the async-modifier pair fire NESTED on legal Dart
+    // (annotation arguments re-enter the star grammar; nested arrow bodies
+    // re-enter the modifier pair), so both frames live on stacks. Running a
+    // shape through the bridge exercises the pop-side `expect`s — an
+    // unbalanced pair panics the parse — and each test pins the OUTER seal:
+    // the nested completion must not shrink or move it.
+
+    /// Every `MetadataStar` extent (UTF-16). The star grammar re-enters
+    /// through annotation arguments (type variables, annotated formals,
+    /// record-type fields, annotation type arguments), so one unit carries
+    /// nested pairs: the outermost spans the annotation union, count-0
+    /// nested pairs seal zero-width at their anchor.
+    fn metadata_star_spans(source: &str) -> Vec<core::ops::Range<u32>> {
+        let parsed = parse_unit(source, Features::default());
+        let mut out = Vec::new();
+        // `children` spans whole subtrees; dedupe by node id so each star is
+        // counted exactly once.
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut stack = vec![parsed.ast.root().expect("root")];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if parsed.ast.kind(id) == NodeKind::MetadataStar {
+                out.push(utf16_span(&parsed.source, &parsed.tokens, &parsed.ast, id));
+            }
+            stack.extend(parsed.ast.children(id).rev());
+        }
+        out
+    }
+
+    #[test]
+    fn metadata_star_nested_gft_type_vars_keeps_outer_end() {
+        // `@A(<T>() => 0)`: the literal's `<T>` takes the simple
+        // type-variables path, which fires a count-0 star pair inside the
+        // annotation's argument window. With the pre-#1283 single slot the
+        // inner completion clobbered the outer frame and the outer seal
+        // snapped to the inner pair's end.
+        let source = "@A(<T>() => 0)\nvar x = 1;\n";
+        let spans = metadata_star_spans(source);
+        assert!(
+            spans.contains(&(0..14)),
+            "outer star spans `@A(<T>() => 0)`, got {spans:?}"
+        );
+        assert!(
+            spans.contains(&(4..4)),
+            "count-0 pair fired inside `<T>`, got {spans:?}"
+        );
+    }
+
+    #[test]
+    fn metadata_star_nested_annotated_parameter_keeps_outer_end() {
+        // `@A((@meta int x) => x)`: every formal opens with the star grammar
+        // (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/parser/
+        // parser_impl.dart `parseFormalParameter`), so the literal's
+        // annotated parameter fires a NON-empty nested pair (`@meta`).
+        let source = "@A((@meta int x) => x)\nvar x = 1;\n";
+        let spans = metadata_star_spans(source);
+        assert!(
+            spans.contains(&(0..22)),
+            "outer star spans the whole annotation, got {spans:?}"
+        );
+        assert!(
+            spans.contains(&(4..9)),
+            "nested star spans the formal's `@meta`, got {spans:?}"
+        );
+    }
+
+    #[test]
+    fn metadata_star_nested_record_type_cast_keeps_outer_end() {
+        // `@A(x as (int, String))`: every record-type field opens its own
+        // star pair (`recordTypeField ::= metadata type identifier?`), two
+        // count-0 pairs inside the cast type, inside the argument window.
+        let source = "@A(x as (int, String))\nvar x = 1;\n";
+        let spans = metadata_star_spans(source);
+        assert!(
+            spans.contains(&(0..22)),
+            "outer star spans the whole annotation, got {spans:?}"
+        );
+        assert!(
+            spans.contains(&(9..9)) && spans.contains(&(14..14)),
+            "a count-0 pair per record field, got {spans:?}"
+        );
+    }
+
+    #[test]
+    fn metadata_star_nested_annotation_type_args_keeps_outer_end() {
+        // `@A<void Function<T>()>()`: the annotation's own type-argument
+        // parse carries the GFT's `<T>` pair entirely between the outer
+        // star's begin and end events — the seal must still cover name +
+        // type args + arguments.
+        let source = "@A<void Function<T>()>()\nvar x = 1;\n";
+        let spans = metadata_star_spans(source);
+        assert!(
+            spans.contains(&(0..24)),
+            "outer star spans name + type args + args, got {spans:?}"
+        );
+        assert!(
+            spans.contains(&(17..17)),
+            "count-0 pair fired inside `<T>`, got {spans:?}"
+        );
+    }
+
+    #[test]
+    fn async_arrow_nested_async_arrow_keeps_outer_marker() {
+        // `void f() async => g(() async => 1);`: the outer arrow body's
+        // window spans the whole argument expression, so the inner literal's
+        // modifier/body events nest inside it — with the pre-#1283 single
+        // pending slot the outer `async` was lost to the inner body.
+        // Async-ness rides the ExpressionBody payload (word 2 = `async`
+        // keyword, word 3 = `*`, TOKEN_NONE sentinel): every body must carry
+        // its OWN keyword.
+        let source = "void f() async => g(() async => 1);\n";
+        let parsed = parse_unit(source, Features::default());
+        // `children` spans whole subtrees; dedupe by node id so each body is
+        // counted exactly once.
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut stack = vec![parsed.ast.root().expect("root")];
+        // (body span start, `async` keyword offset; u32::MAX = lost marker)
+        let mut bodies: Vec<(u32, u32)> = Vec::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if parsed.ast.kind(id) == NodeKind::ExpressionBody {
+                let async_word = parsed.ast.payload(id)[2];
+                let offset = if async_word == TOKEN_NONE {
+                    u32::MAX
+                } else {
+                    parsed
+                        .tokens
+                        .get(async_word as usize)
+                        .expect("async word token")
+                        .utf16_offset
+                };
+                let span = utf16_span(&parsed.source, &parsed.tokens, &parsed.ast, id);
+                bodies.push((span.start, offset));
+            }
+            stack.extend(parsed.ast.children(id).rev());
+        }
+        bodies.sort_unstable();
+        assert_eq!(
+            bodies,
+            [(15, 9), (29, 23)],
+            "outer (arrow at 15) and inner (arrow at 29) bodies each keep their own `async`"
+        );
+    }
+
+    // —— parser↔bridge pairing-miss pins —————————————————————————————————————
+    // The audited pairing `expect`s degrade through `expect_paired` instead
+    // of panicking the lint pass. These pins drive `AstListener` directly
+    // with deliberately mismatched event streams (the production parser
+    // cannot emit them — that is the invariant) and assert the degrade
+    // shape: no panic, the affected emission skipped or re-anchored, and
+    // bounded bookkeeping. A base above every synthetic token id makes
+    // `t()` the identity.
+
+    fn listener() -> AstListener {
+        AstListener::new(u32::MAX)
+    }
+
+    fn span(id: u32) -> TokenSpan {
+        TokenSpan {
+            id,
+            range: dartq_source::SourceRange {
+                offset: id * 2,
+                length: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn unpaired_metadata_star_end_skips_and_records() {
+        // bridge.rs `end_metadata_star`: an end without a begin must not
+        // seal (it would pop an unrelated open node) — it records the miss
+        // and skips, leaving the builder untouched.
+        let mut l = listener();
+        l.end_metadata_star(0);
+        assert_eq!(l.pairing_miss, Some("metadata star pair"));
+        assert_eq!(l.pairing_miss_count, 1);
+        assert!(l.b.is_empty(), "no node was fabricated");
+        // Repeated mismatches only bump the saturating count; the first
+        // invariant text is retained (bounded bookkeeping, never a Vec).
+        for _ in 0..1000 {
+            l.end_metadata_star(0);
+        }
+        assert_eq!(l.pairing_miss, Some("metadata star pair"));
+        assert_eq!(l.pairing_miss_count, 1001);
+    }
+
+    #[test]
+    fn unpaired_async_modifier_defaults_to_absent_sentinels() {
+        // `begin_block_function_body`: the unpaired face (no modifier event
+        // fired) patches the same TOKEN_NONE sentinels a sync body's
+        // sentinel frame writes, and the body node still begins/seals (the
+        // later end event stays paired).
+        let mut l = listener();
+        l.begin_block_function_body(span(1));
+        assert_eq!(l.pairing_miss, Some("async modifier pair"));
+        l.end_block_function_body(0, span(1), span(2));
+        assert_eq!(l.b.len(), 1, "the body node sealed balanced");
+    }
+
+    #[test]
+    fn anchor_miss_skips_the_no_arguments_sentinel() {
+        // `handle_no_arguments`: without a completed anchor node the
+        // zero-width sentinel is skipped, never fabricated at token 0.
+        let mut l = listener();
+        l.handle_no_arguments(span(3));
+        assert_eq!(
+            l.pairing_miss,
+            Some("NoArguments without a completed anchor node")
+        );
+        assert!(l.b.is_empty(), "the sentinel leaf was skipped");
+    }
+
+    #[test]
+    fn object_pattern_without_fields_event_skips_the_node() {
+        // `handle_object_pattern`: the pending fields window is exactly
+        // what the reassembly needs; without it the emission is skipped
+        // and nothing is left open.
+        let mut l = listener();
+        l.handle_object_pattern(span(1), None, None);
+        assert_eq!(
+            l.pairing_miss,
+            Some("handle_object_pattern without a preceding fields event")
+        );
+        assert!(l.b.is_empty(), "the node emission was skipped");
+    }
+
+    #[test]
+    fn end_last_without_a_child_seals_zero_width_at_the_head() {
+        // `end_last` (the `end_show` route): the node is already open, so
+        // the seal must still happen — it degrades to a zero-width seal at
+        // the stream head instead of panicking.
+        let mut l = listener();
+        l.begin_show(span(0));
+        l.end_show(span(0));
+        assert_eq!(l.pairing_miss, Some("end_last before any node"));
+        assert_eq!(l.b.len(), 1, "the opened node was sealed, not dropped");
+    }
+
+    #[test]
+    fn binary_begin_without_lhs_reanchors_at_the_operator() {
+        // `begin_binary_expression`: the later end event must find its
+        // open node, so the miss face opens at the operator with no
+        // adopted child instead of skipping the begin.
+        let mut l = listener();
+        l.begin_binary_expression(span(1));
+        assert_eq!(l.pairing_miss, Some("binary left operand"));
+        assert_eq!(l.pairing_miss_count, 2, "first-token and subtree reads");
+        l.end_binary_expression(span(1), span(2));
+        assert_eq!(l.b.len(), 1, "the node sealed balanced");
+    }
+
+    #[test]
+    fn healthy_stream_records_zero_pairing_misses() {
+        // The fallback is observably unreachable on well-formed event
+        // streams: full production parses over the constructs each audited
+        // site serves must record no miss at all (and the existing
+        // healthy-input pin tests above pin the unchanged rows).
+        for source in [
+            "void f() {\n  if (b) ; else ;\n}\n",
+            "@A(<T>() => 0)\nvar x = 1;\n",
+            "void f(Object o) {\n  if (o case Rect(w: var v)) print(1);\n}\n",
+            "void f() async => g(() async => 1);\n",
+            "void f() { a * b + c; }\n",
+            "import 'a.dart' deferred as a;\nvar m = {1: 2, 3: 4};\nvar r = (x: 1, 2);\nvar s = switch (r) { (x: 1, _) => 0, _ => 1 };\nclass C extends B implements I {\n  int x = 1, y = 2;\n}\n",
+        ] {
+            let mut files = dartq_source::FileTable::default();
+            let file = files.intern(Path::new("unit.dart"));
+            let scanned = scan(source, SCAN_CONFIG, file);
+            let mut tokens = scanned.tokens;
+            let base = tokens.len() as u32;
+            let mut listener = AstListener::new(base);
+            let inserted =
+                dartq_parser::parse_unit_with(source, &tokens, PARSE_FEATURES, &mut listener);
+            tokens.append_inserted(inserted);
+            assert!(
+                listener.pairing_miss.is_none(),
+                "healthy parse of {source:?} recorded {:?}",
+                listener.pairing_miss
+            );
+            assert_eq!(listener.pairing_miss_count, 0);
+            let _ = listener.finish();
+        }
+    }
+
+    #[test]
+    fn plugin_parity_corpus_records_zero_pairing_misses() {
+        // The plugin-parity corpus (tests/plugin-validation/parity/**/lib)
+        // is the input set the daemon arm was walking when the pre-#1786
+        // `metadata star pair` `expect` panicked the parse. These pins parse
+        // every corpus trigger file through the real scanner/parser/listener
+        // stack and assert the audited pairing contract holds — the corpus
+        // is the production boundary, so it must record no miss.
+        let parity =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/plugin-validation/parity");
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut dirs = vec![parity];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("corpus dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "dart") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        assert!(
+            files.len() >= 16,
+            "the parity corpus ships >= 16 triggers, found {}",
+            files.len()
+        );
+        for path in files {
+            let source = std::fs::read_to_string(&path).expect("corpus file");
+            let mut files = dartq_source::FileTable::default();
+            let file = files.intern(Path::new("unit.dart"));
+            let scanned = scan(&source, SCAN_CONFIG, file);
+            let mut tokens = scanned.tokens;
+            let base = tokens.len() as u32;
+            let mut listener = AstListener::new(base);
+            let inserted =
+                dartq_parser::parse_unit_with(&source, &tokens, PARSE_FEATURES, &mut listener);
+            tokens.append_inserted(inserted);
+            assert!(
+                listener.pairing_miss.is_none(),
+                "corpus file {} recorded {:?}",
+                path.display(),
+                listener.pairing_miss
+            );
+            assert_eq!(listener.pairing_miss_count, 0);
+            let _ = listener.finish();
+        }
+    }
+
+    #[test]
+    fn named_record_field_anchors_at_the_value_head() {
+        // Regression: `handle_named_record_field` fired AFTER the value
+        // parse, so anchoring at `last_first_token` landed inside the value
+        // — `a.b` seals `DotAccess` at the selector `b`, `a..b` opens
+        // `Cascade` at `..`, both past the colon — and the seal's
+        // `end < first` tripped the pairing assertion. The marker contract
+        // is zero-width at the value head (the token right after the
+        // colon), with the colon payload and the name token at colon-1.
+        let source = "var r = (x: a.b, y: a..add(1), z: double.infinity, w: 1);\n";
+        let parsed = parse_unit(source, Features::default());
+        // `children` spans whole subtrees; dedupe by node id so each node
+        // is counted exactly once.
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut fields: Vec<(u32, core::ops::Range<u32>)> = Vec::new();
+        let mut stack = vec![parsed.ast.root().expect("root")];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if parsed.ast.kind(id) == NodeKind::NamedRecordField {
+                let range = parsed.ast.token_range(id);
+                fields.push((id, range));
+            }
+            stack.extend(parsed.ast.children(id).rev());
+        }
+        assert_eq!(fields.len(), 4, "one marker per named field");
+        // Value-head utf16 offsets: `a` of `a.b` at 12, `a` of `a..add(1)`
+        // at 20, `double` at 34, `1` at 54.
+        let mut spans: Vec<u32> = fields
+            .iter()
+            .map(|&(_, ref range)| {
+                assert_eq!(range.start, range.end, "zero-width marker");
+                parsed
+                    .tokens
+                    .get(range.start as usize)
+                    .expect("anchor token")
+                    .utf16_offset
+            })
+            .collect();
+        spans.sort_unstable();
+        assert_eq!(spans, [12, 20, 34, 54]);
+        for (id, range) in fields {
+            let colon = parsed.ast.payload(id)[0] as usize;
+            assert_eq!(
+                parsed.tokens.get(colon).map(|t| t.kind),
+                Some(dartq_scanner::TokenKind::Colon),
+                "payload word 0 is the colon"
+            );
+            assert_eq!(
+                parsed.tokens.get(colon - 1).map(|t| t.kind),
+                Some(dartq_scanner::TokenKind::Identifier),
+                "the name token sits right before the colon"
+            );
+            assert_eq!(
+                range.start as usize,
+                colon + 1,
+                "the marker anchors at the token right after the colon"
+            );
+        }
+        assert!(parsed.ast.root().is_some());
+    }
+
+    #[test]
+    fn named_record_field_cascade_value_seals_past_the_colon() {
+        // The cascade value `a..b` opens `Cascade` at `..` (bridge
+        // `begin_cascade`), strictly after the colon — the pre-fix anchor
+        // sealed `end < first` here. A real-parse pin: the parse completing
+        // at all is the assertion in debug builds.
+        let parsed = parse_unit("var r = (x: a..b);\n", Features::default());
+        let mut found = false;
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut stack = vec![parsed.ast.root().expect("root")];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if parsed.ast.kind(id) == NodeKind::NamedRecordField {
+                found = true;
+                let range = parsed.ast.token_range(id);
+                assert_eq!(range.start, range.end, "zero-width at the value head");
+            }
+            stack.extend(parsed.ast.children(id).rev());
+        }
+        assert!(found, "the field marker emitted");
     }
 }

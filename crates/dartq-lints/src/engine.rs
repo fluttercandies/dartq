@@ -12,14 +12,29 @@ use std::sync::LazyLock;
 
 use dartq_ast::{NodeKind, SyntaxTable, byte_span, utf16_span};
 use dartq_scanner::TokenTable;
+use dartq_semantic::Analysis;
 use dartq_source::LineIndex;
 use rustc_hash::FxHashMap;
 
 use crate::comments::Comments;
 use crate::ignore::IgnoreInfo;
-use crate::registry::{EnableSet, RuleId, rule_by_name, rules};
+use crate::registry::{EnableSet, Group, LATE_JOIN_RULES, RuleId, rule_by_name, rules};
 use crate::rules::SupertypeClause;
+use crate::rules::declarations::remove_deprecations_in_breaking_versions::check_annotation;
 use crate::rules::expressions::same_file::Decls;
+
+/// Narrows a source- or arena-derived count/offset to the crate's `u32`
+/// span width. The parser's id/offset layout is `u32` by design and every
+/// real input stays far below `u32::MAX`, so the narrowing never wraps.
+#[inline]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "source/arena quantities are u32 by design (the parser's \
+              id/offset layout); inputs are far below u32::MAX"
+)]
+pub(crate) fn narrow_u32(value: usize) -> u32 {
+    value as u32
+}
 
 /// The language-feature bits a rule may query. Features the caller does not
 /// know are treated per their shipped defaults; the caller pins the bits it
@@ -54,6 +69,24 @@ pub struct Features {
     /// `no_duplicate_case_values` (whose visitor processes only legacy
     /// `SwitchCase` members, `no_duplicate_case_values.dart:41`) is silent.
     pub patterns: bool,
+    /// `primary_constructors` (shipped in 3.13, `experimental_features.yaml`
+    /// `enabledIn: 3.13.0`): the registration face of the declaration-domain
+    /// family — `empty_container_bodies`,
+    /// `unnecessary_const_in_enum_constructor`,
+    /// `unnecessary_type_name_in_constructor`, and `use_primary_constructors`
+    /// register only with it, `var_with_no_type_annotation` only without it
+    /// (each rule's upstream `isFeatureEnabled` registration bail). The
+    /// grammar posture is independent: the parser's fixed 3.15 surface
+    /// always accepts the syntax.
+    pub primary_constructors: bool,
+    /// `null_aware_elements` (shipped in 3.8, `experimental_features.yaml`
+    /// `enabledIn: 3.8.0`): `use_null_aware_elements` registers only with
+    /// it (`use_null_aware_elements.dart:35`).
+    pub null_aware_elements: bool,
+    /// `super_parameters` (shipped in 2.17, `experimental_features.yaml`
+    /// `enabledIn: 2.17.0`): `use_super_parameters` registers only with it
+    /// (`use_super_parameters.dart:43`).
+    pub super_parameters: bool,
 }
 
 impl Default for Features {
@@ -63,6 +96,9 @@ impl Default for Features {
             enhanced_parts: false,
             unnamed_libraries: true,
             patterns: true,
+            primary_constructors: true,
+            null_aware_elements: true,
+            super_parameters: true,
         }
     }
 }
@@ -82,12 +118,38 @@ pub struct Unit<'a> {
     /// path-dependent rules, mirroring the official `element != null` guard.
     pub path: Option<&'a Path>,
     pub features: Features,
+    /// The library's settled language version (`major.minor`): the owning
+    /// package's version with the `// @dart` override folded in — the same
+    /// settled face [`Features`] derives from, mounted by assignment at the
+    /// caller's hand-off (`unit.version = …`, the [`Unit::workspace`]
+    /// shape). The version-gated registrations
+    /// (`crate::registry::VERSION_GATES`) consult it once per run. `None`
+    /// — a caller without a settled face (bare test fixtures) — applies no
+    /// gate: the official posture for a library with no version info is the
+    /// latest default, which admits every current gate.
+    pub version: Option<dartq_language::LanguageVersion>,
     /// The containing-package facts the pub-aware rules read
     /// ([`WorkspaceFacts`]). `None` — outside any known package, or where
     /// the containing pubspec is unparseable — is the official no-pubspec
     /// posture (`package is! PubPackage` / `pubspec == null`,
     /// depend_on_referenced_packages.dart:33-40): those rules stay silent.
     pub workspace: Option<&'a WorkspaceFacts>,
+    /// The mounted reachability face ([`ReachabilityFace`], #1199) — the
+    /// `unreachable_from_main` consumption seam. `None` — a run without the
+    /// engine face — keeps the rule silent, the same posture as the
+    /// semantic rules' unmounted [`Check::semantics`].
+    pub reachability: Option<ReachabilityFace<'a>>,
+    /// The mounted async-gap rows ([`AsyncContextUse`], #1198) — the
+    /// `use_build_context_synchronously` consumption seam. `None` keeps the
+    /// rule silent (the same unmounted-face posture).
+    pub async_context_uses: Option<&'a [AsyncContextUse]>,
+    /// The mounted library type-use counts (#1640) — the
+    /// `avoid_private_typedef_functions` consumption seam: one name-lexeme →
+    /// named-type-row count per owning library, folded across the
+    /// registration-order units ([`crate::engine::type_use_counts`]). `None` — a run
+    /// without the engine face — keeps the rule silent, the same
+    /// unmounted-face posture; no same-file fallback count is fabricated.
+    pub library_type_uses: Option<&'a rustc_hash::FxHashMap<&'a str, u32>>,
 }
 
 /// The pubspec-derived facts of the analyzed file's containing package,
@@ -112,6 +174,98 @@ pub struct WorkspaceFacts {
     /// `implementation_imports`' registration gate
     /// (implementation_imports.dart:30-33).
     pub lib_dir: PathBuf,
+}
+
+/// One `BuildContext` usage verdict of the async-gap face (#1198): the
+/// `use_build_context_synchronously` consumption seam, mounted as
+/// [`Unit::async_context_uses`]. The face owns use identification
+/// (BuildContext-typed values, the `State.context` getter shape, nullable
+/// exemption), await-gap segmentation, and mounted-guard recognition; a row
+/// is one judged use, emitted only when it is reportable or
+/// wrong-guarded.
+pub struct AsyncContextUse {
+    /// UTF-16 half-open span of the use — the report anchor.
+    pub range: core::ops::Range<u32>,
+    /// A valid `mounted` check guards the use on this path: never reported.
+    pub guarded: bool,
+    /// A `mounted` check stood in guard position but resolved to the wrong
+    /// association (`State.mounted` over a plain `BuildContext` use, or the
+    /// reverse): the report upgrades to the `wrong_mounted` message
+    /// variant.
+    pub unrelated_mounted: bool,
+}
+
+/// The mounted reachability face of one unit (#1199 engine pass): the
+/// `unreachable_from_main` consumption seam, mounted as
+/// [`Unit::reachability`]. The face owns entry detection (`main`,
+/// `@pragma('vm:entry-point')`, `@Preview`) and the reference propagation
+/// over the library's captures; the shell reads verdicts and applies its
+/// own reporting face (public, not `@visibleForTesting`, unreachable).
+///
+/// The engine side answers through `Reachability::is_reachable(file, row)`
+/// keyed by capture rows; the adapter that fills this seam (the mounting
+/// lane) joins those bits with the capture rows' name-token offsets and
+/// derives `has_entry` by scanning the library's capture rows for the
+/// entry kinds — the substrate deliberately exposes no separate entry API.
+#[derive(Clone, Copy)]
+pub struct ReachabilityFace<'a> {
+    /// Whether the library (parts included) declares any entry point.
+    /// `false` reports nothing at all — the official empty-entry-points
+    /// bail (`unreachable_from_main.dart`: `if (entryPoints.isEmpty)
+    /// return`).
+    pub has_entry: bool,
+    /// `(name-token UTF-16 offset, reachable)` pairs, ascending — one per
+    /// capture declaration row of this unit. A name offset absent from the
+    /// table is outside the face's universe: the conservative answer is no
+    /// report (the official posture for a declaration the gatherer never
+    /// sees).
+    pub flags: &'a [(u32, bool)],
+}
+
+impl ReachabilityFace<'_> {
+    /// The entry-reachability of the declaration whose name token starts at
+    /// `name_offset`; `None` outside the face's universe.
+    #[must_use]
+    pub fn is_reachable(&self, name_offset: u32) -> Option<bool> {
+        let index = self
+            .flags
+            .partition_point(|&(offset, _)| offset < name_offset);
+        match self.flags.get(index) {
+            Some(&(offset, reachable)) if offset == name_offset => Some(reachable),
+            _ => None,
+        }
+    }
+}
+
+/// Reduces one parsed unit's named-type rows to a name-lexeme → count map —
+/// the per-unit half of the [`Unit::library_type_uses`] face (#1640). The
+/// row face is exactly the one the `avoid_private_typedef_functions` check
+/// reads (upstream `_CountVisitor.visitNamedType` counting `NamedType` rows
+/// by `node.name.lexeme`, upstream Dart SDK source,
+/// pkg/linter/lib/src/rules/avoid_private_typedef_functions.dart:40-50):
+/// every `Type` row contributes its head token's lexeme. The mounting
+/// driver folds this over the owning library's registration-order units —
+/// the defining unit first, then each part in part-directive order, the set
+/// [`dartq_semantic::Analysis::library_units`] publishes — and mounts the
+/// merged map. Keys borrow the unit's own source text, so a caller folding
+/// several units keeps the map's keys anchored to texts that outlive it.
+#[must_use]
+pub fn type_use_counts<'a>(
+    source: &'a str,
+    ast: &SyntaxTable,
+    tokens: &TokenTable,
+) -> FxHashMap<&'a str, u32> {
+    let mut uses: FxHashMap<&'a str, u32> = FxHashMap::default();
+    for row in 0..narrow_u32(ast.len()) {
+        if ast.kind(row) != NodeKind::Type {
+            continue;
+        }
+        let head = ast.token_range(row).start;
+        *uses
+            .entry(tokens.lexeme(source, head as usize))
+            .or_insert(0) += 1;
+    }
+    uses
 }
 
 /// One reported lint.
@@ -208,36 +362,187 @@ pub(crate) struct RunCaches {
     /// per member (#758: each derivation filtered the whole arena by
     /// `parent`).
     pub(crate) body_member_rows: core::cell::RefCell<FxHashMap<u32, Vec<u32>>>,
+    /// The same-file class-hierarchy face of `implicit_reopen` — built once
+    /// per run on first query (`None`-guarded like [`Self::decls`]): the
+    /// extends-able class rows by name plus each row's effective
+    /// class-family flags (written + the sealed induction,
+    /// `instance_member_inferrer.dart` `_setInducedModifier`).
+    pub(crate) class_hierarchy:
+        core::cell::RefCell<Option<crate::rules::declarations::ClassHierarchy>>,
+    /// Typedef row -> its computed per-parameter variances
+    /// (`variance_builder.dart`), computed on demand with the
+    /// provisional-insert cycle guard. Read by the `unsafe_variance`
+    /// argument mapping.
+    pub(crate) alias_variances: core::cell::RefCell<crate::rules::types::AliasVariances>,
 }
 
 /// Runs the enabled rules over one unit. Output is in traversal order:
 /// pre-order (a node before its children), registry order within a node —
-/// the official visitor dispatch order.
+/// the official visitor dispatch order. The AST-only posture: the semantic
+/// query face is unmounted, so semantic rules (their `c.semantics()?`
+/// guard) stay silent — mount one through [`Unit::run_with_semantics`].
 ///
 /// Traversal visits every node exactly once. The arena's `children` range is
 /// a completion window (descendants complete inside it, before their
 /// ancestor), so the walk extracts *direct* children with the subtree-tiling
-/// scan in [`push_direct`]: a child's whole subtree occupies
+/// scan in `push_direct`: a child's whole subtree occupies
 /// `[children(child).start, child]`, contiguous, ending at the child
 /// itself — the next direct sibling starts right after. The one production
 /// exception is the switch-member window (the bridge snapshots the segment
 /// start before the previous member seals, so each member's window starts AT
-/// that member's arena row); [`tile_direct`] canonicalizes it: the block
+/// that member's arena row); `tile_direct` canonicalizes it: the block
 /// level pushes the jump-landed member and skips its subtree, the borrowing
 /// member skips the snapped row, and every row still dispatches exactly
 /// once.
 #[must_use]
+#[expect(
+    clippy::implicit_hasher,
+    reason = "FxHashSet is the workspace-mandated concrete hasher               (deterministic iteration, hot-path cost)"
+)]
 pub fn run(
     unit: &Unit<'_>,
     enabled: &EnableSet,
     unignorable: &rustc_hash::FxHashSet<String>,
 ) -> Vec<Lint> {
+    run_semantics(unit, enabled, unignorable, None)
+}
+
+impl Unit<'_> {
+    /// Runs the enabled rules with the unit's semantic query face mounted
+    /// (the g1031 C.3 run-parameter mount, the sibling of the plain
+    /// [`run`]): `semantics` is one unit's immutable fold projection
+    /// ([`Analysis`], built by the driver per file) and travels to the rules
+    /// through [`Check::semantics`]. `None` — the [`run`] posture — keeps
+    /// every semantic rule silent; a semantic rule that is enabled while the
+    /// face is absent is a driver-configuration error surfaced there, never
+    /// inside a rule body.
+    ///
+    /// The face is the method's own borrow: it needs to outlive exactly this
+    /// call, which is why it rides the call instead of the [`Unit`] (the
+    /// bridge's transient substrate carries no context tables, and the
+    /// AST-only constructors across the crate's test fixtures stay
+    /// field-complete).
+    #[must_use]
+    pub fn run_with_semantics(
+        &self,
+        enabled: &EnableSet,
+        unignorable: &rustc_hash::FxHashSet<String>,
+        semantics: Option<&Analysis<'_>>,
+    ) -> Vec<Lint> {
+        run_semantics(self, enabled, unignorable, semantics)
+    }
+}
+
+/// The breaking-release annotation face (`remove_deprecations_in_breaking_
+/// versions`, the #1156 mount): the official rule registers its annotation
+/// visitor only when the containing package's pubspec `version:` parses to
+/// a breaking release (`remove_deprecations_in_breaking_version.dart
+/// :36-48` — a missing or unparseable value never registers), so the spec
+/// stays `kinds: &[]` — no node dispatch — and the mounting layer joins the
+/// enable set with the pubspec fact, then runs this walk. Every `Metadata`
+/// row goes through [`check_annotation`] (which re-checks the version gate
+/// per row) and a hit reports through the standard emit path, so the
+/// ignore suppression and `cannot-ignore` override ride along. An absent
+/// fact (`""`) is the registration bail.
+///
+/// Returns the walk's rows and its suppression record — the `(line, name)`
+/// pairs its ignore gate dropped. That record is the late-join tail's
+/// facts (#1904): the run's own `unnecessary_ignore` epilogue can never
+/// see these drops (the walk joins after the run returns), so the shell
+/// feeds it to [`unnecessary_ignore_late_rows`], whose join half answers
+/// the late-join citations exactly.
+#[must_use]
+#[expect(
+    clippy::implicit_hasher,
+    reason = "FxHashSet is the workspace-mandated concrete hasher               (deterministic iteration, hot-path cost)"
+)]
+pub fn run_breaking_version_annotations(
+    unit: &Unit<'_>,
+    enabled: &EnableSet,
+    unignorable: &rustc_hash::FxHashSet<String>,
+    pubspec_version: &str,
+) -> (Vec<Lint>, Vec<(u32, &'static str)>) {
+    crate::rules::flutter::reset_refutation_memo();
+    let Some(rule) = rule_by_name("remove_deprecations_in_breaking_versions") else {
+        return (Vec::new(), Vec::new());
+    };
+    if !enabled.is_enabled(rule) {
+        return (Vec::new(), Vec::new());
+    }
+    let Some(root) = unit.ast.root() else {
+        return (Vec::new(), Vec::new());
+    };
+    let comments = Comments::extract(unit.source, unit.tokens);
+    let ignore = IgnoreInfo::parse(unit.source, &comments);
+    let suppressed = core::cell::RefCell::new(Vec::new());
+    let caches = RunCaches {
+        decls: core::cell::RefCell::new(None),
+        field_types: core::cell::RefCell::new(FxHashMap::default()),
+        supertype_lists: core::cell::RefCell::new(FxHashMap::default()),
+        class_rows: core::cell::RefCell::new(None),
+        ancestor_chains: core::cell::RefCell::new(FxHashMap::default()),
+        body_member_rows: core::cell::RefCell::new(FxHashMap::default()),
+        class_hierarchy: core::cell::RefCell::new(None),
+        alias_variances: core::cell::RefCell::new(crate::rules::types::AliasVariances::default()),
+    };
+    let direct = core::cell::RefCell::new(Vec::new());
+    let path = [root];
+    let mut out = Vec::new();
+    // One linear arena pass (the `rows_with_parent` idiom): a `Metadata`
+    // row is one annotation; the scan allocates nothing beyond the hits.
+    for meta in 0..narrow_u32(unit.ast.len()) {
+        if out.len() >= MAX_LINTS_PER_FILE {
+            break;
+        }
+        if unit.ast.kind(meta) != NodeKind::Metadata {
+            continue;
+        }
+        let mut check = Check {
+            unit,
+            comments: &comments,
+            ignore: &ignore,
+            unignorable,
+            suppressed: &suppressed,
+            path: &path,
+            wildcards: &[],
+            rule,
+            direct: &direct,
+            caches: &caches,
+            semantics: None,
+            out: &mut out,
+        };
+        if let Some(range) = check_annotation(&check, pubspec_version, meta) {
+            check.report(range, &[]);
+        }
+    }
+    (out, suppressed.into_inner())
+}
+
+/// The shared walk behind [`run`] and [`Unit::run_with_semantics`].
+fn run_semantics(
+    unit: &Unit<'_>,
+    enabled: &EnableSet,
+    unignorable: &rustc_hash::FxHashSet<String>,
+    semantics: Option<&Analysis<'_>>,
+) -> Vec<Lint> {
+    // One run per memo: verdicts computed below answer for this walk only
+    // (the pin is defense-in-depth; see `spells_framework`).
+    crate::rules::flutter::reset_refutation_memo();
     let root = match unit.ast.root() {
         Some(root) if enabled != &EnableSet::none() => root,
         _ => return Vec::new(),
     };
+    // The registration version gate: the rules whose upstream registration
+    // consults the library's settled language version join the run only
+    // when the carried version admits them. One filtered copy per run —
+    // the per-node dispatch keeps testing bits.
+    let enabled = match unit.version {
+        Some(version) => crate::registry::version_gated(enabled, version),
+        None => *enabled,
+    };
     let comments = Comments::extract(unit.source, unit.tokens);
     let ignore = IgnoreInfo::parse(unit.source, &comments);
+    let suppressed = core::cell::RefCell::new(Vec::new());
     // The wildcard table is collected inside the same DFS (one `Identifier`
     // kind test per node) and only when the one rule that reads it runs —
     // the rule registers only with the wildcard feature OFF
@@ -264,17 +569,21 @@ pub fn run(
         class_rows: core::cell::RefCell::new(None),
         ancestor_chains: core::cell::RefCell::new(FxHashMap::default()),
         body_member_rows: core::cell::RefCell::new(FxHashMap::default()),
+        class_hierarchy: core::cell::RefCell::new(None),
+        alias_variances: core::cell::RefCell::new(crate::rules::types::AliasVariances::default()),
     };
     dispatch(
         unit,
         &comments,
         &ignore,
         unignorable,
+        &suppressed,
         &path,
-        enabled,
+        &enabled,
         &direct,
         &caches,
         &wildcards,
+        semantics,
         &mut out,
     );
     push_direct(unit.ast, root, &mut stack, &direct, path.len());
@@ -290,27 +599,251 @@ pub fn run(
             &comments,
             &ignore,
             unignorable,
+            &suppressed,
             &path,
-            enabled,
+            &enabled,
             &direct,
             &caches,
             &wildcards,
+            semantics,
             &mut out,
         );
         push_direct(unit.ast, node, &mut stack, &direct, path.len());
     }
 
+    // The `unnecessary_ignore` epilogue (the #1345 mount): the emitted set
+    // is complete and the run has not returned — the exact face the official
+    // validator occupies (`library_analyzer.dart`:331-341, the validator
+    // runs after all other diagnostics but before the list is filtered).
+    if rule_by_name("unnecessary_ignore").is_some_and(|id| enabled.is_enabled(id)) {
+        let suppressed = suppressed.into_inner();
+        // The run half (`late_only` = false): the late-join names belong to
+        // the shell's re-join (`unnecessary_ignore_late_rows`).
+        unnecessary_ignore_rows(unit, &ignore, unignorable, &suppressed, false, &mut out);
+    }
+
+    collapse_duplicate_rows(&mut out);
     out
 }
 
-/// Records one wildcard local/parameter declaration. Only the three element
-/// faces the official rule flags enter the table (`LocalVariableElement` /
-/// `FormalParameterElement` / catch parameter — the official test's
-/// `test_field`/`test_getter` faces stay out); the scope is the declaration's
-/// binding extent: the innermost enclosing block/for-in/catch clause for
-/// locals and catch parameters, the enclosing function for parameters.
+/// Collapses the rows the oracle collapses. The analyzer's diagnostic
+/// listener collects into a set whose equality is (code, offset, length,
+/// message) (upstream Dart SDK source, pkg/analyzer/lib/error/listener.dart
+/// with the `Diagnostic ==` in diagnostic.dart), so two rule shapes firing
+/// the same expression surface one row. Within one run the file and the
+/// lint severity are constant, so the per-row identity is
+/// (rule, span, message); `correction` stays outside the key, exactly as
+/// upstream equality ignores it. First emission wins and emission order is
+/// preserved (`retain` keeps kept rows in place), matching the
+/// insertion-ordered set the oracle serves rows from.
+///
+/// One pass over the emitted rows, gated at the duplicate floor; the set
+/// dies with the pass.
+fn collapse_duplicate_rows(out: &mut Vec<Lint>) {
+    if out.len() < 2 {
+        return;
+    }
+    // The key owns its message text: `retain` hands each row a fresh shared
+    // borrow that cannot escape into a set living across calls, so cloning
+    // is the exact, allocation-bounded shape (≤ the row count of short
+    // messages, dropped at return).
+    let mut seen: rustc_hash::FxHashSet<(RuleId, u32, u32, String)> =
+        rustc_hash::FxHashSet::default();
+    out.retain(|lint| {
+        seen.insert((
+            lint.rule,
+            lint.range.start,
+            lint.range.end,
+            lint.message.clone(),
+        ))
+    });
+}
+
+/// The `unnecessary_ignore` run epilogue (the #1345 mount): every ignore
+/// comment citation that dropped no diagnostic of this run reports at the
+/// cited name token — the [`crate::rules::docs::unnecessary_ignore`] spec's
+/// consumption seam, the dartq shape of the analyzer's `IgnoreValidator`
+/// (dart 3.15 main, `ignore_validator.dart:73-289`).
+///
+/// The join is the official walk's tail over this run's own facts. The
+/// citations arrive through [`IgnoreInfo::name_entries`] (the dedup'd walk —
+/// exact duplicates left it, as the official duplicate pass removes them).
+/// "Used" is the run's suppression record: a citation fired exactly when it
+/// dropped a hit — file-wide when the name dropped anywhere, line-scoped
+/// when the drop sat on the entry's line (the official match pass removes
+/// the name from the file list and the diagnostic's line list,
+/// :137-144). Three gates mirror the official unnecessary pass
+/// (:199-249): names in the `cannot-ignore` set never report (the official
+/// unignorable branch removes them from the lists first, :89/:113/:164-174);
+/// names outside the registry never report (the official plugin-code bail,
+/// :211-218 — analyzer error codes this run never produces are the same
+/// face); removed rules never report here (the official removed-state face
+/// reports `removed_lint_use` instead and continues, :219-235). Fourth,
+/// the late-join seam: the join runs in two halves (`late_only`) — the
+/// run's epilogue (`false`) owns the names whose rows this run produced;
+/// the [`LATE_JOIN_RULES`] names belong to the shell's re-join
+/// ([`unnecessary_ignore_late_rows`]), whose suppression record is the
+/// drops the shell's own breaking-version walk made. Each citation answers
+/// against the rows its producing walk carried; the union is the official
+/// single pass over the unfiltered final list (`library_analyzer.dart`
+/// :327-341). The rows then pass the same suppression gate every lint
+/// passes — the official validator's rows run before the pipeline's ignore
+/// filter (`library_analyzer.dart`:135) — so a `// ignore:
+/// unnecessary_ignore` still silences its own verdict.
+///
+/// Bounded: one pass over the citations plus one pass over the suppression
+/// record into two hash sets — linear in citations + suppressed hits.
+fn unnecessary_ignore_rows(
+    unit: &Unit<'_>,
+    ignore: &IgnoreInfo,
+    unignorable: &rustc_hash::FxHashSet<String>,
+    suppressed: &[(u32, &'static str)],
+    late_only: bool,
+    out: &mut Vec<Lint>,
+) {
+    let Some(rule) = rule_by_name("unnecessary_ignore") else {
+        return;
+    };
+    let entries = ignore.name_entries(unit.source);
+    if entries.is_empty() {
+        return;
+    }
+    let mut used_names: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+    let mut used_scopes: rustc_hash::FxHashSet<(u32, &str)> = rustc_hash::FxHashSet::default();
+    for &(line, name) in suppressed {
+        used_names.insert(name);
+        used_scopes.insert((line, name));
+    }
+    let spec = rules()[rule.0 as usize];
+    for entry in entries {
+        if out.len() >= MAX_LINTS_PER_FILE {
+            return;
+        }
+        if unignorable.contains(entry.name.as_str()) {
+            continue;
+        }
+        // A name outside the registry could be a plugin's or an
+        // analyzer-error code this lint-only run never produces — the
+        // official skip keeps both silent.
+        let Some(id) = rule_by_name(&entry.name) else {
+            continue;
+        };
+        if rules()[id.0 as usize].group == Group::Removed {
+            continue;
+        }
+        // The late-join seam (#1353, the #1904 ownership split): a name in
+        // [`LATE_JOIN_RULES`] has its rows joined by the mounting shell's
+        // walk after this run returns, so this run's suppression record can
+        // never hold its citation — yet the citation genuinely suppresses
+        // in the final list the official validator walks unfiltered
+        // (`library_analyzer.dart`:327-341). The run half skips those
+        // names; the shell's re-join (the `late_only` half) owns them,
+        // fed the drops the shell's walk itself recorded.
+        if LATE_JOIN_RULES.contains(&rules()[id.0 as usize].name) != late_only {
+            continue;
+        }
+        let used = match entry.scope {
+            None => used_names.contains(entry.name.as_str()),
+            Some(line) => used_scopes.contains(&(line, entry.name.as_str())),
+        };
+        if used {
+            continue;
+        }
+        let (line, _) = unit.lines.line_col_utf16(unit.source, entry.offset);
+        if ignore.ignored(line, spec.name) && !unignorable.contains(spec.name) {
+            continue;
+        }
+        out.push(Lint {
+            rule,
+            range: entry.offset..entry.offset + entry.length,
+            message: crate::registry::render(spec.problem, &[&entry.name]),
+            correction: (!spec.correction.is_empty())
+                .then(|| crate::registry::render(spec.correction, &[&entry.name])),
+        });
+    }
+}
+
+/// The late-join half of the `unnecessary_ignore` join (#1904): the
+/// mounting shell re-runs the join over the [`LATE_JOIN_RULES`] names,
+/// fed `late_suppressed` — the drops its own breaking-version walk's
+/// ignore gate recorded ([`run_breaking_version_annotations`]'s second
+/// element). A citation that dropped a late row stays silent, one that
+/// dropped nothing reports: the official validator walks the unfiltered
+/// final list where that row would already sit (`library_analyzer.dart`
+/// :327-341). An empty record answers upstream-true as well — the rule
+/// registers only on a breaking version
+/// (`remove_deprecations_in_breaking_version.dart`:37-54), so no row
+/// exists at all, `getRule` still finds the known rule and falls through
+/// the state checks (`ignore_validator.dart`:222-248), the match pass
+/// removes nothing, and the citation reports.
+///
+/// The plain-run face (no mounting shell) keeps the #1353 posture: a bare
+/// [`run`] never reports the late-join names — the verdict belongs here.
+#[must_use]
+#[expect(
+    clippy::implicit_hasher,
+    reason = "FxHashSet is the workspace-mandated concrete hasher               (deterministic iteration, hot-path cost)"
+)]
+pub fn unnecessary_ignore_late_rows(
+    unit: &Unit<'_>,
+    enabled: &EnableSet,
+    unignorable: &rustc_hash::FxHashSet<String>,
+    late_suppressed: &[(u32, &'static str)],
+) -> Vec<Lint> {
+    if !rule_by_name("unnecessary_ignore").is_some_and(|id| enabled.is_enabled(id)) {
+        return Vec::new();
+    }
+    // A citation requires the name's text in the source; the substring
+    // probe skips the comment re-parse for the files that never cite a
+    // late-join rule (the shell calls this per file). A false positive
+    // (the name in a string literal) just takes the full path and finds
+    // no entries — never a wrong verdict.
+    if !LATE_JOIN_RULES
+        .iter()
+        .any(|name| unit.source.contains(*name))
+    {
+        return Vec::new();
+    }
+    let comments = Comments::extract(unit.source, unit.tokens);
+    let ignore = IgnoreInfo::parse(unit.source, &comments);
+    let mut out = Vec::new();
+    unnecessary_ignore_rows(unit, &ignore, unignorable, late_suppressed, true, &mut out);
+    out
+}
+
+/// Records one wildcard local/parameter/pattern-binding declaration. Only
+/// the element faces the official rule flags enter the table
+/// (`LocalVariableElement` / `FormalParameterElement` / catch parameter /
+/// pattern variable — the official test's `test_field`/`test_getter` faces
+/// stay out); the scope is the declaration's binding extent: the innermost
+/// enclosing block/for-in/catch clause for locals, catch parameters, and
+/// pattern bindings, the enclosing function for parameters. The production
+/// block kinds the walk answers: `Block` is a nested-statement block,
+/// `BlockBody` every function/literal body, and `SwitchCase`/
+/// `SwitchExpressionCase` the member form — a case-bound name (or a member
+/// local, the member's flat statement run carries no `Block` of its own)
+/// binds over the member window. The bare-`_` pattern element is a
+/// `WildcardPattern` (the parser routes it there, matching the official
+/// parser) and the official scope walk binds no element for it, so it
+/// stays out of the table — its uses are not wildcard-variable uses.
 fn collect_wildcard(unit: &Unit<'_>, path: &[u32], out: &mut Vec<WildcardScope>) {
-    const LOCAL_SCOPES: [NodeKind; 3] = [NodeKind::Block, NodeKind::ForIn, NodeKind::CatchClause];
+    // A local's binding extent is the innermost enclosing statement block:
+    // `Block` is the nested-statement `{ ... }`, `BlockBody` the function
+    // body form (the production bridge emits `BlockBody` for every body
+    // context — a `var _` at function top level binds over it, not over a
+    // `Block` that never exists). `SwitchCase`/`SwitchExpressionCase` cover
+    // the member forms: case-bound pattern variables and locals declared in
+    // a member's flat statement run bind over the member itself (its window
+    // is the case head plus body — matching the official scope walk, which
+    // ends a case-declared variable at the member's statement list).
+    const LOCAL_SCOPES: [NodeKind; 6] = [
+        NodeKind::Block,
+        NodeKind::BlockBody,
+        NodeKind::ForIn,
+        NodeKind::CatchClause,
+        NodeKind::SwitchCase,
+        NodeKind::SwitchExpressionCase,
+    ];
     const FUNCTION_SCOPES: [NodeKind; 7] = [
         NodeKind::Method,
         NodeKind::TopLevelMethod,
@@ -322,23 +855,48 @@ fn collect_wildcard(unit: &Unit<'_>, path: &[u32], out: &mut Vec<WildcardScope>)
     ];
 
     let node = *path.last().expect("collect on a node");
-    if unit.ast.kind(node) != NodeKind::Identifier {
-        return;
-    }
-    // Identifier payload word 0 is the context discriminant (collapse map
-    // §3.5 Identifier row).
-    let Some(&ctx) = unit.ast.payload(node).first() else {
-        return;
-    };
-    let scopes: &[NodeKind] = match ctx {
-        c if c == dartq_parser::IdentifierContext::LocalVariableDeclaration as u32 => &LOCAL_SCOPES,
-        c if c == dartq_parser::IdentifierContext::CatchParameter as u32 => &LOCAL_SCOPES[2..],
-        c if c == dartq_parser::IdentifierContext::FormalParameterDeclaration as u32 => {
-            &FUNCTION_SCOPES
+    // The name span and scope set per declaration face: an `Identifier`
+    // names through its own node span and reads the context discriminant
+    // off payload word 0; a `DeclaredVariablePattern` names through payload
+    // word 0 (the variable token — the `: T` shorthand carries none) and
+    // scopes like a local.
+    let (name_bytes, scopes) = match unit.ast.kind(node) {
+        NodeKind::Identifier => {
+            let Some(&ctx) = unit.ast.payload(node).first() else {
+                return;
+            };
+            let scopes: &[NodeKind] = match ctx {
+                c if c == dartq_parser::IdentifierContext::LocalVariableDeclaration as u32 => {
+                    &LOCAL_SCOPES[..]
+                }
+                c if c == dartq_parser::IdentifierContext::CatchParameter as u32 => {
+                    &LOCAL_SCOPES[3..4]
+                }
+                c if c == dartq_parser::IdentifierContext::FormalParameterDeclaration as u32 => {
+                    &FUNCTION_SCOPES[..]
+                }
+                _ => return,
+            };
+            (byte_span(unit.tokens, unit.ast, node), scopes)
+        }
+        NodeKind::DeclaredVariablePattern => {
+            let Some(&name_token) = unit.ast.payload(node).first() else {
+                return;
+            };
+            if name_token == dartq_ast::TOKEN_NONE {
+                return;
+            }
+            let Some(token) = unit.tokens.get(name_token as usize) else {
+                debug_assert!(false, "pattern name token outside the table");
+                return;
+            };
+            (
+                token.byte_offset as usize..(token.byte_offset + token.byte_len) as usize,
+                &LOCAL_SCOPES[..],
+            )
         }
         _ => return,
     };
-    let name_bytes = byte_span(unit.tokens, unit.ast, node);
     let name = &unit.source[name_bytes.clone()];
     if !name.bytes().all(|b| b == b'_') {
         return;
@@ -359,7 +917,7 @@ fn collect_wildcard(unit: &Unit<'_>, path: &[u32], out: &mut Vec<WildcardScope>)
 
 /// Pushes the direct children of `id` onto the work stack, last child first
 /// so pops yield source order. Direct children are read off the completion
-/// window by the canonical subtree tiling ([`tile_direct`]). `scratch` is
+/// window by the canonical subtree tiling (`tile_direct`). `scratch` is
 /// the run's shared buffer (the rules borrow it through `Check` between
 /// calls).
 fn push_direct(
@@ -396,10 +954,9 @@ fn push_direct(
 /// - descending into a borrowing member, the snapped row sits at
 ///   `window.start` with its claimed subtree poking below it: not this
 ///   level's child (the block level pushed it) — skip it.
-/// - the first member's window starts one row into its material (the block
-///   head snapshot), leaving a head row claimed only by this level but
-///   parented inside the member's subtree: not this level's child either —
-///   it dispatches under its own parent chain within the member.
+/// - a row at `window.start` whose parent is deeper than this level (the
+///   block-head snapshot faces): not this level's child either — it
+///   dispatches under its own parent chain within the member.
 ///
 /// Rows at `window.start` are only ever *reached* by the decrement when one
 /// of the two head shapes sits there (a clean tiling ends at the bottom
@@ -455,11 +1012,13 @@ fn dispatch(
     comments: &Comments,
     ignore: &IgnoreInfo,
     unignorable: &rustc_hash::FxHashSet<String>,
+    suppressed: &core::cell::RefCell<Vec<(u32, &'static str)>>,
     path: &[u32],
     enabled: &EnableSet,
     direct: &core::cell::RefCell<Vec<u32>>,
     caches: &RunCaches,
     wildcards: &[WildcardScope],
+    semantics: Option<&Analysis<'_>>,
     out: &mut Vec<Lint>,
 ) {
     let current = *path.last().expect("dispatch on a node");
@@ -475,11 +1034,13 @@ fn dispatch(
             comments,
             ignore,
             unignorable,
+            suppressed,
             path,
             wildcards,
             rule: RuleId(rule),
             direct,
             caches,
+            semantics,
             out: &mut *out,
         };
         (rules()[rule as usize].check)(&mut check);
@@ -500,6 +1061,13 @@ pub struct Check<'a> {
     /// through the standalone validator face. Empty for the dominant
     /// workspace.
     pub unignorable: &'a rustc_hash::FxHashSet<String>,
+    /// The run's suppression record: every hit the ignore gate dropped as
+    /// its `(line, name)` — the pre-filter face the `unnecessary_ignore`
+    /// epilogue joins the citations against (upstream runs the
+    /// `IgnoreValidator` over the *unfiltered* diagnostic list,
+    /// library_analyzer.dart:331-341, so a citation is "used" exactly when
+    /// it dropped a hit). One scratch per run, shared by every `Check`.
+    suppressed: &'a core::cell::RefCell<Vec<(u32, &'static str)>>,
     /// Ancestor path, root first, current node last.
     pub path: &'a [u32],
     /// The wildcard local/parameter declaration table (`no_wildcard_variable_
@@ -513,12 +1081,14 @@ pub struct Check<'a> {
     /// The run's lazily-built declaration caches ([`RunCaches`]); the
     /// whole-unit scans the declaration rules read, built once per run.
     pub(crate) caches: &'a RunCaches,
+    /// The unit's semantic query face (`None` under the plain [`run`]).
+    semantics: Option<&'a Analysis<'a>>,
     out: &'a mut Vec<Lint>,
 }
 
 /// Fills `buf` with the direct children of `id`, ascending, via the
 /// canonical subtree tiling of the completion window (see [`run`] and
-/// [`tile_direct`]).
+/// `tile_direct`).
 fn fill_direct(ast: &SyntaxTable, id: u32, buf: &mut Vec<u32>) {
     tile_direct(ast, id, buf);
     buf.reverse();
@@ -546,6 +1116,27 @@ impl<'a> Check<'a> {
     #[must_use]
     pub fn kind(&self, id: u32) -> NodeKind {
         self.unit.ast.kind(id)
+    }
+
+    /// The unit's semantic query face — one `?`-guard away for the semantic
+    /// rules ([`Analysis`], mounted through [`Unit::run_with_semantics`]).
+    /// `None` under the plain [`run`]: the rule stays silent, because a
+    /// semantic rule that is enabled while the face is absent is a
+    /// driver-configuration error surfaced at the driver, never a
+    /// rule-side fallback shape.
+    #[must_use]
+    pub fn semantics(&self) -> Option<&'a Analysis<'a>> {
+        self.semantics
+    }
+
+    /// The library type-use counts (#1640, [`Unit::library_type_uses`]) —
+    /// one entry per name lexeme that heads a named-type row anywhere in
+    /// the owning library's units, the `_CountVisitor` face the
+    /// `avoid_private_typedef_functions` check reads. `None` — a run
+    /// without the driver-mounted face — keeps the consuming rule silent.
+    #[must_use]
+    pub fn library_type_uses(&self) -> Option<&'a rustc_hash::FxHashMap<&'a str, u32>> {
+        self.unit.library_type_uses
     }
 
     /// The completion window of `id` — node ids whose construction happened
@@ -626,6 +1217,71 @@ impl<'a> Check<'a> {
             .is_some_and(dartq_scanner::Token::is_synthetic)
     }
 
+    /// The `token` table entry, `None` when `token` lies outside the table.
+    ///
+    /// The unified table resolves every id an AST row can carry after the
+    /// parser's `append_inserted` fold (dartq-parser `lib.rs`, single choke
+    /// point at parse end), so a `None` here is a stale-id parser bug (an id
+    /// held across a cursor reset/detach), never a user-input face — the
+    /// debug_assert keeps the contract loud in debug builds while release
+    /// degrades to the caller's `let-else`/`?` (a skipped verdict or a
+    /// dropped report anchor, never wrong output).
+    #[must_use]
+    pub fn token(&self, token: u32) -> Option<&'a dartq_scanner::Token> {
+        let entry = self.unit.tokens.get(token as usize);
+        debug_assert!(
+            entry.is_some(),
+            "AST-carried token id {token} outside the unit's folded token table"
+        );
+        entry
+    }
+
+    /// Payload word `word` of `id` as a token id, `None` when the payload
+    /// is absent, short, or carries the `NONE_TOKEN` sentinel.
+    ///
+    /// `patch()` writes operator/name tokens into word 0 of the operator-
+    /// shape rows (`BinaryExpression`/`Assignment`/`OperatorName`/…), so a
+    /// `None` under a kind-dispatched read is a parser layout bug — the
+    /// same debug-loud / release-degrade contract as [`Check::token`].
+    /// Reads that legitimately store a non-token discriminant in word 0
+    /// (the `Identifier` context stamps, `MemberKind`) keep reading
+    /// [`Check::payload`] directly.
+    #[must_use]
+    pub fn payload_word(&self, id: u32, word: usize) -> Option<u32> {
+        let stored = self
+            .unit
+            .ast
+            .payload(id)
+            .get(word)
+            .copied()
+            .filter(|&stored| stored != dartq_ast::TOKEN_NONE);
+        debug_assert!(
+            stored.is_some(),
+            "payload word {word} of {:?} row {id} is absent or NONE_TOKEN",
+            self.unit.ast.kind(id),
+        );
+        stored
+    }
+
+    /// The UTF-16 start offset of `token`, `None` on [`Check::token`] miss.
+    /// The common shape of the token-anchored report sites.
+    #[must_use]
+    pub fn utf16_of_token(&self, token: u32) -> Option<u32> {
+        self.token(token).map(|t| t.utf16_offset)
+    }
+
+    /// The exclusive UTF-16 end of `token`'s lexeme, `None` on
+    /// [`Check::token`] miss.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "utf16 lengths fit u32 by the SourceRange convention"
+    )]
+    #[must_use]
+    pub fn utf16_end_of_token(&self, token: u32) -> Option<u32> {
+        self.token(token)
+            .map(|t| t.utf16_offset + self.lexeme(token).encode_utf16().count() as u32)
+    }
+
     /// Byte span of `id` (raw source coordinates, for slicing lexemes).
     #[must_use]
     pub fn byte_span(&self, id: u32) -> core::ops::Range<usize> {
@@ -673,8 +1329,13 @@ impl<'a> Check<'a> {
             .line_col_utf16(self.unit.source, range.start);
         // The suppression gate with the `cannot-ignore` override: a code in
         // the set survives every ignore comment (library_analyzer.dart
-        // :552-563 — "don't allow un-ignorable codes to be ignored").
+        // :552-563 — "don't allow un-ignorable codes to be ignored"). A
+        // dropped hit marks its citation used for the `unnecessary_ignore`
+        // epilogue — the official match pass removes the names of every
+        // reported (pre-filter) diagnostic from the citation lists
+        // (ignore_validator.dart:137-144).
         if self.ignore.ignored(line, name) && !self.unignorable.contains(name) {
+            self.suppressed.borrow_mut().push((line, name));
             return;
         }
         self.out.push(Lint {
@@ -690,7 +1351,7 @@ impl<'a> Check<'a> {
 mod tests {
     use super::*;
     use crate::registry::rule_by_name;
-    use crate::testsupport::{CONFIG, Fixture, unit_of};
+    use crate::testsupport::{CONFIG, Fixture, one_rule, tok, unit_of};
     use dartq_ast::{AstBuilder, NodeKind};
     use dartq_scanner::scan;
     use dartq_source::FileTable;
@@ -739,17 +1400,21 @@ mod tests {
             lines: &lines,
             path: None,
             features: Features::default(),
+            version: None,
             workspace: None,
+            reachability: None,
+            async_context_uses: None,
+            library_type_uses: None,
         };
         let id = rule_by_name("avoid_empty_else").unwrap();
         let mut enabled = EnableSet::none();
         enabled.add(id);
-        let lints = run(&unit, &enabled, &rustc_hash::FxHashSet::default());
-        assert_eq!(lints.len(), 1, "the suppressed else must not report");
-        assert_eq!(lints[0].rule, id);
+        let hits = run(&unit, &enabled, &rustc_hash::FxHashSet::default());
+        assert_eq!(hits.len(), 1, "the suppressed else must not report");
+        assert_eq!(hits[0].rule, id);
         // The surviving hit is the FIRST if's else (`;` at token 6):
         // pre-order output.
-        assert_eq!(lints[0].range.start, utf16_offset(&tokens, 6));
+        assert_eq!(hits[0].range.start, utf16_offset(&tokens, 6));
     }
 
     fn utf16_offset(tokens: &TokenTable, index: usize) -> u32 {
@@ -795,7 +1460,11 @@ mod tests {
             lines: &f.lines,
             path: Some(&f.path),
             features: f.features,
+            version: f.version,
             workspace: None,
+            reachability: None,
+            async_context_uses: None,
+            library_type_uses: None,
         };
         let id = rule_by_name("avoid_empty_else").unwrap();
         let mut enabled = EnableSet::none();
@@ -812,6 +1481,86 @@ mod tests {
         assert!(f.run(&EnableSet::none()).is_empty());
     }
 
+    /// The epilogue's unignorable face: a citation of a `cannot-ignore`
+    /// name never reports unnecessary — the official unignorable branch
+    /// removes the name from the citation lists before the unnecessary walk
+    /// (ignore_validator.dart:89/:113/:164-174). The armed shape: the
+    /// unignorable row survives suppression at the emit gate and the
+    /// citation stays out of the epilogue.
+    #[test]
+    fn unignorable_citations_never_report_unnecessary() {
+        let f = Fixture::parse("void f() {\n  if (b) ; else ; // ignore: avoid_empty_else\n}\n");
+        let unit = Unit {
+            source: &f.source,
+            tokens: &f.tokens,
+            ast: &f.ast,
+            lines: &f.lines,
+            path: Some(&f.path),
+            features: f.features,
+            version: f.version,
+            workspace: None,
+            reachability: None,
+            async_context_uses: None,
+            library_type_uses: None,
+        };
+        let mut enabled = EnableSet::none();
+        enabled.add(rule_by_name("unnecessary_ignore").expect("registered"));
+        enabled.add(rule_by_name("avoid_empty_else").expect("registered"));
+        let unignorable = rustc_hash::FxHashSet::from_iter(["avoid_empty_else".to_owned()]);
+        let lints = run(&unit, &enabled, &unignorable);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].rule,
+            rule_by_name("avoid_empty_else").expect("registered")
+        );
+    }
+
+    /// The late-join face (#1353): a `remove_deprecations_in_breaking_
+    /// versions` citation above a breaking-release annotation stays silent
+    /// from `unnecessary_ignore` — the rule's rows join the mounting
+    /// shell's walk ([`run_breaking_version_annotations`]) after this run
+    /// returns, so this run's suppression record can never hold them, yet
+    /// the citation genuinely suppresses in the final list the official
+    /// validator walks unfiltered (`library_analyzer.dart`:331-341). A
+    /// normal rule's unused citation still reports.
+    #[test]
+    fn late_join_citations_stay_silent_from_unnecessary_ignore() {
+        let f = Fixture::parse(
+            "// ignore: remove_deprecations_in_breaking_versions\n\
+             // ignore: avoid_empty_else\n\
+             @Deprecated('cleanup')\n\
+             var x = 0;\n",
+        );
+        let unit = Unit {
+            source: &f.source,
+            tokens: &f.tokens,
+            ast: &f.ast,
+            lines: &f.lines,
+            path: Some(&f.path),
+            features: f.features,
+            version: f.version,
+            workspace: None,
+            reachability: None,
+            async_context_uses: None,
+            library_type_uses: None,
+        };
+        let mut enabled = EnableSet::none();
+        enabled.add(rule_by_name("unnecessary_ignore").expect("registered"));
+        enabled.add(rule_by_name("remove_deprecations_in_breaking_versions").expect("registered"));
+        enabled.add(rule_by_name("avoid_empty_else").expect("registered"));
+        let lints = run(&unit, &enabled, &rustc_hash::FxHashSet::default());
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].rule,
+            rule_by_name("unnecessary_ignore").expect("registered")
+        );
+        assert!(
+            lints[0].message.contains("avoid_empty_else"),
+            "{:?}",
+            lints[0].message
+        );
+    }
+
     /// Asserts the canonical dispatch set over the whole arena: walked from
     /// the root through the tiling, every row is reached exactly once.
     fn assert_exactly_once(ast: &SyntaxTable) {
@@ -823,7 +1572,7 @@ mod tests {
         let mut count = 1usize;
         while let Some(node) = stack.pop() {
             tile_direct(ast, node, &mut kids);
-            for &child in kids.iter() {
+            for &child in &kids {
                 assert!(
                     !dispatched[child as usize],
                     "row {child} ({:?}) dispatched twice",
@@ -848,7 +1597,7 @@ mod tests {
     #[test]
     fn switch_member_windows_tile_exactly_once() {
         let f = Fixture::parse(
-            r#"
+            r"
 void f(bool c) {
   switch (c) {
     case true:
@@ -858,10 +1607,10 @@ void f(bool c) {
       print(1);
   }
 }
-"#,
+",
         );
         let ast = &f.ast;
-        let block = (0..ast.len() as u32)
+        let block = (0..narrow_u32(ast.len()))
             .find(|&row| ast.kind(row) == NodeKind::SwitchBlock)
             .expect("the fixture has a switch block");
         let mut members = Vec::new();
@@ -873,11 +1622,11 @@ void f(bool c) {
         };
         // The first member's children: its case expression and body — the
         // rows the spill used to dispatch at block level.
-        let mut first_kids = Vec::new();
-        fill_direct(ast, first, &mut first_kids);
-        let first_kinds: Vec<NodeKind> = first_kids.iter().map(|&row| ast.kind(row)).collect();
+        let mut kid_rows = Vec::new();
+        fill_direct(ast, first, &mut kid_rows);
+        let kid_kinds: Vec<NodeKind> = kid_rows.iter().map(|&row| ast.kind(row)).collect();
         assert_eq!(
-            first_kinds,
+            kid_kinds,
             [
                 NodeKind::CaseExpression,
                 NodeKind::Identifier,
@@ -905,7 +1654,7 @@ void f(bool c) {
     #[test]
     fn three_member_switch_tiles_every_member() {
         let f = Fixture::parse(
-            r#"
+            r"
 void f(bool c) {
   switch (c) {
     case true:
@@ -916,10 +1665,10 @@ void f(bool c) {
       print(3);
   }
 }
-"#,
+",
         );
         let ast = &f.ast;
-        let block = (0..ast.len() as u32)
+        let block = (0..narrow_u32(ast.len()))
             .find(|&row| ast.kind(row) == NodeKind::SwitchBlock)
             .expect("the fixture has a switch block");
         let mut members = Vec::new();
@@ -936,10 +1685,267 @@ void f(bool c) {
         assert_exactly_once(ast);
     }
 
+    /// A default-first member: no row completes between the block head and
+    /// the case event (a bare `default:` consumes only tokens), so the head
+    /// snapshot IS the member's first material row. Pinned through the real
+    /// bridge: the statement is the case's own child, not a block-level
+    /// phantom (`parent` walked to the SwitchBlock under the off-by-one
+    /// snapshot). The statement's read face is the production flat shape —
+    /// `ExpressionStatement` is a span leaf whose expression rows tile at the
+    /// member level beside it (the same sibling run a `Block` yields).
+    #[test]
+    fn default_first_member_claims_its_statement() {
+        let f = Fixture::parse(
+            r"
+void f(int x) {
+  switch (x) {
+    default:
+      a;
+  }
+}
+",
+        );
+        let ast = &f.ast;
+        let block = (0..narrow_u32(ast.len()))
+            .find(|&row| ast.kind(row) == NodeKind::SwitchBlock)
+            .expect("the fixture has a switch block");
+        let mut members = Vec::new();
+        fill_direct(ast, block, &mut members);
+        let [member] = members[..] else {
+            panic!("one member asserted below")
+        };
+        assert_eq!(ast.kind(member), NodeKind::SwitchCase);
+        let mut kids = Vec::new();
+        fill_direct(ast, member, &mut kids);
+        let kinds: Vec<NodeKind> = kids.iter().map(|&row| ast.kind(row)).collect();
+        assert_eq!(
+            kinds,
+            [
+                NodeKind::Identifier,
+                NodeKind::NoTypeArguments,
+                NodeKind::NoArguments,
+                NodeKind::Send,
+                NodeKind::ExpressionStatement
+            ]
+        );
+        assert_eq!(ast.parent(kids[0]), Some(member));
+        assert_eq!(ast.parent(*kids.last().expect("non-empty")), Some(member));
+        assert_exactly_once(ast);
+    }
+
+    /// A labeled-first member: the label's `Identifier` completes before the
+    /// case event too, so the head snapshot must keep it inside the member's
+    /// window — the label-name read face (`declares_label`) walks the
+    /// member's leading `Identifier`/`Label` children.
+    #[test]
+    fn labeled_first_member_keeps_the_label_identifier() {
+        let f = Fixture::parse(
+            r"
+void f(int x) {
+  switch (x) {
+    L:
+    case 1:
+      break;
+  }
+}
+",
+        );
+        let ast = &f.ast;
+        let block = (0..narrow_u32(ast.len()))
+            .find(|&row| ast.kind(row) == NodeKind::SwitchBlock)
+            .expect("the fixture has a switch block");
+        let mut members = Vec::new();
+        fill_direct(ast, block, &mut members);
+        let [member] = members[..] else {
+            panic!("one member asserted below")
+        };
+        let mut kids = Vec::new();
+        fill_direct(ast, member, &mut kids);
+        let kinds: Vec<NodeKind> = kids.iter().map(|&row| ast.kind(row)).collect();
+        assert_eq!(
+            kinds,
+            [
+                NodeKind::Identifier,
+                NodeKind::Label,
+                NodeKind::CaseExpression,
+                NodeKind::Break
+            ]
+        );
+        // The name row anchors at the identifier token and parents to the
+        // member, so `declares_label` reads `L` off it.
+        assert_eq!(
+            f.tokens
+                .lexeme(&f.source, ast.token_range(kids[0]).start as usize),
+            "L"
+        );
+        assert_eq!(ast.parent(kids[0]), Some(member));
+        assert_exactly_once(ast);
+    }
+
     #[test]
     fn unknown_names_are_reported_back() {
         let (set, unknown) = EnableSet::resolve(["avoid_empty_else", "not_a_lint"]);
         assert_eq!(unknown, vec!["not_a_lint"]);
         assert!(set.is_enabled(rule_by_name("avoid_empty_else").unwrap()));
+    }
+
+    /// The pattern-binding feed: `var [__, y] = list;` binds `__` through a
+    /// `DeclaredVariablePattern` (the name is payload word 0, never an
+    /// `Identifier` row), so with the wildcards feature off the `__` use
+    /// reports — upstream the binding is a `PatternVariableElement`
+    /// (extends `LocalVariableElement`), the official rule's flagged kind.
+    /// The report sits at the use; `y` binds normally and stays silent.
+    #[test]
+    fn pattern_binding_wildcard_use_reports() {
+        let source = "f() {\n  var [__, y] = list;\n  __;\n  y;\n}\n";
+        let mut f = Fixture::parse(source);
+        f.features = Features {
+            wildcard_variables: false,
+            ..f.features
+        };
+        let lints = f.run(&one_rule("no_wildcard_variable_uses"));
+        assert_eq!(lints.len(), 1, "the `__` use reports; `y` stays silent");
+        let use_token = tok(source, &f.tokens, "__", 1);
+        assert_eq!(
+            lints[0].range.start,
+            utf16_offset(&f.tokens, use_token as usize)
+        );
+    }
+
+    /// The two skip faces of the same shape: the bare `_` pattern element is
+    /// a `WildcardPattern` — the parser routes it there (matching the
+    /// official parser) and the official scope walk binds no element, so its
+    /// use is not a wildcard-variable use — and `_x` is not
+    /// all-underscores. Neither binding enters the table.
+    #[test]
+    fn wildcard_pattern_and_named_bindings_stay_out_of_the_table() {
+        let mut f = Fixture::parse("f() {\n  var [_, _x] = list;\n  _;\n  _x;\n}\n");
+        f.features = Features {
+            wildcard_variables: false,
+            ..f.features
+        };
+        let lints = f.run(&one_rule("no_wildcard_variable_uses"));
+        assert!(lints.is_empty(), "no wildcard-variable uses in the fixture");
+    }
+
+    /// The scope convention the pattern face carries: a switch-case binding
+    /// has no `Block` between the case and the member, so the nearest `Block`
+    /// ancestor is the member body — the case-bound `__` use reports, like
+    /// the official `PatternVariableElement` scope does.
+    #[test]
+    fn case_pattern_wildcard_binds_over_the_member() {
+        let mut f =
+            Fixture::parse("f(x) {\n  switch (x) {\n    case [var __]:\n      __;\n  }\n}\n");
+        f.features = Features {
+            wildcard_variables: false,
+            ..f.features
+        };
+        let lints = f.run(&one_rule("no_wildcard_variable_uses"));
+        assert_eq!(lints.len(), 1, "the case-bound `__` use reports");
+    }
+
+    // —— Family T+P collapse pins (the shared token/payload helpers) ————————
+    //
+    // The helpers are the single fact source for the two families #1714
+    // graded P2: `Check::token` (the unified-table lookup behind every
+    // `tokens.get(id)` read) and `Check::payload_word` (the word-0 slot the
+    // operator-shape nodes patch their token into). Their miss paths carry a
+    // `debug_assert!(false, ...)` — a stale id or absent slot is a parser bug
+    // by contract, so debug builds still die on it; release degrades to a
+    // skipped verdict. These pins cover the *valid* faces end-to-end through
+    // rules reading each helper — a regression in the helper flips the
+    // report.
+
+    /// `payload_word` over the production parse: `prefer_adjacent_string_
+    /// concatenation` reads word 0 of `BinaryExpression` (the `+` token the
+    /// bridge patches) and reports at it — the helper resolves the slot to
+    /// the `+` token's UTF-16 anchor.
+    #[test]
+    fn payload_word_resolves_the_operator_token() {
+        let source = "var s = 'a' + 'b';\n";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("prefer_adjacent_string_concatenation"));
+        assert_eq!(lints.len(), 1, "the `+` reports through payload word 0");
+        let plus = tok(source, &f.tokens, "+", 0);
+        assert_eq!(lints[0].range.start, utf16_offset(&f.tokens, plus as usize));
+        assert_eq!(lints[0].range.end, lints[0].range.start);
+    }
+
+    /// `utf16_of_token` over the production parse: `unnecessary_new` reports
+    /// at the `new` keyword (the `NewExpression` span head) — the helper
+    /// resolves the head id to the keyword's UTF-16 start.
+    #[test]
+    fn token_lookup_anchors_the_report() {
+        let source = "var l = new List();\n";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("unnecessary_new"));
+        assert_eq!(lints.len(), 1, "the `new` keyword reports");
+        let keyword = tok(source, &f.tokens, "new", 0);
+        assert_eq!(
+            lints[0].range.start,
+            utf16_offset(&f.tokens, keyword as usize)
+        );
+    }
+
+    /// `payload_word` on the second operator shape: `unnecessary_null_
+    /// aware_assignments` reads word 0 of `Assignment` (the `??=` token) —
+    /// the same slot the `BinaryExpression` consumers read, resolved through
+    /// the one helper.
+    #[test]
+    fn payload_word_resolves_the_assignment_operator() {
+        let source = "void f(int? x) {\n  x ??= null;\n}\n";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("unnecessary_null_aware_assignments"));
+        assert_eq!(lints.len(), 1, "the `??=` assignment reports");
+    }
+
+    // —— Aggregation dedup pins (the oracle's diagnostic set semantics) ————
+    //
+    // The oracle's listener collects into a set keyed by (code, offset,
+    // length, message) (upstream Dart SDK source,
+    // pkg/analyzer/lib/error/listener.dart), so two rule shapes reporting
+    // the identical row surface once.
+
+    /// The measured divergence: the core `print` descent and the typed
+    /// non-nullable `String.toString()` face both fire one expression and
+    /// report the same name span with the same message — one row survives,
+    /// anchored at the inner `toString`.
+    #[test]
+    fn identical_rows_from_two_shapes_collapse_to_one() {
+        let source = "void f() {\n  final s = 'x';\n  print(s.toString());\n}\n";
+        let f = Fixture::parse(source);
+        let lints = f.run_semantic(&one_rule("noop_primitive_operations"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The expression has no effect and can be removed."
+        );
+        let name = tok(source, &f.tokens, "toString", 0);
+        assert_eq!(lints[0].range.start, utf16_offset(&f.tokens, name as usize));
+    }
+
+    /// The single-shape control: an `Object` receiver keeps the typed face
+    /// silent (only the `print` descent fires), so the one row comes from
+    /// emission alone — the collapse never manufactures a count.
+    #[test]
+    fn object_receiver_descent_reports_once() {
+        let f = Fixture::parse("void f() {\n  final o = Object();\n  print(o.toString());\n}\n");
+        let lints = f.run_semantic(&one_rule("noop_primitive_operations"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The expression has no effect and can be removed."
+        );
+    }
+
+    /// The over-dedup guard: rows sharing the message but holding distinct
+    /// spans keep their count — the dedup key is the full
+    /// (rule, span, message) identity, so message text alone never merges.
+    #[test]
+    fn distinct_rows_keep_their_count() {
+        let f = Fixture::parse("void f(String x, int y) {\n  x.toString();\n  y.toInt();\n}\n");
+        let lints = f.run_semantic(&one_rule("noop_primitive_operations"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_ne!(lints[0].range, lints[1].range);
     }
 }

@@ -1,5 +1,5 @@
 //! dartq-lints — the built-in lint rule engine and the syntax-visible slice
-//! of the `package:lints` recommended/core sets (PRD §13), complete to the
+//! of the `package:lints` recommended/core sets, complete to the
 //! member level through #586: every set member is implemented under the
 //! documented lexical-approximation discipline or listed blocked with its
 //! fact.
@@ -62,7 +62,7 @@
 //!   `library_prefixes`,
 //!   `no_leading_underscores_for_library_prefixes`,
 //!   `unnecessary_library_name` (recommended). The #300 parser milestone
-//!   landed the directive nodes (collapse map §3.1), so these read the
+//!   landed the directive nodes, so these read the
 //!   [`Unit`] AST directly: `Import` prefix/URI children,
 //!   `LibraryName.has_name`, `PartOf.has_name`, and the `MetadataStar` /
 //!   annotated-sibling pair. The substrate grew two [`Features`] bits for
@@ -163,7 +163,7 @@
 //! - standalone wave 2 (2026-10-13, #987, parity-plan W2) and wave 3
 //!   (#992, parity-plan W3): 22 registered SDK rules outside the
 //!   `package:lints` sets under [`Group::Standalone`] — options-driven
-//!   (no include set carries them, §4.2), each with its per-rule fixture
+//!   (no include set carries them), each with its per-rule fixture
 //!   in the lint corpus. W2: `always_declare_return_types`,
 //!   `always_put_control_body_on_new_line`,
 //!   `always_put_required_named_parameters_first`,
@@ -232,11 +232,22 @@ mod testsupport;
 
 pub use bridge::{ParsedUnit, parse_unit};
 pub use comments::{Comment, CommentKind, Comments};
-pub use engine::{Check, Features, Lint, Unit, WorkspaceFacts, run};
+pub use engine::{
+    AsyncContextUse, Check, Features, Lint, ReachabilityFace, Unit, WorkspaceFacts, run,
+    run_breaking_version_annotations, type_use_counts, unnecessary_ignore_late_rows,
+};
 pub use ignore::{IgnoreInfo, UnignorableIgnore, ignored_name_entries, unignorable_ignores};
-pub use registry::{EnableSet, Group, RULES, RuleId, RuleSpec, rule_by_name, rules};
+pub use registry::{
+    EnableSet, Group, RULES, RuleId, RuleSpec, emittable_rule_names, incompatible_rules,
+    rule_by_name, rules,
+};
 // The pubspec-pass verdicts (#434): the mounting face (dartq-commands'
 // `analyze_lints`) walks the scanned pubspec facts through these — the
 // rules themselves stay crate-internal (`kinds: &[]`, no AST dispatch).
+pub use rules::declarations::remove_deprecations_in_breaking_versions::is_breaking_version;
 pub use rules::pubspec::package_names::check_name;
+pub use rules::pubspec::path_dependencies::{
+    PathVerdict, check_path_entry, resolve_dependency_path, scan_path_entries,
+};
 pub use rules::pubspec::secure_pubspec_urls::check_url;
+pub use rules::pubspec::sort_pub_dependencies::check_section;

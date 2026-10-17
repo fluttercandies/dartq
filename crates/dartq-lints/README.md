@@ -10,7 +10,8 @@ applies `// ignore:` / `// ignore_for_file:` suppression at the sink.
 Reads the substrate facts produced by `dartq-scanner`, `dartq-parser`, and
 `dartq-ast`'s arena AST; every rule cites its official `pkg/linter`
 implementation and message template. `dartq-commands` wires the enabled
-set into the `analyze`, `lints`, and `fix` faces.
+set into the `analyze` and `fix` faces — the daemon serves both through
+the same implementation.
 
 Part of the dartq workspace — see the repository root README for the
 overall architecture and license terms.

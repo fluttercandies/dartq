@@ -1,27 +1,31 @@
 //! The rule registry: one static [`RuleSpec`] table, machine-name lookup, and
 //! enable-set resolution.
 //!
-//! Every rule pins its behavior to the official implementation in
-//! `.third/dart-sdk/pkg/linter/lib/src/rules/<rule>.dart` (cited per module)
-//! and its message templates to the generated codes in
+//! Every rule pins its behavior to the official implementation in upstream
+//! Dart SDK source, `pkg/linter/lib/src/rules/<rule>.dart` (cited per
+//! module) and its message templates to the generated codes in
 //! `pkg/linter/lib/src/diagnostic.g.dart` (cited in each spec). Group
-//! membership follows `.third/lints/lib/{core,recommended}.yaml` (the
-//! `package:lints` sets; recommended includes core); the removed rules
+//! membership follows the pinned `package:lints` snapshot (`core.yaml` /
+//! `recommended.yaml`, upstream dart-lang/lints; recommended includes
+//! core); the removed rules
 //! follow the SDK's `RemovedAnalysisRule` registrations (the rules.json
 //! `removed` state).
 
 use std::sync::LazyLock;
 
 use dartq_ast::NodeKind;
+use dartq_language::LanguageVersion;
 
 use crate::engine::Check;
 
 /// The `package:lints` set a rule belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Group {
-    /// `.third/lints/lib/core.yaml` — critical issues.
+    /// The pinned `package:lints` snapshot's `core.yaml` (upstream
+    /// dart-lang/lints) — critical issues.
     Core,
-    /// `.third/lints/lib/recommended.yaml` — core plus idiom/style rules.
+    /// The pinned `package:lints` snapshot's `recommended.yaml` (upstream
+    /// dart-lang/lints) — core plus idiom/style rules.
     Recommended,
     /// A lint-tier mirror of an analyzer diagnostic that is not a
     /// `package:lints` member. No include set carries it — the enable set
@@ -41,8 +45,12 @@ pub enum Group {
     /// stable/deprecated/experimental states minus the 89-member union): no
     /// include set carries it, so enablement is options-driven only
     /// (`analysis_options` `linter.rules` or a caller-built
-    /// [`EnableSet`]) — parity plan §4.2. Unlike [`Group::Removed`] the
-    /// rule emits, so it joins the lint-gate freeze by name.
+    /// [`EnableSet`]). Unlike [`Group::Removed`] the
+    /// rule generally emits, so it joins the lint-gate freeze by name — the
+    /// `RuleState.internal` SDK-dogfooding wave (#1157 L1) being the
+    /// exception: registered with `kinds: &[]` and structurally silent, it
+    /// is pinned out of the freeze via `STRUCTURALLY_SILENT` and the
+    /// divergence ledger.
     Standalone,
 }
 
@@ -98,8 +106,23 @@ impl core::fmt::Debug for RuleSpec {
 /// completion (the full `package:lints` union: 34 core + 55
 /// recommended-only), the #570 diagnostic mirror, the #986 removed-registry
 /// no-ops (the 14 `RemovedAnalysisRule` registrations), the #987 W2
-/// standalone wave (the first 11 options-driven SDK rules), and the #992 W3
-/// declaration-shape wave (11 more). Order is registry order ([`RuleId`]
+/// standalone wave (the first 11 options-driven SDK rules), the #992 W3
+/// declaration-shape wave (11 more), the batch close that promoted the
+/// parity-plan W4/W7/W8 expression, name/empty/slice, and collection waves,
+/// the `require_trailing_commas` face, and the strings/directives mini wave
+/// (30 more), and the #1094 batch close that promoted the waves A/B/C
+/// declaration-shape, doc-comment, expression, flow-pattern,
+/// type-reference, and collection leftovers (17 more), and the final W5
+/// closeout promotion (#1153) that emptied the last seven domain incoming
+/// slices (19 more, two of them structurally silent), and the W6 closeout
+/// promotion (#1213) that landed the #1157 wave's thirteen names — the
+/// nine `RuleState.internal` SDK-dogfooding rules, the two experimental
+/// variance-domain rules, and the two process-adjacent stable rules
+/// (`use_build_context_synchronously`, `unreachable_from_main`) — leaving
+/// the tail empty again — and the pubspec path-validator tranche (R780
+/// #1521) that landed the analyzer dependency validator's three `path:`
+/// mirrors in the frozen diagnostic-mirror section. Order is registry
+/// order ([`RuleId`]
 /// assignment), grouped core-first then alphabetically within each group,
 /// the mirror section, then the wave sections in wave order (the removed
 /// block first; each new wave appends its section) — keep the pin test in
@@ -111,7 +134,7 @@ impl core::fmt::Debug for RuleSpec {
 /// into this skeleton in the same edit that pins its wave list in the pin
 /// test.
 static BASE_RULES: &[&RuleSpec] = &[
-    // —— core (`.third/lints/lib/core.yaml`) ——
+    // —— core (the pinned `package:lints` snapshot's core.yaml) ——
     &crate::rules::empty::avoid_empty_else::SPEC,
     &crate::rules::directives::avoid_relative_lib_imports::SPEC,
     &crate::rules::types::avoid_shadowing_type_parameters::SPEC,
@@ -146,7 +169,7 @@ static BASE_RULES: &[&RuleSpec] = &[
     &crate::rules::directives::use_string_in_part_of_directives::SPEC,
     &crate::rules::regexp::valid_regexps::SPEC,
     &crate::rules::expressions::void_checks::SPEC,
-    // —— recommended (`.third/lints/lib/recommended.yaml`) ——
+    // —— recommended (the pinned `package:lints` snapshot's recommended.yaml) ——
     &crate::rules::expressions::avoid_function_literals_in_foreach_calls::SPEC,
     &crate::rules::declarations::annotate_overrides::SPEC,
     &crate::rules::declarations::avoid_init_to_null::SPEC,
@@ -204,10 +227,16 @@ static BASE_RULES: &[&RuleSpec] = &[
     &crate::rules::flow::use_rethrow_when_possible::SPEC,
     // —— diagnostic mirrors (analyzer diagnostics outside `package:lints`;
     // no include set carries them, opt-in by name) ——
+    &crate::rules::pubspec::path_dependencies::PATH_DOES_NOT_EXIST,
+    &crate::rules::pubspec::path_dependencies::PATH_NOT_POSIX,
+    &crate::rules::pubspec::path_dependencies::SPEC,
     &crate::rules::expressions::unnecessary_type_check::SPEC,
     // —— removed (the `RemovedAnalysisRule` no-ops, plan W1 #986; the
     // rules.json `removed` state, alphabetical): the names resolve in the
-    // options and ignore faces, the rules never fire ——
+    // options and ignore faces, the rules never fire. Re-enumerated at the
+    // #1025 reconciliation against the published rules.json: the `removed`
+    // state holds exactly these 14 — `prefer_equal_for_default_values` is a
+    // member of the fourteen, not a fifteenth ——
     &crate::rules::removed::always_require_non_null_named_parameters::SPEC,
     &crate::rules::removed::avoid_as::SPEC,
     &crate::rules::removed::avoid_returning_null::SPEC,
@@ -248,29 +277,205 @@ static BASE_RULES: &[&RuleSpec] = &[
     &crate::rules::strings::missing_whitespace_between_adjacent_strings::SPEC,
     &crate::rules::strings::no_adjacent_strings_in_list::SPEC,
     &crate::rules::expressions::no_literal_bool_comparisons::SPEC,
+    // —— standalone W4 (parity-plan wave 4, the expression-shape wave,
+    // alphabetical) ——
+    &crate::rules::expressions::avoid_bool_literals_in_conditional_expressions::SPEC,
+    &crate::rules::expressions::avoid_null_checks_in_equality_operators::SPEC,
+    &crate::rules::expressions::literal_only_boolean_expressions::SPEC,
+    &crate::rules::expressions::noop_primitive_operations::SPEC,
+    &crate::rules::expressions::prefer_expression_function_bodies::SPEC,
+    &crate::rules::expressions::prefer_int_literals::SPEC,
+    &crate::rules::expressions::unnecessary_lambdas::SPEC,
+    &crate::rules::expressions::unnecessary_parenthesis::SPEC,
+    &crate::rules::expressions::unnecessary_statements::SPEC,
+    // —— standalone W7 (parity-plan wave 7, the name/empty/slice wave,
+    // alphabetical across the three domain files) ——
+    &crate::rules::slice::no_self_assignments::SPEC,
+    &crate::rules::empty::one_member_abstracts::SPEC,
+    &crate::rules::empty::prefer_asserts_with_message::SPEC,
+    &crate::rules::names::sort_constructors_first::SPEC,
+    &crate::rules::names::sort_unnamed_constructors_first::SPEC,
+    &crate::rules::empty::throw_in_finally::SPEC,
+    &crate::rules::empty::unnecessary_breaks::SPEC,
+    &crate::rules::empty::unnecessary_final::SPEC,
+    // —— standalone W8 (parity-plan wave 8, the collection wave,
+    // alphabetical) ——
+    &crate::rules::collections::prefer_foreach::SPEC,
+    &crate::rules::collections::prefer_if_elements_to_conditional_expressions::SPEC,
+    // —— standalone: the `require_trailing_commas` face (#1053) — the
+    // version-gated tall-style rule, silent from 3.7 ——
+    &crate::rules::flow::require_trailing_commas::SPEC,
+    // —— standalone: the strings/directives mini wave (alphabetical) ——
+    &crate::rules::directives::directives_ordering::SPEC,
+    &crate::rules::strings::eol_at_end_of_file::SPEC,
+    &crate::rules::directives::library_names::SPEC,
+    &crate::rules::strings::lines_longer_than_80_chars::SPEC,
+    &crate::rules::directives::package_prefixed_library_names::SPEC,
+    &crate::rules::strings::prefer_double_quotes::SPEC,
+    &crate::rules::strings::prefer_single_quotes::SPEC,
+    &crate::rules::directives::unnecessary_library_directive::SPEC,
+    &crate::rules::strings::unnecessary_raw_strings::SPEC,
+    &crate::rules::strings::use_raw_strings::SPEC,
+    // —— standalone: the #1094 batch close (waves A/B/C — the
+    // declaration-shape, doc-comment, expression, flow-pattern,
+    // type-reference, and collection leftovers, alphabetical) ——
+    &crate::rules::docs::document_ignores::SPEC,
+    &crate::rules::declarations::empty_container_bodies::SPEC,
+    &crate::rules::docs::flutter_style_todos::SPEC,
+    &crate::rules::flow::invalid_case_patterns::SPEC,
+    &crate::rules::docs::missing_code_block_language_in_doc_comment::SPEC,
+    &crate::rules::types::prefer_constructors_over_static_methods::SPEC,
+    &crate::rules::declarations::prefer_final_parameters::SPEC,
+    &crate::rules::flow::simplify_variable_pattern::SPEC,
+    &crate::rules::types::strict_top_level_inference::SPEC,
+    &crate::rules::flow::switch_on_type::SPEC,
+    &crate::rules::types::type_annotate_public_apis::SPEC,
+    &crate::rules::declarations::unnecessary_const_in_enum_constructor::SPEC,
+    &crate::rules::declarations::unnecessary_type_name_in_constructor::SPEC,
+    &crate::rules::expressions::unnecessary_underscores::SPEC,
+    &crate::rules::collections::use_null_aware_elements::SPEC,
+    &crate::rules::declarations::use_primary_constructors::SPEC,
+    &crate::rules::declarations::var_with_no_type_annotation::SPEC,
+    // —— standalone: the W1/W2 closeout promotion (#1108 — the directives,
+    // flow, pubspec, type-reference, flutter, doc-comment, and declaration
+    // incoming slices, alphabetical) ——
+    &crate::rules::types::always_specify_types::SPEC,
+    &crate::rules::directives::always_use_package_imports::SPEC,
+    &crate::rules::declarations::annotate_redeclares::SPEC,
+    &crate::rules::declarations::async_return_with_no_await::SPEC,
+    &crate::rules::flow::avoid_catching_errors::SPEC,
+    &crate::rules::declarations::avoid_equals_and_hash_code_on_mutable_classes::SPEC,
+    &crate::rules::declarations::avoid_field_initializers_in_const_classes::SPEC,
+    &crate::rules::types::avoid_futureor_void::SPEC,
+    &crate::rules::declarations::avoid_implementing_value_types::SPEC,
+    &crate::rules::declarations::avoid_positional_boolean_parameters::SPEC,
+    &crate::rules::declarations::avoid_setters_without_getters::SPEC,
+    &crate::rules::flutter::avoid_unnecessary_containers::SPEC,
+    &crate::rules::declarations::avoid_void_async::SPEC,
+    &crate::rules::directives::avoid_web_libraries_in_flutter::SPEC,
+    &crate::rules::directives::conditional_uri_does_not_exist::SPEC,
+    &crate::rules::declarations::deprecated_consistency::SPEC,
+    &crate::rules::flutter::diagnostic_describe_all_properties::SPEC,
+    &crate::rules::types::erase_dart_type_extension_types::SPEC,
+    &crate::rules::flow::join_return_with_assignment::SPEC,
+    &crate::rules::flow::no_default_cases::SPEC,
+    &crate::rules::flutter::no_logic_in_create_state::SPEC,
+    &crate::rules::types::no_raw_types::SPEC,
+    &crate::rules::declarations::omit_local_variable_types::SPEC,
+    &crate::rules::declarations::omit_obvious_local_variable_types::SPEC,
+    &crate::rules::declarations::omit_obvious_property_types::SPEC,
+    &crate::rules::declarations::prefer_asserts_in_initializer_lists::SPEC,
+    &crate::rules::declarations::prefer_const_constructors_in_immutables::SPEC,
+    &crate::rules::declarations::prefer_final_in_for_each::SPEC,
+    &crate::rules::declarations::prefer_final_locals::SPEC,
+    &crate::rules::directives::prefer_relative_imports::SPEC,
+    &crate::rules::types::prefer_void_to_null::SPEC,
+    &crate::rules::docs::public_member_api_docs::SPEC,
+    &crate::rules::directives::simple_directive_paths::SPEC,
+    &crate::rules::flutter::sized_box_for_whitespace::SPEC,
+    &crate::rules::flutter::sized_box_shrink_expand::SPEC,
+    &crate::rules::flutter::sort_child_properties_last::SPEC,
+    &crate::rules::pubspec::sort_pub_dependencies::SPEC,
+    &crate::rules::declarations::specify_nonobvious_local_variable_types::SPEC,
+    &crate::rules::declarations::specify_nonobvious_property_types::SPEC,
+    &crate::rules::declarations::test_types_in_equals::SPEC,
+    &crate::rules::declarations::unnecessary_async::SPEC,
+    &crate::rules::declarations::unnecessary_primary_constructor_body::SPEC,
+    &crate::rules::flutter::use_colored_box::SPEC,
+    &crate::rules::declarations::use_declaring_parameters::SPEC,
+    &crate::rules::flutter::use_decorated_box::SPEC,
+    &crate::rules::flutter::use_full_hex_values_for_flutter_colors::SPEC,
+    &crate::rules::flutter::use_key_in_widget_constructors::SPEC,
+    &crate::rules::declarations::use_late_for_private_fields_and_variables::SPEC,
+    &crate::rules::declarations::use_setters_to_change_properties::SPEC,
+    &crate::rules::declarations::use_to_and_as_if_applicable::SPEC,
+    // —— standalone: the W1/W2 final tail promotion (#1141 — the
+    // expressions, slice, and strings incoming slices, alphabetical) ——
+    &crate::rules::expressions::avoid_dynamic_calls::SPEC,
+    &crate::rules::expressions::avoid_print::SPEC,
+    &crate::rules::expressions::avoid_type_to_string::SPEC,
+    &crate::rules::expressions::cascade_invocations::SPEC,
+    &crate::rules::expressions::cast_nullable_to_non_nullable::SPEC,
+    &crate::rules::expressions::discarded_futures::SPEC,
+    &crate::rules::expressions::do_not_use_environment::SPEC,
+    &crate::rules::expressions::no_dynamic_casts::SPEC,
+    &crate::rules::expressions::no_runtimetype_tostring::SPEC,
+    &crate::rules::expressions::only_throw_errors::SPEC,
+    &crate::rules::slice::parameter_assignments::SPEC,
+    &crate::rules::expressions::prefer_null_aware_method_calls::SPEC,
+    &crate::rules::expressions::unawaited_futures::SPEC,
+    &crate::rules::expressions::unnecessary_await_in_return::SPEC,
+    &crate::rules::expressions::unnecessary_null_aware_operator_on_extension_on_nullable::SPEC,
+    &crate::rules::expressions::unnecessary_null_checks::SPEC,
+    &crate::rules::expressions::unnecessary_unawaited::SPEC,
+    &crate::rules::expressions::use_if_null_to_convert_nulls_to_bools::SPEC,
+    &crate::rules::expressions::use_is_even_rather_than_modulo::SPEC,
+    &crate::rules::strings::use_string_buffers::SPEC,
+    &crate::rules::expressions::use_truncating_division::SPEC,
+    // —— standalone: the W5 closeout promotion (#1153 — the collections,
+    // declarations, docs, expressions, flow, names, and types incoming
+    // slices, alphabetical) ——
+    &crate::rules::expressions::avoid_redundant_argument_values::SPEC,
+    &crate::rules::expressions::avoid_slow_async_io::SPEC,
+    &crate::rules::types::cancel_subscriptions::SPEC,
+    &crate::rules::types::close_sinks::SPEC,
+    &crate::rules::docs::comment_references::SPEC,
+    &crate::rules::declarations::deprecated_member_use_from_same_package::SPEC,
+    &crate::rules::expressions::future_sync_value::SPEC,
+    &crate::rules::names::matching_super_parameters::SPEC,
+    &crate::rules::expressions::prefer_const_constructors::SPEC,
+    &crate::rules::declarations::prefer_const_declarations::SPEC,
+    &crate::rules::collections::prefer_const_literals_to_create_immutables::SPEC,
+    &crate::rules::declarations::prefer_mixin::SPEC,
+    &crate::rules::declarations::remove_deprecations_in_breaking_versions::SPEC,
+    &crate::rules::types::tighten_type_of_initializing_formals::SPEC,
+    &crate::rules::docs::unnecessary_ignore::SPEC,
+    &crate::rules::expressions::unnecessary_this_alias::SPEC,
+    &crate::rules::declarations::use_enums::SPEC,
+    &crate::rules::expressions::use_named_constants::SPEC,
+    &crate::rules::flow::use_test_throws_matchers::SPEC,
+    // —— standalone: the W6 closeout promotion (#1213 — the #1157 wave's
+    // thirteen names: the nine `RuleState.internal` SDK-dogfooding rules,
+    // the two experimental variance-domain rules, and the two
+    // process-adjacent stable rules, alphabetical; the aggregated tail is
+    // empty again) ——
+    &crate::rules::declarations::analyzer_element_model_tracking_bad::SPEC,
+    &crate::rules::declarations::analyzer_element_model_tracking_more_than_one::SPEC,
+    &crate::rules::declarations::analyzer_element_model_tracking_zero::SPEC,
+    &crate::rules::declarations::analyzer_public_api_bad_part_directive::SPEC,
+    &crate::rules::declarations::analyzer_public_api_bad_type::SPEC,
+    &crate::rules::declarations::analyzer_public_api_experimental_inconsistency::SPEC,
+    &crate::rules::declarations::analyzer_public_api_exports_non_public_name::SPEC,
+    &crate::rules::declarations::analyzer_public_api_impl_in_public_api::SPEC,
+    &crate::rules::declarations::analyzer_to_be_deprecated_use::SPEC,
+    &crate::rules::declarations::implicit_reopen::SPEC,
+    &crate::rules::declarations::unreachable_from_main::SPEC,
+    &crate::rules::types::unsafe_variance::SPEC,
+    &crate::rules::flow::use_build_context_synchronously::SPEC,
 ];
 
-/// The registry storage: [`BASE_RULES`] followed by the domain-owned
+/// The registry storage: `BASE_RULES` followed by the domain-owned
 /// incoming slices, name-merged into the open batch's order. The aggregation
 /// is what keeps a registration a one-file edit — the slices live in the
 /// rule files, this wiring is batch-invariant, and a closed batch is
-/// promoted into the skeleton (see [`BASE_RULES`]).
+/// promoted into the skeleton (see `BASE_RULES`).
 pub static RULES: LazyLock<Vec<&'static RuleSpec>> = LazyLock::new(|| {
     // The domain seams (`rules/*.rs`); a new domain file joins here once.
     const INCOMING: &[&[&RuleSpec]] = &[
-        &crate::rules::collections::INCOMING_RULES,
-        &crate::rules::declarations::INCOMING_RULES,
-        &crate::rules::directives::INCOMING_RULES,
-        &crate::rules::docs::INCOMING_RULES,
-        &crate::rules::empty::INCOMING_RULES,
-        &crate::rules::expressions::INCOMING_RULES,
-        &crate::rules::flow::INCOMING_RULES,
-        &crate::rules::names::INCOMING_RULES,
-        &crate::rules::pubspec::INCOMING_RULES,
-        &crate::rules::regexp::INCOMING_RULES,
-        &crate::rules::slice::INCOMING_RULES,
-        &crate::rules::strings::INCOMING_RULES,
-        &crate::rules::types::INCOMING_RULES,
+        crate::rules::collections::INCOMING_RULES,
+        crate::rules::declarations::INCOMING_RULES,
+        crate::rules::directives::INCOMING_RULES,
+        crate::rules::docs::INCOMING_RULES,
+        crate::rules::empty::INCOMING_RULES,
+        crate::rules::expressions::INCOMING_RULES,
+        crate::rules::flutter::INCOMING_RULES,
+        crate::rules::flow::INCOMING_RULES,
+        crate::rules::names::INCOMING_RULES,
+        crate::rules::pubspec::INCOMING_RULES,
+        crate::rules::regexp::INCOMING_RULES,
+        crate::rules::slice::INCOMING_RULES,
+        crate::rules::strings::INCOMING_RULES,
+        crate::rules::types::INCOMING_RULES,
     ];
     let tail_len: usize = INCOMING.iter().map(|slice| slice.len()).sum();
     let mut rules = Vec::with_capacity(BASE_RULES.len() + tail_len);
@@ -282,6 +487,19 @@ pub static RULES: LazyLock<Vec<&'static RuleSpec>> = LazyLock::new(|| {
     // The open batch: name order across the domain slices (the wave-order
     // contract the pin test judges).
     rules[base..].sort_unstable_by_key(|spec| spec.name);
+    // The sort above (and `rule_by_name`'s first-match position lookup) is
+    // well-defined only under unique names — a duplicate would leave the
+    // tail order to pdqsort internals. Debug-only, one-time init: a
+    // duplicate surfaces at build time instead of as a silent reorder (the
+    // wave-order pin `rule_names_are_unique` holds the invariant in tests).
+    debug_assert!(
+        {
+            let mut names: Vec<&str> = rules.iter().map(|spec| spec.name).collect();
+            names.sort_unstable();
+            names.windows(2).all(|pair| pair[0] != pair[1])
+        },
+        "duplicate registered rule name"
+    );
     rules
 });
 
@@ -310,6 +528,143 @@ pub fn rule_by_name(name: &str) -> Option<RuleId> {
         .iter()
         .position(|spec| spec.name.eq_ignore_ascii_case(name))
         .map(|i| RuleId(i as u16))
+}
+
+/// The rules that declare incompatible peers (`rule.incompatibleRules`,
+/// upstream Dart SDK source, `pkg/linter/lib/src/rules/<name>.dart` — each
+/// file's `List<String> get incompatibleRules` override; the getter is
+/// opt-in, so every name outside this table declares none). The lists hold
+/// the machine-name lowercase spellings and mirror the upstream order; the
+/// one empty override (`specify_nonobvious_property_types`) is omitted —
+/// the lookup's default arm renders the same empty face.
+static INCOMPATIBLE_RULES: &[(&str, &[&str])] = &[
+    (
+        "always_specify_types",
+        &[
+            "avoid_types_on_closure_parameters",
+            "omit_local_variable_types",
+            "omit_obvious_local_variable_types",
+            "omit_obvious_property_types",
+        ],
+    ),
+    ("always_use_package_imports", &["prefer_relative_imports"]),
+    ("avoid_final_parameters", &["prefer_final_parameters"]),
+    (
+        "avoid_types_on_closure_parameters",
+        &["always_specify_types"],
+    ),
+    (
+        "omit_local_variable_types",
+        &[
+            "always_specify_types",
+            "specify_nonobvious_local_variable_types",
+        ],
+    ),
+    (
+        "omit_obvious_local_variable_types",
+        &["always_specify_types"],
+    ),
+    (
+        "omit_obvious_property_types",
+        &["always_specify_types", "type_annotate_public_apis"],
+    ),
+    ("prefer_double_quotes", &["prefer_single_quotes"]),
+    ("prefer_final_in_for_each", &["unnecessary_final"]),
+    (
+        "prefer_final_parameters",
+        &["unnecessary_final", "avoid_final_parameters"],
+    ),
+    ("prefer_final_locals", &["unnecessary_final"]),
+    ("prefer_relative_imports", &["always_use_package_imports"]),
+    ("prefer_single_quotes", &["prefer_double_quotes"]),
+    (
+        "specify_nonobvious_local_variable_types",
+        &["omit_local_variable_types"],
+    ),
+    (
+        "type_annotate_public_apis",
+        &["omit_obvious_property_types"],
+    ),
+    (
+        "unnecessary_final",
+        &[
+            "prefer_final_locals",
+            "prefer_final_parameters",
+            "prefer_final_in_for_each",
+        ],
+    ),
+];
+
+/// The names `name` declares incompatible (upstream
+/// `rule.incompatibleRules`): the empty slice for every rule without the
+/// override, including unregistered spellings. Case-insensitive like
+/// [`rule_by_name`] (a linear scan; a once-per-run lookup, not a hot path).
+#[must_use]
+pub fn incompatible_rules(name: &str) -> &'static [&'static str] {
+    INCOMPATIBLE_RULES
+        .iter()
+        .find(|(rule, _)| rule.eq_ignore_ascii_case(name))
+        .map_or(&[], |(_, peers)| peers)
+}
+
+/// The `kinds: &[]` set rules that still emit — through the dartq-commands
+/// pubspec pass at the #434 mounting face, not through AST dispatch (the
+/// crate docs' pubspec seam). The only legitimate empty-`kinds` members
+/// among the gate-governed set rules (the removed no-ops are empty-kinds
+/// too, but they are registry-face registrations, not the gate's universe).
+/// `sort_pub_dependencies` joined at the #1108 close once #1131 wired the
+/// pubspec pass to feed it (`pubspec_rows` -> `check_section`).
+const PUBSPEC_PASS_SEAM: &[&str] = &[
+    "package_names",
+    "secure_pubspec_urls",
+    "sort_pub_dependencies",
+];
+
+/// The Dart-attached rules whose rows join a file's diagnostic list after
+/// a run returns — the mounting shell's breaking-version walk
+/// ([`crate::engine::run_breaking_version_annotations`]) runs once the
+/// run's `unnecessary_ignore` epilogue has already fired, so the run's
+/// suppression record can never hold their citations. The epilogue skips
+/// their names: upstream's validator sees the unfiltered FINAL list where
+/// the row is already in (`library_analyzer.dart`:331-341). Enumerated
+/// like [`PUBSPEC_PASS_SEAM`] — the structural complement (empty `kinds`,
+/// no seam membership) would wrongly sweep in the internal analyzer set,
+/// whose citations in a Dart file are genuinely unused upstream. The rows
+/// genuinely emit (at the shell), so this is also a mount face of
+/// [`emittable_rule_names`] — one enumeration, two consumers.
+pub(crate) const LATE_JOIN_RULES: &[&str] = &["remove_deprecations_in_breaking_versions"];
+
+/// The `kinds: &[]` rules that emit through the engine run's epilogue —
+/// a run-level tail that fires after the dispatch walk completes but
+/// inside the run ([`crate::engine::unnecessary_ignore_rows`], the #1345
+/// mount). No per-node check can carry their verdicts: the verdict needs
+/// the run's complete diagnostic set, so `kinds` stays empty. Distinct
+/// from [`LATE_JOIN_RULES`] on both membership and semantics — an
+/// epilogue emitter's own citations MUST stay in the epilogue's walk (a
+/// `// ignore: <epilogue rule>` citation can itself be unused and must
+/// self-report), while a late join's citations must be skipped.
+const RUN_EPILOGUE_SEAM: &[&str] = &["unnecessary_ignore"];
+
+/// The registered rules the implementation can emit: non-mirror,
+/// non-removed specs that dispatch on the AST (`kinds` non-empty) or run
+/// through one of the out-of-dispatch mount faces — the dartq-commands
+/// pubspec pass, the engine run's epilogue, or the mounting shell's
+/// late-join walk. The single derivation behind the consumers — the
+/// frozen lint-gate universe's governance pin (`tests/registry_pin.rs`,
+/// the `lint_codes.txt` freeze) and the harness fixture-coverage pin's
+/// live lint tier — so the seams are restated nowhere else.
+#[must_use]
+pub fn emittable_rule_names() -> impl Iterator<Item = &'static str> {
+    rules()
+        .iter()
+        .filter(|spec| !matches!(spec.group, Group::Diagnostic | Group::Removed))
+        .filter(|spec| {
+            !spec.kinds.is_empty()
+                || PUBSPEC_PASS_SEAM.contains(&spec.name)
+                || RUN_EPILOGUE_SEAM.contains(&spec.name)
+                || LATE_JOIN_RULES.contains(&spec.name)
+        })
+        .map(|spec| spec.name)
 }
 
 /// The set of rules a run executes.
@@ -381,6 +736,66 @@ impl EnableSet {
     fn set(&mut self, id: RuleId) {
         self.words[id.0 as usize / 64] |= 1 << (id.0 as usize % 64);
     }
+
+    fn clear(&mut self, id: RuleId) {
+        self.words[id.0 as usize / 64] &= !(1 << (id.0 as usize % 64));
+    }
+}
+
+/// A registration's language-version predicate: the upstream registration
+/// consults the library's settled language version and joins the run only
+/// when the predicate admits it (`registerNodeProcessors`' version guard).
+/// The default is no constraint — a rule absent from `VERSION_GATES`
+/// registers unconditionally, so existing rules never carry the face.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VersionGate {
+    /// Registers at/above the version — the feature-`enabledIn`-milestone
+    /// shape the rest of the version-gated family uses.
+    #[expect(
+        dead_code,
+        reason = "constructed with the family's next gate; the face exists \
+                  so both upstream predicate shapes are expressible (#1053)"
+    )]
+    AtLeast(LanguageVersion),
+    /// Registers below the version — the tall-style formatter shape:
+    /// `require_trailing_commas` registers below 3.7 and stays silent from
+    /// 3.7, where `dart format` enforces the commas itself
+    /// (require_trailing_commas.dart:52-56).
+    Below(LanguageVersion),
+}
+
+impl VersionGate {
+    fn admits(self, version: LanguageVersion) -> bool {
+        match self {
+            Self::AtLeast(floor) => version >= floor,
+            Self::Below(ceiling) => version < ceiling,
+        }
+    }
+}
+
+/// The version-gated registrations, keyed by machine name. Consulted once
+/// per run when [`crate::engine::Unit::version`] carries a settled version;
+/// a gate whose predicate rejects the version clears the rule from the
+/// run's enable set (the official silent-at-that-version posture).
+static VERSION_GATES: &[(&str, VersionGate)] = &[(
+    "require_trailing_commas",
+    VersionGate::Below(LanguageVersion::new(3, 7)),
+)];
+
+/// `enabled` without the gated rules `version` rejects — the registration
+/// consult of one run. One pass over `VERSION_GATES` (a two-entry-scale
+/// slice); the per-node dispatch keeps testing the filtered bits, so the
+/// gate costs nothing on the hot path.
+pub(crate) fn version_gated(enabled: &EnableSet, version: LanguageVersion) -> EnableSet {
+    let mut gated = *enabled;
+    for &(name, gate) in VERSION_GATES {
+        if !gate.admits(version)
+            && let Some(id) = rule_by_name(name)
+        {
+            gated.clear(id);
+        }
+    }
+    gated
 }
 
 /// `{n}` slot fill, sequentially (the templates use at most `{0}` today; the

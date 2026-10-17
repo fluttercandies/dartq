@@ -12,11 +12,19 @@ keywords = ["dart", "linter", "lints", "static-analysis"]
 
 [dependencies]
 dartq-ast = { workspace = true }
+dartq-language = { workspace = true }
 dartq-parser = { workspace = true }
 dartq-scanner = { workspace = true }
+dartq-semantic = { workspace = true }
 dartq-source = { workspace = true }
 memchr = { workspace = true }
 rustc-hash = { workspace = true }
+
+# The semantic-rule tests build the library context the #1049 face takes
+# (graph, namespaces) — a test-only edge; the production crate never
+# walks the resolution layer.
+[dev-dependencies]
+dartq-resolution = { workspace = true }
 
 [lints]
 workspace = true
