@@ -324,6 +324,11 @@ fn relative_key(path: &Path, root: &Path) -> String {
 /// Normalizes a `dartq/analyze` result (the incremental face). `root` is
 /// the daemon's workspace dir — the same materialized copy the full
 /// face analyzes — so in-corpus paths strip to corpus-relative keys.
+/// Rows in the `dartq/*` namespace (the workspace advisory the pull
+/// answer embeds, the memory-degradation ladder) are dartq-internal
+/// telemetry, not diagnostics — the CLI machine face carries the same
+/// advisory on stderr, never in the compared rows — so both faces drop
+/// them before the incremental-consistency compare.
 fn normalize_lsp_workspace(result: &Value, root: &Path) -> Result<WorkspaceDiags, String> {
     let entries = result
         .get("diagnostics")
@@ -336,6 +341,13 @@ fn normalize_lsp_workspace(result: &Value, root: &Path) -> Result<WorkspaceDiags
         })?;
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
+        if entry
+            .get("code")
+            .and_then(Value::as_str)
+            .is_some_and(|code| code.starts_with("dartq/"))
+        {
+            continue;
+        }
         let (path, canonical) = replay_edit::canonical_from_lsp(entry)?;
         out.push((relative_key(&path, root), canonical));
     }
@@ -344,7 +356,9 @@ fn normalize_lsp_workspace(result: &Value, root: &Path) -> Result<WorkspaceDiags
 
 /// Normalizes a fresh batch machine run (the full-recompute face). Diag
 /// files are read once each; positions come from the same file bytes the
-/// engine measured (the materialized copy's own content).
+/// engine measured (the materialized copy's own content). The same
+/// `dartq/*` telemetry exclusion as the incremental face applies — the
+/// memory-degradation ladder can ride the machine rows.
 fn normalize_machine_workspace(
     diags: &[MachineDiag],
     corpus_root: &Path,
@@ -352,6 +366,11 @@ fn normalize_machine_workspace(
     let mut sources: FxHashMap<PathBuf, String> = FxHashMap::default();
     let mut out = Vec::with_capacity(diags.len());
     for diag in diags {
+        // Machine-face codes ride uppercase (`emitMachineFormat`); the
+        // lowercase canonical form lands in `canonical_from_machine`.
+        if diag.code.to_ascii_lowercase().starts_with("dartq/") {
+            continue;
+        }
         let file = if diag.file.is_absolute() {
             diag.file.clone()
         } else {
