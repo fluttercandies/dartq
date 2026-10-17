@@ -976,7 +976,8 @@ step_runner() { # <step> — runs every watchdogged phase of the step
     # Machine row shape: SEVERITY|TYPE|CODE|FILE|LINE|COL|LENGTH[|MESSAGE].
     # Filter to the 19 rule codes (stock diagnostics are out of face on
     # both legs), normalize the file path to corpus-root-relative (dartq
-    # may print the path as given or corpus-qualified), keep the corpus's
+    # prints the canonical absolute path; the as-given and corpus-qualified
+    # relative shapes are kept for harness-replay logs), keep the corpus's
     # own lib/ and packages/ trees only (vendored dependency rows are out
     # of face), and lowercase the code to the rule name.
     local codes_file="/tmp/serial_lints-new-codes${TAG}.txt"
@@ -989,6 +990,8 @@ step_runner() { # <step> — runs every watchdogged phase of the step
           file = substr(file, 24)
         else if (substr(file, 1, 2) == "./")
           file = substr(file, 3)
+        else if (file ~ /^\/.*tests\/corpus\/lints-new\//)
+          sub(/^.*tests\/corpus\/lints-new\//, "", file)
         if (file !~ /^(lib|packages)\//) next
         code = tolower($3)
         if (!(code in codes)) next

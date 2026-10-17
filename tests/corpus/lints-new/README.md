@@ -31,8 +31,15 @@ per-block provenance comments.
   everything else on either leg is out of face).
 - `expected` — the DARTQ-leg expectation, (code, file, line) rows, the
   multiset the gate enforces against `dartq analyze --format=machine`.
-- `oracle` — the informational oracle-leg rows derived from the fixture
-  headers (verified against the upstream tests' diagnostic markers).
+- `oracle` — the informational oracle-leg rows. Both tables were REBUILT
+  2026-10-18 from a live oracle run (`dart analyze --format=machine`, fvm
+  default SDK 3.13.1, the corpus's own analysis_options) after the first
+  live gate compare showed the marker-derived approximation could not
+  model the corpus's shared-package reality: all 19 rules analyze every
+  fixture, so cross-rule rows (e.g. prefer_const_constructors firing in
+  the use_enums fixtures) exist on any real run, and per-fixture upstream
+  markers never see them; some markers also carried 3.15-vs-3.13 version
+  drift. The live run under the gate's own SDK is the authoritative face.
 - `adjudications` — the documented dartq-leg deviation families below.
 
 ### Adjudication families (dartq leg structurally silent)
@@ -42,13 +49,11 @@ per-block provenance comments.
    location); dartq mounts the spec `not_dispatched` until an engine
    post-pass exists. Oracle: 1 row each in `unnecessary_ignore.dart` and
    `unnecessary_ignore_line.dart`; dartq: 0.
-2. `remove_deprecations_in_breaking_versions` — registration is gated on
-   the containing package's pubspec `version:` (the pubspec family's
-   mounting seam). `lib/remove_deprecations_in_breaking_versions.dart` is
-   the no-version control (0 rows both legs); the breaking twin
-   `packages/version_breaking` fires 2 rows on the oracle leg and stays
-   structurally silent on the dartq leg; the non-breaking twin
-   `packages/version_minor` is 0 on both legs.
+2. `remove_deprecations_in_breaking_versions` — RESOLVED 2026-10-18: the
+   promotion wave implemented the version-gated registration (the pubspec
+   mounting seam), so the breaking twin now fires the same 2 rows on both
+   legs and the expected table carries them. The no-version root control
+   and the non-breaking twin remain 0 rows on both legs.
 3. Generated-file parity probe — `test.g.dart` expects 0 rows on a face
    where generated-file lint suppression applies; a dartq-only row there
    is the known under-report approximation (upstream suppresses lints in
