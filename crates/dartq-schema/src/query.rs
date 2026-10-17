@@ -1,4 +1,4 @@
-//! The `dartq query` JSON face (§15.2) — today the `query symbol` answer,
+//! The `dartq query` JSON face — today the `query symbol` answer,
 //! one single-line object (`dartq_commands::query::to_json`). Future
 //! query kinds (`references`/`implementations`/`dependencies`/`callers`)
 //! extend this envelope with additive optional arrays under the same
@@ -6,14 +6,16 @@
 //!
 //! Two of those arrays are declared now, on the frozen v1 envelope, as the
 //! freeze-discipline extension point: `implementations` (the
-//! subclass/implementation declaration rows §15.2's `query implementations`
+//! subclass/implementation declaration rows the `query implementations`
 //! will serve, mixin applications included — the writer waits on the #281
-//! mixin/override semantics) and `dependencies` (the reverse-import-graph
-//! rows, typed on `dartq-ai::explain`'s `DependencyRow` — the importing
-//! library's stable `path`, the shape the explain `dependencies` section
-//! already serves). No writer emits either today; both are optional and
-//! absent-tolerant at every tier, so the first emitter lands without
-//! unfreezing v1.
+//! mixin/override semantics) and `dependencies` (the declaring library's
+//! own import edges and consumed symbols — the forward direction — typed
+//! on `dartq-ai::explain`'s `DependencyRow`: the joined library's stable
+//! `path` plus the optional `name` column a per-symbol row carries; the
+//! reverse question, who imports the declaring library, is the impact
+//! face's and the explain `dependencies` section's answer). Both arrays
+//! are optional and absent-tolerant at every tier, so a producer lands
+//! without unfreezing v1.
 
 use std::sync::LazyLock;
 
@@ -22,7 +24,7 @@ use serde_json::{Value, json};
 use crate::SchemaViolation;
 use crate::Verbosity;
 use crate::support::{
-    absent, enum_spelling, exact_fields, field, join, non_negative, object, one_based,
+    absent, array, enum_spelling, exact_fields, field, join, non_negative, object, one_based,
     pinned_version, rows, rows_optional, session_fields, string, string_or_null,
 };
 
@@ -41,7 +43,10 @@ pub fn query_schema() -> &'static Value {
 /// The declaration-row schema — one contract shape shared by `declarations`
 /// and the reserved `implementations` array: an implementation row IS a
 /// declaration hit (the subclass/implementor's declaration site), so the
-/// two arrays cannot drift apart.
+/// two arrays cannot drift apart. The additive `signature`/`annotations`
+/// columns carry the element face's join (the rendered member signature,
+/// the container's annotations); shapes with no matching face keep the
+/// keys omitted.
 static DECLARATION_ITEM: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "type": "object",
@@ -49,15 +54,22 @@ static DECLARATION_ITEM: LazyLock<Value> = LazyLock::new(|| {
         "required": ["file", "kind", "name", "line", "column", "length"],
         "properties": {
             "file": { "type": "string" },
-            // `-` on the machine face (main.rs:931); JSON null for
-            // top-level rows (main.rs:967) — a total column, not an
-            // omitted one.
+            // The member container's name; top-level rows omit the key
+            // (the omission rule — a convenience spelling, not a
+            // locator). The union type stays: earlier producers emitted
+            // an explicit null and the validator stays tolerant of it.
             "container": { "type": ["string", "null"] },
             "kind": { "enum": DECL_KINDS },
             "name": { "type": "string" },
             "line": { "type": "integer", "minimum": 1 },
             "column": { "type": "integer", "minimum": 1 },
             "length": { "type": "integer", "minimum": 0 },
+            // Additive optional on frozen v1: the rendered signature face
+            // (members and top-level executables; never a lossy one).
+            "signature": { "type": "string" },
+            // Additive optional on frozen v1: the container face's
+            // annotations, `@name(args)` spellings in written order.
+            "annotations": { "type": "array", "items": { "type": "string" } },
         },
     })
 });
@@ -101,12 +113,17 @@ static QUERY_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 "additionalProperties": false,
                 "required": ["path"],
                 "properties": {
-                    // The importing library's stable path
+                    // The joined library's stable path
                     // (`dartq-ai::explain::DependencyRow`).
                     "path": { "type": "string" },
+                    // The dependency-library symbol the declaring
+                    // library's resolved uses consume — the forward
+                    // direction's per-symbol rows; a bare import edge
+                    // keeps the key absent.
+                    "name": { "type": "string" },
                 },
             }},
-            // §15.8 session token economics (crate docs, "Token economics").
+            // Session token economics (crate docs, "Token economics").
             "symbols": { "type": "object",
                 "additionalProperties": { "type": "string" } },
             "since": { "type": "integer", "minimum": 0 },
@@ -132,19 +149,30 @@ pub const DECL_KINDS: &[&str] = &[
     "field",
 ];
 
-/// The stable machine spellings of the reference relations
-/// (`main.rs:1020-1028`, exhaustive over `RefKind`).
-pub const REF_KINDS: &[&str] = &["reference", "read", "invoked", "written", "read-written"];
+/// The stable machine spellings of the reference relations — exhaustive
+/// over the stored capture kinds plus the engine query face's
+/// `override` widening (the overriding-declaration rows the references
+/// answer appends for a queried member; the stored rows themselves map
+/// 1:1 onto the first five).
+pub const REF_KINDS: &[&str] = &[
+    "reference",
+    "read",
+    "invoked",
+    "written",
+    "read-written",
+    "override",
+];
 
 const QUERY_TOP: &[&str] = &["schema_version", "name", "declarations", "references"];
 const QUERY_SESSION: &[&str] = &["symbols", "since"];
 // The reserved additive kind arrays (crate docs): declared, no writer yet.
 const QUERY_ADDITIVE: &[&str] = &["implementations", "dependencies"];
 const DECLARATION: &[&str] = &["file", "kind", "name", "line", "column", "length"];
-const DECLARATION_OPTIONAL: &[&str] = &["container"];
+const DECLARATION_OPTIONAL: &[&str] = &["container", "signature", "annotations"];
 const REFERENCE: &[&str] = &["target_file", "kind", "offset", "length"];
 const REFERENCE_OPTIONAL: &[&str] = &["qualified", "file"];
 const DEPENDENCY: &[&str] = &["path"];
+const DEPENDENCY_OPTIONAL: &[&str] = &["name"];
 
 /// The declaration-row checks — the `declarations` contract, shared verbatim
 /// by the reserved `implementations` rows (same [`DECLARATION_ITEM`] shape).
@@ -164,6 +192,17 @@ fn validate_declaration_row(
     non_negative(field(obj, "length", p)?, &length)?;
     if let Some(container) = obj.get("container") {
         string_or_null(container, &join(p, "container"))?;
+    }
+    if let Some(signature) = obj.get("signature") {
+        string(signature, &join(p, "signature"))?;
+    }
+    if let Some(annotations) = obj.get("annotations") {
+        for (i, annotation) in array(annotations, &join(p, "annotations"))?
+            .iter()
+            .enumerate()
+        {
+            string(annotation, &format!("{}.annotations[{i}]", p))?;
+        }
     }
     Ok(())
 }
@@ -211,15 +250,19 @@ pub(crate) fn validate_query(value: &Value) -> Result<(), SchemaViolation> {
     for (i, row) in rows_optional(root, "dependencies")? {
         let p = format!("dependencies[{i}]");
         let obj = object(row, &p)?;
-        exact_fields(obj, DEPENDENCY, &[], &p)?;
+        exact_fields(obj, DEPENDENCY, DEPENDENCY_OPTIONAL, &p)?;
         string(field(obj, "path", &p)?, &join(&p, "path"))?;
+        if let Some(name) = obj.get("name") {
+            string(name, &join(&p, "name"))?;
+        }
     }
     Ok(())
 }
 
 /// The tier-exact check ([`crate::validate_at_tier`]): minimal keeps the
-/// row locators; the convenience spellings (`container`, `qualified`) are
-/// the compact tier's contribution, and the reserved kind arrays
+/// row locators; the convenience spellings (`container`, `qualified`) and
+/// the element-face detail columns (`signature`, `annotations`) are the
+/// compact tier's contribution, and the reserved kind arrays
 /// (`implementations`, `dependencies`) are dropped entirely — non-locating
 /// detail sections (crate docs, query table). The additive use-file column
 /// (`references[].file`) and the session fields ride absent-tolerant at
@@ -237,7 +280,10 @@ pub(crate) fn validate_query_at_tier(
     absent(root, "dependencies", "", tier)?;
     for (i, row) in rows(root, "declarations")? {
         let p = format!("declarations[{i}]");
-        absent(object(row, &p)?, "container", &p, tier)?;
+        let obj = object(row, &p)?;
+        absent(obj, "container", &p, tier)?;
+        absent(obj, "signature", &p, tier)?;
+        absent(obj, "annotations", &p, tier)?;
     }
     for (i, row) in rows(root, "references")? {
         let p = format!("references[{i}]");
@@ -285,6 +331,14 @@ mod tests {
             .collect();
         ref_fields.sort_unstable();
         assert_eq!(schema_keys(references), ref_fields);
+        let dependencies = &query["properties"]["dependencies"]["items"];
+        let mut dep_fields: Vec<String> = DEPENDENCY
+            .iter()
+            .chain(DEPENDENCY_OPTIONAL.iter())
+            .map(|s| (*s).to_owned())
+            .collect();
+        dep_fields.sort_unstable();
+        assert_eq!(schema_keys(dependencies), dep_fields);
     }
 
     #[test]
@@ -301,6 +355,34 @@ mod tests {
                 .collect();
             assert_eq!(spellings, declared);
         }
+    }
+
+    /// The `override` spelling validates on a reference row — the
+    /// overriding-declaration rows the engine's references answer appends
+    /// for a queried member (a kind widened at the query boundary, the
+    /// stored capture kinds untouched). An unknown spelling stays rejected.
+    #[test]
+    fn override_reference_kind_validates() {
+        let doc = serde_json::json!({
+            "schema_version": SCHEMA_VERSION_QUERY,
+            "name": "m",
+            "declarations": [],
+            "references": [{
+                "target_file": "/w/lib/base.dart",
+                "kind": "override",
+                "file": "/w/lib/sub.dart",
+                "offset": 44,
+                "length": 1,
+            }],
+        });
+        assert!(validate_query(&doc).is_ok());
+        assert!(validate_query_at_tier(&doc, Verbosity::Compact).is_ok());
+        assert!(validate_query_at_tier(&doc, Verbosity::Minimal).is_ok());
+
+        let mut bad = doc.clone();
+        bad["references"][0]["kind"] = serde_json::json!("overridden");
+        let violation = validate_query(&bad).expect_err("unknown spelling");
+        assert_eq!(violation.path, "references[0].kind");
     }
 
     /// Tier exactness: a minimal answer omits the convenience spellings;
@@ -333,6 +415,76 @@ mod tests {
         assert_eq!(violation.expected, "omitted at the minimal tier");
         assert!(validate_query_at_tier(&doc, Verbosity::Compact).is_ok());
         assert!(validate_query_at_tier(&doc, Verbosity::Full).is_ok());
+    }
+
+    /// The additive element-face columns (`signature`, `annotations`):
+    /// present they are type-checked, absent they are the everyday shape
+    /// (rows without a matching face), and the minimal tier drops them
+    /// with the other convenience spellings.
+    #[test]
+    fn element_face_columns_validate_and_minimal_drops_them() {
+        let mut doc = serde_json::json!({
+            "schema_version": SCHEMA_VERSION_QUERY,
+            "name": "limit",
+            "declarations": [{
+                "file": "/w/lib/a.dart",
+                "container": "Widget",
+                "kind": "field",
+                "name": "limit",
+                "line": 3,
+                "column": 21,
+                "length": 5,
+                "signature": "static final int limit",
+            }],
+            "references": [],
+        });
+        assert!(validate_query(&doc).is_ok());
+
+        doc["declarations"][0]["annotations"] = serde_json::json!(["@Deprecated('use Other')"]);
+        assert!(validate_query(&doc).is_ok());
+        assert!(validate_query_at_tier(&doc, Verbosity::Compact).is_ok());
+        assert!(validate_query_at_tier(&doc, Verbosity::Full).is_ok());
+
+        // The minimal tier strips the element-face columns with the other
+        // convenience spellings, one violation at a time.
+        let violation = validate_query_at_tier(&doc, Verbosity::Minimal)
+            .expect_err("minimal must not carry the container");
+        assert_eq!(violation.path, "declarations[0].container");
+        doc["declarations"][0]
+            .as_object_mut()
+            .expect("object")
+            .remove("container");
+        let violation = validate_query_at_tier(&doc, Verbosity::Minimal)
+            .expect_err("minimal must not carry the signature");
+        assert_eq!(violation.path, "declarations[0].signature");
+        doc["declarations"][0]
+            .as_object_mut()
+            .expect("object")
+            .remove("signature");
+        let violation = validate_query_at_tier(&doc, Verbosity::Minimal)
+            .expect_err("minimal must not carry the annotations");
+        assert_eq!(violation.path, "declarations[0].annotations");
+
+        // Absent is the everyday shape: rows without a matching face.
+        doc["declarations"][0]
+            .as_object_mut()
+            .expect("object")
+            .remove("annotations");
+        let bare = doc.clone();
+        assert!(validate_query(&bare).is_ok());
+        assert!(validate_query_at_tier(&bare, Verbosity::Minimal).is_ok());
+
+        // Wrong types are named.
+        doc["declarations"][0]["signature"] = serde_json::json!(42);
+        let violation = validate_query(&doc).expect_err("non-string signature");
+        assert_eq!(violation.path, "declarations[0].signature");
+        doc["declarations"][0]["signature"] = serde_json::json!("static final int limit");
+        doc["declarations"][0]["annotations"] = serde_json::json!("@Deprecated");
+        let violation = validate_query(&doc).expect_err("non-array annotations");
+        assert_eq!(violation.path, "declarations[0].annotations");
+        doc["declarations"][0]["annotations"] = serde_json::json!([42]);
+        let violation = validate_query(&doc).expect_err("non-string annotation entry");
+        assert_eq!(violation.path, "declarations[0].annotations[0]");
     }
 
     /// The reserved additive kind arrays: present, their rows validate under

@@ -4,9 +4,9 @@
 //! both faces share). The plugin changes answer in priority order, each
 //! row carrying its provenance (`source` — the plugin's manifest name),
 //! title (`message`), priority (signed — "lower sorts first",
-//! fix.rs:139-141), and its anchored edits on the §15.6 red-line floor
+//! fix.rs:139-141), and its anchored edits on the red-line floor
 //! (the shared `edit_floor` shape); the hosts that could not serve the
-//! request answer in `errors` (omitted when empty, §15.8.5). The writer
+//! request answer in `errors`. The writer
 //! stamps `fix::SCHEMA_VERSION` (fix.rs:87). Mirrors the fix patch's
 //! provenance surface over the plugin rows alone — note the tier split is
 //! the writer's, not the patch's: the row title (`message`) rides every
@@ -36,7 +36,7 @@ pub fn assists_schema() -> &'static Value {
     &ASSISTS_SCHEMA
 }
 
-/// One edit row's schema — the §15.6 floor plus the optional compact-tier
+/// One edit row's schema — the floor plus the optional compact-tier
 /// anchor (the shared `edit_floor` contract), factored out of the document
 /// like the query domain's declaration row.
 static EDIT_ITEM: LazyLock<Value> = LazyLock::new(|| {
@@ -58,7 +58,7 @@ static EDIT_ITEM: LazyLock<Value> = LazyLock::new(|| {
                 "properties": {
                     "line": { "type": "integer", "minimum": 1 },
                     "column": { "type": "integer", "minimum": 1 },
-                    // Empty at line boundaries; §15.8.5 omission.
+                    // Empty at line boundaries; the omission convention.
                     "context_before": { "type": "string" },
                     "context_after": { "type": "string" },
                 },
@@ -140,7 +140,7 @@ pub(crate) fn validate_assists(value: &Value) -> Result<(), SchemaViolation> {
             let edit = object(edit, &ep)?;
             exact_fields(edit, EDIT, EDIT_OPTIONAL, &ep)?;
             // The red-line trio, the provenance tag, and the optional
-            // anchor — the shared §15.6 floor (support::edit_floor).
+            // anchor — the shared edit floor (support::edit_floor).
             edit_floor(edit, &ep)?;
         }
     }

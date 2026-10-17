@@ -1,4 +1,4 @@
-//! The §15.6 fix patch document — `dartq fix --format=machine`, one
+//! The fix patch document — `dartq fix --format=machine`, one
 //! single-line object per patched file.
 
 use std::sync::LazyLock;
@@ -48,9 +48,9 @@ static FIX_PATCH_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                     // crates/dartq-commands/src/fix.rs:744-751): `builtin-lint`
                     // for the built-in rule rows, the plugin's manifest name
                     // for plugin rows. Never dropped — every tier emits it
-                    // (§15.8: minimal trims prose, never location).
+                    //.
                     "source": { "type": "string" },
-                    // The §15.6 drift-correction locator: compact/full emit
+                    // The drift-correction locator: compact/full emit
                     // it, minimal omits it (crate docs, "Verbosity tiers";
                     // fix.rs:766-768, 778-780).
                     "anchor": {
@@ -60,7 +60,7 @@ static FIX_PATCH_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                         "properties": {
                             "line": { "type": "integer", "minimum": 1 },
                             "column": { "type": "integer", "minimum": 1 },
-                            // Empty at line boundaries; §15.8.5 omission.
+                            // Empty at line boundaries; the omission convention.
                             "context_before": { "type": "string" },
                             "context_after": { "type": "string" },
                         },
@@ -73,7 +73,7 @@ static FIX_PATCH_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                     // negative, fix.rs:139-141); structural validator, so
                     // the row-kind split is the emitter's obligation.
                     "priority": { "type": "integer" },
-                    // Reserved §15.6 surface, not yet emitted by the fix
+                    // Reserved patch surface, not yet emitted by the fix
                     // face (stale edits are skipped rather than marked).
                     // Declared absent-tolerant so enabling it is additive,
                     // not an unfreeze.
@@ -98,7 +98,7 @@ pub(crate) fn validate_fix_patch(value: &Value) -> Result<(), SchemaViolation> {
         let obj = object(row, &p)?;
         exact_fields(obj, EDIT, EDIT_OPTIONAL, &p)?;
         // The red-line trio, the provenance tag, and the optional anchor —
-        // the shared §15.6 floor (support::edit_floor).
+        // the shared edit floor (support::edit_floor).
         edit_floor(obj, &p)?;
         if let Some(rule) = obj.get("rule") {
             string(rule, &join(&p, "rule"))?;

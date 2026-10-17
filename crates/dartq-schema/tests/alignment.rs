@@ -7,8 +7,8 @@
 
 use dartq_ai::compatibility::{COMPAT_SCHEMA_VERSION, CompatReport};
 use dartq_ai::explain::{
-    DeclarationRow, DependencyRow, EXPLAIN_SCHEMA_VERSION, ExplainReport, MemberRow, ReferenceRow,
-    SectionCounts, SuperTypeRow,
+    ConstructorRow, DeclarationRow, DependencyRow, EXPLAIN_SCHEMA_VERSION, ExplainReport,
+    MemberRow, ReferenceRow, SectionCounts, SuperTypeRow,
 };
 use dartq_ai::impact::{
     AffectedTarget, AffectedTest, ChangedSymbol, EnvironmentImpact, IMPACT_SCHEMA_VERSION,
@@ -91,7 +91,7 @@ fn empty_impact_report_passes_validation() {
     validate_ok(&payload, Domain::Impact);
 }
 
-/// The §15.8 session fields ride the impact envelope absent-tolerant: a
+/// The session fields ride the impact envelope absent-tolerant: a
 /// daemon answer carrying the symbol table and a delta cursor validates.
 #[test]
 fn impact_report_with_session_fields_passes_validation() {
@@ -126,14 +126,16 @@ fn dropped_schema_version_is_named() {
     assert_eq!(violation.found, "missing");
 }
 
+/// v2: `signature_changed` consults member-level signature digests instead
+/// of the v1 name-presence proxy (#1561) — the former pin 1 is now stale.
 #[test]
 fn wrong_schema_version_is_named() {
     let mut value = serde_json::to_value(fixture_report()).expect("value");
-    value["schema_version"] = 2.into();
+    value["schema_version"] = 1.into();
     let violation = violation_of(&value.to_string(), Domain::Impact);
     assert_eq!(violation.path, "schema_version");
-    assert_eq!(violation.expected, "the integer 1");
-    assert_eq!(violation.found, "2");
+    assert_eq!(violation.expected, "the integer 2");
+    assert_eq!(violation.found, "1");
 }
 
 #[test]
@@ -259,7 +261,7 @@ fn envelope_without_optional_keys_passes_validation() {
     validate_ok(&value.to_string(), Domain::Diagnostics);
 }
 
-/// The minimal tier (§15.8.1) keeps exactly `code` + `location` per row —
+/// The minimal tier keeps exactly `code` + `location` per row —
 /// a valid shape of the same envelope.
 #[test]
 fn minimal_diagnostic_row_passes_validation() {
@@ -277,7 +279,7 @@ fn minimal_diagnostic_row_passes_validation() {
     validate_ok(&value.to_string(), Domain::Diagnostics);
 }
 
-/// Red line (§15.8): a row without its location is never valid, in any
+/// Red line: a row without its location is never valid, in any
 /// tier.
 #[test]
 fn diagnostic_row_without_location_is_named() {
@@ -322,7 +324,7 @@ fn wrong_version_key_is_named() {
 fn schema_documents_carry_the_version_constants() {
     let impact = dartq_schema::impact_schema();
     assert_eq!(impact["$schema"], "http://json-schema.org/draft-07/schema#");
-    assert_eq!(impact["properties"]["schema_version"]["const"], 1);
+    assert_eq!(impact["properties"]["schema_version"]["const"], 2);
     let diagnostics = dartq_schema::diagnostics_schema();
     assert_eq!(
         diagnostics["$schema"],
@@ -356,9 +358,14 @@ fn compact_explain_report() -> ExplainReport {
         inheritance: Some(vec![SuperTypeRow {
             name: "Bar".to_owned(),
             file: Some("a.dart".to_owned()),
+            clause: Some("extends".to_owned()),
         }]),
         interfaces: Some(Vec::new()),
-        constructors: Some(Vec::new()),
+        constructors: Some(vec![ConstructorRow {
+            name: "Foo".to_owned(),
+            kind: "constructor".to_owned(),
+            signature: "Foo()".to_owned(),
+        }]),
         methods: Some(vec![MemberRow {
             name: "area".to_owned(),
             kind: "method".to_owned(),
@@ -372,6 +379,7 @@ fn compact_explain_report() -> ExplainReport {
         }]),
         dependencies: Some(vec![DependencyRow {
             path: "package:t/b.dart".to_owned(),
+            name: None,
         }]),
         affected_tests: Some(vec![AffectedTest {
             path: "package:t/a_test.dart".to_owned(),

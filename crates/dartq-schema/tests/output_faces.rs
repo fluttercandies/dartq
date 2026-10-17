@@ -1,7 +1,7 @@
 //! Hand-derived fixtures for every output face, each citing the writer it
 //! mirrors, validated against the published schemas. The compact fixtures
 //! are byte-shape transcripts of today's writers; the minimal fixtures
-//! exercise the §15.8 verbosity floor; the negatives pin the red line and
+//! exercise the verbosity floor; the negatives pin the red line and
 //! the undeclared-field rejection. Real-producer alignment (dartq-ai) lives
 //! in `tests/alignment.rs`.
 
@@ -27,7 +27,7 @@ fn dartq_native_faces_are_frozen_at_v1() {
 }
 
 // ---------------------------------------------------------------------------
-// Fix patch document (§15.6)
+// Fix patch document
 // ---------------------------------------------------------------------------
 
 /// Transcript of `patch_json` (`crates/dartq-commands/src/fix.rs:761-793`):
@@ -36,7 +36,7 @@ fn dartq_native_faces_are_frozen_at_v1() {
 /// (`edit_floor`, fix.rs:744-751 — `builtin-lint` for the built-in row,
 /// fix.rs:91, the plugin's manifest name for the plugin row, fix.rs:777);
 /// the second edit shows the empty-context omission at line boundaries
-/// (fix.rs:437-452, §15.8.5).
+///.
 #[test]
 fn compact_fix_patch_passes_validation() {
     let doc = serde_json::json!({
@@ -90,7 +90,7 @@ fn minimal_fix_patch_passes_validation() {
 /// 781-784 for the plugin rows): `rule` names the producing rule,
 /// `message` the human row, `priority` the plugin change's ordering
 /// (signed — "lower sorts first", fix.rs:139-141); `stale` stays the
-/// absent-tolerant §15.6 marking with no writer yet.
+/// absent-tolerant patch marking with no writer yet.
 #[test]
 fn full_tier_fix_extras_pass_validation() {
     let doc = serde_json::json!({
@@ -180,16 +180,16 @@ fn fix_missing_file_is_named() {
 }
 
 // ---------------------------------------------------------------------------
-// Query answer (§15.2 `query symbol`)
+// Query answer
 // ---------------------------------------------------------------------------
 
 /// Transcript of `to_json` (`crates/dartq-commands/src/query.rs`): `name` +
-/// `declarations` + `references`, snake_case fields. `container` is a total
+/// `declarations` + `references`, `snake_case` fields. `container` is a total
 /// column — null for the top-level row, spelled `-` on the machine face.
 /// `qualified` is the optional qualified-name convenience spelling: the
 /// writer omits it today because the index row carries only the
 /// `isQualified` bit, not the qualifier spelling. Each reference row names
-/// its use file. `schema_version` is the §15.7 v1 addition (maintainer
+/// its use file. `schema_version` is the v1 addition (maintainer
 /// ruling: every dartq-native face carries it); the writer stamps
 /// `crate::SCHEMA_VERSION`.
 #[test]
@@ -230,7 +230,7 @@ fn compact_query_answer_passes_validation() {
     validate_ok(&doc.to_string(), Domain::Query);
 }
 
-/// `qualified` has no null spelling — §15.8.5 omission, not null.
+/// `qualified` has no null spelling — omitted, not null.
 #[test]
 fn query_qualified_null_is_named() {
     let doc = serde_json::json!({
@@ -302,7 +302,7 @@ fn query_answer_rows_across_tiers_pass_validation() {
     validate_ok(&minimal.to_string(), Domain::Query);
 }
 
-/// §15.8 session token economics on the query face: symbol table + delta
+/// Session token economics on the query face: symbol table + delta
 /// cursor echo, absent-tolerant (crate docs, "Token economics").
 #[test]
 fn query_answer_with_session_fields_passes_validation() {
@@ -355,7 +355,7 @@ fn query_reference_use_file_is_optional() {
 }
 
 /// Red line: a present `file` is a string — internal ids never cross the
-/// boundary (§15.7).
+/// boundary.
 #[test]
 fn query_reference_file_type_error_is_named() {
     let doc = serde_json::json!({
@@ -394,7 +394,7 @@ fn query_unknown_declaration_kind_is_named() {
     assert!(violation.expected.contains("\"extension-type\""));
 }
 
-/// Internal ids never cross the boundary (§15.7).
+/// Internal ids never cross the boundary.
 #[test]
 fn query_internal_file_id_is_undeclared() {
     let doc = serde_json::json!({
@@ -439,7 +439,7 @@ fn query_container_type_error_is_named() {
 }
 
 // ---------------------------------------------------------------------------
-// Compatibility report (§15.5)
+// Compatibility report
 // ---------------------------------------------------------------------------
 
 /// Transcript of the CLI write (`crates/dartq-cli/src/compat.rs:151-159`,
@@ -548,7 +548,7 @@ fn compat_failure_without_message_is_named() {
 // ---------------------------------------------------------------------------
 
 /// Transcript of `RunMetrics::json` (`crates/dartq-cli`), which stamps
-/// `dartq_commands::SCHEMA_VERSION` — the §15.7 v1 addition (maintainer
+/// `dartq_commands::SCHEMA_VERSION` — the v1 addition (maintainer
 /// ruling: the check/analyze machine faces carry it). The null
 /// `max_rss_bytes` spelling is the getrusage-failure shape (`Option<u64>`).
 #[test]
@@ -683,7 +683,7 @@ fn index_run_zero_totals_pass_and_extras_fail() {
 /// (`crates/dartq-daemon/src/commands.rs:972-981`) inside the
 /// `session_answer` envelope (commands.rs:1008): the machine line's field
 /// set as JSON rows, `severity`/`type` carrying the diagnostics domain's
-/// own spellings. `symbols`/`since` ride absent-tolerant (§15.8).
+/// own spellings. `symbols`/`since` ride absent-tolerant.
 #[test]
 fn compact_check_answer_passes_validation() {
     let doc = serde_json::json!({
@@ -715,7 +715,7 @@ fn compact_check_answer_passes_validation() {
     validate_ok(&doc.to_string(), Domain::Check);
 }
 
-/// The minimal tier (check_row, commands.rs:965-971): the red line is the
+/// The minimal tier (`check_row`, commands.rs:965-971): the red line is the
 /// code plus the file locator; an undeclared column is rejected and the
 /// severity spelling is exact.
 #[test]
@@ -769,7 +769,7 @@ fn minimal_check_rows_pass_and_negatives_are_named() {
 /// Transcript of the compact `analyze_answer` entry
 /// (`crates/dartq-daemon/src/commands.rs:934-936`) — the
 /// `lsp::AnalyzeEntry` serialization (lsp.rs:105-110 over the LSP
-/// §Diagnostic of lsp.rs:83-91). Positions are LSP: zero-based lines and
+/// `Diagnostic` shape of lsp.rs:83-91). Positions are LSP: zero-based lines and
 /// UTF-16 columns, unlike the CLI faces' 1-based rows.
 #[test]
 fn compact_analyze_answer_passes_validation() {
@@ -790,7 +790,7 @@ fn compact_analyze_answer_passes_validation() {
     validate_ok(&doc.to_string(), Domain::Analyze);
 }
 
-/// The minimal tier (analyze_answer, commands.rs:929-933): `uri` + `code` +
+/// The minimal tier (`analyze_answer`, commands.rs:929-933): `uri` + `code` +
 /// `range`; the LSP severity is one of the produced values and undeclared
 /// entries fields are named.
 #[test]
@@ -891,7 +891,7 @@ fn compact_assists_document_passes_validation() {
     validate_ok(&doc.to_string(), Domain::Assists);
 }
 
-/// The minimal tier (assists_json, fix.rs:802, 824-828): the row priority
+/// The minimal tier (`assists_json`, fix.rs:802, 824-828): the row priority
 /// and the edit anchors are the trims — the title and the provenance tag
 /// ride every tier; the patch-only `rule` column is not an assists field.
 #[test]
@@ -954,7 +954,7 @@ fn minimal_assists_pass_and_negatives_are_named() {
 }
 
 // ---------------------------------------------------------------------------
-// Verbosity tiers (§15.8): the at-tier validator over the public API
+// Verbosity tiers: the at-tier validator over the public API
 // ---------------------------------------------------------------------------
 
 /// Tier exactness on the fix face: the anchor is compact-tier content and

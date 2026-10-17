@@ -58,7 +58,7 @@ static CHECK_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                     "message": { "type": "string" },
                 },
             }},
-            // §15.8 session token economics (crate docs, "Token
+            // Session token economics (crate docs, "Token
             // economics"): the full-tier short-id table over the rows'
             // file paths, and the delta cursor echo.
             "symbols": { "type": "object",
@@ -71,7 +71,7 @@ static CHECK_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 const CHECK_TOP: &[&str] = &["schema_version", "diagnostics"];
 // Tier-independent (crate docs, "Token economics").
 const CHECK_SESSION: &[&str] = &["symbols", "since"];
-// The red line (§15.8): the code plus the file locator; the classification
+// The red line: the code plus the file locator; the classification
 // and message fields are the compact tier's contribution (check_row,
 // commands.rs:964-982 — full equals compact today).
 const CHECK_ROW: &[&str] = &["file", "code", "line", "column", "length"];

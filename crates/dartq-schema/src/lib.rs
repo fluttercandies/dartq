@@ -1,7 +1,7 @@
 //! Machine-readable JSON schemas for dartq's versioned output faces, plus
-//! the lightweight structural validator CI runs against real output (PRD
-//! §15.7: the diagnostics/patch/impact report schemas ship with the version,
-//! in-crate, so tooling can check outputs against their published shapes).
+//! the lightweight structural validator CI runs against real output (the
+//! diagnostics/patch/impact report schemas ship with the version, in-crate,
+//! so tooling can check outputs against their published shapes).
 //!
 //! # Schema freeze (v1)
 //!
@@ -29,9 +29,9 @@
 //!   meaningful only alongside the `symbols` table in the same answer, so
 //!   consumers resolve through the table and never hardcode an id. Whether
 //!   a given answer carries the table stays the emitter's byte-economics
-//!   decision (PRD §15.8) and is not a shape break.
+//!   decision and is not a shape break.
 //!
-//! # Versioning discipline (PRD §15.7)
+//! # Versioning discipline
 //!
 //! * Every versioned output carries its contract version under
 //!   `schema_version` — except the diagnostics envelope, which keeps the
@@ -45,14 +45,20 @@
 //!   validator rejects undeclared fields and unknown spellings, so such a
 //!   change cannot land silently: it always forces the documented schema
 //!   change first.
-//! * Optional fields are omitted rather than null (§15.8.5). Two total
+//! * Optional fields are omitted rather than null. Two total
 //!   columns predate the rule and keep the null spelling — a query
 //!   declaration row's `container` (null = top-level; the machine face
 //!   prints `-`) and run metrics' `max_rss_bytes` (null = getrusage
 //!   unavailable). The validators accept both spellings for exactly those
 //!   two fields.
 //! * Every entity reference is the stable `label|name` path form; internal
-//!   ids never leave the engine. The validator pins the `label|name` form
+//!   ids never leave the engine. The label is the package-form file
+//!   reference (`package:<name>/<path under the package's lib>`); a file
+//!   no package lib tree addresses keeps its canonical path — the
+//!   documented fallback. The `|name` suffix is the inline symbol
+//!   reference's (the impact report's `changed[].symbol`); the
+//!   row-shaped file columns (`file`, `path`, `target_file`) carry the
+//!   bare file label. The validator pins the `label|name` form
 //!   for the impact report's symbol refs and the session symbol table's
 //!   values. Internal-only data (e.g. the fix edit's verified original
 //!   slice, `fix.rs`'s `Edit.source` — the edit row's declared `source`
@@ -61,23 +67,23 @@
 //! * Enum spellings are the shortest unambiguous form: kebab-case tags for
 //!   impact levels, declaration families, and reference relations; the
 //!   oracle's UPPERCASE spellings for diagnostic severities and types.
-//! * §15.8.5 pins new faces' ranges to `[startOffset, endOffset)` pairs.
+//! * New faces pin their ranges to `[startOffset, endOffset)` pairs.
 //!   The oracle-derived faces keep their pinned older spellings (position
 //!   objects in the diagnostics envelope, `offset`+`length` in query/fix
-//!   rows); a face designed under §15.8 adopts the pair form at its schema
-//!   review.
+//!   rows); a face designed after the pair-form ruling adopts that form at
+//!   its schema review.
 //!
 //! # The `version` alias
 //!
 //! The diagnostics envelope keys its contract version `version`, not
-//! §15.7's generic `schema_version`, because the envelope is byte-compatible
+//! the generic `schema_version`, because the envelope is byte-compatible
 //! with `dart analyze --format=json`. This is a deliberate, recorded alias —
 //! never a reason to add a second key to that envelope. Oracle byte parity
 //! outranks naming uniformity everywhere the two touch (the machine line
 //! formats likewise carry no version key at all; their contract is the
 //! harness parser, not a schema).
 //!
-//! # Verbosity tiers (PRD §15.1, §15.8.1)
+//! # Verbosity tiers
 //!
 //! Every face answers under `--verbosity minimal|compact|full` (default
 //! compact). The tiers are part of this frozen contract; the canonical
@@ -85,13 +91,13 @@
 //!
 //! * **compact** — the shape each producer emits today. It is the baseline
 //!   every fixture pins.
-//! * **minimal** — the red-line floor (§15.8): locating fields are never
+//! * **minimal** — the red-line floor: locating fields are never
 //!   omissible (`code`/`file`/`range` or the face's equivalent, marked ● in
 //!   the tables). Token cost is trimmed by dropping prose and convenience
 //!   spellings, never location.
 //! * **full** — compact plus cheaply-available extras (per-face, listed
 //!   below). Deep content stays behind ids and dedicated endpoints
-//!   (§15.8.6); `full` never inlines unbounded objects.
+//!; `full` never inlines unbounded objects.
 //!
 //! Payloads carry no verbosity marker (adding one would break the compact
 //! byte shape), so each published schema is the **union** of its tiers'
@@ -100,7 +106,7 @@
 //! payload carrying a field its tier must omit (a minimal row with a
 //! `problemMessage`, a compact edit with a `rule`, a full report with the
 //! minimal-only `counts`). Presence beyond the red line stays the emitter's
-//! fixture obligation: the §15.8.5 omission conventions make legitimate
+//! fixture obligation: the omission conventions make legitimate
 //! absences the validator cannot distinguish from tier violations.
 //!
 //! Diagnostics rows (`dartq-diagnostics` envelope; minimal = `code` +
@@ -118,13 +124,13 @@
 //!
 //! `full` equals `compact` today (the envelope already carries the complete
 //! message and documentation). Related-diagnostic and linked-fix surfaces
-//! are §15.8.1 full-tier content with no producer yet; when one lands it is
+//! are full-tier content with no producer yet; when one lands it is
 //! an additive optional field. The CLI's diagnostics faces are tier-
 //! invariant regardless: the oracle faces (`--format machine|json`) are
 //! byte-pinned, and the human listing is the verbose presentation. The
 //! tiers bind the emitters that honor `--verbosity` (daemon/RPC faces).
 //!
-//! Fix patch documents (§15.6; per edit — `file`/`offset`/`length`/
+//! Fix patch documents (per edit — `file`/`offset`/`length`/
 //! `replacement` are the red line, and the provenance tag never drops
 //! either):
 //!
@@ -144,7 +150,7 @@
 //! plugin's manifest name (`edit_floor`, `dartq-commands` fix.rs:744-751);
 //! not to be confused with `fix.rs`'s internal `Edit.source` slice, which
 //! never leaves the engine. `edits[].stale` may appear in any tier when an
-//! applier marks an edit instead of dropping it (§15.6). `stale` is the one
+//! applier marks an edit instead of dropping it. `stale` is the one
 //! absent-tolerant field left: no writer emits it today, so enabling it is
 //! additive.
 //!
@@ -169,13 +175,14 @@
 //!
 //! `symbols` and `since` are session fields, tier-independent — see "Token
 //! economics". The two reserved kind arrays are declared on frozen v1 for
-//! the future query kinds — `implementations` the subclass/implementation
-//! declaration rows (§15.2's `query implementations`, typed on the shared
-//! declaration-row shape), `dependencies` the reverse-import-graph rows
-//! (`path`, typed on `dartq-ai::explain`'s `DependencyRow`) — with no
-//! writer yet; `minimal` drops them (non-locating detail sections).
+//! the query kinds — `implementations` the subclass/implementation
+//! declaration rows (typed on the shared declaration-row shape),
+//! `dependencies` the declaring library's own import edges and consumed
+//! dependency symbols (`path`, plus the optional `name` column — typed on
+//! `dartq-ai::explain`'s `DependencyRow`); `minimal` drops them
+//! (non-locating detail sections).
 //!
-//! Compatibility matrix rows (§15.5; the verdict + axis identity are the
+//! Compatibility matrix rows (the verdict + axis identity are the
 //! red line — evidence is one `check` away):
 //!
 //! | field                    | minimal | compact             | full |
@@ -185,7 +192,7 @@
 //! | `matrix[].first_failure` |         | ● (when errors)     | ●    |
 //! | `matrix[].error`         |         | ● (on load failure) | ●    |
 //!
-//! Explain report rows (§15.3; the declaration's locators are the red
+//! Explain report rows (the declaration's locators are the red
 //! line — `kind` is the row's semantic code. `minimal` drops the section
 //! arrays for the `counts` object, so the AI still sees which sections
 //! exist and are empty; `full` equals `compact` today):
@@ -259,7 +266,7 @@
 //! all), and the index run summary (four totals off the maintained index —
 //! no locator, no prose, nothing to trim).
 //!
-//! # Token economics (PRD §15.8)
+//! # Token economics
 //!
 //! Declared now, absent-tolerant, so v1 does not unfreeze when emitters
 //! land:
@@ -281,33 +288,33 @@
 //! * **Batch queries** — shape-preserving: one envelope per queried symbol,
 //!   the JSONL convention the fix face already uses. No aggregate envelope
 //!   is defined.
-//! * **Null/empty omission** (§15.8.5) — emitters omit optional fields
+//! * **Null/empty omission** — emitters omit optional fields
 //!   instead of sending null/empty; the two legacy null spellings are listed
 //!   under the versioning discipline.
 //!
 //! # Domains
 //!
-//! * [`Domain::Impact`] — the §15.4 impact report ([`impact_schema`];
+//! * [`Domain::Impact`] — the impact report ([`impact_schema`];
 //!   `SCHEMA_VERSION_IMPACT` mirrors `dartq-ai`'s authoritative constant).
 //! * [`Domain::Diagnostics`] — the `dart analyze --format=json` envelope
 //!   ([`diagnostics_schema`]; the `version` alias above).
-//! * [`Domain::FixPatch`] — the §15.6 patch document ([`fix_patch_schema`]).
-//! * [`Domain::Query`] — the §15.2 query answer ([`query_schema`]).
-//! * [`Domain::Explain`] — the §15.3 explain report
+//! * [`Domain::FixPatch`] — the patch document ([`fix_patch_schema`]).
+//! * [`Domain::Query`] — the query answer ([`query_schema`]).
+//! * [`Domain::Explain`] — the explain report
 //!   ([`explain_schema`]; `SCHEMA_VERSION_EXPLAIN` mirrors `dartq-ai`'s
 //!   authoritative constant).
-//! * [`Domain::Compat`] — the §15.5 compatibility report
+//! * [`Domain::Compat`] — the compatibility report
 //!   ([`compat_schema`]; `SCHEMA_VERSION_COMPAT` mirrors `dartq-ai`'s
 //!   authoritative constant).
 //! * [`Domain::RunMetrics`] — the `--metrics-json` run summary
 //!   ([`run_metrics_schema`]).
-//! * [`Domain::Index`] — the §15.1 index run summary ([`index_schema`]).
+//! * [`Domain::Index`] — the index run summary ([`index_schema`]).
 //! * [`Domain::Check`] — the daemon's `dartq/check` answer
 //!   ([`check_schema`]).
 //! * [`Domain::Analyze`] — the daemon's `dartq/analyze` answer
 //!   ([`analyze_schema`]).
 //! * [`Domain::Assists`] — the assists document ([`assists_schema`]).
-//! * The §15.9 workspace config — `dartq.yaml` ([`config_schema`]) — is
+//! * The workspace config — `dartq.yaml` ([`config_schema`]) — is
 //!   published without a [`Domain`]: it is an input document, and its
 //!   enforcement point is the lenient reader in `dartq-commands`, not a
 //!   payload validator (the config module's docs carry the division).
@@ -369,21 +376,21 @@ pub use run_metrics::{SCHEMA_VERSION_RUN_METRICS, run_metrics_schema};
 /// Which published schema a payload is validated against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Domain {
-    /// The §15.4 impact report (`dartq-ai`'s `impact` query output).
+    /// The impact report (`dartq-ai`'s `impact` query output).
     Impact,
     /// The `dart analyze --format=json` envelope (`dartq-diagnostics`).
     Diagnostics,
-    /// The §15.6 fix patch document (`dartq fix --format=machine`).
+    /// The fix patch document (`dartq fix --format=machine`).
     FixPatch,
-    /// The §15.2 query answer (`dartq query --format=json`).
+    /// The query answer (`dartq query --format=json`).
     Query,
-    /// The §15.3 explain report (`dartq-ai`'s `explain` query output).
+    /// The explain report (`dartq-ai`'s `explain` query output).
     Explain,
-    /// The §15.5 compatibility report (`dartq compat`).
+    /// The compatibility report (`dartq compat`).
     Compat,
     /// The `--metrics-json` run summary (`dartq check` / `dartq analyze`).
     RunMetrics,
-    /// The §15.1 index run summary (`dartq index`).
+    /// The index run summary (`dartq index`).
     Index,
     /// The daemon's `dartq/check` answer (`schema_version` + machine rows).
     Check,
@@ -393,11 +400,11 @@ pub enum Domain {
     Assists,
 }
 
-/// A §15.1/§15.8.1 verbosity tier — the `--verbosity` spelling a face
+/// A verbosity tier — the `--verbosity` spelling a face
 /// answered under. Tier exactness is checked by [`validate_at_tier`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verbosity {
-    /// The red-line floor (§15.8): locating fields only — a diagnostic's
+    /// The red-line floor: locating fields only — a diagnostic's
     /// `code` + `location`, an edit's `offset`/`length`/`replacement`.
     /// Nothing prose-like may ride along.
     Minimal,
@@ -485,7 +492,7 @@ pub fn validate(payload: &str, domain: Domain) -> Result<(), SchemaViolation> {
 /// tier-independent fields; a `compact` answer carries no full-only field.
 ///
 /// Presence beyond the red line is not enforced: the ● cells past the
-/// locating floor are the emitter's fixture obligation (§15.8.5 omission
+/// locating floor are the emitter's fixture obligation (the omission
 /// conventions make legitimate absences indistinguishable from violations).
 /// The tier-invariant faces ([`Domain::Impact`], [`Domain::RunMetrics`],
 /// [`Domain::Index`]) ignore the tier — every field is a locator, a

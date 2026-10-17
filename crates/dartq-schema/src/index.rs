@@ -1,4 +1,4 @@
-//! The `dartq index` run summary (PRD §15.1) — the row totals the analyzed
+//! The `dartq index` run summary — the row totals the analyzed
 //! workspace's maintained symbol index reports, serialized by
 //! `dartq_commands::index::IndexRun::to_json` as one flat object:
 //! `schema_version` plus four non-negative integer totals (`files`,

@@ -67,7 +67,7 @@ static ANALYZE_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                     // The LSP §DiagnosticSeverity values dartq produces
                     // (lsp.rs:85): 1 Error · 2 Warning · 3 Information.
                     "severity": { "enum": [1, 2, 3] },
-                    // The stable dartq code name (snake_case, PRD §13.2).
+                    // The stable dartq code name.
                     "code": { "type": "string" },
                     "source": { "type": "string" },
                     "message": { "type": "string" },
@@ -82,7 +82,7 @@ static ANALYZE_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                     },
                 },
             }},
-            // §15.8 session token economics (crate docs, "Token
+            // Session token economics (crate docs, "Token
             // economics"): the full-tier short-id table over the entry
             // URIs. `since` is not declared — this face has no delta
             // parameter, so no writer emits the cursor.
@@ -95,7 +95,7 @@ static ANALYZE_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 const ANALYZE_TOP: &[&str] = &["schema_version", "diagnostics"];
 // Tier-independent (crate docs, "Token economics").
 const ANALYZE_SESSION: &[&str] = &["symbols"];
-// The red line (§15.8): the code plus the locator (`uri` + `range`);
+// The red line: the code plus the locator (`uri` + `range`);
 // severity, source, and message are the compact tier's contribution
 // (analyze_answer, commands.rs:928-937 — full equals compact plus the
 // short-id table).

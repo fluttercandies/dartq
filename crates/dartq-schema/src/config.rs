@@ -1,8 +1,7 @@
-//! The §15.9 workspace config — `dartq.yaml`, the all-optional declaration
-//! of context labels, the generated-file policy (§18.2), and the §17
-//! memory/cache defaults. The schema travels with the output faces' (PRD
-//! §15.9: the config schema is `dartq-schema`'s, under the same versioning
-//! discipline).
+//! The workspace config — `dartq.yaml`, the all-optional declaration
+//! of context labels, the generated-file policy, and the memory/cache
+//! defaults. The schema travels with the output faces (the config schema
+//! is `dartq-schema`'s, under the same versioning discipline).
 //!
 //! Unlike the output faces, this module publishes the schema document only
 //! — no [`crate::validate`] entry. The document's enforcement point is the
@@ -25,7 +24,7 @@ pub const SCHEMA_VERSION_CONFIG: u32 = 1;
 
 /// The published `dartq.yaml` schema (JSON Schema draft-07 subset). No
 /// field is required — the all-optional, zero-config default is the
-/// contract (PRD §15.9), so `{}` is a valid v1 config.
+/// contract, so `{}` is a valid v1 config.
 #[must_use]
 pub fn config_schema() -> &'static Value {
     &CONFIG_SCHEMA
@@ -89,7 +88,7 @@ static CONFIG_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     })
 });
 
-/// The context target spellings (§15.9; lowercase, `io` is the reader's
+/// The context target spellings (lowercase, `io` is the reader's
 /// default when absent).
 pub const TARGET_KINDS: &[&str] = &["io", "web", "wasm"];
 
@@ -142,9 +141,9 @@ mod tests {
         );
     }
 
-    /// The §15.9 example shape — two contexts, every section — is exactly
-    /// what the document describes: the pin that keeps the PRD draft and
-    /// the schema from drifting apart.
+    /// The example shape — two contexts, every section — is exactly
+    /// what the document describes: the pin that keeps the config draft
+    /// and the schema from drifting apart.
     #[test]
     fn the_prd_example_shape_is_the_published_shape() {
         let config = config_schema();

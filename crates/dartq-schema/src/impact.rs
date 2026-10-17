@@ -1,7 +1,7 @@
-//! The §15.4 impact report — `dartq-ai`'s `impact` query output. The row
+//! The impact report — `dartq-ai`'s `impact` query output. The row
 //! shapes are tier-invariant (crate docs, "Verbosity tiers"): every field is
-//! a locator or a verdict, so `minimal` cannot shrink a row. The §15.8
-//! session fields (`symbols`/`since`) are the face's token levers.
+//! a locator or a verdict, so `minimal` cannot shrink a row. The session
+//! fields (`symbols`/`since`) are the face's token levers.
 
 use std::sync::LazyLock;
 
@@ -13,10 +13,13 @@ use crate::support::{
     session_fields, string, symbol_ref,
 };
 
-/// The impact report's output contract version (PRD §15.7). Mirrors the
+/// The impact report's output contract version. Mirrors the
 /// authoritative `IMPACT_SCHEMA_VERSION` in `dartq-ai`; equality is pinned
-/// by an alignment test (`tests/alignment.rs`).
-pub const SCHEMA_VERSION_IMPACT: u32 = 1;
+/// by an alignment test (`tests/alignment.rs`). v2: `signature_changed`
+/// consults the member-level signature digests instead of the v1
+/// name-presence proxy — the field keeps its shape and name, the meaning
+/// underneath changed (the freeze discipline's reuse-the-field major).
+pub const SCHEMA_VERSION_IMPACT: u32 = 2;
 
 /// The published impact report schema (JSON Schema draft-07 subset).
 #[must_use]
@@ -27,8 +30,8 @@ pub fn impact_schema() -> &'static Value {
 static IMPACT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "$id": "dartq/schema/v1/impact-report.json",
-        "title": "dartq impact report (schema_version 1)",
+        "$id": "dartq/schema/v2/impact-report.json",
+        "title": "dartq impact report (schema_version 2)",
         "type": "object",
         "additionalProperties": false,
         "required": ["schema_version", "changed", "affected", "affected_tests", "affected_environments"],
@@ -69,7 +72,7 @@ static IMPACT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                     "compatible": { "type": "boolean" },
                 },
             }},
-            // §15.8 session token economics, declared before any emitter
+            // Session token economics, declared before any emitter
             // exists so v1 does not unfreeze when they land (crate docs,
             // "Token economics").
             "symbols": { "type": "object",
@@ -189,7 +192,7 @@ mod tests {
         bumped["schema_version"] = json!(SCHEMA_VERSION_IMPACT + 1);
         let violation = validate_impact(&bumped).expect_err("bumped version must violate");
         assert_eq!(violation.path, "schema_version");
-        assert_eq!(violation.expected, "the integer 1");
+        assert_eq!(violation.expected, "the integer 2");
     }
 
     #[test]

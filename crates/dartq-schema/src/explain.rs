@@ -1,8 +1,10 @@
-//! The §15.3 explain report — `dartq-ai`'s `explain` query output, the
-//! AI's one-stop symbol report. The §15.3 sections map onto the substrate
-//! the assembler can reach; two sections (`interfaces`, `constructors`)
-//! are documented empty seams until the capture grows the edges/rows, and
-//! they serialize as empty arrays, never placeholders.
+//! The explain report — `dartq-ai`'s `explain` query output, the
+//! AI's one-stop symbol report. The sections map onto the substrate
+//! the assembler can reach; `inheritance` carries the `extends` supertype
+//! edges while `interfaces` carries the `with`/`on`/`implements` ones
+//! (each row naming its clause), and `constructors` carries the element
+//! face's constructor rows (no source span exists for them — the name
+//! and the rendered parameter face are the facts).
 //!
 //! # Verbosity tiers (crate docs, "Verbosity tiers")
 //!
@@ -23,8 +25,8 @@
 //! | `references[].qualified`  | (count) | ●       | ●    |
 //! | `counts`                  | ●       |         |      |
 //!
-//! Ranges are the §15.8.5 `[startOffset, endOffset)` pair form (this face
-//! is new — no legacy spelling to keep). The §15.8 session fields
+//! Ranges are the `[startOffset, endOffset)` pair form (this face
+//! is new — no legacy spelling to keep). The session fields
 //! (`symbols`/`since`) are declared absent-tolerant like every daemon face;
 //! the face's `symbols` table is the id → FILE path spelling — the
 //! economics over this face's own path-valued rows — not query/impact's
@@ -42,7 +44,7 @@ use crate::support::{
     path_session_fields, pinned_version, range_pair, string,
 };
 
-/// The explain report's output contract version (PRD §15.7). Mirrors the
+/// The explain report's output contract version. Mirrors the
 /// authoritative `EXPLAIN_SCHEMA_VERSION` in `dartq-ai`; equality is pinned
 /// by an alignment test (`tests/alignment.rs`).
 pub const SCHEMA_VERSION_EXPLAIN: u32 = 1;
@@ -78,12 +80,12 @@ static EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 },
             },
             "inheritance": supertype_rows(),
-            // The documented empty seam until the capture records
-            // implements/with edges (dartq-ai `explain.rs`).
+            // The `with`/`on`/`implements` supertype edges, each row
+            // naming its clause (dartq-ai `explain.rs`, the clause split).
             "interfaces": supertype_rows(),
-            // The documented empty seam until the capture mints
-            // constructor rows (dartq-ai `explain.rs`).
-            "constructors": member_rows(),
+            // The element face's constructor rows: the spanless shape (the
+            // element model carries no constructor ranges).
+            "constructors": constructor_rows(),
             "methods": member_rows(),
             "references": { "type": "array", "items": {
                 "type": "object",
@@ -113,7 +115,7 @@ static EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                     "affected_tests": { "type": "integer", "minimum": 0 },
                 },
             },
-            // §15.8 session token economics (crate docs, "Token economics").
+            // Session token economics (crate docs, "Token economics").
             "symbols": { "type": "object",
                 "additionalProperties": { "type": "string" } },
             "since": { "type": "integer", "minimum": 0 },
@@ -121,7 +123,7 @@ static EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     })
 });
 
-/// The shared range-pair schema fragment (§15.8.5).
+/// The shared range-pair schema fragment.
 fn range_pair_schema() -> Value {
     json!({
         "type": "array",
@@ -142,6 +144,9 @@ fn supertype_rows() -> Value {
                 "name": { "type": "string" },
                 // Absent = a bare name outside the analyzed set.
                 "file": { "type": "string" },
+                // Absent only for producers that cannot attribute the
+                // clause; the explain producer always emits it.
+                "clause": { "enum": CLAUSE_KINDS },
             },
         },
     })
@@ -158,6 +163,24 @@ fn member_rows() -> Value {
                 "name": { "type": "string" },
                 "kind": { "enum": MEMBER_KINDS },
                 "range": range_pair_schema(),
+            },
+        },
+    })
+}
+
+fn constructor_rows() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "kind"],
+            "properties": {
+                "name": { "type": "string" },
+                "kind": { "enum": CONSTRUCTOR_KINDS },
+                // The rendered parameter face; absent only for producers
+                // that cannot render it (the explain producer always does).
+                "signature": { "type": "string" },
             },
         },
     })
@@ -180,6 +203,14 @@ fn path_rows() -> Value {
 /// The member families that ride the `methods` array.
 pub const MEMBER_KINDS: &[&str] = &["method", "getter", "setter", "field"];
 
+/// The `constructors` section's kind — the member-kind grammar's
+/// constructor spelling, exclusive to that section (the `methods` rows
+/// come from the capture, whose kind set has no constructor).
+pub const CONSTRUCTOR_KINDS: &[&str] = &["constructor"];
+
+/// The supertype clauses the `inheritance`/`interfaces` rows name.
+pub const CLAUSE_KINDS: &[&str] = &["extends", "with", "on", "implements"];
+
 /// The explain report's array sections, in `counts` order.
 pub const EXPLAIN_SECTIONS: &[&str] = &[
     "inheritance",
@@ -193,7 +224,7 @@ pub const EXPLAIN_SECTIONS: &[&str] = &[
 
 const EXPLAIN_TOP: &[&str] = &["schema_version", "symbol"];
 /// Everything beyond the red line is optional: the section arrays drop at
-/// `minimal`, `counts` exists only there, and the §15.8 session fields
+/// `minimal`, `counts` exists only there, and the session fields
 /// (`symbols`/`since`) ride absent-tolerant.
 const EXPLAIN_OPTIONAL: &[&str] = &[
     "declaration",
@@ -211,8 +242,10 @@ const EXPLAIN_OPTIONAL: &[&str] = &[
 const DECLARATION_ROW: &[&str] = &["file", "name", "kind", "range"];
 const DECLARATION_ROW_OPTIONAL: &[&str] = &["container"];
 const SUPERTYPE_ROW: &[&str] = &["name"];
-const SUPERTYPE_ROW_OPTIONAL: &[&str] = &["file"];
+const SUPERTYPE_ROW_OPTIONAL: &[&str] = &["file", "clause"];
 const MEMBER_ROW: &[&str] = &["name", "kind", "range"];
+const CONSTRUCTOR_ROW: &[&str] = &["name", "kind"];
+const CONSTRUCTOR_ROW_OPTIONAL: &[&str] = &["signature"];
 const REFERENCE_ROW: &[&str] = &["file", "kind", "range"];
 const REFERENCE_ROW_OPTIONAL: &[&str] = &["qualified"];
 const PATH_ROW: &[&str] = &["path"];
@@ -249,6 +282,9 @@ pub(crate) fn validate_explain(value: &Value) -> Result<(), SchemaViolation> {
             if let Some(file) = obj.get("file") {
                 string(file, &join(&p, "file"))?;
             }
+            if let Some(clause) = obj.get("clause") {
+                enum_spelling(clause, &join(&p, "clause"), CLAUSE_KINDS)?;
+            }
         }
     }
     for section in ["constructors", "methods"] {
@@ -258,10 +294,21 @@ pub(crate) fn validate_explain(value: &Value) -> Result<(), SchemaViolation> {
         for (i, row) in array(list, section)?.iter().enumerate() {
             let p = format!("{section}[{i}]");
             let obj = object(row, &p)?;
-            exact_fields(obj, MEMBER_ROW, &[], &p)?;
+            // The constructors rows are the spanless shape (the element
+            // model carries no constructor ranges); methods keep the
+            // captured declaration rows' locator.
+            let (required, optional, kinds): (&[&str], &[&str], &[&str]) = match section {
+                "constructors" => (CONSTRUCTOR_ROW, CONSTRUCTOR_ROW_OPTIONAL, CONSTRUCTOR_KINDS),
+                _ => (MEMBER_ROW, &[], MEMBER_KINDS),
+            };
+            exact_fields(obj, required, optional, &p)?;
             string(field(obj, "name", &p)?, &join(&p, "name"))?;
-            enum_spelling(field(obj, "kind", &p)?, &join(&p, "kind"), MEMBER_KINDS)?;
-            range_pair(field(obj, "range", &p)?, &join(&p, "range"))?;
+            enum_spelling(field(obj, "kind", &p)?, &join(&p, "kind"), kinds)?;
+            if section == "methods" {
+                range_pair(field(obj, "range", &p)?, &join(&p, "range"))?;
+            } else if let Some(signature) = obj.get("signature") {
+                string(signature, &join(&p, "signature"))?;
+            }
         }
     }
     if let Some(list) = root.get("references") {
@@ -347,9 +394,11 @@ mod tests {
                 "kind": "class",
                 "range": [40, 43],
             },
-            "inheritance": [{"name": "Bar", "file": "a.dart"}],
-            "interfaces": [],
-            "constructors": [],
+            "inheritance": [{"name": "Bar", "file": "a.dart", "clause": "extends"}],
+            "interfaces": [{"name": "Mix", "file": "b.dart", "clause": "with"}],
+            "constructors": [
+                {"name": "Foo", "kind": "constructor", "signature": "Foo()"},
+            ],
             "methods": [
                 {"name": "area", "kind": "method", "range": [90, 93]},
                 {"name": "label", "kind": "field", "range": [70, 73]},
@@ -413,6 +462,14 @@ mod tests {
             .collect();
         super_fields.sort_unstable();
         assert_eq!(schema_keys(supertype), super_fields);
+        let constructor = &explain["properties"]["constructors"]["items"];
+        let mut ctor_fields: Vec<String> = CONSTRUCTOR_ROW
+            .iter()
+            .chain(CONSTRUCTOR_ROW_OPTIONAL.iter())
+            .map(|s| (*s).to_owned())
+            .collect();
+        ctor_fields.sort_unstable();
+        assert_eq!(schema_keys(constructor), ctor_fields);
         let member = &explain["properties"]["methods"]["items"];
         assert_eq!(schema_keys(member), const_names(MEMBER_ROW));
         let reference = &explain["properties"]["references"]["items"];
@@ -439,7 +496,9 @@ mod tests {
     }
 
     /// The section enums pin the shared query-face spellings plus the
-    /// member subset.
+    /// member subset; the constructors section owns the constructor
+    /// spelling (the methods rows come from the capture, whose kind set
+    /// has no constructor).
     #[test]
     fn kind_enums_match_the_declared_lists() {
         let explain = explain_schema();
@@ -452,9 +511,64 @@ mod tests {
             MEMBER_KINDS
         );
         assert_eq!(
+            spelling(&explain["properties"]["constructors"]["items"]["properties"]["kind"]),
+            CONSTRUCTOR_KINDS
+        );
+        assert_eq!(
+            spelling(&explain["properties"]["interfaces"]["items"]["properties"]["clause"]),
+            CLAUSE_KINDS
+        );
+        assert_eq!(
             spelling(&explain["properties"]["references"]["items"]["properties"]["kind"]),
             REF_KINDS
         );
+    }
+
+    /// The additive supertype/constructor columns: the clause spelling is
+    /// checked, an unknown clause is named, the constructor row's
+    /// signature is optional but contract-bound, and a constructor row
+    /// carrying a range (the methods row's locator) is rejected — the
+    /// element model has no constructor spans.
+    #[test]
+    fn supertype_and_constructor_columns_are_contract_bound() {
+        let mut payload = full_report();
+        payload["interfaces"][0]["clause"] = json!("implements");
+        assert!(validate_explain(&payload).is_ok(), "clause swap is legal");
+
+        let mut payload = full_report();
+        payload["inheritance"][0]
+            .as_object_mut()
+            .expect("object")
+            .remove("clause");
+        assert!(
+            validate_explain(&payload).is_ok(),
+            "the clause column is optional (absent-tolerant)"
+        );
+
+        let mut payload = full_report();
+        payload["interfaces"][0]["clause"] = json!("banana");
+        let violation = validate_explain(&payload).expect_err("unknown clause");
+        assert_eq!(violation.path, "interfaces[0].clause");
+
+        let mut payload = full_report();
+        payload["constructors"][0]
+            .as_object_mut()
+            .expect("object")
+            .remove("signature");
+        assert!(
+            validate_explain(&payload).is_ok(),
+            "the signature column is optional (absent-tolerant)"
+        );
+
+        let mut payload = full_report();
+        payload["constructors"][0]["signature"] = json!(42);
+        let violation = validate_explain(&payload).expect_err("non-string signature");
+        assert_eq!(violation.path, "constructors[0].signature");
+
+        let mut payload = full_report();
+        payload["constructors"][0]["range"] = json!([1, 2]);
+        let violation = validate_explain(&payload).expect_err("constructor rows are spanless");
+        assert_eq!(violation.path, "constructors[0].range");
     }
 
     #[test]

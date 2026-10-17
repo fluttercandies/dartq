@@ -9,12 +9,12 @@ use serde_json::{Value, json};
 use crate::SchemaViolation;
 use crate::Verbosity;
 use crate::support::{
-    absent, enum_spelling, exact_fields, field, join, non_negative, object, one_based,
+    absent, array, enum_spelling, exact_fields, field, join, non_negative, object, one_based,
     pinned_version, rows, string,
 };
 
 /// The diagnostics JSON envelope's contract version — the oracle's
-/// `version` key. Deliberate §15.7 naming alias: the envelope predates the
+/// `version` key. Deliberate naming alias: the envelope predates the
 /// generic `schema_version` naming and stays byte-compatible with the
 /// oracle, so no second key is ever added (crate docs, "The `version`
 /// alias").
@@ -40,6 +40,23 @@ static DIAGNOSTICS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "column": { "type": "integer", "minimum": 1 },
         },
     });
+    let location = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "range"],
+        "properties": {
+            "file": { "type": "string" },
+            "range": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["start", "end"],
+                "properties": {
+                    "start": position,
+                    "end": position,
+                },
+            },
+        },
+    });
     json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
         "$id": "dartq/schema/v1/diagnostics-json.json",
@@ -56,26 +73,22 @@ static DIAGNOSTICS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 "properties": {
                     "code": { "type": "string" },
                     "severity": { "enum": ["INFO", "WARNING", "ERROR"] },
-                    "type": { "enum": ["SYNTACTIC_ERROR", "COMPILE_TIME_ERROR", "STATIC_WARNING", "LINT", "TOOL"] },
-                    "location": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["file", "range"],
-                        "properties": {
-                            "file": { "type": "string" },
-                            "range": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": ["start", "end"],
-                                "properties": {
-                                    "start": position,
-                                    "end": position,
-                                },
+                    "type": { "enum": ["SYNTACTIC_ERROR", "COMPILE_TIME_ERROR", "STATIC_WARNING", "LINT", "HINT", "TODO", "TOOL"] },
+                    "location": location,
+                    "problemMessage": { "type": "string" },
+                    "correctionMessage": { "type": "string" },
+                    "contextMessages": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["location", "message"],
+                            "properties": {
+                                "location": location,
+                                "message": { "type": "string" },
                             },
                         },
                     },
-                    "problemMessage": { "type": "string" },
-                    "correctionMessage": { "type": "string" },
                     "documentation": { "type": "string" },
                 },
             }},
@@ -84,7 +97,7 @@ static DIAGNOSTICS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 });
 
 const DIAGNOSTICS_TOP: &[&str] = &["version", "diagnostics"];
-// Red line (§15.8): every tier keeps `code` + `location`; the message and
+// Red line: every tier keeps `code` + `location`; the message and
 // classification fields are the compact/full tiers' contribution.
 const DIAGNOSTIC: &[&str] = &["code", "location"];
 const DIAGNOSTIC_OPTIONAL: &[&str] = &[
@@ -92,22 +105,29 @@ const DIAGNOSTIC_OPTIONAL: &[&str] = &[
     "type",
     "problemMessage",
     "correctionMessage",
+    "contextMessages",
     "documentation",
 ];
 const LOCATION: &[&str] = &["file", "range"];
 const RANGE: &[&str] = &["start", "end"];
 const POSITION: &[&str] = &["offset", "line", "column"];
+const CONTEXT_MESSAGE: &[&str] = &["location", "message"];
 /// The machine severity spellings (`Severity::as_machine_str`,
 /// `crates/dartq-diagnostics/src/model.rs:35`) — shared with the check
 /// domain, whose rows carry the same field.
 pub(crate) const SEVERITIES: &[&str] = &["INFO", "WARNING", "ERROR"];
-/// The machine `TYPE` spellings (`DiagnosticType::as_str`, model.rs:79) —
-/// shared with the check domain, whose rows carry the same field.
+/// The machine `TYPE` spellings (`DiagnosticType::as_str`, model.rs:107) —
+/// shared with the check domain, whose rows carry the same field. `HINT` and
+/// `TODO` are upstream `DiagnosticType`s whose severity folds to `INFO`
+/// (upstream Dart SDK source,
+/// `pkg/_fe_analyzer_shared/lib/src/base/errors.dart`:284-296).
 pub(crate) const DIAGNOSTIC_TYPES: &[&str] = &[
     "SYNTACTIC_ERROR",
     "COMPILE_TIME_ERROR",
     "STATIC_WARNING",
     "LINT",
+    "HINT",
+    "TODO",
     "TOOL",
 ];
 
@@ -140,6 +160,24 @@ pub(crate) fn validate_diagnostics(value: &Value) -> Result<(), SchemaViolation>
         }
         if let Some(m) = obj.get("correctionMessage") {
             string(m, &join(&p, "correctionMessage"))?;
+        }
+        if let Some(context) = obj.get("contextMessages") {
+            let cp = join(&p, "contextMessages");
+            for (j, element) in array(context, &cp)?.iter().enumerate() {
+                let ep = format!("{cp}[{j}]");
+                let element_obj = object(element, &ep)?;
+                exact_fields(element_obj, CONTEXT_MESSAGE, &[], &ep)?;
+                let lp = join(&ep, "location");
+                let location = object(field(element_obj, "location", &ep)?, &lp)?;
+                exact_fields(location, LOCATION, &[], &lp)?;
+                string(field(location, "file", &lp)?, &join(&lp, "file"))?;
+                let rp = join(&lp, "range");
+                let range = object(field(location, "range", &lp)?, &rp)?;
+                exact_fields(range, RANGE, &[], &rp)?;
+                position(field(range, "start", &rp)?, &join(&rp, "start"))?;
+                position(field(range, "end", &rp)?, &join(&rp, "end"))?;
+                string(field(element_obj, "message", &ep)?, &join(&ep, "message"))?;
+            }
         }
         if let Some(d) = obj.get("documentation") {
             string(d, &join(&p, "documentation"))?;
@@ -260,7 +298,7 @@ mod tests {
         assert!(validate_diagnostics(&value).is_ok());
     }
 
-    /// Red line (§15.8): a minimal row without its location is never valid.
+    /// Red line: a minimal row without its location is never valid.
     #[test]
     fn minimal_row_without_location_is_named() {
         let mut value = envelope();
@@ -268,6 +306,52 @@ mod tests {
         let violation = validate_diagnostics(&value).expect_err("red-line omission");
         assert_eq!(violation.path, "diagnostics[0].location");
         assert_eq!(violation.found, "missing");
+    }
+
+    /// The oracle emits `contextMessages` only when the array is non-empty
+    /// (upstream `analyze.dart` `emitJsonFormat` `if (contextMessages.isNotEmpty)`);
+    /// the schema must accept that optional key, validate its element shape
+    /// (`{location: {file, range}, message}`), and reject undeclared fields
+    /// within the element.
+    #[test]
+    fn context_messages_pass_and_undeclared_fields_are_named() {
+        let mut value = envelope();
+        value["diagnostics"][0]["contextMessages"] = json!([{
+            "location": {
+                "file": "lib/dep.dart",
+                "range": {
+                    "start": {"offset": 12, "line": 2, "column": 1},
+                    "end": {"offset": 18, "line": 2, "column": 7},
+                },
+            },
+            "message": "The declaration is here.",
+        }]);
+        assert!(validate_diagnostics(&value).is_ok());
+
+        value["diagnostics"][0]["contextMessages"][0]["span"] = json!(5);
+        let violation =
+            validate_diagnostics(&value).expect_err("an undeclared element field is named");
+        assert_eq!(violation.path, "diagnostics[0].contextMessages[0].span");
+        assert_eq!(violation.found, "an undeclared field");
+
+        // A malformed inner location is named at its own path.
+        let mut value = envelope();
+        value["diagnostics"][0]["contextMessages"] = json!([{
+            "location": {
+                "file": "lib/dep.dart",
+                "range": {
+                    "start": {"offset": 12, "line": 0, "column": 1},
+                    "end": {"offset": 18, "line": 2, "column": 7},
+                },
+            },
+            "message": "The declaration is here.",
+        }]);
+        let violation =
+            validate_diagnostics(&value).expect_err("a zero line inside context is named");
+        assert_eq!(
+            violation.path,
+            "diagnostics[0].contextMessages[0].location.range.start.line"
+        );
     }
 
     /// Tier exactness: a minimal answer may not carry the compact tier's

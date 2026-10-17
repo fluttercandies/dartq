@@ -90,7 +90,7 @@ pub(crate) fn one_based(value: &Value, path: &str) -> Result<u64, SchemaViolatio
 
 /// A required field that may legitimately be `null`: the producers spell
 /// "no value" as JSON null on the total columns (`container` of a top-level
-/// declaration row, `max_rss_bytes` without getrusage) — see the §15.8.5
+/// declaration row, `max_rss_bytes` without getrusage) — see the range-pair
 /// omission note in the crate docs.
 pub(crate) fn string_or_null(value: &Value, path: &str) -> Result<(), SchemaViolation> {
     if value.is_null() {
@@ -107,7 +107,7 @@ pub(crate) fn non_negative_or_null(value: &Value, path: &str) -> Result<(), Sche
     non_negative(value, path).map(|_| ())
 }
 
-/// A §15.8.5 `[startOffset, endOffset)` range pair — the range spelling
+/// A `[startOffset, endOffset)` range pair — the range spelling
 /// faces designed under the token-economics rule adopt (older faces keep
 /// their pinned `offset`+`length` columns).
 pub(crate) fn range_pair(value: &Value, path: &str) -> Result<(), SchemaViolation> {
@@ -170,7 +170,7 @@ pub(crate) fn enum_spelling(
     }
 }
 
-/// The §15.7 stable path form `label|name` — pinned by containment; the
+/// The stable path form `label|name` — pinned by containment; the
 /// label grammar is the producer's business.
 pub(crate) fn symbol_ref(value: &Value, path: &str) -> Result<(), SchemaViolation> {
     let r#ref = string(value, path)?;
@@ -248,7 +248,7 @@ pub(crate) fn pinned_version(
     }
 }
 
-/// The §15.8 session fields shared by the query and impact faces: a compact
+/// The session fields shared by the query and impact faces: a compact
 /// symbol table (`short id → label|name`) and the delta cursor echo. Both
 /// absent-tolerant — no current emitter sends them; see the crate docs,
 /// "Token economics".
@@ -266,12 +266,12 @@ pub(crate) fn session_fields(obj: &Map<String, Value>) -> Result<(), SchemaViola
     Ok(())
 }
 
-/// The §15.8 economics applied to a face's own path-valued rows (the
+/// The economics applied to a face's own path-valued rows (the
 /// daemon's full-tier `explain` short-id table): `symbols` maps short ids
 /// to FILE paths — the values are the very strings substituted out of the
 /// rows, a different value domain than the query/impact table's
 /// `label|name` entity references (the split the daemon's session-economics
-/// contract pins; §15.8-2's entity-reference table stays the pin above).
+/// contract pins; the entity-reference table above stays the pin).
 /// `since` is the same delta cursor. Both absent-tolerant.
 pub(crate) fn path_session_fields(obj: &Map<String, Value>) -> Result<(), SchemaViolation> {
     if let Some(table) = obj.get("symbols") {
@@ -287,11 +287,11 @@ pub(crate) fn path_session_fields(obj: &Map<String, Value>) -> Result<(), Schema
     Ok(())
 }
 
-/// The §15.6 edit-row floor shared by the fix patch and assists documents:
+/// The edit-row floor shared by the fix patch and assists documents:
 /// the red-line locator trio (`offset`/`length`/`replacement`) plus the
-/// provenance tag (`source` — the row never drops it, §15.8), and the
+/// provenance tag, and the
 /// optional compact-tier anchor (`line`/`column` plus the context flanks;
-/// empty context strings are omitted, §15.8.5). Callers run their own
+/// empty context strings are omitted). Callers run their own
 /// `exact_fields` first: the fix patch rows carry more optional columns
 /// (`rule`/`message`/`priority`/`stale`) than the assists rows.
 pub(crate) fn edit_floor(obj: &Map<String, Value>, p: &str) -> Result<(), SchemaViolation> {

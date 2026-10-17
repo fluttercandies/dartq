@@ -1,4 +1,4 @@
-//! The §15.5 compatibility report — `dartq compat`, the per-SDK-context
+//! The compatibility report — `dartq compat`, the per-SDK-context
 //! verdict matrix produced by `dartq-ai::compatibility::CompatReport` and
 //! serialized by the CLI (`crates/dartq-cli/src/compat.rs:151-159`).
 

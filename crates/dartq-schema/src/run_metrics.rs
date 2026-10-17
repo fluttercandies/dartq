@@ -1,6 +1,6 @@
 //! The `--metrics-json` run summary shared by `dartq check` and
 //! `dartq analyze` (`RunMetrics::json` in `crates/dartq-cli`): one JSON
-//! object at exit, the engine-api-spec §3 benchmark face. Tier-invariant
+//! object at exit, the benchmark face. Tier-invariant
 //! (crate docs, "Verbosity tiers") — a benchmark sidecar has no trimmable
 //! prose.
 
@@ -54,7 +54,7 @@ static RUN_METRICS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "libraries_analyzed": { "type": "integer", "minimum": 0 },
             "libraries_from_cache": { "type": "integer", "minimum": 0 },
             // getrusage failure spells null (main.rs:473 Option<u64>) — a
-            // total column, not an omitted one (§15.8.5 note, crate docs).
+            // total column, not an omitted one.
             "max_rss_bytes": { "type": ["integer", "null"], "minimum": 0 },
         },
     })
