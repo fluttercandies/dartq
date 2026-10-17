@@ -1,5 +1,5 @@
 //! Per-context task queues with three-tier priority, writer-priority drain,
-//! and epoch-based staleness (PRD §16.5, §16.6).
+//! and epoch-based staleness.
 //!
 //! The scheduler is pure data plumbing: tasks are ordered records, not
 //! closures. The daemon/server owns execution and threading (runtime policy:
@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 
 use crate::context::ContextId;
 
-/// Scheduling precedence (PRD §16.5): `Interactive` (a client is waiting on
+/// Scheduling precedence: `Interactive` (a client is waiting on
 /// the answer) > `Normal` (input application and publish pushes) >
 /// `Background` (indexing, prewarming, persistence triggers). `Ord` follows
 /// that ascending order, so higher = drained first within its class.
@@ -34,14 +34,14 @@ pub enum Tier {
     Interactive,
 }
 
-/// One unit of scheduled work (PRD §16.5). A plain record: `cookie` names the
+/// One unit of scheduled work. A plain record: `cookie` names the
 /// job in the caller's own vocabulary, everything else is scheduling data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Task {
     /// The context the task analyzes against.
     pub context: ContextId,
     /// The context epoch at enqueue time; a task whose epoch no longer
-    /// matches is stale and dropped at drain (PRD §16.6).
+    /// matches is stale and dropped at drain.
     pub epoch: u64,
     /// Whether the task writes the context's view (`true`: overlay apply —
     /// every pending write drains before any read) or reads it.
@@ -60,7 +60,7 @@ pub struct DrainReport {
     /// every read (the read-after-write invariant), and context-ascending /
     /// arrival order within one tier stays the deterministic tiebreak.
     pub tasks: Vec<Task>,
-    /// Stale tasks dropped at the drain point (PRD §16.6): their epoch was
+    /// Stale tasks dropped at the drain point: their epoch was
     /// superseded by a later write into their context, so executing them
     /// would analyze a view that no longer exists.
     pub stale_dropped: usize,
@@ -125,7 +125,7 @@ impl Scheduler {
                 reads.push(task);
             }
         }
-        // Tier precedence within each class (§16.5): a stable sort keeps the
+        // Tier precedence within each class: a stable sort keeps the
         // context-ascending / arrival tiebreak inside a tier.
         writes.sort_by_key(|task| Reverse(task.tier));
         reads.sort_by_key(|task| Reverse(task.tier));
@@ -191,7 +191,7 @@ mod tests {
         );
     }
 
-    /// Tier precedence (PRD §16.5) within each class: an interactive task
+    /// Tier precedence within each class: an interactive task
     /// enqueued behind background work drains first, while writer-priority
     /// stays the outer key — a background write still drains before an
     /// interactive read (the read-after-write invariant is a correctness
@@ -246,7 +246,7 @@ mod tests {
             scheduler.enqueue(tiered(1, false, Tier::Interactive, 6));
             scheduler
                 .drain(&|id| match id.index() {
-                    0 | 1 | 2 => 0,
+                    0..=2 => 0,
                     _ => unreachable!("no other context enqueued"),
                 })
                 .tasks

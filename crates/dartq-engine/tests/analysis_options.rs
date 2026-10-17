@@ -1,4 +1,4 @@
-//! Analysis-options merge pins (PRD §12, ticket #313). The merge semantics
+//! Analysis-options merge pins. The merge semantics
 //! mirror the official include walk (`_applyParsedFiles`): depth-first,
 //! included files apply before their includer, so nearer entries override
 //! farther ones; exclude globs anchor to the declaring file's directory
@@ -226,6 +226,85 @@ fn invalid_exclude_sections_and_entries_are_ignored() {
     assert!(entries.is_excluded(&dir.path("valid/x.dart")));
 }
 
+/// The `exclude_invalid_glob` face (`_ParsedExcludesData.parse`,
+/// parse_model:660-668): a string pattern starting with `/` reports the
+/// verbatim row anchored at its own occurrence and contributes no matching
+/// glob (an absolute-rooted glob never matches a parent-relative path),
+/// other leading characters (`~`) stay silent and compile as ordinary
+/// literal relative globs, and an included file's row wraps into
+/// `included_file_warning` (the correction dropped).
+#[test]
+fn leading_slash_exclude_patterns_report_exclude_invalid_glob() {
+    let dir = TempDir::new("bad_glob");
+    dir.write(
+        "analysis_options.yaml",
+        concat!(
+            "analyzer:\n",
+            "  exclude:\n",
+            "    - \"/abs/pattern.dart\"\n",
+            "    - \"generated/**\"\n",
+            "    - \"~/home.dart\"\n",
+        ),
+    );
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    let issue = &options.issues[0];
+    assert_eq!(issue.code.name, "exclude_invalid_glob");
+    assert_eq!(issue.code.machine, "EXCLUDE_INVALID_GLOB");
+    assert_eq!(
+        issue.code.dtype,
+        dartq_diagnostics::DiagnosticType::StaticWarning
+    );
+    assert_eq!(
+        issue.message,
+        "The exclude glob pattern '/abs/pattern.dart' shouldn't start with a forward slash."
+    );
+    assert_eq!(
+        issue.correction.as_deref(),
+        Some("Remove the leading forward slash.")
+    );
+    // Anchored at the pattern token, not the section key (offset 28 in the
+    // text above).
+    assert_eq!(issue.offset, 28);
+    assert_eq!(issue.length, 17);
+
+    // The reported pattern contributes no glob: its leading `/` anchors it
+    // at the filesystem root, so it can never match a path relative to the
+    // declaring directory. The other two patterns compile — the locator's
+    // `addGlob` runs unconditionally per pattern (context_locator.dart
+    // :630-636) and `~` is a literal there, an ordinary relative glob.
+    assert_eq!(options.exclude_globs().len(), 2);
+    assert!(!options.is_excluded(&dir.path("abs/pattern.dart")));
+    assert!(options.is_excluded(&dir.path("generated/a.dart")));
+    assert!(options.is_excluded(&dir.path("~/home.dart")));
+
+    // An included file's row wraps (`_IncludedDiagnosticListener`): the
+    // message names the included file and the inner inclusive span
+    // (`/deep/x.dart` in far.yaml: 28..39), the row anchors at the branch
+    // directive, and the correction never survives.
+    dir.write("near.yaml", "include: far.yaml\n");
+    dir.write(
+        "far.yaml",
+        "analyzer:\n  exclude:\n    - \"/deep/x.dart\"\n",
+    );
+    let near = AnalysisOptions::load(&dir.path("near.yaml"), &empty_config(), &dir.0);
+    assert_eq!(near.issues.len(), 1, "{:?}", near.issues);
+    let wrapped = &near.issues[0];
+    assert_eq!(wrapped.code.name, "included_file_warning");
+    let far = dir.path("far.yaml").display().to_string();
+    assert_eq!(
+        wrapped.message,
+        format!(
+            "Warning in the included options file {far}(28..39): The exclude glob pattern \
+             '/deep/x.dart' shouldn't start with a forward slash."
+        )
+    );
+    assert_eq!(wrapped.correction, None);
+}
+
 #[test]
 fn unreadable_and_missing_includes_degrade_to_nothing() {
     let dir = TempDir::new("degrade");
@@ -242,7 +321,7 @@ fn unreadable_and_missing_includes_degrade_to_nothing() {
 }
 
 /// The diagnostics pipeline applies exclusions: an excluded file never
-/// enters the analysis set (PRD §12.2), so its errors never surface.
+/// enters the analysis set, so its errors never surface.
 #[test]
 fn discovery_excludes_files_from_the_analysis_set() {
     use common::Fixture;
@@ -482,18 +561,20 @@ fn cannot_ignore_explicit_names_and_severity_arms() {
     // ignore comments cannot suppress either.
     assert!(!options.is_ignorable("undefined_identifier"));
     assert!(!options.is_ignorable("dead_code"));
-    // Everything else stays suppressible — including the ERROR-severity
+    // Everything else stays suppressible — including the WARNING-severity
     // codes the `info` arm does not reach.
     assert!(options.is_ignorable("unused_local_variable"));
-    // The `info` arm: registry INFO codes (`prefer_single_quotes` is a LINT →
-    // Info) become unignorable, and `duplicate_definition` joins through its
-    // this-file re-level to info (the errors-before-cannot-ignore order,
-    // parser:166-167) despite its registry severity being ERROR.
-    assert!(!options.is_ignorable("prefer_single_quotes"));
+    // The `info` arm: registry INFO-severity `diagnosticCodeValues` entries
+    // (`deprecated_member_use` is HINT → Info upstream) become unignorable,
+    // and `duplicate_definition` joins through its this-file re-level to
+    // info (the errors-before-cannot-ignore order, parser:166-167) despite
+    // its registry severity being ERROR. A lint rule name is NOT in
+    // `diagnosticCodeValues` at all (`prefer_single_quotes` lives in the
+    // lint registry upstream), so the arm never reaches it — only the
+    // explicit-name path could.
+    assert!(!options.is_ignorable("deprecated_member_use"));
     assert!(!options.is_ignorable("duplicate_definition"));
-    // A WARNING-severity registry code (`unused_local_variable` is
-    // STATIC_WARNING) stays outside the `info` arm.
-    assert!(options.is_ignorable("unused_local_variable"));
+    assert!(options.is_ignorable("prefer_single_quotes"));
 }
 
 /// The language strictness scalars (`_ParsedLanguageData.parse`,
@@ -550,6 +631,82 @@ fn language_scalars_parse_and_expose() {
     assert_eq!(none.strict_casts, None);
     assert_eq!(none.strict_inference, None);
     assert_eq!(none.strict_raw_types, None);
+}
+
+/// The `unsupported_value` face of the strict-* scalars
+/// (`_ParsedLanguageData.parse`, parse_model:944-956): a scalar failing the
+/// `toBool` conversion reports the verbatim row with the `trueOrFalse`
+/// proposal anchored at the value's occurrence, case variants of the
+/// boolean strings stay silent and still merge, and a present-but-null
+/// value reports too while the section-level null stays tolerated (:918).
+#[test]
+fn strict_non_boolean_values_report_unsupported_value() {
+    let dir = TempDir::new("strict_value");
+    dir.write(
+        "analysis_options.yaml",
+        concat!(
+            "analyzer:\n",
+            "  language:\n",
+            "    strict-casts: 42\n",
+            "    strict-inference: TRUE\n",
+            "    strict-raw-types: yes\n",
+        ),
+    );
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    assert_eq!(options.issues.len(), 2, "{:?}", options.issues);
+    let casts = &options.issues[0];
+    assert_eq!(casts.code.name, "unsupported_value");
+    assert_eq!(casts.code.machine, "UNSUPPORTED_VALUE");
+    assert_eq!(
+        casts.code.dtype,
+        dartq_diagnostics::DiagnosticType::StaticWarning
+    );
+    assert_eq!(
+        casts.message,
+        "The value '42' isn't supported by 'strict-casts'."
+    );
+    assert_eq!(
+        casts.correction.as_deref(),
+        Some("Try using one of the supported values: 'true' and 'false'.")
+    );
+    // Anchored at the value token after its option key (offset 40 above).
+    assert_eq!(casts.offset, 40);
+    assert_eq!(casts.length, 2);
+
+    let raw_types = &options.issues[1];
+    assert_eq!(
+        raw_types.message,
+        "The value 'yes' isn't supported by 'strict-raw-types'."
+    );
+    assert_eq!(raw_types.offset, 92);
+    assert_eq!(raw_types.length, 3);
+
+    // The case-insensitive boolean string merges; the reported values
+    // contribute nothing.
+    assert_eq!(options.strict_casts, None);
+    assert_eq!(options.strict_inference, Some(true));
+    assert_eq!(options.strict_raw_types, None);
+
+    // A present-but-null value is a scalar failing the conversion
+    // (`valueNode.value.toString()` renders `null`).
+    let nulls = TempDir::new("strict_null");
+    nulls.write(
+        "analysis_options.yaml",
+        "analyzer:\n  language:\n    strict-casts: null\n",
+    );
+    let options = AnalysisOptions::load(
+        &nulls.path("analysis_options.yaml"),
+        &empty_config(),
+        &nulls.0,
+    );
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    assert_eq!(
+        options.issues[0].message,
+        "The value 'null' isn't supported by 'strict-casts'."
+    );
 }
 
 /// The output face wiring: `Engine::analyze` applies the governing options'
@@ -852,6 +1009,7 @@ fn invalid_section_shapes_report_rows() {
 /// parse_model:547-556), `language` and `linter` are null-tolerant
 /// (:918, :1132).
 #[test]
+#[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 fn unsupported_options_report_verbatim_rows() {
     let dir = TempDir::new("unsupported");
     dir.write(
@@ -1097,6 +1255,7 @@ fn engine_analyze_emits_and_relevels_options_rows() {
 /// an opposite re-request → the conflict message, non-string entries and
 /// non-list sections → `invalid_section_format`.
 #[test]
+#[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 fn experiments_parse_merge_and_validate_rows() {
     let dir = TempDir::new("experiments");
     dir.write(
@@ -1468,8 +1627,42 @@ fn the_diagnostic_name_universe_answers_membership() {
     assert!(is_known_diagnostic_code("undefined_annotation"));
     assert!(!is_known_diagnostic_code("not_a_real_code"));
 }
+
+/// Membership compares the `analyzer.errors` key against the registry's
+/// `name` field lowercased (`codeNames` is built from
+/// `code.lowerCaseName.toUpperCase()`, parse_model:56-59) — NOT the
+/// `uniqueName`. The two spellings diverge on 225 registry entries; these
+/// pins lock both directions of the difference.
+#[test]
+fn the_diagnostic_name_universe_matches_on_name_not_unique_name() {
+    use dartq_engine::analysis_options::is_known_diagnostic_code;
+
+    // `argumentMustBeAConstant`'s registry `name` is
+    // `argument_must_be_a_constant`; its `uniqueName` drops the second
+    // underscore (`argument_must_be_aconstant`). The oracle accepts only the
+    // `name` spelling.
+    assert!(is_known_diagnostic_code("argument_must_be_a_constant"));
+    assert!(!is_known_diagnostic_code("argument_must_be_aconstant"));
+
+    // Name-sharing families: several registry codes carry one `name` under
+    // distinct `uniqueName`s. `undefined_super_member` is the shared `name`
+    // of `undefinedSuper{Getter,Method,Operator,Setter}` — the shared name
+    // resolves, the uniqueName spellings do not.
+    assert!(is_known_diagnostic_code("undefined_super_member"));
+    assert!(!is_known_diagnostic_code("undefined_super_getter"));
+    assert!(!is_known_diagnostic_code("undefined_super_method"));
+
+    // The universe is the name column of the severity table, so a name that
+    // exists only as a uniqueName-derived spelling of a differently-named
+    // code misses too (`deadCodeLateWildcardVariableInitializer` carries
+    // `name: dead_code`).
+    assert!(is_known_diagnostic_code("dead_code"));
+    assert!(!is_known_diagnostic_code(
+        "dead_code_late_wildcard_variable_initializer"
+    ));
+}
 /// The YAML failure faces (#938): the initial file's broken YAML is one
-/// `parse_error` row — COMPILE_TIME_ERROR (the CLI's severity exit maps it
+/// `parse_error` row — `COMPILE_TIME_ERROR` (the CLI's severity exit maps it
 /// to the errors tier), the raw failure point as a zero-length span, the
 /// message the located error text with its ` at line L column C` suffix
 /// stripped; an included file's failure wraps into
@@ -1533,38 +1726,233 @@ fn yaml_failures_report_parse_error_faces() {
     assert_eq!(issue.length, 8, "the far.yaml URI token");
 }
 
-/// The top-level `plugins:` section is one blanket
-/// `invalid_section_format` row on the 3.13.1 oracle (`Invalid format for
-/// the 'plugins' section.`, probed o13): any non-null section shape
-/// reports, absent or null stays silent, and the merged options degrade
-/// exactly as if the section were absent (dartq loads no plugins).
+/// The top-level `plugins:` section parses under the pinned 3.15 model
+/// (`_ParsedPluginsData`, upstream Dart SDK source,
+/// `analysis_options_parse_model.dart`:1529-1837 — VALIDATION ONLY: dartq
+/// loads no plugins, so only the reported rows matter): a well-formed
+/// section (`name: {version|git|path|hosted|diagnostics}` or a bare version
+/// string) is row-free, a non-map section reports `invalid_section_format`,
+/// an unknown plugin-map key reports `unsupported_option` under
+/// `plugins/<name>`, `diagnostics` values validate against
+/// `errorProcessorLegalValues`, a non-string `git` scalar or non-map `git`
+/// reports under `plugins/<name>/git`, and a non-map
+/// `dependency_overrides` reports under `plugins/dependency_overrides`.
 #[test]
-fn plugins_section_reports_one_invalid_section_row() {
-    let dir = TempDir::new("plugins");
-    let text =
-        "plugins:\n  some_plugin:\n    is_initialized: true\nlinter:\n  rules:\n    - kept_rule\n";
-    dir.write("analysis_options.yaml", text);
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+fn plugins_section_reports_the_315_faces() {
+    let dir = TempDir::new("plugins315");
 
-    let options =
-        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+    // Well-formed: a bare version string, a `version` map, a `git` map with
+    // legal keys, and a valid `diagnostics` map — zero rows.
+    dir.write(
+        "ok.yaml",
+        concat!(
+            "plugins:\n",
+            "  plain: 1.0.0\n",
+            "  mapped:\n",
+            "    version: ^2.0.0\n",
+            "    hosted: https://pub.example\n",
+            "  from_git:\n",
+            "    git:\n",
+            "      url: https://example.com/repo.git\n",
+            "      ref: main\n",
+            "      path: sub/dir\n",
+            "      tag_pattern: v{{version}}\n",
+            "  diagged:\n",
+            "    diagnostics:\n",
+            "      some_code: error\n",
+            "      other: ignore\n",
+            "  dependency_overrides:\n",
+            "    shared:\n",
+            "      path: ../shared\n",
+        ),
+    );
+    let options = AnalysisOptions::load(&dir.path("ok.yaml"), &empty_config(), &dir.0);
+    assert!(options.issues.is_empty(), "{:?}", options.issues);
 
-    assert_eq!(options.lint_rules, vec!["kept_rule"]);
-    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
-    let issue = &options.issues[0];
-    assert_eq!(issue.code.name, "invalid_section_format");
-    assert_eq!(issue.message, "Invalid format for the 'plugins' section.");
-    assert_eq!(issue.offset, 0, "the section key token");
+    // A non-map section reports `invalid_section_format` on `plugins` (a
+    // bare `plugins:` null stays silent).
+    dir.write("scalar.yaml", "plugins: scalar\n");
+    let scalar = AnalysisOptions::load(&dir.path("scalar.yaml"), &empty_config(), &dir.0);
+    assert_eq!(scalar.issues.len(), 1, "{:?}", scalar.issues);
+    assert_eq!(scalar.issues[0].code.name, "invalid_section_format");
     assert_eq!(
-        issue.length,
-        "plugins".chars().map(char::len_utf16).sum::<usize>() as u32
+        scalar.issues[0].message,
+        "Invalid format for the 'plugins' section."
+    );
+    assert_eq!(scalar.issues[0].offset, 0);
+    assert_eq!(scalar.issues[0].length, 7);
+
+    dir.write("null.yaml", "plugins:\n");
+    let nulled = AnalysisOptions::load(&dir.path("null.yaml"), &empty_config(), &dir.0);
+    assert!(nulled.issues.is_empty(), "{:?}", nulled.issues);
+
+    // A plugin map's unknown key reports `unsupported_option` under
+    // `plugins/<name>` with the pluginsOptions proposal; a non-string,
+    // non-map plugin value reports `invalid_section_format` under
+    // `plugins/<name>`.
+    dir.write(
+        "bad.yaml",
+        concat!(
+            "plugins:\n",
+            "  some_plugin:\n",
+            "    is_initialized: true\n",
+            "    bogus: x\n",
+            "  numbered: 42\n",
+            "  listed: [1]\n",
+        ),
+    );
+    let options = AnalysisOptions::load(&dir.path("bad.yaml"), &empty_config(), &dir.0);
+    let actual: Vec<(&str, &str, Option<&str>)> = options
+        .issues
+        .iter()
+        .map(|i| (i.code.name, i.message.as_str(), i.correction.as_deref()))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (
+                "unsupported_option",
+                "The option 'is_initialized' isn't supported by 'plugins/some_plugin'.",
+                Some(
+                    "Try using one of the supported options: 'diagnostics', 'git', 'path', \
+                     'version', and 'hosted'."
+                )
+            ),
+            (
+                "unsupported_option",
+                "The option 'bogus' isn't supported by 'plugins/some_plugin'.",
+                Some(
+                    "Try using one of the supported options: 'diagnostics', 'git', 'path', \
+                     'version', and 'hosted'."
+                )
+            ),
+            (
+                "invalid_section_format",
+                "Invalid format for the 'plugins/numbered' section.",
+                None
+            ),
+            (
+                "invalid_section_format",
+                "Invalid format for the 'plugins/listed' section.",
+                None
+            ),
+        ],
+        "{:?}",
+        options.issues
     );
 
-    // Null and absent stay silent.
-    let null_text = "plugins:\nlinter:\n  rules:\n    - kept_rule\n";
-    dir.write("analysis_options.yaml", null_text);
-    let options =
-        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
-    assert!(options.issues.is_empty(), "{:?}", options.issues);
+    // `diagnostics` values validate against `errorProcessorLegalValues`
+    // under `plugins/<name>/diagnostics`; a non-map diagnostics section is
+    // `invalid_section_format`; a non-scalar diagnostics value reports and
+    // stops the loop.
+    dir.write(
+        "diag.yaml",
+        concat!(
+            "plugins:\n",
+            "  p:\n",
+            "    diagnostics:\n",
+            "      dead_code: fatal\n",
+            "      other: warning\n",
+        ),
+    );
+    let options = AnalysisOptions::load(&dir.path("diag.yaml"), &empty_config(), &dir.0);
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    assert_eq!(options.issues[0].code.name, "unsupported_option");
+    assert_eq!(
+        options.issues[0].message,
+        "The option 'fatal' isn't supported by 'plugins/p/diagnostics'."
+    );
+    assert_eq!(
+        options.issues[0].correction.as_deref(),
+        Some(
+            "Try using one of the supported options: 'ignore', 'false', 'true', 'false', \
+             'error', 'info', and 'warning'."
+        )
+    );
+
+    dir.write("diag_scalar.yaml", "plugins:\n  p:\n    diagnostics: 42\n");
+    let options = AnalysisOptions::load(&dir.path("diag_scalar.yaml"), &empty_config(), &dir.0);
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    assert_eq!(
+        options.issues[0].message,
+        "Invalid format for the 'plugins/p/diagnostics' section."
+    );
+
+    // `git` faces: a non-string scalar and a list both report
+    // `invalid_section_format` under `plugins/<name>/git`; an unknown git
+    // key reports `unsupported_option` under the same name; a legal git
+    // key with a non-string value reports under `plugins/<name>/git/<key>`.
+    dir.write(
+        "git.yaml",
+        concat!(
+            "plugins:\n",
+            "  a:\n",
+            "    git: 42\n",
+            "  b:\n",
+            "    git:\n",
+            "      url: https://example.com/x.git\n",
+            "      bogus: 1\n",
+            "      ref: [1]\n",
+        ),
+    );
+    let options = AnalysisOptions::load(&dir.path("git.yaml"), &empty_config(), &dir.0);
+    let actual: Vec<(&str, &str)> = options
+        .issues
+        .iter()
+        .map(|i| (i.code.name, i.message.as_str()))
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            (
+                "invalid_section_format",
+                "Invalid format for the 'plugins/a/git' section."
+            ),
+            (
+                "unsupported_option",
+                "The option 'bogus' isn't supported by 'plugins/b/git'."
+            ),
+            (
+                "invalid_section_format",
+                "Invalid format for the 'plugins/b/git/ref' section."
+            ),
+        ],
+        "{:?}",
+        options.issues
+    );
+    let git_correction = options
+        .issues
+        .iter()
+        .find(|i| i.code.name == "unsupported_option")
+        .and_then(|i| i.correction.as_deref());
+    assert_eq!(
+        git_correction,
+        Some("Try using one of the supported options: 'url', 'ref', 'path', and 'tag_pattern'.")
+    );
+
+    // `dependency_overrides` must be a map; entries validate like plugin
+    // entries under `plugins/dependency_overrides/<name>`.
+    dir.write("deps_scalar.yaml", "plugins:\n  dependency_overrides: 42\n");
+    let options = AnalysisOptions::load(&dir.path("deps_scalar.yaml"), &empty_config(), &dir.0);
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    assert_eq!(
+        options.issues[0].message,
+        "Invalid format for the 'plugins/dependency_overrides' section."
+    );
+    dir.write(
+        "deps_bad.yaml",
+        "plugins:\n  dependency_overrides:\n    shared: [1]\n",
+    );
+    let options = AnalysisOptions::load(&dir.path("deps_bad.yaml"), &empty_config(), &dir.0);
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    assert_eq!(
+        options.issues[0].message,
+        "Invalid format for the 'plugins/dependency_overrides/shared' section."
+    );
+
+    // The section still contributes nothing to the merged options.
+    assert!(options.lint_rules.is_empty());
 }
 
 /// The included files' registry candidates land in
@@ -1653,6 +2041,7 @@ fn cannot_ignore_names_feed_the_unignorable_set() {
 /// also appears earlier in the file (an include URI) anchors at its
 /// occurrence inside its own section, not at the first text hit.
 #[test]
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn declaration_anchors_scope_to_their_section() {
     let dir = TempDir::new("scoped");
     dir.write(
@@ -1674,4 +2063,1074 @@ fn declaration_anchors_scope_to_their_section() {
         "nope_rule".chars().map(char::len_utf16).sum::<usize>() as u32
     );
     assert_eq!(uri_len, 14);
+}
+
+/// G-5: lint rule names lowercase at the section boundary
+/// (`parseLinterSection`, lint/config.dart:86-90 — every entry key
+/// lowercases; the registry lookups downstream match case-insensitively, so
+/// a mixed-case spelling resolves the snake_case rule). The merge form
+/// recurses exactly one level (config.dart:92-103 — a deeper map drops, it
+/// does not descend); the declared recording has no descent at all (the
+/// parse model visits top-level entries only), so group keys record while
+/// their children never do. The recorded declaration names keep their
+/// original spellings: the rows name the written form.
+#[test]
+fn rule_names_lowercase_at_the_section_boundary() {
+    let dir = TempDir::new("rule_case");
+    dir.write(
+        "analysis_options.yaml",
+        concat!(
+            "linter:\n",
+            "  rules:\n",
+            "    Alpha_Rule: true\n",
+            "    Avoid_Print: false\n",
+            "    style:\n",
+            "      Beta_Rule: true\n",
+            "    deep:\n",
+            "      middle:\n",
+            "        Gamma_Rule: true\n",
+        ),
+    );
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    // The mixed-case spellings merge lowercased; the group entry enables
+    // one level deep; the group-of-group contributes nothing.
+    assert_eq!(options.lint_rules, ["alpha_rule", "beta_rule"]);
+
+    let names: Vec<&str> = options
+        .declared_rules
+        .iter()
+        .map(|rule| rule.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["Alpha_Rule", "Avoid_Print", "style", "deep"],
+        "top-level entries only: the group keys record (a non-null value \
+         reaches the seam), their children are never descended — the \
+         one-level descent lives on the merge side only",
+    );
+}
+
+/// G-6: the value facts the registry-gated rows need, recorded per
+/// declaration (`parseRule`, parse_model.dart:1266-1283 — the engine holds
+/// no lint registry, so the emission seam is the CLI face's): `enabled`
+/// follows the parse model's value processing, `illegal_value` carries the
+/// scalar text of a value that is neither a bool nor a legal severity
+/// string (`ignore`/`info`/`warning`/`error`, case-sensitive), and a null
+/// value returns before the registry check (:1252-1253) so it is not
+/// recorded at all. The merge side legitimately differs on `ignore`:
+/// `ConfiguredSeverity` has no `ignore` member (config.dart:116-131), so
+/// the severity string enables there while the parse model disables.
+#[test]
+fn declared_rules_record_value_facts() {
+    let dir = TempDir::new("rule_facts");
+    dir.write(
+        "analysis_options.yaml",
+        concat!(
+            "linter:\n",
+            "  rules:\n",
+            "    keep_on: true\n",
+            "    shut_off: false\n",
+            "    by_severity: warning\n",
+            "    quieted: ignore\n",
+            "    typed: 42\n",
+            "    cased: Info\n",
+            "    grouped:\n",
+            "      inner: true\n",
+            "    nulled:\n",
+        ),
+    );
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    let facts: Vec<(&str, bool, Option<&str>)> = options
+        .declared_rules
+        .iter()
+        .map(|rule| {
+            (
+                rule.name.as_str(),
+                rule.enabled,
+                rule.illegal_value.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        facts,
+        [
+            ("keep_on", true, None),
+            ("shut_off", false, None),
+            ("by_severity", true, None),
+            ("quieted", false, None),
+            ("typed", false, Some("42")),
+            ("cased", false, Some("Info")),
+            // A group map records its Dart `toString` text for the
+            // `unsupported_value` row (#1793).
+            ("grouped", false, Some("{inner: true}")),
+        ],
+        "{:?}",
+        options.declared_rules
+    );
+
+    // The merge side (config.dart:83-104) only recognizes the exact
+    // `disable` spelling: every severity string enables, and the same
+    // `?? ConfiguredSeverity.enable` fallback that turns the parse model's
+    // disabled `ignore` on turns the case-variant `Info` on too. The group
+    // form parses its scalar children one level deep, so `inner: true`
+    // enables; the `typed`/`nulled` scalars contribute nothing.
+    assert_eq!(
+        options.lint_rules,
+        ["by_severity", "cased", "inner", "keep_on", "quieted"]
+    );
+}
+
+/// G-8: the `analyzer.strong-mode` shape rows (`_ParsedStrongModeData.parse`,
+/// parse_model:1841-1911) — the section is NOT null-tolerant (only an absent
+/// key is silent), only `implicit-casts`/`implicit-dynamic` parse (the
+/// legacy `declaration-casts` reports too), a container value is an
+/// `invalid_section_format` sectioned by the option name, a non-boolean
+/// scalar reports `unsupported_value`, and the unknown-key row proposes the
+/// two legal keys. The section parses rows only: no strictness scalar
+/// merges.
+#[test]
+fn strong_mode_shapes_report_rows() {
+    let dir = TempDir::new("strong_mode");
+    dir.write("sm_scalar.yaml", "analyzer:\n  strong-mode: 42\n");
+    dir.write(
+        "sm_map.yaml",
+        concat!(
+            "analyzer:\n",
+            "  strong-mode:\n",
+            "    implicit-casts: 42\n",
+            "    implicit-dynamic: true\n",
+            "    declaration-casts: false\n",
+            "    bogus: 1\n",
+        ),
+    );
+    dir.write("sm_null.yaml", "analyzer:\n  strong-mode:\n");
+
+    let scalar = AnalysisOptions::load(&dir.path("sm_scalar.yaml"), &empty_config(), &dir.0);
+    assert_eq!(scalar.issues.len(), 1, "{:?}", scalar.issues);
+    assert_eq!(scalar.issues[0].code.name, "invalid_section_format");
+    assert_eq!(
+        scalar.issues[0].message,
+        "Invalid format for the 'strong-mode' section."
+    );
+
+    let mapped = AnalysisOptions::load(&dir.path("sm_map.yaml"), &empty_config(), &dir.0);
+    assert_eq!(mapped.issues.len(), 3, "{:?}", mapped.issues);
+    let value = &mapped.issues[0];
+    assert_eq!(value.code.name, "unsupported_value");
+    assert_eq!(
+        value.message,
+        "The value '42' isn't supported by 'implicit-casts'."
+    );
+    assert_eq!(
+        value.correction.as_deref(),
+        Some("Try using one of the supported values: 'true' and 'false'.")
+    );
+    // `analyzer:\n` = 10, `  strong-mode:\n` = 15, 4 spaces = 4, key 14 + ': '
+    // — the value token sits at 45.
+    assert_eq!((value.offset, value.length), (45, 2));
+    for issue in &mapped.issues[1..] {
+        assert_eq!(issue.code.name, "unsupported_option");
+        assert_eq!(
+            issue.correction.as_deref(),
+            Some(
+                "Try using one of the supported options: 'implicit-casts' and \
+                 'implicit-dynamic'."
+            )
+        );
+    }
+    assert_eq!(
+        mapped.issues[1].message,
+        "The option 'declaration-casts' isn't supported by 'strong-mode'."
+    );
+    assert_eq!(
+        mapped.issues[2].message,
+        "The option 'bogus' isn't supported by 'strong-mode'."
+    );
+
+    // A bare `strong-mode:` is a scalar node upstream (`strongMode == null`
+    // tests only absence) — the row fires.
+    let nulled = AnalysisOptions::load(&dir.path("sm_null.yaml"), &empty_config(), &dir.0);
+    assert_eq!(nulled.issues.len(), 1, "{:?}", nulled.issues);
+    assert_eq!(
+        nulled.issues[0].message,
+        "Invalid format for the 'strong-mode' section."
+    );
+
+    // Rows only: nothing merges into the strictness scalars.
+    assert_eq!(mapped.strict_casts, None);
+    assert_eq!(mapped.strict_inference, None);
+    assert_eq!(mapped.strict_raw_types, None);
+}
+
+/// G-8: the `analyzer.optional-checks` shape rows
+/// (`_ParsedOptionalChecksData.parse`, parse_model:1399-1499) — the map
+/// form's parseBool arms mirror strong-mode, the unknown-key row is the odd
+/// face whose section-name argument is the legal-key list itself
+/// (`reportUnsupportedKey` :1423-1433, so the message carries doubled
+/// quotes verbatim), the scalar form enables the legal names silently while
+/// any other scalar — a bare null rendering `null` — reports, and a
+/// sequence is an invalid section.
+#[test]
+fn optional_checks_shapes_report_rows() {
+    let dir = TempDir::new("optional_checks");
+    dir.write(
+        "oc_map.yaml",
+        concat!(
+            "analyzer:\n",
+            "  optional-checks:\n",
+            "    chrome-os-manifest-checks: 42\n",
+            "    propagate-linter-exceptions:\n",
+            "      nested: true\n",
+            "    bogus-key: true\n",
+        ),
+    );
+    dir.write(
+        "oc_scalar.yaml",
+        "analyzer:\n  optional-checks: chrome-os-manifest-checks\n",
+    );
+    dir.write("oc_unknown.yaml", "analyzer:\n  optional-checks: bogus\n");
+    dir.write("oc_bare.yaml", "analyzer:\n  optional-checks:\n");
+    dir.write("oc_seq.yaml", "analyzer:\n  optional-checks: [a]\n");
+
+    let odd_message = "The option 'bogus-key' isn't supported by \
+''chrome-os-manifest-checks' or 'propagate-linter-exceptions'.";
+    let odd_correction = "Try using one of the supported options: \
+'chrome-os-manifest-checks' and 'propagate-linter-exceptions'.";
+
+    let mapped = AnalysisOptions::load(&dir.path("oc_map.yaml"), &empty_config(), &dir.0);
+    assert_eq!(mapped.issues.len(), 3, "{:?}", mapped.issues);
+    let value = &mapped.issues[0];
+    assert_eq!(value.code.name, "unsupported_value");
+    assert_eq!(
+        value.message,
+        "The value '42' isn't supported by 'chrome-os-manifest-checks'."
+    );
+    // `analyzer:\n` = 10, `  optional-checks:\n` = 19, 4 spaces, key 25 + ': '
+    // — the value token sits at 60.
+    assert_eq!((value.offset, value.length), (60, 2));
+    assert_eq!(
+        mapped.issues[1].code.name, "invalid_section_format",
+        "{:?}",
+        mapped.issues[1]
+    );
+    assert_eq!(
+        mapped.issues[1].message,
+        "Invalid format for the 'propagate-linter-exceptions' section."
+    );
+    assert_eq!(mapped.issues[2].message, odd_message);
+    assert_eq!(mapped.issues[2].correction.as_deref(), Some(odd_correction));
+
+    // The legal scalar name enables silently.
+    let scalar = AnalysisOptions::load(&dir.path("oc_scalar.yaml"), &empty_config(), &dir.0);
+    assert!(scalar.issues.is_empty(), "{:?}", scalar.issues);
+
+    // Any other scalar reports — including a bare null, whose rendered
+    // value is `null`.
+    let unknown = AnalysisOptions::load(&dir.path("oc_unknown.yaml"), &empty_config(), &dir.0);
+    assert_eq!(unknown.issues.len(), 1, "{:?}", unknown.issues);
+    assert_eq!(
+        unknown.issues[0].message,
+        "The option 'bogus' isn't supported by ''chrome-os-manifest-checks' \
+ or 'propagate-linter-exceptions'."
+    );
+    let bare = AnalysisOptions::load(&dir.path("oc_bare.yaml"), &empty_config(), &dir.0);
+    assert_eq!(bare.issues.len(), 1, "{:?}", bare.issues);
+    assert_eq!(
+        bare.issues[0].message,
+        "The option 'null' isn't supported by ''chrome-os-manifest-checks' \
+ or 'propagate-linter-exceptions'."
+    );
+
+    // A sequence is an invalid section (the switch's default arm).
+    let sequence = AnalysisOptions::load(&dir.path("oc_seq.yaml"), &empty_config(), &dir.0);
+    assert_eq!(sequence.issues.len(), 1, "{:?}", sequence.issues);
+    assert_eq!(
+        sequence.issues[0].message,
+        "Invalid format for the 'optional-checks' section."
+    );
+}
+
+/// G-8: the top-level `code-style` (`_ParsedCodeStyleData.parse`,
+/// parse_model:407-468) and `formatter` (`_ParsedFormatterData.parse`,
+/// :813-895) shape rows — both null-tolerant, unknown keys report the
+/// without-values `unsupported_option` variant, `format` runs the
+/// parseBool shape, `page_width` demands a positive integer and
+/// `trailing_commas` the exact `automate`/`preserve` spellings (both via
+/// `invalid_option` with the verbatim detail texts), and the legal shapes
+/// stay silent.
+#[test]
+fn code_style_and_formatter_shapes_report_rows() {
+    let dir = TempDir::new("style_formatter");
+    dir.write("cs_values.yaml", "code-style:\n  format: 42\n  bogus: 1\n");
+    dir.write("cs_ok.yaml", "code-style:\n  format: true\n");
+    dir.write("cs_shape.yaml", "code-style:\n  format: [1]\n");
+    dir.write("cs_section.yaml", "code-style: 42\n");
+    dir.write("cs_null.yaml", "code-style:\n");
+    dir.write(
+        "fmt_ok.yaml",
+        "formatter:\n  page_width: 80\n  trailing_commas: preserve\n",
+    );
+    dir.write(
+        "fmt_float.yaml",
+        "formatter:\n  page_width: 3.5\n  trailing_commas: Preserve\n  unknown: 1\n",
+    );
+    dir.write("fmt_negative.yaml", "formatter:\n  page_width: -5\n");
+    dir.write("fmt_section.yaml", "formatter: 42\n");
+    dir.write("fmt_null.yaml", "formatter:\n");
+
+    // code-style: the value face, the unknown-key face, the legal shape,
+    // the container-value face, the section face, and the null tolerance.
+    let values = AnalysisOptions::load(&dir.path("cs_values.yaml"), &empty_config(), &dir.0);
+    assert_eq!(values.issues.len(), 2, "{:?}", values.issues);
+    assert_eq!(
+        values.issues[0].message,
+        "The value '42' isn't supported by 'format'."
+    );
+    assert_eq!(
+        values.issues[1].message,
+        "The option 'bogus' isn't supported by 'code-style'."
+    );
+    assert_eq!(
+        values.issues[1].correction.as_deref(),
+        Some("Try removing the option.")
+    );
+    let ok = AnalysisOptions::load(&dir.path("cs_ok.yaml"), &empty_config(), &dir.0);
+    assert!(ok.issues.is_empty(), "{:?}", ok.issues);
+    let shape = AnalysisOptions::load(&dir.path("cs_shape.yaml"), &empty_config(), &dir.0);
+    assert_eq!(shape.issues.len(), 1, "{:?}", shape.issues);
+    assert_eq!(
+        shape.issues[0].message,
+        "Invalid format for the 'format' section."
+    );
+    let section = AnalysisOptions::load(&dir.path("cs_section.yaml"), &empty_config(), &dir.0);
+    assert_eq!(
+        section.issues[0].message,
+        "Invalid format for the 'code-style' section."
+    );
+    let nulled = AnalysisOptions::load(&dir.path("cs_null.yaml"), &empty_config(), &dir.0);
+    assert!(nulled.issues.is_empty(), "{:?}", nulled.issues);
+
+    // formatter: the legal shapes, then `page_width` non-integers
+    // (float and negative), the case-sensitive `trailing_commas` spellings,
+    // and the unknown key.
+    let good = AnalysisOptions::load(&dir.path("fmt_ok.yaml"), &empty_config(), &dir.0);
+    assert!(good.issues.is_empty(), "{:?}", good.issues);
+    let float = AnalysisOptions::load(&dir.path("fmt_float.yaml"), &empty_config(), &dir.0);
+    assert_eq!(float.issues.len(), 3, "{:?}", float.issues);
+    assert_eq!(
+        float.issues[0].message,
+        "Invalid option specified for 'page_width': \"page_width\" must be a \
+ positive integer."
+    );
+    assert_eq!(float.issues[0].correction, None);
+    assert_eq!(
+        float.issues[1].message,
+        "Invalid option specified for 'trailing_commas': \"trailing_commas\" \
+ must be \"automate\" or \"preserve\"."
+    );
+    assert_eq!(
+        float.issues[2].message,
+        "The option 'unknown' isn't supported by 'formatter'."
+    );
+    let negative = AnalysisOptions::load(&dir.path("fmt_negative.yaml"), &empty_config(), &dir.0);
+    assert_eq!(negative.issues.len(), 1, "{:?}", negative.issues);
+    assert_eq!(
+        negative.issues[0].message,
+        "Invalid option specified for 'page_width': \"page_width\" must be a \
+ positive integer."
+    );
+    let section = AnalysisOptions::load(&dir.path("fmt_section.yaml"), &empty_config(), &dir.0);
+    assert_eq!(
+        section.issues[0].message,
+        "Invalid format for the 'formatter' section."
+    );
+    let nulled = AnalysisOptions::load(&dir.path("fmt_null.yaml"), &empty_config(), &dir.0);
+    assert!(nulled.issues.is_empty(), "{:?}", nulled.issues);
+}
+
+/// G-7: the nested-options boundary. `locate_nested` walks the four
+/// discovery surfaces (`lib`/`bin`/`test`/`tool`) — the same surfaces
+/// discovery analyzes — so an options file under any other directory is
+/// neither located nor honored, and the surface directory still registers.
+/// The combined posture ("options outside the four surfaces never govern")
+/// is a differential face of the discovery axis, not this module's.
+#[test]
+fn nested_options_outside_the_surfaces_do_not_govern() {
+    let dir = TempDir::new("nested_boundary");
+    dir.write(
+        "analysis_options.yaml",
+        "linter:\n  rules:\n    - alpha_rule\n",
+    );
+    dir.write(
+        "example/analysis_options.yaml",
+        "linter:\n  rules:\n    - example_rule\nanalyzer:\n  language:\n    strict-casts: true\n",
+    );
+    dir.write(
+        "tool/analysis_options.yaml",
+        "linter:\n  rules:\n    - tool_rule\n",
+    );
+
+    let per_root = AnalysisOptions::for_roots(&[dir.path("")], &empty_config(), &dir.0);
+
+    // The root entry merges only its own chain: the surface file registers
+    // at its own directory as an independent governing entry (each mapped
+    // file is parsed on its own, context_builder.dart:196-206) — the
+    // containing root takes only the nested excludes into its walk
+    // predicate (context_locator.dart:402-409), never the nested rules or
+    // strictness. The non-surface subtree is not even located.
+    let root = per_root.get(&dir.path("")).expect("root entry");
+    assert_eq!(root.lint_rules, ["alpha_rule"]);
+    assert_eq!(root.strict_casts, None);
+    // The non-surface directory has no governing entry at all.
+    assert!(!per_root.contains_key(&dir.path("example")));
+    // The surface directory does.
+    assert!(per_root.contains_key(&dir.path("tool")));
+}
+
+// --- #1793: the row-divergence fix wave ---
+
+/// The `cannot-ignore` severity arms iterate the whole pinned
+/// `diagnosticCodeValues` universe (`_applyCannotIgnore`, upstream Dart SDK
+/// source, `analysis_options_parser.dart`:173-197 — every diagnostic whose
+/// *effective* severity equals the arm becomes unignorable), so semantic
+/// codes the builtin emit table does not list (`unused_import`,
+/// `dead_null_aware_expression`, …) mark too, while `error`/`warning`/`info`
+/// match on exact equality — a `warning` arm never reaches an ERROR code.
+/// Explicit names still join lowercased.
+#[test]
+fn cannot_ignore_severity_arms_cover_the_full_universe() {
+    let dir = TempDir::new("cannot_ignore_universe");
+    dir.write(
+        "analysis_options.yaml",
+        concat!("analyzer:\n", "  cannot-ignore:\n", "    - warning\n",),
+    );
+    dir.write("error.yaml", "analyzer:\n  cannot-ignore:\n    - error\n");
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+    // Semantic static warnings — codes the builtin table never listed.
+    assert!(options.unignorable().contains("unused_import"));
+    assert!(options.unignorable().contains("dead_null_aware_expression"));
+    assert!(options.unignorable().contains("unused_local_variable"));
+    // Error-tier codes are untouched by the warning arm.
+    assert!(!options.unignorable().contains("undefined_identifier"));
+    // A lint rule name is not in `diagnosticCodeValues` at all.
+    assert!(!options.unignorable().contains("prefer_single_quotes"));
+
+    let error = AnalysisOptions::load(&dir.path("error.yaml"), &empty_config(), &dir.0);
+    assert!(error.unignorable().contains("undefined_identifier"));
+    assert!(error.unignorable().contains("multiple_combinators"));
+    assert!(!error.unignorable().contains("unused_import"));
+
+    // The `errors` re-level still overrides the registry severity before the
+    // arm runs (`errors` applies first, parser:166-167): a code re-leveled
+    // to warning joins the warning arm, and an ignore processor filters it
+    // out entirely.
+    dir.write(
+        "leveled.yaml",
+        concat!(
+            "analyzer:\n",
+            "  errors:\n",
+            "    undefined_identifier: warning\n",
+            "    dead_code: ignore\n",
+            "  cannot-ignore:\n",
+            "    - warning\n",
+        ),
+    );
+    let options = AnalysisOptions::load(&dir.path("leveled.yaml"), &empty_config(), &dir.0);
+    assert!(options.unignorable().contains("undefined_identifier"));
+    assert!(!options.unignorable().contains("dead_code"));
+}
+
+/// The `analyzer.plugins` key reports `analysis_options_deprecated_plugins`
+/// unconditionally at the key node (upstream `_ParsedAnalyzerData.parse`,
+/// `analysis_options_parse_model.dart`:285-289 — the key's mere presence
+/// fires, even a bare `plugins:` null value), and an included file's row
+/// wraps into `included_file_warning`.
+#[test]
+fn analyzer_plugins_key_reports_deprecated_plugins() {
+    let dir = TempDir::new("deprecated_plugins");
+    dir.write(
+        "analysis_options.yaml",
+        "analyzer:\n  plugins:\n    some_plugin: 1.0.0\n",
+    );
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    let issue = &options.issues[0];
+    assert_eq!(issue.code.name, "analysis_options_deprecated_plugins");
+    assert_eq!(issue.code.machine, "ANALYSIS_OPTIONS_DEPRECATED_PLUGINS");
+    assert_eq!(
+        issue.code.dtype,
+        dartq_diagnostics::DiagnosticType::StaticWarning
+    );
+    assert!(!issue.code.has_published_docs);
+    assert_eq!(
+        issue.message,
+        "Support for legacy plugins is deprecated, and will be removed in an \
+         upcoming version of Dart."
+    );
+    assert_eq!(
+        issue.correction.as_deref(),
+        Some(
+            "See https://dart.dev/tools/analyzer-plugins for documentation regarding \
+             the new analyzer plugin system."
+        )
+    );
+    // Anchored at the `plugins` key inside `analyzer:` (offset 12).
+    assert_eq!(issue.offset, 12);
+    assert_eq!(issue.length, 7);
+
+    // A bare `plugins:` null value still reports (getKey fires on the key's
+    // presence).
+    dir.write("null.yaml", "analyzer:\n  plugins:\n");
+    let options = AnalysisOptions::load(&dir.path("null.yaml"), &empty_config(), &dir.0);
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    assert_eq!(
+        options.issues[0].code.name,
+        "analysis_options_deprecated_plugins"
+    );
+
+    // An included file's row wraps into `included_file_warning` at the
+    // branch anchor, message naming the included file and the inner span.
+    dir.write("near.yaml", "include: far.yaml\n");
+    dir.write("far.yaml", "analyzer:\n  plugins: {}\n");
+    let near = AnalysisOptions::load(&dir.path("near.yaml"), &empty_config(), &dir.0);
+    assert_eq!(near.issues.len(), 1, "{:?}", near.issues);
+    let wrapped = &near.issues[0];
+    assert_eq!(wrapped.code.name, "included_file_warning");
+    let far = dir.path("far.yaml").display().to_string();
+    assert_eq!(
+        wrapped.message,
+        format!(
+            "Warning in the included options file {far}(12..18): Support for legacy plugins \
+             is deprecated, and will be removed in an upcoming version of Dart."
+        )
+    );
+}
+
+/// `analyzer.errors` action validity rides the full
+/// `errorProcessorLegalValues` list (upstream Dart SDK source,
+/// `analysis_options_parse_model.dart`:61-65,605-618): `true` is a legal
+/// action — a no-op processor — so `errors: {code: true}` reports nothing
+/// and changes nothing, while `false` reports nothing but filters.
+#[test]
+fn errors_true_is_legal_and_no_op() {
+    let dir = TempDir::new("errors_true");
+    dir.write(
+        "analysis_options.yaml",
+        concat!(
+            "analyzer:\n",
+            "  errors:\n",
+            "    unused_import: true\n",
+            "    dead_code: false\n",
+            "    bogus_action_code: maybe\n",
+        ),
+    );
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    // `true` and `false` report no row; `maybe` reports the legal-values
+    // `unsupported_option`.
+    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
+    assert_eq!(options.issues[0].code.name, "unsupported_option");
+    assert_eq!(
+        options.issues[0].message,
+        "The option 'maybe' isn't supported by 'errors'."
+    );
+    // Effect: `true` is a no-op (declared severity stands), `false` filters.
+    assert_eq!(
+        options.processed_severity("unused_import", dartq_diagnostics::Severity::Warning),
+        Some(dartq_diagnostics::Severity::Warning)
+    );
+    assert_eq!(
+        options.processed_severity("dead_code", dartq_diagnostics::Severity::Warning),
+        None
+    );
+}
+
+/// A container rule value records its Dart `toString` text for the
+/// `unsupported_value` row (`parseRule`'s fall-through arm,
+/// `analysis_options_parse_model.dart`:1272-1284 — `ruleValue.toString()`
+/// renders the YamlMap/YamlList as `{a: b}`/`[x]`): group maps and lists
+/// now carry `illegal_value` text instead of dropping the row.
+#[test]
+fn container_rule_values_record_the_dart_tostring_text() {
+    let dir = TempDir::new("rule_containers");
+    dir.write(
+        "analysis_options.yaml",
+        concat!(
+            "linter:\n",
+            "  rules:\n",
+            "    grouped:\n",
+            "      inner: true\n",
+            "    listed: [x, 42]\n",
+            "    inline_map: {a: b, c: [1]}\n",
+        ),
+    );
+
+    let options =
+        AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
+
+    let facts: Vec<(&str, Option<&str>)> = options
+        .declared_rules
+        .iter()
+        .map(|rule| (rule.name.as_str(), rule.illegal_value.as_deref()))
+        .collect();
+    assert_eq!(
+        facts,
+        [
+            ("grouped", Some("{inner: true}")),
+            ("listed", Some("[x, 42]")),
+            ("inline_map", Some("{a: b, c: [1]}")),
+        ],
+        "{:?}",
+        options.declared_rules
+    );
+    // Containers still record as disabled entries.
+    assert!(options.declared_rules.iter().all(|rule| !rule.enabled));
+}
+
+/// The cross-file lint-check data the CLI consumes (the official
+/// `_IncludedLinterRules` walk, linter_rule_options_validator.dart:105-186):
+/// the initial file's `included_edges` carries one entry per resolved
+/// `include:` directive in declaration order — its written URI, the URI
+/// token's span in the initial file's text, and the target's
+/// [`DeclarationGroup`] index — and each included file's group folds its
+/// subtree's effective rule state (`enabled_rules`/`disabled_rules`, the
+/// official `_EffectiveLinterRules` pair) with nearer entries shadowing
+/// farther ones per name.
+#[test]
+fn include_edges_and_effective_rule_sets_track_the_chain() {
+    let dir = TempDir::new("xlint");
+    // The pair-fires shape: `a.yaml` enables `prefer_double_quotes`,
+    // `b.yaml` enables `prefer_single_quotes` — the initial file's two
+    // include edges carry both, in declaration order.
+    let near = concat!(
+        "include:\n",
+        "  - a.yaml\n",
+        "  - b.yaml\n",
+        "linter:\n",
+        "  rules:\n",
+        "    - avoid_print\n",
+    );
+    dir.write("near.yaml", near);
+    let a = "linter:\n  rules:\n    - prefer_double_quotes\n";
+    dir.write("a.yaml", a);
+    let b = "linter:\n  rules:\n    - prefer_single_quotes\n";
+    dir.write("b.yaml", b);
+
+    let options = AnalysisOptions::load(&dir.path("near.yaml"), &empty_config(), &dir.0);
+
+    // One edge per include entry, in declaration order — the URI text and
+    // the token's span in near.yaml's own text.
+    assert_eq!(
+        options.included_edges.len(),
+        2,
+        "{:?}",
+        options.included_edges
+    );
+    let first = &options.included_edges[0];
+    assert_eq!(first.uri, "a.yaml");
+    assert_eq!(
+        (first.offset, first.length),
+        (
+            u32::try_from(near.find("a.yaml").expect("anchor")).expect("u32"),
+            6
+        )
+    );
+    let second = &options.included_edges[1];
+    assert_eq!(second.uri, "b.yaml");
+    assert_eq!(
+        (second.offset, second.length),
+        (
+            u32::try_from(near.find("b.yaml").expect("anchor")).expect("u32"),
+            6
+        )
+    );
+
+    // The groups the edges index carry each subtree's effective state —
+    // the local enabled declaration lands in `enabled_rules` with its own
+    // file and the name token's span in that file's text.
+    let a_group = &options.included_groups[first.group];
+    assert_eq!(a_group.file, dir.path("a.yaml"));
+    assert_eq!(
+        a_group.enabled_rules.len(),
+        1,
+        "{:?}",
+        a_group.enabled_rules
+    );
+    let a_rule = &a_group.enabled_rules[0];
+    assert_eq!(a_rule.name, "prefer_double_quotes");
+    assert_eq!(a_rule.file, dir.path("a.yaml"));
+    assert_eq!(
+        (a_rule.offset, a_rule.length),
+        (
+            u32::try_from(a.find("prefer_double_quotes").expect("anchor")).expect("u32"),
+            20
+        )
+    );
+    assert!(a_group.disabled_rules.is_empty());
+    assert!(a_group.includes.is_empty(), "a.yaml includes nothing");
+
+    let b_group = &options.included_groups[second.group];
+    assert_eq!(
+        b_group.enabled_rules.len(),
+        1,
+        "{:?}",
+        b_group.enabled_rules
+    );
+    assert_eq!(b_group.enabled_rules[0].name, "prefer_single_quotes");
+    assert_eq!(b_group.enabled_rules[0].file, dir.path("b.yaml"));
+}
+
+/// A nearer include shadows a farther one's same-named declaration in the
+/// folded effective state — the official `apply` removes the enabled entry
+/// the disabled one names before inserting it (`_EffectiveLinterRules.apply`,
+/// linter_rule_options_validator.dart:25-34). The included file's own local
+/// declarations apply after its subtree, so the disable it declares hides
+/// the subtree's enable.
+#[test]
+fn effective_rules_shadow_same_named_entries_across_the_subtree() {
+    let dir = TempDir::new("xshadow");
+    // near.yaml includes mid.yaml; mid.yaml includes far.yaml and disables
+    // `avoid_print` locally — the group's effective state must show the
+    // local disable winning over the subtree's enable.
+    dir.write("near.yaml", "include: mid.yaml\n");
+    dir.write(
+        "mid.yaml",
+        "include: far.yaml\nlinter:\n  rules:\n    avoid_print: false\n",
+    );
+    dir.write("far.yaml", "linter:\n  rules:\n    - avoid_print\n");
+
+    let options = AnalysisOptions::load(&dir.path("near.yaml"), &empty_config(), &dir.0);
+
+    assert_eq!(options.included_edges.len(), 1);
+    let mid = &options.included_groups[options.included_edges[0].group];
+    assert_eq!(mid.file, dir.path("mid.yaml"));
+    // mid.yaml's own include edge lands in its group — the nested walk's
+    // per-level entry.
+    assert_eq!(mid.includes.len(), 1, "{:?}", mid.includes);
+    assert_eq!(mid.includes[0].uri, "far.yaml");
+    // The folded effective state: the local disable hides the subtree's
+    // enable — `avoid_print` lands in `disabled_rules`, not `enabled_rules`.
+    assert!(mid.enabled_rules.is_empty(), "{:?}", mid.enabled_rules);
+    assert_eq!(mid.disabled_rules.len(), 1, "{:?}", mid.disabled_rules);
+    assert_eq!(mid.disabled_rules[0].name, "avoid_print");
+    assert_eq!(mid.disabled_rules[0].file, dir.path("mid.yaml"));
+
+    // far.yaml's own group still reports its local enable — the effective
+    // state is per-file, and far.yaml seen on its own has no disable.
+    let far = &options.included_groups[mid.includes[0].group];
+    assert_eq!(far.file, dir.path("far.yaml"));
+    assert_eq!(far.enabled_rules.len(), 1, "{:?}", far.enabled_rules);
+    assert_eq!(far.enabled_rules[0].name, "avoid_print");
+}
+
+/// An `ignore` value in an included file lands in the group's
+/// `disabled_rules` — the validator's `_LocalLinterRules.disabled` side
+/// (`parseRule` returns the `ignore`-valued declaration in the disabled
+/// list, analysis_options_parse_model.dart:1266-1283), the fact that lets a
+/// local `ignore` suppress the include-side conflict. The merged
+/// `lint_rules` face keeps the name enabled (a non-`false` value is an
+/// enable there) — the two faces diverge by design.
+#[test]
+fn ignore_value_included_file_lands_in_disabled_rules() {
+    let dir = TempDir::new("xignore");
+    dir.write("near.yaml", "include: far.yaml\n");
+    dir.write(
+        "far.yaml",
+        "linter:\n  rules:\n    avoid_print: ignore\n    prefer_double_quotes: true\n",
+    );
+
+    let options = AnalysisOptions::load(&dir.path("near.yaml"), &empty_config(), &dir.0);
+
+    let far = &options.included_groups[options.included_edges[0].group];
+    let disabled: Vec<&str> = far
+        .disabled_rules
+        .iter()
+        .map(|rule| rule.name.as_str())
+        .collect();
+    assert_eq!(disabled, ["avoid_print"], "{:?}", far.disabled_rules);
+    let enabled: Vec<&str> = far
+        .enabled_rules
+        .iter()
+        .map(|rule| rule.name.as_str())
+        .collect();
+    assert_eq!(enabled, ["prefer_double_quotes"], "{:?}", far.enabled_rules);
+    // The merged face keeps `avoid_print` enabled — `ignore` is not `false`.
+    assert!(
+        options.lint_rules.iter().any(|name| name == "avoid_print"),
+        "{:?}",
+        options.lint_rules
+    );
+}
+
+/// The file-count fact the `incompatible_lint_included` row carries (`{2}`
+/// — the distinct include nodes contributing to one conflict): the initial
+/// file's edges stay distinct per `include:` entry even when two entries
+/// reach the same conflicting rule through different subtrees. The nested
+/// walk's per-level entries land in each group's own `includes`.
+#[test]
+fn nested_include_of_include_keeps_per_level_edges() {
+    let dir = TempDir::new("xnest");
+    // top.yaml includes mid.yaml; mid.yaml includes leaf_a.yaml and
+    // leaf_b.yaml — the pair conflict lives one level down, and both the
+    // initial file's edge and mid.yaml's own two edges must exist.
+    dir.write(
+        "top.yaml",
+        "include: mid.yaml\nlinter:\n  rules:\n    - avoid_print\n",
+    );
+    dir.write("mid.yaml", "include:\n  - leaf_a.yaml\n  - leaf_b.yaml\n");
+    dir.write(
+        "leaf_a.yaml",
+        "linter:\n  rules:\n    - prefer_double_quotes\n",
+    );
+    dir.write(
+        "leaf_b.yaml",
+        "linter:\n  rules:\n    - prefer_single_quotes\n",
+    );
+
+    let options = AnalysisOptions::load(&dir.path("top.yaml"), &empty_config(), &dir.0);
+
+    // The initial file sees only its direct edge; the nested pair lives in
+    // mid.yaml's group.
+    assert_eq!(options.included_edges.len(), 1);
+    assert_eq!(options.included_edges[0].uri, "mid.yaml");
+    let mid = &options.included_groups[options.included_edges[0].group];
+    assert_eq!(mid.includes.len(), 2, "{:?}", mid.includes);
+    assert_eq!(mid.includes[0].uri, "leaf_a.yaml");
+    assert_eq!(mid.includes[1].uri, "leaf_b.yaml");
+    // Each leaf group carries its subtree's effective state — folded from
+    // its own (empty) includes plus its local declarations.
+    let leaf_a = &options.included_groups[mid.includes[0].group];
+    assert_eq!(leaf_a.file, dir.path("leaf_a.yaml"));
+    assert_eq!(leaf_a.enabled_rules.len(), 1);
+    assert_eq!(leaf_a.enabled_rules[0].name, "prefer_double_quotes");
+    let leaf_b = &options.included_groups[mid.includes[1].group];
+    assert_eq!(leaf_b.file, dir.path("leaf_b.yaml"));
+    assert_eq!(leaf_b.enabled_rules.len(), 1);
+    assert_eq!(leaf_b.enabled_rules[0].name, "prefer_single_quotes");
+    // mid.yaml's effective state folds both leaves: the pair enabled.
+    let names: Vec<&str> = mid
+        .enabled_rules
+        .iter()
+        .map(|rule| rule.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["prefer_double_quotes", "prefer_single_quotes"],
+        "{:?}",
+        mid.enabled_rules
+    );
+}
+
+/// The INCOMPATIBLE_LINT family's context producers (census W3). Upstream
+/// (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/diagnostic/diagnostic_factory.dart:288-382`) folds
+/// every conflicting declaration into a `Map<file.path, node>` and reports
+/// one context message per entry at the node's span — `"The rule '<name>'
+/// is enabled here."`, with `" in the file '<path>'."` on the files variant
+/// only; the local list's single-file fold collapses to the last entry.
+#[test]
+fn incompatible_lint_context_rows_carry_the_conflicting_rule_anchors() {
+    use dartq_engine::analysis_options::{ContextualIssue, DeclaredRule, RuleData};
+    use dartq_source::FileTable;
+
+    let declared = |name: &str, offset: u32| DeclaredRule {
+        name: name.to_owned(),
+        offset,
+        length: 8,
+        enabled: true,
+        illegal_value: None,
+    };
+    let rule_neg = declared("rule_neg", 30);
+    let rule_pos = declared("rule_pos", 52);
+    let rule_neu = declared("rule_neu", 74);
+
+    let reporting_path = PathBuf::from("/t/analysis_options.yaml");
+    let inc1 = PathBuf::from("/t/inc1.yaml");
+    let inc2 = PathBuf::from("/t/inc2.yaml");
+    let included = |name: &str, file: &PathBuf, offset: u32| RuleData {
+        name: name.to_owned(),
+        file: file.clone(),
+        offset,
+        length: 8,
+    };
+    let pos_in_inc1 = included("rule_pos", &inc1, 12);
+    let neu_in_inc2 = included("rule_neu", &inc2, 20);
+
+    let mut table = FileTable::new();
+    let reporting = table.intern(&reporting_path);
+    let id_inc1 = table.intern(&inc1);
+    let id_inc2 = table.intern(&inc2);
+
+    // Local list: both conflicts enabled in the reporting file, so the
+    // single-file map fold collapses to the last entry; the row message
+    // keeps the plain factory's rendering of all conflicting spellings.
+    let issue = ContextualIssue::incompatible_lint(&rule_neg, &[&rule_pos, &rule_neu]);
+    let diag = issue.to_diagnostic(reporting, |path| table.try_file_id(path));
+    assert_eq!(
+        diag.message.as_str(),
+        "The rule 'rule_neg' is incompatible with ''rule_pos' and 'rule_neu''."
+    );
+    let context = diag.context.expect("local context attached");
+    assert_eq!(
+        context.len(),
+        1,
+        "the single-file fold keeps the last entry"
+    );
+    assert_eq!(context[0].file, reporting);
+    assert_eq!(
+        context[0].message.as_str(),
+        "The rule 'rule_neu' is enabled here."
+    );
+    assert_eq!(context[0].range.offset, 74);
+    assert_eq!(context[0].range.length, 8);
+
+    // Files variant: one context row per entry, in fold order, each naming
+    // its file and anchored at the rule's span in that file.
+    let issue = ContextualIssue::incompatible_lint_files(
+        "rule_neg",
+        &[&pos_in_inc1, &neu_in_inc2],
+        (40, 8),
+    );
+    let diag = issue.to_diagnostic(reporting, |path| table.try_file_id(path));
+    assert_eq!(
+        diag.message.as_str(),
+        "The rule 'rule_neg' is incompatible with 'rule_pos' and 'rule_neu'."
+    );
+    let context = diag.context.expect("files context attached");
+    assert_eq!(context.len(), 2);
+    assert_eq!(context[0].file, id_inc1);
+    assert_eq!(
+        context[0].message.as_str(),
+        format!(
+            "The rule 'rule_pos' is enabled here in the file '{}'.",
+            inc1.display()
+        )
+    );
+    assert_eq!(context[0].range.offset, 12);
+    assert_eq!(context[1].file, id_inc2);
+    assert_eq!(
+        context[1].message.as_str(),
+        format!(
+            "The rule 'rule_neu' is enabled here in the file '{}'.",
+            inc2.display()
+        )
+    );
+    assert_eq!(context[1].range.offset, 20);
+
+    // Included variant: the same anchors with the plain context message
+    // (the include URI lives in the row's message body, not the context).
+    let issue = ContextualIssue::incompatible_lint_included(
+        "inc2.yaml",
+        &[&pos_in_inc1, &neu_in_inc2],
+        2,
+        (14, 12),
+    );
+    let diag = issue.to_diagnostic(reporting, |path| table.try_file_id(path));
+    assert_eq!(
+        diag.message.as_str(),
+        "The rule 'inc2.yaml' is incompatible with 'rule_pos' and 'rule_neu', \
+         which is included from 2 files."
+    );
+    let context = diag.context.expect("included context attached");
+    assert_eq!(context.len(), 2);
+    assert_eq!(context[0].file, id_inc1);
+    assert_eq!(
+        context[0].message.as_str(),
+        "The rule 'rule_pos' is enabled here."
+    );
+    assert_eq!(
+        context[1].message.as_str(),
+        "The rule 'rule_neu' is enabled here."
+    );
+}
+
+/// The context emission's degrade posture: a conflicting rule's file the
+/// caller cannot resolve drops its row — under-report, never a crash — and
+/// a fully-dropped context degrades to the plain no-context row.
+#[test]
+fn incompatible_lint_context_drops_unresolvable_files() {
+    use dartq_engine::analysis_options::{ContextualIssue, RuleData};
+    use dartq_source::FileTable;
+
+    let inc1 = PathBuf::from("/t/missing.yaml");
+    let pos = RuleData {
+        name: "rule_pos".to_owned(),
+        file: inc1.clone(),
+        offset: 12,
+        length: 8,
+    };
+
+    let mut table = FileTable::new();
+    let reporting = table.intern(PathBuf::from("/t/analysis_options.yaml").as_path());
+
+    let issue = ContextualIssue::incompatible_lint_included("inc1.yaml", &[&pos], 1, (14, 12));
+    let diag = issue.to_diagnostic(reporting, |path| table.try_file_id(path));
+    assert!(
+        diag.context.is_none(),
+        "unresolvable file drops the whole context"
+    );
+
+    // Partial resolution keeps the resolvable rows only.
+    table.intern(&inc1);
+    let diag = issue.to_diagnostic(reporting, |path| table.try_file_id(path));
+    let context = diag.context.expect("resolved file attaches its row");
+    assert_eq!(context.len(), 1);
+}
+
+/// The zero-conflict face: a producer handed no conflicting declarations
+/// emits the plain row with no `contextMessages` key at all — the empty
+/// fold degrades through `with_context`'s empty face, the same posture the
+/// unresolvable-file drop lands in (`with_context` keeps `None` on empty).
+#[test]
+fn incompatible_lint_without_conflicts_carries_no_context() {
+    use dartq_engine::analysis_options::{ContextualIssue, DeclaredRule, RuleData};
+    use dartq_source::FileTable;
+
+    let rule = DeclaredRule {
+        name: "rule_neg".to_owned(),
+        offset: 30,
+        length: 8,
+        enabled: true,
+        illegal_value: None,
+    };
+    let included = RuleData {
+        name: "rule_pos".to_owned(),
+        file: PathBuf::from("/t/inc1.yaml"),
+        offset: 12,
+        length: 8,
+    };
+
+    let mut table = FileTable::new();
+    let reporting = table.intern(PathBuf::from("/t/analysis_options.yaml").as_path());
+
+    let local = ContextualIssue::incompatible_lint(&rule, &[])
+        .to_diagnostic(reporting, |path| table.try_file_id(path));
+    assert!(
+        local.context.is_none(),
+        "zero conflicts emit no contextMessages key"
+    );
+
+    let files = ContextualIssue::incompatible_lint_files("rule_neg", &[], (30, 8))
+        .to_diagnostic(reporting, |path| table.try_file_id(path));
+    assert!(
+        files.context.is_none(),
+        "zero conflicts emit no contextMessages key"
+    );
+
+    let thru_includes = ContextualIssue::incompatible_lint_included("inc1.yaml", &[], 1, (14, 12))
+        .to_diagnostic(reporting, |path| table.try_file_id(path));
+    assert!(
+        thru_includes.context.is_none(),
+        "zero conflicts emit no contextMessages key"
+    );
 }

@@ -1,4 +1,4 @@
-//! Facts persistence (M3 cold-start, PRD §17.2): the plain-data projection
+//! Facts persistence: the plain-data projection
 //! a [`dartq_snapshot`] entry carries, the package-graph fingerprint and
 //! the SDK identity encoding the generation header keys on.
 //!
@@ -33,7 +33,9 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, DiagnosticType, Severity};
+use dartq_diagnostics::{
+    CodeInfo, CodeRegistry, ContextMessage, Diagnostic, DiagnosticType, Severity,
+};
 use dartq_package::{PackageIdentity, PackageTable, SourceCategory};
 use dartq_resolution::{
     CombinatorClause, Combinators, Configuration, ResolutionCode, ResolvedTarget,
@@ -41,13 +43,11 @@ use dartq_resolution::{
 use dartq_sdk::SdkSnapshot;
 use dartq_semantic::ApiSignature;
 use dartq_semantic::persisted::{PersistedElements, PersistedRange};
-use dartq_source::{
-    FileId, FileTable, LineIndex, SourceRange, StringId, StringTable, content_hash,
-};
+use dartq_source::{ContentId, FileId, FileTable, LineIndex, SourceRange, StringId, StringTable};
 
 use crate::state::{DirectiveFacts, DirectiveKind, UnitFacts};
 
-/// blake3 truncated to 128 bits — the house digest width (§10.5).
+/// blake3 truncated to 128 bits — the house digest width.
 fn blake3_128(bytes: &[u8]) -> [u8; 16] {
     let digest = blake3::hash(bytes);
     let mut id = [0u8; 16];
@@ -55,7 +55,7 @@ fn blake3_128(bytes: &[u8]) -> [u8; 16] {
     id
 }
 
-/// The package graph fingerprint (PRD §5.6): blake3-128 over every package
+/// The package graph fingerprint: blake3-128 over every package
 /// identity's resolution-relevant columns — name, root, lib dir, language
 /// version, source category — in ascending-name order, each field
 /// length-prefixed so concatenation is unambiguous. Canonical order makes
@@ -89,6 +89,7 @@ pub fn package_graph_fingerprint(packages: &PackageTable) -> [u8; 16] {
 }
 
 /// Appends one length-prefixed field (u32 LE length, then the bytes).
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn field(bytes: &mut Vec<u8>, value: &[u8]) {
     bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
     bytes.extend_from_slice(value);
@@ -200,7 +201,7 @@ impl PersistedFacts {
         let diagnostics = facts
             .diagnostics
             .iter()
-            .map(|diagnostic| PersistedDiagnostic::of(diagnostic, &mut files))
+            .filter_map(|diagnostic| PersistedDiagnostic::of(diagnostic, &mut files))
             .collect();
         Self {
             api_signature: *facts.api_signature.as_bytes(),
@@ -215,14 +216,18 @@ impl PersistedFacts {
     /// mints file ids through `intern_file` (the load wiring drives its own
     /// file table), and rebuilds the line index from `source` — the source
     /// bytes whose content hash keys this entry, which the loader holds by
-    /// construction. `codes` is the builtin registry, built **once per load**
-    /// by the caller: `materialize` runs per entry, and a per-entry
-    /// `CodeRegistry::builtin()` would rebuild the ~270-entry map for every
-    /// snapshot file (the l1.rs #269 F2 anti-pattern).
+    /// construction. `content` is that hash, computed once upstream (the
+    /// apply batch's own content id — the entry key pins the same value, so
+    /// the snapshot path never re-hashes the source). `codes` is the
+    /// builtin registry, built **once per load** by the caller: `materialize`
+    /// runs per entry, and a per-entry `CodeRegistry::builtin` would
+    /// rebuild the ~270-entry map for every snapshot file (the l1.rs #269
+    /// F2 anti-pattern).
     #[must_use]
     pub fn materialize(
         self,
         source: &str,
+        content: ContentId,
         strings: &StringTable,
         codes: &CodeRegistry,
         intern_file: &mut dyn FnMut(&Path) -> FileId,
@@ -237,9 +242,10 @@ impl PersistedFacts {
             .diagnostics
             .into_iter()
             .filter_map(|diagnostic| diagnostic.restore(codes, &files))
+            .map(Arc::new)
             .collect();
         UnitFacts {
-            content: content_hash(source.as_bytes()),
+            content,
             api_signature: ApiSignature::from_bytes(self.api_signature),
             directives,
             elements: Arc::new(self.elements.into_elements(strings)),
@@ -326,7 +332,7 @@ pub struct PersistedCombinator {
     pub name_spans: Vec<PersistedRange>,
 }
 
-/// Mirror of the frozen §4.2 resolution code set; an exhaustive match on
+/// Mirror of the frozen resolution code set; an exhaustive match on
 /// both sides makes a new [`ResolutionCode`] variant a compile error here,
 /// i.e. a forced persistence-format review instead of silent truncation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,7 +401,7 @@ impl PersistedResolutionCode {
 /// foreign names (a lint table outside the builtin registry) rebuild from
 /// the stored columns so no diagnostic is ever dropped on load — the one
 /// exception being a corrupt out-of-range file index, which
-/// [`PersistedDiagnostic::restore`] drops as unattributable.
+/// `PersistedDiagnostic::restore` drops as unattributable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedDiagnostic {
     pub severity: PersistedSeverity,
@@ -408,6 +414,28 @@ pub struct PersistedDiagnostic {
     pub file: u32,
     pub range: PersistedRange,
     pub correction: Option<String>,
+    /// The `contextMessages` rows, each carrying its own file index. `None`
+    /// is the zero-cost no-context face — no key is written at all
+    /// (`skip_serializing_if`), so a payload without context stays exactly
+    /// its previous size; `Some` persists every element's message, file, and
+    /// UTF-16 span. A corrupt file index inside a context row drops just
+    /// that element on restore (under-report, never a crash) — the parent
+    /// diagnostic survives because its own `file` already resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Vec<PersistedContextMessage>>,
+}
+
+/// One `contextMessages` element in payload form — the mirror of
+/// [`dartq_diagnostics::ContextMessage`] with its `FileId` remapped to a
+/// [`PersistedFacts::files`] index.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedContextMessage {
+    /// The context message text.
+    pub message: String,
+    /// Indexes [`PersistedFacts::files`].
+    pub file: u32,
+    /// UTF-16 span within the referenced file.
+    pub range: PersistedRange,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,6 +451,8 @@ pub enum PersistedDiagnosticType {
     CompileTimeError,
     StaticWarning,
     Lint,
+    Hint,
+    Todo,
     Tool,
 }
 
@@ -436,10 +466,15 @@ impl PersistedDirective {
                 DirectiveKind::PartOf => PersistedDirectiveKind::PartOf,
                 DirectiveKind::Library => PersistedDirectiveKind::Library,
             },
-            uri: directive.uri.as_ref().map(|uri| uri.to_string()),
+            uri: directive.uri.as_ref().map(std::string::ToString::to_string),
             uri_span: PersistedRange::of(directive.uri_span),
             target: match directive.target {
-                ResolvedTarget::Resolved(file) => PersistedTarget::File(files.id(file)),
+                // An unencodable file id degrades to the missing-target
+                // face — the load side's out-of-range posture mirrored
+                // (`under-report, never a crash`).
+                ResolvedTarget::Resolved(file) => files
+                    .id(file)
+                    .map_or(PersistedTarget::Missing, PersistedTarget::File),
                 ResolvedTarget::External => PersistedTarget::External,
                 ResolvedTarget::Missing => PersistedTarget::Missing,
             },
@@ -447,14 +482,17 @@ impl PersistedDirective {
             prefix: directive.prefix.map(|id| strings.resolve(id).to_owned()),
             deferred: directive.deferred,
             combinators: written_clauses(directive.combinators.written_with_clauses(), strings),
-            name: directive.name.as_ref().map(|name| name.to_string()),
+            name: directive
+                .name
+                .as_ref()
+                .map(std::string::ToString::to_string),
             configurations: directive
                 .configurations
                 .iter()
                 .zip(directive.configuration_spans.iter())
                 .map(|(config, span)| PersistedConfiguration {
                     dotted_name: config.dotted_name.to_string(),
-                    value: config.value.as_ref().map(|value| value.to_string()),
+                    value: config.value.as_ref().map(std::string::ToString::to_string),
                     uri: config.uri.to_string(),
                     uri_span: PersistedRange::of(*span),
                 })
@@ -555,8 +593,12 @@ impl PersistedDirective {
 }
 
 impl PersistedDiagnostic {
-    fn of(diagnostic: &Diagnostic, files: &mut Files<'_>) -> Self {
-        Self {
+    /// `None` when the diagnostic's file cannot be encoded — the
+    /// encode↔table pairing broken (an engine bug): the row skips, the
+    /// load side's unattributable-row posture mirrored (persist is
+    /// best-effort; under-report, never a crash).
+    fn of(diagnostic: &Diagnostic, files: &mut Files<'_>) -> Option<Self> {
+        Some(Self {
             severity: match diagnostic.severity {
                 Severity::Info => PersistedSeverity::Info,
                 Severity::Warning => PersistedSeverity::Warning,
@@ -569,14 +611,35 @@ impl PersistedDiagnostic {
                 DiagnosticType::CompileTimeError => PersistedDiagnosticType::CompileTimeError,
                 DiagnosticType::StaticWarning => PersistedDiagnosticType::StaticWarning,
                 DiagnosticType::Lint => PersistedDiagnosticType::Lint,
+                DiagnosticType::Hint => PersistedDiagnosticType::Hint,
+                DiagnosticType::Todo => PersistedDiagnosticType::Todo,
                 DiagnosticType::Tool => PersistedDiagnosticType::Tool,
             },
             code_published: diagnostic.code.has_published_docs,
-            message: diagnostic.message.clone().into_owned(),
-            file: files.id(diagnostic.file),
+            message: diagnostic.message.into_owned(),
+            file: files.id(diagnostic.file)?,
             range: PersistedRange::of(diagnostic.range),
-            correction: diagnostic.correction.clone(),
-        }
+            correction: diagnostic.correction.as_deref().map(str::to_owned),
+            // A context row whose file fails the encode is an encode↔table
+            // pairing break (an engine bug): the whole diagnostic skips,
+            // the same under-report posture as its own `file` index above.
+            context: diagnostic
+                .context
+                .as_deref()
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .map(|m| {
+                            Some(PersistedContextMessage {
+                                message: m.message.as_str().to_owned(),
+                                file: files.id(m.file)?,
+                                range: PersistedRange::of(m.range),
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>()
+                })
+                .flatten(),
+        })
     }
 
     /// Restores one diagnostic. Returns `None` only for a corrupt payload —
@@ -598,6 +661,8 @@ impl PersistedDiagnostic {
                     PersistedDiagnosticType::CompileTimeError => DiagnosticType::CompileTimeError,
                     PersistedDiagnosticType::StaticWarning => DiagnosticType::StaticWarning,
                     PersistedDiagnosticType::Lint => DiagnosticType::Lint,
+                    PersistedDiagnosticType::Hint => DiagnosticType::Hint,
+                    PersistedDiagnosticType::Todo => DiagnosticType::Todo,
                     PersistedDiagnosticType::Tool => DiagnosticType::Tool,
                 },
                 self.code_published,
@@ -608,19 +673,41 @@ impl PersistedDiagnostic {
             PersistedSeverity::Warning => Severity::Warning,
             PersistedSeverity::Error => Severity::Error,
         };
-        Some(Diagnostic::new(
+        // A context row whose stored file index is out of range is a corrupt
+        // payload: that element drops, the diagnostic it annotates survives
+        // (under-report, never a crash — the same posture as a bad top-level
+        // `file` index dropping the row itself, one layer down).
+        let context: Vec<ContextMessage> = self
+            .context
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|m| {
+                Some(ContextMessage {
+                    message: m.message.into(),
+                    file: *files.get(m.file as usize)?,
+                    range: m.range.source_range(),
+                })
+            })
+            .collect();
+        let diagnostic = Diagnostic::new(
             severity,
             code,
             self.message,
             file,
             self.range.source_range(),
             self.correction,
-        ))
+        )
+        .with_context(context);
+        Some(diagnostic)
     }
 }
 
 /// The file-id slice under construction: every referenced `FileId` gets one
-/// path slot, first-use ordered.
+/// path slot, first-use ordered. An id the engine's table never interned —
+/// the encode↔table pairing broken, so an engine bug — answers `None` and
+/// the referencing row skips or degrades: persist is best-effort, the
+/// load side's under-report posture mirrored (`under-report, never a
+/// crash`).
 struct Files<'a> {
     table: &'a FileTable,
     paths: Vec<PathBuf>,
@@ -636,19 +723,16 @@ impl<'a> Files<'a> {
         }
     }
 
-    fn id(&mut self, file: FileId) -> u32 {
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+    fn id(&mut self, file: FileId) -> Option<u32> {
         if let Some(&at) = self.at.get(&file) {
-            return at;
+            return Some(at);
         }
-        let path = self
-            .table
-            .path(file)
-            .expect("facts only carry file ids the engine's own table interned")
-            .to_path_buf();
+        let path = self.table.path(file)?.to_path_buf();
         self.paths.push(path);
         let at = self.paths.len() as u32 - 1;
         self.at.insert(file, at);
-        at
+        Some(at)
     }
 }
 
@@ -695,8 +779,14 @@ mod tests {
     use crate::state::DirectiveKind;
     use crate::{CancellationToken, Engine, EngineConfig, EngineEvent, memory_store};
     use dartq_pub::{LockFile, PackageConfig, Pubspec, build_graph};
+    use dartq_semantic::persisted::{
+        PersistedAnnotation, PersistedContainer, PersistedContainerKind, PersistedFormal,
+        PersistedFormals, PersistedMemberEntry, PersistedMemberKind, PersistedMicroKind,
+        PersistedTopDecl, PersistedTy,
+    };
     use dartq_snapshot::{SnapshotConfig, SnapshotStore};
     use dartq_source::SourceRange;
+    use dartq_source::content_hash;
     use std::collections::BTreeMap;
     use std::path::Path;
     use std::path::PathBuf;
@@ -730,19 +820,22 @@ mod tests {
         r#""correction":null},{"severity":"Warning","code_name":"dead_code","#,
         r#""code_machine":"DEAD_CODE","code_dtype":"StaticWarning","code_published":true,"#,
         r#""message":"Dead code.","file":1,"range":{"offset":4,"length":9},"#,
-        r#""correction":"Try removing the dead code."}],"#,
+        r#""correction":"Try removing the dead code.","context":[{"message":"'dead' "#,
+        r#"is declared here.","file":1,"range":{"offset":0,"length":4}}]}],"#,
         r#""files":["/w/lib/main.dart","/w/lib/other.dart"]}"#,
     );
 
     /// The representative payload the shape pin guards: one instance of every
     /// engine-side payload struct in the `PersistedFacts` tree, exercising
     /// the `Some`/`None` faces (`uri`, `code`, `prefix`, `name`,
-    /// `correction`), both combinator directions, a file-target index, and
-    /// two severities. The element model rides empty
-    /// (`FileElements::default()` projects to empty columns): the semantic
-    /// mirrors live in dartq-semantic with their own review surface, while
-    /// the pin guards the engine-side layout — including
-    /// `PersistedElements`' own column list.
+    /// `correction`, `context` — the second row carries a context message,
+    /// pinning the `PersistedContextMessage` layout), both combinator
+    /// directions, a file-target index, and two severities. The element
+    /// model rides empty (`FileElements::default()` projects to empty
+    /// columns): the pin guards the engine-side layout, including
+    /// `PersistedElements`' own column list, while the populated element
+    /// rows are pinned separately
+    /// ([`Self::populated_elements_shape_is_pinned`]).
     fn shape_probe() -> PersistedFacts {
         let strings = StringTable::new();
         PersistedFacts {
@@ -813,6 +906,7 @@ mod tests {
                         length: 18,
                     }),
                     correction: None,
+                    context: None,
                 },
                 PersistedDiagnostic {
                     severity: PersistedSeverity::Warning,
@@ -827,6 +921,14 @@ mod tests {
                         length: 9,
                     }),
                     correction: Some("Try removing the dead code.".to_owned()),
+                    context: Some(vec![PersistedContextMessage {
+                        message: "'dead' is declared here.".to_owned(),
+                        file: 1,
+                        range: PersistedRange::of(SourceRange {
+                            offset: 0,
+                            length: 4,
+                        }),
+                    }]),
                 },
             ],
             files: vec![
@@ -860,6 +962,208 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&decoded).expect("re-encode"),
             FACTS_SHAPE_JSON_PIN,
+            "decode+re-encode must reproduce the pinned encoding byte-for-byte"
+        );
+    }
+
+    /// Byte-exact pinned encoding of [`Self::populated_elements_probe`] —
+    /// the elements-subtree half of the facts-shape guard, the mirror rows
+    /// the main probe rides empty. Any layout edit inside an element row
+    /// (a mirror column added to a formal, member, or annotation; a serde
+    /// representation change) moves these bytes while
+    /// `FACTS_SHAPE_VERSION` (state.rs) stays put, and
+    /// [`Self::populated_elements_shape_is_pinned`] fails — the same
+    /// bump-the-version-and-re-pin contract as the main pin.
+    const FACTS_SHAPE_ELEMENTS_JSON_PIN: &str = concat!(
+        r#"{"strings":["C","m","x","y","int","0","f","z","Deprecated","('v')","String"],"decls":[[6,"#,
+        r#"{"kind":"TopLevelFn","type_params":0,"var_ty":"Unknown","return_ty":"Void","#,
+        r#""formals":{"positional":[{"name":7,"ty":{"Function":{"nullable":true,"type_params":0,"#,
+        r#""return_ty":{"Named":{"name":10,"nullable":false,"args":[]}},"positional":[{"Named":{"name":4,"#,
+        r#""nullable":false,"args":[]}}],"named":[]}},"required":true,"covariant":false,"#,
+        r#""default_value":null}],"named":[]}}]],"containers":[[0,{"kind":"Class","is_abstract":false,"#,
+        r#""is_base":false,"is_final":false,"is_interface":false,"is_mixin_class":false,"superclass":null,"#,
+        r#""members":[[1,{"kind":"Method","is_static":false,"is_abstract":false,"is_external":false,"#,
+        r#""is_final":false,"type_params":0,"type_param_names":[],"var_ty":"Unknown","return_ty":"Void","#,
+        r#""formals":{"positional":[{"name":2,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"#,
+        r#""required":true,"covariant":false,"default_value":null}],"named":[{"name":3,"#,
+        r#""ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":false,"covariant":true,"#,
+        r#""default_value":5}]},"annotations":[{"name":8,"offset":0,"length":16,"args_text":9}],"#,
+        r#""name_range":[34,1]}]],"type_params":0,"sealed":false,"with_clause":[],"implements_clause":[],"#,
+        r#""on_clause":[],"header_residue":[],"primary_formals":[],"enum_constants":[],"constructors":[],"#,
+        r#""has_unnamed_constructor":false,"ctor_formals":[],"annotations":[]}]],"container_order":[0],"#,
+        r#""extension_faces":[],"duplicates":[],"arity_violations":[]}"#,
+    );
+
+    /// The element rows the main probe rides past empty, modeled on the
+    /// source `@Deprecated('v') class C { void m(int x, {covariant int y =
+    /// 0}) {} } void f(String Function(int)? z) {}`: one top-level
+    /// function row, one container row with one annotated method member,
+    /// and the empty columns (container order, extension faces,
+    /// duplicates, arity). The mirror columns are populated where they
+    /// earn their keep: the named formal carries the covariant bit and a
+    /// default-value text (the #1637 columns), the member carries an
+    /// annotation star with its argument-group text (#1083) and its
+    /// name-token anchor (#1867), and the top-level function's formal
+    /// carries a function-typed declared type (the function-shape
+    /// columns) — so a layout edit in any of those subtrees moves the
+    /// pinned bytes and forces the `FACTS_SHAPE_VERSION` bump the
+    /// state.rs contract requires.
+    fn populated_elements_probe() -> PersistedElements {
+        PersistedElements {
+            strings: vec![
+                "C".to_owned(),
+                "m".to_owned(),
+                "x".to_owned(),
+                "y".to_owned(),
+                "int".to_owned(),
+                "0".to_owned(),
+                "f".to_owned(),
+                "z".to_owned(),
+                "Deprecated".to_owned(),
+                "('v')".to_owned(),
+                "String".to_owned(),
+            ],
+            decls: vec![(
+                6,
+                PersistedTopDecl {
+                    kind: PersistedMicroKind::TopLevelFn,
+                    type_params: 0,
+                    var_ty: PersistedTy::Unknown,
+                    return_ty: PersistedTy::Void,
+                    formals: Some(Box::new(PersistedFormals {
+                        positional: vec![PersistedFormal {
+                            name: 7,
+                            // `String Function(int)?` — the function-shape
+                            // columns (return type, parameter count,
+                            // positional formals).
+                            ty: PersistedTy::Function {
+                                nullable: true,
+                                type_params: 0,
+                                return_ty: Box::new(PersistedTy::Named {
+                                    name: 10,
+                                    nullable: false,
+                                    args: Vec::new(),
+                                }),
+                                positional: vec![PersistedTy::Named {
+                                    name: 4,
+                                    nullable: false,
+                                    args: Vec::new(),
+                                }],
+                                named: Vec::new(),
+                            },
+                            required: true,
+                            covariant: false,
+                            default_value: None,
+                        }],
+                        named: Vec::new(),
+                    })),
+                },
+            )],
+            containers: vec![(
+                0,
+                PersistedContainer {
+                    kind: PersistedContainerKind::Class,
+                    is_abstract: false,
+                    is_base: false,
+                    is_final: false,
+                    is_interface: false,
+                    is_mixin_class: false,
+                    superclass: None,
+                    members: vec![(
+                        1,
+                        PersistedMemberEntry {
+                            kind: PersistedMemberKind::Method,
+                            is_static: false,
+                            is_abstract: false,
+                            is_external: false,
+                            is_final: false,
+                            type_params: 0,
+                            type_param_names: Vec::new(),
+                            var_ty: PersistedTy::Unknown,
+                            return_ty: PersistedTy::Void,
+                            formals: Some(Box::new(PersistedFormals {
+                                positional: vec![PersistedFormal {
+                                    name: 2,
+                                    ty: PersistedTy::Named {
+                                        name: 4,
+                                        nullable: false,
+                                        args: Vec::new(),
+                                    },
+                                    required: true,
+                                    covariant: false,
+                                    default_value: None,
+                                }],
+                                named: vec![PersistedFormal {
+                                    name: 3,
+                                    ty: PersistedTy::Named {
+                                        name: 4,
+                                        nullable: false,
+                                        args: Vec::new(),
+                                    },
+                                    required: false,
+                                    covariant: true,
+                                    default_value: Some(5),
+                                }],
+                            })),
+                            annotations: vec![PersistedAnnotation {
+                                name: 8,
+                                offset: 0,
+                                length: 16,
+                                args_text: Some(9),
+                            }],
+                            name_range: Some((34, 1)),
+                        },
+                    )],
+                    type_params: 0,
+                    sealed: false,
+                    with_clause: Vec::new(),
+                    implements_clause: Vec::new(),
+                    on_clause: Vec::new(),
+                    header_residue: Vec::new(),
+                    primary_formals: Vec::new(),
+                    enum_constants: Vec::new(),
+                    constructors: Vec::new(),
+                    has_unnamed_constructor: false,
+                    ctor_formals: Vec::new(),
+                    annotations: Vec::new(),
+                },
+            )],
+            container_order: vec![0],
+            extension_faces: Vec::new(),
+            duplicates: Vec::new(),
+            arity_violations: Vec::new(),
+        }
+    }
+
+    /// The elements-subtree half of the shape guard (state.rs
+    /// `FACTS_SHAPE_VERSION` contract): the populated mirror rows must
+    /// encode byte-for-byte to the pinned literal, so a mirror-layout edit
+    /// cannot land without the version bump that invalidates old
+    /// snapshots — these subtrees moved zero bytes while the main probe
+    /// rode empty (facts-consistency audit 2026-10-17, G2). The message
+    /// names the whole fix; the printed actual encoding is the re-pin
+    /// value.
+    #[test]
+    fn populated_elements_shape_is_pinned() {
+        let bytes =
+            serde_json::to_vec(&populated_elements_probe()).expect("probe payload serializes");
+        let encoded = String::from_utf8(bytes).expect("json is utf-8");
+        assert_eq!(
+            encoded, FACTS_SHAPE_ELEMENTS_JSON_PIN,
+            "the persisted elements layout changed without a \
+             FACTS_SHAPE_VERSION bump (state.rs): a snapshot written by the \
+             old shape must never be served to code expecting the new one. \
+             Bump FACTS_SHAPE_VERSION, extend its shape history, and re-pin \
+             FACTS_SHAPE_ELEMENTS_JSON_PIN to the actual encoding printed \
+             below."
+        );
+        // Decode + re-encode must reproduce the pinned bytes: serde's own
+        // representation of the shape is stable, not just the derive surface.
+        let decoded: PersistedElements =
+            serde_json::from_str(FACTS_SHAPE_ELEMENTS_JSON_PIN).expect("pinned encoding decodes");
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("re-encode"),
+            FACTS_SHAPE_ELEMENTS_JSON_PIN,
             "decode+re-encode must reproduce the pinned encoding byte-for-byte"
         );
     }
@@ -935,7 +1239,7 @@ mod tests {
         {"name": "b", "rootUri": "../b", "languageVersion": "3.5"}
     ], "generator": "pub"}"#;
     const GRAPH_LOCK_EMPTY: &str = "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n";
-    /// Locking `a` as hosted flips its source category (Path → PubCache),
+    /// Locking `a` as hosted flips its source category (Path → `PubCache`),
     /// the fifth folded column.
     const GRAPH_LOCK_HOSTED_A: &str = "packages:\n  a:\n    description:\n      name: a\n      sha256: \"0\"\n      url: \"https://pub.dev\"\n    source: hosted\n    version: \"1.0.0\"\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n";
 
@@ -1005,6 +1309,7 @@ mod tests {
                     length: 18,
                 }),
                 correction: None,
+                context: None,
             }],
             files: vec![PathBuf::from("/w/lib/main.dart")],
         };
@@ -1014,6 +1319,7 @@ mod tests {
         let mut restored_files = FileTable::new();
         let restored = payload.materialize(
             "import 'package:a/a.dart';\n",
+            content_hash(b"import 'package:a/a.dart';\n"),
             &restored_strings,
             &codes,
             &mut |path| restored_files.intern(path),
@@ -1029,7 +1335,7 @@ mod tests {
         );
     }
 
-    /// The fingerprint is the whole-generation miss gate (PRD §5.6/§17.2):
+    /// The fingerprint is the whole-generation miss gate:
     /// identical tables digest equally across fresh builds, config entry
     /// order is normalized away, and moving any one folded column (name,
     /// root, lib dir, language version, source category) forks the digest.
@@ -1188,10 +1494,13 @@ mod tests {
     /// the next apply serves the materialized facts — the warm face equals
     /// a from-scratch engine's on every observable column, and the
     /// directive re-resolves against the consuming file's directory —
-    /// while an entry whose content moved since the save drops (its file
-    /// recomputes) and the staging map drains whole.
+    /// while an entry whose content moved since the save never serves (its
+    /// file recomputes from scratch) and stands in staging until a later
+    /// claim, the budget shed, or the next ingest replaces it (#1387 — the
+    /// single-shot drain this seam replaced dropped precisely the later
+    /// revert hits, an undo).
     #[test]
-    fn warm_start_round_trips_and_drops_stale_entries() {
+    fn warm_start_round_trips_and_stale_entries_never_serve() {
         let config_dir = graph_config_dir();
         let root = config_dir.parent().expect("fixture root").to_path_buf();
         let main_path = root.join("lib/main.dart");
@@ -1264,9 +1573,13 @@ mod tests {
             .analyze(&[], &mut on_event, &cancel)
             .expect("analyze");
 
-        assert!(
-            warm_engine.state.warm_start.is_empty(),
-            "single-shot staging: matched entries consumed, stale ones dropped"
+        // The matched entry was consumed at its claim; the stale one is
+        // unclaimable but stands (#1387) — it can only serve a later batch
+        // whose content reverts to the staged identity, never this one.
+        assert_eq!(
+            warm_engine.state.warm_start.len(),
+            1,
+            "matched entry consumed at the claim, stale entry standing"
         );
 
         // The warm face equals the from-scratch engine on every observable.
@@ -1310,11 +1623,152 @@ mod tests {
         let _ = std::fs::remove_dir_all(&cache);
     }
 
+    /// The single generation's entries directory under `cache` — the
+    /// fixtures write exactly one header, so the snapshots root holds one
+    /// directory.
+    fn only_entries_dir(cache: &Path) -> PathBuf {
+        let mut generations: Vec<PathBuf> = std::fs::read_dir(cache.join("snapshots"))
+            .expect("snapshots root")
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(generations.len(), 1, "one generation per fixture");
+        generations.pop().expect("generation").join("entries")
+    }
+
+    /// The #1386 flush discipline at the engine face: a flush with zero
+    /// changes writes zero entries (every recorded key is skipped — no
+    /// projection, no encode, no read, no rewrite), a one-file edit
+    /// rewrites exactly that file's entry, and the delta flushes leave a
+    /// generation a fresh store instance loads in full.
+    #[test]
+    fn flush_rewrites_only_changed_entries() {
+        use filetime::{FileTime, set_file_mtime};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let config_dir = graph_config_dir();
+        let root = config_dir.parent().expect("fixture root").to_path_buf();
+        let main_path = root.join("lib/main.dart");
+        let other_path = root.join("lib/other.dart");
+        let main_src = "import 'other.dart';\nvoid main() { other(); }\n";
+        let other_src = "int other() => 1;\n";
+        let other_edited = "// edited\nint other() => 1;\n";
+
+        let pub_config = Arc::new(PackageConfig::parse(GRAPH_CONFIG).expect("valid config"));
+        let mut engine = Engine::new(EngineConfig {
+            store: memory_store(),
+            sdk: sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES),
+            packages: graph_table(&config_dir, GRAPH_CONFIG, GRAPH_LOCK_EMPTY),
+            pub_config: Arc::clone(&pub_config),
+            config_dir: config_dir.clone(),
+            semdiag: None,
+            target: "vm".to_owned(),
+            declared_variables: FxHashMap::default(),
+            experiments: Vec::new(),
+        })
+        .expect("engine");
+        engine.set_content(&main_path, main_src.as_bytes());
+        engine.set_content(&other_path, other_src.as_bytes());
+        let mut on_event = |_event: EngineEvent| {};
+        let cancel = CancellationToken::new();
+        engine
+            .analyze(&[], &mut on_event, &cancel)
+            .expect("analyze");
+
+        let cache = snapshot_cache_dir();
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(cache.clone()),
+            capacity_bytes: 64 * 1024 * 1024,
+        })
+        .expect("open store");
+        assert_eq!(engine.save_facts_snapshot(&store).expect("flush"), 2);
+
+        // Plant a distinctly old mtime on every entry file: any rewrite
+        // after this point is observable as a different mtime.
+        let entries_dir = only_entries_dir(&cache);
+        let entry_files = |dir: &Path| -> Vec<PathBuf> {
+            let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+                .expect("entries dir")
+                .flatten()
+                .map(|entry| entry.path())
+                .collect();
+            files.sort();
+            files
+        };
+        let first_flush = entry_files(&entries_dir);
+        assert_eq!(first_flush.len(), 2, "one entry per distinct content");
+        let planted = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        for path in &first_flush {
+            set_file_mtime(path, FileTime::from_unix_time(1_000_000, 0)).expect("plant mtime");
+        }
+        let mtime = |path: &Path| {
+            std::fs::metadata(path)
+                .expect("entry meta")
+                .modified()
+                .expect("entry mtime")
+        };
+
+        // The no-change flush: the manifest still claims both keys, but
+        // not one entry file is touched.
+        assert_eq!(
+            engine.save_facts_snapshot(&store).expect("no-change flush"),
+            2,
+            "the manifest still claims the full set"
+        );
+        for path in &first_flush {
+            assert_eq!(
+                mtime(path),
+                planted,
+                "an unchanged entry must not be rewritten: {}",
+                path.display()
+            );
+        }
+
+        // One content change: exactly that file's entry is rewritten (its
+        // new key was never recorded), the untouched file's entry keeps
+        // its planted mtime, and the swept old key leaves one coherent set.
+        engine.set_content(&other_path, other_edited.as_bytes());
+        engine
+            .analyze(&[], &mut on_event, &cancel)
+            .expect("analyze");
+        assert_eq!(engine.save_facts_snapshot(&store).expect("flush"), 2);
+        let after_edit = entry_files(&entries_dir);
+        assert_eq!(
+            after_edit.len(),
+            2,
+            "the edited file's old key is swept, the new key written"
+        );
+        let rewritten = after_edit
+            .iter()
+            .filter(|path| mtime(path) != planted)
+            .count();
+        assert_eq!(
+            rewritten, 1,
+            "exactly the edited file's entry pays the rewrite"
+        );
+
+        // Coherence: a fresh store instance (the daemon-restart shape)
+        // loads the generation the delta flushes produced.
+        let header = engine.snapshot_header();
+        let fresh = SnapshotStore::open(SnapshotConfig {
+            root: Some(cache.clone()),
+            capacity_bytes: 64 * 1024 * 1024,
+        })
+        .expect("reopen store");
+        let snapshot = fresh
+            .load::<PersistedFacts>(&header)
+            .expect("the delta-flushed generation loads in full");
+        assert_eq!(snapshot.entries.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&cache);
+    }
+
     /// A directive with show/hide combinators, a file target, a prefix, and
     /// a diagnostic survive the payload round trip; the api signature rides
     /// byte-exact; the restored line index and content hash match a fresh
     /// compute over the same source.
     #[test]
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     fn facts_round_trip_through_the_payload() {
         let strings = StringTable::new();
         let mut files = FileTable::new();
@@ -1346,7 +1800,7 @@ mod tests {
             configurations: Box::default(),
             configuration_spans: Box::default(),
         }];
-        let diagnostics = vec![Diagnostic::new(
+        let diagnostics = vec![Arc::new(Diagnostic::new(
             Severity::Error,
             CodeRegistry::builtin()
                 .get("uri_does_not_exist")
@@ -1355,7 +1809,7 @@ mod tests {
             declared,
             range,
             None,
-        )];
+        ))];
         let source = "import 'package:other/other.dart';\nvoid main() {}\n";
         let facts = UnitFacts {
             content: content_hash(source.as_bytes()),
@@ -1376,9 +1830,13 @@ mod tests {
         let codes = CodeRegistry::builtin();
         let restored_strings = StringTable::new();
         let mut restored_files = FileTable::new();
-        let restored = decoded.materialize(source, &restored_strings, &codes, &mut |path| {
-            restored_files.intern(path)
-        });
+        let restored = decoded.materialize(
+            source,
+            facts.content,
+            &restored_strings,
+            &codes,
+            &mut |path| restored_files.intern(path),
+        );
 
         assert_eq!(restored.content, facts.content, "content hash reproduced");
         assert_eq!(restored.api_signature, facts.api_signature);
@@ -1399,9 +1857,12 @@ mod tests {
         );
         assert_eq!(diagnostic.severity, original.severity);
         assert_eq!(diagnostic.code, original.code);
-        assert_eq!(diagnostic.message, original.message);
+        assert_eq!(diagnostic.message.as_str(), original.message.as_str());
         assert_eq!(diagnostic.range, original.range);
-        assert_eq!(diagnostic.correction, original.correction);
+        assert_eq!(
+            diagnostic.correction.as_deref(),
+            original.correction.as_deref()
+        );
 
         let directive = &restored.directives[0];
         assert_eq!(directive.kind, DirectiveKind::Import);
@@ -1440,6 +1901,184 @@ mod tests {
         );
     }
 
+    /// The `contextMessages` payload (#1821): message text, the referenced
+    /// file's index into the facts' path table, and the UTF-16 span all
+    /// survive the round trip — `None` rows persist as no key at all
+    /// (`skip_serializing_if`), while `Some` rows ride their elements'
+    /// columns verbatim. A corrupt inner file index drops just that element
+    /// (under-report, never a crash) — the parent diagnostic survives.
+    #[test]
+    fn diagnostic_context_round_trips_and_omits_when_empty() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let reported = files.intern(Path::new("/w/lib/main.dart"));
+        let context_file = files.intern(Path::new("/w/lib/dep.dart"));
+
+        let with_context = Diagnostic::new(
+            Severity::Warning,
+            CodeRegistry::builtin()
+                .get("dead_code")
+                .expect("registry code"),
+            "Dead code.",
+            reported,
+            SourceRange {
+                offset: 4,
+                length: 9,
+            },
+            None,
+        )
+        .with_context(vec![ContextMessage {
+            message: "The declaration is here.".into(),
+            file: context_file,
+            range: SourceRange {
+                offset: 12,
+                length: 6,
+            },
+        }]);
+        let without_context = Diagnostic::new(
+            Severity::Error,
+            CodeRegistry::builtin()
+                .get("uri_does_not_exist")
+                .expect("registry code"),
+            "Target of URI doesn't exist: 'package:a/a.dart'.",
+            reported,
+            SourceRange {
+                offset: 0,
+                length: 18,
+            },
+            None,
+        );
+
+        let source = "import 'package:a/a.dart';\nvoid f() {}\n";
+        let facts = UnitFacts {
+            content: content_hash(source.as_bytes()),
+            api_signature: ApiSignature::from_bytes([3; 16]),
+            directives: Vec::new(),
+            elements: Arc::new(dartq_semantic::FileElements::default()),
+            diagnostics: vec![Arc::new(with_context), Arc::new(without_context)],
+            line_index: LineIndex::new(source),
+        };
+
+        let payload = PersistedFacts::of(&facts, &strings, &files);
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let decoded: PersistedFacts = serde_json::from_slice(&bytes).expect("deserialize");
+
+        // The no-context row persists byte-identically to before the field
+        // existed — `skip_serializing_if` writes no key.
+        let contextless_bytes = serde_json::to_string(&decoded.diagnostics[1]).expect("re-encode");
+        assert!(
+            !contextless_bytes.contains("\"context\""),
+            "None writes no context key: {contextless_bytes}"
+        );
+        let context_bytes =
+            serde_json::to_string(&decoded.diagnostics[0]).expect("re-encode context row");
+        assert!(
+            context_bytes.contains("\"context\""),
+            "Some persists the context key: {context_bytes}"
+        );
+
+        let codes = CodeRegistry::builtin();
+        let restored_strings = StringTable::new();
+        let mut restored_files = FileTable::new();
+        let restored = decoded.materialize(
+            source,
+            facts.content,
+            &restored_strings,
+            &codes,
+            &mut |path| restored_files.intern(path),
+        );
+        assert_eq!(restored.diagnostics.len(), 2);
+        let messages = restored.diagnostics[0]
+            .context
+            .as_deref()
+            .expect("context restored");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message.as_str(), "The declaration is here.");
+        assert_eq!(
+            restored_files.path(messages[0].file),
+            Some(Path::new("/w/lib/dep.dart")),
+            "the context file's path survives the remap"
+        );
+        assert_eq!(
+            messages[0].range,
+            SourceRange {
+                offset: 12,
+                length: 6
+            }
+        );
+        assert!(
+            restored.diagnostics[1].context.is_none(),
+            "an empty context stays absent on restore"
+        );
+    }
+
+    /// A `context` row whose stored file index is out of range is disk rot:
+    /// serde decodes it, only the loader can see it. The offending element
+    /// drops while the parent diagnostic survives — under-report, never a
+    /// crash, the same posture as a corrupt top-level `file` index dropping
+    /// its own row one layer down.
+    #[test]
+    fn corrupt_context_file_index_drops_the_element_only() {
+        let strings = StringTable::new();
+        let payload = PersistedFacts {
+            api_signature: [7; 16],
+            directives: Vec::new(),
+            elements: PersistedElements::of(&dartq_semantic::FileElements::default(), &strings),
+            diagnostics: vec![PersistedDiagnostic {
+                severity: PersistedSeverity::Warning,
+                code_name: "dead_code".to_owned(),
+                code_machine: "DEAD_CODE".to_owned(),
+                code_dtype: PersistedDiagnosticType::StaticWarning,
+                code_published: true,
+                message: "Dead code.".to_owned(),
+                file: 0,
+                range: PersistedRange::of(SourceRange {
+                    offset: 4,
+                    length: 9,
+                }),
+                correction: None,
+                context: Some(vec![
+                    PersistedContextMessage {
+                        message: "kept".to_owned(),
+                        file: 0,
+                        range: PersistedRange::of(SourceRange {
+                            offset: 1,
+                            length: 2,
+                        }),
+                    },
+                    PersistedContextMessage {
+                        message: "dropped".to_owned(),
+                        file: 7,
+                        range: PersistedRange::of(SourceRange {
+                            offset: 0,
+                            length: 1,
+                        }),
+                    },
+                ]),
+            }],
+            files: vec![PathBuf::from("/w/lib/main.dart")],
+        };
+
+        let codes = CodeRegistry::builtin();
+        let restored_strings = StringTable::new();
+        let mut restored_files = FileTable::new();
+        let restored = payload.materialize(
+            "void f() {}\n",
+            content_hash(b"void f() {}\n"),
+            &restored_strings,
+            &codes,
+            &mut |path| restored_files.intern(path),
+        );
+
+        assert_eq!(restored.diagnostics.len(), 1, "parent survives");
+        let context = restored.diagnostics[0]
+            .context
+            .as_deref()
+            .expect("one element survives");
+        assert_eq!(context.len(), 1, "the corrupt element drops");
+        assert_eq!(context[0].message.as_str(), "kept");
+    }
+
     /// The written combinator sequence survives the payload round trip
     /// (#539): written order, duplicates (one name written twice → two
     /// tokens with distinct spans), and the captured UTF-16 spans — the
@@ -1447,6 +2086,7 @@ mod tests {
     /// the l1.rs `walk_import_export` posture), which is the sequence the
     /// undefined-combinator reports iterate.
     #[test]
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     fn combinator_written_sequence_round_trips_with_spans() {
         let strings = StringTable::new();
         let mut files = FileTable::new();
@@ -1516,9 +2156,13 @@ mod tests {
         let codes = CodeRegistry::builtin();
         let restored_strings = StringTable::new();
         let mut restored_files = FileTable::new();
-        let restored = decoded.materialize(source, &restored_strings, &codes, &mut |path| {
-            restored_files.intern(path)
-        });
+        let restored = decoded.materialize(
+            source,
+            facts.content,
+            &restored_strings,
+            &codes,
+            &mut |path| restored_files.intern(path),
+        );
 
         let written = |facts: &UnitFacts, strings: &StringTable| {
             facts.directives[0]
@@ -1639,9 +2283,13 @@ mod tests {
         let codes = CodeRegistry::builtin();
         let restored_strings = StringTable::new();
         let mut restored_files = FileTable::new();
-        let restored = decoded.materialize(source, &restored_strings, &codes, &mut |path| {
-            restored_files.intern(path)
-        });
+        let restored = decoded.materialize(
+            source,
+            facts.content,
+            &restored_strings,
+            &codes,
+            &mut |path| restored_files.intern(path),
+        );
 
         let combinators = &restored.directives[0].combinators;
         assert!(
@@ -1666,6 +2314,7 @@ mod tests {
     /// start recomputes from source, yielding the spanned written face the
     /// new shape persists.
     #[test]
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     fn warm_start_misses_cleanly_on_a_schema_version_change() {
         let config_dir = graph_config_dir();
         let root = config_dir.parent().expect("fixture root").to_path_buf();
@@ -1847,6 +2496,7 @@ mod tests {
         let mut restored_files = FileTable::new();
         let restored = decoded.materialize(
             CLAUSE_ROUND_TRIP_SOURCE,
+            facts.content,
             &restored_strings,
             &codes,
             &mut |path| restored_files.intern(path),
@@ -1941,6 +2591,7 @@ mod tests {
     /// The merged-run payload collapsed the boundaries, so a warm start
     /// over-reported the duplicates and equated the paired imports.
     #[test]
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     fn warm_start_reproduces_cold_clause_boundary_faces() {
         let config_dir = graph_config_dir();
         let root = config_dir.parent().expect("fixture root").to_path_buf();

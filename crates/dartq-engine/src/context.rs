@@ -1,11 +1,11 @@
-//! The multi-context runtime substrate (PRD §16): configuration-forked
+//! The multi-context runtime substrate: configuration-forked
 //! analysis contexts coexisting over one base, with per-context overlays,
 //! writer-priority scheduling, and epoch-based cancellation.
 //!
-//! # Shape (§16.1–§16.3)
+//! # Shape
 //!
-//! * A [`Context`] is a configuration fork dimension — SDK identity, package
-//!   graph (which decides the language-version table, §16.2), merged
+//! * A `Context` is a configuration fork dimension — SDK identity, package
+//!   graph, merged
 //!   analysis options, and the reserved flag word — hashed into a
 //!   [`ContextKey`]. Two opens with equal keys are the same context (dedup
 //!   on insert), so a live context set is always pairwise-distinct in
@@ -15,7 +15,7 @@
 //!   facts). Fork-irrelevant content is shared at the identity level:
 //!   [`ContentId`]s are content addresses valid across contexts, and
 //!   identical overlay bytes occupy one slot in the runtime's own
-//!   content-addressed overlay store (§16.3's path → `ContentId` map).
+//!   content-addressed overlay store.
 //!   Physical byte sharing of *engine* stores is opt-in per store handle:
 //!   contexts constructed over one
 //!   [`ContentPool`](crate::ContentPool)
@@ -28,12 +28,12 @@
 //!   a file resident without touching disk, with the same batch +
 //!   invalidation semantics as any other content change.
 //! * Writes bump the context's epoch; tasks enqueued under older epochs are
-//!   dropped at the single drain point ([`Runtime::drain`], §16.6).
+//!   dropped at the single drain point.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use dartq_source::{ContentId, MemorySourceStore, SourceStore};
+use dartq_source::{ContentId, MAX_SOURCE_BYTES, MemorySourceStore, SourceStore, SourceText};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::analysis_options;
@@ -83,10 +83,10 @@ impl ContextKey {
 }
 
 /// One context's configuration: everything [`EngineConfig`] already carries
-/// (the fork dimensions of PRD §5.4's context slice — SDK identity, target
+/// (the fork dimensions of the context slice — SDK identity, target
 /// segment, declared variables, package graph, merged options) plus the
 /// reserved flag word for fork dimensions not yet materialized (the flutter
-/// panel — §16.2). Consumed by [`Runtime::open_context`].
+/// panel). Consumed by [`Runtime::open_context`].
 pub struct ContextConfig {
     /// The per-context analysis configuration, passed through to
     /// [`Engine::new`] verbatim (including the context's own content store).
@@ -102,13 +102,15 @@ pub struct ContextConfig {
     pub flags: u64,
 }
 
-/// One entry of a per-context overlay batch (§16.3): full-content
+/// One entry of a per-context overlay batch: full-content
 /// replacement or removal. Writes never touch the base tree on disk.
 pub enum OverlayChange {
     /// `path` reads as `bytes` in this context's view from the next apply on.
-    /// Exactly one leading UTF-8 BOM is stripped (the engine read-layer
-    /// rule); invalid UTF-8 decodes lossily at the engine boundary as in
-    /// [`crate::Engine::set_content`].
+    /// Exactly one leading UTF-8 BOM is stripped and invalid UTF-8 decodes
+    /// lossily (the engine read-layer rule, [`crate::Engine::set_content`]);
+    /// the overlay stores and hashes that canonical text, so the overlay's
+    /// [`ContentId`] is the same identity the engine's residency computes
+    /// for the same logical content.
     Set { path: PathBuf, bytes: Vec<u8> },
     /// `path` is absent from this context's view. Already-absent is success
     /// (batch semantics — the overlay declares the view, it does not edit
@@ -118,11 +120,11 @@ pub enum OverlayChange {
 
 /// One open context: its engine (the independent semantic-layer products),
 /// its identity key, its cancellation epoch, and its standing overlay
-/// (§16.3's path → `ContentId` map — re-appliable if the view is rebuilt).
+///.
 struct Context {
     engine: Engine,
     key: ContextKey,
-    /// Monotonic write epoch (§16.6): bumped by every [`Runtime::apply_overlay`]
+    /// Monotonic write epoch: bumped by every [`Runtime::apply_overlay`]
     /// and [`Runtime::cancel`]; tasks carrying older epochs are stale.
     epoch: u64,
     /// Standing overlay: paths this context reads as overlay bytes. Bounded
@@ -130,7 +132,7 @@ struct Context {
     overlay: FxHashMap<PathBuf, ContentId>,
 }
 
-/// The multi-context runtime (§16.1): one process, one base, N
+/// The multi-context runtime: one process, one base, N
 /// configuration-forked contexts, a shared content-addressed overlay store,
 /// and the per-context scheduler queues.
 ///
@@ -142,7 +144,7 @@ struct Context {
 /// clear, and [`Runtime::sweep`] reclaims dead overlay content.
 #[derive(Default)]
 pub struct Runtime {
-    /// The shared overlay content layer (§16.3): bytes addressable by
+    /// The shared overlay content layer: bytes addressable by
     /// [`ContentId`], deduplicated across every context's overlay. Runtime-
     /// owned and runtime-exclusive — engines keep their own per-context
     /// stores (see the module docs for the sharing adjudication).
@@ -155,7 +157,7 @@ pub struct Runtime {
     /// among live contexts only — reopening a closed configuration is a new
     /// context.
     keys: FxHashMap<ContextKey, ContextId>,
-    /// Per-context task queues (PRD §16.5), drained writer-first.
+    /// Per-context task queues, drained writer-first.
     scheduler: Scheduler,
 }
 
@@ -166,7 +168,7 @@ impl Runtime {
         Self::default()
     }
 
-    /// Opens (or dedups to) the context described by `config` (§16.2).
+    /// Opens (or dedups to) the context described by `config`.
     ///
     /// Returns the existing id when a live context's key equals the computed
     /// one — same configuration is the same context, and the incoming
@@ -241,12 +243,12 @@ impl Runtime {
         Some(&mut self.slot_mut(id)?.engine)
     }
 
-    /// Applies an overlay batch to one context's view (§16.3): each entry
+    /// Applies an overlay batch to one context's view: each entry
     /// flows through the engine's enqueue → apply-path discipline, so the
     /// view updates as one barrier with normal invalidation — and the base
     /// tree on disk is never touched. The context's epoch bumps afterwards:
     /// tasks enqueued before this write are stale and drop at the next
-    /// drain (§16.6).
+    /// drain.
     ///
     /// # Errors
     ///
@@ -267,10 +269,35 @@ impl Runtime {
         for change in changes {
             match change {
                 OverlayChange::Set { path, bytes } => {
-                    let text = crate::strip_one_bom(bytes);
-                    let cid = self.shared.put(text);
+                    // The span-capacity gate, before any state is touched:
+                    // the shared store never holds the bytes, the overlay
+                    // never records the content, and the engine's pending
+                    // queue never enqueues it — skipping here keeps the
+                    // manager's overlay view and the engine's residency in
+                    // agreement (a set the apply funnel would only drop
+                    // later must not be recorded as applied). The file is
+                    // rejected; the batch's remaining changes proceed.
+                    if bytes.len() > MAX_SOURCE_BYTES {
+                        on_event(EngineEvent::SourceRejected {
+                            path: path.clone(),
+                            len: bytes.len() as u64,
+                        });
+                        continue;
+                    }
+                    // Canonicalize once at the overlay boundary — one
+                    // leading BOM stripped, invalid UTF-8 lossily decoded,
+                    // exactly the residency form — so the shared store, the
+                    // standing overlay, and the engine's residency all name
+                    // one logical content with one `ContentId` even when the
+                    // raw bytes are not valid UTF-8. The text enters the
+                    // engine as a lease (`set_source`): one decode, one
+                    // copy, shared by refcount from here through the pending
+                    // overlay and the apply batch (a second BOM stays
+                    // content, not a second strip).
+                    let text = SourceText::canonical(bytes);
+                    let cid = self.shared.put(text.as_bytes());
                     context.overlay.insert(path.clone(), cid);
-                    context.engine.set_content(path, text);
+                    context.engine.set_source(path, text);
                 }
                 OverlayChange::Remove { path } => {
                     context.overlay.remove(path);
@@ -289,7 +316,7 @@ impl Runtime {
 
     /// Cancels the context's in-flight work without a write: bumps the
     /// epoch so every task enqueued so far goes stale, returning the new
-    /// epoch (§16.6 — partial results of stale tasks never surface).
+    /// epoch.
     ///
     /// # Errors
     ///
@@ -305,7 +332,7 @@ impl Runtime {
         Some(self.slot(id)?.epoch)
     }
 
-    /// Enqueues one task against `id`'s queue (PRD §16.5), stamped with the
+    /// Enqueues one task against `id`'s queue, stamped with the
     /// context's current epoch. `tier` is the task's precedence within its
     /// class (see [`Tier`]); the caller owns the mapping — the daemon wires
     /// it where each intake path enters the scheduler. Returns the stamped
@@ -339,7 +366,7 @@ impl Runtime {
         Ok(task)
     }
 
-    /// The single drain point (§16.5, §16.6): pops every queued task,
+    /// The single drain point: pops every queued task,
     /// drops stale-epoch ones, and returns the live set in writer-priority
     /// order, tier-ordered within each class — every pending write
     /// (interactive first, then normal, background; context ascending,
@@ -411,10 +438,10 @@ fn fold_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-/// blake3-128 over the canonical configuration tuple (§16.2): SDK identity,
+/// blake3-128 over the canonical configuration tuple: SDK identity,
 /// the SDK's language metadata and target segment, the conditional-import
 /// declared variables, the config directory, every package-graph row (name,
-/// root, language version — the version table §16.2 derives from the graph),
+/// root, language version — the version table derives from the graph),
 /// the merged-options fingerprint per root, and the flag word. Rows, roots,
 /// and declared-variable names sort before folding so table layout cannot
 /// move the key. The target and variable columns mirror the context salt's
@@ -507,6 +534,7 @@ mod tests {
     use dartq_package::PackageTable;
     use dartq_pub::{LockFile, PackageConfig, Pubspec, build_graph};
     use dartq_sdk::SdkSnapshot;
+    use dartq_source::content_hash;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -722,5 +750,133 @@ mod tests {
         assert_eq!(b.stored_contents(), 1);
         assert_eq!(a.content(main_a), Some(&source[..]));
         assert_eq!(b.content(main_b), Some(&source[..]));
+    }
+
+    /// A single-context runtime over the fixture (the overlay identity test
+    /// bed): the runtime, its context id, and the workspace root.
+    fn overlay_runtime(tag: &str) -> (Runtime, ContextId, PathBuf) {
+        let (root, config, packages) = fixture(tag);
+        let mut runtime = Runtime::new();
+        let id = runtime
+            .open_context(ContextConfig {
+                engine: engine_config(&root, &config, &packages, crate::memory_store()),
+                flags: 0,
+            })
+            .expect("open");
+        (runtime, id, root)
+    }
+
+    /// Applies one overlay Set and returns the standing overlay's content
+    /// id for `path` — the id the shared store was keyed under.
+    fn overlay_set(runtime: &mut Runtime, id: ContextId, path: &Path, bytes: &[u8]) -> ContentId {
+        let mut on_event = |_event: EngineEvent| {};
+        runtime
+            .apply_overlay(
+                id,
+                &[OverlayChange::Set {
+                    path: path.to_path_buf(),
+                    bytes: bytes.to_vec(),
+                }],
+                &mut on_event,
+            )
+            .expect("apply");
+        runtime.contexts[id.index() as usize]
+            .as_ref()
+            .expect("open")
+            .overlay[path]
+    }
+
+    /// The content id the engine's residency holds for `path` after an
+    /// apply (residency keys its store by the same blake3 over the text).
+    fn residency_cid(runtime: &Runtime, id: ContextId, path: &Path) -> ContentId {
+        let engine = runtime.context_state(id).expect("open");
+        let file = engine.state.files.try_file_id(path).expect("interned");
+        content_hash(engine.content(file).expect("resident"))
+    }
+
+    /// A non-UTF-8 overlay write yields ONE identity across all three
+    /// faces — shared store, standing overlay, engine residency — because
+    /// the overlay boundary canonicalizes to the same lossy text residency
+    /// stores. Before the fix the overlay hashed raw bytes while residency
+    /// hashed lossy text, splitting the identity.
+    #[test]
+    fn overlay_matches_residency_cid_on_invalid_utf8() {
+        let (mut runtime, id, root) = overlay_runtime("overlay-cid");
+        let path = root.join("lib/main.dart");
+        let overlay_cid = overlay_set(&mut runtime, id, &path, b"void f() {} // \xff\xfe broken\n");
+
+        let canonical = "void f() {} // \u{FFFD}\u{FFFD} broken\n";
+        let expected = content_hash(canonical.as_bytes());
+        assert_eq!(overlay_cid, expected, "the overlay hashes the lossy text");
+        assert_eq!(
+            residency_cid(&runtime, id, &path),
+            expected,
+            "residency derives the same identity"
+        );
+        assert_eq!(
+            runtime.shared.get(expected),
+            Some(canonical.as_bytes()),
+            "the shared store holds the lossy text under that id"
+        );
+    }
+
+    /// Valid UTF-8 keeps its pre-fix identity: the lossy decode of valid
+    /// UTF-8 is the input itself, so the overlay cid equals the hash over
+    /// the raw (BOM-stripped) bytes — existing content needs no migration.
+    #[test]
+    fn overlay_cid_is_unchanged_for_valid_utf8() {
+        let (mut runtime, id, root) = overlay_runtime("overlay-ascii");
+        let path = root.join("lib/main.dart");
+        let plain = overlay_set(&mut runtime, id, &path, b"void main() {}\n");
+        assert_eq!(plain, content_hash(b"void main() {}\n"), "plain ASCII");
+        assert_eq!(residency_cid(&runtime, id, &path), plain);
+
+        // The same text under one leading BOM: the canonicalization strips
+        // it, so the overlay hashes the identical bytes and dedups to the
+        // plain identity.
+        let bommed = overlay_set(
+            &mut runtime,
+            id,
+            &path,
+            "\u{FEFF}void main() {}\n".as_bytes(),
+        );
+        assert_eq!(
+            bommed, plain,
+            "the same text under a BOM dedups to one identity"
+        );
+        assert_eq!(residency_cid(&runtime, id, &path), plain);
+    }
+
+    /// Empty overlay content: both faces agree on the empty-text id and the
+    /// file stays a valid resident.
+    #[test]
+    fn overlay_empty_content_yields_matching_ids() {
+        let (mut runtime, id, root) = overlay_runtime("overlay-empty");
+        let path = root.join("lib/main.dart");
+        let overlay_cid = overlay_set(&mut runtime, id, &path, b"");
+        assert_eq!(overlay_cid, content_hash(b""));
+        assert_eq!(residency_cid(&runtime, id, &path), overlay_cid);
+        assert_eq!(runtime.shared.get(overlay_cid), Some(&b""[..]));
+    }
+
+    /// Canonicalization runs exactly once: of two leading BOMs the first is
+    /// stripped and the second is content (the engine read-layer rule) —
+    /// the pre-fix path stripped the second BOM inside the engine while the
+    /// overlay had hashed the once-stripped bytes, splitting the identity.
+    #[test]
+    fn overlay_canonicalizes_exactly_once() {
+        let (mut runtime, id, root) = overlay_runtime("overlay-double-bom");
+        let path = root.join("lib/main.dart");
+        let overlay_cid = overlay_set(&mut runtime, id, &path, "\u{FEFF}\u{FEFF}x".as_bytes());
+
+        let canonical = "\u{FEFF}x";
+        assert_eq!(overlay_cid, content_hash(canonical.as_bytes()));
+        let engine = runtime.context_state(id).expect("open");
+        let file = engine.state.files.try_file_id(&path).expect("interned");
+        assert_eq!(
+            engine.content(file),
+            Some(canonical.as_bytes()),
+            "the second BOM survives as content"
+        );
     }
 }

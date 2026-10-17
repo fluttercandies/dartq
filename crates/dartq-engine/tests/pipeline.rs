@@ -1,8 +1,8 @@
 //! The full-pipeline integration pin (goal #88): a two-file fixture through
 //! scan → parse → semantic collect → resolution graph → diagnostics
 //! assembly, plus the CSR export shape and the removal path. Contracts come
-//! from engine-api-spec §1.2/§1.3/§2.2, incremental-l1-spec §3/§6, and the
-//! GPU posture rider (CSR-friendly `&[u32]` views).
+//! from the engine's pinned pipeline shape and the GPU posture rider
+//! (CSR-friendly `&[u32]` views).
 
 mod common;
 
@@ -29,7 +29,7 @@ fn two_file_fixture_runs_the_full_pipeline() {
 
     let mut log = EventLog::default();
     let diagnostics = engine
-        .analyze(&[], &mut log.sink(), &Default::default())
+        .analyze(&[], &mut log.sink(), &CancellationToken::default())
         .expect("analyze");
 
     // Valid Dart: no diagnostics.
@@ -38,7 +38,7 @@ fn two_file_fixture_runs_the_full_pipeline() {
         "unexpected diagnostics: {diagnostics:?}"
     );
 
-    // Event contract for the cold run (§1.4): one OverlayApplied with both
+    // Event contract for the cold run: one OverlayApplied with both
     // files changed, one Parsed FileRevalidated per file, one non-empty
     // CascadeInvalidated, one LibraryAnalyzed per library.
     assert_eq!(log.overlay_applied, vec![(2, 0)], "overlay batch boundary");
@@ -54,7 +54,7 @@ fn two_file_fixture_runs_the_full_pipeline() {
     assert_eq!(log.analyzed.len(), 2);
     assert!(log.analyzed.iter().all(|(_, from_cache)| !*from_cache));
 
-    // Read faces (§1.3): content round-trip, line index presence, library
+    // Read faces: content round-trip, line index presence, library
     // membership — two defining libraries, no parts.
     let main = engine
         .file_table()
@@ -76,7 +76,7 @@ fn two_file_fixture_runs_the_full_pipeline() {
     // Repeat analyze: everything cached, no work events.
     let mut warm = EventLog::default();
     let warm_diagnostics = engine
-        .analyze(&[], &mut warm.sink(), &Default::default())
+        .analyze(&[], &mut warm.sink(), &CancellationToken::default())
         .expect("warm analyze");
     assert_eq!(warm_diagnostics, diagnostics, "clean re-analyze is stable");
     assert!(warm.overlay_applied.is_empty(), "empty queue emits nothing");
@@ -97,7 +97,7 @@ fn unresolved_import_emits_uri_diagnostic() {
     engine.discover_workspace().expect("discovery");
 
     let diagnostics = engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("analyze");
     assert_eq!(
         diagnostics.len(),
@@ -228,7 +228,7 @@ fn csr_exports_match_the_import_shape() {
     let mut engine = fixture.engine();
     engine.discover_workspace().expect("discovery");
     engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("analyze");
 
     let main = engine
@@ -272,7 +272,7 @@ fn remove_file_recomputes_the_importer_with_uri_diagnostic() {
     let mut engine = fixture.engine();
     engine.discover_workspace().expect("discovery");
     let clean = engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("clean");
     assert!(clean.is_empty());
 
@@ -282,7 +282,7 @@ fn remove_file_recomputes_the_importer_with_uri_diagnostic() {
 
     let mut log = EventLog::default();
     let diagnostics = engine
-        .analyze(&[], &mut log.sink(), &Default::default())
+        .analyze(&[], &mut log.sink(), &CancellationToken::default())
         .expect("analyze");
 
     assert!(log.overlay_applied.contains(&(0, 1)), "one file removed");
@@ -309,7 +309,7 @@ fn edited_content_is_still_clean() {
     let mut engine = fixture.engine();
     engine.discover_workspace().expect("discovery");
     let diagnostics = engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("analyze");
     assert!(diagnostics.is_empty());
 }
@@ -326,7 +326,7 @@ fn unknown_remove_is_an_explicit_error() {
 
 /// Above-latest `// @dart` override (#245): officially warned and dropped,
 /// never applied — the file stays at its package version (3.15 here), so a
-/// clean file yields exactly the one STATIC_WARNING, pinned at the whole
+/// clean file yields exactly the one `STATIC_WARNING`, pinned at the whole
 /// comment lexeme.
 #[test]
 fn above_latest_override_warns_and_drops() {
@@ -337,7 +337,7 @@ fn above_latest_override_warns_and_drops() {
     let mut engine = fixture.engine();
     engine.discover_workspace().expect("discovery");
     let diagnostics = engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("analyze");
 
     assert_eq!(
@@ -354,7 +354,7 @@ fn above_latest_override_warns_and_drops() {
         "the whole `// @dart = 4.0` lexeme"
     );
     assert_eq!(
-        warning.message,
+        warning.message.as_str(),
         format!(
             "The language version override can't specify a version greater than \
              the latest known language version: {DEFAULT_LANGUAGE_VERSION}."
@@ -372,7 +372,7 @@ fn below_latest_override_still_applies_without_warning() {
     let mut engine = fixture.engine();
     engine.discover_workspace().expect("discovery");
     let diagnostics = engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("analyze");
 
     assert!(
@@ -399,7 +399,7 @@ fn capture_face_shares_the_override_settlement() {
     let mut engine = fixture.engine();
     engine.discover_workspace().expect("discovery");
     engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("analyze");
 
     let main = engine
@@ -604,10 +604,8 @@ void main() {}
                 134,
                 5,
                 "undefined_hidden_name",
-                format!(
-                    "The library 'dart:math' doesn't export a member with the hidden name \
-                     'nope2'."
-                )
+                "The library 'dart:math' doesn't export a member with the hidden name 'nope2'."
+                    .to_owned()
             ),
         ],
         "one report per written undefined token; `greet` (defined) and `alsoGone` \

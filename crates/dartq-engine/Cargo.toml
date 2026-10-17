@@ -25,6 +25,7 @@ dartq-sdk = { workspace = true }
 dartq-snapshot = { workspace = true }
 dartq-source = { workspace = true }
 libc = { workspace = true }
+memchr = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
@@ -47,6 +48,17 @@ harness = false
 [[bench]]
 name = "apply_residency"
 harness = false
+
+[[bench]]
+name = "snapshot_flush"
+harness = false
+
+[[bench]]
+name = "rss_decomposition"
+harness = false
+
+[dev-dependencies]
+filetime = { workspace = true }
 
 [lints]
 workspace = true

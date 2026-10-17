@@ -1,4 +1,4 @@
-//! The reproducibility-tuple pin (PRD §19.5): same input + same engine
+//! The reproducibility-tuple pin: same input + same engine
 //! version ⇒ byte-identical outputs. The assertion face is the rendered
 //! machine-format lines (`dartq-diagnostics`' `write_machine`) over the
 //! canonical merged diagnostic set — the observable bytes the CLI prints,
@@ -14,7 +14,7 @@
 //!   library interned first;
 //! * an incremental sequence (edit + `apply_pending`) whose result must be
 //!   byte-identical to a fresh full recompute of the same final content —
-//!   PRD §19.4's caliber at smoke depth;
+//!   the full-parity caliber at smoke depth;
 //! * the double analysis runs twice (four cold chains in one process), so
 //!   any process-wide cache (statics, lazy cells) that leaked between runs
 //!   would diverge the later bytes.
@@ -23,7 +23,7 @@
 //! (store, SDK snapshot keyed by a blake3 `ContentId`, package table over
 //! the parsed config, paths, the semantic plug point) — no timestamps,
 //! randomness, or process ids. The per-library `Duration` exists only on
-//! work-order `EngineEvent` telemetry (PRD §19.3 benchmark hook), never in
+//! work-order `EngineEvent` telemetry, never in
 //! the output face. `engine_version_key_is_stable_across_constructions`
 //! pins the version-tuple precondition the output identity is keyed by.
 
@@ -33,7 +33,7 @@ use std::path::Path;
 
 use common::Fixture;
 use dartq_diagnostics::{AnalysisOutput, Diagnostic, FileLayoutProvider, write_machine};
-use dartq_engine::Engine;
+use dartq_engine::{CancellationToken, Engine};
 use dartq_sdk::SdkSnapshot;
 use dartq_source::FileId;
 
@@ -56,7 +56,7 @@ const GAMMA: &str = "final int gammaValue = 7;\n";
 /// Standalone library with two syntax errors.
 const DELTA: &str = "int broken() => ;\nvar x = ;\n";
 /// The edit applied on the incremental arm: new bytes, a third `Item`
-/// definition, and a third syntax error — ContentId must differ.
+/// definition, and a third syntax error — `ContentId` must differ.
 const DELTA_EDITED: &str = "int broken() => ;\nvar x = ;\nvar y = '';\nclass Item {}\n";
 
 const LIB_FILES: [(&str, &str); 5] = [
@@ -68,7 +68,7 @@ const LIB_FILES: [(&str, &str); 5] = [
 ];
 
 // ---------------------------------------------------------------------------
-// The observable face: machine-format bytes (§19.5 asserts these, not Debug)
+// The observable face: machine-format bytes
 // ---------------------------------------------------------------------------
 
 struct Layout<'a>(&'a Engine);
@@ -111,7 +111,7 @@ fn cold_chain_bytes(fixture: &Fixture) -> Vec<u8> {
     let mut engine = fixture.engine();
     engine.discover_workspace().expect("discovery");
     let diagnostics = engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("analyze");
     let bytes = machine_bytes(&engine, &diagnostics);
     assert!(
@@ -158,7 +158,7 @@ fn engine_version_key_is_stable_across_constructions() {
 }
 
 /// Face 3: cold → edit + `apply_pending` → incremental analyze must equal a
-/// fresh full recompute of the same final content, byte for byte (PRD §19.4's
+/// fresh full recompute of the same final content, byte for byte (
 /// incremental==full gate at smoke depth).
 #[test]
 fn incremental_result_matches_full_recompute_of_final_content() {
@@ -169,12 +169,12 @@ fn incremental_result_matches_full_recompute_of_final_content() {
     let mut incremental = fixture.engine();
     incremental.discover_workspace().expect("discovery");
     incremental
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("cold");
     incremental.set_content(&fixture.path("lib/delta.dart"), DELTA_EDITED.as_bytes());
     incremental.apply_pending(&mut |_| {});
     let edited = incremental
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("incremental");
     let incremental_bytes = machine_bytes(&incremental, &edited);
     assert!(
@@ -187,7 +187,7 @@ fn incremental_result_matches_full_recompute_of_final_content() {
     full.discover_workspace().expect("discovery");
     full.set_content(&fixture.path("lib/delta.dart"), DELTA_EDITED.as_bytes());
     let recomputed = full
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("full recompute");
     assert_eq!(
         incremental_bytes,

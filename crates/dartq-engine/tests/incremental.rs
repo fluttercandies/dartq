@@ -1,12 +1,11 @@
-//! Incremental gate pins (goal #88, engine-api-spec §1.2 + §5 item 2,
-//! incremental-l1-spec §1.2/§3.2/§6): the ContentId no-op gate, the
+//! Incremental gate pins (goal #88): the `ContentId` no-op gate, the
 //! single-file recompute after one edit, the cascade reach, and the
 //! apply+analyze vs analyze-alone byte-equality.
 
 mod common;
 
 use common::{EventLog, Fixture, GREETER_0, GREETER_1, MAIN_0, STANDALONE_0};
-use dartq_engine::RevalidateGate;
+use dartq_engine::{CancellationToken, RevalidateGate};
 
 fn summarized(
     engine: &dartq_engine::Engine,
@@ -34,17 +33,17 @@ fn identical_rewrite_is_a_gate_no_op() {
     let mut engine = fixture.engine();
     engine.discover_workspace().expect("discovery");
     let clean = engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("cold");
     assert!(clean.is_empty());
 
-    // Rewrite with identical bytes: legal changeFile, zero cascade (§1.2).
+    // Rewrite with identical bytes: legal changeFile, zero cascade.
     let greeter = fixture.path("lib/greeter.dart");
     engine.set_content(&greeter, GREETER_0.as_bytes());
 
     let mut log = EventLog::default();
     let diagnostics = engine
-        .analyze(&[], &mut log.sink(), &Default::default())
+        .analyze(&[], &mut log.sink(), &CancellationToken::default())
         .expect("no-op");
     assert_eq!(diagnostics, clean);
 
@@ -81,17 +80,17 @@ fn single_edit_recomputes_only_its_cascade() {
     let mut engine = fixture.engine();
     engine.discover_workspace().expect("discovery");
     engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("cold");
 
-    // Change one file: only it revalidates; the L2 signature gate (PRD
-    // §11.3) stops the cascade there — the edit keeps greet's element face,
+    // Change one file: only it revalidates; the L2 signature gate (the
+    // cascade rule) stops the cascade there — the edit keeps greet's element face,
     // so the importer keeps its result.
     engine.set_content(&fixture.path("lib/greeter.dart"), GREETER_1.as_bytes());
 
     // The untouched libraries ride along as the AnalyzeFile targets: targets
     // drive only the amplification events, and a clean targeted library
-    // reports a cache hit (engine-api-spec §1.3).
+    // reports a cache hit.
     let target = engine
         .file_table()
         .try_file_id(&fixture.path("lib/standalone.dart"))
@@ -99,7 +98,7 @@ fn single_edit_recomputes_only_its_cascade() {
 
     let mut log = EventLog::default();
     let diagnostics = engine
-        .analyze(&[target], &mut log.sink(), &Default::default())
+        .analyze(&[target], &mut log.sink(), &CancellationToken::default())
         .expect("edit");
     assert!(diagnostics.is_empty());
 
@@ -131,12 +130,12 @@ fn single_edit_recomputes_only_its_cascade() {
     // same content and observe zero work.
     let mut again = EventLog::default();
     engine
-        .analyze(&[], &mut again.sink(), &Default::default())
+        .analyze(&[], &mut again.sink(), &CancellationToken::default())
         .expect("settle");
     assert!(again.revalidated.is_empty() && again.analyzed.iter().all(|(_, hit)| *hit));
 }
 
-/// The directive face rides the API signature (PRD §11.3, #282): flipping
+/// The directive face rides the API signature: flipping
 /// an export combinator changes the file's contribution to its importers'
 /// namespaces while its element face stands, so the signature gate must
 /// still seed the cascade — without the directive face in the hash, b would
@@ -156,7 +155,7 @@ fn reexport_combinator_change_reaches_importers() {
     engine.set_content(&a_path, A_SHOW.as_bytes());
     engine.set_content(&b_path, B.as_bytes());
     let cold = engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("cold");
     assert!(cold.is_empty(), "{cold:?}");
 
@@ -165,7 +164,7 @@ fn reexport_combinator_change_reaches_importers() {
     engine.set_content(&a_path, A_HIDE.as_bytes());
     let mut log = EventLog::default();
     let diagnostics = engine
-        .analyze(&[], &mut log.sink(), &Default::default())
+        .analyze(&[], &mut log.sink(), &CancellationToken::default())
         .expect("flip");
     let b = engine.file_table().try_file_id(&b_path).expect("interned");
     assert!(
@@ -181,7 +180,7 @@ fn reexport_combinator_change_reaches_importers() {
     engine.set_content(&a_path, A_SHOW.as_bytes());
     let mut log = EventLog::default();
     let healed = engine
-        .analyze(&[], &mut log.sink(), &Default::default())
+        .analyze(&[], &mut log.sink(), &CancellationToken::default())
         .expect("revert");
     assert!(healed.is_empty(), "{healed:?}");
     assert_eq!(log.cascades[0].len(), 2, "a and b recompute again");
@@ -194,7 +193,7 @@ fn explicit_apply_then_analyze_matches_analyze_alone() {
     solo.discover_workspace().expect("discovery");
     let mut solo_log = EventLog::default();
     let solo_result = solo
-        .analyze(&[], &mut solo_log.sink(), &Default::default())
+        .analyze(&[], &mut solo_log.sink(), &CancellationToken::default())
         .expect("solo");
 
     let mut split = fixture.engine();
@@ -203,10 +202,10 @@ fn explicit_apply_then_analyze_matches_analyze_alone() {
     let report = split.apply_pending(&mut apply_log.sink());
     let mut analyze_log = EventLog::default();
     let split_result = split
-        .analyze(&[], &mut analyze_log.sink(), &Default::default())
+        .analyze(&[], &mut analyze_log.sink(), &CancellationToken::default())
         .expect("split");
 
-    // Byte-identical diagnostics (§5 item 2), single OverlayApplied across
+    // Byte-identical diagnostics, single OverlayApplied across
     // both calls, no double emission.
     assert_eq!(
         summarized(&split, &split_result),
@@ -260,7 +259,7 @@ fn cancel_then_remove_then_analyze_does_not_panic() {
     let mut engine = fixture.engine();
     engine.discover_workspace().expect("discovery");
     engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("cold");
 
     // Edit the importer: only its library goes stale, and a pre-cancelled
@@ -295,12 +294,17 @@ fn cancel_then_remove_then_analyze_does_not_panic() {
     assert_eq!(engine.libraries().len(), 1, "only b's library remains");
 }
 
-/// Name-form `part of` belonging (incremental-l1-spec §7.1): a name-form
+/// Name-form `part of` belonging (the enhanced-parts world, where the
+/// include-face mismatch rows are off): a name-form
 /// part file joins the same-package library whose declared library name
 /// matches, and stays an orphan singleton when none does — the URI include
-/// (`part 'pn.dart';`) alone must not claim it. Diagnostics stay empty
-/// throughout: a name-form directive resolves by name, never through the URI
-/// layer, and the clean contents bake nothing.
+/// (`part 'pn.dart';`) alone must not claim it. The one diagnostic row is
+/// the name-form directive itself: with the feature granted, upstream
+/// reports `part_of_name` on the dotted name (upstream Dart SDK source,
+/// ast_builder.dart `endPartOf`, the `Feature.enhanced_parts` branch),
+/// while the include's name-form mismatch row is above the reporting
+/// horizon (library_analyzer.dart `_resolvePartDirective`, the
+/// `Feature.enhanced_parts` branch); the clean contents bake nothing else.
 #[test]
 fn name_form_part_bounded_name_scan() {
     const N_P8: &str = "library p8;\npart 'pn.dart';\nint f() => 1;\n";
@@ -308,7 +312,19 @@ fn name_form_part_bounded_name_scan() {
     const PN_P9: &str = "part of p9;\nint g() => 1;\n";
     const PN_P8: &str = "part of p8;\nint g() => 1;\n";
 
-    let fixture = Fixture::new(&[("lib/n.dart", N_P8), ("lib/pn.dart", PN_P9)]);
+    // The name-form directive's own row — identical for `part of p9;` and
+    // `part of p8;` (the dotted name starts after the 8-code-unit
+    // `part of ` prefix).
+    let expect_part_of_name_row = |diagnostics: &[dartq_diagnostics::Diagnostic], pn| {
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let row = &diagnostics[0];
+        assert_eq!(row.file, pn, "the row anchors on the dotted name");
+        assert_eq!(row.code.name, "part_of_name");
+        assert_eq!(row.range.offset, 8);
+        assert_eq!(row.range.length, 2);
+    };
+
+    let fixture = Fixture::with_enhanced_parts(&[("lib/n.dart", N_P8), ("lib/pn.dart", PN_P9)]);
     let n_path = fixture.path("lib/n.dart");
     let pn_path = fixture.path("lib/pn.dart");
     let mut engine = fixture.engine();
@@ -320,9 +336,9 @@ fn name_form_part_bounded_name_scan() {
     // Cold: p9 names no library — pn stays its own singleton even though
     // n's URI-resolved include points at it (no force-claim).
     let diagnostics = engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("cold");
-    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    expect_part_of_name_row(&diagnostics, pn);
     assert_eq!(
         engine.libraries().len(),
         2,
@@ -340,9 +356,9 @@ fn name_form_part_bounded_name_scan() {
     engine.set_content(&pn_path, PN_P8.as_bytes());
     let mut log = EventLog::default();
     let diagnostics = engine
-        .analyze(&[], &mut log.sink(), &Default::default())
+        .analyze(&[], &mut log.sink(), &CancellationToken::default())
         .expect("join");
-    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    expect_part_of_name_row(&diagnostics, pn);
     assert_eq!(engine.library_of(n), engine.library_of(pn), "pn joined n");
     let joined = engine.library_of(n).expect("live");
     assert_eq!(
@@ -367,9 +383,9 @@ fn name_form_part_bounded_name_scan() {
     engine.set_content(&n_path, N_P9.as_bytes());
     let mut log = EventLog::default();
     let diagnostics = engine
-        .analyze(&[], &mut log.sink(), &Default::default())
+        .analyze(&[], &mut log.sink(), &CancellationToken::default())
         .expect("leave");
-    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    expect_part_of_name_row(&diagnostics, pn);
     assert_eq!(engine.libraries().len(), 2, "n plus the fresh pn singleton");
     assert_ne!(
         engine.library_of(n),
@@ -382,6 +398,73 @@ fn name_form_part_bounded_name_scan() {
     assert!(
         log.cascades[0].contains(&orphan),
         "the new singleton dirties"
+    );
+}
+
+/// The same include face below the enhanced-parts horizon (package language
+/// 3.5, no grants): the URI include of a name-form part whose part-of name
+/// does not match the includer's declared library name reports
+/// `part_of_different_library` on the include's URI literal — the oracle's
+/// ungated-at-3.5 row (upstream Dart SDK source, library_analyzer.dart
+/// `_resolvePartDirective`, the `!featureSet.isEnabled(Feature.enhanced_parts)`
+/// branch) — while the include still claims nothing: the unmatched part
+/// stays an orphan singleton, and matching the name heals the row and joins
+/// it through the bounded name scan.
+#[test]
+fn name_form_include_mismatch_reports_below_enhanced_parts() {
+    const N_P8: &str = "library p8;\npart 'pn.dart';\nint f() => 1;\n";
+    const PN_P9: &str = "part of p9;\nint g() => 1;\n";
+    const PN_P8: &str = "part of p8;\nint g() => 1;\n";
+
+    let fixture = Fixture::new(&[("lib/n.dart", N_P8), ("lib/pn.dart", PN_P9)]);
+    let pn_path = fixture.path("lib/pn.dart");
+    let mut engine = fixture.engine();
+    engine.set_content(&fixture.path("lib/n.dart"), N_P8.as_bytes());
+    engine.set_content(&pn_path, PN_P9.as_bytes());
+    let n = engine
+        .file_table()
+        .try_file_id(&fixture.path("lib/n.dart"))
+        .expect("interned");
+    let pn = engine.file_table().try_file_id(&pn_path).expect("interned");
+
+    // Cold: the mismatch row fires on n's include URI; pn stays an orphan.
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
+        .expect("cold");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    let row = &diagnostics[0];
+    assert_eq!(row.file, n, "the row anchors on the include directive");
+    assert_eq!(row.code.name, "part_of_different_library");
+    assert_eq!(
+        row.message.as_str(),
+        "Expected this library to be part of 'p8', not 'p9'."
+    );
+    assert_eq!(row.range.offset, 17);
+    assert_eq!(row.range.length, 9);
+    assert_eq!(
+        engine.libraries().len(),
+        2,
+        "n plus the pn orphan singleton"
+    );
+    assert_ne!(engine.library_of(n), engine.library_of(pn));
+
+    // The part-of name matching the declared library heals the row and
+    // joins pn through the name scan.
+    engine.set_content(&pn_path, PN_P8.as_bytes());
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
+        .expect("join");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(engine.library_of(n), engine.library_of(pn), "pn joined n");
+    let joined = engine.library_of(n).expect("live");
+    assert_eq!(
+        engine
+            .libraries()
+            .into_iter()
+            .find(|(id, _)| *id == joined)
+            .map(|(_, members)| members)
+            .expect("live"),
+        vec![n, pn]
     );
 }
 
@@ -407,7 +490,7 @@ fn interpolated_part_include_claims_nothing() {
     let p = engine.file_table().try_file_id(&p_path).expect("interned");
 
     let diagnostics = engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("cold");
     assert!(
         diagnostics
@@ -461,7 +544,7 @@ fn interpolated_part_of_is_an_orphan_singleton() {
     let p = engine.file_table().try_file_id(&p_path).expect("interned");
 
     let diagnostics = engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("cold");
     assert!(
         diagnostics

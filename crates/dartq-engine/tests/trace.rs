@@ -1,10 +1,11 @@
-//! `--trace-events` JSONL face pins (PRD §17.4): a real apply/analyze
+//! `--trace-events` JSONL face pins: a real apply/analyze
 //! sequence records the taxonomy events with stable bytes, and the capture
-//! aggregates to the §19.3 Cache Hit Rate.
+//! aggregates to the Cache Hit Rate.
 
 mod common;
 
 use common::{Fixture, GREETER_0, MAIN_0};
+use dartq_engine::CancellationToken;
 use dartq_engine::EngineEvent;
 use dartq_engine::event::{TraceSink, cache_hit_rate};
 
@@ -23,7 +24,7 @@ fn trace_capture_records_taxonomy_and_rates() {
     engine.set_content(&fixture.path("lib/main.dart"), MAIN_0.as_bytes());
     engine.set_content(&fixture.path("lib/greeter.dart"), GREETER_0.as_bytes());
     engine
-        .analyze(&[], &mut |_: EngineEvent| {}, &Default::default())
+        .analyze(&[], &mut |_: EngineEvent| {}, &CancellationToken::default())
         .expect("cold analyze");
 
     let capture = std::fs::read_to_string(&path).expect("capture readable");
@@ -39,15 +40,19 @@ fn trace_capture_records_taxonomy_and_rates() {
             "missing {kind} in: {capture}"
         );
     }
-    // A cold run serves nothing from cache: §19.3 rate 0.
+    // A cold run serves nothing from cache: hit rate 0.
     assert_eq!(cache_hit_rate(&capture), Some(0.0));
 
     // The clean re-request of one library reports from_cache — the
-    // §1.3/§1.4 AnalyzeFile face — seeding the rate: 1 hit of 3 analyses.
+    // AnalyzeFile face — seeding the rate: 1 hit of 3 analyses.
     let main = fixture.path("lib/main.dart");
     let main = engine.file_table().try_file_id(&main).expect("interned");
     engine
-        .analyze(&[main], &mut |_: EngineEvent| {}, &Default::default())
+        .analyze(
+            &[main],
+            &mut |_: EngineEvent| {},
+            &CancellationToken::default(),
+        )
         .expect("warm analyze");
     let capture = std::fs::read_to_string(&path).expect("capture grows in place");
     assert_eq!(cache_hit_rate(&capture), Some(1.0 / 3.0));
@@ -66,7 +71,7 @@ fn disarmed_sink_stops_the_capture() {
     engine.set_trace_sink(Some(TraceSink::create(&path).expect("sink opens")));
     engine.set_content(&fixture.path("lib/main.dart"), MAIN_0.as_bytes());
     engine
-        .analyze(&[], &mut |_: EngineEvent| {}, &Default::default())
+        .analyze(&[], &mut |_: EngineEvent| {}, &CancellationToken::default())
         .expect("cold analyze");
     let armed_len = std::fs::metadata(&path)
         .expect("armed capture exists")
@@ -81,7 +86,7 @@ fn disarmed_sink_stops_the_capture() {
         "String greet() => 'hi';\n".as_bytes(),
     );
     engine
-        .analyze(&[], &mut |_: EngineEvent| {}, &Default::default())
+        .analyze(&[], &mut |_: EngineEvent| {}, &CancellationToken::default())
         .expect("second analyze");
     let disarmed_len = std::fs::metadata(&path).expect("capture persists").len();
     assert_eq!(armed_len, disarmed_len, "a disarmed engine writes nothing");

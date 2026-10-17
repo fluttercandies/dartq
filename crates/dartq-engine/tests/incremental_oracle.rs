@@ -1,5 +1,4 @@
-//! Dual-arm incremental oracle — the full eight-case set C1–C8 (the
-//! executable form of `incremental-oracle-cases.md` §1–§3, PRD §19.4's gate:
+//! Dual-arm incremental oracle — the full eight-case set C1–C8 (the gate:
 //! every step of an edit sequence, incremental result == full-recompute
 //! result, byte-identical except internal IDs).
 //!
@@ -15,19 +14,19 @@
 //! C8's name-form halves are engine-green and its pins hold end to end; C1,
 //! C3 and C5's semantic halves light through the wired `SemanticDiagnoser`
 //! (#236: the default `semdiag::Diagnoser`, the graph-level dart:core face).
-//! Since #282 (L2 signature gate, PRD §11.3) the cascade is
+//! Since #282 the cascade is
 //! signature-gated: body/comment edits with a stable element face stop at
 //! the edited file (C1.1/C2.1/C4.1/C6.1/C8.1 narrow), while a
 //! signature-changing edit seeds the unconditional transitive closure (C9).
 //! C5 and C7 were long red on pre-existing gaps (C5: the overlay-only part
-//! file interning under a different FileTable spelling than the resolver
-//! composes; C7: dartq-semantic's UndefinedGuard over-suppressing bare
+//! file interning under a different `FileTable` spelling than the resolver
+//! composes; C7: dartq-semantic's `UndefinedGuard` over-suppressing bare
 //! misses under any unfiltered broken import) — both now pass end to end
 //! (C7's A3 table asserts the previously-suppressed `undefined_function`
 //! rows), so no case is red; the case comments carry the history.
 //!
 //! The manifests and expectations live as in-test tables. Hoisting them into
-//! `tests/cases/<case>/{manifest.json, expectations.json}` (§4 placement) is
+//! `tests/cases/<case>/{manifest.json, expectations.json}` is
 //! mechanical and deferred until a consumer needs the files.
 
 mod common;
@@ -41,7 +40,7 @@ use dartq_engine::{CancellationToken, Engine, EngineEvent, LibraryId, Revalidate
 use dartq_source::FileId;
 
 // ---------------------------------------------------------------------------
-// Case tables (incremental-oracle-cases §2, verbatim expectations)
+// Case tables
 // ---------------------------------------------------------------------------
 
 const C1_A0: &str = "int f() => 1;\n";
@@ -91,9 +90,11 @@ const C8_PN1: &str = "part of p8;\nint g() => 3;\n";
 const C9_C: &str = "import 'b.dart';\nint h() => g();\n";
 const C9_A_RENAMED: &str = "int f2() => 1;\n";
 
-// C10/C11 — membership-change seeds (audit P0: part detach / claim
-// transfer). Both edit one file yet move a member BETWEEN libraries, so the
-// losing/gaining sides carry no signature of their own.
+// C10/C11 — membership-change seeds (audit P0: part detach / include
+// detach). Both edit one file yet move a part between membership states (C10
+// re-homes it across libraries, C11 dangles one library's include while the
+// equally-named sibling keeps it), so the affected sides carry no signature
+// of their own.
 const C10_M: &str = "import 'n.dart';\nint v = f() + g();\n";
 const C10_N: &str = "library p8;\npart 'pn.dart';\nint f() => 1;\n";
 const C10_P9: &str = "library p9;\npart 'pn.dart';\nint h() => 2;\n";
@@ -107,7 +108,7 @@ const C11_N2: &str = "library p8;\npart 'pn.dart';\nint h() => 2;\n";
 const C11_PN: &str = "part of p8;\nint g() => 1;\n";
 
 /// One manifest batch entry: `Some(bytes)` = `set_content`, `None` =
-/// `remove_file` (incremental-oracle-cases §1.1).
+/// `remove_file`.
 type Batch = &'static [(&'static str, Option<&'static str>)];
 
 struct Step {
@@ -307,12 +308,12 @@ static CASE_C3: Case = Case {
 
 /// C5 — part add/remove: library shape change (l1-spec ⑤). One batch edits a
 /// and interns p2; the membership churn rebuilds a's content identity (part
-/// directive order, §7.4) and step 2 must round-trip it — over-cascade to b
+/// directive order) and step 2 must round-trip it — over-cascade to b
 /// is L1 definition behavior. The semantic half is wired (#236). RED on a
 /// pre-existing engine divergence the harness's path projection used to mask:
-/// overlay-only p2 (never on disk) interns under the literal temp_dir
+/// overlay-only p2 (never on disk) interns under the literal `temp_dir`
 /// spelling while a's re-resolved `part 'p2.dart'` composes from a's
-/// canonicalized path — FileTable normalization is existence-dependent, so
+/// canonicalized path — `FileTable` normalization is existence-dependent, so
 /// the two spellings carry different ids, the part claim misses residency,
 /// and p2 forms an orphan singleton (`invalidated` gains it; the gap rule
 /// would add a bogus `uri_does_not_exist`). Fix belongs to the
@@ -354,7 +355,8 @@ static CASE_C5: Case = Case {
 /// target left residency carries `uri_does_not_exist`) is what surfaces the
 /// deletions in both arms. Step 3: library a ceases, pa's `part of 'a.dart'`
 /// dangles, and pa reappears in `invalidated` as a newly-formed singleton —
-/// the engine-api-spec §1.2 orphan rule, observed. RED on the semantic half:
+/// the orphan rule (a removed library's parts leave in `invalidated`),
+/// observed. RED on the semantic half:
 /// dartq-semantic's `UndefinedGuard` suppresses a bare miss under ANY
 /// unfiltered broken import, so `u()` after util's removal is silenced — the
 /// oracle ignores only show-listed names (element.dart:7470-7502) and
@@ -420,14 +422,13 @@ static CASE_C7: Case = Case {
     order_pin: None,
 };
 
-/// C8 — name-form `part of` + rename orphan (l1-spec §7.1, engine-api-spec
-/// §5.3). Green end to end: the URI layer skips name-form part-of
-/// resolution, the §7.1 bounded same-package name scan claims pn, the
+/// C8 — name-form `part of` + rename orphan. Green end to end: the URI layer skips name-form part-of
+/// resolution, the bounded same-package name scan claims pn, the
 /// capture-time duplicate log bakes step 0's `duplicate_definition`, and the
 /// wired semantic diagnoser reports m's `g()` loss after the rename orphan
 /// leaves n's scope (#236). Step 1's pn edit removes the duplicate and
 /// changes pn's body under a stable face — the L2 gate keeps m clean (its
-/// view of g() is untouched) while n recomputes (its content identity
+/// view of `g` is untouched) while n recomputes (its content identity
 /// includes pn's bytes) and the duplicate diagnostic clears.
 static CASE_C8: Case = Case {
     id: "C8",
@@ -453,9 +454,17 @@ static CASE_C8: Case = Case {
     absolute: Absolute::Explicit(&[
         &[("duplicate_definition", "lib/pn.dart")],
         &[],
-        // The §5.4-TBD orphan-part entry is deferred (no code landed for a
-        // name-form orphan); m's loss of g is the pinned remainder.
-        &[("undefined_function", "lib/m.dart")],
+        // The rename orphans pn (no p8 remains to claim it) and n's dangling
+        // include reports its name mismatch (the oracle's partOfDifferentLibrary
+        // fires on the failed join); m's loss of g strands its import, but the
+        // oracle still spares it — the bare miss consulted the namespace, so
+        // unused_import must NOT co-fire (oracle-probed 2026-10-18, #2086:
+        // dart analyze 3.13.1 emits undefined_function + part_of_different_
+        // library only; 4 further family probes never co-fire).
+        &[
+            ("part_of_different_library", "lib/n.dart"),
+            ("undefined_function", "lib/m.dart"),
+        ],
     ]),
     stable_bytes: &[],
     mode_b: false,
@@ -463,7 +472,7 @@ static CASE_C8: Case = Case {
 };
 
 // ---------------------------------------------------------------------------
-// A1 caliber: write_machine bytes over the canonical set (§1.2)
+// A1 caliber: write_machine bytes over the canonical set
 // ---------------------------------------------------------------------------
 
 struct Layout<'a>(&'a Engine);
@@ -500,7 +509,7 @@ fn machine_bytes(engine: &Engine, diagnostics: &[Diagnostic]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// A4 event capture: raw events now, ID-free projection afterwards (§1.3)
+// A4 event capture: raw events now, ID-free projection afterwards
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -532,7 +541,14 @@ impl RawLog {
             self.events.push(match event {
                 // A budget tier firing is not part of the incremental
                 // contract (this suite never arms a budget) — skipped.
+                // A version-skew degrade needs a skewed SDK whitelist —
+                // this suite's synthetic SDK names none — so it is
+                // likewise outside the contract (ticket #1304). A
+                // span-capacity rejection needs an over-4GiB source —
+                // likewise outside the contract (#1543).
                 EngineEvent::MemoryDegrade { .. } => return,
+                EngineEvent::ExperimentDegrade { .. } => return,
+                EngineEvent::SourceRejected { .. } => return,
                 EngineEvent::OverlayApplied { changed, removed } => {
                     RawEvent::Overlay { changed, removed }
                 }
@@ -628,7 +644,7 @@ fn defining_relative(fixture: &Fixture, engine: &Engine, library: LibraryId) -> 
     relative(fixture, file, engine)
 }
 
-/// The §3 A4 goldens (step numbers are 1-based manifest steps).
+/// The C1–C8 A4 goldens (step numbers are 1-based manifest steps).
 fn expected_golden(case: &str, step: usize) -> Option<Vec<GoldenEvent>> {
     match (case, step) {
         // C1.2: gate-emptied apply — OverlayApplied with empty payloads, the
@@ -791,7 +807,7 @@ fn code_file_set(entries: &[(&'static str, &'static str)]) -> BTreeSet<(String, 
 }
 
 // ---------------------------------------------------------------------------
-// The dual-arm runner (§1.1)
+// The dual-arm runner
 // ---------------------------------------------------------------------------
 
 fn enqueue(
@@ -803,17 +819,14 @@ fn enqueue(
     let mut entries: Vec<&(&str, Option<&str>)> = batch.iter().collect();
     entries.sort_by_key(|entry| entry.0);
     for (path, content) in entries {
-        match content {
-            Some(source) => {
-                engine.set_content(&fixture.path(*path), source.as_bytes());
-                state.insert((*path).to_owned(), (*source).to_owned());
-            }
-            None => {
-                engine
-                    .remove_file(&fixture.path(*path))
-                    .expect("removed path was interned");
-                state.remove(*path);
-            }
+        if let Some(source) = content {
+            engine.set_content(&fixture.path(path), source.as_bytes());
+            state.insert((*path).to_owned(), (*source).to_owned());
+        } else {
+            engine
+                .remove_file(&fixture.path(path))
+                .expect("removed path was interned");
+            state.remove(*path);
         }
     }
 }
@@ -846,7 +859,7 @@ fn live_targets(
         .collect()
 }
 
-/// The full arm (§1.1): a fresh engine over the step's end state, one cold
+/// The full arm: a fresh engine over the step's end state, one cold
 /// `set_content`-all + `analyze`. Only its output bytes matter.
 fn full_arm_bytes(fixture: &Fixture, state: &BTreeMap<String, String>) -> Vec<u8> {
     let mut engine = fixture.engine();
@@ -858,6 +871,7 @@ fn full_arm_bytes(fixture: &Fixture, state: &BTreeMap<String, String>) -> Vec<u8
     machine_bytes(&engine, &diagnostics)
 }
 
+#[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 fn run_case(case: &'static Case) {
     let fixture = Fixture::new(case.initial);
     let mut state: BTreeMap<String, String> = case
@@ -872,11 +886,11 @@ fn run_case(case: &'static Case) {
     // case mandates it).
     let mut engine_b = case.mode_b.then(|| fixture.engine());
 
-    // Step 0: initial state; A1 + A3 baseline only (§2 conventions).
+    // Step 0: initial state; A1 + A3 baseline only.
     for (path, source) in case.initial {
-        engine_a.set_content(&fixture.path(*path), source.as_bytes());
+        engine_a.set_content(&fixture.path(path), source.as_bytes());
         if let Some(engine_b) = engine_b.as_mut() {
-            engine_b.set_content(&fixture.path(*path), source.as_bytes());
+            engine_b.set_content(&fixture.path(path), source.as_bytes());
         }
     }
     let mut log_a = RawLog::default();
@@ -930,7 +944,7 @@ fn run_case(case: &'static Case) {
     for (index, step) in case.steps.iter().enumerate() {
         let k = index + 1;
         // Mode B reruns the same batch from the same pre-batch state on its
-        // own long-lived engine (§1.1 arms are long-lived by definition).
+        // own long-lived engine.
         let mut state_b = state.clone();
         enqueue(&fixture, &mut engine_a, &mut state, step.batch);
 
@@ -1085,7 +1099,7 @@ fn c8_name_form_part_rename_orphan() {
 }
 
 /// C9 — signature-changing edit, transitive cascade through clean middles
-/// (the L2 acceptance arm, PRD §11.3): renaming a.dart's `f` flips its API
+///: renaming a.dart's `f` flips its API
 /// signature, seeding the closure; the chain a←b←c propagates **through** b
 /// even though b and c are identity-clean (their own faces never moved) —
 /// the unconditional-closure adjudication. Step 2 reverts the rename: the
@@ -1133,7 +1147,7 @@ fn c9_signature_rename_cascades_through_clean_middles() {
 /// C10 — part detach (audit P0 hole 1): pn edits its own `part of` from p8
 /// to p9, moving itself from n's library to p9's. pn is the only changed
 /// file, but the LOSING library n is identity-stale with identity-clean
-/// importers: m keeps its cached "g() defined" view of n's namespace while a
+/// importers: m keeps its cached "`g` defined" view of n's namespace while a
 /// full recompute reports `undefined_function` — the pre-fix silent
 /// divergence. The membership seeds (pre-reform owner capture in `apply` +
 /// the owner diff in `close`) must seed n so m recomputes.
@@ -1152,10 +1166,15 @@ static CASE_C10: Case = Case {
         invalidated: &["lib/m.dart", "lib/n.dart", "lib/p9.dart"],
     }],
     absolute: Absolute::Explicit(&[
-        // Baseline: m sees f() (n) and g() (pn through n) — clean.
-        &[],
-        // n's namespace drops g with pn; m's stale view must recompute.
-        &[("undefined_function", "lib/m.dart")],
+        // Baseline: m sees f() (n) and g() (pn through n); p9's competing
+        // include of the n-claimed pn reports its name mismatch.
+        &[("part_of_different_library", "lib/p9.dart")],
+        // n's namespace drops g with pn (its dangling include reports the
+        // mismatch); m's stale view must recompute.
+        &[
+            ("part_of_different_library", "lib/n.dart"),
+            ("undefined_function", "lib/m.dart"),
+        ],
     ]),
     stable_bytes: &[],
     mode_b: false,
@@ -1167,13 +1186,18 @@ fn c10_part_detach_seeds_losing_library_importers() {
     run_case(&CASE_C10);
 }
 
-/// C11 — claim transfer (audit P0 hole 2): n1 and n2 both declare `library
-/// p8;` with a `part 'pn.dart';` directive; pn's claim goes to n1 (smallest
-/// defining URI). Renaming n1's directive away hands pn to n2 — pn's bytes
-/// are unchanged (no signature) and n2's own files are unchanged, so the
-/// pre-fix seeds never reach n2 and its importer m keeps the pre-transfer
-/// `undefined_function` for pn's g(). The part-target identity flip in
-/// `close` is the only signal that seeds n2.
+/// C11 — include detach under per-library membership (audit P0 hole 2): n1
+/// and n2 both declare `library p8;` with a `part 'pn.dart';` directive, so
+/// pn is a MEMBER of both libraries — the baseline is clean (m resolves h()
+/// and g() through n2's namespace; the oracle's element layer links a
+/// name-matched part into every matching library), while pn's attribution
+/// owner is still the path-smallest claimant n1. Renaming n1's directive
+/// away dangles only n1's include — its name-mismatch row fires on
+/// recompute — while n2's membership never moved (pn's bytes and n2's files
+/// are unchanged), so n2 keeps its cached result and m its view through it:
+/// the invalidated set is n1 alone. The pre-membership engine flipped pn's
+/// ownership between the libraries here and had to recompute both sides;
+/// membership makes the transfer invisible outside n1.
 static CASE_C11: Case = Case {
     id: "C11",
     initial: &[
@@ -1186,13 +1210,15 @@ static CASE_C11: Case = Case {
         batch: &[("lib/n1.dart", Some(C11_N1_1))],
         changed: &["lib/n1.dart"],
         removed: &[],
-        invalidated: &["lib/m.dart", "lib/n1.dart", "lib/n2.dart"],
+        invalidated: &["lib/n1.dart"],
     }],
     absolute: Absolute::Explicit(&[
-        // Baseline: pn belongs to n1, so m's g() (through n2) is undefined.
-        &[("undefined_function", "lib/m.dart")],
-        // The transfer heals m: n2's namespace now carries pn's g().
+        // Baseline: both equally-named libraries include pn, so m's g()
+        // through n2 resolves — the oracle is clean.
         &[],
+        // The transfer leaves n1's include dangling (its name mismatch
+        // fires); n2's namespace still carries pn's g(), so m stays clean.
+        &[("part_of_different_library", "lib/n1.dart")],
     ]),
     stable_bytes: &[],
     mode_b: false,
@@ -1200,17 +1226,19 @@ static CASE_C11: Case = Case {
 };
 
 #[test]
-fn c11_claim_transfer_seeds_gaining_library_importers() {
+fn c11_include_detach_keeps_equal_named_sibling_namespace() {
     run_case(&CASE_C11);
 }
 
 /// `part 'b.dart';` whose target is a plain library: the target belongs to
 /// neither membership nor the dep set, so its residency flip is visible only
-/// through the part-target staleness identity. Removing it must dirty the
-/// owning library and surface the owed `uri_does_not_exist`, byte-identical
-/// to a full recompute; the re-add round-trip (fresh library id for the
-/// target, part-target flip for the owner) must settle back to the clean
-/// full recompute.
+/// through the part-target staleness identity. The cold baseline pins the
+/// plain-library include's `part_of_non_part` (the oracle's partOfNonPart,
+/// unconditionally); removing the target dirties the owning library and
+/// surfaces the owed `uri_does_not_exist`, byte-identical to a full
+/// recompute; the re-add round-trip (fresh library id for the target,
+/// part-target flip for the owner) must settle back to the cold full
+/// recompute.
 #[test]
 fn unclaimed_part_target_removal_matches_full_recompute() {
     const A: &str = "part 'b.dart';\nint f() => 1;\n";
@@ -1219,7 +1247,8 @@ fn unclaimed_part_target_removal_matches_full_recompute() {
     let b_disk = fixture.path("lib/b.dart");
     let mut engine = fixture.engine();
 
-    // Cold baseline: the part target resolves (on disk), nothing owed.
+    // Cold baseline: the part target resolves (on disk) but is a plain
+    // library, so the include reports part_of_non_part.
     engine.set_content(&fixture.path("lib/a.dart"), A.as_bytes());
     engine.set_content(&b_disk, B.as_bytes());
     engine.apply_pending(&mut |_| {});
@@ -1229,9 +1258,11 @@ fn unclaimed_part_target_removal_matches_full_recompute() {
     ]);
     let mut log = RawLog::default();
     let cold = analyze_all(&fixture, &mut engine, &state, &mut log);
-    assert!(
-        cold.is_empty(),
-        "cold baseline is clean: {:?}",
+    let cold_set = code_file_set(&[("part_of_non_part", "lib/a.dart")]);
+    assert_eq!(
+        absolute_set(&fixture, &engine, &cold),
+        cold_set,
+        "cold baseline pins the plain-library include: {:?}",
         absolute_set(&fixture, &engine, &cold)
     );
 
@@ -1272,9 +1303,11 @@ fn unclaimed_part_target_removal_matches_full_recompute() {
     let diagnostics = engine
         .analyze(&[], &mut log.sink(), &CancellationToken::new())
         .expect("analyze");
-    assert!(
-        diagnostics.is_empty(),
-        "re-add settles clean: {diagnostics:?}"
+    assert_eq!(
+        absolute_set(&fixture, &engine, &diagnostics),
+        cold_set,
+        "re-add settles back to the cold face: {:?}",
+        absolute_set(&fixture, &engine, &diagnostics)
     );
     assert_eq!(
         machine_bytes(&engine, &diagnostics),

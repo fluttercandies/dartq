@@ -1,14 +1,14 @@
-//! Engine events (engine-api-spec §1.4, incremental-l1-spec §4.2) and the
-//! `--trace-events` JSONL face (PRD §17.4).
+//! Engine events and the
+//! `--trace-events` JSONL face.
 //!
 //! Delivered synchronously through the `&mut dyn FnMut(EngineEvent)`
 //! callbacks of [`apply_pending`](crate::Engine::apply_pending) and
 //! [`analyze`](crate::Engine::analyze). Events fire only when work happened:
 //! an empty pending queue emits nothing, and a queue whose every entry hits
-//! the ContentId gate emits `OverlayApplied` plus per-file `ContentIdHit`
+//! the `ContentId` gate emits `OverlayApplied` plus per-file `ContentIdHit`
 //! `FileRevalidated`s and an empty `CascadeInvalidated`.
 //!
-//! # The trace face (§17.4)
+//! # The trace face
 //!
 //! [`TraceSink`] records one JSON object per event, field order fixed by
 //! the record structs (CI sampling compares captures byte-wise), flushing
@@ -17,8 +17,8 @@
 //! remembered by the writer (later writes no-op) and never fails the
 //! analysis it observes. The taxonomy maps as: `OverlayApplied`,
 //! `CascadeInvalidated`, `MemoryDegrade` verbatim; `FileRevalidated`'s
-//! `ast_cache_hit` is the §17.4 `AstCacheHit` observable;
-//! `LibraryAnalyzed.from_cache` is the §19.3 Cache Hit Rate seed (aggregated
+//! `ast_cache_hit` is the `AstCacheHit` observable;
+//! `LibraryAnalyzed.from_cache` is the Cache Hit Rate seed (aggregated
 //! by [`cache_hit_rate`]). The remaining taxonomy names (`StoreHit`,
 //! `SnapshotReuse`, `SignatureUnchanged`, `ContextBuilt`,
 //! `SchedulerQueueDepth`, `PluginLatency`) land as variants with their
@@ -27,7 +27,12 @@
 //! condensation rebuild at the `structure_dirty` gate — and `CycleReused` —
 //! the libraries whose cycle fingerprint stood at the post-closure reuse
 //! gate; deliberately no `EngineEvent` variants, so the event goldens stay
-//! byte-stable.
+//! byte-stable. `ExperimentDegrade` (#1304) is additive on both faces: a
+//! version-skewed SDK whitelist degraded to known-only grants, the
+//! observable signal for the lenient posture #1293 introduced.
+//! `ResidencyDegrade` (stability lane #1459) joins the additive
+//! trace-only rows: a residency-pairing miss a derived pass salvaged
+//! over, one line per (file, face) pair per engine.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -38,14 +43,14 @@ use serde::Serialize;
 
 use crate::state::LibraryId;
 
-/// In-process observation of apply/analyze work (§4.2 M1 subset).
+/// In-process observation of apply/analyze work.
 #[derive(Debug)]
 pub enum EngineEvent {
     /// Apply batch boundary: the pending queue that was just drained, split
     /// by gate outcome. Fired once per non-empty queue, before the per-file
     /// and cascade events of the same apply.
     OverlayApplied {
-        /// Files whose ContentId differed from residency (work follows).
+        /// Files whose `ContentId` differed from residency (work follows).
         changed: Vec<FileId>,
         /// Resident files removed by this apply.
         removed: Vec<FileId>,
@@ -61,10 +66,9 @@ pub enum EngineEvent {
         gate: RevalidateGate,
     },
     /// Per-library recompute outcome; `from_cache` is the Cache Hit Rate
-    /// seed (PRD §19.3). `duration` is an additive delta against
-    /// incremental-l1-spec §4.2's draft payload — it implements the
-    /// benchmark harness's per-library duration hook (§3 of
-    /// engine-api-spec) inside the event the API already has.
+    /// seed. `duration` is an additive delta against the draft payload —
+    /// it implements the benchmark harness's per-library duration hook
+    /// inside the event the API already has.
     LibraryAnalyzed {
         /// The recomputed (or cache-served) library.
         library: LibraryId,
@@ -80,13 +84,13 @@ pub enum EngineEvent {
         /// Every library marked dirty by this apply, gate-to-closure.
         libraries: Vec<LibraryId>,
     },
-    /// A memory-budget tier fired (PRD §17.1's ladder; §17.4's
+    /// A memory-budget tier fired (ladder; the
     /// `MemoryDegrade`). `tier` is the machine key (`lazy_parse` |
     /// `semantic_slices` | `ast_cold`); `file` anchors the event the same
     /// way the paired `dartq/memory_degraded` diagnostic anchors. Fires at
     /// most once per tier per engine — the ladder is sticky and one-way.
     MemoryDegrade {
-        /// The machine key of the §17.1 tier that fired.
+        /// The machine key of the tier that fired.
         tier: &'static str,
         /// The armed budget limit, in MiB.
         limit_mib: u64,
@@ -94,7 +98,46 @@ pub enum EngineEvent {
         /// library's).
         file: FileId,
     },
+    /// A version-skewed SDK whitelist: the analyzed SDK's
+    /// `allowed_experiments.json` named an experiment the vendored feature
+    /// registry does not know, so the grant degraded to the known-only set
+    /// instead of aborting (#1293) — this event is that degradation's
+    /// observable signal (#1304). Fires at most once per unknown experiment
+    /// name per engine, carried by the apply whose lanes first derived the
+    /// degraded grant; a name already reported never re-fires, whatever
+    /// else re-derives it (the memo bounds derivations per owner and
+    /// version, the report set bounds across them).
+    ExperimentDegrade {
+        /// The SDK version whose whitelist named the unknown experiments
+        /// (the SDK `version` file's trimmed content).
+        sdk_version: String,
+        /// The unknown experiment names, in whitelist order.
+        unknown: Vec<String>,
+        /// The granted fallback posture — [`KNOWN_ONLY_GRANT`]: an unknown
+        /// grant cannot be honored and is skipped; every known one applies.
+        granted: &'static str,
+    },
+    /// A content set was dropped because the text exceeds the engine's
+    /// 32-bit span capacity ([`dartq_source::MAX_SOURCE_BYTES`]) — the
+    /// file is rejected and everything else keeps analyzing. Fires at
+    /// either gate: the apply funnel (a pending set over capacity never
+    /// reaches residency — the file keeps its previous content, or stays
+    /// absent if never resident) and the manager overlay (the change is
+    /// skipped before the shared store ever holds the bytes). Warning-tier
+    /// telemetry: the faces render it as a stderr notice, never a
+    /// diagnostic row.
+    SourceRejected {
+        /// The rejected file's path (possibly never interned — the overlay
+        /// face rejects before interning).
+        path: std::path::PathBuf,
+        /// The content's byte size.
+        len: u64,
+    },
 }
+
+/// The machine key of the granted fallback posture
+/// [`EngineEvent::ExperimentDegrade`] reports: the known-only set.
+pub const KNOWN_ONLY_GRANT: &str = "known_only";
 
 /// The per-file revalidation branch of [`EngineEvent::FileRevalidated`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +151,7 @@ pub enum RevalidateGate {
     Parsed { ast_cache_hit: bool },
 }
 
-/// The `--trace-events` sink (PRD §17.4): appends one JSON object per event
+/// The `--trace-events` sink: appends one JSON object per event
 /// to `path`, field order fixed by the record structs below. Armed through
 /// [`crate::Engine::set_trace_sink`]; an unarmed engine constructs nothing
 /// and touches no event path.
@@ -162,7 +205,7 @@ impl TraceSink {
         });
     }
 
-    /// Records [`EngineEvent::LibraryAnalyzed`] — the §19.3 Cache Hit Rate
+    /// Records [`EngineEvent::LibraryAnalyzed`] — the Cache Hit Rate
     /// seed line.
     pub(crate) fn library_analyzed(&mut self, uri: &str, from_cache: bool, duration_us: u64) {
         self.write_line(&LibraryAnalyzedTrace {
@@ -182,13 +225,24 @@ impl TraceSink {
         });
     }
 
-    /// Records [`EngineEvent::MemoryDegrade`] (§17.4 taxonomy, verbatim).
+    /// Records [`EngineEvent::MemoryDegrade`].
     pub(crate) fn memory_degrade(&mut self, tier: &'static str, limit_mib: u64, uri: &str) {
         self.write_line(&MemoryDegradeTrace {
             event: "MemoryDegrade",
             tier,
             limit_mib,
             uri,
+        });
+    }
+
+    /// Records [`EngineEvent::ExperimentDegrade`] (#1304): the version-skew
+    /// degrade, additive to the taxonomy.
+    pub(crate) fn experiment_degrade(&mut self, sdk_version: &str, unknown: &[String]) {
+        self.write_line(&ExperimentDegradeTrace {
+            event: "ExperimentDegrade",
+            sdk_version,
+            unknown,
+            granted: KNOWN_ONLY_GRANT,
         });
     }
 
@@ -213,6 +267,19 @@ impl TraceSink {
             libraries,
         });
     }
+
+    /// Records the residency-pairing degrade (stability lane #1459): a
+    /// derived pass salvaged over a live member whose capture, residency,
+    /// store, or UTF-8 pairing missed, dropping the unit from its product.
+    /// Trace-only — no `EngineEvent` variant (the g485 D3 posture), the
+    /// event goldens stay byte-stable.
+    pub(crate) fn residency_degrade(&mut self, uri: &str, face: &str) {
+        self.write_line(&ResidencyDegradeTrace {
+            event: "ResidencyDegrade",
+            uri,
+            face,
+        });
+    }
 }
 
 /// Wall time as additive microseconds (integer — float durations would not
@@ -221,9 +288,11 @@ pub(crate) fn duration_us(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
-/// PRD §19.3's Cache Hit Rate, aggregated over a `--trace-events` capture:
+/// The Cache Hit Rate, aggregated over a `--trace-events` capture:
 /// cache-served [`EngineEvent::LibraryAnalyzed`] lines over all of them.
 /// `None` when the capture holds no library lines (nothing to rate).
+#[must_use]
+#[expect(clippy::cast_precision_loss)] // span arithmetic narrows under the scanner u32 offset cap
 pub fn cache_hit_rate(jsonl: &str) -> Option<f64> {
     let (hits, total) = jsonl
         .lines()
@@ -243,7 +312,7 @@ pub fn cache_hit_rate(jsonl: &str) -> Option<f64> {
 }
 
 /// Trace records — serde serializes struct fields in declaration order, so
-/// each struct below IS the wire contract (§17.4: CI samples these bytes).
+/// each struct below IS the wire contract.
 #[derive(Serialize)]
 struct OverlayAppliedTrace {
     event: &'static str,
@@ -283,6 +352,14 @@ struct MemoryDegradeTrace<'a> {
 }
 
 #[derive(Serialize)]
+struct ExperimentDegradeTrace<'a> {
+    event: &'static str,
+    sdk_version: &'a str,
+    unknown: &'a [String],
+    granted: &'static str,
+}
+
+#[derive(Serialize)]
 struct CycleRebuiltTrace {
     event: &'static str,
     cycles: usize,
@@ -292,6 +369,13 @@ struct CycleRebuiltTrace {
 struct CycleReusedTrace {
     event: &'static str,
     libraries: usize,
+}
+
+#[derive(Serialize)]
+struct ResidencyDegradeTrace<'a> {
+    event: &'static str,
+    uri: &'a str,
+    face: &'a str,
 }
 
 #[cfg(test)]
@@ -309,7 +393,7 @@ mod tests {
     }
 
     /// The wire contract per event kind: exact bytes, stable field order
-    /// (§17.4 — CI samples captures byte-wise). `content_id_hit` omits
+    ///. `content_id_hit` omits
     /// `ast_cache_hit`; the parsed branch carries it.
     #[test]
     fn jsonl_shape_pins_every_event_kind() {
@@ -325,6 +409,7 @@ mod tests {
         sink.library_analyzed("/w/lib/a.dart", false, 1500);
         sink.cascade_invalidated(&["/w/lib/a.dart".into(), "/w/lib/b.dart".into()]);
         sink.memory_degrade("ast_cold", 2048, "/w/lib/a.dart");
+        sink.experiment_degrade("3.10.0", &["future_flag".to_owned()]);
         sink.cycle_rebuilt(2);
         drop(sink);
         let capture = std::fs::read_to_string(&path).expect("capture readable");
@@ -337,6 +422,7 @@ mod tests {
                 "{\"event\":\"LibraryAnalyzed\",\"uri\":\"/w/lib/a.dart\",\"from_cache\":false,\"duration_us\":1500}\n",
                 "{\"event\":\"CascadeInvalidated\",\"libraries\":[\"/w/lib/a.dart\",\"/w/lib/b.dart\"]}\n",
                 "{\"event\":\"MemoryDegrade\",\"tier\":\"ast_cold\",\"limit_mib\":2048,\"uri\":\"/w/lib/a.dart\"}\n",
+                "{\"event\":\"ExperimentDegrade\",\"sdk_version\":\"3.10.0\",\"unknown\":[\"future_flag\"],\"granted\":\"known_only\"}\n",
                 "{\"event\":\"CycleRebuilt\",\"cycles\":2}\n",
             )
         );
@@ -358,7 +444,25 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// §19.3's Cache Hit Rate: cache-served library lines over all
+    /// The residency-pairing degrade row's wire contract (stability lane
+    /// #1459): exact bytes, stable field order, same additive-row
+    /// discipline as `CycleRebuilt`/`CycleReused` — the passes emit the
+    /// row only when a pairing invariant broke, so the healthy-event
+    /// captures above stay byte-frozen.
+    #[test]
+    fn residency_degrade_row_is_pinned() {
+        let (mut sink, path) = temp_sink("residency-degrade");
+        sink.residency_degrade("/w/lib/a.dart", "capture");
+        drop(sink);
+        let capture = std::fs::read_to_string(&path).expect("capture readable");
+        assert_eq!(
+            capture,
+            "{\"event\":\"ResidencyDegrade\",\"uri\":\"/w/lib/a.dart\",\"face\":\"capture\"}\n"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// the Cache Hit Rate: cache-served library lines over all
     /// well-formed library lines; other event kinds, malformed lines, and
     /// library lines without a `from_cache` field don't count; a capture
     /// without library lines rates `None`.

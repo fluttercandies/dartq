@@ -1,4 +1,4 @@
-//! The multi-context substrate (PRD §16): configuration-forked contexts
+//! The multi-context substrate: configuration-forked contexts
 //! over one base, per-context overlays, writer-priority scheduling, and
 //! epoch-based cancellation.
 
@@ -116,7 +116,7 @@ fn equal_configs_dedup_flag_forks_split() {
 
 /// Two contexts over one base coexist: the one whose options exclude
 /// `test/**` never reports the broken test file, the other one does, and
-/// neither leaks into the other (PRD §16.2's options fork dimension).
+/// neither leaks into the other.
 #[test]
 fn options_fork_isolates_discovery_and_diagnostics() {
     let fixture = Fixture::new(&[
@@ -166,7 +166,7 @@ fn options_fork_isolates_discovery_and_diagnostics() {
 
 /// An overlay edit is immediately visible through its owner's read path,
 /// never touches the base tree on disk, and stays invisible to a context
-/// without the overlay (PRD §16.3).
+/// without the overlay.
 #[test]
 fn overlay_visible_to_owner_only_disk_untouched() {
     let fixture = Fixture::new(&[("lib/main.dart", MAIN_0)]);
@@ -278,7 +278,7 @@ fn overlay_removal_hides_file_from_owner_only() {
 }
 
 /// Every write bumps the context's epoch; tasks enqueued under older epochs
-/// drop at the single drain point (PRD §16.6) — whether invalidated by an
+/// drop at the single drain point — whether invalidated by an
 /// overlay apply or an explicit cancel.
 #[test]
 fn stale_epoch_tasks_drop_at_drain() {
@@ -339,7 +339,7 @@ fn stale_epoch_tasks_drop_at_drain() {
     );
 }
 
-/// Writer-priority drain (PRD §16.5): every pending write drains before any
+/// Writer-priority drain: every pending write drains before any
 /// read, context-ascending, arrival order within a context — deterministic.
 #[test]
 fn drain_orders_writes_before_reads() {

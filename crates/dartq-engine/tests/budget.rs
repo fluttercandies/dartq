@@ -1,4 +1,4 @@
-//! Memory-budget runtime pins (PRD §17.1): the ladder sheds capacity, never
+//! Memory-budget runtime pins: the ladder sheds capacity, never
 //! truth — a bottom-tier-exhausted run still reports the complete diagnostic
 //! set, and an unarmed engine's output face carries no budget rows.
 
@@ -6,6 +6,7 @@ mod common;
 
 use common::{Fixture, GREETER_0, diagnostic_summary};
 use dartq_diagnostics::Severity;
+use dartq_engine::CancellationToken;
 use dartq_engine::EngineEvent;
 
 /// `x }` inside a block is a missing-`;` statement terminator — a parse
@@ -19,7 +20,7 @@ const MAIN_BROKEN: &str = "void f() { x }\n";
 /// The `dartq/memory_degraded` code.
 const MEMORY_DEGRADED: &str = "dartq/memory_degraded";
 
-/// The §17.1 tier names in ladder order, as the emitted messages carry them.
+/// The tier names in ladder order, as the emitted messages carry them.
 const TIERS: [&str; 3] = [
     "lazy-parse results evicted (LRU)",
     "non-active context semantic slices swapped out (L2)",
@@ -41,7 +42,7 @@ fn bottom_tier_exhausted_run_stays_complete() {
         engine.set_content(&fixture.path("lib/main.dart"), MAIN_BROKEN.as_bytes());
         engine.set_content(&fixture.path("lib/greeter.dart"), GREETER_0.as_bytes());
         let out = engine
-            .analyze(&[], &mut |_: EngineEvent| {}, &Default::default())
+            .analyze(&[], &mut |_: EngineEvent| {}, &CancellationToken::default())
             .expect("baseline analyze");
         assert!(!out.is_empty(), "the parse errors exist unarmed");
         assert!(
@@ -60,7 +61,7 @@ fn bottom_tier_exhausted_run_stays_complete() {
     engine.set_content(&fixture.path("lib/main.dart"), MAIN_BROKEN.as_bytes());
     engine.set_content(&fixture.path("lib/greeter.dart"), GREETER_0.as_bytes());
     let out = engine
-        .analyze(&[], &mut |_: EngineEvent| {}, &Default::default())
+        .analyze(&[], &mut |_: EngineEvent| {}, &CancellationToken::default())
         .expect("budgeted analyze");
 
     let degraded: Vec<_> = out
@@ -70,7 +71,7 @@ fn bottom_tier_exhausted_run_stays_complete() {
     assert_eq!(
         degraded.len(),
         TIERS.len(),
-        "one row per §17.1 tier: {degraded:?}"
+        "one row per memory tier: {degraded:?}"
     );
     for tier in TIERS {
         assert!(

@@ -1,8 +1,8 @@
-//! The library-dependency condensation (PRD §11.2, g485 L3 plan §3.1 —
+//! The library-dependency condensation (g485 L3 plan,
 //! wave W1): iterative Tarjan SCC over the maintained library `deps` edges
 //! and one stable blake3-128 fingerprint per strongly-connected component,
-//! rebuilt wholesale under the same `structure_dirty` gate that rebuilds
-//! the resolution graph (`pipeline::analyze`).
+//! rebuilt under the same `structure_dirty` gate that rebuilds the
+//! resolution graph (`pipeline::analyze`).
 //!
 //! Everything here is derived data: nothing accumulates per edit, a rebuild
 //! discards the previous mapping wholesale, and retired ids never enter a
@@ -12,13 +12,28 @@
 //! rebuild; wave W2 consumes the fingerprints as the product-reuse key
 //! (the post-closure gate in `pipeline`) and wave W3 the member/dependency
 //! faces as the recompute order ([`Condensation::topo_order`]).
+//!
+//! The partition is re-derived wholesale every time (the SCC shape moves
+//! arbitrarily under an edit), but the fingerprints are salvaged from the
+//! previous mapping (#1387): each cycle records the exact fold inputs it
+//! hashed — the byte-canonical member-signature multiset and the
+//! dependency-fingerprint section — so a new cycle whose collected inputs
+//! are byte-equal to a previous cycle's reuses its digest with no hash. The
+//! fingerprint is a pure function of those inputs, so the reuse is exact,
+//! and no identity is assumed: recycled ids, reshaped member sets, and
+//! moved dependencies all fail a byte compare and re-fold. A structure
+//! keystroke therefore re-folds only its dirty front (the moved cycle plus
+//! the transitive closure of its changed dependency digests) and probes the
+//! standing workspace instead.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::hash::Hasher;
 
-use blake3::Hasher;
+use blake3::Hasher as FoldHasher;
 use dartq_semantic::ApiSignature;
 use dartq_source::FileId;
+use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::state::{LibraryId, LibraryTable};
 
@@ -26,7 +41,7 @@ use crate::state::{LibraryId, LibraryTable};
 /// current mapping predates. [`Condensation::cycle_of`] answers `None`.
 const NO_CYCLE: u32 = u32::MAX;
 
-/// The fingerprint-composition tag (g485 §3.1): the version rides the
+/// The fingerprint-composition tag: the version rides the
 /// `v<N>` suffix. The condensation is pure derived data, so bumping the tag
 /// re-derives every digest at the next rebuild automatically — nothing
 /// persists a fingerprint before wave 4.
@@ -49,7 +64,12 @@ pub(crate) struct Condensation {
 /// order ([`Condensation::topo_order`], W3) walks; the order derives unit
 /// membership through `cycle_of` and the dirty set, so the `members` field
 /// itself stays pinned for the tests (which read it) — removing the
-/// expectation would turn it into a dead-code warning outside them.
+/// expectation would turn it into a dead-code warning outside them. The
+/// two recorded sections are the exact fold inputs the fingerprint hashed:
+/// `signatures` the byte-sorted member-signature multiset, `dep_fps` the
+/// byte-sorted, deduplicated dependency-fingerprint section — the next
+/// rebuild's salvage probe compares a candidate cycle's freshly collected
+/// inputs against them.
 #[derive(Debug)]
 pub(crate) struct CycleInfo {
     #[cfg_attr(not(test), expect(dead_code))]
@@ -58,6 +78,14 @@ pub(crate) struct CycleInfo {
     pub(crate) members: Box<[LibraryId]>,
     /// Distinct direct dependency cycles, ascending by cycle index.
     pub(crate) deps: Box<[u32]>,
+    /// The fold's member section: every member file's API signature
+    /// (defining then parts per member), byte-sorted — the multiset the
+    /// fold hashes, in the canonical form the salvage probe compares.
+    pub(crate) signatures: Box<[ApiSignature]>,
+    /// The fold's dependency section: one fingerprint per distinct direct
+    /// dependency cycle, byte-sorted and deduplicated — the section tail the
+    /// fold hashes, in the canonical form the salvage probe compares.
+    pub(crate) dep_fps: Box<[ApiSignature]>,
     /// blake3-128 over the member signatures and the dependency-cycle
     /// fingerprints — the cycle-granular face the reuse rule compares.
     pub(crate) fingerprint: ApiSignature,
@@ -102,19 +130,27 @@ impl Condensation {
     /// Every dirty id answers a cycle here: the apply contract keeps the
     /// dirty set live (`state.invalidated ⊆ live()`) and the wholesale
     /// rebuild under the structure gate keeps the mapping current over the
-    /// live set.
+    /// live set. A miss (a retired id, a stale mapping — both excluded by
+    /// those contracts, so only an engine bug can produce one) or a drain
+    /// shortfall bails to the full sorted dirty set — the plain
+    /// library-level order — instead of crashing or silently dropping
+    /// libraries from the recompute: per-library diagnosis is
+    /// order-independent, so the degrade only reshapes event delivery
+    /// while every dirty library still recomputes.
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     pub(crate) fn topo_order(&self, dirty: &[LibraryId]) -> Vec<LibraryId> {
         let mut dirty = dirty.to_vec();
         dirty.sort_unstable();
         let total = dirty.len();
-        // Per-unit dirty members, ascending (the input was sorted). A miss
-        // would be a retired id or a stale mapping — both excluded by the
-        // apply contract above, so a miss is an upstream bug.
+        // Per-unit dirty members, ascending (the input was sorted).
         let mut members: Vec<Vec<LibraryId>> = vec![Vec::new(); self.cycles.len()];
-        for library in dirty {
-            let cycle = self
-                .cycle_of(library)
-                .expect("dirty library is live under the current mapping");
+        for &library in &dirty {
+            // The dirty library is live under the current mapping (the
+            // apply contract) — a miss is an upstream bug: bail to the
+            // full sorted dirty set.
+            let Some(cycle) = self.cycle_of(library) else {
+                return dirty;
+            };
             members[cycle as usize].push(library);
         }
         // Cycle-DAG bookkeeping: a dirty unit waits on its dirty dependency
@@ -156,13 +192,12 @@ impl Condensation {
             }
         }
         // The cycle relation is an acyclic digraph with self-edges excluded
-        // and deduplicated at build, so every dirty unit drains; a shortfall
-        // would silently drop libraries from the recompute — surface it.
-        assert_eq!(
-            order.len(),
-            total,
-            "every dirty unit drains over the acyclic cycle relation",
-        );
+        // and deduplicated at build, so every dirty unit drains. A shortfall
+        // would silently drop libraries from the recompute — an upstream
+        // bug: discard `order` and deliver the full sorted dirty set.
+        if order.len() != total {
+            return dirty;
+        }
         order
     }
 
@@ -172,10 +207,43 @@ impl Condensation {
     /// completion, when every cycle it depends on is already fingerprinted.
     /// `signature` supplies a member file's baked API signature — the same
     /// value the L2 gate compares.
+    ///
+    /// `salvage` is the standing condensation (`None` for the wholesale
+    /// build — the cold start and the tests' byte-parity oracle): the
+    /// partition re-derives wholesale, but a cycle whose freshly collected
+    /// fold inputs are byte-equal to a previous cycle's recorded sections
+    /// reuses that cycle's digest with no hash (#1387) — a structure
+    /// keystroke re-folds its dirty front and probes the standing front.
+    ///
+    /// A Tarjan-invariant break (a live-table incoherence only an engine
+    /// bug can produce) bails to the empty mapping — every slot answers no
+    /// cycle — instead of crashing: the reuse gate then marks every library
+    /// dirty and [`Self::topo_order`] serves the plain sorted dirty order,
+    /// so the caller's recompute delivers the full, unsalvaged dirty set.
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     pub(crate) fn build(
+        salvage: Option<&Condensation>,
         libraries: &LibraryTable,
         signature: impl Fn(FileId) -> ApiSignature,
     ) -> Self {
+        // The salvage probe's shortlist: previous cycles hashed by their
+        // recorded member-signature multiset. The digest only nominates
+        // candidates — the probe disambiguates by comparing the recorded
+        // sections byte-for-byte, so a collision costs a compare, never a
+        // wrong reuse.
+        let mut candidates: FxHashMap<u64, Vec<u32>> = FxHashMap::default();
+        if let Some(prev) = salvage {
+            for (index, cycle) in prev.cycles.iter().enumerate() {
+                let mut hasher = FxHasher::default();
+                for signature in cycle.signatures.as_ref() {
+                    hasher.write(signature.as_bytes());
+                }
+                candidates
+                    .entry(hasher.finish())
+                    .or_default()
+                    .push(index as u32);
+            }
+        }
         let arena = libraries.arena_len() as usize;
         let mut condensation = Self {
             cycle_of: vec![NO_CYCLE; arena],
@@ -205,16 +273,19 @@ impl Condensation {
             on_stack[root_index] = true;
             frames.push((root, 0));
             while let Some(&(node, mut cursor)) = frames.last() {
-                let deps = libraries
-                    .info(node)
-                    .expect("frame node is live")
-                    .deps
-                    .as_slice();
+                // The frame node is live: every frame descends from an
+                // `iter_infos` root or a live-guarded dep, so the table
+                // holds the info. A miss is table incoherence — bail to
+                // the empty mapping (see the build doc).
+                let Some(frame_info) = libraries.info(node) else {
+                    return Self::default();
+                };
+                let deps = frame_info.deps.as_slice();
                 let mut descended = false;
                 while cursor < deps.len() {
                     let dep = deps[cursor];
                     cursor += 1;
-                    // Live-gated (g485 §3.1 retirement rule): a dep id
+                    // Live-gated: a dep id
                     // retired since its importer's formation enters no
                     // cycle and no fingerprint.
                     if libraries.info(dep).is_none() {
@@ -228,8 +299,14 @@ impl Condensation {
                         stack.push(dep);
                         on_stack[di] = true;
                         // The advanced cursor belongs to THIS frame — write
-                        // it back before the child lands on top of it.
-                        frames.last_mut().expect("frame under the cursor").1 = cursor;
+                        // it back before the child lands on top of it. The
+                        // frame under the cursor is the `while let` match
+                        // itself, so the slot exists; a miss is walk
+                        // incoherence — bail to the empty mapping.
+                        let Some(frame) = frames.last_mut() else {
+                            return Self::default();
+                        };
+                        frame.1 = cursor;
                         frames.push((dep, 0));
                         descended = true;
                         break;
@@ -252,12 +329,21 @@ impl Condensation {
                     // fold the cycle — the members' signatures as a canonical
                     // multiset over the already-fingerprinted dependency
                     // cycles (completion order guarantees they exist).
-                    let cycle_index = condensation.cycles.len() as u32;
+                    // The cycle count fits u32 — the mapping's cycle
+                    // indexes are u32-addressed; beyond that the walk
+                    // cannot continue — bail to the empty mapping.
+                    let Ok(cycle_index) = u32::try_from(condensation.cycles.len()) else {
+                        return Self::default();
+                    };
                     let mut members: Vec<LibraryId> = Vec::new();
                     loop {
-                        let member = stack
-                            .pop()
-                            .expect("component member is on the tarjan stack");
+                        // The component member is on the Tarjan stack: the
+                        // component's root was pushed before its frame
+                        // descended, so the drain cannot run dry. A miss is
+                        // walk incoherence — bail to the empty mapping.
+                        let Some(member) = stack.pop() else {
+                            return Self::default();
+                        };
                         on_stack[member.index() as usize] = false;
                         members.push(member);
                         if member == node {
@@ -271,7 +357,13 @@ impl Condensation {
                     let mut signatures: Vec<ApiSignature> = Vec::new();
                     let mut dep_cycles: Vec<u32> = Vec::new();
                     for &member in &members {
-                        let info = libraries.info(member).expect("component member is live");
+                        // The component member is live: stack members come
+                        // from `iter_infos` roots or live-guarded deps. A
+                        // miss is table incoherence — bail to the empty
+                        // mapping.
+                        let Some(info) = libraries.info(member) else {
+                            return Self::default();
+                        };
                         signatures.push(signature(info.defining));
                         signatures.extend(info.parts.iter().map(|&part| signature(part)));
                         for dep in &info.deps {
@@ -279,10 +371,13 @@ impl Condensation {
                                 continue;
                             }
                             let dep_cycle = condensation.cycle_of[dep.index() as usize];
-                            assert_ne!(
-                                dep_cycle, NO_CYCLE,
-                                "dependency cycles complete before dependents",
-                            );
+                            // Dependency cycles complete before dependents
+                            // (Tarjan completion order) — a `NO_CYCLE` dep
+                            // here is walk incoherence: bail to the empty
+                            // mapping.
+                            if dep_cycle == NO_CYCLE {
+                                return Self::default();
+                            }
                             if dep_cycle != cycle_index {
                                 dep_cycles.push(dep_cycle);
                             }
@@ -290,15 +385,49 @@ impl Condensation {
                     }
                     dep_cycles.sort_unstable();
                     dep_cycles.dedup();
-                    let dep_fingerprints: Vec<ApiSignature> = dep_cycles
+                    let mut dep_fps: Vec<ApiSignature> = dep_cycles
                         .iter()
                         .map(|&dep| condensation.cycles[dep as usize].fingerprint)
                         .collect();
-                    let fingerprint =
-                        fold_fingerprint(FINGERPRINT_TAG, &signatures, &dep_fingerprints);
+                    // Both sections in the fold's canonical form (the same
+                    // sort/dedup `fold_fingerprint` applies, idempotent over
+                    // them): what gets hashed is exactly what gets recorded,
+                    // so the next rebuild's probe compares the true inputs.
+                    signatures.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+                    canonicalize(&mut dep_fps);
+                    // Dirty-front salvage (#1387): byte-equal collected inputs
+                    // to a previous cycle's recorded sections mean the digest
+                    // is a pure-function replay — reuse it, no hash. Anything
+                    // else (a moved member face, a moved dependency digest, a
+                    // fresh shape) re-folds. No identity is assumed: member
+                    // ids never enter the comparison, so a recycled slot's
+                    // new tenant is judged by its own bytes.
+                    let mut hasher = FxHasher::default();
+                    for signature in &signatures {
+                        hasher.write(signature.as_bytes());
+                    }
+                    let fingerprint = candidates
+                        .get(&hasher.finish())
+                        .and_then(|shortlist| {
+                            salvage.and_then(|prev| {
+                                shortlist
+                                    .iter()
+                                    .map(|&i| &prev.cycles[i as usize])
+                                    .find(|old| {
+                                        old.signatures.as_ref() == signatures.as_slice()
+                                            && old.dep_fps.as_ref() == dep_fps.as_slice()
+                                    })
+                            })
+                        })
+                        .map(|old| old.fingerprint)
+                        .unwrap_or_else(|| {
+                            fold_fingerprint(FINGERPRINT_TAG, &signatures, &dep_fps)
+                        });
                     condensation.cycles.push(CycleInfo {
                         members: members.into_boxed_slice(),
                         deps: dep_cycles.into_boxed_slice(),
+                        signatures: signatures.into_boxed_slice(),
+                        dep_fps: dep_fps.into_boxed_slice(),
                         fingerprint,
                     });
                 }
@@ -308,7 +437,14 @@ impl Condensation {
     }
 }
 
-/// The cycle fingerprint (g485 §3.1): blake3 truncated to 128 bits (the
+/// The byte-canonical form of a fingerprint section: sorted, deduplicated —
+/// exactly the sequence [`fold_fingerprint`] hashes for that section.
+fn canonicalize(section: &mut Vec<ApiSignature>) {
+    section.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    section.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
+}
+
+/// The cycle fingerprint: blake3 truncated to 128 bits (the
 /// `ContentId` / `ApiSignature` width) over the tag, then the
 /// member-signature multiset and the dependency-fingerprint set, each
 /// canonicalized here — sorted (members as a multiset, deps deduplicated)
@@ -320,9 +456,8 @@ fn fold_fingerprint(tag: &[u8], members: &[ApiSignature], deps: &[ApiSignature])
     let mut members = members.to_vec();
     members.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     let mut deps = deps.to_vec();
-    deps.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    deps.dedup_by(|a, b| a.as_bytes() == b.as_bytes());
-    let mut hasher = Hasher::new();
+    canonicalize(&mut deps);
+    let mut hasher = FoldHasher::new();
     hasher.update(tag);
     hasher.update(&(members.len() as u64).to_le_bytes());
     for member in &members {
@@ -355,12 +490,19 @@ mod tests {
     }
 
     /// A live one-file library per `(uri, dep-uris)` entry; the defining
-    /// file is a throwaway intern (the build reads only ids and the
-    /// signature closure), so a test graph is one spec line per library.
-    /// Returns the table and the ids in spec order.
-    fn graph(spec: &[(&str, &[&str])]) -> (LibraryTable, Vec<LibraryId>) {
+    /// file is a throwaway intern over one shared table (so each library's
+    /// `FileId` is distinct and a signature closure can move one member's
+    /// face — the salvage pins need exactly that), the build reads only ids
+    /// and the signature closure. Returns the table, the ids in spec order,
+    /// and each library's defining file in the same order.
+    fn graph(spec: &[(&str, &[&str])]) -> (LibraryTable, Vec<LibraryId>, Vec<FileId>) {
         let mut table = LibraryTable::default();
+        let mut files = FileTable::new();
         let ids: Vec<LibraryId> = spec.iter().map(|&(uri, _)| table.intern(uri)).collect();
+        let defining: Vec<FileId> = spec
+            .iter()
+            .map(|&(uri, _)| files.intern(Path::new(&format!("/{uri}"))))
+            .collect();
         let by_uri: FxHashMap<&str, LibraryId> = spec
             .iter()
             .map(|&(uri, _)| uri)
@@ -371,7 +513,7 @@ mod tests {
                 id,
                 LibraryInfo {
                     uri: Arc::from(uri),
-                    defining: FileTable::new().intern(Path::new("/stub.dart")),
+                    defining: defining[id.index() as usize],
                     parts: Vec::new(),
                     content: Box::new([]),
                     deps: deps.iter().map(|dep| by_uri[dep]).collect(),
@@ -379,12 +521,12 @@ mod tests {
                 },
             );
         }
-        (table, ids)
+        (table, ids, defining)
     }
 
     #[test]
     fn scc_shapes_two_member_cycle_bridge_and_singletons() {
-        let (table, ids) = graph(&[
+        let (table, ids, _) = graph(&[
             ("package:a/a.dart", &["package:b/b.dart"]),
             ("package:b/b.dart", &["package:a/a.dart"]),
             ("package:c/c.dart", &["package:a/a.dart"]),
@@ -393,7 +535,7 @@ mod tests {
         let [a, b, c, d] = ids[..] else {
             unreachable!()
         };
-        let condensation = Condensation::build(&table, |_| sig(0));
+        let condensation = Condensation::build(None, &table, |_| sig(0));
 
         assert_eq!(condensation.cycle_count(), 3);
         assert_eq!(condensation.cycle_of(a), Some(0));
@@ -418,12 +560,12 @@ mod tests {
 
     #[test]
     fn acyclic_chain_folds_fingerprints_bottom_up() {
-        let (table, _) = graph(&[
+        let (table, _, _) = graph(&[
             ("package:a/a.dart", &["package:b/b.dart"]),
             ("package:b/b.dart", &["package:c/c.dart"]),
             ("package:c/c.dart", &[]),
         ]);
-        let condensation = Condensation::build(&table, |_| sig(0));
+        let condensation = Condensation::build(None, &table, |_| sig(0));
         assert_eq!(condensation.cycle_count(), 3, "acyclic: singleton cycles");
         // Completion order: dependencies first.
         assert_eq!(condensation.cycles[1].deps.as_ref(), &[0]);
@@ -439,7 +581,7 @@ mod tests {
         assert_ne!(fingerprints[1], fingerprints[2]);
         // The signature seam feeds the digest: a moved member signature
         // moves every fingerprint.
-        let moved = Condensation::build(&table, |_| sig(1));
+        let moved = Condensation::build(None, &table, |_| sig(1));
         for (old, new) in fingerprints.iter().zip(moved.cycles.iter()) {
             assert_ne!(*old, new.fingerprint);
         }
@@ -481,8 +623,8 @@ mod tests {
             ("package:c/c.dart", &["package:a/a.dart"]),
         ])
         .0;
-        let one = Condensation::build(&table, |_| sig(3));
-        let two = Condensation::build(&table, |_| sig(3));
+        let one = Condensation::build(None, &table, |_| sig(3));
+        let two = Condensation::build(None, &table, |_| sig(3));
         assert_eq!(one.cycle_count(), two.cycle_count());
         for (a, b) in one.cycles.iter().zip(two.cycles.iter()) {
             assert_eq!(
@@ -492,11 +634,132 @@ mod tests {
             assert_eq!(a.members, b.members);
             assert_eq!(a.deps, b.deps);
         }
+        // The salvaged rebuild over an unchanged workspace stands byte-equal
+        // too — every cycle probes and reuses (#1387).
+        let salvaged = Condensation::build(Some(&two), &table, |_| sig(3));
+        assert_same_condensation(&two, &salvaged, &[]);
+    }
+
+    /// Full-field parity of two condensations over the same table: the
+    /// partition, every cycle's recorded fold sections and digest, and the
+    /// slot mapping. `ids` (when supplied) covers the `cycle_of` mapping.
+    fn assert_same_condensation(one: &Condensation, two: &Condensation, ids: &[LibraryId]) {
+        assert_eq!(one.cycle_count(), two.cycle_count(), "cycle count");
+        for (a, b) in one.cycles.iter().zip(two.cycles.iter()) {
+            assert_eq!(a.members, b.members, "members");
+            assert_eq!(a.deps, b.deps, "deps");
+            assert_eq!(a.signatures, b.signatures, "recorded member section");
+            assert_eq!(a.dep_fps, b.dep_fps, "recorded dependency section");
+            assert_eq!(a.fingerprint, b.fingerprint, "digest");
+        }
+        for &id in ids {
+            assert_eq!(one.cycle_of(id), two.cycle_of(id), "slot mapping");
+        }
+    }
+
+    /// The salvage's core promise (#1387): a rebuild over the standing
+    /// condensation is indistinguishable from a wholesale derivation — over
+    /// an unchanged workspace (everything probes and reuses) and after a
+    /// member face moves (the dirty front re-folds). The partition is
+    /// re-derived either way; only the hashing is skipped on byte-equal
+    /// inputs, so the outputs must match field for field.
+    #[test]
+    fn salvaged_rebuild_matches_the_wholesale_oracle() {
+        let (table, ids, files) = graph(&[
+            ("package:a/a.dart", &["package:b/b.dart"]),
+            ("package:b/b.dart", &["package:a/a.dart"]),
+            ("package:c/c.dart", &["package:a/a.dart"]),
+            ("package:d/d.dart", &[]),
+        ]);
+        // An unchanged workspace: every cycle's inputs are byte-equal to the
+        // standing sections — the all-salvage shape.
+        let standing = Condensation::build(None, &table, |_| sig(0));
+        let salvaged = Condensation::build(Some(&standing), &table, |_| sig(0));
+        assert_same_condensation(&standing, &salvaged, &ids);
+
+        // A moved member face: c's cycle and its dependency closure re-fold,
+        // and the salvage still lands on the wholesale bytes.
+        let moved = |file: FileId| if file == files[2] { sig(9) } else { sig(0) };
+        let wholesale = Condensation::build(None, &table, moved);
+        let salvaged = Condensation::build(Some(&standing), &table, moved);
+        assert_same_condensation(&wholesale, &salvaged, &ids);
+    }
+
+    /// The dirty front (#1387): a signature move re-folds exactly the moved
+    /// cycle; standing cycles keep the previous digest byte-for-byte — that
+    /// is the salvage's entire point — while the whole rebuild still matches
+    /// the wholesale oracle. Here only `d`'s face moves, so the a-b cycle
+    /// and its dependent `c` reuse their standing digests.
+    #[test]
+    fn salvage_reuses_the_standing_front_and_refolds_the_dirty_one() {
+        let (table, ids, files) = graph(&[
+            ("package:a/a.dart", &["package:b/b.dart"]),
+            ("package:b/b.dart", &["package:a/a.dart"]),
+            ("package:c/c.dart", &["package:a/a.dart"]),
+            ("package:d/d.dart", &[]),
+        ]);
+        let [a, _b, c, d] = ids[..] else {
+            unreachable!()
+        };
+        let standing = Condensation::build(None, &table, |_| sig(0));
+        let moved_d = |file: FileId| if file == files[3] { sig(1) } else { sig(0) };
+        let salvaged = Condensation::build(Some(&standing), &table, moved_d);
+        assert_eq!(
+            salvaged.fingerprint_of(a),
+            standing.fingerprint_of(a),
+            "the standing cycle keeps its digest"
+        );
+        assert_eq!(
+            salvaged.fingerprint_of(c),
+            standing.fingerprint_of(c),
+            "a foreign front keeps its digest"
+        );
+        assert_ne!(
+            salvaged.fingerprint_of(d),
+            standing.fingerprint_of(d),
+            "the moved cycle re-folds"
+        );
+        let wholesale = Condensation::build(None, &table, moved_d);
+        assert_same_condensation(&wholesale, &salvaged, &ids);
+    }
+
+    /// The recycle hazard, pinned: a slot's new tenant may reuse the old
+    /// member ids, but the probe compares fold inputs, not identities — the
+    /// reshaped world's cycles collect their own bytes and re-fold, and the
+    /// salvaged rebuild stays byte-equal to the wholesale oracle.
+    #[test]
+    fn recycled_tenant_salvage_stays_equal_to_the_wholesale_oracle() {
+        let (mut table, ids, _) = graph(&[
+            ("package:a/a.dart", &["package:b/b.dart"]),
+            ("package:b/b.dart", &[]),
+        ]);
+        let (_, b) = (ids[0], ids[1]);
+        let standing = Condensation::build(None, &table, |_| sig(0));
+
+        // Retire b, recycle its slot to a fresh tenant importing a: the
+        // world condenses into one two-member cycle of a different shape.
+        table.retire(b);
+        let fresh = table.intern("package:fresh/fresh.dart");
+        assert_eq!(fresh, b, "the freelist recycles the slot");
+        table.set_info(
+            fresh,
+            LibraryInfo {
+                uri: Arc::from("package:fresh/fresh.dart"),
+                defining: FileTable::new().intern(Path::new("/fresh.dart")),
+                parts: Vec::new(),
+                content: Box::new([]),
+                deps: vec![ids[0]],
+                part_targets: Box::new([]),
+            },
+        );
+        let salvaged = Condensation::build(Some(&standing), &table, |_| sig(0));
+        let wholesale = Condensation::build(None, &table, |_| sig(0));
+        assert_same_condensation(&wholesale, &salvaged, &ids);
     }
 
     #[test]
     fn retired_ids_point_nowhere_and_recycled_ids_rebuild_from_current_facts() {
-        let (mut table, ids) = graph(&[
+        let (mut table, ids, _) = graph(&[
             ("package:a/a.dart", &["package:b/b.dart"]),
             ("package:b/b.dart", &[]),
         ]);
@@ -504,7 +767,7 @@ mod tests {
         // Retire b with a's deps edge still naming it: the live-gated build
         // drops the edge and the retired id answers no cycle.
         table.retire(b);
-        let condensation = Condensation::build(&table, |_| sig(0));
+        let condensation = Condensation::build(None, &table, |_| sig(0));
         assert_eq!(condensation.cycle_count(), 1);
         assert_eq!(condensation.cycle_of(a), Some(0));
         assert_eq!(condensation.cycle_of(b), None, "retired id points nowhere");
@@ -527,7 +790,7 @@ mod tests {
                 part_targets: Box::new([]),
             },
         );
-        let condensation = Condensation::build(&table, |_| sig(0));
+        let condensation = Condensation::build(None, &table, |_| sig(0));
         assert_eq!(
             condensation.cycle_count(),
             1,
@@ -536,7 +799,7 @@ mod tests {
         assert_eq!(condensation.cycle_of(fresh), Some(0));
         assert_eq!(condensation.cycles[0].members.as_ref(), &[a, fresh]);
         // The derivation is stateless: a second build reproduces the shape.
-        let again = Condensation::build(&table, |_| sig(0));
+        let again = Condensation::build(None, &table, |_| sig(0));
         assert_eq!(again.cycles[0].members.as_ref(), &[a, fresh]);
     }
 
@@ -546,24 +809,25 @@ mod tests {
     /// treats the mapping gap as a moved fingerprint and recomputes.
     #[test]
     fn fingerprint_of_answers_the_covering_cycle_or_nothing() {
-        let (mut table, ids) = graph(&[
+        let (mut table, ids, _) = graph(&[
             ("package:a/a.dart", &["package:b/b.dart"]),
             ("package:b/b.dart", &["package:a/a.dart"]),
         ]);
-        let [a, b] = ids[..] else {
-            unreachable!()
-        };
-        let condensation = Condensation::build(&table, |_| sig(5));
+        let [a, b] = ids[..] else { unreachable!() };
+        let condensation = Condensation::build(None, &table, |_| sig(5));
         let cycle = condensation.cycle_of(a).expect("a is live");
         assert_eq!(
             condensation.fingerprint_of(a),
             Some(condensation.cycles[cycle as usize].fingerprint)
         );
-        assert_eq!(condensation.fingerprint_of(b), condensation.fingerprint_of(a));
+        assert_eq!(
+            condensation.fingerprint_of(b),
+            condensation.fingerprint_of(a)
+        );
         let pair_fingerprint = condensation.fingerprint_of(a);
 
         table.retire(b);
-        let condensation = Condensation::build(&table, |_| sig(5));
+        let condensation = Condensation::build(None, &table, |_| sig(5));
         assert_eq!(condensation.fingerprint_of(b), None, "retired: no cycle");
         // The survivor's cycle re-shaped (the member multiset shrank), so a
         // result recorded under the pair's digest can never alias the
@@ -575,7 +839,7 @@ mod tests {
     /// order as one unit, dependents run after the units they depend on.
     #[test]
     fn topo_order_delivers_cycle_members_adjacent_in_dependency_order() {
-        let (table, ids) = graph(&[
+        let (table, ids, _) = graph(&[
             ("package:a/a.dart", &["package:b/b.dart"]),
             ("package:b/b.dart", &["package:a/a.dart"]),
             ("package:c/c.dart", &["package:a/a.dart"]),
@@ -584,7 +848,7 @@ mod tests {
         let [a, b, c, d] = ids[..] else {
             unreachable!()
         };
-        let condensation = Condensation::build(&table, |_| sig(0));
+        let condensation = Condensation::build(None, &table, |_| sig(0));
 
         // All dirty: the a-b unit, then its dependent c, then the
         // independent d — regardless of the input's order.
@@ -605,7 +869,7 @@ mod tests {
     /// very front, ahead of the cycle it imports).
     #[test]
     fn topo_order_ties_ready_units_by_smallest_member_not_discovery() {
-        let (table, ids) = graph(&[
+        let (table, ids, _) = graph(&[
             ("package:r/r.dart", &["package:x1/x1.dart"]),
             ("package:a/a.dart", &["package:b/b.dart"]),
             ("package:b/b.dart", &["package:a/a.dart"]),
@@ -618,11 +882,11 @@ mod tests {
         let expected = vec![a, b, x1, x2, r];
         // Twice on one mapping, then a wholesale rebuild: same inputs,
         // same order.
-        let condensation = Condensation::build(&table, |_| sig(0));
+        let condensation = Condensation::build(None, &table, |_| sig(0));
         assert_eq!(condensation.topo_order(&ids), expected);
         assert_eq!(condensation.topo_order(&ids), expected);
         assert_eq!(
-            Condensation::build(&table, |_| sig(0)).topo_order(&ids),
+            Condensation::build(None, &table, |_| sig(0)).topo_order(&ids),
             expected
         );
     }
@@ -633,32 +897,53 @@ mod tests {
     /// event-order goldens byte-identical.
     #[test]
     fn topo_order_is_the_library_rule_on_acyclic_graphs() {
-        let (table, ids) = graph(&[
+        let (table, ids, _) = graph(&[
             ("package:c/c.dart", &["package:b/b.dart"]),
             ("package:b/b.dart", &["package:a/a.dart"]),
             ("package:a/a.dart", &[]),
         ]);
-        let [c, b, a] = ids[..] else {
-            unreachable!()
-        };
+        let [c, b, a] = ids[..] else { unreachable!() };
         assert_eq!(
-            Condensation::build(&table, |_| sig(0)).topo_order(&ids),
+            Condensation::build(None, &table, |_| sig(0)).topo_order(&ids),
             vec![a, b, c]
         );
 
         // Ready-singleton tie: b (independent, smaller id) before c, both
         // before their dependent a.
-        let (table, ids) = graph(&[
+        let (table, ids, _) = graph(&[
             ("package:a/a.dart", &["package:c/c.dart"]),
             ("package:b/b.dart", &[]),
             ("package:c/c.dart", &[]),
         ]);
-        let [a, b, c] = ids[..] else {
-            unreachable!()
-        };
+        let [a, b, c] = ids[..] else { unreachable!() };
         assert_eq!(
-            Condensation::build(&table, |_| sig(0)).topo_order(&ids),
+            Condensation::build(None, &table, |_| sig(0)).topo_order(&ids),
             vec![b, c, a]
         );
+    }
+
+    /// The topo bail (stability lane): a dirty id the mapping does not
+    /// cover — the apply contract broken, so an upstream bug — degrades to
+    /// the full sorted dirty set instead of panicking, and the degrade
+    /// delivers the same order the healthy mapping would (here the sorted
+    /// order IS the dependency order, so fallback equals normal).
+    #[test]
+    fn topo_order_bails_to_the_full_sorted_dirty_set_on_a_mapping_gap() {
+        let (mut table, ids, _) = graph(&[
+            ("package:a/a.dart", &[]),
+            ("package:b/b.dart", &["package:a/a.dart"]),
+        ]);
+        let [a, b] = ids[..] else { unreachable!() };
+        // The healthy mapping: b's unit runs after a's, plain-sorted here.
+        let normal = Condensation::build(None, &table, |_| sig(0)).topo_order(&ids);
+        assert_eq!(normal, vec![a, b]);
+
+        // Break the pairing: retire b after it entered the dirty set — the
+        // stale-mapping shape. The uncovered id must not panic the order
+        // and must not drop from it: every dirty library still recomputes.
+        table.retire(b);
+        let stale = Condensation::build(None, &table, |_| sig(0));
+        assert_eq!(stale.cycle_of(b), None, "the mapping no longer covers b");
+        assert_eq!(stale.topo_order(&ids), normal, "bail == full sorted set");
     }
 }

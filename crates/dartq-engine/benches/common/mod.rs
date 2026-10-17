@@ -1,7 +1,20 @@
-//! Shared §19.3 benchmark fixture: a throwaway pub workspace + synthetic
-//! SDK + the engine assembly the `dartq check` pipeline runs (§2.2).
+//! Shared benchmark fixture: a throwaway pub workspace + synthetic
+//! SDK + the engine assembly the `dartq check` pipeline runs.
 //! Execution is deferred to the serial phase; these skeletons exist so the
-//! metric extraction code is pinned and reviewable (PRD §19.3).
+//! metric extraction code is pinned and reviewable.
+//!
+//! Cost-axis convention for every bench in this directory (#1320 audit):
+//! a reported figure is exactly one of
+//!
+//! * **whole-run amortized** — cold walls (engine build + discovery + full
+//!   analysis) normalized by a workspace total (LOC, diagnostics, files);
+//!   cold cost is included in every derived per-unit figure, or
+//! * **marginal** — per-operation walls on an already-warm engine
+//!   (edit+analyze, apply, query); fixture build, discovery, and warm-up
+//!   sit outside the timed region.
+//!
+//! The two never share one number and are never compared as like-for-like;
+//! each bench's acceptance-axis line names its axis explicitly.
 
 #![allow(dead_code)]
 
@@ -22,7 +35,7 @@ pub const LIB_B: &str = "import 'c.dart';\n\nString libB() => libC();\n";
 pub const LIB_C: &str = "String libC() => 'c';\n";
 
 /// The libraries the incremental bench edits (comment churn: same shape,
-/// different bytes — the L1 cascade hits, the ContentId gate passes).
+/// different bytes — the L1 cascade hits, the `ContentId` gate passes).
 pub const LIB_A_EDITED: &str =
     "import 'b.dart';\n\n// edited\nvoid topA() {\n  print(libB());\n}\n";
 
@@ -120,6 +133,7 @@ impl Fixture {
             semdiag: None,
             target: dartq_engine::DEFAULT_TARGET.to_owned(),
             declared_variables: rustc_hash::FxHashMap::default(),
+            experiments: Vec::new(),
         })
         .expect("engine")
     }
@@ -137,6 +151,7 @@ impl Fixture {
             semdiag: Some(dartq_engine::semdiag::diagnoser()),
             target: dartq_engine::DEFAULT_TARGET.to_owned(),
             declared_variables: rustc_hash::FxHashMap::default(),
+            experiments: Vec::new(),
         })
         .expect("engine")
     }
@@ -157,7 +172,7 @@ impl Drop for Fixture {
 pub fn part_library(parts: usize) -> Vec<(String, String)> {
     let mut main = String::from("library;\n");
     for i in 1..=parts {
-        let _ = write!(main, "part 'p{i:03}.dart';\n");
+        let _ = writeln!(main, "part 'p{i:03}.dart';");
     }
     main.push_str("\nvoid top() {\n  print(g001(1));\n}\n");
     let mut libraries = Vec::with_capacity(parts + 1);
@@ -178,7 +193,30 @@ pub fn part_library(parts: usize) -> Vec<(String, String)> {
 
 static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// The hub shape the query join's growth axis measures: `count` libraries
+/// that each declare a same-named top-level `hub` and call it (each use
+/// resolves to its own file's declaration — locals beat imports). Every
+/// file posts `hub` to both query faces, so the join iterates D declaring
+/// files × L referencing libraries; its probe term (quadratic before the
+/// name-keyed join, linear after) reads off the p95/max deltas between two
+/// `DARTQ_BENCH_PARTS` scales.
+pub fn hub_library(count: usize) -> Vec<(String, String)> {
+    (0..count)
+        .map(|i| {
+            (
+                format!("lib/h{i:03}.dart"),
+                "void hub() {}\n\nvoid caller() {\n  hub();\n}\n".to_string(),
+            )
+        })
+        .collect()
+}
+
 /// Percentile of a sorted sample (nearest-rank).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)] // span arithmetic narrows under the scanner u32 offset cap
 pub fn percentile(sorted: &[Duration], p: f64) -> Duration {
     let index = ((sorted.len() as f64 - 1.0) * p).round() as usize;
     sorted[index.min(sorted.len() - 1)]
@@ -187,6 +225,12 @@ pub fn percentile(sorted: &[Duration], p: f64) -> Duration {
 /// Milliseconds with one decimal.
 pub fn millis(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
+}
+
+/// Microseconds with one decimal — the resolution the marginal warm-cycle
+/// walls (zero-dirty analyze, query) report at.
+pub fn micros(d: Duration) -> f64 {
+    d.as_secs_f64() * 1_000_000.0
 }
 
 /// A simple wall-clock helper for phase timing.

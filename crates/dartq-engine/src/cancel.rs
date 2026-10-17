@@ -1,4 +1,4 @@
-//! Cooperative cancellation (engine-api-spec §1.5, incremental-l1-spec §5.3).
+//! Cooperative cancellation.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///
 /// Carries no partial diagnostics: libraries that finished their recompute
 /// before the checkpoint keep their cached results (a complete unit per the
-/// §3.1 per-library cache), everything else stays dirty and is recomputed by
+/// per-library cache), everything else stays dirty and is recomputed by
 /// the next `analyze`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cancelled;
@@ -16,7 +16,7 @@ pub struct Cancelled;
 ///
 /// Checkpoints fire at **library granularity only** — before each library
 /// recompute in `pipeline.rs`; scan/parse are single passes with no
-/// checkpoint, matching checkpoint density to work granularity (PRD §16.6).
+/// checkpoint, matching checkpoint density to work granularity.
 /// No async runtime, no watcher thread: the M1 CLI constructs a
 /// never-cancelled token; the type exists for tests and the future daemon.
 #[derive(Clone, Default)]

@@ -40,24 +40,54 @@
 //!
 //! `dartq_semantic::diagnose_with` re-folds the collector's capture-time
 //! duplicate log into its report front; the bake in
-//! [`l1::duplicate_diagnostics`] is the single source, so the fold drops the
+//! `l1::duplicate_diagnostics` is the single source, so the fold drops the
 //! re-issued `duplicate_definition`s and passes everything else through.
-//! The report's §8 names rows ([`dartq_semantic::FileReport::names`]) stay
+//! The report's names rows ([`dartq_semantic::FileReport::names`]) stay
 //! unmounted until #122 moves the names table behind dartq-index.
-
-use std::sync::Arc;
+//!
+//! # The member-fold memo (#1384)
+//!
+//! The fold is memoized per member: a member whose identity inputs stood —
+//! its own content id, the graph generation, the owning library's cycle
+//! fingerprint, the strict modes, and the posture epoch — is served
+//! byte-identical from the engine state's semdiag memo, skipping the text
+//! decode, the scan-face lookup, and the parse+resolve fold; only members
+//! whose faces moved re-fold. The inputs are exactly
+//! what `diagnose_unit` reads beyond the unit's own face, and the fold is
+//! deliberately NOT treated as monotone (a dependency edit can remove a
+//! row as easily as add one), so no dirty-front pruning decides validity —
+//! the key proves freshness outright or the fold reruns. The cycle
+//! fingerprint is the load-bearing component: it folds every member face
+//! and every transitive dependency face, which is precisely the face set
+//! the fold observes through the namespaces + element index, and it is the
+//! same trust the L2 result-reuse gate already runs on (g485 W2). The
+//! posture epoch covers the one input no fingerprint folds — a `// @dart`
+//! header edit moves the `class-modifiers` posture under a standing
+//! signature. The memo is consumed only where the fold runs (inside the
+//! analyze, past the apply), so unlike the reachability memo it carries no
+//! applied/stale window: a stale entry just misses its key.
 
 #[cfg(test)]
 use std::cell::Cell;
+use std::sync::Arc;
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 
 use dartq_diagnostics::Diagnostic;
+use dartq_language::Feature;
 use dartq_parser::ParserFeatures;
-use dartq_semantic::{ElementIndex, LibraryUsages};
-use dartq_source::FileId;
+use dartq_resolution::LibraryClassModifiers;
+use dartq_semantic::{
+    ElementIndex, ExportUseFace, ImportUseFace, LibraryUsages, StrictModes, UnitUseFace,
+};
+use dartq_source::{ContentId, FileId};
 use rustc_hash::FxHashMap;
+use std::sync::PoisonError;
 
 use crate::l1;
-use crate::state::UnitFacts;
+use crate::pipeline::ResolvedGraph;
+use crate::state::{EngineState, ScannedFace, UnitFacts};
 use crate::{LibraryView, SemanticDiagnoser};
 
 // Test-only build counter for the #775 sharing pin: counting invocations
@@ -96,12 +126,189 @@ pub(crate) fn build_index(facts: &FxHashMap<FileId, Arc<UnitFacts>>) -> ElementI
     index
 }
 
+/// The per-library `class-modifiers` posture (#1294): every live engine
+/// library's defining file's settled version (the `@dart` override applied)
+/// resolved through the feature registry (`class-modifiers`, `enabledIn
+/// 3.0.0`). Built once per analyze beside the element index and shared by
+/// reference through the whole fan-out; the graph's synthetic `dart:` face
+/// nodes have no engine-library mapping (`ResolvedGraph::graph_ids`) and
+/// stay absent — [`LibraryClassModifiers`] answers them the modern posture,
+/// which is what the platform libraries carry upstream.
+pub(crate) fn build_class_modifiers(
+    state: &mut EngineState,
+    resolved: &ResolvedGraph,
+) -> LibraryClassModifiers {
+    // The defining files snapshot first: the posture walk needs `&mut`
+    // (the cache fill) and `iter_infos` borrows `state` immutably for the
+    // whole loop.
+    let defining_files: Vec<(dartq_resolution::LibraryId, FileId)> = state
+        .libraries
+        .iter_infos()
+        .filter_map(|(library, info)| {
+            resolved
+                .graph_ids
+                .get(&library)
+                .map(|&graph_library| (graph_library, info.defining))
+        })
+        .collect();
+    let mut posture = LibraryClassModifiers::default();
+    for (graph_library, defining) in &defining_files {
+        posture.insert(*graph_library, class_modifiers_of(state, *defining));
+    }
+    posture
+}
+
+/// `Feature::ClassModifiers` at `file`'s settled version: the persisted
+/// scan face when cached, else a local re-derivation persisted under the
+/// facts key — the same miss shape the fold's own member loop and the
+/// apply-phase recompute follow, so a warm-start or evicted face is derived
+/// exactly once per analyze and every later consumer hits.
+fn class_modifiers_of(state: &mut EngineState, file: FileId) -> bool {
+    if let Some(face) = state.settled_face(file) {
+        return face.features.is_enabled(Feature::ClassModifiers);
+    }
+    let content = state.residency[&file].content;
+    let key = l1::facts_key(&state.grants(), file, content);
+    // The resident content backs the facts (the residency contract) and is
+    // lossy-decoded UTF-8 (the store contract) — a pairing miss skips the
+    // fold and records a bounded degrade row: the posture answers the
+    // modern face (what an absent map entry means) and the next apply
+    // re-captures the file.
+    let Some(bytes) = state.store.get(content) else {
+        state.residency_degrades.record(&[(file, "store")]);
+        return true;
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        state.residency_degrades.record(&[(file, "utf8")]);
+        return true;
+    };
+    let version = l1::language_version_for(&state.packages, &state.files, file);
+    let (feature_set, settled, scanned, _) = l1::scan_unit(text, version, file, &state.grants());
+    state.cache_scanned(
+        key,
+        ScannedFace {
+            tokens: scanned.tokens,
+            features: feature_set,
+            version: settled,
+        },
+    );
+    feature_set.is_enabled(Feature::ClassModifiers)
+}
+
 /// The default semantic diagnoser over [`LibraryView`] (stateless; the
 /// analyze fan-out shares one instance across workers).
 pub struct Diagnoser;
 
+/// The per-library identity inputs of the member fold (#1384): everything
+/// `dartq_semantic::diagnose_unit` reads beyond the unit's own face. Two
+/// members fold identically iff these stood alongside their content ids —
+/// the graph generation pins the graph and its namespaces, the cycle
+/// fingerprint pins every member and transitive dependency element face
+/// the resolution walk can reach (the same trust the L2 result-reuse gate
+/// runs on), the strict modes pin the options face, and the posture epoch
+/// pins the settled feature faces the `class-modifiers` posture derives
+/// from (an `// @dart` header edit moves those under a standing
+/// signature — no per-library fingerprint folds them).
+#[derive(Clone, Copy)]
+pub(crate) struct FoldInputs {
+    pub(crate) generation: u32,
+    pub(crate) fingerprint: dartq_semantic::ApiSignature,
+    pub(crate) strict: StrictModes,
+    pub(crate) posture_epoch: u32,
+}
+
+/// One member's memoized fold (#1384): the identity the product was folded
+/// under and the product itself — the duplicate-filtered diagnostic rows
+/// (the bake in `l1::duplicate_diagnostics` is the single source, and the
+/// filter is a pure function of the report) and the unit use face the
+/// substrate closes per library. `names` stays unmounted exactly as the
+/// live fold leaves it (#122). The rows are refcounted once here (#1501):
+/// the per-library results hold handles to these very rows, so a fold's
+/// bytes exist once across the memo, its library's run, and the merged
+/// output's clone.
+pub(crate) struct MemberFold {
+    inputs: FoldInputs,
+    content: ContentId,
+    diagnostics: Arc<[Arc<Diagnostic>]>,
+    face: Arc<UnitUseFace>,
+}
+
+impl MemberFold {
+    /// Whether this product answers a fold of `content` under `inputs`:
+    /// exact field equality — the fold is not monotone (a dependency edit
+    /// removes rows as readily as it adds them), so freshness is proven,
+    /// never inferred from a dirty front.
+    fn serves(&self, content: ContentId, inputs: &FoldInputs) -> bool {
+        self.content == content
+            && self.inputs.generation == inputs.generation
+            && self.inputs.fingerprint == inputs.fingerprint
+            && self.inputs.strict == inputs.strict
+            && self.inputs.posture_epoch == inputs.posture_epoch
+    }
+}
+
+/// The fold map plus the calling library's identity inputs, handed to the
+/// diagnoser through [`LibraryView`]. Copyable — one probe/insert pair per
+/// member, the guard covers hash operations only (the grants-memo
+/// precedent), and the fold itself runs outside it.
+#[derive(Clone, Copy)]
+pub(crate) struct MemoHandle<'a> {
+    pub(crate) memo: &'a Mutex<crate::state::SemdiagMemo>,
+    pub(crate) inputs: FoldInputs,
+}
+
+impl MemoHandle<'_> {
+    /// The member's standing product, when its identity stood.
+    fn hit(&self, file: FileId, content: ContentId) -> Option<Arc<MemberFold>> {
+        let memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner);
+        let fold = memo
+            .folds
+            .get(&file)
+            .filter(|fold| fold.serves(content, &self.inputs))?;
+        #[cfg(test)]
+        memo.serves.fetch_add(1, Ordering::Relaxed);
+        Some(Arc::clone(fold))
+    }
+
+    /// Stores the freshly folded product under the member's file.
+    fn insert(&self, file: FileId, fold: MemberFold) {
+        self.memo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .folds
+            .insert(file, Arc::new(fold));
+    }
+}
+
+/// Clones a unit use face — the memo serves faces into the substrate by
+/// value and `UnitUseFace` is not `Clone` upstream. Kept here because only
+/// the memo needs it; a new `UnitUseFace` field breaks this compile-time,
+/// so the clone cannot silently drop one.
+fn clone_use_face(face: &UnitUseFace) -> UnitUseFace {
+    UnitUseFace {
+        used: face.used.clone(),
+        reads: face.reads.clone(),
+        annotations: face.annotations.clone(),
+        imports: face
+            .imports
+            .iter()
+            .map(|import| ImportUseFace {
+                prefix: import.prefix,
+                shown: import.shown.clone(),
+            })
+            .collect(),
+        exports: face
+            .exports
+            .iter()
+            .map(|export| ExportUseFace {
+                shown: export.shown.clone(),
+            })
+            .collect(),
+    }
+}
+
 impl SemanticDiagnoser for Diagnoser {
-    fn diagnose_library(&self, library: LibraryView<'_>, out: &mut Vec<Diagnostic>) {
+    fn diagnose_library(&self, library: LibraryView<'_>, out: &mut Vec<Arc<Diagnostic>>) {
         let duplicate = duplicate_definition_name();
         // The M3 U1 use-face substrate (#767): every fold emits its unit's
         // face alongside the report, and the library's faces close into the
@@ -114,8 +321,29 @@ impl SemanticDiagnoser for Diagnoser {
         let mut usages = LibraryUsages::default();
         for &file in library.files {
             let facts = &library.facts[&file];
-            let bytes = library.store.get(facts.content).expect("resident content");
-            let text = std::str::from_utf8(bytes).expect("engine content is UTF-8");
+            // The member-level memo (#1384): a member whose identity inputs
+            // stood is served byte-identical — the text decode, the
+            // scan-face lookup, and the parse+resolve fold all skip. The
+            // use face re-enters the substrate by clone, so the consumed
+            // set closes exactly as a re-fold would have closed it.
+            if let Some(fold) = library.memo.hit(file, facts.content) {
+                out.extend(fold.diagnostics.iter().cloned());
+                usages.add_unit(library.graph_library, clone_use_face(&fold.face));
+                continue;
+            }
+            // The member's facts' content is resident in the store (the
+            // residency contract) and lossy-decoded UTF-8 (the store
+            // contract): a pairing miss skips the unit's fold — no
+            // diagnostics, no use face — and records a bounded degrade
+            // row; the next apply re-captures the file.
+            let Some(bytes) = library.store.get(facts.content) else {
+                library.degrades.record(&[(file, "store")]);
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                library.degrades.record(&[(file, "utf8")]);
+                continue;
+            };
             // The persisted scan face; a miss (eviction above the cache cap)
             // re-derives the identical face — the scan the apply recompute
             // would have run.
@@ -125,7 +353,7 @@ impl SemanticDiagnoser for Diagnoser {
             } else {
                 let version = l1::language_version_for(library.packages, library.file_table, file);
                 let grants = l1::Grants {
-                    grants: library.grants,
+                    tables: library.grants,
                     experiments: &library.sdk.platform_metadata,
                     packages: library.packages,
                     files: library.file_table,
@@ -151,13 +379,39 @@ impl SemanticDiagnoser for Diagnoser {
                 // item 4): resolved from the governing analysis options at
                 // the view build, all-off without any.
                 library.strict,
+                // The per-library `class-modifiers` posture (#1294): the
+                // analyzed set's defining files' settled versions resolved
+                // through the feature registry, once per analyze (see
+                // `build_class_modifiers`).
+                library.class_modifiers,
+                // The field-promotion grant (#1417): the unit's own settled
+                // feature set — the `@dart` override applied (`scanned`'s
+                // persisted face or the re-derivation above) — so a
+                // pre-3.2 library analyzes with promotion off.
+                feature_set.is_enabled(Feature::InferenceUpdate2),
             );
-            usages.add_unit(library.graph_library, face);
-            out.extend(
-                report
-                    .diagnostics
-                    .into_iter()
-                    .filter(|diagnostic| diagnostic.code.name != duplicate),
+            // The bake in `l1::duplicate_diagnostics` is the single source,
+            // so the fold drops the re-issued rows; the filtered set is
+            // what the memo stores (the filter is a pure function of the
+            // report and the constant code name). Each row takes its
+            // refcount once here (#1501): the run and the merged output
+            // hold handles or a single served clone, never fresh bytes.
+            let rows: Vec<Arc<Diagnostic>> = report
+                .diagnostics
+                .into_iter()
+                .filter(|diagnostic| diagnostic.code.name != duplicate)
+                .map(Arc::new)
+                .collect();
+            out.extend(rows.iter().cloned());
+            usages.add_unit(library.graph_library, clone_use_face(&face));
+            library.memo.insert(
+                file,
+                MemberFold {
+                    inputs: library.memo.inputs,
+                    content: facts.content,
+                    diagnostics: rows.into(),
+                    face: Arc::new(face),
+                },
             );
         }
         let _consumed = usages.close_library_usage(library.graph_library);
@@ -177,7 +431,7 @@ mod tests {
     use dartq_pub::{LockFile, PackageConfig, Pubspec, build_graph};
     use dartq_sdk::SdkSnapshot;
     use dartq_source::{FileTable, LineIndex, StringTable, content_hash};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
     use crate::{CancellationToken, Engine, EngineConfig, memory_store};
@@ -218,16 +472,19 @@ mod tests {
         }
     }
 
-    /// Analyzes a two-library single-package workspace through the real
+    /// Analyzes a three-library single-package workspace through the real
     /// engine (the l1/persist unit-test fixture shape): synthetic SDK, the
     /// real pub/package faces, `semdiag` wired as the diagnoser. `main`
     /// imports `other` (a sibling library, not a part), so `main`'s member
-    /// walk must consult `other` through the residency-wide shared index.
+    /// walk must consult `other` through the residency-wide shared index;
+    /// `old` is a third sibling for the cross-library posture tests (its
+    /// content carries its own `// @dart` header when one is needed).
     /// Returns main's file id plus the merged analyze diagnostics.
-    fn analyze_two_libraries(
+    fn analyze_libraries(
         semdiag: Arc<dyn SemanticDiagnoser>,
         main: &str,
         other: &str,
+        old: &str,
     ) -> (FileId, Vec<Diagnostic>) {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -301,6 +558,7 @@ mod tests {
         .expect("engine");
         let main_file = engine.set_content(&root.join("lib/main.dart"), main.as_bytes());
         engine.set_content(&root.join("lib/other.dart"), other.as_bytes());
+        engine.set_content(&root.join("lib/old.dart"), old.as_bytes());
         let diagnostics = engine
             .analyze(&[], &mut |_| {}, &CancellationToken::default())
             .expect("analyze completes");
@@ -316,10 +574,11 @@ mod tests {
     /// pinned through the real engine fan-out.
     #[test]
     fn cross_library_superclass_emits_end_to_end() {
-        let (main_file, diagnostics) = analyze_two_libraries(
+        let (main_file, diagnostics) = analyze_libraries(
             diagnoser(),
             "import 'other.dart';\nclass B extends A { void f() {} }\n",
             "class A { void f(int x) {} }\n",
+            "class O {}\n",
         );
         let overrides: Vec<_> = diagnostics
             .iter()
@@ -342,10 +601,11 @@ mod tests {
     /// actually fired.
     #[test]
     fn extends_overflow_residue_is_never_a_super_face_across_libraries() {
-        let (main_file, diagnostics) = analyze_two_libraries(
+        let (main_file, diagnostics) = analyze_libraries(
             diagnoser(),
             "import 'other.dart';\nclass A {}\nclass C extends A, B { void f() {} }\n",
             "class B { void f(int x) {} }\n",
+            "class O {}\n",
         );
         assert!(
             !diagnostics
@@ -368,7 +628,7 @@ mod tests {
     struct FoldProbe(AtomicUsize);
 
     impl SemanticDiagnoser for FoldProbe {
-        fn diagnose_library(&self, _library: LibraryView<'_>, _out: &mut Vec<Diagnostic>) {
+        fn diagnose_library(&self, _library: LibraryView<'_>, _out: &mut Vec<Arc<Diagnostic>>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -386,10 +646,11 @@ mod tests {
     fn one_index_shared_across_the_analyze_fan_out() {
         let probe = Arc::new(FoldProbe(AtomicUsize::new(0)));
         BUILD_INDEX_CALLS.with(|calls| calls.set(0));
-        let (_, diagnostics) = analyze_two_libraries(
+        let (_, diagnostics) = analyze_libraries(
             Arc::clone(&probe) as Arc<dyn SemanticDiagnoser>,
             "import 'other.dart';\nclass B extends A {}\n",
             "class A {}\n",
+            "class O {}\n",
         );
         let folds = probe.0.load(Ordering::Relaxed);
         assert!(
@@ -401,5 +662,340 @@ mod tests {
             builds, 1,
             "one index build per analyze, not one per fold: {builds} builds for {folds} folds"
         );
+    }
+
+    /// The pre-3.0 posture pin (probe P2, guard half): a `// @dart=2.19`
+    /// use site does NOT blanket-suppress the outside-library family — the
+    /// platform exemption needs an SDK *supertype* library, and a modern
+    /// user library's `final class` is never exempt (`_mayIgnoreClassModifiers`,
+    /// error_verifier.dart:8471-8472). Guards the posture gate against an
+    /// over-broad fix; the oracle reports the same row.
+    #[test]
+    fn pre_feature_use_site_still_reports_user_final_supers() {
+        let (main_file, diagnostics) = analyze_libraries(
+            diagnoser(),
+            "// @dart=2.19\nimport 'other.dart';\nclass Z extends F {}\n",
+            "final class F {}\n",
+            "class O {}\n",
+        );
+        let rows: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.file == main_file && d.code.name == "invalid_use_of_type_outside_library")
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].message,
+            "The class 'F' can't be extended outside of its library because it's a final class."
+        );
+    }
+
+    /// The posture gate's observable face (#1294): the implements walk's
+    /// indirect-supertype skip (error_verifier.dart:5641-5648) reads the
+    /// *named* declaration's library posture — a `// @dart=2.19` naming
+    /// library (no class modifiers) lets the walk reach the transitive
+    /// `final` supertype in the modern third library, so
+    /// `final_class_implemented_outside_of_library` fires at the modern use
+    /// site. Under the retired hardcoded modern posture the walk skipped
+    /// and the row was absent; the oracle reports it.
+    #[test]
+    fn pre_feature_naming_library_lets_the_implements_walk_reach_final() {
+        let (main_file, diagnostics) = analyze_libraries(
+            diagnoser(),
+            "import 'old.dart';\nclass X implements F {}\n",
+            "final class G {}\n",
+            "// @dart=2.19\nimport 'other.dart';\nclass F extends G {}\n",
+        );
+        let rows: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.file == main_file && d.code.name == "invalid_use_of_type_outside_library")
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].message,
+            "The class 'G' can't be implemented outside of its library because it's a final class."
+        );
+    }
+
+    /// A throwaway single-package workspace for the memo pin: the
+    /// synthetic-SDK fixture shape, sources mounted through `set_content`
+    /// by the caller (so one root backs the incremental engine and every
+    /// per-step wholesale oracle). Returns the canonicalized root.
+    fn memo_workspace() -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dartq-engine-semdiag-memo-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, content).expect("file");
+        };
+        write(
+            "pubspec.yaml",
+            "name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            "pubspec.lock",
+            "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+        );
+        write(
+            ".dart_tool/package_config.json",
+            r#"{"configVersion": 2, "packages": [{"name": "t", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+        );
+        write("sdk/version", "3.13.1\n");
+        write(
+            "sdk/lib/libraries.json",
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+        );
+        write(
+            "sdk/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        );
+        // Canonicalize before the pub faces resolve it (the #287 spelling
+        // universe — macOS /var vs /private/var).
+        root.canonicalize().expect("fixture root resolves")
+    }
+
+    /// A fresh default-diagnoser engine over [`memo_workspace`]'s faces —
+    /// the wholesale oracle the pin rebuilds per step.
+    fn memo_engine(root: &Path) -> Engine {
+        let config_dir = root.join(".dart_tool");
+        let config = Arc::new(
+            PackageConfig::parse(
+                &std::fs::read_to_string(config_dir.join("package_config.json")).expect("config"),
+            )
+            .expect("valid config"),
+        );
+        let lock = LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
+            .expect("valid lock");
+        let root_pubspec = Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
+            .expect("valid pubspec");
+        let graph = build_graph(
+            &config,
+            &lock,
+            &root_pubspec,
+            &std::collections::BTreeMap::new(),
+            None,
+            &config_dir,
+        )
+        .expect("graph");
+        Engine::new(EngineConfig {
+            store: memory_store(),
+            sdk: SdkSnapshot::load(&root.join("sdk"), None).expect("synthetic SDK loads"),
+            packages: PackageTable::build(&config, &graph, &config_dir).expect("table"),
+            pub_config: Arc::clone(&config),
+            config_dir,
+            semdiag: Some(diagnoser()),
+            target: crate::DEFAULT_TARGET.to_owned(),
+            declared_variables: rustc_hash::FxHashMap::default(),
+            experiments: Vec::new(),
+        })
+        .expect("engine")
+    }
+
+    /// The pin's byte-identity face: every diagnostic field projected
+    /// across engines, the file spelled by its path (`FileId`s are
+    /// per-engine internings).
+    fn canonical_rows(
+        engine: &Engine,
+        rows: &[Diagnostic],
+    ) -> Vec<(String, String, String, String, String, Option<String>)> {
+        rows.iter()
+            .map(|row| {
+                (
+                    engine
+                        .file_table()
+                        .path(row.file)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                    row.code.name.to_string(),
+                    format!("{:?}", row.severity),
+                    row.message.to_string(),
+                    format!("{:?}", row.range),
+                    row.correction.as_deref().map(str::to_owned),
+                )
+            })
+            .collect()
+    }
+
+    /// The wholesale check: a fresh cold engine over the same current
+    /// contents must produce byte-identical rows to the memo-served
+    /// incremental engine (the pre-memo eager fold is a cold engine's
+    /// every-member recompute).
+    fn assert_matches_wholesale(
+        root: &Path,
+        engine: &Engine,
+        current: &[(String, String)],
+        served: &[Diagnostic],
+    ) {
+        let mut oracle = memo_engine(root);
+        for (relative, content) in current {
+            oracle.set_content(&root.join(relative), content.as_bytes());
+        }
+        let expected = oracle
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("oracle analyze");
+        assert_eq!(
+            canonical_rows(engine, served),
+            canonical_rows(&oracle, &expected),
+            "memo-served output diverged from a wholesale recompute over {current:?}",
+        );
+    }
+
+    /// The memo serves this session (the pin's liveness evidence).
+    fn memo_serves(engine: &Engine) -> usize {
+        engine
+            .state
+            .semdiag
+            .lock()
+            .expect("semdiag memo mutex")
+            .serves
+            .load(Ordering::Relaxed)
+    }
+
+    /// The salvage pin (#1384), the `salvaged_map_matches_wholesale_over_edits`
+    /// shape: the steps sweep the memo's decision paths — the standing
+    /// member salvaged beside its re-folded library (step 1), the
+    /// generation-forked wholesale rerun (steps 2-4) — and the served output
+    /// stays byte-identical to a cold wholesale recompute over the same
+    /// contents. Step 5 is the one where keying on (content, graph
+    /// generation) alone would be wrong: a dependency's MEMBER-face move
+    /// rebuilds neither the graph nor any member's content, but it moves
+    /// the owning library's cycle fingerprint and `p1`'s `undefined_method`
+    /// row must clear through a fresh fold — the non-monotone direction.
+    #[test]
+    fn memo_served_folds_match_wholesale_over_edits() {
+        let root = memo_workspace();
+        let mut engine = memo_engine(&root);
+        let main_base = "import 'other.dart';\npart 'p1.dart';\n\nvoid top() {\n  ghost();\n}\n\nclass UsesOther {\n  final Other o;\n  UsesOther(this.o);\n}\n";
+        let p1_base = "part of 'main.dart';\n\nint g1(int x) => x;\n";
+        let other_base = "class Other {\n  void m() {}\n}\n";
+        // Current contents in canonical mount order — the oracle mounts
+        // exactly this list, so the two engines see identical workspaces.
+        let mut current: Vec<(String, String)> = vec![
+            ("lib/main.dart".into(), main_base.into()),
+            ("lib/p1.dart".into(), p1_base.into()),
+            ("lib/other.dart".into(), other_base.into()),
+        ];
+        for (relative, content) in &current {
+            engine.set_content(&root.join(relative), content.as_bytes());
+        }
+        let analyze = |engine: &mut Engine| {
+            engine
+                .analyze(&[], &mut |_| {}, &CancellationToken::default())
+                .expect("analyze")
+        };
+
+        // 0 — the cold build: every fold fresh, and the pin is live (the
+        // undefined `ghost` reports at main).
+        let out = analyze(&mut engine);
+        assert!(
+            out.iter().any(|row| row.code.name == "undefined_function"),
+            "{out:?}"
+        );
+        assert_eq!(memo_serves(&engine), 0, "a cold build serves nothing");
+        assert_matches_wholesale(&root, &engine, &current, &out);
+
+        // 1 — comment churn on the defining file: the library recomputes
+        // (its content identity moved), the standing part's fold is served
+        // byte-identical — the no-op-fold salvage the ticket names. The
+        // churn appends after every token: signature v6's member
+        // name-token anchor (#1867, the cross-file context-row face) hashes
+        // member spans, so a byte-shifting insertion upstream of
+        // `UsesOther`'s members (e.g. before `void top`) moves the anchor
+        // face, forks the cycle fingerprint, and the part legitimately
+        // re-folds — the adjudicated trade that the byte-consistency gate
+        // outranks the comment-churn cascade saving. A trailing comment
+        // moves no anchor, so the fingerprint — and with it the part's
+        // memo key — stands.
+        current[0].1 = format!("{main_base}// churn\n");
+        engine.set_content(&root.join("lib/main.dart"), current[0].1.as_bytes());
+        let out = analyze(&mut engine);
+        assert_eq!(
+            memo_serves(&engine),
+            1,
+            "exactly the standing part is salvaged"
+        );
+        assert_matches_wholesale(&root, &engine, &current, &out);
+
+        // 2 — member edit: p1's bytes move, its fold reruns and reports the
+        // unresolved `n` (`Other.n()` is an invocation, the static face's
+        // `undefined_method` shape). The edit adds a top-level declaration,
+        // so the structural face moves and the graph generation forks every
+        // memo key — nothing is salvaged, the same wholesale posture step 3
+        // takes.
+        current[1].1 = format!("{p1_base}\nint h2() => Other.n();\n");
+        engine.set_content(&root.join("lib/p1.dart"), current[1].1.as_bytes());
+        let out = analyze(&mut engine);
+        assert!(
+            out.iter().any(|row| row.code.name == "undefined_method"),
+            "{out:?}"
+        );
+        assert_eq!(
+            memo_serves(&engine),
+            1,
+            "the generation fork salvages nothing — the tally holds step 1's \
+             standing-part serve"
+        );
+        assert_matches_wholesale(&root, &engine, &current, &out);
+
+        // 3 — member add: the membership move is structural, the graph
+        // generation forks every key, and the fold reruns wholesale.
+        current[0].1 = current[0]
+            .1
+            .replace("part 'p1.dart';", "part 'p1.dart';\npart 'p2.dart';");
+        current.push((
+            "lib/p2.dart".into(),
+            "part of 'main.dart';\n\nvoid fromP2() {}\n".into(),
+        ));
+        engine.set_content(&root.join("lib/main.dart"), current[0].1.as_bytes());
+        engine.set_content(&root.join("lib/p2.dart"), current[3].1.as_bytes());
+        let out = analyze(&mut engine);
+        assert_eq!(
+            memo_serves(&engine),
+            1,
+            "a structural move salvages nothing"
+        );
+        assert_matches_wholesale(&root, &engine, &current, &out);
+
+        // 4 — member remove: p2 leaves with its part line, same wholesale
+        // posture.
+        current[0].1 = current[0].1.replace("\npart 'p2.dart';", "");
+        current.pop();
+        engine.set_content(&root.join("lib/main.dart"), current[0].1.as_bytes());
+        engine
+            .remove_file(&root.join("lib/p2.dart"))
+            .expect("remove");
+        let out = analyze(&mut engine);
+        assert_eq!(memo_serves(&engine), 1);
+        assert_matches_wholesale(&root, &engine, &current, &out);
+
+        // 5 — the decisive non-monotone case: a dependency's member-face
+        // move (`n` comes into existence) rebuilds neither the graph nor
+        // any member's content, but it moves main's library cycle
+        // fingerprint, so p1's stale `undefined_method` row must clear
+        // through a fresh fold. Keying on (content, generation) alone
+        // would serve the stale row here.
+        let generation_before = engine.state.graph_generation;
+        current[2].1 = "class Other {\n  void m() {}\n  void n() {}\n}\n".into();
+        engine.set_content(&root.join("lib/other.dart"), current[2].1.as_bytes());
+        let out = analyze(&mut engine);
+        assert_eq!(
+            engine.state.graph_generation, generation_before,
+            "a member-face move must not rebuild the graph — the fingerprint is what invalidates"
+        );
+        assert!(
+            !out.iter().any(|row| row.code.name == "undefined_method"),
+            "the dependency's new member resolves through the fresh fold: {out:?}"
+        );
+        assert_eq!(
+            memo_serves(&engine),
+            1,
+            "the fingerprint move forks every key — nothing stale is served"
+        );
+        assert_matches_wholesale(&root, &engine, &current, &out);
     }
 }

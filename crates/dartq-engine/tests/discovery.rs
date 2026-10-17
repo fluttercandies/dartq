@@ -69,3 +69,35 @@ fn discovery_includes_symlinked_files_not_symlinked_dirs() {
         );
     }
 }
+
+/// A discovered file over the engine's span capacity
+/// ([`dartq_source::MAX_SOURCE_BYTES`]) is rejected at the open gate and
+/// never enters the set: not interned, not counted, and reported in
+/// `DiscoveryStats::oversized` for the faces' notice channel (#1543). The
+/// fixture is a sparse file — `set_len` sizes it without writing blocks,
+/// so the test costs no disk and no read pass; what the gate checks is
+/// exactly the metadata length the fixture sets.
+#[test]
+fn discovery_skips_files_over_the_span_capacity() {
+    use common::Fixture;
+
+    let fixture = Fixture::new(&[("lib/real.dart", "void real() {}\n")]);
+    let huge = std::fs::File::create(fixture.path("lib/huge.dart")).expect("create fixture");
+    huge.set_len(dartq_source::MAX_SOURCE_BYTES as u64 + 1)
+        .expect("size fixture");
+    drop(huge);
+
+    let mut engine = fixture.engine();
+    let stats = engine.discover_workspace().expect("discovery");
+    engine.apply_pending(&mut |_| {});
+
+    assert_eq!(stats.file_count, 1, "only real.dart enters the set");
+    assert_eq!(stats.oversized, vec![fixture.path("lib/huge.dart")]);
+    assert!(
+        engine
+            .file_table()
+            .try_file_id(&fixture.path("lib/huge.dart"))
+            .is_none(),
+        "rejected file must not be interned"
+    );
+}

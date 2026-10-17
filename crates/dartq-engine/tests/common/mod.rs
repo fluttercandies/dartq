@@ -1,6 +1,6 @@
 //! Shared integration-test fixture: a throwaway pub workspace + synthetic
 //! VM-segment SDK, assembled through the real dartq-pub/dartq-package/
-//! dartq-sdk faces (the engine-api-spec §2.2 M1 assembly, minus the CLI).
+//! dartq-sdk faces.
 
 #![allow(dead_code)]
 
@@ -17,13 +17,20 @@ use dartq_sdk::SdkSnapshot;
 pub const MAIN_0: &str = "import 'greeter.dart';\n\nvoid main() {\n  print(greet());\n}\n";
 /// The imported library (valid — no diagnostics expected from the pair).
 pub const GREETER_0: &str = "String greet() => 'hi';\n";
-/// Edited import target: same shape, different bytes (ContentId gate must pass).
+/// Edited import target: same shape, different bytes (`ContentId` gate must pass).
 pub const GREETER_1: &str = "String greet() => 'hello';\n";
 /// Standalone library: imports nothing, imported by nothing — it never enters
 /// any cascade, so it serves as the clean analysis target.
 pub const STANDALONE_0: &str = "int standalone() => 3;\n";
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// The empty experiment whitelist — the zero-grant baseline.
+const NO_EXPERIMENTS: &str = r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#;
+
+/// The whitelist granting `enhanced-parts` to the SDK's default set and to
+/// package `fixture` (audit #708 P2-1's grants shape).
+const ENHANCED_PARTS_EXPERIMENTS: &str = r#"{"version": 1, "experimentSets": {"sdkExperiments": ["enhanced-parts"]}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {"fixture": {"experimentSet": "sdkExperiments"}}}"#;
 
 /// A throwaway workspace: root package `fixture` with the given `lib/` files
 /// and a synthetic `dart:core`-only SDK.
@@ -43,6 +50,23 @@ impl Fixture {
     /// `package_config.json` entry the engine derives per-file versions
     /// from).
     pub fn with_language_version(libraries: &[(&str, &str)], language_version: &str) -> Self {
+        Self::new_inner(libraries, language_version, NO_EXPERIMENTS)
+    }
+
+    /// The same workspace with the `enhanced-parts` experiment granted to
+    /// the SDK's default set and to package `fixture`, at package language
+    /// version 3.7 — above the experiment's 3.6 experimental release, so
+    /// the grant sticks at the file's version (the l1 in-module fixture's
+    /// grants shape).
+    pub fn with_enhanced_parts(libraries: &[(&str, &str)]) -> Self {
+        Self::new_inner(libraries, "3.7", ENHANCED_PARTS_EXPERIMENTS)
+    }
+
+    fn new_inner(
+        libraries: &[(&str, &str)],
+        language_version: &str,
+        allowed_experiments: &str,
+    ) -> Self {
         let root = std::env::temp_dir().join(format!(
             "dartq-engine-test-{}-{}",
             std::process::id(),
@@ -76,7 +100,7 @@ impl Fixture {
         );
         write(
             "sdk/lib/_internal/allowed_experiments.json",
-            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+            allowed_experiments,
         );
         for (relative, content) in libraries {
             write(relative, content);
@@ -173,6 +197,8 @@ impl EventLog {
                 self.cascades.push(libraries);
             }
             dartq_engine::EngineEvent::MemoryDegrade { .. } => {}
+            dartq_engine::EngineEvent::ExperimentDegrade { .. } => {}
+            dartq_engine::EngineEvent::SourceRejected { .. } => {}
         }
     }
 }

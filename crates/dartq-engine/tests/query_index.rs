@@ -1,5 +1,5 @@
-//! The maintained symbol-index face (index-design-spec §6/§8 — the Engine
-//! owns dirty scheduling, the index never invalidates itself): `query
+//! The maintained symbol-index face (the Engine owns dirty scheduling, the
+//! index never invalidates itself): `query
 //! symbol` answers from the captures and per-library reference surfaces
 //! analyze maintains at the `LibraryAnalyzed` point.
 //!
@@ -12,6 +12,7 @@
 mod common;
 
 use common::Fixture;
+use dartq_engine::CancellationToken;
 
 const MAIN: &str = "import 'greeter.dart';\n\nclass Use {\n  String hi() => greet();\n}\n";
 const GREETER: &str = "// header\nString greet() => 'hi';\n";
@@ -21,7 +22,7 @@ const GREETER_SHIFTED: &str = "// header\n// shifted\nString greet() => 'hi';\n"
 
 fn analyze(engine: &mut dartq_engine::Engine) {
     engine
-        .analyze(&[], &mut |_| {}, &Default::default())
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
         .expect("analyze");
 }
 
@@ -72,7 +73,7 @@ fn query_tracks_spans_across_signature_stable_edits() {
     assert_eq!(decl.range.length, 5);
     assert_eq!(answer.refs.len(), 1, "one use site: {answer:?}");
     assert_eq!(answer.refs[0].target_file, decl.file);
-    assert!(!answer.refs[0].qualified);
+    assert!(!answer.refs[0].explicit);
 
     // A comment line above the declaration: the L2 gate keeps the greeter
     // library clean (no recomputation, no cascade), but the name token's

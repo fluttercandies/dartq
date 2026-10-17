@@ -51,7 +51,7 @@ fn codes(diagnostics: &[dartq_diagnostics::Diagnostic], file: FileId) -> Vec<&'s
         .filter(|diagnostic| diagnostic.file == file)
         .map(|diagnostic| diagnostic.code.name)
         .collect();
-    names.sort();
+    names.sort_unstable();
     names
 }
 
@@ -69,9 +69,7 @@ fn enum_constant_type_args_report_enum_code_end_to_end() {
         .expect("analyze completes");
     let names = codes(&diagnostics, main);
     assert!(
-        names
-            .iter()
-            .any(|&name| name == "wrong_number_of_type_arguments_enum"),
+        names.contains(&"wrong_number_of_type_arguments_enum"),
         "the `_enum` code must fire at the constant's group: {names:?}"
     );
 }
@@ -137,9 +135,7 @@ fn enum_constant_selector_type_args_report_enum_code_end_to_end() {
         .expect("analyze completes");
     let names = codes(&diagnostics, main);
     assert!(
-        names
-            .iter()
-            .any(|&name| name == "wrong_number_of_type_arguments_enum"),
+        names.contains(&"wrong_number_of_type_arguments_enum"),
         "the selector's group is the constant's group: {names:?}"
     );
 }
@@ -159,9 +155,7 @@ fn null_argument_reports_argument_type_not_assignable_end_to_end() {
         .expect("analyze completes");
     let names = codes(&diagnostics, main);
     assert!(
-        names
-            .iter()
-            .any(|&name| name == "argument_type_not_assignable"),
+        names.contains(&"argument_type_not_assignable"),
         "null into a non-nullable formal must report: {names:?}"
     );
 }
@@ -181,9 +175,7 @@ fn null_argument_boundaries_stay_silent() {
         .expect("analyze completes");
     let names = codes(&diagnostics, main);
     assert!(
-        !names
-            .iter()
-            .any(|&name| name == "argument_type_not_assignable"),
+        !names.contains(&"argument_type_not_assignable"),
         "assignable arguments must stay silent: {names:?}"
     );
 }

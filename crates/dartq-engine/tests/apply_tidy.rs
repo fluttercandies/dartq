@@ -117,8 +117,9 @@ fn cross_batch_facts_cache_hit_reattributes_per_file() {
     let mut sink = |_: EngineEvent| {};
 
     // Batch 1: the anchor plus both cache templates. `a` resolves its
-    // relative import against lib/ (target resident, no diagnostic); `c`
-    // caches a failing resolution with its diagnostic attributed to itself.
+    // relative import against lib/ (target resident, no URI diagnostic);
+    // `c` caches a failing resolution with its diagnostic attributed to
+    // itself.
     engine.set_content(&fixture.path("lib/a.dart"), IMPORTER.as_bytes());
     engine.set_content(&fixture.path("lib/c.dart"), LEAKER.as_bytes());
     engine.set_content(&fixture.path("lib/anchor.dart"), ANCHOR.as_bytes());
@@ -170,25 +171,54 @@ fn cross_batch_facts_cache_hit_reattributes_per_file() {
 
     // The hits land fully re-attributed: `b` re-resolves against lib/src/
     // (no anchor there — its own uri_does_not_exist), and `d`'s served
-    // diagnostics are its own copy, not `c`'s FileId.
+    // diagnostics are its own copy, not `c`'s FileId. `a` legitimately
+    // carries `unused_import` — its import resolves (the anchor is
+    // resident next to it) and nothing uses it — and no hit can inherit
+    // it: the semantic pass skips imports whose target failed to resolve,
+    // and the hits re-derive from the pre-resolution cache face, so `b`'s
+    // edge carries no target. Pinning the full per-file code face keeps
+    // the hit files exact (each exactly its own single row, nothing else).
     let diagnostics = engine
         .analyze(&[], &mut second.sink(), &CancellationToken::default())
         .expect("batch 2 analyze succeeds");
-    let mut per_path: BTreeMap<String, usize> = BTreeMap::new();
+    let mut per_path: BTreeMap<String, BTreeMap<&str, usize>> = BTreeMap::new();
     for diagnostic in &diagnostics {
-        assert_eq!(diagnostic.code.name, "uri_does_not_exist");
         let path = engine
             .file_table()
             .path(diagnostic.file)
             .expect("attributed file is interned")
             .to_string_lossy()
             .into_owned();
-        *per_path.entry(path).or_default() += 1;
+        *per_path
+            .entry(path)
+            .or_default()
+            .entry(diagnostic.code.name)
+            .or_default() += 1;
     }
-    let expected: BTreeMap<String, usize> = ["lib/src/b.dart", "lib/c.dart", "lib/src/d.dart"]
-        .into_iter()
-        .map(|path| (fixture.path(path).to_string_lossy().into_owned(), 1))
-        .collect();
+    let expected: BTreeMap<String, BTreeMap<&str, usize>> = BTreeMap::from([
+        (
+            fixture.path("lib/a.dart").to_string_lossy().into_owned(),
+            BTreeMap::from([("unused_import", 1)]),
+        ),
+        (
+            fixture
+                .path("lib/src/b.dart")
+                .to_string_lossy()
+                .into_owned(),
+            BTreeMap::from([("uri_does_not_exist", 1)]),
+        ),
+        (
+            fixture.path("lib/c.dart").to_string_lossy().into_owned(),
+            BTreeMap::from([("uri_does_not_exist", 1)]),
+        ),
+        (
+            fixture
+                .path("lib/src/d.dart")
+                .to_string_lossy()
+                .into_owned(),
+            BTreeMap::from([("uri_does_not_exist", 1)]),
+        ),
+    ]);
     assert_eq!(
         per_path, expected,
         "each hit must carry exactly its own diagnostic: {per_path:?}"
