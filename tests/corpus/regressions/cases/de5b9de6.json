@@ -1,0 +1,441 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/primary_constructors/factory_constructor_head.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "body_might_complete_normally",
+      "line": 10,
+      "column": 3,
+      "length": 7,
+      "message": "The body might complete normally, causing 'null' to be returned, but the return type, 'C', is a potentially non-nullable type."
+    },
+    {
+      "code": "body_might_complete_normally",
+      "line": 11,
+      "column": 11,
+      "length": 1,
+      "message": "The body might complete normally, causing 'null' to be returned, but the return type, 'C', is a potentially non-nullable type."
+    },
+    {
+      "code": "body_might_complete_normally",
+      "line": 12,
+      "column": 3,
+      "length": 12,
+      "message": "The body might complete normally, causing 'null' to be returned, but the return type, 'C', is a potentially non-nullable type."
+    },
+    {
+      "code": "body_might_complete_normally",
+      "line": 13,
+      "column": 11,
+      "length": 6,
+      "message": "The body might complete normally, causing 'null' to be returned, but the return type, 'C', is a potentially non-nullable type."
+    },
+    {
+      "code": "body_might_complete_normally",
+      "line": 26,
+      "column": 9,
+      "length": 7,
+      "message": "The body might complete normally, causing 'null' to be returned, but the return type, 'C', is a potentially non-nullable type."
+    },
+    {
+      "code": "body_might_complete_normally",
+      "line": 27,
+      "column": 17,
+      "length": 1,
+      "message": "The body might complete normally, causing 'null' to be returned, but the return type, 'C', is a potentially non-nullable type."
+    },
+    {
+      "code": "body_might_complete_normally",
+      "line": 28,
+      "column": 9,
+      "length": 12,
+      "message": "The body might complete normally, causing 'null' to be returned, but the return type, 'C', is a potentially non-nullable type."
+    },
+    {
+      "code": "body_might_complete_normally",
+      "line": 29,
+      "column": 17,
+      "length": 6,
+      "message": "The body might complete normally, causing 'null' to be returned, but the return type, 'C', is a potentially non-nullable type."
+    },
+    {
+      "code": "const_factory",
+      "line": 22,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 23,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 24,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 25,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 26,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 27,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 28,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 29,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 3,
+      "column": 20,
+      "length": 1,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 5,
+      "column": 20,
+      "length": 6,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 6,
+      "column": 3,
+      "length": 7,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 7,
+      "column": 11,
+      "length": 1,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 8,
+      "column": 3,
+      "length": 12,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 9,
+      "column": 11,
+      "length": 6,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 10,
+      "column": 3,
+      "length": 7,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 11,
+      "column": 11,
+      "length": 1,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 12,
+      "column": 3,
+      "length": 12,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 13,
+      "column": 11,
+      "length": 6,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 14,
+      "column": 3,
+      "length": 7,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 15,
+      "column": 11,
+      "length": 1,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 16,
+      "column": 3,
+      "length": 12,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 17,
+      "column": 11,
+      "length": 6,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 18,
+      "column": 18,
+      "length": 7,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 19,
+      "column": 26,
+      "length": 1,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 20,
+      "column": 18,
+      "length": 12,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 21,
+      "column": 26,
+      "length": 6,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 22,
+      "column": 9,
+      "length": 7,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 23,
+      "column": 17,
+      "length": 1,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 24,
+      "column": 9,
+      "length": 12,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 25,
+      "column": 17,
+      "length": 6,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 26,
+      "column": 9,
+      "length": 7,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 27,
+      "column": 17,
+      "length": 1,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 28,
+      "column": 9,
+      "length": 12,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 29,
+      "column": 17,
+      "length": 6,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 30,
+      "column": 9,
+      "length": 7,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 31,
+      "column": 17,
+      "length": 1,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 32,
+      "column": 9,
+      "length": 12,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 33,
+      "column": 17,
+      "length": 6,
+      "message": "The constructor with name 'name' is already defined."
+    },
+    {
+      "code": "redirect_to_non_const_constructor",
+      "line": 30,
+      "column": 22,
+      "length": 1,
+      "message": "A constant redirecting constructor can't redirect to a non-constant constructor."
+    },
+    {
+      "code": "redirect_to_non_const_constructor",
+      "line": 31,
+      "column": 23,
+      "length": 1,
+      "message": "A constant redirecting constructor can't redirect to a non-constant constructor."
+    },
+    {
+      "code": "redirect_to_non_const_constructor",
+      "line": 32,
+      "column": 26,
+      "length": 1,
+      "message": "A constant redirecting constructor can't redirect to a non-constant constructor."
+    },
+    {
+      "code": "redirect_to_non_const_constructor",
+      "line": 33,
+      "column": 28,
+      "length": 1,
+      "message": "A constant redirecting constructor can't redirect to a non-constant constructor."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "const_factory",
+      "line": 22,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 23,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 24,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 25,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 26,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 27,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 28,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "const_factory",
+      "line": 29,
+      "column": 3,
+      "length": 5,
+      "message": "Only redirecting factory constructors can be declared to be 'const'."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 35,
+      "column": 21,
+      "length": 1,
+      "message": "A value of type 'C' can't be returned from the method 'factory' because it has a return type of 'void'."
+    }
+  ],
+  "source": "class C {\n  external factory ();\n  external factory C();\n  external factory name();\n  external factory C.name();\n  factory () => C();\n  factory C() => C();\n  factory name() => C();\n  factory C.name() => C();\n  factory () {}\n  factory C() {}\n  factory name() {}\n  factory C.name() {}\n  factory () = C;\n  factory C() = C;\n  factory name() = C;\n  factory C.name() = C;\n  external const factory ();\n  external const factory C();\n  external const factory name();\n  external const factory C.name();\n  const factory () => C();\n  const factory C() => C();\n  const factory name() => C();\n  const factory C.name() => C();\n  const factory () {}\n  const factory C() {}\n  const factory name() {}\n  const factory C.name() {}\n  const factory () = C;\n  const factory C() = C;\n  const factory name() = C;\n  const factory C.name() = C;\n\n  void factory() => C(); // Not a factory constructor.\n}",
+  "captured_at": 1792266659,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-rc2-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/de5b9de6.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

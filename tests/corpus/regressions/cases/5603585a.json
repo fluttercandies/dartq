@@ -242,13 +242,154 @@
       "message": "The value of the local variable 'extendsNumReturnArg7' isn't used."
     }
   ],
-  "dartq": [],
+  "dartq": [
+    {
+      "code": "unused_local_variable",
+      "line": 34,
+      "column": 7,
+      "length": 16,
+      "message": "The value of the local variable 'unboundedReturn1' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 35,
+      "column": 7,
+      "length": 16,
+      "message": "The value of the local variable 'unboundedReturn2' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 36,
+      "column": 7,
+      "length": 16,
+      "message": "The value of the local variable 'unboundedReturn3' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 42,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg1' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 43,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg2' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 44,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg3' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 45,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg4' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 46,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg5' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 47,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg6' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 48,
+      "column": 7,
+      "length": 19,
+      "message": "The value of the local variable 'unboundedReturnArg7' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 60,
+      "column": 7,
+      "length": 17,
+      "message": "The value of the local variable 'extendsNumReturn1' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 61,
+      "column": 7,
+      "length": 17,
+      "message": "The value of the local variable 'extendsNumReturn2' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 62,
+      "column": 7,
+      "length": 17,
+      "message": "The value of the local variable 'extendsNumReturn3' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 68,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg1' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 69,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg2' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 70,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg3' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 71,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg4' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 72,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg5' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 73,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg6' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 74,
+      "column": 7,
+      "length": 20,
+      "message": "The value of the local variable 'extendsNumReturnArg7' isn't used."
+    }
+  ],
   "source": "// Copyright (c) 2021, the Dart project authors. Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\nvoid unboundedUnused<T>() {}\n\nvoid unboundedArg<T>(T t) {}\n\nT unboundedReturn<T>() => throw '';\n\nT unboundedReturnArg<T>(T t) => t;\n\nvoid extendsNumUnused<T extends num>() {}\n\nvoid extendsNumArg<T extends num>(T t) {}\n\nT extendsNumReturn<T extends num>() => throw '';\n\nT extendsNumReturnArg<T extends num>(T t) => t;\n\nvoid multipleArgs<T, U, S>(T t, S s, U u) {}\n\nstaticInvocations() {\n  unboundedUnused /*<dynamic>*/ ();\n  unboundedUnused<int>();\n\n  unboundedArg /*<Null>*/ (null);\n  unboundedArg /*<int>*/ (0);\n  unboundedArg /*<String>*/ (\"\");\n  unboundedArg<num>(0);\n\n  unboundedReturn /*<dynamic>*/ ();\n  unboundedReturn<int>();\n  var unboundedReturn1 = unboundedReturn /*<dynamic>*/ ();\n  int unboundedReturn2 = unboundedReturn /*<int>*/ ();\n  num unboundedReturn3 = unboundedReturn<int>();\n\n  unboundedReturnArg /*<Null>*/ (null);\n  unboundedReturnArg /*<int>*/ (0);\n  unboundedReturnArg /*<String>*/ (\"\");\n  unboundedReturnArg<num>(0);\n  var unboundedReturnArg1 = unboundedReturnArg /*<int>*/ (0);\n  var unboundedReturnArg2 = unboundedReturnArg /*<String>*/ (\"\");\n  num unboundedReturnArg3 = unboundedReturnArg /*<num>*/ (0);\n  int unboundedReturnArg4 = unboundedReturnArg /*<int>*/ (0);\n  int unboundedReturnArg5 = unboundedReturnArg /*<int>*/ (0.5);\n  int unboundedReturnArg6 = unboundedReturnArg /*<int>*/ (\"\");\n  int unboundedReturnArg7 = unboundedReturnArg<num>(0);\n\n  extendsNumUnused /*<num>*/ ();\n  extendsNumUnused<int>();\n\n  extendsNumArg /*<num>*/ (null);\n  extendsNumArg /*<int>*/ (0);\n  extendsNumArg /*<num>*/ (\"\");\n  extendsNumArg<num>(0);\n\n  extendsNumReturn /*<num>*/ ();\n  extendsNumReturn<int>();\n  var extendsNumReturn1 = extendsNumReturn /*<num>*/ ();\n  int extendsNumReturn2 = extendsNumReturn /*<int>*/ ();\n  num extendsNumReturn3 = extendsNumReturn<int>();\n\n  extendsNumReturnArg /*<num>*/ (null);\n  extendsNumReturnArg /*<int>*/ (0);\n  extendsNumReturnArg /*<num>*/ (\"\");\n  extendsNumReturnArg<num>(0);\n  var extendsNumReturnArg1 = extendsNumReturnArg /*<int>*/ (0);\n  var extendsNumReturnArg2 = extendsNumReturnArg /*<num>*/ (\"\");\n  num extendsNumReturnArg3 = extendsNumReturnArg /*<num>*/ (0);\n  int extendsNumReturnArg4 = extendsNumReturnArg /*<int>*/ (0);\n  int extendsNumReturnArg5 = extendsNumReturnArg /*<int>*/ (0.5);\n  int extendsNumReturnArg6 = extendsNumReturnArg /*<int>*/ (\"\");\n  int extendsNumReturnArg7 = extendsNumReturnArg<num>(0);\n\n  multipleArgs /*analyzer.<dynamic,dynamic,dynamic>*/ ();\n  multipleArgs /*<int,String,bool>*/ (0, true, \"\");\n  multipleArgs<int, bool, String>(0, true, \"\");\n}\n",
-  "captured_at": 1791787153,
+  "captured_at": 1792266659,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-rc2-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -258,8 +399,8 @@
     "--edits",
     "tests/corpus/regressions/cases/5603585a.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "--daemon-cmd",
-    "./target/release/dartq daemon {dir}"
+    "./target/release/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
   ]
 }

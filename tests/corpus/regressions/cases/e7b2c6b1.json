@@ -63,9 +63,9 @@
     }
   ],
   "source": "// Targets implements_before_with: the with clause must be before the\n// implements clause.\nclass A extends B implements C with D {}\n",
-  "captured_at": 1792065400,
+  "captured_at": 1792266659,
   "source_run": {
-    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "report": "target/evidence/gate-m0/trend-w5-rc2-union/report.json",
     "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
@@ -77,8 +77,8 @@
     "--edits",
     "tests/corpus/regressions/cases/e7b2c6b1.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "--daemon-cmd",
-    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+    "./target/release/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
   ]
 }

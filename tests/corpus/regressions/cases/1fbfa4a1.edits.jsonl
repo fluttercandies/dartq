@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/missing_statement.dart","length":161,"line":1,"new_text":"// Targets missing_statement: expected a statement (a reserved keyword in\n// expression-statement position is recovered as an identifier).\nvoid f() {\n  class;\n}\n"}

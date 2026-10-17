@@ -482,6 +482,62 @@
       "message": "Getters, setters and methods can't be declared to be 'const'."
     },
     {
+      "code": "duplicate_definition",
+      "line": 7,
+      "column": 3,
+      "length": 7,
+      "message": "The name 'factory' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 11,
+      "column": 3,
+      "length": 7,
+      "message": "The name 'factory' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 15,
+      "column": 3,
+      "length": 7,
+      "message": "The name 'factory' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 19,
+      "column": 18,
+      "length": 7,
+      "message": "The name 'factory' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 23,
+      "column": 9,
+      "length": 7,
+      "message": "The name 'factory' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 27,
+      "column": 9,
+      "length": 7,
+      "message": "The name 'factory' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 31,
+      "column": 9,
+      "length": 7,
+      "message": "The name 'factory' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 36,
+      "column": 8,
+      "length": 7,
+      "message": "The name 'factory' is already defined."
+    },
+    {
       "code": "redirection_in_non_factory_constructor",
       "line": 15,
       "column": 14,
@@ -494,14 +550,21 @@
       "column": 20,
       "length": 1,
       "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 36,
+      "column": 21,
+      "length": 1,
+      "message": "A value of type 'C' can't be returned from the method 'factory' because it has a return type of 'void'."
     }
   ],
   "source": "// @dart=3.10\nclass C {\n  external factory ();\n  external factory C();\n  external factory name();\n  external factory C.name();\n  factory () => C();\n  factory C() => C();\n  factory name() => C();\n  factory C.name() => C();\n  factory () {}\n  factory C() {}\n  factory name() {}\n  factory C.name() {}\n  factory () = C;\n  factory C() = C;\n  factory name() = C;\n  factory C.name() = C;\n  external const factory ();\n  external const factory C();\n  external const factory name();\n  external const factory C.name();\n  const factory () => C();\n  const factory C() => C();\n  const factory name() => C();\n  const factory C.name() => C();\n  const factory () {}\n  const factory C() {}\n  const factory name() {}\n  const factory C.name() {}\n  const factory () = C;\n  const factory C() = C;\n  const factory name() = C;\n  const factory C.name() = C;\n\n  void factory() => C(); // Not a factory constructor.\n}",
-  "captured_at": 1791787153,
+  "captured_at": 1792266659,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-rc2-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -511,8 +574,8 @@
     "--edits",
     "tests/corpus/regressions/cases/d2ef13e2.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "--daemon-cmd",
-    "./target/release/dartq daemon {dir}"
+    "./target/release/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
   ]
 }

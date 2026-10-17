@@ -1,0 +1,56 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/patterns/constant_identifier_namedAs.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "illegal_pattern_identifier_name",
+      "line": 3,
+      "column": 10,
+      "length": 2,
+      "message": "A pattern can't refer to an identifier named 'as'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 3,
+      "column": 10,
+      "length": 2,
+      "message": "Undefined name 'as'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 3,
+      "column": 10,
+      "length": 2,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "illegal_pattern_identifier_name",
+      "line": 3,
+      "column": 10,
+      "length": 2,
+      "message": "A pattern can't refer to an identifier named 'as'."
+    }
+  ],
+  "source": "void f(x) {\n  switch (x) {\n    case as:\n  }\n}\n",
+  "captured_at": 1792266659,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-rc2-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/715ae934.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

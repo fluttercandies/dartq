@@ -55,6 +55,13 @@
       "message": "Missing selector such as '.identifier' or '[0]'."
     },
     {
+      "code": "non_constant_record_field",
+      "line": 2,
+      "column": 10,
+      "length": 1,
+      "message": "The fields in a const record literal must be constants."
+    },
+    {
       "code": "record_literal_one_positional_no_trailing_comma",
       "line": 2,
       "column": 11,
@@ -63,11 +70,11 @@
     }
   ],
   "source": "f(x) {\n  const (_) = x;\n}\n",
-  "captured_at": 1791787153,
+  "captured_at": 1792266659,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-rc2-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -77,8 +84,8 @@
     "--edits",
     "tests/corpus/regressions/cases/4ec0b724.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "--daemon-cmd",
-    "./target/release/dartq daemon {dir}"
+    "./target/release/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
   ]
 }

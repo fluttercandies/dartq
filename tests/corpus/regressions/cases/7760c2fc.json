@@ -91,9 +91,9 @@
     }
   ],
   "source": "// Copyright (c) 2025, the Dart project authors.  Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\nsealed class Option<T> {\n  const Option();\n}\n\nclass Some<T> extends Option<T> {\n  final T value;\n  const Some(this.value);\n}\n\nclass None extends Option<Never> {\n  // T can be any type\n  const None();\n\n  /// Placeholder get, to use it in switch in this example\n  bool get noneProp => false;\n}\n\n/// Global const.\nconst none = None();\n\n/// Works as expected\nvoid fun<T>(Option<T> option) {\n  /*\n   checkingOrder={Option<T>,Some<T>,None},\n   subtypes={Some<T>,None},\n   type=Option<T>\n  */\n  switch (option) {\n    /*space=Some<T>*/\n    case Some():\n      final _ = option.value;\n    /*space=None*/\n    case None():\n      final _ = option.noneProp;\n  }\n}\n\n/// Works as expected\nclass MyClass {\n  void fun<T>(Option<T> option) {\n    /*\n     checkingOrder={Option<T>,Some<T>,None},\n     subtypes={Some<T>,None},\n     type=Option<T>\n    */\n    switch (option) {\n      /*space=Some<T>*/\n      case Some():\n        final _ = option.value;\n      /*space=None*/\n      case None():\n        final _ = option.noneProp;\n    }\n  }\n}\n\nvoid globalFunWithNestedFun() {\n  void fun<T>(Option<T> option) {\n    /*\n     checkingOrder={Option<T>,Some<T>,None},\n     subtypes={Some<T>,None},\n     type=Option<T>\n    */\n    switch (option) {\n      /*space=Some<T>*/\n      case Some():\n        final _ = option.value;\n      /*space=None*/\n      case None():\n        final _ = option.noneProp;\n    }\n  }\n\n  var f = <T>(Option<T> option) {\n    /*\n     checkingOrder={Option<T>,Some<T>,None},\n     subtypes={Some<T>,None},\n     type=Option<T>\n    */\n    switch (option) {\n      /*space=Some<T>*/\n      case Some():\n        final _ = option.value;\n      /*space=None*/\n      case None():\n        final _ = option.noneProp;\n    }\n  };\n}\n",
-  "captured_at": 1792065400,
+  "captured_at": 1792266659,
   "source_run": {
-    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "report": "target/evidence/gate-m0/trend-w5-rc2-union/report.json",
     "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
@@ -105,8 +105,8 @@
     "--edits",
     "tests/corpus/regressions/cases/7760c2fc.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "--daemon-cmd",
-    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+    "./target/release/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
   ]
 }

@@ -1175,6 +1175,90 @@
   ],
   "dartq": [
     {
+      "code": "const_with_non_const",
+      "line": 88,
+      "column": 18,
+      "length": 5,
+      "message": "The constructor being called isn't a const constructor."
+    },
+    {
+      "code": "const_with_non_const",
+      "line": 89,
+      "column": 18,
+      "length": 5,
+      "message": "The constructor being called isn't a const constructor."
+    },
+    {
+      "code": "const_with_non_const",
+      "line": 90,
+      "column": 18,
+      "length": 5,
+      "message": "The constructor being called isn't a const constructor."
+    },
+    {
+      "code": "const_with_non_const",
+      "line": 91,
+      "column": 18,
+      "length": 5,
+      "message": "The constructor being called isn't a const constructor."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 24,
+      "column": 12,
+      "length": 4,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 25,
+      "column": 12,
+      "length": 6,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 49,
+      "column": 12,
+      "length": 5,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 52,
+      "column": 14,
+      "length": 8,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 70,
+      "column": 18,
+      "length": 5,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 73,
+      "column": 20,
+      "length": 8,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 96,
+      "column": 28,
+      "length": 1,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
+      "code": "constant_pattern_with_non_constant_expression",
+      "line": 97,
+      "column": 22,
+      "length": 1,
+      "message": "The expression of a constant pattern must be a valid constant."
+    },
+    {
       "code": "expected_token",
       "line": 46,
       "column": 20,
@@ -1284,13 +1368,6 @@
       "line": 66,
       "column": 18,
       "length": 1,
-      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
-    },
-    {
-      "code": "invalid_constant_const_prefix",
-      "line": 110,
-      "column": 25,
-      "length": 12,
       "message": "The expression can't be prefixed by 'const' to form a constant pattern."
     },
     {
@@ -1490,11 +1567,18 @@
       "message": "The unary operator ~ is not supported as a constant pattern."
     },
     {
+      "code": "invocation_of_non_function_expression",
+      "line": 26,
+      "column": 12,
+      "length": 5,
+      "message": "The expression doesn't evaluate to a function, so it can't be invoked."
+    },
+    {
       "code": "missing_identifier",
       "line": 46,
       "column": 25,
       "length": 1,
-      "message": "Expected an identifier, but got ':'."
+      "message": "Expected an identifier."
     },
     {
       "code": "named_function_expression",
@@ -1505,17 +1589,17 @@
     },
     {
       "code": "undefined_getter",
-      "line": 107,
-      "column": 30,
+      "line": 108,
+      "column": 37,
       "length": 3,
-      "message": "The getter 'new' isn't defined for the type 'GenericClass'."
+      "message": "The getter 'new' isn't defined for the type 'InvalidType'."
     },
     {
       "code": "undefined_getter",
-      "line": 113,
-      "column": 37,
+      "line": 114,
+      "column": 44,
       "length": 3,
-      "message": "The getter 'new' isn't defined for the type 'GenericClass'."
+      "message": "The getter 'new' isn't defined for the type 'InvalidType'."
     },
     {
       "code": "unexpected_token",
@@ -1547,9 +1631,9 @@
     }
   ],
   "source": "// Copyright (c) 2023, the Dart project authors.  Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\nimport 'const_patterns.dart' as prefix;\n\nconst int value = 42;\n\nvoid func() {}\n\nclass Class {\n  const Class([a]);\n\n  const Class.named();\n\n  call() {}\n\n  test(o) async {\n    const dynamic local = 0;\n    dynamic variable = 0;\n    switch (o) {\n      case true: // Ok\n      case null: // Ok\n      case this: // Error\n      case this(): // Error\n      case super(): // Error\n      case 42: // Ok\n      case -42: // Ok\n      case 42.5: // Ok\n      case -42.5: // Ok\n      case 'foo': // Ok\n      case 'foo' 'bar': // Ok\n      case value: // Ok\n      case value!: // Ok\n      case value?: // Ok\n      case value as int: // Ok\n      case -value: // Error\n      case local: // Ok\n      case -local: // Error\n      case func: // Ok\n      case prefix.value: // Ok\n      case -prefix.value: // Error\n      case prefix.Class.named: // Ok\n      case 1 + 2: // Error\n      case 1 * 2: // Error\n      case void fun() {}: // Error\n      case assert(false): // Error\n      case switch (o) { _ => true }: // Error\n      case await 0: // Error\n      case !false: // Error\n      case ~0: // Error\n      case ++variable: // Error\n      case const 0: // Error\n      case const 0x0: // Error\n      case const 0.5: // Error\n      case const true: // Error\n      case const null: // Error\n      case const -0: // Error\n      case const 'foo': // Error\n      case const #a: // Error\n      case const value: // Error\n      case const local: // Error\n      case const prefix.value: // Error\n      case const -prefix.value: // Error\n      case const prefix.Class.named: // Error\n      case const 1 + 2: // Error\n      case const void fun() {}: // Error\n      case const assert(false): // Error\n      case const switch (o) { _ => true }: // Error\n      case const await 0: // Error\n      case const !false: // Error\n      case const ~0: // Error\n      case const ++variable: // Error\n      case const Class(): // Ok\n      case const Class(0): // Ok\n      case const GenericClass(): // Ok\n      case const GenericClass(a: 0): // Ok\n      case const GenericClass<int>(): // Ok\n      case const GenericClass<int>(a: 0): // Ok\n      case const GenericClass<int>.new(): // Ok\n      case const GenericClass<int>.new(a: 1): // Ok\n      case const []: // Ok\n      case const <int>[]: // Ok\n      case const {}: // Ok\n      case const <int, String>{}: // Ok\n      case const const Class(): // Error\n      case const const Class(0): // Error\n      case const const GenericClass(): // Error\n      case const const GenericClass(a: 0): // Error\n      case const const GenericClass<int>(): // Error\n      case const const GenericClass<int>(a: 0): // Error\n      case const const []: // Error\n      case const const <int>[]: // Error\n      case const const {}: // Error\n      case const const <int, String>{}: // Error\n      case const new Class(): // Error\n      case new Class(): // Error\n      case const (): // Error\n      case const const (): // Error\n      case const (1): // Ok\n      case const (-1): // Ok\n      case const (value): // Ok\n      case const (-value): // Ok\n      case const (1 + 2): // Ok\n      case GenericClass<int>: // Error\n      case prefix.GenericClass<int>: // Error\n      case GenericClass<int>.new: // Error\n      case prefix.GenericClass<int>.new: // Error\n      case const GenericClass<int>: // Error\n      case const prefix.GenericClass<int>: // Error\n      case const (GenericClass<int>): // Ok\n      case const (prefix.GenericClass<int>): // Ok\n      case const (GenericClass<int>.new): // Ok\n      case const (prefix.GenericClass<int>.new): // Ok\n       print(0);\n    }\n  }\n}\n\nclass GenericClass<T> {\n  const GenericClass({a});\n}\n",
-  "captured_at": 1792065400,
+  "captured_at": 1792266659,
   "source_run": {
-    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "report": "target/evidence/gate-m0/trend-w5-rc2-union/report.json",
     "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
@@ -1561,8 +1645,8 @@
     "--edits",
     "tests/corpus/regressions/cases/70d226a5.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "--daemon-cmd",
-    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+    "./target/release/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
   ]
 }

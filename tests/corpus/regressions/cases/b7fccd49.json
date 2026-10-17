@@ -63,9 +63,9 @@
     }
   ],
   "source": "// Targets multiple_with_clauses: each class definition can have at most one\n// with clause.\nclass A extends B with C with D {}\n",
-  "captured_at": 1792065400,
+  "captured_at": 1792266659,
   "source_run": {
-    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "report": "target/evidence/gate-m0/trend-w5-rc2-union/report.json",
     "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
@@ -77,8 +77,8 @@
     "--edits",
     "tests/corpus/regressions/cases/b7fccd49.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "--daemon-cmd",
-    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+    "./target/release/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
   ]
 }
