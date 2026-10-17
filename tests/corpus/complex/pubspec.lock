@@ -6,7 +6,7 @@ packages:
     description:
       path: "packages/stock_policy"
       relative: true
-      source: path
+    source: path
     version: "1.0.0"
 sdks:
   dart: ">=3.13.0 <4.0.0"
