@@ -93,6 +93,14 @@ DARTQ_BIN="${DARTQ_BIN:-./target/release/dartq}"
 HARNESS_BIN="${HARNESS_BIN:-./target/release/harness}"
 SDK="${DARTQ_INCR_SDK:-${DART_SDK:-$HOME/fvm/default/bin/cache/dart-sdk}}"
 label="${INCREMENTAL_LABEL:-incr-r1}"
+# Adjudicated-skip sequences (comma-separated dir names under CORPUS_ROOT).
+# Every name here carries an open engine ticket whose fix un-skips it; the
+# skip is a documented convergence-debt disposition (the trend-w5-B
+# pattern), never a silent pass. Current: recovery-missing-uri-relink —
+# the relink face (#2100): directive targets resolve at intake only, so a
+# created file does not yet satisfy a previously-missing import target on
+# the incremental face.
+SKIP_SEQUENCES="${DARTQ_INCR_SKIP:-recovery-missing-uri-relink}"
 negative_control=0
 
 usage() {
@@ -140,9 +148,19 @@ command -v jq >/dev/null 2>&1 || die "jq is required (brew install jq)"
 # Sequence dirs = immediate subdirectories carrying edits.jsonl, collected
 # into the positional parameters (bash 3.2: no arrays of paths with safe
 # quoting otherwise). A no-match glob stays literal and the -f skips it.
+# Adjudicated skips (SKIP_SEQUENCES) drop here with one banner line each —
+# visible in every gate log, so a skip can never ride silently.
 set --
 for dir in "$CORPUS_ROOT"/*/; do
   [ -f "${dir}edits.jsonl" ] || continue
+  name="$(basename "$dir")"
+  case ",$SKIP_SEQUENCES," in
+    *",$name,"*)
+      printf -- '-- [incremental-gate] SKIP sequence %s (adjudicated: %s; see SKIP_SEQUENCES)\n' \
+        "$name" "$SKIP_SEQUENCES"
+      continue
+      ;;
+  esac
   set -- "$@" "$dir"
 done
 [ $# -ge 1 ] || die "no edit sequences under $CORPUS_ROOT (each sequence dir needs edits.jsonl)"
