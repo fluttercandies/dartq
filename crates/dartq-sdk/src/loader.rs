@@ -1,13 +1,13 @@
 //! Loading an [`SdkSnapshot`] from an on-disk SDK layout.
 //!
-//! Step order follows the SDK loader contract §5: version file →
+//! Step order follows the SDK loader contract: version file →
 //! revision → `libraries.json` (with target resolution) →
 //! `allowed_experiments.json` → canonical id.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::str::FromStr;
 
 use serde::Deserialize;
@@ -34,7 +34,7 @@ impl SdkSnapshot {
     /// library table with the `sky_engine` `_embedder.yaml` mapping, with
     /// analyzer `EmbedderSdk` semantics (full table replacement, not
     /// overlay — a flutter project's `dart:core` and `dart:ui` come from
-    /// `sky_engine`, the SDK loader contract §4). Passing a root
+    /// `sky_engine`). Passing a root
     /// before that lands is a hard error rather than a silently partial
     /// load, and `None` is fully self-sufficient: the dart-sdk
     /// `libraries.json` covers every non-embedder `dart:` library.
@@ -390,6 +390,7 @@ fn resolve_segment(
 /// `_`-prefixed names, direct-import default `always`.
 fn convert_library(name: &str, raw: &RawLibrary) -> Result<SdkLibrary, String> {
     check_uri_scheme("uri", name, &raw.uri)?;
+    check_library_uri(name, &raw.uri)?;
     for patch in &raw.patches.0 {
         check_uri_scheme("patches", name, patch)?;
     }
@@ -425,6 +426,26 @@ fn check_uri_scheme(field: &str, library: &str, value: &str) -> Result<(), Strin
         return Err(format!(
             "unsupported URI scheme `{scheme}:` in `{field}` of library `{library}`: \
              only scheme-less paths and `file:` URIs are supported"
+        ));
+    }
+    Ok(())
+}
+
+/// A library `uri` is a non-empty path relative to the SDK `lib/` root.
+/// Empty or absolute-shaped values would escape the `<root>/lib/<uri>`
+/// path composition downstream (an absolute `Path::join` replaces the
+/// base, and an empty/root-shaped uri leaves no parent directory), so they
+/// are load-time hard errors like any other malformed metadata — never a
+/// downstream panic (ticket #1293).
+fn check_library_uri(name: &str, uri: &str) -> Result<(), String> {
+    if uri.is_empty()
+        || Path::new(uri)
+            .components()
+            .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)))
+    {
+        return Err(format!(
+            "invalid `uri` of library `{name}`: `{uri}` is not a non-empty path \
+             relative to `lib/`"
         ));
     }
     Ok(())

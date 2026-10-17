@@ -1,4 +1,4 @@
-//! `dartq index` — the PRD §15.1 index-building face: build the symbol
+//! `dartq index` — the index-building face: build the symbol
 //! index over the analyzed workspace and report what it built.
 //!
 //! The build (per-library capture + resolution riding the engine's
@@ -6,7 +6,7 @@
 //! one implementation the daemon's RPC face will share. This binary adds
 //! argument parsing, the crash tier, and the usage-tier mapping.
 //!
-//! Output is the §15.1 unified JSON contract (`schema_version: 1`), one
+//! Output is the unified JSON contract (`schema_version: 1`), one
 //! single-line object — the impact/compat convention for the newer command
 //! family, not the query faces' machine grammar.
 
@@ -18,13 +18,14 @@ use clap::Args;
 use dartq_commands::index::IndexError;
 use dartq_commands::index::run as index_run;
 
+use crate::Verbosity;
 use crate::exit;
 
 #[derive(Args)]
 pub(crate) struct IndexArgs {
     /// Force a rebuild instead of reusing incremental state. The engine has
     /// no resident index yet — every run builds fresh — so both modes build
-    /// full today; the flag pins the §15.1 grammar.
+    /// full today; the flag pins the output contract.
     #[arg(long)]
     pub(crate) full: bool,
     /// Package directory holding pubspec.yaml and
@@ -34,6 +35,13 @@ pub(crate) struct IndexArgs {
     /// Dart SDK root; defaults to `$DART_SDK`.
     #[arg(long)]
     pub(crate) sdk: Option<PathBuf>,
+    /// Report detail tier (`-v`/`--verbosity minimal|compact|full`), for
+    /// grammar parity with the other faces. The run summary is
+    /// tier-invariant (the canonical tables: four verdict totals — no
+    /// locator, no prose, nothing to trim), so every tier emits the same
+    /// bytes; the default `compact` was already the only shape.
+    #[arg(short = 'v', long, value_enum, default_value_t = Verbosity::Compact)]
+    pub(crate) verbosity: Verbosity,
 }
 
 /// Crash tier like the other engine faces: a panic aborts with exit 4 and
@@ -53,6 +61,10 @@ fn run(args: &IndexArgs, out: &mut impl Write) -> u8 {
 }
 
 fn run_checked(args: &IndexArgs, out: &mut impl Write) -> u8 {
+    // The tier parses for grammar parity and shapes nothing: the run summary
+    // is tier-invariant (the canonical tables trim nothing here), the same
+    // accept-and-document posture the daemon's `dartq/index` answer holds.
+    let _ = args.verbosity;
     let built = match index_run(&args.dir, args.sdk.as_deref(), args.full) {
         Ok(built) => built,
         // Workspace/engine-bind problems are the usage tier (their Display
@@ -136,10 +148,11 @@ mod tests {
             full: true,
             dir: root.to_path_buf(),
             sdk: Some(root.join("sdk")),
+            verbosity: Verbosity::Compact,
         }
     }
 
-    /// End to end over the query test's fixture: the §15.1 JSON report with
+    /// End to end over the query test's fixture: the JSON report with
     /// the pinned totals (2 files, 2 libraries, 4 declaration rows — Foo,
     /// meth, foo, main — and 2 resolved reference rows: the `Foo()` and
     /// `foo()` call sites), exit 0; a missing directory is the usage tier.

@@ -10,9 +10,9 @@ readme = "README.md"
 keywords = ["dart", "analyzer", "linter", "cli"]
 categories = ["development-tools"]
 
-# The published command faces are `dartq check` (M0 differential,
-# engine-api-spec §4.1) and `dartq analyze` (M1 engine); ship the binary
-# under the tool name rather than the package name.
+# The published command faces are `dartq check` (M0 differential) and
+# `dartq analyze` (M1 engine); ship the binary under the tool name rather
+# than the package name.
 [[bin]]
 name = "dartq"
 path = "src/main.rs"
@@ -23,16 +23,24 @@ dartq-commands = { workspace = true }
 dartq-daemon = { workspace = true }
 dartq-diagnostics = { workspace = true }
 dartq-engine = { workspace = true }
+# Pub-native plugin discovery (the fix/assists launcher) resolves declared
+# plugin packages against the parsed package_config.json.
+dartq-pub = { workspace = true }
+# The daemon face's dartq.yaml context assembly (#1086) loads each
+# declared context's SDK snapshot at the shell edge (the CLI owns SDK
+# discovery; the daemon is shell only).
+dartq-sdk = { workspace = true }
+# The fix apply face's span-capacity gate (#1543 bypass face) speaks the
+# source crate's capacity constant and error text directly.
+dartq-source = { workspace = true }
 serde_json = { workspace = true }
 
-# Test-only: the main.rs tests build `Diagnostic`s over a `FileTable`, the
-# fix face's write-back tests anchor edits with a `LineIndex`, and the
-# stale-config advisory tests pin the pub faces' mtime chain.
+# Test-only: the stale-config advisory tests pin the pub faces' mtime
+# chain.
 [dev-dependencies]
-dartq-source = { workspace = true }
 filetime = { workspace = true }
 
-# The metrics hook reads peak RSS through getrusage (engine-api-spec §3);
+# The metrics hook reads peak RSS through getrusage;
 # unix-only until a non-unix story exists.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

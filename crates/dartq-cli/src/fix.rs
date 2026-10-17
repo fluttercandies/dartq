@@ -1,16 +1,17 @@
-//! `dartq fix` / `dartq assists` — the structured-patch faces (PRD §15.6).
+//! `dartq fix` / `dartq assists` — the structured-patch faces.
 //!
-//! The anchoring substrate, the drift-correction applier, the §15.6 patch
+//! The anchoring substrate, the drift-correction applier, the patch
 //! document, and the plugin dispatch live in [`dartq_commands::fix`] (the
 //! one implementation the daemon's `dartq/fix` and `dartq/assists` share);
 //! this binary adds argument parsing, the in-place apply, human
 //! formatting, and the exit tiers:
 //!
-//! - `--dry-run` only outputs the patches, never writes (§15.6); without it
+//! - `--dry-run` only outputs the patches, never writes; without it
 //!   the edits apply in place (the machine document still prints, as the
 //!   record of what was written);
 //! - both faces dispatch the discovered plugin hosts (the `plugins/`
-//!   convention under the working directory): built-in lint rows, the
+//!   convention and the pub-native `plugins:` section under the working
+//!   directory): built-in lint rows, the
 //!   semantic engine pass's rows, and the plugins' `request/fixes`
 //!   proposals, every row provenance-tagged (`builtin-lint`,
 //!   `builtin-semantic`, or the plugin's manifest name); a plugin's
@@ -21,25 +22,29 @@
 //!   nothing mutated), and a write failing midway prints which files were
 //!   already mutated before the internal-error exit;
 //! - `--format=machine` emits one single-line JSON document per patched
-//!   file — empty context strings omitted (§15.7); the default format is a
-//!   human listing;
+//!   file — empty context strings omitted; an apply run records each
+//!   row's outcome (`applied`/`stale`) plus the document-level summary,
+//!   so an all-stale run (a safe no-op, still exit 0) stays legible to
+//!   the machine consumer; the default format is a human listing;
 //! - exit tiers follow the query faces: 0 on success (zero fixes included;
 //!   stale entries are safe no-ops, not failures), 64 usage, 4 internal.
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 use dartq_commands::Verbosity;
 use dartq_commands::discover::DiscoverError;
 use dartq_commands::fix::{self, EditOutcome, FileFixSet, PluginHosts};
+use dartq_pub::PackageConfig;
+use dartq_source::{MAX_SOURCE_BYTES, OpenError};
 
 use crate::exit;
 
 #[derive(Args)]
 pub(crate) struct FixArgs {
-    /// Only output the patches; never write files (PRD §15.6).
+    /// Only output the patches; never write files.
     #[arg(long)]
     pub(crate) dry_run: bool,
     #[arg(long, value_enum, default_value_t = FixFormat::Default)]
@@ -67,17 +72,31 @@ pub(crate) struct AssistsArgs {
 pub(crate) enum FixFormat {
     /// Human listing (rule, location, applied/stale status).
     Default,
-    /// One single-line JSON document per patched file.
+    /// One single-line JSON document per patched file; an apply run adds
+    /// each row's `outcome` (`applied`/`stale`) and the document `summary`
+    /// (a dry run emits bare proposals).
     Machine,
 }
 
-/// Machine format: one single-line patch document per file with rows.
-fn write_machine(out: &mut impl Write, per_file: &[FileFixSet]) -> io::Result<()> {
-    for set in per_file {
+/// Machine format: one single-line patch document per file with rows —
+/// the proposal shape on a dry run, the apply record (one `outcome` per
+/// row plus the `summary`) once the run writes, the statuses the apply
+/// stage reported in row order.
+fn write_machine(
+    out: &mut impl Write,
+    per_file: &[FileFixSet],
+    statuses: &[Vec<EditOutcome>],
+    dry_run: bool,
+) -> io::Result<()> {
+    for (index, set) in per_file.iter().enumerate() {
         if set.fixes.is_empty() && set.plugin.is_empty() {
             continue;
         }
-        writeln!(out, "{}", fix::patch_json(set, Verbosity::Compact))?;
+        let document = match (dry_run, statuses.get(index)) {
+            (false, Some(outcomes)) => fix::patch_json_applied(set, Verbosity::Compact, outcomes),
+            _ => fix::patch_json(set, Verbosity::Compact),
+        };
+        writeln!(out, "{document}")?;
     }
     Ok(())
 }
@@ -215,13 +234,62 @@ pub(crate) fn run_assists_entry(args: &AssistsArgs) -> u8 {
     code
 }
 
-/// The plugin hosts for a one-shot CLI run: discovered under the working
-/// directory's `plugins/` convention (the daemon discovers under its
-/// session workspace root instead). A run with no plugins pays one
-/// directory read.
+/// The plugin hosts for a one-shot CLI run: discovered from the working
+/// directory's `plugins/` convention and the governing `analysis_options`'s
+/// pub-native `plugins:` section, the latter resolved through the parsed
+/// `.dart_tool/package_config.json` beside the root (the daemon passes its
+/// session's resolution instead). The config's state decides the posture —
+/// see [`resolve_pub_config`].
 fn launch_hosts() -> PluginHosts {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    PluginHosts::launch(&cwd)
+    launch_hosts_in(&cwd)
+}
+
+/// [`launch_hosts`] over an injectable root.
+fn launch_hosts_in(cwd: &Path) -> PluginHosts {
+    let config_dir = cwd.join(".dart_tool");
+    let Some(pub_config) = resolve_pub_config(&config_dir.join("package_config.json")) else {
+        return PluginHosts::empty();
+    };
+    PluginHosts::launch(cwd, &pub_config, &config_dir)
+}
+
+/// The pub-native config at `config_path`, forked on its state:
+/// missing → the empty substitution, so the launch proceeds and declared
+/// plugins skip as declared-but-unresolved — pub never resolved here, the
+/// skips' `pub get` advice is right; present but unusable (unparsable
+/// JSON, non-UTF-8 bytes, unreadable) → `None` after naming the file and
+/// the real cause on stderr — pub did resolve and the artifact broke
+/// afterwards, so advising `pub get` would be wrong, and the run takes
+/// the no-dispatch posture instead. A valid file parses through
+/// untouched.
+fn resolve_pub_config(config_path: &Path) -> Option<PackageConfig> {
+    let empty = || {
+        PackageConfig::parse(r#"{"configVersion": 2, "packages": []}"#)
+            .expect("empty config parses")
+    };
+    match fs::read_to_string(config_path) {
+        Ok(text) => match PackageConfig::parse(&text) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                eprintln!(
+                    "dartq: `{}` is corrupt ({error}); pub-native plugins cannot be \
+                     resolved this run — check what wrote the file or restore it",
+                    config_path.display()
+                );
+                None
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(empty()),
+        Err(error) => {
+            eprintln!(
+                "dartq: `{}` is unreadable ({error}); pub-native plugins cannot be \
+                 resolved this run — check what wrote the file or restore it",
+                config_path.display()
+            );
+            None
+        }
+    }
 }
 
 /// The hosts' terminal failures surface on stderr — never silently.
@@ -270,7 +338,7 @@ fn run_assists(args: &AssistsArgs, out: &mut impl Write) -> u8 {
         return exit::USAGE;
     }
     let mut hosts = launch_hosts();
-    let collected = fix::assists(&args.path, args.offset, args.length, &mut hosts);
+    let collected = fix::assists(&args.path, args.offset, args.length, &mut hosts, None);
     let answer = match collected {
         Ok(answer) => answer,
         Err(DiscoverError::Io(error)) => {
@@ -320,12 +388,23 @@ fn write_assists_human(out: &mut impl Write, answer: &fix::AssistAnswer) -> io::
     }
 }
 
+/// The span-capacity rejection on the apply face's read-failure channel
+/// (the #1543 bypass face): the canonical capacity message under the
+/// face's `reading … failed` prefix.
+fn report_capacity(path: &str, len: u64) {
+    eprintln!(
+        "dartq: internal error: reading {path} failed: {}",
+        OpenError::TooLarge { len }
+    );
+}
+
 /// The apply + report stages over collected fix sets, collect-then-write:
 /// every file's patched buffer is computed in memory first — a read or
 /// patch failure here leaves nothing on disk mutated — and only then do
 /// the writes run; one failing midway prints which files were already
 /// mutated before the internal-error exit. The report follows: machine
-/// rows, or the human listing carrying the per-edit outcomes.
+/// documents (the apply record once the run writes), or the human listing
+/// carrying the per-edit outcomes.
 fn apply_and_report(
     per_file: &[FileFixSet],
     dry_run: bool,
@@ -335,6 +414,17 @@ fn apply_and_report(
     let mut staged: Vec<(&str, String, Vec<EditOutcome>)> = Vec::new();
     if !dry_run {
         for set in per_file {
+            // Span-capacity gates (#1543 bypass face): this is the last
+            // read before the edits' `LineIndex`, so the stat refuses
+            // before the bytes are read and the byte length is the
+            // authoritative bound — a file swapped to oversized between
+            // the collect read and this one is refused, never indexed.
+            if let Ok(metadata) = fs::metadata(&set.path)
+                && metadata.len() > MAX_SOURCE_BYTES as u64
+            {
+                report_capacity(&set.path, metadata.len());
+                return exit::INTERNAL_ERROR;
+            }
             let text = match fs::read_to_string(&set.path) {
                 Ok(text) => text,
                 Err(error) => {
@@ -345,6 +435,10 @@ fn apply_and_report(
                     return exit::INTERNAL_ERROR;
                 }
             };
+            if text.len() > MAX_SOURCE_BYTES {
+                report_capacity(&set.path, text.len() as u64);
+                return exit::INTERNAL_ERROR;
+            }
             let edits = edits_of(set);
             let (patched, outcome) = fix::apply(&text, &edits);
             staged.push((&set.path, patched, outcome));
@@ -368,7 +462,7 @@ fn apply_and_report(
     }
 
     let written = match format {
-        FixFormat::Machine => write_machine(out, per_file),
+        FixFormat::Machine => write_machine(out, per_file, &statuses, dry_run),
         FixFormat::Default => write_human(out, per_file, &statuses, dry_run),
     }
     .and_then(|()| out.flush());
@@ -447,6 +541,60 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The pub-config fork behind the host launch: missing → the empty
+    /// substitution stands in (the launch proceeds; declared-but-unresolved
+    /// skips keep their correct `pub get` advice); present but corrupt
+    /// (unparsable, non-UTF-8) → no config, so the run cannot advise
+    /// `pub get` for a broken artifact; a valid file parses through
+    /// untouched.
+    #[test]
+    fn pub_config_missing_stands_in_corrupt_takes_no_dispatch() {
+        let root = std::env::temp_dir().join(format!("dq_cli_fix_cfg_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let config_dir = root.join(".dart_tool");
+        fs::create_dir_all(&config_dir).expect("mkdir");
+        let config_path = config_dir.join("package_config.json");
+
+        let config =
+            resolve_pub_config(&config_path).expect("missing substitutes the empty config");
+        assert!(
+            config.entry("anything").is_none(),
+            "the substitution is empty"
+        );
+        assert!(
+            launch_hosts_in(&root).is_empty(),
+            "the missing face launches normally over an empty workspace"
+        );
+
+        fs::write(&config_path, "{ not json").expect("write");
+        assert!(
+            resolve_pub_config(&config_path).is_none(),
+            "a corrupt artifact takes the no-dispatch posture"
+        );
+        fs::write(&config_path, [0xff, 0x00]).expect("write bytes");
+        assert!(
+            resolve_pub_config(&config_path).is_none(),
+            "non-UTF-8 bytes are the corrupt face too"
+        );
+        assert!(
+            launch_hosts_in(&root).is_empty(),
+            "the corrupt face skips the launch entirely"
+        );
+
+        fs::write(
+            &config_path,
+            r#"{"configVersion": 2, "packages": [{"name": "a", "rootUri": "../", "packageUri": "lib/"}]}"#,
+        )
+        .expect("write");
+        let config = resolve_pub_config(&config_path).expect("a valid config parses");
+        assert!(
+            config.entry("a").is_some(),
+            "the real config resolves its packages"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// The `unnecessary_new` fix set addressed to `path` — the exact edit
     /// the rule materializes over this source in dartq-commands (keyword
     /// plus trailing space at offset 19..23, verified in its
@@ -517,6 +665,80 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The machine face's two documents: a dry run keeps the proposal
+    /// shape (no `outcome`, no `summary` — the rows are proposals); an
+    /// apply run records every row's outcome plus the summary, so an
+    /// all-stale run — a safe no-op that writes nothing and exits 0 — is
+    /// still legible to the machine consumer.
+    #[test]
+    fn machine_face_proposes_on_dry_run_and_records_on_apply() {
+        let root = std::env::temp_dir().join(format!("dq_cli_fix_machine_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let path = root.join("a.dart");
+        fs::write(&path, "void f() { var a = new B(); }\n").expect("write");
+        let per_file = vec![unnecessary_new_fix(&path)];
+
+        let mut out = Vec::new();
+        assert_eq!(
+            apply_and_report(&per_file, true, FixFormat::Machine, &mut out),
+            exit::CLEAN
+        );
+        let line = String::from_utf8(out).expect("utf-8");
+        assert!(
+            line.contains("\"edits\":[{"),
+            "one proposal document: {line}"
+        );
+        assert!(
+            !line.contains("outcome") && !line.contains("summary"),
+            "proposals carry neither field: {line}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "void f() { var a = new B(); }\n",
+            "the dry run wrote nothing"
+        );
+
+        let mut out = Vec::new();
+        assert_eq!(
+            apply_and_report(&per_file, false, FixFormat::Machine, &mut out),
+            exit::CLEAN
+        );
+        let line = String::from_utf8(out).expect("utf-8");
+        assert!(line.contains("\"outcome\":\"applied\""), "{line}");
+        assert!(
+            line.contains("\"summary\":{\"applied\":1,\"stale\":0}"),
+            "{line}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "void f() { var a = B(); }\n",
+            "the apply run rewrote the file"
+        );
+
+        // The stale record: the edit no longer matches the file, nothing
+        // is written, and the document says so (applied 0, stale 1).
+        fs::write(&path, "void f() { var a = B(); }\n").expect("write");
+        let mut out = Vec::new();
+        assert_eq!(
+            apply_and_report(&per_file, false, FixFormat::Machine, &mut out),
+            exit::CLEAN
+        );
+        let line = String::from_utf8(out).expect("utf-8");
+        assert!(line.contains("\"outcome\":\"stale\""), "{line}");
+        assert!(
+            line.contains("\"summary\":{\"applied\":0,\"stale\":1}"),
+            "{line}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "void f() { var a = B(); }\n",
+            "the stale run wrote nothing"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// The collect-then-write contract's failure half: when a write fails
     /// midway, the earlier files stay mutated (the partial-write record on
     /// stderr names them), the failing write never lands, stdout stays
@@ -558,10 +780,43 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The apply stage's span-capacity funnel (#1543 bypass face): a
+    /// target that turned oversized between the collect read and the
+    /// apply read is refused at the internal tier — stdout stays empty,
+    /// nothing is written. The sparse fixture claims the size with
+    /// `set_len` (no blocks materialized); the stat rejects before any
+    /// read.
+    #[test]
+    fn apply_rejects_span_capacity_target() {
+        let root = std::env::temp_dir().join(format!("dq_cli_fix_capacity_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let huge = root.join("huge.dart");
+        fs::File::create(&huge)
+            .and_then(|file| file.set_len(dartq_source::MAX_SOURCE_BYTES as u64 + 1))
+            .expect("sparse fixture");
+
+        let per_file = vec![unnecessary_new_fix(&huge)];
+        let mut out = Vec::new();
+        assert_eq!(
+            apply_and_report(&per_file, false, FixFormat::Default, &mut out),
+            exit::INTERNAL_ERROR
+        );
+        assert!(out.is_empty(), "stdout stays empty on internal errors");
+        assert_eq!(
+            fs::metadata(&huge).expect("stat").len(),
+            dartq_source::MAX_SOURCE_BYTES as u64 + 1,
+            "nothing was written"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// The assists face: argument defaults, the usage tier on a missing
     /// target, and the plugin-less run (no plugins under the working
-    /// directory) reporting the human zero summary or the machine
-    /// document with an empty assist list.
+    /// directory): the built-in producers still propose — the default
+    /// human run lists the async-body assist one row per edit, the
+    /// off-selection machine run carries the empty assist list.
     #[test]
     fn assists_cli_defaults_and_zero_plugin_run() {
         fn parse(args: &[&str]) -> AssistsArgs {
@@ -610,9 +865,19 @@ mod tests {
         let mut out = Vec::new();
         let args = parse(&["assists", path.to_str().expect("utf-8")]);
         assert_eq!(run_assists(&args, &mut out), exit::CLEAN);
+        // Offset 0 sits at the body's first token end, so the builtin
+        // async-body assist proposes (the official guard declines only
+        // past `body.block.beginToken.end`). One change, two edits — the
+        // `async ` insertion at the body and the `Future<void>` wrap at
+        // the `void` return type — one human row per edit.
         assert_eq!(
             String::from_utf8(out).expect("utf-8"),
-            "No assists found.\n"
+            format!(
+                "{path}:1:10 • builtin-assist • Convert to async function body\n\
+                 {path}:1:1 • builtin-assist • Convert to async function body\n\
+                 2 proposed assists.\n",
+                path = path.display()
+            )
         );
 
         let mut out = Vec::new();

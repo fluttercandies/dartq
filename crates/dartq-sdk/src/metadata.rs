@@ -109,7 +109,7 @@ pub struct TargetLibraries {
 /// `patches` is kept as path list only — patch files are backend
 /// implementation details that do not change the public API surface, so they
 /// are stored for later platform-file localization but never read
-/// (the SDK metadata capture §6).
+///.
 #[derive(Debug, Clone, Serialize)]
 pub struct SdkLibrary {
     /// Implementation file relative to `<dart-sdk>/lib`, e.g.
@@ -215,6 +215,35 @@ impl AllowedExperiments {
         feature_set_with_experiments(version, self.for_sdk_library(name))
     }
 
+    /// The [`FeatureSet`] for package `name` at language `version`, degrading
+    /// unknown experiment names to known-only instead of erroring: an unknown
+    /// grant cannot be honored, and the engine's grant path must analyze any
+    /// input rather than abort the process (ticket #1293). Same lookup
+    /// contract as [`Self::feature_set_for_package`] — a package without a
+    /// grant gets the version-derived baseline only.
+    #[must_use]
+    pub fn feature_set_for_package_lenient(
+        &self,
+        name: &str,
+        version: LanguageVersion,
+    ) -> FeatureSet {
+        match self.for_package(name) {
+            Some(experiments) => feature_set_with_known_experiments(version, experiments),
+            None => FeatureSet::for_language_version(version),
+        }
+    }
+
+    /// The lenient twin of [`Self::feature_set_for_sdk_library`] — same
+    /// degradation contract as [`Self::feature_set_for_package_lenient`].
+    #[must_use]
+    pub fn feature_set_for_sdk_library_lenient(
+        &self,
+        name: &str,
+        version: LanguageVersion,
+    ) -> FeatureSet {
+        feature_set_with_known_experiments(version, self.for_sdk_library(name))
+    }
+
     /// The [`FeatureSet`] for package `name` at language `version`; a
     /// package without a grant gets the version-derived baseline only.
     ///
@@ -253,6 +282,24 @@ fn feature_set_with_experiments(
     } else {
         Err(UnknownExperiments(unknown))
     }
+}
+
+/// The lenient twin of [`feature_set_with_experiments`]: applies only the
+/// names the vendored feature registry knows, skipping the rest. An unknown
+/// grant cannot be honored, and the engine's grant path must degrade to the
+/// known-only set rather than abort the process on a version-skewed SDK
+/// (ticket #1293).
+fn feature_set_with_known_experiments(
+    version: LanguageVersion,
+    experiments: &BTreeSet<String>,
+) -> FeatureSet {
+    let mut set = FeatureSet::for_language_version(version);
+    for name in experiments {
+        if let Ok(feature) = Feature::try_from(name.as_str()) {
+            set = set.with_experiment_for_version(version, feature);
+        }
+    }
+    set
 }
 
 /// One or more experiment names in an `allowed_experiments.json` whitelist

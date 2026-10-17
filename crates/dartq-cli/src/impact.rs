@@ -1,4 +1,4 @@
-//! `dartq impact` — the PRD §15.4 impact face: what a change to one file
+//! `dartq impact` — the impact face: what a change to one file
 //! would affect, over the analyzed workspace.
 //!
 //! The substrate (import closure over the engine's CSR, the test graph, the
@@ -12,24 +12,30 @@
 //! depends on this file's API surface". The daemon passes real before/after
 //! diffs through the same query.
 //!
-//! Output is the §15.7 JSON contract (`schema_version: 1`, stable path
-//! labels; the v1 labels are the canonical file paths — package-form URIs
-//! land with the daemon's URI-aware substrate).
+//! Output is the frozen JSON contract (`schema_version: 2`; the labels are
+//! the shared pkg_label projection — a file under a package's `lib` tree
+//! answers its `package:<name>/<path>` form, files outside one keep the
+//! canonical path), schema-valid at birth (the shared core's shaper
+//! validates against `Domain::Impact`). The report is tier-invariant (the
+//! canonical tables: every field a locator or a verdict — nothing to
+//! trim), so `--verbosity` parses for grammar parity and every tier emits
+//! the same bytes.
 
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 
 use clap::Args;
 
-use dartq_commands::impact::{ImpactError, impact as query_impact};
+use dartq_commands::impact::{ImpactError, impact as query_impact, to_json};
 use dartq_commands::workspace::open_engine;
 
+use crate::Verbosity;
 use crate::exit;
 
 #[derive(Args)]
 pub(crate) struct ImpactArgs {
     /// The changed file to assess; must be an analyzed `.dart` file of the
-    /// workspace.
+    /// workspace. A relative path resolves against DIR.
     pub(crate) path: PathBuf,
     /// Package directory holding pubspec.yaml and
     /// `.dart_tool/package_config.json`; defaults to the current directory.
@@ -38,6 +44,13 @@ pub(crate) struct ImpactArgs {
     /// Dart SDK root; defaults to `$DART_SDK`.
     #[arg(long)]
     pub(crate) sdk: Option<PathBuf>,
+    /// Report detail tier (`-v`/`--verbosity minimal|compact|full`), for
+    /// grammar parity with the other faces. The report is tier-invariant
+    /// (the canonical tables: every field a locator or a verdict — the
+    /// published schema requires them at every tier), so every tier emits
+    /// the same bytes; the default `compact` was already the only shape.
+    #[arg(short = 'v', long, value_enum, default_value_t = Verbosity::Compact)]
+    pub(crate) verbosity: Verbosity,
 }
 
 /// Crash tier like the other engine faces: a panic aborts with exit 4 and
@@ -55,18 +68,36 @@ pub(crate) fn run_entry(args: &ImpactArgs) -> u8 {
 }
 
 fn run(args: &ImpactArgs, out: &mut impl Write) -> u8 {
-    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+    // The tier parses for grammar parity and shapes nothing: the report is
+    // tier-invariant (the canonical tables trim nothing here), the same
+    // accept-and-document posture the daemon's `dartq/impact` answer holds.
+    let _ = args.verbosity;
+    let (mut engine, dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {
             eprintln!("error: {error}");
             return exit::USAGE;
         }
     };
-    let report = match query_impact(&mut engine, &args.path) {
+    // The target resolves against `--dir`, not the process cwd: a relative
+    // path joins the assembly's canonical package directory — the same
+    // resolution base the daemon's workspace-root resolution serves. An
+    // absolute path passes through (the core canonicalizes either way).
+    let target = if args.path.is_absolute() {
+        args.path.clone()
+    } else {
+        dir.join(&args.path)
+    };
+    let report = match query_impact(&mut engine, &target) {
         Ok(report) => report,
-        // Target problems are the usage tier (their Display bodies are the
-        // printed messages); prelude failures the internal tier.
-        Err(error @ (ImpactError::Missing(_) | ImpactError::NotAnalyzed(_))) => {
+        // Target problems, plus the environments axis' unusable inputs (a
+        // malformed config, an unresolvable context locator), are the usage
+        // tier — their Display bodies are the printed messages, the compat
+        // face's split ([`ImpactError`]'s contract); prelude and axis-engine
+        // failures the internal tier.
+        Err(
+            error @ (ImpactError::Missing(_) | ImpactError::NotAnalyzed(_) | ImpactError::Usage(_)),
+        ) => {
             eprintln!("error: {error}");
             return exit::USAGE;
         }
@@ -78,8 +109,8 @@ fn run(args: &ImpactArgs, out: &mut impl Write) -> u8 {
 
     let written = out
         .write_all(
-            serde_json::to_string(&report)
-                .expect("ImpactReport serializes")
+            serde_json::to_string(&to_json(&report))
+                .expect("the validated report serializes")
                 .as_bytes(),
         )
         .and_then(|()| out.write_all(b"\n"))
@@ -119,11 +150,23 @@ mod tests {
         assert_eq!(args.path, PathBuf::from("lib/a.dart"));
         assert_eq!(args.dir, PathBuf::from("."), "default target cwd");
         assert!(args.sdk.is_none(), "no sdk by default");
+        assert_eq!(
+            args.verbosity.into_commands(),
+            dartq_commands::Verbosity::Compact,
+            "compact is the default tier"
+        );
 
         let args = parse(&["impact", "--sdk", "/sdk", "/pkg/lib/a.dart", "/pkg"]);
         assert_eq!(args.sdk, Some(PathBuf::from("/sdk")), "--sdk parses");
         assert_eq!(args.path, PathBuf::from("/pkg/lib/a.dart"));
         assert_eq!(args.dir, PathBuf::from("/pkg"));
+
+        let args = parse(&["impact", "-v", "minimal", "lib/a.dart"]);
+        assert_eq!(
+            args.verbosity.into_commands(),
+            dartq_commands::Verbosity::Minimal,
+            "--verbosity parses"
+        );
 
         for rejected in [
             &["impact", "lib/a.dart", "/pkg", "/sdk"][..],
@@ -184,7 +227,7 @@ mod tests {
 
     /// End to end: the hypothetical change of `lib/a.dart` names its face
     /// symbols, tags the direct importers (`b.dart`, the test) semantic,
-    /// and lands the test file in AffectedTests.
+    /// and lands the test file in `AffectedTests`.
     #[test]
     fn impact_end_to_end() {
         let root = fixture("e2e");
@@ -193,6 +236,7 @@ mod tests {
             path: a.clone(),
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
+            verbosity: Verbosity::Compact,
         };
         let mut out: Vec<u8> = Vec::new();
         let code = run(&args, &mut out);
@@ -200,7 +244,10 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], 2);
+        // Lib files answer their package-form references (the shared
+        // pkg_label projection), ASCII-sorted, hypothetical signature
+        // flags.
         let symbols: Vec<&str> = json["changed"]
             .as_array()
             .expect("changed")
@@ -209,10 +256,7 @@ mod tests {
             .collect();
         assert_eq!(
             symbols,
-            vec![
-                format!("{}|Foo", a.display()),
-                format!("{}|foo", a.display()),
-            ],
+            vec!["package:fixture/a.dart|Foo", "package:fixture/a.dart|foo",],
             "every face name, ASCII-sorted, hypothetical signature flags"
         );
         assert!(
@@ -223,7 +267,9 @@ mod tests {
                 .all(|row| row["signature_changed"] == true),
         );
 
-        let b = root.canonicalize().expect("root").join("lib/b.dart");
+        // The test tree file keeps its canonical path (no `package:` URI
+        // addresses it — the documented fallback), and the path sort puts
+        // it first: `/` sorts before `p` in `package:`.
         let test_path = root.canonicalize().expect("root").join("test/a_test.dart");
         let affected: Vec<(String, &str)> = json["affected"]
             .as_array()
@@ -239,8 +285,8 @@ mod tests {
         assert_eq!(
             affected,
             vec![
-                (b.display().to_string(), "semantic"),
                 (test_path.display().to_string(), "semantic"),
+                ("package:fixture/b.dart".to_string(), "semantic"),
             ],
             "both import a directly; the import of the test resolves through the package URI"
         );
@@ -251,10 +297,48 @@ mod tests {
             .map(|row| row["path"].as_str().expect("path").to_string())
             .collect();
         assert_eq!(tests, vec![test_path.display().to_string()]);
+        // The contextless default row is the compat rule's verdict over the
+        // affected set, and the set spans the test file: its
+        // `package:test` import has no package-config entry, the URI
+        // layer's ERROR lands in the set, and the honest row is
+        // incompatible.
         assert_eq!(
             json["affected_environments"],
-            serde_json::json!([{ "label": "default", "compatible": true }]),
+            serde_json::json!([{ "label": "default", "compatible": false }]),
         );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The tier-invariance boundary, end to end: the report's canonical
+    /// tables trim nothing (every field a locator or a verdict the
+    /// published schema requires at every tier), so `minimal`, `compact`,
+    /// and `full` emit identical bytes.
+    #[test]
+    fn every_verbosity_tier_emits_identical_bytes() {
+        let root = fixture("tiers");
+        let base = ImpactArgs {
+            path: root.join("lib/a.dart"),
+            dir: root.clone(),
+            sdk: Some(root.join("sdk")),
+            verbosity: Verbosity::Compact,
+        };
+        let mut compact: Vec<u8> = Vec::new();
+        assert_eq!(run(&base, &mut compact), exit::CLEAN);
+        for (tier, name) in [(Verbosity::Minimal, "minimal"), (Verbosity::Full, "full")] {
+            let args = ImpactArgs {
+                verbosity: tier,
+                path: base.path.clone(),
+                dir: base.dir.clone(),
+                sdk: base.sdk.clone(),
+            };
+            let mut out: Vec<u8> = Vec::new();
+            assert_eq!(run(&args, &mut out), exit::CLEAN);
+            assert_eq!(
+                out, compact,
+                "{name} emits the compact bytes: nothing to trim"
+            );
+        }
 
         fs::remove_dir_all(&root).ok();
     }
@@ -267,8 +351,41 @@ mod tests {
             path: root.join("lib/missing.dart"),
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
+            verbosity: Verbosity::Compact,
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A relative target resolves against `--dir`, not the process cwd: the
+    /// fixture answers through `lib/a.dart` joined onto the package
+    /// directory. (The retired resolution canonicalized the raw path
+    /// against the cwd and reported `Missing` for any cwd without one.)
+    #[test]
+    fn relative_path_resolves_against_dir() {
+        let root = fixture("relative");
+        let args = ImpactArgs {
+            path: PathBuf::from("lib/a.dart"),
+            dir: root.clone(),
+            sdk: Some(root.join("sdk")),
+            verbosity: Verbosity::Compact,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(run(&args, &mut out), exit::CLEAN);
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
+        let symbols: Vec<&str> = json["changed"]
+            .as_array()
+            .expect("changed")
+            .iter()
+            .map(|row| row["symbol"].as_str().expect("symbol"))
+            .collect();
+        assert_eq!(
+            symbols,
+            vec!["package:fixture/a.dart|Foo", "package:fixture/a.dart|foo",],
+            "the seed is the dir-joined lib/a.dart, its label the package form"
+        );
+
         fs::remove_dir_all(&root).ok();
     }
 
@@ -281,6 +398,7 @@ mod tests {
             path: root.join("lib/nope.dart"),
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
+            verbosity: Verbosity::Compact,
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
         fs::remove_dir_all(&root).ok();
@@ -295,6 +413,7 @@ mod tests {
             path: root.join("lib/a.dart"),
             dir: root.clone(),
             sdk: Some(root.join("no-such-sdk")),
+            verbosity: Verbosity::Compact,
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
         fs::remove_dir_all(&root).ok();

@@ -188,6 +188,72 @@ fn uri_errors_are_explicit() {
 }
 
 #[test]
+fn flat_existence_face_resolves_across_segments() {
+    // The fixture's `vm` segment lists only the base set plus `cli` — the
+    // flat table (generated from the oracle's `libraries.dart`) resolves
+    // past segment boundaries, matching the oracle's URI-existence posture:
+    // no platform flags, no segment filter.
+    let tree = TempTree::new(&standard_files());
+    let sdk = tree.load();
+
+    let html = sdk
+        .flat_library_to_path("html", "")
+        .expect("html is in the flat table");
+    assert_eq!(
+        html,
+        tree.dart_sdk().join("lib/html/dart2js/html_dart2js.dart")
+    );
+
+    // Parts join the flat entry's path the analyzer's way.
+    let part = sdk
+        .flat_library_to_path("core", "bool.dart")
+        .expect("core is in the flat table");
+    assert_eq!(part, tree.dart_sdk().join("lib/core/bool.dart"));
+
+    // The ten web libraries the `vm` segment lacks all resolve; the
+    // VM-internal names the oracle's table lacks do not.
+    for name in [
+        "async",
+        "collection",
+        "concurrent",
+        "convert",
+        "core",
+        "developer",
+        "ffi",
+        "html",
+        "html_common",
+        "indexed_db",
+        "io",
+        "isolate",
+        "js",
+        "js_interop",
+        "js_interop_unsafe",
+        "js_util",
+        "math",
+        "mirrors",
+        "svg",
+        "typed_data",
+        "web_audio",
+        "web_gl",
+    ] {
+        assert!(
+            sdk.flat_library_to_path(name, "").is_some(),
+            "dart:{name} must exist on the flat face"
+        );
+    }
+    assert_eq!(
+        sdk.flat_library_to_path("_builtin", ""),
+        None,
+        "VM-internal name outside the oracle's table"
+    );
+    assert_eq!(
+        sdk.flat_library_to_path("web_sql", ""),
+        None,
+        "on disk in real SDK trees, tabulated by neither side"
+    );
+}
+
+#[test]
 fn support_values_follow_segment_and_gates() {
     let tree = TempTree::new(&standard_files());
     let sdk = tree.load();

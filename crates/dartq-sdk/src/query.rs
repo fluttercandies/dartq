@@ -3,7 +3,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::metadata::{SdkLibrary, SdkSnapshot, TargetLibraries};
+use crate::metadata::{SdkSnapshot, TargetLibraries};
 
 impl SdkSnapshot {
     /// The dart SDK root this snapshot was loaded from (the directory
@@ -19,7 +19,7 @@ impl SdkSnapshot {
     ///
     /// Segment sets drift across SDK versions, so segments are addressed by
     /// their `libraries.json` name — never a hardcoded enumeration
-    /// (the SDK metadata capture §7).
+    ///.
     #[must_use]
     pub fn target(&self, segment: &str) -> Option<&TargetLibraries> {
         self.sdk_libraries.get(segment)
@@ -39,7 +39,7 @@ impl SdkSnapshot {
     ///
     /// Patch files are deliberately unreachable from here: they are backend
     /// implementation details, kept as [`SdkLibrary::patches`](crate::SdkLibrary::patches)
-    /// path lists only (the SDK metadata capture §6).
+    /// path lists only.
     ///
     /// The structural twin [`SdkSnapshot::library_to_path`] consumes the
     /// already-split `(library, part)` pair with byte-identical semantics;
@@ -74,7 +74,7 @@ impl SdkSnapshot {
                 target: segment.to_owned(),
                 library: name.to_owned(),
             })?;
-        Ok(self.library_file(info, part))
+        Ok(self.join_part(&info.uri, part))
     }
 
     /// Resolves a `dart:` library from its already-split parts against
@@ -95,14 +95,34 @@ impl SdkSnapshot {
     #[must_use]
     pub fn library_to_path(&self, segment: &str, library: &str, part: &str) -> Option<PathBuf> {
         let info = self.target(segment)?.libraries.get(library)?;
-        Some(self.library_file(info, part))
+        Some(self.join_part(&info.uri, part))
     }
 
-    /// The single path builder behind both faces: `<root>/lib/<library.uri>`
+    /// The flat existence face: resolves `library` (+ optional `part`)
+    /// against the generated [`FLAT_LIBRARIES`] table — the oracle's own
+    /// `dart:` library map, flat across all target segments (the vendored
+    /// analyzer never consults platform flags for URI existence), which is
+    /// the posture `dart analyze` answers `uri_does_not_exist` from.
+    /// `library` carries no `dart:` prefix; a name outside the table (e.g.
+    /// `web_sql`, on disk in the SDK tree but tabulated by neither side)
+    /// yields `None`.
+    ///
+    /// [`FLAT_LIBRARIES`] is generated from the pinned oracle SDK — see
+    /// `tools/sdk-faces-gen`; the per-segment tables above stay authoritative
+    /// for `dart.library.*` support values.
+    #[must_use]
+    pub fn flat_library_to_path(&self, library: &str, part: &str) -> Option<PathBuf> {
+        let index = crate::FLAT_LIBRARIES
+            .binary_search_by_key(&library, |entry| entry.0)
+            .ok()?;
+        Some(self.join_part(crate::FLAT_LIBRARIES[index].1, part))
+    }
+
+    /// The single path builder behind both faces: `<root>/lib/<library uri>`
     /// with `part` joined the analyzer's way.
-    fn library_file(&self, library: &SdkLibrary, part: &str) -> PathBuf {
+    fn join_part(&self, library_uri: &str, part: &str) -> PathBuf {
         let lib_root = self.dart_sdk_root.join("lib");
-        let library_file = lib_root.join(&library.uri);
+        let library_file = lib_root.join(library_uri);
         match part {
             "" => library_file,
             part => {
@@ -134,8 +154,7 @@ impl SdkSnapshot {
     /// The key domain is library names, not platform segment names: the CFE
     /// looks up `dart.library.<libraryName>` against the target's effective
     /// library set (`pkg/kernel/lib/target/targets.dart`,
-    /// `dartLibraryPrefix`; correction of PRD §7 in
-    /// the SDK metadata capture §1).
+    /// `dartLibraryPrefix`).
     #[must_use]
     pub fn library_support_value(&self, segment: &str, library: &str) -> bool {
         self.target(segment)

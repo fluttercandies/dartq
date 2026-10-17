@@ -1,4 +1,4 @@
-//! `dartq compat` — the PRD §15.5 compatibility face: the same workspace
+//! `dartq compatibility` — the compatibility face: the same workspace
 //! analyzed under several SDK roots, aggregated into a per-axis ✓/✗ matrix.
 //!
 //! The matrix mechanics (one axis = one SDK context, sequential axes over
@@ -11,10 +11,12 @@
 //! back to `$DART_SDK` when nothing declared any axis), the tier mapping,
 //! and the JSON output.
 //!
-//! Output is the §15.7 JSON contract (`schema_version: 1`): the queried
+//! Output is the frozen JSON contract (`schema_version: 1`): the queried
 //! file plus the matrix in axis order (CLI flags first, then contexts in
-//! file order). Contexts add rows, never row fields. The axis verdict rule
-//! and the `first_failure` ordering live in `dartq_ai::compatibility`.
+//! file order), schema-valid at birth (the shared core's shaper validates
+//! against `Domain::Compat`). Contexts add rows, never row fields. The
+//! axis verdict rule and the `first_failure` ordering live in
+//! `dartq_ai::compatibility`.
 //!
 //! Exit codes follow the query faces: 0 on a successful query —
 //! incompatible axes are the answer's data, not a failure — 64 usage, 4
@@ -25,9 +27,10 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-use dartq_commands::compat::{CompatError, compat as query_compat};
+use dartq_commands::compat::{CompatError, at_verbosity, compat as query_compat, to_json};
 use dartq_commands::config::{ConfigError, compat_axis_roots};
 
+use crate::Verbosity;
 use crate::exit;
 
 #[derive(Args)]
@@ -48,6 +51,14 @@ pub(crate) struct CompatArgs {
     /// errors. Needs a dartq.yaml at the workspace root.
     #[arg(long = "context")]
     pub(crate) contexts: Vec<String>,
+    /// Matrix detail tier (`-v`/`--verbosity minimal|compact|full`):
+    /// `minimal` keeps the verdict + axis identity (`sdk`/`compatible`) and
+    /// drops the evidence rows (`first_failure`/`error` — one compact run
+    /// away); `compact` is the frozen row shape; `full` equals `compact`
+    /// (the canonical tables list no compat-only extras). Default
+    /// `compact`: the default run's bytes are unchanged.
+    #[arg(short = 'v', long, value_enum, default_value_t = Verbosity::Compact)]
+    pub(crate) verbosity: Verbosity,
 }
 
 /// Crash tier like the other query faces: a panic aborts with exit 4 and
@@ -84,8 +95,8 @@ fn run(args: &CompatArgs, out: &mut impl Write) -> u8 {
     } else {
         axes
     };
-    let report = match query_compat(&args.dir, &args.path, &roots) {
-        Ok(report) => report,
+    let (report, notices) = match query_compat(&args.dir, &args.path, &roots) {
+        Ok(faces) => faces,
         Err(CompatError::Usage(message)) => {
             eprintln!("error: {message}");
             return exit::USAGE;
@@ -95,11 +106,21 @@ fn run(args: &CompatArgs, out: &mut impl Write) -> u8 {
             return exit::INTERNAL_ERROR;
         }
     };
+    // The canonical tier cut (minimal drops the evidence rows) rides the
+    // shared core's shapers — the cut on the typed report, then the
+    // validate-at-birth serialization — the one implementation the
+    // daemon's answer mirrors.
+    let report = to_json(&at_verbosity(report, args.verbosity.into_commands()));
+    // The axes' version-skew degrade notices (#1311) on stderr ahead of the
+    // report — the JSON on stdout stays the whole data contract.
+    for line in &notices {
+        eprintln!("{line}");
+    }
 
     let written = out
         .write_all(
             serde_json::to_string(&report)
-                .expect("CompatReport serializes")
+                .expect("the validated report serializes")
                 .as_bytes(),
         )
         .and_then(|()| out.write_all(b"\n"))
@@ -199,6 +220,7 @@ mod tests {
                 root.join("sdks/new"),
                 root.join("sdks/broken"),
             ],
+            verbosity: Verbosity::Compact,
         };
         let mut out: Vec<u8> = Vec::new();
         let code = run(&args, &mut out);
@@ -222,12 +244,8 @@ mod tests {
         assert_eq!(matrix[0]["compatible"], false);
         assert_eq!(matrix[0]["first_failure"]["code"], "uri_does_not_exist");
         assert_eq!(
-            matrix[0]["first_failure"]["file"],
-            root.canonicalize()
-                .expect("root")
-                .join("lib/a.dart")
-                .display()
-                .to_string(),
+            matrix[0]["first_failure"]["file"], "package:fixture/a.dart",
+            "the failure file is the package-form label, not the raw path"
         );
         assert_eq!(matrix[0]["first_failure"]["line"], 1);
         assert_eq!(matrix[0]["first_failure"]["col"], 8, "the URI literal span");
@@ -256,6 +274,54 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The minimal tier's row shape, end to end: every axis keeps the
+    /// verdict + identity pair (`sdk`/`compatible`) and drops the evidence
+    /// keys — the analyzed axis's `first_failure` and the isolated axis's
+    /// `error` (one compact run away). The other sections ride unchanged.
+    #[test]
+    fn minimal_tier_keeps_the_verdict_rows_only() {
+        let root = fixture("minimal");
+        let args = CompatArgs {
+            path: root.join("lib/a.dart"),
+            dir: root.clone(),
+            contexts: vec![],
+            sdk_roots: vec![
+                root.join("sdks/old"),
+                root.join("sdks/new"),
+                root.join("sdks/broken"),
+            ],
+            verbosity: Verbosity::Minimal,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(run(&args, &mut out), exit::CLEAN);
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(
+            json["file"],
+            root.canonicalize()
+                .expect("root")
+                .join("lib/a.dart")
+                .display()
+                .to_string(),
+            "the subject label stays"
+        );
+        let matrix = json["matrix"].as_array().expect("matrix");
+        assert_eq!(matrix.len(), 3, "one row per axis, in CLI order");
+        for (axis, sdk) in matrix.iter().zip(["3.5.0", "3.13.1"]) {
+            assert_eq!(axis["sdk"], sdk, "the axis identity stays");
+            assert!(
+                axis.get("first_failure").is_none() && axis.get("error").is_none(),
+                "evidence drops at minimal: {axis}"
+            );
+        }
+        assert_eq!(matrix[0]["compatible"], false, "the verdict stays");
+        assert_eq!(matrix[1]["compatible"], true, "the verdict stays");
+        assert_eq!(matrix[2]["compatible"], false, "the verdict stays");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// Usage tier: a target outside the analyzed workspace.
     #[test]
     fn target_outside_workspace_is_usage() {
@@ -265,6 +331,7 @@ mod tests {
             dir: root.clone(),
             contexts: vec![],
             sdk_roots: vec![root.join("sdks/new")],
+            verbosity: Verbosity::Compact,
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
         fs::remove_dir_all(&root).ok();
@@ -281,6 +348,7 @@ mod tests {
             dir: root.clone(),
             contexts: vec![],
             sdk_roots: vec![root.join("sdks/new"), root.join("sdks/old")],
+            verbosity: Verbosity::Compact,
         };
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(run(&args, &mut out), exit::CLEAN);
@@ -314,6 +382,7 @@ mod tests {
             dir: root.clone(),
             contexts: vec![],
             sdk_roots: vec![],
+            verbosity: Verbosity::Compact,
         };
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(run(&args, &mut out), exit::CLEAN);
@@ -345,6 +414,7 @@ mod tests {
             dir: root.clone(),
             contexts: vec!["old".to_owned()],
             sdk_roots: vec![root.join("sdks/new")],
+            verbosity: Verbosity::Compact,
         };
         assert_eq!(run(&args, &mut out), exit::CLEAN);
         let json: serde_json::Value =
@@ -380,6 +450,7 @@ mod tests {
             dir: root.clone(),
             contexts: vec!["nope".to_owned()],
             sdk_roots: vec![],
+            verbosity: Verbosity::Compact,
         };
         assert_eq!(run(&unknown, &mut Vec::new()), exit::USAGE);
 
