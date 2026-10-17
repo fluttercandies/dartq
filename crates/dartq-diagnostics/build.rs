@@ -1,7 +1,7 @@
 //! Build-time generator for the official diagnostic code table.
 //!
 //! Parses `data/syntax-codes.tsv` — the authoritative code data captured in
-//! the pinned syntax-codes capture §9, locked to the dart 3.13.1 oracle — and
+//! the pinned syntax-codes capture, locked to the dart 3.13.1 oracle — and
 //! emits `syntax_codes_generated.rs` into `OUT_DIR`, which `src/code.rs`
 //! includes. Any malformed row fails the build with a `file:line` message;
 //! the emitted file is a pure function of the TSV, so builds are
@@ -254,9 +254,9 @@ fn placeholders(message: &str) -> Vec<(u32, usize)> {
 ///   — class type `STATIC_WARNING`.
 /// - Everything else: parser/scanner class type `SYNTACTIC_ERROR`.
 ///
-/// Per-row severity overrides the class severity (facts §2/§3); the emitted
+/// Per-row severity overrides the class severity; the emitted
 /// SEVERITY comes from the diagnostics, the TYPE from this mapping.
-/// `COMPILE_TIME_ERROR` routing of pseudoSharedCode parser errors (facts §2)
+/// `COMPILE_TIME_ERROR` routing of pseudoSharedCode parser errors
 /// is an emit-site decision per parse route and is not a property of the
 /// table.
 fn dtype_of(source: &str) -> &'static str {
@@ -283,7 +283,7 @@ fn emit(rows: &[Row]) {
     // One constant per code; the MACHINE column is already the SCREAMING_SNAKE
     // Rust identifier (validated above).
     for row in rows {
-        let doc = format!("`{}` — {}", row.name, row.message);
+        let doc = format!("`{}` — {}", row.name, doc_esc(&row.message));
         writeln!(out, "#[doc = {}]", rust_str(&doc)).unwrap();
         writeln!(
             out,
@@ -320,11 +320,9 @@ fn emit(rows: &[Row]) {
     out.push_str(
         "/// `(name, oracle SEV, message template, hasPublishedDocs)` rows in table order;\n",
     );
-    out.push_str(
-        "/// backs the consistency tests and [`crate::code::message_template`]. Test-only\n",
-    );
-    out.push_str("/// payload: emit sites carry their message texts, so the static is compiled\n");
-    out.push_str("/// only into test builds.\n");
+    out.push_str("/// backs the consistency tests (against the live [`message_template`] face\n");
+    out.push_str("/// and the emit-path pins). Test-only payload: emitters render through the\n");
+    out.push_str("/// generated match, so the static is compiled only into test builds.\n");
     out.push_str("#[cfg(test)]\n");
     out.push_str("pub static OFFICIAL_CODE_DATA: &[(&str, &str, &str, bool)] = &[\n");
     for row in rows {
@@ -340,7 +338,38 @@ fn emit(rows: &[Row]) {
     }
     out.push_str("];\n");
 
+    // The emission-path template face: a match over the literal rows, so a
+    // lookup is a string-match dispatch (no table scan, no map build) and a
+    // name absent from the table falls to the explicit `None` arm — callers
+    // that require a row fail loudly on it instead of rendering a default.
+    out.push_str("\n/// Message template of an official code, by exact name (`{0}`/`{1}` are\n");
+    out.push_str("/// substitution placeholders). The emission-path single source: emitters\n");
+    out.push_str("/// whose code rows are byte-pinned against this table render from it\n");
+    out.push_str("/// instead of carrying local literals. Official codes only — dartq-own\n");
+    out.push_str("/// codes carry their messages at the emit site.\n");
+    out.push_str("#[must_use]\n");
+    out.push_str("pub fn message_template(name: &str) -> Option<&'static str> {\n");
+    out.push_str("    match name {\n");
+    for row in rows {
+        writeln!(
+            out,
+            "        {} => Some({}),",
+            rust_str(&row.name),
+            rust_str(&row.message)
+        )
+        .unwrap();
+    }
+    out.push_str("        _ => None,\n");
+    out.push_str("    }\n");
+    out.push_str("}\n");
+
     fs::write(out_dir.join("syntax_codes_generated.rs"), out).expect("write generated code table");
+}
+
+/// Escapes rustdoc link brackets so table prose like `'[0]'` renders
+/// literally instead of parsing as a broken intra-doc link.
+fn doc_esc(s: &str) -> String {
+    s.replace('[', "\\[").replace(']', "\\]")
 }
 
 /// Renders `s` as a Rust string literal (escapes `\` and `"`).

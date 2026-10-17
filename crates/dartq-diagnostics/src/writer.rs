@@ -1,16 +1,17 @@
 //! Output writers reproducing `dart analyze --format=machine` and
-//! `--format=json` field-for-field and byte-for-byte (oracle facts §1/§2).
+//! `--format=json` field-for-field and byte-for-byte.
 //!
 //! With no diagnostics the machine writer emits nothing at all, while the
 //! JSON writer still prints the bare `{"version":1,"diagnostics":[]}` line —
 //! both matching the oracle (only the human-readable default differs).
 
+use std::borrow::Cow;
 use std::io::{self, Write};
 
 use serde::Serialize;
 
 use crate::code::CodeInfo;
-use crate::model::{AnalysisOutput, Diagnostic};
+use crate::model::{AnalysisOutput, ContextMessage, Diagnostic, FileId, SourceRange};
 
 /// Writes diagnostics in the oracle machine format, one line per diagnostic:
 ///
@@ -70,7 +71,7 @@ pub fn write_machine(out: &mut impl Write, output: &AnalysisOutput<'_>) -> io::R
 /// always ends with a newline — the oracle routes every format through
 /// `writeln` (measured: empty set → exactly `{"version":1,"diagnostics":[]}\n`).
 ///
-/// Serialization goes through [`JsonDiagnostic`] so `serde_json` owns the
+/// Serialization goes through `JsonDiagnostic` so `serde_json` owns the
 /// string escaping; its escape table is byte-identical to Dart's
 /// `jsonEncode` for every character the writers can encounter (short escapes
 /// for the common controls, lowercase `\u00xx` for the remaining C0 bytes,
@@ -93,7 +94,10 @@ pub fn write_json(out: &mut impl Write, output: &AnalysisOutput<'_>) -> io::Resu
 }
 
 /// The one-diagnostic JSON object. Field declaration order is the oracle's
-/// key order — `serde` serializes struct fields in declaration order.
+/// key order — `serde` serializes struct fields in declaration order:
+/// `code`, `severity`, `type`, `location`, `problemMessage`,
+/// `correctionMessage`, `contextMessages`, `documentation` (upstream Dart
+/// SDK source, `analyze.dart` `emitJsonFormat` map literal :549-572).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonDiagnostic<'a> {
@@ -106,12 +110,24 @@ struct JsonDiagnostic<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     correction_message: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    context_messages: Option<Vec<JsonContextMessage<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     documentation: Option<&'a str>,
+}
+
+/// One `contextMessages` element: `{location: {file, range}, message}` —
+/// the oracle's element shape, location first (upstream `analyze.dart`
+/// `emitJsonFormat` :519-547).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonContextMessage<'a> {
+    location: JsonLocation<'a>,
+    message: &'a str,
 }
 
 #[derive(Serialize)]
 struct JsonLocation<'a> {
-    file: &'a str,
+    file: Cow<'a, str>,
     range: JsonRange,
 }
 
@@ -137,33 +153,63 @@ fn write_json_diagnostic(
     d: &Diagnostic,
     url: &mut String,
 ) -> serde_json::Result<()> {
-    let (start_line, start_column) = output.files.line_col(d.file, d.range.offset);
-    let (end_line, end_column) = output.files.line_col(d.file, d.range.end());
-    let file = output.files.file_path(d.file).to_string_lossy();
     let diagnostic = JsonDiagnostic {
         code: d.code.name,
         severity: d.severity.as_machine_str(),
         diagnostic_type: d.code.dtype.as_str(),
-        location: JsonLocation {
-            file: &file,
-            range: JsonRange {
-                start: JsonPosition {
-                    offset: d.range.offset,
-                    line: start_line,
-                    column: start_column,
-                },
-                end: JsonPosition {
-                    offset: d.range.end(),
-                    line: end_line,
-                    column: end_column,
-                },
-            },
-        },
+        location: json_location(output, d.file, d.range),
         problem_message: &d.message,
         correction_message: d.correction.as_deref(),
+        context_messages: d.context.as_deref().map(|context| {
+            context
+                .iter()
+                .map(|m| json_context_message(output, m))
+                .collect()
+        }),
         documentation: documentation_url(d.code, url),
     };
     serde_json::to_writer(out, &diagnostic)
+}
+
+/// One `{file, range}` pair resolved through the layout provider — the
+/// shape the diagnostic's own location and every context-message location
+/// share (upstream `locationJson`/`rangeJson`/`positionJson`,
+/// `analyze.dart` `emitJsonFormat` :501-513). `to_string_lossy` gives the
+/// `Cow` directly: borrowed for UTF-8-clean paths, owned otherwise.
+fn json_location<'a>(
+    output: &'a AnalysisOutput<'_>,
+    file_id: FileId,
+    range: SourceRange,
+) -> JsonLocation<'a> {
+    let (start_line, start_column) = output.files.line_col(file_id, range.offset);
+    let (end_line, end_column) = output.files.line_col(file_id, range.end());
+    JsonLocation {
+        file: output.files.file_path(file_id).to_string_lossy(),
+        range: JsonRange {
+            start: JsonPosition {
+                offset: range.offset,
+                line: start_line,
+                column: start_column,
+            },
+            end: JsonPosition {
+                offset: range.end(),
+                line: end_line,
+                column: end_column,
+            },
+        },
+    }
+}
+
+/// One context-message element in the oracle's shape: location object
+/// first, message second (`analyze.dart` `emitJsonFormat` :530-543).
+fn json_context_message<'a>(
+    output: &'a AnalysisOutput<'_>,
+    m: &'a ContextMessage,
+) -> JsonContextMessage<'a> {
+    JsonContextMessage {
+        location: json_location(output, m.file, m.range),
+        message: &m.message,
+    }
 }
 
 /// The oracle emits `documentation` only for codes its registry marks

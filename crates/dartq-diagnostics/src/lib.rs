@@ -1,7 +1,7 @@
 //! dartq's diagnostic data model and oracle-exact output writers.
 //!
 //! This crate is the single source of truth for the shape and serialization of
-//! dartq diagnostics (PRD §13). Its output must match `dart analyze`'s
+//! dartq diagnostics. Its output must match `dart analyze`'s
 //! machine formats field-for-field, so every layout decision here is pinned to
 //! the measured oracle facts (the oracle machine-format contract).
 //!
@@ -10,11 +10,11 @@
 //!   `SYNTACTIC_ERROR` / `COMPILE_TIME_ERROR` / `STATIC_WARNING` / `LINT`,
 //!   plus dartq's own `TOOL` for the `dartq/` namespace).
 //! - [`CodeInfo`] and [`CodeRegistry`]: stable official code names
-//!   (`snake_case`, one-to-one with the analyzer's codes, PRD §13.2) and
+//!   and
 //!   dartq-own `dartq/`-prefixed codes. The official table is generated at
 //!   build time from `data/syntax-codes.tsv` (dart 3.13.1 oracle lock).
 //! - [`Diagnostic`]: one diagnostic located by a [`FileId`] plus a
-//!   UTF-16-unit [`SourceRange`] (PRD §13.1).
+//!   UTF-16-unit [`SourceRange`].
 //! - [`write_machine`] / [`write_json`]: byte-exact oracle output writers.
 //!   Both consume an [`AnalysisOutput`], pairing the diagnostics with a
 //!   [`FileLayoutProvider`] the caller implements on top of the engine's line
@@ -22,7 +22,7 @@
 //!
 //! [`FileId`] and [`SourceRange`] are re-exported from `dartq-source`, the
 //! single source of truth for file identity and the UTF-16 position
-//! convention (PRD §6/§7/§10.4).
+//! convention.
 
 mod code;
 mod model;
@@ -33,6 +33,7 @@ mod writer;
 // M0-measured and dartq-own namespaces.
 pub use code::*;
 pub use model::{
-    AnalysisOutput, Diagnostic, DiagnosticType, FileId, FileLayoutProvider, Severity, SourceRange,
+    AnalysisOutput, ContextMessage, Diagnostic, DiagnosticType, FileId, FileLayoutProvider,
+    Severity, SharedStr, SourceRange,
 };
 pub use writer::{write_json, write_machine};

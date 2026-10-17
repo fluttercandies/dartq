@@ -1,12 +1,12 @@
 //! Golden tests pinning `write_machine`/`write_json` to measured oracle
-//! output (the oracle machine-format contract §1/§2). File contents are
+//! output. File contents are
 //! reconstructed so the fixtures reproduce the oracle's measured positions.
 
 use std::path::Path;
 
 use dartq_diagnostics::{
-    AnalysisOutput, CodeInfo, CodeRegistry, Diagnostic, DiagnosticType, FileId, FileLayoutProvider,
-    Severity, SourceRange, write_json, write_machine,
+    AnalysisOutput, CodeInfo, CodeRegistry, ContextMessage, Diagnostic, DiagnosticType, FileId,
+    FileLayoutProvider, Severity, SourceRange, write_json, write_machine,
 };
 use dartq_source::{FileTable, LineIndex};
 
@@ -90,7 +90,7 @@ fn machine_empty_diagnostics_write_nothing() {
 
 #[test]
 fn json_empty_diagnostics_write_bare_envelope() {
-    // Oracle facts §1.2 (2026-10-08 audit correction): --format=json always
+    // Oracle facts (2026-10-08 audit correction): --format=json always
     // prints the envelope, even with zero diagnostics — exactly 31 bytes
     // including the trailing newline (`od -c` measured). Only --format=machine
     // writes nothing.
@@ -214,7 +214,7 @@ fn machine_golden_unterminated_string_literal() {
 
 #[test]
 fn machine_golden_pipe_message_is_escaped() {
-    // Oracle facts §1.1: `import "a|b.dart";` → message field carries 'a\|b.dart'.
+    // Oracle facts: `import "a|b.dart";` → message field carries 'a\|b.dart'.
     let mut files = Fixture::default();
     let f = files.add(PIPE_TEST_PATH, "import \"a|b.dart\";\n");
     let d = diagnostic(
@@ -328,7 +328,7 @@ fn machine_multiple_diagnostics_keep_field_order() {
     let mut files = Fixture::default();
     let syntax = files.add(SYNTAX_ERROR_PATH, "void broken() {\n  int x = 1\n}\n");
     let warn = files.add(WARN_PATH, "void f() {\n  var unused = 1;\n}\n");
-    // 16 one-char lines, then line 17: oracle facts §1.2 last sample row
+    // 16 one-char lines, then line 17: oracle facts last sample row
     // (17|5|100) — note the trailing space in the measured message.
     let arg_type = files.add(ARG_TYPE_PATH, "x\n".repeat(16) + "int f(int? x) => g(x);\n");
     let diagnostics = [
@@ -463,7 +463,7 @@ fn json_golden_range_end_column_after_emoji() {
 
 #[test]
 fn json_golden_unused_local_variable() {
-    // Byte-exact oracle facts §2 sample, wrapped in the version envelope.
+    // Byte-exact oracle facts json sample, wrapped in the version envelope.
     // Every oracle json output ends with a newline (measured `]}\n`).
     let mut files = Fixture::default();
     let f = files.add(WARN_PATH, "void f() {\n  var unused = 1;\n}\n");
@@ -606,6 +606,185 @@ fn json_escapes_special_characters_in_message() {
     );
 }
 
+/// Oracle JSON shape pin (`analyze.dart` `emitJsonFormat` :515-572): a
+/// diagnostic with no related information emits no `contextMessages` key
+/// at all — the oracle guards with `if (contextMessages.isNotEmpty)`, so
+/// the byte-pinned row carries exactly the keys the oracle emits for a
+/// context-free row (same skip posture as `correctionMessage`).
+#[test]
+fn json_omits_context_messages_when_absent() {
+    let mut files = Fixture::default();
+    let f = files.add(WARN_PATH, "void f() {\n  var unused = 1;\n}\n");
+    let d = diagnostic(
+        Severity::Warning,
+        dartq_diagnostics::UNUSED_LOCAL_VARIABLE,
+        "The value of the local variable 'unused' isn't used.",
+        f,
+        SourceRange {
+            offset: 17,
+            length: 6,
+        },
+    );
+    let out = json(&files.output(&[d]));
+    assert!(!out.contains("contextMessages"), "{out}");
+}
+
+/// Oracle JSON shape pin: with context, `contextMessages` lands between
+/// `correctionMessage` and `documentation`, each element is
+/// `{location: {file, range: {start: {offset,line,column}, end}}, message}`
+/// — location first, message second (`analyze.dart` `emitJsonFormat`
+/// :519-547). Line/column are 1-based UTF-16 positions resolved through
+/// the same `LineIndex` path the diagnostic's own location uses.
+#[test]
+fn json_emits_context_messages_in_oracle_shape() {
+    let mut files = Fixture::default();
+    let f = files.add(WARN_PATH, "void f() {\n  var unused = 1;\n}\n");
+    let d = Diagnostic::new(
+        Severity::Warning,
+        dartq_diagnostics::UNUSED_LOCAL_VARIABLE,
+        "The value of the local variable 'unused' isn't used.",
+        f,
+        SourceRange {
+            offset: 17,
+            length: 6,
+        },
+        Some(String::from("Try removing the variable or using it.")),
+    )
+    .with_context(vec![ContextMessage {
+        message: "The declaration is here.".into(),
+        file: f,
+        range: SourceRange {
+            offset: 17,
+            length: 6,
+        },
+    }]);
+    assert_eq!(
+        json(&files.output(&[d])),
+        concat!(
+            r#"{"version":1,"diagnostics":[{"code":"unused_local_variable","severity":"WARNING","#,
+            r#""type":"STATIC_WARNING","location":{"file":"/private/tmp/dq_oracle_scratch/pkg_min/lib/warn.dart","#,
+            r#""range":{"start":{"offset":17,"line":2,"column":7},"end":{"offset":23,"line":2,"column":13}}},"#,
+            r#""problemMessage":"The value of the local variable 'unused' isn't used.","#,
+            r#""correctionMessage":"Try removing the variable or using it.","#,
+            r#""contextMessages":[{"location":{"file":"/private/tmp/dq_oracle_scratch/pkg_min/lib/warn.dart","#,
+            r#""range":{"start":{"offset":17,"line":2,"column":7},"end":{"offset":23,"line":2,"column":13}}},"#,
+            r#""message":"The declaration is here."}],"#,
+            r#""documentation":"https://dart.dev/diagnostics/unused_local_variable"}]}"#,
+            "\n",
+        )
+    );
+}
+
+/// An empty `with_context` slice degrades to the no-context face — the
+/// oracle's `isNotEmpty` guard means an empty array never reaches the wire.
+#[test]
+fn json_with_context_empty_slice_omits_key() {
+    let mut files = Fixture::default();
+    let f = files.add(WARN_PATH, "void f() {}\n");
+    let d = diagnostic(
+        Severity::Error,
+        dartq_diagnostics::EXPECTED_TOKEN,
+        "Expected to find ';'.",
+        f,
+        SourceRange {
+            offset: 0,
+            length: 1,
+        },
+    )
+    .with_context(Vec::new());
+    let out = json(&files.output(&[d]));
+    assert!(!out.contains("contextMessages"), "{out}");
+}
+
+/// Oracle machine-format pin (`analyze.dart` `emitMachineFormat` :593-614):
+/// HINT/TODO rows print `INFO` in the severity column (upstream
+/// `DiagnosticType.HINT`/`TODO` are declared with `DiagnosticSeverity.INFO`,
+/// errors.dart :284-296) and `HINT`/`TODO` in the TYPE column.
+#[test]
+fn machine_golden_hint_type_folds_to_info_severity() {
+    let mut files = Fixture::default();
+    let f = files.add(WARN_PATH, "void f() {\n  var x = deprecated;\n}\n");
+    const DEPRECATED_MEMBER_USE: CodeInfo = CodeInfo::new(
+        "deprecated_member_use",
+        "DEPRECATED_MEMBER_USE",
+        DiagnosticType::Hint,
+        false,
+    );
+    let d = diagnostic(
+        Severity::Info,
+        DEPRECATED_MEMBER_USE,
+        "'deprecated' is deprecated and shouldn't be used.",
+        f,
+        SourceRange {
+            offset: 21,
+            length: 10,
+        },
+    );
+    assert_eq!(
+        machine(&files.output(&[d])),
+        "INFO|HINT|DEPRECATED_MEMBER_USE|\
+         /private/tmp/dq_oracle_scratch/pkg_min/lib/warn.dart|2|11|10|\
+         'deprecated' is deprecated and shouldn't be used.\n"
+    );
+}
+
+#[test]
+fn machine_golden_todo_type_folds_to_info_severity() {
+    let mut files = Fixture::default();
+    let f = files.add(WARN_PATH, "void f() {\n  // TODO: fix\n}\n");
+    const TODO: CodeInfo = CodeInfo::new("todo", "TODO", DiagnosticType::Todo, false);
+    let d = diagnostic(
+        Severity::Info,
+        TODO,
+        "TODO: fix",
+        f,
+        SourceRange {
+            offset: 16,
+            length: 9,
+        },
+    );
+    assert_eq!(
+        machine(&files.output(&[d])),
+        "INFO|TODO|TODO|/private/tmp/dq_oracle_scratch/pkg_min/lib/warn.dart|2|6|9|TODO: fix\n"
+    );
+}
+
+/// JSON face pin: a HINT-typed row emits `"severity":"INFO"` and
+/// `"type":"HINT"` — the oracle's severity/type split carries through JSON
+/// identically to machine.
+#[test]
+fn json_hint_type_uppercase_with_info_severity() {
+    let mut files = Fixture::default();
+    let f = files.add(WARN_PATH, "void f() {}\n");
+    const DEPRECATED_MEMBER_USE: CodeInfo = CodeInfo::new(
+        "deprecated_member_use",
+        "DEPRECATED_MEMBER_USE",
+        DiagnosticType::Hint,
+        false,
+    );
+    let d = diagnostic(
+        Severity::Info,
+        DEPRECATED_MEMBER_USE,
+        "'x' is deprecated.",
+        f,
+        SourceRange {
+            offset: 0,
+            length: 1,
+        },
+    );
+    let out = json(&files.output(&[d]));
+    assert!(out.contains(r#""severity":"INFO""#), "{out}");
+    assert!(out.contains(r#""type":"HINT""#), "{out}");
+}
+
+#[test]
+fn diagnostic_type_hint_and_todo_spellings_and_severity() {
+    assert_eq!(DiagnosticType::Hint.as_str(), "HINT");
+    assert_eq!(DiagnosticType::Todo.as_str(), "TODO");
+    assert_eq!(DiagnosticType::Hint.severity(), Severity::Info);
+    assert_eq!(DiagnosticType::Todo.severity(), Severity::Info);
+}
+
 #[test]
 fn severity_orders_info_then_warning_then_error() {
     let mut diagnostics = [Severity::Error, Severity::Info, Severity::Warning];
@@ -639,6 +818,8 @@ fn diagnostic_type_display_is_uppercase_underscore() {
     );
     assert_eq!(DiagnosticType::StaticWarning.to_string(), "STATIC_WARNING");
     assert_eq!(DiagnosticType::Lint.to_string(), "LINT");
+    assert_eq!(DiagnosticType::Hint.to_string(), "HINT");
+    assert_eq!(DiagnosticType::Todo.to_string(), "TODO");
     assert_eq!(DiagnosticType::Tool.to_string(), "TOOL");
 }
 
@@ -664,7 +845,8 @@ fn code_registry_looks_up_official_and_dartq_codes() {
         assert_eq!(code.machine, code.name.to_uppercase());
         count += 1;
     }
-    // 259 official table codes (7 measured-dead rows pruned, #222) + 15
-    // hand-written codes.
-    assert_eq!(count, 274);
+    // 276 builtin codes: the R780 parity wave plus the #1797 dialect
+    // extension's two dartq-own rows (`dartq/package_config_invalid`,
+    // `dartq/source_rejected`); the live iteration above is the authority.
+    assert_eq!(count, 276);
 }

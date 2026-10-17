@@ -1,9 +1,9 @@
 //! Stable diagnostic codes: the official analyzer code set dartq aligns to,
-//! plus dartq's own `dartq/` namespace (PRD §13.2).
+//! plus dartq's own `dartq/` namespace.
 //!
 //! The official set — 255 registry-gated codes plus 4 supplemental rows —
 //! is generated at build time from `data/syntax-codes.tsv`, the
-//! authoritative table captured in the pinned syntax-codes capture §9
+//! authoritative table captured in the pinned syntax-codes capture
 //! (dart 3.13.1 oracle lock). To update it,
 //! edit the TSV and rebuild; the per-code constants, the [`OFFICIAL_CODES`]
 //! slice, and [`OFFICIAL_CODE_DATA`] are regenerated. Only codes outside that
@@ -54,7 +54,7 @@ impl CodeInfo {
 
 // Per-code doc comments embed verbatim oracle message text — data, not
 // prose we may reformat, so doc-text lints are exempt.
-#[expect(clippy::doc_markdown, clippy::doc_link_with_quotes)]
+#[expect(clippy::doc_markdown)]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/syntax_codes_generated.rs"));
 }
@@ -68,21 +68,13 @@ pub use generated::*;
 // (dartq-engine/dartq-cli); both variant texts are in analyzer-8.4.1
 // `error/codes.g.dart` — AT_SIGN 11527-11540, GREATER 11560-11571.
 
-/// Message template of an official code, by exact name (TSV column 5; `{0}`/
-/// `{1}` are substitution placeholders). Official codes only — dartq-own
-/// codes carry their messages at the emit site.
-///
-/// Test-only: emit sites carry their message texts locally, so the template
-/// payload would otherwise ship dead in release binaries. Wiring the emitters
-/// to the registry as the single message source is a recorded follow-up.
-#[cfg(test)]
-#[must_use]
-pub fn message_template(name: &str) -> Option<&'static str> {
-    OFFICIAL_CODE_DATA
-        .iter()
-        .find(|(n, ..)| *n == name)
-        .map(|(_, _, message, _)| *message)
-}
+// The emission-path face of the table is the generated [`message_template`]
+// match: emitters whose code rows are byte-pinned against it render from it
+// instead of carrying local literals (the dartq-semantic registry-backed rows
+// keep their previous emit-site literals as test pins in both crates). Codes
+// outside the table keep their emit-site texts: the dartq-own namespace by
+// design, `invalid_language_version_override`'s production GREATER variant by
+// divergence (see the note above).
 
 // A code's [`DiagnosticType`] is the machine format's TYPE value. Generated
 // rows are SYNTACTIC_ERROR (parser/scanner class types), except the
@@ -91,8 +83,8 @@ pub fn message_template(name: &str) -> Option<&'static str> {
 // language_version_override are CompileTimeErrorCode-class COMPILE_TIME_ERROR
 // (analyzer-8.4.1 codes.g.dart; re-verified in the pinned live registry —
 // diagnostic.g.dart:7356-7365 and :7946-7956 vs :9184-9330, dart 3.15 main).
-// Codes the oracle routes by hand to COMPILE_TIME_ERROR at emit time (facts
-// §2 pseudoSharedCode routing) are emit-site decisions, not registry facts.
+// Codes the oracle routes by hand to COMPILE_TIME_ERROR at emit time (the
+// pseudoSharedCode routing) are emit-site decisions, not registry facts.
 
 // --- M0-measured codes outside the generated syntax table ---
 // hasPublishedDocs values captured from the generated registries
@@ -165,7 +157,7 @@ pub const PREFER_SINGLE_QUOTES: CodeInfo = CodeInfo::new(
     false,
 );
 
-// --- dartq-own namespace (PRD §13.2): never part of the official value set,
+// --- dartq-own namespace: never part of the official value set,
 // always rendered with type TOOL. ---
 
 /// `package_config` is missing or stale; deep analysis is withheld.
@@ -184,28 +176,38 @@ pub const DARTQ_PACKAGE_CONFIG_MISSING: CodeInfo = CodeInfo::new(
     DiagnosticType::Tool,
     false,
 );
-/// An internal panic/bug was downgraded to a per-file diagnostic (PRD §8).
+/// `package_config.json` exists but is unusable (malformed JSON, duplicate
+/// package names); analysis runs on the `Packages.empty` floor with every
+/// `package:` import unresolved (the oracle's parse-failure catch-all — it
+/// analyzes, it does not refuse).
+pub const DARTQ_PACKAGE_CONFIG_INVALID: CodeInfo = CodeInfo::new(
+    "dartq/package_config_invalid",
+    "DARTQ/PACKAGE_CONFIG_INVALID",
+    DiagnosticType::Tool,
+    false,
+);
+/// An internal panic/bug was downgraded to a per-file diagnostic.
 pub const DARTQ_INTERNAL_ERROR: CodeInfo = CodeInfo::new(
     "dartq/internal_error",
     "DARTQ/INTERNAL_ERROR",
     DiagnosticType::Tool,
     false,
 );
-/// A memory-budget downgrade step fired (PRD §11).
+/// A memory-budget downgrade step fired.
 pub const DARTQ_MEMORY_DEGRADED: CodeInfo = CodeInfo::new(
     "dartq/memory_degraded",
     "DARTQ/MEMORY_DEGRADED",
     DiagnosticType::Tool,
     false,
 );
-/// A build-generated source is imported but missing (PRD §17).
+/// A build-generated source is imported but missing.
 pub const DARTQ_MISSING_GENERATED_SOURCE: CodeInfo = CodeInfo::new(
     "dartq/missing_generated_source",
     "DARTQ/MISSING_GENERATED_SOURCE",
     DiagnosticType::Tool,
     false,
 );
-/// A plugin process died or broke the wire contract (PRD §14.3 crash and
+/// A plugin process died or broke the wire contract (crash and
 /// memory isolation; the restart budget's exhaustion is the terminal form).
 pub const DARTQ_PLUGIN_CRASHED: CodeInfo = CodeInfo::new(
     "dartq/plugin_crashed",
@@ -215,17 +217,25 @@ pub const DARTQ_PLUGIN_CRASHED: CodeInfo = CodeInfo::new(
 );
 /// A plugin overran a wall-clock deadline (handshake/shutdown request budget
 /// or the per-callback budget on `request/fixes`); the child is killed
-/// (PRD §14.3 CPU and IPC rows).
+///.
 pub const DARTQ_PLUGIN_TIMEOUT: CodeInfo = CodeInfo::new(
     "dartq/plugin_timeout",
     "DARTQ/PLUGIN_TIMEOUT",
     DiagnosticType::Tool,
     false,
 );
+/// A submitted source exceeds the analysis capacity limit and is excluded
+/// from analysis; an advisory row names the rejected file.
+pub const DARTQ_SOURCE_REJECTED: CodeInfo = CodeInfo::new(
+    "dartq/source_rejected",
+    "DARTQ/SOURCE_REJECTED",
+    DiagnosticType::Tool,
+    false,
+);
 
 /// The hand-written codes above: M0-measured families outside the generated
 /// table, plus the dartq-own namespace.
-const OWN_CODES: [CodeInfo; 15] = [
+const OWN_CODES: [CodeInfo; 17] = [
     DUPLICATE_DEFINITION,
     AWAIT_IN_WRONG_CONTEXT,
     URI_DOES_NOT_EXIST,
@@ -236,11 +246,13 @@ const OWN_CODES: [CodeInfo; 15] = [
     PREFER_SINGLE_QUOTES,
     DARTQ_PACKAGE_CONFIG_OUT_OF_DATE,
     DARTQ_PACKAGE_CONFIG_MISSING,
+    DARTQ_PACKAGE_CONFIG_INVALID,
     DARTQ_INTERNAL_ERROR,
     DARTQ_MEMORY_DEGRADED,
     DARTQ_MISSING_GENERATED_SOURCE,
     DARTQ_PLUGIN_CRASHED,
     DARTQ_PLUGIN_TIMEOUT,
+    DARTQ_SOURCE_REJECTED,
 ];
 
 /// Name → [`CodeInfo`] lookup over the builtin code set (generated official
@@ -286,7 +298,7 @@ mod tests {
 
     /// Table shape: 255 registry-gated syntax codes + 4 supplemental rows
     /// (the 3-code language-version family plus
-    /// invalid_covariant_modifier_in_primary_constructor; the 7 measured-dead
+    /// `invalid_covariant_modifier_in_primary_constructor`; the 7 measured-dead
     /// rows were pruned from the snapshot, #222), globally
     /// unique names, machine forms are the uppercase names, and every row is
     /// reachable through the registry next to the hand-written own codes.
@@ -316,10 +328,10 @@ mod tests {
     /// (so emitters must emit severity `Error`), the oracle-WARNING row is
     /// the static-warning family, and ERROR rows never carry a warning
     /// family. TYPE follows the oracle registry class, not per-row severity:
-    /// `illegal/inconsistent_language_version_override` are CompileTime-
-    /// ErrorCode entries (diagnostic.g.dart:7356-7365 and :7946-7956, ERROR +
-    /// COMPILE_TIME_ERROR) while `invalid_language_version_override` is
-    /// WarningCode (diagnostic.g.dart:9184-9330, WARNING + STATIC_WARNING) —
+    /// `illegal/inconsistent_language_version_override` are `CompileTime`-
+    /// `ErrorCode` entries (diagnostic.g.dart:7356-7365 and :7946-7956, ERROR +
+    /// `COMPILE_TIME_ERROR`) while `invalid_language_version_override` is
+    /// `WarningCode` (diagnostic.g.dart:9184-9330, WARNING + `STATIC_WARNING`) —
     /// severity alone does not decide the family.
     #[test]
     fn dtype_matches_oracle_severity() {
@@ -500,6 +512,31 @@ mod tests {
         assert_eq!(message_template("dartq/internal_error"), None);
     }
 
+    /// The generated match face can never drift from the data table: every
+    /// row's name resolves to exactly its template. The dartq-semantic
+    /// `SemanticCode::message` arms wired to the registry additionally pin
+    /// their previous emit-site literals byte-for-byte — the migration's
+    /// byte-identity proof on the registry side (the emission-side pins live
+    /// in dartq-semantic's `messages_are_verbatim`).
+    #[test]
+    fn message_template_covers_the_table_and_pins_emit_rows() {
+        for (name, _, message, _) in OFFICIAL_CODE_DATA {
+            assert_eq!(message_template(name), Some(*message), "{name}");
+        }
+        assert_eq!(
+            message_template("wrong_number_of_parameters_for_setter"),
+            Some("Setters must declare exactly one required positional parameter.")
+        );
+        assert_eq!(
+            message_template("member_with_class_name"),
+            Some("A class member can't have the same name as the enclosing class.")
+        );
+        assert_eq!(
+            message_template("expected_representation_type"),
+            Some("Expected a representation type.")
+        );
+    }
+
     /// Audit F1: exactly 15 published codes among the 259 table rows — the 13
     /// `hasPublishedDocs: true` syntax codes (captured from analyzer-8.4.1
     /// `syntactic_errors.g.dart`, re-verified in the pinned live registry
@@ -584,7 +621,7 @@ mod tests {
     }
 
     /// The resolution family (dartq-resolution `ResolutionCode`, frozen at
-    /// resolution-design-spec §4.2) shares official codes with this registry,
+    /// its design freeze) shares official codes with this registry,
     /// but dartq-resolution is not a dependency of this crate, so the 15
     /// name/machine pairs are pinned as string literals transcribed from its
     /// `ResolutionCode::info` — a spelling change on either side must update
