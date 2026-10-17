@@ -1,0 +1,13 @@
+name: version_breaking
+description: >-
+  Breaking-version twin for remove_deprecations_in_breaking_versions
+  (#1160): the containing package's `version:` IS the rule's registration
+  gate, so each version face of the upstream testVersion matrix needs its
+  own package context. This twin mounts the breaking face (upstream
+  test_breakingMajor: '2.0.0', isProblem: true) — the deprecations here
+  fire on the oracle leg. Analysis options are inherited from the corpus
+  root by upward discovery; the twin is listed in the corpus package_config
+  (longest-prefix match, same idiom as tests/corpus/lints/nested).
+version: 2.0.0
+environment:
+  sdk: ^3.13.0

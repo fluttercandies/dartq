@@ -1,0 +1,10 @@
+name: meta
+version: 1.19.0
+description: >-
+  Minimal vendored package:meta for the lints-new differential corpus
+  (#1160). Carries exactly the two annotations the upstream
+  prefer_const_literals_to_create_immutables and prefer_const_constructors
+  corpora mount (upstream addMetaPackageDep): Immutable and Literal, with
+  the class shapes of upstream Dart SDK source pkg/meta/lib/meta.dart.
+environment:
+  sdk: ^3.0.0

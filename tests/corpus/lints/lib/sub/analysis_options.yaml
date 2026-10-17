@@ -11,8 +11,8 @@
 #  - await_only_futures is silenced ONLY via this subtree set: the root
 #    control lib/await_only_futures.dart fires, lib/sub/sub_silence.dart is
 #    expect-empty (paired control design, same as the ignore-face files).
-#  - prefer_single_quotes (a real SDK lint outside the package:lints sets —
-#    the design doc section 1.1 machine-row sample) is enabled ONLY via
+#  - prefer_single_quotes (a real SDK lint outside the package:lints sets)
+#    is enabled ONLY via
 #    this subtree set: the oracle runs it on lib/sub/sub_quotes.dart;
 #    dartq has no implementation and reports undefined_lint on this
 #    options file instead — both rows sit outside the frozen universe

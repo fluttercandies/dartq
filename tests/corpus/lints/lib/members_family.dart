@@ -3,14 +3,16 @@
 // the name (the conservative dartq face), and the file must stay on the
 // both-sides-agree path. void_checks lives in its own file because its
 // dart:async import would silence unnecessary_this on dartq only.
-// Expected rows: 7, all keyed members_family.dart — HASH_AND_EQUALS
-// (PairKey defines == without hashCode), AVOID_RETURN_TYPES_ON_SETTERS
-// (the `void set tagged` return type), PREFER_FINAL_FIELDS (Tally._count
-// initialized at declaration, never mutated), UNNECESSARY_GETTERS_SETTERS
-// (Wrap's trivial _size wrap, reported at the getter), RECURSIVE_GETTERS
-// (Loop.level reads itself), UNNECESSARY_THIS (WidthHost's `this.width`,
-// no scope hit on either side), NULL_CHECK_ON_NULLABLE_TYPE_PARAMETER
-// (Holder's `held!` under the written `T?` return context).
+// Expected rows: 6 (oracle 3.13.1), all keyed members_family.dart —
+// HASH_AND_EQUALS (PairKey defines == without hashCode),
+// AVOID_RETURN_TYPES_ON_SETTERS (the `void set tagged` return type),
+// PREFER_FINAL_FIELDS (Tally._count initialized at declaration, never
+// mutated), UNNECESSARY_GETTERS_SETTERS (Wrap's trivial _size wrap,
+// reported at the getter), RECURSIVE_GETTERS (Loop.level reads itself),
+// UNNECESSARY_THIS (WidthHost's `this.width`, no scope hit on either
+// side). The formerly listed NULL_CHECK_ON_NULLABLE_TYPE_PARAMETER row
+// (Holder's `held!`) is stale: the oracle keeps it silent under the
+// upstream four-condition expected-type guard.
 class PairKey {
   @override
   bool operator ==(Object other) => other is PairKey;

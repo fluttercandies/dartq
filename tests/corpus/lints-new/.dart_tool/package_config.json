@@ -1,0 +1,37 @@
+{
+  "configVersion": 2,
+  "packages": [
+    {
+      "name": "lint_new_corpus",
+      "rootUri": "../",
+      "packageUri": "lib/",
+      "languageVersion": "3.13"
+    },
+    {
+      "name": "version_breaking",
+      "rootUri": "../packages/version_breaking",
+      "packageUri": "lib/",
+      "languageVersion": "3.13"
+    },
+    {
+      "name": "version_minor",
+      "rootUri": "../packages/version_minor",
+      "packageUri": "lib/",
+      "languageVersion": "3.13"
+    },
+    {
+      "name": "meta",
+      "rootUri": "../vendor/meta",
+      "packageUri": "lib/",
+      "languageVersion": "3.3"
+    },
+    {
+      "name": "test_api",
+      "rootUri": "../vendor/test_api",
+      "packageUri": "lib/",
+      "languageVersion": "3.0"
+    }
+  ],
+  "generator": "pub",
+  "generatorVersion": "3.13.1"
+}

@@ -1,10 +1,10 @@
-# The lint-face corpus root options (design doc section 1.2): the
-# include chain under test plus the options-driven standalone rules.
+# The lint-face corpus root options: the include chain under test plus
+# the options-driven standalone rules.
 # package:lints resolves through .dart_tool/package_config.json to the
 # vendored copy in vendor/lints — both dart analyze and dartq
 # resolve_include land on the same on-disk yaml, producing the
 # name-for-name same 89-rule base universe. The linter section names the
-# standalone (non-package:lints) SDK rules (parity plan section 4.2): no
+# standalone (non-package:lints) SDK rules: no
 # include set carries them, so this section is their only enablement and
 # both sides run the same nominal set on the same files.
 include: package:lints/recommended.yaml
@@ -35,3 +35,84 @@ linter:
     missing_whitespace_between_adjacent_strings: true
     no_adjacent_strings_in_list: true
     no_literal_bool_comparisons: true
+    # Batch close (#1094 residual, #1098): the 17 wave-A/B/C promotions
+    # plus the 30-rule #1060-era backfill join the universe the same way —
+    # options-driven by name, one fixture per rule at lib/<rule>.dart.
+    avoid_bool_literals_in_conditional_expressions: true
+    avoid_null_checks_in_equality_operators: true
+    directives_ordering: true
+    document_ignores: true
+    empty_container_bodies: true
+    eol_at_end_of_file: true
+    flutter_style_todos: true
+    invalid_case_patterns: true
+    library_names: true
+    lines_longer_than_80_chars: true
+    literal_only_boolean_expressions: true
+    missing_code_block_language_in_doc_comment: true
+    no_self_assignments: true
+    noop_primitive_operations: true
+    one_member_abstracts: true
+    package_prefixed_library_names: true
+    prefer_asserts_with_message: true
+    prefer_constructors_over_static_methods: true
+    prefer_double_quotes: true
+    prefer_expression_function_bodies: true
+    prefer_final_parameters: true
+    prefer_foreach: true
+    prefer_if_elements_to_conditional_expressions: true
+    prefer_int_literals: true
+    prefer_single_quotes: true
+    require_trailing_commas: true
+    simplify_variable_pattern: true
+    sort_constructors_first: true
+    sort_unnamed_constructors_first: true
+    strict_top_level_inference: true
+    switch_on_type: true
+    throw_in_finally: true
+    type_annotate_public_apis: true
+    unnecessary_breaks: true
+    unnecessary_const_in_enum_constructor: true
+    unnecessary_final: true
+    unnecessary_lambdas: true
+    unnecessary_library_directive: true
+    unnecessary_raw_strings: true
+    unnecessary_type_name_in_constructor: true
+    unnecessary_underscores: true
+    use_null_aware_elements: true
+    use_primary_constructors: true
+    use_raw_strings: true
+    var_with_no_type_annotation: true
+    # #1187 baseline corpus exposure for the #1135 adjudication faces: the
+    # fixtures (lib/parameter_assignments.dart, lib/use_string_buffers.dart)
+    # land ahead of the A1+A2 fix lane, options-driven like every standalone
+    # wave, so the gate judges the faces as soon as the codes join the
+    # frozen lint-gate universe.
+    parameter_assignments: true
+    use_string_buffers: true
+    # W6 standalone expansion (#1157; corpus prep #1224):
+    # unreachable_from_main joins the universe options-driven like every
+    # standalone wave, one fixture at lib/unreachable_from_main.dart
+    # derived verbatim from the official linter test data. The wave's
+    # other rule, use_build_context_synchronously, stays unnamed for now:
+    # the official identification is element identity with Flutter's
+    # BuildContext, which this plain-Dart corpus cannot resolve, and the
+    # dartq face silences a unit declaring a BuildContext-named type by
+    # the same posture — the stub fixture at
+    # lib/use_build_context_synchronously.dart holds both sides silent,
+    # so naming the rule would only judge a vacuous 0-vs-0 face. Add the
+    # name when the corpus gains flutter resolution, swapping the fixture
+    # stub in the same edit.
+    unreachable_from_main: true
+    # #1347 corpus exposure wave: avoid_print and deprecated_consistency
+    # join the universe options-driven like every standalone wave, one
+    # fixture per rule at lib/<rule>.dart (lib/avoid_print.dart,
+    # lib/deprecated_consistency.dart) — the first corpus mounts for two
+    # rules the #1343 blind-spot audit found unmounted.
+    avoid_print: true
+    deprecated_consistency: true
+    # unnecessary_parenthesis / unnecessary_statements stay unnamed (#1949,
+    # the F2 posture): both carry open excluded faces (#1395/#1355) in
+    # tests/harness/lint_divergences.tsv, and the ratified gate posture
+    # keeps un-burnable-face rules out of the universe until they close —
+    # re-enable when the ledger rows retire.

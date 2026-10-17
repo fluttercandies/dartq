@@ -1,0 +1,196 @@
+{
+  "corpus": "tests/corpus/lints-new",
+  "gate_step": "lints-new-gate",
+  "schema": "expected/oracle map file -> rule name -> expected diagnostic lines (1-based). `expected` is the DARTQ-leg multiset the gate enforces against `dartq analyze --format=machine` (filtered to `rules`, file paths normalized relative to the corpus root). `oracle` is the informational oracle-leg multiset derived from the fixture headers and verified against the upstream tests' diagnostic markers; rows present in `oracle` but absent from `expected` are the documented adjudication families (see `adjudications`).",
+  "rules": [
+    "avoid_redundant_argument_values",
+    "avoid_slow_async_io",
+    "cancel_subscriptions",
+    "close_sinks",
+    "comment_references",
+    "deprecated_member_use_from_same_package",
+    "future_sync_value",
+    "matching_super_parameters",
+    "prefer_const_constructors",
+    "prefer_const_declarations",
+    "prefer_const_literals_to_create_immutables",
+    "prefer_mixin",
+    "remove_deprecations_in_breaking_versions",
+    "tighten_type_of_initializing_formals",
+    "unnecessary_ignore",
+    "unnecessary_this_alias",
+    "use_enums",
+    "use_named_constants",
+    "use_test_throws_matchers"
+  ],
+  "expected": {
+    "lib/avoid_redundant_argument_values.dart": {
+      "avoid_redundant_argument_values": [24, 32, 42, 51, 59, 63, 68, 92, 116, 130, 154, 164, 171, 178, 186, 253, 285, 320, 348, 358, 370]
+    },
+    "lib/avoid_slow_async_io.dart": {
+      "avoid_slow_async_io": [17, 25, 35, 45, 53, 74, 84, 95, 106, 117, 129]
+    },
+    "lib/cancel_subscriptions.dart": {
+      "cancel_subscriptions": [23, 30, 36, 47, 55]
+    },
+    "lib/close_sinks.dart": {
+      "close_sinks": [18, 26, 36, 47, 56]
+    },
+    "lib/comment_references.dart": {
+      "comment_references": [12, 16, 20, 24, 33, 38, 43, 48, 53]
+    },
+    "lib/deprecated_member_use_from_same_package.dart": {
+      "deprecated_member_use_from_same_package": [22, 193, 200, 207, 216, 224, 231, 238, 246, 256, 267, 274, 281, 287, 296, 306, 314, 322, 330, 338, 349, 362, 373, 383, 419, 429, 439, 461, 471, 480, 491, 501, 511, 521, 528, 534, 543, 553, 561, 568, 578, 584, 594, 603, 611, 620, 630]
+    },
+    "lib/deprecated_member_use_from_same_package/export_library.dart": {
+      "deprecated_member_use_from_same_package": [8]
+    },
+    "lib/deprecated_member_use_from_same_package/import_deprecated.dart": {
+      "deprecated_member_use_from_same_package": [9]
+    },
+    "lib/deprecated_member_use_from_same_package/part_leaf.dart": {
+      "deprecated_member_use_from_same_package": [10]
+    },
+    "lib/deprecated_member_use_from_same_package/part_single_leaf.dart": {
+      "deprecated_member_use_from_same_package": [10]
+    },
+    "lib/deprecated_member_use_from_same_package/show_combinator.dart": {
+      "deprecated_member_use_from_same_package": [9]
+    },
+    "lib/future_sync_value.dart": {
+      "future_sync_value": [18, 33, 36]
+    },
+    "lib/future_sync_value_pre.dart": {},
+    "lib/matching_super_parameters.dart": {
+      "matching_super_parameters": [80, 81, 137, 138, 157, 236, 236, 277, 277, 291, 364, 364, 407, 407, 421, 491, 491, 528, 528, 540]
+    },
+    "lib/prefer_const_constructors.dart": {
+      "prefer_const_constructors": [26, 32, 52, 58, 67, 74, 80, 93, 106, 131, 137, 145, 146, 154, 261, 266, 271, 317]
+    },
+    "lib/prefer_const_declarations.dart": {
+      "prefer_const_declarations": [19, 27, 34, 52, 66, 71, 89, 95, 105, 116, 126, 176, 188, 193, 198, 208, 228, 244, 251, 258, 261, 266]
+    },
+    "lib/prefer_const_literals_to_create_immutables.dart": {
+      "prefer_const_literals_to_create_immutables": [38, 62, 63, 71, 80, 110, 117, 124, 131, 138, 145, 152, 171]
+    },
+    "lib/prefer_mixin.dart": {},
+    "lib/prefer_mixin_pre.dart": {
+      "prefer_mixin": [22, 29]
+    },
+    "lib/remove_deprecations_in_breaking_versions.dart": {},
+    "lib/test.g.dart": {},
+    "lib/tighten_type_of_initializing_formals.dart": {
+      "tighten_type_of_initializing_formals": [21, 32, 33, 40, 47, 50, 66]
+    },
+    "lib/unnecessary_ignore.dart": {},
+    "lib/unnecessary_ignore_line.dart": {},
+    "lib/unnecessary_this_alias.dart": {
+      "unnecessary_this_alias": [91, 101, 113, 123, 133, 143, 153, 163, 173, 186, 199, 212, 222, 232, 243, 254, 264, 276]
+    },
+    "lib/use_enums.dart": {
+      "use_enums": [21, 30, 38, 239, 260, 273, 280, 287, 296]
+    },
+    "lib/use_named_constants.dart": {
+      "use_named_constants": [24, 39, 45, 54, 63, 72, 83, 93]
+    },
+    "lib/use_test_throws_matchers.dart": {
+      "use_test_throws_matchers": [20]
+    },
+    "packages/version_breaking/lib/remove_deprecations_in_breaking_versions.dart": {},
+    "packages/version_minor/lib/remove_deprecations_in_breaking_versions.dart": {}
+  },
+  "oracle": {
+    "lib/avoid_redundant_argument_values.dart": {
+      "avoid_redundant_argument_values": [24, 32, 42, 51, 59, 63, 68, 92, 116, 130, 154, 164, 171, 178, 186, 253, 285, 320, 348, 358, 370]
+    },
+    "lib/avoid_slow_async_io.dart": {
+      "avoid_slow_async_io": [17, 25, 35, 45, 53, 74, 84, 95, 106, 117, 129]
+    },
+    "lib/cancel_subscriptions.dart": {
+      "cancel_subscriptions": [23, 30, 36, 47, 55]
+    },
+    "lib/close_sinks.dart": {
+      "close_sinks": [18, 26, 36, 47, 56]
+    },
+    "lib/comment_references.dart": {
+      "comment_references": [12, 16, 20, 24, 33, 38, 43, 48, 53]
+    },
+    "lib/deprecated_member_use_from_same_package.dart": {
+      "deprecated_member_use_from_same_package": [22, 193, 200, 207, 216, 224, 231, 238, 246, 256, 267, 274, 281, 287, 296, 306, 314, 322, 330, 338, 349, 362, 373, 383, 419, 429, 439, 461, 471, 480, 491, 501, 511, 521, 528, 534, 543, 553, 561, 568, 578, 584, 594, 603, 611, 620, 630]
+    },
+    "lib/deprecated_member_use_from_same_package/export_library.dart": {
+      "deprecated_member_use_from_same_package": [8]
+    },
+    "lib/deprecated_member_use_from_same_package/import_deprecated.dart": {
+      "deprecated_member_use_from_same_package": [9]
+    },
+    "lib/deprecated_member_use_from_same_package/part_leaf.dart": {
+      "deprecated_member_use_from_same_package": [10]
+    },
+    "lib/deprecated_member_use_from_same_package/part_single_leaf.dart": {
+      "deprecated_member_use_from_same_package": [10]
+    },
+    "lib/deprecated_member_use_from_same_package/show_combinator.dart": {
+      "deprecated_member_use_from_same_package": [9]
+    },
+    "lib/future_sync_value.dart": {
+      "future_sync_value": [18, 33, 36]
+    },
+    "lib/future_sync_value_pre.dart": {},
+    "lib/matching_super_parameters.dart": {
+      "matching_super_parameters": [80, 81, 137, 138, 157, 236, 236, 277, 277, 291, 364, 364, 407, 407, 421, 491, 491, 528, 528, 540]
+    },
+    "lib/prefer_const_constructors.dart": {
+      "prefer_const_constructors": [26, 32, 52, 58, 67, 74, 80, 93, 106, 131, 137, 145, 146, 154, 261, 266, 271, 317]
+    },
+    "lib/prefer_const_declarations.dart": {
+      "prefer_const_declarations": [19, 27, 34, 52, 66, 71, 89, 95, 105, 116, 126, 176, 188, 193, 198, 208, 228, 244, 251, 258, 261, 266]
+    },
+    "lib/prefer_const_literals_to_create_immutables.dart": {
+      "prefer_const_literals_to_create_immutables": [38, 62, 63, 71, 80, 110, 117, 124, 131, 138, 145, 152, 171]
+    },
+    "lib/prefer_mixin.dart": {},
+    "lib/prefer_mixin_pre.dart": {
+      "prefer_mixin": [22, 29]
+    },
+    "lib/remove_deprecations_in_breaking_versions.dart": {},
+    "lib/test.g.dart": {},
+    "lib/tighten_type_of_initializing_formals.dart": {
+      "tighten_type_of_initializing_formals": [21, 32, 33, 40, 47, 50, 66]
+    },
+    "lib/unnecessary_ignore.dart": {
+      "unnecessary_ignore": [19]
+    },
+    "lib/unnecessary_ignore_line.dart": {
+      "unnecessary_ignore": [13]
+    },
+    "lib/unnecessary_this_alias.dart": {
+      "unnecessary_this_alias": [91, 101, 113, 123, 133, 143, 153, 163, 173, 186, 199, 212, 222, 232, 243, 254, 264, 276]
+    },
+    "lib/use_enums.dart": {
+      "use_enums": [21, 30, 38, 239, 260, 273, 280, 287, 296]
+    },
+    "lib/use_named_constants.dart": {
+      "use_named_constants": [24, 39, 45, 54, 63, 72, 83, 93]
+    },
+    "lib/use_test_throws_matchers.dart": {
+      "use_test_throws_matchers": [20]
+    },
+    "packages/version_breaking/lib/remove_deprecations_in_breaking_versions.dart": {
+      "remove_deprecations_in_breaking_versions": [10, 12]
+    },
+    "packages/version_minor/lib/remove_deprecations_in_breaking_versions.dart": {}
+  },
+  "adjudications": [
+    {
+      "family": "unnecessary_ignore",
+      "files": ["lib/unnecessary_ignore.dart", "lib/unnecessary_ignore_line.dart"],
+      "reason": "The official rule body is the analyzer's IgnoreValidator post-pass (needs the complete diagnostic set of a location); dartq mounts the spec not_dispatched until an engine post-pass exists. Oracle reports 1 row per file; the dartq leg is structurally silent (0 rows enforced here). A dartq UNNECESSARY_IGNORE row in lib/test.g.dart additionally reds the gate by design (the generated-file parity probe, README family 3)."
+    },
+    {
+      "family": "remove_deprecations_in_breaking_versions",
+      "files": ["packages/version_breaking/lib/remove_deprecations_in_breaking_versions.dart"],
+      "reason": "Registration is gated on the containing package's pubspec version (the pubspec family's mounting seam). The breaking twin fires 2 rows on the oracle leg and stays structurally silent on the dartq leg; the no-version root control and the non-breaking twin are 0 rows on both legs."
+    }
+  ]
+}

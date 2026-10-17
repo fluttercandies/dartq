@@ -7,7 +7,7 @@
 // Expected rows: 2 — IMPLICIT_CALL_TEAROFFS keyed
 // implicit_call_tearoffs.dart (`= c` bare field; `= this.c` prefixed
 // field). Face re-validated against the oracle at the r0 run. Co-fire:
-// UNNECESSARY_THIS on the `this.c` receiver (line 19; same no-import
+// UNNECESSARY_THIS on the `this.c` receiver (line 21; same no-import
 // face); the prefixed field stays — it carries a dartq pin value.
 class Callable {
   void call() {}

@@ -6,7 +6,7 @@
 // `drained` stays public (out of prefer_final_fields' private face) and
 // the constructor's initializing formal keeps it definitely assigned.
 // Expected rows: 1 — VOID_CHECKS keyed void_checks.dart (`drained =
-// piece;` — int literal into the FutureOr<void> field).
+// piece;` — int parameter into the FutureOr<void> field).
 import 'dart:async';
 
 class VoidSink {

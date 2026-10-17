@@ -5,7 +5,7 @@
 // (variables, parameters, fields, `bool Function` returns) drive the
 // type read; a written `bool?` stays silent like the official
 // non-nullability gate.
-// Expected rows: 6 — NO_LITERAL_BOOL_COMPARISONS keyed
+// Expected rows: 7 — NO_LITERAL_BOOL_COMPARISONS keyed
 // no_literal_bool_comparisons.dart, message
 // "Unnecessary comparison to a boolean literal.":
 //   `true` in `value && true` -> local variable operand
@@ -14,6 +14,8 @@
 //   `false` in `flag != false` -> top-level variable operand
 //   `true` in `true == true` -> both sides are literals
 //   `true` in `box.flag || true` -> same-file class field operand
+// plus UNRELATED_TYPE_EQUALITY_CHECKS keyed the same file (`==` in
+// `someInt == true` — int parameter vs bool literal are unrelated).
 bool flag = true;
 
 class Box {
@@ -31,7 +33,8 @@ void f(bool b, bool? maybe, dynamic dyn, int someInt) {
   var r6 = box.flag || true;
 
   // GOOD: nullable/dynamic/non-bool operands, non-comparison operators
-  // and literal-free comparisons stay silent.
+  // and literal-free comparisons stay silent. `g4` reports under
+  // unrelated_type_equality_checks (int vs bool), not this rule.
   var g1 = maybe ?? true;
   var g2 = dyn == true;
   var g3 = value || maybe;
