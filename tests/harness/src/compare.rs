@@ -1,15 +1,23 @@
-//! (code, file) entry-set comparison (PRD §19 semantics): codes are lowercased, files are
-//! normalized to corpus-relative paths, Jaccard is computed per severity tier, and per-side
-//! diff details are produced. Entry ordering is always lexicographic.
+//! (severity, code, file) entry-set comparison:
+//! codes are lowercased, files are normalized to corpus-relative paths, the entry key is
+//! the full RESULT triple, and Jaccard is computed per severity tier (the metric is
+//! unchanged: a triple set partitions by severity, so per-tier comparison is exactly
+//! triple-set comparison). Per-side diff details are produced. Entry ordering is
+//! severity-major, then (code, file) lexicographic.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::machine::{EntryKeyBuilder, MachineDiag, Severity};
 
-pub(crate) type EntryKey = (String, String);
+/// The compared RESULT identity per the parity ADR: `(severity, code, file)`. Severity
+/// comes first so `BTreeSet`/`BTreeMap` iteration is `(severity, code, file)` — the
+/// documented row order of the per-tier faces — and so a severity flip on the same
+/// (code, file) is a different key on every projection.
+pub(crate) type EntryKey = (Severity, String, String);
 
-/// One side's diagnostic set: full entry keys + grouping by severity + per-key sample (occurrence count and first message).
+/// One side's diagnostic set: full entry keys (the RESULT triple) + grouping by severity
+/// + per-key sample (occurrence count and first message).
 pub(crate) struct Side {
     /// Diagnostic instances before the severity/type/codes filters
     pub(crate) pre_filter_total: usize,
@@ -21,12 +29,16 @@ pub(crate) struct Side {
     pub(crate) dropped_by_filter: usize,
     pub(crate) entries: BTreeSet<EntryKey>,
     pub(crate) per_severity: BTreeMap<Severity, BTreeSet<EntryKey>>,
-    samples: BTreeMap<EntryKey, Sample>,
-    /// Instance count per (severity, key). `samples` totals all instances of a key regardless of
-    /// tier, so per-tier instance aggregation ([`distribution`]`::code_by_severity`) sources its
-    /// counts from here: a key spanning two tiers must not leak its cross-tier total into either
-    /// tier's count.
-    tier_samples: BTreeMap<(Severity, EntryKey), usize>,
+    /// Per-`(code, file)` sample, pooled across severity tiers (first message wins):
+    /// the distribution identity domain — a key spanning two tiers must count once in
+    /// `files_by_code`/`by_type`, so those aggregations iterate this map directly.
+    samples: BTreeMap<(String, String), Sample>,
+    /// Diagnostic instance count per entry key (severity, code, file). `samples` totals
+    /// all instances of a key regardless of tier, so per-tier instance aggregation
+    /// ([`distribution`]`::code_by_severity`, the diff-list counts and
+    /// [`side_entries`]) sources its counts from here: a key spanning two tiers must
+    /// not leak its cross-tier total into either tier's count.
+    tier_samples: BTreeMap<EntryKey, usize>,
 }
 
 pub(crate) struct Sample {
@@ -64,20 +76,22 @@ pub(crate) fn build_side_labeled(
             continue;
         }
         side.total_diags += 1;
-        let mut key = keys.key(d);
-        if let Some(label) = label {
-            key.1 = format!("{label}/{}", key.1);
-        }
-        side.entries.insert(key.clone());
-        side.per_severity
-            .entry(d.severity)
-            .or_default()
-            .insert(key.clone());
+        let (severity, code, file) = keys.key(d);
+        let file = match label {
+            Some(label) => format!("{label}/{file}"),
+            None => file,
+        };
+        side.entries.insert((severity, code.clone(), file.clone()));
+        side.per_severity.entry(severity).or_default().insert((
+            severity,
+            code.clone(),
+            file.clone(),
+        ));
         *side
             .tier_samples
-            .entry((d.severity, key.clone()))
+            .entry((severity, code.clone(), file.clone()))
             .or_default() += 1;
-        let sample = side.samples.entry(key).or_insert_with(|| Sample {
+        let sample = side.samples.entry((code, file)).or_insert_with(|| Sample {
             count: 0,
             dtype: d.dtype.clone(),
             line: d.line,
@@ -138,6 +152,7 @@ pub(crate) fn jaccard(a: &BTreeSet<EntryKey>, b: &BTreeSet<EntryKey>) -> f64 {
 }
 
 pub(crate) struct DiffEntry {
+    pub(crate) severity: Severity,
     pub(crate) code: String,
     pub(crate) file: String,
     pub(crate) count: usize,
@@ -149,8 +164,9 @@ pub(crate) struct DiffEntry {
     pub(crate) sample_message: String,
 }
 
-/// One row of a side's full post-filter entry list: a (severity tier, code, file) triple with
-/// that tier's own diagnostic instance count. Rows are sorted by (severity, code, file).
+/// One row of a side's full post-filter entry list: one RESULT triple with that
+/// tier's own diagnostic instance count. Rows are sorted by (severity, code, file),
+/// the entry-key `BTreeMap` iteration order.
 pub(crate) struct SideEntry {
     pub(crate) code: String,
     pub(crate) file: String,
@@ -180,7 +196,16 @@ pub(crate) struct Comparison {
     pub(crate) file_count: usize,
     /// Fixed order ERROR / WARNING / INFO
     pub(crate) severities: Vec<SeverityStats>,
-    /// Lexicographic
+    /// Severity-aware diff rows over the re-keyed entry sets: the set-difference of the
+    /// RESULT triples. A severity flip on the same (code, file) — oracle emits it at
+    /// severity A, dartq at B — therefore shows up on BOTH sides, `oracle_only` at A and
+    /// `dartq_only` at B: neither side's triple is in the other's set, because triple
+    /// equality includes the severity component and the side holds only the other
+    /// severity for that (code, file). Each row's `count` is its own side's tier-scoped
+    /// instance count (never the cross-tier total). Under the former flat (code, file)
+    /// keying a flip produced no row here at all.
+    ///
+    /// Rows are severity-major, then (code, file) lexicographic.
     pub(crate) oracle_only: Vec<DiffEntry>,
     pub(crate) dartq_only: Vec<DiffEntry>,
     /// Full post-filter per-side entry lists (one row per (severity tier, key), sorted by
@@ -226,26 +251,25 @@ pub(crate) struct Distribution {
 /// filtered side, so the distribution scope follows the filters.
 pub(crate) fn distribution(side: &Side) -> Distribution {
     let mut dist = Distribution::default();
-    for ((severity, key), count) in &side.tier_samples {
+    for (key, &count) in &side.tier_samples {
         *dist
             .code_by_severity
-            .entry(*severity)
+            .entry(key.0)
             .or_default()
-            .entry(key.0.clone())
+            .entry(key.1.clone())
             .or_default() += count;
     }
-    // files_by_code counts distinct (code, file) pairs: a key can appear in
-    // more than one severity tier, so counting from the per-tier loops above
-    // would double-count its file.
-    for key in &side.entries {
-        let sample = &side.samples[key];
+    // by_type/files_by_code/files_by_type aggregate over distinct (code, file) pairs:
+    // a key can appear in more than one severity tier, and `samples` is keyed by the
+    // pooled pair (not the triple), so iterating it counts each pair exactly once.
+    for ((code, file), sample) in &side.samples {
         *dist.by_type.entry(sample.dtype.clone()).or_default() += sample.count;
-        *dist.files_by_code.entry(key.0.clone()).or_default() += 1;
+        *dist.files_by_code.entry(code.clone()).or_default() += 1;
         *dist
             .files_by_type
             .entry(sample.dtype.clone())
             .or_default()
-            .entry(key.1.clone())
+            .entry(file.clone())
             .or_default() += sample.count;
     }
     dist
@@ -283,7 +307,7 @@ pub(crate) fn compare(oracle: &Side, dartq: &Side) -> Comparison {
     let file_count = oracle
         .entries
         .union(&dartq.entries)
-        .map(|k| k.1.clone())
+        .map(|k| k.2.clone())
         .collect::<BTreeSet<_>>()
         .len();
     Comparison {
@@ -303,30 +327,34 @@ pub(crate) fn compare(oracle: &Side, dartq: &Side) -> Comparison {
     }
 }
 
-/// Full post-filter entry list of one side: one row per (severity tier, key) with that
+/// Full post-filter entry list of one side: one row per RESULT triple with that
 /// tier's own diagnostic instance count, sourced from `tier_samples` (the same per-tier
 /// map [`distribution`] aggregates — an all-tier total from `samples` would glue a
-/// cross-tier count onto a single-tier row). A key appearing in more than one tier (one
-/// analyzer emitting a code under different severities) gets one row per tier; rows are
-/// sorted by (severity, code, file), the `BTreeMap` iteration order.
+/// cross-tier count onto a single-tier row). A (code, file) pair emitted under more
+/// than one severity gets one row per tier; rows are sorted by (severity, code, file),
+/// the `BTreeMap` iteration order of the triple key.
 fn side_entries(side: &Side) -> Vec<SideEntry> {
     side.tier_samples
         .iter()
-        .map(|((severity, key), &count)| SideEntry {
-            code: key.0.clone(),
-            file: key.1.clone(),
-            severity: *severity,
+        .map(|(key, &count)| SideEntry {
+            severity: key.0,
+            code: key.1.clone(),
+            file: key.2.clone(),
             count,
         })
         .collect()
 }
 
+/// One severity-aware diff row: the triple key supplies the tier, `tier_samples` the
+/// tier-scoped instance count, and the pooled per-(code, file) sample the triage
+/// payload (first message/position across the side's tiers of that key).
 fn diff_entry(key: &EntryKey, side: &Side) -> DiffEntry {
-    let sample = &side.samples[key];
+    let sample = &side.samples[&(key.1.clone(), key.2.clone())];
     DiffEntry {
-        code: key.0.clone(),
-        file: key.1.clone(),
-        count: sample.count,
+        severity: key.0,
+        code: key.1.clone(),
+        file: key.2.clone(),
+        count: side.tier_samples[key],
         dtype: sample.dtype.clone(),
         line: sample.line,
         col: sample.col,
@@ -353,10 +381,11 @@ mod tests {
         }
     }
 
+    /// Entry-key set fixture: all-ERROR triples (Jaccard math is severity-agnostic).
     fn set(entries: &[(&str, &str)]) -> BTreeSet<EntryKey> {
         entries
             .iter()
-            .map(|(c, f)| (c.to_string(), f.to_string()))
+            .map(|(c, f)| (Severity::Error, c.to_string(), f.to_string()))
             .collect()
     }
 
@@ -417,6 +446,41 @@ mod tests {
         assert!((cmp.error_jaccard() - 1.0 / 3.0).abs() < 1e-12);
     }
 
+    /// Severity flip visibility (the parity ADR's flat-plane fix): oracle emits
+    /// (`e_a`, a.dart) at ERROR, dartq the same (code, file) at WARNING. Under the
+    /// former flat (code, file) keying this produced no diff row; now the flip shows
+    /// on BOTH sides — `oracle_only` at ERROR, `dartq_only` at WARNING — each with its
+    /// own side's tier-scoped count, because triple set-difference cannot cancel a
+    /// severity mismatch.
+    #[test]
+    #[allow(clippy::float_cmp)] // disjoint per-tier sets: jaccard 0.0 is exact
+    fn severity_flip_on_same_key_shows_on_both_sides() {
+        let oracle = vec![diag("E_A", "/corpus/a.dart", Severity::Error, "as error")];
+        let dartq = vec![diag(
+            "e_a",
+            "/corpus/a.dart",
+            Severity::Warning,
+            "as warning",
+        )];
+        let root = Path::new("/corpus");
+        let cmp = compare(
+            &build_side_labeled(&oracle, root, None, |_| true),
+            &build_side_labeled(&dartq, root, None, |_| true),
+        );
+        assert_eq!(cmp.oracle_only.len(), 1, "flip visible on the oracle side");
+        assert_eq!(cmp.oracle_only[0].severity, Severity::Error);
+        assert_eq!(cmp.oracle_only[0].code, "e_a");
+        assert_eq!(cmp.oracle_only[0].file, "a.dart");
+        assert_eq!(cmp.oracle_only[0].count, 1);
+        assert_eq!(cmp.dartq_only.len(), 1, "flip visible on the dartq side");
+        assert_eq!(cmp.dartq_only[0].severity, Severity::Warning);
+        assert_eq!(cmp.dartq_only[0].code, "e_a");
+
+        // The per-tier metric (unchanged) catches the same flip on both tiers.
+        assert_eq!(cmp.severities[0].jaccard, 0.0, "ERROR tier disjoint");
+        assert_eq!(cmp.severities[1].jaccard, 0.0, "WARNING tier disjoint");
+    }
+
     #[test]
     fn count_and_sample_aggregate_per_key() {
         let oracle = vec![
@@ -425,10 +489,14 @@ mod tests {
         ];
         let side = build_side_labeled(&oracle, Path::new("/corpus"), None, |_| true);
         assert_eq!(side.total_diags, 2);
-        assert_eq!(side.entries.len(), 1, "same (code,file) dedups");
+        assert_eq!(side.entries.len(), 1, "same (severity, code, file) dedups");
         let key = side.entries.iter().next().unwrap();
-        assert_eq!(side.samples[key].count, 2);
-        assert_eq!(side.samples[key].message, "first", "keeps first message");
+        assert_eq!(side.samples[&(key.1.clone(), key.2.clone())].count, 2);
+        assert_eq!(
+            side.samples[&(key.1.clone(), key.2.clone())].message,
+            "first",
+            "keeps first message"
+        );
     }
 
     /// Full per-side entry lists: one row per (severity tier, key) with the tier's own
@@ -617,13 +685,13 @@ mod tests {
         assert!(
             merged
                 .entries
-                .contains(&("e_a".into(), "m0/lib/x.dart".into()))
+                .contains(&(Severity::Error, "e_a".into(), "m0/lib/x.dart".into()))
         );
-        assert!(
-            merged
-                .entries
-                .contains(&("e_a".into(), "m0-syntax/lib/x.dart".into()))
-        );
+        assert!(merged.entries.contains(&(
+            Severity::Error,
+            "e_a".into(),
+            "m0-syntax/lib/x.dart".into()
+        )));
 
         // Same corpus, same key: counts accumulate across merges
         let a2 = vec![

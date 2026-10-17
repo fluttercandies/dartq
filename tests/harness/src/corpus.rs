@@ -1,8 +1,8 @@
-//! M0 corpus assembly (facts §5 Plan A): filter "self-contained" .dart files from a source
+//! M0 corpus assembly: filter "self-contained" .dart files from a source
 //! directory and copy them into a synthetic package preserving the relative directory layout
 //! (zero dependencies, so `dart pub get --offline` passes in one shot).
 //! The relative structure must be preserved: flattening would let same-name basenames in
-//! subdirectories silently overwrite each other (lessons from facts §7.2).
+//! subdirectories silently overwrite each other.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,14 +11,14 @@ use std::time::Duration;
 use crate::oracle::{driver_timeout_from_env, run_captured};
 
 /// Corpus package manifest. The sdk lower bound pins the languageVersion pub
-/// records in `.dart_tool/package_config.json`; it must stay >= 3.13 (Plan A,
-/// the version-skew ledger §4): a lower pin re-disables shipped language
+/// records in `.dart_tool/package_config.json`; it must stay >= 3.13 (the
+/// Plan A rule): a lower pin re-disables shipped language
 /// features (e.g. inline-class @ 3.3) and floods the gate with
 /// `experiment_not_enabled` assembly noise (51/51 of the old syntactic bucket).
 /// Shared with the bench fixture materialization (`bench::BenchFixture`).
 pub(crate) const PUBSPEC: &str = "name: corpus_m0\nenvironment:\n  sdk: ^3.13.0\n";
 
-/// Minimum corpus language version (Plan A, the version-skew ledger §4).
+/// Minimum corpus language version.
 const MIN_LANGUAGE_VERSION: (u32, u32) = (3, 13);
 
 /// Preflight before oracle runs: the corpus package's own `languageVersion` in
@@ -67,7 +67,7 @@ pub(crate) fn check_language_version(corpus_dir: &Path) -> Result<(), String> {
         return Err(format!(
             "preflight: corpus `{}` languageVersion is {version}, need >= 3.13; \
              bump the pubspec sdk lower bound and re-run `dart pub get` \
-             (the version-skew ledger §4)",
+             (the Plan A rule)",
             corpus_dir.display()
         ));
     }
@@ -129,7 +129,7 @@ pub(crate) fn build_corpus(
 }
 
 /// Run `dart pub get --offline` in the corpus directory under the shared
-/// driver timeout budget (facts §5: zero dependencies, offline, one shot).
+/// driver timeout budget.
 pub(crate) fn pub_get(dart: &str, target: &Path) -> Result<(), String> {
     run_pub_get(dart, target, driver_timeout_from_env()?)
 }
@@ -274,7 +274,7 @@ pub(crate) fn dart_files(corpus_dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-/// Self-contained rule (facts §5): the full text contains no `package:` substring (equivalent to `grep -L 'package:'`),
+/// Self-contained rule: the full text contains no `package:` substring (equivalent to `grep -L 'package:'`),
 /// and the URIs of all import/export/part directives (if any) are `dart:*`.
 /// Each line has `//` line comments stripped before scanning directives; extreme forms such as a `//` (URL)
 /// inside a string on a directive line degrade to a "no-URI directive" pass -- even a missed or wrong

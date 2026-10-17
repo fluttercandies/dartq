@@ -1,4 +1,4 @@
-# M1 frozen diagnostic gate codes (PRD section 20.3, M1 row): the frozen set
+# M1 frozen diagnostic gate codes: the frozen set
 # the M1 milestone gates on -- uri_does_not_exist, the undefined_* family,
 # duplicate_definition, the wrong_number_of_* family, and the static-
 # nullability four (invalid_assignment / argument_type_not_assignable /
@@ -20,8 +20,8 @@
 # the pinned resolution trigger table (lookup failures against the resolved import scope). Same format as
 # tests/corpus/syntax-codes.txt: one code per line, # comments, case- and
 # TSV-tolerant on the harness side. wrong_number_of_parameters_for_setter
-# overlaps the M0 syntax gate (tests/corpus/syntax-codes.txt) by PRD wording:
-# the M1 list is not scoped to semantic-only codes.
+# overlaps the M0 syntax gate (tests/corpus/syntax-codes.txt) by official
+# wording: the M1 list is not scoped to semantic-only codes.
 argument_type_not_assignable
 duplicate_definition
 invalid_assignment

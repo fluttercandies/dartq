@@ -1,0 +1,22 @@
+{
+  "oracle": {
+    "instances": 0,
+    "corpora": [
+      {
+        "dir": "/corpus/m0-syntax",
+        "label": "m0-syntax",
+        "diagnostics": []
+      }
+    ]
+  },
+  "dartq": {
+    "instances": 0,
+    "corpora": [
+      {
+        "dir": "/corpus/m0-syntax",
+        "label": "m0-syntax",
+        "diagnostics": []
+      }
+    ]
+  }
+}

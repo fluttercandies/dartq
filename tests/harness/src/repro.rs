@@ -1,4 +1,4 @@
-//! PRD §19.5 reproducibility face: identical run tuples answer byte-identical
+//! reproducibility face: identical run tuples answer byte-identical
 //! normalized output.
 //!
 //! The engine's in-process pin (crates/dartq-engine/tests/reproducibility.rs)
@@ -16,7 +16,7 @@
 //! (`code|severity|type|file|line|col|length|message`). Rows sort before the
 //! byte compare — the differential face compares (code, file) sets, so the
 //! repro contract is order-normalized too: identical rows in a different
-//! emission order are not a §19.5 divergence, any content divergence is.
+//! emission order are not a divergence, any content divergence is.
 //!
 //! # Tuple
 //!
@@ -198,7 +198,7 @@ pub(crate) fn repro_entry(args: &[String]) -> Result<(String, bool), Outcome> {
 fn usage() -> &'static str {
     "usage:
   harness repro --corpus-dir DIR --dartq-cmd TEMPLATE [--runs N] [--out DIR]
-      PRD §19.5 reproducibility: run the dartq side N times (default 2) over
+      reproducibility: run the dartq side N times (default 2) over
       the corpus with fresh processes, normalize each run's machine rows
       through the differential face's normalizer (corpus-relative paths,
       lowercased codes, order-normalized), and byte-compare every run against
@@ -242,7 +242,9 @@ fn normalize_rows(corpus_root: &std::path::Path, diags: &[MachineDiag], out: &mu
     let mut keys = EntryKeyBuilder::new(corpus_root);
     let mut rows: Vec<String> = Vec::with_capacity(diags.len());
     for diag in diags {
-        let (code, file) = keys.key(diag);
+        // The row embeds severity verbatim from the diag, so the key's severity
+        // component is not needed here.
+        let (_, code, file) = keys.key(diag);
         rows.push(format!(
             "{code}|{}|{}|{file}|{}|{}|{}|{}",
             diag.severity.as_str(),
@@ -324,7 +326,7 @@ mod tests {
 
     /// Same rows in a different emission order normalize to identical bytes:
     /// the contract is order-normalized (mirroring the differential face's
-    /// set comparison), so a benign reorder is not a §19.5 divergence.
+    /// set comparison), so a benign reorder is not a divergence.
     #[test]
     fn normalized_rows_are_order_normalized() {
         let corpus = std::path::Path::new("/w");

@@ -19,13 +19,18 @@ dartq-plugin = { workspace = true }
 dartq-source = { workspace = true }
 
 # cache-hit-rate: the traced warm run post-processes through the engine's
-# §19.3 aggregator (dartq_engine::event::cache_hit_rate) — one source of
+# Event-count aggregator (dartq_engine::event::cache_hit_rate) — one source of
 # truth for the rate's semantics.
 dartq-engine = { workspace = true }
 
 # incremental-p95-resident: the resident arm opens the same workspace
 # assembly the `dartq analyze` face runs (dartq_commands::workspace).
 dartq-commands = { workspace = true }
+
+# fixture-coverage pin: the lint tier's universe derives live from the rule
+# registry's emittable face (registered_gate_codes in main.rs), not from the
+# frozen lint_codes.txt.
+dartq-lints = { workspace = true }
 
 # POSIX process-group kill for timed-out drivers (see oracle.rs kill_driver).
 [target.'cfg(unix)'.dependencies]

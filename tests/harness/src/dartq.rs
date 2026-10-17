@@ -1,8 +1,8 @@
 //! dartq-side driver: invokes the dartq CLI as an external command and parses its machine-format
-//! output (PRD P6 superset contract). The command line comes from the `--dartq-cmd` template
+//! output. The command line comes from the `--dartq-cmd` template
 //! (see [`DartqDriver::from_template`]); process invocation, timeout handling, and machine parsing
-//! are shared with the oracle side via [`crate::oracle::run_driver`]. Exit-code contract (facts §3,
-//! dartdev): {0,1,2,3} are valid analysis exits (0 clean / 1 infos / 2 warnings / 3 errors) and the
+//! are shared with the oracle side via [`crate::oracle::run_driver`]. Exit-code contract (dartdev):
+//! {0,1,2,3} are valid analysis exits (0 clean / 1 infos / 2 warnings / 3 errors) and the
 //! parsed lines are the Jaccard input; 64 is a usage error and 4 a crash — both fail the harness
 //! instead of producing a diagnostic set.
 
@@ -141,7 +141,7 @@ mod tests {
         assert!(err.contains("dartq"), "error names the side: {err}");
     }
 
-    /// Exit 4 with empty stdout is the crash tier (facts §3) AND the panic
+    /// Exit 4 with empty stdout is the crash tier AND the panic
     /// signature: the whole-batch `catch_unwind` shape the corpus auto-bisect
     /// attributes. A crash with leftover stdout is a plain failure instead
     /// (see `probe_classifies_measurement_panic_and_failure`).

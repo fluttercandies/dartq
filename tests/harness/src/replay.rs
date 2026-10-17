@@ -1,4 +1,4 @@
-//! `harness replay` — the PRD §19.4 incremental-consistency driver: an edit
+//! `harness replay` — the incremental-consistency driver: an edit
 //! sequence drives ONE live dartq daemon session (overlay `didChange` +
 //! the `dartq/analyze` pull face = the incremental result) while the same
 //! edits land on a materialized disk copy re-analyzed fresh per step (the
@@ -6,14 +6,42 @@
 //! canonical shape ([`replay_edit::CanonicalDiag`]) and compare byte-wise;
 //! the run passes only when every step matches.
 //!
-//! Why this shape: §19.4 demands "incremental result == full-recompute
+//! Why this shape: the gate demands "incremental result == full-recompute
 //! result, except internal IDs". The daemon's `dartq/analyze` pull answers
 //! with the post-edit whole-workspace view synchronously (one turn applies
 //! queued edits before answering), sidestepping the publish face's
 //! change-only baseline suppression; the pull carries no volatile fields
-//! (see `replay_edit.rs` for the normalization ledger). The copy never
-//! shares bytes with the live corpus: the live side is overlay-only, so a
-//! crash mid-replay leaves the workspace untouched.
+//! (see `replay_edit.rs` for the normalization ledger).
+//!
+//! Both faces share ONE mutable workspace: the materialized copy. The
+//! daemon session runs on the copy (its `{dir}`), and the caller's corpus
+//! dir is never written — a crash mid-replay leaves it untouched. Splices
+//! ride whole-text `didChange` with the same bytes written to the copy.
+//! File-set steps mutate the copy on disk before the matching
+//! notification, so both arms observe identical file sets: a remove is the
+//! on-disk delete followed by `didClose` — the session stages a removal
+//! exactly when its disk read finds the file gone (`Session::queue_close`
+//! stages the on-disk bytes over an existing file, which would resurrect
+//! it), and it only acts on session-opened documents, so a never-opened
+//! target is didOpened first (the staged Set is superseded by the Remove
+//! at the same drain). A create is the on-disk write followed by
+//! `didOpen`. The per-step byte comparison therefore holds across
+//! file-set changes, not just content changes: a removed file's
+//! diagnostics vanish from both planes and every importer's churn errors
+//! must match line for line. (A file that carries no diagnostics on either
+//! face is unobservable on this face by construction — the comparison
+//! plane is the diagnostics themselves; universe consistency behind a
+//! silent file is pinned at the engine level, not here.)
+//!
+//! Non-vacuity: an all-equal run means something only if the steps
+//! compared anything. A sequence where every step carried zero diagnostics
+//! on BOTH faces is the vacuous signature — a universe-narrowing break (a
+//! silently skipped file, a filtered-out code family) silences both arms
+//! identically and would otherwise pass on empty sets. The report
+//! therefore records the per-step and sequence diagnostic totals it
+//! compared and fails a whole-sequence zero with an explicit reason, even
+//! when every step was equal. Individual clean steps are legitimate; only
+//! a sequence-level zero across both arms is judged.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -181,7 +209,12 @@ impl DaemonClient {
     }
 
     fn stderr_tail(&self) -> String {
-        stderr_tail(&self.stderr.stderr_bytes())
+        // Decorates error messages; an unreadable capture is surfaced in
+        // them, never silently emptied.
+        match self.stderr.stderr_bytes() {
+            Ok(bytes) => stderr_tail(&bytes),
+            Err(e) => format!("<captured stderr unreadable: {e}>"),
+        }
     }
 
     /// One JSON-RPC request → its result, skipping server notifications
@@ -306,8 +339,10 @@ fn relative_key(path: &Path, root: &Path) -> String {
         .to_string()
 }
 
-/// Normalizes a `dartq/analyze` result (the incremental face).
-fn normalize_lsp_workspace(result: &Value, corpus_root: &Path) -> Result<WorkspaceDiags, String> {
+/// Normalizes a `dartq/analyze` result (the incremental face). `root` is
+/// the daemon's workspace dir — the same materialized copy the full
+/// face analyzes — so in-corpus paths strip to corpus-relative keys.
+fn normalize_lsp_workspace(result: &Value, root: &Path) -> Result<WorkspaceDiags, String> {
     let entries = result
         .get("diagnostics")
         .and_then(Value::as_array)
@@ -320,7 +355,7 @@ fn normalize_lsp_workspace(result: &Value, corpus_root: &Path) -> Result<Workspa
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         let (path, canonical) = replay_edit::canonical_from_lsp(entry)?;
-        out.push((relative_key(&path, corpus_root), canonical));
+        out.push((relative_key(&path, root), canonical));
     }
     Ok(out)
 }
@@ -360,7 +395,7 @@ fn normalize_machine_workspace(
 }
 
 /// Comparison plane: sorted `file<TAB>key` lines. Byte equality of these
-/// vectors IS the §19.4 verdict for a step.
+/// vectors IS the verdict for a step.
 fn canonical_lines(mut diags: WorkspaceDiags) -> Vec<String> {
     diags.sort();
     diags
@@ -392,6 +427,7 @@ fn first_difference(incremental: &[String], full: &[String]) -> Option<(String, 
 
 struct StepReport {
     index: usize,
+    kind: &'static str,
     file: String,
     line: u32,
     column: u32,
@@ -470,24 +506,32 @@ fn parse_options(args: &[String]) -> Result<ReplayOptions, Outcome> {
 const USAGE: &str = r#"usage:
   harness replay --corpus-dir DIR --edits FILE.jsonl --dartq-cmd TEMPLATE
                  --daemon-cmd TEMPLATE [--label NAME] [--out DIR]
-  PRD 19.4 oracle incremental consistency: drive one live `dartq daemon`
+  Oracle incremental consistency: drive one live `dartq daemon`
   session with an edit sequence (overlay didChange + the `dartq/analyze`
   pull = the incremental result) while the same edits land on a materialized
   disk copy re-analyzed fresh per step (`--dartq-cmd` = the full-recompute
   result). Per step both sides normalize to one canonical diagnostic shape
   and compare byte-wise.
-  --edits FILE: JSONL, one step per line:
+  --edits FILE: JSONL, one step per line, three forms:
       {"file":"lib/a.dart","line":3,"column":8,"length":2,"new_text":"x"}
-      1-based line/column (UTF-16), `length` UTF-16 code units to replace
-      (0 = insert), `new_text` "" = delete; `file` is corpus-relative.
-  TEMPLATE: whitespace-split argv; {dir} is replaced by the corpus dir
-  (appended as last arg when absent), e.g.
+          in-file splice: 1-based line/column (UTF-16), `length` UTF-16
+          code units to replace (0 = insert), `new_text` "" = delete;
+          `file` is corpus-relative.
+      {"remove":"lib/a.dart"}
+          delete the file from the workspace (it must exist).
+      {"create":"lib/b.dart","text":"int x = 1;\n"}
+          create the file with `text` as its full content (it must not
+          exist).
+  TEMPLATE: whitespace-split argv; {dir} is replaced by the replay's
+  materialized workspace copy (appended as last arg when absent) — both
+  faces analyze that same copy, e.g.
       --dartq-cmd "cargo run -q -p dartq-cli -- analyze --format=machine"
       --daemon-cmd "cargo run -q -p dartq-cli -- daemon"
   --label NAME: report directory suffix (default replay-r1). Report:
   <out>/<label>/{report.json,report.md}.
-  exit: 0 all steps equal | 1 any mismatch (report carries the step list) |
-  2 harness error (env, daemon, or malformed edits)."#;
+  exit: 0 every step equal and the run non-vacuous | 1 any mismatch, or a
+  vacuous all-equal run (zero diagnostics compared across both faces; the
+  report names it) | 2 harness error (env, daemon, or malformed edits)."#;
 
 /// Copies a corpus tree to a temp dir, skipping symlinks (same rule as the
 /// corpus assembler). Returns the canonicalized copy root so machine-side
@@ -529,46 +573,95 @@ fn materialize_copy(corpus: &Path) -> Result<PathBuf, String> {
         .map_err(|e| format!("canonicalizing the replay copy {}: {e}", dir.display()))
 }
 
+/// The run's verdict from the compared step list: every step equal, AND the
+/// sequence non-vacuous. An all-equal run that compared zero diagnostics
+/// across both faces proves nothing (a universe-narrowing break silences
+/// both arms identically), so it fails with the vacuity reason; a run with
+/// any mismatch, or with at least one compared diagnostic, keeps its
+/// natural verdict.
+fn run_verdict(steps: &[StepReport], all_equal: bool) -> (bool, Option<String>) {
+    let total_diagnostics: usize = steps
+        .iter()
+        .map(|step| step.incremental_count + step.full_count)
+        .sum();
+    if all_equal && total_diagnostics == 0 {
+        (
+            false,
+            Some(
+                "vacuous replay: every step compared zero diagnostics on both faces \
+                 (incremental and full recompute) — equality over empty sets proves \
+                 nothing"
+                    .to_owned(),
+            ),
+        )
+    } else {
+        (all_equal, None)
+    }
+}
+
+#[expect(clippy::too_many_lines)] // the JSON and markdown reports render from one step slice; a split would duplicate the schema
 fn write_report(
     opts: &ReplayOptions,
     steps: &[StepReport],
-    all_equal: bool,
+    passed: bool,
+    failure_reason: Option<&str>,
 ) -> Result<PathBuf, String> {
+    // The step's human-facing description: the splice coordinates read
+    // straight off a differential report, the file-set forms name the
+    // operation and its target.
+    fn step_label(step: &StepReport) -> String {
+        if step.kind == "splice" {
+            format!("{}:{}+{}", step.file, step.line, step.length)
+        } else {
+            format!("{} {}", step.kind, step.file)
+        }
+    }
+
     let dir = opts.out_dir.join(&opts.label);
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("creating the report dir {}: {e}", dir.display()))?;
     let equal_steps = steps.iter().filter(|s| s.equal).count();
+    let total_diagnostics: usize = steps
+        .iter()
+        .map(|step| step.incremental_count + step.full_count)
+        .sum();
+    let mut verdict = json!({
+           "passed": passed,
+           "equal_steps": equal_steps,
+    "total_steps": steps.len(),
+           "total_diagnostics_compared": total_diagnostics,
+       });
+    if let Some(reason) = failure_reason {
+        verdict["failure_reason"] = json!(reason);
+    }
     let json_report = json!({
-        "schema": "replay-report-v1",
-        "meta": {
-            "label": opts.label,
-            "corpus_dir": opts.corpus_dir.display().to_string(),
-            "edits_file": opts.edits_path.display().to_string(),
-            "dartq_cmd": opts.dartq_cmd,
-            "daemon_cmd": opts.daemon_cmd,
-        },
-        "verdict": {
-            "passed": all_equal,
-            "equal_steps": equal_steps,
-            "total_steps": steps.len(),
-        },
-        "steps": steps.iter().map(|step| {
-            json!({
-                "index": step.index,
-                "file": step.file,
-                "line": step.line,
-                "column": step.column,
-                "length": step.length,
-                "equal": step.equal,
-                "incremental_diagnostics": step.incremental_count,
-                "full_recompute_diagnostics": step.full_count,
-                "first_diff": step.first_diff.as_ref().map(|(inc, full)| json!({
-                    "incremental": inc,
-                    "full_recompute": full,
-                })),
-            })
-        }).collect::<Vec<_>>(),
-    });
+           "schema": "replay-report-v1",
+           "meta": {
+               "label": opts.label,
+               "corpus_dir": opts.corpus_dir.display().to_string(),
+               "edits_file": opts.edits_path.display().to_string(),
+               "dartq_cmd": opts.dartq_cmd,
+               "daemon_cmd": opts.daemon_cmd,
+           },
+           "verdict": verdict,
+    "steps": steps.iter().map(|step| {
+               json!({
+                   "index": step.index,
+                   "kind": step.kind,
+                   "file": step.file,
+                   "line": step.line,
+                   "column": step.column,
+                   "length": step.length,
+                   "equal": step.equal,
+                   "incremental_diagnostics": step.incremental_count,
+                   "full_recompute_diagnostics": step.full_count,
+                   "first_diff": step.first_diff.as_ref().map(|(inc, full)| json!({
+                       "incremental": inc,
+                       "full_recompute": full,
+                   })),
+               })
+           }).collect::<Vec<_>>(),
+       });
     let json_path = dir.join("report.json");
     std::fs::write(
         &json_path,
@@ -579,36 +672,37 @@ fn write_report(
     let mut md = String::new();
     writeln!(
         md,
-        "# harness replay — {}\n\ncorpus: {}\n\nverdict: {} ({equal_steps}/{} steps equal)\n\n| step | edit | equal | incremental | full |\n| --- | --- | --- | --- | --- |",
+        "# harness replay — {}\n\ncorpus: {}\n\nverdict: {} ({equal_steps}/{} steps equal, \
+         {total_diagnostics} diagnostics compared)\n\n| step | edit | equal | incremental | full |\n| --- | --- | --- | --- | --- |",
         opts.label,
         opts.corpus_dir.display(),
-        if all_equal { "PASS" } else { "FAIL" },
+        if passed { "PASS" } else { "FAIL" },
         steps.len(),
     )
-    .expect("string write");
+.expect("string write");
+    if let Some(reason) = failure_reason {
+        writeln!(md, "\n{reason}").expect("string write");
+    }
     for step in steps {
         writeln!(
             md,
-            "| {} | `{}:{}` | {} | {} | {} |",
+            "| {} | `{}` | {} | {} | {} |",
             step.index,
-            step.file,
-            step.line,
+            step_label(step),
             if step.equal { "yes" } else { "**no**" },
             step.incremental_count,
             step.full_count,
         )
         .expect("string write");
     }
-    if !all_equal {
+    if equal_steps < steps.len() {
         md.push_str("\n## Mismatches\n");
         for step in steps.iter().filter(|s| !s.equal) {
             writeln!(
                 md,
-                "\n### step {} — {}:{}+{}\n\n- incremental: `{}`\n- full: `{}`",
+                "\n### step {} — {}\n\n- incremental: `{}`\n- full: `{}`",
                 step.index,
-                step.file,
-                step.line,
-                step.length,
+                step_label(step),
                 step.first_diff
                     .as_ref()
                     .map_or("<absent>", |(i, _)| i.as_str()),
@@ -640,62 +734,162 @@ fn resolve_template(template: &str, dir: &Path) -> (String, Vec<String>) {
     (program, resolved)
 }
 
+/// didOpen one workspace file from its on-disk bytes (the overlay must
+/// start from the universe's current content) and track it as opened.
+fn open_document(
+    daemon: &mut DaemonClient,
+    copy: &Path,
+    file: &str,
+    version: &mut i64,
+    opened: &mut BTreeSet<String>,
+    texts: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    let path = copy.join(file);
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    *version += 1;
+    daemon.notify(
+        "textDocument/didOpen",
+        &json!({"textDocument": {
+            "uri": path_to_uri(&path),
+            "languageId": "dart",
+            "version": *version,
+            "text": text,
+        }}),
+    )?;
+    opened.insert(file.to_owned());
+    texts.insert(file.to_owned(), text);
+    Ok(())
+}
+
+/// Writes one file's bytes to the copy — the full-recompute face reads the
+/// same universe the incremental face's notifications describe.
+fn write_copy_file(file: &Path, text: &str, step_no: usize) -> Result<(), String> {
+    std::fs::write(file, text)
+        .map_err(|e| format!("step {step_no}: writing {}: {e}", file.display()))
+}
+
 /// The edit sequence against one daemon session and one materialized copy.
+/// The daemon's `{dir}` IS the copy, so every step keeps the two arms on
+/// one workspace universe: the notification rides the session overlay, the
+/// bytes land on the copy's disk for the fresh per-step batch run.
+#[expect(clippy::too_many_lines)] // the step dispatch mirrors the edit-sequence grammar; each arm is one step kind
 fn run_steps(
     daemon: &mut DaemonClient,
     batch: &crate::dartq::DartqDriver,
-    corpus: &Path,
     copy: &Path,
-    edits: &[replay_edit::Edit],
+    edits: &[replay_edit::EditStep],
 ) -> Result<(Vec<StepReport>, bool), String> {
     let mut opened: BTreeSet<String> = BTreeSet::new();
     let mut texts: BTreeMap<String, String> = BTreeMap::new();
     let mut version: i64 = 0;
     let mut steps = Vec::with_capacity(edits.len());
     let mut all_equal = true;
-    for (idx, edit) in edits.iter().enumerate() {
+    for (idx, step) in edits.iter().enumerate() {
         let step_no = idx + 1;
-        // Live side: didOpen on first touch (the overlay must start from
-        // the on-disk bytes), then the whole-text didChange.
-        if !opened.contains(&edit.file) {
-            let path = corpus.join(&edit.file);
-            let text = std::fs::read_to_string(&path)
-                .map_err(|e| format!("step {step_no}: reading {}: {e}", path.display()))?;
-            version += 1;
-            daemon.notify(
-                "textDocument/didOpen",
-                &json!({"textDocument": {
-                    "uri": path_to_uri(&path),
-                    "languageId": "dart",
-                    "version": version,
-                    "text": text,
-                }}),
-            )?;
-            opened.insert(edit.file.clone());
-            texts.insert(edit.file.clone(), text);
+        match step {
+            replay_edit::EditStep::Splice(edit) => {
+                let path = copy.join(&edit.file);
+                if !path.exists() {
+                    return Err(format!(
+                        "step {step_no}: splice targets {}, which is not in the workspace \
+                         (absent from the corpus and never created by a `create` step)",
+                        edit.file
+                    ));
+                }
+                // Live side: didOpen on first touch (the overlay must start
+                // from the on-disk bytes), then the whole-text didChange.
+                if !opened.contains(&edit.file) {
+                    open_document(
+                        daemon,
+                        copy,
+                        &edit.file,
+                        &mut version,
+                        &mut opened,
+                        &mut texts,
+                    )?;
+                }
+                let new_text = replay_edit::apply_edit(&texts[&edit.file], edit)
+                    .map_err(|e| format!("step {step_no}: {e}"))?;
+                version += 1;
+                let uri = path_to_uri(&path);
+                daemon.notify(
+                    "textDocument/didChange",
+                    &json!({
+                                           "textDocument": {"uri": uri, "version": version},
+                    "contentChanges": [{"text": new_text.clone()}],
+                                       }),
+                )?;
+                texts.insert(edit.file.clone(), new_text.clone());
+                write_copy_file(&path, &new_text, step_no)?;
+            }
+            replay_edit::EditStep::Remove { file } => {
+                let path = copy.join(file);
+                if !path.exists() {
+                    return Err(format!(
+                        "step {step_no}: `remove` targets {file}, which is not part of the \
+                         workspace (absent from the corpus and never created); only an existing \
+                         file can be removed"
+                    ));
+                }
+                // didClose only acts on session-opened documents (the
+                // session no-ops otherwise), so open the file first when
+                // this session never touched it; the staged Set is
+                // superseded by the Remove at the same drain.
+                if !opened.contains(file) {
+                    open_document(daemon, copy, file, &mut version, &mut opened, &mut texts)?;
+                }
+                // The on-disk delete MUST land before the didClose: the
+                // session stages a removal only when its disk read finds
+                // the file gone — over an existing file it stages the
+                // on-disk bytes (a revert), resurrecting the file.
+                std::fs::remove_file(&path)
+                    .map_err(|e| format!("step {step_no}: removing {}: {e}", path.display()))?;
+                daemon.notify(
+                    "textDocument/didClose",
+                    &json!({"textDocument": {"uri": path_to_uri(&path)}}),
+                )?;
+                opened.remove(file);
+                texts.remove(file);
+            }
+            replay_edit::EditStep::Create { file, text } => {
+                let path = copy.join(file);
+                if path.exists() {
+                    return Err(format!(
+                        "step {step_no}: `create` targets {file}, which already exists (part of \
+                         the corpus or created by an earlier step); splice into it or remove it \
+                         first"
+                    ));
+                }
+                if let Some(parent) = path.parent()
+                    && parent != Path::new("")
+                {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        format!("step {step_no}: creating {}: {e}", parent.display())
+                    })?;
+                }
+                write_copy_file(&path, text, step_no)?;
+                version += 1;
+                daemon.notify(
+                    "textDocument/didOpen",
+                    &json!({"textDocument": {
+                        "uri": path_to_uri(&path),
+                        "languageId": "dart",
+                        "version": version,
+                        "text": text,
+                    }}),
+                )?;
+                opened.insert(file.clone());
+                texts.insert(file.clone(), text.clone());
+            }
         }
-        let new_text = replay_edit::apply_edit(&texts[&edit.file], edit)
-            .map_err(|e| format!("step {step_no}: {e}"))?;
-        version += 1;
-        let uri = path_to_uri(&corpus.join(&edit.file));
-        daemon.notify(
-            "textDocument/didChange",
-            &json!({
-                "textDocument": {"uri": uri, "version": version},
-                "contentChanges": [{"text": new_text.clone()}],
-            }),
-        )?;
-        texts.insert(edit.file.clone(), new_text);
 
-        // Incremental face: the post-edit whole-workspace pull.
+        // Incremental face: the post-step whole-workspace pull.
         let incremental =
-            normalize_lsp_workspace(&daemon.call("dartq/analyze", &json!({}))?, corpus)?;
+            normalize_lsp_workspace(&daemon.call("dartq/analyze", &json!({}))?, copy)?;
 
-        // Full-recompute face: the same bytes on the materialized copy,
-        // analyzed fresh by the batch driver.
-        let copy_file = copy.join(&edit.file);
-        std::fs::write(&copy_file, &texts[&edit.file])
-            .map_err(|e| format!("step {step_no}: writing {}: {e}", copy_file.display()))?;
+        // Full-recompute face: the same universe on disk, analyzed fresh
+        // by the batch driver.
         let diags = match batch.probe(copy, OutputFormat::Machine) {
             DartqProbe::Measured(diags) => diags,
             DartqProbe::Panic => {
@@ -720,10 +914,20 @@ fn run_steps(
         all_equal &= equal;
         steps.push(StepReport {
             index: step_no,
-            file: edit.file.clone(),
-            line: edit.line,
-            column: edit.column,
-            length: edit.length,
+            kind: step.kind(),
+            file: step.file().to_owned(),
+            line: match step {
+                replay_edit::EditStep::Splice(edit) => edit.line,
+                _ => 0,
+            },
+            column: match step {
+                replay_edit::EditStep::Splice(edit) => edit.column,
+                _ => 0,
+            },
+            length: match step {
+                replay_edit::EditStep::Splice(edit) => edit.length,
+                _ => 0,
+            },
             equal,
             incremental_count: incremental_lines.len(),
             full_count: full_lines.len(),
@@ -735,8 +939,10 @@ fn run_steps(
 
 /// Entry point: preflight → materialized copy → one daemon session over
 /// the edit sequence → per-step byte compare → report. `Ok((summary,
-/// true))` = every step equal (exit 0); `Ok((_, false))` = at least one
-/// mismatch (exit 1); `Err(Outcome::Error)` = harness/environment error
+/// true))` = every step equal and the run non-vacuous (exit 0);
+/// `Ok((_, false))` = at least one mismatch, or a vacuous all-equal run
+/// that compared zero diagnostics across both faces (exit 1, the report
+/// names which); `Err(Outcome::Error)` = harness/environment error
 /// (exit 2): malformed edits, daemon launch/handshake/answer failures,
 /// fresh-run crashes.
 pub(crate) fn replay_entry(args: &[String]) -> Result<(String, bool), Outcome> {
@@ -765,28 +971,42 @@ pub(crate) fn replay_entry(args: &[String]) -> Result<(String, bool), Outcome> {
     }
     let copy = materialize_copy(&corpus).map_err(Outcome::Error)?;
     let batch = crate::dartq::DartqDriver::from_template(&opts.dartq_cmd);
-    let (program, daemon_args) = resolve_template(&opts.daemon_cmd, &corpus);
+    // The daemon session runs on the materialized copy — the one workspace
+    // both faces observe, and the only place a remove/create can mutate
+    // the file set (the corpus dir is never written).
+    let (program, daemon_args) = resolve_template(&opts.daemon_cmd, &copy);
     let mut daemon = DaemonClient::spawn(&program, &daemon_args).map_err(Outcome::Error)?;
     let result = (|| -> Result<(Vec<StepReport>, bool), String> {
         daemon.initialize()?;
-        run_steps(&mut daemon, &batch, &corpus, &copy, &edits)
+        run_steps(&mut daemon, &batch, &copy, &edits)
     })();
     let shutdown_result = daemon.shutdown();
     let _ = std::fs::remove_dir_all(&copy);
     // Step errors win over shutdown errors (the diagnosis points earlier).
     let (steps, all_equal) = result.map_err(Outcome::Error)?;
     shutdown_result.map_err(Outcome::Error)?;
-    let dir = write_report(&opts, &steps, all_equal).map_err(Outcome::Error)?;
+    let (passed, failure_reason) = run_verdict(&steps, all_equal);
+    let dir =
+        write_report(&opts, &steps, passed, failure_reason.as_deref()).map_err(Outcome::Error)?;
     let equal_steps = steps.iter().filter(|step| step.equal).count();
-    let summary = format!(
-        "replay {}: {}/{} steps equal ({}); report: {}",
-        opts.label,
-        equal_steps,
-        steps.len(),
-        if all_equal { "PASS" } else { "FAIL" },
-        dir.display(),
-    );
-    Ok((summary, all_equal))
+    let summary = match failure_reason {
+        Some(reason) => format!(
+            "replay {}: {}/{} steps equal, FAIL — {reason}; report: {}",
+            opts.label,
+            equal_steps,
+            steps.len(),
+            dir.display(),
+        ),
+        None => format!(
+            "replay {}: {}/{} steps equal ({}); report: {}",
+            opts.label,
+            equal_steps,
+            steps.len(),
+            if passed { "PASS" } else { "FAIL" },
+            dir.display(),
+        ),
+    };
+    Ok((summary, passed))
 }
 
 #[cfg(test)]
@@ -943,5 +1163,44 @@ mod tests {
             parse_options(&["--nope".into()]).is_err(),
             "unknown flags must fail"
         );
+    }
+
+    fn verdict_step(incremental: usize, full: usize, equal: bool) -> StepReport {
+        StepReport {
+            index: 1,
+            kind: "splice",
+            file: "lib/a.dart".into(),
+            line: 1,
+            column: 1,
+            length: 0,
+            equal,
+            incremental_count: incremental,
+            full_count: full,
+            first_diff: None,
+        }
+    }
+
+    #[test]
+    fn vacuous_all_equal_sequence_fails_the_verdict() {
+        // The vacuous signature: all steps equal, zero diagnostics on both
+        // faces across the whole sequence.
+        let (passed, reason) = run_verdict(&[verdict_step(0, 0, true)], true);
+        assert!(!passed, "an all-equal zero-diagnostics run must fail");
+        let reason = reason.expect("the vacuity failure is named");
+        assert!(
+            reason.contains("vacuous"),
+            "reason names the vacuity: {reason}"
+        );
+
+        // A clean step among comparing steps is legitimate, not vacuous.
+        let (passed, reason) =
+            run_verdict(&[verdict_step(0, 0, true), verdict_step(2, 2, true)], true);
+        assert!(passed, "a sequence that compared anything passes");
+        assert!(reason.is_none());
+
+        // A mismatch fails regardless of the totals.
+        let (passed, reason) = run_verdict(&[verdict_step(0, 0, false)], false);
+        assert!(!passed);
+        assert!(reason.is_none(), "a plain mismatch needs no vacuity reason");
     }
 }

@@ -1,8 +1,8 @@
-//! §19.3 benchmark metric substrate (M3 gate arbiter tooling): eight
+//! Benchmark metric substrate (M3 gate arbiter tooling): eight
 //! process-level collectors as the `harness bench` subcommand — no criterion,
 //! the metrics are end-to-end process measurements, not micro-benchmarks.
 //!
-//! Metrics (PRD §1.5):
+//! Metrics:
 //! - `rss-100k`: peak tree-RSS (KiB) of one full dartq analysis over the
 //!   corpus, divided by `LOC/100_000`. Sampling polls `/bin/ps -axo pgid=,rss=`
 //!   (the child runs in its own process group, so the pgid filter covers the
@@ -23,7 +23,7 @@
 //!   the *batch* arm: one full driver process per step.
 //! - `incremental-p95-resident`: the same edit manifest driven through one
 //!   in-process engine that stays warm across steps (the resident face
-//!   PRD §1.5's incremental target describes — edits land as in-memory
+//!   the incremental target describes — edits land as in-memory
 //!   overlays, the daemon edit shape, and each step is one `analyze` pass,
 //!   no process restart). Reports the same P50/P95/P99 shape over the same
 //!   step set, comparable against the batch arm.
@@ -38,7 +38,7 @@
 //!   lives only on `explain` — so the report carries `tiers: ["fixed"]`
 //!   instead of inventing flags; real tiers are swept where they exist.
 //! - `plugin-overhead`: the cost the plugin subsystem adds per analyze cycle
-//!   (M4, PRD §14) — per-cycle wall time of one feed+drain round trip
+//!   — per-cycle wall time of one feed+drain round trip
 //!   against a live plugin host (the `samples/compat` compatibility plugin,
 //!   launched through the daemon's `dart <entrypoint>` path) and the plugin
 //!   sidecar's peak RSS (the runtime's own monitor): the "with plugins" side
@@ -56,7 +56,7 @@
 //!   The meta also carries the env descriptor `oracle_baseline.sh` records
 //!   (dart version / OS / chip / cores, #798), so the two instruments'
 //!   reports are comparable side by side.
-//! - `cache-hit-rate`: PRD §19.3's Cache Hit Rate over a defined warm run —
+//! - `cache-hit-rate`: the Cache Hit Rate over a defined warm run —
 //!   two `dartq analyze` processes over the same corpus sharing one fresh
 //!   cache root (`XDG_CACHE_HOME` pinned to an empty scratch dir): run 1
 //!   untraced (cold, populates the cross-session cache), run 2 with
@@ -66,7 +66,7 @@
 //!   total is visible as such. The verbatim warm-run definition rides every
 //!   report — the rate is meaningless without the run shape that produced it.
 //! - `snapshot-size`: the bytes one analyze run persists under the cache
-//!   root (`$XDG_CACHE_HOME/dartq` else `~/.cache/dartq`, PRD §17.2). The
+//!   root. The
 //!   measured run pins `XDG_CACHE_HOME` to an empty scratch dir, so a
 //!   per-file stat walk (no `du`) sums exactly this run's writes:
 //!   content-store blobs under `<root>/store` today; snapshot generations
@@ -81,9 +81,11 @@
 //!   median + P95 (nearest-rank) over the sample set.
 //!
 //! Every report carries `schema_version: 1` and its full input set (corpus
-//! dir, LOC definition, tokenizer id, sample counts, commands) for PRD §19.5
+//! dir, LOC definition, tokenizer id, sample counts, commands) for
 //! reproducibility, written as `<out>/<metric>/report.json` (default out:
-//! `target/evidence/bench`).
+//! `target/evidence/bench`). `rss-100k` nests one level deeper —
+//! `<out>/rss-100k/<corpus-name>/report.json` — so multi-size runs over one
+//! `--out` (10k then 100k) cannot overwrite each other's report.
 //!
 //! Discipline: the process-driving functions are exercised only by the
 //! serial verification phase — the unit tests cover the pure core
@@ -95,9 +97,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
-use dartq_plugin::{
-    CycleConfig, CyclePush, Manifest, PluginDiagnostic, PluginRuntime, SpawnSpec,
-};
+use dartq_plugin::{CycleConfig, CyclePush, Manifest, PluginDiagnostic, PluginRuntime, SpawnSpec};
 use dartq_source::{FileId, FileTable};
 use serde::{Deserialize, Serialize};
 
@@ -194,7 +194,7 @@ manifest instead.";
 /// The verbatim cache-path definition riding every `snapshot-size` report.
 const CACHE_PATH_DEFINITION: &str = "`$XDG_CACHE_HOME/dartq` when \
 XDG_CACHE_HOME is set non-empty, else `~/.cache/dartq` \
-(dartq_engine::store::default_root, PRD §17.2); the measured run pins \
+(dartq_engine::store::default_root); the measured run pins \
 XDG_CACHE_HOME to an empty scratch dir, so the sum covers exactly one \
 analyze run's writes: content-store blobs under <root>/store (the CLI \
 analyze face); snapshot generations under <root>/snapshots are written by \
@@ -210,9 +210,9 @@ const FIXED_TIERS: [&str; 1] = ["fixed"];
 
 /// The verbatim tier definitions riding every token-cost report (the input
 /// set must define its dimensions): the schema's tier table
-/// (`dartq_schema::Verbosity`, §15.8) as the CLI spells it, plus the
+/// as the CLI spells it, plus the
 /// `fixed` marker for the tierless faces this metric drives.
-const TIER_DEFINITIONS: &str = "minimal = the red-line floor (schema §15.8): \
+const TIER_DEFINITIONS: &str = "minimal = the red-line floor: \
 locating fields only — a diagnostic's code + location, nothing prose-like; \
 compact = the default tier, each producer's baseline shape; full = compact \
 plus the cheaply-available extras named per face; `fixed` = the driven face \
@@ -368,7 +368,7 @@ fn percentile(mut samples: Vec<f64>, p: f64) -> Option<f64> {
     samples.get(rank - 1).copied()
 }
 
-/// Output tokenizer for the token-cost metric (PRD §1.5). v1 is the chars/4
+/// Output tokenizer for the token-cost metric. v1 is the chars/4
 /// heuristic; a real BPE (cl100k) slots in behind this trait without touching
 /// the metric code — only `id()` and `count()` change.
 trait Tokenizer {
@@ -401,7 +401,7 @@ impl Tokenizer for CharsPer4 {
 /// additive); the totals keep their whole-stdout definition so reports stay
 /// comparable across schema revisions.
 struct FileTokens {
-    /// Tokens per file URI, in URI order (BTreeMap: deterministic reports).
+    /// Tokens per file URI, in URI order (`BTreeMap`: deterministic reports).
     per_file: BTreeMap<String, u64>,
     /// Lines with no file field (fewer than four `|` fields — contract
     /// drift, summary prose): outside the distribution, counted for honesty,
@@ -530,11 +530,11 @@ fn count_loc(corpus_dir: &Path) -> Result<LocStats, String> {
     Ok(stats)
 }
 
-/// Raw §19.3 event counts over a `--trace-events` capture: (cache hits,
+/// Raw event counts over a `--trace-events` capture: (cache hits,
 /// `LibraryAnalyzed` lines admitted). Same line admissibility as the
 /// engine's [`dartq_engine::event::cache_hit_rate`] — malformed lines and
 /// lines without a boolean `from_cache` don't count; the predicate is the
-/// §17.4-pinned wire shape, and the round-trip test pins the two faces
+/// pinned wire shape, and the round-trip test pins the two faces
 /// together (`rate == hits / total`).
 fn library_hit_counts(jsonl: &str) -> (u64, u64) {
     jsonl
@@ -698,7 +698,7 @@ fn resolve_sdk_root(opts: &BenchOptions) -> Option<PathBuf> {
 
 // ---------------------------------------------------------------------------
 // Report schema (schema_version 1; every metric records its full input set,
-// PRD §19.5)
+//)
 // ---------------------------------------------------------------------------
 
 /// Report shapes follow the existing report.rs pattern: one nested `meta`
@@ -864,7 +864,7 @@ struct ColdReport {
     /// One cold `dart analyze` over the same corpus, timed the same way.
     oracle_elapsed_ms: f64,
     /// `oracle_elapsed_ms / dartq_elapsed_ms` — the charter's cold face
-    /// (≤ 0.5 means dartq cold is at least 2x faster); null when the dartq
+    /// (≥ 2.0 means dartq cold is at least 2x faster); null when the dartq
     /// side elapsed zero (undefined division; unreachable for a real process
     /// run).
     cold_ratio: Option<f64>,
@@ -884,7 +884,7 @@ struct ColdEnv {
     /// null when the probe failed — the times are the payload, a failed
     /// banner does not fail the metric.
     dart_version: Option<String>,
-    /// OS + version (macOS: "macOS <sw_vers -productVersion>", the script's
+    /// OS + version (macOS: "macOS `<sw_vers -productVersion>`", the script's
     /// rendering; elsewhere `std::env::consts::OS`).
     os: String,
     /// CPU identifier (macOS: `sysctl -n machdep.cpu.brand_string`; elsewhere
@@ -941,7 +941,7 @@ struct PluginOverheadMeta {
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct CacheHitRateReport {
     meta: CacheHitRateMeta,
-    /// `LibraryAnalyzed` lines admitted in the traced warm run (the §17.4
+    /// `LibraryAnalyzed` lines admitted in the traced warm run (the pinned
     /// admissibility: event kind + boolean `from_cache`).
     library_analyzed: u64,
     /// Of which `from_cache=true`.
@@ -1014,17 +1014,18 @@ fn epoch_seconds() -> u64 {
 }
 
 /// The existing report-helper pattern (report.rs): pretty JSON under the out
-/// dir, one subdir per report kind.
+/// dir, one subdir per report scope (`<out>/<scope>/report.json`; the scope
+/// may nest, e.g. `rss-100k/<corpus-name>`).
 fn write_report<T: Serialize>(
-    metric: &str,
+    scope: &str,
     out_root: &Path,
     report: &T,
 ) -> Result<PathBuf, Outcome> {
-    let dir = out_root.join(metric);
+    let dir = out_root.join(scope);
     fs::create_dir_all(&dir)
         .map_err(|e| Outcome::Error(format!("creating {}: {e}", dir.display())))?;
     let json = serde_json::to_string_pretty(report)
-        .map_err(|e| Outcome::Error(format!("serializing {metric} report: {e}")))?;
+        .map_err(|e| Outcome::Error(format!("serializing {scope} report: {e}")))?;
     let path = dir.join("report.json");
     fs::write(&path, json)
         .map_err(|e| Outcome::Error(format!("writing {}: {e}", path.display())))?;
@@ -1148,7 +1149,9 @@ fn run_sampled(
             "[{name}] `{program}` exited before any RSS sample could be taken"
         ));
     }
-    let stderr = capture.stderr_bytes();
+    let stderr = capture
+        .stderr_bytes()
+        .map_err(|e| format!("[{name}] reading captured stderr: {e}"))?;
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
     Ok(SampledRun {
         status,
@@ -1177,7 +1180,7 @@ fn ps_snapshot() -> Result<String, String> {
 }
 
 /// Exit validation shared by all bench drivers: the analysis exit tiers
-/// {0,1,2,3} are measurements (dartdev analyze contract, facts §3); anything
+/// {0,1,2,3} are measurements; anything
 /// else fails the metric instead of reporting numbers off a crashed run.
 fn validate_exit(
     name: &str,
@@ -1261,7 +1264,9 @@ fn run_with_env(
     };
     Ok(EnvRun {
         status,
-        stderr: capture.stderr_bytes(),
+        stderr: capture
+            .stderr_bytes()
+            .map_err(|e| format!("[{name}] reading captured stderr: {e}"))?,
     })
 }
 
@@ -1318,14 +1323,13 @@ fn first_stdout_byte_ms(
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(_) => {
                     if first_byte.is_none() {
                         first_byte = Some(Instant::now());
                         let _ = tx.send(first_byte);
                     }
                 }
-                Err(_) => break,
             }
         }
         if first_byte.is_none() {
@@ -1346,7 +1350,7 @@ fn first_stdout_byte_ms(
         }
         match rx.recv_timeout(remaining) {
             Ok(first_byte) => break first_byte,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break None,
         }
     };
@@ -1372,7 +1376,9 @@ fn first_stdout_byte_ms(
         }
     };
     let _ = reader.join();
-    let stderr = stderr_capture.stderr_bytes();
+    let stderr = stderr_capture
+        .stderr_bytes()
+        .map_err(|e| format!("[{name}] reading captured stderr: {e}"))?;
     validate_exit(name, program, status, &stderr)?;
     let Some(first_byte) = first_byte else {
         return Err(format!(
@@ -1435,6 +1441,24 @@ pub(crate) fn bench_entry(args: &[String]) -> Result<(String, bool), Outcome> {
     Ok((lines.join("\n"), true))
 }
 
+/// The rss-100k report scope under the out root: `rss-100k/<corpus-name>`.
+/// The corpus discriminator keeps multi-size runs over one shared `--out`
+/// (10k then 100k) from overwriting each other's report.json (the round-1
+/// incident: the @100k leg clobbered the @10k artifact in place).
+#[cfg(unix)]
+fn rss_report_scope(corpus: &Path) -> Result<String, String> {
+    let name = corpus
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "corpus dir `{}` has no final path component to name the report dir",
+                corpus.display()
+            )
+        })?;
+    Ok(format!("rss-100k/{name}"))
+}
+
 /// `rss-100k`: one full sampled analysis over the corpus, peak tree RSS
 /// normalized by `LOC/100_000`.
 #[cfg(unix)]
@@ -1479,7 +1503,8 @@ fn metric_rss(opts: &BenchOptions, corpus: &Path) -> Result<String, Outcome> {
         rss_per_100k_loc_kib: per_100k,
         elapsed_ms: run.elapsed_ms,
     };
-    let path = write_report("rss-100k", &opts.out, &report)?;
+    let scope = rss_report_scope(corpus).map_err(Outcome::Error)?;
+    let path = write_report(&scope, &opts.out, &report)?;
     Ok(format!(
         "rss-100k: peak {} KiB / {} LOC ({} files) -> {:.1} KiB per 100k LOC \
          (samples: {}, interval: {}ms) -> {}",
@@ -1583,7 +1608,7 @@ fn metric_incremental(opts: &BenchOptions, corpus: &Path) -> Result<String, Outc
 
 /// `incremental-p95-resident`: the same manifest driven through one
 /// in-process engine that stays warm across steps — no process restart, the
-/// resident face PRD §1.5's incremental target describes. The engine is the
+/// resident face the incremental target describes. The engine is the
 /// `dartq analyze` face's own workspace assembly (semdiag included); edits
 /// land as in-memory overlays (the daemon edit shape) and each step is one
 /// timed `analyze` pass ([`RESIDENT_DEFINITION`] rides the report).
@@ -1767,7 +1792,7 @@ fn metric_tokens(opts: &BenchOptions, corpus: &Path) -> Result<String, Outcome> 
                 "{} analyze --format=machine --no-fatal-warnings",
                 opts.oracle_dart
             ),
-            tiers: FIXED_TIERS.iter().map(|tier| tier.to_string()).collect(),
+            tiers: FIXED_TIERS.iter().map(ToString::to_string).collect(),
             tier_definitions: TIER_DEFINITIONS.to_string(),
         },
         dartq_output_bytes: dartq_out.stdout.len() as u64,
@@ -1933,7 +1958,7 @@ fn synthesized_batch() -> (Vec<Diagnostic>, FileTable, Vec<String>) {
 }
 
 /// Probe the `cold` env descriptor: one `<oracle-dart> --version` spawn plus
-/// the host fields oracle_baseline.sh records (macOS sw_vers/sysctl, same
+/// the host fields `oracle_baseline.sh` records (`macOS` `sw_vers`/`sysctl`, same
 /// sources; elsewhere the std consts). Serial-phase only. A failed sub-probe
 /// degrades to a fallback/None field — the descriptor is context, never a
 /// reason to fail the metric.
@@ -1954,9 +1979,7 @@ fn probe_cold_env(oracle_dart: &str) -> ColdEnv {
             }
         })
         .filter(|banner| !banner.is_empty());
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(0);
+    let cores = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
 
     #[cfg(target_os = "macos")]
     {
@@ -2060,7 +2083,7 @@ fn metric_cold(_opts: &BenchOptions, _corpus: &Path) -> Result<String, Outcome> 
     ))
 }
 
-/// `cache-hit-rate`: PRD §19.3's Cache Hit Rate over the defined warm run —
+/// `cache-hit-rate`: the Cache Hit Rate over the defined warm run —
 /// two `analyze` processes over the same corpus sharing one fresh cache
 /// root, run 2 traced, the engine's own aggregator scoring the capture. A
 /// traced run without a single `LibraryAnalyzed` line fails the metric
@@ -2524,7 +2547,7 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    // -- §19.3 event counts --------------------------------------------------
+    // -- event counts --------------------------------------------------
 
     #[test]
     fn library_hit_counts_admits_only_library_lines() {
@@ -2545,10 +2568,11 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::cast_precision_loss)] // the rate's semantics is f64; u64 counts feed the same division the engine does
     fn library_hit_counts_agree_with_the_engine_rate() {
         // One source of truth for the rate's semantics: hits / total from
         // the local counts must equal the engine aggregator's rate on the
-        // same capture (the §17.4 wire predicate is shared, this pins it).
+        // same capture.
         let capture = concat!(
             "{\"event\":\"LibraryAnalyzed\",\"uri\":\"a\",\"from_cache\":false,\"duration_us\":1}\n",
             "{\"event\":\"LibraryAnalyzed\",\"uri\":\"b\",\"from_cache\":true,\"duration_us\":0}\n",
@@ -2756,9 +2780,34 @@ mod tests {
         assert_eq!(resolve_sdk_root(&opts), None);
     }
 
+    // -- rss-100k report path ---------------------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn rss_report_scope_discriminates_corpus_sizes() {
+        // The round-1 incident: both scale legs shared one `--out`, and the
+        // @100k run overwrote the @10k report.json in place.
+        assert_eq!(
+            rss_report_scope(Path::new("/repo/tests/corpus/mega/10k")),
+            Ok("rss-100k/10k".to_string())
+        );
+        assert_eq!(
+            rss_report_scope(Path::new("/repo/tests/corpus/mega/100k")),
+            Ok("rss-100k/100k".to_string())
+        );
+        assert_eq!(
+            rss_report_scope(Path::new("/repo/tests/corpus/m0")),
+            Ok("rss-100k/m0".to_string())
+        );
+        // A corpus path without a final named component fails loudly instead
+        // of collapsing into one colliding report slot.
+        assert!(rss_report_scope(Path::new("/")).is_err());
+    }
+
     // -- report schema round trip ---------------------------------------------
 
     #[test]
+    #[expect(clippy::too_many_lines)] // every schema field round-trips through disk; field-by-field literals don't split cleanly
     fn report_schemas_round_trip_through_disk() {
         let out = std::env::temp_dir().join(format!("dq_bench_report_{}", std::process::id()));
         let rss = RssReport {
@@ -2817,7 +2866,7 @@ mod tests {
                 epoch_seconds: 1_700_000_000,
                 tokenizer: "chars-per-4".to_string(),
                 oracle_cmd: "dart analyze --format=machine --no-fatal-warnings".to_string(),
-                tiers: FIXED_TIERS.iter().map(|tier| tier.to_string()).collect(),
+                tiers: FIXED_TIERS.iter().map(ToString::to_string).collect(),
                 tier_definitions: TIER_DEFINITIONS.to_string(),
             },
             dartq_output_bytes: 10,
@@ -2992,6 +3041,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::too_many_lines)] // every schema field round-trips through disk; field-by-field literals don't split cleanly
     fn new_metric_reports_round_trip_through_disk() {
         let out = std::env::temp_dir().join(format!("dq_bench_new_{}", std::process::id()));
         let hit_rate = CacheHitRateReport {

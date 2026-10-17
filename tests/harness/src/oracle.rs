@@ -1,5 +1,5 @@
 //! Oracle-side driver: runs `dart analyze` and parses its output into a diagnostic set.
-//! Exit code semantics (facts §3): {0,1,2,3} are valid; 4 = crash, 64 = usage error -> harness itself fails.
+//! Exit code semantics: {0,1,2,3} are valid; 4 = crash, 64 = usage error -> harness itself fails.
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -19,7 +19,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// `dart analyze` driver. `dart` is the executable path (defaults to dart on PATH).
-/// `--no-fatal-warnings` makes the exit code reflect only 0/3 (facts §7.9); diagnostic output is unaffected.
+/// `--no-fatal-warnings` makes the exit code reflect only 0/3; diagnostic output is unaffected.
 pub(crate) struct OracleDriver {
     pub(crate) dart: String,
 }
@@ -79,7 +79,7 @@ impl DriverSide {
 }
 
 /// Capture the oracle's reference version once per run (`dart --version`, one banner line) —
-/// recorded in every report per PRD §19.1 (the embedded analyzer version rides the SDK).
+/// recorded in every report per (the embedded analyzer version rides the SDK).
 pub(crate) fn dart_version(dart: &str) -> Result<String, String> {
     let timeout = driver_timeout_from_env()?;
     let output = run_captured("oracle", dart, &["--version".to_string()], None, timeout)?;
@@ -138,7 +138,7 @@ pub(crate) enum DriverOutcome {
 
 /// Pipeline shared by both drivers: "run command under a time budget -> validate exit code -> parse output".
 /// `side` selects the exit-code contract (see [`DriverSide::valid_exit`]).
-/// Diagnostic lines always go to stdout (facts §3); stderr is ignored on valid exit codes, and its tail is attached to aid locating failures on abnormal exits.
+/// Diagnostic lines always go to stdout; stderr is ignored on valid exit codes, and its tail is attached to aid locating failures on abnormal exits.
 pub(crate) fn run_driver(
     side: DriverSide,
     program: &str,
@@ -181,7 +181,7 @@ pub(crate) fn run_driver_classified(
         }
         return DriverOutcome::Failed(msg);
     }
-    // Strict decode: diagnostic text is UTF-8 (facts §1/§2); lossy decoding
+    // Strict decode: diagnostic text is UTF-8; lossy decoding
     // would silently mangle messages, so a non-UTF-8 stream is a harness error.
     let stdout = match String::from_utf8(output.stdout) {
         Ok(stdout) => stdout,
@@ -275,7 +275,12 @@ pub(crate) fn run_captured(
                 if Instant::now() >= deadline {
                     kill_driver(&mut child);
                     let _ = child.wait();
-                    let tail = stderr_tail(&capture.stderr_bytes());
+                    // The tail decorates the timeout error; an unreadable
+                    // capture is surfaced in it, never silently emptied.
+                    let tail = match capture.stderr_bytes() {
+                        Ok(bytes) => stderr_tail(&bytes),
+                        Err(e) => format!("<captured stderr unreadable: {e}>"),
+                    };
                     return Err(format!(
                         "[{name}] `{program}` timed out after {}ms and was killed; stderr tail:\n{tail}",
                         timeout.as_millis()
@@ -288,8 +293,12 @@ pub(crate) fn run_captured(
     };
     Ok(Output {
         status,
-        stdout: capture.stdout_bytes(),
-        stderr: capture.stderr_bytes(),
+        stdout: capture
+            .stdout_bytes()
+            .map_err(|e| format!("[{name}] reading captured stdout: {e}"))?,
+        stderr: capture
+            .stderr_bytes()
+            .map_err(|e| format!("[{name}] reading captured stderr: {e}"))?,
     })
 }
 
@@ -341,12 +350,15 @@ impl TempCapture {
         }
     }
 
-    pub(crate) fn stdout_bytes(&self) -> Vec<u8> {
-        std::fs::read(&self.stdout_path).unwrap_or_default()
+    /// Reads the captured stdout. A read failure is an explicit error — a
+    /// silent default would surface an unreadable capture as an empty
+    /// diagnostic set.
+    pub(crate) fn stdout_bytes(&self) -> std::io::Result<Vec<u8>> {
+        std::fs::read(&self.stdout_path)
     }
 
-    pub(crate) fn stderr_bytes(&self) -> Vec<u8> {
-        std::fs::read(&self.stderr_path).unwrap_or_default()
+    pub(crate) fn stderr_bytes(&self) -> std::io::Result<Vec<u8>> {
+        std::fs::read(&self.stderr_path)
     }
 }
 
@@ -388,7 +400,7 @@ mod tests {
             .analyze(&dir, OutputFormat::Machine)
             .unwrap_or_else(|e| panic!("oracle analyze failed: {e}"));
 
-        // `var x = 1 }` -> EXPECTED_TOKEN plus the derived EXPECTED_EXECUTABLE (facts §6 cascaded-line form)
+        // `var x = 1 }` -> EXPECTED_TOKEN plus the derived EXPECTED_EXECUTABLE
         assert_eq!(
             diags.len(),
             2,
@@ -398,12 +410,12 @@ mod tests {
         assert_eq!(diags[0].severity, crate::machine::Severity::Error);
         assert_eq!(diags[0].line, 1);
         assert_eq!(diags[0].col, 9);
-        // oracle emits symlink-resolved canonical paths (facts §7.4); the expectation is normalized the same way
+        // oracle emits symlink-resolved canonical paths; the expectation is normalized the same way
         let expected_file = dir.canonicalize().unwrap().join("lib").join("bad.dart");
         assert_eq!(diags[0].file, expected_file);
         assert_eq!(diags[1].code, "EXPECTED_EXECUTABLE");
 
-        // clean file on its own = no diagnostics, exit 0 (facts §3)
+        // clean file on its own = no diagnostics, exit 0
         let diags = driver
             .analyze(&dir.join("lib").join("clean.dart"), OutputFormat::Machine)
             .expect("clean file must analyze");
@@ -412,7 +424,7 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// facts §3: nonexistent path -> exit 64 -> harness failure, not an empty diagnostic set.
+    /// Nonexistent path -> exit 64 -> harness failure, not an empty diagnostic set.
     #[test]
     fn missing_path_is_harness_error() {
         if std::env::var("DARTQ_HARNESS_E2E").as_deref() != Ok("1") {
@@ -519,7 +531,7 @@ mod tests {
         assert_eq!(output.stdout.len(), 200_000);
     }
 
-    /// Diagnostic text is UTF-8 (facts §1/§2): lossy decoding would silently
+    /// Diagnostic text is UTF-8: lossy decoding would silently
     /// mangle messages, so a non-UTF-8 stdout is a harness error, not mojibake.
     #[test]
     fn invalid_utf8_stdout_is_strict_error() {

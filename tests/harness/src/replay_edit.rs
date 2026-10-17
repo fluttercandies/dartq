@@ -1,8 +1,13 @@
-//! Pure replay logic (PRD §19.4 incremental consistency): the edit schema,
+//! Pure replay logic: the edit schema,
 //! UTF-16-span application, and the canonical normalization that makes the
 //! daemon's `dartq/analyze` LSP entries and the batch machine output
 //! byte-comparable. No processes and no I/O beyond string handling — every
 //! function here is unit-tested.
+//!
+//! The schema has three step forms, one JSON object
+//! per JSONL line: the in-file UTF-16 splice (`file`/`line`/`column`/
+//! `length`/`new_text`), the workspace file delete (`remove`), and the
+//! workspace file create (`create` + `text`). See [`EditStep`].
 //!
 //! Volatile-field normalization (the two faces, per the daemon/engine
 //! sources): the machine face prints
@@ -26,13 +31,13 @@ use serde_json::{Value, json};
 use crate::machine::{MachineDiag, Severity};
 use dartq_source::{LineIndex, utf16_len_of, utf16_offset_to_byte};
 
-/// One replay step: replace `length` UTF-16 code units starting at 1-based
-/// (`line`, `column`) with `new_text` (empty = deletion, `length` 0 = pure
-/// insertion). Coordinates follow the machine-format convention — 1-based
-/// lines, 1-based UTF-16 columns, UTF-16 lengths — so a step can be read
-/// straight off a differential report. `length` may span line terminators;
-/// `column` must address within its line's content (one past the end =
-/// insert at end of line).
+/// One replay step that replaces `length` UTF-16 code units starting at
+/// 1-based (`line`, `column`) with `new_text` (empty = deletion, `length`
+/// 0 = pure insertion). Coordinates follow the machine-format convention —
+/// 1-based lines, 1-based UTF-16 columns, UTF-16 lengths — so a step can be
+/// read straight off a differential report. `length` may span line
+/// terminators; `column` must address within its line's content (one past
+/// the end = insert at end of line).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Edit {
     pub(crate) file: String,
@@ -40,6 +45,45 @@ pub(crate) struct Edit {
     pub(crate) column: u32,
     pub(crate) length: u32,
     pub(crate) new_text: String,
+}
+
+/// One replay step, in one of the three supported forms:
+///
+/// - [`EditStep::Splice`] — `{"file":…,"line":…,"column":…,"length":…,
+///   "new_text":…}`: an in-file UTF-16 splice (see [`Edit`]).
+/// - [`EditStep::Remove`] — `{"remove":"lib/a.dart"}`: deletes the file
+///   from the workspace. The driver errors on a target that is neither in
+///   the corpus nor created by an earlier step.
+/// - [`EditStep::Create`] — `{"create":"lib/b.dart","text":"…"}`: creates
+///   the file with `text` as its full content. The driver errors on a
+///   target that already exists. `text` is UTF-8 by construction (JSON
+///   strings decode and validate), so no separate byte check exists.
+///
+/// All paths are corpus-relative plain segments (`checked_rel_path`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EditStep {
+    Splice(Edit),
+    Remove { file: String },
+    Create { file: String, text: String },
+}
+
+impl EditStep {
+    /// The step's report-facing name (`splice` / `remove` / `create`).
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            EditStep::Splice(_) => "splice",
+            EditStep::Remove { .. } => "remove",
+            EditStep::Create { .. } => "create",
+        }
+    }
+
+    /// The workspace file the step addresses; every form carries one.
+    pub(crate) fn file(&self) -> &str {
+        match self {
+            EditStep::Splice(edit) => &edit.file,
+            EditStep::Remove { file } | EditStep::Create { file, .. } => file,
+        }
+    }
 }
 
 /// Per-line scalar UTF-16 offsets and content lengths (terminators
@@ -142,7 +186,7 @@ pub(crate) fn apply_edit(source: &str, edit: &Edit) -> Result<String, String> {
 /// Parses the `--edits` JSONL file: one step per line, blank lines skipped.
 /// The whole sequence validates up front so a malformed step fails the run
 /// before any process spawns.
-pub(crate) fn parse_edits(text: &str) -> Result<Vec<Edit>, String> {
+pub(crate) fn parse_edits(text: &str) -> Result<Vec<EditStep>, String> {
     let mut edits = Vec::new();
     for (no, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -156,10 +200,73 @@ pub(crate) fn parse_edits(text: &str) -> Result<Vec<Edit>, String> {
     Ok(edits)
 }
 
-fn parse_edit(value: &Value) -> Result<Edit, String> {
+/// Dispatches on shape: a `remove` or `create` key marks a file-set step,
+/// anything else must be the splice form. Mixing forms in one object is a
+/// real authoring mistake (the extra fields would be silently unread), so
+/// it is rejected rather than ignored.
+fn parse_edit(value: &Value) -> Result<EditStep, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "expected a JSON object".to_string())?;
+    match (object.get("remove"), object.get("create")) {
+        (Some(_), Some(_)) => Err(
+            "a step carries either `remove` or `create`, not both; deleting and creating are \
+             separate steps"
+                .into(),
+        ),
+        (Some(raw), None) => {
+            reject_splice_fields(object, "remove")?;
+            let file = raw
+                .as_str()
+                .ok_or("`remove` must be a string: the corpus-relative file to delete")?
+                .to_owned();
+            checked_rel_path("remove", &file)?;
+            Ok(EditStep::Remove { file })
+        }
+        (None, Some(raw)) => {
+            reject_splice_fields(object, "create")?;
+            let file = raw
+                .as_str()
+                .ok_or("`create` must be a string: the corpus-relative file to create")?
+                .to_owned();
+            checked_rel_path("create", &file)?;
+            let text = match object.get("text").and_then(Value::as_str) {
+                Some(text) => text.to_owned(),
+                None => {
+                    return Err(
+                        "`create` needs a string `text`: the new file's full content \
+                                    (an empty string is a valid empty file)"
+                            .into(),
+                    );
+                }
+            };
+            Ok(EditStep::Create { file, text })
+        }
+        (None, None) => parse_splice(object).map(EditStep::Splice),
+    }
+}
+
+/// A remove/create step must not carry fields outside its shape: one step
+/// is one shape, and the extra fields would be silently unread. (`text` is
+/// the `create` step's own content field, so only `remove` rejects it.)
+fn reject_splice_fields(object: &serde_json::Map<String, Value>, kind: &str) -> Result<(), String> {
+    for name in ["file", "line", "column", "length", "new_text", "text"] {
+        if kind == "create" && name == "text" {
+            continue;
+        }
+        if object.contains_key(name) {
+            return Err(format!(
+                "a `{kind}` step carries only the `{kind}` path field{}; found field \
+                 `{name}` — one step is exactly one of: {{file,line,column,length,new_text}} | \
+                 {{remove}} | {{create,text}}",
+                if kind == "create" { " plus `text`" } else { "" },
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_splice(object: &serde_json::Map<String, Value>) -> Result<Edit, String> {
     let field = |name: &str| -> Result<&Value, String> {
         object
             .get(name)
@@ -169,7 +276,7 @@ fn parse_edit(value: &Value) -> Result<Edit, String> {
         .as_str()
         .ok_or("`file` must be a string")?
         .to_owned();
-    checked_rel_path(&file)?;
+    checked_rel_path("file", &file)?;
     let number = |name: &str| -> Result<u32, String> {
         let raw = field(name)?
             .as_u64()
@@ -192,23 +299,23 @@ fn parse_edit(value: &Value) -> Result<Edit, String> {
     Ok(edit)
 }
 
-/// Edit paths are corpus-relative with plain segments only: no absolute
+/// Step paths are corpus-relative with plain segments only: no absolute
 /// paths, no `..`/`.` components, no separators other than `/`.
-fn checked_rel_path(raw: &str) -> Result<(), String> {
+fn checked_rel_path(field: &str, raw: &str) -> Result<(), String> {
     if raw.is_empty() {
-        return Err("`file` must not be empty".into());
+        return Err(format!("`{field}` must not be empty"));
     }
     if raw.contains('\\') {
-        return Err(format!("`file` `{raw}` uses `\\`; use `/` separators"));
+        return Err(format!("`{field}` `{raw}` uses `\\`; use `/` separators"));
     }
     let path = Path::new(raw);
     if path.is_absolute() {
-        return Err(format!("`file` `{raw}` must be corpus-relative"));
+        return Err(format!("`{field}` `{raw}` must be corpus-relative"));
     }
     for component in path.components() {
         if !matches!(component, Component::Normal(_)) {
             return Err(format!(
-                "`file` `{raw}` must be plain corpus-relative segments (no `..`, `.`, or root)"
+                "`{field}` `{raw}` must be plain corpus-relative segments (no `..`, `.`, or root)"
             ));
         }
     }
@@ -517,7 +624,7 @@ mod tests {
         .expect("valid edits");
         assert_eq!(
             edits,
-            vec![edit("lib/a.dart", 3, 8, 2, "x")],
+            vec![EditStep::Splice(edit("lib/a.dart", 3, 8, 2, "x"))],
             "blank lines skipped, fields mapped"
         );
         for bad in [
@@ -531,6 +638,50 @@ mod tests {
             assert!(parse_edits(bad).is_err(), "must reject: {bad}");
         }
         assert!(parse_edits("").expect("empty file").is_empty());
+    }
+
+    #[test]
+    fn parse_edits_reads_remove_and_create_steps() {
+        let edits = parse_edits(
+            "{\"remove\":\"lib/old.dart\"}\n\n{\"create\":\"lib/new.dart\",\"text\":\"int x = 1;\\n\"}\n",
+        )
+.expect("valid file-set steps");
+        assert_eq!(
+            edits,
+            vec![
+                EditStep::Remove {
+                    file: "lib/old.dart".into(),
+                },
+                EditStep::Create {
+                    file: "lib/new.dart".into(),
+                    text: "int x = 1;\n".into(),
+                },
+            ],
+            "both file-set forms map to their variants"
+        );
+        // An empty created file is legitimate; the path rules apply to the
+        // new forms with the same rigor as to splices.
+        let empty = parse_edits("{\"create\":\"b.dart\",\"text\":\"\"}").expect("empty file");
+        assert_eq!(
+            empty,
+            vec![EditStep::Create {
+                file: "b.dart".into(),
+                text: String::new(),
+            }],
+        );
+        for bad in [
+            "{\"remove\":5}",
+            "{\"remove\":\"../esc.dart\"}",
+            "{\"remove\":\"a.dart\",\"line\":1}",
+            "{\"remove\":\"a.dart\",\"text\":\"stray\"}",
+            "{\"create\":\"a.dart\"}",
+            "{\"create\":\"a.dart\",\"text\":7}",
+            "{\"create\":\"/abs.dart\",\"text\":\"\"}",
+            "{\"create\":\"a.dart\",\"text\":\"\",\"remove\":\"b.dart\"}",
+            "{\"remove\":\"a.dart\",\"create\":\"b.dart\",\"text\":\"\"}",
+        ] {
+            assert!(parse_edits(bad).is_err(), "must reject: {bad}");
+        }
     }
 
     fn machine_diag(
@@ -554,7 +705,7 @@ mod tests {
     }
 
     /// Both faces describing the same diagnostic must normalize to the
-    /// same canonical bytes — the §19.4 comparison's core pin.
+    /// same canonical bytes — the comparison's core pin.
     #[test]
     fn machine_and_lsp_faces_normalize_to_one_canonical_form() {
         let source = "int a = 1;\nint b = 2;\n";

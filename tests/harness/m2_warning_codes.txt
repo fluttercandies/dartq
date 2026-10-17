@@ -1,5 +1,5 @@
-# M2 WARNING-tier diagnostic gate codes (PRD section 20.3 M2 row: WARNING
-# >= 95%, (code,file) Jaccard per section 19.1): the code set for the
+# M2 WARNING-tier diagnostic gate codes (WARNING tier: (code,file)
+# Jaccard, full parity): the code set for the
 # WARNING-severity tier run of the M2 gate (#479). The WARNING tier runs
 # one harness invocation over the dedicated `tests/corpus/m2-warning`
 # corpus package (`--severity-filter WARNING` plus this `--codes-file`);
@@ -12,7 +12,7 @@
 # each `name:` literal paired with the following `type:` line) -- the
 # severity family `dart analyze --format=machine` reports as WARNING;
 # 190 unique names at freeze time -- and intersect it with the per-bucket
-# freeze below (PRD section 20.3 M2 feature areas). The pin test
+# freeze below. The pin test
 # m2_warning_codes_file_matches_derivation (tests/harness/src/main.rs)
 # derives the family live and asserts set equality against this file, so
 # a registry drift (a name re-typed or removed) forces a conscious
@@ -74,7 +74,7 @@
 #    text_direction_code_point_in_literal: doc-comment validation and
 #    bidi comment/literal checks are outside the M2 feature set.
 #  - pubspec / plugin / analysis-options / lint-management tooling
-#    (56 names): asset_*, workspace_*, path_*, removed_lint(_use),
+#    (53 names): asset_*, workspace_*, removed_lint(_use),
 #    replaced_lint(_use), unsupported_chrome_os_* prefixes plus
 #    analysis_option_deprecated, analysis_options_deprecated_plugins,
 #    camera_permissions_incompatible, dependencies_field_not_map,
@@ -93,6 +93,11 @@
 #    unrecognized_error_code, unsupported_option, unsupported_value,
 #    invalid_widget_preview_application, invalid_widget_preview_private_argument:
 #    analyzer's tooling validation surface, which dartq does not implement.
+#  - pubspec path dependencies (3): path_does_not_exist, path_not_posix,
+#    path_pubspec_does_not_exist -- implemented (the analyzer pubspec
+#    dependency validator, mounted always-on in the lint pass) but held
+#    outside this gate: the m2-warning corpus carries no pubspec fixtures,
+#    so scoring them would add gate surface with no corpus backing.
 #  - meta-annotation members-use diagnostics (33): @Deprecated/@internal/
 #    @protected/@visibleFor*/@mustBeOverridden/@mustCallSuper/@required/
 #    @factoryMethod/@redeclare/@doNotStore/@Target-driven families

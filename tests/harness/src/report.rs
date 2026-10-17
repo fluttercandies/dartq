@@ -20,7 +20,7 @@ pub(crate) struct RunMeta {
     pub(crate) corpus_dir: String,
     pub(crate) oracle_cmd: String,
     pub(crate) dartq_cmd: String,
-    /// Full `dart --version` banner line captured once per run (PRD §19.1:
+    /// Full `dart --version` banner line captured once per run (:
     /// every report records the oracle reference version)
     pub(crate) oracle_version: String,
     pub(crate) threshold: f64,
@@ -153,7 +153,9 @@ fn build_raw_side(
         let diagnostics = diags
             .iter()
             .map(|d| {
-                let (code, file) = keys.key(d);
+                // The record carries severity verbatim below; the key's severity
+                // component is not needed for the join shape.
+                let (_, code, file) = keys.key(d);
                 JsonRawDiag {
                     file: match label {
                         Some(label) => format!("{label}/{file}"),
@@ -182,11 +184,12 @@ fn build_raw_side(
     }
 }
 
-/// One paired diagnostic instance of a matched (code, file) entry whose position
-/// differs between the sides. `delta_*` = dartq − oracle; both sides report the
+/// One paired diagnostic instance of a matched (severity, code, file) entry whose
+/// position differs between the sides. `delta_*` = dartq − oracle; both sides report the
 /// same 1-based line/column coordinates, so the deltas are directly comparable.
 #[derive(Serialize)]
 struct JsonPositionDeltaRow {
+    severity: &'static str,
     code: String,
     file: String,
     oracle_line: u32,
@@ -197,15 +200,17 @@ struct JsonPositionDeltaRow {
     delta_col: i64,
 }
 
-/// Position-delta channel over the matched (code, file) entries (PRD §19.1:
+/// Position-delta channel over the matched entry triples (:
 /// range/position differences never enter the Jaccard denominator — they are
 /// reported here, separately). Purely informational: nothing in this section
 /// feeds the gate verdict.
 ///
 /// Provenance: matched entries come from the post-filter comparison; the paired
 /// instance positions come from the raw per-side machine outputs (the same plane
-/// as `raw-outputs.json`). A key spanning several severity tiers contributes all
-/// of its raw instances, including any the gate's filters dropped.
+/// as `raw-outputs.json`). The join is per (severity, code, file) triple, so a
+/// (code, file) key's instances pair only within their own severity tier and are
+/// never cross-joined across tiers; instances of tiers the gate's filters dropped
+/// belong to no matched triple and stay out of the pairing.
 ///
 /// Pairing rule: within an entry, each side's instances are sorted by (line, col)
 /// ascending and paired by index; surplus instances on the longer side stay
@@ -213,7 +218,7 @@ struct JsonPositionDeltaRow {
 /// fuzzy matching.
 #[derive(Serialize)]
 struct JsonPositionDeltas {
-    /// Matched (code, file) entries examined (post-filter intersection)
+    /// Matched (severity, code, file) entry triples examined (post-filter intersection)
     matched_entries: usize,
     /// Matched entries with at least one nonzero paired delta
     entries_with_nonzero_delta: usize,
@@ -234,24 +239,25 @@ struct JsonPositionDeltas {
     sample: Vec<JsonPositionDeltaRow>,
 }
 
-/// Entry keys matched by both sides in the post-filter comparison (the set the
-/// Jaccard intersection sees, flattened across severity tiers).
+/// Entry triples matched by both sides in the post-filter comparison (the set the
+/// Jaccard intersection sees): (severity, code, file) keys, so instances of one
+/// (code, file) in different severity tiers are never pooled or cross-joined.
 fn matched_entry_keys(cmp: &Comparison) -> BTreeSet<EntryKey> {
     let dartq_keys: BTreeSet<EntryKey> = cmp
         .dartq_entries
         .iter()
-        .map(|e| (e.code.clone(), e.file.clone()))
+        .map(|e| (e.severity, e.code.clone(), e.file.clone()))
         .collect();
     cmp.oracle_entries
         .iter()
-        .map(|e| (e.code.clone(), e.file.clone()))
+        .map(|e| (e.severity, e.code.clone(), e.file.clone()))
         .filter(|key| dartq_keys.contains(key))
         .collect()
 }
 
-/// Per-key instance positions of one side, from the raw per-corpus machine outputs,
-/// keyed in the entry-key form (lowercase code, label-prefixed corpus-relative file)
-/// so keys join against the comparison entries.
+/// Per-entry-triple instance positions of one side, from the raw per-corpus machine
+/// outputs, keyed in the entry-key form (severity, lowercase code, label-prefixed
+/// corpus-relative file) so keys join against the comparison entries.
 fn side_positions(
     corpora: &[(Option<String>, PathBuf)],
     per_corpus: &[Vec<MachineDiag>],
@@ -260,13 +266,13 @@ fn side_positions(
     for ((label, dir), diags) in corpora.iter().zip(per_corpus) {
         let mut keys = EntryKeyBuilder::new(dir);
         for d in diags {
-            let (code, file) = keys.key(d);
+            let (severity, code, file) = keys.key(d);
             let file = match label {
                 Some(label) => format!("{label}/{file}"),
                 None => file,
             };
             positions
-                .entry((code, file))
+                .entry((severity, code, file))
                 .or_default()
                 .push((d.line, d.col));
         }
@@ -311,8 +317,9 @@ fn position_deltas(cmp: &Comparison, raw: &RawSideOutputs<'_>) -> JsonPositionDe
             entry_nonzero += 1;
             if sample.len() < POSITION_DELTA_SAMPLE_CAP {
                 sample.push(JsonPositionDeltaRow {
-                    code: key.0.clone(),
-                    file: key.1.clone(),
+                    severity: key.0.as_str(),
+                    code: key.1.clone(),
+                    file: key.2.clone(),
                     oracle_line: o_line,
                     oracle_col: o_col,
                     dartq_line: d_line,
@@ -356,7 +363,7 @@ struct JsonReport<'a> {
     /// Additive pointer to the raw per-side machine outputs (all severities,
     /// unfiltered); the faces above keep their shape.
     raw_outputs: JsonRawOutputsPointer,
-    /// Additive position-delta channel over matched entries (PRD §19.1:
+    /// Additive position-delta channel over matched entries (:
     /// reported separately, never part of the Jaccard verdict).
     position_deltas: JsonPositionDeltas,
 }
@@ -439,6 +446,7 @@ struct JsonSeverityStats {
 
 #[derive(Serialize)]
 struct JsonDiffEntry {
+    severity: &'static str,
     code: String,
     file: String,
     count: usize,
@@ -548,6 +556,7 @@ pub(crate) fn write_reports(
             .oracle_only
             .iter()
             .map(|e| JsonDiffEntry {
+                severity: e.severity.as_str(),
                 code: e.code.clone(),
                 file: e.file.clone(),
                 count: e.count,
@@ -562,6 +571,7 @@ pub(crate) fn write_reports(
             .dartq_only
             .iter()
             .map(|e| JsonDiffEntry {
+                severity: e.severity.as_str(),
                 code: e.code.clone(),
                 file: e.file.clone(),
                 count: e.count,
@@ -731,11 +741,14 @@ fn push_diff_table(md: &mut String, entries: &[crate::compare::DiffEntry]) {
         md.push_str("(none)\n");
         return;
     }
-    md.push_str("| code | file | count | message sample |\n| --- | --- | --- | --- |\n");
+    md.push_str(
+        "| severity | code | file | count | message sample |\n| --- | --- | --- | --- | --- |\n",
+    );
     for e in entries.iter().take(MD_DIFF_CAP) {
         let _ = writeln!(
             md,
-            "| {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} |",
+            e.severity.as_str(),
             e.code,
             e.file,
             e.count,
@@ -753,7 +766,7 @@ fn escape_md_cell(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Regression persistence (PRD §19.1: differential failures auto-persist as
+// Regression persistence (: differential failures auto-persist as
 // regression cases)
 //
 // `--persist-regressions <dir>`: every post-filter diffing (code, file) entry
@@ -812,7 +825,17 @@ pub(crate) fn load_known_diffs(path: &Path) -> Result<Vec<KnownDiff>, String> {
     };
     let table: KnownDiffsFile =
         serde_json::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
-    Ok(table.entries)
+    // Codes normalize at load, like parse_codes_file: the table is
+    // human-authored while diff entries carry the entry-key builder's
+    // lowercase codes — entry_is_exempt must compare like-for-like.
+    Ok(table
+        .entries
+        .into_iter()
+        .map(|mut entry| {
+            entry.code = entry.code.to_lowercase();
+            entry
+        })
+        .collect())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -894,6 +917,11 @@ pub(crate) fn persist_regressions(
     raw: &RawSideOutputs<'_>,
     opts: &PersistOptions<'_>,
 ) -> Result<PersistStats, String> {
+    // Record the ambient SDK path in tilde form (`/Users/<name>/fvm/...` ->
+    // `~/fvm/...`): persisted cases cite only the fvm default tool position,
+    // never a machine-absolute home path.
+    let dartq_cmd = tildify_home(opts.dartq_cmd);
+    let oracle_cmd = tildify_home(opts.oracle_cmd);
     let mut by_file: BTreeMap<&str, Vec<&DiffEntry>> = BTreeMap::new();
     for entry in cmp.oracle_only.iter().chain(&cmp.dartq_only) {
         by_file.entry(entry.file.as_str()).or_default().push(entry);
@@ -941,9 +969,9 @@ pub(crate) fn persist_regressions(
                 "--edits".to_string(),
                 repo_relative(&opts.dir.join(format!("{hash}.edits.jsonl"))),
                 "--dartq-cmd".to_string(),
-                opts.dartq_cmd.to_string(),
+                dartq_cmd.clone(),
                 "--daemon-cmd".to_string(),
-                daemon_template(opts.dartq_cmd),
+                daemon_template(&dartq_cmd),
             ];
         }
 
@@ -960,8 +988,8 @@ pub(crate) fn persist_regressions(
             captured_at: opts.captured_at,
             source_run: SourceRun {
                 report: repo_relative(opts.report_path),
-                dartq_cmd: opts.dartq_cmd.to_string(),
-                oracle_cmd: opts.oracle_cmd.to_string(),
+                dartq_cmd: dartq_cmd.clone(),
+                oracle_cmd: oracle_cmd.clone(),
             },
             replay_command,
         };
@@ -1000,7 +1028,10 @@ fn side_case_rows(diags: &[MachineDiag], dir: &Path, rel: &str) -> Vec<CaseRow> 
     let mut rows: Vec<CaseRow> = diags
         .iter()
         .map(|d| {
-            let (code, file) = keys.key(d);
+            // Case rows keep the verbatim quintuple (no severity field in the
+            // on-disk regression-case schema), so the key's severity component
+            // is not needed here.
+            let (_, code, file) = keys.key(d);
             (code, file, d)
         })
         .filter(|(_, file, _)| file == rel)
@@ -1048,20 +1079,30 @@ fn hash8(file_key: &str) -> String {
         .collect()
 }
 
+/// Rewrites the user's home prefix in a recorded command to tilde form
+/// (`/Users/<name>/fvm/...` -> `~/fvm/...`): persisted cases reference only
+/// the fvm default tool position, so they replay on any machine and never
+/// carry a machine-absolute home path.
+fn tildify_home(cmd: &str) -> String {
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => {
+            let prefix = format!("{}/", home.to_string_lossy());
+            cmd.replace(&prefix, "~/")
+        }
+        _ => cmd.to_string(),
+    }
+}
+
 /// The replay argv's `--daemon-cmd` template, derived from the run's dartq
 /// command: same program, `daemon` subcommand, non-analysis flags kept, the
 /// corpus dir as the literal `{dir}` placeholder the replay template
 /// contract substitutes. `./dartq analyze --format=machine --sdk X` ->
-/// `./dartq daemon --dir {dir} --sdk X`.
+/// `./dartq daemon {dir} --sdk X` (the daemon's dir argument is the
+/// untouched positional — there is no `--dir` flag).
 fn daemon_template(dartq_cmd: &str) -> String {
     let mut parts = dartq_cmd.split_whitespace();
     let program = parts.next().unwrap_or_default().to_string();
-    let mut argv = vec![
-        program,
-        "daemon".to_string(),
-        "--dir".to_string(),
-        "{dir}".to_string(),
-    ];
+    let mut argv = vec![program, "daemon".to_string(), "{dir}".to_string()];
     for arg in parts {
         if matches!(arg, "analyze" | "check" | "--format=machine") {
             continue;
@@ -1857,7 +1898,10 @@ mod tests {
             parsed["source_run"]["dartq_cmd"],
             "./target/debug/dartq analyze --format=machine --sdk /sdk"
         );
-        assert_eq!(parsed["source_run"]["report"], "target/evidence/x/report.json");
+        assert_eq!(
+            parsed["source_run"]["report"],
+            "target/evidence/x/report.json"
+        );
         // Oracle rows verbatim and sorted; dartq side empty (its only entry matched)
         let oracle_rows = parsed["oracle"].as_array().expect("oracle rows");
         assert_eq!(oracle_rows.len(), 2);
@@ -1887,15 +1931,24 @@ mod tests {
             crate::replay_edit::parse_edits(&fs::read_to_string(&edits_path).expect("edits file"))
                 .expect("edits parse through the replay schema");
         assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].file, "lib/a.dart");
-        assert_eq!(edits[0].new_text, "int a = 1;\nint b = 2;\n");
+        assert_eq!(
+            edits[0],
+            crate::replay_edit::EditStep::Splice(crate::replay_edit::Edit {
+                file: "lib/a.dart".into(),
+                line: 1,
+                column: 1,
+                length: dartq_source::utf16_len_of("int a = 1;\nint b = 2;\n"),
+                new_text: "int a = 1;\nint b = 2;\n".into(),
+            }),
+            "the persisted case replays one whole-file splice step"
+        );
         let daemon_index = argv
             .iter()
             .position(|a| *a == "--daemon-cmd")
             .expect("--daemon-cmd");
         assert_eq!(
             argv[daemon_index + 1],
-            "./target/debug/dartq daemon --dir {dir} --sdk /sdk",
+            "./target/debug/dartq daemon {dir} --sdk /sdk",
             "analyze/--format tokens dropped, corpus dir becomes the {{dir}} placeholder"
         );
 
@@ -2277,5 +2330,67 @@ mod tests {
         );
 
         fs::remove_dir_all(&out).ok();
+    }
+
+    /// The jq twin of `entry_is_exempt` (scripts/lib/diff-score.sh, sourced
+    /// by every differential gate script) must keep joining the merge-label-
+    /// prefixed diff keys of a multi-corpus report against the label-free
+    /// exemption table: labels resolve from the sibling raw-outputs.json and
+    /// the first `label/` prefix in run order is stripped — the same rule as
+    /// `locate_corpus`. The committed fixture pair is a fixed 1-exempt /
+    /// 1-unattributed report: a regression of that join turns the exempt
+    /// entry UNATTRIBUTED and this pin fails. Runs bash + jq only — no
+    /// product binary.
+    #[test]
+    fn diff_score_jq_twin_joins_label_prefixed_files() {
+        if std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            panic!("jq is not on PATH — it is the diff-score gate tier's scoring engine");
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("repo root");
+        let fix = root.join("tests/harness/fixtures/diff-score-selftest");
+        let script = format!(
+            ". '{root}/scripts/lib/diff-score.sh' && diff_gate_classify \
+             '{fix}/report.json' '{fix}/known-diffs.json'",
+            root = root.display(),
+            fix = fix.display(),
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("bash");
+        assert!(
+            out.status.success(),
+            "diff_gate_classify failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8(out.stdout).expect("utf-8 TSV");
+        let rows: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            rows.last().copied(),
+            Some("SUMMARY\t1\t1"),
+            "expected the fixture's 1 exempted + 1 unattributed, got:\n{text}"
+        );
+        assert!(
+            rows.iter().any(|row| {
+                row.starts_with(
+                    "EXEMPTED\toracle_only\tmissing_identifier\t\
+                     m0-syntax/lib/targeted/blindspot_accessors.dart",
+                )
+            }),
+            "the label-prefixed entry must exempt via the label-free table row; got:\n{text}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("UNATTRIBUTED\tdartq_only\tundefined_identifier\t")),
+            "the untabled entry must stay unattributed; got:\n{text}"
+        );
     }
 }

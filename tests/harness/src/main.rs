@@ -122,7 +122,7 @@ fn print_usage() {
       a harness error unless --allow-vacuous is given. --allow-vacuous:
       accept such a run (e.g. a genuinely clean corpus).
       Preflight: every corpus dir must carry a .dart_tool/package_config.json
-      whose own languageVersion is >= 3.13 (Plan A, the version-skew ledger §4) — a stale pin floods the gate with
+      whose own languageVersion is >= 3.13 (the Plan A preflight) — a stale pin floods the gate with
       experiment_not_enabled assembly noise and fails the run up front.
       Panic isolation: if the dartq side crashes (exit 4 with empty stdout),
       the corpus is auto-bisected to attribute the panicking files; the run
@@ -150,7 +150,7 @@ fn print_usage() {
 
   harness replay --corpus-dir DIR --edits FILE.jsonl --dartq-cmd TEMPLATE
                  --daemon-cmd TEMPLATE [--label NAME] [--out DIR]
-      PRD §19.4 oracle incremental consistency: drive one live `dartq
+      oracle incremental consistency: drive one live `dartq
       daemon` session with an edit sequence (overlay didChange + the
       `dartq/analyze` pull = the incremental result) while the same edits
       land on a materialized disk copy re-analyzed fresh per step (the
@@ -160,7 +160,7 @@ fn print_usage() {
       equal, 1 any mismatch, 2 harness error.
 
   harness repro --corpus-dir DIR --dartq-cmd TEMPLATE [--runs N] [--out DIR]
-      PRD §19.5 reproducibility: run the dartq side N times (default 2) over
+      reproducibility: run the dartq side N times (default 2) over
       the corpus with fresh processes — the same template resolution the run
       face uses — normalize each run's machine rows through the differential
       face's normalizer (corpus-relative paths, lowercased codes,
@@ -178,8 +178,10 @@ fn print_usage() {
                 [--manifest PATH] [--dartq-cmd TEMPLATE] [--oracle-dart PATH]
                 [--rss-interval-ms MS] [--with-oracle] [--plugin-dir DIR]
                 [--plugin-cycles N] [--sdk PATH]
-      §19.3 benchmark metric collectors (PRD §1.5), one JSON report per
-      metric under <out>/<metric>/report.json (schema_version 1; every
+      benchmark metric collectors, one JSON report per
+      metric under <out>/<metric>/report.json (rss-100k:
+      <out>/rss-100k/<corpus-name>/report.json so multi-size runs cannot
+      overwrite each other; schema_version 1; every
       report records its inputs for reproducibility). --metric is
       repeatable (rss-100k | incremental-p95 | incremental-p95-resident |
       token-cost | plugin-overhead | cold); default = all nine, in that
@@ -201,7 +203,7 @@ fn print_usage() {
       batch arm: one full driver process per step.
       incremental-p95-resident: the same --manifest driven through one
       in-process engine that stays warm across steps (no process restart;
-      the resident face PRD §1.5's incremental target describes). Edits
+      the resident face the incremental target describes). Edits
       land as in-memory overlays (the daemon edit shape); each step is one
       timed `analyze` pass over the `dartq analyze` face's own workspace
       assembly. Reports the same P50/P95/P99 shape, comparable against the
@@ -248,17 +250,20 @@ fn run_corpus(args: &[String]) -> Result<String, Outcome> {
         i += 1;
     }
 
-    let source = source.map(Ok).unwrap_or_else(|| {
-        std::env::var("DARTQ_SDK_CHECKOUT")
-            .map(|root| PathBuf::from(root).join("pkg/_fe_analyzer_shared/test"))
-            .map_err(|_| {
-                Outcome::Error(
-                    "corpus source not set: pass --source DIR or export \
-                     DARTQ_SDK_CHECKOUT=<dart-lang/sdk checkout>"
-                        .into(),
-                )
-            })
-    })?;
+    let source = source.map_or_else(
+        || {
+            std::env::var("DARTQ_SDK_CHECKOUT")
+                .map(|root| PathBuf::from(root).join("pkg/_fe_analyzer_shared/test"))
+                .map_err(|_| {
+                    Outcome::Error(
+                        "corpus source not set: pass --source DIR or export \
+                         DARTQ_SDK_CHECKOUT=<dart-lang/sdk checkout>"
+                            .into(),
+                    )
+                })
+        },
+        Ok,
+    )?;
     if !source.is_dir() {
         return Err(Outcome::Error(format!(
             "source dir `{}` does not exist (point --source or DARTQ_SDK_CHECKOUT at a dart-lang/sdk checkout)",
@@ -268,7 +273,7 @@ fn run_corpus(args: &[String]) -> Result<String, Outcome> {
     let report = corpus::build_corpus(&source, &target, rebuild).map_err(Outcome::Error)?;
     corpus::pub_get(&dart, &target).map_err(Outcome::Error)?;
     // Same preflight as `run`: assembly is only valid when pub recorded a
-    // languageVersion >= 3.13 (Plan A, the version-skew ledger §4).
+    // languageVersion >= 3.13.
     corpus::check_language_version(&target).map_err(Outcome::Error)?;
     let target_display = target.canonicalize().map_or_else(
         |_| target.display().to_string(),
@@ -300,7 +305,7 @@ struct RunOptions {
     /// without judging anything).
     allow_vacuous: bool,
     /// `--persist-regressions <dir>`: materialize every post-filter diffing
-    /// entry as a self-contained regression case under `dir` (PRD §19.1).
+    /// entry as a self-contained regression case under `dir`.
     persist_regressions: Option<PathBuf>,
     /// `--list-known`: offline face printing the exemption table
     /// (tests/corpus/regressions/known-diffs.json) with stale entries marked;
@@ -412,7 +417,7 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
     let oracle = OracleDriver {
         dart: opts.oracle_dart.clone(),
     };
-    // Oracle reference version, captured once per run (PRD §19.1: every report records it)
+    // Oracle reference version, captured once per run
     let oracle_version = oracle::dart_version(&opts.oracle_dart).map_err(Outcome::Error)?;
     let oracle_diags = analyze_corpora(&corpora, |dir| oracle.analyze(dir, opts.oracle_format))?;
     let oracle_side = build_filtered_side(&corpora, &oracle_diags, &filters);
@@ -460,7 +465,7 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
     let (json_path, md_path) =
         report::write_reports(&cmp, &meta, verdict, &raw, &opts.out).map_err(Outcome::Error)?;
 
-    // Regression persistence (PRD §19.1): when asked, every post-filter
+    // Regression persistence: when asked, every post-filter
     // diffing entry is materialized as a self-contained case under the
     // persist dir — known divergences suppressed via the exemption table.
     let persist_note = match &opts.persist_regressions {
@@ -594,7 +599,7 @@ pub(crate) fn canonical_corpus(corpus_dir: &Path) -> Result<PathBuf, Outcome> {
 }
 
 /// Canonicalize every corpus dir in declaration order, failing fast on the Plan A
-/// languageVersion preflight (the version-skew ledger §4: a stale corpus
+/// languageVersion preflight (the Plan A rule: a stale corpus
 /// languageVersion re-enables `experiment_not_enabled` skew; fail before any oracle
 /// run so the noise can never reach a report).
 ///
@@ -735,7 +740,7 @@ fn parse_type_filter(spec: &str) -> Result<Option<Vec<String>>, Outcome> {
 /// oracle-only out-of-set entries are dropped and never enter the denominator. This is exactly the
 /// M0 syntax-tier criterion: **codes-file (the 255 scanner/parser codes, see
 /// tests/corpus/syntax-codes.txt) ∩ severity ERROR**; the analyzer reports `ParserErrorCode` as
-/// `COMPILE_TIME_ERROR` (the M0 differential baseline §1), so the syntax tier cannot be obtained by
+/// `COMPILE_TIME_ERROR`, so the syntax tier cannot be obtained by
 /// `--type-filter syntactic_error` alone and must be filtered by code set.
 ///
 /// Empty-set semantics: a filter may remove all diagnostics from both sides -- then both entry sets
@@ -823,8 +828,8 @@ fn build_filtered_side(
 /// `crates/dartq-diagnostics/data/syntax-codes.tsv` (258 rows = 255
 /// scanner/parser codes + 3 language-version-family codes) can be passed
 /// directly. The M0 gate input is `tests/corpus/syntax-codes.txt`, the TSV
-/// minus the 3 language-version-family codes (the version-skew ledger §5.3:
-/// skew codes must not enter the gate denominator); the derivation is pinned
+/// minus the 3 language-version-family codes (skew codes must not enter
+/// the gate denominator); the derivation is pinned
 /// by `gate_codes_file_matches_authoritative_tsv` below.
 ///
 /// Zero codes (no data lines) = usage error: an empty code set has zero gate
@@ -864,6 +869,10 @@ pub(crate) fn unknown_flag(flag: &str, subcommand: &str) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // fixture-coverage lint-tier universe: the registry's live gate face
+    // (registered_gate_codes below).
+    use dartq_lints::emittable_rule_names;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
@@ -1043,9 +1052,11 @@ mod tests {
 
     /// Derivation pin: the M0 gate codes file (tests/corpus/syntax-codes.txt)
     /// must stay exactly the authoritative TSV
-    /// (crates/dartq-diagnostics/data/syntax-codes.tsv) minus the 3
-    /// language-version-family codes (the version-skew ledger §5.3: skew
-    /// codes must not enter the gate denominator). Catches silent drift
+    /// (crates/dartq-diagnostics/data/syntax-codes.tsv) minus the 4
+    /// supplemental codes (the 3-code language-version family plus
+    /// `invalid_covariant_modifier_in_primary_constructor`; skew codes must
+    /// not enter the gate denominator). Catches
+    /// silent drift
     /// between the two files and parser regression in one shot.
     #[test]
     fn gate_codes_file_matches_authoritative_tsv() {
@@ -1060,7 +1071,11 @@ mod tests {
             .expect("gate codes file present");
         let tsv_codes = parse_codes_file(&tsv).expect("TSV parses");
         let gate_codes = parse_codes_file(&txt).expect("gate file parses");
-        assert_eq!(tsv_codes.len(), 258, "TSV = 255 syntax + 3 family codes");
+        assert_eq!(
+            tsv_codes.len(),
+            259,
+            "TSV = 255 syntax + 4 supplemental codes"
+        );
         assert_eq!(gate_codes.len(), 255, "gate file = 255 syntax codes");
         // 255 raw data lines for the gate file (comments/blanks excluded): a
         // duplicated line would hide in the set comparison but still be drift.
@@ -1071,10 +1086,11 @@ mod tests {
                 .count(),
             255
         );
-        let family: BTreeSet<String> = [
+        let supplemental: BTreeSet<String> = [
             "illegal_language_version_override",
             "inconsistent_language_version_override",
             "invalid_language_version_override",
+            "invalid_covariant_modifier_in_primary_constructor",
         ]
         .into_iter()
         .map(str::to_string)
@@ -1084,8 +1100,8 @@ mod tests {
                 .difference(&gate_codes)
                 .cloned()
                 .collect::<BTreeSet<_>>(),
-            family,
-            "gate file = TSV minus exactly the language-version family"
+            supplemental,
+            "gate file = TSV minus exactly the supplemental codes"
         );
         assert!(
             gate_codes.is_subset(&tsv_codes),
@@ -1094,8 +1110,8 @@ mod tests {
     }
 
     /// Derivation pin: the M1 gate codes file (`tests/harness/m1_codes.txt`)
-    /// must equal its documented derivation (file header, PRD section 20.3 M1
-    /// row): the `undefined_*` and `wrong_number_of_*` wildcard families expanded
+    /// must equal its documented derivation (the m1_codes.txt file header):
+    /// the `undefined_*` and `wrong_number_of_*` wildcard families expanded
     /// over the SDK main unified registry (upstream Dart SDK, pkg/analyzer
     /// lib/src/diagnostic/diagnostic.g.dart, `name:` literals), unioned with
     /// the explicit picks (`uri_does_not_exist`, `duplicate_definition`, the
@@ -1187,7 +1203,7 @@ mod tests {
 
     /// Derivation pin: the M2 WARNING-tier gate codes file
     /// (`tests/harness/m2_warning_codes.txt`) must equal its documented
-    /// derivation (file header, PRD section 20.3 M2 row): the SDK main
+    /// derivation: the SDK main
     /// unified registry's WARNING severity family (`type:
     /// DiagnosticType.STATIC_WARNING`, what `dart analyze --format=machine`
     /// reports as WARNING) intersected with the per-bucket freeze list
@@ -1199,9 +1215,10 @@ mod tests {
     /// (`multiple_combinators` is registered under two types; it is
     /// excluded by the tooling family either way). Three long-named
     /// entries wrap the `name:` value onto the next line and are skipped
-    /// by the line-anchored parse; all three are COMPILE_TIME_ERROR, so
+    /// by the line-anchored parse; all three are `COMPILE_TIME_ERROR`, so
     /// the WARNING family is unaffected.
     #[test]
+    #[expect(clippy::too_many_lines)] // derives the frozen row from the official diagnostics table line by line
     fn m2_warning_codes_file_matches_derivation() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -1229,12 +1246,11 @@ mod tests {
             let trimmed = line.trim_start();
             if let Some(rest) = trimmed.strip_prefix("name: '") {
                 pending = rest.strip_suffix("',").map(str::to_string);
-            } else if let Some(rest) = trimmed.strip_prefix("type: DiagnosticType.") {
-                if let Some(name) = pending.take() {
-                    if rest.strip_suffix(',') == Some("STATIC_WARNING") {
-                        warning_family.insert(name);
-                    }
-                }
+            } else if let Some(rest) = trimmed.strip_prefix("type: DiagnosticType.")
+                && let Some(name) = pending.take()
+                && rest.strip_suffix(',') == Some("STATIC_WARNING")
+            {
+                warning_family.insert(name);
             }
         }
         let frozen: BTreeSet<String> = [
@@ -1346,9 +1362,9 @@ mod tests {
     /// Corpus-hygiene pin for the M2 WARNING-tier gate corpus
     /// (`tests/corpus/m2-warning`, the run of `scripts/m2-gate.sh`): the
     /// gate's 1.000 bar over the 43-code universe holds only while the
-    /// corpus never triggers the excluded STATIC_WARNING families whose
+    /// corpus never triggers the excluded `STATIC_WARNING` families whose
     /// codes are oracle-emittable from plain Dart (the #905 exemption
-    /// re-audit §5 S6 conditional keeps and §7 P2 watchlist: the
+    /// re-audit's S6 conditional keeps and P2 watchlist: the
     /// usage-analysis `unused_*` set, the deprecation machinery, doc-comment
     /// directives & bidi, the async error-handler family,
     /// `unnecessary_set_literal`). This pin makes that hygiene
@@ -1398,6 +1414,7 @@ mod tests {
     /// strict-analysis opt-in family (8 codes) is guarded structurally:
     /// the corpus must carry no `analysis_options.yaml` at all.
     #[test]
+    #[expect(clippy::too_many_lines)] // walks the corpus tree once per excluded shape; each walk is independent
     fn m2_warning_corpus_carries_no_excluded_code_trigger_shapes() {
         fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1539,7 +1556,7 @@ mod tests {
                 ));
                 continue;
             }
-            if !rel.ends_with(".dart") {
+            if Path::new(&rel).extension() != Some(std::ffi::OsStr::new("dart")) {
                 continue;
             }
             let text = match std::fs::read_to_string(file) {
@@ -1617,17 +1634,20 @@ mod tests {
             let path = entry.expect("readable nail entry").path();
             // `.edits.jsonl` companions carry edit scripts, not rows; only
             // the per-case `.json` snapshots do.
-            if path.extension().map(|e| e.to_string_lossy().into_owned()).as_deref()
+            if path
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .as_deref()
                 != Some("json")
             {
                 continue;
             }
-            let case: serde_json::Value = serde_json::from_str(
-                &std::fs::read_to_string(&path).expect("nail readable"),
-            )
-            .expect("nail JSON parses");
+            let case: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).expect("nail readable"))
+                    .expect("nail JSON parses");
             assert_eq!(
-                case["schema"], "regression-case-v1",
+                case["schema"],
+                "regression-case-v1",
                 "unexpected nail schema in {}",
                 path.display()
             );
@@ -1658,45 +1678,55 @@ mod tests {
             "tests/harness/m3_unused_codes.txt",
             "tests/harness/lint_codes.txt",
         ] {
-            let text = std::fs::read_to_string(root.join(file))
+            let content = std::fs::read_to_string(root.join(file))
                 .unwrap_or_else(|e| panic!("frozen gate codes file {file} must be present: {e}"));
-            frozen.extend(parse_codes_file(&text).expect("frozen file parses"));
+            frozen.extend(parse_codes_file(&content).expect("frozen file parses"));
         }
 
         let expected: BTreeSet<String> = nail_codes.difference(&frozen).cloned().collect();
 
         assert_eq!(
             gate_codes.len(),
-            65,
-            "sem2 freezes 65 codes at the 2026-10-13 derivation"
+            77,
+            "sem2 freezes 77 codes at the 2026-10-15 re-freeze"
         );
-        // 65 raw data lines (comments/blanks excluded): a duplicated line
+        // 77 raw data lines (comments/blanks excluded): a duplicated line
         // would hide in the set comparison but still be drift.
         assert_eq!(
             txt.lines()
                 .map(str::trim)
                 .filter(|l| !l.is_empty() && !l.starts_with('#'))
                 .count(),
-            65
+            77
         );
         assert_eq!(
             gate_codes, expected,
             "gate file = nail codes minus the five frozen gate universes"
         );
 
-        // Load-bearing dartq-only members: the two rename codes have no
-        // oracle-side nail rows (the oracle emits const_not_initialized /
-        // final_not_initialized at the same positions); their presence in
-        // the tier is the designed divergence signal (codes-file header).
-        for dartq_only in [
+        // Rename retirement pin (2026-10-15): dartq adopted the oracle
+        // names const_not_initialized / final_not_initialized, retiring the
+        // two dartq-only rename codes this tier used to carry (see the
+        // codes-file header's historical note). They must stay retired:
+        // absent from the tier and from every nail row.
+        for retired in [
             "const_field_without_initializer",
             "final_field_without_initializer",
         ] {
             assert!(
-                gate_codes.contains(dartq_only),
-                "{dartq_only} must stay in the sem2 tier (dartq-only rename signal)"
+                !gate_codes.contains(retired),
+                "{retired} must stay retired (dartq adopted the oracle name)"
+            );
+            assert!(
+                !nail_codes.contains(retired),
+                "{retired} resurfaced in nail rows -- a rename regression"
             );
         }
+        assert!(
+            gate_codes.contains("const_not_initialized")
+                && gate_codes.contains("final_not_initialized"),
+            "the adopted oracle names must carry the tier's const/final init rows"
+        );
     }
 
     /// Core codes-filter semantics: out-of-set entries are dropped on both sides --
@@ -1963,62 +1993,162 @@ mod tests {
 
     // ─── Fixture-coverage manifest (tests/harness/fixture-coverage.tsv) ────
 
-    /// One frozen gate tier of the fixture-coverage manifest: its codes file,
-    /// the gate corpora the tier's run scores (the `--corpus-dir` values the
-    /// tier's gate script passes), and whether the scanner-goldens column
-    /// applies (the syntax tier only — the weaker dartq-only scanner face,
-    /// never full coverage on its own).
+    /// One gate tier of the fixture-coverage manifest: where its universe
+    /// codes come from, the gate corpora the tier's run scores (the
+    /// `--corpus-dir` values the tier's gate script passes), and whether
+    /// the scanner-goldens column applies (the syntax tier only — the
+    /// weaker dartq-only scanner face, never full coverage on its own).
     struct FixtureCoverageTier {
         tier: &'static str,
-        codes_file: &'static str,
+        codes: TierCodes,
         corpus_dirs: &'static [&'static str],
         scanner_goldens: bool,
+    }
+
+    /// Where a tier's universe codes come from.
+    enum TierCodes {
+        /// The frozen codes file, relative to the repo root. The five
+        /// diagnostic tiers: the codes file is itself the tier's universe
+        /// definition (no separate registry face exists for it).
+        File(&'static str),
+        /// The lint tier: derived live from the rule registry — every
+        /// registered emittable rule's code minus the divergence ledger's
+        /// `gate_status=excluded` rows (`registered_gate_codes` below).
+        /// Deliberately NOT the frozen `lint_codes.txt`: the freeze lags
+        /// the registry by design while a rule wave is in flight (the
+        /// re-freeze is a deliberate single-shot, N1), and the freeze is
+        /// governed independently by `lint_codes_freeze_matches_the_registry`
+        /// (crates/dartq-lints). Anchoring the coverage pin to the same
+        /// registered face the governance pin reconciles against keeps this
+        /// manifest green through wave-time lag and re-freezes alike, while
+        /// still forcing a conscious re-derive whenever the registry grows.
+        RegisteredLintGate,
     }
 
     const FIXTURE_COVERAGE_TIERS: &[FixtureCoverageTier] = &[
         FixtureCoverageTier {
             tier: "syntax",
-            codes_file: "tests/corpus/syntax-codes.txt",
+            codes: TierCodes::File("tests/corpus/syntax-codes.txt"),
             corpus_dirs: &["tests/corpus/m0", "tests/corpus/m0-syntax"],
             scanner_goldens: true,
         },
         FixtureCoverageTier {
             tier: "m1",
-            codes_file: "tests/harness/m1_codes.txt",
+            codes: TierCodes::File("tests/harness/m1_codes.txt"),
             corpus_dirs: &["tests/corpus/m1-semantic"],
             scanner_goldens: false,
         },
         FixtureCoverageTier {
             tier: "m2",
-            codes_file: "tests/harness/m2_warning_codes.txt",
+            codes: TierCodes::File("tests/harness/m2_warning_codes.txt"),
             corpus_dirs: &["tests/corpus/m2-warning"],
             scanner_goldens: false,
         },
         FixtureCoverageTier {
             tier: "m3",
-            codes_file: "tests/harness/m3_unused_codes.txt",
+            codes: TierCodes::File("tests/harness/m3_unused_codes.txt"),
             corpus_dirs: &["tests/corpus/m3-unused"],
             scanner_goldens: false,
         },
         FixtureCoverageTier {
             tier: "lint",
-            codes_file: "tests/harness/lint_codes.txt",
+            codes: TierCodes::RegisteredLintGate,
             corpus_dirs: &["tests/corpus/lints"],
             scanner_goldens: false,
         },
         FixtureCoverageTier {
             tier: "sem2",
-            codes_file: "tests/harness/sem2_codes.txt",
+            codes: TierCodes::File("tests/harness/sem2_codes.txt"),
             corpus_dirs: &["tests/corpus/sem2"],
             scanner_goldens: false,
         },
     ];
 
     const FIXTURE_COVERAGE_MANIFEST: &str = "tests/harness/fixture-coverage.tsv";
+
+    /// The divergence ledger `tests/harness/lint_divergences.tsv` — the
+    /// source of truth for gate exclusions, shared with the registry
+    /// governance pin.
+    const LINT_DIVERGENCES: &str = "tests/harness/lint_divergences.tsv";
+
+    /// The `gate_status` tokens the ledger's column prose defines. The TSV
+    /// carries no header row (the columns live in its `#` comment block),
+    /// so the status column is located by this vocabulary, not by position.
+    const GATE_STATUSES: &[&str] = &["excluded", "in_universe", "fixed"];
+
+    /// The ledger's `gate_status=excluded` rule names (lowercase). A data
+    /// row without exactly one status token fails loudly — format drift
+    /// surfaces here as a tutorial panic, never as a silent misparse.
+    fn ledger_excluded(text: &str) -> BTreeSet<String> {
+        let mut excluded = BTreeSet::new();
+        for line in text.lines() {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let rule = line.split('\t').next().unwrap_or_default();
+            let statuses: Vec<&str> = line
+                .split('\t')
+                .filter(|field| GATE_STATUSES.contains(field))
+                .collect();
+            assert!(
+                statuses.len() == 1,
+                "{LINT_DIVERGENCES}: row {rule:?} carries {statuses:?} where exactly one \
+                 gate_status token belongs ({GATE_STATUSES:?}) — the ledger format drifted; \
+                 fix the row or this parser"
+            );
+            if statuses[0] == "excluded" {
+                excluded.insert(rule.to_ascii_lowercase());
+            }
+        }
+        excluded
+    }
+
+    /// The lint tier's live universe: every registered rule the
+    /// implementation can emit (non-diagnostic, non-removed, AST-dispatched
+    /// or pubspec-pass mounted) minus the divergence ledger's
+    /// `gate_status=excluded` rows. The emittable half is the lints crate's
+    /// public derivation (`emittable_rule_names`) — the exact face
+    /// `lint_codes_freeze_matches_the_registry` (crates/dartq-lints) holds
+    /// `lint_codes.txt` to; the ledger parse stays here (the TSV lives in
+    /// this tree).
+    ///
+    /// Why the coverage pin anchors here and not to the frozen file: the
+    /// freeze deliberately lags the registry while a rule wave is in flight
+    /// (its re-freeze is a conscious single-shot), so a frozen-file anchor
+    /// reds on every wave. The registry face is the source of truth; the
+    /// freeze follows it under its own independent enforcement — never the
+    /// reverse. Deriving live keeps the manifest green through wave-time
+    /// lag and re-freezes alike, while a newly registered rule still fails
+    /// the pin until a manifest row (fixture or hand-authored gap note)
+    /// exists for it.
+    fn registered_gate_codes(root: &Path) -> BTreeSet<String> {
+        let emittable: BTreeSet<String> = emittable_rule_names()
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let ledger = std::fs::read_to_string(root.join(LINT_DIVERGENCES)).unwrap_or_else(|e| {
+            panic!("divergence ledger {LINT_DIVERGENCES} must be present: {e}")
+        });
+        &emittable - &ledger_excluded(&ledger)
+    }
+
+    /// A tier's universe codes (sorted, lowercase, deduped — the same shape
+    /// `parse_codes_file` yields for the frozen files).
+    fn tier_codes(tier: &FixtureCoverageTier, root: &Path) -> BTreeSet<String> {
+        match tier.codes {
+            TierCodes::File(path) => {
+                let text = std::fs::read_to_string(root.join(path))
+                    .unwrap_or_else(|e| panic!("frozen codes file {path} must be present: {e}"));
+                parse_codes_file(&text).expect("frozen codes file parses")
+            }
+            TierCodes::RegisteredLintGate => registered_gate_codes(root),
+        }
+    }
+
     const SCANNER_GOLDENS_MANIFEST: &str = "tests/corpus/scanner-goldens/manifest.json";
 
     /// One manifest row: tier, code, coverage, targeted, annotation,
-    /// scanner_goldens, note — `-` marks an empty cell.
+    /// `scanner_goldens`, note — `-` marks an empty cell.
     type CoverageRow = [String; 7];
 
     /// The lowercase whole-word set of a corpus text: maximal
@@ -2071,16 +2201,20 @@ mod tests {
     /// frozen (tier, code), the three evidence cells — same-named targeted
     /// fixtures (file stem == code), annotation mentions (whole-word,
     /// case-insensitive), and (syntax tier) the scanner-goldens case ids —
-    /// plus the covered / documented_gap verdict. Rows follow the tier
-    /// table order, codes sorted within a tier; the note cell stays empty
-    /// (a gap note is deliberate prose, carried over by the regen test).
+    /// plus the covered / `documented_gap` verdict. Rows follow the tier
+    /// table order, codes sorted within a tier; covered rows emit `-` in
+    /// the note cell (the pin's schema face), while a gap note is
+    /// deliberate prose, carried over by the regen test.
     fn derive_fixture_coverage(root: &Path) -> Vec<CoverageRow> {
-        let goldens_raw =
-            std::fs::read(root.join(SCANNER_GOLDENS_MANIFEST)).expect("scanner-goldens manifest present");
+        let goldens_raw = std::fs::read(root.join(SCANNER_GOLDENS_MANIFEST))
+            .expect("scanner-goldens manifest present");
         let goldens_json: serde_json::Value =
             serde_json::from_slice(&goldens_raw).expect("scanner-goldens manifest parses");
         let mut goldens: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for case in goldens_json["cases"].as_array().expect("goldens cases array") {
+        for case in goldens_json["cases"]
+            .as_array()
+            .expect("goldens cases array")
+        {
             let id = case["id"].as_str().expect("golden case id").to_string();
             for diag in case["diagnostics"].as_array().unwrap_or(&Vec::new()) {
                 // Diagnostic rows are [code, offset, args?]; the first
@@ -2100,10 +2234,7 @@ mod tests {
 
         let mut rows = Vec::new();
         for tier in FIXTURE_COVERAGE_TIERS {
-            let text = std::fs::read_to_string(root.join(tier.codes_file)).unwrap_or_else(|e| {
-                panic!("frozen codes file {} must be present: {e}", tier.codes_file)
-            });
-            let codes = parse_codes_file(&text).expect("frozen codes file parses");
+            let codes = tier_codes(tier, root);
 
             let mut files: Vec<(String, String, BTreeSet<String>)> = Vec::new();
             for corpus in tier.corpus_dirs {
@@ -2117,7 +2248,11 @@ mod tests {
                     // Lossy decode: the corpus deliberately carries a
                     // non-UTF-8 fixture (the encoding face); its ASCII
                     // comment text must still be readable.
-                    let stem = path.file_stem().expect("file stem").to_string_lossy().into_owned();
+                    let stem = path
+                        .file_stem()
+                        .expect("file stem")
+                        .to_string_lossy()
+                        .into_owned();
                     files.push((rel, stem, word_set(&String::from_utf8_lossy(&bytes))));
                 }
             }
@@ -2135,11 +2270,20 @@ mod tests {
                     .map(|(rel, _, _)| rel.clone())
                     .collect();
                 let golden: Vec<String> = if tier.scanner_goldens {
-                    goldens.get(code).map(|s| s.iter().cloned().collect()).unwrap_or_default()
+                    goldens
+                        .get(code)
+                        .map(|s| s.iter().cloned().collect())
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
-                let cell = |v: &[String]| if v.is_empty() { "-".to_string() } else { v.join(";") };
+                let cell = |v: &[String]| {
+                    if v.is_empty() {
+                        "-".to_string()
+                    } else {
+                        v.join(";")
+                    }
+                };
                 let covered = !targeted.is_empty() || !annotated.is_empty() || !golden.is_empty();
                 rows.push([
                     tier.tier.to_string(),
@@ -2148,7 +2292,14 @@ mod tests {
                     cell(&targeted),
                     cell(&annotated),
                     cell(&golden),
-                    String::new(),
+                    // The pin's schema face: covered rows carry no note.
+                    // A gap note is deliberate prose, carried over by the
+                    // regen test before anything is written.
+                    if covered {
+                        "-".to_string()
+                    } else {
+                        String::new()
+                    },
                 ]);
             }
         }
@@ -2182,19 +2333,23 @@ mod tests {
 
     /// Coverage-manifest pin (audit finding: no committed per-code exposure
     /// artifact — coverage claims were prose, not pins): the committed
-    /// table must equal the live derivation over the frozen universe.
+    /// table must equal the live derivation over the gate universe.
     ///
     /// Schema: every row carries 7 cells; `covered` rows show at least one
     /// evidence cell and no note; `documented_gap` rows carry all-empty
     /// evidence plus a hand-authored reason; the scanner-goldens column is
-    /// syntax-tier only. Universe: exactly one row per (tier, code) over
-    /// the six frozen codes files — the row count is fully determined by
-    /// them (521 rows at the 2026-10-13 derivation: 255 + 36 + 43 + 11 +
-    /// 111 + 65). Cells: targeted, annotation and scanner-goldens columns
-    /// must equal the corpora-derived evidence byte-for-byte, and every
-    /// derived gap must carry its manifest exclusion row. Any corpus or
-    /// frozen-file edit that moves coverage fails here and forces a
-    /// conscious re-derive (regen test below).
+    /// syntax-tier only. Universe: exactly one row per (tier, code) — the
+    /// five diagnostic tiers over their frozen codes files, the lint tier
+    /// over the registry's live gate face (`registered_gate_codes`:
+    /// registered emittable minus the divergence ledger's excluded rows).
+    /// The row count is fully determined by those universes (647 rows at
+    /// the 2026-10-14 derivation: 255 + 36 + 43 + 11 + 237 + 65; the lint
+    /// term moves with the registry). Cells: targeted, annotation and
+    /// scanner-goldens columns must equal the corpora-derived evidence
+    /// byte-for-byte, and every derived gap must carry its manifest
+    /// exclusion row. Any corpus, frozen-file or registry edit that moves
+    /// coverage fails here and forces a conscious re-derive (regen test
+    /// below).
     #[test]
     fn fixture_coverage_manifest_matches_corpus_derivation() {
         let root = fixture_coverage_repo_root();
@@ -2230,16 +2385,12 @@ mod tests {
             }
         }
 
-        // Universe equality: the manifest is exactly the frozen (tier, code)
+        // Universe equality: the manifest is exactly the (tier, code)
         // universe — no missing row, no duplicate, no invention.
         let mut universe: Vec<(String, String)> = Vec::new();
         for tier in FIXTURE_COVERAGE_TIERS {
-            let text = std::fs::read_to_string(root.join(tier.codes_file)).unwrap_or_else(|e| {
-                panic!("frozen codes file {} must be present: {e}", tier.codes_file)
-            });
             universe.extend(
-                parse_codes_file(&text)
-                    .expect("frozen codes file parses")
+                tier_codes(tier, root)
                     .into_iter()
                     .map(|code| (tier.tier.to_string(), code)),
             );
@@ -2250,7 +2401,7 @@ mod tests {
         manifest_keys.sort();
         assert_eq!(
             manifest_keys, universe,
-            "manifest rows must be exactly the frozen (tier, code) universe"
+            "manifest rows must be exactly the (tier, code) universe"
         );
 
         // Cell equality against the live derivation.
@@ -2263,11 +2414,15 @@ mod tests {
             let d = derived_map
                 .get(&(row[0].as_str(), row[1].as_str()))
                 .unwrap_or_else(|| {
-                panic!("derivation missing a manifest row: {}::{}", row[0], row[1])
-            });
+                    panic!("derivation missing a manifest row: {}::{}", row[0], row[1])
+                });
             let hint = "re-derive with: cargo test -p harness \
                         regen_fixture_coverage_manifest -- --ignored";
-            assert_eq!(row[2], d[2], "coverage verdict drift for {}::{}; {}", row[0], row[1], hint);
+            assert_eq!(
+                row[2], d[2],
+                "coverage verdict drift for {}::{}; {}",
+                row[0], row[1], hint
+            );
             for col in 3..=5 {
                 assert_eq!(
                     row[col], d[col],
@@ -2281,13 +2436,13 @@ mod tests {
     /// Regen (writes the manifest; not run by default):
     /// `cargo test -p harness regen_fixture_coverage_manifest -- --ignored`
     /// re-derives the evidence live and rewrites the data rows, preserving
-    /// the committed header verbatim and carrying the documented_gap notes
+    /// the committed header verbatim and carrying the `documented_gap` notes
     /// of still-dark codes over from the current table. A new dark code
     /// without an existing note fails here — the note is deliberate prose
     /// (the reason a code has no fixture) and must be authored, never
     /// derived.
     #[test]
-    #[ignore]
+    #[ignore = "regenerates the manifest in place; run explicitly with --ignored"]
     fn regen_fixture_coverage_manifest() {
         let root = fixture_coverage_repo_root();
         let mut derived = derive_fixture_coverage(root);
@@ -2299,11 +2454,12 @@ mod tests {
             .map(|r| ((r[0].clone(), r[1].clone()), r[6].clone()))
             .collect();
         // The committed header block: every leading comment line, verbatim.
-        let header_len = old_text
+        let header_len = old_text.lines().take_while(|l| l.starts_with('#')).count();
+        let mut out: String = old_text
             .lines()
-            .take_while(|l| l.starts_with('#'))
-            .count();
-        let mut out: String = old_text.lines().take(header_len).map(|l| format!("{l}\n")).collect();
+            .take(header_len)
+            .map(|l| l.to_owned() + "\n")
+            .collect();
 
         for row in &mut derived {
             let row: &mut CoverageRow = row;
@@ -2322,6 +2478,10 @@ mod tests {
             out.push('\n');
         }
         std::fs::write(&manifest_path, out).expect("rewrite coverage manifest");
-        println!("regenerated {} ({} data rows)", manifest_path.display(), derived.len());
+        println!(
+            "regenerated {} ({} data rows)",
+            manifest_path.display(),
+            derived.len()
+        );
     }
 }

@@ -22,13 +22,16 @@
 #  unused_element             library-private class _C, unreferenced
 #  unused_field               private field written via initializing formal, never read
 #  unused_element_parameter   private method [int? y]; invoked without it
+#  unused_field_from_primary_constructor  primary-constructor field, never read
 #  unused_import              dart:async, never used
 #  unused_shown_name          show A, B; only A used (companion file exports both)
 #  unused_result              @useResult int f(); discarded as a statement (package:meta)
 #
-# Parked (NOT included): unused_field_from_primary_constructor — no M3
-# emission path this round; a fixture without one would mint permanent
-# oracle-only denominator rows.
+# `unused_field_from_primary_constructor` originally parked without an
+# emission path; its producer landed with the primary-constructor face
+# (unused_local_elements_verifier.dart:887-920) and the fixture joined the
+# gate, so the list below is the full implemented set — one code per
+# fixture, no parked remainder.
 #
 unused_catch_clause
 unused_catch_stack

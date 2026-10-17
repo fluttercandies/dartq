@@ -4,13 +4,15 @@
 //! `emitMachineFormat` (stdout, uppercase codes). `analyzer_cli`'s `MachineErrorFormatter`
 //! (`pkg/analyzer_cli/lib/src/error_formatter.dart`, stderr, lowercase codes) is the legacy CLI
 //! path, not what this oracle prints. Format facts source:
-//! the oracle machine-format contract §1 (machine EBNF/escapes), §2 (json fields).
+//! the oracle machine-format contract (machine EBNF/escapes, json fields).
 
 use std::path::{Path, PathBuf};
 
 use rustc_hash::FxHashMap;
 
-/// All values of the diagnostic TYPE field in machine/json output (observed domain per facts §1/§2).
+use crate::compare::EntryKey;
+
+/// All values of the diagnostic TYPE field in machine/json output.
 pub(crate) const DIAG_TYPES: [&str; 4] = [
     "SYNTACTIC_ERROR",
     "COMPILE_TIME_ERROR",
@@ -18,8 +20,9 @@ pub(crate) const DIAG_TYPES: [&str; 4] = [
     "LINT",
 ];
 
-/// Diagnostic severity (first machine field, always uppercase).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Diagnostic severity (first machine field, always uppercase). Ordered by tier
+/// (Error < Warning < Info) and hashable: the entry key's first component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Severity {
     Error,
     Warning,
@@ -92,7 +95,7 @@ pub(crate) fn parse_output(text: &str, format: OutputFormat) -> Result<Vec<Machi
     }
 }
 
-/// Parse machine output: each line has 8 `|`-separated fields (facts §1.1 EBNF); empty output =
+/// Parse machine output: each line has 8 `|`-separated fields; empty output =
 /// no diagnostics; a blank line is malformed output and errors like every other malformed line
 /// (dartdev machine mode never emits blank lines).
 fn parse_machine(text: &str) -> Result<Vec<MachineDiag>, String> {
@@ -135,7 +138,7 @@ fn parse_machine(text: &str) -> Result<Vec<MachineDiag>, String> {
     Ok(diags)
 }
 
-/// Split on "unescaped `|`". The unescaping order is fixed here (facts §7.5): first the escape-aware split,
+/// Split on "unescaped `|`". The unescaping order is fixed here: first the escape-aware split,
 /// then a single unescape pass over `FILE_PATH`/`MESSAGE`; unescaping first would turn `\|` into a real separator and destroy field boundaries.
 fn split_unescaped_pipe(line: &str) -> Vec<&str> {
     let mut fields = Vec::new();
@@ -178,7 +181,7 @@ fn unescape_field(raw: &str) -> String {
     out
 }
 
-/// Parse json output (facts §2): a single-line JSON object `{version:1, diagnostics:[...]}`.
+/// Parse json output: a single-line JSON object `{version:1, diagnostics:[...]}`.
 fn parse_json(text: &str) -> Result<Vec<MachineDiag>, String> {
     let root: serde_json::Value =
         serde_json::from_str(text).map_err(|e| format!("json output is not valid JSON: {e}"))?;
@@ -216,12 +219,12 @@ fn parse_json_diag(obj: &serde_json::Value) -> Result<MachineDiag, String> {
     Ok(MachineDiag {
         severity,
         dtype: json_str(obj, "type")?.to_owned(),
-        // json codes are always lowercase (facts §2), no conversion needed
+        // json codes are always lowercase, no conversion needed
         code: json_str(obj, "code")?.to_owned(),
         file: PathBuf::from(json_str(&obj["location"], "file")?),
         line: json_num(start, "line")?,
         col: json_num(start, "column")?,
-        // json length = end.offset - start.offset (UTF-16 code units, facts §2)
+        // json length = end.offset - start.offset
         length: end_offset - start_offset,
         message: json_str(obj, "problemMessage")?.to_owned(),
     })
@@ -264,11 +267,13 @@ impl EntryKeyBuilder {
         }
     }
 
-    /// Entry key = (lowercased code, path relative to the corpus). The oracle emits symlink-resolved
-    /// absolute paths (facts §7.4); the dartq side canonicalizes before normalizing too, so
+    /// Entry key = (severity, lowercased code, path relative to the corpus) — the
+    /// full RESULT triple per the parity ADR: a severity flip on the same (code, file)
+    /// must be a different key on every consumer. The oracle emits symlink-resolved
+    /// absolute paths; the dartq side canonicalizes before normalizing too, so
     /// `corpus_root` must already be canonicalized. Files outside the corpus root keep their
     /// canonical absolute path -- both sides normalize identically, so comparison still holds.
-    pub(crate) fn key(&mut self, diag: &MachineDiag) -> (String, String) {
+    pub(crate) fn key(&mut self, diag: &MachineDiag) -> EntryKey {
         let canon = self.canonical(&diag.file);
         let rel = canon.strip_prefix(&self.corpus_root).ok().map(|p| {
             p.components()
@@ -277,7 +282,7 @@ impl EntryKeyBuilder {
                 .join("/")
         });
         let file = rel.unwrap_or_else(|| canon.display().to_string());
-        (diag.code.to_lowercase(), file)
+        (diag.severity, diag.code.to_lowercase(), file)
     }
 
     fn canonical(&mut self, raw: &Path) -> PathBuf {
@@ -294,7 +299,7 @@ impl EntryKeyBuilder {
 mod tests {
     use super::*;
 
-    /// Observed sample from facts §1.2 (six lines, covering three severity tiers and two TYPEs).
+    /// Observed sample (six lines, covering three severity tiers and two TYPEs).
     const GOLDEN: &str = "\
 ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|/private/tmp/dq_oracle_scratch/pkg_min/lib/syntax_error.dart|2|11|1|Expected to find ';'.
 WARNING|STATIC_WARNING|UNUSED_LOCAL_VARIABLE|/private/tmp/dq_oracle_scratch/pkg_min/lib/warn.dart|2|7|6|The value of the local variable 'unused' isn't used.
@@ -304,7 +309,7 @@ WARNING|STATIC_WARNING|INVALID_LANGUAGE_VERSION_OVERRIDE|/private/tmp/dq_oracle_
 ERROR|COMPILE_TIME_ERROR|ARGUMENT_TYPE_NOT_ASSIGNABLE|/private/tmp/dq_oracle_scratch/corpus_a/lib/argument_type_not_assignable_nullability_error.dart|17|5|100|The argument type 'int?' can't be assigned to the parameter type 'int'.
 ";
 
-    /// Observed escape sample from facts §1.1: message contains an escaped pipe.
+    /// Observed escape sample: message contains an escaped pipe.
     const ESCAPED: &str = "\
 ERROR|COMPILE_TIME_ERROR|URI_DOES_NOT_EXIST|/private/tmp/dq_oracle_scratch/pkg_min/lib/pipe_test.dart|1|8|10|Target of URI doesn't exist: 'a\\|b.dart'.
 ";
@@ -403,7 +408,7 @@ ERROR|COMPILE_TIME_ERROR|URI_DOES_NOT_EXIST|/private/tmp/dq_oracle_scratch/pkg_m
         );
     }
 
-    /// Observed json sample from facts §2 (one entry, verbatim).
+    /// Observed json sample (one entry, verbatim).
     #[test]
     fn json_sample_parse() {
         let line = r#"{"code":"unused_local_variable","severity":"WARNING","type":"STATIC_WARNING","location":{"file":"/private/tmp/dq_oracle_scratch/pkg_min/lib/warn.dart","range":{"start":{"offset":17,"line":2,"column":7},"end":{"offset":23,"line":2,"column":13}}},"problemMessage":"The value of the local variable 'unused' isn't used.","correctionMessage":"Try removing the variable or using it.","documentation":"https://dart.dev/diagnostics/unused_local_variable"}"#;
@@ -459,7 +464,14 @@ ERROR|COMPILE_TIME_ERROR|URI_DOES_NOT_EXIST|/private/tmp/dq_oracle_scratch/pkg_m
             message: "m".into(),
         };
         let key = keys.key(&diag);
-        assert_eq!(key, ("expected_token".into(), "lib/a.dart".into()));
+        assert_eq!(
+            key,
+            (
+                Severity::Error,
+                "expected_token".into(),
+                "lib/a.dart".into()
+            )
+        );
         // Memo consistency: the same raw path through the cache must normalize
         // identically (the memo elides repeated syscalls, never changes results).
         assert_eq!(keys.key(&diag), key);
@@ -472,7 +484,7 @@ ERROR|COMPILE_TIME_ERROR|URI_DOES_NOT_EXIST|/private/tmp/dq_oracle_scratch/pkg_m
         };
         let expected_outside = PathBuf::from("/etc/hosts").canonicalize().unwrap();
         let key = keys.key(&outside);
-        assert_eq!(key.1, expected_outside.display().to_string());
+        assert_eq!(key.2, expected_outside.display().to_string());
 
         std::fs::remove_dir_all(&root).ok();
     }

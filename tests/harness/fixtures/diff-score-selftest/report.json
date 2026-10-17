@@ -1,0 +1,26 @@
+{
+  "oracle_only": [
+    {
+      "code": "missing_identifier",
+      "file": "m0-syntax/lib/targeted/blindspot_accessors.dart",
+      "count": 1,
+      "dtype": "SYNTACTIC_ERROR",
+      "sample_line": 3,
+      "sample_col": 1,
+      "sample_length": 4,
+      "sample_message": "Expected an identifier."
+    }
+  ],
+  "dartq_only": [
+    {
+      "code": "undefined_identifier",
+      "file": "m0-syntax/lib/other.dart",
+      "count": 1,
+      "dtype": "UNDEFINED_IDENTIFIER",
+      "sample_line": 5,
+      "sample_col": 3,
+      "sample_length": 1,
+      "sample_message": "Undefined name 'x'."
+    }
+  ]
+}
