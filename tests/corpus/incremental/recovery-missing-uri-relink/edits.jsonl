@@ -1,0 +1,8 @@
+{"create":"lib/src/broken/no_such_helper.dart","text":"/// Relink helper created by the recovery sequence.\nString helperTag() => 'relinked';\n"}
+{"create":"lib/src/broken/missing/nothing.dart","text":"// Near-empty relink target for the recovery sequence.\n"}
+{"file":"lib/src/broken/broken_missing_uri.dart","line":10,"column":1,"length":33,"new_text":"  print('imports never resolve: ${helperTag()}');"}
+{"file":"lib/src/broken/no_such_helper.dart","line":2,"column":1,"length":34,"new_text":""}
+{"file":"lib/src/broken/no_such_helper.dart","line":1,"column":1,"length":52,"new_text":"/// Relink helper created by the recovery sequence.\nString helperTag() => 'relinked';\n"}
+{"file":"lib/src/broken/broken_missing_uri.dart","line":10,"column":1,"length":49,"new_text":"  print('imports never resolve');"}
+{"remove":"lib/src/broken/missing/nothing.dart"}
+{"remove":"lib/src/broken/no_such_helper.dart"}

@@ -1,0 +1,5 @@
+{"file":"lib/main.dart","line":1,"column":22,"length":0,"new_text":" // touched"}
+{"remove":"lib/legacy.dart"}
+{"create":"lib/legacy.dart","text":"const int legacyValue = 2;\n\nint legacyCompute(int x) => x + legacyValue;\n"}
+{"file":"lib/legacy.dart","line":3,"column":19,"length":3,"new_text":"String"}
+{"file":"lib/main.dart","line":5,"column":34,"length":1,"new_text":"'2'"}

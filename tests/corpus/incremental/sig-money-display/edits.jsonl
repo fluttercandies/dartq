@@ -1,0 +1,8 @@
+{"file":"lib/src/core/money.dart","line":48,"column":3,"length":16,"new_text":"String render()"}
+{"file":"lib/src/domain/order.dart","line":88,"column":60,"length":18,"new_text":"subtotal.render()"}
+{"file":"lib/src/domain/events.dart","line":51,"column":59,"length":18,"new_text":"unitCost.render()"}
+{"file":"lib/src/reporting/summary.dart","line":47,"column":19,"length":17,"new_text":"revenue.render()"}
+{"file":"lib/src/core/money.dart","line":48,"column":3,"length":15,"new_text":"String display()"}
+{"file":"lib/src/domain/order.dart","line":88,"column":60,"length":17,"new_text":"subtotal.display()"}
+{"file":"lib/src/domain/events.dart","line":51,"column":59,"length":17,"new_text":"unitCost.display()"}
+{"file":"lib/src/reporting/summary.dart","line":47,"column":19,"length":16,"new_text":"revenue.display()"}

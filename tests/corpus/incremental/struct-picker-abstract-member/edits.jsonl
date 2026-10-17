@@ -1,0 +1,6 @@
+{"file":"lib/src/warehouse/picker.dart","line":13,"column":1,"length":33,"new_text":""}
+{"file":"lib/src/warehouse/picker.dart","line":27,"column":28,"length":79,"new_text":""}
+{"file":"lib/src/warehouse/picker.dart","line":11,"column":1,"length":32,"new_text":"  String get name;\n\n  int get basePayCents => 1_800;\n\n  @override"}
+{"file":"lib/src/warehouse/picker.dart","line":27,"column":1,"length":39,"new_text":"  @override\n  String get name => _name;\n\n  @override\n  int get basePayCents => super.basePayCents + picksPerHour * 12;"}
+{"file":"lib/src/warehouse/picker.dart","line":13,"column":1,"length":32,"new_text":"  int get basePayCents => 2_100;"}
+{"file":"lib/src/warehouse/picker.dart","line":13,"column":1,"length":32,"new_text":"  int get basePayCents => 1_800;"}

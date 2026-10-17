@@ -1,0 +1,8 @@
+{"file":"packages/chain_00/lib/chain_d/level_000.dart","line":4,"column":1,"length":22,"new_text":"  T payload(T x, {T? seed}) => seed ?? x;"}
+{"file":"packages/chain_01/lib/chain_d/level_001.dart","line":7,"column":1,"length":22,"new_text":"  T payload(T x, {T? seed}) => seed ?? x;"}
+{"file":"packages/chain_00/lib/chain_d/level_000.dart","line":6,"column":1,"length":12,"new_text":""}
+{"file":"packages/chain_00/lib/chain_d/level_000.dart","line":5,"column":1,"length":39,"new_text":"\n}"}
+{"file":"packages/chain_00/lib/chain_d/level_000.dart","line":4,"column":1,"length":44,"new_text":"  T payload(T x, {T? seed}) => seed ?? x;\n\n  T? hold;\n}"}
+{"file":"packages/chain_00/lib/chain_d/level_000.dart","line":6,"column":1,"length":12,"new_text":"  T? hold;\n\n  void keep(T x) {\n    hold = x;\n  }\n}"}
+{"file":"packages/chain_00/lib/chain_d/level_000.dart","line":4,"column":1,"length":41,"new_text":"  T payload(T x) => x;"}
+{"file":"packages/chain_01/lib/chain_d/level_001.dart","line":7,"column":1,"length":41,"new_text":"  T payload(T x) => x;"}

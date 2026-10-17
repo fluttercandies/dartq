@@ -1,0 +1,12 @@
+{"file":"lib/src/import_graph/deep_edge.dart","line":45,"column":1,"length":55,"new_text":"String formatHeadline(int nodeCount, int edgeCount) =>"}
+{"file":"lib/src/import_graph/deferred_report.dart","line":15,"column":1,"length":52,"new_text":"  return lazy.formatHeadline(nodeCount, edgeCount);"}
+{"file":"lib/src/import_graph/deep_edge.dart","line":45,"column":1,"length":54,"new_text":"String formatHeadline(int nodes, int edges) =>"}
+{"file":"lib/src/import_graph/deep_edge.dart","line":46,"column":1,"length":50,"new_text":"    'chain of $nodes nodes, $edges edges';"}
+{"file":"lib/src/import_graph/deferred_report.dart","line":13,"column":1,"length":81,"new_text":"Future<String> snapshot({required int nodes, required int edges}) async {"}
+{"file":"lib/src/import_graph/deferred_report.dart","line":15,"column":1,"length":51,"new_text":"  return lazy.formatHeadline(nodes, edges);"}
+{"file":"lib/src/import_graph/deep_edge.dart","line":45,"column":1,"length":46,"new_text":"String formatHeadline(int nodeCount, int edgeCount) =>"}
+{"file":"lib/src/import_graph/deep_edge.dart","line":46,"column":1,"length":42,"new_text":"    'chain of $nodeCount nodes, $edgeCount edges';"}
+{"file":"lib/src/import_graph/deferred_report.dart","line":13,"column":1,"length":73,"new_text":"Future<String> snapshot({required int nodeCount, required int edgeCount}) async {"}
+{"file":"lib/src/import_graph/deferred_report.dart","line":15,"column":1,"length":43,"new_text":"  return lazy.formatHeadline(nodeCount, edgeCount);"}
+{"file":"lib/src/import_graph/deep_edge.dart","line":45,"column":1,"length":54,"new_text":"String stubbedHeadline(int nodeCount, int edgeCount) =>"}
+{"file":"lib/src/import_graph/deferred_report.dart","line":15,"column":1,"length":51,"new_text":"  return lazy.stubbedHeadline(nodeCount, edgeCount);"}

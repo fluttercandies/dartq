@@ -1,0 +1,10 @@
+{"file":"lib/src/import_graph/deep_mid.dart","line":7,"column":1,"length":38,"new_text":"export 'deep_core.dart' hide DeepNode;"}
+{"file":"lib/src/import_graph/deep_core.dart","line":12,"column":3,"length":16,"new_text":"int get height =>"}
+{"file":"lib/src/import_graph/deep_core.dart","line":17,"column":1,"length":31,"new_text":"      if (child.height > best) {"}
+{"file":"lib/src/import_graph/deep_edge.dart","line":36,"column":14,"length":40,"new_text":"edge.from.height > best ? edge.from.height"}
+{"file":"lib/src/import_graph/deep_edge.dart","line":37,"column":14,"length":36,"new_text":"edge.to.height > best ? edge.to.height"}
+{"file":"lib/src/import_graph/deep_core.dart","line":12,"column":3,"length":17,"new_text":"int get depth =>"}
+{"file":"lib/src/import_graph/deep_core.dart","line":17,"column":1,"length":32,"new_text":"      if (child.depth > best) {"}
+{"file":"lib/src/import_graph/deep_edge.dart","line":36,"column":14,"length":42,"new_text":"edge.from.depth > best ? edge.from.depth"}
+{"file":"lib/src/import_graph/deep_edge.dart","line":37,"column":14,"length":38,"new_text":"edge.to.depth > best ? edge.to.depth"}
+{"file":"lib/src/import_graph/deep_mid.dart","line":7,"column":1,"length":38,"new_text":"export 'deep_core.dart' show DeepNode;"}

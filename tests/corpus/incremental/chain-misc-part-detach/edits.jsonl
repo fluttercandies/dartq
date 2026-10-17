@@ -1,0 +1,8 @@
+{"file":"packages/misc_00/lib/misc/m007.dart","line":5,"column":1,"length":26,"new_text":""}
+{"file":"packages/misc_00/lib/misc/m007.dart","line":3,"column":1,"length":62,"new_text":"import 'package:core_types/geometry.dart';\n\npart 'part_impl_7.dart';\n\nString hostCall7()"}
+{"file":"packages/misc_00/lib/misc/part_impl_7.dart","line":7,"column":1,"length":17,"new_text":"int _counter = 8;"}
+{"file":"packages/misc_00/lib/misc/m007.dart","line":7,"column":23,"length":41,"new_text":"'${_helper(const Point(2, 3))}/$_counter'"}
+{"file":"packages/misc_00/lib/misc/m007.dart","line":7,"column":23,"length":41,"new_text":"'${_helper(const Point(1, 2))}/$_counter'"}
+{"file":"packages/misc_00/lib/misc/part_impl_7.dart","line":7,"column":1,"length":17,"new_text":"int _counter = 7;"}
+{"file":"packages/misc_00/lib/misc/m007.dart","line":5,"column":1,"length":26,"new_text":""}
+{"file":"packages/misc_00/lib/misc/m007.dart","line":3,"column":1,"length":62,"new_text":"import 'package:core_types/geometry.dart';\n\npart 'part_impl_7.dart';\n\nString hostCall7()"}

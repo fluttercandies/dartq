@@ -1,0 +1,6 @@
+{"file":"packages/stock_policy/lib/src/policy.dart","line":12,"column":3,"length":25,"new_text":"int assess(int onHand);"}
+{"file":"lib/src/validation/validator.dart","line":37,"column":23,"length":21,"new_text":"rule.assess(onHand)"}
+{"file":"lib/complex.dart","line":61,"column":1,"length":65,"new_text":"export 'package:stock_policy/stock_policy.dart' show RestockRule;"}
+{"file":"lib/complex.dart","line":61,"column":1,"length":65,"new_text":"export 'package:stock_policy/stock_policy.dart' hide RestockRule;"}
+{"file":"packages/stock_policy/lib/src/policy.dart","line":12,"column":3,"length":23,"new_text":"int evaluate(int onHand);"}
+{"file":"lib/src/validation/validator.dart","line":37,"column":23,"length":19,"new_text":"rule.evaluate(onHand)"}
