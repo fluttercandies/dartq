@@ -1415,7 +1415,16 @@ fn refresh_structure_digests(
     let mut moved = !removed.is_empty();
     let mut scratch = Vec::new();
     for file in changed {
-        let digest = structure_digest(&state.residency[file], &mut scratch);
+        // A later batch inside the same refresh window may have removed
+        // the file (create → tombstone in one turn: the base restore's set
+        // and the standing tombstone's removal apply back to back). Its
+        // digest left with the removal loop above, and a non-resident file
+        // has no facts to read a fresh digest from — skip it; `removed`
+        // already carries the move.
+        let Some(facts) = state.residency.get(file) else {
+            continue;
+        };
+        let digest = structure_digest(facts, &mut scratch);
         moved |= state.structure_digests.insert(*file, digest) != Some(digest);
     }
     moved
@@ -2513,6 +2522,61 @@ mod tests {
         let spliced = splice_merged(&files, previous, &[fresh_first.as_slice()], |_| true);
         let expected = merged(&files, &[fresh_first.as_slice()]);
         assert_eq!(spliced, expected, "the all-stale rebuild is the fresh side");
+    }
+
+    /// The structure-digest refresh must skip a changed file a LATER batch
+    /// in the same refresh window removed (create → tombstone in one daemon
+    /// turn: the base restore's set and the standing tombstone's removal
+    /// apply back to back, and the accumulator carries the file on both
+    /// sides). Reading `residency` for it indexed a map the removal had
+    /// just emptied — the recovery-missing-uri-relink panic (pipeline
+    /// refresh, #2100-adjacent): a reachable hot-path panic, fixed to the
+    /// skip (the removal loop already purged the digest; a non-resident
+    /// file has no facts to read).
+    #[test]
+    fn refresh_skips_changed_files_a_later_batch_removed() {
+        let fixture = crate::l1::tests::Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let a = crate::l1::tests::set(&mut state, &lib.join("a.dart"), "int a() => 1;\n");
+        let b = crate::l1::tests::set(&mut state, &lib.join("b.dart"), "int b() => 2;\n");
+        // Batch A lands both sets with no analyze between (the daemon's
+        // wear-barrier shape — Engine::apply_pending appends each batch's
+        // outcome to the structure accumulator; mirrored here at the state
+        // level): both files enter the refresh accumulator's changed side.
+        let mut sink = |_| {};
+        let batch_a = crate::l1::apply(&mut state, &mut sink);
+        state
+            .structure_changed
+            .extend(batch_a.changed.iter().copied());
+        // Batch B removes b — the same refresh window, the removal side.
+        state.pending_order.push(b);
+        state
+            .pending
+            .insert(b, crate::state::PendingChange::Remove);
+        let batch_b = crate::l1::apply(&mut state, &mut sink);
+        state
+            .structure_removed
+            .extend(batch_b.removed.iter().copied());
+        // The next analyze's refresh reads residency for every changed
+        // file — b is changed (batch A) AND removed (batch B): the skip,
+        // not a panic.
+        let mut graph: Option<ResolvedGraph> = None;
+        let cancel = CancellationToken::new();
+        let merged = analyze(&mut state, &mut graph, None, &[], &mut |_| {}, &cancel)
+            .expect("analyze after a create-then-remove window");
+        assert!(
+            merged.iter().all(|row| row.file != b),
+            "the removed file's rows are gone: {merged:?}"
+        );
+        assert!(
+            state.structure_digests.get(&a).is_some(),
+            "the survivor's digest stands"
+        );
+        assert!(
+            state.structure_digests.get(&b).is_none(),
+            "the removed file's digest left with the removal loop"
+        );
     }
 
     /// The cache-reuse proof at the state level (#1039, audit g1034 F1): a
