@@ -3,7 +3,7 @@
 A single coherent Dart package simulating a realistically complex project:
 a warehouse inventory and order-processing domain, organized as `lib/src`
 modules exactly like production code. It exercises the Dart 3.13 language
-surface at depth — the PRD §19 deliverable "complete test cases for a
+surface at depth — the deliverable "complete test cases for a
 super-complex project" — plus a `broken_*` fixture set carrying intentional
 diagnostics for oracle-differential runs.
 

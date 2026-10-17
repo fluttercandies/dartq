@@ -4,7 +4,7 @@ A multi-package language-version matrix: every subpackage pins a different
 Dart language version, with per-file `// @dart=X.Y` overrides in both
 directions and one cross-package import edge across a version boundary.
 Purpose: exercise the engine's language-version resolution and per-feature
-version gating (PRD §19.1 corpus axis — the other corpus tiers all pin
+version gating (corpus axis — the other corpus tiers all pin
 `sdk: ^3.13.0`).
 
 This corpus is NOT wired into the m0/m1 gates. See "Wiring" at the bottom.

@@ -47,3 +47,16 @@ var constructor_tearoff_prefixed_generic = prefix.C<int>.new;
 var constructor_tearoff_prefixed_generic_method_invocation =
     prefix.C<int>.new.toString();
 var constructor_tearoff_prefixed_method_invocation = prefix.C.new.toString();
+
+// Cascade face: `..new` and `?..new` invoking the unnamed constructor
+// through the `new` identifier in cascade sections.
+class C2 {
+  C2();
+
+  int x = 0;
+}
+
+void cascadeNew() {
+  C2()..new()..x = 1;
+  C2()?..new();
+}

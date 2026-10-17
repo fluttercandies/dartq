@@ -1,6 +1,6 @@
 name: corpus_complex
 description: >-
-  Super-complex-project corpus (PRD section 19 deliverable): a single coherent
+  Super-complex-project corpus (the M1 deliverable corpus): a single coherent
   Dart package simulating a realistically complex warehouse inventory and
   order-processing domain. Exercises the Dart 3.13 language surface at depth
   (sealed hierarchies, deep generics, extension types, records, the full
