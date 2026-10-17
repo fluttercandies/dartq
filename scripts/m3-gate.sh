@@ -2,12 +2,15 @@
 # m3-gate.sh — the M3 unused-family differential gate (goal #764).
 #
 # One harness run over tests/corpus/m3-unused with the frozen M3 code set
-# (tests/harness/m3_unused_codes.txt), WARNING severity, bar 1.0 — full
-# parity like every differential gate (2026-10-12 ruling,
-# the full-parity bars ADR; supersedes the PRD-era
-# numeric bars; residuals pass only via individually adjudicated pinned
-# exemptions, never a numeric budget) — against
-# the same single oracle of record as M1/M2: the fvm default install. All
+# (tests/harness/m3_unused_codes.txt), WARNING severity, threshold 1.0 — the
+# 100% release caliber (ticket #1293; 2026-10-12 ruling, the full-parity bars
+# ADR; supersedes the earlier numeric bars): the gate passes only when the
+# WARNING-tier diff plane is empty after the known-diffs exemption — every
+# entry is either matched by tests/corpus/regressions/known-diffs.json (the
+# adjudicated burn-down ledger, reported as EXEMPTED) or it is unattributed
+# divergence and fails the gate. There is no numeric pass bar; the raw
+# (pre-exemption) Jaccard is a TELEMETRY row. Oracle of record: the same
+# single oracle as M1/M2: the fvm default install. All
 # ten codes are registry STATIC_WARNING (see the codes-file header), so the
 # WARNING tier carries the whole family and the codes file scopes the run.
 #
@@ -25,22 +28,28 @@
 #   scripts/m3-gate.sh [--dry-run]
 #
 # Environment overrides: FVM_HOME (default ~/fvm; the default install's Dart
-# version banner is checked on the run path, a mismatch is a WARN, not
-# fatal), DARTQ_CMD (the dartq side of the harness), M3_LABEL (report
+# version banner is checked on the run path and a mismatch is FATAL;
+# DARTQ_ORACLE_VERSION re-pins the expectation, DARTQ_ORACLE_VERSION_CHECK=off
+# accepts a deliberate off-caliber oracle as a warning), DARTQ_CMD (the dartq
+# side of the harness), M3_LABEL (report
 # directory name under target/evidence/gate-m3/, default m3-r1; an existing
 # report directory is refused — a rerun never overwrites recorded evidence).
 #
-# Exit codes: 0 gate met (WARNING-tier Jaccard >= 1.0); 1 below the bar;
-# 2 usage or environment error, or the harness's own error tier (dartq
-# crash, corpus preflight failure) — never scored as a Jaccard result.
+# Exit codes: 0 gate met (WARNING-tier diff plane empty after the known-diffs
+# exemption — set equality, ticket #1293); 1 unattributed divergence; 2 usage
+# or environment error, malformed known-diffs table, or the harness's own
+# error tier (dartq crash, corpus preflight failure) — never scored as a
+# Jaccard result.
 
 set -u -o pipefail
 cd "$(dirname "$0")/.." || exit 2
+. "$(dirname "$0")/lib/diff-score.sh"
 
 CORPUS="tests/corpus/m3-unused"
 CODES_FILE="tests/harness/m3_unused_codes.txt"
 THRESHOLD="1.0"
-EXPECTED_VERSION="3.13.1"
+KNOWN_DIFFS="tests/corpus/regressions/known-diffs.json"
+EXPECTED_VERSION="${DARTQ_ORACLE_VERSION:-3.13.1}"
 OUT_ROOT="target/evidence/gate-m3"
 HARNESS="./target/debug/harness"
 label="${M3_LABEL:-m3-r1}"
@@ -65,8 +74,9 @@ done
 # unused_field_from_primary_constructor, ahead of the re-freeze regen), so
 # counting its members keeps this pin exact across the regen. Freeze rows are
 # counted as the harness's parse_codes_file reads them (skip blank/'#' lines).
-# RED today by design (freeze 10 rows, family 11) until the serial window
-# runs the regen — the pin is the calibration protection, not a bug.
+# The freeze has been regenerated to the full 11-code family (the pin is
+# GREEN: freeze rows == family members, no regen pending) — the pin stays so
+# the next registry-side family change trips here before the gate runs.
 PIN_SRC="crates/dartq-semantic/tests/m3_codes_pin.rs"
 [ -f "$PIN_SRC" ] || { echo "m3-gate: $PIN_SRC not found (the count pin's registry-derivation source)" >&2; exit 2; }
 m3_expected="$(sed -n '/^const USAGE_FAMILY/,/^];/p' "$PIN_SRC" | grep -c 'SemanticCode::')"
@@ -95,19 +105,27 @@ if [ -e "$outdir" ]; then
   echo "m3-gate: $outdir already exists — refusing to overwrite recorded gate evidence (set a new M3_LABEL)" >&2
   exit 2
 fi
-echo "== m3-gate [$label]: corpus=$CORPUS codes=$CODES_FILE (WARNING tier, bar $THRESHOLD)"
+echo "== m3-gate [$label]: corpus=$CORPUS codes=$CODES_FILE (WARNING tier, raw threshold $THRESHOLD — telemetry; the gate is the 100% caliber)"
 echo "== oracle=$sdk_root/bin/dart dartq=$DARTQ_CMD report=$outdir"
 if [ "$dry_run" = 1 ]; then
   echo "== dry run: paths resolved, nothing executed"
   exit 0
 fi
 
-# Oracle version banner (run path only; the report meta records the real
-# banner either way, and M3 semantics are pinned to the 3.13.1 caliber —
-# a different oracle can legitimately emit a different code set).
+# Oracle version gate (run path only; the report meta records the real
+# banner either way). M3 semantics are pinned to the 3.13.1 caliber — a
+# different oracle can legitimately emit a different code set, so a
+# mismatch is FATAL. Escapes: DARTQ_ORACLE_VERSION re-pins the expectation,
+# DARTQ_ORACLE_VERSION_CHECK=off accepts a deliberate off-caliber oracle as
+# a warning record.
 found="$("$sdk_root/bin/dart" --version 2>&1 | sed -nE 's/^Dart SDK version: ([^ ]+).*/\1/p')"
 if [ "$found" != "$EXPECTED_VERSION" ]; then
-  echo "m3-gate: WARN expected dart $EXPECTED_VERSION, found '${found:-unrecognized banner}'"
+  if [ "${DARTQ_ORACLE_VERSION_CHECK:-}" = "off" ]; then
+    echo "m3-gate: WARN dart $EXPECTED_VERSION mismatch accepted (DARTQ_ORACLE_VERSION_CHECK=off), found '${found:-unrecognized banner}'"
+  else
+    echo "m3-gate: FATAL expected dart $EXPECTED_VERSION, found '${found:-unrecognized banner}' — gate semantics are version-pinned; install the fvm default pin or point FVM_HOME at it, set DARTQ_ORACLE_VERSION to the oracle's version, or set DARTQ_ORACLE_VERSION_CHECK=off to accept a deliberate off-caliber oracle" >&2
+    exit 2
+  fi
 fi
 
 # --- run the gate ------------------------------------------------------------
@@ -131,15 +149,24 @@ EOF
 # post-filter means the gate scored without judging anything (a broken codes
 # file, a wrong corpus, or an oracle that silently produced nothing).
 [ "$((inter + oonly))" -gt 0 ] || { echo "m3-gate: ERRORED — no oracle-side WARNING entries post-filter; the gate would pass without judging anything" >&2; exit 2; }
-echo "== m3-gate [$label]: intersection=$inter oracle_only=$oonly dartq_only=$donly report=$outdir/report.json"
-# Exact decision on the raw counts: i/u >= 1.0 with u = intersection +
-# oracle-only + dartq-only (the Jaccard union) means zero residuals —
-# intersection == union, i.e. oracle-only + dartq-only == 0; integer, no
-# rounding.
-union=$((inter + oonly + donly))
-if [ "$inter" -ge "$union" ]; then
-  echo "m3-gate: VERDICT PASS (WARNING-tier Jaccard meets the $THRESHOLD bar)"
+echo "== m3-gate [$label]: intersection=$inter oracle_only=$oonly dartq_only=$donly (raw, TELEMETRY — never a gate) report=$outdir/report.json"
+# 100% scoring (ticket #1293): classify every flat diff entry against the
+# known-diffs ledger. Empty output = unreadable report or malformed table.
+classification="$(diff_gate_classify "$outdir/report.json" "$KNOWN_DIFFS")"
+if [ -z "$classification" ]; then
+  echo "m3-gate: cannot classify $outdir/report.json against $KNOWN_DIFFS (report unreadable or the known-diffs table malformed)" >&2
+  exit 2
+fi
+IFS="$(printf '\t')" read -r _ exempted unattributed <<EOF
+$(printf '%s\n' "$classification" | awk -F'\t' '$1 == "SUMMARY" {print; exit}')
+EOF
+echo "== m3-gate [$label]: exempted=$exempted (known-diffs ledger) unattributed=$unattributed (gate caliber: 0)"
+if [ "$unattributed" -gt 0 ]; then
+  printf '%s\n' "$classification" | awk -F'\t' '$1 == "UNATTRIBUTED" { printf "    %-12s %s %s\n", $2, $3, $4 }'
+fi
+if [ "$unattributed" -eq 0 ]; then
+  echo "m3-gate: VERDICT PASS (100% caliber: every WARNING-tier diff entry is matched or exempted)"
   exit 0
 fi
-echo "m3-gate: VERDICT FAIL (below the $THRESHOLD bar)"
+echo "m3-gate: VERDICT FAIL ($unattributed unattributed divergence entries — fix, or attribute in $KNOWN_DIFFS with a reason; the gate never passes on a numeric bar)"
 exit 1

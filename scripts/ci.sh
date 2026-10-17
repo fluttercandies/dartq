@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Release-readiness gate: calibration pin tests + per-crate rustfmt + clippy
-# over the workspace.
+# + rustdoc over the workspace.
 #
 # Walks the workspace members declared in the root Cargo.toml (skipping
 # fixture/test-only members), one crate at a time, serially:
@@ -10,10 +10,14 @@
 #
 # then runs the oracle-free calibration pins (#937): `cargo test -p harness`
 # and `cargo test -p dartq-semantic --test m3_codes_pin` — seconds-fast,
-# catch frozen-universe drift before any differential work. The m3 pin is
-# RED by design until the serial window runs the m3 re-freeze regen (the
-# freeze file is at 10 rows, the registry family at 11); ci.sh going red
-# there today is the calibration protection working, not a bug.
+# catch frozen-universe drift before any differential work. The m3 pin
+# asserts set equality between tests/harness/m3_unused_codes.txt (already
+# re-frozen: 11 rows) and the 11-variant USAGE_FAMILY in m3_codes_pin.rs —
+# verification only, green on the committed freeze. A red there is a real
+# drift, never a designed one: add the targeted fixture it demands first,
+# then `cargo test -p dartq-semantic --test m3_codes_pin
+# regen_m3_unused_codes -- --ignored` and reconcile the header prose —
+# never regen blind.
 #
 # `--check-only` runs a fast `cargo check -p <crate>` instead (no pins: the
 # mode compiles only). The script
@@ -27,9 +31,26 @@
 # ONLY: the flag rebuilds the whole workspace with coverage instrumentation
 # and runs the full test suite, so a --coverage invocation IS the sanctioned
 # serial window's coverage face — never alongside development-phase lanes
-# (the 80GB/90GB memory-incident discipline). Advisory runs and the §19.5
+# (the 80GB/90GB memory-incident discipline). Advisory runs and the reproducibility
 # two-run stability protocol remain direct calls (scripts/coverage-gate.sh,
 # scripts/coverage-run.sh). Mutually exclusive with --check-only.
+#
+# The env var COVERAGE is the flag-free opt-in (the flag wins when both are
+# given): COVERAGE=1|true|full selects the serial-window face above;
+# COVERAGE=smoke runs the cheap advisory subset pre-flight
+# (scripts/coverage-gate.sh --smoke: the three fastest pure-logic crates
+# only, distinct target/coverage outputs, never a floors baseline). Any
+# other value is a usage error, never a silent skip. Unset: no coverage
+# face.
+# Doc gate (#1169): after the faces above, `cargo doc -p <crate> --no-deps`
+# runs one crate at a time (same member skip rule) with
+# RUSTDOCFLAGS="-D warnings": every rustdoc warning — broken intra-doc
+# links included, a class check/clippy cannot see (the #1166 sweep found
+# stale links that escaped every existing face) — fails the gate naming
+# the crate. Rustdoc honors the workspace jobs = 2 pin via
+#.cargo/config.toml; no -j is passed. From a warm target dir the face
+# costs a few seconds per crate (~1-2 min over the 24 members). Gate mode
+# only: --check-only stays the compile-only probe.
 #
 # Usage: scripts/ci.sh [--check-only] [--coverage]
 
@@ -49,7 +70,21 @@ for arg in "$@"; do
         ;;
     esac
 done
-if [ "$mode" = "check" ] && [ "$coverage" = 1 ]; then
+# COVERAGE env opt-in (see the header): flag --coverage already set wins;
+# 1/true/full = the full serial-window face, smoke = the advisory subset
+# pre-flight, anything else = hard usage error. Applied BEFORE the
+# mutual-exclusion guard so --check-only rejects every coverage face.
+if [ "$coverage" = 0 ] && [ -n "${COVERAGE:-}" ]; then
+    case "$COVERAGE" in
+    1 | true | full) coverage=1 ;;
+    smoke) coverage=smoke ;;
+    *)
+        echo "ci: unsupported COVERAGE value '$COVERAGE' (use 1|true|full|smoke)" >&2
+        exit 2
+        ;;
+    esac
+fi
+if [ "$mode" = "check" ] && [ "$coverage" != 0 ]; then
     echo "ci: --check-only and --coverage are mutually exclusive (compile-only probe vs the serial-phase instrumented suite)" >&2
     exit 2
 fi
@@ -101,13 +136,21 @@ if [ "$mode" = "gate" ]; then
     fi
 fi
 
-# Coverage gate (--coverage): the llvm-cov line-coverage floor gate over
-# the full instrumented suite. Serial-phase-only — see the header.
-if [ "$coverage" = 1 ]; then
-    echo "== coverage gate: scripts/coverage-gate.sh --enforce"
-    if ! bash scripts/coverage-gate.sh --enforce; then
-        echo "ci: coverage gate FAILED" >&2
-        exit 1
+# Coverage gate (--coverage / COVERAGE): the llvm-cov line-coverage floor
+# gate. Serial-phase-only — see the header.
+if [ "$coverage" != 0 ]; then
+    if [ "$coverage" = "smoke" ]; then
+        echo "== coverage gate: scripts/coverage-gate.sh --smoke (advisory subset pre-flight)"
+        if ! bash scripts/coverage-gate.sh --smoke; then
+            echo "ci: coverage gate FAILED" >&2
+            exit 1
+        fi
+    else
+        echo "== coverage gate: scripts/coverage-gate.sh --enforce"
+        if ! bash scripts/coverage-gate.sh --enforce; then
+            echo "ci: coverage gate FAILED" >&2
+            exit 1
+        fi
     fi
 fi
 
@@ -117,12 +160,32 @@ fi
 # for the serial verification phase (the resource discipline after the 80GB/90GB memory incidents):
 #   scripts/m1-gate.sh         — M1 differential gate (serial phase only)
 #   scripts/acceptance-gate.sh — valid-syntax acceptance gate (serial phase only)
-#   scripts/repro-gate.sh      — §19.5 reproducibility gate (serial phase only)
+#   scripts/repro-gate.sh      — reproducibility gate (serial phase only)
 #   scripts/serial-gates.sh    — the full serial chain, coverage included
-# The coverage face is the one exception: --coverage opts this invocation in
-# as the serial window's coverage step (the gate above).
+# The coverage face is the one exception: --coverage (or COVERAGE=1) opts
+# this invocation in as the serial window's coverage step (the gate above);
+# COVERAGE=smoke opts in only the advisory subset pre-flight.
 
-# Untracked-reference gate: no tracked file may reference never-tracked local
-# workspace material (vendored checkouts, evidence/ledger paths, home paths).
+# Doc gate (#1169): rustdoc per member with --no-deps, one crate at a time
+# (same skip rule as the faces above — fixture/test members excluded).
+# RUSTDOCFLAGS="-D warnings" promotes every rustdoc warning to a hard
+# error, structurally catching the broken-intra-doc-link rot class that
+# check/clippy resolution cannot see (#1166). Gate mode only: --check-only
+# stays the compile-only probe.
+if [ "$mode" = "gate" ]; then
+    for member in $members; do
+        case "$member" in tests/*) continue;; esac
+        crate=${member##*/}
+        echo "== cargo doc: $crate"
+        if ! RUSTDOCFLAGS="-D warnings" cargo doc -q -p "$crate" --no-deps --offline; then
+            echo "ci: cargo doc FAILED: $crate" >&2
+            exit 1
+        fi
+    done
+fi
+
+# Untracked-reference gate: no tracked file — and no untracked candidate on
+# its way into the repo — may reference never-tracked local workspace
+# material (vendored checkouts, evidence/ledger paths, home paths).
 bash "$(dirname "$0")/untracked-ref-gate.sh"
 echo "ci: gate passed"

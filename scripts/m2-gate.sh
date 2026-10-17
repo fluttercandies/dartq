@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# m2-gate.sh — the M2 WARNING-tier differential gate (PRD section 20.3, M2 row).
+# m2-gate.sh — the M2 WARNING-tier differential gate.
 #
 # Runs the harness once over tests/corpus/m2-warning with the frozen M2 code
 # universe (tests/harness/m2_warning_codes.txt), WARNING severity, threshold
-# 1.0 — the M2 bar, full parity like every differential gate (2026-10-12
-# ruling, the full-parity bars ADR; supersedes the PRD
-# section 20.3 numeric bars; residuals pass only via individually adjudicated
-# pinned exemptions, never a numeric budget) — against the same single oracle
-# of record as M1: the fvm default install (Dart 3.13.1, the gate-caliber-r5
-# baseline). The WARNING
+# 1.0 — the 100% release caliber (ticket #1293; 2026-10-12 ruling, the
+# full-parity bars ADR; supersedes the earlier numeric bars): the
+# gate passes only when the WARNING-tier diff plane is empty after the
+# known-diffs exemption — every entry is either matched by
+# tests/corpus/regressions/known-diffs.json (the adjudicated burn-down
+# ledger, reported as EXEMPTED) or it is unattributed divergence and fails
+# the gate. There is no numeric pass bar; the raw (pre-exemption) Jaccard is
+# a TELEMETRY row. Oracle of record: the same single oracle as M1 — the fvm
+# default install (Dart 3.13.1, the gate-caliber-r5 baseline). The WARNING
 # tier scores only semantic STATIC_WARNING codes; lint rules are INFO and
 # excluded by design (the M2 audit's tier split). The 43-code frozen set's
 # derivation lives in the codes-file header.
@@ -42,25 +45,30 @@
 #                   produced nothing).
 #
 # Environment overrides: FVM_HOME (default ~/fvm; the default install must
-# exist — its Dart version banner is checked on the run path, a mismatch is
-# a WARN, not fatal), DARTQ_CMD (the dartq side of the harness; default
+# exist — its Dart version banner is checked on the run path and a mismatch
+# is FATAL; DARTQ_ORACLE_VERSION re-pins the expectation,
+# DARTQ_ORACLE_VERSION_CHECK=off accepts a deliberate off-caliber oracle as
+# a warning), DARTQ_CMD (the dartq side of the harness; default
 # `./target/debug/dartq analyze --format=machine --sdk <fvm default
 # dart-sdk>`), DARTQ_HARNESS_ORACLE_TIMEOUT_MS (forwarded to the harness
 # drivers).
 #
-# Exit codes: 0 gate met (WARNING-tier Jaccard >= 1.0); 1 below the bar;
-# 2 usage or environment error — missing binaries, fvm default missing, jq
-# missing, unreadable report, violated vacuity guard — and the harness's own
-# error tier (dartq crash, corpus preflight failure), which is never scored
-# as a Jaccard result.
+# Exit codes: 0 gate met (WARNING-tier diff plane empty after the known-diffs
+# exemption — set equality, ticket #1293); 1 unattributed divergence; 2 usage
+# or environment error — missing binaries, fvm default missing, jq missing,
+# unreadable report, malformed known-diffs table, violated vacuity guard —
+# and the harness's own error tier (dartq crash, corpus preflight failure),
+# which is never scored as a Jaccard result.
 
 set -u -o pipefail
 cd "$(dirname "$0")/.." || exit 2
+. "$(dirname "$0")/lib/diff-score.sh"
 
 CORPUS="tests/corpus/m2-warning"
 CODES_FILE="tests/harness/m2_warning_codes.txt"
 THRESHOLD="1.0"
-EXPECTED_VERSION="3.13.1"
+KNOWN_DIFFS="tests/corpus/regressions/known-diffs.json"
+EXPECTED_VERSION="${DARTQ_ORACLE_VERSION:-3.13.1}"
 OUT_ROOT="target/evidence/gate-m2"
 HARNESS="./target/debug/harness"
 DEFAULT_LABEL="m2-r1"
@@ -153,7 +161,7 @@ if [ -e "$outdir" ]; then
 fi
 echo "== m2-gate plan"
 printf '  %-16s %s\n' "corpus" "$CORPUS"
-printf '  %-16s %s (WARNING tier, bar %s)\n' "codes" "$CODES_FILE" "$THRESHOLD"
+printf '  %-16s %s (WARNING tier, raw threshold %s — telemetry; the gate is the 100% caliber)\n' "codes" "$CODES_FILE" "$THRESHOLD"
 printf '  %-16s %s\n' "oracle" "$dart_bin"
 printf '  %-16s %s\n' "dartq" "$DARTQ_CMD"
 printf '  %-16s %s\n' "report" "$outdir"
@@ -164,12 +172,20 @@ if [ "$dry_run" = 1 ]; then
   exit 0
 fi
 
-# Oracle version banner (run path only; the report meta records the real
-# banner either way, and M2 semantics are pinned to the 3.13.1 caliber —
-# a different oracle can legitimately emit a different code set).
+# Oracle version gate (run path only; the report meta records the real
+# banner either way). M2 semantics are pinned to the 3.13.1 caliber — a
+# different oracle can legitimately emit a different code set, so a
+# mismatch is FATAL. Escapes: DARTQ_ORACLE_VERSION re-pins the expectation,
+# DARTQ_ORACLE_VERSION_CHECK=off accepts a deliberate off-caliber oracle as
+# a warning record.
 found="$("$dart_bin" --version 2>&1 | sed -nE 's/^Dart SDK version: ([^ ]+).*/\1/p')"
 if [ "$found" != "$EXPECTED_VERSION" ]; then
-  echo "m2-gate: WARN expected dart $EXPECTED_VERSION, found '${found:-unrecognized banner}'"
+  if [ "${DARTQ_ORACLE_VERSION_CHECK:-}" = "off" ]; then
+    echo "m2-gate: WARN dart $EXPECTED_VERSION mismatch accepted (DARTQ_ORACLE_VERSION_CHECK=off), found '${found:-unrecognized banner}'"
+  else
+    echo "m2-gate: FATAL expected dart $EXPECTED_VERSION, found '${found:-unrecognized banner}' — gate semantics are version-pinned; install the fvm default pin or point FVM_HOME at it, set DARTQ_ORACLE_VERSION to the oracle's version, or set DARTQ_ORACLE_VERSION_CHECK=off to accept a deliberate off-caliber oracle" >&2
+    exit 2
+  fi
 fi
 
 # --- run the gate ------------------------------------------------------------
@@ -240,19 +256,29 @@ fi
 echo
 echo "== m2-gate summary"
 printf '  %-16s %s\n' "label" "$label"
-printf '  %-16s %s (bar %s)\n' "warning_jaccard" "$jac" "$THRESHOLD"
+printf '  %-16s %s (TELEMETRY: raw, pre-exemption — never a gate)\n' "warning_jaccard" "$jac"
 printf '  %-16s %s oracle | %s dartq (post-filter instances)\n' "diags" "$ototal" "$dtotal"
 printf '  %-16s %s oracle-only, %s dartq-only entries (attribution: report.json)\n' "diffs" "$oonly" "$donly"
+
+# 100% scoring (ticket #1293): classify every flat diff entry against the
+# known-diffs ledger. Empty output = unreadable report or malformed table.
+classification="$(diff_gate_classify "$outdir/report.json" "$KNOWN_DIFFS")"
+if [ -z "$classification" ]; then
+  echo "m2-gate: cannot classify $outdir/report.json against $KNOWN_DIFFS (report unreadable or the known-diffs table malformed)" >&2
+  exit 2
+fi
+IFS="$(printf '\t')" read -r _ exempted unattributed <<EOF
+$(printf '%s\n' "$classification" | awk -F'\t' '$1 == "SUMMARY" {print; exit}')
+EOF
+printf '  %-16s %s matched by the known-diffs ledger (the burn-down mechanism)\n' "exempted" "$exempted"
+printf '  %-16s %s (gate caliber: 0 — any unattributed divergence fails)\n' "unattributed" "$unattributed"
+if [ "$unattributed" -gt 0 ]; then
+  printf '%s\n' "$classification" | awk -F'\t' '$1 == "UNATTRIBUTED" { printf "    %-12s %s %s\n", $2, $3, $4 }'
+fi
 printf '  %-16s %s\n' "report" "$outdir/report.json"
-# Exact decision on the raw counts: i/u >= 1.0 with u = intersection +
-# oracle-only + dartq-only (the Jaccard union) means zero residuals —
-# intersection == union, i.e. oracle-only + dartq-only == 0; integer, no
-# rounding. The 3-decimal `jac` above is display-only: a true Jaccard in
-# [0.9995, 1.0) rounds to 1.0 and must not pass.
-union=$((inter + oonly + donly))
-if [ "$inter" -ge "$union" ]; then
-  echo "m2-gate: VERDICT PASS (WARNING-tier Jaccard meets the $THRESHOLD bar)"
+if [ "$unattributed" -eq 0 ]; then
+  echo "m2-gate: VERDICT PASS (100% caliber: every WARNING-tier diff entry is matched or exempted)"
   exit 0
 fi
-echo "m2-gate: VERDICT FAIL (below the $THRESHOLD bar)"
+echo "m2-gate: VERDICT FAIL ($unattributed unattributed divergence entries — fix, or attribute in $KNOWN_DIFFS with a reason; the gate never passes on a numeric bar)"
 exit 1

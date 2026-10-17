@@ -16,7 +16,7 @@
 # == Delegation (single execution posture) ==
 # Every llvm-cov execution is delegated to scripts/coverage-gate.sh — the one
 # place that owns the run posture: RUSTC_WRAPPER="" sccache bypass, the
-# isolated target/coverage-build tree, --offline, the §19.5 repro-tuple seal,
+# isolated target/coverage-build tree, --offline, the repro-tuple seal,
 # and the byte-stable summary.txt this script parses. This script owns only
 # the floors workflow; there is no second llvm-cov invocation shape here.
 #

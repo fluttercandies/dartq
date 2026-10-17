@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # mega-run.sh — the S4-scale budget runner over the generated mega corpus
-# (PRD section 19.2 S4 row + section 19.3 RSS/100k-LOC and Incremental P95
-# axes).
+# (S4 acceptance axes: RSS/100k-LOC and Incremental P95 budgets).
 #
 # Per scale (1k / 10k / 100k, via --scale, default 1k; --all runs the
 # ladder): it (a) regenerates the scale tree if absent (corpus-gen, pinned
@@ -17,11 +16,11 @@
 #
 # NO oracle differential by default: S4 acceptance is a dartq-side budget
 # (RSS ceiling + latency), not a Jaccard row — `dart analyze` over 100k
-# files is not the acceptance shape (PRD section 19.2 S4; the differential
-# axis stays with the m0/m1 gates).
+# files is not the S4 acceptance shape (the differential axis stays with
+# the m0/m1 gates).
 #
 # --oracle-leg runs the mega T2 oracle differential leg at the 1k tier only
-# (the mega acceptance-bar ledger §3.2 fast tier + §4 A9; #736). It materializes
+#. It materializes
 # the seeded-error variant of the 1k tree (scripts/mega-seed-errors.sh from
 # the checked-in manifest scripts/mega-seeded-errors.json) and drives the
 # existing harness differential face twice, once per tree:
@@ -49,10 +48,10 @@
 # oracle-related runs and the strict table keeps the A7/A8/A9 SKIP row
 # verbatim.
 #
-# --strict turns the run into the acceptance gate face (the mega acceptance-bar
-# ledger §4): per-scale budget rows are asserted and the run gets a
+# --strict turns the run into the acceptance gate face (the strict
+# acceptance ledger): per-scale budget rows are asserted and the run gets a
 # labeled VERDICT. Asserted faces: A1 rss_per_100k_loc_kib <= 200000 KiB at
-# the 100k tier (PRD section 1.5, the RSS charter row; 1k/10k stay report-only per
+# the 100k tier (the RSS charter row; 1k/10k stay report-only per
 # A2 — fixed process overhead dominates there), A3 the 8 GiB watchdog cap,
 # A4/A5/A6 the batch-proxy incremental p95 bars (2000/4000/60000 ms by
 # tier, adopted at recon closure #733), A10 zero-panic, A11 completion
@@ -77,7 +76,7 @@
 #
 #   --scale S       single scale to run (default 1k).
 #   --all           run the whole ladder (1k, 10k, 100k) in order.
-#   --strict        acceptance gate face (the mega acceptance-bar ledger §4):
+#   --strict        acceptance gate face:
 #                   assert the budget rows, print a VERDICT line, exit 1 on
 #                   any breach. Under a strict 100k tier a disk-headroom
 #                   precheck (~800 MB for the incremental copy) runs first.
@@ -89,18 +88,24 @@
 #                   Jaccard >= bar on both. Also measures the A7 cold pair
 #                   (#798): oracle_baseline.sh twice over the clean 1k tree
 #                   (oracle-of-record dart vs DARTQ_CMD, 5 rounds each,
-#                   round 1 = cold; single-instance, sequential). Reports
+#                   round 1 = cold; single-instance, sequential; a 30 s
+#                   oracle canary precedes the sides, and each side runs
+#                   under a 900 s wall cap — a hung canary or round is
+#                   group-killed and fails the leg). Reports
 #                   land at target/evidence/mega/<label>/1k/{oracle-clean,
-#                   oracle-seeded,cold}/. Mutually exclusive with --all and
-#                   scales other than 1k.
+#                   oracle-seeded,cold}/ — the cold dir also carries the
+#                   canary record and the pinned round-outputs work dir.
+#                   Mutually exclusive with --all and scales other than 1k.
 #   --dry-run       print the plan + exact commands, execute nothing
 #                   (--dry-run --strict prints the asserted table).
 #   --label L       report directory name under target/evidence/mega/.
 #                   Default: MEGA_LABEL env, else mega-r1. A label whose
 #                   directory already exists refuses the run (exit 2) —
 #                   recorded evidence is never overwritten. Reports land at
-#                   target/evidence/mega/<label>/<scale>/{rss-100k,
-#                   incremental-p95}/report.json plus edit-manifest.json.
+#                   target/evidence/mega/<label>/<scale>/rss-100k/<corpus>/
+#                   report.json (corpus = the scale name),
+#                   <scale>/incremental-p95/report.json, plus
+#                   edit-manifest.json.
 #
 # Environment overrides: DARTQ_CMD (the dartq side; default
 # `./target/debug/dartq analyze --format=machine --sdk <fvm default
@@ -133,9 +138,8 @@ HARNESS="./target/debug/harness"
 DEFAULT_LABEL="mega-r1"
 DEFAULT_TIMEOUT_MS=600000
 
-# --- strict acceptance bars (asserted only under --strict; sources are
-# the mega acceptance-bar ledger §4) -------------------------------------------------
-# A1: PRD §1.5 (the RSS charter row) "RSS/100k LOC <= 200 MB" — decimal reading,
+# --- strict acceptance bars (asserted only under --strict; defined below) -------------------------------------------------
+# A1: (the RSS charter row) "RSS/100k LOC <= 200 MB" — decimal reading,
 # 200000 KiB (stricter than the MiB reading, 204800). Asserted at the 100k
 # tier only. Env override: MEGA_RSS_100K_LIMIT_KIB.
 RSS_100K_LIMIT_KIB=200000
@@ -157,10 +161,10 @@ INC_P95_100K_MS=60000
 # before timing it (~398 MB corpus + the copy; tools/corpus-gen/README.md
 # consumption note and the #546 ledger's deferred note).
 DISK_HEADROOM_100K_MIB=800
-# A9 (oracle leg, 1k only): ERROR (code,file) Jaccard bar, the mega acceptance-bar
-# ledger §4 A9. Bar 1.0 — full parity like every differential gate
+# A9 (oracle leg, 1k only): ERROR (code,file) Jaccard bar.
+# Bar 1.0 — full parity like every differential gate
 # (2026-10-12 ruling, the full-parity bars ADR;
-# supersedes the PRD-era numeric bars; residuals pass only via individually
+# supersedes the earlier numeric bars; residuals pass only via individually
 # adjudicated pinned exemptions, never a numeric budget). The harness
 # enforces it as its own --threshold; this script classifies the
 # harness exit. Env override: MEGA_ORACLE_JACCARD_MIN (decimal in [0,1]).
@@ -175,6 +179,23 @@ SEED_DIR="tests/corpus/mega/1k-seeded"
 # instrument's default 5 covers it with margin). Both sides get the same
 # count so the round records line up.
 COLD_ROUNDS=5
+# A7 cold-leg wall cap per side (seconds). oracle_baseline.sh has no timeout
+# of its own and the serial chain's watchdog enforces RSS only, so the cap
+# converts a hung analysis into a red leg. Per side, not per round: the
+# instrument runs all rounds in one session (rounds 2..N are the
+# same-session hot records the A7 face exists to record), so per-round caps
+# would corrupt the hot-round evidence — the 30 s canary below bounds the
+# startup-hang case instead. 900 s recalibrates the old flat 600 s (#1246):
+# a 100k cold round measured 633 s of legitimate work against the old cap,
+# so this clears the known-good longest round with headroom while staying
+# ~300x the 1k tier's ~3 s cold round. Bigger tiers need the cap revisited
+# alongside the 1k-only flag gate.
+COLD_WALL_CAP_S=900
+# A7 canary preflight bound (seconds): one exact-shape oracle round against
+# a bare one-file corpus before the measured sides — a hung oracle fails
+# here in 30 s with captured evidence instead of burning the side cap on
+# round 1 (#1246).
+COLD_CANARY_CAP_S=30
 # Oracle-of-record caliber (mirrors m1-gate.sh; a mismatch is a WARN, not
 # fatal — the report meta records the real banner either way).
 EXPECTED_ORACLE_VERSION="3.13.1"
@@ -243,7 +264,7 @@ done
 # the harness's own threshold gate either way) --------------------------------
 if [ "$oracle_leg" -eq 1 ]; then
   if [ "$all_scales" -eq 1 ] || [ "$scales" != "1k" ]; then
-    die "--oracle-leg runs the 1k tier only (the mega acceptance-bar ledger §3.2); use --scale 1k"
+    die "--oracle-leg runs the 1k tier only; use --scale 1k"
   fi
   oracle_jac_min="${MEGA_ORACLE_JACCARD_MIN:-$ORACLE_JACCARD_MIN}"
   case "$oracle_jac_min" in
@@ -287,6 +308,14 @@ fi
 FVM_HOME="${FVM_HOME:-$HOME/fvm}"
 sdk_root="$FVM_HOME/default/bin/cache/dart-sdk"
 dart_bin="$sdk_root/bin/dart"
+# Pin the oracle binary to its physical path: the fvm `default` component is
+# a symlink, and the symlinked argv[0] was the one process-level input
+# unique to the A7 round-1 hang (#1246). Resolving kills that divergence
+# and pins which binary ran into every plan line and record. Guarded so a
+# missing install keeps the fvm-shaped path for the die below.
+if dart_dir="$(cd "$(dirname "$dart_bin")" 2>/dev/null && pwd -P)"; then
+  dart_bin="$dart_dir/dart"
+fi
 DEFAULT_DARTQ_CMD="./target/debug/dartq analyze --format=machine --sdk $sdk_root"
 DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
 if [ "$DARTQ_CMD" = "$DEFAULT_DARTQ_CMD" ] && [ ! -x "./target/debug/dartq" ]; then
@@ -390,8 +419,8 @@ write_manifest() {
 EOF
 }
 
-# Classify one failed bench invocation for the strict gate (mega-corpus.md
-# §4 verdict shape). Driver-level failures are acceptance breaches — the
+# Classify one failed bench invocation for the strict gate. Driver-level
+# failures are acceptance breaches — the
 # harness's own markers identify which face broke: watchdog kill (A3),
 # wall-clock timeout (A11), dartq exit outside the valid analysis tiers
 # {0,1,2,3} (A10 — crash or panic). A harness-own failure (launch error, ps
@@ -439,7 +468,7 @@ run_bench() {
   return 1
 }
 
-# Strict acceptance rows for one scale (the mega acceptance-bar ledger §4),
+# Strict acceptance rows for one scale,
 # printed inside the summary. Reads the summary globals; appends breaches
 # and sets strict_fail. A12 (corpus identity) runs on every scale and is an
 # environment-tier failure when violated — the tree must come from the
@@ -455,7 +484,7 @@ strict_rows() {
 
   if [ "$rss_ok" -eq 1 ]; then
     if [ "$s" = "100k" ]; then
-      a1="$(jq -r '.rss_per_100k_loc_kib | ceil' "$outdir/rss-100k/report.json" 2>/dev/null)" || a1=""
+      a1="$(jq -r '.rss_per_100k_loc_kib | ceil' "$outdir/rss-100k/$s/report.json" 2>/dev/null)" || a1=""
       if [ -z "$a1" ]; then
         die "rss report for $s carries no rss_per_100k_loc_kib"
       fi
@@ -514,8 +543,7 @@ strict_rows() {
   fi
 }
 
-# --- oracle leg helpers (mega T2, the mega acceptance-bar ledger §3.2 fast
-# tier + §4 A9; run path only) -------------------------------------------------
+# --- oracle leg helpers (mega T2 fast tier + A9; run path only) -------------------------------------------------
 
 # Run one differential face of the leg and classify the harness exit into
 # $oracle_face_class: "ok" (harness exit 0 — the ERROR gate met the bar),
@@ -549,7 +577,7 @@ run_oracle_face() {
 # One A9 summary row for a face: the (code,file) Jaccard row out of the
 # harness report (same jq shape as m1-gate.sh). Under --strict a class
 # other than "ok" records a breach and fails the verdict — the A9 assert
-# (per plan §4 it asserts from the start; a FAIL is a legal r1 intermediate
+# (it asserts from the start; a FAIL is a legal r1 intermediate
 # result, recorded with its attribution, not an environment error). Sets
 # $oracle_row_ok=1 when a report row was actually read.
 oracle_row() {
@@ -607,7 +635,7 @@ oracle_leg_run() {
   seeded_class="$oracle_face_class"
 }
 
-# The A7 cold leg for the 1k scale (the mega acceptance-bar ledger §4 A7; #798):
+# The A7 cold leg for the 1k scale:
 # the generalized oracle_baseline.sh driven twice over the same clean tree —
 # the oracle side (oracle-of-record dart, `dart analyze --format=machine`,
 # the instrument's default shape passed via --cmd so both legs share one
@@ -618,18 +646,110 @@ oracle_leg_run() {
 # command's stdout line count on both sides). Runs FIRST in the per-scale
 # flow — the coldest session state the 1k tree gets — and strictly
 # sequentially: the single-instance discipline (never alongside another
-# analysis process) is the instrument's own contract.
+# analysis process) is the instrument's own contract. A 30 s canary of the
+# exact oracle shape precedes the sides (#1246), each side runs under the
+# COLD_WALL_CAP_S wall cap (oracle_baseline.sh has no timeout of its own):
+# a hung round is group-killed and dies loudly, never silently, and the
+# instrument's WORK dir is pinned under $cdir/work so a cap-killed round's
+# raw outputs survive for post-mortem.
+
+# Wall-capped runner: the child
+# sits in its own session (perl setsid — bash 3.2 has no setsid) so a
+# breach group-kills exactly the analysis tree (/usr/bin/time + dart),
+# never this runner. Returns 124 on a cap kill, the child's exit code
+# otherwise; the structured kill line goes to stderr (the caller's stdout
+# is the leg's JSONL stream). The nested session makes the leg briefly
+# invisible to an outer serial-gates RSS poll — bounded by this cap, and
+# the leg's calibrated footprint (~200 MB oracle side) sits orders below
+# the chain caps.
+capped_run() { # <cap_s> <cmd...>
+  cr_cap="$1"
+  shift
+  cr_t0=$(date +%s)
+  perl -MPOSIX -e 'setsid; exec @ARGV' -- "$@" &
+  cr_pid=$!
+  while kill -0 "$cr_pid" 2>/dev/null; do
+    if [ $(( $(date +%s) - cr_t0 )) -ge "$cr_cap" ]; then
+      cr_pgid="$(ps -o pgid= -p "$cr_pid" 2>/dev/null | tr -d ' ')"
+      if [ -n "$cr_pgid" ]; then
+        kill -9 -"$cr_pgid" 2>/dev/null
+        sleep 0.2
+        kill -9 -"$cr_pgid" 2>/dev/null
+      fi
+      printf 'mega-run: WALL_CAP_KILL cap=%ss elapsed=%ss\n' "$cr_cap" "$(( $(date +%s) - cr_t0 ))" >&2
+      wait "$cr_pid" 2>/dev/null
+      return 124
+    fi
+    sleep 5
+  done
+  wait "$cr_pid" 2>/dev/null
+}
+
+# Canary preflight for the A7 cold leg (#1246): run the EXACT oracle command
+# shape once — same capped_run session nesting, same /usr/bin/time wrapper,
+# same resolved dart binary — against a bare one-file corpus (no pubspec, so
+# no implicit pub get; dart analyze works context-free) under a 30 s cap. A
+# hung oracle then fails in 30 s with captured evidence (canary.log plus the
+# pinned WORK files under $cdir/work/) instead of burning the side cap on
+# round 1. The rounds:1 summary line in canary.log carries empty hot fields
+# (an oracle_baseline.sh single-round quirk) — the log is diagnostic; the
+# leg jsonl files are the records.
+cold_canary_run() {
+  mkdir -p "$cdir/canary" || die "creating $cdir/canary failed"
+ printf 'void main {}\n' >"$cdir/canary/main.dart"
+  echo "-- [$label/1k] A7 cold leg: oracle canary (${COLD_CANARY_CAP_S}s bound)"
+  capped_run "$COLD_CANARY_CAP_S" bash tests/bench/oracle_baseline.sh "$cdir/canary" 1 \
+    --cmd "$dart_bin analyze --format=machine" >"$cdir/canary.log" 2>&1
+  canary_rc=$?
+  [ "$canary_rc" -eq 0 ] && return 0
+  if [ "$canary_rc" -eq 124 ]; then
+    die "A7 cold leg: oracle canary hung — killed at the ${COLD_CANARY_CAP_S}s wall cap; the measured leg would hang the same way (see $cdir/canary.log and the surviving out.1/err.1/time.1 under $cdir/work/)"
+  fi
+  die "A7 cold leg: oracle canary failed (exit $canary_rc, see $cdir/canary.log)"
+}
+
+# One side of the A7 cold leg, wall-capped: <side> is "oracle" (the
+# oracle-of-record dart, the instrument's default shape) or "dartq"
+# (DARTQ_CMD, the m1-gate shape). A cap kill or a failed leg dies naming
+# the side and how far the rounds got — a red step, never a silent skip.
+cold_side() {
+  side="$1"
+  case "$side" in
+  oracle) side_cmd="$dart_bin analyze --format=machine";;
+  dartq) side_cmd="$DARTQ_CMD";;
+  esac
+  echo "-- [$label/1k] A7 cold leg: $side side ($COLD_ROUNDS rounds, round 1 = cold)"
+  capped_run "$COLD_WALL_CAP_S" bash tests/bench/oracle_baseline.sh "tests/corpus/mega/1k" "$COLD_ROUNDS" \
+    --cmd "$side_cmd" >"$cdir/$side.jsonl"
+  side_rc=$?
+  [ "$side_rc" -eq 0 ] && return 0
+  done_rounds="$(grep -c '"record":"round"' "$cdir/$side.jsonl")" || done_rounds=0
+  if [ "$side_rc" -eq 124 ]; then
+    die "A7 cold leg: $side side hung — killed at the ${COLD_WALL_CAP_S}s wall cap after $done_rounds/$COLD_ROUNDS rounds (see $cdir/$side.jsonl; the in-flight round's out.N/err.N/time.N survive under $cdir/work/)"
+  fi
+  die "$side cold leg failed (exit $side_rc, see $cdir/$side.jsonl)"
+}
+
 cold_leg_run() {
   cdir="$outdir/cold"
-  mkdir -p "$cdir" || die "creating $cdir failed"
-  echo "-- [$label/1k] A7 cold leg: oracle side ($COLD_ROUNDS rounds, round 1 = cold)"
-  bash tests/bench/oracle_baseline.sh "tests/corpus/mega/1k" "$COLD_ROUNDS" \
-    --cmd "$dart_bin analyze --format=machine" >"$cdir/oracle.jsonl" ||
-    die "oracle cold leg failed (see $cdir/oracle.jsonl)"
-  echo "-- [$label/1k] A7 cold leg: dartq side ($COLD_ROUNDS rounds, round 1 = cold)"
-  bash tests/bench/oracle_baseline.sh "tests/corpus/mega/1k" "$COLD_ROUNDS" \
-    --cmd "$DARTQ_CMD" >"$cdir/dartq.jsonl" ||
-    die "dartq cold leg failed (see $cdir/dartq.jsonl)"
+  mkdir -p "$cdir" "$cdir/work" || die "creating $cdir failed"
+  # Pin the instrument's WORK dir inside the evidence dir: oracle_baseline.sh
+  # creates its WORK via `mktemp -d`, which honors TMPDIR, so a cap-killed
+  # round's out.N/err.N/time.N survive under $cdir for post-mortem instead
+  # of a trap-less SIGKILL stranding them in the system temp (#1246 — the r1
+  # post-mortem only succeeded because a stray system WORK dir happened to
+  # survive). Restored after the leg so the harness benches keep the ambient
+  # temp.
+  TMPDIR_SAVE="${TMPDIR:-}"
+  export TMPDIR="$cdir/work"
+  cold_canary_run
+  cold_side oracle
+  cold_side dartq
+  if [ -n "$TMPDIR_SAVE" ]; then
+    export TMPDIR="$TMPDIR_SAVE"
+  else
+    unset TMPDIR
+  fi
   for side in oracle dartq; do
     grep -q '"record":"summary"' "$cdir/$side.jsonl" ||
       die "$cdir/$side.jsonl carries no summary record (leg incomplete)"
@@ -711,14 +831,14 @@ if [ "$oracle_leg" -eq 1 ]; then
   printf '  %-16s 1k T2 oracle differential leg: harness run on the clean tree (record face, --allow-vacuous) + the seeded tree (judgment face)\n' "oracle"
   printf '  %-16s %s (seeded from %s via %s)\n' "seeded tree" "$SEED_DIR" "$SEED_MANIFEST" "$SEED_SCRIPT"
   printf '  %-16s ERROR (code,file) Jaccard >= %s on both faces — harness exit 0 (A9; bar override MEGA_ORACLE_JACCARD_MIN)\n' "A9 bar" "$oracle_jac_min"
-  printf '  %-16s A7 cold pair: oracle_baseline.sh x2 on the 1k tree (%s rounds each, round 1 = cold) -> cold/{oracle,dartq}.jsonl\n' "cold leg" "$COLD_ROUNDS"
+  printf '  %-16s A7 cold pair: oracle_baseline.sh x2 on the 1k tree (%s rounds each, round 1 = cold, %ss oracle canary, %ss wall cap per side) -> cold/{oracle,dartq}.jsonl\n' "cold leg" "$COLD_ROUNDS" "$COLD_CANARY_CAP_S" "$COLD_WALL_CAP_S"
   printf '  %-16s %s (oracle-of-record; version mismatch = WARN, report meta records the real banner)\n' "oracle dart" "$dart_bin"
 else
-  printf '  %-16s NO oracle differential (S4 is a dartq-side budget: PRD 19.2 S4, 19.3)\n' "oracle"
+  printf '  %-16s NO oracle differential (S4 is a dartq-side budget)\n' "oracle"
 fi
 printf '  %-16s target/evidence/mega/%s/<scale>/\n' "reports" "$label"
 if [ "$strict" -eq 1 ]; then
-  echo "== strict acceptance gate (the mega acceptance-bar ledger §4)"
+  echo "== strict acceptance gate"
   printf '  %-6s %s\n' "A1" "rss_per_100k_loc_kib <= $rss_limit_kib KiB at 100k (RSS charter row, decimal; 1k/10k report-only per A2)"
   printf '  %-6s %s\n' "A3" "watchdog tree cap $WATCHDOG_CAP_KIB KiB — harness breach = FAIL (runbook:8)"
   printf '  %-6s %s\n' "A4" "incremental p95 batch proxy <= $inc_p95_1k_ms ms at 1k (adopted #733: the resident-2s charter row analog)"
@@ -732,7 +852,7 @@ if [ "$strict" -eq 1 ]; then
     printf '  %-6s %s\n' "A7" "cold pair measured, record-only (oracle-of-record dart vs DARTQ_CMD, $COLD_ROUNDS rounds each, round 1 = cold; assert bar dartq <= 1/2 oracle not asserted this round)"
     printf '  %-6s %s\n' "SKIP" "A8 10k/100k oracle DNF record — stress tiers, arbitration = A1 (the stress-tier arbitration row)"
   else
-    printf '  %-6s %s\n' "SKIP" "A7/A8/A9 oracle differential faces — mega T2 (the mega acceptance-bar ledger §5)"
+    printf '  %-6s %s\n' "SKIP" "A7/A8/A9 oracle differential faces — mega T2 (deferred face)"
   fi
   printf '  %-6s %s\n' "SKIP" "A13 S4 LOC accounting — parked T4 (bench non-blank vs manifest 5402483 lines)"
   printf '  %-6s %s\n' "env" "bar overrides: MEGA_RSS_100K_LIMIT_KIB MEGA_INC_P95_1K_MS MEGA_INC_P95_10K_MS MEGA_INC_P95_100K_MS$([ "$oracle_leg" -eq 1 ] && printf ' MEGA_ORACLE_JACCARD_MIN')"
@@ -794,7 +914,7 @@ for s in $scales; do
   inc=""
   if [ "$rss_ok" -eq 1 ]; then
     rss="$(jq -r '[.file_count, .loc, .peak_rss_kib, .rss_per_100k_loc_kib, .samples] | @tsv' \
-      "$outdir/rss-100k/report.json" 2>/dev/null)" || rss=""
+      "$outdir/rss-100k/$s/report.json" 2>/dev/null)" || rss=""
   fi
   if [ "$inc_ok" -eq 1 ]; then
     inc="$(jq -r '[.baseline_duration_ms, .p50_ms, .p95_ms, .p99_ms, (.steps | length)] | @tsv' \
@@ -808,7 +928,7 @@ for s in $scales; do
     # A failed face already recorded its breach; a report missing after a
     # successful bench is an environment error.
     if [ "$rss_ok" -eq 1 ] && [ -z "$rss" ]; then
-      die "report $outdir/rss-100k/report.json is missing or unreadable"
+      die "report $outdir/rss-100k/$s/report.json is missing or unreadable"
     fi
     if [ "$inc_ok" -eq 1 ] && [ -z "$inc" ]; then
       die "report $outdir/incremental-p95/report.json is missing or unreadable"
@@ -843,7 +963,7 @@ EOF
   if [ "$oracle_leg" -eq 1 ] && [ "$s" = "1k" ]; then
     oracle_rows
   fi
-  echo "  reports: $outdir/{rss-100k,incremental-p95}/report.json"
+  echo "  reports: $outdir/rss-100k/$s/report.json + $outdir/incremental-p95/report.json"
   if [ "$oracle_leg" -eq 1 ] && [ "$s" = "1k" ]; then
     printf '  %-16s %s\n' "oracle reports" "$outdir/{oracle-clean,oracle-seeded}/report.json (+ raw-outputs.json: both sides, unfiltered — the oracle-face record)"
     printf '  %-16s %s\n' "cold reports" "$outdir/cold/{oracle,dartq}.jsonl (round+summary records, identical schema)"
@@ -854,7 +974,7 @@ echo
 if [ "$oracle_leg" -eq 1 ]; then
   deferred="deferred faces: A8 stress-tier DNF record (arbitration = A1; A7 cold pair is measured above, record-only); A13 LOC accounting -> parked T4"
 else
-  deferred="deferred faces: A7/A8/A9 oracle leg -> mega T2; A13 LOC accounting -> parked T4 (the mega acceptance-bar ledger §5)"
+  deferred="deferred faces: A7/A8/A9 oracle leg -> mega T2; A13 LOC accounting -> parked T4 (deferred face)"
 fi
 if [ "$strict" -eq 1 ]; then
   if [ "$strict_fail" -eq 1 ]; then

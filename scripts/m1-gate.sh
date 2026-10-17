@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# m1-gate.sh — the M1 frozen-code differential gate (PRD section 20.3, M1 row).
+# m1-gate.sh — the M1 frozen-code differential gate.
 #
 # Runs the harness once over tests/corpus/m1-semantic with the frozen M1 code
 # universe (tests/harness/m1_codes.txt), ERROR severity, threshold 1.0 — the
-# M1 bar, full parity like every differential gate (2026-10-12 ruling,
-# the full-parity bars ADR; supersedes the PRD section
-# 20.3 numeric bars; residuals pass only via individually adjudicated pinned
-# exemptions, never a numeric budget) — against a single oracle of record:
-# the fvm default install (Dart 3.13.1, the gate-caliber-r5 baseline). No
+# 100% release caliber (ticket #1293; 2026-10-12 ruling, the full-parity bars
+# ADR; supersedes the earlier numeric bars): the gate passes only
+# when the ERROR-tier diff plane is empty after the known-diffs exemption —
+# every entry is either matched by tests/corpus/regressions/known-diffs.json
+# (the adjudicated burn-down ledger, reported as EXEMPTED) or it is
+# unattributed divergence and fails the gate. There is no numeric pass bar;
+# the raw (pre-exemption) Jaccard is a TELEMETRY row. Oracle of record: the
+# fvm default install (Dart 3.13.1, the gate-caliber-r5 baseline). No
 # matrix: M1 acceptance is defined on one caliber. The report lands under
 # target/evidence/gate-m1/<label>/ (label: --label or M1_LABEL, default m1-r4;
 # the recorded history is baseline-r1, r2 and r3, and r2 measured ERROR-tier
-# Jaccard 0.8235 below this bar over the pre-growth corpus — five dartq
+# Jaccard 0.8235 below the raw bar over the pre-growth corpus — five dartq
 # misses in the wrong_number_of_type_arguments family plus one dartq-only
 # attribution).
 #
@@ -36,18 +39,22 @@
 #                   corpus, an oracle that silently produced nothing).
 #   Every run persists post-filter divergences as regression cases under
 #   tests/corpus/regressions/cases (exempted against
-#   tests/corpus/regressions/known-diffs.json, PRD section 19.1).
+#   tests/corpus/regressions/known-diffs.json).
 #
 # Environment overrides: FVM_HOME (default ~/fvm; the default install must
-# exist — its Dart version banner is checked on the run path, a mismatch is
-# a WARN, not fatal), DARTQ_CMD (the dartq side of the harness; default
+# exist — its Dart version banner is checked on the run path and a mismatch
+# is FATAL; DARTQ_ORACLE_VERSION re-pins the expectation,
+# DARTQ_ORACLE_VERSION_CHECK=off accepts a deliberate off-caliber oracle as
+# a warning), DARTQ_CMD (the dartq side of the harness; default
 # `./target/debug/dartq analyze --format=machine --sdk <fvm default
 # dart-sdk>` — the recorded baseline-r2 shape), DARTQ_HARNESS_ORACLE_TIMEOUT_MS
 # (forwarded to the harness drivers).
 #
-# Exit codes: 0 gate met (ERROR-tier Jaccard >= 1.0); 1 below the bar;
-# 2 usage or environment error — missing binaries, fvm default missing, jq
-# missing, unreadable report — and the harness's own error tier (exit 2:
+# Exit codes: 0 gate met (ERROR-tier diff plane empty after the known-diffs
+# exemption — set equality, ticket #1293); 1 unattributed divergence (some
+# diff entry is neither matched nor exempted); 2 usage or environment error —
+# missing binaries, fvm default missing, jq missing, unreadable report,
+# malformed known-diffs table — and the harness's own error tier (exit 2:
 # violated vacuity guard, dartq crash, corpus preflight failure), which is
 # never scored as a Jaccard result. The harness SKIPPED verdict cannot
 # occur here: the script always passes --severity-filter ERROR, so the gate
@@ -55,11 +62,13 @@
 
 set -u -o pipefail
 cd "$(dirname "$0")/.." || exit 2
+. "$(dirname "$0")/lib/diff-score.sh"
 
 CORPUS="tests/corpus/m1-semantic"
 CODES_FILE="tests/harness/m1_codes.txt"
 THRESHOLD="1.0"
-EXPECTED_VERSION="3.13.1"
+KNOWN_DIFFS="tests/corpus/regressions/known-diffs.json"
+EXPECTED_VERSION="${DARTQ_ORACLE_VERSION:-3.13.1}"
 OUT_ROOT="target/evidence/gate-m1"
 HARNESS="./target/debug/harness"
 DEFAULT_LABEL="m1-r4"
@@ -163,19 +172,30 @@ if [ "$dry_run" = 1 ]; then
   exit 0
 fi
 
-# Oracle version banner (run path only; the report meta records the real
-# banner either way, and M1 semantics are pinned to the 3.13.1 caliber —
-# a different oracle can legitimately emit a different code set).
+# Oracle version gate (run path only; the report meta records the real
+# banner either way). M1 semantics are pinned to the 3.13.1 caliber — a
+# different oracle can legitimately emit a different code set, so a
+# mismatch is FATAL. Escapes: DARTQ_ORACLE_VERSION re-pins the expectation,
+# DARTQ_ORACLE_VERSION_CHECK=off accepts a deliberate off-caliber oracle as
+# a warning record.
 found="$("$dart_bin" --version 2>&1 | sed -nE 's/^Dart SDK version: ([^ ]+).*/\1/p')"
 if [ "$found" != "$EXPECTED_VERSION" ]; then
-  echo "m1-gate: WARN expected dart $EXPECTED_VERSION, found '${found:-unrecognized banner}'"
+  if [ "${DARTQ_ORACLE_VERSION_CHECK:-}" = "off" ]; then
+    echo "m1-gate: WARN dart $EXPECTED_VERSION mismatch accepted (DARTQ_ORACLE_VERSION_CHECK=off), found '${found:-unrecognized banner}'"
+  else
+    echo "m1-gate: FATAL expected dart $EXPECTED_VERSION, found '${found:-unrecognized banner}' — gate semantics are version-pinned; install the fvm default pin or point FVM_HOME at it, set DARTQ_ORACLE_VERSION to the oracle's version, or set DARTQ_ORACLE_VERSION_CHECK=off to accept a deliberate off-caliber oracle" >&2
+    exit 2
+  fi
 fi
 
 # --- run the gate ------------------------------------------------------------
-# Harness exit codes: 0 PASS, 1 below threshold (the report is still
-# written), 2 harness error (vacuity guard, dartq crash, corpus preflight —
-# no verdict is scored). The SKIPPED verdict cannot occur: ERROR is always
-# in scope.
+# Harness exit codes: 0 the RAW (pre-exemption) ERROR Jaccard met the
+# threshold, 1 below it (the report is still written either way), 2 harness
+# error (vacuity guard, dartq crash, corpus preflight — no verdict scored).
+# The harness verdict is exemption-blind, so rc 1 is NOT the gate verdict:
+# the 100% scoring below classifies every diff entry against the known-diffs
+# ledger and fails only on unattributed divergence. The SKIPPED verdict
+# cannot occur: ERROR is always in scope.
 run_args=(
   run
   --corpus-dir "$CORPUS"
@@ -184,7 +204,7 @@ run_args=(
   --severity-filter ERROR
   --threshold "$THRESHOLD"
   --codes-file "$CODES_FILE"
-  # Divergences land in tests/corpus/regressions/cases, exempted via tests/corpus/regressions/known-diffs.json (PRD §19.1).
+ # Divergences land in tests/corpus/regressions/cases, exempted via known-diffs.json.
   --persist-regressions tests/corpus/regressions/cases
   --out "$outdir"
 )
@@ -195,18 +215,16 @@ fi
 echo
 echo "== [$label] m1 gate"
 mkdir -p "$outdir"
-verdict=PASS
-if "$HARNESS" "${run_args[@]}"; then
-  echo "-- [$label] gate PASSED the bar; report: $outdir/report.json"
+rc=0
+"$HARNESS" "${run_args[@]}" || rc=$?
+if [ "$rc" -ge 2 ]; then
+  echo "-- [$label] gate ERRORED (harness exit $rc, harness-own failure; no verdict scored)" >&2
+  exit 2
+fi
+if [ "$rc" -eq 0 ]; then
+  echo "-- [$label] raw bar met (zero diffs); report: $outdir/report.json"
 else
-  rc=$?
-  if [ "$rc" -eq 1 ]; then
-    verdict=FAIL
-    echo "-- [$label] gate FAILED below the bar (harness exit 1); report: $outdir/report.json"
-  else
-    echo "-- [$label] gate ERRORED (harness exit $rc, harness-own failure; no verdict scored)" >&2
-    exit 2
-  fi
+  echo "-- [$label] below the raw bar (harness exit 1); scoring the known-diffs exemption from the report"
 fi
 
 # --- summary -----------------------------------------------------------------
@@ -224,16 +242,33 @@ fi
 IFS="$(printf '\t')" read -r jac ototal dtotal oonly donly <<EOF
 $row
 EOF
+
+# 100% scoring (ticket #1293): classify every flat diff entry against the
+# known-diffs ledger. Empty output = unreadable report or malformed table.
+classification="$(diff_gate_classify "$outdir/report.json" "$KNOWN_DIFFS")"
+if [ -z "$classification" ]; then
+  echo "m1-gate: cannot classify $outdir/report.json against $KNOWN_DIFFS (report unreadable or the known-diffs table malformed)" >&2
+  exit 2
+fi
+IFS="$(printf '\t')" read -r _ exempted unattributed <<EOF
+$(printf '%s\n' "$classification" | awk -F'\t' '$1 == "SUMMARY" {print; exit}')
+EOF
+
 echo
 echo "== m1-gate summary"
 printf '  %-16s %s\n' "label" "$label"
-printf '  %-16s %s (bar %s)\n' "error_jaccard" "$jac" "$THRESHOLD"
+printf '  %-16s %s (TELEMETRY: raw, pre-exemption — never a gate)\n' "error_jaccard" "$jac"
 printf '  %-16s %s oracle | %s dartq (post-filter instances)\n' "diags" "$ototal" "$dtotal"
 printf '  %-16s %s oracle-only, %s dartq-only entries (attribution: report.json)\n' "diffs" "$oonly" "$donly"
+printf '  %-16s %s matched by the known-diffs ledger (the burn-down mechanism)\n' "exempted" "$exempted"
+printf '  %-16s %s (gate caliber: 0 — any unattributed divergence fails)\n' "unattributed" "$unattributed"
+if [ "$unattributed" -gt 0 ]; then
+  printf '%s\n' "$classification" | awk -F'\t' '$1 == "UNATTRIBUTED" { printf "    %-12s %s %s\n", $2, $3, $4 }'
+fi
 printf '  %-16s %s\n' "report" "$outdir/report.json"
-if [ "$verdict" = "PASS" ]; then
-  echo "m1-gate: VERDICT PASS (ERROR-tier Jaccard meets the $THRESHOLD bar)"
+if [ "$unattributed" -eq 0 ]; then
+  echo "m1-gate: VERDICT PASS (100% caliber: every ERROR-tier diff entry is matched or exempted)"
   exit 0
 fi
-echo "m1-gate: VERDICT FAIL (below the $THRESHOLD bar)"
+echo "m1-gate: VERDICT FAIL ($unattributed unattributed divergence entries — fix, or attribute in $KNOWN_DIFFS with a reason; the gate never passes on a numeric bar)"
 exit 1

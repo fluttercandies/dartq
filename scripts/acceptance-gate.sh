@@ -11,7 +11,7 @@
 #   SEVERITY|TYPE|CODE|FILE|LINE|COL|LENGTH|MESSAGE  (SEVERITY in
 #   ERROR|WARNING|INFO)
 # Rationale: the check face is the syntax tier only (scan → parse, no
-# semantic engine; engine-api-spec §2.1), and the corpus is valid by
+# semantic engine), and the corpus is valid by
 # construction over shipped, version-enabled syntax, so a clean run produces
 # zero rows of every severity — there are no known-deliberate advisory rows.
 # No oracle is involved; validity is asserted by construction (see
@@ -96,7 +96,7 @@ fi
 # Pure-input checks run on both paths; the release-binary check is a
 # run-path guard below (a dry-run must not fail — nor build — when the
 # release binary is not on disk yet). No .dart_tool/package_config.json
-# requirement: the check face is pub-free by design (engine-api-spec §2.1),
+# requirement: the check face is pub-free by design,
 # unlike the harness corpora the m0 gate drives.
 [ -f "$CORPUS/pubspec.yaml" ] || {
   echo "acceptance-gate: $CORPUS is not a corpus package (pubspec.yaml missing)" >&2
@@ -133,7 +133,7 @@ fi
 }
 
 # --- run the gate -------------------------------------------------------------
-# dartq check exit tiers (engine-api-spec §4.2): 0 clean/info-only, 1 fatal
+# dartq check exit tiers: 0 clean/info-only, 1 fatal
 # infos, 2 fatal warnings, 3 errors present, 4 internal failure, 64 usage.
 # The verdict comes from the ROWS, not the exit code — info-only runs exit 0
 # and still carry INFO rows this gate must fail on. Tiers 4/64 are tool

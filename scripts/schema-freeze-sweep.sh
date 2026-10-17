@@ -12,11 +12,16 @@
 #   cli-check-json       `dartq check --format json`: the oracle envelope
 #                        {"version":1,"diagnostics":[...]} with the frozen
 #                        row key set (code/severity/type/location/
-#                        problemMessage/correctionMessage), zero-based ranges.
-#   rpc-initialize       the daemon's initialize answer: serverInfo.name
-#                        "dartq", positionEncoding utf-16, and
-#                        capabilities.experimental == the frozen 12-method
-#                        map, every entry carrying schemaVersion 1.
+#                        problemMessage/correctionMessage); the oracle's
+#                        location positions are 1-based line/column (the
+#                        analyzer's lspToUser) plus the absolute offset.
+#   rpc-session-ready    the no-handshake session face: the daemon has no
+#                        lifecycle (see crates/dartq-daemon/src/server.rs
+#                        `run()` — the session answers real requests from
+#                        frame one), so the lightest real request,
+#                        `dartq/index`, answers the frozen index envelope
+#                        {schema_version, files, libraries, symbols,
+#                        references} with no handshake at all.
 #   rpc-overlay-ack      `dartq/overlay.set` / `dartq/overlay.clear` answers:
 #                        exactly {schema_version: 1}.
 #   rpc-check-tiers      `dartq/check` at minimal/compact/full: the frozen
@@ -25,7 +30,7 @@
 #                        file paths with sN ids backed by the `symbols`
 #                        table; minimal/compact stay unshortened.
 #   rpc-fix-answer       `dartq/fix` at compact/full: {schema_version, files}
-#                        of §15.6 patch documents {file, schema_version,
+#                        of patch documents {file, schema_version,
 #                        edits[]}; every edit rides the red-line floor
 #                        (offset/length/replacement/source) plus the anchor
 #                        at compact; full adds the builtin rule/message
@@ -39,7 +44,10 @@
 #                        so the tier split on rows stays the unit fixtures').
 #   rpc-assists-rejects  `dartq/assists` with a session field: same
 #                        INVALID_PARAMS rejection.
-#   rpc-shutdown         shutdown answers without error.
+#
+#   Session teardown is EOF (stdin close) — the protocol's only end signal,
+#   there is no shutdown method; the driver asserts the daemon exits
+#   EXIT_CLEAN (0) after it.
 #
 # Expected shapes are embedded below as heredoc/jq skeletons — no external
 # golden files. A shape drift (missing/extra/renamed field, wrong version
@@ -130,7 +138,9 @@ fi
 # One package, two probes: main.dart carries three uri_does_not_exist rows on
 # one deeply nested path (the depth + repetition is what makes the daemon's
 # full-tier short-id economics fire deterministically), fixme.dart carries
-# unnecessary_new hits so the fix face answers a non-empty patch set.
+# unnecessary_new hits so the fix face answers a non-empty patch set — the
+# lint set is options-governed (no options file = no lints enabled), so the
+# options file below enables exactly the rule fixme.dart trips.
 work="$(mktemp -d "${TMPDIR:-/tmp}/dartq-schema-sweep.XXXXXX")"
 cleanup() {
   rm -rf "$work"
@@ -154,6 +164,14 @@ EOF
 cat >"$fx/.dart_tool/package_config.json" <<'EOF'
 {"configVersion": 2, "packages": [{"name": "sweep", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}
 EOF
+# The fix face's patch source: without an options file the lint enable set is
+# empty, so enable exactly the rule the probe source trips (the in-crate fix
+# tests use the same minimal options shape).
+cat >"$fx/analysis_options.yaml" <<'EOF'
+linter:
+  rules:
+    - unnecessary_new
+EOF
 cat >"$fx/$deep/main.dart" <<'EOF'
 import 'missing.dart';
 import 'missing.dart';
@@ -168,7 +186,11 @@ void main() {
   var b = new Object();
 }
 EOF
-probe_file="$fx/$deep/main.dart"
+# The daemon answers paths under the workspace root the way the OS resolves
+# it — canonical (macOS symlinks /var → /private/var, doubled slashes
+# flattened) — so the expected path must be canonical too, not the raw
+# mktemp spelling.
+probe_file="$(cd "$fx/$deep" && pwd -P)/main.dart"
 
 # --- face runner --------------------------------------------------------------
 face_fail=0
@@ -179,6 +201,7 @@ face() {
 }
 chk() {
   local desc="$1" out
+  shift
   if out="$("$@" 2>&1)"; then
     printf '   ok   %s\n' "$desc"
   else
@@ -219,17 +242,20 @@ all_match() { # <file> <ere>
 
 # --- face: cli-check-machine ---------------------------------------------------
 machine_out="$work/machine.txt"
-machine_shape='^(ERROR|WARNING|INFO)\|[A-Z_]+\|[a-z_]+\|.+\|[0-9]+\|[0-9]+\|[0-9]+\|.+$'
+# The machine CODE field is the oracle's uppercase spelling — emitMachineFormat
+# prints `error.code?.toUpperCase()` — so the frozen shape pins uppercase like
+# the severity/type fields (byte parity with `dart analyze --format=machine`).
+machine_shape='^(ERROR|WARNING|INFO)\|[A-Z_]+\|[A-Z_]+\|.+\|[0-9]+\|[0-9]+\|[0-9]+\|.+$'
 face cli-check-machine
 rc=0
 "$DARTQ_BIN" check --format machine "$fx" >"$machine_out" 2>"$work/machine.err" || rc=$?
 chk "error fixture exits 3 (ERRORS)" [ "$rc" -eq 3 ]
 chk "three machine rows (one per directive)" [ "$(wc -l <"$machine_out" | tr -d ' ')" -eq 3 ]
 chk "every row matches the 8-field machine shape" all_match "$machine_out" "$machine_shape"
-chk "rows are ERROR|COMPILE_TIME_ERROR|uri_does_not_exist" \
-  all_match "$machine_out" '^ERROR\|COMPILE_TIME_ERROR\|uri_does_not_exist\|'
-chk "first row pins locator + oracle message" \
-  grep -Eq "^ERROR\|COMPILE_TIME_ERROR\|uri_does_not_exist\|.*main\.dart\|1\|1\|[0-9]+\|Target of URI doesn't exist: 'missing.dart'\." "$machine_out"
+chk "rows are ERROR|COMPILE_TIME_ERROR|URI_DOES_NOT_EXIST" \
+  all_match "$machine_out" '^ERROR\|COMPILE_TIME_ERROR\|URI_DOES_NOT_EXIST\|'
+chk "first row pins locator + oracle message (the URI literal: 1|8, length 14)" \
+  grep -Eq "^ERROR\|COMPILE_TIME_ERROR\|URI_DOES_NOT_EXIST\|.*main\.dart\|1\|8\|14\|Target of URI doesn't exist: 'missing.dart'\." "$machine_out"
 
 clean_dir="$work/clean"
 mkdir -p "$clean_dir"
@@ -253,35 +279,36 @@ chk "rows carry the frozen key set" jq_true "$json_out" \
   '[.diagnostics[] | has("code") and has("severity") and has("type") and has("location") and has("problemMessage") and has("correctionMessage")] | all'
 chk "row code/severity/type spellings" jq_true "$json_out" \
   '[.diagnostics[] | .code == "uri_does_not_exist" and .severity == "ERROR" and .type == "COMPILE_TIME_ERROR"] | all'
-chk "location names the probe file with a zero-based range" jq_true "$json_out" \
-  '([.diagnostics[] | .location.file | endswith("probe/main.dart")] | all) and .diagnostics[0].location.range.start.line == 0 and .diagnostics[0].location.range.start.character == 0'
+chk "location names the probe file with the oracle 1-based range" jq_true "$json_out" \
+  '([.diagnostics[] | .location.file | endswith("probe/main.dart")] | all) and .diagnostics[0].location.range.start.line == 1 and .diagnostics[0].location.range.start.column == 8 and .diagnostics[0].location.range.start.offset == 7'
 end_face
 
 # --- daemon conversation -------------------------------------------------------
-# Steps are static (relative paths resolve against the workspace root), so the
-# driver only injects initialize's params. Ids are referenced by the bash
-# assertions below through body_<id>.json.
+# The method names below are the daemon's served request family (see
+# crates/dartq-daemon/src/wire.rs for the row/envelope shapes and
+# crates/dartq-daemon/src/commands.rs `METHODS` for the family): there is no
+# lifecycle handshake — the session answers from frame one and EOF is the
+# only end signal. Ids are referenced by the bash assertions below through
+# body_<id>.json.
 cat >"$work/steps.json" <<'EOF'
 [
-  {"id": 1, "method": "initialize"},
-  {"notify": "initialized", "params": {}},
-  {"id": 3, "method": "dartq/check", "params": {"paths": ["lib/deeply/nested/freeze/probe/main.dart"], "verbosity": "minimal"}},
-  {"id": 4, "method": "dartq/check", "params": {"paths": ["lib/deeply/nested/freeze/probe/main.dart"], "verbosity": "compact"}},
-  {"id": 5, "method": "dartq/check", "params": {"paths": ["lib/deeply/nested/freeze/probe/main.dart"], "verbosity": "full"}},
-  {"id": 6, "method": "dartq/fix", "params": {"paths": ["lib/fixme.dart"], "verbosity": "compact"}},
-  {"id": 7, "method": "dartq/fix", "params": {"paths": ["lib/fixme.dart"], "verbosity": "full"}},
-  {"id": 8, "method": "dartq/fix", "params": {"paths": ["lib/fixme.dart"], "agentId": "sweep-probe", "context": "default", "since": 1}},
-  {"id": 9, "method": "dartq/assists", "params": {"path": "lib/fixme.dart", "verbosity": "compact"}},
-  {"id": 10, "method": "dartq/assists", "params": {"path": "lib/fixme.dart", "since": 1}},
-  {"id": 11, "method": "dartq/overlay.set", "params": {"agentId": "sweep-probe", "files": {}}},
-  {"id": 12, "method": "dartq/overlay.clear", "params": {"agentId": "sweep-probe"}},
-  {"id": 13, "method": "shutdown"}
+  {"id": 1, "method": "dartq/index", "params": {}},
+  {"id": 2, "method": "dartq/check", "params": {"paths": ["lib/deeply/nested/freeze/probe/main.dart"], "verbosity": "minimal"}},
+  {"id": 3, "method": "dartq/check", "params": {"paths": ["lib/deeply/nested/freeze/probe/main.dart"], "verbosity": "compact"}},
+  {"id": 4, "method": "dartq/check", "params": {"paths": ["lib/deeply/nested/freeze/probe/main.dart"], "verbosity": "full"}},
+  {"id": 5, "method": "dartq/fix", "params": {"paths": ["lib/fixme.dart"], "verbosity": "compact"}},
+  {"id": 6, "method": "dartq/fix", "params": {"paths": ["lib/fixme.dart"], "verbosity": "full"}},
+  {"id": 7, "method": "dartq/fix", "params": {"paths": ["lib/fixme.dart"], "agentId": "sweep-probe", "context": "default", "since": 1}},
+  {"id": 8, "method": "dartq/assists", "params": {"path": "lib/fixme.dart", "verbosity": "compact"}},
+  {"id": 9, "method": "dartq/assists", "params": {"path": "lib/fixme.dart", "since": 1}},
+  {"id": 10, "method": "dartq/overlay.set", "params": {"agentId": "sweep-probe", "files": {}}},
+  {"id": 11, "method": "dartq/overlay.clear", "params": {"agentId": "sweep-probe"}}
 ]
 EOF
 
-cat >"$work/lsp_drive.py" <<'PYEOF'
+cat >"$work/rpc_drive.py" <<'PYEOF'
 #!/usr/bin/env python3
-"""Drives one scripted LSP conversation against `dartq daemon` over stdio.
+"""Drives one scripted dartq-RPC conversation against `dartq daemon` over stdio.
 
 Records every inbound frame (responses and server-initiated notifications) as
 one JSON object per line — {"from_server": <frame>} — to the output path, so
@@ -297,7 +324,7 @@ import time
 from pathlib import Path
 
 def die(msg):
-    print("lsp_drive: " + msg, file=sys.stderr)
+    print("rpc_drive: " + msg, file=sys.stderr)
     sys.exit(2)
 
 def frame(obj):
@@ -348,7 +375,7 @@ class Reader:
 
 def main():
     if len(sys.argv) != 6:
-        die("usage: lsp_drive.py <dartq> <fixture> <sdk> <steps.json> <out.jsonl>")
+        die("usage: rpc_drive.py <dartq> <fixture> <sdk> <steps.json> <out.jsonl>")
     dartq, fixture, sdk, steps_path, out_path = sys.argv[1:6]
     deadline = time.monotonic() + int(os.environ.get("DARTQ_SWEEP_TIMEOUT", "240"))
     steps = json.loads(Path(steps_path).read_text())
@@ -374,12 +401,6 @@ def main():
                     die("daemon closed stdin before " + step["notify"])
                 continue
             params = step.get("params", {})
-            if step["method"] == "initialize":
-                params = {
-                    "processId": os.getpid(),
-                    "rootUri": fx.as_uri(),
-                    "capabilities": {},
-                }
             try:
                 proc.stdin.write(frame({
                     "jsonrpc": "2.0", "id": step["id"],
@@ -395,14 +416,16 @@ def main():
                 out.flush()
                 if inbound.get("id") == step["id"]:
                     break
-        proc.stdin.write(frame({"jsonrpc": "2.0", "method": "exit"}))
-        proc.stdin.flush()
+        # EOF is the session's only end signal (there is no shutdown method):
+        # closing stdin must end the daemon with EXIT_CLEAN (0).
         proc.stdin.close()
         try:
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
             proc.kill()
-            die("daemon ignored exit; killed")
+            die("daemon ignored EOF; killed")
+        if proc.returncode != 0:
+            die("daemon exited %s after EOF (protocol failure)" % proc.returncode)
     finally:
         out.close()
         err.close()
@@ -417,7 +440,7 @@ PYEOF
 rpc_jsonl="$work/rpc.jsonl"
 echo
 echo "== [$label] driving the daemon session (budget ${TIMEOUT_SECS}s)"
-if ! DARTQ_SWEEP_TIMEOUT="$TIMEOUT_SECS" python3 "$work/lsp_drive.py" \
+if ! DARTQ_SWEEP_TIMEOUT="$TIMEOUT_SECS" python3 "$work/rpc_drive.py" \
   "$DARTQ_BIN" "$fx" "$SDK" "$work/steps.json" "$rpc_jsonl" \
   2>"$work/transport.err"; then
   echo "schema-freeze-sweep: daemon transport failed (environment error); stderr:" >&2
@@ -430,7 +453,7 @@ fi
 
 # Materialize one body file per scripted id; a missing or duplicated response
 # is itself a face failure.
-for id in 1 3 4 5 6 7 8 9 10 11 12 13; do
+for id in 1 2 3 4 5 6 7 8 9 10 11; do
   count="$(jq -s --argjson id "$id" \
     '[.[] | select(.from_server.id == $id)] | length' "$rpc_jsonl")"
   if [ "$count" != "1" ]; then
@@ -442,30 +465,28 @@ for id in 1 3 4 5 6 7 8 9 10 11 12 13; do
     "$rpc_jsonl" >"$work/body_$id.json"
 done
 
-FROZEN_METHODS="dartq/index dartq/analyze dartq/check dartq/query dartq/impact dartq/fix dartq/assists dartq/compat dartq/explain dartq/overlay.set dartq/overlay.commit dartq/overlay.clear"
-
-# --- face: rpc-initialize ------------------------------------------------------
+# --- face: rpc-session-ready ----------------------------------------------------
+# The no-handshake face: the first request of the conversation is a real one
+# and answers normally (see crates/dartq-daemon/src/server.rs `run()`).
 body="$work/body_1.json"
-face rpc-initialize
-chk "serverInfo.name is dartq" jq_eq "$body" '.result.serverInfo.name' dartq
-chk "positionEncoding is utf-16" jq_eq "$body" '.result.capabilities.positionEncoding' utf-16
-chk "experimental announces exactly the frozen 12 methods" jq_true "$body" \
-  "(.result.capabilities.experimental | keys | sort) == (\"$FROZEN_METHODS\" | split(\" \") | sort)"
-chk "every method carries schemaVersion 1" jq_true "$body" \
-  '[.result.capabilities.experimental[] | .schemaVersion] | all(. == 1)'
+face rpc-session-ready
+chk "the first request (dartq/index) answers without error" jq_true "$body" '.error == null'
+chk "the answer is the frozen index envelope (schema_version + the four tallies)" jq_true "$body" \
+  '(.result | keys | sort) == ["files", "libraries", "references", "schema_version", "symbols"]'
+chk "schema_version is the frozen 1" jq_eq "$body" '.result.schema_version' 1
 end_face
 
 # --- face: rpc-overlay-ack -----------------------------------------------------
 face rpc-overlay-ack
-chk "overlay.set answers exactly {schema_version: 1}" jq_true "$work/body_11.json" \
+chk "overlay.set answers exactly {schema_version: 1}" jq_true "$work/body_10.json" \
   '(.result | keys) == ["schema_version"] and .result.schema_version == 1'
-chk "overlay.clear answers exactly {schema_version: 1}" jq_true "$work/body_12.json" \
+chk "overlay.clear answers exactly {schema_version: 1}" jq_true "$work/body_11.json" \
   '(.result | keys) == ["schema_version"] and .result.schema_version == 1'
 end_face
 
 # --- face: rpc-check-tiers -----------------------------------------------------
 face rpc-check-tiers
-body="$work/body_3.json"
+body="$work/body_2.json"
 chk "minimal: envelope is exactly {schema_version, diagnostics}" jq_true "$body" \
   '(.result | keys | sort) == ["diagnostics", "schema_version"]'
 chk "minimal: schema_version is 1" jq_eq "$body" '.result.schema_version' 1
@@ -475,7 +496,7 @@ chk "minimal: three uri_does_not_exist rows on the probe file" jq_true "$body" \
   '(.result.diagnostics | length) == 3 and ([.result.diagnostics[].code] | all(. == "uri_does_not_exist"))'
 chk "minimal: paths stay unshortened" jq_eq "$body" '.result.diagnostics[0].file' "$probe_file"
 
-body="$work/body_4.json"
+body="$work/body_3.json"
 chk "compact: rows carry exactly the frozen 8-field set" jq_true "$body" \
   '[.result.diagnostics[] | (keys | sort) == ["code", "column", "file", "length", "line", "message", "severity", "type"]] | all'
 chk "compact: severity/type spellings and non-empty message" jq_true "$body" \
@@ -483,7 +504,7 @@ chk "compact: severity/type spellings and non-empty message" jq_true "$body" \
 chk "compact: no session economics on the answer" jq_true "$body" \
   '(.result | keys | sort) == ["diagnostics", "schema_version"]'
 
-body="$work/body_5.json"
+body="$work/body_4.json"
 chk "full: the short-id table rides the answer" jq_true "$body" \
   '(.result | has("symbols")) and (.result.symbols | keys | length >= 1)'
 chk "full: table keys are the frozen sN form" jq_true "$body" \
@@ -497,7 +518,7 @@ end_face
 
 # --- face: rpc-fix-answer ------------------------------------------------------
 face rpc-fix-answer
-body="$work/body_6.json"
+body="$work/body_5.json"
 chk "compact: the intake answer is {schema_version, files}" jq_true "$body" \
   '(.result | keys | sort) == ["files", "schema_version"]'
 chk "compact: schema_version is 1" jq_eq "$body" '.result.schema_version' 1
@@ -510,7 +531,7 @@ chk "compact: edits ride the red-line floor plus the anchor" jq_true "$body" \
 chk "compact: builtin provenance and a located anchor" jq_true "$body" \
   '[.result.files[].edits[] | .source == "builtin-lint" and (.anchor | has("line") and has("column"))] | all'
 
-body="$work/body_7.json"
+body="$work/body_6.json"
 chk "full: edits add the builtin rule/message columns" jq_true "$body" \
   '[.result.files[].edits[] | (keys | sort) == ["anchor", "length", "message", "offset", "replacement", "rule", "source"]] | all'
 chk "full: rule and message are strings" jq_true "$body" \
@@ -519,7 +540,7 @@ end_face
 
 # --- face: rpc-fix-rejects -----------------------------------------------------
 face rpc-fix-rejects
-body="$work/body_8.json"
+body="$work/body_7.json"
 chk "agentId/context/since answer INVALID_PARAMS (-32602)" jq_eq "$body" '.error.code' -32602
 chk "the rejection names the disk-view rule and the method" jq_true "$body" \
   '.error.message | test("answers the disk view") and test("dartq/fix")'
@@ -528,7 +549,7 @@ end_face
 
 # --- face: rpc-assists ---------------------------------------------------------
 face rpc-assists
-body="$work/body_9.json"
+body="$work/body_8.json"
 chk "the document is exactly {file, schema_version, assists}" jq_true "$body" \
   '(.result | keys | sort) == ["assists", "file", "schema_version"]'
 chk "schema_version is 1" jq_eq "$body" '.result.schema_version' 1
@@ -539,15 +560,10 @@ end_face
 
 # --- face: rpc-assists-rejects -------------------------------------------------
 face rpc-assists-rejects
-body="$work/body_10.json"
+body="$work/body_9.json"
 chk "a session field answers INVALID_PARAMS (-32602)" jq_eq "$body" '.error.code' -32602
 chk "the rejection names the disk-view rule and the method" jq_true "$body" \
   '.error.message | test("answers the disk view") and test("dartq/assists")'
-end_face
-
-# --- face: rpc-shutdown --------------------------------------------------------
-face rpc-shutdown
-chk "shutdown answers without error" jq_true "$work/body_13.json" '.error == null'
 end_face
 
 # --- summary -------------------------------------------------------------------

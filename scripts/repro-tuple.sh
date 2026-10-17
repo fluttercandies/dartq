@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# repro-tuple.sh — emit the PRD §19.5 reproducibility tuple for a dartq run.
+# repro-tuple.sh — emit the reproducibility tuple for a dartq run.
 #
-# What it captures (the environment identity face of §19.5):
+# What it captures:
 #   - git_head:            HEAD commit the working tree is based on
 #   - worktree_patch_sha256: hash over `git diff HEAD` bytes — every staged
 #                          or unstaged change to tracked files, so two runs
@@ -13,7 +13,7 @@
 #   - output_sha256:       hash of the run-output file given via --output
 #
 # Output-face note: crates/dartq-engine/tests/reproducibility.rs already
-# pins §19.5's OUTPUT determinism (byte-identical machine-format lines
+# pins the OUTPUT determinism (byte-identical machine-format lines
 # across repeated in-process runs). This script pins the identity of the
 # ENVIRONMENT those runs happen in, so CI can assert "same tuple ⇒ same
 # output digest" across runs and machines. The per-Context faces of the

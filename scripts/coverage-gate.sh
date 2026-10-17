@@ -17,7 +17,8 @@
 #     pass.
 #
 # == sccache interaction (documented caveat + mitigation) ==
-# .cargo/config.toml wraps every rustc call with sccache (build.rustc-wrapper).
+# The workspace pins no rustc-wrapper; a locally enabled sccache (via the
+# RUSTC_WRAPPER environment variable) wraps every rustc call all the same.
 # Coverage builds inject -C instrument-coverage through RUSTFLAGS; if they
 # flowed through the shared sccache cache, instrumented artifacts would be
 # stored under coverage-shaped keys, and any key-semantics gap between sccache
@@ -70,13 +71,21 @@
 #   coverage.lcov   lcov tracefile (the gate input)
 #   summary.txt     toolchain banner + git identity stamp + the per-crate
 #                   table (LC_ALL=C sort and decimal point — byte-stable)
-#   tuple.json      the §19.5 identity tuple sealed over summary.txt
+#   tuple.json      the identity tuple sealed over summary.txt
 #   html/           browsable report (--html; llvm-cov emits one format per
 #                   run, so --html replaces the lcov pass and evaluates no
 #                   gate)
 #
-# == --stability: the §19.5 two-run reproducibility protocol ==
-# PRD §19.5 pins reproducibility on the full ContextId tuple: identical
+# A judged run (run/report modes) also prints one greppable identity line at
+# the end: `coverage-tuple: mode=... threshold=... enforce=... rustc=...
+# llvm-cov=... total=...` (the machine-readable seal lives in tuple.json;
+# in --report mode the toolchain fields read "unknown" by design).
+#
+# --smoke renames its outputs so a cheap pre-flight can never clobber a full
+# run's record: smoke.lcov, smoke-summary.txt, smoke-tuple.json, smoke-html/.
+#
+# == --stability: the two-run reproducibility protocol ==
+# pins reproducibility on the full ContextId tuple: identical
 # (Source, SDK, PackageGraph, LanguageVersions, Options, Target,
 # ConditionalEnv, EngineVersion) ⇒ identical analysis output. The coverage
 # face of that contract is run-to-run stability of the instrumented suite
@@ -95,7 +104,7 @@
 # any difference = exit 1 with both runs' totals printed. Floors do not
 # apply in this mode (the gate criterion is stability, not thresholds).
 #
-# §19.5 seal: a run-mode summary.txt carries `git_head` and
+# Repro-tuple seal: a run-mode summary.txt carries `git_head` and
 # `worktree_patch_sha256` lines (via scripts/repro-tuple.sh — the single
 # source of the identity computation, so the stamp and tuple.json agree
 # field for field; a clean tree hashes the empty diff). Gate
@@ -105,7 +114,7 @@
 # identity).
 #
 # Usage:
-#   scripts/coverage-gate.sh [--floors FILE | --floor N] [--enforce] [--html] [--dry-run]
+#   scripts/coverage-gate.sh [--smoke] [--floors FILE | --floor N] [--enforce] [--html] [--dry-run]
 #   scripts/coverage-gate.sh --stability [--html] [--dry-run]
 #   scripts/coverage-gate.sh --report FILE [--floors FILE | --floor N] [--enforce]
 #   scripts/coverage-gate.sh --help
@@ -123,7 +132,17 @@
 #                  Default: advisory — below-floor rows are reported on
 #                  stderr, exit stays 0; flip once the measured baseline is
 #                  committed (the floors table header pins the contract).
-#   --stability     the §19.5 two-run protocol: two consecutive llvm-cov
+#   --smoke        fast-subset pre-flight: measure the three fastest
+#                  pure-logic crates (dartq-scanner dartq-ast
+#                  dartq-diagnostics, the tier-A units of the floors table)
+#                  instead of --workspace, under the identical posture
+#                  (sccache bypass, isolated target dir, serial tests). The
+#                  floors gate runs over whatever rows the subset trace
+#                  yields (advisory unless --enforce). Never a floors
+#                  baseline: subset coverage understates integration-heavy
+#                  crates (see coverage-run.sh for the measured-floors
+#                  procedure). Incompatible with --stability and --report.
+#   --stability     the two-run protocol: two consecutive llvm-cov
 #                   passes; pass/fail on the run-to-run stability of the
 #                   TOTAL coverage percentage (identical aggregate
 #                   lines-hit/lines-total = reproducible). Floors do not
@@ -143,6 +162,11 @@
 #                  the trace's producing environment is unknown).
 #   --output FILE  override the lcov destination (default:
 #                  target/coverage/coverage.lcov).
+#
+# Environment: COVERAGE_MIN_LINES=<0-100> acts as --floor when no --floor or
+#               --floors flag is given (explicit flags always win). Applies
+#               to the threshold modes (run/report) only; --html and
+#               --stability ignore it so ambient env cannot perturb them.
 #
 # Exit codes: 0 = gate met (or advisory mode, dry run, help, or a stability
 # run with identical totals); 1 = enforcing gate red (a crate row below its
@@ -176,9 +200,15 @@ TEST_THREADS="1"
 FLOOR_DEFAULT="0.0"
 REPORT_DEFAULT="target/coverage/coverage.lcov"
 HTML_DIR_DEFAULT="target/coverage/html"
+SMOKE_REPORT_DEFAULT="target/coverage/smoke.lcov"
+SMOKE_HTML_DIR_DEFAULT="target/coverage/smoke-html"
 STAB_RUN1="target/coverage/stability-run1.lcov"
 STAB_RUN2="target/coverage/stability-run2.lcov"
 STAB_SUMMARY="target/coverage/stability-summary.txt"
+SUMMARY_NAME="summary.txt"
+TUPLE_NAME="tuple.json"
+SMOKE=0
+SMOKE_PKGS=(dartq-scanner dartq-ast dartq-diagnostics)
 
 usage() {
   sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
@@ -188,7 +218,7 @@ FLOOR="$FLOOR_DEFAULT"
 REPORT="$REPORT_DEFAULT"
 HTML_DIR="$HTML_DIR_DEFAULT"
 FLOORS=""
-MODE="run" # run (lcov + gate) | html (browsable, no gate) | report (re-gate) | stability (two-run §19.5)
+MODE="run" # run (lcov + gate) | html (browsable, no gate) | report (re-gate) | stability (two-run repro-tuple seal)
 DRY_RUN=0
 ENFORCE=0
 FLOOR_EXPLICIT=0
@@ -209,6 +239,10 @@ while [ $# -gt 0 ]; do
     --enforce)
       [ "$MODE" = "run" ] || { echo "coverage-gate: --enforce does not apply to $MODE mode (no floors gate evaluated)" >&2; exit 2; }
       ENFORCE=1; shift ;;
+    --smoke)
+      [ "$MODE" != "stability" ] || { echo "coverage-gate: --smoke cannot be combined with --stability (the protocol measures the full workspace)" >&2; exit 2; }
+      [ "$MODE" != "report" ] || { echo "coverage-gate: --smoke cannot be combined with --report" >&2; exit 2; }
+      SMOKE=1; shift ;;
     --stability)
       if [ "$MODE" = "html" ]; then
         echo "coverage-gate: --stability must precede --html to compose the post-pair html pass (use: --stability --html)" >&2
@@ -249,12 +283,42 @@ if [ "$MODE" = "stability" ]; then
   fi
 fi
 
+# Post-parse smoke coherence (order-independent): --smoke narrows the
+# measured scope, which is meaningless for a re-gate of an existing trace
+# (--report) and would break the full-workspace contract of the stability
+# protocol, whichever way the flags are ordered.
+if [ "$SMOKE" = 1 ] && [ "$MODE" != "run" ] && [ "$MODE" != "html" ]; then
+  echo "coverage-gate: --smoke cannot be combined with --report or --stability" >&2
+  exit 2
+fi
+
 # The thread count actually executed: stability mode pins 1 structurally
 # (its criterion is run-to-run determinism, not throughput); every other
 # mode honors TEST_THREADS.
 RUN_THREADS="$TEST_THREADS"
 if [ "$MODE" = "stability" ]; then
   RUN_THREADS=1
+fi
+
+# Env-provided global floor: COVERAGE_MIN_LINES stands in for --floor when no
+# flag-level policy was given (an explicit --floor/--floors always wins).
+# Threshold modes only — --html and --stability judge or render without
+# floors, so ambient env must not perturb them.
+if { [ "$MODE" = "run" ] || [ "$MODE" = "report" ]; } \
+  && [ "$FLOOR_EXPLICIT" = 0 ] && [ -z "$FLOORS" ] && [ -n "${COVERAGE_MIN_LINES:-}" ]; then
+  FLOOR="$COVERAGE_MIN_LINES"
+  FLOOR_EXPLICIT=1
+fi
+
+# Smoke subset defaults: distinct output names so a cheap pre-flight can
+# never clobber a full run's coverage.lcov / summary.txt / tuple.json record
+# (or the full run's html/ tree). An explicit --output / --html-dir-less
+# default only: user-passed destinations are honored as-is.
+if [ "$SMOKE" = 1 ]; then
+  if [ "$REPORT" = "$REPORT_DEFAULT" ]; then REPORT="$SMOKE_REPORT_DEFAULT"; fi
+  if [ "$HTML_DIR" = "$HTML_DIR_DEFAULT" ]; then HTML_DIR="$SMOKE_HTML_DIR_DEFAULT"; fi
+  SUMMARY_NAME="smoke-summary.txt"
+  TUPLE_NAME="smoke-tuple.json"
 fi
 
 case "$FLOOR" in
@@ -326,11 +390,34 @@ if [ "$MODE" != "report" ]; then
     echo "  also required: rustup component add llvm-tools-preview" >&2
     exit 2
   fi
+  # Same fail-closed posture for the component, probed before — not after —
+  # the instrumented cold rebuild. Matched by family prefix: rustup
+  # generations spell it llvm-tools-preview, llvm-tools-<triple>, or plain
+  # llvm-tools. rustup absent means nothing to probe here (a
+  # differently-managed toolchain): the run itself still fails with the hint
+  # if the tools are truly missing.
+  if command -v rustup >/dev/null 2>&1; then
+    if ! rustup component list --installed 2>/dev/null | grep -q '^llvm-tools'; then
+      echo "coverage-gate: the llvm-tools rustup component is missing; the coverage gate cannot run." >&2
+      echo "  install once: rustup component add llvm-tools-preview" >&2
+      exit 2
+    fi
+  fi
 
   resolve_floors
+  # Measurement scope: the full workspace by default; --smoke narrows to the
+  # fast pure-logic subset (see the --smoke doc in the header). One array,
+  # interpolated verbatim into every cargo command below — the plan line and
+  # the executed command can never disagree.
+  if [ "$SMOKE" = 1 ]; then
+    PKG_SEL=()
+    for p in "${SMOKE_PKGS[@]}"; do PKG_SEL+=(-p "$p"); done
+  else
+    PKG_SEL=(--workspace)
+  fi
   echo "== coverage-gate plan"
   if [ "$MODE" = "stability" ]; then
-    printf '  %-14s %s\n' "mode" "stability — the §19.5 two-run reproducibility protocol"
+    printf '  %-14s %s\n' "mode" "stability — the two-run reproducibility protocol"
     printf '  %-14s %s\n' "gate" "identical aggregate (lines-hit, lines-total) across both runs"
     printf '  %-14s %s\n' "runs" "2 x cargo llvm-cov --workspace --tests (consecutive, same posture)"
     printf '  %-14s %s\n' "outputs" "$STAB_RUN1 , $STAB_RUN2 , $STAB_SUMMARY"
@@ -350,18 +437,21 @@ if [ "$MODE" != "report" ]; then
     fi
     printf '  %-14s %s\n' "gate" "$gate_note"
     printf '  %-14s %s crates: %s\n' "members" "$(printf '%s\n' $members | wc -l | tr -d ' ')" "$(printf '%s ' $members)"
+    if [ "$SMOKE" = 1 ]; then
+      printf '  %-14s %s\n' "scope" "smoke subset: ${SMOKE_PKGS[*]} (not a floors baseline)"
+    fi
     if [ "$MODE" = "html" ]; then
       printf '  %-14s %s\n' "output" "$HTML_DIR/ (browsable; no lcov, no gate)"
-      printf '  %-14s %s\n' "command" "RUSTC_WRAPPER='' cargo llvm-cov --workspace --tests --offline --html --output-dir $HTML_DIR -- --test-threads=$RUN_THREADS"
+      printf '  %-14s %s\n' "command" "RUSTC_WRAPPER='' cargo llvm-cov ${PKG_SEL[*]} --tests --offline --html --output-dir $HTML_DIR -- --test-threads=$RUN_THREADS"
     else
-      printf '  %-14s %s\n' "output" "$REPORT (+ summary.txt alongside)"
-      printf '  %-14s %s\n' "command" "RUSTC_WRAPPER='' cargo llvm-cov --workspace --tests --offline --lcov --output-path $REPORT -- --test-threads=$RUN_THREADS"
+      printf '  %-14s %s\n' "output" "$REPORT (+ $SUMMARY_NAME alongside)"
+      printf '  %-14s %s\n' "command" "RUSTC_WRAPPER='' cargo llvm-cov ${PKG_SEL[*]} --tests --offline --lcov --output-path $REPORT -- --test-threads=$RUN_THREADS"
     fi
   fi
   if [ "$MODE" = "stability" ]; then
-    printf '  %-14s %s\n' "suite" "2 x cargo llvm-cov --workspace --tests (lib + integration tests; benches excluded)"
+    printf '  %-14s %s\n' "suite" "2 x cargo llvm-cov ${PKG_SEL[*]} --tests (lib + integration tests; benches excluded)"
   else
-    printf '  %-14s %s\n' "suite" "cargo llvm-cov --workspace --tests (lib + integration tests; benches excluded)"
+    printf '  %-14s %s\n' "suite" "cargo llvm-cov ${PKG_SEL[*]} --tests (lib + integration tests; benches excluded)"
   fi
   printf '  %-14s %s\n' "threads" "-- --test-threads=$RUN_THREADS (serial, deterministic traces)"
   printf '  %-14s %s\n' "wrapper" "RUSTC_WRAPPER='' for this invocation (sccache bypassed — see header)"
@@ -376,24 +466,24 @@ if [ "$MODE" != "report" ]; then
   # Serial execution: one workspace pass per llvm-cov invocation, test
   # binaries pinned to a single thread via the forwarded arg (see the
   # serial-phase note in the header). RUSTC_WRAPPER="" unsets the
-  # workspace's sccache wrapper for this invocation only (see the sccache
+  # locally enabled sccache wrapper for this invocation only (see the sccache
   # section in the header). --offline assumes a dev host with a warm cargo
   # registry: on a machine with no populated registry the run fails
   # (accepted — serial-phase, dev-host-only tooling).
   rc=0
   if [ "$MODE" = "stability" ]; then
     mkdir -p "$(dirname "$STAB_RUN1")"
-    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --lcov --output-path "$STAB_RUN1" -- --test-threads=$RUN_THREADS || rc=$?
+    RUSTC_WRAPPER="" cargo llvm-cov "${PKG_SEL[@]}" --tests --offline --lcov --output-path "$STAB_RUN1" -- --test-threads=$RUN_THREADS || rc=$?
     if [ "$rc" -eq 0 ]; then
       rc=0
-      RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --lcov --output-path "$STAB_RUN2" -- --test-threads=$RUN_THREADS || rc=$?
+      RUSTC_WRAPPER="" cargo llvm-cov "${PKG_SEL[@]}" --tests --offline --lcov --output-path "$STAB_RUN2" -- --test-threads=$RUN_THREADS || rc=$?
     fi
   elif [ "$MODE" = "html" ]; then
     mkdir -p "$HTML_DIR"
-    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --html --output-dir "$HTML_DIR" -- --test-threads=$RUN_THREADS || rc=$?
+    RUSTC_WRAPPER="" cargo llvm-cov "${PKG_SEL[@]}" --tests --offline --html --output-dir "$HTML_DIR" -- --test-threads=$RUN_THREADS || rc=$?
   else
     mkdir -p "$(dirname "$REPORT")"
-    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --lcov --output-path "$REPORT" -- --test-threads=$RUN_THREADS || rc=$?
+    RUSTC_WRAPPER="" cargo llvm-cov "${PKG_SEL[@]}" --tests --offline --lcov --output-path "$REPORT" -- --test-threads=$RUN_THREADS || rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
     echo "coverage-gate: coverage run FAILED (exit $rc); if the llvm tools are missing: rustup component add llvm-tools-preview" >&2
@@ -402,7 +492,7 @@ if [ "$MODE" != "report" ]; then
   if [ "$MODE" = "stability" ] && [ "$STABILITY_HTML" = 1 ]; then
     # Browsing pass after the pair (llvm-cov emits one format per run).
     mkdir -p "$HTML_DIR"
-    RUSTC_WRAPPER="" cargo llvm-cov --workspace --tests --offline --html --output-dir "$HTML_DIR" -- --test-threads=$RUN_THREADS || {
+    RUSTC_WRAPPER="" cargo llvm-cov "${PKG_SEL[@]}" --tests --offline --html --output-dir "$HTML_DIR" -- --test-threads=$RUN_THREADS || {
       echo "coverage-gate: the html pass FAILED (the stability pair itself is already judged below)" >&2
       exit 2
     }
@@ -410,7 +500,7 @@ if [ "$MODE" != "report" ]; then
 
   banner="$(rustc --version) / $(cargo llvm-cov --version)"
 
-  # §19.5 seal (the repro-tuple identity contract): stamp the run's
+  # Repro-tuple seal (the identity contract): stamp the run's
   # environment identity from repro-tuple.sh — the single source of the
   # identity computation, so the summary stamp and tuple.json agree field
   # for field. A clean tree hashes the empty diff (sha256 of zero bytes),
@@ -457,7 +547,7 @@ pct_of() { # <hit> <total> -> percentage, one decimal
   awk -v h="$1" -v t="$2" 'BEGIN { printf "%.1f", (t > 0) ? h * 100 / t : 100 }'
 }
 
-# --- stability verdict (§19.5 two-run protocol) --------------------------------
+# --- stability verdict --------------------------------
 # The gate criterion is run-to-run stability of the TOTAL coverage
 # percentage, judged integer-exact: both runs' aggregate (lines-hit,
 # lines-total) must be identical. Per-crate churn with equal totals is
@@ -575,12 +665,32 @@ set -e
 
 printf '%s\n' "$TABLE"
 
-# Persist the record next to the tracefile: toolchain banner + §19.5 git
+# One greppable identity line at the end of every judged run (mode,
+# threshold policy, enforcement, toolchain, total) — the quick-grep form of
+# the record; the machine-readable seal lives in $TUPLE_NAME. In --report
+# mode the producing environment is unknown, so the toolchain fields read
+# "unknown".
+total_agg="$(sum_rows "$ROWS")"
+total_pct="$(pct_of "${total_agg%% *}" "${total_agg##* }")"
+if [ "$FLOOR_EXPLICIT" = 1 ]; then
+  threshold_desc="$FLOOR (global override)"
+else
+  threshold_desc="$FLOORS (per-crate table)"
+fi
+if [ -n "$banner" ]; then
+  printf 'coverage-tuple: mode=%s threshold=%s enforce=%d rustc="%s" llvm-cov="%s" total=%s\n' \
+    "$MODE" "$threshold_desc" "$ENFORCE" "${banner%% / *}" "${banner##* / }" "$total_pct"
+else
+  printf 'coverage-tuple: mode=%s threshold=%s enforce=%d rustc=unknown llvm-cov=unknown total=%s\n' \
+    "$MODE" "$threshold_desc" "$ENFORCE" "$total_pct"
+fi
+
+# Persist the record next to the tracefile: toolchain banner + repro-tuple git
 # identity stamp (run mode only — in --report mode the trace's producing
 # environment is unknown, so neither is stamped) + the table. LC_ALL=C row
 # ordering and the pinned decimal point keep this byte-stable run over run:
 # same committed HEAD + same worktree patch + same toolchain ⇒ byte-identical
-# summary.txt (the §19.5 seal contract).
+# summary.
 {
   [ -z "$banner" ] || printf '%s\n' "$banner"
   if [ -n "$GIT_HEAD" ]; then
@@ -589,14 +699,14 @@ printf '%s\n' "$TABLE"
     printf 'test_threads %s\n' "$RUN_THREADS"
   fi
   printf '%s\n' "$TABLE"
-} > "$(dirname "$REPORT")/summary.txt"
+} > "$(dirname "$REPORT")/$SUMMARY_NAME"
 
-# Seal the §19.5 tuple over the summary so the record and its identity ship
+# Seal the tuple over the summary so the record and its identity ship
 # together; the CI assertion (when workflows exist) compares both against
 # the previous baseline.
 if [ -n "$GIT_HEAD" ]; then
-  "$SCRIPT_DIR/repro-tuple.sh" --output "$(dirname "$REPORT")/summary.txt" \
-    > "$(dirname "$REPORT")/tuple.json"
+  "$SCRIPT_DIR/repro-tuple.sh" --output "$(dirname "$REPORT")/$SUMMARY_NAME" \
+    > "$(dirname "$REPORT")/$TUPLE_NAME"
 fi
 
 exit "$GATE_RC"

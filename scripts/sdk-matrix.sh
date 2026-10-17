@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# sdk-matrix.sh — multi-SDK-version differential gate (PRD §19.1/§19.2).
+# sdk-matrix.sh — multi-SDK-version differential gate.
 #
 # Runs the existing gate caliber — the gate-caliber-r5 shape: `harness run`
 # over tests/corpus/m0 + tests/corpus/m0-syntax, ERROR severity, threshold
-# 1.0 (full parity like every differential gate; 2026-10-12 ruling,
-# the full-parity bars ADR), the full syntax-codes
-# TSV — once per supported Dart SDK oracle, then
+# 1.0 — once per supported Dart SDK oracle, scoring each version at the 100%
+# release caliber (ticket #1293; 2026-10-12 ruling, the full-parity bars
+# ADR): a version PASSES only when its diff plane is empty after the
+# known-diffs exemption (tests/corpus/regressions/known-diffs.json — matched
+# entries are EXEMPTED, anything else is unattributed divergence and fails;
+# the raw pre-exemption Jaccard is a TELEMETRY column), then
 # prints a per-version summary (version / Jaccard / verdict) and
 # pre-classifies one-sided (code,file) entries through the version-skew
-# attribution rules (the version-skew ledger §5: the 7 `removedIn` codes
+# attribution rules (the 7 `removedIn` codes
 # and the language-version diagnostic family are version skew; so is the
 # addedIn class — dartq-only entries in a feature family whose rung in
 # scripts/sdk-feature-ladder.txt postdates the oracle's language minor.
@@ -37,7 +40,7 @@
 # development-phase lanes (memory-incident discipline).
 #
 # Matrix set (single source of truth: MATRIX + the vendored anchor below).
-# The PRD §19.1 anchors are fvm 3.29 / 3.35 / 3.38 (Flutter versions; each
+# The anchors are fvm 3.29 / 3.35 / 3.38 (Flutter versions; each
 # bundles a Dart SDK) + the vendored dev SDK source checkout (main
 # 3.15.0-dev). The current gate oracle of record (fvm default → Dart 3.13.1,
 # the gate-caliber-r5 baseline) is included so matrix numbers stay comparable
@@ -79,8 +82,9 @@
 # (see above).
 #
 # Exit codes: 0 every executed gate PASSes and every matrix entry resolved
-# (or --allow-skip accepted the SKIPs); 1 at least one gate FAILed below the
-# threshold; 2 usage or environment error — missing binaries, jq, fvm without
+# (or --allow-skip accepted the SKIPs); 1 at least one gate FAILed on
+# unattributed divergence; 2 usage or environment error — missing binaries,
+# jq, fvm without
 # override, a SKIPped entry without --allow-skip (verdict INCOMPLETE), or an
 # entry whose harness run errored (harness rc >= 2) while none failed the
 # gate (verdict ERRORED). A resolved dart whose version banner contradicts
@@ -88,10 +92,11 @@
 
 set -u -o pipefail
 cd "$(dirname "$0")/.." || exit 2
+. "$(dirname "$0")/lib/diff-score.sh"
 
 # --- matrix definition (single source of truth) ------------------------------
 # "label|fvm version dir under $FVM_HOME/versions ('default' = the fvm default
-# symlink)|expected dart version". The first three entries are the PRD §19.1
+# symlink)|expected dart version". The first three entries are the
 # anchors; dart-3.13 is the oracle of record (gate-caliber-r5).
 MATRIX=(
   "dart-3.7|3.29.3|3.7.2"
@@ -106,13 +111,13 @@ CODES_FILE="crates/dartq-diagnostics/data/syntax-codes.tsv"
 LADDER_FILE="scripts/sdk-feature-ladder.txt"
 EXPECT_FILE="scripts/sdk-matrix-expectations.tsv"
 THRESHOLD="1.0"
+KNOWN_DIFFS="tests/corpus/regressions/known-diffs.json"
 OUT_ROOT="target/evidence/sdk-matrix"
 HARNESS="${HARNESS:-./target/debug/harness}"
 DEFAULT_DARTQ_CMD="./target/debug/dartq check --format=machine"
 DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
 
-# Version-skew diagnostic families (the version-skew ledger §2.2 removedIn
-# codes + §2 language-version family), matched case-insensitively against the
+# Version-skew diagnostic families (the removedIn codes + the language-version family), matched case-insensitively against the
 # one-sided (code,file) entry codes computed from raw-outputs.json — the
 # unfiltered plane. report.json's diff lists are post-codes-filter and can
 # never contain the removedIn codes (they are pruned from the TSV), so the
@@ -376,9 +381,13 @@ if [ "$resolved" -eq 0 ]; then
 fi
 
 # --- run the gate per version ------------------------------------------------
-# Gate caliber = gate-caliber-r5: ERROR severity, threshold 1.0, full syntax
-# codes TSV, m0 + m0-syntax corpora. Harness exit codes: 0 PASS (or SKIPPED
-# verdict), 1 below gate (the report is still written), 2 harness error.
+# Gate caliber = the 100% release caliber (ticket #1293): ERROR severity,
+# raw threshold 1.0 (telemetry), full syntax codes TSV, m0 + m0-syntax
+# corpora. Harness exit codes: 0 the RAW Jaccard met the threshold, 1 below
+# it (the report is still written either way), 2 harness error. The harness
+# verdict is exemption-blind, so rc 1 is NOT the gate verdict: the 100%
+# scoring below classifies each report's diff plane against the known-diffs
+# ledger and fails the version only on unattributed divergence.
 results=()
 skips=0
 for item in "${plan[@]}"; do
@@ -393,30 +402,54 @@ EOF
   outdir="$OUT_ROOT/$label"
   echo
   echo "== [$label] oracle $dart_bin"
+  if [ -e "$outdir" ]; then
+    echo "sdk-matrix: $outdir already exists — refusing to overwrite recorded gate evidence (remove it consciously or point OUT_ROOT elsewhere)" >&2
+    exit 2
+  fi
   mkdir -p "$outdir"
   corpus_args=()
   for c in "${CORPORA[@]}"; do
     corpus_args+=(--corpus-dir "$c")
   done
-  if "$HARNESS" run \
+  rc=0
+  "$HARNESS" run \
     "${corpus_args[@]}" \
     --oracle-dart "$dart_bin" \
     --dartq-cmd "$DARTQ_CMD" \
     --severity-filter ERROR \
     --threshold "$THRESHOLD" \
     --codes-file "$CODES_FILE" \
-    --out "$outdir"; then
-    echo "-- [$label] gate PASSED; report: $outdir/report.json"
+    --out "$outdir" || rc=$?
+  if [ "$rc" -ge 2 ]; then
+    echo "-- [$label] gate ERRORED (harness exit $rc, harness-own failure); report may be absent: $outdir/report.json"
+    # A harness error before the report write would leave a previous run's
+    # report.json/raw-outputs.json pair in place — drop it so the summary
+    # loop cannot score the stale pair as this version's evidence.
+    rm -f "$outdir/report.json" "$outdir/raw-outputs.json"
+    results+=("$label|ERROR|-|$outdir/report.json")
+    continue
+  fi
+  if [ "$rc" -eq 0 ]; then
+    echo "-- [$label] raw bar met (zero diffs); report: $outdir/report.json"
+  else
+    echo "-- [$label] below the raw bar (harness exit 1); scoring the known-diffs exemption from the report"
+  fi
+  classification="$(diff_gate_classify "$outdir/report.json" "$KNOWN_DIFFS")"
+  if [ -z "$classification" ]; then
+    echo "-- [$label] cannot classify $outdir/report.json against $KNOWN_DIFFS (report unreadable or the known-diffs table malformed)" >&2
+    results+=("$label|ERROR|-|$outdir/report.json")
+    continue
+  fi
+  IFS="$(printf '\t')" read -r _ exempted unattributed <<EOF
+$(printf '%s\n' "$classification" | awk -F'\t' '$1 == "SUMMARY" {print; exit}')
+EOF
+  if [ "$unattributed" -eq 0 ]; then
+    echo "-- [$label] gate PASSED the 100% caliber ($exempted exempted via the known-diffs ledger); report: $outdir/report.json"
     results+=("$label|PASS|-|$outdir/report.json")
   else
-    rc=$?
-    if [ "$rc" -eq 1 ]; then
-      echo "-- [$label] gate FAILED below the threshold (harness exit 1); report: $outdir/report.json"
-      results+=("$label|FAIL|-|$outdir/report.json")
-    else
-      echo "-- [$label] gate ERRORED (harness exit $rc, harness-own failure); report may be absent: $outdir/report.json"
-      results+=("$label|ERROR|-|$outdir/report.json")
-    fi
+    echo "-- [$label] gate FAILED the 100% caliber ($unattributed unattributed divergence entries):"
+    printf '%s\n' "$classification" | awk -F'\t' '$1 == "UNATTRIBUTED" { printf "    %-12s %s %s\n", $2, $3, $4 }'
+    results+=("$label|FAIL|-|$outdir/report.json")
   fi
 done
 
@@ -494,7 +527,7 @@ echo "'<removedIn-skew>/<addedIn>/<total>' — one-sided (code,file) entries"
 echo "computed from raw-outputs.json (all severities, unfiltered), so codes"
 echo "outside the gate's codes-file set — e.g. the removedIn codes pruned"
 echo "from the TSV — are still classified. removedIn codes + language-version"
-echo "family = version skew (the version-skew ledger §5 rule 3); dartq-only"
+echo "family = version skew; dartq-only"
 echo "entries in a feature family whose rung in scripts/sdk-feature-ladder.txt"
 echo "postdates the oracle's language minor = addedIn skew (the oracle cannot"
 echo "emit them); the remaining one-sided entries are real-defect candidates —"
@@ -503,16 +536,16 @@ echo "no automatic fixing. Per-version clamp expectations:"
 echo "scripts/sdk-matrix-expectations.tsv (UNKNOWN-until-probed rows are"
 echo "filled by the serial probe phase)."
 if [ "$any_fail" = 1 ]; then
-  echo "sdk-matrix: VERDICT FAIL (at least one version below the gate)"
+  echo "sdk-matrix: VERDICT FAIL (at least one version carries unattributed divergence — the 100% caliber)"
   exit 1
 fi
 if [ "$any_error" = 1 ]; then
-  echo "sdk-matrix: VERDICT ERRORED (harness/environment error on at least one entry, none below the gate)"
+  echo "sdk-matrix: VERDICT ERRORED (harness/environment error on at least one entry, none failing the 100% caliber)"
   exit 2
 fi
 if [ "$skips" -gt 0 ] && [ "$allow_skip" -eq 0 ]; then
   echo "sdk-matrix: VERDICT INCOMPLETE ($skips entry/skipped; rerun with --allow-skip to accept the coverage gap)"
   exit 2
 fi
-echo "sdk-matrix: VERDICT PASS (all resolved versions meet the gate)"
+echo "sdk-matrix: VERDICT PASS (all resolved versions meet the 100% caliber: every diff entry matched or exempted)"
 exit 0

@@ -50,9 +50,9 @@ Every number in this file is a static count; no test bodies are executed.
 | dartq-parser | 535 | grammar coverage (literals, collections, records, patterns, types, members, statements, formal params, metadata), error recovery paths, feature gating (`features.rs`), cursor/listener event shapes |
 | dartq-lints | 473 | registry pins (integration `tests/registry_pin.rs`, 12: unique rule names, official-set membership, core/recommended disjointness, pinned registry count, code-string freeze, message-template well-formedness); per-rule behavior suites in the 12 rule modules under `src/rules/` (names, declarations, expressions, collections, types, strings, docs, directives, pubspec, regexp, empty, flow) plus engine/bridge/comments/ignore machinery |
 | dartq-semantic | 388 | element resolution: bare names, containers, member rows, receiver rows, symbol interning; M3 diagnostic-code pin (integration `tests/m3_codes_pin.rs`) |
-| dartq-engine | 189 | discovery, pipeline, incremental edit chains (`tests/incremental.rs`, `incremental_oracle.rs`), §19.4/§19.5 byte-identity pins (`tests/reproducibility.rs`: repeated-run, cross-round, and incremental==full-recompute byte equality; engine version-key stability), memory accounting (`tests/memory_accounting.rs`) |
+| dartq-engine | 189 | discovery, pipeline, incremental edit chains (`tests/incremental.rs`, `incremental_oracle.rs`), byte-identity pins (`tests/reproducibility.rs`: repeated-run, cross-round, and incremental==full-recompute byte equality; engine version-key stability), memory accounting (`tests/memory_accounting.rs`) |
 | dartq-flow | 152 | flow analysis over parser events: reachability/dead-code span composition (returns, `if`/`else`, switch members, loop bodies, short-circuit operand rows), definite assignment incl. `late` (zero-iteration loops, `break`/`continue` edges), type promotion/demotion chains; record layer label-id stability and type-token base classification (`src/tests.rs` 150, `src/record.rs` 2) |
-| dartq-daemon | 151 | LSP shell: lifecycle smoke, overlay sessions (`tests/overlay_session.rs`), RPC command/query faces (`tests/rpc_commands.rs`, `rpc_query_batch.rs`, `rpc_query_kinds.rs`), schema conformance (`tests/rpc_schema.rs`), multi-agent read pool (`tests/seven_agents.rs`); plugin RPC (`src/plugins.rs`) |
+| dartq-daemon | 200 | dartq-RPC daemon: no-lifecycle session smoke (`tests/rpc_smoke.rs`), overlay sessions (`tests/overlay_session.rs`), RPC command/query/resolveAt/completion faces (`tests/rpc_commands.rs`, `rpc_query_batch.rs`, `rpc_query_kinds.rs`), schema conformance (`tests/rpc_schema.rs`), multi-agent read pool (`tests/seven_agents.rs`), yaml context routing (`tests/dartq_yaml_contexts.rs`), scenario script (`tests/rpc_scenario.rs`); session runtime + plugin discovery/weave (`src/session.rs`, `src/plugins.rs`) |
 | dartq-types | 136 | subtype relation pairs, nullability merges (`T?` edges), LUB, hierarchy checks, function subtyping, structural type interning canonicality (integration suites under `tests/`) |
 | dartq-scanner | 119 | tokenization state machine: numbers (int/hex/dot runs), keywords, lexeme slicing; golden corpus pinned via `tests/corpus/scanner-goldens/manifest.json`; scanner diagnostic surface |
 | dartq-pub | 113 | package_config / pubspec.lock consumption: version scanning (`scan_bare_version`, comparison ops), number parsing, config parsing |
@@ -90,11 +90,11 @@ the Rust gate as the workspace's only non-Cargo member (see Summary).
   is byte-audited by blake3 (`dartq-diagnostics/tests/syntax_codes_tsv.rs`)
   and the gate file is re-derived and count-pinned in the harness
   (`tests/harness/src/main.rs`, `gate_codes_file_matches_authoritative_tsv`).
-- **§19.5 output determinism**: `dartq-engine/tests/reproducibility.rs` pins
+- **Output determinism**: `dartq-engine/tests/reproducibility.rs` pins
   byte-identical machine-format output across repeated runs, cross-round
   process state, and an incremental-vs-full-recompute chain.
 - **Environment tuple**: `scripts/repro-tuple.sh` seals git HEAD + worktree
-  patch hash + toolchain versions (+ optional run-output digest) per §19.5;
+  patch hash + toolchain versions (+ optional run-output digest);
   `scripts/coverage-gate.sh` enforces measured coverage against the floor.
 
 ## Maintenance rule

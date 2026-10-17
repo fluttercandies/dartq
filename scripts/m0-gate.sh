@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# m0-gate.sh — the M0 syntax + union differential gates (PRD section 20.3, M0 row).
+# m0-gate.sh — the M0 syntax + union differential gates.
 #
 # Two harness runs against a single oracle of record, the fvm default install:
 #
@@ -18,10 +18,14 @@
 #   diagnoser mounted). The check face can never match the oracle's
 #   semantic rows, so a union-caliber run requires the analyze face.
 #
-#   Both bars are 1.0 — full parity (2026-10-12 ruling,
-#   the full-parity bars ADR; supersedes the PRD
-#   section 20.3 numeric bars). Residuals pass only via individually
-#   adjudicated pinned exemptions, never a numeric budget.
+#   Both bars are the 100% release caliber (ticket #1293; 2026-10-12 ruling,
+#   the full-parity bars ADR; supersedes the earlier numeric bars):
+#   each caliber passes only when its diff plane is empty after the
+#   known-diffs exemption — every entry is either matched by
+#   tests/corpus/regressions/known-diffs.json (the adjudicated burn-down
+#   ledger, reported as EXEMPTED) or it is unattributed divergence and fails
+#   the gate. There is no numeric pass bar; the raw (pre-exemption) Jaccard
+#   is a TELEMETRY row.
 #
 # Neither run passes --type-filter: the M0 gates are code-scoped, never
 # type-scoped.
@@ -49,21 +53,27 @@
 #                   recorded evidence. M0_LABEL env is accepted too.
 #
 # Environment overrides: FVM_HOME (default ~/fvm; the oracle version banner
-# is echoed on the run path), DARTQ_CMD (run A's dartq side, the check face;
+# is enforced on the run path — a mismatch is FATAL; DARTQ_ORACLE_VERSION
+# re-pins the expectation, DARTQ_ORACLE_VERSION_CHECK=off accepts a
+# deliberate off-caliber oracle as a warning), DARTQ_CMD (run A's dartq
+# side, the check face;
 # default `./target/release/dartq check --format=machine` — the recorded M0
 # shape), DARTQ_ANALYZE_CMD (run B's dartq side, the analyze face; default
 # `./target/release/dartq analyze --format=machine --sdk <fvm default
 # dart-sdk>` — the m1-gate shape against the release binary).
 #
-# Exit codes: 0 both calibers met their bars; 1 either caliber below its
-# bar; 2 usage or environment error (missing binaries, corpora not pub-get,
-# jq missing, label missing, an existing report directory, union drift off
-# the pinned 290), or the harness's own error tier (vacuity guard, dartq
-# crash, corpus preflight failure) — the latter is never scored as a
-# Jaccard result.
+# Exit codes: 0 both calibers met the 100% caliber (diff planes empty after
+# the known-diffs exemption); 1 either caliber carries unattributed
+# divergence; 2 usage or environment error (missing binaries, corpora not
+# pub-get, jq missing, label missing, an existing report directory, union
+# drift off the pinned 290, oracle version mismatch, malformed known-diffs
+# table), or the harness's own error tier
+# (vacuity guard, dartq crash, corpus preflight failure) — the latter is
+# never scored as a Jaccard result.
 
 set -u -o pipefail
 cd "$(dirname "$0")/.." || exit 2
+. "$(dirname "$0")/lib/diff-score.sh"
 
 CORPUS_M0="tests/corpus/m0"
 CORPUS_SYNTAX="tests/corpus/m0-syntax"
@@ -73,6 +83,8 @@ UNION_CODES="target/gate/union-codes.txt"
 EXPECTED_UNION_COUNT="290" # 255 (syntax) + 36 (M1) - 1 overlap
 SYNTAX_THRESHOLD="1.0"
 UNION_THRESHOLD="1.0"
+KNOWN_DIFFS="tests/corpus/regressions/known-diffs.json"
+EXPECTED_VERSION="${DARTQ_ORACLE_VERSION:-3.13.1}"
 OUT_ROOT="target/evidence/gate-m0"
 HARNESS="./target/release/harness"
 PERSIST_DIR="tests/corpus/regressions/cases"
@@ -182,8 +194,8 @@ done
 # --- plan --------------------------------------------------------------------
 echo "== m0-gate plan"
 printf '  %-16s %s + %s\n' "corpora" "$CORPUS_M0" "$CORPUS_SYNTAX"
-printf '  %-16s %s (ERROR tier, bar %s)\n' "run A codes" "$SYNTAX_CODES" "$SYNTAX_THRESHOLD"
-printf '  %-16s %s codes = 255 + 36 - 1 overlap (ERROR tier, bar %s)\n' "run B codes" "$union_count" "$UNION_THRESHOLD"
+printf '  %-16s %s (ERROR tier, raw threshold %s — telemetry; the gate is the 100% caliber)\n' "run A codes" "$SYNTAX_CODES" "$SYNTAX_THRESHOLD"
+printf '  %-16s %s codes = 255 + 36 - 1 overlap (ERROR tier, raw threshold %s — telemetry)\n' "run B codes" "$union_count" "$UNION_THRESHOLD"
 printf '  %-16s %s\n' "union file" "$UNION_CODES"
 printf '  %-16s %s\n' "oracle" "$dart_bin"
 printf '  %-16s %s\n' "dartq run A" "$CHECK_CMD"
@@ -220,8 +232,23 @@ fi
 # no verdict is scored). The SKIPPED verdict cannot occur: ERROR is always
 # in scope.
 
-# Oracle version banner (run path only; --dry-run executes nothing).
-echo "== oracle banner: $("$dart_bin" --version 2>&1)"
+# Oracle version gate (run path only; --dry-run executes nothing). M0
+# semantics are pinned to the same 3.13.1 caliber as the other differential
+# gates — a different oracle can legitimately emit a different code set, so
+# a mismatch is FATAL. Escapes: DARTQ_ORACLE_VERSION re-pins the
+# expectation, DARTQ_ORACLE_VERSION_CHECK=off accepts a deliberate
+# off-caliber oracle as a warning record.
+banner="$("$dart_bin" --version 2>&1)"
+found="$(printf '%s\n' "$banner" | sed -nE 's/^Dart SDK version: ([^ ]+).*/\1/p')"
+if [ "$found" != "$EXPECTED_VERSION" ]; then
+  if [ "${DARTQ_ORACLE_VERSION_CHECK:-}" = "off" ]; then
+    echo "m0-gate: WARN dart $EXPECTED_VERSION mismatch accepted (DARTQ_ORACLE_VERSION_CHECK=off), found '${found:-unrecognized banner}'"
+  else
+    echo "m0-gate: FATAL expected dart $EXPECTED_VERSION, found '${found:-unrecognized banner}' — gate semantics are version-pinned; install the fvm default pin or point FVM_HOME at it, set DARTQ_ORACLE_VERSION to the oracle's version, or set DARTQ_ORACLE_VERSION_CHECK=off to accept a deliberate off-caliber oracle" >&2
+    exit 2
+  fi
+fi
+echo "== oracle banner: $banner"
 
 mkdir -p "$(dirname "$UNION_CODES")"
 compose_union >"$UNION_CODES"
@@ -237,25 +264,28 @@ run_gate() { # <threshold> <codes-file> <outdir> <dartq-cmd> <title>
     --severity-filter ERROR
     --threshold "$1"
     --codes-file "$2"
-    # Divergences land in tests/corpus/regressions/cases, exempted via tests/corpus/regressions/known-diffs.json (PRD §19.1).
+ # Divergences land in tests/corpus/regressions/cases, exempted via known-diffs.json.
     --persist-regressions "$PERSIST_DIR"
     --out "$3"
   )
   echo
-  echo "== [$label] m0 gate: $5 (bar $1)"
+  echo "== [$label] m0 gate: $5 (100% caliber, ticket #1293)"
   # Capture the harness exit status at invocation: `if harness; then ... fi`
   # without an `else` exits 0 when the condition fails (the if statement's own
   # status), so a scored FAIL (exit 1) would be misread as 0 here.
   rc=0
   "$HARNESS" "${run_args[@]}" || rc=$?
-  if [ "$rc" -eq 0 ]; then
-    echo "-- [$label] $5 PASSED the bar; report: $3/report.json"
-  elif [ "$rc" -eq 1 ]; then
-    verdict=FAIL
-    echo "-- [$label] $5 FAILED below the bar (harness exit 1); report: $3/report.json"
-  else
+  if [ "$rc" -ge 2 ]; then
     echo "-- [$label] $5 ERRORED (harness exit $rc, harness-own failure; no verdict scored)" >&2
     exit 2
+  fi
+  # rc 1 = below the RAW (pre-exemption) threshold — the harness verdict is
+  # exemption-blind, so it is not the gate verdict; the 100% scoring below
+  # decides. rc 0 means zero diffs at all (trivially fully attributed).
+  if [ "$rc" -eq 0 ]; then
+    echo "-- [$label] $5 raw bar met (zero diffs); report: $3/report.json"
+  else
+    echo "-- [$label] $5 below the raw bar (harness exit 1); scoring the known-diffs exemption from the report"
   fi
 }
 
@@ -263,7 +293,7 @@ run_gate "$SYNTAX_THRESHOLD" "$SYNTAX_CODES" "$outdir_syntax" "$CHECK_CMD" "run 
 run_gate "$UNION_THRESHOLD" "$UNION_CODES" "$outdir_union" "$ANALYZE_CMD" "run B (union caliber, $union_count codes, analyze face)"
 
 # --- summary -----------------------------------------------------------------
-summarize() { # <report-dir> <bar>
+score_caliber() { # <report-dir> <title> — prints telemetry rows, sets globals
   row="$(jq -r '
     [ (.error_jaccard * 1000 | round / 1000 | tostring),
       (.oracle_total | tostring),
@@ -278,22 +308,38 @@ summarize() { # <report-dir> <bar>
   IFS="$(printf '\t')" read -r jac ototal dtotal oonly donly <<EOF
 $row
 EOF
-  printf '  %-16s %s (bar %s)\n' "error_jaccard" "$jac" "$2"
+  classification="$(diff_gate_classify "$1/report.json" "$KNOWN_DIFFS")"
+  if [ -z "$classification" ]; then
+    echo "m0-gate: cannot classify $1/report.json against $KNOWN_DIFFS (report unreadable or the known-diffs table malformed)" >&2
+    exit 2
+  fi
+  IFS="$(printf '\t')" read -r _ exempted unattributed <<EOF
+$(printf '%s\n' "$classification" | awk -F'\t' '$1 == "SUMMARY" {print; exit}')
+EOF
+  printf '  %-16s %s (TELEMETRY: raw, pre-exemption — never a gate)\n' "error_jaccard" "$jac"
   printf '  %-16s %s oracle | %s dartq (post-filter instances)\n' "diags" "$ototal" "$dtotal"
   printf '  %-16s %s oracle-only, %s dartq-only entries (attribution: report.json)\n' "diffs" "$oonly" "$donly"
+  printf '  %-16s %s matched by the known-diffs ledger (the burn-down mechanism)\n' "exempted" "$exempted"
+  printf '  %-16s %s (gate caliber: 0 — any unattributed divergence fails)\n' "unattributed" "$unattributed"
+  if [ "$unattributed" -gt 0 ]; then
+    printf '%s\n' "$classification" | awk -F'\t' '$1 == "UNATTRIBUTED" { printf "    %-12s %s %s\n", $2, $3, $4 }'
+  fi
   printf '  %-16s %s\n' "report" "$1/report.json"
+  if [ "$unattributed" -ne 0 ]; then
+    verdict=FAIL
+  fi
 }
 
 echo
 echo "== m0-gate summary [$label]"
 echo "  -- run A: syntax caliber"
-summarize "$outdir_syntax" "$SYNTAX_THRESHOLD"
+score_caliber "$outdir_syntax" "run A"
 echo "  -- run B: union caliber ($union_count codes)"
-summarize "$outdir_union" "$UNION_THRESHOLD"
+score_caliber "$outdir_union" "run B"
 
 if [ "$verdict" = "PASS" ]; then
-  echo "m0-gate: VERDICT PASS (both calibers meet their bars: $SYNTAX_THRESHOLD syntax, $UNION_THRESHOLD union)"
+  echo "m0-gate: VERDICT PASS (100% caliber on both calibers: every diff entry matched or exempted)"
   exit 0
 fi
-echo "m0-gate: VERDICT FAIL (a caliber is below its bar; see the summary above)"
+echo "m0-gate: VERDICT FAIL (unattributed divergence — fix, or attribute in $KNOWN_DIFFS with a reason; the gate never passes on a numeric bar)"
 exit 1

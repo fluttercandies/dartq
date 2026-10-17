@@ -4,8 +4,12 @@
 #
 # Runs the harness once over tests/corpus/sem2 with the frozen semantic
 # wave-2 code universe (tests/harness/sem2_codes.txt), ERROR severity,
-# threshold 1.0 — the full-parity bar, same caliber as every differential
-# gate — against the single oracle of record: the fvm default install
+# threshold 1.0 — the 100% release caliber (ticket #1293), same gate shape as
+# every differential gate: it passes only when the ERROR-tier diff plane is
+# empty after the known-diffs exemption (tests/corpus/regressions/
+# known-diffs.json — matched entries are EXEMPTED, anything else is
+# unattributed divergence and fails; the raw pre-exemption Jaccard is a
+# TELEMETRY row). Oracle of record: the fvm default install
 # (Dart 3.13.1). The tier's derivation pin
 # (sem2_codes_file_matches_derivation, tests/harness/src/main.rs) keeps the
 # codes file equal to its live derivation from the regression nails, so the
@@ -36,25 +40,30 @@
 #   tests/corpus/regressions/known-diffs.json).
 #
 # Environment overrides: FVM_HOME (default ~/fvm; the default install must
-# exist — its Dart version banner is checked on the run path, a mismatch is
-# a WARN, not fatal), DARTQ_CMD (the dartq side of the harness; default
+# exist — its Dart version banner is checked on the run path and a mismatch
+# is FATAL; DARTQ_ORACLE_VERSION re-pins the expectation,
+# DARTQ_ORACLE_VERSION_CHECK=off accepts a deliberate off-caliber oracle as
+# a warning), DARTQ_CMD (the dartq side of the harness; default
 # `./target/debug/dartq analyze --format=machine --sdk <fvm default
 # dart-sdk>`), DARTQ_HARNESS_ORACLE_TIMEOUT_MS (forwarded to the harness
 # drivers).
 #
-# Exit codes: 0 gate met (ERROR-tier Jaccard >= 1.0); 1 below the bar;
+# Exit codes: 0 gate met (ERROR-tier diff plane empty after the known-diffs
+# exemption — set equality, ticket #1293); 1 unattributed divergence;
 # 2 usage or environment error — missing binaries, fvm default missing, jq
-# missing, unreadable report — and the harness's own error tier (exit 2:
-# violated vacuity guard, dartq crash, corpus preflight failure), which is
-# never scored as a Jaccard result.
+# missing, unreadable report, malformed known-diffs table — and the harness's
+# own error tier (exit 2: violated vacuity guard, dartq crash, corpus
+# preflight failure), which is never scored as a Jaccard result.
 
 set -u -o pipefail
 cd "$(dirname "$0")/.." || exit 2
+. "$(dirname "$0")/lib/diff-score.sh"
 
 CORPUS="tests/corpus/sem2"
 CODES_FILE="tests/harness/sem2_codes.txt"
 THRESHOLD="1.0"
-EXPECTED_VERSION="3.13.1"
+KNOWN_DIFFS="tests/corpus/regressions/known-diffs.json"
+EXPECTED_VERSION="${DARTQ_ORACLE_VERSION:-3.13.1}"
 OUT_ROOT="target/evidence/gate-sem2"
 HARNESS="./target/debug/harness"
 DEFAULT_LABEL="sem2-r1"
@@ -150,7 +159,7 @@ if [ -e "$outdir" ]; then
 fi
 echo "== sem2-gate plan"
 printf '  %-16s %s\n' "corpus" "$CORPUS"
-printf '  %-16s %s (ERROR tier, bar %s)\n' "codes" "$CODES_FILE" "$THRESHOLD"
+printf '  %-16s %s (ERROR tier, raw threshold %s — telemetry; the gate is the 100% caliber)\n' "codes" "$CODES_FILE" "$THRESHOLD"
 printf '  %-16s %s\n' "oracle" "$dart_bin"
 printf '  %-16s %s\n' "dartq" "$DARTQ_CMD"
 printf '  %-16s %s\n' "report" "$outdir"
@@ -161,17 +170,29 @@ if [ "$dry_run" = 1 ]; then
   exit 0
 fi
 
-# Oracle version banner (run path only; the report meta records the real
-# banner either way).
+# Oracle version gate (run path only; the report meta records the real
+# banner either way). Sem-wave-2 semantics are pinned to the 3.13.1 caliber
+# — a different oracle can legitimately emit a different code set, so a
+# mismatch is FATAL. Escapes: DARTQ_ORACLE_VERSION re-pins the expectation,
+# DARTQ_ORACLE_VERSION_CHECK=off accepts a deliberate off-caliber oracle as
+# a warning record.
 found="$("$dart_bin" --version 2>&1 | sed -nE 's/^Dart SDK version: ([^ ]+).*/\1/p')"
 if [ "$found" != "$EXPECTED_VERSION" ]; then
-  echo "sem2-gate: WARN expected dart $EXPECTED_VERSION, found '${found:-unrecognized banner}'"
+  if [ "${DARTQ_ORACLE_VERSION_CHECK:-}" = "off" ]; then
+    echo "sem2-gate: WARN dart $EXPECTED_VERSION mismatch accepted (DARTQ_ORACLE_VERSION_CHECK=off), found '${found:-unrecognized banner}'"
+  else
+    echo "sem2-gate: FATAL expected dart $EXPECTED_VERSION, found '${found:-unrecognized banner}' — gate semantics are version-pinned; install the fvm default pin or point FVM_HOME at it, set DARTQ_ORACLE_VERSION to the oracle's version, or set DARTQ_ORACLE_VERSION_CHECK=off to accept a deliberate off-caliber oracle" >&2
+    exit 2
+  fi
 fi
 
 # --- run the gate ------------------------------------------------------------
-# Harness exit codes: 0 PASS, 1 below threshold (the report is still
-# written), 2 harness error (vacuity guard, dartq crash, corpus preflight —
-# no verdict is scored).
+# Harness exit codes: 0 the RAW (pre-exemption) ERROR Jaccard met the
+# threshold, 1 below it (the report is still written either way), 2 harness
+# error (vacuity guard, dartq crash, corpus preflight — no verdict scored).
+# The harness verdict is exemption-blind, so rc 1 is NOT the gate verdict:
+# the 100% scoring below classifies every diff entry against the known-diffs
+# ledger and fails only on unattributed divergence.
 run_args=(
   run
   --corpus-dir "$CORPUS"
@@ -180,7 +201,7 @@ run_args=(
   --severity-filter ERROR
   --threshold "$THRESHOLD"
   --codes-file "$CODES_FILE"
-  # Divergences land in tests/corpus/regressions/cases, exempted via tests/corpus/regressions/known-diffs.json.
+  # Divergences land in tests/corpus/regressions/cases, exempted via known-diffs.json.
   --persist-regressions tests/corpus/regressions/cases
   --out "$outdir"
 )
@@ -191,18 +212,16 @@ fi
 echo
 echo "== [$label] sem2 gate"
 mkdir -p "$outdir"
-verdict=PASS
-if "$HARNESS" "${run_args[@]}"; then
-  echo "-- [$label] gate PASSED the bar; report: $outdir/report.json"
+rc=0
+"$HARNESS" "${run_args[@]}" || rc=$?
+if [ "$rc" -ge 2 ]; then
+  echo "-- [$label] gate ERRORED (harness exit $rc, harness-own failure; no verdict scored)" >&2
+  exit 2
+fi
+if [ "$rc" -eq 0 ]; then
+  echo "-- [$label] raw bar met (zero diffs); report: $outdir/report.json"
 else
-  rc=$?
-  if [ "$rc" -eq 1 ]; then
-    verdict=FAIL
-    echo "-- [$label] gate FAILED below the bar (harness exit 1); report: $outdir/report.json"
-  else
-    echo "-- [$label] gate ERRORED (harness exit $rc, harness-own failure; no verdict scored)" >&2
-    exit 2
-  fi
+  echo "-- [$label] below the raw bar (harness exit 1); scoring the known-diffs exemption from the report"
 fi
 
 # --- summary -----------------------------------------------------------------
@@ -220,16 +239,32 @@ fi
 IFS="$(printf '\t')" read -r jac ototal dtotal oonly donly <<EOF
 $row
 EOF
+
+# 100% scoring (ticket #1293): classify every flat diff entry against the
+# known-diffs ledger. Empty output = unreadable report or malformed table.
+classification="$(diff_gate_classify "$outdir/report.json" "$KNOWN_DIFFS")"
+if [ -z "$classification" ]; then
+  echo "sem2-gate: cannot classify $outdir/report.json against $KNOWN_DIFFS (report unreadable or the known-diffs table malformed)" >&2
+  exit 2
+fi
+IFS="$(printf '\t')" read -r _ exempted unattributed <<EOF
+$(printf '%s\n' "$classification" | awk -F'\t' '$1 == "SUMMARY" {print; exit}')
+EOF
 echo
 echo "== sem2-gate summary"
 printf '  %-16s %s\n' "label" "$label"
-printf '  %-16s %s (bar %s)\n' "error_jaccard" "$jac" "$THRESHOLD"
+printf '  %-16s %s (TELEMETRY: raw, pre-exemption — never a gate)\n' "error_jaccard" "$jac"
 printf '  %-16s %s oracle | %s dartq (post-filter instances)\n' "diags" "$ototal" "$dtotal"
 printf '  %-16s %s oracle-only, %s dartq-only entries (attribution: report.json)\n' "diffs" "$oonly" "$donly"
+printf '  %-16s %s matched by the known-diffs ledger (the burn-down mechanism)\n' "exempted" "$exempted"
+printf '  %-16s %s (gate caliber: 0 — any unattributed divergence fails)\n' "unattributed" "$unattributed"
+if [ "$unattributed" -gt 0 ]; then
+  printf '%s\n' "$classification" | awk -F'\t' '$1 == "UNATTRIBUTED" { printf "    %-12s %s %s\n", $2, $3, $4 }'
+fi
 printf '  %-16s %s\n' "report" "$outdir/report.json"
-if [ "$verdict" = "PASS" ]; then
-  echo "sem2-gate: VERDICT PASS (ERROR-tier Jaccard meets the $THRESHOLD bar)"
+if [ "$unattributed" -eq 0 ]; then
+  echo "sem2-gate: VERDICT PASS (100% caliber: every ERROR-tier diff entry is matched or exempted)"
   exit 0
 fi
-echo "sem2-gate: VERDICT FAIL (below the $THRESHOLD bar)"
+echo "sem2-gate: VERDICT FAIL ($unattributed unattributed divergence entries — fix, or attribute in $KNOWN_DIFFS with a reason; the gate never passes on a numeric bar)"
 exit 1

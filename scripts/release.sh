@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# release.sh — the one-shot v1.0.0 release harness (goal #892).
+# release.sh — the one-shot release harness.
 #
-# Orchestrates the adjudicated 0.1.0 release gate set (#622: the #881 gate
-# chain + the D1-D5 rulings from the release-prep rulings):
+# Orchestrates the release gate set (the adjudicated full-parity bars and
+# release rulings):
 #   M0/M1 differential at full parity (bar 1.0 per the 2026-10-12 ADR,
-#   the full-parity bars ADR, which superseded the
-#   PRD-era 0.99/0.95 numbers), calibration pins green, lints/m2/m3 green,
+#   the full-parity bars ADR, which superseded the earlier
+#   0.99/0.95 numbers), calibration pins green, lints/m2/m3 green,
 #   ci.sh green,
-#   repro-gate sealed, bench five-axis evidence persisted, CHANGELOG 0.1.0
-#   section present, legacy-name gate clean, clean tree -> annotated tag ->
+#   repro-gate sealed, bench five-axis evidence persisted, the release
+#   version's CHANGELOG section present, legacy-name gate clean, clean
+#   tree -> annotated tag ->
 #   push. Tag + binary distribution; crates.io publish deferred (D1).
 #
 # Phases (each a function; run one with --phase NAME or a bare NAME; the
@@ -18,24 +19,28 @@
 #   preflight  clean tracked tree (refuses otherwise), HEAD on main,
 #              legacy-name gate (tracked content must not mention the old
 #              product name), Cargo.lock consistency probe, required tools
-#              (toolchain pin match, sha256 tool, jq, gh, sccache). Every
+#              (toolchain pin match, sha256 tool, jq, gh). Every
 #              miss exits 2 with a remediation hint. Read-only: --dry-run
 #              is accepted for symmetry and changes nothing.
 #   build      release build of the cli + harness binaries, then a plain
 #              debug-tree refresh (cargo build --workspace) so the gate
 #              chain runs against warm, current binaries (the stale
-#              debug-binary problem). sccache stays ON: the wrapper is
-#              local host policy; the fresh-clone CI stripping rule does
-#              not apply to this local harness. --dry-run prints the exact
+#              debug-binary problem). The workspace pins no rustc-wrapper;
+#              a locally enabled sccache (RUSTC_WRAPPER) stays transparent.
+#              --dry-run prints the exact
 #              commands and executes nothing.
 #   verify     the gate chain in order, one subprocess at a time, each with
 #              its own RSS watchdog slot (and a timeout backstop when
 #              timeout(1) exists) and full exit-code propagation:
 #                calibration pins (harness unit pins + m3_codes_pin)
+#                -> serial-window evidence assertion (SERIAL_TAG; no
+#                   process — asserts the scripts/serial-gates.sh window's
+#                   evidence directories exist and postdate HEAD's commit)
 #                -> m0-gate -> m1-gate -> lint-gate -> m2-gate -> m3-gate
 #                -> M4 suites (daemon/plugin/commands/schema) + the
 #                schema-freeze sweep (+ the DARTQ_M4_LIVE live faces, opt-in)
-#                -> ci.sh -> repro-gate
+#                -> ci.sh (fmt + clippy + calibration pins + rustdoc doc
+#                   gate + untracked-ref gate) -> repro-gate
 #              One PASS/FAIL line per gate; on FAIL the harness stops and
 #              names the gate and its evidence directory. Before repro-gate
 #              the tracked tree is re-checked: m0/m1 persist regression
@@ -46,12 +51,13 @@
 #              as SKIP).
 #   bench      five-axis evidence plan per the bench-readiness ledger.
 #              Default: print the plan only. --run-bench executes the two
-#              named runs (mega-r1 oracle leg incl. the A7 cold pair, and
-#              the resident incremental_p95 engine bench) under the
-#              watchdog; the m0 harness-bench invocation stays a printed
-#              step (its --out label is a release-owner call per the
-#              readiness doc). The G2 tokenizer caveat is printed in both
-#              modes.
+#              named runs (mega-r1 oracle leg incl. the A7 cold pair — the
+#              release-face DARTQ_CMD + --strict shape of serial-gates.sh
+#              (#1145), and the resident incremental_p95 engine bench)
+#              under the watchdog; the m0 harness-bench invocation stays a
+#              printed step (its --out label is a release-owner call per
+#              the readiness doc). The G2 tokenizer caveat is printed in
+#              both modes.
 #   bundle     dist/dartq-v<version>-<target-triple>/ with the release
 #              binaries (dartq, harness), README.md, CHANGELOG.md,
 #              LICENSE-APACHE, LICENSE-MIT and a SHA256SUMS file. CHANGELOG
@@ -78,11 +84,17 @@
 # their own defaults (m1-r4 / lints-r1 / m2-r1) and env overrides; m3 is run
 # with M3_LABEL="${M3_LABEL:-m3-r1}"; repro-gate uses its default label.
 # Override any of them via the gate's own env for reruns (-r2 convention).
+# SERIAL_TAG (verify, required): the tag the serial window ran under — the
+# serial-window evidence assertion composes the window's label directories
+# from it (serial-gates.sh's "<default>-$SERIAL_TAG" rule); unset is a
+# usage error (exit 2) outside --dry-run.
 #
 # Usage:
 #   scripts/release.sh                            # preflight only
 #   scripts/release.sh [--phase NAME|NAME] [--all]
 #                      [--dry-run] [--run-bench] [--execute] [--help]
+#   SERIAL_TAG=<tag> scripts/release.sh --phase verify   # verify needs the
+#                      serial window's tag (see Labels above)
 #
 #   --phase NAME   one of: preflight build verify bench bundle tag
 #   --all          full chain: preflight -> build -> verify -> bench ->
@@ -103,6 +115,10 @@ cd "$(dirname "$0")/.." || exit 2
 
 RSS_WRAPPER="/tmp/rss_cmd.sh"
 TIMEOUT_BIN="$(command -v timeout 2>/dev/null || true)"
+# The fvm-pinned SDK, resolved the serial-gates.sh way (same names): the
+# bench mega oracle leg pins a release-face DARTQ_CMD against it.
+FVM_HOME="${FVM_HOME:-$HOME/fvm}"
+SDK_ROOT="$FVM_HOME/default/bin/cache/dart-sdk"
 
 # Assembled from pieces on purpose: this file is tracked content and the
 # preflight naming gate greps tracked content for the old product name —
@@ -197,7 +213,7 @@ check_clean_tree() {
     # set is the workspace-policy list that must never enter Git (the
 # vendored checkouts, local evidence, the local ledger, the charter files) — it can never be "cleaned",
     # so refusing on it would make every release impossible.
-    leftovers="$(git status --porcelain | grep '^??' | cut -c4- | grep -v -E '^([.](third|goal)/|[d]ocs/|AGENTS[.]md|PRD[.]md|REF[.]md|GOALS(_ARCHIVE)?[.]md)/?$' || true)"
+    leftovers="$(git status --porcelain | grep '^??' | cut -c4- | grep -v -E '^([.](third|goal)/|[d]ocs/|AGENTS[.]md|[P]RD[.]md|REF[.]md|GOALS(_ARCHIVE)?[.]md)/?$' || true)"
     if [ -n "$leftovers" ]; then
         echo "release: untracked files outside the release-exempt set (vendored checkouts, local evidence, the local ledger, the local charter files) — commit them or add them to .gitignore before releasing:" >&2
         printf '%s\n' "$leftovers" | sed 's/^/  /' >&2
@@ -207,7 +223,7 @@ check_clean_tree() {
 
 check_branch() {
     branch="$(git branch --show-current)"
-    [ "$branch" = "main" ] || die "HEAD is on '$branch', not main — the 0.1.0 tag is cut from main (D3/D5). Switch to main and re-run."
+    [ "$branch" = "main" ] || die "HEAD is on '$branch', not main — the release tag is cut from main (D3/D5). Switch to main and re-run."
 }
 
 check_naming() {
@@ -235,7 +251,6 @@ check_tools() {
     [ -n "$(sha_cmd)" ] || die "no sha256 tool found — need sha256sum or shasum (macOS ships shasum at /usr/bin/shasum)."
     command -v jq >/dev/null 2>&1 || die "jq is required by every differential gate (brew install jq)"
     command -v gh >/dev/null 2>&1 || die "gh is required for the tag-push probe (brew install gh, then gh auth login)"
-    command -v sccache >/dev/null 2>&1 || die "sccache is required: .cargo/config.toml sets rustc-wrapper = sccache, every cargo command would fail without it (brew install sccache)"
     [ -n "$TIMEOUT_BIN" ] || warn "timeout(1) not found — gate timeout backstops are disabled (the RSS watchdog still applies when present)"
     [ -x "$RSS_WRAPPER" ] || warn "$RSS_WRAPPER missing — heavy phases will run unwatched (restore it from the serial-phase runbook before the serial phase)"
 }
@@ -291,6 +306,60 @@ phase_build() {
 
 # --- verify ------------------------------------------------------------------
 
+# Serial-window evidence assertion (#1182, the #1179 P2-3 ruling). The
+# verify chain below is the #622 subset; the full 32-step universe
+# (acceptance, sem2, incremental, trend, lints-new, mega perf, the crate
+# suites, coverage) is scripts/serial-gates.sh (#147), run separately under
+# SERIAL_TAG. This step never re-runs the window: it asserts that every
+# evidence-producing window step left its label directory on disk AND that
+# each is newer than HEAD's commit time — i.e. the window ran against the
+# content being released (a commit after the window stales all of it; run
+# the window last). Steps without a target/evidence directory (rebuilds,
+# pins, the crate suites, lints-new-gate, schema-freeze, the live faces,
+# coverage under target/coverage) cannot be asserted this way and stay out
+# of this face. The path table mirrors serial-gates.sh's label block
+# (default label + "-$SERIAL_TAG") and each gate script's OUT_ROOT.
+serial_evidence_paths() {
+    tag="-$1"
+    cat <<EOF
+target/evidence/gate-m0/trend-w5${tag}-syntax
+target/evidence/gate-m0/trend-w5${tag}-union
+target/evidence/gate-m1/m1-r5${tag}
+target/evidence/gate-acceptance/serial${tag}
+target/evidence/gate-lints/lints-r1${tag}
+target/evidence/incremental/incr-r1${tag}
+target/evidence/gate-m2/m2-r1${tag}
+target/evidence/gate-sem2/sem2-r1${tag}
+target/evidence/gate-m3/m3-r1${tag}
+target/evidence/mega/mega-r1${tag}-oracleleg
+target/evidence/mega/mega-r1${tag}
+target/evidence/repro/serial${tag}
+EOF
+}
+
+serial_evidence_assert() {
+    # SERIAL_TAG presence is a usage check at dispatch time (before any phase
+    # runs), so an unset tag never reaches this point outside --dry-run.
+    # Reference file stamped with HEAD's commit time; format-local and
+    # touch -t both use the local zone, and find -newer is a POSIX mtime
+    # compare — no date parsing, no stat(1) dialect.
+    ref="$(mktemp)" || die "mktemp failed"
+    touch -t "$(git log -1 --date=format-local:%Y%m%d%H%M.%S --format=%cd)" "$ref" || die "cannot stamp the HEAD commit time onto $ref"
+    head_desc="HEAD $(git log -1 --format='%h committed %cI')"
+    bad=0
+    for p in $(serial_evidence_paths "$SERIAL_TAG"); do
+        if [ ! -e "$p" ]; then
+            echo "verify: serial-evidence MISSING $p" >&2
+            bad=1
+        elif [ -z "$(find "$p" -prune -newer "$ref")" ]; then
+            echo "verify: serial-evidence STALE $p (older than $head_desc)" >&2
+            bad=1
+        fi
+    done
+    rm -f "$ref"
+    [ "$bad" = 0 ]
+}
+
 # run_gate NAME TIMEOUT CAP EVIDENCE CMD...
 phase_verify() {
     echo "release: [verify] RSS-watchdog reminder: the gates spawn real dart/dartq processes — freeze every other lane for the duration"
@@ -304,14 +373,17 @@ phase_verify() {
 
     # Calibration pins first (#937): the oracle-free pin tests are
     # seconds-fast and catch frozen-universe drift before hours of oracle
-    # gate work. Required step, not best-effort. The m3 pin is RED by design
-    # until the serial window runs the m3 re-freeze regen (the freeze file
-    # is at 10 rows, the registry family at 11): release.sh going red here
-    # today is the calibration protection working, not a bug — the regen
-    # turns it green. Nothing below works around that redness.
+    # gate work. Required step, not best-effort. The m3 pin asserts set
+    # equality between tests/harness/m3_unused_codes.txt (already
+    # re-frozen: 11 rows) and the 11-variant USAGE_FAMILY in
+    # m3_codes_pin.rs — verification only, green on the committed freeze.
+    # A red here is a real drift, never a designed one: add the targeted
+    # fixture it demands first, then `cargo test -p dartq-semantic --test
+    # m3_codes_pin regen_m3_unused_codes -- --ignored` and reconcile the
+    # header prose — never regen blind. Nothing below works around a red.
     if [ "$DRY_RUN" = 1 ]; then
         echo "release: [verify] would run: cargo test -p harness   # calibration pins"
-        echo "release: [verify] would run: cargo test -p dartq-semantic --test m3_codes_pin   # m3 freeze pin (red until the re-freeze regen)"
+        echo "release: [verify] would run: cargo test -p dartq-semantic --test m3_codes_pin   # m3 unused-family freeze pin (set equality, 11 rows)"
         echo "verify: SKIP pins (dry-run)"
     else
         run_gate pins-harness 600 8388608 "terminal output (harness calibration pins)" \
@@ -320,8 +392,26 @@ phase_verify() {
             cargo test -p dartq-semantic --test m3_codes_pin || return 1
     fi
 
-    # Gates are invoked via `bash scripts/...` (the CI convention): several
-    # gate scripts (m0/m2/m3/repro-gate) are not committed executable.
+    # Serial-window evidence next (#1182): a filesystem check, instant — a
+    # missing or stale window fails here, before the hours of gate work
+    # below (the same seconds-first logic as the pins). See
+    # serial_evidence_assert above for what it proves and what it cannot.
+    if [ "$DRY_RUN" = 1 ]; then
+        echo "release: [verify] would assert serial-window evidence (SERIAL_TAG=${SERIAL_TAG:-<unset>}) present and newer than HEAD's commit time:"
+        serial_evidence_paths "${SERIAL_TAG:-<tag>}" | sed 's/^/    /'
+        echo "verify: SKIP serial-evidence (dry-run)"
+    else
+        echo "verify: running serial-evidence..."
+        if serial_evidence_assert; then
+            echo "verify: PASS serial-evidence"
+        else
+            echo "verify: FAIL serial-evidence — the serial window has not run against HEAD: run SERIAL_TAG=<fresh tag> scripts/serial-gates.sh (#147), then re-run verify with the same SERIAL_TAG" >&2
+            return 1
+        fi
+    fi
+
+    # Gates are invoked via `bash scripts/...` (the CI convention; every gate
+    # script is committed 100755, so the prefix is convention, not a crutch).
     run_gate m0 2400 8388608 "target/evidence/gate-m0/${m0_label}-syntax, target/evidence/gate-m0/${m0_label}-union" \
         bash scripts/m0-gate.sh --label "$m0_label" $gate_dry || return 1
     run_gate m1 900 8388608 "target/evidence/gate-m1/$m1_label" \
@@ -380,10 +470,10 @@ phase_verify() {
     fi
 
     if [ "$DRY_RUN" = 1 ]; then
-        echo "release: [verify] would run: scripts/ci.sh   # no dry mode: per-crate serial fmt + clippy (15-40 min)"
+        echo "release: [verify] would run: scripts/ci.sh   # no dry mode: per-crate serial fmt + clippy, calibration pins, rustdoc doc gate (#1169), untracked-ref gate (15-40 min)"
         echo "verify: SKIP ci (dry-run)"
     else
-        run_gate ci 3600 8388608 "terminal output (per-crate fmt + clippy, first-fail)" \
+        run_gate ci 3600 8388608 "terminal output (per-crate fmt + clippy, calibration pins, rustdoc doc gate, untracked-ref gate; first-fail)" \
             bash scripts/ci.sh || return 1
     fi
     if [ "$DRY_RUN" != 1 ]; then
@@ -418,8 +508,9 @@ release: [bench] five-axis evidence plan (the bench-readiness ledger) — serial
       --dartq-cmd "./target/release/dartq check --format=machine" \\
       --oracle-dart "\$HOME/fvm/default/bin/dart" \\
       --with-oracle --out target/evidence/bench-<fresh-label>
-  axis 4 cold (milestone provenance, mega-r1 oracle leg incl. the A7 cold pair):
-    rss_cmd.sh mega1 12582912 scripts/mega-run.sh --scale 1k --oracle-leg --label $mega_label
+  axis 4 cold (milestone provenance, mega-r1 oracle leg incl. the A7 cold pair; release face + --strict, the serial-gates #1145 shape):
+    rss_cmd.sh mega1 12582912 env DARTQ_CMD="./target/release/dartq analyze --format=machine --sdk $SDK_ROOT" \\
+      scripts/mega-run.sh --scale 1k --oracle-leg --strict --label $mega_label
   axis 2 resident arm:
     rss_cmd.sh cargobench 4294967296 cargo bench -p dartq-engine --bench incremental_p95
   axis 5 reproducibility tuple: covered by the verify phase (repro-gate seal).
@@ -432,8 +523,15 @@ EOF
         return 0
     fi
     echo "release: [bench] RSS-watchdog reminder: serial phase — one dart/cargo process at a time from here on"
+    # The A7 dartq cold leg must meet the release-quality oracle on the same
+    # face (a debug dartq understates the oracle/dartq ratio), and without
+    # --strict mega-run asserts nothing — the serial-gates.sh #1145 shape.
+    # Scoped env prefix, never a global export: mega-run's own default
+    # (debug) face stays untouched for any other invocation.
+    [ -x ./target/release/dartq ] || die "./target/release/dartq not found — the A7 cold leg drives the release face; run --phase build first."
     run_guarded bench-mega 12582912 3600 \
-        scripts/mega-run.sh --scale 1k --oracle-leg --label "$mega_label" || {
+        env DARTQ_CMD="./target/release/dartq analyze --format=machine --sdk $SDK_ROOT" \
+        scripts/mega-run.sh --scale 1k --oracle-leg --strict --label "$mega_label" || {
         echo "release: FAIL bench (mega-run $mega_label) — see target/evidence/mega/$mega_label and /tmp/serial_bench-mega.log" >&2
         return 1
     }
@@ -517,7 +615,10 @@ EOF
 # --- usage + dispatch --------------------------------------------------------
 
 usage() {
-    sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//'
+    # The whole header through the Usage block, anchored on the `set` line
+    # (the serial-gates.sh idiom) — a hardcoded line range truncated
+    # --help mid-sentence as the header grew.
+    sed -n '2,/^set -u -o pipefail$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
 }
 
 ALL=0; DRY_RUN=0; RUN_BENCH=0; EXECUTE=0
@@ -558,6 +659,11 @@ if [ "$EXECUTE" = 1 ] && [ "$ALL" = 0 ] && [ "$phase" != "tag" ]; then
 fi
 if [ "$RUN_BENCH" = 1 ] && [ -n "$phase" ] && [ "$phase" != "bench" ]; then
     die "--run-bench only applies to the bench phase"
+fi
+# verify's serial-window evidence assertion composes the window's label
+# directories from SERIAL_TAG — refuse up front, not after preflight + build.
+if [ "$DRY_RUN" = 0 ] && [ -z "${SERIAL_TAG:-}" ] && { [ "$ALL" = 1 ] || [ "$phase" = "verify" ]; }; then
+    die "SERIAL_TAG is required by verify's serial-window evidence assertion: pass the tag the window ran under (SERIAL_TAG=<tag> scripts/serial-gates.sh, #147), e.g. SERIAL_TAG=r7 scripts/release.sh --phase verify"
 fi
 
 run_phase() {

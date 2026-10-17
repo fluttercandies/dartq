@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# repro-gate.sh — the PRD §19.5 CI reproducibility gate (goal #799).
+# repro-gate.sh — the CI reproducibility gate (goal #799).
 #
 # Composes the repro trio into one gate: builds the dartq CLI and the
 # harness, runs `harness repro` (fresh-process N-run byte-identical
