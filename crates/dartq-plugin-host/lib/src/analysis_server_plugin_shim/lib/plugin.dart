@@ -53,7 +53,7 @@ abstract class Plugin {
 /// Any failure — a missing or malformed manifest, a wire-contract violation,
 /// a producer that throws — propagates out of this call, terminating the
 /// process. The core reports the crash as one `dartq/plugin_crashed`
-/// diagnostic and keeps running (PRD section 14.3); nothing here hangs.
+/// diagnostic and keeps running; nothing here hangs.
 Future<void> startPlugin(
   Plugin plugin, {
   Stream<List<int>>? input,

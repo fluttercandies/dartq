@@ -15,6 +15,7 @@ library;
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:analysis_server_plugin/edit/change_builder/change_builder.dart';
 import 'package:analysis_server_plugin/edit/dart/correction_producer.dart';
 import 'package:analysis_server_plugin/edit/dart/dart_fix_kind_priority.dart';
 import 'package:analysis_server_plugin/plugin.dart';
@@ -102,8 +103,27 @@ void main() {
       final registration = _Registration();
       plugin.register(registration.shim);
 
-      expect(registration.mirror.fixesByRule.keys, ['shim/fixture_rule']);
+      expect(registration.mirror.fixesByRule.keys, [
+        'shim/fixture_rule',
+        'shim/fixture_resolved_rule',
+      ]);
       expect(registration.mirror.assists, hasLength(1));
+
+      // The authoring-family fix reads its kind through the same adapted
+      // generator face: the ResolvedCorrectionProducer tearoff fits the
+      // official ProducerGenerator shape (covariant through
+      // `ResolvedUnitResult implements ParsedUnitResult`).
+      final generators =
+          registration.mirror.fixesByRule['shim/fixture_resolved_rule']!;
+      final producer = await generators.single(
+        const dartq.ProducerContext(
+          file: '/w/lib/a.dart',
+          offset: 7,
+          length: 3,
+        ),
+      );
+      expect(producer.priority, -DartFixKindPriority.standard);
+      expect(producer.message, 'Fix the fixture range (resolved)');
     });
 
     test(
@@ -113,6 +133,7 @@ void main() {
         plugin.register(registration.shim);
         expect(registration.mirror.fixesByRule.keys, [
           ShimFixturePlugin.code.lowerCaseName,
+          ShimFixturePlugin.resolvedCode.lowerCaseName,
         ]);
       },
     );
@@ -364,5 +385,5 @@ class _KindlessFix extends CorrectionProducer {
       CorrectionApplicability.singleLocation;
 
   @override
-  Future<List<SourceEdit>> compute() async => const [];
+  Future<void> compute(ChangeBuilder builder) async {}
 }

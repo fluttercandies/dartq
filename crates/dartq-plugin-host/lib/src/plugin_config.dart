@@ -1,21 +1,25 @@
 /// The plugin manifest (`dartq_plugin.json`) as a Dart value object.
 ///
 /// Mirrors `Manifest` in the Rust crate `dartq-plugin` (`src/manifest.rs`);
-/// both files must change together. Defaults follow PRD section 14.3.
+/// both files must change together; the constants below are the shared
+/// defaults.
 library;
 
 import 'capabilities.dart';
 
-/// Default per-callback wall-clock timeout (PRD section 14.3: 5 s).
+/// Default per-callback wall-clock timeout: 5 s.
 const int defaultCallbackTimeoutMs = 5000;
 
-/// Default per-request IPC timeout (PRD section 14.3: 10 s).
+/// Default per-request IPC timeout: 10 s.
 const int defaultRequestTimeoutMs = 10000;
 
-/// Default per-request retry budget (PRD section 14.3: 3 retries).
+/// Default per-request retry budget: 3 retries.
 const int defaultRequestRetries = 3;
 
-/// Default memory budget in MB (PRD section 14.3: 512 MB RSS cap).
+/// Default memory budget in MB: 512 MB RSS cap. Host-side self-description
+/// only: the core owns enforcement, and its default is profile-aware
+/// (4096 debug / 512 release), so this constant never gates a running
+/// plugin.
 const int defaultMemoryBudgetMb = 512;
 
 /// Wall-clock and retry budgets of a plugin session. The protocol carries
@@ -63,8 +67,7 @@ class PluginConfigException implements Exception {
 /// A plugin's self-description: identity, entry point, capabilities, and
 /// resource budget.
 class PluginConfig {
-  /// Builds a config; omitted budgets default to the PRD section 14.3
-  /// values.
+  /// Builds a config; omitted budgets take the defaults above.
   PluginConfig({
     required this.name,
     required this.version,

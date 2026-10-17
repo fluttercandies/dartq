@@ -1,6 +1,6 @@
 /// The host main loop: stdio transport for one plugin session.
 ///
-/// The dartq core spawns this process per plugin (PRD section 14.2) and
+/// The dartq core spawns this process per plugin and
 /// speaks the wire contract of the Rust crate `dartq-plugin`. The loop
 /// enforces the 16 MiB frame bound on raw bytes before any decode, so host
 /// memory stays bounded when the core misbehaves.
@@ -192,8 +192,9 @@ Future<void> _serveFrameAndFlush(
 /// `registerFixForRule` generator fires on the plugin's own lint finding,
 /// not only on a pushed engine row. Every failure path — registration, the
 /// wire loop, a producer or a rule that throws — propagates and tears the
-/// session down: the core reports the crash (PRD section 14.3; a throwing
-/// rule mirrors the official `shouldPropagateExceptions: true`), the reply
+/// session down: the core reports the crash as one `dartq/plugin_crashed`
+/// diagnostic (a throwing rule mirrors the official
+/// `shouldPropagateExceptions: true`), the reply
 /// is never fabricated. A stalled producer is the core's budget to enforce
 /// (`callback_ms`); the async loop stays responsive while one computes.
 Future<void> servePlugin(
@@ -221,12 +222,12 @@ Future<void> servePlugin(
       input: input,
       send: send,
       onPluginConfig: (config) => cycleConfig = config,
-      onEngineDiagnostics: (batch) {
+      onEngineDiagnostics: (batch) async {
         engineDiagnostics = batch.diagnostics;
         if (registry.lintRules.isEmpty && registry.warningRules.isEmpty) {
           return const <PluginDiagnostic>[];
         }
-        return ownFindings = runRules(
+        return ownFindings = await runRules(
           registry: registry,
           config: cycleConfig,
           batch: batch,

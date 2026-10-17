@@ -5,7 +5,7 @@ import 'package:dartq_plugin_host/dartq_plugin_host.dart';
 /// Test plugin for the callback-timeout kill path (dartq-plugin's
 /// `tests/callback_timeout.rs`): answers the handshake normally, then stalls
 /// in `request/fixes` far past any core-side `callback_ms` budget, so the
-/// runtime's per-callback deadline (PRD section 14.3) fires, kills this
+/// runtime's per-callback deadline fires, kills this
 /// process, and consumes the restart budget.
 ///
 /// Reads frames on stdin, writes replies on stdout; never run interactively

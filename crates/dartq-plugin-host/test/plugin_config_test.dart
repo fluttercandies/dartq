@@ -28,7 +28,7 @@ PluginConfigException _configError(Map<String, Object?> manifest) {
 }
 
 void main() {
-  group('budget defaults (PRD section 14.3)', () {
+  group('budget defaults', () {
     test('pin the shared defaults (must match the Rust manifest)', () {
       expect(defaultCallbackTimeoutMs, 5000);
       expect(defaultRequestTimeoutMs, 10000);

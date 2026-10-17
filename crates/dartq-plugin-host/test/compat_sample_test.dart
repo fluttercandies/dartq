@@ -99,7 +99,10 @@ void main() {
       expect(config.timeouts.callbackMs, 30000);
       expect(config.timeouts.requestMs, 60000);
       expect(config.timeouts.requestRetries, 3);
-      expect(config.memoryBudgetMb, 512);
+      // 1024 matches every sibling sample manifest: the samples run under
+      // the real `dart` VM, which needs more headroom than the 512 default
+      // applied when the field is absent.
+      expect(config.memoryBudgetMb, 1024);
     });
 
     test('the handshake advertises the manifest capabilities and the rule '

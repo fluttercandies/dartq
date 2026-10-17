@@ -23,7 +23,16 @@ import 'dart:async';
 
 import 'package:analyzer/analysis_rule/analysis_rule.dart'
     show AbstractAnalysisRule;
+import 'package:analyzer/dart/analysis/results.dart' show ParsedUnitResult;
+import 'package:analyzer/dart/analysis/session.dart' show AnalysisSession;
 import 'package:analyzer/error/error.dart' show DiagnosticCode;
+import 'package:analyzer/file_system/file_system.dart' show ResourceProvider;
+import 'package:analyzer/file_system/physical_file_system.dart'
+    show PhysicalResourceProvider;
+import 'package:analyzer_plugin/utilities/change_builder/change_builder_core.dart'
+    show ChangeBuilder;
+import 'package:analyzer_plugin/utilities/change_builder/change_workspace.dart'
+    show ChangeWorkspace;
 import 'package:dartq_plugin_host/dartq_plugin_host.dart' as dartq;
 
 import 'edit/dart/correction_producer.dart';
@@ -131,7 +140,7 @@ final class _AdaptedGenerator {
   FutureOr<dartq.Producer> call(dartq.ProducerContext context) {
     final producer = _generator(
       context: CorrectionProducerContext(
-        file: context.file,
+        path: context.file,
         offset: context.offset,
         length: context.length,
       ),
@@ -143,7 +152,7 @@ final class _AdaptedGenerator {
 final class _AdaptedProducer implements dartq.Producer {
   _AdaptedProducer(this._producer, this._face);
 
-  final CorrectionProducer _producer;
+  final CorrectionProducer<ParsedUnitResult> _producer;
   final _ProducerFace _face;
 
   @override
@@ -153,11 +162,33 @@ final class _AdaptedProducer implements dartq.Producer {
   String get message => _requiredKind().message;
 
   @override
-  Future<List<dartq.SourceEdit>> compute(dartq.ProducerContext context) =>
-      // The producer already holds its per-request context (the adapted
-      // generator built it); the wire context it was reached through is the
-      // same one.
-      _producer.compute();
+  Future<List<dartq.SourceEdit>> compute(dartq.ProducerContext context) async {
+    // The official acquisition path
+    // (`pkg/analysis_server_plugin/lib/src/correction/fix_processor.dart`):
+    // construct one builder per producer run, drive the producer's compute,
+    // then read the builder's `sourceChange` and keep the target file's
+    // edits. Generic file edits run fully over this workspace; a producer
+    // editing a Dart file through `addDartFileEdit` needs the analysis
+    // session the wire does not carry and fails contained (the engine Query
+    // API lands that channel).
+    final producer = _producer;
+    final builder = ChangeBuilder(
+      workspace: _WireWorkspace(),
+      defaultEol: producer.defaultEol,
+    );
+    await producer.compute(builder);
+    final change = builder.sourceChange;
+    return [
+      for (final fileEdit in change.edits)
+        if (fileEdit.file == context.file)
+          for (final edit in fileEdit.edits)
+            dartq.SourceEdit(
+              offset: edit.offset,
+              length: edit.length,
+              replacement: edit.replacement,
+            ),
+    ];
+  }
 
   /// The producer's kind for this face. A producer whose kind was non-null at
   /// registration but null here is misbehaving; the error tears the session
@@ -196,7 +227,7 @@ final class _AdaptedProducer implements dartq.Producer {
 ///
 /// Every failure path — registration (`UnsupportedError`, `ArgumentError`),
 /// the wire loop, a producer that throws — propagates: the process exits and
-/// the core reports `dartq/plugin_crashed` (PRD section 14.3).
+/// the core reports `dartq/plugin_crashed`.
 Future<void> serveShimPlugin(
   Plugin plugin, {
   required dartq.PluginConfig config,
@@ -228,4 +259,24 @@ final class _PluginAdapter extends dartq.Plugin {
 
   @override
   FutureOr<void> shutDown() => _plugin.shutDown();
+}
+
+/// The workspace the adapter hands the real `package:analyzer_plugin` change
+/// builder: the sidecar's physical file system (the files the host analyzes)
+/// and no analysis session. Generic file edits run fully; `getSession`
+/// answers null, so a producer editing a Dart file through
+/// `addDartFileEdit` gets the builder's own `AnalysisException` instead of a
+/// fabricated fix — the engine Query API lands the session channel.
+///
+/// One fresh instance per producer run, matching the official processor's
+/// per-run builder construction; the workspace itself is stateless.
+final class _WireWorkspace extends ChangeWorkspace {
+  @override
+  ResourceProvider get resourceProvider => PhysicalResourceProvider.INSTANCE;
+
+  @override
+  bool containsFile(String path) => true;
+
+  @override
+  AnalysisSession? getSession(String path) => null;
 }

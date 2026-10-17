@@ -21,10 +21,10 @@ stable string via `code.uniqueName`) and `registerAssist` — onto a
 
 `registerLintRule`/`registerWarningRule` have no host mirror: protocol v1
 has no rule registry (the engine's diagnostics batch is the plugin's
-context, PRD section 14.2), and the upstream rules compute from the analyzer
+context), and the upstream rules compute from the analyzer
 AST, which the v1 wire does not carry. All sixteen warning rules are
 census-only (`lint=0 warning=16 fix=6 assist=12`); the rule semantics land
-with the Query API (PRD section 14.2). This is a surface gap, not a
+with the Query API. This is a surface gap, not a
 structural one — the `Plugin.register` shape itself maps cleanly.
 
 ## Layout

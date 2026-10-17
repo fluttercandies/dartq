@@ -132,11 +132,15 @@ final class EngineBatch {
 }
 
 /// Signature of the hook the host calls when the core pushes its analyze
-/// cycle (`notification/engine_diagnostics`). Pure function: whatever it
+/// cycle (`notification/engine_diagnostics`). May compute synchronously or
+/// return a future — rule execution resolves libraries through the async
+/// analyzer driver when an enabled rule needs the element model, so the
+/// session awaits the result the same way it awaits a `request/fixes`
+/// handler (the cycle is served before the next inbound frame). Whatever it
 /// returns is emitted back to the core as `notification/diagnostic` frames,
 /// in order.
 typedef EngineDiagnosticsHandler =
-    List<PluginDiagnostic> Function(EngineBatch batch);
+    FutureOr<List<PluginDiagnostic>> Function(EngineBatch batch);
 
 /// Signature of the hook the host calls when the core pushes the per-cycle
 /// execution config (`notification/plugin_config`): which census rules are
@@ -149,7 +153,7 @@ typedef PluginConfigHandler = void Function(PluginCycleConfig config);
 /// future: the serve loop awaits it, so a producer that needs async work
 /// delays only its own reply — the callback budget (`callback_ms`) stays
 /// the core's to enforce, and a stalled reply is answered by the runtime's
-/// kill-and-restart (PRD section 14.3). The returned changes are serialized
+/// kill-and-restart. The returned changes are serialized
 /// into the reply frame, best (lowest priority) first. A handler failure
 /// propagates: the session never fabricates a fix. [queries] is the T4
 /// Query API facade — using it un-negotiated throws [QueryError], so a
@@ -207,7 +211,7 @@ class PluginSession {
   /// Called for each `request/fixes` the core sends. Optional: a plugin
   /// without a fixes handler answers with the empty set — the protocol
   /// layer is complete either way; serving real fixes needs the engine
-  /// Query API (PRD section 14.2).
+  /// Query API.
   final FixesHandler? onRequestFixes;
 
   /// The reverse-query transport (see [FrameWriter]).
@@ -296,12 +300,13 @@ class PluginSession {
   /// core notifications (`notification/engine_diagnostics`,
   /// `notification/plugin_config`) dispatch to their handlers and complete
   /// with null. The future completes once the frame is fully served — an
-  /// async [onRequestFixes] is awaited before the reply exists, so frames
-  /// are served strictly in arrival order.
+  /// async [onRequestFixes] or [onEngineDiagnostics] is awaited before the
+  /// reply (or the queued diagnostics) exists, so frames are served strictly
+  /// in arrival order.
   Future<PluginFrame?> handleFrame(PluginFrame frame) async {
     final id = frame.id;
     if (id == null) {
-      _handleCoreNotification(frame);
+      await _handleCoreNotification(frame);
       return null;
     }
     switch (frame.method) {
@@ -339,10 +344,10 @@ class PluginSession {
     return drained;
   }
 
-  void _handleCoreNotification(PluginFrame frame) {
+  Future<void> _handleCoreNotification(PluginFrame frame) async {
     switch (frame.method) {
       case methodEngineDiagnostics:
-        _handleEngineDiagnostics(frame);
+        await _handleEngineDiagnostics(frame);
       case methodPluginConfig:
         _handlePluginConfig(frame);
       default:
@@ -363,13 +368,13 @@ class PluginSession {
     onPluginConfig?.call(PluginCycleConfig.fromJson(frame.params));
   }
 
-  void _handleEngineDiagnostics(PluginFrame frame) {
+  Future<void> _handleEngineDiagnostics(PluginFrame frame) async {
     if (_state != SessionState.ready) {
       throw const PluginProtocolException(
         'notification/engine_diagnostics is only valid after initialize completes',
       );
     }
-    final emitted = onEngineDiagnostics?.call(
+    final emitted = await onEngineDiagnostics?.call(
       EngineBatch.fromJson(frame.params),
     );
     if (emitted != null) {
@@ -442,7 +447,7 @@ class PluginSession {
     final handler = onRequestFixes;
     if (handler == null) {
       // No fixes handler: the honest answer for any location is the empty
-      // set (real fixes need the engine Query API, PRD section 14.2).
+      // set (real fixes need the engine Query API).
       return PluginFrame.request(id, frame.method, {
         'fixes': const <Object?>[],
       });

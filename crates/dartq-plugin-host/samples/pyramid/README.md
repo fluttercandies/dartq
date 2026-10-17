@@ -21,10 +21,10 @@ string via `code.uniqueName`) and `registerAssist` — onto a
 
 - **Registry surface**: `registerLintRule` has no host mirror — protocol v1
   has no rule registry (the engine's diagnostics batch is the plugin's
-  context, PRD section 14.2), and the upstream rules compute from the
+  context), and the upstream rules compute from the
   analyzer AST, which the v1 wire does not carry. All 37 rule registrations
   are census-only (`lint=37 warning=0 fix=23 assist=3`); the rule semantics
-  land with the Query API (PRD section 14.2). A surface gap, not a
+  land with the Query API. A surface gap, not a
   structural one.
 - **Capability posture**: the manifest advertises `[lint]` only, so the core
   never sends `request/fixes` — the fix and assist delegations are provably

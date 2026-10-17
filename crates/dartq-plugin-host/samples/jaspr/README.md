@@ -20,10 +20,10 @@ two kinds the host mirrors — `registerFixForRule` (official `DiagnosticCode`
 
 `registerLintRule`/`registerWarningRule` have no host mirror: protocol v1
 has no rule registry (the engine's diagnostics batch is the plugin's
-context, PRD section 14.2), and the upstream rules compute from the analyzer
+context), and the upstream rules compute from the analyzer
 AST, which the v1 wire does not carry. Those registrations are counted in
 the bridge census (`lint=3 warning=2 fix=4 assist=14`) instead of delegated;
-the rule semantics land with the Query API (PRD section 14.2). This is a
+the rule semantics land with the Query API. This is a
 surface gap, not a structural one — the `Plugin.register` shape itself maps
 cleanly.
 

@@ -13,8 +13,8 @@
 ///
 /// The adapter gap this overlay documents: `registerLintRule` and
 /// `registerWarningRule` have no host mirror (protocol v1 has no rule
-/// registry — the engine's diagnostics batch is the plugin's context, PRD
-/// section 14.2), so those registrations are counted in the bridge census
+/// registry — the engine's diagnostics batch is the plugin's context),
+/// so those registrations are counted in the bridge census
 /// instead of delegated. For the same reason the wire faces are
 /// deterministic bridges, not the upstream rules' semantics (they need the
 /// analyzer AST, which the v1 wire does not carry): the lint face reports

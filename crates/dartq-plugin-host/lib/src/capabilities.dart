@@ -1,4 +1,4 @@
-/// Capability vocabulary of the dartq plugin protocol (PRD section 14.1).
+/// Capability vocabulary of the dartq plugin protocol.
 ///
 /// Mirrors `Capability` / `CapabilitySet` in the Rust crate `dartq-plugin`
 /// (`src/capability.rs`); both files must change together.

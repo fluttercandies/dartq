@@ -76,17 +76,14 @@ class PluginRegistryImpl implements PluginRegistry {
   /// carries the core's resolution (the census names it enabled against the
   /// analysis options' rule configs — the official kind-defaulting,
   /// warning-unless-disabled and lint-only-when-enabled, happened there, so
-  /// membership here is plain enablement). Resolution-dependent rules are
-  /// skipped: dartq executes parsed-only (the T4 boundary) — the official
-  /// host resolves them, ours degrades the single rule instead of vetoing
-  /// the plugin's turn.
+  /// membership here is plain enablement). Resolution-requiring rules are
+  /// included: the runner resolves the libraries they run over (the
+  /// official `_canUseParsedResult` dispatch, per library).
   List<AbstractAnalysisRule> enabled(Set<String> enabledNames) => [
     for (final entry in warningRules.entries)
-      if (enabledNames.contains(entry.key) && entry.value.canUseParsedResult)
-        entry.value,
+      if (enabledNames.contains(entry.key)) entry.value,
     for (final entry in lintRules.entries)
-      if (enabledNames.contains(entry.key) && entry.value.canUseParsedResult)
-        entry.value,
+      if (enabledNames.contains(entry.key)) entry.value,
   ];
 
   /// The registration census (the `initialize` reply's `rules` array), in

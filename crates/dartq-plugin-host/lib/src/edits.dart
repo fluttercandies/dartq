@@ -5,7 +5,7 @@
 /// crate `dartq-plugin`; the producer surface mirrors
 /// `package:analysis_server_plugin` (upstream Dart SDK source,
 /// `pkg/analysis_server_plugin`). `ProducerContext`
-/// grows with the engine Query API (PRD section 14.2).
+/// grows with the engine Query API.
 library;
 
 import 'dart:async';

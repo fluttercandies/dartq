@@ -13,7 +13,7 @@
 ///
 /// Two gaps documented here. First, the adapter gap: `registerLintRule` has
 /// no host mirror (protocol v1 has no rule registry — the engine's
-/// diagnostics batch is the plugin's context, PRD section 14.2), so the 37
+/// diagnostics batch is the plugin's context), so the 37
 /// rule registrations are census-only. Second, the capability posture: the
 /// manifest advertises `[lint]` only, so the core never sends
 /// `request/fixes` — the 23 fix and 3 assist delegations are provably

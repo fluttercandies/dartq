@@ -2,7 +2,7 @@
 /// `package:dartq_plugin_host/capabilities.dart`.
 ///
 /// Pins the "unknown means not enabled, never an error" contract and the
-/// intersection rule of PRD section 14.1.
+/// intersection rule (effective capabilities = advertised ∩ requested).
 library;
 
 import 'package:dartq_plugin_host/dartq_plugin_host.dart';

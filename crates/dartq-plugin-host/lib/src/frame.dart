@@ -27,7 +27,7 @@ const String methodDiagnosticNotification = 'notification/diagnostic';
 
 /// Core-to-plugin notification: the engine's current diagnostics for the
 /// analyzed set, pushed once per analyze cycle as the plugin's diagnostic
-/// context (PRD section 14.2). Additively carries the cycle's analyzed file
+/// context. Additively carries the cycle's analyzed file
 /// set under `files` — the files a rule-executing plugin runs its enabled
 /// rules over.
 const String methodEngineDiagnostics = 'notification/engine_diagnostics';
@@ -117,7 +117,7 @@ class PluginFrame {
 }
 
 /// A wire-contract violation. Any of these is fatal: the session must be
-/// torn down (PRD section 14.3 crash isolation) — there is no
+/// torn down (crash isolation) — there is no
 /// resynchronization, matching the Rust codec.
 class PluginProtocolException implements Exception {
   /// What broke.

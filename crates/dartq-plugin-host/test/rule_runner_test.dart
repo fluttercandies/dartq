@@ -1,20 +1,26 @@
 /// Unit tests for the rule runner: `package:dartq_plugin_host/rule_runner.dart`
-/// (`runRules`) — the T5 execution of a plugin's enabled analyzer rules over
+/// (`runRules`) — the execution of a plugin's enabled analyzer rules over
 /// the analyzed set.
 ///
 /// Pins the contract the core depends on: enablement is plain membership
 /// (the core resolved the official kind-defaulting against the census),
-/// resolution-dependent rules are skipped (`canUseParsedResult`), overlays
-/// beat disk and unreadable files are skipped, severity overrides re-level
-/// the rows, and a throwing rule propagates (the official
+/// dispatch is per library — parsed when every enabled rule answers
+/// `canUseParsedResult`, resolved through a per-cycle
+/// `AnalysisContextCollection` otherwise — overlays beat disk and
+/// unreadable files are skipped, severity overrides re-level the rows, and
+/// a throwing rule propagates (the official
 /// `shouldPropagateExceptions: true` posture — one bad rule tears the
 /// session down).
 library;
+
+import 'dart:io' as io;
 
 import 'package:analyzer/analysis_rule/analysis_rule.dart';
 import 'package:analyzer/analysis_rule/rule_context.dart' show RuleContext;
 import 'package:analyzer/analysis_rule/rule_visitor_registry.dart'
     show RuleVisitorRegistry;
+import 'package:analyzer/src/analysis_rule/rule_context.dart'
+    show RuleContextWithResolvedResults;
 import 'package:analyzer/dart/ast/ast.dart';
 import 'package:analyzer/dart/ast/visitor.dart';
 import 'package:analyzer/error/error.dart';
@@ -54,13 +60,42 @@ class BooleanRule extends AnalysisRule {
   }
 }
 
-/// A rule identical to [BooleanRule] but resolution-dependent: the runner
-/// must skip it (dartq executes parsed-only).
-class ResolvingRule extends BooleanRule {
-  ResolvingRule() : super();
+/// A resolution-dependent rule reporting one finding per boolean literal,
+/// but only after proving the element model is reachable: it reads
+/// `RuleContextWithResolvedResults.typeProvider` at registration, which a
+/// parsed context would throw on — so a reported finding proves the library
+/// resolved.
+class ResolvingRule extends AnalysisRule {
+  static const LintCode code = LintCode(
+    'runner_resolved',
+    'Boolean literals need a resolved review.',
+    uniqueName: 'RUNNER_RESOLVED',
+    severity: DiagnosticSeverity.WARNING,
+  );
+
+  ResolvingRule()
+    : super(
+        name: 'runner_resolved_review',
+        description: 'Test rule: resolved findings per boolean literal.',
+      );
+
+  @override
+  DiagnosticCode get diagnosticCode => code;
 
   @override
   bool get canUseParsedResult => false;
+
+  @override
+  void registerNodeProcessors(
+    RuleVisitorRegistry registry,
+    RuleContext context,
+  ) {
+    // The element-model read that defines "resolved": `typeProvider` throws
+    // `UnsupportedError` on a parsed context, so reaching the visitor
+    // registration proves the resolved path ran.
+    (context as RuleContextWithResolvedResults).typeProvider;
+    registry.addBooleanLiteral(this, _Visitor(this));
+  }
 }
 
 /// A rule whose node processor throws mid-visit.
@@ -132,8 +167,8 @@ PluginCycleConfig _config({
 
 void main() {
   group('enablement', () {
-    test('an enabled parse-only rule runs over the analyzed set', () {
-      final findings = runRules(
+    test('an enabled parse-only rule runs over the analyzed set', () async {
+      final findings = await runRules(
         registry: _registry(lint: [BooleanRule()]),
         config: _config(),
         batch: _batch(),
@@ -149,8 +184,8 @@ void main() {
 
     test(
       'a rule outside the enabled set does not run (disabled by default)',
-      () {
-        final findings = runRules(
+      () async {
+        final findings = await runRules(
           registry: _registry(lint: [BooleanRule()]),
           config: _config(enabledRules: const {}),
           batch: _batch(),
@@ -161,8 +196,8 @@ void main() {
 
     test(
       'enablement is exact on the wire names (both ends push lower-cased)',
-      () {
-        final findings = runRules(
+      () async {
+        final findings = await runRules(
           registry: _registry(lint: [BooleanRule()]),
           config: _config(enabledRules: const {'runner_boolean_review'}),
           batch: _batch(),
@@ -171,7 +206,7 @@ void main() {
         // The wire contract is lower-cased names on both ends (the census
         // keys and the config parse both fold), so an upper-case probe does
         // not match here — case-insensitivity lives at the config boundary.
-        final upper = runRules(
+        final upper = await runRules(
           registry: _registry(lint: [BooleanRule()]),
           config: _config(enabledRules: const {'RUNNER_BOOLEAN_REVIEW'}),
           batch: _batch(),
@@ -179,20 +214,121 @@ void main() {
         expect(upper, isEmpty);
       },
     );
+  });
 
-    test('a resolution-dependent rule is skipped, not fatal', () {
-      final findings = runRules(
-        registry: _registry(lint: [ResolvingRule()]),
-        config: _config(),
-        batch: _batch(),
+  group('resolution', () {
+    // The resolved path needs a real analysis context over real files:
+    // `io.Directory.systemTemp` supplies a tree the collection can root,
+    // and the overlay provider feeds the file contents.
+    late io.Directory sandbox;
+    late String libFile;
+
+    /// Runs [rules] (all enabled) over [fileContent] written at
+    /// `lib/main.dart` under the sandbox, returned as wire rows.
+    Future<List<PluginDiagnostic>> resolve({
+      required List<AnalysisRule> rules,
+      required String fileContent,
+      Map<String, String>? extraFiles,
+    }) async {
+      libFile = '${sandbox.path}/lib/main.dart';
+      io.File(libFile)
+        ..parent.createSync(recursive: true)
+        ..writeAsStringSync(fileContent);
+      extraFiles?.forEach((path, content) {
+        io.File('${sandbox.path}/$path')
+          ..parent.createSync(recursive: true)
+          ..writeAsStringSync(content);
+      });
+      final registry = _registry(lint: rules);
+      final config = PluginCycleConfig(
+        enabledRules: {for (final rule in rules) rule.name.toLowerCase()},
+        overlays: [
+          OverlayEntry(file: libFile, content: fileContent),
+          if (extraFiles != null)
+            for (final entry in extraFiles.entries)
+              OverlayEntry(
+                file: '${sandbox.path}/${entry.key}',
+                content: entry.value,
+              ),
+        ],
       );
-      expect(findings, isEmpty);
+      return runRules(
+        registry: registry,
+        config: config,
+        batch: _batch([libFile]),
+      );
+    }
+
+    setUp(() {
+      sandbox = io.Directory.systemTemp.createTempSync('dartq_runner_');
+    });
+
+    tearDown(() {
+      if (sandbox.existsSync()) {
+        sandbox.deleteSync(recursive: true);
+      }
+    });
+
+    test('a resolution-dependent rule resolves and reports', () async {
+      final findings = await resolve(
+        rules: [ResolvingRule()],
+        fileContent: fixture,
+      );
+      expect(findings, hasLength(1));
+      expect(findings.single.code, 'runner_resolved');
+      expect(findings.single.severity, Severity.warning);
+      expect(findings.single.file, libFile);
+      expect(findings.single.offset, 20);
+      expect(findings.single.length, 4);
+      expect(
+        findings.single.message,
+        'Boolean literals need a resolved review.',
+      );
+    });
+
+    test('a parsed-capable rule rides the resolved context too', () async {
+      // Upstream runs every enabled rule over the resolved units once the
+      // library resolves — the parse-only rule sees the same AST.
+      final findings = await resolve(
+        rules: [BooleanRule(), ResolvingRule()],
+        fileContent: fixture,
+      );
+      expect(findings, hasLength(2));
+      expect(
+        findings.map((f) => f.code).toSet(),
+        {'runner_boolean', 'runner_resolved'},
+      );
+    });
+
+    test('a resolution-dependent rule reads the overlay, not the disk',
+        () async {
+      // The overlay carries two booleans; the disk carries one — resolution
+      // must observe the pushed text, matching the parse path's overlay
+      // precedence.
+      libFile = '${sandbox.path}/lib/main.dart';
+      io.File(libFile)
+        ..parent.createSync(recursive: true)
+        ..writeAsStringSync('void main() { print(true); }\n');
+      final findings = await runRules(
+        registry: _registry(lint: [ResolvingRule()]),
+        config: PluginCycleConfig(
+          enabledRules: const {'runner_resolved_review'},
+          overlays: [
+            OverlayEntry(
+              file: libFile,
+              content: 'void main() { print(true, false); }\n',
+            ),
+          ],
+        ),
+        batch: _batch([libFile]),
+      );
+      expect(findings, hasLength(2));
     });
   });
 
   group('file surface', () {
-    test('the overlay text is what parses, not the disk', () {
-      final findings = runRules(
+    test('the overlay text is what parses, not the disk', () async {
+      final findings = await runRules(
         registry: _registry(lint: [BooleanRule()]),
         config: _config(
           overlays: [
@@ -208,8 +344,8 @@ void main() {
       expect(findings, hasLength(2));
     });
 
-    test('a file with no overlay and no disk text is skipped', () {
-      final findings = runRules(
+    test('a file with no overlay and no disk text is skipped', () async {
+      final findings = await runRules(
         registry: _registry(lint: [BooleanRule()]),
         config: _config(overlays: const []),
         batch: _batch(['lib/missing_on_disk.dart']),
@@ -217,8 +353,8 @@ void main() {
       expect(findings, isEmpty);
     });
 
-    test('the same file pushed twice runs once', () {
-      final findings = runRules(
+    test('the same file pushed twice runs once', () async {
+      final findings = await runRules(
         registry: _registry(lint: [BooleanRule()]),
         config: _config(),
         batch: _batch(['lib/a.dart', 'lib/a.dart']),
@@ -227,12 +363,12 @@ void main() {
     });
 
     test('a non-Dart payload still runs the rule (the runner is parse-based, '
-        'not extension-based)', () {
+        'not extension-based)', () async {
       // The core's analyzed set is the engine's Dart libraries; the runner
       // does not re-filter. A .txt path would simply parse with syntax
       // errors (throwIfDiagnostics: false) and report whatever survives —
       // pinned here as zero findings for prose.
-      final findings = runRules(
+      final findings = await runRules(
         registry: _registry(lint: [BooleanRule()]),
         config: _config(
           overlays: [
@@ -246,8 +382,8 @@ void main() {
   });
 
   group('severity', () {
-    test('an override re-levels the row', () {
-      final findings = runRules(
+    test('an override re-levels the row', () async {
+      final findings = await runRules(
         registry: _registry(lint: [BooleanRule()]),
         config: _config(
           severityOverrides: const {'runner_boolean': Severity.error},
@@ -260,8 +396,8 @@ void main() {
       expect(findings.single.offset, 20);
     });
 
-    test('without an override the declared severity stands', () {
-      final findings = runRules(
+    test('without an override the declared severity stands', () async {
+      final findings = await runRules(
         registry: _registry(lint: [BooleanRule()]),
         config: _config(
           severityOverrides: const {'other_code': Severity.error},
@@ -273,8 +409,8 @@ void main() {
   });
 
   group('failure posture', () {
-    test('a throwing rule propagates out of the runner', () {
-      expect(
+    test('a throwing rule propagates out of the runner', () async {
+      await expectLater(
         () => runRules(
           registry: _registry(lint: [ThrowingRule()]),
           config: _config(enabledRules: const {'runner_throwing_review'}),

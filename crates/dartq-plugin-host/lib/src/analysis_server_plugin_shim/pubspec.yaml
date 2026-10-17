@@ -1,10 +1,10 @@
 name: analysis_server_plugin
 description: >-
   Import shim standing in for the official package:analysis_server_plugin on
-  the dartq plugin host (PRD section 14). A plugin written verbatim against
-  the official API imports this package unchanged; the host launcher maps the
-  `analysis_server_plugin` package name here via package_config. Never
-  published.
+  the dartq plugin host: it mirrors the upstream analysis_server_plugin API
+  surface so a plugin written verbatim against the official API imports this
+  package unchanged; the host launcher maps the `analysis_server_plugin`
+  package name here via package_config. Never published.
 version: 0.4.0
 environment:
   sdk: ^3.10.0
@@ -16,3 +16,10 @@ dependencies:
   # both against analyzer 8.4 / 12.1 / 13.x, and the shim touches only the
   # `AbstractAnalysisRule` + `DiagnosticCode` names shared by all three.
   analyzer: ">=8.4.0 <14.0.0"
+  # The authoring producers' `compute(ChangeBuilder builder)` names the real
+  # `package:analyzer_plugin` ChangeBuilder — the same dependency the official
+  # package re-exports (`edit/change_builder/change_builder.dart`). The dartq
+  # plugin probes pin analyzer_plugin 0.14.x (paired with analyzer 14.x)
+  # through their injected package_config; the host's own resolution pairs
+  # 0.13.4 with its analyzer 13.x, which the range spans.
+  analyzer_plugin: ">=0.13.4 <0.15.0"
