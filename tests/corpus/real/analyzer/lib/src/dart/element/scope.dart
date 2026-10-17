@@ -1,0 +1,992 @@
+// Copyright (c) 2020, the Dart project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+import 'package:_fe_analyzer_shared/src/scanner/string_canonicalizer.dart';
+import 'package:analyzer/dart/analysis/features.dart';
+import 'package:analyzer/dart/element/element.dart';
+import 'package:analyzer/dart/element/scope.dart';
+import 'package:analyzer/src/dart/element/element.dart';
+import 'package:analyzer/src/fine/requirements.dart';
+import 'package:analyzer/src/summary2/combinator.dart';
+import 'package:analyzer/src/utilities/extensions/collection.dart';
+
+/// The scope for the initializers in a constructor.
+class ConstructorInitializerScope extends EnclosedScope {
+  ConstructorInitializerScope(
+    super.parent,
+    ConstructorElement element,
+    List<FormalParameterFragmentImpl> formalParameterFragments,
+  ) {
+    var hasWildcardVariables = element.library.featureSet.isEnabled(
+      Feature.wildcard_variables,
+    );
+
+    for (var formalParameter in formalParameterFragments) {
+      if (formalParameter.isOriginOtherFragmentOfEnclosing) {
+        continue;
+      }
+
+      var name = formalParameter.name;
+      if (name == null || name == '_' && hasWildcardVariables) {
+        continue;
+      }
+
+      // If the parameter is a private named parameter, then the formal
+      // parameter's name is the public name, but in the constructor initializer
+      // list, it is referred to by its private name.
+      if (formalParameter case FieldFormalParameterFragmentImpl(
+        :var privateName?,
+      )) {
+        _getters[privateName] ??= formalParameter.element;
+      } else {
+        _getters[name] ??= formalParameter.element;
+      }
+    }
+  }
+}
+
+/// The scope of the names provided by the `@docImport`s of a file.
+///
+/// Doc imports are scoped like imports with the parts-with-imports feature:
+/// the scope of a file looks up its doc import prefixes, then the names that
+/// it doc-imports without a prefix, and then the scope of the enclosing file.
+/// A part file can shadow the names doc-imported by its enclosing files, and
+/// extend their prefixes.
+class DocImportScope implements Scope {
+  final LibraryFragmentImpl _libraryFragment;
+  final DocImportScope? _parent;
+  final List<LibraryImportImpl> _imports;
+  final Map<String, DocImportPrefixElementImpl> _prefixElements = {};
+
+  /// The names imported without a prefix.
+  ///
+  /// Built lazily, because most documentation comments reference only names
+  /// that are found in their lexical scope.
+  late final PrefixScope _noPrefixScope = PrefixScope(
+    libraryFragment: _libraryFragment,
+    parent: null,
+    libraryImports: _imports,
+    prefix: null,
+  );
+
+  DocImportScope({
+    required LibraryFragmentImpl libraryFragment,
+    required DocImportScope? parent,
+    required List<LibraryImportImpl> imports,
+  }) : _libraryFragment = libraryFragment,
+       _parent = parent,
+       _imports = imports {
+    for (var import in imports) {
+      var prefix = import.prefix?.element;
+      if (prefix is DocImportPrefixElementImpl) {
+        if (prefix.name case var name?) {
+          _prefixElements[name] = prefix;
+        }
+      }
+    }
+  }
+
+  @override
+  ScopeLookupResult lookup(String id) {
+    if (_libraryFragment.isAllowedAsPrefixName(id)) {
+      if (_prefixElements[id] case var prefixElement?) {
+        return ScopeLookupResultImpl(getter: prefixElement, setter: null);
+      }
+    }
+
+    var result = _noPrefixScope.lookup(id);
+    if (result.getter != null || result.setter != null) {
+      return result;
+    }
+
+    if (_parent case var parent?) {
+      return parent.lookup(id);
+    }
+    return result;
+  }
+
+  /// Returns the doc import prefix with the [name], declared in the file of
+  /// this scope, or in an enclosing file.
+  DocImportPrefixElementImpl? lookupPrefix(String name) {
+    for (DocImportScope? scope = this; scope != null; scope = scope._parent) {
+      if (scope._prefixElements[name] case var prefix?) {
+        return prefix;
+      }
+    }
+    return null;
+  }
+}
+
+/// The scope that looks up elements in documentation comments.
+///
+/// Elements of the lexical scope shadow the names from doc imports.
+class DocumentationCommentScope implements Scope {
+  final Scope _innerScope;
+  final DocImportScope _docImportScope;
+
+  DocumentationCommentScope(this._innerScope, this._docImportScope);
+
+  @override
+  ScopeLookupResult lookup(String id) {
+    var result = _innerScope.lookup(id);
+    if (result.getter != null || result.setter != null) return result;
+    return _docImportScope.lookup(id);
+  }
+}
+
+/// A scope that is lexically enclosed in another scope.
+class EnclosedScope with _GettersAndSetters implements Scope {
+  final Scope _parent;
+
+  EnclosedScope(Scope parent) : _parent = parent;
+
+  Scope get parent => _parent;
+
+  @override
+  ScopeLookupResult lookup(String id) {
+    var getter = _getters[id];
+    var setter = _setters[id];
+    if (getter != null || setter != null) {
+      return ScopeLookupResultImpl(getter: getter, setter: setter);
+    }
+
+    return _parent.lookup(id);
+  }
+}
+
+/// The scope defined by an extension.
+class ExtensionScope extends EnclosedScope {
+  ExtensionScope(super.parent, ExtensionElement element) {
+    element.getters.forEach(_addGetter);
+    element.setters.forEach(_addSetter);
+    element.methods.forEach(_addGetter);
+  }
+}
+
+class FormalParameterScope extends EnclosedScope {
+  FormalParameterScope(
+    super.parent,
+    List<FormalParameterFragmentImpl> fragments, {
+    required FeatureSet featureSet,
+  }) {
+    for (var fragment in fragments) {
+      if (fragment.isOriginOtherFragmentOfEnclosing ||
+          fragment is FieldFormalParameterFragmentImpl ||
+          fragment is SuperFormalParameterFragmentImpl) {
+        continue;
+      }
+
+      var name = fragment.name;
+      if (featureSet.isEnabled(Feature.wildcard_variables) && name == '_') {
+        continue;
+      }
+
+      if (name != null) {
+        _getters[name] ??= fragment.element;
+      }
+    }
+  }
+}
+
+/// Tracking information for all import in [LibraryFragmentImpl].
+class ImportsTracking {
+  /// Tracking information for each import prefix.
+  final Map<PrefixElementImpl?, ImportsTrackingOfPrefix> map;
+
+  ImportsTracking({required this.map});
+
+  /// The elements that are used from [import].
+  Set<Element> elementsOf(LibraryImportImpl import) {
+    return trackerOf(import)?.importToUsedElements[import] ?? {};
+  }
+
+  void notifyExtensionUsed(ExtensionElement element) {
+    for (var tracking in map.values) {
+      tracking.notifyExtensionUsed(element);
+    }
+  }
+
+  ImportsTrackingOfPrefix? trackerOf(LibraryImportImpl import) {
+    var prefix = import.prefix?.element;
+    return map[prefix];
+  }
+}
+
+class ImportsTrackingOfPrefix {
+  final PrefixScope scope;
+
+  /// Key: an element.
+  /// Value: the imports that provide the element.
+  final Map<Element, List<LibraryImportImpl>> _elementImports = {};
+
+  /// Key: an import.
+  /// Value: used elements imported from the import.
+  final Map<LibraryImportImpl, Set<Element>> importToUsedElements = {};
+
+  /// Key: an import.
+  /// Value: used elements imported from the import.
+  /// Excludes elements from deprecated exports.
+  final Map<LibraryImportImpl, Set<Element>> importToAccessedElements2 = {};
+
+  /// Whether the prefix is used without naming an element, so no lookup
+  /// tells which of the imports with this prefix is used.
+  ///
+  /// This happens in comment references like `[math]`, where it is allowed,
+  /// and in incomplete code like `math.`, where the parser reports the
+  /// missing name. This makes the whole group of imports "used".
+  bool hasPrefixUsedWithoutName = false;
+
+  /// We set it temporarily to `false` while resolving combinators.
+  bool active = true;
+
+  ImportsTrackingOfPrefix({required this.scope}) {
+    _buildElementToImportsMap();
+  }
+
+  /// The elements that are used from [import].
+  Set<Element> elementsOf(LibraryImportImpl import) {
+    return importToUsedElements[import] ?? {};
+  }
+
+  /// The subset of [elementsOf], excludes elements that are from deprecated
+  /// exports inside the imported library.
+  Set<Element> elementsOf2(LibraryImportImpl import) {
+    var result = importToAccessedElements2[import];
+    if (result != null) {
+      return result;
+    }
+
+    var accessedElements = elementsOf(import);
+
+    // SAFETY: the scope adds only imports with libraries.
+    var importedLibrary = import.importedLibrary!;
+    var elementFactory = importedLibrary.internal.elementFactory;
+
+    for (var entry in importedLibrary.exportEntries) {
+      var element = elementFactory.elementOfReference3(entry.reference);
+
+      // Check only accessed elements.
+      if (!accessedElements.contains(element)) {
+        continue;
+      }
+
+      // We want to exclude only deprecated exports.
+      if (!importedLibrary.isFromDeprecatedExport(entry)) {
+        continue;
+      }
+
+      // OK, we have to clone the set, and remove the element.
+      result ??= accessedElements.toSet();
+      result.remove(element);
+    }
+
+    result ??= accessedElements;
+    return importToAccessedElements2[import] = result;
+  }
+
+  void lookupResult(Element? element) {
+    if (!active) {
+      return;
+    }
+
+    if (element == null) {
+      return;
+    }
+
+    if (element is MultiplyDefinedElement) {
+      return;
+    }
+
+    // SAFETY: if we have `element`, it is from a local import.
+    var imports = _elementImports[element]!;
+    for (var import in imports) {
+      (importToUsedElements[import] ??= {}).add(element);
+    }
+  }
+
+  void notifyExtensionUsed(ExtensionElement element) {
+    var imports = _elementImports[element];
+    if (imports != null) {
+      for (var import in imports) {
+        (importToUsedElements[import] ??= {}).add(element);
+      }
+    } else {
+      // We include into `accessibleExtensions` elements from parents.
+      // So, it is possible that the element is not from this scope.
+      // In this case we notify the parent tracker.
+      var parentTracking = scope.parent?._importsTracking;
+      parentTracking?.notifyExtensionUsed(element);
+    }
+  }
+
+  void notifyPrefixUsedWithoutName() {
+    hasPrefixUsedWithoutName = true;
+  }
+
+  void _buildElementToImportsMap() {
+    for (var import in scope._importElements) {
+      var importedLibrary = import.importedLibrary!;
+      var elementFactory = importedLibrary.internal.elementFactory;
+      var combinators = import.combinators.build();
+      for (var entry in importedLibrary.exportEntries) {
+        if (combinators.allows(entry.name)) {
+          var element = elementFactory.elementOfReference3(entry.reference);
+          (_elementImports[element] ??= []).add(import);
+        }
+      }
+    }
+  }
+}
+
+/// The scope defined by an instance element.
+class InstanceScope extends EnclosedScope {
+  InstanceScope(super.parent, InstanceElement element) {
+    element.getters.forEach(_addGetter);
+    element.setters.forEach(_addSetter);
+    element.methods.forEach(_addGetter);
+  }
+
+  @override
+  ScopeLookupResult lookup(String id) {
+    // When a lexical lookup encounters an instance member with the requested
+    // basename, the returned result should have null as the getter and setter
+    // (and that is the result, so we should not search the enclosing scope).
+    // This corresponds to the following rule from the specification:
+    // "Consider the case where D is an instance member declaration in a class
+    // or mixin A. The lexical lookup then yields nothing."
+    var getter = _getters[id];
+    var setter = _setters[id];
+    if (getter == null && setter == null) {
+      return _parent.lookup(id);
+    }
+    if (_isStatic(getter) || _isStatic(setter)) {
+      return ScopeLookupResultImpl(getter: getter, setter: setter);
+    }
+    // A declaration with the right basename was found, so the search ends.
+    // Return nulls to ensure that it is handled as with a prepended `this.`.
+    return ScopeLookupResultImpl(getter: null, setter: null);
+  }
+
+  static bool _isStatic(Element? element) {
+    switch (element) {
+      case PropertyAccessorElement(:var isStatic) ||
+          MethodElement(:var isStatic):
+        return isStatic;
+      default:
+        return false;
+    }
+  }
+}
+
+/// The top-level declarations of the library.
+class LibraryDeclarations with _GettersAndSetters {
+  List<ExtensionElement> extensions = [];
+
+  LibraryDeclarations(LibraryElementImpl library) {
+    library.getters.forEach(_addGetter);
+    library.enums.forEach(_addGetter);
+    library.extensions.forEach(_addExtension);
+    library.extensionTypes.forEach(_addGetter);
+    library.setters.forEach(_addSetter);
+    library.topLevelFunctions.forEach(_addGetter);
+    library.typeAliases.forEach(_addGetter);
+    library.mixins.forEach(_addGetter);
+    library.classes.forEach(_addGetter);
+
+    // Add implicit 'dart:core' declarations.
+    if ('${library.uri}' == 'dart:core') {
+      _addGetter(DynamicElementImpl.instance);
+      _addGetter(NeverElementImpl.instance);
+    }
+
+    extensions = extensions.toFixedList();
+  }
+
+  /// Returns a getter or setter with the [name].
+  Element? withName(String name) {
+    return _getters[name] ?? _setters[name];
+  }
+
+  void _addExtension(ExtensionElement element) {
+    _addGetter(element);
+    if (!extensions.contains(element)) {
+      extensions.add(element);
+    }
+  }
+}
+
+class LibraryFragmentScope implements Scope {
+  final LibraryFragmentScope? parent;
+  final LibraryFragmentImpl fragment;
+  final PrefixScope noPrefixScope;
+
+  final Map<String, PrefixElementImpl> _prefixElements = {};
+
+  /// All libraries that contribute to [accessibleExtensions].
+  List<LibraryElementImpl>? _importedLibrariesContributingExtensions;
+
+  /// The cached result for [accessibleExtensions].
+  List<ExtensionElement>? _extensions;
+
+  /// This field is set temporarily while resolving all files of a library.
+  /// So, we can track which elements were actually returned, and which imports
+  /// in which file (including enclosing files) provided these elements.
+  ///
+  /// When we are done, we remove the tracker, so that it does not use memory
+  /// when we are not resolving files of this library.
+  ImportsTracking? _importsTracking;
+
+  factory LibraryFragmentScope(LibraryFragmentImpl fragment) {
+    var parent = fragment.enclosingFragment?.scope;
+    return LibraryFragmentScope._(
+      parent: parent,
+      fragment: fragment,
+      noPrefixScope: PrefixScope(
+        libraryFragment: fragment,
+        parent: parent?.noPrefixScope,
+        libraryImports: fragment.libraryImports,
+        prefix: null,
+      ),
+    );
+  }
+
+  LibraryFragmentScope._({
+    required this.parent,
+    required this.fragment,
+    required this.noPrefixScope,
+  }) {
+    for (var prefix in fragment.prefixes) {
+      if (prefix.name case var name?) {
+        _prefixElements[name] = prefix;
+      }
+      prefix.scope = PrefixScope(
+        libraryFragment: fragment,
+        parent: _getParentPrefixScope(prefix),
+        libraryImports: fragment.libraryImports,
+        prefix: prefix,
+      );
+    }
+  }
+
+  /// The extensions accessible within [fragment].
+  List<ExtensionElement> get accessibleExtensions {
+    if (_extensions case var extensions?) {
+      return extensions;
+    }
+
+    globalResultRequirements?.record_libraryFragmentScope_accessibleExtensions(
+      importedLibraries: importedLibrariesContributingExtensions,
+    );
+
+    return _extensions = {
+      ...fragment.library.libraryDeclarations.extensions,
+      ...noPrefixScope._extensions,
+      for (var prefix in _prefixElements.values) ...prefix.scope._extensions,
+      ...?parent?.accessibleExtensions,
+    }.toFixedList();
+  }
+
+  List<LibraryElementImpl> get importedLibrariesContributingExtensions {
+    return _importedLibrariesContributingExtensions ??= {
+      ...noPrefixScope._importedLibraries,
+      for (var prefix in _prefixElements.values)
+        ...prefix.scope._importedLibraries,
+      ...?parent?.importedLibrariesContributingExtensions,
+    }.toFixedList();
+  }
+
+  // TODO(scheglov): this is kludge.
+  // We should not use the fragment scope for resolving combinators.
+  // We should use the export scope of the imported library.
+  void importsTrackingActive(bool value) {
+    if (_importsTracking case var importsTracking?) {
+      for (var tracking in importsTracking.map.values) {
+        tracking.active = value;
+      }
+    }
+  }
+
+  void importsTrackingDestroy() {
+    noPrefixScope.importsTrackingDestroy();
+    for (var prefixElement in _prefixElements.values) {
+      prefixElement.scope.importsTrackingDestroy();
+    }
+    _importsTracking = null;
+  }
+
+  ImportsTracking importsTrackingInit() {
+    return _importsTracking = ImportsTracking(
+      map: {
+        null: noPrefixScope.importsTrackingInit(),
+        for (var prefixElement in _prefixElements.values)
+          prefixElement: prefixElement.scope.importsTrackingInit(),
+      },
+    );
+  }
+
+  @override
+  ScopeLookupResult lookup(String id) {
+    // Try declarations of the whole library.
+    if (_lookupLibrary(id) case var result?) {
+      return result;
+    }
+
+    // Try the combined import scope.
+    var importResult = _lookupCombined(id);
+    if (importResult != null) {
+      return importResult;
+    }
+
+    // No result.
+    return ScopeLookupResultImpl(getter: null, setter: null);
+  }
+
+  void notifyExtensionUsed(ExtensionElement element) {
+    _importsTracking?.notifyExtensionUsed(element);
+  }
+
+  PrefixScope? _getParentPrefixScope(PrefixElementImpl prefix) {
+    var isDeferred = prefix.imports.any((import) {
+      return import.prefix?.isDeferred ?? false;
+    });
+    if (isDeferred) {
+      return null;
+    }
+
+    for (var scope = parent; scope != null; scope = scope.parent) {
+      var parentPrefix = scope._prefixElements[prefix.name];
+      if (parentPrefix != null) {
+        return parentPrefix.scope;
+      }
+    }
+    return null;
+  }
+
+  ScopeLookupResult? _lookupCombined(String id) {
+    // Try prefix elements.
+    if (fragment.isAllowedAsPrefixName(id)) {
+      if (_prefixElements[id] case var prefixElement?) {
+        return ScopeLookupResultImpl(getter: prefixElement, setter: null);
+      }
+    }
+
+    // Try imports of the library fragment.
+    var noPrefixResult = noPrefixScope.lookup(id);
+    if (noPrefixResult.getter != null || noPrefixResult.setter != null) {
+      return noPrefixResult;
+    }
+
+    // Try the parent's combined import scope.
+    return parent?._lookupCombined(id);
+  }
+
+  ScopeLookupResult? _lookupLibrary(String id) {
+    var libraryDeclarations = fragment.library.libraryDeclarations;
+    var libraryGetter = libraryDeclarations._getters[id];
+    var librarySetter = libraryDeclarations._setters[id];
+    if (libraryGetter != null || librarySetter != null) {
+      return ScopeLookupResultImpl(
+        getter: libraryGetter,
+        setter: librarySetter,
+      );
+    }
+    return null;
+  }
+}
+
+class LocalScope extends EnclosedScope {
+  final FeatureSet _featureSet;
+
+  LocalScope(super.parent, {required FeatureSet featureSet})
+    : _featureSet = featureSet;
+
+  void add(Element element) {
+    assert(() {
+      return element is LocalVariableElement ||
+          element is LocalFunctionElement ||
+          // TODO(scheglov): why not FormalParameterScope?
+          element is FormalParameterElement;
+    }());
+    if (element.name == '_') {
+      if (element is PatternVariableElement ||
+          _featureSet.isEnabled(Feature.wildcard_variables)) {
+        return;
+      }
+    }
+    _addGetter(element);
+  }
+
+  void addAll(Iterable<Element> elements) {
+    for (var element in elements) {
+      add(element);
+    }
+  }
+}
+
+class PrefixScope implements Scope {
+  final LibraryFragmentImpl libraryFragment;
+
+  /// The scope of the enclosing file that this scope extends: for a prefix,
+  /// the scope of the prefix with the same name, and for the imports without
+  /// a prefix, the scope of such imports.
+  ///
+  /// It is `null` for a deferred prefix, which provides only the names of its
+  /// own library.
+  final PrefixScope? parent;
+
+  final List<LibraryImportImpl> _importElements = [];
+  final List<LibraryElementImpl> _importedLibraries = [];
+
+  final Map<String, Element> _getters = {};
+  final Map<String, Element> _setters = {};
+  Set<String>? _settersFromDeprecatedExport;
+  Set<String>? _gettersFromDeprecatedExport;
+  final Set<ExtensionElement> _extensions = {};
+  LibraryElement? _deferredLibrary;
+
+  ImportsTrackingOfPrefix? _importsTracking;
+
+  final PrefixScopeRequirementState _requirementState =
+      PrefixScopeRequirementState();
+
+  PrefixScope({
+    required this.libraryFragment,
+    required this.parent,
+    required List<LibraryImportImpl> libraryImports,
+    required PrefixElement? prefix,
+  }) {
+    var elementFactory = libraryElement.session.elementFactory;
+    for (var import in libraryImports) {
+      var importedUri = import.uri;
+      if (importedUri is DirectiveUriWithLibraryImpl &&
+          import.prefix?.element == prefix) {
+        _importElements.add(import);
+        var importedLibrary = importedUri.library;
+        _importedLibraries.add(importedLibrary);
+        var combinators = import.combinators.build();
+        for (var entry in importedLibrary.exportEntries) {
+          if (combinators.allows(entry.name)) {
+            var element = elementFactory.elementOfReference3(entry.reference);
+            if (_shouldAdd(importedLibrary, element)) {
+              _add(element, importedLibrary.isFromDeprecatedExport(entry));
+            }
+          }
+        }
+        if (import.prefix case var importPrefix?) {
+          if (importPrefix.isDeferred) {
+            _deferredLibrary ??= importedLibrary;
+          }
+        }
+      }
+    }
+  }
+
+  /// The libraries imported into this scope, and into [parent].
+  ///
+  /// Excludes the libraries of files that don't exist, because their URIs
+  /// are already reported, and they don't provide any elements.
+  List<LibraryElementImpl> get libraries {
+    return {
+      for (var library in _importedLibraries)
+        if (!library.isOriginNotExistingFile) library,
+      ...?parent?.libraries,
+    }.toList();
+  }
+
+  LibraryElementImpl get libraryElement {
+    return libraryFragment.element;
+  }
+
+  void importsTrackingDestroy() {
+    _importsTracking = null;
+  }
+
+  ImportsTrackingOfPrefix importsTrackingInit() {
+    return _importsTracking = ImportsTrackingOfPrefix(scope: this);
+  }
+
+  @override
+  ScopeLookupResult lookup(String id) {
+    var deferredLibrary = _deferredLibrary;
+    if (deferredLibrary != null &&
+        id == TopLevelFunctionElement.LOAD_LIBRARY_NAME) {
+      return ScopeLookupResultImpl(
+        getter: deferredLibrary.loadLibraryFunction,
+        setter: null,
+      );
+    }
+
+    if (globalResultRequirements case var resultRequirements?) {
+      resultRequirements.record_importPrefixScope_lookup(
+        state: _requirementState,
+        importedLibraries: _importedLibraries,
+        id: id,
+      );
+    }
+
+    var getter = _getters[id];
+    var setter = _setters[id];
+    if (getter != null || setter != null) {
+      _importsTracking?.lookupResult(getter);
+      _importsTracking?.lookupResult(setter);
+      return PrefixScopeLookupResult(
+        getter: getter,
+        setter: setter,
+        getterIsFromDeprecatedExport:
+            _gettersFromDeprecatedExport?.contains(id) ?? false,
+        setterIsFromDeprecatedExport:
+            _settersFromDeprecatedExport?.contains(id) ?? false,
+      );
+    }
+
+    if (parent case var parent?) {
+      return parent.lookup(id);
+    }
+
+    return ScopeLookupResultImpl(getter: null, setter: null);
+  }
+
+  /// Notifies that the prefix is used without naming an element.
+  ///
+  /// See [ImportsTrackingOfPrefix.hasPrefixUsedWithoutName].
+  void notifyPrefixUsedWithoutName() {
+    _importsTracking?.notifyPrefixUsedWithoutName();
+  }
+
+  void _add(Element element, bool isFromDeprecatedExport) {
+    if (element is SetterElement) {
+      _addTo(
+        element,
+        isFromDeprecatedExport: isFromDeprecatedExport,
+        isSetter: true,
+      );
+    } else {
+      _addTo(
+        element,
+        isFromDeprecatedExport: isFromDeprecatedExport,
+        isSetter: false,
+      );
+      if (element is ExtensionElement) {
+        _extensions.add(element);
+      }
+    }
+  }
+
+  void _addTo(
+    Element element, {
+    required bool isFromDeprecatedExport,
+    required bool isSetter,
+  }) {
+    var map = isSetter ? _setters : _getters;
+    var id = element.displayName;
+    var existing = map[id];
+
+    if (existing == null) {
+      map[id] = element;
+      if (isFromDeprecatedExport) {
+        if (isSetter) {
+          (_settersFromDeprecatedExport ??= {}).add(id);
+        } else {
+          (_gettersFromDeprecatedExport ??= {}).add(id);
+        }
+      }
+      return;
+    }
+
+    var deprecatedSet = isSetter
+        ? _settersFromDeprecatedExport
+        : _gettersFromDeprecatedExport;
+    var wasFromDeprecatedExport = deprecatedSet?.contains(id) ?? false;
+    if (existing == element) {
+      if (wasFromDeprecatedExport && !isFromDeprecatedExport) {
+        deprecatedSet!.remove(id);
+      }
+      return;
+    }
+
+    map[id] = _merge(existing, element);
+    if (wasFromDeprecatedExport) {
+      deprecatedSet!.remove(id);
+    }
+  }
+
+  Element _merge(Element existing, Element other) {
+    if (_isSdkElement(existing)) {
+      if (!_isSdkElement(other)) {
+        return other;
+      }
+    } else {
+      if (_isSdkElement(other)) {
+        return existing;
+      }
+    }
+
+    var conflictingElements = <Element>{};
+    _addElement(conflictingElements, existing);
+    _addElement(conflictingElements, other);
+
+    return MultiplyDefinedElementImpl(
+      libraryFragment,
+      conflictingElements.first.name!,
+      conflictingElements.toList(),
+    );
+  }
+
+  bool _shouldAdd(LibraryElementImpl importedLibrary, Element element) {
+    // It is an error for the identifier `Record`, denoting the `Record` class
+    // from `dart:core`, where that import scope name is only imported from
+    // platform libraries, to appear in a library whose language version is
+    // less than `v`; assuming that `v` is the language version in which
+    // records are released.
+    if (!libraryElement.featureSet.isEnabled(Feature.records)) {
+      if (importedLibrary.isInSdk &&
+          element is ClassElementImpl &&
+          element.isDartCoreRecord) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static void _addElement(Set<Element> conflictingElements, Element element) {
+    if (element is MultiplyDefinedElementImpl) {
+      conflictingElements.addAll(element.conflictingElements);
+    } else {
+      conflictingElements.add(element);
+    }
+  }
+
+  static bool _isSdkElement(Element element) {
+    if (element is DynamicElementImpl || element is NeverElementImpl) {
+      return true;
+    }
+    if (element is MultiplyDefinedElement) {
+      return false;
+    }
+    return element.library!.isInSdk;
+  }
+}
+
+class PrefixScopeLookupResult extends ScopeLookupResultImpl {
+  static const int getterIsFromDeprecatedExportBit = 1 << 0;
+  static const int setterIsFromDeprecatedExportBit = 1 << 1;
+
+  final int _deprecatedBits;
+
+  PrefixScopeLookupResult({
+    required super.getter,
+    required super.setter,
+    required bool getterIsFromDeprecatedExport,
+    required bool setterIsFromDeprecatedExport,
+  }) : _deprecatedBits =
+           (getterIsFromDeprecatedExport
+               ? getterIsFromDeprecatedExportBit
+               : 0) |
+           (setterIsFromDeprecatedExport ? setterIsFromDeprecatedExportBit : 0);
+
+  /// This flag is set to `true` if [getter] is available using import
+  /// directives where every imported library re-exports the element, and
+  /// every such `export` directive is marked as deprecated.
+  bool get getterIsFromDeprecatedExport =>
+      (_deprecatedBits & getterIsFromDeprecatedExportBit) != 0;
+
+  /// This flag is set to `true` if [setter] is available using import
+  /// directives where every imported library re-exports the element, and
+  /// every such `export` directive is marked as deprecated.
+  bool get setterIsFromDeprecatedExport =>
+      (_deprecatedBits & setterIsFromDeprecatedExportBit) != 0;
+}
+
+/// The primary parameter scope.
+///
+/// It includes every primary formal parameter which is not declaring, not
+/// initializing, and not a super parameter.
+class PrimaryParameterScope extends EnclosedScope {
+  PrimaryParameterScope(
+    super.parent,
+    ConstructorElement element,
+    List<FormalParameterFragmentImpl> formalParameterFragments,
+  ) {
+    assert(element.isPrimary);
+
+    var hasWildcardVariables = element.library.featureSet.isEnabled(
+      Feature.wildcard_variables,
+    );
+
+    for (var fragment in formalParameterFragments) {
+      if (fragment.isOriginOtherFragmentOfEnclosing ||
+          fragment is FieldFormalParameterFragmentImpl ||
+          fragment is SuperFormalParameterFragmentImpl) {
+        continue;
+      }
+
+      var name = fragment.name;
+      if (name == null || hasWildcardVariables && name == '_') {
+        continue;
+      }
+
+      _getters[name] ??= fragment.element;
+    }
+  }
+}
+
+class ScopeLookupResultImpl extends ScopeLookupResult {
+  @override
+  final Element? getter;
+
+  @override
+  final Element? setter;
+
+  ScopeLookupResultImpl({required this.getter, required this.setter});
+}
+
+class TypeParameterScope extends EnclosedScope {
+  TypeParameterScope(
+    super.parent,
+    List<TypeParameterElement> elements, {
+    required FeatureSet featureSet,
+  }) {
+    var wildcardVariablesEnabled = featureSet.isEnabled(
+      Feature.wildcard_variables,
+    );
+    for (var element in elements) {
+      if (wildcardVariablesEnabled && element.name == '_') {
+        continue;
+      }
+      _addGetter(element);
+    }
+  }
+}
+
+mixin _GettersAndSetters {
+  final Map<String, Element> _getters = {};
+  final Map<String, Element> _setters = {};
+
+  void _addGetter(Element element) {
+    var id = element.lookupName;
+    if (id != null) {
+      _getters[id] ??= element;
+    }
+  }
+
+  void _addSetter(Element element) {
+    var name = element.lookupName;
+    if (name != null && name.endsWith('=')) {
+      var id = considerCanonicalizeString(name.substring(0, name.length - 1));
+      _setters[id] ??= element;
+    }
+  }
+}
+
+extension on LibraryFragmentImpl {
+  /// Whether [id] can be the name of an import prefix.
+  ///
+  /// With wildcard variables, `as _` does not declare a prefix.
+  bool isAllowedAsPrefixName(String id) {
+    if (id == '_') {
+      return !library.featureSet.isEnabled(Feature.wildcard_variables);
+    }
+    return true;
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "files": 181,
+  "files_per_top_level_dir": {
+    "lib": 15,
+    "packages": 120,
+    "pubspec.yaml": 1,
+    "tests": 24,
+    "zadv": 21
+  },
+  "fingerprint": "fnv1a64:0458b80edeaf443e",
+  "generator": "corpus-gen",
+  "lines": 8125,
+  "scale": "slice",
+  "seed": 0
+}
