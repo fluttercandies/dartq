@@ -1,4 +1,4 @@
-//! Handshake timeout (PRD §14.3 IPC row): a child that never answers
+//! Handshake timeout: a child that never answers
 //! `initialize` is killed at the request budget, and every relaunch attempt
 //! inside the manifest's retry budget hits the same silence. What `spawn`
 //! surfaces at the end is the typed [`RuntimeError::HandshakeTimeout`] with

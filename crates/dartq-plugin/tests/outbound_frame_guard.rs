@@ -1,4 +1,4 @@
-//! Outbound frame guard (PRD §14.3, the write-side twin of the inbound
+//! Outbound frame guard (, the write-side twin of the inbound
 //! decoder gate): a batch whose frame would exceed [`MAX_FRAME_SIZE`] is
 //! rejected at the handle with the same typed protocol error before any byte
 //! reaches the child. The child stays alive, no restart is consumed, and the
@@ -49,9 +49,9 @@ fn dart_host_survives_an_over_limit_outbound_batch() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");
         return;
     }
-    // Pinned above the 512 MiB default: a real Dart host's JIT startup loads
+    // Pinned above the 512 MiB release default: a real Dart host's JIT startup loads
     // the analyzer parse stack through the host package and crosses the
-    // default before the first request (calibration in `callback_timeout.rs`).
+    // release default before the first request (calibration in `callback_timeout.rs`).
     let manifest = Manifest::parse(
         r#"{"name": "echo", "version": "0.1.0", "entrypoint": "bin/echo_plugin.dart",
             "capabilities": ["lint"],

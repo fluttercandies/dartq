@@ -1,7 +1,7 @@
 //! The core-side plugin session: handshake state machine as pure functions
 //! over frames (testable without spawning any process).
 //!
-//! Lifecycle (PRD §14, wire contract v1):
+//! Lifecycle:
 //!
 //! 1. Core sends `initialize` (its protocol version + supported capabilities).
 //! 2. Plugin replies with its version + advertised capabilities. The reply
@@ -21,7 +21,7 @@
 //! - A diagnostic notification **before** initialize completes is rejected
 //!   with [`SessionError::UnexpectedFrame`] — never queued. Queueing would
 //!   hide a protocol violation and add an unbounded buffer; the host tears
-//!   the plugin down instead (PRD §14.3).
+//!   the plugin down instead.
 //! - A diagnostic arriving while the shutdown reply is awaited
 //!   ([`SessionState::AwaitingShutdownReply`]) is queued, not rejected: the
 //!   host wrote it before it could have seen the shutdown request, so it is
@@ -289,7 +289,7 @@ pub struct CyclePush {
 }
 
 /// Builds the core → plugin `notification/plugin_config` frame carrying
-/// [config]. A notification: the plugin never replies to it.
+/// `config`. A notification: the plugin never replies to it.
 #[must_use]
 pub fn plugin_config_frame(config: &CycleConfig) -> Frame {
     let mut params = Map::new();
@@ -1322,7 +1322,7 @@ mod tests {
     }
 
     /// A `request/query` frame as the Dart host would send it.
-    fn query_frame(id: u64, params: Value) -> Frame {
+    fn query_frame(id: u64, params: &Value) -> Frame {
         Frame::request(
             id,
             METHOD_REQUEST_QUERY,
@@ -1342,7 +1342,7 @@ mod tests {
         // The handshake consumed id 1; the fixes request is id 2.
         assert_eq!(fixes.id, Some(2));
 
-        let query = query_frame(5, json!({"kind": "symbol", "name": "Foo"}));
+        let query = query_frame(5, &json!({"kind": "symbol", "name": "Foo"}));
         assert_eq!(
             session.handle(query).expect("route"),
             Incoming::Query {
@@ -1371,7 +1371,7 @@ mod tests {
     #[test]
     fn reverse_query_without_the_negotiated_capability_is_fatal() {
         let mut session = ready_session(&["lint"]);
-        let query = query_frame(1, json!({"kind": "symbol", "name": "Foo"}));
+        let query = query_frame(1, &json!({"kind": "symbol", "name": "Foo"}));
         assert_eq!(
             session.handle(query).unwrap_err(),
             SessionError::CapabilityNotNegotiated(Capability::Query)
@@ -1384,7 +1384,7 @@ mod tests {
         let shutdown = session.send_shutdown().expect("send shutdown");
         let query = query_frame(
             2,
-            json!({"kind": "element_at", "file": "f.dart", "offset": 3}),
+            &json!({"kind": "element_at", "file": "f.dart", "offset": 3}),
         );
         assert_eq!(
             session.handle(query).expect("crossing query queues"),
@@ -1405,7 +1405,7 @@ mod tests {
             Incoming::ShutdownComplete
         );
         // After the reply the session is over; a late query is a violation.
-        let late = query_frame(3, json!({"kind": "symbol", "name": "x"}));
+        let late = query_frame(3, &json!({"kind": "symbol", "name": "x"}));
         assert_eq!(
             session.handle(late).unwrap_err(),
             SessionError::UnexpectedFrame {
@@ -1425,7 +1425,7 @@ mod tests {
             json!({"kind": "element_at", "file": "f.dart"}),
             json!({"kind": "mystery", "name": "x"}),
         ] {
-            let frame = query_frame(1, params);
+            let frame = query_frame(1, &params);
             assert!(
                 matches!(
                     session.handle(frame),

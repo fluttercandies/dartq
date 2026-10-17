@@ -15,8 +15,11 @@ categories = ["development-tools"]
 # `FileTable` resolves FileIds to the wire's path strings.
 dartq-diagnostics = { workspace = true }
 dartq-source = { workspace = true }
+# Pub-native discovery resolves declared plugin packages against the parsed
+# package_config.json (dartq-pub owns the rootUri resolution rules).
+dartq-pub = { workspace = true }
 # Process-group kill on Unix: an enforcement kill must take descendants that
-# inherited the child's pipes down with the child (PRD §14.3 isolation).
+# inherited the child's pipes down with the child.
 libc = { workspace = true }
 memchr = { workspace = true }
 serde = { workspace = true }

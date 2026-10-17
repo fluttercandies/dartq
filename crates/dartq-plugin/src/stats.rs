@@ -1,4 +1,4 @@
-//! Per-plugin isolation counters (PRD §14.3): the observable face of the
+//! Per-plugin isolation counters: the observable face of the
 //! resource-isolation substrate.
 //!
 //! Counters are process-wide atomics shared by the runtime's threads — the
@@ -9,6 +9,7 @@
 //! atomic once and the result is a valid point-in-time lower bound.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Internal, shared counter set. Cheap to clone (`Arc` at the call sites).
 #[derive(Debug, Default)]
@@ -21,6 +22,10 @@ pub struct PluginStats {
     frames_dropped: AtomicU64,
     rss_disarms: AtomicU64,
     restarts: AtomicU64,
+    evictions: AtomicU64,
+    cycles: AtomicU64,
+    degraded_cycles: AtomicU64,
+    busy_nanos: AtomicU64,
 }
 
 /// One point-in-time read of every isolation counter. The face the daemon and
@@ -58,10 +63,31 @@ pub struct PluginStatsSnapshot {
     /// the analyze callback clock stays armed regardless.
     pub rss_disarms: u64,
     /// Times the child process died and was relaunched during this runtime's
-    /// lifetime (PRD §14.3 crash isolation: a crash never takes the engine
+    /// lifetime (crash isolation: a crash never takes the engine
     /// down; restarts beyond the manifest's retry budget end in
     /// [`crate::RuntimeError::Crashed`]).
     pub restarts: u64,
+    /// Times the monitor evicted an idle child (the manifest's
+    /// `idle_evict_ms` elapsed with no interaction). An eviction is a host
+    /// memory action, not a failure: the child is killed to release its
+    /// resident set and relaunches budget-free at the next interaction —
+    /// it never counts into [`Self::restarts`] and never surfaces a crash.
+    pub evictions: u64,
+    /// Analyze cycles the daemon hosted on this plugin (one `feed` + bounded
+    /// drain each). The per-plugin overhead attribution face: alongside
+    /// [`Self::busy_nanos`] and [`Self::degraded_cycles`] it prices the
+    /// plugin subsystem's share of a benchmark cycle. Zero without plugins —
+    /// no runtime, no counter.
+    pub cycles: u64,
+    /// Cycles whose drain budget expired before the plugin quiesced — the
+    /// degraded shape: the plugin's remaining rows publish on a later cycle
+    /// (the core-first publish invariant's skip-don't-wait posture).
+    /// Persistently nonzero is the slow-plugin signature.
+    pub degraded_cycles: u64,
+    /// Total wall time the daemon spent interacting with this plugin (feed
+    /// plus drain windows, summed over cycles), in nanoseconds. The absent
+    /// path never arms a timer: this counter exists only on a live runtime.
+    pub busy_nanos: u64,
 }
 
 impl PluginStats {
@@ -108,6 +134,25 @@ impl PluginStats {
         self.restarts.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one idle eviction (the monitor killed an idle child; the
+    /// next interaction relaunches budget-free).
+    pub fn evict(&self) {
+        self.evictions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one hosted analyze cycle: its busy wall time (the caller's
+    /// feed-plus-drain window) and whether the drain budget expired before
+    /// the plugin quiesced (a degraded cycle — rows deferred to a later
+    /// cycle).
+    pub fn observe_cycle(&self, busy: Duration, degraded: bool) {
+        self.cycles.fetch_add(1, Ordering::Relaxed);
+        let nanos = u64::try_from(busy.as_nanos()).unwrap_or(u64::MAX);
+        self.busy_nanos.fetch_add(nanos, Ordering::Relaxed);
+        if degraded {
+            self.degraded_cycles.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Reads every counter once.
     #[must_use]
     pub fn snapshot(&self) -> PluginStatsSnapshot {
@@ -121,6 +166,10 @@ impl PluginStats {
             frames_dropped: load(&self.frames_dropped),
             rss_disarms: load(&self.rss_disarms),
             restarts: load(&self.restarts),
+            evictions: load(&self.evictions),
+            cycles: load(&self.cycles),
+            degraded_cycles: load(&self.degraded_cycles),
+            busy_nanos: load(&self.busy_nanos),
         }
     }
 }
@@ -143,6 +192,7 @@ mod tests {
         stats.observe_rss(300);
         stats.observe_rss(200);
         stats.restart();
+        stats.evict();
         stats.rss_disarm();
 
         let snap = stats.snapshot();
@@ -153,6 +203,16 @@ mod tests {
         assert_eq!(snap.frames_dropped, 1);
         assert_eq!(snap.peak_rss_bytes, 300);
         assert_eq!(snap.restarts, 1);
+        assert_eq!(snap.evictions, 1);
         assert_eq!(snap.rss_disarms, 1);
+
+        // The cycle face: every observed cycle counts, its wall time
+        // accumulates, and only budget-expired drains count degraded.
+        stats.observe_cycle(Duration::from_millis(5), false);
+        stats.observe_cycle(Duration::from_millis(7), true);
+        let snap = stats.snapshot();
+        assert_eq!(snap.cycles, 2);
+        assert_eq!(snap.degraded_cycles, 1);
+        assert!(snap.busy_nanos >= 12_000_000, "busy time accumulates");
     }
 }

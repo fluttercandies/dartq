@@ -4,7 +4,7 @@
 //! joined that reader for as long as the descendant lived — one budgeted
 //! enforcement kill (RSS, callback, analyze, write-stall, or a natural death
 //! the analyze budget converts into one) and every later interaction hung
-//! past any budget (§14.3 isolation breach). Two bounds close the wedge: the
+//! past any budget. Two bounds close the wedge: the
 //! child is spawned as its own Unix process group and every kill signals the
 //! group (descendants die with it, the pipe closes), and the teardown's
 //! joins are bounded — a reader that still has not seen EOF is detached and

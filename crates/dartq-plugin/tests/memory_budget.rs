@@ -1,4 +1,4 @@
-//! Memory-budget enforcement (PRD §14.3 memory row): a child whose RSS
+//! Memory-budget enforcement: a child whose RSS
 //! sample exceeds the manifest's `memory_budget_mb` is killed by the
 //! monitor thread, the death record names the budget, and the breach rides
 //! the ordinary crash path — one restart absorbed, the next interaction
@@ -93,7 +93,7 @@ fn rss_over_the_memory_budget_is_killed_and_reported_as_the_memory_row() {
         "the death record names the memory row: {terminal:?}"
     );
 
-    // The §14.3 memory counters: the monitor recorded the over-budget
+    // The memory counters: the monitor recorded the over-budget
     // sample as the peak before killing, and the kill consumed exactly the
     // one manifest restart.
     let stats = runtime.stats();

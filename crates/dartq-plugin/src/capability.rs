@@ -4,7 +4,7 @@
 //! capabilities and the plugin's advertised ones. Unknown capability names on
 //! either side are ignored — they mean "not enabled", never an error — so a
 //! newer plugin can advertise capabilities an older core does not know about
-//! (PRD §14.1: the wire protocol layer carries the version adaptation).
+//!.
 
 use serde_json::Value;
 

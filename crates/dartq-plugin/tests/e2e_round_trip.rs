@@ -1,8 +1,8 @@
 //! End-to-end engine-wiring round trip against the real Dart host:
 //! core pushes engine diagnostics (`notification/engine_diagnostics`), the
 //! echo plugin echoes one back (`notification/diagnostic`), the runtime
-//! surfaces it for the output merge, and the §14.3 isolation counters show
-//! the traffic (PRD §14 conformance; module docs of `dartq_plugin`).
+//! surfaces it for the output merge, and the isolation counters show
+//! the traffic.
 //!
 //! Runs `dart` (on `PATH`) against the echo plugin in the sibling
 //! `dartq-plugin-host` package — the one place a Dart process is part of a
@@ -23,7 +23,7 @@ mod support;
 use support::dart_available;
 
 /// Generous handshake budget: a cold `dart` JIT start must fit inside one
-/// request timeout (PRD §14.3 default is 10 s; CI cold caches get slack).
+/// request timeout.
 const REQUEST_MS: u64 = 120_000;
 
 fn host_package_dir() -> PathBuf {
@@ -31,9 +31,9 @@ fn host_package_dir() -> PathBuf {
 }
 
 fn spawn_echo() -> PluginRuntime {
-    // Pinned above the 512 MiB default: a real Dart host's JIT startup loads
+    // Pinned above the 512 MiB release default: a real Dart host's JIT startup loads
     // the analyzer parse stack through the host package and crosses the
-    // default before the first request (calibration in `callback_timeout.rs`).
+    // release default before the first request (calibration in `callback_timeout.rs`).
     let manifest = Manifest::parse(&format!(
         r#"{{"name": "echo", "version": "0.1.0", "entrypoint": "bin/echo_plugin.dart",
             "capabilities": ["lint"], "timeouts": {{"request_ms": {REQUEST_MS}}},
@@ -104,7 +104,7 @@ fn engine_diagnostics_round_trip_through_the_dart_host() {
     assert_eq!(diagnostic.offset, 12);
     assert_eq!(diagnostic.length, 16);
 
-    // §14.3 counters: the wire traffic of the round trip is all observable.
+    // Isolation counters: the wire traffic of the round trip is all observable.
     let stats = runtime.stats();
     assert_eq!(stats.restarts, 0);
     assert_eq!(stats.frames_dropped, 0);

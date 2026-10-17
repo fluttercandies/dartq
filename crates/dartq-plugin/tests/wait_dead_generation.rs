@@ -1,4 +1,4 @@
-//! wait_diagnostics on an already-dead generation: the eager restart gate
+//! `wait_diagnostics` on an already-dead generation: the eager restart gate
 //! runs BEFORE the park, so a child that died since the last interaction
 //! yields a typed outcome immediately — the terminal crash when the restart
 //! budget is spent — instead of parking out the caller's whole timeout on a

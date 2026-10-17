@@ -24,7 +24,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Hard upper bound for one frame **on the wire** — the JSON content plus
 /// its `'\n'` terminator — enforced before buffering: the decoder never
 /// holds more than this many bytes, keeping host memory bounded when a
-/// plugin misbehaves (PRD §14.3 resource isolation).
+/// plugin misbehaves.
 ///
 /// The accounting is raw stream bytes, identical to the Dart host's gate
 /// (`dartq_plugin_host`, `host.dart`): a frame whose content is exactly
@@ -41,7 +41,7 @@ pub const METHOD_SHUTDOWN: &str = "shutdown";
 pub const METHOD_DIAGNOSTIC_NOTIFICATION: &str = "notification/diagnostic";
 /// Core-to-plugin notification: the engine's current diagnostics for the
 /// analyzed set, pushed once per analyze cycle as the plugin's diagnostic
-/// context (PRD §14.2: plugins never hold core references — this batch is
+/// context (: plugins never hold core references — this batch is
 /// the push half of that contract). Additively carries the cycle's analyzed
 /// file set under `files` — the files a rule-executing plugin runs its
 /// enabled rules over.
@@ -109,7 +109,7 @@ impl Frame {
 }
 
 /// Codec-level failures. Any of these means the wire contract is broken; the
-/// caller must tear the plugin process down (PRD §14.3 crash isolation) —
+/// caller must tear the plugin process down —
 /// the codec never attempts resynchronization.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ProtocolError {

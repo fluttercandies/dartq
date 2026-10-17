@@ -1,8 +1,8 @@
-//! Discovery end-to-end (PRD §14.2): the `<workspace>/plugins/` convention
+//! Discovery end-to-end: the `<workspace>/plugins/` convention
 //! finds a fixture manifest (and skips a broken one with a structured
 //! error), the discovered plugin spawns as a real Dart host, the
 //! handshake + engine-diagnostics push + `request/fixes` round trip run
-//! against it, and the §14.3 counters move coherently.
+//! against it, and the counters move coherently.
 //!
 //! Like `e2e_round_trip.rs`, this is the one place a Dart process is part of
 //! a Rust test: the contract under test is the process boundary.
@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
 use dartq_plugin::{
-    CapabilitySet, CyclePush, ManifestError, PluginRuntime, Severity as WireSeverity, SpawnSpec,
-    discover,
+    CapabilitySet, CyclePush, DiscoveryError, DiscoveryReport, ManifestError, PluginRuntime,
+    PubNative, Severity as WireSeverity, SpawnSpec, discover,
 };
 use dartq_source::FileTable;
 
@@ -23,8 +23,26 @@ mod support;
 use support::dart_available;
 
 /// Generous handshake/write budget: a cold `dart` JIT start must fit inside
-/// one request timeout (PRD §14.3 default is 10 s; CI cold caches get slack).
+/// one request timeout.
 const REQUEST_MS: u64 = 120_000;
+
+/// Discovery with overrides and the convention scan only: these scenarios
+/// declare no `plugins:` section, so the pub-native source contributes
+/// nothing.
+fn discover_without_pub_native(workspace_root: &Path, overrides: &[PathBuf]) -> DiscoveryReport {
+    let config = dartq_pub::PackageConfig::parse(r#"{"configVersion": 2, "packages": []}"#)
+        .expect("valid config");
+    discover(
+        workspace_root,
+        overrides,
+        &PubNative {
+            declared: &[],
+            config: &config,
+            config_dir: workspace_root,
+            options_file: workspace_root,
+        },
+    )
+}
 
 fn host_package_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dartq-plugin-host")
@@ -67,8 +85,8 @@ impl Drop for Workspace {
 fn fixture_manifest() -> String {
     let entrypoint = host_package_dir().join("bin/fix_plugin.dart");
     // 1024MB for the same reason as the other live spawns: the analyzer
-    // parse stack's JIT baseline sits at ~555MB, past the 512MB default —
-    // a budget, not a leak.
+    // parse stack's JIT baseline sits at ~555MB, past the 512MB release
+    // default — a budget, not a leak.
     format!(
         r#"{{"name": "fixer", "version": "0.1.0", "entrypoint": "{}",
             "capabilities": ["lint", "fix"],
@@ -95,12 +113,15 @@ fn discovery_spawns_the_fixture_and_round_trips_fixes() {
     );
     fs::create_dir_all(workspace.path().join("plugins").join("notes")).expect("non-plugin dir");
 
-    let report = discover(workspace.path(), &[]);
+    let report = discover_without_pub_native(workspace.path(), &[]);
     assert_eq!(report.plugins.len(), 1, "only the valid fixture spawns");
     assert_eq!(report.skipped.len(), 1);
     assert_eq!(
         report.skipped[0].error,
-        ManifestError::InvalidField("memory_budget_mb", "must be a positive integer".to_owned(),)
+        DiscoveryError::Manifest(ManifestError::InvalidField(
+            "memory_budget_mb",
+            "must be a positive integer".to_owned(),
+        ))
     );
 
     let discovered = &report.plugins[0];
@@ -158,7 +179,7 @@ fn discovery_spawns_the_fixture_and_round_trips_fixes() {
     assert_eq!(reply.fixes[0].edits[0].length, 2);
     assert_eq!(reply.fixes[0].edits[0].replacement, "const ");
 
-    // §14.3 counters: initialize + engine push + fixes request out, their
+    // Isolation counters: initialize + engine push + fixes request out, their
     // three replies in, zero restarts or guard drops.
     let stats = runtime.stats();
     assert_eq!(stats.restarts, 0);
@@ -183,7 +204,7 @@ fn overrides_load_directories_and_report_missing_paths() {
 
     // A directory override and its manifest file resolve to the same plugin;
     // neither the convention scan nor a double override duplicates it.
-    let report = discover(
+    let report = discover_without_pub_native(
         workspace.path(),
         &[plugin_dir.clone(), plugin_dir.join("dartq_plugin.json")],
     );
@@ -193,7 +214,7 @@ fn overrides_load_directories_and_report_missing_paths() {
     // An override the caller named explicitly must report, not skip silently;
     // the convention scan still finds the fixture on its own.
     let missing = workspace.path().join("plugins").join("nowhere");
-    let report = discover(workspace.path(), &[missing]);
+    let report = discover_without_pub_native(workspace.path(), &[missing]);
     assert_eq!(report.plugins.len(), 1);
     assert_eq!(report.skipped.len(), 1);
     assert!(report.skipped[0].path.to_string_lossy().contains("nowhere"));

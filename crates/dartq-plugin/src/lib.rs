@@ -1,5 +1,5 @@
 //! dartq plugin protocol: the IPC contract between the Rust core and the
-//! per-plugin Dart host process (PRD §14).
+//! per-plugin Dart host process.
 //!
 //! Plugins never enter the Rust core. Each plugin runs as its own sidecar
 //! process (the Dart host, package `dartq_plugin_host`), and the only thing
@@ -54,7 +54,7 @@
 //! reply the session is over.
 //!
 //! Any session error is fatal: the core tears the plugin process down and
-//! reports a `plugin_crashed` diagnostic (PRD §14.3 crash isolation). There
+//! reports a `plugin_crashed` diagnostic. There
 //! is no resynchronization on the wire.
 //!
 //! # Round trip
@@ -78,11 +78,11 @@
 //! The Dart host implements the exact same schema (package `dartq_plugin_host`,
 //! `lib/src/frame.dart`); both files must change together.
 //!
-//! # Engine wiring and isolation metrics (M4, PRD §14 conformance)
+//! # Engine wiring and isolation metrics
 //!
 //! [`runtime::PluginRuntime`] is the engine-facing face this contract serves:
 //!
-//! - **§14.2 process model**: [`discovery`] locates manifests (the
+//! - **Process model**: [`discovery`] locates manifests (the
 //!   `<workspace>/plugins/*/dartq_plugin.json` convention plus explicit
 //!   overrides), and one child process runs per plugin, wire-only contact —
 //!   the plugin never holds a core reference. The engine read face is the
@@ -91,7 +91,7 @@
 //!   converts and pushes it (`notification/engine_diagnostics`, one batch
 //!   per analyze cycle) and drains plugin-emitted diagnostics back for the
 //!   caller's output merge. No engine crate changes are required.
-//! - **§14.1 extension points**: the wire layer is dartq's own v1 (the
+//! - **Extension points**: the wire layer is dartq's own v1 (the
 //!   official `analyzer_plugin` protocol is pre-1.0 and adapted here, risk
 //!   R2); the official `registerAssist`/`registerFixForRule` API shape is
 //!   mirrored by the host package's `Plugin`/`PluginRegistry`. The Query API
@@ -102,7 +102,7 @@
 //!   current engine view. Parsed-level AST context stays host-local (the
 //!   host parses with its own analyzer); full resolved-context parity is
 //!   the recorded R2 evolution path.
-//! - **§14.3 isolation**: per-plugin counters (peak child RSS, frame/byte
+//! - **Isolation**: per-plugin counters (peak child RSS, frame/byte
 //!   totals per direction, 16 MiB guard drops, restart count) via
 //!   [`runtime::PluginRuntime::stats`] → [`stats::PluginStatsSnapshot`];
 //!   RSS over the manifest's `memory_budget_mb` kills the child (Linux
@@ -110,7 +110,7 @@
 //!   manifest's `callback_ms` and `initialize`/`shutdown` under the request
 //!   deadline; child death restarts within the manifest's retry budget and
 //!   never takes the engine down.
-//! - **§13.3 output face**: [`runtime::crash_diagnostic`] converts a
+//! - **Output face**: [`runtime::crash_diagnostic`] converts a
 //!   terminal [`runtime::RuntimeError`] into a `dartq/plugin_crashed` /
 //!   `dartq/plugin_timeout` [`dartq_diagnostics::Diagnostic`] for the
 //!   daemon's output merge; plugin *findings* stay wire-form
@@ -123,7 +123,7 @@
 //! `pkg/analysis_server_plugin/lib/src/plugin_server.dart`):
 //! version check first, then registration/work, then shutdown, with fixes
 //! requested per location. The method names are dartq's own (the official
-//! wire protocol is pre-1.0 and dartq adapts at this layer, PRD §14.1).
+//! wire protocol is pre-1.0 and dartq adapts at this layer).
 
 pub mod capability;
 pub mod discovery;
@@ -134,14 +134,17 @@ pub mod session;
 pub mod stats;
 
 pub use capability::{Capability, CapabilitySet};
-pub use discovery::{DiscoveredPlugin, DiscoveryIssue, DiscoveryReport, discover};
+pub use discovery::{
+    DiscoveredPlugin, DiscoveryError, DiscoveryIssue, DiscoveryReport, PubNative, discover,
+};
 pub use frame::{
     Frame, FrameDecoder, MAX_FRAME_SIZE, METHOD_DIAGNOSTIC_NOTIFICATION, METHOD_ENGINE_DIAGNOSTICS,
     METHOD_INITIALIZE, METHOD_PLUGIN_CONFIG, METHOD_REQUEST_FIXES, METHOD_REQUEST_QUERY,
     METHOD_SHUTDOWN, PROTOCOL_VERSION, ProtocolError, decode_line, encode_frame,
 };
 pub use manifest::{
-    DEFAULT_MEMORY_BUDGET_MB, MANIFEST_FILE_NAME, Manifest, ManifestError, Timeouts,
+    DEFAULT_IDLE_EVICT_MS, DEFAULT_MEMORY_BUDGET_MB, EntrypointKind, MANIFEST_FILE_NAME, Manifest,
+    ManifestError, Timeouts,
 };
 pub use runtime::{
     CycleDrain, PendingQuery, PluginRuntime, RuntimeError, SpawnSpec, StdioPolicy, crash_diagnostic,

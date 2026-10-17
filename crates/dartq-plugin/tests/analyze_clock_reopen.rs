@@ -1,4 +1,4 @@
-//! Analyze clock close→reopen (PRD §14.3 CPU row, analyze path): a demand
+//! Analyze clock close→reopen: a demand
 //! satisfied by produced diagnostics closes the clock, and the NEXT fed batch
 //! opens a fresh, still-enforced demand. If the close were sticky, a plugin
 //! that answers exactly one cycle and then stalls would be exempt from the

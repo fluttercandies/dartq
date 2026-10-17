@@ -1,4 +1,4 @@
-//! Shutdown timeout (PRD §14.3 IPC row): `shutdown` awaits its reply under
+//! Shutdown timeout: `shutdown` awaits its reply under
 //! the request budget; a plugin that never answers is killed at the budget
 //! and the consuming call surfaces [`RuntimeError::ShutdownTimeout`] with the
 //! enforced budget. The kill consumes no restart — the runtime ends with the

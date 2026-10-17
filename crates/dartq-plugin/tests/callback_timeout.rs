@@ -1,4 +1,4 @@
-//! Callback-budget enforcement (PRD §14.3 CPU row): a `request/fixes` that
+//! Callback-budget enforcement: a `request/fixes` that
 //! overruns the manifest's `callback_ms` kills the child and consumes one
 //! restart at the error site; repeated overruns exhaust the budget into the
 //! terminal [`RuntimeError::Crashed`], which [`crash_diagnostic`] turns into
@@ -27,8 +27,8 @@ fn dart_plugin_over_callback_budget_is_killed_and_restarted() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");
         return;
     }
-    // The memory budget is pinned above the 512 MiB default: this fixture is
-    // a real Dart host whose JIT startup loads the analyzer parse stack
+    // The memory budget is pinned above the 512 MiB release default: this
+    // fixture is a real Dart host whose JIT startup loads the analyzer parse stack
     // through the host package, a baseline observed at 554 MB before the
     // first request — the default fired first and killed every generation
     // during the handshake, before the callback row this test pins could be

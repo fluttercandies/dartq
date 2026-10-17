@@ -1,12 +1,16 @@
 //! The core-side plugin runtime: owns one Dart host process and drives the
-//! wire contract against it (PRD §14.2), with the §14.3 isolation metrics
+//! wire contract against it (), with the isolation metrics
 //! wired at every enforcement point.
 //!
 //! # Face
 //!
 //! [`PluginRuntime::spawn`] launches the host, performs the `initialize`
-//! handshake (within the manifest's request budget), and hands back a handle.
-//! From there the engine wiring is two calls per analyze cycle:
+//! handshake (within the manifest's request budget), and hands back a handle;
+//! [`PluginRuntime::lazy`] hands back the same handle without launching —
+//! the first generation then starts at the first interaction
+//! ([`PluginRuntime::ensure_alive`], the same path every restart rides), so
+//! a plugin whose capability is never needed never costs a process. From
+//! there the engine wiring is two calls per analyze cycle:
 //!
 //! - [`PluginRuntime::feed`] pushes the engine's merged diagnostics to the
 //!   plugin as one `notification/engine_diagnostics` batch (its diagnostic
@@ -14,22 +18,23 @@
 //! - [`PluginRuntime::take_output`] drains the diagnostics the plugin
 //!   emitted back (`notification/diagnostic`) for the caller to merge into
 //!   its output. Plugin findings keep their wire shape here: engine
-//!   [`CodeInfo`]s are `&'static`-interned, so namespacing plugin codes into
+//!   [`CodeInfo`](dartq_diagnostics::CodeInfo)s are `&'static`-interned, so
+//!   namespacing plugin codes into
 //!   the engine's diagnostic set is the daemon/CLI output layer's job
-//!   (PRD §14 fix sources), not the transport's.
+//!  , not the transport's.
 //! - [`PluginRuntime::request_fixes`] is the fix face: it sends
 //!   `request/fixes` and awaits the reply under the manifest's callback
-//!   budget (§14.3 CPU row, default 5 s). An overrun kills the child and
+//!   budget. An overrun kills the child and
 //!   consumes the restart budget, surfacing
 //!   [`RuntimeError::CallbackTimeout`]. The analyze push has no reply to
 //!   await, so the monitor enforces the same budget on the demand itself:
 //!   the clock [`PluginRuntime::feed`] opens must close with produced
 //!   diagnostics before `callback_ms` elapses.
 //!
-//! [`PluginRuntime::stats`] is the §14.3 observability face (peak RSS, frame
+//! [`PluginRuntime::stats`] is the observability face (peak RSS, frame
 //! and byte counters, guard drops, restart count) the daemon/CLI read.
 //! [`crash_diagnostic`] converts a terminal [`RuntimeError`] into the
-//! `dartq/`-namespace [`Diagnostic`] the output layer merges (PRD §14.3:
+//! `dartq/`-namespace [`Diagnostic`] the output layer merges (:
 //! a plugin failure is one tool diagnostic, never an engine failure).
 //!
 //! # Discovery
@@ -39,11 +44,11 @@
 //! explicit override paths); each hit launches through
 //! [`SpawnSpec::dart`].
 //!
-//! # PRD §14.3 conformance
+//! # conformance
 //!
 //! | Dimension | Mechanism here |
 //! | --- | --- |
-//! | Memory | RSS monitor thread (100 ms tick) samples the child; Linux reads the kernel's `VmHWM` high-water mark, macOS `proc_pid_rusage` (`ri_resident_size`, SDK-header-pinned ABI); exceeding the manifest's `memory_budget_mb` kills the child. Sampling loss never disarms the monitor: a platform without a sampler (or a live child that keeps failing its samples past a bounded tolerance) disarms only the RSS face — counted in `stats.rss_disarms` — while the thread stays on the analyze clock. |
+//! | Memory | RSS monitor thread (100 ms tick) samples the child; Linux reads the kernel's `VmHWM` high-water mark, macOS `proc_pid_rusage` (`ri_resident_size`, SDK-header-pinned ABI); exceeding the manifest's `memory_budget_mb` kills the child. The same thread carries the idle-eviction arm: a child idle past the manifest's `idle_evict_ms` (default 5 min, `0` disables; `DARTQ_PLUGIN_IDLE_EVICT_MS` overrides for measurement) is killed to release its resident set and relaunches budget-free at the next interaction — an eviction is a host memory action, never a crash, and is counted in `stats.evictions`. Sampling loss never disarms the monitor: a platform without a sampler (or a live child that keeps failing its samples past a bounded tolerance) disarms only the RSS face — counted in `stats.rss_disarms` — while the thread stays on the analyze clock. |
 //! | CPU | `request/fixes` awaits its reply under the manifest's `callback_ms`; an overrun kills the child and consumes the restart budget. The analyze demand is enforced against the same budget: feeding engine diagnostics opens a clock in the monitor, closed when the child produces diagnostics (or dies); a demand still open past `callback_ms` kills the child through the same path. |
 //! | IPC | `initialize` and `shutdown` run under the manifest's `request_ms`; every stdin write is bounded by the same deadline (writer thread). |
 //! | Crash | Child death never propagates: the runtime relaunches within the manifest's retry budget (counted in `stats.restarts`), then reports [`RuntimeError::Crashed`] — the terminal form names the exhausted budget. |
@@ -54,14 +59,18 @@
 //! Per generation (one child process): a reader thread owns the child's
 //! stdout, the [`Session`] state machine (behind a mutex shared with the
 //! handle), and the pending-diagnostics buffer; a monitor thread enforces
-//! the memory budget (RSS samples) and the analyze demand's clock; a writer
-//! thread owns the child's stdin
+//! the memory budget (RSS samples), the analyze demand's clock, and the
+//! idle-eviction deadline; a writer thread owns the child's stdin
 //! and is the only process writing to it — the handle (`&mut self`) feeds it
 //! frames and awaits per-write acks, which bounds every write without ever
 //! blocking the handle on a full pipe. Under [`StdioPolicy::Capture`] (the
 //! default) a stderr drain thread keeps the child's stderr pipe empty and
 //! feeds the bounded startup capture, whose text folds into the surfaced
-//! startup-failure error. All shared counters are atomics; the
+//! startup-failure error. A worker the OS cannot create (thread creation
+//! fails under fd or memory exhaustion) takes the ordinary death path —
+//! cause recorded in the death slot, child killed, restart budget decides —
+//! so a resource-starved host degrades one plugin instead of aborting the
+//! daemon. All shared counters are atomics; the
 //! only cross-thread locks are the three leaf mutexes (session, pending,
 //! child) and the death slot, never nested.
 //!
@@ -95,7 +104,7 @@ use thiserror::Error;
 
 use crate::capability::{Capability, CapabilitySet};
 use crate::frame::{Frame, FrameDecoder, MAX_FRAME_SIZE, ProtocolError, encode_frame};
-use crate::manifest::Manifest;
+use crate::manifest::{EntrypointKind, Manifest};
 use crate::session::{
     CycleConfig, CyclePush, FixesReply, Incoming, PluginDiagnostic, QueryRequest, RuleCensus,
     Session, SessionError, SessionState, Severity, engine_diagnostics_frame, plugin_config_frame,
@@ -174,11 +183,12 @@ pub struct SpawnSpec {
     /// Executable, e.g. `dart` (resolved over `PATH`).
     pub program: String,
     /// Arguments after the program; for the manifest contract this is the
-    /// entrypoint script ([`SpawnSpec::dart`] builds it).
+    /// entrypoint path ([`SpawnSpec::dart`] builds it — a script, kernel
+    /// snapshot, or executable per the manifest's `entrypoint_kind`).
     pub args: Vec<String>,
     /// Working directory of the plugin (its package directory).
     pub current_dir: PathBuf,
-    /// The parsed manifest: capabilities and §14.3 budgets.
+    /// The parsed manifest: capabilities and resource budgets.
     pub manifest: Manifest,
     /// Where the child's stderr goes; the default captures it into a bounded
     /// startup buffer so a startup failure surfaces with the host's own
@@ -223,26 +233,48 @@ impl StdioPolicy {
 }
 
 impl SpawnSpec {
-    /// The manifest contract's default launch: run the manifest's entrypoint
-    /// script with `dart` inside the plugin directory. Query serving stays
-    /// off — a caller with a query server (the daemon's analyze face) flips
-    /// [`SpawnSpec::serve_queries`].
+    /// The manifest contract's default launch, branched on the manifest's
+    /// [`EntrypointKind`] — this is the one place the spawn argv is built:
+    ///
+    /// - `source` / `kernel`: `dart <entrypoint>`. Both share the argv;
+    ///   they differ in what the VM does with the file. A source script is
+    ///   compiled by the VM's in-process CFE at startup; a kernel snapshot
+    ///   (`.dill`) is recognized by magic number and loaded precompiled —
+    ///   no CFE source compile runs in the child (upstream Dart SDK source,
+    ///   `runtime/bin/dfe.cc`).
+    /// - `exe`: the self-contained `dart compile exe` product is spawned
+    ///   directly — no `dart` front end at all. The path is absolutized:
+    ///   the executable is resolved against the *parent's* working
+    ///   directory on some platforms (Windows) while `current_dir` only
+    ///   takes effect inside the child.
+    ///
+    /// Query serving stays off — a caller with a query server (the daemon's
+    /// analyze face) flips [`SpawnSpec::serve_queries`].
     #[must_use]
     pub fn dart(plugin_dir: &Path, manifest: Manifest) -> Self {
-        Self {
+        let mut spec = Self {
             program: "dart".to_owned(),
             args: vec![manifest.entrypoint.clone()],
             current_dir: plugin_dir.to_path_buf(),
             manifest,
             stderr: StdioPolicy::Capture,
             serve_queries: false,
+        };
+        if spec.manifest.entrypoint_kind == EntrypointKind::Exe {
+            let exe = plugin_dir.join(&spec.manifest.entrypoint);
+            spec.program = std::path::absolute(&exe)
+                .unwrap_or(exe)
+                .to_string_lossy()
+                .into_owned();
+            spec.args.clear();
         }
+        spec
     }
 }
 
 /// Runtime failures. Any variant other than a successful shutdown leaves the
 /// runtime dead or restarting — the engine never loses its own state to a
-/// plugin failure (PRD §14.3).
+/// plugin failure.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     /// The plugin process could not be started.
@@ -271,7 +303,7 @@ pub enum RuntimeError {
         ms: u64,
     },
     /// The plugin overran the manifest's `callback_ms` budget on
-    /// `request/fixes` (§14.3 CPU row): the child was killed and one restart
+    /// `request/fixes`: the child was killed and one restart
     /// consumed; the terminal form when the budget is spent is
     /// [`RuntimeError::Crashed`].
     #[error("plugin `request/fixes` timed out after {ms} ms (callback budget)")]
@@ -364,7 +396,7 @@ impl PendingOutput {
     /// Queues one reverse query (the plugin's own correlation id) and wakes
     /// a parked waiter. Queries do **not** close the analyze demand's
     /// clock — a query round trip eats the plugin's own callback budget
-    /// (§14.3 CPU row): the clock closes when diagnostics are produced.
+    ///: the clock closes when diagnostics are produced.
     /// Shares the diagnostics fuse (see [`PendingOutput::push`]).
     fn push_query(&self, query: PendingQuery) -> Result<(), String> {
         let mut queues = self.queues.lock().expect("pending output lock");
@@ -546,7 +578,7 @@ fn stderr_note(stderr: &str) -> String {
     }
 }
 
-/// The analyze demand's wall clock (§14.3 CPU row, analyze path): closed at
+/// The analyze demand's wall clock: closed at
 /// birth, opened by [`PluginRuntime::feed`] when a batch goes on the wire,
 /// closed when the child produces diagnostics or the generation dies. The
 /// stored value is the runtime's age in milliseconds at open time
@@ -611,6 +643,11 @@ pub struct PendingQuery {
     pub request: QueryRequest,
 }
 
+/// A reverse-query server: answers one pending query with its reply params
+/// (`Err` answers the wire's error channel).
+type QueryServer<'a> =
+    &'a mut dyn FnMut(&PendingQuery) -> Result<serde_json::Map<String, Value>, String>;
+
 /// One drain of the reader's output queue: the plugin diagnostics the
 /// caller merges, plus the count of reverse queries still queued — the
 /// caller answers those through [`PluginRuntime::serve_queries`], the one
@@ -625,7 +662,9 @@ pub struct CycleDrain {
 
 /// One live plugin: child process, session, isolation monitor, counters.
 ///
-/// Created by [`PluginRuntime::spawn`]; `&mut self` methods make the handle
+/// Created by [`PluginRuntime::spawn`] (eager: first generation at
+/// construction) or [`PluginRuntime::lazy`] (first generation at the first
+/// interaction); `&mut self` methods make the handle
 /// thread the only writer, so the reader thread and monitor never contend
 /// with a write.
 #[derive(Debug)]
@@ -635,6 +674,13 @@ pub struct PluginRuntime {
     callback_timeout: Duration,
     restart_budget: u32,
     memory_cap_bytes: u64,
+    /// Idle-eviction deadline (`None` = disabled): the manifest's
+    /// `idle_evict_ms` (`0` disables), clamped up to the runtime's own
+    /// interaction window (`request_ms + callback_ms`) so the monitor's
+    /// eviction arm can never fire inside an in-flight request — every
+    /// interaction touches the clock at entry and concludes within that
+    /// window. `DARTQ_PLUGIN_IDLE_EVICT_MS` overrides the manifest value.
+    idle_evict: Option<Duration>,
 
     // Per generation (one child process); replaced on every launch.
     session: Arc<Mutex<Session>>,
@@ -646,6 +692,14 @@ pub struct PluginRuntime {
     analyze_clock: Arc<AnalyzeClock>,
     running: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
+    /// Set by the monitor's eviction arm before it kills the child: the
+    /// generation is dead but the runtime is *resumable* — the next
+    /// interaction relaunches free of the restart-budget charge (an
+    /// eviction is a host memory action, not a crash).
+    evicted: Arc<AtomicBool>,
+    /// Milliseconds since `created` at the last interaction (the monitor's
+    /// idle clock); touched at every interaction entry and at each launch.
+    last_interaction_ms: Arc<AtomicU64>,
     death: Arc<Mutex<Option<String>>>,
     stderr_capture: Arc<StderrCapture>,
     stderr_drain: Option<JoinHandle<()>>,
@@ -658,6 +712,10 @@ pub struct PluginRuntime {
     created: Instant,
     stats: Arc<PluginStats>,
     restarts_used: u32,
+    /// Whether the first generation was already launched: the initial
+    /// launch rides [`Self::ensure_alive`] for the lazy form and must run
+    /// regardless of the restart budget (the budget prices relaunches).
+    launched_once: bool,
 
     // Config-push dedup: the last pushed config's params and the restart
     // count it was pushed at. A relaunched child starts with no config
@@ -667,7 +725,13 @@ pub struct PluginRuntime {
 }
 
 impl PluginRuntime {
-    /// Launches the plugin process and completes the handshake.
+    /// Launches the plugin process and completes the handshake eagerly.
+    ///
+    /// The eager form for faces whose first use immediately follows
+    /// construction (the fix face). The daemon's analyze face builds
+    /// [`Self::lazy`] handles instead: no sidecar process exists until its
+    /// capability is first needed, so an unneeded plugin never costs its
+    /// resident set.
     ///
     /// A process that dies before answering is relaunched within the
     /// manifest's retry budget (each attempt counted in
@@ -681,18 +745,43 @@ impl PluginRuntime {
     /// time, [`RuntimeError::Crashed`] when the process dies or breaks the
     /// wire contract, plus the codec/session error variants.
     pub fn spawn(spec: SpawnSpec) -> Result<Self, RuntimeError> {
+        let mut runtime = Self::construct(spec);
+        runtime.launched_once = true;
+        runtime.launch_with_budget()?;
+        Ok(runtime)
+    }
+
+    /// Builds the runtime handle **without launching**: no sidecar process
+    /// exists until its capability is first needed. The first interaction —
+    /// [`Self::feed`], [`Self::wait_output`], [`Self::take_output`],
+    /// [`Self::request_fixes`], or an explicit [`Self::ensure_alive`] —
+    /// launches the first generation through the same budgeted path every
+    /// restart rides. A readiness concern is accepted by construction: the
+    /// first request pays the spawn + handshake (budgeted, seconds-scale),
+    /// never a boot-time prewarm.
+    #[must_use]
+    pub fn lazy(spec: SpawnSpec) -> Self {
+        Self::construct(spec)
+    }
+
+    /// The shared constructor body: budgets resolved, per-generation state
+    /// at its empty placeholders, no threads, no child.
+    fn construct(spec: SpawnSpec) -> Self {
         let request_timeout = Duration::from_millis(spec.manifest.timeouts.request_ms);
         let callback_timeout = Duration::from_millis(spec.manifest.timeouts.callback_ms);
         let restart_budget = spec.manifest.timeouts.request_retries;
         let memory_cap_bytes = u64::from(spec.manifest.memory_budget_mb) * 1024 * 1024;
+        let idle_evict = idle_evict_timeout(&spec.manifest)
+            .map(|timeout| timeout.max(request_timeout + callback_timeout));
         let (events_tx, events) = mpsc::channel();
         drop(events_tx); // placeholder replaced by the first launch
-        let mut runtime = Self {
+        Self {
             spec,
             request_timeout,
             callback_timeout,
             restart_budget,
             memory_cap_bytes,
+            idle_evict,
             session: Arc::new(Mutex::new(Session::new(CapabilitySet::all()))),
             commands: None,
             acks: mpsc::channel().1,
@@ -702,6 +791,8 @@ impl PluginRuntime {
             analyze_clock: Arc::new(AnalyzeClock::new()),
             running: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
+            evicted: Arc::new(AtomicBool::new(false)),
+            last_interaction_ms: Arc::new(AtomicU64::new(0)),
             death: Arc::new(Mutex::new(None)),
             stderr_capture: Arc::new(StderrCapture::new()),
             stderr_drain: None,
@@ -712,11 +803,10 @@ impl PluginRuntime {
             stats: Arc::new(PluginStats::default()),
             created: Instant::now(),
             restarts_used: 0,
+            launched_once: false,
             pushed_config: None,
             pushed_at_restarts: 0,
-        };
-        runtime.launch_with_budget()?;
-        Ok(runtime)
+        }
     }
 
     /// The capability set negotiated at the last completed handshake.
@@ -728,6 +818,11 @@ impl PluginRuntime {
     /// The plugin's registration census (the `initialize` reply's `rules`
     /// array), empty until the handshake completed. The caller resolves the
     /// per-cycle enablement against it ([`CyclePush`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the session mutex is poisoned — a thread panicked while
+    /// holding it, a program bug, not a plugin failure.
     #[must_use]
     pub fn rule_census(&self) -> Vec<RuleCensus> {
         self.session
@@ -742,7 +837,7 @@ impl PluginRuntime {
     /// push — a relaunched child always re-receives it, its config state
     /// died with the old generation), then the engine's current diagnostics
     /// plus the cycle's analyzed file set as one
-    /// `notification/engine_diagnostics` batch (PRD §14.2).
+    /// `notification/engine_diagnostics` batch.
     ///
     /// A cycle with no diagnostics and no analyzed files sends nothing: the
     /// batch would carry no diagnostic context and the rules would have no
@@ -751,7 +846,7 @@ impl PluginRuntime {
     /// too, and their findings are the cycle's whole output.
     ///
     /// A child that died since the last call is restarted here (within
-    /// budget) before the push. The push opens the §14.3 analyze clock: the
+    /// budget) before the push. The push opens the analyze clock: the
     /// child must produce diagnostics (or die) within the manifest's
     /// `callback_ms`, or the monitor kills it through the ordinary crash
     /// path.
@@ -791,7 +886,7 @@ impl PluginRuntime {
         }
         let frame = engine_diagnostics_frame(&wire_diagnostics(diagnostics, files), &push.analyzed);
         self.write_frame(&frame)?;
-        // §14.3 CPU row, analyze path: the demand's clock opens with the
+        // CPU budget row, analyze path: the demand's clock opens with the
         // batch on the wire and closes when the child produces diagnostics
         // (reader) or the generation dies — the monitor kills a demand still
         // open past the callback budget.
@@ -823,7 +918,7 @@ impl PluginRuntime {
     }
 
     /// [`Self::take_output`] with a wait: parks on the reader's push signal
-    /// until diagnostics arrived (holding through one [`BURST_SETTLE`] quiet
+    /// until diagnostics arrived (holding through one `BURST_SETTLE` quiet
     /// window so a synchronous reply — one analyze cycle answered with
     /// contiguous `notification/diagnostic` frames — drains as the whole
     /// burst, never as its first line) or a reverse query arrived (returned
@@ -851,7 +946,7 @@ impl PluginRuntime {
     }
 
     /// Answers the plugin's queued reverse `request/query` frames through
-    /// [server], one reply frame per query under the same correlation id
+    /// `server`, one reply frame per query under the same correlation id
     /// ([`query_reply_frame`]; a server that declines with `Err` answers the
     /// wire's error channel via [`query_error_frame`] — the session stays
     /// up). Queries are served in arrival order; a write failure surfaces
@@ -868,19 +963,16 @@ impl PluginRuntime {
     ///
     /// Panics when an internal mutex is poisoned — a thread panicked while
     /// holding it, a program bug, not a plugin failure.
-    pub fn serve_queries(
-        &mut self,
-        server: &mut dyn FnMut(&PendingQuery) -> Result<serde_json::Map<String, Value>, String>,
-    ) -> Result<usize, RuntimeError> {
+    pub fn serve_queries(&mut self, server: QueryServer<'_>) -> Result<usize, RuntimeError> {
         let queries = self.pending.take_queries();
-        let served = queries.len();
+        let count = queries.len();
         for query in &queries {
             match server(query) {
                 Ok(params) => self.write_frame(&query_reply_frame(query.id, params))?,
                 Err(message) => self.write_frame(&query_error_frame(query.id, &message))?,
             }
         }
-        Ok(served)
+        Ok(count)
     }
 
     /// Declines the plugin's queued reverse queries with error replies —
@@ -888,6 +980,10 @@ impl PluginRuntime {
     /// server at this interaction (a querying producer fails immediately
     /// with a typed message instead of stalling its own reply past the
     /// callback budget).
+    ///
+    /// # Errors
+    ///
+    /// Transport failures per [`RuntimeError`].
     pub fn decline_queued_queries(&mut self) -> Result<(), RuntimeError> {
         let queries = self.pending.take_queries();
         for query in &queries {
@@ -901,7 +997,7 @@ impl PluginRuntime {
     }
 
     /// Sends `request/fixes` for `file` at the given UTF-16 range and awaits
-    /// the reply under the manifest's `callback_ms` budget (§14.3 CPU row).
+    /// the reply under the manifest's `callback_ms` budget.
     /// Requires the `fix` capability to have been negotiated.
     ///
     /// A producer that queries while its fixes are computed stalls its own
@@ -941,7 +1037,7 @@ impl PluginRuntime {
 
     /// [`Self::request_fixes`] with a query server: the plugin's reverse
     /// queries queued while the fixes reply is awaited are answered through
-    /// [server] (`Err` answers the wire's error channel — the session stays
+    /// `server` (`Err` answers the wire's error channel — the session stays
     /// up). This is the form a query-capable face drives producers with;
     /// the plain form declines instead.
     ///
@@ -954,7 +1050,7 @@ impl PluginRuntime {
         file: &str,
         offset: u64,
         length: u64,
-        server: &mut dyn FnMut(&PendingQuery) -> Result<serde_json::Map<String, Value>, String>,
+        server: QueryServer<'_>,
     ) -> Result<FixesReply, RuntimeError> {
         self.request_fixes_inner(file, offset, length, Some(server))
     }
@@ -964,9 +1060,7 @@ impl PluginRuntime {
         file: &str,
         offset: u64,
         length: u64,
-        mut server: Option<
-            &mut dyn FnMut(&PendingQuery) -> Result<serde_json::Map<String, Value>, String>,
-        >,
+        mut server: Option<QueryServer<'_>>,
     ) -> Result<FixesReply, RuntimeError> {
         self.ensure_alive()?;
         let frame = self
@@ -1025,7 +1119,7 @@ impl PluginRuntime {
                     });
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    // §14.3 CPU row: a callback that overruns its budget is a
+                    // CPU budget row: a callback that overruns its budget is a
                     // misbehaving child — kill it and consume one restart so the
                     // consumption is observable at this error site.
                     let reason = format!(
@@ -1043,10 +1137,19 @@ impl PluginRuntime {
         }
     }
 
-    /// The isolation metrics snapshot (PRD §14.3).
+    /// The isolation metrics snapshot.
     #[must_use]
     pub fn stats(&self) -> PluginStatsSnapshot {
         self.stats.snapshot()
+    }
+
+    /// Records one analyze cycle's interaction cost with this plugin — the
+    /// caller's feed-plus-drain wall time and whether the drain budget
+    /// expired before the plugin quiesced ([`PluginStatsSnapshot::degraded_cycles`]).
+    /// The per-plugin overhead attribution face (counters only; the absent
+    /// path never constructs a runtime, so no timer arms without plugins).
+    pub fn observe_cycle(&self, busy: Duration, degraded: bool) {
+        self.stats.observe_cycle(busy, degraded);
     }
 
     /// The graceful teardown: `shutdown` request, reply awaited under the
@@ -1073,6 +1176,14 @@ impl PluginRuntime {
     /// Panics when an internal mutex is poisoned — a thread panicked while
     /// holding it, a program bug, not a plugin failure.
     pub fn shutdown(mut self) -> Result<(), RuntimeError> {
+        if self.evicted.load(Ordering::Relaxed) {
+            // An evicted generation is already dead and reaped (the
+            // monitor's eviction arm): no handshake exists to run. Close
+            // the writer and join what remains — a clean teardown, no
+            // shutdown error.
+            self.join_generation();
+            return Ok(());
+        }
         if !self.alive.load(Ordering::Relaxed) {
             self.reap_child();
             return Err(self.crash_error());
@@ -1112,7 +1223,7 @@ impl PluginRuntime {
                 // terminating and the query dies with the runtime — no
                 // answer is coming, which the host's own teardown absorbs.
                 // Keep waiting for the reply within the same deadline.
-                Ok(ProtocolEvent::QueriesQueued) => continue,
+                Ok(ProtocolEvent::QueriesQueued) => {}
                 Err(RecvTimeoutError::Timeout) => {
                     self.kill_child();
                     break Err(RuntimeError::ShutdownTimeout {
@@ -1163,9 +1274,38 @@ impl PluginRuntime {
         outcome
     }
 
-    fn ensure_alive(&mut self) -> Result<(), RuntimeError> {
+    /// Ensures a live generation, launching on demand — the single path
+    /// every interaction's first launch and every restart rides.
+    ///
+    /// Three states, in order: a live child is a clock touch and an atomic
+    /// load; an evicted generation (the monitor's idle arm) relaunches
+    /// budget-free — an eviction is a host memory action, not a crash; and
+    /// a dead generation relaunches within the restart budget, whose
+    /// exhaustion is terminal. The very first launch (the lazy form) runs
+    /// regardless of that budget: the budget prices *relaunches*, and the
+    /// eager form already launches once at `request_retries: 0`.
+    ///
+    /// # Errors
+    ///
+    /// Restart-budget exhaustion and launch failures, per [`RuntimeError`].
+    pub fn ensure_alive(&mut self) -> Result<(), RuntimeError> {
         if self.alive.load(Ordering::Relaxed) {
+            self.touch();
             return Ok(());
+        }
+        if self.evicted.load(Ordering::Relaxed) {
+            // Join the evicted generation's threads (the monitor already
+            // killed and reaped the child), then relaunch fresh. The config
+            // cache drops too: the new generation has no config state, and
+            // an eviction — unlike a crash — does not move `restarts_used`,
+            // so the feed-side dedup would otherwise suppress the re-push.
+            self.teardown_generation();
+            self.pushed_config = None;
+            return self.launch_with_budget();
+        }
+        if !self.launched_once {
+            self.launched_once = true;
+            return self.launch_with_budget();
         }
         if self.restarts_used >= self.restart_budget {
             return Err(self.crash_error());
@@ -1174,6 +1314,16 @@ impl PluginRuntime {
         self.stats.restart();
         self.restarts_used += 1;
         self.launch_with_budget()
+    }
+
+    /// Stamps the idle clock (milliseconds since `created`): the monitor's
+    /// eviction arm measures inactivity against this. Called at every
+    /// interaction entry (via this path — `feed`, `wait_output`,
+    /// `take_output`, and `request_fixes` all open with
+    /// [`Self::ensure_alive`]) and at each launch.
+    fn touch(&self) {
+        self.last_interaction_ms
+            .store(elapsed_millis(self.created), Ordering::Relaxed);
     }
 
     /// The capabilities the core offers at the handshake: everything the
@@ -1214,18 +1364,14 @@ impl PluginRuntime {
         // Both pipes were just piped: the invariants hold by construction.
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
-        // Startup stderr face: `Capture` pipes the host's stderr into the
-        // bounded capture, drained by its own thread (the host can never
-        // fill and stall on it); `Null`/`Inherit` leave no capture. Fresh
-        // per generation, like every other per-generation field.
-        self.stderr_capture = Arc::new(StderrCapture::new());
-        self.stderr_drain = match child.stderr.take() {
-            Some(stderr) => Some(spawn_stderr_drain(stderr, Arc::clone(&self.stderr_capture))),
-            None => None,
-        };
+        let stderr = child.stderr.take();
 
         // Fresh per-generation state (the previous generation's Arcs stay
-        // with its threads, which wind down on their own flags).
+        // with its threads, which wind down on their own flags). Installed
+        // BEFORE the worker threads: a thread the OS cannot create below
+        // then has the full generation shape to tear down — the death slot
+        // to record the cause in and the child to kill — the ordinary
+        // death path instead of aborting the host.
         self.session = Arc::new(Mutex::new(Session::new(Self::local_capabilities(
             self.spec.serve_queries,
         ))));
@@ -1235,9 +1381,24 @@ impl PluginRuntime {
         self.analyze_clock = Arc::new(AnalyzeClock::new());
         self.running = Arc::new(AtomicBool::new(true));
         self.alive = Arc::new(AtomicBool::new(true));
+        self.evicted = Arc::new(AtomicBool::new(false));
+        self.last_interaction_ms = Arc::new(AtomicU64::new(elapsed_millis(self.created)));
         self.death = Arc::new(Mutex::new(None));
         self.negotiated = None;
         *self.child.lock().expect("child lock") = Some(child);
+
+        // Startup stderr face: `Capture` pipes the host's stderr into the
+        // bounded capture, drained by its own thread (the host can never
+        // fill and stall on it); `Null`/`Inherit` leave no capture. Fresh
+        // per generation, like every other per-generation field.
+        self.stderr_capture = Arc::new(StderrCapture::new());
+        self.stderr_drain = match stderr {
+            Some(stderr) => Some(
+                spawn_stderr_drain(stderr, Arc::clone(&self.stderr_capture))
+                    .map_err(|source| self.thread_spawn_failed("stderr drain", source))?,
+            ),
+            None => None,
+        };
 
         let (commands, commands_rx) = mpsc::channel();
         let (acks, acks_rx) = mpsc::channel();
@@ -1250,19 +1411,28 @@ impl PluginRuntime {
             clock: Arc::clone(&self.analyze_clock),
             running: Arc::clone(&self.running),
             alive: Arc::clone(&self.alive),
+            evicted: Arc::clone(&self.evicted),
+            last_interaction_ms: Arc::clone(&self.last_interaction_ms),
             death: Arc::clone(&self.death),
             stats: Arc::clone(&self.stats),
         };
-        self.reader = Some(spawn_reader(stdout, handles.clone()));
-        self.writer = Some(spawn_writer(stdin, commands_rx, acks));
-        self.monitor = Some(spawn_monitor(
+        let reader = spawn_reader(stdout, handles.clone())
+            .map_err(|source| self.thread_spawn_failed("reader", source))?;
+        self.reader = Some(reader);
+        let writer = spawn_writer(stdin, commands_rx, acks)
+            .map_err(|source| self.thread_spawn_failed("writer", source))?;
+        self.writer = Some(writer);
+        let monitor = spawn_monitor(
             handles,
             pid,
             self.memory_cap_bytes,
             self.callback_timeout,
+            self.idle_evict,
             self.created,
             Arc::clone(&self.child),
-        ));
+        )
+        .map_err(|source| self.thread_spawn_failed("monitor", source))?;
+        self.monitor = Some(monitor);
 
         // Handshake: one `initialize`, reply awaited under the request budget.
         let init = self
@@ -1308,9 +1478,11 @@ impl PluginRuntime {
         };
         match handshake {
             // Readiness verdict reached: stop retaining — the drain thread
-            // keeps emptying the pipe, but nothing more is captured.
+            // keeps emptying the pipe, but nothing more is captured. The
+            // fresh generation starts its idle window now.
             Ok(()) => {
                 self.stderr_capture.seal();
+                self.touch();
                 Ok(())
             }
             Err(error) => Err(self.attach_startup_stderr(error)),
@@ -1326,7 +1498,7 @@ impl PluginRuntime {
     /// (on Unix the group kill reaches descendants that inherited them), but
     /// a descendant that escaped the group keeps the write end open and the
     /// reader parked with no EOF. Waiting unbounded would turn a budgeted
-    /// enforcement kill into a permanent hang (§14.3); past the bound the
+    /// enforcement kill into a permanent hang; past the bound the
     /// thread is detached and the relaunch proceeds — see [`join_bounded`]
     /// for why detaching is safe.
     fn teardown_generation(&mut self) {
@@ -1398,6 +1570,24 @@ impl PluginRuntime {
             );
         }
         RuntimeError::Crashed { reason }
+    }
+
+    /// The death path for a per-generation worker whose thread the OS could
+    /// not create (fd or memory exhaustion): record the cause
+    /// first-writer-wins in the fresh generation's death slot, kill the
+    /// child, and surface the ordinary crash — [`Self::launch_with_budget`]
+    /// prices the relaunch from the restart budget, and only its exhaustion
+    /// is terminal. A host too starved to create one thread degrades exactly
+    /// like a plugin that will not start: one surfaced tool diagnostic,
+    /// never an abort of the daemon.
+    fn thread_spawn_failed(&mut self, thread: &str, source: std::io::Error) -> RuntimeError {
+        let mut slot = self.death.lock().expect("death lock");
+        if slot.is_none() {
+            *slot = Some(format!("{thread} thread could not be spawned: {source}"));
+        }
+        drop(slot);
+        self.kill_child();
+        self.crash_error()
     }
 
     /// Binds the captured startup stderr to a startup failure. Waits
@@ -1558,11 +1748,17 @@ struct GenerationHandles {
     clock: Arc<AnalyzeClock>,
     running: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
+    evicted: Arc<AtomicBool>,
+    last_interaction_ms: Arc<AtomicU64>,
     death: Arc<Mutex<Option<String>>>,
     stats: Arc<PluginStats>,
 }
 
-fn spawn_reader(stdout: ChildStdout, h: GenerationHandles) -> JoinHandle<()> {
+/// Spawns the per-generation reader: the only reader of the child's stdout
+/// and the driver of the [`Session`] state machine behind the shared mutex.
+/// Returns `Err` when the OS cannot create the thread — the caller routes
+/// that through [`PluginRuntime::thread_spawn_failed`], never an abort.
+fn spawn_reader(stdout: ChildStdout, h: GenerationHandles) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("dartq-plugin-reader".to_owned())
         .spawn(move || {
@@ -1597,7 +1793,6 @@ fn spawn_reader(stdout: ChildStdout, h: GenerationHandles) -> JoinHandle<()> {
                 let _ = h.events.send(ProtocolEvent::Dead);
             }
         })
-        .expect("spawn reader thread")
 }
 
 /// Reads frames until the stream ends or the contract breaks. `Ok(())` only
@@ -1656,7 +1851,7 @@ fn run_reader(
                     let _ = events.send(ProtocolEvent::Initialized(caps));
                 }
                 Ok(Incoming::Diagnostic(diagnostic)) => {
-                    // §14.3 CPU row: produced diagnostics close the analyze
+                    // CPU budget row: produced diagnostics close the analyze
                     // demand's clock.
                     clock.close();
                     pending.push(diagnostic)?;
@@ -1685,11 +1880,13 @@ fn run_reader(
 /// Spawns the per-generation stdin writer: the only thread writing to the
 /// child, so a full pipe blocks it instead of the runtime handle, and the
 /// handle-side deadline in [`PluginRuntime::write_frame`] bounds every write.
+/// Returns `Err` when the OS cannot create the thread — the caller routes
+/// that through [`PluginRuntime::thread_spawn_failed`], never an abort.
 fn spawn_writer(
     mut stdin: ChildStdin,
     commands: mpsc::Receiver<WriterCommand>,
     acks: Sender<std::io::Result<()>>,
-) -> JoinHandle<()> {
+) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("dartq-plugin-writer".to_owned())
         .spawn(move || {
@@ -1716,7 +1913,6 @@ fn spawn_writer(
                 }
             }
         })
-        .expect("spawn writer thread")
 }
 
 /// Spawns the per-generation stderr drain: the only reader of the child's
@@ -1724,8 +1920,13 @@ fn spawn_writer(
 /// on a full pipe. Everything read is offered to the bounded capture (which
 /// discards once the handshake succeeded); the thread ends at the pipe's
 /// EOF — the child's death — and its bounded join at a failure site is what
-/// makes the final bytes deterministic in the surfaced error.
-fn spawn_stderr_drain(stderr: ChildStderr, capture: Arc<StderrCapture>) -> JoinHandle<()> {
+/// makes the final bytes deterministic in the surfaced error. Returns `Err`
+/// when the OS cannot create the thread — the caller routes that through
+/// [`PluginRuntime::thread_spawn_failed`], never an abort.
+fn spawn_stderr_drain(
+    stderr: ChildStderr,
+    capture: Arc<StderrCapture>,
+) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("dartq-plugin-stderr".to_owned())
         .spawn(move || {
@@ -1740,7 +1941,6 @@ fn spawn_stderr_drain(stderr: ChildStderr, capture: Arc<StderrCapture>) -> JoinH
                 }
             }
         })
-        .expect("spawn stderr drain thread")
 }
 
 /// The monitor's RSS arm: armed at birth when the platform has a sampler,
@@ -1790,21 +1990,28 @@ impl RssWatch {
     }
 }
 
+/// Spawns the per-generation isolation monitor: the RSS budget arm, the
+/// analyze demand's clock, and the idle-eviction deadline (see the module
+/// docs' conformance table). Returns `Err` when the OS cannot create the
+/// thread — the caller routes that through
+/// [`PluginRuntime::thread_spawn_failed`], never an abort: an unenforced
+/// generation must not exist, and the restart budget decides what does.
 fn spawn_monitor(
     h: GenerationHandles,
     pid: u32,
     memory_cap_bytes: u64,
     callback_timeout: Duration,
+    idle_evict: Option<Duration>,
     created: Instant,
     child: Arc<Mutex<Option<Child>>>,
-) -> JoinHandle<()> {
+) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("dartq-plugin-monitor".to_owned())
         .spawn(move || {
             // The RSS arm disarming (no sampler on this platform, or
             // sampling this child keeps failing) must never take the thread
             // down: the analyze-clock arm below is the other half of the
-            // §14.3 enforcement, and a monitor that quit on its first bad
+            // budget enforcement, and a monitor that quit on its first bad
             // sample would silently drop both budgets for the generation.
             // Disarms are counted in the stats instead.
             let mut rss = RssWatch::new();
@@ -1812,7 +2019,7 @@ fn spawn_monitor(
                 h.stats.rss_disarm();
             }
             while h.running.load(Ordering::Relaxed) {
-                // §14.3 CPU row, analyze path: a fed demand that has produced
+                // CPU budget row, analyze path: a fed demand that has produced
                 // no diagnostics for longer than the callback budget is the
                 // same isolation breach as the memory row. Checked before the
                 // RSS sample because unsampled targets report no RSS at all —
@@ -1830,6 +2037,16 @@ fn spawn_monitor(
                     // arm then only finishes the corpse (the kill below is a
                     // no-op reap) and must not re-attribute the death to the
                     // budget.
+                    // Lock-poison posture: `death` is a `std::sync::Mutex`,
+                    // and a panic elsewhere while it is held poisons it —
+                    // either `expect` in this loop (this arm and the RSS arm
+                    // below) would then kill the monitor thread and silently
+                    // lose both budget faces (the RSS row and the analyze
+                    // clock) for the rest of the generation. Accepted: every
+                    // writer holds the lock only across the plain slot
+                    // store, so a poison here already implies a panicking
+                    // peer, and this crate carries no parking_lot dependency
+                    // to swap in.
                     let mut slot = h.death.lock().expect("death lock");
                     if slot.is_none() {
                         *slot = Some(format!(
@@ -1860,7 +2077,7 @@ fn spawn_monitor(
                             rss.sampled();
                             h.stats.observe_rss(rss_bytes);
                             if rss_bytes > memory_cap_bytes {
-                                // §14.3 memory enforcement: over-budget child
+                                // memory budget enforcement: over-budget child
                                 // dies. Record the cause so the crash diagnostic
                                 // can name the memory row, and flip `alive` so
                                 // the next interaction restarts instead of
@@ -1889,10 +2106,54 @@ fn spawn_monitor(
                         }
                     }
                 }
+                // Idle eviction: a generation idle past the deadline holds
+                // its resident set for nothing — kill it here (no new
+                // thread, no async: this monitor tick is the deadline
+                // check) and let the next interaction relaunch budget-free.
+                // The deadline was clamped above every interaction budget at
+                // construction, so no request can be in flight when it
+                // fires; the re-read closes the one residual window where a
+                // just-started interaction's touch has not become visible
+                // to this thread yet.
+                if let Some(idle_timeout) = idle_evict {
+                    let last = h.last_interaction_ms.load(Ordering::Relaxed);
+                    if Duration::from_millis(elapsed_millis(created).saturating_sub(last))
+                        >= idle_timeout
+                        && h.last_interaction_ms.load(Ordering::Relaxed) == last
+                    {
+                        // Resumable death: `evicted` flips before the kill
+                        // so every later observer (ensure_alive, shutdown)
+                        // takes the budget-free resume path, and the death
+                        // slot stays untouched — an eviction never surfaces
+                        // a crash row and never consumes the restart
+                        // budget.
+                        h.evicted.store(true, Ordering::Relaxed);
+                        h.stats.evict();
+                        h.alive.store(false, Ordering::Relaxed);
+                        if let Some(mut child) = child.lock().expect("child lock").take() {
+                            kill_and_reap(&mut child);
+                        }
+                        break;
+                    }
+                }
                 std::thread::sleep(RSS_POLL_INTERVAL);
             }
         })
-        .expect("spawn monitor thread")
+}
+
+/// The runtime's idle-eviction timeout: the manifest's `idle_evict_ms`
+/// (default `DEFAULT_IDLE_EVICT_MS`, 5 minutes; `0` disables) with the
+/// `DARTQ_PLUGIN_IDLE_EVICT_MS` environment override taking precedence when
+/// it parses as a non-negative integer — the measurement harness exercises
+/// eviction at short timeouts without editing plugin manifests. A malformed
+/// override falls back to the manifest value (the manifest is the
+/// configuration of record; the env var is a measurement knob).
+fn idle_evict_timeout(manifest: &Manifest) -> Option<Duration> {
+    let ms = std::env::var("DARTQ_PLUGIN_IDLE_EVICT_MS")
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+        .unwrap_or(manifest.idle_evict_ms);
+    (ms > 0).then(|| Duration::from_millis(ms))
 }
 
 /// The child's resident set in bytes, `None` once the process is gone.
@@ -2004,7 +2265,7 @@ fn wire_diagnostics(diagnostics: &[Diagnostic], files: &FileTable) -> Vec<Plugin
 }
 
 /// Converts a runtime failure into the `dartq/`-namespace engine diagnostic
-/// the output layer merges (PRD §14.3: a plugin failure costs one tool
+/// the output layer merges (: a plugin failure costs one tool
 /// diagnostic, never engine state). Deadline overruns map to
 /// `dartq/plugin_timeout`, everything else — process death, wire
 /// violations, restart-budget exhaustion, spawn failures — to
@@ -2175,6 +2436,96 @@ mod tests {
         assert!(
             capture.take_text().is_none(),
             "post-verdict writes are not retained"
+        );
+    }
+
+    #[test]
+    fn spawn_spec_argv_follows_the_entrypoint_kind() {
+        let manifest_for = |kind: &str, entry: &str| {
+            Manifest::parse(&format!(
+                r#"{{"name": "n", "version": "1.0.0", "entrypoint": "{entry}", "entrypoint_kind": "{kind}"}}"#
+            ))
+.expect("parse")
+        };
+        let dir = Path::new("/plugins/dcl");
+
+        // Source and kernel share the `dart <entrypoint>` argv: a kernel
+        // snapshot differs in what the VM does with the file (magic-number
+        // sniff, direct load), not in how it is spawned.
+        for kind in ["source", "kernel"] {
+            let spec = SpawnSpec::dart(dir, manifest_for(kind, "bin/serve"));
+            assert_eq!(spec.program, "dart");
+            assert_eq!(spec.args, vec!["bin/serve".to_owned()]);
+            assert_eq!(spec.current_dir, dir);
+        }
+
+        // The exe form drops the dart front end: the precompiled executable
+        // is the program (absolutized — resolution must not depend on the
+        // child's cwd change ordering), with no args.
+        let spec = SpawnSpec::dart(dir, manifest_for("exe", "bin/serve.exe"));
+        let program = Path::new(&spec.program);
+        assert!(program.is_absolute(), "exe program absolutized: {spec:?}");
+        assert!(program.ends_with("bin/serve.exe"), "{spec:?}");
+        assert!(spec.args.is_empty());
+        assert_eq!(spec.current_dir, dir);
+    }
+
+    #[test]
+    fn thread_spawn_failure_takes_the_death_path_and_never_aborts() {
+        // Test-form rationale: an OS thread-creation failure has no
+        // portable, deterministic in-process trigger (`Builder::spawn` fails
+        // only on real fd/memory exhaustion, and exhausting host limits to
+        // force one is flaky and resource-hostile), so this pin targets the
+        // shared failure arm all four spawn sites route through — each
+        // site's wiring is the `Err => thread_spawn_failed` mapping checked
+        // by the compiler, and the restart-budget ride is the ordinary
+        // `launch_with_budget` path the crash integration tests exercise.
+        let manifest = Manifest::parse(
+            r#"{"name": "n", "version": "1.0.0", "entrypoint": "x", "timeouts": {"request_retries": 0}}"#,
+        )
+        .expect("parse");
+        let mut runtime = PluginRuntime::lazy(SpawnSpec::dart(Path::new("/plugins/dcl"), manifest));
+        // Shape of a live generation at the spawn sites (launch_once sets
+        // the flag before any worker thread is created).
+        runtime.alive.store(true, Ordering::Relaxed);
+
+        // The failure arm records the cause, kills the (here absent) child
+        // without panicking, and surfaces the crash form carrying the reason
+        // and the spent budget — one tool diagnostic at exhaustion, never a
+        // host abort.
+        let error = runtime.thread_spawn_failed(
+            "reader",
+            std::io::Error::new(std::io::ErrorKind::OutOfMemory, "host thread limit"),
+        );
+        let RuntimeError::Crashed { reason } = &error else {
+            panic!("the death path surfaces the crash form, got {error:?}");
+        };
+        assert!(
+            reason.contains("reader thread could not be spawned")
+                && reason.contains("host thread limit"),
+            "the reason names the thread and the io error: {reason}"
+        );
+        assert!(
+            reason.contains("restart budget of 0 exhausted"),
+            "the budget accounting is uniform with every death: {reason}"
+        );
+        assert!(
+            !runtime.alive.load(Ordering::Relaxed),
+            "the generation is dead; the relaunch rides the next interaction"
+        );
+
+        // First-writer-wins, as on every death-slot recorder: a second
+        // failure on the same generation must not clobber the cause.
+        let _ = runtime.thread_spawn_failed(
+            "writer",
+            std::io::Error::new(std::io::ErrorKind::OutOfMemory, "again"),
+        );
+        let RuntimeError::Crashed { reason } = runtime.crash_error() else {
+            panic!("the death slot still surfaces the crash form");
+        };
+        assert!(
+            reason.contains("reader thread") && !reason.contains("writer"),
+            "the first recorded cause stands: {reason}"
         );
     }
 

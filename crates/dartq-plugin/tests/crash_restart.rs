@@ -1,7 +1,7 @@
 //! Crash isolation: child death is counted and absorbed within the restart
 //! budget, then surfaces as a terminal [`RuntimeError::Crashed`] — the
 //! runtime never loops forever on a deterministically broken plugin, and the
-//! engine's own state never follows the plugin down (PRD §14.3).
+//! engine's own state never follows the plugin down.
 //!
 //! Unix-gated: the children are `sh` one-liners, deliberately not Dart
 //! processes — startup speed and determinism are the point.

@@ -1,4 +1,4 @@
-//! Protocol violations end-to-end (PRD §14.3): every wire-contract break —
+//! Protocol violations end-to-end: every wire-contract break —
 //! an unknown method, a foreign `schema_version`, non-UTF-8 bytes, a frame
 //! beyond the 16 MiB bound — trips the reader into the death slot, consumes
 //! the restart budget through the ordinary crash path, and surfaces the

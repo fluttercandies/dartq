@@ -5,7 +5,7 @@
 //! negotiation, an engine push giving the request its fix context, a
 //! `request/fixes` reply computed by the registered producer, graceful
 //! shutdown in budget, and mid-session crash isolation reported as the
-//! `dartq/plugin_crashed` diagnostic (PRD §14).
+//! `dartq/plugin_crashed` diagnostic.
 //!
 //! Distinct from `e2e_round_trip.rs` (echo over the raw callback API) and
 //! `plugin_discovery.rs` (manifest discovery): this exercises the
@@ -35,7 +35,7 @@ use support::dart_available;
 const LIVE_RULE: CodeInfo = CodeInfo::new("live/fixed", "LIVE_FIXED", DiagnosticType::Lint, false);
 
 /// Generous request budget: a cold `dart run` JIT start must fit inside one
-/// (PRD §14.3 default is 10 s; CI cold caches get the same slack as
+/// (default is 10 s; CI cold caches get the same slack as
 /// `e2e_round_trip`). The tests never shrink the runtime's budgets — every
 /// wait is a manifest budget the runtime itself enforces.
 const REQUEST_MS: u64 = 120_000;
@@ -47,9 +47,9 @@ fn host_package_dir() -> PathBuf {
 /// Spawns the fixture: `dart run bin/live_plugin.dart [args...]` inside the
 /// host package directory.
 fn spawn_live(args: &[&str]) -> PluginRuntime {
-    // Pinned above the 512 MiB default: a real Dart host's JIT startup loads
+    // Pinned above the 512 MiB release default: a real Dart host's JIT startup loads
     // the analyzer parse stack through the host package and crosses the
-    // default before the first request (calibration in `callback_timeout.rs`).
+    // release default before the first request (calibration in `callback_timeout.rs`).
     let manifest = Manifest::parse(&format!(
         r#"{{"name": "live", "version": "0.1.0", "entrypoint": "bin/live_plugin.dart",
             "capabilities": ["lint", "fix"],
@@ -141,7 +141,7 @@ fn live_plugin_round_trips_fixes_and_shuts_down_in_budget() {
     assert_eq!(reply.fixes[0].edits[0].length, 4);
     assert_eq!(reply.fixes[0].edits[0].replacement, "fixed");
 
-    // §14.3 counters over the live wire: handshake + engine push + fixes
+    // Isolation counters over the live wire: handshake + engine push + fixes
     // request out, their replies in (the fixture emits no diagnostics of
     // its own); no restarts, no frame-guard drops; the child's RSS is
     // sampled.

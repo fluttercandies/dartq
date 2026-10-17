@@ -1,4 +1,4 @@
-//! Analyze-demand CPU enforcement (PRD §14.3 CPU row, analyze path): a
+//! Analyze-demand CPU enforcement: a
 //! plugin that consumes every fed batch but never produces
 //! `notification/diagnostic` keeps the demand's clock open; the monitor
 //! kills it at the manifest's `callback_ms`, the death record names the

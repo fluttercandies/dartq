@@ -8,7 +8,7 @@
 //! the registered rule executing host-side over the overlay text, the
 //! severity override re-leveling, the daemon-side merge contract, the fixes
 //! face with a UTF-16 edit applied to real text, and the crash mode surfaced
-//! as the `dartq/plugin_crashed` diagnostic (PRD §14). A further row drives
+//! as the `dartq/plugin_crashed` diagnostic. A further row drives
 //! the query mode (`query` launch argument + `serve_queries: true`): the
 //! runtime serves the producer's reverse `request/query` round trips and the
 //! reply's changes state the resolution facts. The
@@ -30,7 +30,7 @@
 //! on-disk samples with their real `dartq_plugin.json` manifests. All tests
 //! spawn a real `dart` process: `#[ignore]`d here so the flag-gated
 //! plugin-live serial face owns them — run with
-//! `cargo test -p dartq-plugin -- --ignored` (DARTQ_M4_LIVE=1).
+//! `cargo test -p dartq-plugin -- --ignored` (`DARTQ_M4_LIVE=1`).
 //! A missing `dart` skips at runtime (CI without the SDK must not go red);
 //! children are reaped by the runtime's own shutdown paths.
 
@@ -42,12 +42,12 @@ use std::time::Duration;
 use dartq_diagnostics::{Diagnostic, Severity, SourceRange, URI_DOES_NOT_EXIST};
 use dartq_plugin::session::SessionError;
 use dartq_plugin::{
-    Capability, CapabilitySet, CycleConfig, CyclePush, Manifest, OverlayEntry, PendingQuery,
-    PluginRuntime, QueryKind, RuleKind, RuntimeError, Severity as WireSeverity, SpawnSpec,
-    StdioPolicy, crash_diagnostic, discover,
+    Capability, CapabilitySet, CycleConfig, CyclePush, DiscoveryReport, Manifest, OverlayEntry,
+    PendingQuery, PluginRuntime, PubNative, QueryKind, RuleKind, RuntimeError,
+    Severity as WireSeverity, SpawnSpec, StdioPolicy, crash_diagnostic, discover,
 };
-use serde_json::{Map, Value, json};
 use dartq_source::{FileTable, LineIndex, utf16_offset_to_byte};
+use serde_json::{Map, Value, json};
 
 mod support;
 
@@ -58,12 +58,29 @@ fn sample_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../dartq-plugin-host/samples/compat")
 }
 
+/// Discovery with overrides only: the live scenarios declare no `plugins:`
+/// section, so the pub-native source contributes nothing.
+fn discover_overrides(workspace_root: &Path, overrides: &[PathBuf]) -> DiscoveryReport {
+    let config = dartq_pub::PackageConfig::parse(r#"{"configVersion": 2, "packages": []}"#)
+        .expect("valid config");
+    discover(
+        workspace_root,
+        overrides,
+        &PubNative {
+            declared: &[],
+            config: &config,
+            config_dir: workspace_root,
+            options_file: workspace_root,
+        },
+    )
+}
+
 /// The content the engine holds for `lib/a.dart` (the test plays the
 /// engine's resident-text role). The emoji is a surrogate pair, so UTF-16
 /// offsets past it differ from byte offsets — the position exchange's proof.
 const A_DART: &str = "import '\u{1F600}.dart';\nvoid main() {}\n";
 
-/// The open-document text pushed as the cycle's overlay: [A_DART] plus a
+/// The open-document text pushed as the cycle's overlay: [`A_DART`] plus a
 /// boolean literal — the rule fires at UTF-16 offset 38, length 4 (past the
 /// emoji, where UTF-16 and byte offsets diverge).
 const FIXTURE: &str = "import '\u{1F600}.dart';\nvoid main() { print(true); }\n";
@@ -73,10 +90,11 @@ const TRUE_OFFSET: u64 = 38;
 
 #[test]
 #[ignore = "spawns real dart processes; run in the serial window via plugin-live (DARTQ_M4_LIVE=1)"]
-// One linear end-to-end scenario (discovery → spawn → feed → merge → fixes
-// → teardown) whose value is the uninterrupted sequence; carving it into
-// helpers would thread six Arcs of context for no reader benefit.
-#[expect(clippy::too_many_lines, reason = "see above")]
+#[expect(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    reason = "one linear end-to-end scenario whose value is the uninterrupted sequence; carving it into helpers would thread six Arcs of context for no reader benefit"
+)]
 fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
     if !dart_available() {
         println!("skipping: no `dart` on PATH, the live fixture cannot run");
@@ -84,7 +102,7 @@ fn compat_sample_diagnostics_merge_and_fixes_apply_over_a_live_process() {
     }
     // Discovery through the real manifest: an explicit override loads the
     // sample directory (the convention scan is empty here).
-    let report = discover(
+    let report = discover_overrides(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join(".."),
         &[sample_dir()],
     );
@@ -402,7 +420,7 @@ fn compat_sample_crash_mode_surfaces_as_plugin_crashed() {
 /// line 1's end at 29 is the miss position.
 const QUERY_FIXTURE: &str = "void main() { print(true); }\nvoid unused() {}\n";
 
-/// The fixture table's `(offset, length)` pairs into [QUERY_FIXTURE].
+/// The fixture table's `(offset, length)` pairs into [`QUERY_FIXTURE`].
 const QUERY_PRINT: (u64, u64) = (14, 5);
 const QUERY_UNUSED: (u64, u64) = (34, 6);
 /// Line 1's end: nothing resolves there (the legal empty answer).
@@ -543,19 +561,15 @@ fn compat_sample_query_mode_serves_reverse_queries_over_a_live_process() {
                 // absolute test-crate form (the gone-file arm below rides the
                 // raw request string, which never interns, and stays literal).
                 let element = match (file, request.offset) {
-                    (_, Some(offset))
-                        if file == a_path && offset == QUERY_PRINT.0 =>
-                    {
+                    (_, Some(offset)) if file == a_path && offset == QUERY_PRINT.0 => {
                         Some(&print_element)
                     }
-                    (_, Some(offset))
-                        if file == a_path && offset == QUERY_UNUSED.0 =>
-                    {
+                    (_, Some(offset)) if file == a_path && offset == QUERY_UNUSED.0 => {
                         Some(&unused_element)
                     }
                     _ => None,
                 };
-                let elements = element.map(|row| json!([row])).unwrap_or_else(|| json!([]));
+                let elements = element.map_or_else(|| json!([]), |row| json!([row]));
                 Ok(query_reply("elements", elements))
             }
             QueryKind::References => {
@@ -594,7 +608,10 @@ fn compat_sample_query_mode_serves_reverse_queries_over_a_live_process() {
         "the requested UTF-16 range echoed"
     );
     assert_eq!(edit.replacement, "print /* compat: 2 refs */");
-    assert!(reply.fixes[1].edits.is_empty(), "the suggestion is message-only");
+    assert!(
+        reply.fixes[1].edits.is_empty(),
+        "the suggestion is message-only"
+    );
 
     // An unreferenced declaration: the removal-candidate decision,
     // message-only (a safe removal needs more than the name span).
@@ -613,7 +630,10 @@ fn compat_sample_query_mode_serves_reverse_queries_over_a_live_process() {
         .expect("fixes reply arrives within the callback budget");
     assert_eq!(
         reply.fixes[0].message,
-        format!("compat query: nothing resolved at {a_path}:{}", QUERY_MISS.0)
+        format!(
+            "compat query: nothing resolved at {a_path}:{}",
+            QUERY_MISS.0
+        )
     );
 
     // An unknown file rides the error channel into a QueryError and degrades
@@ -626,7 +646,11 @@ fn compat_sample_query_mode_serves_reverse_queries_over_a_live_process() {
         reply.fixes[0].message,
         "compat query failed: unknown file `lib/gone.dart`"
     );
-    assert_eq!(reply.fixes.len(), 2, "the session survived the failed query");
+    assert_eq!(
+        reply.fixes.len(),
+        2,
+        "the session survived the failed query"
+    );
 
     assert_eq!(runtime.stats().restarts, 0);
     runtime.shutdown().expect("graceful shutdown");
@@ -809,7 +833,6 @@ fn parse_census(message: &str) -> (u64, u64, u64, u64) {
 // One linear end-to-end scenario per row; carving it up would thread the
 // runtime through helpers for no reader benefit (the compat test above
 // keeps the same posture).
-#[expect(clippy::too_many_lines, reason = "see above")]
 fn drive_overlay(row: &OverlayRow) {
     let Some(dir) = overlay_ready(row.name) else {
         return;
@@ -817,7 +840,7 @@ fn drive_overlay(row: &OverlayRow) {
 
     // Discovery through the real manifest: an explicit override loads the
     // overlay directory (the convention scan is empty here).
-    let report = discover(&Path::new(env!("CARGO_MANIFEST_DIR")).join(".."), &[dir]);
+    let report = discover_overrides(&Path::new(env!("CARGO_MANIFEST_DIR")).join(".."), &[dir]);
     assert!(
         report.skipped.is_empty(),
         "the overlay manifest must load cleanly: {:?}",
@@ -881,53 +904,50 @@ fn drive_overlay(row: &OverlayRow) {
         "registration census pins the clone revision"
     );
 
-    match &row.fixes {
-        Some(face) => {
-            let reply = runtime
-                .request_fixes(&a_path, 8, 2)
-                .expect("fixes reply arrives within the callback budget");
-            assert_eq!(
-                reply.fixes.len(),
-                face.count,
-                "one change per registered generator"
-            );
-            assert_eq!(reply.fixes[0].message, face.first_message);
-            let edit = &reply.fixes[0].edits[0];
-            assert_eq!(
-                (edit.offset, edit.length),
-                (8, 2),
-                "the requested UTF-16 range echoed"
-            );
-            assert_eq!(edit.replacement, face.replacement);
-            // Applying the edit proves the UTF-16 exchange: offsets 8..10
-            // span the emoji's surrogate pair, where UTF-16 and byte offsets
-            // diverge.
-            let start = utf16_offset_to_byte(A_DART, 8);
-            let end = utf16_offset_to_byte(A_DART, 10);
-            let mut fixed = String::with_capacity(A_DART.len());
-            fixed.push_str(&A_DART[..start]);
-            fixed.push_str(&edit.replacement);
-            fixed.push_str(&A_DART[end..]);
-            assert_eq!(
-                fixed,
-                format!("import '{}.dart';\nvoid main() {{}}\n", face.replacement),
-                "the fix applied at the UTF-16 range the plugin echoed"
-            );
-        }
-        None => {
-            // Lint-only row: `request/fixes` is gated on the negotiated
-            // `fix` capability and must never reach the plugin.
-            let error = runtime
-                .request_fixes(&a_path, 0, 0)
-                .expect_err("the fix capability is not negotiated");
-            assert!(
-                matches!(
-                    error,
-                    RuntimeError::Protocol(SessionError::CapabilityNotNegotiated(Capability::Fix))
-                ),
-                "the gate is the capability check, got {error:?}"
-            );
-        }
+    if let Some(face) = &row.fixes {
+        let reply = runtime
+            .request_fixes(&a_path, 8, 2)
+            .expect("fixes reply arrives within the callback budget");
+        assert_eq!(
+            reply.fixes.len(),
+            face.count,
+            "one change per registered generator"
+        );
+        assert_eq!(reply.fixes[0].message, face.first_message);
+        let edit = &reply.fixes[0].edits[0];
+        assert_eq!(
+            (edit.offset, edit.length),
+            (8, 2),
+            "the requested UTF-16 range echoed"
+        );
+        assert_eq!(edit.replacement, face.replacement);
+        // Applying the edit proves the UTF-16 exchange: offsets 8..10
+        // span the emoji's surrogate pair, where UTF-16 and byte offsets
+        // diverge.
+        let start = utf16_offset_to_byte(A_DART, 8);
+        let end = utf16_offset_to_byte(A_DART, 10);
+        let mut fixed = String::with_capacity(A_DART.len());
+        fixed.push_str(&A_DART[..start]);
+        fixed.push_str(&edit.replacement);
+        fixed.push_str(&A_DART[end..]);
+        assert_eq!(
+            fixed,
+            format!("import '{}.dart';\nvoid main() {{}}\n", face.replacement),
+            "the fix applied at the UTF-16 range the plugin echoed"
+        );
+    } else {
+        // Lint-only row: `request/fixes` is gated on the negotiated
+        // `fix` capability and must never reach the plugin.
+        let error = runtime
+            .request_fixes(&a_path, 0, 0)
+            .expect_err("the fix capability is not negotiated");
+        assert!(
+            matches!(
+                error,
+                RuntimeError::Protocol(SessionError::CapabilityNotNegotiated(Capability::Fix))
+            ),
+            "the gate is the capability check, got {error:?}"
+        );
     }
 
     runtime.shutdown().expect("graceful shutdown");
