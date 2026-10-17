@@ -416,8 +416,7 @@ fn modifier_rejection_is_feature_gated() {
     // The extraneous face is the only feature-gated half: `var` + a type
     // keeps `var_and_type` at every version (official typeAfterVar has no
     // feature gate), and `final` stays fully silent pre-feature.
-    let (table, text) =
-        super::collector::scan_ok("void f(final int x) {}\nvoid p(var int q) {}\n");
+    let (table, text) = super::collector::scan_ok("void f(final int x) {}\nvoid p(var int q) {}\n");
     let mut collector = Collector::default();
     let mut parser = crate::Parser::new(
         text,

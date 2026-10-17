@@ -1812,7 +1812,13 @@ mod tests {
         declared: &'a FxHashMap<String, String>,
         files: &'a mut FileTable,
     ) -> UriResolver<'a> {
-        UriResolver::new(&fixture.packages, &fixture.snapshot, declared, files, &|_| false)
+        UriResolver::new(
+            &fixture.packages,
+            &fixture.snapshot,
+            declared,
+            files,
+            &|_| false,
+        )
     }
 
     /// [`resolver_with`] under the oracle-default empty context.
@@ -2207,7 +2213,8 @@ mod tests {
         // `web_sql` is on disk in the SDK tree but tabulated by neither the
         // oracle's flat table nor dartq's: source null —
         // `uri_does_not_exist` per the URI-layer contract.
-        let unknown = resolver.resolve(container, Some("dart:web_sql"), DirectiveKind::ImportExport);
+        let unknown =
+            resolver.resolve(container, Some("dart:web_sql"), DirectiveKind::ImportExport);
         assert_eq!(
             unknown.uri,
             ResolvedUri::Unresolved(UnresolvedKind::NotExist)
@@ -2735,8 +2742,7 @@ mod tests {
         let app = files.intern(&root.join("app/lib/main.dart"));
         let nested = files.intern(&root.join("app/nested/lib/n.dart"));
 
-        let mut resolver =
-            UriResolver::new(&table, &snapshot, &declared, &mut files, &|_| false);
+        let mut resolver = UriResolver::new(&table, &snapshot, &declared, &mut files, &|_| false);
 
         // Root context: its own package resolves; nothing from the
         // sibling's universe does.
@@ -2830,8 +2836,7 @@ mod tests {
         let mut files = FileTable::new();
         let app = files.intern(&root.join("app/lib/main.dart"));
         let nested = files.intern(&root.join("app/nested/lib/n.dart"));
-        let mut resolver =
-            UriResolver::new(&table, &snapshot, &declared, &mut files, &|_| false);
+        let mut resolver = UriResolver::new(&table, &snapshot, &declared, &mut files, &|_| false);
         let own = resolver.resolve(
             app,
             Some("package:app/main.dart"),
@@ -2897,8 +2902,7 @@ mod tests {
         let mut files = FileTable::new();
         let app = files.intern(&root.join("app/lib/main.dart"));
         let dep = files.intern(&root.join("app/dep/lib/d.dart"));
-        let mut resolver =
-            UriResolver::new(&table, &snapshot, &declared, &mut files, &|_| false);
+        let mut resolver = UriResolver::new(&table, &snapshot, &declared, &mut files, &|_| false);
         // Root context: the as-written dep entry resolves.
         let from_root =
             resolver.resolve(app, Some("package:dep/d.dart"), DirectiveKind::ImportExport);

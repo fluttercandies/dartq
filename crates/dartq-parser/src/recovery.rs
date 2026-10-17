@@ -1006,7 +1006,10 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         // `ensureSemicolon`/`rewriteAndRecover` anchor behavior; frozen
         // oracle 0c9fda4b L85 anchors the `;` row on the token following
         // the recovery point).
-        if self.spill_after.is_some_and(|mark| anchor.range.offset <= mark) {
+        if self
+            .spill_after
+            .is_some_and(|mark| anchor.range.offset <= mark)
+        {
             // `findNonZeroLengthToken` over the resume token (upstream Dart
             // SDK source, pkg/_fe_analyzer_shared/lib/src/parser/util.dart):
             // a zero-width synthetic at the resume point must not capture

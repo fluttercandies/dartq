@@ -1117,11 +1117,7 @@ fn unclosed_interpolation_eof_recovery_terminates() {
     let file = files.intern(std::path::Path::new("test.dart"));
     let result = dartq_scanner::scan(source, config, file);
     let table: &'static dartq_scanner::TokenTable = Box::leak(Box::new(result.tokens));
-    let scanner_codes: Vec<&str> = result
-        .diagnostics
-        .iter()
-        .map(|d| d.code.name)
-        .collect();
+    let scanner_codes: Vec<&str> = result.diagnostics.iter().map(|d| d.code.name).collect();
     let text: &'static str = Box::leak(source.to_string().into_boxed_str());
     let features =
         crate::ParserFeatures::from_feature_set(dartq_language::FeatureSet::for_language_version(
