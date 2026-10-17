@@ -1,0 +1,5 @@
+# Generated output of tests/corpus/torture/tools/gen_torture.py.
+# The generator is tracked; the generated corpus is not (same policy as
+# tests/corpus/mega). Regenerate with:
+#   python3 tests/corpus/torture/tools/gen_torture.py --force
+/corpus/

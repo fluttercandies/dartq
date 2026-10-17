@@ -1,0 +1,2 @@
+// recovery: partial_code/switch_statement_test.dart/test_switch_statement_leftBrace_try
+f() { switch (a) { try {} finally {} }

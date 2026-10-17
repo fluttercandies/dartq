@@ -1,0 +1,2 @@
+// recovery: partial_code/while_statement_test.dart/test_while_statement_keyword_return
+f() { while return; }

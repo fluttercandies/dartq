@@ -1,0 +1,2 @@
+// recovery: partial_code/for_statement_test.dart/test_for_statement_keyword_do
+f() { for do {} while (true); }
