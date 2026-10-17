@@ -1,4 +1,4 @@
-//! Memory footprint measurement for `StringTable` (ast-layout-spec §5).
+//! Memory footprint measurement for `StringTable`.
 //!
 //! Run with:
 //! `cargo run -p dartq-source --release --example string_table_footprint`
@@ -78,6 +78,7 @@ fn report(label: &str, distinct: usize, calls: usize, payload: usize, before: us
 
 fn main() {
     const N: usize = 100_000;
+    const POOL: usize = 20_000;
 
     // Scenario A: 100k distinct identifier-shaped strings (17 B each).
     let table = dartq_source::StringTable::new();
@@ -113,7 +114,6 @@ fn main() {
 
     // Scenario B: 100k intern calls over a 20k distinct pool (80% hits),
     // matching identifier reuse in a real corpus.
-    const POOL: usize = 20_000;
     let table = dartq_source::StringTable::new();
     let before = live();
     for call in 0..N {

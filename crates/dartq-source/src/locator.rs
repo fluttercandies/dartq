@@ -1,4 +1,4 @@
-//! Sparse path-to-content mapping backing change detection (PRD §16.7).
+//! Sparse path-to-content mapping backing change detection.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -9,7 +9,7 @@ use crate::content_id::ContentId;
 use crate::file_table::PathMemo;
 
 /// Records which [`ContentId`] each path had at which modification time, as
-/// the mtime prefilter for change detection (PRD §16.7): on a later pass, a
+/// the mtime prefilter for change detection: on a later pass, a
 /// path whose mtime is unchanged can reuse its recorded [`ContentId`] without
 /// re-reading or rehashing; a changed mtime means the content must be
 /// re-read, rehashed, and re-recorded via [`Locator::record`].
@@ -70,7 +70,7 @@ impl Locator {
     /// reclaimed instead of leaking for the session. Entries for other
     /// spellings that canonicalize to the same file stay until their own
     /// forget — the memo is keyed by spelling and keeps no
-    /// canonical-to-spellings index (see [`PathMemo::retract`]).
+    /// canonical-to-spellings index (see `PathMemo::retract`).
     ///
     /// Deletion is a two-structure obligation: the engine must also call
     /// [`FileTable::forget`](crate::FileTable::forget) for the same path.

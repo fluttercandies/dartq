@@ -1,4 +1,4 @@
-//! Strings interned to small stable integers (ast-layout-spec §5).
+//! Strings interned to small stable integers.
 
 use std::sync::RwLock;
 
@@ -14,6 +14,13 @@ use rustc_hash::FxHashMap;
 pub struct StringId(u32);
 
 impl StringId {
+    /// The absent-id sentinel for packed rows' optional string columns (a
+    /// bare reference row's qualifier). Ids are handed out from 0, and
+    /// minting 2³²−1 distinct strings — hundreds of GB of text at the
+    /// table's measured per-entry cost — is past every session ceiling, so
+    /// equality with this constant is the packed-row "no string" test.
+    pub const NONE: Self = Self(u32::MAX);
+
     /// The underlying integer, stable for the lifetime of the issuing
     /// [`StringTable`].
     #[must_use]
@@ -24,7 +31,7 @@ impl StringId {
 
 /// Interning table for strings that must outlive a single file: element
 /// names surfaced in results, diagnostic message fragments
-/// (ast-layout-spec §5).
+///.
 ///
 /// `intern` dedups by content: the same text always yields the same
 /// [`StringId`], and ids are handed out from 0 in first-intern order. The
@@ -34,10 +41,10 @@ impl StringId {
 /// names cannot be attributed to one content whose death would prove the
 /// names dead, because the same text arrives from many files and from
 /// synthesized spellings (setter names, prefixed imports), so the holder
-/// of a dedup hit is not the recorded first interner. The deferred §17
+/// of a dedup hit is not the recorded first interner. The deferred
 /// mark-sweep story is thereby closed in favor of a session ceiling:
 /// memory grows with distinct interned strings at the measured ~93 B/entry
-/// (ast-layout-spec §5, #128), [`len`](Self::len) exposes the count
+///, [`len`](Self::len) exposes the count
 /// against that bound, and overshoot is accepted — interning past any
 /// nominal bound costs memory, never truth.
 ///
@@ -52,7 +59,7 @@ impl StringId {
 /// (the rust-analyzer `symbol.rs` shape minus the tagged pointer, with u32
 /// ids). The leak is the price of [`resolve`](Self::resolve) returning
 /// slices without unsafe under interior mutability; the measured per-entry
-/// footprint is recorded in ast-layout-spec §5.
+/// footprint is measured in the string-table memory test.
 #[derive(Debug, Default)]
 pub struct StringTable {
     inner: RwLock<Inner>,
@@ -101,7 +108,7 @@ impl StringTable {
     }
 
     /// How many distinct strings the table holds — the count the session
-    /// ceiling's memory bound scales with (~93 B/entry, ast-layout-spec §5).
+    /// ceiling's memory bound scales with.
     ///
     /// # Panics
     ///

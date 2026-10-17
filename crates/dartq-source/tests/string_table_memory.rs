@@ -1,10 +1,10 @@
-//! Measured per-entry footprint of [`StringTable`] (ast-layout-spec §5 note).
+//! Measured per-entry footprint of [`StringTable`].
 //!
 //! One test per binary with a counting global allocator: net live bytes
 //! (allocations minus frees) around interning 100k distinct 12-byte strings,
 //! minus the payload itself, divided by the entry count. The reported figure
 //! includes power-of-two growth slack of the id/origin vecs and the hash
-//! bucket array at 100k entries; the doc note in ast-layout-spec §5 quotes
+//! bucket array at 100k entries; the string_table.rs doc note quotes
 //! this measurement.
 //!
 //! Run: `cargo test -p dartq-source --test string_table_memory -- --nocapture`

@@ -1,10 +1,10 @@
 //! The engine's external position convention: UTF-16 based ranges, line
-//! indexing, and the byte/UTF-16 conversions (PRD §10.4).
+//! indexing, and the byte/UTF-16 conversions.
 
 /// A span of source text: `offset .. offset + length`.
 ///
 /// Both fields are in **UTF-16 code units** — the official Dart analyzer and
-/// LSP convention fixed by PRD §10.4. Byte-oriented internal passes must
+/// LSP convention fixed by Byte-oriented internal passes must
 /// convert through [`LineIndex`] and [`byte_offset_to_utf16`] before
 /// producing a `SourceRange`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,7 +147,11 @@ impl LineIndex {
     /// # Panics
     ///
     /// Panics when `source` exceeds [`u32::MAX`] bytes; offsets in this
-    /// crate are 32-bit by design (PRD §10.4).
+    /// crate are 32-bit by design. Unreachable through the engine: the
+    /// intake gates reject sources over [`crate::MAX_SOURCE_BYTES`] at
+    /// load and again at residency, before any position is derived — the
+    /// check below is the crate's internal invariant statement, and direct
+    /// callers outside the gates must size-check themselves.
     #[must_use]
     pub fn new(source: &str) -> Self {
         let source_len = u32::try_from(source.len()).expect("source exceeds u32::MAX bytes");
@@ -665,11 +669,12 @@ mod tests {
     }
 
     /// The fused `line_col_utf16` must agree with the official recipe
-    /// (`official_line_col` above: UTF-16 line starts, `offset - lineStart
-    /// + 1` pure arithmetic) on every UTF-16 offset of wide-character
-    /// sources — hanzi, astral emoji, BOM — plus an ASCII control and the
-    /// audit's astral-final unterminated-comment shape, whose eof-pinned
-    /// diagnostics land between the surrogates of the final character.
+    /// (`official_line_col` above: UTF-16 line starts, pure
+    /// `offset - lineStart + 1` arithmetic) on every UTF-16 offset of
+    /// wide-character sources — hanzi, astral emoji, BOM — plus an ASCII
+    /// control and the audit's astral-final unterminated-comment shape,
+    /// whose eof-pinned diagnostics land between the surrogates of the
+    /// final character.
     #[test]
     fn line_col_utf16_matches_external_recipe() {
         let sources = [

@@ -1,5 +1,5 @@
 //! Content identities: the 128-bit blake3 digest that names source bytes
-//! everywhere in dartq (PRD §5.2).
+//! everywhere in dartq.
 
 use std::fmt;
 use std::str::FromStr;
@@ -8,8 +8,8 @@ use std::str::FromStr;
 ///
 /// This is the universal name for source content in dartq — two byte
 /// sequences are the same content if and only if their [`ContentId`]s are
-/// equal, regardless of file path, package, or machine (PRD §5.2). The
-/// 128-bit truncation is the PRD-confirmed choice (`blake3-128`); it keeps
+/// equal, regardless of file path, package, or machine. The
+/// 128-bit truncation is the ratified choice (`blake3-128`); it keeps
 /// ids small enough to embed in caches and diagnostics while collision
 /// risk stays negligible for source-sized inputs.
 ///

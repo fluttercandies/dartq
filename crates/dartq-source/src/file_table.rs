@@ -1,4 +1,4 @@
-//! Workspace paths interned to small stable integers (PRD §10.4).
+//! Workspace paths interned to small stable integers.
 //!
 //! # The path-universe invariant
 //!
@@ -23,7 +23,7 @@ use rustc_hash::FxHashMap;
 ///
 /// Issued by a [`FileTable`]; the integer is only meaningful together with
 /// the table that created it. This is the `file` field of every
-/// [`SourceRange`](crate::SourceRange) and diagnostic (PRD §10.4).
+/// [`SourceRange`](crate::SourceRange) and diagnostic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FileId(u32);
 
@@ -42,12 +42,12 @@ impl FileId {
 /// [`FileId`], and ids are handed out from 0 in first-intern order.
 ///
 /// The canonical path string is stored once per resident path: the map key
-/// and the id slot share one allocation. The [`PathMemo`] additionally holds
+/// and the id slot share one allocation. The `PathMemo` additionally holds
 /// the cleaned spelling as its cache key — a second, owned copy per
-/// normalized spelling — which [`forget`] retracts together with the path
+/// normalized spelling — which [`Self::forget`] retracts together with the path
 /// resolution.
 ///
-/// [`forget`] severs path resolution but never reclaims ids — the
+/// [`Self::forget`] severs path resolution but never reclaims ids — the
 /// immortal-`FileId` contract: ids already recorded in diagnostics, caches,
 /// or other structures keep pointing at the same file, so a forgotten id
 /// becomes a permanent hole (`path(id)` and `try_file_id` both miss) and is
@@ -67,7 +67,7 @@ impl FileTable {
     }
 
     /// Returns the [`FileId`] for `path`, allocating the next id on first
-    /// sight. The path is normalized first — see [`PathMemo`] for the rule
+    /// sight. The path is normalized first — see `PathMemo` for the rule
     /// and its caching — so aliased spellings of one file share a single id.
     /// Repeated interning of an already-canonicalized spelling is pure
     /// hashing.
@@ -104,6 +104,22 @@ impl FileTable {
         self.ids_by_path.get(normalized.as_ref()).copied()
     }
 
+    /// How many distinct paths this table has ever interned — the
+    /// session-lifetime count the daemon's live-path ceiling gates on and
+    /// the memory accounting reads. Ids are immortal and slots never
+    /// shrink (`forget` holes a slot, never removes it), so this counts
+    /// every distinct admitted path, resident or long gone.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    /// Whether the table never interned a path.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
     /// Removes `path` from the table, returning the id it used to hold.
     ///
     /// `path` is normalized once and exactly the key under that one
@@ -124,7 +140,7 @@ impl FileTable {
     /// re-filled by the forget itself), so forgotten spellings stop
     /// occupying memo space and churn cycles do not grow the memo. Entries
     /// for other spellings of the same file stay until their own `forget` —
-    /// see [`PathMemo::retract`] for the exact boundary. Pinned by
+    /// see `PathMemo::retract` for the exact boundary. Pinned by
     /// `intern_forget_delete_reintern_cycles_do_not_grow_the_memo`.
     pub fn forget(&mut self, path: &Path) -> Option<FileId> {
         let normalized = self.memo.get_or_normalize(path);
@@ -175,7 +191,7 @@ impl FileTable {
 /// oracle produce.
 ///
 /// [`FileTable`] and [`Locator`](crate::Locator) consume the rule through
-/// [`PathMemo`], which memoizes both branches — see its doc for the caching
+/// `PathMemo`, which memoizes both branches — see its doc for the caching
 /// policy.
 #[must_use]
 pub fn normalize_path(path: &Path) -> PathBuf {
