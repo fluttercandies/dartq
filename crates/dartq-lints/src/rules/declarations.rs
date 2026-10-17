@@ -17686,6 +17686,21 @@ set size(int input) {\n    _size = input;\n  }\n}\n";
         assert!(f.run(&one_rule("annotate_overrides")).is_empty());
     }
 
+    /// The annotated operator face: `@override` on an `operator ==`
+    /// declaration (with or without a written return type) stays silent —
+    /// the members_family.dart rc2 divergence (the metadata lookup must
+    /// reach the operator's `MetadataStar` like any other member).
+    #[test]
+    fn annotate_overrides_annotated_operator_stays_silent() {
+        let f = Fixture::parse(
+            "class PairKey {\n  @override\n  bool operator ==(Object other) => other is PairKey;\n}\n",
+        );
+        assert!(f.run(&one_rule("annotate_overrides")).is_empty());
+
+        let f = Fixture::parse("class C {\n  @override\n  operator ==(Object other) => true;\n}\n");
+        assert!(f.run(&one_rule("annotate_overrides")).is_empty());
+    }
+
     /// The unannotated setter reports with the `x=` argument (:47
     /// `arguments: [member.name!]` — the setter element's name).
     #[test]

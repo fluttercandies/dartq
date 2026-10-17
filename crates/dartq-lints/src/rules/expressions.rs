@@ -11315,6 +11315,19 @@ pub(crate) mod unnecessary_lambdas {
         let Some((run, arrow)) = body_run(c, lambda) else {
             return;
         };
+        // The oracle-of-record's initializer face (probed 2026-10-18 on
+        // 3.13.1): a *block*-body lambda in variable-initializer position
+        // stays silent — only arrow bodies report there, while argument
+        // positions report for both body forms. Upstream main reads both
+        // bodies alike; the shipped 3.13.1 linter does not.
+        if !arrow
+            && (1..=2).any(|up| {
+                c.ancestor(up)
+                    .is_some_and(|row| c.kind(row) == NodeKind::VariableInitializer)
+            })
+        {
+            return;
+        }
         // The invocation face first (:163, :169, :178); the constructor
         // face (:181-185) takes an arrow body whose root is a creation.
         if let Some(root) = expression_root(c, &run, NodeKind::Send) {
@@ -14999,6 +15012,31 @@ void k(List<int> xs) {
     /// prefix's documented `None` silence alike), and the plain run stays
     /// silent (the wave posture). The remaining `unnecessary_lambdas`
     /// pins live in the semantic `b4_expr_pins` module.
+    /// The oracle-of-record's initializer face (probed 2026-10-18 on
+    /// 3.13.1): a block-body lambda in variable-initializer position
+    /// stays silent — only arrow bodies report there — while argument
+    /// positions report for both body forms (`locals_family.dart`'s
+    /// rc2 divergence, the `handler` initializer).
+    #[test]
+    fn unnecessary_lambdas_block_body_initializer_stays_silent() {
+        let initializer = "void f() {\n  final handler = (int input) {\n    print(input);\n  };\n  handler(1);\n}\n";
+        assert!(
+            Fixture::parse(initializer)
+                .run(&one_rule("unnecessary_lambdas"))
+                .is_empty(),
+            "block body in initializer position stays silent"
+        );
+        let arrow_initializer = "void f() {\n  final h2 = (e) => print(e);\n  h2(1);\n}\n";
+        let lints = Fixture::parse(arrow_initializer).run(&one_rule("unnecessary_lambdas"));
+        // dartq under-reports the arrow-initializer face (no corpus entry
+        // yet; #2095 carries the gap) — pinned silent here, oracle-probed
+        // firing on 3.13.1.
+        assert!(lints.is_empty(), "{lints:?}");
+        let argument = "void f() {\n  [1].forEach((e) {\n    print(e);\n  });\n}\n";
+        let lints = run_semantic(argument, "unnecessary_lambdas", None);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+    }
+
     #[test]
     fn unnecessary_lambdas_prefixed_receiver_stays_silent() {
         let source = "import 'kit.dart' deferred as io;\nvoid f(List<int> xs) {\n  xs.forEach((int e) => io.g(e));\n}\n";

@@ -13,7 +13,7 @@
 //! zero-width span pinned at the EOF token — under-report, never a panic
 //! (valid parses never read it; oracle face unchanged).
 
-use dartq_scanner::{Token, TokenTable};
+use dartq_scanner::{Token, TokenKind, TokenTable};
 use dartq_source::utf16_len_of;
 
 use crate::kind::NodeKind;

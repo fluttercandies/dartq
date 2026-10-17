@@ -1045,12 +1045,16 @@ pub(crate) mod unnecessary_final {
         }
 
         /// `test_patternVariableDeclaration` face: the declaration keyword
-        /// reports once per declared pattern variable.
+        /// reports once per declared pattern variable — but both variables
+        /// of `final (a, b) = …` anchor at the one statement keyword, and
+        /// the oracle's DiagnosticSet dedup (code, offset, length, message)
+        /// collapses the identical rows: the oracle-of-record emits ONE
+        /// row (probed 2026-10-18 on 3.13.1), and so does dartq.
         #[test]
         fn reports_pattern_declaration_variables() {
             let f = Fixture::parse("void f() { final (a, b) = (1, 2); print(a + b); }");
             let lints = f.run(&one_rule("unnecessary_final"));
-            assert_eq!(lints.len(), 2);
+            assert_eq!(lints.len(), 1);
         }
 
         /// A case-pattern variable reports at its own keyword.

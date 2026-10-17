@@ -825,22 +825,31 @@ pub(crate) fn has_override_annotation(c: &Check<'_>, body: u32, member: u32) -> 
 
 /// The `Metadata` rows of one member: the `MetadataStar` left sibling's
 /// children (declarations.rs `has_annotations` idiom), empty when the
-/// member carries no annotations.
+/// member carries no annotations. An operator's `OperatorName` row tiles
+/// as a body-level sibling between the `MetadataStar` and the `Method`
+/// row (the name-token holder lives inside the member for every other
+/// shape), so the walk left skips name rows before deciding.
 pub(crate) fn member_annotations(c: &Check<'_>, body: u32, member: u32) -> Vec<u32> {
     let members = c.collect_direct(body);
     let Some(index) = members.iter().position(|&m| m == member) else {
         return Vec::new();
     };
-    let Some(&star) = index.checked_sub(1).and_then(|i| members.get(i)) else {
-        return Vec::new();
-    };
-    if c.kind(star) != NodeKind::MetadataStar {
-        return Vec::new();
+    let mut probe = index;
+    while let Some(&row) = probe.checked_sub(1).and_then(|i| members.get(i)) {
+        probe -= 1;
+        match c.kind(row) {
+            NodeKind::MetadataStar => {
+                return c
+                    .collect_direct(row)
+                    .into_iter()
+                    .filter(|&meta| c.kind(meta) == NodeKind::Metadata)
+                    .collect();
+            }
+            NodeKind::OperatorName => continue,
+            _ => return Vec::new(),
+        }
     }
-    c.collect_direct(star)
-        .into_iter()
-        .filter(|&meta| c.kind(meta) == NodeKind::Metadata)
-        .collect()
+    Vec::new()
 }
 
 fn has_annotation_named(c: &Check<'_>, body: u32, member: u32, name: &str) -> bool {
