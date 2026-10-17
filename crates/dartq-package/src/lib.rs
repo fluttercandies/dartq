@@ -1,17 +1,17 @@
-//! Package identity model (PRD §5.1, §8.1) — the typed identity surface the
+//! Package identity model — the typed identity surface the
 //! resolution layer consumes, composed on top of `dartq-pub`'s artifacts.
 //!
 //! `dartq-pub` owns the pub side of the model: parsing
 //! `package_config.json`/`pubspec.lock` and assembling the
 //! [`dartq_pub::ResolvedPackageGraph`], whose [`dartq_pub::PackageInstance`]
-//! is the PRD §8.1 instance tuple `(source_kind, source_ref, version,
+//! is the instance tuple `(source_kind, source_ref, version,
 //! content_hash)`. This crate adds only what the identity face still lacks
 //! and never redefines a pub type:
 //!
 //! - [`PackageName`] — the grammar-validated canonical name
 //!   (`identifier(.identifier)*`, `pubspec_parse.dart:17-19`), usable as a
 //!   map key.
-//! - [`PackageId`] — PRD §5.1 `PackageId = (name, PackageInstanceId)`, the
+//! - [`PackageId`] — `PackageId = (name, PackageInstanceId)`, the
 //!   cross-context semantic isolation unit; its instance components are
 //!   `dartq-pub` types verbatim.
 //! - [`PackageIdentity`] — one package's resolution-facing identity: root

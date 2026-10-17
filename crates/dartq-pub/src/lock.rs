@@ -1,15 +1,15 @@
-//! `pubspec.lock` parsing (facts §3).
+//! `pubspec.lock` parsing.
 //!
 //! Consumer notes baked in:
 //! - `sdks` holds pub's **effective** constraints (R6-rewritten), never to
-//!   be diffed against a pubspec's original text (facts §8.1);
+//!   be diffed against a pubspec's original text;
 //! - the legacy top-level `sdk` key from pub 1.14-1.18 is folded into
 //!   `sdks["dart"]`;
 //! - `dependency` classification only reflects the root package's sections
 //!   and is absent in old locks;
 //! - absolute path dependencies serialize `relative: 'false'` — the
 //!   *string* `"false"`, a pub quirk that must parse as `false`
-//!   (facts §3/§8.4).
+//!  .
 
 use std::collections::BTreeMap;
 
@@ -46,10 +46,10 @@ pub enum DependencyKind {
     DirectMain,
     /// `"direct dev"`.
     DirectDev,
-    /// `"direct overridden"` — only in `dependency_overrides` (facts §7).
+    /// `"direct overridden"` — only in `dependency_overrides`.
     DirectOverridden,
     /// `transitive` — including workspace members' direct deps, which pub
-    /// still records as transitive (facts §8.2).
+    /// still records as transitive.
     Transitive,
 }
 
@@ -109,7 +109,7 @@ pub struct LockedPackage {
 /// A parsed `pubspec.lock`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct LockFile {
-    /// SDK name -> **effective** constraint string (facts §8.1: do not
+    /// SDK name -> **effective** constraint string (do not
     /// compare against pubspec originals).
     pub sdks: BTreeMap<String, String>,
     /// Locked packages by name; the root package is never here.
@@ -405,7 +405,7 @@ sdks:
 
     #[test]
     fn path_absolute_dependency_string_false_quirk() {
-        // facts §8.4: `relative: 'false'` is the string "false".
+        // pub quirk: `relative: 'false'` is the string "false".
         let yaml = "\
 packages:
   abs_dep:

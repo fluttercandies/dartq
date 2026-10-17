@@ -1,4 +1,4 @@
-//! `ResolvedPackageGraph` assembly (PRD §8.2) — the consumption product of
+//! `ResolvedPackageGraph` assembly — the consumption product of
 //! the five resolution inputs, with no version solving anywhere.
 //!
 //! Instance identity and the graph id, scoped to this milestone:
@@ -26,7 +26,7 @@ use crate::pubspec::Pubspec;
 use crate::version::Version;
 
 /// How a dependency edge is usable from the entry-point perspective
-/// (PRD §8.2: direct / dev / dev_of_transitive).
+///.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DepKind {
     /// Reached through `dependencies` (importable from production code).
@@ -58,7 +58,7 @@ pub enum SourceRef {
     },
 }
 
-/// One resolved package instance (PRD §8.1): source identity, version, and
+/// One resolved package instance: source identity, version, and
 /// the (M2) content Merkle.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PackageInstance {
@@ -110,7 +110,7 @@ pub struct ResolvedPackageGraph {
     pub id: PackageGraphId,
     /// Every package of the resolution: config entries (workspace members
     /// and root included), lock-only stragglers, plus the implicit SDK
-    /// instance `"sdk:dart"` used for `dart:` bookkeeping (PRD §8.2).
+    /// instance `"sdk:dart"` used for `dart:` bookkeeping.
     pub instances: Vec<PackageInstance>,
     pub edges: Vec<PackageEdge>,
     pub root: PackageInstanceId,
@@ -177,7 +177,7 @@ pub fn build_graph(
                 Some(locked.version.clone()),
             ),
             // Workspace members and the root are not in the lock; they are
-            // local directories (facts §3: root never enters `packages:`).
+            // local directories.
             None => (
                 SourceKind::Path,
                 SourceRef::Path {
@@ -282,7 +282,7 @@ fn source_ref_of(locked: &LockedPackage, config_dir: &Path) -> SourceRef {
         },
         LockDescription::Path { path, relative } => {
             // Relative path descriptions anchor at the lock's directory,
-            // which sits next to `.dart_tool/` (facts §3).
+            // which sits next to `.dart_tool/`.
             let resolved = if *relative {
                 crate::workspace::normalize(&config_dir.join("..").join(path))
             } else {
@@ -317,7 +317,7 @@ fn collect_edges(
     };
 
     // (from, to) -> kind; only a Direct discovery may overwrite an earlier
-    // Dev one, mirroring pub's main > dev priority (facts §7).
+    // Dev one, mirroring pub's main > dev priority.
     let mut edges: BTreeMap<(String, String), DepKind> = BTreeMap::new();
     let mut insert = |from: &str, to: &str, kind: DepKind| {
         edges
@@ -550,7 +550,7 @@ dependency_overrides:
             "`meta` has no instance (not in config/lock)"
         );
         // Overrides fold into Direct with no duplicate edge for the same
-        // target (main > dev > overridden, facts §7).
+        // target.
         assert_eq!(
             graph
                 .edges

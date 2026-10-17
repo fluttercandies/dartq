@@ -1,6 +1,7 @@
 //! Spanned pubspec facts for the lint face (`secure_pubspec_urls`,
-//! `package_names`): the `name:` value and the URL-bearing values with
-//! their byte spans, read by one linear scan over the raw text.
+//! `package_names`, the breaking-version gate): the `name:`/`version:`
+//! values and the URL-bearing values with their byte spans, read by one
+//! linear scan over the raw text.
 //!
 //! Production callers run [`Pubspec::parse`][crate::Pubspec::parse] on the
 //! same text first (the mounting pass needs the parsed dependency names
@@ -41,6 +42,11 @@ pub struct Scalar {
 pub struct PubspecFacts {
     /// The top-level `name:` value.
     pub name: Option<Scalar>,
+    /// The top-level `version:` value — the breaking-version gate's fact
+    /// (`remove_deprecations_in_breaking_versions`). The fact is the cooked
+    /// scalar, not a verdict: an unparseable value extracts verbatim and
+    /// the gate rejects it.
+    pub version: Option<Scalar>,
     /// The `homepage` / `repository` / `issue_tracker` / `documentation`
     /// values.
     pub urls: Vec<Scalar>,
@@ -108,6 +114,7 @@ impl Scan {
             if !self.section && !value.is_empty() {
                 match key {
                     "name" => self.facts.name = Some(Scalar { range, value }),
+                    "version" => self.facts.version = Some(Scalar { range, value }),
                     "homepage" | "repository" | "issue_tracker" | "documentation" => {
                         self.facts.urls.push(Scalar { range, value });
                     }
@@ -274,5 +281,49 @@ mod tests {
         assert_eq!(urls("homepage: url # c\n"), vec!["url"]);
         // No whitespace before the `#`: part of the value.
         assert_eq!(urls("homepage: url#frag\n"), vec!["url#frag"]);
+    }
+
+    fn version(text: &str) -> Option<String> {
+        scan(text).version.map(|scalar| scalar.value)
+    }
+
+    /// The gate's fact face: the cooked top-level scalar rides verbatim —
+    /// release, prerelease, and build segments alike — and quoted values
+    /// cook.
+    #[test]
+    fn version_scalar_extracts_the_cooked_value() {
+        assert_eq!(version("name: f\nversion: 1.2.3\n"), Some("1.2.3".into()));
+        assert_eq!(
+            version("version: 2.0.0-dev.1\n"),
+            Some("2.0.0-dev.1".into())
+        );
+        assert_eq!(
+            version("version: 1.0.0+build\n"),
+            Some("1.0.0+build".into())
+        );
+        assert_eq!(version("version: \"1.2.3\"\n"), Some("1.2.3".into()));
+    }
+
+    /// Missing, block-form, and dep-spec `version:` fields are no fact —
+    /// the official gate reads the package's own top-level value only.
+    #[test]
+    fn version_absent_or_nested_stays_none() {
+        assert_eq!(version("name: f\n"), None);
+        assert_eq!(version("version:\n"), None);
+        assert_eq!(
+            version("dependencies:\n  foo:\n    version: ^1.0.0\n"),
+            None
+        );
+    }
+
+    /// Junk extracts verbatim — the fact is the scalar; the gate owns the
+    /// verdict.
+    #[test]
+    fn version_junk_extracts_verbatim() {
+        assert_eq!(version("version: 1.2.3.4\n"), Some("1.2.3.4".into()));
+        assert_eq!(
+            version("version: not-a-version\n"),
+            Some("not-a-version".into())
+        );
     }
 }

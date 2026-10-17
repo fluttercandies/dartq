@@ -1,4 +1,4 @@
-//! Resolution freshness (facts §6, PRD §8.2).
+//! Resolution freshness.
 //!
 //! The judgment follows pub's fast path with a content fallback instead of
 //! pub's solver-based revalidation (dartq does no version solving):
@@ -12,7 +12,7 @@
 //!   the lock — equality counts as stale (entrypoint.dart:1274) — and the
 //!   package_config must not be older than the lock;
 //! - content fallback: mtimes alone cannot be trusted (VCS checkouts give
-//!   files the checkout mtime, facts §8.5), so a file failing the mtime
+//!   files the checkout mtime), so a file failing the mtime
 //!   chain is *excused* when its blake3-128 content id
 //!   ([`ContentId`]) still matches the [`ResolutionBaseline`] captured when
 //!   the resolution was accepted — byte-identical inputs cannot invalidate a
@@ -66,7 +66,7 @@ pub enum StaleReason {
     /// (or the config carries none).
     GeneratorSdkMismatch { config: String, current: String },
     /// A pubspec is not strictly older than the lock; equality is stale
-    /// (facts §8.5).
+    ///.
     PubspecNotStrictlyOlder { package: String, file: &'static str },
     /// A relative config entry points at a directory without a pubspec.
     PackageDirMissing { package: String },
@@ -138,7 +138,7 @@ impl FreshnessReport {
 /// blake3-128 content ids of the resolution inputs, captured when the
 /// resolution was last accepted. The content fallback in
 /// [`Freshness::check`] compares against this to excuse mtime-chain
-/// failures whose files did not actually change (facts §8.5).
+/// failures whose files did not actually change.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResolutionBaseline {
     content_ids: BTreeMap<PathBuf, ContentId>,
@@ -166,7 +166,7 @@ impl ResolutionBaseline {
         for entry in &config.packages {
             let package_dir = entry.resolve_root(&config_dir)?;
             if is_cache_member(&config, &package_dir) {
-                continue; // pub-cache packages are immutable (facts §6.5)
+                continue; // pub-cache packages are immutable
             }
             let pubspec = package_dir.join("pubspec.yaml");
             content_ids.insert(
@@ -329,7 +329,7 @@ impl Freshness {
                 }
             };
             if is_cache_member(&config, &package_dir) {
-                continue; // pub-cache packages: no mtime check (facts §6.5)
+                continue; // pub-cache packages: no mtime check
             }
             // Matches pub: entrypoint.dart:1284-1298 mtime-gates
             // pubspec.yaml and pubspec_overrides.yaml alike, so an
@@ -350,7 +350,7 @@ impl Freshness {
                     }
                 };
                 // Failing the mtime chain is excused when the file's content
-                // is byte-identical to the accepted baseline (facts §8.5).
+                // is byte-identical to the accepted baseline.
                 if mtime >= lock_mtime && !unchanged_since_baseline(baseline, &path) {
                     reasons.push(StaleReason::PubspecNotStrictlyOlder {
                         package: entry.name.clone(),
@@ -360,7 +360,7 @@ impl Freshness {
             }
         }
 
-        // Config must not be older than the lock (facts §6 pseudocode);
+        // Config must not be older than the lock;
         // same content fallback as above.
         if let Ok(config_mtime) = modified(&config_path)
             && config_mtime < lock_mtime

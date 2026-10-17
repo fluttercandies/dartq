@@ -1,19 +1,19 @@
 //! Consumers for pub's resolution artifacts — `package_config.json`,
 //! `pubspec.yaml`, `pubspec.lock` — plus workspace discovery, freshness,
-//! and [`graph::ResolvedPackageGraph`] assembly (PRD §8.2).
+//! and [`graph::ResolvedPackageGraph`] assembly.
 //!
 //! dartq does **no version solving**: `pub get` is an external dependency,
 //! and this crate only reads what it materialized. Behavior is anchored to
 //! the pub formats contract, which cites upstream pub line-by-line.
 //!
 //! Module map:
-//! - [`version`] module — pub_semver subset and language versions (§5)
-//! - [`config`] module — `package_config.json` (§1)
-//! - [`pubspec`] module — pubspec consumption field set (§2)
-//! - [`lock`] module — `pubspec.lock` with the four source shapes (§3)
-//! - [`workspace`]: workspace root walk and `workspace_ref.json` checks (§4)
+//! - [`version`] module — pub_semver subset and language versions
+//! - [`config`] module — `package_config.json`
+//! - [`pubspec`] module — pubspec consumption field set
+//! - [`lock`] module — `pubspec.lock` with the four source shapes
+//! - [`workspace`]: workspace root walk and `workspace_ref.json` checks
 //! - [`freshness`]: staleness judgment — mtime chain, environment
-//!   fingerprint, and the content-id fallback (§6); reports reasons, never
+//!   fingerprint, and the content-id fallback; reports reasons, never
 //!   diagnostics directly
 //! - [`glob`]: the pinned `package:glob` 2.1.3 port (parse + full-path match
 //!   + listing), shared by workspace expansion and analysis-options excludes

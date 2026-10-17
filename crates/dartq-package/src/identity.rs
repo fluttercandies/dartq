@@ -1,4 +1,4 @@
-//! Per-package identity types (PRD §5.1, §8.1).
+//! Per-package identity types.
 
 use std::path::PathBuf;
 
@@ -17,7 +17,7 @@ use crate::PackageName;
 /// the config's `pubCache` root (entrypoint.dart:1263-1265) — not on this
 /// category: the two coincide for pub-faithful resolutions and can diverge
 /// when the config lacks a decodable `pubCache` property or uses a custom
-/// cache layout (facts §6.5). `pubspec.lock`-level [`SourceKind`]
+/// cache layout. `pubspec.lock`-level [`SourceKind`]
 /// is not reused here because the two taxonomies answer different questions
 /// (provenance vs. layout) and the shapes differ (three vs. four variants).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -44,7 +44,7 @@ impl SourceCategory {
     }
 }
 
-/// PRD §5.1: `PackageId = (name, PackageInstanceId)`, where the instance
+///: `PackageId = (name, PackageInstanceId)`, where the instance
 /// tuple is `(source_kind, source_ref, version, content_hash)`.
 ///
 /// This struct is that tuple flattened into direct fields — not
@@ -74,7 +74,7 @@ impl PackageId {
     ///
     /// # Errors
     ///
-    /// Returns [`PackageError::InvalidName`] if the instance name is not a
+    /// Returns [`PackageError::InvalidName`](crate::PackageError::InvalidName) if the instance name is not a
     /// valid package name (the implicit `"sdk:dart"` instance, for example).
     pub fn from_instance(instance: &PackageInstance) -> Result<PackageId, crate::PackageError> {
         Ok(PackageId {
@@ -88,7 +88,7 @@ impl PackageId {
 }
 
 /// One package's resolution-facing identity: where it lives and what
-/// language version applies (PRD §8.3, package_config's `languageVersion`).
+/// language version applies.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PackageIdentity {
     pub name: PackageName,

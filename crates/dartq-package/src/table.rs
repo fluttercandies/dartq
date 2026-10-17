@@ -963,7 +963,7 @@ sdks:
             dartq_pub::normalize(Path::new("../../..")),
             PathBuf::from("../../..")
         );
-        // `..` past an absolute root clamps at the root (RFC 3986 §5.2.4) —
+        // `..` past an absolute root clamps at the root —
         // the oracle's drop semantics the normalizer converged on.
         assert_eq!(
             dartq_pub::normalize(Path::new("/a/../..")),

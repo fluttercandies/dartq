@@ -1,4 +1,4 @@
-//! `pubspec.yaml` consumption (facts §2): the minimal field set dartq
+//! `pubspec.yaml` consumption: the minimal field set dartq
 //! reads — identity, environment, workspace/resolution, and the three
 //! dependency sections in their hosted/git/path/sdk forms.
 //!
@@ -57,7 +57,7 @@ impl Resolution {
     }
 }
 
-/// One dependency entry, in the source form pub accepts (facts §2).
+/// One dependency entry, in the source form pub accepts.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DependencySpec {
     /// `foo: ^1.2.3` or `{hosted: ..., version: ...}`; absent `version`
@@ -110,7 +110,7 @@ impl Pubspec {
     /// Returns [`PubError::Pubspec`] for invalid YAML, a missing `name`,
     /// constraint syntax errors, unknown `resolution` values, or
     /// `workspace:`/`resolution:` on a package whose language version is
-    /// below 3.5 (facts §2, `pubspec.dart:71-133`).
+    /// below 3.5.
     pub fn parse(yaml: &str) -> Result<Pubspec, PubError> {
         Self::parse_with_overrides(yaml, None)
     }
@@ -258,9 +258,15 @@ impl Pubspec {
 
 fn require_workspaces(language_version: LanguageVersion) -> Result<(), PubError> {
     if language_version < LanguageVersion::FIRST_WITH_WORKSPACES {
+        // Pub's hint names the running SDK's version (`sdk.version`); dartq's
+        // stand-in is the vendored registry default (`SDK_DEFAULT`, 3.15).
         return Err(PubError::Pubspec(format!(
-            "`workspace` and `resolution` require at least language version {}",
-            LanguageVersion::FIRST_WITH_WORKSPACES
+            "`workspace` and `resolution` requires at least language version {}\n\
+             Consider updating the SDK constraint to:\n\n\
+             environment:\n  sdk: '^{}.{}.0'\n",
+            LanguageVersion::FIRST_WITH_WORKSPACES,
+            LanguageVersion::SDK_DEFAULT.major(),
+            LanguageVersion::SDK_DEFAULT.minor(),
         )));
     }
     Ok(())
@@ -308,8 +314,13 @@ fn parse_environment(
     value: Option<&serde_yaml::Value>,
     invalid: &dyn Fn(String) -> PubError,
 ) -> Result<Environment, PubError> {
-    let Some(value) = value else {
-        return Ok(Environment::default());
+    // pub tests `yaml == null` before the map check and falls to
+    // `VersionConstraint.any` (`_parseEnvironment`, pubspec.dart:214-215),
+    // so a key left with a null body — every value commented out — is the
+    // absent shape, not a type error.
+    let value = match value {
+        None | Some(serde_yaml::Value::Null) => return Ok(Environment::default()),
+        Some(value) => value,
     };
     let mapping = value
         .as_mapping()
@@ -483,8 +494,13 @@ fn parse_dependency_map(
     language_version: LanguageVersion,
     invalid: &dyn Fn(String) -> PubError,
 ) -> Result<BTreeMap<String, DependencySpec>, PubError> {
-    let Some(value) = value else {
-        return Ok(BTreeMap::new());
+    // "Allow an empty dependencies key": `node == null || node.value ==
+    // null` returns the empty map (`_parseDependencies`,
+    // pubspec.dart:574-575), for every section the helper serves
+    // (dependencies, dev_dependencies, dependency_overrides).
+    let value = match value {
+        None | Some(serde_yaml::Value::Null) => return Ok(BTreeMap::new()),
+        Some(value) => value,
     };
     let mapping = value
         .as_mapping()
@@ -983,6 +999,23 @@ dev_dependencies:
     }
 
     #[test]
+    fn explicit_null_section_bodies_are_absent() {
+        // pubspec.dart:214-215 (`_parseEnvironment`) and :574-575
+        // (`_parseDependencies`): a key present with a null body — the
+        // realistic fully-commented-out hand-edit — is the absent shape:
+        // the default environment and empty maps, never a type error.
+        let spec = Pubspec::parse(
+            "name: a\nenvironment:\ndependencies:\ndev_dependencies:\ndependency_overrides:\n",
+        )
+        .expect("null section bodies parse as absent");
+        assert!(spec.environment.sdk.is_none());
+        assert!(spec.environment.flavors.is_empty());
+        assert!(spec.dependencies.is_empty());
+        assert!(spec.dev_dependencies.is_empty());
+        assert!(spec.dependency_overrides.is_empty());
+    }
+
+    #[test]
     fn workspace_and_resolution_gate_on_language_version() {
         // >=3.5: accepted.
         let ok =
@@ -991,9 +1024,24 @@ dev_dependencies:
         assert_eq!(spec.workspace, vec!["pkg_b"]);
         assert_eq!(spec.resolution, Resolution::Workspace);
 
-        // <3.5: both keys rejected.
+        // <3.5: both keys rejected, with pub's wording and hint
+        // (pubspec.dart:73-86; the hint names the running SDK's version,
+        // dartq's vendored default 3.15).
         let old = "name: r\nenvironment:\n  sdk: '>=3.0.0 <4.0.0'\nresolution: workspace\n";
-        assert!(matches!(Pubspec::parse(old), Err(PubError::Pubspec(_))));
+        let err = match Pubspec::parse(old) {
+            Err(error) => error,
+            Ok(_) => panic!("old language version accepted"),
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("`workspace` and `resolution` requires at least language version 3.5"),
+            "unexpected error: {text}"
+        );
+        assert!(
+            text.contains("Consider updating the SDK constraint to:"),
+            "unexpected error: {text}"
+        );
+        assert!(text.contains("sdk: '^3.15.0'"), "unexpected error: {text}");
         // No sdk constraint: pub default 2.7 < 3.5 -> rejected.
         let no_sdk = "name: r\nworkspace:\n  - pkg_b\n";
         assert!(matches!(Pubspec::parse(no_sdk), Err(PubError::Pubspec(_))));

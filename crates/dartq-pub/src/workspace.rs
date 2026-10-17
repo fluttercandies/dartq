@@ -1,4 +1,4 @@
-//! Pub workspace layout discovery (facts §4).
+//! Pub workspace layout discovery.
 //!
 //! Walks up from a directory to the workspace root — the first pubspec
 //! whose `resolution` is unspecified (pub's `Resolution.none`;
@@ -101,9 +101,10 @@ pub fn find_workspace_root(from: &Path) -> Result<WorkspaceLayout, PubError> {
                 {
                     return Err(PubError::Workspace(format!(
                         "Found a pubspec.yaml at {}. But it has resolution `{}`. \
-                         But found no workspace root including it in parent directories.",
+                         But found no workspace root including it in parent directories.\n\n\
+                         See https://dart.dev/go/pub-workspaces for more information.",
                         first_dir.display(),
-                        first_resolution.as_str()
+                        first_resolution.as_str(),
                     )));
                 }
                 let (members, member_pubspecs): (Vec<PathBuf>, Vec<Pubspec>) =
@@ -125,9 +126,10 @@ pub fn find_workspace_root(from: &Path) -> Result<WorkspaceLayout, PubError> {
                     )),
                     Some((dir, resolution)) => PubError::Workspace(format!(
                         "Found a pubspec.yaml at {}. But it has resolution `{}`. \
-                         But found no workspace root including it in parent directories.",
+                         But found no workspace root including it in parent directories.\n\n\
+                         See https://dart.dev/go/pub-workspaces for more information.",
                         dir.display(),
-                        resolution.as_str()
+                        resolution.as_str(),
                     )),
                 });
             }
@@ -160,7 +162,11 @@ fn load_pubspec(dir: &Path) -> Result<Pubspec, PubError> {
 /// arrival at an already-included directory — the same entry listed twice, a
 /// diamond, a cycle, or a symlink alias — is a hard error, matching pub's
 /// `validateWorkspace` (package.dart:486-524) rather than a silent
-/// visited-set cut; so is a duplicate member name (package.dart:517-524, the
+/// visited-set cut: a lexically identical repeat reports pub's
+/// duplicate-inclusion text, a symlink alias (whose spellings differ)
+/// reports pub's duplicate-NAME error, the rejection pub itself produces
+/// for that layout (package.dart:517-524); so is a duplicate member name
+/// (package.dart:517-524, the
 /// root included), a member without `resolution: workspace`
 /// (package.dart:241-249), two members overriding the same package or an
 /// override targeting a workspace package (package.dart:531-555), and a
@@ -172,13 +178,20 @@ fn load_pubspec(dir: &Path) -> Result<Pubspec, PubError> {
 /// the inclusion map's keys are canonical.
 fn collect_members(root: &Path, spec: &Pubspec) -> Result<Vec<(PathBuf, Pubspec)>, PubError> {
     let mut members = Vec::new();
-    // Included member directory -> the pubspec directory that included it.
-    // Keys are canonical (`inclusion_key`), values lexically normalized.
-    // Seeded with the root: a member naming the root is a second arrival
-    // at an already-included directory.
+    // Included member directory (canonical key) -> (the member's lexical
+    // directory as first included, its package name, the including pubspec
+    // directory, lexically normalized). Keys are canonical
+    // (`inclusion_key`). Seeded with the root: a member naming the root is
+    // a second arrival at an already-included directory.
     let normalized_root = normalize(root);
-    let mut included_from: BTreeMap<PathBuf, PathBuf> =
-        BTreeMap::from([(inclusion_key(root), normalized_root)]);
+    let mut included_from: BTreeMap<PathBuf, (PathBuf, String, PathBuf)> = BTreeMap::from([(
+        inclusion_key(root),
+        (
+            normalized_root.clone(),
+            spec.name.clone(),
+            normalized_root.clone(),
+        ),
+    )]);
     let mut names_seen: BTreeMap<String, PathBuf> =
         BTreeMap::from([(spec.name.clone(), root.to_path_buf())]);
     // Every workspace package with an overrides map, in `transitiveWorkspace`
@@ -198,8 +211,22 @@ fn collect_members(root: &Path, spec: &Pubspec) -> Result<Vec<(PathBuf, Pubspec)
 
     while let Some((dir, parent)) = stack.pop() {
         let key = inclusion_key(&dir);
-        if let Some(previous) = included_from.get(&key).cloned() {
-            return Err(if previous == normalize(&parent) {
+        if let Some((first_dir, first_name, previous)) = included_from.get(&key).cloned() {
+            return Err(if normalize(&dir) != first_dir {
+                // A lexically distinct spelling of an already-included
+                // directory is a symlink alias. Pub's canonical keys are
+                // purely lexical (`p.canonicalize`, `package:path`), so pub
+                // never collides here — the alias is rejected by the
+                // duplicate-name check instead (package.dart:517-524), and
+                // this reports that error verbatim.
+                PubError::Workspace(format!(
+                    "Workspace members must have unique names.\n\
+                     `{}` and `{}` are both called \"{}\".\n",
+                    first_dir.join("pubspec.yaml").display(),
+                    dir.join("pubspec.yaml").display(),
+                    first_name,
+                ))
+            } else if previous == normalize(&parent) {
                 PubError::Workspace(format!(
                     "Packages can only be included in the workspace once: \
                      `{}` is included twice into the workspace of `{}`.",
@@ -216,7 +243,6 @@ fn collect_members(root: &Path, spec: &Pubspec) -> Result<Vec<(PathBuf, Pubspec)
                 ))
             });
         }
-        included_from.insert(key, normalize(&parent));
 
         let child_spec = load_pubspec(&dir)?;
         if child_spec.resolution != Resolution::Workspace {
@@ -230,13 +256,18 @@ fn collect_members(root: &Path, spec: &Pubspec) -> Result<Vec<(PathBuf, Pubspec)
         }
         if let Some(previous_dir) = names_seen.get(&child_spec.name).cloned() {
             return Err(PubError::Workspace(format!(
-                "Workspace members must have unique names: `{}` and `{}` are both called `{}`.",
+                "Workspace members must have unique names.\n\
+                 `{}` and `{}` are both called \"{}\".\n",
                 previous_dir.join("pubspec.yaml").display(),
                 dir.join("pubspec.yaml").display(),
                 child_spec.name,
             )));
         }
         names_seen.insert(child_spec.name.clone(), dir.clone());
+        included_from.insert(
+            key,
+            (normalize(&dir), child_spec.name.clone(), normalize(&parent)),
+        );
         loaded.push((
             child_spec.name.clone(),
             dir.clone(),
@@ -366,7 +397,7 @@ fn check_overrides(
 fn check_stray_pubspecs(
     root: &Path,
     members: &[PathBuf],
-    included_from: &BTreeMap<PathBuf, PathBuf>,
+    included_from: &BTreeMap<PathBuf, (PathBuf, String, PathBuf)>,
 ) -> Result<(), PubError> {
     // By seeding with the root the walk never ascends past it
     // (package.dart:558-561).
@@ -449,7 +480,9 @@ pub fn workspace_ref_mismatches(layout: &WorkspaceLayout) -> Vec<PathBuf> {
 /// keys do not collapse symlink aliases — the same alias layout is rejected
 /// there by the duplicate-*name* check instead, with different error text
 /// but the same outcome. Resolving symlinks here keeps dartq's rejection at
-/// the inclusion map; a path that cannot be canonicalized (a dangling
+/// the inclusion map, and a collision whose lexical spellings differ is
+/// reported with that duplicate-name text (see `collect_members`); a path
+/// that cannot be canonicalized (a dangling
 /// symlink) falls back to its lexical form and the subsequent load fails on
 /// it either way. Only the inclusion map uses this — discovery stays
 /// lexical.
@@ -468,8 +501,8 @@ fn inclusion_key(path: &Path) -> PathBuf {
 /// implementation of the discipline, shared with the FileTable rule so the
 /// package universe and the file universe clean spellings identically.
 ///
-/// The `..`-past-root discipline is the oracle's drop semantics: RFC 3986
-/// §5.2.4 `remove_dot_segments` clamps absolute paths at their root, and so
+/// The `..`-past-root discipline is the oracle's drop semantics:
+/// RFC 3986 §5.2.4 `remove_dot_segments` clamps absolute paths at their root, and so
 /// do Dart (`Uri.normalizePath`, `tests/corelib/uri_normalize_path_test.dart`)
 /// and package:path's `Context.normalize` — pub's `p.normalize`, the only
 /// path tooling its workspace walk uses (`package.dart:199`,
@@ -662,6 +695,10 @@ mod tests {
             text.contains("found no workspace root including it"),
             "unexpected error: {text}"
         );
+        assert!(
+            text.contains("See https://dart.dev/go/pub-workspaces for more information."),
+            "unexpected error: {text}"
+        );
 
         // A first-met pubspec that IS a member resolves to the root
         // normally.
@@ -813,9 +850,14 @@ mod tests {
             "name: dup\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
         );
         let err = find_workspace_root(&root).expect_err("duplicate names");
+        let text = err.to_string();
         assert!(
-            err.to_string().contains("unique names"),
-            "unexpected error: {err}"
+            text.contains("Workspace members must have unique names."),
+            "unexpected error: {text}"
+        );
+        assert!(
+            text.contains("both called \"dup\""),
+            "unexpected error: {text}"
         );
 
         // …and a member named like the root (pub checks the whole
@@ -839,9 +881,11 @@ mod tests {
     #[test]
     fn symlinked_duplicate_member_dir_is_rejected() {
         // Two lexically distinct entries that resolve to one directory are
-        // a duplicate inclusion: pub's validateWorkspace compares
-        // canonicalized map keys (package.dart:496,513), so a symlink
-        // alias cannot smuggle a member in twice.
+        // a duplicate inclusion: dartq's canonical inclusion map collapses
+        // the alias, where pub's purely lexical `p.canonicalize`
+        // (`package:path`) does not — pub rejects the same layout through
+        // the duplicate-NAME check (package.dart:517-524), and the error
+        // text reported here is that message verbatim.
         let root = temp_dir("symlink-dup");
         write(
             &root.join("pubspec.yaml"),
@@ -853,9 +897,14 @@ mod tests {
         );
         std::os::unix::fs::symlink(root.join("pkg_a"), root.join("alias")).expect("symlink");
         let err = find_workspace_root(&root).expect_err("symlinked duplicate");
+        let text = err.to_string();
         assert!(
-            err.to_string().contains("included twice"),
-            "unexpected error: {err}"
+            text.contains("Workspace members must have unique names."),
+            "unexpected error: {text}"
+        );
+        assert!(
+            text.contains("both called \"pkg_a\""),
+            "unexpected error: {text}"
         );
     }
 

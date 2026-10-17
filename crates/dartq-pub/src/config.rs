@@ -1,4 +1,4 @@
-//! `.dart_tool/package_config.json` parsing (facts §1).
+//! `.dart_tool/package_config.json` parsing.
 //!
 //! Consumer, not writer: unknown top-level and per-entry keys are tolerated
 //! and preserved (`pub` appends `flutterRoot`/`flutterVersion`/`pubCache`),
@@ -43,7 +43,7 @@ pub struct PackageConfig {
     pub generator_version: Option<Version>,
     /// Unknown top-level keys, preserved verbatim. This is where
     /// `flutterRoot`/`flutterVersion`/`pubCache` live; freshness compares
-    /// them against the current environment (facts §6.3).
+    /// them against the current environment.
     pub additional_properties: BTreeMap<String, serde_json::Value>,
 }
 
@@ -176,7 +176,7 @@ impl PackageConfigEntry {
     /// [`Self::resolve_root`] to reject non-`file` schemes — pub writes
     /// pub-cache packages as absolute `file:` URIs, but so are absolute
     /// path dependencies (`relative: false`), which live outside the cache
-    /// and must stay freshness-checked (facts §6.5). Scheme detection is
+    /// and must stay freshness-checked. Scheme detection is
     /// prefix-anchored, not a `://` search: a relative path that merely
     /// contains a literal `://` (`../weird://name`) stays relative.
     #[must_use]
@@ -239,7 +239,7 @@ impl PackageConfigEntry {
 /// grow diverging copies of the policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedPackage {
-    /// The entry's name (validated against [`is_valid_config_name`]).
+    /// The entry's name (validated against `is_valid_config_name`).
     pub name: String,
     /// `rootUri` resolved against the config's directory and lexically
     /// normalized ([`crate::workspace::normalize`]).
@@ -653,8 +653,8 @@ mod tests {
     #[test]
     fn scheme_detection_is_prefix_anchored() {
         // A relative path that merely contains a literal `://` stays
-        // relative (the scheme grammar is anchored at the start, RFC 3986
-        // §3.1), while a real non-file scheme is still rejected.
+        // relative (the scheme grammar is anchored at the start,
+        // RFC 3986 §3.1), while a real non-file scheme is still rejected.
         let tricky = r#"{"configVersion": 2, "packages": [
             {"name": "a", "rootUri": "../weird://name"}]}"#;
         let config = PackageConfig::parse(tricky).expect("ok");

@@ -489,7 +489,7 @@ impl LanguageVersion {
     /// `firstVersionWithTagPattern` — gates the git `tag_pattern` key
     /// (language_version.dart:116).
     pub const FIRST_WITH_TAG_PATTERN: LanguageVersion = LanguageVersion::new(3, 9);
-    /// dartq's chain bottom (PRD §8.3 level 4): the current SDK default,
+    /// dartq's chain bottom: the current SDK default,
     /// taken from the vendored registry's `DEFAULT_LANGUAGE_VERSION` (3.15).
     pub const SDK_DEFAULT: LanguageVersion = LanguageVersion::new(
         DEFAULT_LANGUAGE_VERSION.major,
@@ -536,7 +536,7 @@ impl LanguageVersion {
     }
 
     /// pub's `LanguageVersion.fromSdkConstraint`: the constraint's lower
-    /// bound major.minor; `2.7` when absent or bound-less (facts §5-L1).
+    /// bound major.minor; `2.7` when absent or bound-less.
     #[must_use]
     pub fn from_sdk_constraint(constraint: Option<&VersionConstraint>) -> LanguageVersion {
         constraint
@@ -764,7 +764,7 @@ mod tests {
 
     #[test]
     fn no_tilde_syntax_accepted_fact() {
-        // facts §2: pub has no `~`/`~>` syntax and no comma lists.
+        // pub has no `~`/`~>` syntax and no comma lists.
         for bad in ["~1.2.3", "~>1.2.3", ">=1.0.0, <2.0.0"] {
             assert!(
                 VersionConstraint::parse(bad).is_err(),
@@ -776,7 +776,7 @@ mod tests {
     #[test]
     fn language_version_from_sdk_constraint() {
         use LanguageVersion as Lv;
-        // facts §5-L1 measured cases.
+        // measured oracle cases.
         assert_eq!(
             Lv::from_sdk_constraint(Some(&c(">=3.0.0 <4.0.0"))),
             Lv::new(3, 0)

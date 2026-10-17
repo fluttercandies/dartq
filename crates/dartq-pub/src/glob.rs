@@ -20,7 +20,7 @@
 //! filesystem traversal to us.
 //!
 //! Two consumers share this module: pub's workspace expansion (listing via
-//! [`Glob::list_sync`]) and the analysis-options exclude face (full-path
+//! `Glob::list_sync`) and the analysis-options exclude face (full-path
 //! matching via [`Glob::matches_path`], the `package:glob` `Glob.matches`
 //! shape the analyzer compiles exclude patterns into).
 
@@ -1319,7 +1319,7 @@ mod tests {
 
         // Construction allocations are out of scope; only this thread's
         // tally delta across the matching loop must be zero.
-        let before = ALLOCATIONS.with(|count| count.get());
+        let before = ALLOCATIONS.with(std::cell::Cell::get);
         let mut hits = 0;
         for _ in 0..100 {
             for glob in &globs {
@@ -1330,7 +1330,7 @@ mod tests {
                 }
             }
         }
-        let after = ALLOCATIONS.with(|count| count.get());
+        let after = ALLOCATIONS.with(std::cell::Cell::get);
         assert_eq!(after, before, "matches_path allocated on the hot path");
         assert!(hits > 0, "corpus must exercise matching paths");
     }

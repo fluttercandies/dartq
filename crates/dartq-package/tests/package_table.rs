@@ -1,5 +1,5 @@
 //! Table-level pins over the public composition API: `packageUri` layout,
-//! `languageVersion` provenance (PRD §8.3 priority 2), and
+//! `languageVersion` provenance, and
 //! [`PackageTable::containing`] as the engine's file→package attribution
 //! entry point.
 
@@ -94,7 +94,7 @@ fn custom_package_uri_lands_on_lib_dir() {
 
 #[test]
 fn config_entry_language_version_flows_to_identity() {
-    // PRD §8.3 priority 2: an explicit per-entry `languageVersion` is the
+    // priority 2: an explicit per-entry `languageVersion` is the
     // version source — taken verbatim per entry, independent of the lock's
     // `sdks:` constraint (`>=3.5.0`).
     let table = table_for(CONFIG);
