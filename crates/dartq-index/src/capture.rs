@@ -1,4 +1,4 @@
-//! The unlinked declaration capture (spec §8 keep list, first face): one
+//! The unlinked declaration capture: one
 //! pass over the parser event stream records every declaration the parse
 //! surface carries — with its name-token span and container anchor — and
 //! every identifier use as a raw reference site, refined in place by the
@@ -36,6 +36,16 @@
 //!   rows: the kind set has no constructor kind and the formals table is
 //!   #119's (`undefined_named_parameter` consumes it there). Operators
 //!   commit under whatever spelling `begin_method` hands over.
+//! * Positional columns (`DeclRow::decl_end`, `DeclRow::body_open`) ride
+//!   the same events: a container's braces and every member's closing
+//!   token arrive on the end events the capture already consumes, and the
+//!   token table's byte face turns each end into an exact byte offset at
+//!   zero extra walks — byte units hold for every lexeme, including
+//!   multi-byte and astral content where the events' UTF-16 spans
+//!   diverge. Shapes whose events carry no end (type parameters, enum
+//!   constants) and rows whose declaration never closed — including ends
+//!   closed by a parser-inserted token, which has no byte position — stay
+//!   [`DeclRow::UNKNOWN`], never a plausible-looking guess.
 //! * Setters are stored under their `name=` lookup spelling (the #117
 //!   export-scope convention); the row span stays the bare name token.
 //!
@@ -60,14 +70,14 @@
 //!   (compound), skipping candidates inside a bracket/cascade chain —
 //!   `a[i] = v` writes an element, not the index. Postfix/prefix `++`/`--`
 //!   and pattern assignments keep their read kind (documented under-report;
-//!   spec §12.2 posture).
+//!   the pinned under-report posture).
 //!
 //! Sites are appended in source order (the committed parse is
 //! left-to-right; speculative parses run on a null listener), which is what
 //! makes the send/assignment lookups binary searches. Local declarations
 //! (`LocalVariableDeclaration`, formals, catch parameters, labels) and
 //! named-argument names are not sites: locals are outside the index by
-//! design (spec §3) and named arguments resolve only against a callee's
+//! design and named arguments resolve only against a callee's
 //! formal list (#119's table, not a namespace hit).
 
 use std::cell::RefCell;
@@ -118,8 +128,16 @@ pub enum DeclKind {
     Field,
 }
 
-/// One declaration row: name, kind, name-token span, and the container
-/// chain anchor.
+/// One declaration row: name, kind, name-token span, positional columns,
+/// and the container chain anchor.
+///
+/// The positional columns (`decl_end`, `body_open`) are byte offsets, not
+/// UTF-16 — they feed insertion-point arithmetic (fix producers compose
+/// edits by byte offset), while `range` stays UTF-16 for the external
+/// convention. Both carry [`Self::UNKNOWN`] wherever the parse supplies no
+/// position; a sentinel beats an `Option` pack because the row already
+/// anchors with one ([`Self::NONE`]) and the row must stay its packed
+/// 28-byte size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeclRow {
     /// The declared name (lookup spelling: setters under `name=`).
@@ -129,7 +147,7 @@ pub struct DeclRow {
     /// The row is a member of an unnamed extension: it carries no container
     /// anchor (the extension has no row to point at) and — unlike other
     /// `container == NONE` rows — is not a library face. Fits in the `kind`
-    /// field's padding: the row stays its 20-byte size.
+    /// field's padding.
     pub unnamed_extension_member: bool,
     /// The name token's span (UTF-16 — the engine's external convention,
     /// carried verbatim from `TokenSpan.range`).
@@ -137,11 +155,31 @@ pub struct DeclRow {
     /// Row index of the enclosing container declaration; [`Self::NONE`] for
     /// top-level rows and unnamed-extension members.
     pub container: u32,
+    /// Exclusive end offset of the declaration's last token (byte offset one
+    /// past the `}`/`;` the parse closed it with — the upstream
+    /// `enclosingMember.end` convention). [`Self::UNKNOWN`] where no end
+    /// event attributes the row: type parameters (the parser's
+    /// `end_type_variable` carries no reliable end), enum constants (no
+    /// per-element end event), and rows whose declaration never closed
+    /// (bailed parse, recovery-consumed member, or a closing token the
+    /// parser inserted — it has no byte position).
+    pub decl_end: u32,
+    /// Byte offset one past a brace body's `{` — the insertion point for
+    /// member synthesis into the container. Container rows only;
+    /// [`Self::UNKNOWN`] for every other row, for bodyless containers
+    /// (`class C;` shapes, named mixin applications), and for a
+    /// parser-inserted brace (no byte position).
+    pub body_open: u32,
 }
 
 impl DeclRow {
     /// The `container` value of a row with no enclosing container.
     pub const NONE: u32 = u32::MAX;
+
+    /// The value of a positional column the parse could not derive. Never a
+    /// valid offset: consumers must narrow before use, never compare against
+    /// a source bound.
+    pub const UNKNOWN: u32 = u32::MAX;
 
     /// Whether the row is a library-scope name: a top-level row that is
     /// neither a type parameter nor an unnamed-extension member. Members
@@ -154,6 +192,13 @@ impl DeclRow {
             && !self.unnamed_extension_member
     }
 }
+
+/// The packed-row pin: name + kind(+bit) + range + container anchors (20 B)
+/// plus the two positional u32 columns (8 B). The capture's standing cost is
+/// ~8 bytes per declaration for the positional columns — the D2 ruling's
+/// budget — and any future field must re-negotiate it here, not silently
+/// pad the row.
+const _: () = assert!(std::mem::size_of::<DeclRow>() == 28);
 
 /// The supertype clause an edge came from, ordered so every declaration
 /// shape's clause sort key equals its source order — a class header
@@ -194,7 +239,7 @@ pub struct SuperEdge {
 /// Rows are sorted by `(name, offset)`; equal-name runs (duplicate
 /// declarations are #120's `duplicate_definition` business, not a modeling
 /// event) are contiguous for binary-search probes.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct FileIndex {
     decls: Vec<DeclRow>,
     supers: Vec<SuperEdge>,
@@ -281,7 +326,7 @@ pub(crate) enum Family {
 /// search on). Promoted into [`crate::LibraryIndex`] tables at build time.
 /// Crate-internal: the only consumer is [`crate::LibraryBuilder`], and no
 /// external face names this type (#547 hygiene).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct RawSites {
     names: Vec<StringId>,
     kinds: Vec<u8>,
@@ -291,10 +336,55 @@ pub(crate) struct RawSites {
 }
 
 impl RawSites {
+    /// No columns reserved — the shed twin's shape
+    /// ([`FileCapture::without_sites`]).
+    fn empty() -> Self {
+        Self {
+            names: Vec::new(),
+            kinds: Vec::new(),
+            families: Vec::new(),
+            offsets: Vec::new(),
+            lengths: Vec::new(),
+        }
+    }
+
+    /// Empty columns reserved to `tokens` — the file's token count, the
+    /// upper bound on identifier sites (a site is one identifier token) —
+    /// so the parse grows the five columns without reallocation.
+    fn with_capacity(tokens: usize) -> Self {
+        Self {
+            names: Vec::with_capacity(tokens),
+            kinds: Vec::with_capacity(tokens),
+            families: Vec::with_capacity(tokens),
+            offsets: Vec::with_capacity(tokens),
+            lengths: Vec::with_capacity(tokens),
+        }
+    }
+
     /// The number of sites.
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.names.len()
+    }
+
+    /// The reserved column capacity in rows. `with_capacity` reserves the
+    /// file's token count and the columns push in lockstep (`site` is the
+    /// only push point), so one face reports the whole table.
+    #[must_use]
+    pub(crate) fn capacity(&self) -> usize {
+        self.names.capacity()
+    }
+
+    /// Sheds the token-count reservation the columns were born with — sites
+    /// are a small fraction of tokens, so without this the finished capture
+    /// pins ~2/3 of its reserved site bytes for the session (the same
+    /// freeze-time shrink `LibraryBuilder` applies to its tables).
+    fn shrink_to_fit(&mut self) {
+        self.names.shrink_to_fit();
+        self.kinds.shrink_to_fit();
+        self.families.shrink_to_fit();
+        self.offsets.shrink_to_fit();
+        self.lengths.shrink_to_fit();
     }
 
     /// The site's name.
@@ -342,6 +432,53 @@ pub struct FileCapture {
     /// The raw reference sites. Crate-internal with [`RawSites`] (the
     /// only consumer is [`crate::LibraryBuilder`]).
     pub(crate) sites: RawSites,
+    /// Whether the sites were shed after the capture was built (`#1859`
+    /// LRU discipline): the engine's site cache capped out and replaced
+    /// this capture with its [`FileCapture::without_sites`] twin. A fresh
+    /// capture is never shed; the declaration surface is unaffected, and
+    /// the sites re-derive purely from (content, feature set) on the next
+    /// library build.
+    shed: bool,
+}
+
+impl FileCapture {
+    /// The site table's reserved capacity in rows — the column count
+    /// `RawSites` holds heap-side. `Builder::finish` shrinks the
+    /// token-count reservation down to the row count, so this reports the
+    /// pinned slack (post-freeze: `== sites.len()`; the memory-accounting
+    /// pin and the RSS-decomposition bench read it). Zero once the sites
+    /// were shed.
+    #[must_use]
+    pub fn sites_capacity(&self) -> usize {
+        self.sites.capacity()
+    }
+
+    /// Whether the raw sites are mounted. False only for the shed twin
+    /// ([`FileCapture::without_sites`]) — a file with genuinely zero sites
+    /// still reports true, so the engine's rebuild face can tell "nothing
+    /// to fold" from "shed, re-derive".
+    #[must_use]
+    pub fn sites_present(&self) -> bool {
+        !self.shed
+    }
+
+    /// The shed twin: the same file and declaration surface with the site
+    /// columns emptied and [`FileCapture::sites_present`] cleared — the
+    /// drop-the-payload half of the engine's site LRU (`#1859`), which
+    /// swaps resident captures for this twin when the cache caps out and
+    /// re-derives the sites from content on the next library build. The
+    /// declaration rows are cloned, not shared: the twin replaces the
+    /// original in the engine's arena, and the columns are flat
+    /// `Copy`-row `Vec`s, so the clone is the whole cost.
+    #[must_use]
+    pub fn without_sites(&self) -> FileCapture {
+        FileCapture {
+            file: self.file,
+            index: self.index.clone(),
+            sites: RawSites::empty(),
+            shed: true,
+        }
+    }
 }
 
 /// The capture state shared between the listener and [`capture`].
@@ -374,6 +511,13 @@ struct Builder<'src, 'tab> {
     pending_member: Option<PendingMember>,
     pending_top: Option<PendingTop>,
     pending_typedef: Option<PendingTop>,
+    /// First row index of the open field group (`begin_fields` →
+    /// `end_fields`/`end_top_level_fields`): the group's variables commit at
+    /// their name tokens, but the group's end arrives at the closing event —
+    /// the whole trailing run gets stamped then. Never nests (a field group
+    /// contains no declarations), so one slot suffices; a bail leaves it set
+    /// and the unended group's rows honestly `UNKNOWN`.
+    field_group: Option<usize>,
     sites: RawSites,
     /// The token the bare-send marker last armed for (`handle_no_arguments`
     /// under dartq's emission, `handle_send_without_arguments` under the
@@ -391,7 +535,7 @@ struct Builder<'src, 'tab> {
     /// The nested-assignment shape `x = a[i] = v;` is the visible
     /// casualty: `x`'s candidate ends before the index chain's close, so
     /// its `Written` label is suppressed — the documented M1 under-report
-    /// posture (spec §12.2), recorded here so the shape has a name.
+    /// posture, recorded here so the shape has a name.
     access_chain_end: u32,
 }
 
@@ -436,7 +580,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             pending_member: None,
             pending_top: None,
             pending_typedef: None,
-            sites: RawSites::default(),
+            field_group: None,
+            sites: RawSites::with_capacity(tokens.len()),
             no_args_at: None,
             type_arg_depth: 0,
             access_chain_end: 0,
@@ -458,9 +603,35 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             .map(|t| &self.source[t.byte_range()])
     }
 
+    /// The token's exclusive end as a byte offset — the positional columns'
+    /// unit, read straight off the token table's byte face (`byte_offset +
+    /// byte_len`). Byte units are exact for every lexeme, including
+    /// multi-byte and astral (surrogate-pair) content where the event's
+    /// UTF-16 span under-counts. A parser-inserted token has no byte face
+    /// (its id sits past the table): the declaration it closes never
+    /// existed in the source, so the row takes [`DeclRow::UNKNOWN`].
+    fn byte_end(&self, token: Token) -> u32 {
+        self.tokens
+            .get(token.id as usize)
+            .map_or(DeclRow::UNKNOWN, |t| t.byte_offset + t.byte_len)
+    }
+
+    /// The setter's `name=` lookup spelling. Setter commits repeat a short
+    /// name, so the key composes into a stack buffer and only a name longer
+    /// than it falls back to the heap.
     fn setter_spelling(&self, name: StringId) -> StringId {
-        let setter = format!("{}=", self.strings.resolve(name));
-        self.strings.intern(&setter)
+        let name = self.strings.resolve(name);
+        const STACK_KEY: usize = 64;
+        let mut buf = [0u8; STACK_KEY];
+        if name.len() + 1 <= STACK_KEY {
+            buf[..name.len()].copy_from_slice(name.as_bytes());
+            buf[name.len()] = b'=';
+            let key =
+                std::str::from_utf8(&buf[..name.len() + 1]).expect("utf-8 name plus `=` is utf-8");
+            self.strings.intern(key)
+        } else {
+            self.strings.intern(&format!("{name}="))
+        }
     }
 
     /// The open container's decl row, `NONE` inside an unnamed extension.
@@ -474,7 +645,19 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// the crate's contract keeps members out of the library faces, and
     /// without the anchor there is nothing else distinguishing it from a
     /// top-level row.
-    fn commit(&mut self, name: StringId, kind: DeclKind, range: dartq_source::SourceRange) {
+    ///
+    /// `decl_end` is the commit event's own end token as a byte offset
+    /// ([`Builder::byte_end`]) where the shape commits at its end
+    /// (methods, top-level functions, typedefs) and [`DeclRow::UNKNOWN`]
+    /// where the end arrives later (field groups stamp their trailing run
+    /// at `end_fields`) or never (type parameters, enum constants).
+    fn commit(
+        &mut self,
+        name: StringId,
+        kind: DeclKind,
+        range: dartq_source::SourceRange,
+        decl_end: u32,
+    ) {
         let container = self.container();
         let unnamed_extension_member = container == DeclRow::NONE && !self.containers.is_empty();
         self.decls.push(DeclRow {
@@ -483,10 +666,14 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             unnamed_extension_member,
             range,
             container,
+            decl_end,
+            body_open: DeclRow::UNKNOWN,
         });
     }
 
     /// Opens a container: its own row (unless unnamed) plus the stack push.
+    /// The row's positional columns start `UNKNOWN` — the body events stamp
+    /// them ([`Builder::stamp_container`]) as the parse delivers the braces.
     fn open_container(
         &mut self,
         kind: DeclKind,
@@ -499,6 +686,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 unnamed_extension_member: false,
                 range,
                 container: DeclRow::NONE,
+                decl_end: DeclRow::UNKNOWN,
+                body_open: DeclRow::UNKNOWN,
             });
             crate::narrow(self.decls.len() - 1)
         });
@@ -509,6 +698,44 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         });
         self.super_candidates.clear();
         self.super_head_armed = false;
+    }
+
+    /// Stamps the open container's body-open column (one past its `{`); a
+    /// no-op for unnamed containers — no row to carry the position.
+    fn stamp_container_body_open(&mut self, open: Token) {
+        if let Some(container) = self.containers.last()
+            && container.row != DeclRow::NONE
+        {
+            self.decls[container.row as usize].body_open = self.byte_end(open);
+        }
+    }
+
+    /// Stamps the open container's declaration-end column (one past its
+    /// closing `}` or `;`); the same no-op contract as
+    /// [`Builder::stamp_container_body_open`].
+    fn stamp_container_decl_end(&mut self, end: Token) {
+        if let Some(container) = self.containers.last()
+            && container.row != DeclRow::NONE
+        {
+            self.decls[container.row as usize].decl_end = self.byte_end(end);
+        }
+    }
+
+    /// Stamps every declaration row of the open field group with the
+    /// group's end (the closing `;`'s exclusive byte end) and closes the
+    /// slot. Type parameters are skipped: a generic-function-type field
+    /// (`int Function<T>(T) f;`) commits its `<T>` rows between the group's
+    /// start and the name commit, and they stay [`DeclRow::UNKNOWN`] —
+    /// never the field's `;` end.
+    fn stamp_field_group_end(&mut self, end: Token) {
+        let end = self.byte_end(end);
+        if let Some(start) = self.field_group.take() {
+            for row in &mut self.decls[start..] {
+                if row.kind != DeclKind::TypeParam {
+                    row.decl_end = end;
+                }
+            }
+        }
     }
 
     fn close_container(&mut self) {
@@ -634,7 +861,10 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             self.close_container();
         }
         // Sort rows by (name, offset) and remap the container anchors and
-        // superclass edges through the permutation.
+        // superclass edges through the permutation. The anchors remap in
+        // place first (they are values, not positions), then the rows
+        // permute in place — the build's only table-sized extra allocation
+        // is the index vector driving the permutation.
         let mut order: Vec<u32> = (0..crate::narrow(self.decls.len())).collect();
         order.sort_by_key(|&i| {
             (
@@ -646,36 +876,101 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         for (new, &old) in order.iter().enumerate() {
             remap[old as usize] = crate::narrow(new);
         }
-        let decls: Vec<DeclRow> = order
-            .iter()
-            .map(|&old| {
-                let mut row = self.decls[old as usize];
-                if row.container != DeclRow::NONE {
-                    row.container = remap[row.container as usize];
-                }
-                row
-            })
-            .collect();
-        let supers: Vec<SuperEdge> = std::mem::take(&mut self.supers);
-        let mut supers = supers
-            .into_iter()
-            .map(|mut edge| {
-                edge.container = remap[edge.container as usize];
-                edge
-            })
-            .collect::<Vec<SuperEdge>>();
+        for row in &mut self.decls {
+            if row.container != DeclRow::NONE {
+                row.container = remap[row.container as usize];
+            }
+        }
+        let mut supers = std::mem::take(&mut self.supers);
+        for edge in &mut supers {
+            edge.container = remap[edge.container as usize];
+        }
         supers.sort_by_key(|edge| (edge.container, edge.clause));
+        // Cycle the rows into their sorted slots through `remap` (old →
+        // new): each swap settles the row at `j = remap[i]` and fixes
+        // `remap[j]`, so the walk is O(n) swaps with no second table copy
+        // and lands every row at exactly the slot the collected gather
+        // held. Swapping along `order` instead would apply the inverse
+        // permutation and scramble the table.
+        for i in 0..remap.len() {
+            while remap[i] as usize != i {
+                let j = remap[i] as usize;
+                self.decls.swap(i, j);
+                remap.swap(i, j);
+            }
+        }
+        // Freeze: the site columns move into the long-lived capture, so the
+        // token-count reservation `RawSites::with_capacity` opened with must
+        // be shed here — sites run well under tokens, and holding the slack
+        // would keep ~2/3 of the reserved site bytes resident per file.
+        self.sites.shrink_to_fit();
         FileCapture {
             file: self.file,
-            index: FileIndex { decls, supers },
+            index: FileIndex {
+                decls: self.decls,
+                supers,
+            },
             sites: self.sites,
+            shed: false,
         }
     }
 }
 
-/// The [`ParserListener`] implementation feeding a shared [`Builder`].
-struct Capturer<'src, 'tab> {
+/// The [`ParserListener`] implementation feeding a `Builder`: driven
+/// through the parse multiplexer — standalone in [`capture`], or fanned
+/// out with the engine's other apply-side consumers — and finished into
+/// the file capture once the parse ends.
+pub struct Capturer<'src, 'tab> {
     builder: Rc<RefCell<Builder<'src, 'tab>>>,
+}
+
+impl<'src, 'tab> Capturer<'src, 'tab> {
+    /// Builds the capturer for `file` over the `source`/`tokens` pair the
+    /// parser reads, interning every name into `strings`.
+    pub fn new(
+        file: FileId,
+        source: &'src str,
+        tokens: &'tab TokenTable,
+        strings: &'src StringTable,
+    ) -> Self {
+        Self {
+            builder: Rc::new(RefCell::new(Builder::new(file, source, tokens, strings))),
+        }
+    }
+
+    /// Reclaims the capture. The multiplexer only borrows the capturer, so
+    /// this is the sole remaining builder owner by construction and the
+    /// reclaim cannot fail.
+    ///
+    /// # Panics
+    ///
+    /// Only if the builder is still shared after the parse — an internal
+    /// invariant breach (a live borrow outliving the parse).
+    #[must_use]
+    pub fn finish(self) -> FileCapture {
+        Rc::into_inner(self.builder)
+            .expect("sole builder owner after the parse")
+            .into_inner()
+            .finish()
+    }
+}
+
+/// Parses one compilation unit and captures its declaration surface and
+/// raw reference sites.
+///
+/// `tokens` must be the scan of `source` (the parser reads lexemes through
+/// the same pair); `strings` receives every interned name and must be the
+/// table the caller resolves ids against afterwards.
+pub fn capture(
+    file: FileId,
+    source: &str,
+    tokens: &TokenTable,
+    features: ParserFeatures,
+    strings: &StringTable,
+) -> FileCapture {
+    let mut capturer = Capturer::new(file, source, tokens, strings);
+    Parser::new(source, tokens, features, &mut capturer).parse_unit();
+    capturer.finish()
 }
 
 impl Capturer<'_, '_> {
@@ -687,44 +982,6 @@ impl Capturer<'_, '_> {
         let named = builder.name_of(token).map(|name| (name, token.range));
         builder.open_container(kind, named);
     }
-}
-
-/// Parses one compilation unit and captures its declaration surface and
-/// raw reference sites.
-///
-/// `tokens` must be the scan of `source` (the parser reads lexemes through
-/// the same pair); `strings` receives every interned name and must be the
-/// table the caller resolves ids against afterwards.
-///
-/// # Panics
-///
-/// Panics never in practice: the single `expect` reclaims the shared
-/// builder after the parser (its sole co-owner) is dropped, so the strong
-/// count is 1 by construction.
-pub fn capture(
-    file: FileId,
-    source: &str,
-    tokens: &TokenTable,
-    features: ParserFeatures,
-    strings: &StringTable,
-) -> FileCapture {
-    let builder = Rc::new(RefCell::new(Builder::new(file, source, tokens, strings)));
-    let mut parser = Parser::new(
-        source,
-        tokens,
-        features,
-        Capturer {
-            builder: Rc::clone(&builder),
-        },
-    );
-    parser.parse_unit();
-    drop(parser);
-    // The parser held the only other strong reference and is gone, so the
-    // unwrap cannot fail.
-    Rc::into_inner(builder)
-        .expect("the parser released its listener")
-        .into_inner()
-        .finish()
 }
 
 impl ParserListener for Capturer<'_, '_> {
@@ -771,11 +1028,14 @@ impl ParserListener for Capturer<'_, '_> {
         _class: Token,
         _equals: Token,
         _implements: Option<Token>,
-        _end: Token,
+        end: Token,
     ) {
         // The implements targets already came through `handle_implements`
-        // (the keyword Option here is header residue); close the container.
-        self.builder.borrow_mut().close_container();
+        // (the keyword Option here is header residue); the `end` is the
+        // declaration's closing `;`. Stamp, then close the container.
+        let mut builder = self.builder.borrow_mut();
+        builder.stamp_container_decl_end(end);
+        builder.close_container();
     }
 
     fn begin_mixin_declaration(
@@ -853,6 +1113,115 @@ impl ParserListener for Capturer<'_, '_> {
         _end: Token,
     ) {
         self.builder.borrow_mut().close_container();
+    }
+
+    // —— container bodies and field groups: the positional columns ————
+    // The brace events hand over the real (or recovery-synthetic) `{`/`}`
+    // tokens, so the container's row gets the exact insertion point (one
+    // past `{`) and the exact end (one past `}`); the no-body events hand
+    // over the `;` that closed the declaration.
+
+    fn begin_class_or_mixin_or_extension_body(&mut self, _kind: DeclarationKind, token: Token) {
+        self.builder.borrow_mut().stamp_container_body_open(token);
+    }
+
+    fn end_class_or_mixin_or_extension_body(
+        &mut self,
+        _kind: DeclarationKind,
+        _count: usize,
+        _begin: Token,
+        end: Token,
+    ) {
+        self.builder.borrow_mut().stamp_container_decl_end(end);
+    }
+
+    fn begin_enum_body(&mut self, token: Token) {
+        self.builder.borrow_mut().stamp_container_body_open(token);
+    }
+
+    fn end_enum_body(&mut self, _begin: Token, end: Token) {
+        self.builder.borrow_mut().stamp_container_decl_end(end);
+    }
+
+    fn handle_no_class_body(&mut self, semicolon: Token) {
+        self.builder
+            .borrow_mut()
+            .stamp_container_decl_end(semicolon);
+    }
+
+    fn handle_no_mixin_body(&mut self, semicolon: Token) {
+        self.builder
+            .borrow_mut()
+            .stamp_container_decl_end(semicolon);
+    }
+
+    fn handle_no_extension_body(&mut self, semicolon: Token) {
+        self.builder
+            .borrow_mut()
+            .stamp_container_decl_end(semicolon);
+    }
+
+    fn handle_no_extension_type_body(&mut self, semicolon: Token) {
+        self.builder
+            .borrow_mut()
+            .stamp_container_decl_end(semicolon);
+    }
+
+    fn handle_no_enum_body(&mut self, semicolon: Token) {
+        self.builder
+            .borrow_mut()
+            .stamp_container_decl_end(semicolon);
+    }
+
+    fn begin_fields(
+        &mut self,
+        _kind: DeclarationKind,
+        _augment_kw: Option<Token>,
+        _abstract_kw: Option<Token>,
+        _external_kw: Option<Token>,
+        _static_kw: Option<Token>,
+        _covariant_kw: Option<Token>,
+        _late_kw: Option<Token>,
+        _var_final_or_const: Option<Token>,
+        _last_consumed: Token,
+    ) {
+        // The group's variables commit at their name tokens; the slot marks
+        // where the trailing run to stamp at `end_fields` begins.
+        let mut builder = self.builder.borrow_mut();
+        builder.field_group = Some(builder.decls.len());
+    }
+
+    fn end_fields(
+        &mut self,
+        _kind: DeclarationKind,
+        _abstract_kw: Option<Token>,
+        _augment_kw: Option<Token>,
+        _external_kw: Option<Token>,
+        _static_kw: Option<Token>,
+        _covariant_kw: Option<Token>,
+        _late_kw: Option<Token>,
+        _var_final_or_const: Option<Token>,
+        _count: usize,
+        _begin: Token,
+        end: Token,
+    ) {
+        self.builder.borrow_mut().stamp_field_group_end(end);
+    }
+
+    fn end_top_level_fields(
+        &mut self,
+        _augment_kw: Option<Token>,
+        _abstract_kw: Option<Token>,
+        _external_kw: Option<Token>,
+        _static_kw: Option<Token>,
+        _covariant_kw: Option<Token>,
+        _late_kw: Option<Token>,
+        _var_final_or_const: Option<Token>,
+        _count: usize,
+        _begin: Token,
+        end: Token,
+    ) {
+        self.builder.borrow_mut().stamp_field_group_end(end);
     }
 
     fn handle_class_extends(&mut self, extends: Option<Token>, count: usize) {
@@ -994,10 +1363,10 @@ impl ParserListener for Capturer<'_, '_> {
         };
         match context {
             C::TopLevelVariableDeclaration => {
-                builder.commit(name, DeclKind::TopLevelVar, token.range);
+                builder.commit(name, DeclKind::TopLevelVar, token.range, DeclRow::UNKNOWN);
             }
             C::FieldDeclaration | C::EnumValueDeclaration => {
-                builder.commit(name, DeclKind::Field, token.range);
+                builder.commit(name, DeclKind::Field, token.range, DeclRow::UNKNOWN);
             }
             C::TopLevelFunctionDeclaration => {
                 if let Some(pending) = &mut builder.pending_top {
@@ -1016,7 +1385,11 @@ impl ParserListener for Capturer<'_, '_> {
     fn begin_type_variable(&mut self, token: Token) {
         let mut builder = self.builder.borrow_mut();
         if let Some(name) = builder.name_of(token) {
-            builder.commit(name, DeclKind::TypeParam, token.range);
+            // The end event (`end_type_variable`) hands no reliable end
+            // token — the complex-variables path fires it before the bound
+            // parse with the start token — so the row stays honestly
+            // `UNKNOWN`.
+            builder.commit(name, DeclKind::TypeParam, token.range, DeclRow::UNKNOWN);
         }
     }
 
@@ -1049,13 +1422,16 @@ impl ParserListener for Capturer<'_, '_> {
         _begin: Token,
         _begin_param: Token,
         _begin_initializers: Option<Token>,
-        _end: Token,
+        end: Token,
     ) {
         let mut builder = self.builder.borrow_mut();
         if let Some(pending) = builder.pending_member.take()
             && let Some((name, kind)) = pending.shape
         {
-            builder.commit(name, kind, pending.range);
+            // The body parse hands back the declaration's last token (the
+            // `}` of a block body, the `;` of a `;`/`=>` body).
+            let end = builder.byte_end(end);
+            builder.commit(name, kind, pending.range, end);
         }
     }
 
@@ -1068,7 +1444,7 @@ impl ParserListener for Capturer<'_, '_> {
         self.builder.borrow_mut().pending_top = Some(PendingTop { name: None });
     }
 
-    fn end_top_level_method(&mut self, _begin: Token, get_or_set: Option<Token>, _end: Token) {
+    fn end_top_level_method(&mut self, _begin: Token, get_or_set: Option<Token>, end: Token) {
         let mut builder = self.builder.borrow_mut();
         if let Some(pending) = builder.pending_top.take()
             && let Some((name, range)) = pending.name
@@ -1077,7 +1453,8 @@ impl ParserListener for Capturer<'_, '_> {
                 Some("set") => builder.setter_spelling(name),
                 _ => name,
             };
-            builder.commit(spelling, DeclKind::TopLevelFn, range);
+            let end = builder.byte_end(end);
+            builder.commit(spelling, DeclKind::TopLevelFn, range, end);
         }
     }
 
@@ -1090,13 +1467,14 @@ impl ParserListener for Capturer<'_, '_> {
         _augment: Option<Token>,
         _typedef: Token,
         _equals: Option<Token>,
-        _end: Token,
+        end: Token,
     ) {
         let mut builder = self.builder.borrow_mut();
         if let Some(pending) = builder.pending_typedef.take()
             && let Some((name, range)) = pending.name
         {
-            builder.commit(name, DeclKind::TypeAlias, range);
+            let end = builder.byte_end(end);
+            builder.commit(name, DeclKind::TypeAlias, range, end);
         }
     }
 
@@ -1698,6 +2076,167 @@ mod tests {
             "the extension type row is captured"
         );
         assert!(index.supers().is_empty(), "no edge for the extension type");
+    }
+
+    /// The positional columns on bodied shapes: container rows carry the
+    /// exact body-open (one past `{`) and declaration end (one past the
+    /// closing `}`), members carry their own closing token's end, a field
+    /// group stamps every variable of the group, and the enum constant
+    /// stays `UNKNOWN` (no per-element end event). ASCII sources, so the
+    /// byte offsets read directly off the literal.
+    #[test]
+    fn positional_columns_pin_bodied_declarations() {
+        let strings = StringTable::new();
+        let source = "class C { void m() {} int get g => 1; int a = 0, b = 1; } \
+             enum E { x }";
+        let captured = build(source, &strings);
+        let index = &captured.index;
+        let row = |name: &str| index.by_name(id(&strings, name)).expect(name)[0];
+
+        let c = row("C");
+        assert_eq!(c.body_open as usize, source.find('{').unwrap() + 1);
+        let c_end = source.find("int a = 0, b = 1; }").unwrap() + "int a = 0, b = 1; }".len();
+        assert_eq!(c.decl_end as usize, c_end);
+
+        let m = row("m");
+        let m_end = source.find("void m() {}").unwrap() + "void m() {}".len();
+        assert_eq!(m.decl_end as usize, m_end);
+        assert_eq!(m.body_open, DeclRow::UNKNOWN);
+        let g = row("g");
+        let g_end = source.find("int get g => 1;").unwrap() + "int get g => 1;".len();
+        assert_eq!(g.decl_end as usize, g_end);
+        assert_eq!(g.body_open, DeclRow::UNKNOWN);
+
+        let group_end = source.find("int a = 0, b = 1;").unwrap() + "int a = 0, b = 1;".len();
+        assert_eq!(row("a").decl_end as usize, group_end);
+        assert_eq!(row("b").decl_end as usize, group_end);
+
+        let e = row("E");
+        assert_eq!(
+            e.body_open as usize,
+            source.find("enum E {").unwrap() + "enum E {".len()
+        );
+        assert_eq!(e.decl_end as usize, source.len());
+        let x = row("x");
+        assert_eq!(x.decl_end, DeclRow::UNKNOWN);
+        assert_eq!(x.body_open, DeclRow::UNKNOWN);
+    }
+
+    /// The `UNKNOWN` round-trip: shapes the parse cannot close carry the
+    /// sentinel on both columns — never a plausible offset — while every
+    /// shape the parse does close carries its exact end: abstract/external
+    /// members at their `;`, the named mixin application at its `;`, the
+    /// bodyless mixin at its braces.
+    #[test]
+    fn positional_columns_unknown_round_trip() {
+        let strings = StringTable::new();
+        let source = "class B<T> {} \
+             class C { external void f(); abstract int g(); } \
+             mixin M {} \
+             class D = A with B; \
+             enum Q { y }";
+        let captured = build(source, &strings);
+        let index = &captured.index;
+        let row = |name: &str| index.by_name(id(&strings, name)).expect(name)[0];
+
+        // Type parameter: `end_type_variable` carries no reliable end.
+        let t = row("T");
+        assert_eq!(t.decl_end, DeclRow::UNKNOWN);
+        assert_eq!(t.body_open, DeclRow::UNKNOWN);
+
+        // Abstract/external members: the `;` closes them exactly; no body.
+        let f = row("f");
+        let f_end = source.find("external void f();").unwrap() + "external void f();".len();
+        assert_eq!(f.decl_end as usize, f_end);
+        assert_eq!(f.body_open, DeclRow::UNKNOWN);
+        let g = row("g");
+        let g_end = source.find("abstract int g();").unwrap() + "abstract int g();".len();
+        assert_eq!(g.decl_end as usize, g_end);
+        assert_eq!(g.body_open, DeclRow::UNKNOWN);
+
+        // Bodyless mixin body events: exact braces.
+        let m = row("M");
+        assert_eq!(
+            m.body_open as usize,
+            source.find("mixin M {").unwrap() + "mixin M {".len()
+        );
+        assert_eq!(
+            m.decl_end as usize,
+            source.find("mixin M {}").unwrap() + "mixin M {}".len()
+        );
+
+        // Named mixin application: `;`-closed container, no body to open.
+        let d = row("D");
+        let d_end = source.find("class D = A with B;").unwrap() + "class D = A with B;".len();
+        assert_eq!(d.decl_end as usize, d_end);
+        assert_eq!(d.body_open, DeclRow::UNKNOWN);
+
+        // Enum constants: unknowns round-trip the (name, offset) sort.
+        let y = row("y");
+        assert_eq!(y.decl_end, DeclRow::UNKNOWN);
+        assert_eq!(y.body_open, DeclRow::UNKNOWN);
+    }
+
+    /// The positional columns are byte offsets, not UTF-16: a prefix
+    /// carrying a two-byte char (π) and an astral emoji (a surrogate pair
+    /// in UTF-16) shifts every byte position past its UTF-16 counterpart,
+    /// and every stamp pins the byte end off the token table's byte face —
+    /// the top-level group's `;`, the container's braces, and the member
+    /// group's `;`.
+    #[test]
+    fn positional_columns_are_byte_offsets_for_non_ascii_sources() {
+        let strings = StringTable::new();
+        // π is 2 bytes in UTF-8 (1 UTF-16 unit) and the emoji is 4 bytes
+        // (2 UTF-16 units): the declaration positions below differ by 3
+        // between the two units, so a UTF-16 stamp cannot pass.
+        let source = "final s = 'π😀';\nclass C { int f = 0; }";
+        let captured = build(source, &strings);
+        let index = &captured.index;
+        let row = |name: &str| index.by_name(id(&strings, name)).expect(name)[0];
+
+        // Byte-layout pins: the assertions read the literal's bytes, not
+        // character counts.
+        let bytes = source.as_bytes();
+        assert_eq!(&bytes[18..19], b";");
+        assert_eq!(&bytes[19..20], b"\n");
+        assert_eq!(&bytes[20..29], b"class C {");
+        assert_eq!(&bytes[30..40], b"int f = 0;");
+        assert_eq!(&bytes[41..42], b"}");
+        assert_eq!(source.len(), 42);
+
+        // Top-level field group: the `;` after the emoji string, at its
+        // byte end (its UTF-16 end would be 16).
+        assert_eq!(row("s").decl_end as usize, 19);
+        // Container braces at their byte ends (UTF-16 would say 26 and 39).
+        let c = row("C");
+        assert_eq!(c.body_open as usize, 29);
+        assert_eq!(c.decl_end as usize, 42);
+        // Member field group: byte end of `int f = 0;` (UTF-16 would say
+        // 37).
+        assert_eq!(row("f").decl_end as usize, 40);
+    }
+
+    /// A generic-function-type field's own type parameters
+    /// (`int Function<T>(T) f;`) commit their rows between the field
+    /// group's start and the name commit; the group's end stamp skips them
+    /// — type parameters stay `UNKNOWN`, never the field's `;` end — while
+    /// the field itself carries the group's end exactly.
+    #[test]
+    fn field_group_end_skips_generic_function_type_parameters() {
+        let strings = StringTable::new();
+        let source = "class C { int Function<T>(T) f; }";
+        let captured = build(source, &strings);
+        let index = &captured.index;
+        let row = |name: &str| index.by_name(id(&strings, name)).expect(name)[0];
+
+        let t = row("T");
+        assert_eq!(t.kind, DeclKind::TypeParam);
+        assert_eq!(t.decl_end, DeclRow::UNKNOWN, "no plausible guess for T");
+        assert_eq!(t.body_open, DeclRow::UNKNOWN);
+        let f = row("f");
+        assert_eq!(f.kind, DeclKind::Field);
+        let f_end = source.find("int Function<T>(T) f;").unwrap() + "int Function<T>(T) f;".len();
+        assert_eq!(f.decl_end as usize, f_end);
     }
 
     /// Unpaired `handle_no_arguments` firings — enum constants and bare

@@ -1,4 +1,4 @@
-//! The test graph (PRD §15.4): `test_of` edges from test files to the
+//! The test graph: `test_of` edges from test files to the
 //! libraries they test, stored in the index's dependency-subgraph posture
 //! (flat CSR arrays over the library id space).
 //!
@@ -43,7 +43,7 @@
 use rustc_hash::FxHashMap;
 use std::path::Path;
 
-/// The basename suffix that marks a test file (PRD §15.4's fallback signal).
+/// The basename suffix that marks a test file.
 const TEST_SUFFIX: &str = "_test.dart";
 
 /// The basename index behind the naming fallback: basename -> each
@@ -176,7 +176,7 @@ impl TestGraph {
     }
 
     /// The test libraries whose edges point at `lib`, ascending — the
-    /// `AffectedTests` join of the impact query (PRD §15.4). An id outside
+    /// `AffectedTests` join of the impact query. An id outside
     /// the graph's library space — including any probe of a
     /// default-built, edge-free graph — holds no tests and answers empty.
     #[must_use]

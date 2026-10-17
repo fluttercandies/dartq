@@ -1,4 +1,4 @@
-//! The per-library reference index (spec §8 keep list, second face):
+//! The per-library reference index:
 //! identifier uses resolved against the file-local scope and the #117
 //! [`Namespaces`], the unresolved-names recovery table, and the resolved
 //! supertype edges.
@@ -20,17 +20,18 @@
 //! declaration; the file's complete [`FileIndex`] must exist first). Local
 //! variables and members accessed without qualification land in the names
 //! table too — M1 has no local/member scope chain; that residual is the
-//! documented under-report posture (spec §12.2), and the names table is
+//! documented under-report posture, and the names table is
 //! exactly where the `undefined_*` recovery reads it.
 //!
 //! # The #120 seam
 //!
 //! The `undefined_*` family resolves identifiers as a side effect of its
-//! checks; those miss rows belong here, not in a parallel path (spec §8's
-//! recovery-surface ruling on ticket #120). [`LibraryIndex::record_unresolved`]
-//! inserts into an overflow buffer kept sorted by `(name, offset)` like the
-//! built-in table, and [`LibraryIndex::unresolved`] binary-searches both —
-//! no re-sort, no allocation on the probe path. Rows recorded this way live
+//! checks; those miss rows belong here, not in a parallel path (the
+//! M1 recovery-surface ruling on ticket #120). [`LibraryIndex::record_unresolved`]
+//! batches them into an overflow buffer sorted by `(name, offset)` like the
+//! built-in table — one sort per recording phase instead of a per-row
+//! insert — and [`LibraryIndex::unresolved`] binary-searches both, no
+//! re-sort, no allocation on the probe path. Rows recorded this way live
 //! until the library rebuilds whole, at which point the resolver that
 //! produced them regenerates them.
 //!
@@ -43,9 +44,9 @@ use dartq_source::{FileId, SourceRange, StringId};
 
 use crate::capture::{Family, FileCapture, FileIndex, SuperClause};
 
-/// The relation kind of a reference or name row — the §8 M1 subset.
+/// The relation kind of a reference or name row — the M1 subset.
 /// Constructor-reference specials, named-argument references, and comment
-/// references are folded into these per the §8 cut list.
+/// references are folded into these per the M1 cut list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RefKind {
@@ -96,16 +97,30 @@ pub struct RefRow {
     pub kind: RefKind,
     /// The use site's span (UTF-16).
     pub range: SourceRange,
-    /// The use has an explicit qualifier (`p.x`) and cannot be shadowed by
-    /// a local declaration (the official `isQualified` bit, spec §4).
-    pub qualified: bool,
-    /// The import prefix that armed the resolution (`p` in `p.fa`) — the
-    /// §15.8 qualified-name spelling's qualifier half, resolved to its
-    /// interned spelling at the query boundary. `None` for bare uses.
-    pub qualifier: Option<StringId>,
+    /// The import prefix that armed the resolution (`p` in `p.fa`), interned;
+    /// [`StringId::NONE`] for bare uses. `qualified` — the use cannot be
+    /// shadowed by a local declaration — derives from the sentinel, so the
+    /// row stays 28 B.
+    pub qualifier: StringId,
 }
 
-/// One unresolved name use — the §8 names table row (the recovery surface
+impl RefRow {
+    /// Whether the use carries an explicit qualifier (`p.x`) and cannot be
+    /// shadowed by a local declaration.
+    #[must_use]
+    pub fn qualified(&self) -> bool {
+        self.qualifier != StringId::NONE
+    }
+}
+
+/// The packed-row pin: four ids (16 B) + the kind byte + the range (8 B)
+/// plus tail pad. `refs` is the crate's largest standing table (~0.5 KB per
+/// KB of source at corpus scale); the qualifier sentinel and the derived
+/// `qualified` bit hold the row at 28 B — any future field re-negotiates it
+/// here, not silently.
+const _: () = assert!(std::mem::size_of::<RefRow>() == 28);
+
+/// One unresolved name use — a names-table row (the recovery surface
 /// for the `undefined_*` family and the only reference signal when
 /// resolution is partial).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,8 +137,8 @@ pub struct NameRow {
 
 /// The target of a resolved supertype edge: a workspace declaration, or the
 /// bare name when the supertype lies outside the analyzed set (`dart:`
-/// SDK, unanalyzed dependency) — the official string-keyed fallback (spec
-/// §5, `SubtypeIndexElementId`).
+/// SDK, unanalyzed dependency) — the official string-keyed fallback
+/// (`SubtypeIndexElementId`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetRef {
     /// A workspace declaration.
@@ -148,20 +163,30 @@ pub struct SubtypeEdge {
 }
 
 /// The reference surface of one library (defining unit plus parts), built
-/// whole by [`LibraryBuilder`] and replaced whole on re-analysis (spec §6:
-/// no partial index update).
+/// whole by [`LibraryBuilder`] and replaced whole on re-analysis (no
+/// partial index update).
 ///
-/// Invariants (the §5 sorted-column discipline): `refs` ascend by
-/// `(target, use file, offset)` with [`Self::runs`] holding each
-/// distinct-target run's start — a CSR offsets array over the rows; `names`
-/// ascend by `(name, offset)`; `names_overflow` (the #120 seam's
-/// insertions) ascend by `(name, offset)` too; `supers` ascend by
-/// `(subtype file, name, clause)`.
+/// Invariants: `refs` ascend by
+/// `(target, use file, offset)` with `Self::runs` holding each
+/// distinct-target run's start — a CSR offsets array over the rows;
+/// `name_refs` re-groups those runs by `target_name` (ascending; within a
+/// name, the runs keep their target-ascending table order) with `name_runs`
+/// holding each distinct name's group start; `names` ascend by
+/// `(name, offset)`; `names_overflow` (the #120 seam's insertions) ascend by
+/// `(name, offset)` too; `supers` ascend by `(subtype file, name, clause)`.
 /// Every probe is a binary search plus an equal-run scan.
+///
+/// The name-keyed run index costs 4 B per `(target, name)` run plus 4 B per
+/// distinct target name of standing memory — the documented trade for the
+/// workspace query join's one-search-per-library shape (hub names were
+/// quadratic through the per-(decl file, library) probe the exact-target
+/// search forced).
 #[derive(Debug, Default)]
 pub struct LibraryIndex {
     refs: Vec<RefRow>,
     runs: Vec<u32>,
+    name_runs: Vec<u32>,
+    name_refs: Vec<u32>,
     names: Vec<NameRow>,
     names_overflow: Vec<NameRow>,
     supers: Vec<SubtypeEdge>,
@@ -184,6 +209,48 @@ impl LibraryIndex {
             .get(start + 1)
             .map_or(self.refs.len(), |&end| end as usize);
         Some(&self.refs[run as usize..end])
+    }
+
+    /// The reference runs naming `name` as their target, whatever the
+    /// declaring file: one binary search over the name-keyed run groups,
+    /// the matched group's runs yielded target-ascending, each run's rows
+    /// ascending by `(use file, offset)` (the table order). The workspace
+    /// query join's entry point — one search per referencing library
+    /// instead of one per (decl file, library) pair.
+    #[must_use]
+    pub fn references_named(&self, name: StringId) -> impl Iterator<Item = &[RefRow]> + '_ {
+        let group_name = |slot: usize| {
+            let run = self.name_refs[slot] as usize;
+            self.refs[self.runs[run] as usize].target_name
+        };
+        let start = self
+            .name_runs
+            .partition_point(|&slot| group_name(slot as usize) < name);
+        let end = match self.name_runs.get(start) {
+            Some(&slot) if group_name(slot as usize) == name => self
+                .name_runs
+                .get(start + 1)
+                .map_or(self.name_refs.len(), |&next| next as usize),
+            _ => start,
+        };
+        self.name_refs[start..end].iter().map(move |&run| {
+            let run = run as usize;
+            let end = self
+                .runs
+                .get(run + 1)
+                .map_or(self.refs.len(), |&next| next as usize);
+            &self.refs[self.runs[run] as usize..end]
+        })
+    }
+
+    /// The distinct reference-target names, ascending — the name-keyed run
+    /// groups themselves, one name per group.
+    #[must_use]
+    pub fn distinct_reference_names(&self) -> impl Iterator<Item = StringId> + '_ {
+        self.name_runs.iter().copied().map(move |slot| {
+            let run = self.name_refs[slot as usize] as usize;
+            self.refs[self.runs[run] as usize].target_name
+        })
     }
 
     /// The unresolved uses of `name`: built-in rows from the sorted table
@@ -210,18 +277,19 @@ impl LibraryIndex {
         (start < end).then(|| &self.supers[start..end])
     }
 
-    /// Inserts an unresolved-name row after the build — the #120 seam
+    /// Records unresolved-name rows after the build — the #120 seam
     /// (`undefined_*` lookup byproducts; see the module docs).
     ///
-    /// The row slots into its `(name, offset)` position, so
-    /// [`Self::unresolved`] probes stay a binary search. A library rebuild
-    /// replaces the whole index, and the resolver that produced the
-    /// byproduct regenerates it.
-    pub fn record_unresolved(&mut self, row: NameRow) {
-        let at = self.names_overflow.partition_point(|existing| {
-            (existing.name, existing.range.offset) < (row.name, row.range.offset)
-        });
-        self.names_overflow.insert(at, row);
+    /// One call per recording phase: the rows join the overflow buffer and
+    /// a single sort restores the `(name, offset)` order, so a miss-heavy
+    /// rebuild pays one O(n log n) pass instead of a per-row insert, and
+    /// [`Self::unresolved`] probes stay a binary search either way. A
+    /// library rebuild replaces the whole index, and the resolver that
+    /// produced the byproducts regenerates them.
+    pub fn record_unresolved(&mut self, rows: impl IntoIterator<Item = NameRow>) {
+        self.names_overflow.extend(rows);
+        self.names_overflow
+            .sort_unstable_by_key(|row| (row.name, row.range.offset));
     }
 
     /// Every reference row, ordered by the table's sort (CSR source data).
@@ -253,8 +321,8 @@ enum BareHit {
 /// The caller captures every file of the library (defining unit plus
 /// parts) and adds them in any order; the namespaces must already exist
 /// (the graph's export scopes fold the whole workspace, so cross-library
-/// targets resolve exactly like the L1 `LibraryAnalyzed` point — spec §8's
-/// build timing).
+/// targets resolve exactly like the L1 `LibraryAnalyzed` point — the
+/// M1 build timing).
 pub struct LibraryBuilder<'a> {
     lib: LibraryId,
     graph: &'a LibraryGraph,
@@ -300,8 +368,7 @@ impl<'a> LibraryBuilder<'a> {
                             target_name: name,
                             kind,
                             range,
-                            qualified: false,
-                            qualifier: None,
+                            qualifier: StringId::NONE,
                         }),
                         BareHit::Prefix(prefix) => armed = Some(prefix),
                         BareHit::Miss => self.names.push(NameRow {
@@ -316,7 +383,8 @@ impl<'a> LibraryBuilder<'a> {
                     let hit = armed.take().map(|prefix| {
                         (
                             prefix,
-                            self.namespaces.lookup_prefixed(self.lib, prefix, name),
+                            self.namespaces
+                                .lookup_prefixed(self.graph, self.lib, prefix, name),
                         )
                     });
                     match hit {
@@ -327,8 +395,7 @@ impl<'a> LibraryBuilder<'a> {
                                 target_name: name,
                                 kind,
                                 range,
-                                qualified: true,
-                                qualifier: Some(prefix),
+                                qualifier: prefix,
                             });
                         }
                         // No armed prefix (member access on an untyped
@@ -375,7 +442,7 @@ impl<'a> LibraryBuilder<'a> {
     /// Sorts the tables into their probed order and finishes the index.
     #[must_use]
     pub fn finish(mut self) -> LibraryIndex {
-        // Deterministic total orders (spec §12.4: queries merge name-keyed
+        // Deterministic total orders (queries merge name-keyed
         // and element-keyed data, so any nondeterminism leaks into output).
         // The use `file` joins the key before the offset: a multi-file
         // library's member captures can carry equal offsets, and the caller
@@ -392,12 +459,36 @@ impl<'a> LibraryBuilder<'a> {
                 prev = Some(key);
             }
         }
+        // The name-keyed face of the same runs: run indices regrouped by
+        // target name — the stable sort keeps each name's runs in their
+        // target-ascending table order — plus one group-start offset per
+        // distinct name (see `LibraryIndex`'s memory note for the trade).
+        let mut name_refs: Vec<u32> = (0..crate::narrow(runs.len())).collect();
+        name_refs.sort_by_key(|&run| self.refs[runs[run as usize] as usize].target_name);
+        let mut name_runs = Vec::new();
+        let mut prev_name: Option<StringId> = None;
+        for (slot, &run) in name_refs.iter().enumerate() {
+            let name = self.refs[runs[run as usize] as usize].target_name;
+            if prev_name != Some(name) {
+                name_runs.push(crate::narrow(slot));
+                prev_name = Some(name);
+            }
+        }
         self.names.sort_by_key(|row| (row.name, row.range.offset));
         self.supers
             .sort_by_key(|edge| (edge.file, edge.name, edge.clause));
+        // Freeze: the push-grown tables move into the long-lived index, so
+        // std's doubling slack (up to ~2× capacity resident for the session)
+        // must be shed here — the freeze-time shrink `SyntaxTable::from_parts`
+        // applies to its frozen vectors.
+        self.refs.shrink_to_fit();
+        self.names.shrink_to_fit();
+        self.supers.shrink_to_fit();
         LibraryIndex {
             refs: self.refs,
             runs,
+            name_runs,
+            name_refs,
             names: self.names,
             names_overflow: Vec::new(),
             supers: self.supers,
@@ -420,9 +511,9 @@ pub(crate) mod tests {
     use std::path::Path;
 
     const SRC_A: &str = "class A {\n  void m() {}\n}\n\nvoid fa() {}\nint top = 0;\n";
-    const SRC_B: &str = "import 'a.dart';\nimport 'a.dart' as p;\n\nclass B extends A {\n  void use() {\n    A();\n    fa();\n    p.fa();\n    top = 1;\n    nope;\n  }\n}\n";
+    pub(crate) const SRC_B: &str = "import 'a.dart';\nimport 'a.dart' as p;\n\nclass B extends A {\n  void use() {\n    A();\n    fa();\n    p.fa();\n    top = 1;\n    nope;\n  }\n}\n";
 
-    /// The two-file fixture (index-design-spec §8-§10): `a.dart` declares
+    /// The two-file fixture: `a.dart` declares
     /// the surface, `b.dart` imports it twice (bare and prefixed), extends
     /// `A`, invokes across the boundary, writes a top-level, and holds one
     /// unresolvable use.
@@ -437,7 +528,7 @@ pub(crate) mod tests {
         pub(crate) capture_b: FileCapture,
     }
 
-    fn capture_one(
+    pub(crate) fn capture_one(
         strings: &StringTable,
         files: &mut FileTable,
         path: &str,
@@ -605,7 +696,7 @@ pub(crate) mod tests {
         // The seam merge: a byproduct row for a name that already has a
         // built-in row is served after it, from one probe.
         let mut surface = surface;
-        surface.record_unresolved(NameRow {
+        surface.record_unresolved(std::iter::once(NameRow {
             name: strings.intern("x"),
             kind: RefKind::Read,
             range: SourceRange {
@@ -613,7 +704,7 @@ pub(crate) mod tests {
                 length: 1,
             },
             qualified: false,
-        });
+        }));
         let merged: Vec<(u32, bool)> = surface
             .unresolved(strings.intern("x"))
             .map(|row| (row.range.offset, row.qualified))
@@ -622,6 +713,53 @@ pub(crate) mod tests {
             merged,
             vec![(x_offset, false), (9_999, false)],
             "built-in rows first, seam rows after"
+        );
+    }
+
+    /// The seam's scale shape: 10k rows land in one out-of-order batch and
+    /// one sort serves every probe in `(name, offset)` order — the batch
+    /// contract the `undefined_*` rebuild flow will drive (correctness of
+    /// the ordering here; its cost is the bench phase's business).
+    #[test]
+    fn seam_batch_serves_out_of_order_rows_sorted() {
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let names: Vec<StringId> = (0..100)
+            .map(|i| strings.intern(&format!("seam_name_{i:03}")))
+            .collect();
+        let mut surface = LibraryIndex::default();
+
+        // Name-major descending, offset descending within — the exact
+        // reverse of the probed order.
+        let rows: Vec<NameRow> = names
+            .iter()
+            .rev()
+            .flat_map(|&name| {
+                (0..100u32).rev().map(move |k| NameRow {
+                    name,
+                    kind: RefKind::Read,
+                    range: SourceRange {
+                        offset: k * 16,
+                        length: 4,
+                    },
+                    qualified: false,
+                })
+            })
+            .collect();
+        assert_eq!(rows.len(), 10_000);
+        surface.record_unresolved(rows);
+
+        let expected: Vec<u32> = (0..100u32).map(|k| k * 16).collect();
+        for &name in &names {
+            let offsets: Vec<u32> = surface
+                .unresolved(name)
+                .map(|row| row.range.offset)
+                .collect();
+            assert_eq!(offsets, expected, "{name:?}: rows offset-ascending");
+        }
+        assert_eq!(
+            surface.unresolved(strings.intern("seam_absent")).count(),
+            0,
+            "a name outside the batch misses"
         );
     }
 
@@ -644,7 +782,7 @@ pub(crate) mod tests {
         let a_surface = builder.finish();
 
         // Bare cross-file invocation, and the prefixed twin: same target,
-        // one unqualified, one qualified — the `isQualified` bit (spec §4).
+        // one unqualified, one qualified — the `isQualified` bit.
         let fa_refs = b_surface
             .references_of(file_a, strings.intern("fa"))
             .expect("fa referenced from b");
@@ -652,12 +790,15 @@ pub(crate) mod tests {
         assert!(fa_refs[0].range.offset < fa_refs[1].range.offset);
         assert!(fa_refs.iter().all(|row| row.kind == RefKind::Invoked));
         assert_eq!(
-            fa_refs.iter().map(|row| row.qualified).collect::<Vec<_>>(),
+            fa_refs
+                .iter()
+                .map(|row| row.qualified())
+                .collect::<Vec<_>>(),
             vec![false, true]
         );
         assert_eq!(
             fa_refs.iter().map(|row| row.qualifier).collect::<Vec<_>>(),
-            vec![None, Some(strings.intern("p"))],
+            vec![StringId::NONE, strings.intern("p")],
             "the prefixed twin carries its import prefix, the bare twin none"
         );
         // The call span pins to the source (`fa()` line 6 of b).
@@ -682,7 +823,7 @@ pub(crate) mod tests {
         );
 
         // Unresolved: the member access `nope` (unknown receiver shape →
-        // the §8 names table), and nothing else from this fixture's uses.
+        // the names table), and nothing else from this fixture's uses.
         let nope = b_surface
             .unresolved(strings.intern("nope"))
             .collect::<Vec<_>>();
@@ -706,7 +847,7 @@ pub(crate) mod tests {
 
         // The #120 seam: a byproduct row joins the probe immediately.
         let mut b_surface = b_surface;
-        b_surface.record_unresolved(NameRow {
+        b_surface.record_unresolved(std::iter::once(NameRow {
             name: strings.intern("orphan"),
             kind: RefKind::Read,
             range: SourceRange {
@@ -714,7 +855,7 @@ pub(crate) mod tests {
                 length: 6,
             },
             qualified: false,
-        });
+        }));
         assert_eq!(
             b_surface.unresolved(strings.intern("orphan")).count(),
             1,
@@ -722,7 +863,7 @@ pub(crate) mod tests {
         );
 
         // Workspace round trip: query symbol by name → files+kinds+spans;
-        // the reverse face loops libraries (spec §9 fan-out).
+        // the reverse face loops libraries.
         let mut index = SymbolIndex::default();
         index.insert_file(fx.capture_a.file, fx.capture_a.index);
         index.insert_file(fx.capture_b.file, fx.capture_b.index);
@@ -935,8 +1076,8 @@ pub(crate) mod tests {
             .references_of(file_d, strings.intern("gone"))
             .expect("prefixed hit");
         assert_eq!(gone.len(), 1);
-        assert!(gone[0].qualified);
-        assert_eq!(gone[0].qualifier, Some(strings.intern("p")));
+        assert!(gone[0].qualified());
+        assert_eq!(gone[0].qualifier, strings.intern("p"));
 
         // `z.w;`: the bare miss `z` disarmed the prefix, so `w` is a member
         // access even though d.dart declares it.
@@ -1023,6 +1164,73 @@ pub(crate) mod tests {
             members.iter().all(|&(file, _)| file != file_d),
             "the use file is the library member, never the target's file"
         );
+    }
+
+    /// The name-keyed run groups (the workspace query join's face): one
+    /// library referencing the same name in two target files answers both
+    /// runs target-ascending off a single search, each group's slice
+    /// matches the exact-target probe, a miss searches to empty, and the
+    /// distinct-name walk names each group once.
+    #[test]
+    fn name_groups_serve_every_target_off_one_search() {
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut files = FileTable::new();
+        let dep_d = capture_one(strings, &mut files, "d.dart", "void fa() {}\n");
+        let dep_e = capture_one(strings, &mut files, "e.dart", "void fa() {}\n");
+        let main = capture_one(
+            strings,
+            &mut files,
+            "m.dart",
+            "import 'd.dart' as p;\nimport 'e.dart' as q;\n\nvoid main() {\n p.fa();\n q.fa();\n}\n",
+        );
+
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib_d = builder.intern("package:t/d.dart");
+        let lib_e = builder.intern("package:t/e.dart");
+        let lib_m = builder.intern("package:t/m.dart");
+        let file_d = files.try_file_id(Path::new("d.dart")).unwrap();
+        let file_e = files.try_file_id(Path::new("e.dart")).unwrap();
+        for (lib, cap) in [(lib_d, &dep_d), (lib_e, &dep_e), (lib_m, &main)] {
+            for row in cap.index.decls() {
+                if row.is_library_face() {
+                    builder.declare(lib, row.name, cap.file);
+                }
+            }
+        }
+        for (prefix, target) in [("p", lib_d), ("q", lib_e)] {
+            builder.import(
+                lib_m,
+                ImportEdge {
+                    target: Some(target),
+                    prefix: Some(strings.intern(prefix)),
+                    deferred: false,
+                    combinators: Combinators::unfiltered(),
+                },
+            );
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+
+        let mut builder = LibraryBuilder::new(lib_m, &graph, &namespaces);
+        builder.add_file(&main);
+        let surface = builder.finish();
+
+        let fa = strings.intern("fa");
+        let groups: Vec<&[RefRow]> = surface.references_named(fa).collect();
+        assert_eq!(groups.len(), 2, "one run per target file");
+        assert_eq!(groups[0][0].target_file, file_d, "runs target-ascending");
+        assert_eq!(groups[1][0].target_file, file_e);
+        assert_eq!(groups[0], surface.references_of(file_d, fa).expect("d hit"));
+        assert_eq!(groups[1], surface.references_of(file_e, fa).expect("e hit"));
+        assert!(
+            surface
+                .references_named(strings.intern("zz_absent"))
+                .next()
+                .is_none(),
+            "a miss searches to empty"
+        );
+        let names: Vec<StringId> = surface.distinct_reference_names().collect();
+        assert_eq!(names, vec![fa], "one group per distinct target name");
     }
 
     /// Clause-typed supers through the fold: every clause kind resolves by
@@ -1131,5 +1339,23 @@ pub(crate) mod tests {
         assert!(index.remove_library(fx.lib_a).is_none(), "absent id: no-op");
         assert!(index.remove_file(fx.capture_a.file).is_some());
         assert!(index.file(fx.capture_a.file).is_none());
+    }
+
+    /// The freeze-time shrink: `finish` moves the push-grown tables into
+    /// the long-lived index with capacity == len — len-based memory
+    /// accounting cannot see capacity, so this pin is the slack's only
+    /// witness.
+    #[test]
+    fn finish_sheds_push_growth_slack() {
+        let fx = fixture();
+        let mut builder = LibraryBuilder::new(fx.lib_b, &fx.graph, &fx.namespaces);
+        builder.add_file(&fx.capture_b);
+        let surface = builder.finish();
+        assert!(!surface.refs.is_empty(), "fixture has resolved uses");
+        assert_eq!(surface.refs.capacity(), surface.refs.len(), "refs");
+        assert!(!surface.names.is_empty(), "fixture has an unresolved use");
+        assert_eq!(surface.names.capacity(), surface.names.len(), "names");
+        assert!(!surface.supers.is_empty(), "fixture has a supertype edge");
+        assert_eq!(surface.supers.capacity(), surface.supers.len(), "supers");
     }
 }

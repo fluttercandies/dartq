@@ -20,5 +20,9 @@ rustc-hash = { workspace = true }
 [dev-dependencies]
 dartq-language = { workspace = true }
 
+[[bench]]
+name = "query_postings"
+harness = false
+
 [lints]
 workspace = true
