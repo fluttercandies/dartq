@@ -2,7 +2,7 @@
 //! variable declarations.
 
 use crate::ev::Ev;
-use crate::interp::{Expr, Frame, Interp, PatternKind, PatternState, VarMeta};
+use crate::interp::{Expr, Frame, Interp, PatternKind, PatternState, Resolved, VarMeta};
 use crate::ty::{Base, Ty};
 
 impl Interp<'_> {
@@ -17,12 +17,17 @@ impl Interp<'_> {
         if self.collecting()
             && matches!(
                 ev,
-                Ev::PatternBegin | Ev::PatternEnd | Ev::GuardBegin | Ev::GuardEnd
+                Ev::PatternBegin
+                    | Ev::PatternEnd
+                    | Ev::ObjectPattern { .. }
+                    | Ev::GuardBegin
+                    | Ev::GuardEnd
             )
         {
             return;
         }
         match ev {
+            Ev::ObjectPattern { name, args } => self.matched_object_pattern(*name, *args),
             Ev::PatternBegin => {
                 self.pattern_depth += 1;
                 if self.pattern_depth == 1 {
@@ -68,15 +73,14 @@ impl Interp<'_> {
                 {
                     let meta = &self.vars[var as usize];
                     let declared = meta.ty;
-                    let promoted = self.ops.promote_to_non_null(declared);
+                    let (promoted, promoted_args) = self.promote_to_non_null(declared, meta.args);
                     if promoted != declared {
-                        let declared_args = meta.args;
                         self.current = self.current.clone().finish_type_test(
                             self.ops,
                             &mut self.lists,
                             var,
                             None,
-                            Some((promoted, declared_args)),
+                            Some((promoted, promoted_args)),
                         );
                     }
                 }
@@ -108,7 +112,10 @@ impl Interp<'_> {
                 }
             }
             Ev::AssignedVarPattern { name } => {
-                if let Some(var) = self.resolve(*name) {
+                // A top-level name in an assigned-var position writes no
+                // tracked local — the pending write feeds a state write,
+                // which only a local id addresses.
+                if let Some(Resolved::Local(var)) = self.resolve(*name) {
                     self.pending_writes.push(var);
                 }
             }
@@ -130,6 +137,10 @@ impl Interp<'_> {
                 }
             }
             Ev::GuardEnd => {
+                // The guard expression ends: rejoin null-shorting opened
+                // inside it before its value is read; an enclosing `?`
+                // chain stays open.
+                self.flush_null_shorts_above(self.consumer_base(1));
                 let guard = self.exprs.pop();
                 if let Some(pattern) = self.pattern.as_mut() {
                     pattern
@@ -138,6 +149,102 @@ impl Interp<'_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A matched object pattern's promotion of the switched variable
+    /// (official `promoteForPattern`, flow_analysis.dart:7703-7755, fed by
+    /// `analyzeObjectPattern` — shared type_analyzer.dart:1749-1772 — with
+    /// the pattern's downward-inferred required type). The match splits
+    /// matched/unmatched through the same [`Interp::branch_type_test`]
+    /// port as an `is` test (`tryPromoteForTypeCheck`): the matched arm is
+    /// what the clause's guard and body run on — the official order is
+    /// pattern → guard → body, so the guard of the same clause sees the
+    /// promotion — and the failed arm joins the unmatched chain when the
+    /// match can fail (official `coversMatchedType` gate), so the next
+    /// clause and the post-switch state see the unpromoted variable. A
+    /// nullability-disjoint pair kills the matched path (official
+    /// `cannotMatch` → `setUnreachable`): the case body is dead.
+    pub(crate) fn matched_object_pattern(&mut self, name: u32, args: u32) {
+        // A top-level pattern constrains the matched value; a field's
+        // sub-pattern constrains that field (the official sub-pattern face
+        // runs under pushPropertySubpattern) and promotes nothing here.
+        if self.pattern_depth != 1 {
+            return;
+        }
+        // The promotion target: the switch scrutinee (statement or
+        // expression alternative), or the pattern context's own matched
+        // value — an if-case's condition or a declaration's initializer
+        // (the official `promoteForPattern` runs in every context, over
+        // the matched value's reference). The kind gate keeps an if-case
+        // nested in a case body from latching the switch frame's
+        // scrutinee; the if-case context retypes from Decl only at
+        // `ThenBegin`, after the pattern walk, so both standalone kinds
+        // read the context's scrutinee slot here.
+        let var = match self.pattern.as_ref().map(|p| p.kind) {
+            Some(PatternKind::Switch | PatternKind::SwitchExpr) => {
+                self.switch_frame()
+                    .and_then(|index| match &self.stack[index] {
+                        Frame::Switch { scrutinee, .. } => *scrutinee,
+                        _ => None,
+                    })
+            }
+            Some(PatternKind::IfCase | PatternKind::Decl) => {
+                self.pattern.as_ref().and_then(|p| p.scrutinee)
+            }
+            None => None,
+        };
+        let Some(var) = var else {
+            return;
+        };
+        let known = Ty {
+            base: Base::Name(name),
+            nullable: false,
+        };
+        let model = self.current.model(var);
+        let matched = self.promoted_type_of(var, &model);
+        let candidate = self.pattern_promotion_candidate(var, known, args);
+        let (matched_arm, unmatched_arm) = self.branch_type_test(var, known, args, candidate);
+        self.current = matched_arm;
+        if self.disjoint_by_nullability(matched, known) {
+            self.unreachable_cur();
+        }
+        if !self.ops.is_subtype(matched, known)
+            && let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone())
+        {
+            let joined = self.join(Some(chain), Some(unmatched_arm));
+            if let Some(pattern) = self.pattern.as_mut() {
+                pattern.unmatched = joined;
+            }
+        }
+    }
+
+    /// The pattern-face promotion candidate (official
+    /// `tryPromoteForTypeCheck`'s true arm reached through
+    /// `promoteForPattern`): the pattern type factored against every
+    /// standing promotion ([`Interp::factored_candidate`]). The argument
+    /// gate cuts to same-base shapes — the written-vs-declared comparison
+    /// is the raw-spelling question (`case List():` against `List<int> x`
+    /// spells `List<dynamic>`, the match can fail); across bases the
+    /// parameter lists are unrelated and the question is the undecidable
+    /// cross-type subtyping the is-test face answers optimistically.
+    /// The unparameterized head of a cross-base match (`case Some():` on
+    /// `Option<T>`) promotes: the official entry infers the required
+    /// type's arguments downward from the matched type
+    /// (`downwardInferObjectPatternRequiredType`), and the written
+    /// spelling stays the honest name-level stand-in.
+    fn pattern_promotion_candidate(&self, var: u32, tested: Ty, tested_args: u32) -> Option<Ty> {
+        match tested.base {
+            Base::Unknown | Base::Dynamic | Base::Void => None,
+            _ => {
+                if let Some(meta) = self.vars.get(var as usize)
+                    && meta.ty.base == tested.base
+                    && !self.args_admit(tested, tested_args, meta.args)
+                {
+                    return None;
+                }
+                self.factored_candidate(var, tested)
+            }
         }
     }
 

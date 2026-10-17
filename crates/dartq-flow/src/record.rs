@@ -46,6 +46,14 @@ pub struct Flow<'t> {
     /// structurally, so equal spellings share one entry and the promotion
     /// gate's id comparison is tree equality (#611 step 4).
     pub(crate) type_args: Vec<Vec<crate::ty::ArgTy>>,
+    /// The interned non-promotion entry rows of the unit; index 0 is the
+    /// reserved empty row (upstream's empty `whyNotPromoted` map — a
+    /// consumer renders nothing). Each row is the ordered
+    /// `(type, args, cause)` list behind one fact row's `entries` id —
+    /// the `computeWhyNotPromotedMessages` producer's data. Per
+    /// executable the interpreter folds its own pool into here at
+    /// `exec_end`, rebasing the facts' ids.
+    non_promotions: Vec<Vec<crate::facts::NonPromotionEntry>>,
     /// The interned argument list of the type row that fires next:
     /// `end_type_arguments` sets it, `handle_type` consumes it,
     /// `handle_no_type_arguments` clears it — all three fire immediately
@@ -80,7 +88,82 @@ pub struct Flow<'t> {
     /// [`Flow::end_conditional_expression_then_arm`], consumed by the
     /// argless colon call that follows it.
     cond_then: Option<(TokenSpan, u32)>,
+    /// Declared-bound nullability faces by interned type-parameter name
+    /// (see [`crate::ty::Boundary`]). Commits accumulate within one
+    /// top-level declaration (class members see the class's parameters;
+    /// later commits shadow earlier ones — the name-level model is
+    /// spelling-keyed) and the table clears at the declaration's end, so
+    /// an executable's replay always sees exactly its enclosing
+    /// declaration's parameters. Absent rows keep the pre-#1077 behavior.
+    boundaries: Vec<Option<crate::ty::Boundary>>,
+    /// Open type-variable completions (`begin_type_variable` brackets):
+    /// gates the bound-shape capture and pairs begun names with their
+    /// ends, which complete in reverse declaration order (the parser
+    /// rewinds per bound, `type_args.rs` completion loop) — a pop pairs
+    /// correctly in both the single-variable and the group protocol.
+    tv_open: u32,
+    /// Begun type-variable names, innermost last (`end_type_variable`'s
+    /// token argument is the name only in the group protocol — the
+    /// single-variable path passes the closer — so the begin latches).
+    tv_names: Vec<u32>,
+    /// The completing variable's captured bound face. A bound's shape can
+    /// arrive as several events (`void` return keyword, nested argument
+    /// ends, the head row); the last writer of the completion step wins —
+    /// the head row and `end_function_type` always fire last for their
+    /// own type.
+    tv_bound: Option<crate::ty::Boundary>,
+    /// Saved `tv_bound` of the enclosing type-variable completion: a
+    /// generic-function-type bound parses its own type-variable group
+    /// inside the outer completion, and the inner group's commits must
+    /// not consume the outer bound's capture.
+    tv_saved: Vec<Option<crate::ty::Boundary>>,
+    /// Inside a record-type spelling: its field rows are head rows (no
+    /// argument group) and must not capture the enclosing bound's face —
+    /// a record bound has no head row of its own, so it degrades.
+    tv_in_record: bool,
+    /// The unit's captured top-level variable declarations (name id → the
+    /// written type face): the fold's top-level read fallback, the lexical
+    /// chain's outermost scope (official unqualified-name lookup: the
+    /// scope chain first, the implicit-`this` face only past it — upstream
+    /// Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/property_element_resolver.dart:2137-2139).
+    /// Top-level declarations parse with no recording buffer open, so
+    /// their events reach no replay; the recorder captures them as a
+    /// parse side-effect. Class-like members never enter (the capture is
+    /// gated on [`Flow::container_depth`]) — instance and static fields
+    /// keep the implicit-`this` read face. A declaration parsed after an
+    /// executable (a forward reference) is captured too late for that
+    /// executable's replay and under-reports there.
+    top_level: FxHashMap<u32, TopVar>,
+    /// The header type row of the declaration now parsing outside any
+    /// executable: `Type`/`NoType` fire immediately before
+    /// `begin_variables_declaration`, and a function-type/void header
+    /// clears the latch (its own return/parameter rows must not leak), so
+    /// an untyped or function-typed header answers unknown.
+    top_last_type: Option<(crate::ty::Ty, u32)>,
+    /// The captured header face of the top-level variables declaration
+    /// now open (`begin_variables_declaration` .. `end_variables_declaration`);
+    /// every declarator of the list reads it.
+    top_decl: Option<TopVar>,
+    /// Open class-like containers (class/mixin/enum/extension/extension
+    /// type): a variables declaration under one is a member, not a
+    /// top-level declaration.
+    container_depth: usize,
+    /// The recording [`Flow::begin_variable_initializer`] opened for a
+    /// declaration outside any executable (a field or top-level
+    /// initializer is its own executable — the official folds it):
+    /// [`Flow::end_variable_initializer`] closes it.
+    initializer_exec: bool,
     facts: Vec<FlowFact>,
+}
+
+/// One captured top-level variable declaration's read face: the written
+/// type (name-level). Untyped headers answer unknown — the initializer's
+/// inferred type is the type layer's increment.
+#[derive(Clone, Copy)]
+pub(crate) struct TopVar {
+    pub(crate) ty: crate::ty::Ty,
+    pub(crate) args: u32,
 }
 
 impl<'t> Flow<'t> {
@@ -93,6 +176,7 @@ impl<'t> Flow<'t> {
             names_by_id: Vec::new(),
             type_arg_groups: Vec::new(),
             type_args: vec![Vec::new()],
+            non_promotions: vec![Vec::new()],
             pending_type_args: crate::ty::EMPTY_ARGS,
             pending_label_ref: None,
             pending_labels: Vec::new(),
@@ -103,6 +187,17 @@ impl<'t> Flow<'t> {
             do_body_is_block: false,
             exec_depth: 0,
             cond_then: None,
+            boundaries: Vec::new(),
+            tv_open: 0,
+            tv_names: Vec::new(),
+            tv_bound: None,
+            tv_saved: Vec::new(),
+            tv_in_record: false,
+            top_level: FxHashMap::default(),
+            top_last_type: None,
+            top_decl: None,
+            container_depth: 0,
+            initializer_exec: false,
             facts: Vec::new(),
         }
     }
@@ -168,24 +263,115 @@ impl<'t> Flow<'t> {
         // allocate; the owning key is built only on first sight.
         if self.tokens.get(index).is_some() {
             let lexeme = self.tokens.lexeme(self.source, index);
-            if let Some(&id) = self.names.get(lexeme) {
+            self.intern_lexeme(lexeme)
+        } else {
+            // Parser-inserted synthetic tokens key on the token handle.
+            let key: Box<str> = format!("#{}", token.id).into();
+            if let Some(&id) = self.names.get(&key) {
                 return id;
             }
             let id = u32::try_from(self.names.len()).expect("interned name count fits u32");
-            let key: Box<str> = lexeme.into();
             self.names_by_id.push(key.clone());
             self.names.insert(key, id);
-            return id;
+            id
         }
-        // Parser-inserted synthetic tokens key on the token handle.
-        let key: Box<str> = format!("#{}", token.id).into();
-        if let Some(&id) = self.names.get(&key) {
+    }
+
+    /// Interns a lexeme directly — the core-name face for spellings the
+    /// file may never write (the implicit `Object?` bound's promotion
+    /// target). Written occurrences share the id, so `Base::Name` equality
+    /// stays lexeme equality.
+    fn intern_lexeme(&mut self, lexeme: &str) -> u32 {
+        if let Some(&id) = self.names.get(lexeme) {
             return id;
         }
         let id = u32::try_from(self.names.len()).expect("interned name count fits u32");
+        let key: Box<str> = lexeme.into();
         self.names_by_id.push(key.clone());
         self.names.insert(key, id);
         id
+    }
+
+    /// Whether a bound-shape event may capture: inside a type-variable
+    /// completion and not within a record-type spelling.
+    fn tv_capturing(&self) -> bool {
+        self.tv_open > 0 && !self.tv_in_record
+    }
+
+    /// Captures the completing variable's bound face from a head type row
+    /// (`handle_type` with no open argument group) — the last shape event
+    /// of a non-function bound, so it wins over any nested argument's
+    /// earlier capture. Undecidable shapes capture nothing: the parameter
+    /// keeps the pre-#1077 behavior.
+    fn capture_bound_type(&mut self, base: crate::ty::Base, nullable: bool, args: u32) {
+        let Some((class, target)) = self.bound_face(base, nullable, args) else {
+            return;
+        };
+        self.tv_bound = Some(crate::ty::Boundary { class, target });
+    }
+
+    /// The nullability face of one type spelling beside its promotion
+    /// target — the name-level reduction of the official subtype question
+    /// (`T <: Object` per upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/subtype.dart:303-325, `FutureOr<S>
+    /// <: Object` iff `S <: Object`, top types excluded by :290-296).
+    /// `None` when the spelling carries no derivable face.
+    fn bound_face(
+        &self,
+        base: crate::ty::Base,
+        nullable: bool,
+        args: u32,
+    ) -> Option<(crate::ty::Classification, Option<(crate::ty::Ty, u32)>)> {
+        use crate::ty::Base as B;
+        use crate::ty::Classification as C;
+        if nullable {
+            // `B? <: Object` fails; the non-null face is the bound
+            // without its `?` (type_system.dart:1497).
+            return Some(match base {
+                B::Dynamic | B::Void | B::Unknown | B::Null => (C::PotentiallyNullable, None),
+                B::Never => (C::NullOrEquivalent, None),
+                other @ B::Name(_) => (
+                    C::PotentiallyNullable,
+                    Some((
+                        crate::ty::Ty {
+                            base: other,
+                            nullable: false,
+                        },
+                        args,
+                    )),
+                ),
+            });
+        }
+        match base {
+            // Top types include `null` among their values; an unknown
+            // shape classifies potentially-nullable like the official
+            // invalid-type arm.
+            B::Dynamic | B::Void | B::Unknown => Some((C::PotentiallyNullable, None)),
+            // `Null <: Null`.
+            B::Null => Some((C::NullOrEquivalent, None)),
+            B::Name(id) if self.name_lexeme(id) == "FutureOr" => {
+                // The face follows the single argument's; a nested
+                // `FutureOr` recurses. `FutureOr<Null>` reduces to
+                // potentially-nullable here (its null-or-equivalent face
+                // is left on the table — conservative in the live
+                // direction). The promotion target is none: the bound is
+                // `?`-less, so `NonNull` collapses to itself.
+                let row = self.type_args.get(args as usize)?;
+                if row.len() != 1 {
+                    return None; // malformed `FutureOr` spelling: degrade
+                }
+                let argument = row[0];
+                let class =
+                    match self.bound_face(argument.base, argument.nullable, argument.args)? {
+                        (C::NonNullable, _) => C::NonNullable,
+                        _ => C::PotentiallyNullable,
+                    };
+                Some((class, None))
+            }
+            // `Never <: Object`; any other non-nullable named bound is a
+            // subtype of `Object` too.
+            B::Never | B::Name(_) => Some((C::NonNullable, None)),
+        }
     }
 
     /// The lexeme of an interned name id — the recovery face turning
@@ -208,6 +394,73 @@ impl<'t> Flow<'t> {
         &self.type_args[id as usize]
     }
 
+    /// The non-promotion entries interned at arena `id` — the cross-crate
+    /// read face of the why-not-promoted fact rows' `entries` (#1830).
+    /// Index 0 (the reserved empty row) reads as the empty slice — the
+    /// official empty-map path (`flow_analysis.dart:8858`), where a
+    /// consumer renders nothing. A fact row only ever carries ids this
+    /// recorder interned, so an out-of-range id is a program bug.
+    #[must_use]
+    pub fn non_promotion_at(&self, id: u32) -> &[crate::facts::NonPromotionEntry] {
+        &self.non_promotions[id as usize]
+    }
+
+    /// The structured non-promotion reasons behind one fact row — the
+    /// `computeWhyNotPromotedMessages` producer's entry point
+    /// (`type_analyzer.dart:772`): match the row's own identity fields
+    /// (read span, member name, receiver), then read its ordered
+    /// `(type, args, cause)` entries here — no flow-graph re-walk.
+    /// `None` for fact rows that carry no non-promotion face.
+    #[must_use]
+    pub fn non_promotion_context(
+        &self,
+        fact: &FlowFact,
+    ) -> Option<&[crate::facts::NonPromotionEntry]> {
+        match fact {
+            FlowFact::WhyNotPromoted { entries, .. }
+            | FlowFact::NonPromotedPropertyRead { entries, .. }
+            | FlowFact::ThisNotPromoted { entries, .. } => Some(self.non_promotion_at(*entries)),
+            _ => None,
+        }
+    }
+
+    /// The structured non-promotion reasons behind one fact row, resolved
+    /// to the five-variant shape ([`crate::facts::NonPromotionReason`])
+    /// the context-message producer renders from
+    /// (`computeWhyNotPromotedMessages`, `type_analyzer.dart:772`). The
+    /// recorded write/suspension links pass through with their anchors;
+    /// the property family resolves through `property` — the diagnoser's
+    /// element-layer verdict for the row's member, the mirror of
+    /// upstream's `whyPropertyIsNotPromotable` operation (upstream Dart
+    /// SDK source,
+    /// pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:8769-8772):
+    /// `Some(why)` is `PropertyNotPromotedForInherentReason`, `None` is
+    /// `PropertyNotPromotedForNonInherentReason` (a library-level
+    /// conflicting declaration, field promotion disabled, or both). A
+    /// public member name answers
+    /// [`crate::facts::PropertyNonPromotability::NotPrivate`] statically.
+    /// Consulted only for rows carrying property evidence
+    /// ([`FlowFact::NonPromotedPropertyRead`]); variable and `this` rows
+    /// never read it.
+    ///
+    /// Rows without a non-promotion face answer empty, as does the
+    /// reserved empty entries row — the official empty-map path
+    /// (`flow_analysis.dart:8858`).
+    #[must_use]
+    pub fn non_promotion_reasons(
+        &self,
+        fact: &FlowFact,
+        property: Option<crate::facts::PropertyNonPromotability>,
+    ) -> Vec<crate::facts::NonPromotionReason> {
+        let Some(entries) = self.non_promotion_context(fact) else {
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .map(|entry| crate::facts::NonPromotionReason::resolve(entry.cause, property))
+            .collect()
+    }
+
     /// Takes the pending label reference if one is set (break/continue
     /// with a target).
     fn take_label(&mut self, has_target: bool) -> Option<u32> {
@@ -226,6 +479,13 @@ impl<'t> Flow<'t> {
             | FlowFact::UnassignedRead { span, .. }
             | FlowFact::PromotedRead { span, .. }
             | FlowFact::ReadType { span, .. }
+            | FlowFact::ConditionType { span, .. }
+            | FlowFact::MatchedType { span, .. }
+            | FlowFact::AsyncContextUse { span, .. }
+            | FlowFact::PromotedPropertyRead { span }
+            | FlowFact::WhyNotPromoted { span, .. }
+            | FlowFact::NonPromotedPropertyRead { span, .. }
+            | FlowFact::ThisNotPromoted { span, .. }
             | FlowFact::BodyMayCompleteNormally { span } => span.range.offset,
             FlowFact::WriteSite { decl_name_span, .. } => decl_name_span.offset,
         });
@@ -299,9 +559,26 @@ impl<'t> Flow<'t> {
         let Some(events) = self.buffer.take() else {
             return;
         };
+        // The async-gap context face ids first (interning borrows the
+        // recorder mutably; the interpreter below borrows its type tables).
+        let (context_ty, state_ty, mounted, context_name) = (
+            self.intern_lexeme("BuildContext"),
+            self.intern_lexeme("State"),
+            self.intern_lexeme("mounted"),
+            self.intern_lexeme("context"),
+        );
         let ops = NameTypeOps;
-        let mut interp = Interp::new(&ops, &self.type_args);
+        let mut interp = Interp::new(&ops, &self.type_args, &self.boundaries);
+        // The unit's top-level read face (captured so far — declarations
+        // parsed after this executable under-report there).
+        interp.top_level = &self.top_level;
         interp.run(&events);
+        // The async-gap context face: one linear replay over the same
+        // buffer (the ids are interned lazily — already-present names keep
+        // their ids, so existing name-id assertions never shift).
+        let gap = crate::async_gap::GapPass::new(context_ty, state_ty, mounted, context_name)
+            .run(&events);
+        interp.facts.extend(gap.facts);
         // The outermost body's fall-through completion: after `run` the
         // interpreter's current state IS the body's exit state (official
         // `checkForBodyMayCompleteNormally`'s reachability gate,
@@ -309,6 +586,34 @@ impl<'t> Flow<'t> {
         // own `ExecEnd` inside the replay).
         if interp.reachable() {
             interp.emit(FlowFact::BodyMayCompleteNormally { span: end });
+        }
+        // The non-promotion entry rows: append this executable's pool after
+        // the unit's reserved empty row and rebase the facts' ids (the
+        // interpreter's row 1 becomes the unit arena's next slot; its
+        // reserved 0 stays 0).
+        if interp.non_promotions.len() > 1 {
+            let base = self.non_promotions.len();
+            self.non_promotions.extend(interp.non_promotions.drain(1..));
+            for fact in &mut interp.facts {
+                match fact {
+                    FlowFact::WhyNotPromoted { entries, .. }
+                    | FlowFact::NonPromotedPropertyRead { entries, .. }
+                    | FlowFact::ThisNotPromoted { entries, .. } => {
+                        *entries = if *entries == 0 {
+                            0
+                        } else {
+                            #[expect(
+                                clippy::cast_possible_truncation,
+                                reason = "arena index; a unit with 2^32 \
+                                          demotion contexts cannot parse"
+                            )]
+                            let base = base as u32;
+                            base + *entries - 1
+                        };
+                    }
+                    _ => {}
+                }
+            }
         }
         self.facts.append(&mut interp.facts);
     }
@@ -427,6 +732,106 @@ impl ParserListener for Flow<'_> {
         self.exec_end(true, end);
     }
 
+    // —— class-like containers ————————————————————————————————————————
+
+    // The container depth gates the top-level capture (see `top_level`):
+    // a variables declaration under any class-like container is a member,
+    // never a top-level variable. A named mixin application declares no
+    // body and is not counted.
+    fn begin_class_declaration(
+        &mut self,
+        _begin: Token,
+        _abstract_kw: Option<Token>,
+        _sealed_kw: Option<Token>,
+        _base_kw: Option<Token>,
+        _interface_kw: Option<Token>,
+        _final_kw: Option<Token>,
+        _augment_kw: Option<Token>,
+        _mixin_kw: Option<Token>,
+        _name: Token,
+    ) {
+        self.container_depth += 1;
+    }
+
+    fn end_class_declaration(&mut self, _begin: Token, _end: Token) {
+        self.container_depth = self.container_depth.saturating_sub(1);
+    }
+
+    fn begin_mixin_declaration(
+        &mut self,
+        _begin: Token,
+        _augment_kw: Option<Token>,
+        _base_kw: Option<Token>,
+        _mixin: Token,
+        _name: Token,
+    ) {
+        self.container_depth += 1;
+    }
+
+    fn end_mixin_declaration(&mut self, _begin: Token, _end: Token) {
+        self.container_depth = self.container_depth.saturating_sub(1);
+    }
+
+    fn begin_enum_declaration(
+        &mut self,
+        _begin: Token,
+        _augment_kw: Option<Token>,
+        _enum_keyword: Token,
+        _name: Token,
+    ) {
+        self.container_depth += 1;
+    }
+
+    fn end_enum_declaration(
+        &mut self,
+        _begin: Token,
+        _enum_keyword: Token,
+        _left_brace: Token,
+        _member_count: usize,
+        _end: Token,
+    ) {
+        self.container_depth = self.container_depth.saturating_sub(1);
+    }
+
+    fn begin_extension_declaration(
+        &mut self,
+        _augment: Option<Token>,
+        _extension_keyword: Token,
+        _name: Option<Token>,
+    ) {
+        self.container_depth += 1;
+    }
+
+    fn end_extension_declaration(
+        &mut self,
+        _begin: Token,
+        _extension_keyword: Token,
+        _on: Option<Token>,
+        _end: Token,
+    ) {
+        self.container_depth = self.container_depth.saturating_sub(1);
+    }
+
+    fn begin_extension_type_declaration(
+        &mut self,
+        _augment_kw: Option<Token>,
+        _extension_keyword: Token,
+        _name: Token,
+    ) {
+        self.container_depth += 1;
+    }
+
+    fn end_extension_type_declaration(
+        &mut self,
+        _begin: Token,
+        _augment_kw: Option<Token>,
+        _extension_keyword: Token,
+        _type_keyword: Token,
+        _end: Token,
+    ) {
+        self.container_depth = self.container_depth.saturating_sub(1);
+    }
+
     // —— bodies ————————————————————————————————————————————————————————
 
     fn begin_block_function_body(&mut self, _token: Token) {
@@ -542,6 +947,7 @@ impl ParserListener for Flow<'_> {
     fn end_formal_parameter(
         &mut self,
         _var_or_final: Option<Token>,
+        _covariant_kw: Option<Token>,
         this_keyword: Option<Token>,
         _super_keyword: Option<Token>,
         _period: Option<Token>,
@@ -560,13 +966,12 @@ impl ParserListener for Flow<'_> {
     }
 
     fn end_function_typed_formal_parameter(&mut self, token: Token, _question: Option<Token>) {
-        // The official event's token is the parameter name position.
-        let name = self.name(token);
-        self.record(Ev::Formal {
-            name,
-            this_or_super: false,
-            token,
-        });
+        // The formal's own `end_formal_parameter` follows this event and
+        // records `Ev::Formal` — recording one here too would double the
+        // declaration (the second read finds an empty `pending_ty` and
+        // redeclares the variable `Unknown`, #1758: `f()?.m()`'s receiver
+        // classification then misses the written return type).
+        let _ = self.name(token);
     }
 
     // —— local declarations —————————————————————————————————————————————
@@ -590,10 +995,20 @@ impl ParserListener for Flow<'_> {
             is_final,
             span: token,
         });
+        // Top-level capture: outside any executable and outside every
+        // class-like container the list declares top-level variables — its
+        // header face joins the fold's top-level read table (the first
+        // intern of a name wins; a redeclaration is the
+        // duplicate-definition error's territory, not the read face's).
+        let header = self.top_last_type.take();
+        if self.buffer.is_none() && self.container_depth == 0 {
+            self.top_decl = header.map(|(ty, args)| TopVar { ty, args });
+        }
     }
 
     fn end_variables_declaration(&mut self, _count: usize, end: Option<Token>) {
         self.record(Ev::VarDeclEnd);
+        self.top_decl = None;
         if let Some(end) = end {
             self.record(Ev::StmtEnd {
                 end: end.range.end(),
@@ -603,6 +1018,11 @@ impl ParserListener for Flow<'_> {
 
     fn begin_initialized_identifier(&mut self, token: Token) {
         let name = self.name(token);
+        // The top-level read table gains the declarator (the capture gate
+        // is `begin_variables_declaration`'s).
+        if let Some(header) = self.top_decl {
+            self.top_level.entry(name).or_insert(header);
+        }
         self.record(Ev::InitializedIdent { name, token });
     }
 
@@ -616,11 +1036,28 @@ impl ParserListener for Flow<'_> {
     }
 
     fn begin_variable_initializer(&mut self, _token: Token) {
+        // A declaration outside any executable folds its initializer as
+        // its own executable (the official analyzes field and top-level
+        // initializers): the buffer opens here, and reads of earlier
+        // top-level declarations inside it publish their rows through the
+        // top-level read table.
+        if self.buffer.is_none() {
+            self.exec_begin(false);
+            self.initializer_exec = true;
+        }
         self.record(Ev::InitializerBegin);
     }
 
-    fn end_variable_initializer(&mut self, _token: Token) {
+    fn end_variable_initializer(&mut self, token: Token) {
         self.record(Ev::InitializerEnd);
+        // The `=` token anchors the initializer's body-completion fact;
+        // the semantic layer stages completions by exact executable end
+        // span, so the initializer face's row (never staged) drops
+        // silently there.
+        if self.initializer_exec {
+            self.initializer_exec = false;
+            self.exec_end(false, token);
+        }
     }
 
     fn handle_pattern_variable_declaration_statement(
@@ -671,7 +1108,24 @@ impl ParserListener for Flow<'_> {
                 args,
             });
         }
-        self.record(Ev::Type { base, nullable, args });
+        self.record(Ev::Type {
+            base,
+            nullable,
+            args,
+        });
+        // The top-level header latch (see `top_last_type`): a declaration
+        // outside any executable reads the row that immediately precedes
+        // it.
+        if self.buffer.is_none() {
+            self.top_last_type = Some((crate::ty::Ty { base, nullable }, args));
+        }
+        // A head row (no open argument group) inside a type-variable
+        // completion is that variable's bound — the definitive face for
+        // every non-function shape (it fires last: after the bound's own
+        // argument groups, and after any nested function-type capture).
+        if self.type_arg_groups.is_empty() && self.tv_capturing() {
+            self.capture_bound_type(base, nullable, args);
+        }
     }
 
     fn begin_type_arguments(&mut self, _token: Token) {
@@ -691,14 +1145,133 @@ impl ParserListener for Flow<'_> {
 
     fn handle_no_type(&mut self, _last_consumed: Token) {
         self.record(Ev::NoType);
+        // An untyped header answers unknown (the latch clears).
+        if self.buffer.is_none() {
+            self.top_last_type = None;
+        }
     }
 
-    fn end_function_type(&mut self, _function: Token, _question: Option<Token>) {
+    fn end_function_type(&mut self, _function: Token, question: Option<Token>) {
         self.record(Ev::FunctionType);
+        // A function-typed header has no name-level row; its own
+        // return/parameter rows must not leak into the latch.
+        if self.buffer.is_none() {
+            self.top_last_type = None;
+        }
+        // A function-type bound's definitive face: fires after its return
+        // keyword and any nested argument captures, so it wins. (A `void`
+        // return's earlier capture is overwritten here.)
+        if self.tv_capturing() {
+            self.tv_bound = Some(crate::ty::Boundary {
+                class: if question.is_some() {
+                    crate::ty::Classification::PotentiallyNullable
+                } else {
+                    crate::ty::Classification::NonNullable
+                },
+                target: None,
+            });
+        }
     }
 
     fn handle_void_keyword(&mut self, _token: Token) {
         self.record(Ev::VoidType);
+        // A void header never types a variable; the latch clears so the
+        // next declaration's face decides.
+        if self.buffer.is_none() {
+            self.top_last_type = None;
+        }
+        // A bare `void` bound's provisional face (a top type); a
+        // function-type bound overwrites at its own end event.
+        if self.tv_capturing() {
+            self.tv_bound = Some(crate::ty::Boundary {
+                class: crate::ty::Classification::PotentiallyNullable,
+                target: None,
+            });
+        }
+    }
+
+    // —— type variables (declared-bound nullability, #1077) ————————————
+
+    fn begin_type_variables(&mut self, _token: Token) {}
+
+    fn end_type_variables(&mut self, _begin: Token, _end: Token) {
+        // The group is complete: drop any recovery-desynced state (the
+        // committed boundaries survive — they belong to the declaration).
+        self.tv_open = 0;
+        self.tv_names.clear();
+        self.tv_bound = None;
+        self.tv_saved.clear();
+    }
+
+    fn begin_type_variable(&mut self, token: Token) {
+        let id = self.name(token);
+        self.tv_open += 1;
+        self.tv_names.push(id);
+        // A generic-function-type bound opens its own group inside the
+        // enclosing completion; the outer bound's partial capture is none
+        // of the inner variable's business.
+        self.tv_saved.push(self.tv_bound.take());
+    }
+
+    fn end_type_variable(
+        &mut self,
+        _token: Token,
+        _index: usize,
+        extends_or_super: Option<Token>,
+        _variance: Option<Token>,
+    ) {
+        let Some(id) = self.tv_names.pop() else {
+            return;
+        };
+        let boundary = if extends_or_super.is_some() {
+            self.tv_bound.take()
+        } else {
+            // No extends clause: the implicit bound is `Object?` (the
+            // subtype rule's default, subtype.dart:313) — potentially
+            // nullable, promoting to `T & Object` on a null check.
+            let object = self.intern_lexeme("Object");
+            Some(crate::ty::Boundary {
+                class: crate::ty::Classification::PotentiallyNullable,
+                target: Some((
+                    crate::ty::Ty {
+                        base: crate::ty::Base::Name(object),
+                        nullable: false,
+                    },
+                    crate::ty::EMPTY_ARGS,
+                )),
+            })
+        };
+        if let Some(boundary) = boundary {
+            let index = id as usize;
+            if self.boundaries.len() <= index {
+                self.boundaries.resize(index + 1, None);
+            }
+            self.boundaries[index] = Some(boundary);
+        }
+        self.tv_bound = self.tv_saved.pop().flatten();
+        self.tv_open -= 1;
+    }
+
+    fn begin_record_type(&mut self, _left_paren: Token) {
+        self.tv_in_record = true;
+    }
+
+    fn end_record_type(
+        &mut self,
+        _left_paren: Token,
+        _question: Option<Token>,
+        _count: usize,
+        _has_named_fields: bool,
+    ) {
+        self.tv_in_record = false;
+    }
+
+    fn end_top_level_declaration(&mut self, _end: Token) {
+        self.boundaries.clear();
+    }
+
+    fn handle_invalid_top_level_declaration(&mut self, _end: Token) {
+        self.boundaries.clear();
     }
 
     // —— statements ——————————————————————————————————————————————————————
@@ -866,18 +1439,28 @@ impl ParserListener for Flow<'_> {
 
     fn end_yield_statement(&mut self, begin: Token, _star: Option<Token>, end: Token) {
         self.record(Ev::YieldBegin { span: begin });
-        self.record(Ev::YieldEnd);
+        self.record(Ev::YieldEnd {
+            span: dartq_source::SourceRange {
+                offset: begin.range.offset,
+                length: end.range.end().saturating_sub(begin.range.offset),
+            },
+        });
         self.record(Ev::StmtEnd {
             end: end.range.end(),
         });
     }
 
-    fn begin_await_expression(&mut self, _token: Token) {
-        self.record(Ev::AwaitBegin);
+    fn begin_await_expression(&mut self, token: Token) {
+        self.record(Ev::AwaitBegin { token });
     }
 
-    fn end_await_expression(&mut self, _begin: Token, _end: Token) {
-        self.record(Ev::AwaitEnd);
+    fn end_await_expression(&mut self, begin: Token, end: Token) {
+        self.record(Ev::AwaitEnd {
+            span: dartq_source::SourceRange {
+                offset: begin.range.offset,
+                length: end.range.end().saturating_sub(begin.range.offset),
+            },
+        });
     }
 
     fn handle_break_statement(&mut self, has_target: bool, break_kw: Token, end: Token) {
@@ -1062,13 +1645,16 @@ impl ParserListener for Flow<'_> {
 
     fn end_switch_expression_case(
         &mut self,
-        _begin: Token,
+        begin: Token,
         when: Option<Token>,
         _arrow: Token,
         _end: Token,
     ) {
         self.record(Ev::SwitchExprCaseEnd {
             has_guard: when.is_some(),
+            // The alternative's first token: the matched-type row's clause
+            // anchor (#1349).
+            begin,
         });
     }
 
@@ -1177,7 +1763,7 @@ impl ParserListener for Flow<'_> {
     }
 
     fn handle_this_expression(&mut self, token: Token, _context: IdentifierContext) {
-        self.record(Ev::OtherExpr { span: token });
+        self.record(Ev::This { span: token });
     }
 
     fn handle_super_expression(&mut self, token: Token, _context: IdentifierContext) {
@@ -1226,8 +1812,8 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::IsEnd);
     }
 
-    fn begin_as_operator_type(&mut self, _operator: Token) {
-        self.record(Ev::AsBegin);
+    fn begin_as_operator_type(&mut self, operator: Token) {
+        self.record(Ev::AsBegin { span: operator });
     }
 
     fn end_as_operator_type(&mut self, _operator: Token) {
@@ -1238,10 +1824,21 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::AsOperator);
     }
 
-    fn handle_assignment_expression(&mut self, operator: Token, _end: Token) {
+    fn handle_assignment_expression(&mut self, operator: Token, end: Token) {
+        // The end token is the updater expression's end — the anchor the
+        // dead-updater row needs (header parts carry no statement wrapper,
+        // dead_code_verifier.dart:361-375's `updaters.endToken`).
         self.record(Ev::Assign {
             plain: self.is_plain_assign(operator),
+            end: end.range.end(),
         });
+    }
+
+    fn handle_unary_prefix_assignment_expression(&mut self, operator: Token) {
+        // The operator's span begins the dead-updater row; its end folds
+        // from the operand's events (the parser reports the prefix
+        // assignment after the operand parse).
+        self.record(Ev::UnaryPrefixAssign { span: operator });
     }
 
     fn handle_unary_postfix_assignment_expression(&mut self, operator: Token) {
@@ -1327,10 +1924,19 @@ impl ParserListener for Flow<'_> {
         });
     }
 
-    fn handle_dot_access(&mut self, _token: Token, _end: Token, is_null_aware: bool) {
+    fn handle_dot_access(&mut self, _token: Token, member: Token, is_null_aware: bool) {
         self.record(Ev::DotAccess {
             null_aware: is_null_aware,
+            member,
         });
+    }
+
+    fn handle_null_aware_index_operand_begin(&mut self, _question: Token) {
+        self.record(Ev::NullAwareIndexOperandBegin);
+    }
+
+    fn handle_null_aware_member_begin(&mut self, _question: Token) {
+        self.record(Ev::NullAwareMemberBegin);
     }
 
     fn handle_indexed_expression(&mut self, question: Option<Token>, _open: Token, _close: Token) {
@@ -1375,8 +1981,13 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::RecordLitEnd { count });
     }
 
-    fn begin_cascade(&mut self, _operator: Token) {
-        self.record(Ev::CascadeBegin);
+    fn begin_cascade(&mut self, operator: Token) {
+        self.record(Ev::CascadeBegin {
+            null_aware: matches!(
+                self.kind(operator),
+                Some(dartq_scanner::TokenKind::QuestionPeriodPeriod)
+            ),
+        });
     }
 
     fn handle_cascade_access(&mut self, _operator: Token, _end: Token, is_null_aware: bool) {
@@ -1489,6 +2100,28 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::GuardEnd);
     }
 
+    fn handle_object_pattern(
+        &mut self,
+        first_identifier: Token,
+        dot: Option<Token>,
+        _second_identifier: Option<Token>,
+    ) {
+        // The bare `Type(...)` head is the pattern's type; a `Type.field`
+        // shorthand head names a member and constrains nothing here. The
+        // written arguments are taken, not read: the group completes with
+        // no head `handle_type` to consume them (the head is this event),
+        // so leaving them would leak into the next construct's type row.
+        // A typed field sub-pattern resets the pending list first, so a
+        // `Type<...>(field: Typed x)` head degrades to the bare spelling —
+        // under-precision, never a wrong non-empty tree.
+        let args = std::mem::take(&mut self.pending_type_args);
+        if dot.is_some() {
+            return;
+        }
+        let name = self.name(first_identifier);
+        self.record(Ev::ObjectPattern { name, args });
+    }
+
     // —— deliberately unrecorded faces ———————————————————————————————————
 
     fn handle_recoverable_error(&mut self, _message: Message, _start: Token, _end: Token) {}
@@ -1504,8 +2137,16 @@ impl ParserListener for Flow<'_> {
     fn handle_invalid_function_body(&mut self, _token: Token) {}
     fn handle_invalid_statement(&mut self, _begin: Token) {}
     fn begin_rethrow_statement(&mut self, _token: Token) {}
-    fn end_rethrow_statement(&mut self, _rethrow_kw: Token, _end: Token) {
+    fn end_rethrow_statement(&mut self, _rethrow_kw: Token, end: Token) {
         self.record(Ev::Rethrow);
+        // The statement-completion contract every other statement kind
+        // keeps: `StmtEnd` extends an open dead interval across the
+        // rethrow and refreshes the began-dead snapshot, so the statement
+        // AFTER a flow-killing `rethrow;` anchors its own row (the
+        // `throw 0;` path gets this from `handle_expression_statement`).
+        self.record(Ev::StmtEnd {
+            end: end.range.end(),
+        });
     }
 }
 

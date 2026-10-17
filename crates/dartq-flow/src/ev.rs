@@ -8,6 +8,7 @@
 //! initializers/condition/updaters regions by token offset.
 
 use dartq_parser::{IdentifierContext, TokenSpan};
+use dartq_source::SourceRange;
 
 /// Block kinds the interpreter distinguishes (subset of the parser's
 /// `BlockKind`): plain statement blocks scope locals and can be dead code.
@@ -175,9 +176,23 @@ pub enum Ev {
     YieldBegin {
         span: TokenSpan,
     },
-    YieldEnd,
-    AwaitBegin,
-    AwaitEnd,
+    YieldEnd {
+        /// The `yield` statement's own range (keyword through `;`) — the
+        /// `DemoteViaSuspension.node` anchor the suspension demotion
+        /// records.
+        span: SourceRange,
+    },
+    /// `token` is the `await` keyword: the async-gap face anchors the gap
+    /// segment it opens on it (the row's `gap_at`).
+    AwaitBegin {
+        token: TokenSpan,
+    },
+    AwaitEnd {
+        /// The `await` expression's own range (keyword through operand end)
+        /// — the `DemoteViaSuspension.node` anchor the suspension demotion
+        /// records.
+        span: SourceRange,
+    },
     Break {
         label: Option<u32>,
         span: TokenSpan,
@@ -252,6 +267,10 @@ pub enum Ev {
     SwitchExprCasePattern,
     SwitchExprCaseEnd {
         has_guard: bool,
+        /// The alternative's first token: the matched-type row's clause
+        /// anchor (the parser delivers no `case` keyword face on the
+        /// switch-expression path).
+        begin: TokenSpan,
     },
     AssertBegin {
         span: TokenSpan,
@@ -271,11 +290,27 @@ pub enum Ev {
     OtherExpr {
         span: TokenSpan,
     },
+    /// A `this` expression: distinguished from [`Ev::OtherExpr`] so the
+    /// async-gap face can read `this.mounted` as the State-side guard and
+    /// `this.context` as the State-side context value (upstream resolves
+    /// both through the `State` member); every other consumer treats it
+    /// exactly like [`Ev::OtherExpr`].
+    This {
+        span: TokenSpan,
+    },
     UnaryPrefix {
         is_not: bool,
     },
     NonNullAssert,
-    UnaryPrefixAssign,
+    /// Prefix `++`/`--` (`handleUnaryPrefixAssignmentExpression`): the
+    /// operator's span follows the operand's events (the parser reports
+    /// after the operand parse) and begins the dead-updater row; the row's
+    /// end folds from the operand's own spanned events (the part has no
+    /// `ExprStmt`/`StmtEnd` wrapper: the header parses bare
+    /// `parse_expression` lists).
+    UnaryPrefixAssign {
+        span: TokenSpan,
+    },
     /// Postfix `++`/`--` (`handleUnaryPostfixAssignmentExpression`): the
     /// operator's end is the updater expression's end — the anchor the
     /// dead-updater row needs (the part has no `ExprStmt`/`StmtEnd`
@@ -301,11 +336,21 @@ pub enum Ev {
     IsOperator {
         is_not: bool,
     },
-    AsBegin,
+    /// The `as` cast's type spelling begins; `span` is the `as` operator
+    /// token — the dead-window poll for a Never-typed operand's exit (the
+    /// official `checkUnreachableNode(node.type)` face,
+    /// type_analyzer.dart:2090).
+    AsBegin {
+        span: TokenSpan,
+    },
     AsEnd,
     AsOperator,
     Assign {
         plain: bool,
+        /// The assignment expression's end (`handleAssignmentExpression`'s
+        /// `end`): a dead updater's row ends here (`i = 0`, `i += 1` — the
+        /// header parts carry no statement wrapper).
+        end: u32,
     },
     PatternAssign,
     CondBegin,
@@ -325,7 +370,26 @@ pub enum Ev {
     },
     DotAccess {
         null_aware: bool,
+        /// The member expression's end token: a plain-identifier member is
+        /// exactly that token — the property rows' anchor (#1409), aligned
+        /// with the semantic member row's own span.
+        member: TokenSpan,
     },
+    /// The `?[` of a null-aware index selector was just consumed — the
+    /// receiver is the top of the expression stack and the operand's events
+    /// have not run yet (official `nullAwareAccess_rightBegin` timing,
+    /// flow_analysis.dart:9199). The skip-path state must be captured here:
+    /// by [`Ev::IndexAccess`] the operand's own `throw`/Never events have
+    /// already landed on `current`.
+    NullAwareIndexOperandBegin,
+    /// The `?.` of a null-aware member selector was just consumed — the
+    /// receiver is the top of the expression stack and the member's events
+    /// (including any invocation arguments) have not run yet. Same
+    /// `nullAwareAccess_rightBegin` timing as
+    /// [`Ev::NullAwareIndexOperandBegin`]: by [`Ev::DotAccess`] a
+    /// `throw`/Never inside `x?.m(throw _)`'s argument list has already
+    /// landed on `current`.
+    NullAwareMemberBegin,
     IndexAccess {
         null_aware: bool,
     },
@@ -360,7 +424,14 @@ pub enum Ev {
     /// One map entry (`k: v`) ended after its value's events: the key and
     /// value each left one expression value.
     MapEntryEnd,
-    CascadeBegin,
+    CascadeBegin {
+        /// The cascade operator is `?..` (official
+        /// `cascadeExpression_afterTarget`'s `isNullAware`): the sections
+        /// run on the target's not-null path and the skip state joins at
+        /// [`Ev::CascadeEnd`] (`nullAwareAccess_end`,
+        /// flow_analysis.dart:7400).
+        null_aware: bool,
+    },
     CascadeAccess {
         null_aware: bool,
     },
@@ -384,6 +455,20 @@ pub enum Ev {
     // —— patterns ——
     PatternBegin,
     PatternEnd,
+    /// An object pattern's head: `Some` in `case Some():`. The head type
+    /// constrains the matched value (official `analyzeObjectPattern`'s
+    /// `promoteForPattern`, shared type_analyzer.dart:1749-1772), so the
+    /// flow walk promotes the switched variable inside the matched clause.
+    /// Only the bare `Type(...)` shape records: a `Type.field` shorthand
+    /// head names a member, not a type (the same gate the semantic layer's
+    /// object-field face applies).
+    ObjectPattern {
+        /// The interned head type name.
+        name: u32,
+        /// The written type-argument tree (arena index; [`EMPTY_ARGS`]
+        /// when the head spells no arguments).
+        args: u32,
+    },
     ConstantPatternBegin,
     ConstantPatternEnd,
     DeclaredVarPattern {
@@ -452,7 +537,8 @@ impl Ev {
             | Ev::ExprStmt { span }
             | Ev::Break { span, .. }
             | Ev::Continue { span, .. }
-            | Ev::OtherExpr { span } => Some(*span),
+            | Ev::OtherExpr { span }
+            | Ev::This { span } => Some(*span),
             Ev::ForParts { right_sep, .. } => Some(*right_sep),
             Ev::Ident { token, .. } | Ev::Wildcard { token } => Some(*token),
             _ => None,

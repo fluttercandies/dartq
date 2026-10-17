@@ -18,11 +18,6 @@ impl Interp<'_> {
     /// every non-wrapper arm refreshes [`Interp::stmt_began_dead`] after it
     /// runs (the reachability then is the state the NEXT statement begins
     /// in), while the post-order wrapper arms read it instead.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "single port of the official statement decision order; splitting the \
-                  match would scatter the per-event documentation"
-    )]
     pub(crate) fn stmt_step(&mut self, ev: &Ev, events: &[Ev], i: usize, match_of: &[u32]) -> bool {
         // The wrapper arms fire at the statement's END (post-order): they
         // must observe the state the statement BEGAN in, so only the other
@@ -42,10 +37,21 @@ impl Interp<'_> {
     }
 
     /// The statement decision order proper (see [`Interp::stmt_step`]).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single port of the official statement decision order; splitting the \
+                  match would scatter the per-event documentation"
+    )]
     fn stmt_step_arm(&mut self, ev: &Ev, events: &[Ev], i: usize, match_of: &[u32]) -> bool {
         match ev {
             Ev::ExprStmt { span } => {
                 self.header_dead_check(*span);
+                // The statement-level expression ends: the null-shorting
+                // its own `?` opened rejoins here (official
+                // `finishNullShorting` at the expression boundary) — a
+                // `throw`/Never inside the shorted tail must not kill the
+                // receiver-was-null path.
+                self.flush_null_shorts_above(self.consumer_base(1));
                 // Inside a `for` header the statement wrapper is an
                 // artifact of the part's parsing: its value feeds the
                 // header replay, so it stays on the stack.
@@ -63,9 +69,9 @@ impl Interp<'_> {
                     window.extend(*end);
                 }
             }
-            Ev::IfBegin { span }
-            | Ev::SwitchBegin { span }
-            | Ev::SwitchExprBegin { span } => self.dead_code(*span),
+            Ev::IfBegin { span } | Ev::SwitchBegin { span } | Ev::SwitchExprBegin { span } => {
+                self.dead_code(*span);
+            }
             // `end_return_statement`/`end_yield_statement` record these at
             // the statement's END: gate on the began-dead snapshot, never
             // the live state (`return throw 1;` must not self-anchor).
@@ -86,7 +92,14 @@ impl Interp<'_> {
                     }
                 }
                 let _ = &self.pattern;
+                // The condition ends: the null-shorting its own `?`
+                // opened rejoins before the branch split (official
+                // `finishNullShorting`).
+                self.flush_null_shorts_above(self.consumer_base(1));
                 let cond = self.pop_value();
+                // The condition's own query (official
+                // `handle_ifStatement_conditionEnd`, type_analyzer.dart:1191).
+                self.condition_operand(&cond);
                 let (if_true, if_false) = self.cond_split(&cond);
                 self.stack.push(Frame::If {
                     branch: if_false,
@@ -159,10 +172,16 @@ impl Interp<'_> {
                 if self.collecting() {
                     return true;
                 }
-                let cond = self
-                    .exprs
-                    .pop()
-                    .unwrap_or_else(|| Expr::trivial(Ty::UNKNOWN));
+                // The condition ends: rejoin the null-shorting its own `?`
+                // opened before the branch split.
+                self.flush_null_shorts_above(self.consumer_base(1));
+                let cond = self.exprs.pop();
+                // The condition's own query (official `visitWhileStatement`,
+                // type_analyzer.dart:4889).
+                if let Some(cond) = &cond {
+                    self.condition_operand(cond);
+                }
+                let cond = cond.unwrap_or_else(|| Expr::trivial(Ty::UNKNOWN));
                 let (if_true, if_false) = self.cond_split(&cond);
                 if let Some(Frame::While { cond_false, .. }) = self.stack.last_mut() {
                     *cond_false = Some(if_false);
@@ -229,10 +248,16 @@ impl Interp<'_> {
                 if self.collecting() {
                     return true;
                 }
-                let cond = self
-                    .exprs
-                    .pop()
-                    .unwrap_or_else(|| Expr::trivial(Ty::UNKNOWN));
+                // The condition ends: rejoin the null-shorting its own `?`
+                // opened before the branch split.
+                self.flush_null_shorts_above(self.consumer_base(1));
+                let cond = self.exprs.pop();
+                // The do-while condition's own query (official
+                // `visitDoStatement`, type_analyzer.dart:2817).
+                if let Some(cond) = &cond {
+                    self.condition_operand(cond);
+                }
+                let cond = cond.unwrap_or_else(|| Expr::trivial(Ty::UNKNOWN));
                 let (_, if_false) = self.cond_split(&cond);
                 if let Some(Frame::While { cond_false, .. }) = self.stack.last_mut() {
                     *cond_false = Some(if_false);
@@ -253,20 +278,29 @@ impl Interp<'_> {
             }
             Ev::ReturnEnd { has_expression } => {
                 if *has_expression {
+                    // The returned expression ends: rejoin the
+                    // null-shorting its own `?` opened before the value is
+                    // consumed.
+                    self.flush_null_shorts_above(self.consumer_base(1));
                     self.exprs.pop();
                 }
                 // Official handleReturn: the current path becomes
                 // unreachable (inside closures too).
                 self.unreachable_cur();
             }
-            Ev::YieldEnd => {
+            Ev::YieldEnd { span } => {
+                self.flush_null_shorts_above(self.consumer_base(1));
                 self.exprs.pop();
-                self.suspend();
+                self.suspend(*span);
             }
-            Ev::AwaitEnd => {
+            Ev::AwaitEnd { span } => {
+                // The awaited operand ends: rejoin the null-shorting its
+                // own `?` opened before the suspension (official
+                // `finishNullShorting` at the operand boundary).
+                self.flush_null_shorts_above(self.consumer_base(1));
                 self.exprs.pop();
                 self.exprs.push(Expr::trivial(Ty::UNKNOWN));
-                self.suspend();
+                self.suspend(*span);
             }
             Ev::Break { label, span } => {
                 self.dead_code(*span);
@@ -391,8 +425,13 @@ impl Interp<'_> {
                     _ => return true,
                 };
                 let entry = if first {
-                    let finals = self.finals_of(&written);
-                    let state = previous.conservative_join(&written, &captured, &finals);
+                    // Models AND property slots sweep together: a receiver
+                    // written in the try body kills the promotions tested
+                    // before the try on the catch path too (official
+                    // `FlowModel.conservativeJoin`,
+                    // flow_analysis.dart:3786-3830, invoked from
+                    // `tryCatchStatement_bodyEnd`, :8163-8181).
+                    let state = self.join_state_with_sweep(previous, &written, &captured, None);
                     // The try body's normal exit seeds the after-accumulator
                     // (official tryCatchStatement_bodyEnd).
                     let body_exit = self.current.clone();
@@ -464,9 +503,11 @@ impl Interp<'_> {
                 };
                 self.current = after_try.clone();
                 // Exception-entry path into the finally: join the pre-try
-                // state conservatively over the try body's writes.
-                let finals = self.finals_of(&wrote);
-                let entry = pre.conservative_join(&wrote, &captured, &finals);
+                // state conservatively over the try body's writes. The
+                // receivers written in the try body invalidate their
+                // property promotions on the exception path too (the
+                // write may have happened before the exception; #1409).
+                let entry = self.join_state_with_sweep(pre, &wrote, &captured, None);
                 self.current = self.join(Some(self.current.clone()), Some(entry));
                 self.stack.push(Frame::TryFinally {
                     after_try: Some(after_try),
@@ -520,8 +561,15 @@ impl Interp<'_> {
                 if self.collecting() {
                     return true;
                 }
-                // The scrutinee expression value is on the stack.
-                self.exprs.pop();
+                // The scrutinee ends: rejoin null-shorting opened inside it
+                // before its value is read (`flush_null_shorts` keeps any
+                // enclosing `?` chain open).
+                self.flush_null_shorts_above(self.consumer_base(1));
+                // The scrutinee expression value is on the stack; its
+                // variable (when the scrutinee is a bare read) is the
+                // promotion key the matched-type rows answer against
+                // (#1349).
+                let scrutinee = self.exprs.pop().and_then(|e| e.reference);
                 // An unmatched begin (parser recovery) scopes no block
                 // events: the block range stays empty.
                 let end = match_of[i];
@@ -533,6 +581,8 @@ impl Interp<'_> {
                     previous: self.current.clone(),
                     unmatched: self.current.clone(),
                     break_model: None,
+                    scrutinee,
+                    pending_matched: None,
                     case_open: false,
                     group_labels: false,
                     group_default: false,
@@ -625,6 +675,20 @@ impl Interp<'_> {
                 if self.collecting() {
                     return true;
                 }
+                // The matched-value query fires at the pattern match,
+                // before the clause's own pattern and guard touch anything
+                // (official `getMatchedValueType` inside the pattern walk;
+                // the frame's chain below is the match-time one — only
+                // `case_pattern_end` writes it).
+                if let Some(frame_index) = self.switch_frame()
+                    && let Some((ty, args)) = self.matched_type_at(frame_index)
+                {
+                    self.emit(FlowFact::MatchedType {
+                        span: *kw,
+                        ty,
+                        args,
+                    });
+                }
                 // `handleCaseHead`'s `flowEnd(member)` runs before
                 // `switch_endAlternative`: a member anchored at its own
                 // keyword reports there and resets.
@@ -671,7 +735,12 @@ impl Interp<'_> {
                 if self.collecting() {
                     return true;
                 }
-                let _scrutinee = self.exprs.pop();
+                // The scrutinee ends: rejoin null-shorting opened inside it
+                // (`flush_null_shorts` keeps any enclosing `?` chain open).
+                self.flush_null_shorts_above(self.consumer_base(1));
+                // The scrutinee's variable is the matched-type rows'
+                // promotion key (#1349).
+                let scrutinee = self.exprs.pop().and_then(|e| e.reference);
                 let checkpoint = self.current.reach;
                 self.stack.push(Frame::Switch {
                     is_expr: true,
@@ -679,6 +748,8 @@ impl Interp<'_> {
                     previous: self.current.clone(),
                     unmatched: self.current.clone(),
                     break_model: None,
+                    scrutinee,
+                    pending_matched: None,
                     case_open: false,
                     group_labels: false,
                     group_default: false,
@@ -710,14 +781,43 @@ impl Interp<'_> {
                 if self.collecting() {
                     return true;
                 }
+                // The matched-value query fires at the pattern match: the
+                // chain below is the match-time one (`case_pattern_end_expr`
+                // updates it right after), and the clause's anchor token
+                // only arrives at `SwitchExprCaseEnd` — latch the row there
+                // (#1349).
+                if let Some(frame_index) = self.switch_frame()
+                    && let Some(row) = self.matched_type_at(frame_index)
+                    && let Frame::Switch {
+                        pending_matched, ..
+                    } = &mut self.stack[frame_index]
+                {
+                    *pending_matched = Some(row);
+                }
                 // End of the alternative's pattern (official
                 // switch_endAlternative): chain the unmatched state and
                 // join the combined group state.
                 self.case_pattern_end_expr();
             }
-            Ev::SwitchExprCaseEnd { has_guard } => {
+            Ev::SwitchExprCaseEnd { has_guard, begin } => {
                 if self.collecting() {
                     return true;
+                }
+                // The latched match-time row (see `SwitchExprCasePattern`).
+                if let Some(frame_index) = self.switch_frame() {
+                    let pending = match &mut self.stack[frame_index] {
+                        Frame::Switch {
+                            pending_matched, ..
+                        } => pending_matched.take(),
+                        _ => None,
+                    };
+                    if let Some((ty, args)) = pending {
+                        self.emit(FlowFact::MatchedType {
+                            span: *begin,
+                            ty,
+                            args,
+                        });
+                    }
                 }
                 // Official decision order (flow_analysis.dart:1776-1786):
                 // pattern → guard → `switch_endAlternative` → body. The
@@ -728,7 +828,10 @@ impl Interp<'_> {
                 // (flow_analysis.dart:9324-9332) runs here: the value's
                 // flow state is the guard-true branch and guard-false
                 // chains into the unmatched state the later alternatives
-                // branch from.
+                // branch from. Null-shorting opened inside the case value
+                // (and guard) rejoins here; an enclosing `?` chain stays
+                // open.
+                self.flush_null_shorts_above(self.consumer_base(usize::from(*has_guard) + 1));
                 let mut guard_false = None;
                 if *has_guard {
                     let _value = self.exprs.pop();
@@ -822,13 +925,27 @@ impl Interp<'_> {
                 // The first expression since begin is the condition; the
                 // message (if any) ran after it and its effects are
                 // dropped, matching the official join of previous &
-                // condTrue only.
+                // condTrue only. The condition's own query fires before the
+                // truncate (official `visitAssertStatement`,
+                // type_analyzer.dart:2167; the initializer twin at :2139).
+                let cond = self
+                    .exprs
+                    .get(exprs_base)
+                    .map(|c| (c.read_span, c.reference, c.ty, c.args));
+                if let Some((span, reference, ty, args)) = cond
+                    && let (Some(span), Some(_)) = (span, reference)
+                {
+                    self.emit(FlowFact::ConditionType { span, ty, args });
+                }
                 let cond_true = self.exprs.get(exprs_base).and_then(|cond| {
                     cond.branches
                         .as_ref()
                         .map(|(if_true, _)| if_true.clone())
                         .or(cond.bool_value.filter(|&b| b).map(|_| self.current.clone()))
                 });
+                // The assert's expressions end: rejoin null-shorting opened
+                // inside them before the previous-state join.
+                self.flush_null_shorts_above(exprs_base);
                 self.exprs.truncate(exprs_base);
                 let joined = self.join(Some(previous), cond_true);
                 self.current = joined.unsplit(&mut self.reach);
@@ -902,15 +1019,32 @@ impl Interp<'_> {
                 let var = self.declare_var(*name, meta, false);
                 self.pending_inits.push(var);
             }
+            Ev::InitializerBegin => {
+                // The variable-initializer bracket (paired at
+                // `InitializerEnd`): the cast-type dead poll reads the
+                // snapshot depth to leave the initializer-face row to the
+                // semantic as-cast tail face.
+                self.init_exec_depth = Some(self.exec_frame_depth());
+            }
             Ev::InitializerEnd => {
+                self.init_exec_depth = None;
+                // The initializer expression ends: rejoin null-shorting
+                // opened inside it (`var v = x?.y` — official
+                // `finishNullShorting` at the initializer's boundary); an
+                // enclosing `?` chain stays open.
+                self.flush_null_shorts_above(self.consumer_base(1));
                 let var = self.pending_inits.pop();
                 let rhs = self.exprs.pop();
                 if let (Some(var), Some(rhs)) = (var, rhs) {
-                    self.write_var(var, rhs.ty, true);
-                    // The write-site face's observational subtraction (see
-                    // [`Interp::initializer_writes`]): the official
-                    // AssignedVariables does not count plain initializers.
-                    self.initializer_writes.insert(var);
+                    // The declaration's own initialization moves the flow
+                    // state (assignments, promotions) but is not a write in
+                    // the official `AssignedVariables` sets — the
+                    // `prefer_final_locals` premise — so the write-site
+                    // record is skipped ([`Interp::apply_write`]), and no
+                    // demotion reason attaches (the official
+                    // `declare`/`_initialize` carry no
+                    // `nonPromotionReason`, `flow_analysis.dart:4914-4916`).
+                    self.apply_write(var, rhs.ty, true, None);
                 }
             }
             Ev::VarDeclEnd => {
@@ -946,7 +1080,18 @@ impl Interp<'_> {
             }
             Ev::PatternVarDeclStmt { span } => self.header_dead_check(*span),
             Ev::Block { kind, span } => {
-                if matches!(kind, BlockKind::Statement) {
+                // An empty block directly inside an if branch anchors
+                // nothing: the branch body's traversal visits NODES
+                // (`checkUnreachableNode`), and an empty `{}` has none to
+                // visit — `if (x is! int) {}` keeps its dead then branch
+                // silent (oracle-probed). A loop-body `{}` is itself
+                // polled (probe table J u1/u4 report its row), so only the
+                // branch frame suppresses; any other empty block keeps the
+                // pre-existing poll.
+                if matches!(kind, BlockKind::Statement)
+                    && (!matches!(self.stack.last(), Some(Frame::If { .. }))
+                        || !matches!(events.get(i + 1), Some(Ev::EndBlock { .. })))
+                {
                     self.dead_code(*span);
                 }
                 self.scopes.push(Scope::new());
@@ -966,10 +1111,15 @@ impl Interp<'_> {
                     // the anchor node's own extent, `}` included
                     // (dead_code_verifier.dart:253-279's trim only applies
                     // when the anchor sits inside, not at, the covering
-                    // node). The stack can be shallow here — the outermost
-                    // executable records no Exec frame — so the parent is
-                    // looked up guarded; a missing parent is a statement
-                    // block.
+                    // node). A block nested in a statement list is the trim
+                    // TARGET instead: `visitBlock` fires no `flowEnd` of
+                    // its own (type_analyzer.dart:2230), so the covering
+                    // close's single-step trim ends the row at the list's
+                    // last statement, `}` included (`visitForStatement`'s
+                    // `flowEnd(node.body)`, type_analyzer.dart:3194). The
+                    // stack can be shallow here — the outermost executable
+                    // records no Exec frame — so the parent is looked up
+                    // guarded; a missing parent is a statement block.
                     let parent = self
                         .stack
                         .len()
@@ -1034,9 +1184,18 @@ impl Interp<'_> {
     /// when the statement began dead. A statement that began live but
     /// terminated flow itself (`throw 0;`, `return throw 1;`) must not
     /// self-anchor — the official's first dead node is the next visited
-    /// node (dead_code_verifier `_visitNode`).
+    /// node (`dead_code_verifier` `_visitNode`).
+    ///
+    /// The begin-dead snapshot misses one shape: the recorder can drain a
+    /// Never exit ([`Ev::Exit`]) past its own statement's `StmtEnd`, so the
+    /// refresh there still reads a live state. A wrapper whose flow is dead
+    /// from an exit that PRECEDES its own begin is a statement that started
+    /// after the exit (`boom(); g();` anchors at `g();`); an exit at or
+    /// after the begin is the statement's own death and stays silent.
     fn wrapper_dead_check(&mut self, span: TokenSpan) {
-        if self.stmt_began_dead {
+        if self.stmt_began_dead
+            || (!self.reachable() && self.exit_at.is_some_and(|at| at < span.range.offset))
+        {
             self.dead_code(span);
         }
     }
@@ -1183,11 +1342,17 @@ impl Interp<'_> {
                     labeled_effects: Some(effects),
                     previous,
                     ..
-                } => (&effects.written, &effects.captured, previous.clone()),
+                } => (
+                    effects.written.clone(),
+                    effects.captured.clone(),
+                    previous.clone(),
+                ),
                 _ => return,
             };
-            let finals = self.finals_of(written);
-            let joined = previous.conservative_join(written, captured, &finals);
+            // The join sweeps models and property slots together: a
+            // receiver written in any case body kills the promotions
+            // carried into the switch on every labeled-entry path.
+            let joined = self.join_state_with_sweep(previous, &written, &captured, None);
             self.current = joined;
         } else {
             // Official `switch_endAlternatives`
@@ -1307,7 +1472,13 @@ impl Interp<'_> {
 
 /// The official `attachFinally` at the state level: reachability follows
 /// the finally's exit; per-variable promotion models follow the version
-/// compare (identical before/after models keep the try promotions).
+/// compare (identical before/after models keep the try promotions). The
+/// property slots join under the same per-key rule — the official
+/// `_applyPropertyPromotions` transfers finally-established property
+/// promotions onto the post-state (`flow_analysis.dart:5745-5800`), which
+/// the flat slot form reproduces by running the identical per-key compare:
+/// a receiver written in the try body reset its slots there, so the
+/// finally's own tests decide the exit promotions (#1409).
 fn attach_finally(
     interp: &mut Interp<'_>,
     after_try: &State,
@@ -1315,6 +1486,11 @@ fn attach_finally(
     after_finally: &State,
 ) -> State {
     let vars = u32::try_from(interp.vars.len()).expect("variable count fits u32");
+    let slots = after_try
+        .props
+        .len()
+        .max(before_finally.props.len())
+        .max(after_finally.props.len());
     let reachable_after = interp.reach.locally_reachable(after_finally.reach);
     let mut models = Vec::with_capacity(vars as usize);
     for var in 0..vars {
@@ -1326,10 +1502,23 @@ fn attach_finally(
         let before = if v2 == v1 { None } else { Some(v2) };
         models.push(attach_finally_model(&interp.lists, v1, before, v3));
     }
+    let mut props = Vec::with_capacity(slots);
+    for slot in 0..slots {
+        let slot = u32::try_from(slot).expect("property slot count fits u32");
+        let v1 = after_try.prop(slot);
+        let v2 = before_finally.prop(slot);
+        let v3 = after_finally.prop(slot);
+        let before = if v2 == v1 { None } else { Some(v2) };
+        props.push(attach_finally_model(&interp.lists, v1, before, v3));
+    }
     let reach = if reachable_after {
         after_try.reach
     } else {
         interp.reach.set_unreachable(after_try.reach)
     };
-    State { reach, models }
+    State {
+        reach,
+        models,
+        props,
+    }
 }

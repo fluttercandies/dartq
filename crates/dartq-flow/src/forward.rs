@@ -504,6 +504,16 @@ impl ParserListener for SharedFlow<'_> {
             .handle_dot_access(token, end, is_null_aware);
     }
 
+    fn handle_null_aware_index_operand_begin(&mut self, question: Token) {
+        self.0
+            .borrow_mut()
+            .handle_null_aware_index_operand_begin(question);
+    }
+
+    fn handle_null_aware_member_begin(&mut self, question: Token) {
+        self.0.borrow_mut().handle_null_aware_member_begin(question);
+    }
+
     fn handle_indexed_expression(&mut self, question: Option<Token>, open: Token, close: Token) {
         self.0
             .borrow_mut()
@@ -881,6 +891,7 @@ impl ParserListener for SharedFlow<'_> {
     fn end_formal_parameter(
         &mut self,
         var_or_final: Option<Token>,
+        covariant_kw: Option<Token>,
         this_keyword: Option<Token>,
         super_keyword: Option<Token>,
         period_after_this_or_super: Option<Token>,
@@ -892,6 +903,7 @@ impl ParserListener for SharedFlow<'_> {
     ) {
         self.0.borrow_mut().end_formal_parameter(
             var_or_final,
+            covariant_kw,
             this_keyword,
             super_keyword,
             period_after_this_or_super,

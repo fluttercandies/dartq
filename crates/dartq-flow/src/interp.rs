@@ -16,8 +16,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ev::Ev;
 use crate::facts::FlowFact;
-use crate::model::{Lists, NIL, ReachArena, State};
-use crate::ty::{Classification, Ty, TypeOps};
+use crate::model::{Lists, NIL, ReachArena, Reasons, State};
+use crate::ty::{Base, Classification, Ty, TypeOps};
 
 /// Metadata of one local variable (or parameter).
 pub(crate) struct VarMeta {
@@ -51,6 +51,11 @@ impl Scope {
 pub(crate) struct Effects {
     pub declared: FxHashSet<u32>,
     pub written: FxHashSet<u32>,
+    /// The writes recorded at this frame's own depth — closure-nested
+    /// writes land only in the closure's frame, so the outermost frame's
+    /// set is the direct-write view the write-site rows need (a variable
+    /// written both ways carries both facts).
+    pub written_direct: FxHashSet<u32>,
     pub read: FxHashSet<u32>,
     /// Reads inside nested closures (official `readCaptured`).
     pub read_captured: FxHashSet<u32>,
@@ -158,6 +163,14 @@ pub(crate) enum Frame {
     },
     Cascade {
         exprs_base: usize,
+        /// `null_shorts` depth at cascade begin, INCLUDING the head `?..`
+        /// entry when the cascade opened one: section-end flushes stop
+        /// above it (the head's skip path joins at `CascadeEnd`, official
+        /// `nullAwareAccess_end` after the last section).
+        null_shorts_base: usize,
+        /// The head `?..` opened a short (it sits at `null_shorts_base - 1`
+        /// and joins at `CascadeEnd`).
+        own_short: bool,
     },
     /// A loop: break/continue target (`collection` selects a
     /// collection-`for` element).
@@ -193,6 +206,16 @@ pub(crate) enum Frame {
         previous: State,
         unmatched: State,
         break_model: Option<State>,
+        /// The scrutinee's variable when it is a bare read: the promotion
+        /// key the matched-type rows answer against (#1349). Any other
+        /// scrutinee shape carries no flow-visible promotion.
+        scrutinee: Option<u32>,
+        /// The switch-expression latch: the match-time matched-type row a
+        /// `SwitchExprCasePattern` computed, emitted at the alternative's
+        /// `SwitchExprCaseEnd` where the clause anchor token arrives (the
+        /// chain state updates at the pattern close, so the row cannot be
+        /// recomputed there).
+        pending_matched: Option<(Ty, u32)>,
         /// A `CaseExprEnd` was seen: the group awaits its first body event
         /// (one-event lookahead closes the alternatives there).
         case_open: bool,
@@ -322,6 +345,16 @@ pub(crate) struct Expr {
     pub args: u32,
     /// The expression reads this variable (promotable reference).
     pub reference: Option<u32>,
+    /// The expression reads a property whose receiver is itself a
+    /// promotable reference (a bare local read or `this`): the property
+    /// slot ([`Interp::prop_slot`]) the promotion state lives in (#1409).
+    /// The read's flow type at this layer is the marker pair
+    /// ([`Ty::UNKNOWN_NULLABLE`] unpromoted, [`Ty::UNKNOWN`] promoted).
+    pub prop: Option<u32>,
+    /// The expression is exactly a `this` read: the promotable receiver
+    /// shape of property promotion (official `thisExpression()`'s
+    /// `_thisVersion` reference, `flow_analysis.dart:8149-8153`).
+    pub this_recv: bool,
     /// Boolean literal truth.
     pub bool_value: Option<bool>,
     /// Non-trivial branch states (`ifTrue`/`ifFalse`); `None` = trivial.
@@ -330,6 +363,19 @@ pub(crate) struct Expr {
     /// one: a plain assignment target retracts the read's fact (the
     /// identifier is the write, not a read).
     pub read_span: Option<TokenSpan>,
+    /// The interned name when this expression came from an identifier
+    /// event: the member face of a property read (`c._b`'s `_b` — the
+    /// property key's field half).
+    pub name: Option<u32>,
+    /// The `exprs` index where this value's null-shorted chain began — the
+    /// receiver row's own index (or its propagated `chain_base` for a
+    /// chained `x?.y?.z`), set on the result row a null-aware
+    /// DotAccess/IndexAccess pushes. A consumer closing the operand region
+    /// above this index owns the chain's join (official
+    /// `finishNullShorting`'s `targetDepth`, type_analyzer.dart:804-827 —
+    /// the shorts opened by the consumed expression, all the way down its
+    /// chain).
+    pub chain_base: Option<usize>,
 }
 
 impl Expr {
@@ -338,9 +384,13 @@ impl Expr {
             ty,
             args: crate::ty::EMPTY_ARGS,
             reference: None,
+            prop: None,
+            this_recv: false,
             bool_value: None,
             branches: None,
             read_span: None,
+            name: None,
+            chain_base: None,
         }
     }
 
@@ -349,11 +399,137 @@ impl Expr {
             ty,
             args,
             reference: Some(var),
+            prop: None,
+            this_recv: false,
             bool_value: None,
             branches: None,
             read_span: None,
+            name: None,
+            chain_base: None,
         }
     }
+
+    /// The promotable receiver identity of this expression, when property
+    /// promotion can track through it: a bare local read (its variable id)
+    /// or a `this` read ([`THIS_RECEIVER`]).
+    pub(crate) fn prop_receiver(&self) -> Option<u32> {
+        if self.this_recv {
+            Some(THIS_RECEIVER)
+        } else {
+            self.reference
+        }
+    }
+}
+
+/// The property-key receiver sentinel for `this` (explicit or implicit):
+/// `this` never rebinds within one executable body (the official
+/// `_thisVersions` stack exists for extension-member dispatch, which this
+/// layer does not analyze), so one fixed identity is sound (#1409;
+/// eligibility per upstream `ThisPropertyTarget`,
+/// `flow_analysis.dart:5977-5990`).
+pub(crate) const THIS_RECEIVER: u32 = u32::MAX - 1;
+
+/// One open null-shorting context (official `_NullAwareAccessContext`,
+/// flow_analysis.dart:9664): the skip path captured at the `?.`/`?[`/`?..`
+/// and the access-path state the condition face can still read back.
+pub(crate) struct NullShort {
+    /// The receiver-was-null path (upstream `shortcutControlPath` —
+    /// `flow_analysis.dart:9206`): the pre-split state, made unreachable
+    /// when the receiver type can never be null (:9217-9221).
+    pub shortcut: State,
+    /// The receiver-was-non-null path (upstream's promoted `_current` at
+    /// the access): the consumer-visible branch pair's non-null half, kept
+    /// so the expression's `branches` still splits a condition on it.
+    pub matched: Option<State>,
+    /// `exprs` depth when the context opened: the `?` belongs to the
+    /// expression whose operand region began at this depth, so a consumer
+    /// closing a deeper operand (`throw e`, `f(e)`, `x[e]`) leaves it open
+    /// — the official `nullShortingDepth` bound (`finishNullShorting`'s
+    /// `targetDepth`, type_analyzer.dart:804-827).
+    pub exprs_depth: usize,
+    /// Whether the access path was already dead when the context opened —
+    /// the pre-split state was unreachable, or a never-null/Null-typed
+    /// receiver classified it dead (:9214-9221). The member-level dead-node
+    /// poll (`checkUnreachableNode`, type_analyzer.dart:2082) reads the
+    /// state as the member STARTED — a `throw`/Never inside the member's own
+    /// tail (`x?.m(throw _)`) dies after the poll, so it must not anchor the
+    /// access row; a dead-at-open path is the genuine dead member.
+    pub dead_at_open: bool,
+}
+
+/// The receiver-invalidation sweep over one state's property slots: the
+/// state-level half of [`Interp::join_state_with_sweep`], also driven
+/// directly by [`Interp::write_var`] with empty finals (a true write has
+/// no finality exception — see [`Interp::join_state_with_sweep`] for the
+/// upstream anchors). A cleared promoted chain is not destroyed: each
+/// entry lands in the slot's [`VarModel::history`] as
+/// [`crate::facts::NonPromotionCause::PropertyEvidence`] — the flat-slot form of upstream's
+/// `_nonPromotableProperties` version chain (`flow_analysis.dart:5707-5719`),
+/// so a later failed read can still name the promotion that WOULD have
+/// stood when the consumer resolves the member's non-promotability.
+pub(crate) fn sweep_state_props(
+    state: &mut State,
+    props: &[(u32, u32)],
+    written: &FxHashSet<u32>,
+    captured: &FxHashSet<u32>,
+    finals: &FxHashSet<u32>,
+    lists: &Lists,
+    reasons: &mut Reasons,
+) {
+    // Slots interned after this state forked (property reads inside the
+    // joined region) sit past the state's extent — `State::props` only
+    // grows through the resizing promotion writes. Fresh models fill the
+    // gap (the same fill [`State::with_prop`] uses) so the indexed writes
+    // below stay in bounds; for a never-touched slot the fresh model IS
+    // the entry ([`State::prop`]'s fallback, now materialized).
+    state
+        .props
+        .resize(props.len(), crate::model::VarModel::fresh());
+    for slot in 0..props.len() {
+        let (receiver, _) = props[slot];
+        if captured.contains(&receiver) {
+            let model = state.prop(slot as u32);
+            if model.captured() && model.promoted == NIL {
+                continue;
+            }
+            let history = stash_prop_evidence(model.promoted, model.history, lists, reasons);
+            state.props[slot] = crate::model::VarModel {
+                promoted: NIL,
+                tested: NIL,
+                version: crate::model::CAPTURED,
+                history,
+                ..model
+            };
+        } else if written.contains(&receiver) && !finals.contains(&receiver) {
+            let model = state.prop(slot as u32);
+            if model.promoted == NIL {
+                continue;
+            }
+            let history = stash_prop_evidence(model.promoted, model.history, lists, reasons);
+            state.props[slot] = crate::model::VarModel {
+                promoted: NIL,
+                history,
+                ..model
+            };
+        }
+    }
+}
+
+/// Moves a property slot's cleared promoted chain into its history as
+/// would-be evidence, most specific first (the official's
+/// `allPreviouslyPromotedTypes` gathers `promotedTypes` in version order —
+/// upstream Dart SDK source, flow_analysis.dart:8773-8788).
+fn stash_prop_evidence(promoted: u32, history: u32, lists: &Lists, reasons: &mut Reasons) -> u32 {
+    let mut history = history;
+    for (ty, args) in lists.iter_entries(promoted) {
+        history = reasons.cons(
+            ty,
+            args,
+            crate::facts::NonPromotionCause::PropertyEvidence,
+            history,
+        );
+    }
+    history
 }
 
 /// One open dead-code interval (official `_DeadCodeStart` plus the
@@ -384,6 +560,17 @@ pub(crate) struct DeadWindow {
     /// The split's second row is suppressed: a break exits the do-while,
     /// so the code after it is reachable (official `hasBreakStatement`).
     split_broken: bool,
+    /// The interval's row is reported by the semantic layer's as-cast
+    /// tail face instead: the cast-type poll opened it directly inside a
+    /// variable initializer, where that face stages the official row at
+    /// the cast type's head token (probed: dart analyze 3.13.1 —
+    /// `var a = f() as int;` with a Never-typed `f()` anchors `DEAD_CODE`
+    /// there). The interval itself still follows the official one-row
+    /// rule (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/error/dead_code_verifier.dart:183-189 — later
+    /// unreachable nodes continue it, a covering `flowEnd` retires it),
+    /// so following dead statements extend it; only the emission skips.
+    suppressed: bool,
 }
 
 impl DeadWindow {
@@ -397,6 +584,7 @@ impl DeadWindow {
             awaiting: false,
             split_start: None,
             split_broken: false,
+            suppressed: false,
         }
     }
 
@@ -417,6 +605,7 @@ impl DeadWindow {
             awaiting: true,
             split_start: None,
             split_broken: false,
+            suppressed: false,
         }
     }
 
@@ -456,6 +645,12 @@ impl DeadWindow {
         self.awaiting = false;
         self.split_broken = tail_reachable;
     }
+
+    /// Marks the interval's row as the semantic as-cast tail face's: the
+    /// cast-type poll opened it directly inside a variable initializer.
+    pub(crate) fn suppress(&mut self) {
+        self.suppressed = true;
+    }
 }
 
 /// How a construct end covers an open dead-code interval
@@ -485,14 +680,45 @@ pub(crate) struct Interp<'o> {
     /// `Ev::Type` rows carry ids into it and the promotion gate compares
     /// the trees structurally (#611 step 4).
     pub(crate) args: &'o [Vec<crate::ty::ArgTy>],
+    /// Declared-bound nullability faces by interned type-parameter name
+    /// ([`crate::ty::Boundary`]) — the enclosing declaration's table the
+    /// recorder captured at parse time. Absent rows degrade to the
+    /// syntactic classification.
+    pub(crate) boundaries: &'o [Option<crate::ty::Boundary>],
+    /// The unit's top-level variable declarations (the recorder's capture,
+    /// mounted at replay time): the lexical chain's outermost scope, the
+    /// read fallback once every scope frame misses. The empty table is the
+    /// direct-construction default.
+    pub(crate) top_level: &'o FxHashMap<u32, crate::record::TopVar>,
     pub(crate) reach: ReachArena,
     pub(crate) lists: Lists,
+    /// The non-promotion history pool beside [`Interp::lists`] — the same
+    /// per-executable lifetime (fresh per `run`, folded into the
+    /// recorder's unit arena at `exec_end`).
+    pub(crate) reasons: Reasons,
+    /// The interned `WhyNotPromoted`/`NonPromotedPropertyRead`/
+    /// `ThisNotPromoted` entry rows this executable produced — index 0 is
+    /// the reserved empty row (upstream's empty-map shape); the recorder
+    /// appends it to the unit arena at `exec_end` and rewrites the facts'
+    /// `entries` ids by the base offset.
+    pub(crate) non_promotions: Vec<Vec<crate::facts::NonPromotionEntry>>,
     pub(crate) current: State,
     pub(crate) stack: Vec<Frame>,
     pub(crate) exprs: Vec<Expr>,
     pub(crate) scopes: Vec<Scope>,
     pub(crate) vars: Vec<VarMeta>,
     pub(crate) facts: Vec<FlowFact>,
+    /// The property-key table (#1409): slot → `(receiver, field)` — the
+    /// receiver is a variable id or [`THIS_RECEIVER`], the field an
+    /// interned member name (the flow-level stand-in for upstream's
+    /// `propertyName` keys, `flow_analysis.dart:5694-5716`). Slot order is
+    /// allocation order and matches every [`State::props`] index; slots are
+    /// never freed (stable across collect rollbacks, which truncate back to
+    /// the snapshot's length).
+    pub(crate) props: Vec<(u32, u32)>,
+    /// Property key → slot, the resolve-or-insert side of
+    /// [`Interp::prop_slot`].
+    prop_slots: FxHashMap<(u32, u32), u32>,
 
     pub(crate) decl: DeclCtx,
     /// Enclosing declaration contexts: `VarDeclBegin` swaps the single
@@ -533,10 +759,6 @@ pub(crate) struct Interp<'o> {
     pub(crate) in_decl: bool,
     pub(crate) in_type_test: bool,
     pub(crate) in_as_cast: bool,
-    /// The expr-stack depth when `AsBegin` fired: a cast pattern's primary
-    /// is a pattern, not an expression, so an unchanged depth at `AsEnd`
-    /// identifies the pattern face (`p as T` — no operand was pushed).
-    pub(crate) as_base: usize,
     pub(crate) for_header_depth: usize,
     /// The depth contributed by condition slices of C-style `for` headers
     /// (raised by `run_header_expr` only): condition wrappers dead-anchor
@@ -544,15 +766,6 @@ pub(crate) struct Interp<'o> {
     /// separates them from init/updater slices.
     pub(crate) header_cond_depth: usize,
     pub(crate) anywhere: Effects,
-    /// Observational only (the write-site face's official semantics):
-    /// variables whose declaration initializer wrote them. The official
-    /// `AssignedVariables` does not count plain initializers as writes
-    /// (`prefer_final_locals`' premise), while the flow layer's own
-    /// `write_var` at `InitializerEnd` feeds promotions and stays — the
-    /// set lets the write-site aggregation subtract them without touching
-    /// any flow decision. Ids are stable across collect runs, so no
-    /// rollback bookkeeping is needed.
-    pub(crate) initializer_writes: FxHashSet<u32>,
     /// The open dead-code interval (official
     /// `NullSafetyDeadCodeVerifier._firstDead`): the first unreachable
     /// node anchors one row; every later unreachable node continues the
@@ -571,6 +784,34 @@ pub(crate) struct Interp<'o> {
     /// is the next visited node (`_visitNode`).
     pub(crate) stmt_began_dead: bool,
 
+    /// The start offset of the [`Ev::Exit`] that killed the flow, while the
+    /// flow is dead from it. The statement wrapper's anchor decision
+    /// ([`Interp::wrapper_dead_check`]) reads it: the recorder can drain
+    /// the exit past its own statement's `StmtEnd`, whose snapshot refresh
+    /// still reads a live state, so a following statement compares the
+    /// exit position with its own begin.
+    pub(crate) exit_at: Option<u32>,
+
+    /// Open null-shorting contexts (official `_NullAwareAccessContext`
+    /// stack, flow_analysis.dart:9664): each entry is the skip-path state
+    /// captured when a `?.`/`?[`/`?..` was reached — the pre-promotion
+    /// state of `_nullAwareAccess_rightBegin` (:9206), or unreachable when
+    /// the receiver type can never be null (:9217-9221). The chain's
+    /// shorted run continues in `self.current` (the receiver promoted
+    /// non-null); the pending states rejoin at the enclosing expression's
+    /// boundary — upstream's `finishNullShorting`/`nullAwareAccess_end`
+    /// (`_join(_current, context._previous).unsplit()`, :7403) — which the
+    /// event stream marks at every value-consumer event.
+    pub(crate) null_shorts: Vec<NullShort>,
+
+    /// The executable-frame depth when the current variable initializer
+    /// began; `None` outside one. The cast-type dead poll ([`Ev::AsBegin`])
+    /// reads it: a poll that opens the interval directly inside the
+    /// initializer (no nested executable between) marks the interval
+    /// suppressed — the semantic layer's as-cast tail face reports that
+    /// row, and a flow row of its own would duplicate it.
+    pub(crate) init_exec_depth: Option<usize>,
+
     pub(crate) collect: Option<Vec<Effects>>,
     snapshot: Option<Snapshot>,
 }
@@ -583,19 +824,45 @@ struct Snapshot {
     scopes_len: usize,
     vars_len: usize,
     facts_len: usize,
+    /// The interned non-promotion rows roll back with the collect run —
+    /// their fact rows do, so unreferenced rows must not linger.
+    non_promotions_len: usize,
+    props_len: usize,
     dead: Option<DeadWindow>,
+    init_exec_depth: Option<usize>,
+    /// Open null-shorting contexts: pushed and joined inside the collect
+    /// run's replay, so they roll back with it.
+    null_shorts_len: usize,
+}
+
+/// The direct-construction default for [`Interp::top_level`]: no unit face.
+static NO_TOP_LEVEL: std::sync::LazyLock<FxHashMap<u32, crate::record::TopVar>> =
+    std::sync::LazyLock::new(FxHashMap::default);
+
+/// The resolution of one bare-name reference: a local variable id (the
+/// scope chain's answer — promotion and definite-assignment state track
+/// it) or a top-level declaration face (no flow state; the read row
+/// carries the written type).
+pub(crate) enum Resolved {
+    Local(u32),
+    Top(crate::record::TopVar),
 }
 
 impl<'o> Interp<'o> {
     pub(crate) fn new(
         ops: &'o dyn TypeOps,
         args: &'o [Vec<crate::ty::ArgTy>],
+        boundaries: &'o [Option<crate::ty::Boundary>],
     ) -> Self {
         Self {
             ops,
             args,
+            boundaries,
+            top_level: &NO_TOP_LEVEL,
             reach: ReachArena::new(),
             lists: Lists::default(),
+            reasons: Reasons::default(),
+            non_promotions: vec![Vec::new()],
             current: State::new(0),
             stack: Vec::new(),
             exprs: Vec::new(),
@@ -604,6 +871,8 @@ impl<'o> Interp<'o> {
             }],
             vars: Vec::new(),
             facts: Vec::new(),
+            props: Vec::new(),
+            prop_slots: FxHashMap::default(),
             decl: DeclCtx::default(),
             decl_stack: Vec::new(),
             pending_ty: None,
@@ -622,13 +891,14 @@ impl<'o> Interp<'o> {
             in_decl: false,
             in_type_test: false,
             in_as_cast: false,
-            as_base: 0,
             for_header_depth: 0,
             header_cond_depth: 0,
             anywhere: Effects::default(),
-            initializer_writes: FxHashSet::default(),
             dead: None,
             stmt_began_dead: false,
+            exit_at: None,
+            init_exec_depth: None,
+            null_shorts: Vec::new(),
             collect: None,
             snapshot: None,
         }
@@ -648,26 +918,24 @@ impl<'o> Interp<'o> {
             }
         }
         // The write-site rows (the semantic query face's family-c):
-        // aggregated from the AssignedVariables anywhere sets — `captured`
-        // holds the writes inside nested closures, `written` minus
-        // `captured` the writes outside them (declaration initializers
-        // subtract — the official sets do not count them, see
-        // [`Self::initializer_writes`]) — one row per (declaration,
-        // in-closure) pair. Emitted after the replay: the ids the
-        // pre-pass recorded are the replay's own (the declaration
-        // sequence is deterministic), so the metadata lookup cannot name
-        // the wrong variable. Stale ids (collect-rollback residue, the
-        // `cjoin` live filter's concern) and declarations without a name
-        // span emit nothing. Ids sort first because the take_facts sort
-        // is stable and equal decl-offset keys would otherwise order by
-        // hash-set iteration — nondeterministic.
-        let mut ids: Vec<u32> = self
-            .anywhere
-            .written
-            .difference(&self.anywhere.captured)
-            .copied()
-            .filter(|var| !self.initializer_writes.contains(var))
-            .collect();
+        // aggregated from the AssignedVariables anywhere sets —
+        // `written_direct` holds the writes outside nested closures,
+        // `captured` the writes inside them — one row per (declaration,
+        // in-closure) pair, so a variable written both ways emits both
+        // rows (`written` itself carries the closure-merged shape the
+        // demotion faces need). Declaration initializers and for-in loop
+        // variables never reach the sets (they write through
+        // [`Self::apply_write`], the official sets do not count them —
+        // the `prefer_final_locals` premise).
+        // Emitted after the replay: the ids the pre-pass recorded are the
+        // replay's own (the declaration sequence is deterministic), so the
+        // metadata lookup cannot name the wrong variable. Stale ids
+        // (collect-rollback residue, the `cjoin` live filter's concern)
+        // and declarations without a name span emit nothing. Ids sort
+        // first because the take_facts sort is stable and equal
+        // decl-offset keys would otherwise order by hash-set iteration —
+        // nondeterministic.
+        let mut ids: Vec<u32> = self.anywhere.written_direct.iter().copied().collect();
         ids.sort_unstable();
         for &var in &ids {
             if let Some(span) = self.vars.get(var as usize).and_then(|meta| meta.decl_span) {
@@ -681,9 +949,7 @@ impl<'o> Interp<'o> {
         ids.extend(self.anywhere.captured.iter().copied());
         ids.sort_unstable();
         for var in ids {
-            if let Some(span) =
-                self.vars.get(var as usize).and_then(|meta| meta.decl_span)
-            {
+            if let Some(span) = self.vars.get(var as usize).and_then(|meta| meta.decl_span) {
                 self.emit(FlowFact::WriteSite {
                     decl_name_span: span,
                     in_closure: true,
@@ -724,20 +990,54 @@ impl<'o> Interp<'o> {
         }
     }
 
-    pub(crate) fn resolve(&self, name_id: u32) -> Option<u32> {
+    /// The official lexical lookup's order (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/property_element_resolver.dart:2137-2139):
+    /// the scope chain innermost-first, then the unit's own top-level
+    /// declarations as the outermost scope frame. Only a full miss falls to
+    /// the caller's implicit-`this` face.
+    pub(crate) fn resolve(&self, name_id: u32) -> Option<Resolved> {
         for scope in self.scopes.iter().rev() {
             if let Some(&var) = scope.bindings.get(&name_id) {
-                return Some(var);
+                return Some(Resolved::Local(var));
             }
         }
-        None
+        self.top_level.get(&name_id).copied().map(Resolved::Top)
     }
 
     /// Records a write (real or collect mode) and updates the flow state.
     /// `promote_to_interest` is false for compound and unknown-type
-    /// writes.
-    pub(crate) fn write_var(&mut self, var: u32, written: Ty, promote_to_interest: bool) {
+    /// writes. `write_span` is the write expression's own range — the
+    /// official `DemoteViaExplicitWrite.node` anchor
+    /// (`assignment_expression_resolver.dart:324,533,698`,
+    /// `increment_or_decrement_resolver.dart:339`,
+    /// `for_resolver.dart:236`); `None` for the write shapes the official
+    /// passes no node to (pattern assignments, the synthetic-degraded
+    /// faces) — their demotions record no reason link.
+    pub(crate) fn write_var(
+        &mut self,
+        var: u32,
+        written: Ty,
+        promote_to_interest: bool,
+        write_span: Option<SourceRange>,
+    ) {
         self.record_write(var);
+        self.apply_write(var, written, promote_to_interest, write_span);
+    }
+
+    /// The state half of [`Self::write_var`], without the
+    /// AssignedVariables record. Per-iteration initializations — a
+    /// declaration's own initializer and a for-in loop variable — move
+    /// the flow state but are not writes in the official sets
+    /// (`prefer_final_locals` treats the variables as never assigned), so
+    /// they pass `None`: the official `declare`/`_initialize` carry no
+    /// `nonPromotionReason` (`flow_analysis.dart:4914-4916`).
+    pub(crate) fn apply_write(
+        &mut self,
+        var: u32,
+        written: Ty,
+        promote_to_interest: bool,
+        write_span: Option<SourceRange>,
+    ) {
         // A stale id (a collect rollback can strand effect-set entries and
         // scope bindings past their variable) degrades to the unknown
         // declared type; the state write itself is model-bounds-safe.
@@ -748,12 +1048,65 @@ impl<'o> Interp<'o> {
         self.current = self.current.clone().write(
             self.ops,
             &mut self.lists,
+            &mut self.reasons,
             var,
             declared,
             declared_args,
             written,
             promote_to_interest,
+            write_span,
         );
+        // The receiver's value version changed (official `write` allocates
+        // a fresh one), so its property promotions do not carry over
+        // (#1409): every property slot keyed on this receiver resets. No
+        // finality exception — an actual write bumps the version even for
+        // a `late final` (official `PromotionModel.write` checks no
+        // finality, flow_analysis.dart:4802-4866), unlike the conservative
+        // join's finals rule (upstream Dart SDK source,
+        // pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:3799-3813).
+        let mut written_one = FxHashSet::default();
+        written_one.insert(var);
+        let no_finals = FxHashSet::default();
+        sweep_state_props(
+            &mut self.current,
+            &self.props,
+            &written_one,
+            &FxHashSet::default(),
+            &no_finals,
+            &self.lists,
+            &mut self.reasons,
+        );
+    }
+
+    /// The property-key slot of `(receiver, field)`, allocated on first
+    /// use (#1409). Slot order is allocation order — every [`State::props`]
+    /// index is one of these slots.
+    pub(crate) fn prop_slot(&mut self, receiver: u32, field: u32) -> u32 {
+        if let Some(&slot) = self.prop_slots.get(&(receiver, field)) {
+            return slot;
+        }
+        let slot = u32::try_from(self.props.len()).expect("property slot count fits u32");
+        self.props.push((receiver, field));
+        self.prop_slots.insert((receiver, field), slot);
+        slot
+    }
+
+    /// Whether property lookups on `receiver` are dead because the
+    /// receiver is write-captured (official `_handleProperty`'s
+    /// target-version gate via `target._getVersion() == null`,
+    /// `flow_analysis.dart:9021-9026` — a captured receiver's value version
+    /// association is permanently gone). `this` is never captured.
+    pub(crate) fn prop_target_captured(&self, receiver: u32) -> bool {
+        receiver != THIS_RECEIVER && self.current.model(receiver).captured()
+    }
+
+    /// The property slot's standing promotion: `Some` when a non-null
+    /// promotion chain stands and neither the receiver nor the slot is
+    /// write-captured.
+    pub(crate) fn prop_promoted(&self, receiver: u32, slot: u32) -> bool {
+        !self.prop_target_captured(receiver)
+            && !self.current.prop(slot).captured()
+            && self.current.prop(slot).promoted != crate::model::NIL
     }
 
     // —— effect recording (collect mode) —————————————————————————————————
@@ -762,6 +1115,13 @@ impl<'o> Interp<'o> {
         if let Some(frames) = self.collect.as_mut() {
             for frame in frames.iter_mut() {
                 frame.written.insert(var);
+            }
+            // The direct-write view records at the innermost frame only: a
+            // closure-body write is a capture of the enclosing scopes, not
+            // one of their direct writes, and dies with the closure's own
+            // frame at the pop.
+            if let Some(frame) = frames.last_mut() {
+                frame.written_direct.insert(var);
             }
         }
     }
@@ -828,14 +1188,157 @@ impl<'o> Interp<'o> {
         self.current = self.current.clone().set_unreachable(&mut self.reach);
     }
 
+    /// Opens a null-shorting context over `receiver` (official
+    /// `_nullAwareAccess_rightBegin`, flow_analysis.dart:9199-9257):
+    /// splits the current state, keeps the pre-promotion state as the skip
+    /// path, and promotes the receiver to non-null on the access path.
+    /// A never-null receiver makes the skip path unreachable (official
+    /// `_isGuaranteedNonNullWithSoundNullSafety`, :9217-9221); a
+    /// null-typed receiver makes the access path unreachable (:9214-9216).
+    /// The receiver's matched state is kept beside the shortcut so the
+    /// access's own event can still feed the condition face
+    /// (`Expr::branches`) the pair it reported before this machinery.
+    ///
+    /// The caller hands over the receiver's `(reference, ty, args)`
+    /// triple — read off the expression stack — rather than the `Expr`
+    /// itself, so the call holds no borrow into `self`.
+    pub(crate) fn null_short_begin(&mut self, receiver: (Option<u32>, Ty, u32)) {
+        self.split_cur();
+        let mut shortcut = self.current.clone();
+        let mut matched = None;
+        let (reference, ty, args) = receiver;
+        if let Some(var) = reference {
+            let (promoted, promoted_args) = self.promote_to_non_null(ty, args);
+            let next = self.current.clone().finish_type_test(
+                self.ops,
+                &mut self.lists,
+                var,
+                None,
+                Some((promoted, promoted_args)),
+            );
+            self.current = next;
+            matched = Some(self.current.clone());
+        }
+        match self.classify(ty) {
+            Classification::NullOrEquivalent => self.unreachable_cur(),
+            Classification::NonNullable => {
+                shortcut = shortcut.set_unreachable(&mut self.reach);
+            }
+            _ => {}
+        }
+        self.null_shorts.push(NullShort {
+            shortcut,
+            matched,
+            exprs_depth: self.exprs.len(),
+            dead_at_open: !self.reachable(),
+        });
+    }
+
+    /// Closes one open null-shorting context (official
+    /// `nullAwareAccess_end`, flow_analysis.dart:7400-7404): joins the
+    /// access path into the skip path and drops the checkpoint.
+    pub(crate) fn null_short_end(&mut self) -> Option<NullShort> {
+        let short = self.null_shorts.pop()?;
+        self.current = self
+            .join(Some(self.current.clone()), Some(short.shortcut.clone()))
+            .unsplit(&mut self.reach);
+        Some(short)
+    }
+
+    /// Ends the null-shorting contexts opened inside the operand region the
+    /// caller is closing — `exprs_base` is the value-stack depth at that
+    /// operand's start. Only shorts opened strictly inside (`exprs_depth >
+    /// base`) close: the chain's own `?` (`x?.m(g()?.n)`'s outer short
+    /// beside an argument's) ends at its access event, not here — the
+    /// official `nullShortingTargetDepth` bound (type_analyzer.dart:804-827)
+    /// mapped onto the event stream.
+    pub(crate) fn flush_null_shorts_above(&mut self, exprs_base: usize) {
+        while self
+            .null_shorts
+            .last()
+            .is_some_and(|short| short.exprs_depth > exprs_base)
+        {
+            self.null_short_end();
+        }
+    }
+
+    /// The operand-region bound for a consumer about to eat the top `arity`
+    /// rows, chain-aware: a null-shorted result row's [`Expr::chain_base`]
+    /// drags the bound down to the chain's receiver index, so
+    /// `x?.m(throw _)`'s own `?.` short joins at this consumer (official
+    /// `finishNullShorting` runs at the consumed expression's boundary) while
+    /// `x?[throw _]`'s — whose `throw` sits strictly inside the operand —
+    /// survives for the access's own close. Compute BEFORE the pops the
+    /// consumer performs: the rows it reads are the ones being consumed.
+    pub(crate) fn consumer_base(&self, arity: usize) -> usize {
+        let top = self.exprs.len().saturating_sub(arity);
+        self.exprs[top.min(self.exprs.len())..]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.chain_base.map(|b| b.min(top + i)))
+            .min()
+            .unwrap_or(top)
+    }
+
+    /// The branch pair a null-aware access contributes to a condition
+    /// split: the innermost open context's (non-null, skip) halves, or
+    /// `None` when no `?` opened for this receiver.
+    pub(crate) fn null_short_branches(&mut self) -> Option<(State, State)> {
+        let short = self.null_shorts.last()?;
+        Some((
+            short
+                .matched
+                .clone()
+                .unwrap_or_else(|| self.current.clone()),
+            short.shortcut.clone(),
+        ))
+    }
+
+    /// Boundary-aware nullability classification — the name-level stand-in
+    /// for the official `classifyType` subtype question (upstream Dart SDK
+    /// source, pkg/analyzer/lib/src/dart/resolver/flow_analysis_visitor.dart:615-632).
+    /// A `?`-less type-parameter reference resolves through its declared
+    /// bound ([`crate::ty::Boundary`]): `T extends Object?` classifies
+    /// potentially-nullable where the written spelling alone would say
+    /// non-nullable. A nullable-written reference (`T?`) and every
+    /// non-parameter name fall through to the syntactic
+    /// [`TypeOps::classify`].
+    pub(crate) fn classify(&self, t: Ty) -> Classification {
+        if !t.nullable
+            && let Base::Name(id) = t.base
+            && let Some(boundary) = self.boundaries.get(id as usize).copied().flatten()
+        {
+            return boundary.class;
+        }
+        self.ops.classify(t)
+    }
+
+    /// Boundary-aware promote-to-non-null: the promoted type beside its
+    /// written-argument tree (official `tryMarkNonNullable` +
+    /// `promoteToNonNull`). A boundary-potentially-nullable parameter
+    /// promotes to its bound's non-null face; a boundary whose non-null
+    /// face is the bound itself (`dynamic`, `FutureOr<void>` — the
+    /// identical-bound collapse, pkg/analyzer/lib/src/dart/element/type_system.dart:1467-1495)
+    /// returns the input unchanged, like the syntactic path.
+    pub(crate) fn promote_to_non_null(&self, t: Ty, args: u32) -> (Ty, u32) {
+        if !t.nullable
+            && let Base::Name(id) = t.base
+            && let Some(boundary) = self.boundaries.get(id as usize).copied().flatten()
+        {
+            return boundary
+                .target
+                .map_or((t, args), |(ty, target_args)| (ty, target_args));
+        }
+        (self.ops.promote_to_non_null(t), args)
+    }
+
     /// Official `_typesAreDisjointDueToNullability`: one side is
     /// null-or-equivalent (`classifyType` → nullOrEquivalent) while the
     /// other is non-nullable — every value of either lies outside the
     /// other, so a type check between them always fails.
     pub(crate) fn disjoint_by_nullability(&self, a: Ty, b: Ty) -> bool {
-        let (a_class, b_class) = (self.ops.classify(a), self.ops.classify(b));
-        (a_class == Classification::NullOrEquivalent
-            && b_class == Classification::NonNullable)
+        let (a_class, b_class) = (self.classify(a), self.classify(b));
+        (a_class == Classification::NullOrEquivalent && b_class == Classification::NonNullable)
             || (b_class == Classification::NullOrEquivalent
                 && a_class == Classification::NonNullable)
     }
@@ -850,6 +1353,17 @@ impl<'o> Interp<'o> {
         if self.collect.is_none() {
             self.facts.push(fact);
         }
+    }
+
+    /// The number of executable frames on the stack — the face the
+    /// initializer bracket snapshots ([`Interp::init_exec_depth`]) to
+    /// detect a cast directly inside the initializer versus inside a
+    /// nested executable.
+    pub(crate) fn exec_frame_depth(&self) -> usize {
+        self.stack
+            .iter()
+            .filter(|frame| matches!(frame, Frame::Exec { .. }))
+            .count()
     }
 
     /// The first unreachable node opens the dead-code interval (official
@@ -955,7 +1469,9 @@ impl<'o> Interp<'o> {
     /// Emits and clears the open dead-code interval when `covers` holds
     /// (the shared tail of the close gates): a do-while split emits the
     /// `while (c);` part first and the tail second, anything else one row
-    /// from the anchor to the interval's end.
+    /// from the anchor to the interval's end. A suppressed interval
+    /// (whose row the semantic as-cast tail face reports) retires
+    /// without emitting.
     fn close_covered(&mut self, covers: bool) {
         if !covers {
             return;
@@ -963,6 +1479,9 @@ impl<'o> Interp<'o> {
         let Some(window) = self.dead.take() else {
             return;
         };
+        if window.suppressed {
+            return;
+        }
         if let Some(while_part) = window.split {
             self.emit(FlowFact::DeadCode {
                 span: TokenSpan {
@@ -1015,6 +1534,48 @@ impl<'o> Interp<'o> {
         }
     }
 
+    /// The condition-operand query row (official `checkForNonBoolCondition`'s
+    /// flow half — upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/error/bool_expression_verifier.dart:45-73): the
+    /// flow type at the operand's evaluation point, when the operand value
+    /// is a promotable reference read (its read anchor travels with the
+    /// value). Other operand shapes — calls, property accesses, `is`-tests,
+    /// assignments — carry no flow-visible type and emit no row; their
+    /// static type is the type layer's question. No reachability gate: the
+    /// official verdict is a type question and fires in dead code too.
+    pub(crate) fn condition_operand(&mut self, cond: &Expr) {
+        if let (Some(span), Some(_)) = (cond.read_span, cond.reference) {
+            self.emit(FlowFact::ConditionType {
+                span,
+                ty: cond.ty,
+                args: cond.args,
+            });
+        }
+    }
+
+    /// The scrutinee's flow type under a switch frame's match-time chain
+    /// state (official `getMatchedValueType`,
+    /// flow_analysis.dart:8753-8760: the current promotion model's head
+    /// for the matched value's promotion key, falling back to the matched
+    /// value's declared type). `None` when the scrutinee is not a
+    /// promotable reference read — its static type is then the type
+    /// layer's answer.
+    pub(crate) fn matched_type_at(&self, frame_index: usize) -> Option<(Ty, u32)> {
+        let Frame::Switch {
+            scrutinee: Some(var),
+            unmatched,
+            ..
+        } = &self.stack[frame_index]
+        else {
+            return None;
+        };
+        let model = unmatched.model(*var);
+        Some((
+            self.promoted_type_of(*var, &model),
+            self.promoted_args_of(*var, &model),
+        ))
+    }
+
     // —— collect runs ——————————————————————————————————————————————————
 
     /// Runs the event ranges once in collect mode and returns the bottom
@@ -1036,7 +1597,11 @@ impl<'o> Interp<'o> {
             scopes_len: self.scopes.len(),
             vars_len: self.vars.len(),
             facts_len: self.facts.len(),
+            non_promotions_len: self.non_promotions.len(),
+            props_len: self.props.len(),
             dead: self.dead,
+            init_exec_depth: self.init_exec_depth,
+            null_shorts_len: self.null_shorts.len(),
         };
         let outer = self.collect.replace(vec![Effects::default()]);
         let _ = self.snapshot.replace(snapshot);
@@ -1061,8 +1626,14 @@ impl<'o> Interp<'o> {
         self.scopes.truncate(s.scopes_len);
         self.vars.truncate(s.vars_len);
         self.facts.truncate(s.facts_len);
+        self.non_promotions.truncate(s.non_promotions_len);
+        self.props.truncate(s.props_len);
+        self.prop_slots
+            .retain(|_, slot| (*slot as usize) < s.props_len);
         self.current = s.current;
         self.dead = s.dead;
+        self.init_exec_depth = s.init_exec_depth;
+        self.null_shorts.truncate(s.null_shorts_len);
         self.collect = outer;
         frames.into_iter().next().unwrap_or_default()
     }
@@ -1105,6 +1676,9 @@ impl<'o> Interp<'o> {
             }
         } else if let Some(parent) = frames.last_mut() {
             parent.written.extend(inner.written.iter().copied());
+            parent
+                .written_direct
+                .extend(inner.written_direct.iter().copied());
             parent.read.extend(inner.read.iter().copied());
             parent.captured.extend(inner.captured.iter().copied());
             parent
@@ -1133,8 +1707,69 @@ impl Interp<'_> {
             .collect()
     }
 
-    /// `current.conservativeJoin(written, captured)` with finality applied.
+    /// The complete conservative join over a detached state: the model
+    /// half ([`State::conservative_join`]) plus its property-slot half
+    /// ([`sweep_state_props`]) — two halves of one event, paired here so
+    /// a call site cannot run the models alone and carry stale property
+    /// promotions into the joined region. The sweep's receiver rule: a
+    /// receiver in `written` loses its property promotions (its value
+    /// version changed — final receivers keep them, the official
+    /// conservative-join finals rule, `flow_analysis.dart:3803-3813`); a
+    /// receiver in `captured` is permanently write-captured and every
+    /// property lookup on it dies (official `conservativeJoin`'s captured
+    /// arm plus the `_handleProperty` lookup gate, :3826-3831 — the
+    /// official model-level join does not sweep dependent properties
+    /// because the lookup re-checks capture; the flat slot form records
+    /// the capture on the slots so the join's captured arm propagates
+    /// it). The two halves touch disjoint state fields (`models` vs
+    /// `props`), so either order yields the same state. `reason` rides to
+    /// the model half: `Some` only at suspension points, where each
+    /// dropped promotion appends a `DemoteViaSuspension` link (the
+    /// official's sole reason-bearing join); every other join passes
+    /// `None`, which drops the history outright.
+    pub(crate) fn join_state_with_sweep(
+        &mut self,
+        state: State,
+        written: &FxHashSet<u32>,
+        captured: &FxHashSet<u32>,
+        reason: Option<crate::facts::NonPromotionCause>,
+    ) -> State {
+        let finals = self.finals_of(written);
+        let mut state = state.conservative_join(
+            written,
+            captured,
+            &finals,
+            &self.lists,
+            &mut self.reasons,
+            reason,
+        );
+        sweep_state_props(
+            &mut state,
+            &self.props,
+            written,
+            captured,
+            &finals,
+            &self.lists,
+            &mut self.reasons,
+        );
+        state
+    }
+
+    /// `current.conservativeJoin(written, captured)` with finality applied
+    /// and no demotion reason: loop heads and closure entries erase the
+    /// history (`flow_analysis.dart:4732-4741`).
     pub(crate) fn cjoin(&mut self, written: &FxHashSet<u32>, captured: &FxHashSet<u32>) {
+        self.cjoin_reason(written, captured, None);
+    }
+
+    /// [`Self::cjoin`] carrying the official `getNonPromotionReason`
+    /// payload — `Some` only at suspension points.
+    pub(crate) fn cjoin_reason(
+        &mut self,
+        written: &FxHashSet<u32>,
+        captured: &FxHashSet<u32>,
+        reason: Option<crate::facts::NonPromotionCause>,
+    ) {
         // Effect sets recorded by a collect run may reference variables
         // declared inside the collected range: those ids are gone after the
         // state rollback (they are re-declared per iteration) and must not
@@ -1142,9 +1777,8 @@ impl Interp<'_> {
         let live = |v: &u32| (*v as usize) < self.vars.len();
         let written: FxHashSet<u32> = written.iter().copied().filter(live).collect();
         let captured: FxHashSet<u32> = captured.iter().copied().filter(live).collect();
-        let finals = self.finals_of(&written);
         let current = std::mem::take(&mut self.current);
-        self.current = current.conservative_join(&written, &captured, &finals);
+        self.current = self.join_state_with_sweep(current, &written, &captured, reason);
     }
 
     /// The official `suspension` (`flow_analysis.dart:7909`): every
@@ -1153,8 +1787,11 @@ impl Interp<'_> {
     /// applies only when the suspension point sits inside a local function
     /// (official `_enclosingFunctionExpressionInfoStack` non-empty): an
     /// await/yield directly in an async/sync* method body cannot let an
-    /// enclosing function resume, so nothing demotes there.
-    pub(crate) fn suspend(&mut self) {
+    /// enclosing function resume, so nothing demotes there. `span` is the
+    /// suspension node's own range — the `DemoteViaSuspension.node` anchor
+    /// each dropped promotion's reason link carries
+    /// (`flow_analysis.dart:7935-7947`).
+    pub(crate) fn suspend(&mut self, span: SourceRange) {
         let demote: FxHashSet<u32> = match self.stack.iter().rev().find(|f| {
             matches!(
                 f,
@@ -1173,7 +1810,55 @@ impl Interp<'_> {
                 .collect(),
             _ => return,
         };
-        self.cjoin(&demote, &FxHashSet::default());
+        self.cjoin_reason(
+            &demote,
+            &FxHashSet::default(),
+            Some(crate::facts::NonPromotionCause::Suspension { span }),
+        );
+    }
+
+    /// Interns a non-promotion entry row: the history chain walked front to
+    /// back (most recent demotion first), subtype-filtered against `current`
+    /// when given (the official variable arm's
+    /// `!isSubtypeOf(currentType, nonPromotedType)` rule,
+    /// `flow_analysis.dart:8846-8848` — a dropped type the flow type is
+    /// still below is irrelevant), deduplicated first-wins per type (the
+    /// official map's `??=`). The property arm passes `None`: every cleared
+    /// promoted type stands as evidence. Equal rows share one arena slot,
+    /// so repeated reads of the same demoted state cost no growth.
+    pub(crate) fn intern_non_promotion(&mut self, current: Option<(Ty, u32)>, history: u32) -> u32 {
+        if history == crate::model::NIL {
+            return 0;
+        }
+        let mut entries: Vec<crate::facts::NonPromotionEntry> = Vec::new();
+        for (ty, args, cause) in self.reasons.iter(history) {
+            if current.is_some_and(|(cur, _)| self.ops.is_subtype(cur, ty)) {
+                continue;
+            }
+            if entries.iter().any(|e| e.ty == ty && e.args == args) {
+                continue;
+            }
+            entries.push(crate::facts::NonPromotionEntry { ty, args, cause });
+        }
+        if entries.is_empty() {
+            return 0;
+        }
+        if let Some(index) = self.non_promotions.iter().position(|row| *row == entries) {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "arena index; a body with 2^32 distinct demotion \
+                          contexts cannot parse"
+            )]
+            return index as u32;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "arena index; a body with 2^32 distinct demotion \
+                      contexts cannot parse"
+        )]
+        let id = self.non_promotions.len() as u32;
+        self.non_promotions.push(entries);
+        id
     }
 
     /// Runs a range of the buffer through the driver, honoring jumps.
@@ -1542,6 +2227,9 @@ impl Interp<'_> {
         self.stmt_began_dead = !self.reachable();
         // Condition (empty condition = `true`).
         let cond = self.run_header_expr(events, bounds.cond.clone(), match_of, base);
+        if let Some(expr) = &cond {
+            self.condition_operand(expr);
+        }
         let (if_true, if_false) = if let Some(expr) = cond {
             self.cond_split(&expr)
         } else {
@@ -1582,29 +2270,48 @@ impl Interp<'_> {
             _ => None,
         };
         self.current = self.join(Some(self.current.clone()), continue_model);
-        // Official `for_updaterBegin` (dead_code_verifier.dart:357-375):
+        // Official `for_updaterBegin` (dead_code_verifier.dart:357-378):
         // updaters entered unreachable fire their own immediate row — from
         // the first updater's begin token to the last one's end. The part
         // carries no statement wrapper (the header parses a bare
         // `parse_expression` list), so the begin comes from the first
-        // spanned event (an updater identifier's token) and the end from
-        // the postfix operators' ends. The row is independent of the
-        // body's: the official reports it without opening an interval, so
-        // the loop's exit path is unaffected (a live condition keeps the
-        // tail row-free, probe u3) and a wholly dead loop folds the
-        // updaters into its own row instead (probe u5).
+        // spanned event (an updater identifier's token), pulled back to a
+        // prefix assignment's operator when one precedes it, and the end
+        // from the postfix operators' and assignment expressions' ends
+        // (the operand events' own ends for a bare prefix `++i`). The row
+        // is independent of the body's: the official reports it without
+        // opening an interval, so the loop's exit path is unaffected (a
+        // live condition keeps the tail row-free, probe u3) and a wholly
+        // dead loop folds the updaters into its own row instead (probe
+        // u5).
         if !self.reachable() && !had_dead {
             let mut begin: Option<TokenSpan> = None;
             let mut last: Option<u32> = None;
             for event in &events[bounds.upd.clone()] {
-                if begin.is_none()
-                    && let Some(span) = event.span()
-                {
-                    begin = Some(span);
+                if let Some(span) = event.span() {
+                    if begin.is_none() {
+                        begin = Some(span);
+                    }
+                    last = Some(
+                        last.map_or(span.range.end(), |current| current.max(span.range.end())),
+                    );
                 }
                 match *event {
-                    Ev::StmtEnd { end: stmt_end } | Ev::UnaryPostfixAssign { end: stmt_end } => {
-                        last = Some(last.map_or(stmt_end, |current| current.max(stmt_end)));
+                    // `++i`: the operator's span follows the operand's events
+                    // (the parser reports the prefix assignment after the
+                    // operand parse) and precedes it in the source — the row
+                    // begins at the operator (the updaters' beginToken,
+                    // dead_code_verifier.dart:367-375).
+                    Ev::UnaryPrefixAssign { span } => {
+                        begin = Some(match begin {
+                            Some(b) if b.range.offset <= span.range.offset => b,
+                            _ => span,
+                        });
+                    }
+                    Ev::Assign { end, .. }
+                    | Ev::StmtEnd { end }
+                    | Ev::UnaryPostfixAssign { end } => {
+                        last = Some(last.map_or(end, |current| current.max(end)));
                     }
                     _ => {}
                 }
@@ -1664,6 +2371,10 @@ impl Interp<'_> {
         self.run_range(events, range, match_of);
         self.for_header_depth = self.for_header_depth.saturating_sub(1);
         self.header_cond_depth = self.header_cond_depth.saturating_sub(1);
+        // The slice is one expression: null-shorting opened inside it ends
+        // here (official `finishNullShorting` at the dispatch boundary); an
+        // enclosing `?` chain stays open.
+        self.flush_null_shorts_above(base);
         let expr = if self.exprs.len() > base {
             self.exprs.pop()
         } else {
@@ -1760,9 +2471,19 @@ impl Interp<'_> {
         collection: bool,
         match_of: &[u32],
     ) {
+        // The iterable expression ends: rejoin null-shorting opened inside
+        // it before its value is consumed; an enclosing `?` chain stays
+        // open.
+        self.flush_null_shorts_above(self.exprs.len().saturating_sub(1));
         // The iterable expression value is on the stack; it contributes no
         // promotion state.
         self.exprs.pop();
+        // The zero-iteration state (the loop head's cond-false arm) is the
+        // state BEFORE the loop variable's per-iteration write: official
+        // `forEach_bodyBegin` writes on the body path only, so a loop that
+        // runs zero times leaves a declared loop variable definitely
+        // unassigned at the exit.
+        let previous = self.current.clone();
         // A declared head's loop variable is initialized before the body
         // (analyzer for_resolver.dart:222-226 `declare(initialized: true)`
         // right before `forEach_bodyBegin`; for_each.dart
@@ -1773,11 +2494,18 @@ impl Interp<'_> {
         // declarations follow it. The identifier-head form's target was
         // written at its Ident event; a pattern head declares its
         // variables assigned on match.
-        if let Some(var) = events[head_start..i].iter().find_map(|ev| match ev {
+        if let Some(Resolved::Local(var)) = events[head_start..i].iter().find_map(|ev| match ev {
             Ev::InitializedIdent { name, .. } => self.resolve(*name),
             _ => None,
         }) {
-            self.write_var(var, Ty::UNKNOWN, false);
+            // Not a write in the official sets (the loop variable can be
+            // `final`) and carries no demotion reason (the official
+            // `forEach_assigns_to_declared_var` declares — no
+            // `nonPromotionReason`, `flow_analysis.dart:4914-4916`): the
+            // state moves without the write-site record.
+            // (The searched names declared in this buffer always resolve
+            // local — the top-level face never reaches this write.)
+            self.apply_write(var, Ty::UNKNOWN, false, None);
         }
         let body_start = (i..end).find(|&j| matches!(events[j], Ev::ForInBodyBegin));
         let body = match body_start {
@@ -1785,7 +2513,6 @@ impl Interp<'_> {
             None => i + 1..end,
         };
         let effects = self.collect_ranges(events, body, match_of);
-        let previous = self.current.clone();
         self.split_cur();
         self.cjoin(&effects.written, &effects.captured);
         let checkpoint = self.reach.parent(self.current.reach);

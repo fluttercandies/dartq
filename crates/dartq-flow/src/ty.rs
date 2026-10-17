@@ -58,6 +58,15 @@ impl Ty {
         base: Base::Unknown,
         nullable: false,
     };
+    /// The potentially-nullable unknown face: the marker type of a
+    /// property read whose static type the flow layer cannot resolve (the
+    /// field's declared type lives in the semantic layer). Its non-null
+    /// face is [`Ty::UNKNOWN`] — the promotion marker a null check records
+    /// on a property slot (#1409).
+    pub const UNKNOWN_NULLABLE: Ty = Ty {
+        base: Base::Unknown,
+        nullable: true,
+    };
     pub const DYNAMIC: Ty = Ty {
         base: Base::Dynamic,
         nullable: false,
@@ -100,6 +109,28 @@ pub enum Classification {
     PotentiallyNullable,
     /// Non-nullable.
     NonNullable,
+}
+
+/// One type parameter's declared-bound nullability face. The official
+/// `classifyType` is a subtype question, not a spelling check (upstream
+/// Dart SDK source, pkg/analyzer/lib/src/dart/resolver/flow_analysis_visitor.dart:615-632):
+/// `T <: Object` → nonNullable, `T <: Null` → nullOrEquivalent, else
+/// potentiallyNullable — and for a type variable those rules consult its
+/// bound: `T <: Object` iff `B <: Object`, the implicit bound being
+/// `Object?` (pkg/analyzer/lib/src/dart/element/subtype.dart:303-318). A
+/// `?`-less reference to `T extends Object?` therefore classifies
+/// potentially-nullable where the syntactic shape alone says non-nullable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Boundary {
+    /// The classification of a `?`-less reference to the parameter.
+    pub(crate) class: Classification,
+    /// The bound's non-null face when it differs from the bound — the
+    /// `tryMarkNonNullable` promotion target beside its written-argument
+    /// tree (official `NonNull(X) = X & NonNull(B)` with the
+    /// identical-bound collapse, pkg/analyzer/lib/src/dart/element/type_system.dart:1467-1495:
+    /// a top-type or `FutureOr`-of-top bound promotes to nothing, its
+    /// non-null form being itself). `None` → a null check promotes nothing.
+    pub(crate) target: Option<(Ty, u32)>,
 }
 
 /// The client-supplied type operations seam (official

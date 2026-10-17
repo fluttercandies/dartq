@@ -7,7 +7,7 @@ use dartq_language::{FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
 use dartq_scanner::{ScanConfig, TokenTable};
 
-use crate::facts::FlowFact;
+use crate::facts::{AsyncOrigin, FlowFact};
 use crate::forward::SharedFlow;
 use crate::record::Flow;
 
@@ -25,15 +25,10 @@ fn facts_of(source: &str) -> Vec<FlowFact> {
     let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
         LanguageVersion::new(3, 15),
     ));
-    let flow = SharedFlow(std::rc::Rc::new(std::cell::RefCell::new(Flow::new(
+    let mut flow = SharedFlow(std::rc::Rc::new(std::cell::RefCell::new(Flow::new(
         tokens, source,
     ))));
-    let mut parser = dartq_parser::Parser::new(
-        source,
-        tokens,
-        features,
-        SharedFlow(std::rc::Rc::clone(&flow.0)),
-    );
+    let mut parser = dartq_parser::Parser::new(source, tokens, features, &mut flow);
     parser.parse_unit();
     drop(parser);
     flow.0.borrow_mut().take_facts()
@@ -55,15 +50,10 @@ fn analyze(source: &str) -> (SharedFlow<'_>, Vec<FlowFact>) {
     let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
         LanguageVersion::new(3, 15),
     ));
-    let flow = SharedFlow(std::rc::Rc::new(std::cell::RefCell::new(Flow::new(
+    let mut flow = SharedFlow(std::rc::Rc::new(std::cell::RefCell::new(Flow::new(
         tokens, source,
     ))));
-    let mut parser = dartq_parser::Parser::new(
-        source,
-        tokens,
-        features,
-        SharedFlow(std::rc::Rc::clone(&flow.0)),
-    );
+    let mut parser = dartq_parser::Parser::new(source, tokens, features, &mut flow);
     parser.parse_unit();
     drop(parser);
     let facts = flow.0.borrow_mut().take_facts();
@@ -98,6 +88,13 @@ fn dead_snippets(source: &str) -> Vec<String> {
             | FlowFact::PromotedRead { .. }
             | FlowFact::ReadType { .. }
             | FlowFact::WriteSite { .. }
+            | FlowFact::ConditionType { .. }
+            | FlowFact::MatchedType { .. }
+            | FlowFact::AsyncContextUse { .. }
+            | FlowFact::PromotedPropertyRead { .. }
+            | FlowFact::WhyNotPromoted { .. }
+            | FlowFact::NonPromotedPropertyRead { .. }
+            | FlowFact::ThisNotPromoted { .. }
             | FlowFact::BodyMayCompleteNormally { .. } => None,
         })
         .collect()
@@ -117,6 +114,13 @@ fn unassigned_snippets(source: &str) -> Vec<String> {
             | FlowFact::PromotedRead { .. }
             | FlowFact::ReadType { .. }
             | FlowFact::WriteSite { .. }
+            | FlowFact::ConditionType { .. }
+            | FlowFact::MatchedType { .. }
+            | FlowFact::AsyncContextUse { .. }
+            | FlowFact::PromotedPropertyRead { .. }
+            | FlowFact::WhyNotPromoted { .. }
+            | FlowFact::NonPromotedPropertyRead { .. }
+            | FlowFact::ThisNotPromoted { .. }
             | FlowFact::BodyMayCompleteNormally { .. } => None,
         })
         .collect()
@@ -126,7 +130,7 @@ fn unassigned_snippets(source: &str) -> Vec<String> {
 /// promoted reads) without the completion and query-face rows: the
 /// assertion face of the tests that pin the three diagnostic faces. A
 /// reachable executable emits a completion row by design (#676), and
-/// every reachable read emits a ReadType row plus its body the write
+/// every reachable read emits a `ReadType` row plus its body the write
 /// rows (#1056), so a whole-list emptiness check would observe them.
 fn read_facts_of(source: &str) -> Vec<FlowFact> {
     facts_of(source)
@@ -137,6 +141,12 @@ fn read_facts_of(source: &str) -> Vec<FlowFact> {
                 FlowFact::BodyMayCompleteNormally { .. }
                     | FlowFact::ReadType { .. }
                     | FlowFact::WriteSite { .. }
+                    | FlowFact::ConditionType { .. }
+                    | FlowFact::MatchedType { .. }
+                    | FlowFact::PromotedPropertyRead { .. }
+                    | FlowFact::WhyNotPromoted { .. }
+                    | FlowFact::NonPromotedPropertyRead { .. }
+                    | FlowFact::ThisNotPromoted { .. }
             )
         })
         .collect()
@@ -198,7 +208,10 @@ fn decl_block(name: u32, ty: crate::ev::Ev) -> Vec<crate::ev::Ev> {
             span: tspan(0),
         },
         ty,
-        crate::ev::Ev::InitializedIdent { name, token: tspan(0) },
+        crate::ev::Ev::InitializedIdent {
+            name,
+            token: tspan(0),
+        },
         crate::ev::Ev::InitializerBegin,
         crate::ev::Ev::OtherExpr { span: tspan(1) },
         crate::ev::Ev::InitializerEnd,
@@ -208,7 +221,7 @@ fn decl_block(name: u32, ty: crate::ev::Ev) -> Vec<crate::ev::Ev> {
 
 /// Drives a hand-built buffer through a fresh interpreter (name-level ops).
 fn interp_of(events: &[crate::ev::Ev]) -> crate::interp::Interp<'static> {
-    let mut interp = crate::interp::Interp::new(&crate::ty::NameTypeOps, &[]);
+    let mut interp = crate::interp::Interp::new(&crate::ty::NameTypeOps, &[], &[]);
     interp.run(events);
     interp
 }
@@ -479,6 +492,157 @@ fn never_typed_subexpression_exit_kills_the_rest() {
     );
 }
 
+/// The as-cast tail face owns the initializer's dead row: a cast whose
+/// operand exits Never (`var a = f() as int;` with a Never-typed `f`)
+/// opens the interval at the cast type directly inside the initializer,
+/// where the semantic layer's as-cast tail face stages the official row
+/// at the cast type's head token (probed: dart analyze 3.13.1 —
+/// `DEAD_CODE` anchored there, `Dead code.`) — so the interval retires
+/// without emitting rather than reporting a second `dead_code` row for
+/// the same region. The interval itself keeps the official one-row rule
+/// (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/error/dead_code_verifier.dart:183-189): later
+/// unreachable nodes continue it and a covering close retires it — only
+/// the emission skips. Hand-driven: only the engine can resolve a
+/// subexpression's type to Never, so the parser pipeline cannot produce
+/// this buffer yet.
+#[test]
+fn dead_cast_tail_owns_the_initializer_row() {
+    // `void main() { var a = f() as int; }` — offsets: `var` at 14, `f()`
+    // at 22-24, `as` at 26, `;` at 32, `}` at 34. The recorded grammar
+    // per declaration: `VarDeclBegin` at the keyword, the identifier,
+    // then the initializer bracket wrapping the expression's events; the
+    // engine's Exit lands right after the send's `)` (the cast-type poll
+    // at `AsBegin` is then the first unreachable node).
+    let events: Vec<crate::ev::Ev> = [
+        vec![
+            crate::ev::Ev::ExecBegin { is_closure: false },
+            crate::ev::Ev::BlockBodyBegin,
+        ],
+        vec![
+            crate::ev::Ev::VarDeclBegin {
+                late: false,
+                is_final: false,
+                span: tspan(14),
+            },
+            crate::ev::Ev::InitializedIdent {
+                name: 0,
+                token: tspan(18),
+            },
+            crate::ev::Ev::InitializerBegin,
+            crate::ev::Ev::OtherExpr { span: tspan(22) },
+            crate::ev::Ev::Exit { end: tspan(24) },
+            crate::ev::Ev::AsBegin { span: tspan(26) },
+            crate::ev::Ev::AsEnd,
+            crate::ev::Ev::AsOperator,
+            crate::ev::Ev::InitializerEnd,
+            crate::ev::Ev::VarDeclEnd,
+            crate::ev::Ev::StmtEnd { end: 33 },
+        ],
+        vec![
+            crate::ev::Ev::BlockBodyEnd,
+            crate::ev::Ev::ExecEnd {
+                is_expr: false,
+                end: tspan(34),
+            },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(&events);
+    // The row belongs to the as-cast tail face: no flow row of our own.
+    assert!(
+        !interp
+            .facts
+            .iter()
+            .any(|fact| matches!(fact, FlowFact::DeadCode { .. })),
+        "{:?}",
+        interp.facts
+    );
+
+    // Control: the same cast outside an initializer (the expression
+    // statement face) keeps its flow row — the suppression keys on the
+    // initializer bracket, and an expression-statement wrapper's dead
+    // interval stays the flow window's.
+    let bare: Vec<crate::ev::Ev> = events
+        .iter()
+        .copied()
+        .filter(|ev| {
+            !matches!(
+                ev,
+                crate::ev::Ev::InitializerBegin | crate::ev::Ev::InitializerEnd
+            )
+        })
+        .collect();
+    let interp = interp_of(&bare);
+    let rows: Vec<_> = interp
+        .facts
+        .iter()
+        .filter(|fact| matches!(fact, FlowFact::DeadCode { .. }))
+        .collect();
+    let [FlowFact::DeadCode { span }] = rows.as_slice() else {
+        panic!("expected one DeadCode row, got {:?}", interp.facts);
+    };
+    assert_eq!(span.range.offset, 26, "anchor is the cast type poll");
+    assert_eq!(span.range.length, 7, "the row runs to the `;`");
+
+    // Control: a cast inside a nested executable within the initializer
+    // (synthetic offsets — the bracket wraps the closure) keeps its row:
+    // the executable's own frame depth breaks the initializer match, the
+    // face the as-cast tail's own frame gate leaves to the flow window.
+    let nested: Vec<crate::ev::Ev> = [
+        vec![
+            crate::ev::Ev::ExecBegin { is_closure: false },
+            crate::ev::Ev::BlockBodyBegin,
+            crate::ev::Ev::VarDeclBegin {
+                late: false,
+                is_final: false,
+                span: tspan(14),
+            },
+            crate::ev::Ev::InitializedIdent {
+                name: 0,
+                token: tspan(18),
+            },
+            crate::ev::Ev::InitializerBegin,
+            crate::ev::Ev::ExecBegin { is_closure: true },
+        ],
+        vec![
+            crate::ev::Ev::OtherExpr { span: tspan(22) },
+            crate::ev::Ev::Exit { end: tspan(24) },
+            crate::ev::Ev::AsBegin { span: tspan(26) },
+            crate::ev::Ev::AsEnd,
+            crate::ev::Ev::AsOperator,
+            crate::ev::Ev::ExprStmt { span: tspan(22) },
+            crate::ev::Ev::StmtEnd { end: 33 },
+            crate::ev::Ev::ExecEnd {
+                is_expr: true,
+                end: tspan(34),
+            },
+        ],
+        vec![
+            crate::ev::Ev::InitializerEnd,
+            crate::ev::Ev::VarDeclEnd,
+            crate::ev::Ev::StmtEnd { end: 33 },
+            crate::ev::Ev::BlockBodyEnd,
+            crate::ev::Ev::ExecEnd {
+                is_expr: false,
+                end: tspan(36),
+            },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(&nested);
+    let rows: Vec<_> = interp
+        .facts
+        .iter()
+        .filter(|fact| matches!(fact, FlowFact::DeadCode { .. }))
+        .collect();
+    let [FlowFact::DeadCode { span }] = rows.as_slice() else {
+        panic!("expected one DeadCode row, got {:?}", interp.facts);
+    };
+    assert_eq!(span.range.offset, 26, "anchor is the cast type poll");
+    assert_eq!(span.range.length, 7, "the row runs to the `;`");
+}
+
 /// official `test_doWhile` (`dead_code_test.dart`): a dead do-while back
 /// edge anchors the interval on the condition, and the close splits into
 /// the `while (c);` part plus the tail after the statement (official
@@ -563,7 +727,7 @@ fn for_break_after_assignment() {
 /// A labeled break's dead tail: `break a` exits the OUTER loop, so the
 /// assignment after the INNER while is the dead statement (official
 /// `test_breakOutFromLoop` containment), and the covering close is the
-/// outer while's `flowEnd(node.body)` (type_analyzer.dart:4901) trimmed
+/// outer while's `flowEnd(node.body)` (`type_analyzer.dart:4901`) trimmed
 /// to the body block's last statement `x = 1;` — its `;` included
 /// (dead_code_verifier.dart:269-271, :326-332). The trailing `x;` is
 /// alive (the break joins the outer exit) — it reads definitely
@@ -787,14 +951,125 @@ fn never_question_takes_the_null_type_arms() {
     assert_eq!(dead_snippets(source), ["{ print(1); }"]);
     // NullOrEquivalent x NonNullable: known not-equal — `==` kills the
     // then-branch, `!=` the else-branch.
-    let source = "void f() { Never? n = null; int y = 0; if (y == n) { print(1); } else { print(2); } }";
+    let source =
+        "void f() { Never? n = null; int y = 0; if (y == n) { print(1); } else { print(2); } }";
     assert_eq!(dead_snippets(source), ["{ print(1); }"]);
-    let source = "void f() { Never? n = null; int y = 0; if (y != n) { print(1); } else { print(2); } }";
+    let source =
+        "void f() { Never? n = null; int y = 0; if (y != n) { print(1); } else { print(2); } }";
     assert_eq!(dead_snippets(source), ["{ print(2); }"]);
     // NullOrEquivalent x PotentiallyNullable: no information.
-    let source = "void f() { Never? n = null; int? x; if (x == n) { print(1); } else { print(2); } }";
+    let source =
+        "void f() { Never? n = null; int? x; if (x == n) { print(1); } else { print(2); } }";
     assert!(dead_snippets(source).is_empty(), "{source:?}");
     assert!(promoted_tys(source).is_empty());
+}
+
+// —— declared-bound nullability faces (#1077) ————————————————————————————
+//
+// The official `classifyType` is a subtype question: a type-parameter
+// reference `T` classifies through its declared bound (`T <: Object` iff
+// `B <: Object`, the implicit bound being `Object?` — upstream Dart SDK
+// source, pkg/analyzer/lib/src/dart/resolver/flow_analysis_visitor.dart:615-632
+// and pkg/analyzer/lib/src/dart/element/subtype.dart:303-325), so the
+// syntactic `?`-less spelling alone must not say non-nullable.
+
+/// official `equalityOp(x != <null expr>)` on `T extends Object?`: the
+/// reference is potentially nullable (the bound admits `null`), so the
+/// check reaches the promotion arm — both branches live, the else side
+/// promoted (also the unbounded `T` twin, whose implicit bound is
+/// `Object?`). The pre-#1077 syntactic face judged the then-branch dead.
+#[test]
+fn nullable_bound_type_param_null_check_keeps_both_branches_live() {
+    for source in [
+        "void f<T extends Object?>(T x) { if (x == null) { print(1); } else { print(2); } }",
+        "void f<T>(T x) { if (x == null) { print(1); } else { print(2); } }",
+        "void f<T extends Object?>(T x) { if (x != null) { print(1); } else { print(2); } }",
+        // Nullable spelled bounds behave like `Object?`.
+        "void f<T extends int?>(T x) { if (x == null) { print(1); } else { print(2); } }",
+    ] {
+        assert!(dead_snippets(source).is_empty(), "{source:?}");
+    }
+    // The else-branch read carries the promotion to the bound's non-null
+    // face (`T & Object` — name-level: `Object`).
+    let source = "void f<T extends Object?>(T x) { if (x == null) { x = x; } else { int y = x; } }";
+    let promoted = promoted_tys(source);
+    assert_eq!(promoted.len(), 1, "{source:?}");
+    assert!(
+        matches!(promoted[0].base, crate::ty::Base::Name(_)),
+        "{source:?}"
+    );
+    assert!(!promoted[0].nullable, "{source:?}");
+}
+
+/// The promotion is a real one: after `if (x == null) return;` the
+/// parameter's promoted non-null face classifies non-nullable, so a
+/// second `x == null` is a known not-equal result and the then-branch is
+/// dead — the shape the pre-#1077 face could never reach.
+#[test]
+fn nullable_bound_type_param_promotion_kills_a_second_null_check() {
+    let source =
+        "void f<T extends Object?>(T x) { if (x == null) return; if (x == null) { print(1); } }";
+    assert_eq!(dead_snippets(source), ["{ print(1); }"]);
+}
+
+/// official classifyType on `T extends Object` (and any strictly
+/// non-nullable bound): the reference classifies non-nullable, so the
+/// null check is a known not-equal result — the disjoint arm stays, the
+/// then-branch of `==` (the else-branch of `!=`) is dead, and nothing
+/// promotes (#1077 keeps the pre-existing behavior here).
+#[test]
+fn non_nullable_bound_type_param_keeps_the_disjoint_branch_kill() {
+    for source in [
+        "void f<T extends Object>(T x) { if (x == null) { print(1); } else { print(2); } }",
+        "void f<T extends num>(T x) { if (x != null) { print(1); } else { print(2); } }",
+    ] {
+        assert_eq!(dead_snippets(source).len(), 1, "{source:?}");
+        assert!(promoted_tys(source).is_empty(), "{source:?}");
+    }
+}
+
+/// `FutureOr<void>` bounds: `FutureOr<S> <: Object` iff `S <: Object`, and
+/// `void <: Object` fails (a top type) — potentially nullable (upstream
+/// Dart SDK source, pkg/analyzer/lib/src/dart/element/subtype.dart:319-325
+/// and :290-296). Both branches live; the promotion itself bails on
+/// `isSameType` (`NonNull(FutureOr<void>)` is `FutureOr<void>` —
+/// pkg/analyzer/lib/src/dart/element/type_system.dart:1467-1497), so no
+/// promotion row. A strictly-non-nullable `FutureOr<int>` control keeps
+/// the disjoint kill.
+#[test]
+fn future_or_void_bound_is_potentially_nullable_without_promotion() {
+    let source =
+        "void f<T extends FutureOr<void>>(T x) { if (x == null) { print(1); } else { print(2); } }";
+    assert!(dead_snippets(source).is_empty(), "{source:?}");
+    assert!(promoted_tys(source).is_empty(), "{source:?}");
+    let control =
+        "void f<T extends FutureOr<int>>(T x) { if (x == null) { print(1); } else { print(2); } }";
+    assert_eq!(dead_snippets(control), ["{ print(1); }"], "{control:?}");
+}
+
+/// A bound whose shape carries no derivable face (a record-type bound
+/// fires no head type row) degrades silently to the pre-#1077 behavior —
+/// no capture, no panic, the syntactic classification stands.
+#[test]
+fn underivable_bound_degrades_to_the_syntactic_face() {
+    let source =
+        "void f<T extends (int, String)>(T x) { if (x == null) { print(1); } else { print(2); } }";
+    assert_eq!(dead_snippets(source), ["{ print(1); }"], "{source:?}");
+}
+
+/// The boundary table is per-declaration: a second top-level declaration
+/// reusing the spelling starts from nothing, and a class's parameters
+/// stay visible across its members.
+#[test]
+fn boundary_table_scopes_to_one_top_level_declaration() {
+    // The class's `T extends Object?` reaches both members…
+    let source = "class C<T extends Object?> { void f(T x) { if (x == null) { print(1); } else { print(2); } } void g(T y) { y == null; } }";
+    assert!(dead_snippets(source).is_empty(), "{source:?}");
+    // …and does not leak into the next declaration: `h`'s unbounded `T`
+    // is independently nullable (also live), while a non-nullable rebind
+    // (`k`) kills its own branch.
+    let live = "void h<T extends Object?>(T x) { if (x == null) { print(1); } else { print(2); } }";
+    assert!(dead_snippets(live).is_empty(), "{live:?}");
 }
 
 /// #1037 pin: a closure parameter's type annotation types only that
@@ -992,7 +1267,10 @@ fn promoted_reads_carry_their_written_arguments() {
     // `x is List<int>`: real promotion, the row carries the written `<int>`.
     let arg_bearing = read_args("void f(List? x) { if (x is List<int>) { x; } }");
     assert_eq!(arg_bearing.len(), 1, "{arg_bearing:?}");
-    assert_eq!(arg_bearing[0], vec![("int".to_string(), crate::ty::EMPTY_ARGS)]);
+    assert_eq!(
+        arg_bearing[0],
+        vec![("int".to_string(), crate::ty::EMPTY_ARGS)]
+    );
     // `x is List`: the same promotion shape, no arguments — empty slot.
     let arg_free = read_args("void f(List? x) { if (x is List) { x; } }");
     assert_eq!(arg_free.len(), 1, "{arg_free:?}");
@@ -1037,19 +1315,23 @@ fn name_lexeme_recovers_interned_spellings() {
 }
 
 /// (e) `take_facts` stays offset-sorted with the new variant mixed in
-/// (the sort arm covers all four fact kinds).
+/// (the sort arm covers all fact kinds).
 #[test]
 fn take_facts_stays_offset_sorted_with_promotion_reads() {
     let source = "void f() { return; 1; } void g(num x) { if (x is int) { x; } }";
     let facts = facts_of(source);
     // f ends unreachable (no completion row); g falls through — its row
-    // anchors at the unit's last token, so it sorts last. The read emits
-    // the promotion row and its own ReadType row at the same span (#1056).
-    assert_eq!(facts.len(), 4, "{facts:?}");
+    // anchors at the unit's last token, so it sorts last. g's condition
+    // read (`x is int`'s operand) carries its own ReadType row at the
+    // declared type (every reachable read does, #1056); the branch read
+    // emits the promotion row and its ReadType row at the same span, the
+    // promotion row first (the emit order the stable sort preserves).
+    assert_eq!(facts.len(), 5, "{facts:?}");
     assert!(matches!(facts[0], FlowFact::DeadCode { .. }));
-    assert!(matches!(facts[1], FlowFact::PromotedRead { .. }));
-    assert!(matches!(facts[2], FlowFact::ReadType { .. }));
-    assert!(matches!(facts[3], FlowFact::BodyMayCompleteNormally { .. }));
+    assert!(matches!(facts[1], FlowFact::ReadType { .. }));
+    assert!(matches!(facts[2], FlowFact::PromotedRead { .. }));
+    assert!(matches!(facts[3], FlowFact::ReadType { .. }));
+    assert!(matches!(facts[4], FlowFact::BodyMayCompleteNormally { .. }));
     let offsets: Vec<u32> = facts
         .iter()
         .map(|fact| match fact {
@@ -1057,11 +1339,122 @@ fn take_facts_stays_offset_sorted_with_promotion_reads() {
             | FlowFact::UnassignedRead { span, .. }
             | FlowFact::PromotedRead { span, .. }
             | FlowFact::ReadType { span, .. }
+            | FlowFact::ConditionType { span, .. }
+            | FlowFact::MatchedType { span, .. }
+            | FlowFact::AsyncContextUse { span, .. }
+            | FlowFact::PromotedPropertyRead { span }
+            | FlowFact::WhyNotPromoted { span, .. }
+            | FlowFact::NonPromotedPropertyRead { span, .. }
+            | FlowFact::ThisNotPromoted { span, .. }
             | FlowFact::BodyMayCompleteNormally { span } => span.range.offset,
             FlowFact::WriteSite { decl_name_span, .. } => decl_name_span.offset,
         })
         .collect();
     assert!(offsets.windows(2).all(|pair| pair[0] <= pair[1]));
+}
+
+/// Read-type rows of a source, keyed by the read's offset.
+fn read_types_of(source: &str) -> Vec<(u32, crate::ty::Ty)> {
+    facts_of(source)
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::ReadType { span, ty, .. } => Some((span.range.offset, ty)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The top-level read face (#1730): a read of the unit's own top-level
+/// declaration publishes its `ReadType` row — the lexical fallback answers
+/// the written type (official unqualified-name lookup: the scope chain
+/// first, the unit's top-level scope last,
+/// property_element_resolver.dart:2137-2139). The written type is
+/// asserted against a declared local's read in the same source (one
+/// interned spelling, one id).
+#[test]
+fn top_level_read_carries_the_written_type() {
+    let source = "String a = '';\nvoid f() { String b = a; var c = b; }\n";
+    // `a` reads at offset 37, `b` at 48.
+    let rows = read_types_of(source);
+    let top = rows.iter().find(|(offset, _)| *offset == 37);
+    let local = rows.iter().find(|(offset, _)| *offset == 48);
+    let (Some((_, top)), Some((_, local))) = (top, local) else {
+        panic!("missing read rows: {rows:?}");
+    };
+    assert!(*top != crate::ty::Ty::UNKNOWN, "{top:?}");
+    assert_eq!(top, local, "the top-level face answers the written type");
+}
+
+/// A read inside a top-level initializer folds too: the initializer is
+/// its own executable, so `var b = a` sees the earlier declaration's row.
+#[test]
+fn top_level_initializer_read_folds() {
+    let source = "String a = '';\nvar b = a;\n";
+    let rows = read_types_of(source);
+    // `a` reads at offset 23, inside `b`'s initializer.
+    assert!(
+        rows.iter()
+            .any(|(offset, ty)| *offset == 23 && *ty != crate::ty::Ty::UNKNOWN),
+        "{rows:?}"
+    );
+}
+
+/// A class field never joins the table: the capture is gated on the
+/// container depth, so an unresolvable bare read keeps the
+/// implicit-`this` face and publishes no row.
+#[test]
+fn class_field_does_not_join_the_top_level_table() {
+    let source = "class C { String b = ''; }\nvoid f() { var x = b; }\n";
+    assert!(
+        !read_types_of(source)
+            .iter()
+            .any(|(offset, _)| *offset == 46),
+        "a field read must not answer from the top-level table"
+    );
+}
+
+/// A shadowing local wins: the scope chain answers first, so the local's
+/// own face (initializer-derived unknown at name level) covers the read.
+#[test]
+fn shadowing_local_wins_over_the_top_level_face() {
+    let source = "String a = '';\nvoid f() { var a = 1; var b = a; }\n";
+    let rows = read_types_of(source);
+    // `a` reads at offset 45 — the local's face, not the top-level
+    // `String`.
+    let row = rows.iter().find(|(offset, _)| *offset == 45);
+    assert_eq!(
+        row.map(|(_, ty)| *ty),
+        Some(crate::ty::Ty::UNKNOWN),
+        "{rows:?}"
+    );
+}
+
+/// A plain assignment target retracts its row: the top-level target is
+/// the write, not a read.
+#[test]
+fn plain_assignment_retracts_the_top_level_row() {
+    let source = "String a = '';\nvoid f() { a = 'x'; }\n";
+    assert!(
+        !read_types_of(source)
+            .iter()
+            .any(|(offset, _)| *offset == 26),
+        "{:?}",
+        read_types_of(source)
+    );
+}
+
+/// A forward reference under-reports: the declaration parsed after the
+/// executable is captured too late for its replay.
+#[test]
+fn forward_referenced_declaration_under_reports() {
+    let source = "void f() { var x = a; }\nString a = '';\n";
+    assert!(
+        !read_types_of(source)
+            .iter()
+            .any(|(offset, _)| *offset == 19),
+        "{:?}",
+        read_types_of(source)
+    );
 }
 
 /// The plain-assignment target retraction covers `PromotedRead` too: a
@@ -1074,6 +1467,7 @@ fn take_facts_stays_offset_sorted_with_promotion_reads() {
 /// and its span is the condition's, not the target's — outside the
 /// retraction's span key.
 #[test]
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn plain_assign_target_retracts_its_promoted_read() {
     let source = "void f() { String? x; if (x is String) { x = 'a'; } }";
     let facts = read_facts_of(source);
@@ -1147,7 +1541,7 @@ fn infinite_loop_shapes_decide_by_reachability() {
 }
 
 /// A closure body is its own executable: it completes independently of
-/// the enclosing body (the official gate fires per FunctionBody).
+/// the enclosing body (the official gate fires per `FunctionBody`).
 #[test]
 fn closure_bodies_complete_independently() {
     // Both the closure and the enclosing body fall through; the closure's
@@ -1219,6 +1613,55 @@ fn cast_pattern_does_not_pop_the_expr_stack() {
     // Guard position: the guard also evaluates under the matched state.
     let source = "void f(Object? o) { switch (o) { case var x as int when x > 0: 1; } }";
     assert!(unassigned_snippets(source).is_empty());
+}
+
+/// A cast in a case GUARD streams after `PatternEnd` (the parser closes
+/// the pattern before `begin_switch_case_when_clause` opens the guard), so
+/// `AsEnd`'s depth discriminator routes it to the expression face: the
+/// operand pops, the cast value pushes, and the operand variable promotes
+/// on the guard-true state the body opens on (official
+/// `switch_endAlternative`'s guardInfo split — flow_analysis.dart:8004-8042
+/// through `apply_pattern_exit`). No pattern-face refinement runs (the
+/// wildcard head declares nothing to refine — the `p as T` in-place primary
+/// is the other face), and the promotion cannot leak past the switch: the
+/// close join with the unmatched chain drops it. The switch stays
+/// exhaustive-agnostic — no dead rows anywhere. #1619 residual pin.
+#[test]
+fn case_guard_cast_takes_the_expression_face() {
+    let source = "void f(Object? o, int? y) { switch (o) { case _ when (y as int) > 0: y; } y; }";
+    let (flow, facts) = analyze(source);
+    let read_types: Vec<(String, crate::ty::Ty)> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::ReadType { span, ty, .. } => Some((
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
+                    .to_string(),
+                *ty,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        read_types
+            .iter()
+            .map(|(snippet, _)| snippet.as_str())
+            .collect::<Vec<_>>(),
+        ["o", "y", "y", "y"],
+        "{facts:?}"
+    );
+    // Scrutinee and the guard's cast operand read declared (the operand
+    // precedes the cast's promotion); the body read carries the guard-true
+    // promotion; the post-switch read is back at the declared type.
+    assert!(read_types[0].1.nullable, "{read_types:?}");
+    assert!(read_types[1].1.nullable, "{read_types:?}");
+    assert!(!read_types[2].1.nullable, "{read_types:?}");
+    assert!(read_types[3].1.nullable, "{read_types:?}");
+    let crate::ty::Base::Name(id) = read_types[2].1.base else {
+        panic!("expected a named type, got {:?}", read_types[2].1);
+    };
+    assert_eq!(flow.0.borrow().name_lexeme(id), "int");
+    assert!(dead_snippets(source).is_empty(), "{source:?}");
 }
 
 /// The case head's state carries into the case body: the guard's outcome
@@ -1340,8 +1783,7 @@ fn block_local_write_keeps_entry_promotion_in_later_groups() {
     assert_eq!(
         promoted.len(),
         1,
-        "entry promotion survives the block-local write: {:?}",
-        promoted
+        "entry promotion survives the block-local write: {promoted:?}"
     );
     assert!(!promoted[0].nullable);
 }
@@ -1429,6 +1871,7 @@ fn join_promoted_intersection_keeps_deeper_common_types() {
             version: 1,
             assigned: true,
             unassigned: false,
+            history: NIL,
         });
         s
     };
@@ -1480,7 +1923,7 @@ fn unmatched_construct_begins_do_not_panic() {
         // Switch block without SwitchBlockEnd.
         Ev::SwitchBlockBegin,
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
 }
 
@@ -1528,7 +1971,10 @@ fn c_style_collection_for_closes_its_loop_frame() {
             is_final: true,
             span: span(10),
         },
-        Ev::InitializedIdent { name: 0, token: span(1) },
+        Ev::InitializedIdent {
+            name: 0,
+            token: span(1),
+        },
         Ev::OtherExpr { span: span(11) },
         Ev::InitializerEnd,
         Ev::VarDeclEnd,
@@ -1549,7 +1995,7 @@ fn c_style_collection_for_closes_its_loop_frame() {
         Ev::OtherExpr { span: span(40) },
         Ev::ForControlFlowEnd { for_in: false },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.exprs.len(), 1);
@@ -1592,7 +2038,7 @@ fn closure_collect_keeps_enclosing_loop_frame() {
         Ev::WhileEnd,
         Ev::ExprStmt { span: span(4) },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     // The closure body falls off its end: one completion row (the outer
@@ -1624,7 +2070,7 @@ fn case_less_switch_expression_does_not_panic() {
         Ev::SwitchExprBlockBegin,
         Ev::SwitchExprBlockEnd,
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -1665,7 +2111,7 @@ fn try_catch_finally_completes_normally() {
         Ev::OtherExpr { span: span(7) },
         Ev::TryEnd { has_finally: true },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -1700,7 +2146,7 @@ fn try_finally_body_return_leaves_tail_dead() {
         Ev::ExprStmt { span: span(5) },
         Ev::OtherExpr { span: span(6) },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.facts.len(), 1);
@@ -1734,7 +2180,7 @@ fn try_finally_return_leaves_tail_dead() {
         Ev::ExprStmt { span: span(5) },
         Ev::OtherExpr { span: span(6) },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.facts.len(), 1);
@@ -1772,7 +2218,7 @@ fn try_two_catches_first_returns_second_completes() {
         Ev::CatchClauseEnd,
         Ev::TryEnd { has_finally: false },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -1809,7 +2255,7 @@ fn finally_break_exits_via_loop_exit_join() {
         Ev::ExprStmt { span: span(6) },
         Ev::OtherExpr { span: span(7) },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -1846,7 +2292,7 @@ fn finally_continue_exits_via_loop_exit_join() {
         Ev::ExprStmt { span: span(6) },
         Ev::OtherExpr { span: span(7) },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -1885,7 +2331,7 @@ fn try_catch_finally_returning_catch_keeps_tail_alive() {
         Ev::ExprStmt { span: span(7) },
         Ev::OtherExpr { span: span(8) },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -1898,8 +2344,9 @@ fn try_catch_finally_returning_catch_keeps_tail_alive() {
 /// wildcard): each arm branches from the chained unmatched state, the
 /// guard events run between `SwitchExprCasePattern` and the arm value (the
 /// recorder's order), and the block end joins the arms' combined state.
-/// Invariant-level: stack drains, no facts, replay stays reachable
-/// (official `switch_beginAlternative`/`switch_endAlternative`,
+/// Invariant-level: stack drains, replay stays reachable, and one
+/// matched-type row per alternative (official
+/// `switch_beginAlternative`/`switch_endAlternative`,
 /// `flow_analysis.dart:1680`).
 #[test]
 fn switch_expression_cases_and_guard_replay() {
@@ -1913,6 +2360,23 @@ fn switch_expression_cases_and_guard_replay() {
         range: SourceRange { offset, length: 1 },
     };
     let events = vec![
+        // `var x = ...;` — the scrutinee must resolve to a variable for
+        // the matched-type rows (official `getMatchedValueType` keys on
+        // the matched value's promotion key; an unresolved name carries
+        // none and emits no row).
+        Ev::VarDeclBegin {
+            late: false,
+            is_final: false,
+            span: span(0),
+        },
+        Ev::InitializedIdent {
+            name: 0,
+            token: span(0),
+        },
+        Ev::InitializerBegin,
+        Ev::OtherExpr { span: span(0) },
+        Ev::InitializerEnd,
+        Ev::VarDeclEnd,
         Ev::SwitchExprBegin { span: span(1) },
         Ev::Ident {
             name: 0,
@@ -1932,7 +2396,10 @@ fn switch_expression_cases_and_guard_replay() {
         Ev::Bool { value: true },
         Ev::GuardEnd,
         Ev::OtherExpr { span: span(4) },
-        Ev::SwitchExprCaseEnd { has_guard: true },
+        Ev::SwitchExprCaseEnd {
+            has_guard: true,
+            begin: span(3),
+        },
         // `_ => e`.
         Ev::SwitchExprCaseBegin,
         Ev::PatternBegin,
@@ -1940,13 +2407,35 @@ fn switch_expression_cases_and_guard_replay() {
         Ev::PatternEnd,
         Ev::SwitchExprCasePattern,
         Ev::OtherExpr { span: span(6) },
-        Ev::SwitchExprCaseEnd { has_guard: false },
+        Ev::SwitchExprCaseEnd {
+            has_guard: false,
+            begin: span(5),
+        },
         Ev::SwitchExprBlockEnd,
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
-    assert!(interp.facts.is_empty());
+    // The matched-type rows (#1349): one per alternative — the scrutinee
+    // is a bare read of an unknown-typed local, so the rows carry the
+    // unknown declared type. The scrutinee read itself carries its
+    // read-type row (the query face, #1056).
+    assert_eq!(interp.facts.len(), 3, "{:?}", interp.facts);
+    assert!(
+        interp
+            .facts
+            .iter()
+            .filter(|fact| matches!(fact, FlowFact::MatchedType { .. }))
+            .count()
+            == 2,
+        "{:?}",
+        interp.facts
+    );
+    assert!(
+        matches!(interp.facts.first(), Some(FlowFact::ReadType { .. })),
+        "{:?}",
+        interp.facts
+    );
     assert!(interp.reachable());
 }
 
@@ -1967,6 +2456,22 @@ fn switch_statement_default_exhaustive_tail_dead() {
         range: SourceRange { offset, length: 1 },
     };
     let events = vec![
+        // `var x = ...;` — the scrutinee resolves to a variable so the
+        // case head emits its matched-type row (a promotion key requires
+        // a variable read; an unresolved name emits none).
+        Ev::VarDeclBegin {
+            late: false,
+            is_final: false,
+            span: span(0),
+        },
+        Ev::InitializedIdent {
+            name: 0,
+            token: span(0),
+        },
+        Ev::InitializerBegin,
+        Ev::OtherExpr { span: span(0) },
+        Ev::InitializerEnd,
+        Ev::VarDeclEnd,
         Ev::SwitchBegin { span: span(1) },
         Ev::Ident {
             name: 0,
@@ -2011,10 +2516,31 @@ fn switch_statement_default_exhaustive_tail_dead() {
         Ev::ExprStmt { span: span(6) },
         Ev::OtherExpr { span: span(7) },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
-    assert_eq!(interp.facts.len(), 1);
+    // The dead tail, the matched-type row the case head emits (#1349; the
+    // bare-read scrutinee has no declared metadata: the unknown type), and
+    // the scrutinee read's own read-type row (the query face, #1056).
+    assert_eq!(interp.facts.len(), 3, "{:?}", interp.facts);
+    assert!(
+        interp
+            .facts
+            .iter()
+            .filter(|fact| matches!(fact, FlowFact::MatchedType { .. }))
+            .count()
+            == 1,
+        "{:?}",
+        interp.facts
+    );
+    assert!(
+        interp
+            .facts
+            .iter()
+            .any(|fact| matches!(fact, FlowFact::DeadCode { .. })),
+        "{:?}",
+        interp.facts
+    );
     assert!(!interp.reachable());
 }
 
@@ -2060,7 +2586,7 @@ fn assert_join_with_message_invariants() {
         Ev::Bool { value: true },
         Ev::AssertEnd,
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.exprs.is_empty());
@@ -2094,7 +2620,10 @@ fn assert_condition_write_unassigned_after() {
             is_final: false,
             span: span(1),
         },
-        Ev::InitializedIdent { name: 0, token: span(1) },
+        Ev::InitializedIdent {
+            name: 0,
+            token: span(1),
+        },
         Ev::NoInitializer,
         Ev::VarDeclEnd,
         // assert((v = 0) >= 0, v);
@@ -2108,7 +2637,10 @@ fn assert_condition_write_unassigned_after() {
             context: IdentifierContext::Expression,
         },
         Ev::OtherExpr { span: span(4) },
-        Ev::Assign { plain: true },
+        Ev::Assign {
+            plain: true,
+            end: 0,
+        },
         Ev::BinaryBegin {
             op: BinOp::Other,
             span: span(4),
@@ -2133,7 +2665,7 @@ fn assert_condition_write_unassigned_after() {
         },
         Ev::ExprStmt { span: span(8) },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(
@@ -2175,7 +2707,10 @@ fn pattern_assignment_writes_targets() {
             is_final: false,
             span: span(1),
         },
-        Ev::InitializedIdent { name: 0, token: span(1) },
+        Ev::InitializedIdent {
+            name: 0,
+            token: span(1),
+        },
         Ev::NoInitializer,
         Ev::VarDeclEnd,
         Ev::VarDeclBegin {
@@ -2183,7 +2718,10 @@ fn pattern_assignment_writes_targets() {
             is_final: false,
             span: span(2),
         },
-        Ev::InitializedIdent { name: 1, token: span(2) },
+        Ev::InitializedIdent {
+            name: 1,
+            token: span(2),
+        },
         Ev::NoInitializer,
         Ev::VarDeclEnd,
         Ev::PatternBegin,
@@ -2207,10 +2745,20 @@ fn pattern_assignment_writes_targets() {
         },
         Ev::ExprStmt { span: span(8) },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
-    assert!(interp.facts.is_empty());
+    // The diagnostic faces stay silent; the remaining rows are the query
+    // faces — the two reads' read-type rows and the targets' write-site
+    // rows (the pattern assignment is a real write in the official sets).
+    assert!(
+        interp.facts.iter().all(|fact| !matches!(
+            fact,
+            FlowFact::DeadCode { .. } | FlowFact::UnassignedRead { .. }
+        )),
+        "{:?}",
+        interp.facts
+    );
     assert!(interp.current.model(0).assigned);
     assert!(interp.current.model(1).assigned);
     assert!(interp.reachable());
@@ -2261,10 +2809,23 @@ fn pattern_declaration_declares_assigned() {
         },
         Ev::ExprStmt { span: span(7) },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
-    assert!(interp.facts.is_empty());
+    // The diagnostic faces stay silent; the declared variables read back
+    // with their read-type rows (the query face, #1056). Pattern
+    // declarations are not writes in the official sets, so no write-site
+    // row aggregates.
+    assert!(
+        interp.facts.iter().all(|fact| !matches!(
+            fact,
+            FlowFact::DeadCode { .. }
+                | FlowFact::UnassignedRead { .. }
+                | FlowFact::WriteSite { .. }
+        )),
+        "{:?}",
+        interp.facts
+    );
     assert!(interp.current.model(0).assigned);
     assert!(interp.current.model(1).assigned);
     assert!(interp.reachable());
@@ -2314,7 +2875,10 @@ fn closure_await_demotes_captured_reads() {
             is_final: false,
             span: span(1),
         },
-        Ev::InitializedIdent { name: 0, token: span(1) },
+        Ev::InitializedIdent {
+            name: 0,
+            token: span(1),
+        },
         Ev::InitializerBegin,
         Ev::OtherExpr { span: span(2) },
         Ev::InitializerEnd,
@@ -2331,14 +2895,19 @@ fn closure_await_demotes_captured_reads() {
             context: IdentifierContext::Expression,
         },
         Ev::ExprStmt { span: span(4) },
-        Ev::AwaitBegin,
+        Ev::AwaitBegin { token: span(4) },
         Ev::Ident {
             name: 1,
             token: span(5),
             context: IdentifierContext::Expression,
         },
         Ev::SendNoArgs,
-        Ev::AwaitEnd,
+        Ev::AwaitEnd {
+            span: dartq_source::SourceRange {
+                offset: 4,
+                length: 10,
+            },
+        },
         Ev::ExecEnd {
             is_expr: false,
             end: tspan(0),
@@ -2350,17 +2919,44 @@ fn closure_await_demotes_captured_reads() {
             context: IdentifierContext::Expression,
         },
         Ev::OtherExpr { span: span(7) },
-        Ev::Assign { plain: true },
+        Ev::Assign {
+            plain: true,
+            end: 0,
+        },
         Ev::ExprStmt { span: span(8) },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
-    // The closure body falls off its end: one completion row.
-    assert!(matches!(
-        interp.facts.as_slice(),
-        [FlowFact::BodyMayCompleteNormally { .. }]
-    ));
+    // The demotion's diagnostic observable is silence: no dead rows, no
+    // unassigned reads, no promoted reads. The remaining composition is
+    // exactly three rows, in emission order: (1) the closure read's
+    // read-type row at span(3) — every reachable read of a resolved local
+    // carries one (the `Ident` handler), with no promotion row beside it
+    // because x is never promoted; (2) the closure body's completion row
+    // at tspan(0) — `ExecEnd` sees a reachable fall-through
+    // (`BodyMayCompleteNormally`); (3) the `x = 1;` write-site row —
+    // emitted after the replay from the anywhere sets: x enters
+    // `written` through the plain assignment (the declaration
+    // initializer's `apply_write` records nothing) and never enters
+    // `captured` (the closure writes nothing), so exactly one
+    // `in_closure: false` row at the declaration name span(1); the
+    // assignment target's own read-type row (span(6)) is retracted by
+    // the plain assign.
+    let [
+        FlowFact::ReadType { span: read, .. },
+        FlowFact::BodyMayCompleteNormally { span: end },
+        FlowFact::WriteSite {
+            decl_name_span,
+            in_closure: false,
+        },
+    ] = interp.facts.as_slice()
+    else {
+        panic!("unexpected fact composition: {:?}", interp.facts);
+    };
+    assert_eq!(read.range.offset, 3, "{:?}", interp.facts);
+    assert_eq!(end.range.offset, 0, "{:?}", interp.facts);
+    assert_eq!(decl_name_span.offset, 1, "{:?}", interp.facts);
     assert!(interp.reachable());
 }
 
@@ -2405,7 +3001,10 @@ fn for_in_statement_replay_invariants() {
             is_final: false,
             span: span(1),
         },
-        Ev::InitializedIdent { name: 0, token: span(1) },
+        Ev::InitializedIdent {
+            name: 0,
+            token: span(1),
+        },
         Ev::NoInitializer,
         Ev::VarDeclEnd,
         Ev::ForInExprBegin,
@@ -2420,16 +3019,30 @@ fn for_in_statement_replay_invariants() {
             context: IdentifierContext::Expression,
         },
         Ev::OtherExpr { span: span(4) },
-        Ev::Assign { plain: true },
+        Ev::Assign {
+            plain: true,
+            end: 0,
+        },
         Ev::ExprStmt { span: span(5) },
         Ev::ForInBodyEnd,
         Ev::ForInEnd,
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.exprs.is_empty());
-    assert!(interp.facts.is_empty());
+    // The diagnostic faces stay silent; the body's `a = 1;` aggregates the
+    // loop variable's write-site row (a real write in the official sets).
+    assert!(
+        interp.facts.iter().all(|fact| !matches!(
+            fact,
+            FlowFact::DeadCode { .. }
+                | FlowFact::UnassignedRead { .. }
+                | FlowFact::PromotedRead { .. }
+        )),
+        "{:?}",
+        interp.facts
+    );
     // The zero-iteration path dominates the exit: one body write does not
     // make the loop variable definitely assigned after the loop.
     assert!(!interp.current.model(0).assigned);
@@ -2456,7 +3069,10 @@ fn for_in_break_joins_exit() {
             is_final: false,
             span: span(1),
         },
-        Ev::InitializedIdent { name: 0, token: span(1) },
+        Ev::InitializedIdent {
+            name: 0,
+            token: span(1),
+        },
         Ev::NoInitializer,
         Ev::VarDeclEnd,
         Ev::ForInExprBegin,
@@ -2473,7 +3089,7 @@ fn for_in_break_joins_exit() {
         Ev::ExprStmt { span: span(4) },
         Ev::OtherExpr { span: span(5) },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert!(interp.facts.is_empty());
@@ -2504,7 +3120,10 @@ fn collection_for_in_element_nets_one_value() {
             is_final: false,
             span: span(1),
         },
-        Ev::InitializedIdent { name: 0, token: span(1) },
+        Ev::InitializedIdent {
+            name: 0,
+            token: span(1),
+        },
         Ev::InitializerBegin,
         Ev::OtherExpr { span: span(2) },
         Ev::InitializerEnd,
@@ -2516,7 +3135,7 @@ fn collection_for_in_element_nets_one_value() {
         Ev::OtherExpr { span: span(4) },
         Ev::ForControlFlowEnd { for_in: true },
     ];
-    let mut interp = Interp::new(&NameTypeOps, &[]);
+    let mut interp = Interp::new(&NameTypeOps, &[], &[]);
     interp.run(&events);
     assert!(interp.stack.is_empty());
     assert_eq!(interp.exprs.len(), 1);
@@ -2685,7 +3304,7 @@ fn dead_interval_switch_members_report_per_group() {
 /// ends without a covering close, so the interval anchored inside runs
 /// through the label's closing brace to the enclosing close. The anchor
 /// is the FIRST LABEL token (official `firstDead.firstToken`,
-/// dead_code_verifier.dart:253 — the AST node starts at `L`), so the
+/// `dead_code_verifier.dart:253` — the AST node starts at `L`), so the
 /// `L: ` prefix sits inside the row (#641).
 #[test]
 fn dead_interval_labeled_statement_runs_to_the_tail() {
@@ -2720,7 +3339,7 @@ fn dead_interval_last_statement_block_ends_at_the_brace() {
 // dead_code_test.dart shapes) ————————————————————————————————————————
 
 /// official `test_forStatement` (11 carets): the close is
-/// `visitForStatement`'s `flowEnd(node.body)` (type_analyzer.dart:3194);
+/// `visitForStatement`'s `flowEnd(node.body)` (`type_analyzer.dart:3194`);
 /// the body block is EMPTY, so the trim's `statements.isNotEmpty` guard
 /// keeps the block itself (dead_code_verifier.dart:269-271) and the row
 /// ends at its `}`.
@@ -2730,7 +3349,7 @@ fn dead_interval_for_empty_body_runs_to_the_brace() {
     assert_eq!(dead_snippets(source), ["for (;;) {}"]);
 }
 
-/// `visitWhileStatement`'s `flowEnd(node.body)` (type_analyzer.dart:4901)
+/// `visitWhileStatement`'s `flowEnd(node.body)` (`type_analyzer.dart:4901`)
 /// with an empty body block: the trim keeps the block, the row ends at
 /// its `}`.
 #[test]
@@ -2782,9 +3401,9 @@ fn dead_interval_switch_without_members_runs_to_the_brace() {
 
 /// official row anchor of a dead labeled statement: the LABELED
 /// STATEMENT's first token — the label (`a`) — because
-/// `firstDead.firstToken` reads the AST node (dead_code_verifier.dart
+/// `firstDead.firstToken` reads the AST node (`dead_code_verifier.dart`
 /// :253/:325-332), while fasta's `beginLabeledStatement(next, …)`
-/// (parser_impl.dart:6909) delivers the statement PAST the labels as the
+/// (`parser_impl.dart:6909`) delivers the statement PAST the labels as the
 /// event marker. The recorder latches the first label-declaration token
 /// and anchors `LabeledBegin` on it, so the `a: ` prefix is INSIDE the
 /// row. #641.
@@ -2819,7 +3438,7 @@ fn dead_interval_for_condition_anchors_at_the_condition() {
 }
 
 /// Gate polarity guard: init/updater wrappers stay suppressed. A wholly
-/// dead loop anchors at `for` itself (`for_begin`, official ForStatement
+/// dead loop anchors at `for` itself (`for_begin`, official `ForStatement`
 /// `firstToken`); a header wrapper anchoring instead would start the row
 /// at the init expression.
 #[test]
@@ -3251,7 +3870,10 @@ fn assignment_demotion_keeps_the_least_specific_suffix() {
             read(X),
             // `x = other;`: the right-hand side is a `num` value.
             read(OTHER),
-            Ev::Assign { plain: true },
+            Ev::Assign {
+                plain: true,
+                end: 0,
+            },
             Ev::ExecEnd {
                 is_expr: false,
                 end: tspan(0),
@@ -3312,7 +3934,8 @@ fn is_not_then_branch_carries_the_factored_remainder() {
 /// (official `ifFalseIsUnreachable`, flow_analysis.dart:4159-4173 — the
 /// sound arm; `sound-flow-analysis` is enabled-by-default and expired,
 /// experiments/flags.dart:309-315): `int x` cannot fail `x is int?`, so
-/// the else branch is dead code.
+/// the else branch is dead code. The scrutinee's own read row (the
+/// read-type face, #1056) precedes the dead row.
 #[test]
 fn bottom_remainder_marks_the_else_branch_unreachable() {
     use crate::ev::Ev;
@@ -3341,6 +3964,7 @@ fn bottom_remainder_marks_the_else_branch_unreachable() {
         matches!(
             interp.facts.as_slice(),
             [
+                FlowFact::ReadType { .. },
                 FlowFact::DeadCode { .. },
                 FlowFact::BodyMayCompleteNormally { .. }
             ]
@@ -3413,7 +4037,10 @@ fn if_null_write_repromotes_via_types_of_interest() {
                 op: crate::ev::BinOp::IfNull,
                 end: 3,
             },
-            Ev::Assign { plain: true },
+            Ev::Assign {
+                plain: true,
+                end: 0,
+            },
             Ev::ExecEnd {
                 is_expr: false,
                 end: tspan(0),
@@ -3529,8 +4156,7 @@ fn mismatched_written_args_refuse_promotion() {
         is_test(7, ty_with_args(4, false), false),
     ]
     .concat();
-    let mut interp =
-        crate::interp::Interp::new(&crate::ty::NameTypeOps, arg_arena());
+    let mut interp = crate::interp::Interp::new(&crate::ty::NameTypeOps, arg_arena(), &[]);
     interp.run(&events);
     assert_eq!(
         interp.current.model(0).promoted,
@@ -3551,11 +4177,10 @@ fn equal_written_args_promote_with_args() {
         is_test(7, ty_with_args(3, false), false),
     ]
     .concat();
-    let mut interp =
-        crate::interp::Interp::new(&crate::ty::NameTypeOps, arg_arena());
+    let mut interp = crate::interp::Interp::new(&crate::ty::NameTypeOps, arg_arena(), &[]);
     interp.run(&events);
     let model = interp.current.model(0);
-    assert_eq!(interp.lists.head(model.promoted).nullable, false);
+    assert!(!interp.lists.head(model.promoted).nullable);
     assert_eq!(
         interp.lists.head_args(model.promoted),
         3,
@@ -3573,8 +4198,7 @@ fn raw_tested_against_written_declaration_refuses() {
         is_test(7, ty_with_args(crate::ty::EMPTY_ARGS, false), false),
     ]
     .concat();
-    let mut interp =
-        crate::interp::Interp::new(&crate::ty::NameTypeOps, arg_arena());
+    let mut interp = crate::interp::Interp::new(&crate::ty::NameTypeOps, arg_arena(), &[]);
     interp.run(&events);
     assert_eq!(interp.current.model(0).promoted, crate::model::NIL);
 }
@@ -3585,7 +4209,7 @@ fn raw_tested_against_written_declaration_refuses() {
 /// `return throw 1;`, `rethrow`) never anchors its own dead row: the
 /// post-order statement wrappers read the statement's began-dead
 /// snapshot, and the official's first dead node is the next visited node
-/// (`_visitNode`, upstream Dart SDK dead_code_verifier.dart).
+/// (`_visitNode`, upstream Dart SDK `dead_code_verifier.dart`).
 #[test]
 fn flow_terminating_statement_does_not_anchor_itself() {
     assert!(dead_snippets("void f() { throw 0; }").is_empty());
@@ -3593,7 +4217,10 @@ fn flow_terminating_statement_does_not_anchor_itself() {
         dead_snippets("void f() { throw 0; print(1); }"),
         ["print(1);"]
     );
-    assert_eq!(dead_snippets("void f() { return; print(2); }"), ["print(2);"]);
+    assert_eq!(
+        dead_snippets("void f() { return; print(2); }"),
+        ["print(2);"]
+    );
     assert_eq!(
         dead_snippets("void f() { return throw 1; print(2); }"),
         ["print(2);"]
@@ -3622,23 +4249,57 @@ fn try_body_terminator_leaves_catch_clauses_reachable() {
     }
 }
 
-/// A cast whose operand type and target are disjoint by nullability
-/// always throws (official `asExpression_end`:
-/// `_isTypeCheckGuaranteedToFailWithSoundNullSafety` sets unreachable,
-/// then still promotes): the block tail is dead from the next statement,
-/// and the cast's own declaration statement does not self-anchor. The
-/// written `Null` type names the core null type, the null literal is its
-/// own — both sides of the disjointness rule.
+/// A cast whose operand type and target are disjoint by nullability keeps
+/// the continuation alive: the measured oracle emits no `dead_code` after
+/// `var a = null as int;` (the `cast_from_null_always_fails` row is the
+/// semantic layer's value face, and the written `Null` type names the core
+/// null type just like the null literal). The flow kill for a cast whose
+/// operand never completes comes from the operand's own `Ev::Exit`, not
+/// from the disjointness question.
 #[test]
-fn cast_from_null_type_kills_the_following_statement() {
-    assert_eq!(
-        dead_snippets("void f(Null n) { var x = n as int; print(x); }"),
-        ["print(x);"]
+fn cast_from_null_keeps_the_following_statement_alive() {
+    for source in [
+        "void f(Null n) { var x = n as int; print(x); }",
+        "void f() { var x = null as int; print(x); }",
+    ] {
+        assert!(dead_snippets(source).is_empty(), "{source:?}");
+    }
+}
+
+/// An expression cast promotes its operand variable straight-line, no
+/// branch split (official `asExpression_end`'s `tryPromoteForTypeCast`,
+/// flow_analysis.dart:6475-6479, fed after the type events route the cast
+/// type): a nullable-declared `x` cast to `int` leaves the following read
+/// at the cast type. The operand's own read row precedes the promotion
+/// (the declared type stands at its evaluation point), the promotion
+/// surfaces as its own fact, and no dead code follows — a downcast can
+/// fail but is not guaranteed to (the measured oracle keeps even the
+/// guaranteed-fail continuation alive,
+/// `cast_from_null_keeps_the_following_statement_alive`). #1619 residual
+/// pin: the arm's first live promotion face.
+#[test]
+fn expression_cast_promotes_the_operand() {
+    let source = "void f(int? x) { x as int; x; }";
+    let (flow, facts) = analyze(source);
+    let read_types: Vec<crate::ty::Ty> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::ReadType { ty, .. } => Some(*ty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(read_types.len(), 2, "{facts:?}");
+    assert!(read_types[0].nullable, "the cast operand read is declared");
+    assert!(
+        !read_types[1].nullable,
+        "the read after the cast is promoted"
     );
-    assert_eq!(
-        dead_snippets("void f() { var x = null as int; print(x); }"),
-        ["print(x);"]
-    );
+    let crate::ty::Base::Name(id) = read_types[1].base else {
+        panic!("expected a named type, got {:?}", read_types[1]);
+    };
+    assert_eq!(flow.0.borrow().name_lexeme(id), "int");
+    assert_eq!(promoted_tys(source).len(), 1, "{source:?}");
+    assert!(dead_snippets(source).is_empty(), "{source:?}");
 }
 
 /// A statement dead boundary never leaks OUT of a nested executable: a
@@ -3694,14 +4355,65 @@ fn read_type_rows_carry_the_flow_type_at_reads() {
     );
 }
 
+/// The collection-if element split carries the promotion into the
+/// then-element only (official `handle_ifElement_conditionEnd`,
+/// type_analyzer.dart:1161, replayed at `ThenControlFlow` — the split
+/// opens on the condition's own event, interp_expr.rs): the then-element's
+/// read is promoted, the else-element's read is not (`!=`'s false arm
+/// carries no factored remainder — official `_equalityCheck`,
+/// flow_analysis.dart:4046-4076), and each element read's read-type row
+/// carries its branch's flow type.
+#[test]
+fn collection_if_splits_promotion_across_elements() {
+    let source = "void f(int? x, List<int> g) { g([if (x != null) x else x]); }";
+    let (_, facts) = analyze(source);
+    let cond_offset = (source.find("(x != null)").unwrap() + 1) as u32;
+    let then_offset = (source.find(") x else").unwrap() + ") ".len()) as u32;
+    let else_offset = (source.find("else x").unwrap() + "else ".len()) as u32;
+    // Exactly one promoted read: the then-element's.
+    let promoted: Vec<u32> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::PromotedRead { span, .. } => Some(span.range.offset),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(promoted, [then_offset], "{facts:?}");
+    let read_types: Vec<(u32, crate::ty::Ty)> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::ReadType { span, ty, .. } => Some((span.range.offset, *ty)),
+            _ => None,
+        })
+        .collect();
+    let ty_at = |offset: u32| {
+        read_types
+            .iter()
+            .find(|(at, _)| *at == offset)
+            .map(|(_, ty)| *ty)
+            .unwrap_or_else(|| panic!("no read-type row at {offset}: {read_types:?}"))
+    };
+    // The condition read sits before the split; the then read is promoted
+    // non-null; the else read is back at the declared nullable type.
+    assert!(ty_at(cond_offset).nullable, "{read_types:?}");
+    assert!(!ty_at(then_offset).nullable, "{read_types:?}");
+    assert!(ty_at(else_offset).nullable, "{read_types:?}");
+}
+
 // —— write-site facts (WriteSite, #1056) —————————————————————————————————
 
-/// The write-site rows aggregate the AssignedVariables anywhere sets, one
+/// The write-site rows aggregate the `AssignedVariables` anywhere sets, one
 /// row per (declaration, in-closure) pair: a reassignment outside
 /// closures rows once, a closure write rows with `in_closure: true`, and
-/// declaration initializers subtract (the official sets do not count
-/// them — the final-suggestion premise).
+/// a variable written both ways rows twice. Emission groups the sets —
+/// writes outside closures first — and the fact sink's stable offset
+/// sort then interleaves the rows by declaration offset. Declaration
+/// initializers and for-in declared loop variables are state-only: they
+/// move the flow state through `apply_write` and never enter the sets
+/// (the official sets do not count them — the `prefer_final_locals`
+/// premise), so only genuine reassignments emit rows.
 #[test]
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn write_site_rows_aggregate_the_write_sets() {
     let source = "void f() { int a = 0; int b; b = 1; int c = 0; () { c = 2; }; int d = 0; d = 1; () { d = 2; }; }";
     let (_, facts) = analyze(source);
@@ -3725,5 +4437,1522 @@ fn write_site_rows_aggregate_the_write_sets() {
             (at("d = 0;"), true),
         ],
         "{facts:?}"
+    );
+}
+
+// —— async-gap context face (use_build_context_synchronously core) ——
+
+/// The async-gap face rows of a source, in fact order:
+/// (`snippet`, `origin`, `gap`, `guarded`, `unrelated_mounted`).
+fn async_rows(source: &str) -> Vec<(String, AsyncOrigin, u32, bool, bool)> {
+    facts_of(source)
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::AsyncContextUse {
+                span,
+                origin,
+                gap,
+                gap_at: _,
+                guarded,
+                unrelated_mounted,
+            } => Some((
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
+                    .to_string(),
+                origin,
+                gap,
+                guarded,
+                unrelated_mounted,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn async_gap_flags_use_after_await() {
+    let source = r"
+void f(BuildContext context) async {
+  await g();
+  context.read();
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 1, false, false)]
+    );
+}
+
+#[test]
+fn async_gap_mounted_check_in_then_guards() {
+    let source = r"
+void f(BuildContext context) async {
+  await g();
+  if (context.mounted) {
+    context.read();
+  }
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 1, true, false)]
+    );
+}
+
+#[test]
+fn async_gap_negative_guard_with_exit_guards() {
+    // `if (!context.mounted) return;` — the notMountedCheck on a
+    // terminating then-branch guards the continuation.
+    let source = r"
+void f(BuildContext context) async {
+  await g();
+  if (!context.mounted) return;
+  context.read();
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 1, true, false)]
+    );
+}
+
+#[test]
+fn async_gap_positive_guard_with_else_exit_guards() {
+    let source = r"
+void f(BuildContext context) async {
+  await g();
+  if (context.mounted) {
+    g();
+  } else {
+    return;
+  }
+  context.read();
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 1, true, false)]
+    );
+}
+
+/// The else entry's verdict rows derive from the split-time latch, not
+/// from the statement stack: at `ElseBegin` the condition's markers are
+/// already folded (`ThenBegin`'s `fold_to`) and statement sequences balance,
+/// so the legacy `pop_val` there pops the clean-stack placeholder — inert,
+/// structurally unable to fold anything into the else fold. The rows come
+/// from `branch_entry`'s `check_entry` fallback: the branch a positive
+/// check does not select keeps the verdict the check latched at its
+/// evaluation, so a use in the else of `if (context.mounted)` rows guarded
+/// with the latched crossing — the same shape the branch-join family pins.
+/// #1619 residual pin: the documented latent shape stays deterministic.
+#[test]
+fn async_gap_else_entry_keeps_the_split_verdict() {
+    let source = r"
+void f(BuildContext context) async {
+  await g();
+  if (context.mounted) {
+    g();
+  } else {
+    context.read();
+  }
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 1, true, false)]
+    );
+}
+
+#[test]
+fn async_gap_guard_does_not_survive_branch_join() {
+    // Both branches verified does not carry past the if (upstream merge
+    // parity: the walk falls through to the pre-if state).
+    let source = r"
+void f(BuildContext context) async {
+  await g();
+  if (context.mounted) {
+    context.read();
+  } else {
+    context.read();
+  }
+  context.read();
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![
+            ("context".into(), AsyncOrigin::Context, 1, true, false),
+            ("context".into(), AsyncOrigin::Context, 1, true, false),
+            ("context".into(), AsyncOrigin::Context, 1, false, false),
+        ]
+    );
+}
+
+#[test]
+fn async_gap_state_mounted_check_flags_wrong_mounted() {
+    // The bare (implicit this) `mounted` is a State-side check: the
+    // context usage after it is unguarded with the wrong-mounted face.
+    let source = r"
+void f(BuildContext context) async {
+  await g();
+  if (!mounted) return;
+  context.read();
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 1, false, true)]
+    );
+}
+
+#[test]
+fn async_gap_bare_context_is_state_origin() {
+    let source = r"
+Future<void> f() async {
+  await g();
+  context.read();
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::State, 1, false, false)]
+    );
+}
+
+#[test]
+fn async_gap_this_context_is_state_origin() {
+    let source = r"
+class C {
+  Future<void> f() async {
+    await g();
+    this.context.read();
+  }
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::State, 1, false, false)]
+    );
+}
+
+#[test]
+fn async_gap_non_context_usages_ignored() {
+    let source = r"
+void f(String s) async {
+  await g();
+  s.isEmpty;
+  print(s);
+}
+";
+    assert!(async_rows(source).is_empty());
+}
+
+#[test]
+fn async_gap_no_await_no_rows() {
+    let source = r"
+void f(BuildContext context) {
+  context.read();
+}
+";
+    assert!(async_rows(source).is_empty());
+}
+
+#[test]
+fn async_gap_loop_back_upgrade_flags_use() {
+    // The use precedes the loop's await; the next iteration runs after
+    // it (the loop-back upgrade).
+    let source = r"
+void f(BuildContext context) async {
+  for (var i = 0; i < 1; i++) {
+    context.read();
+    await g();
+  }
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 1, false, false)]
+    );
+}
+
+#[test]
+fn async_gap_closure_is_opaque() {
+    let source = r"
+void f(BuildContext context) async {
+  await g();
+  callback(() {
+    context.read();
+  });
+}
+";
+    assert!(async_rows(source).is_empty());
+}
+
+#[test]
+fn async_gap_await_in_try_gaps_finally() {
+    let source = r"
+void f(BuildContext context) async {
+  try {
+    await g();
+  } finally {
+    context.read();
+  }
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 1, false, false)]
+    );
+}
+
+#[test]
+fn async_gap_argument_use_uses_post_argument_state() {
+    let source = r"
+void f(BuildContext context) async {
+  await g();
+  print(context);
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 1, false, false)]
+    );
+}
+
+#[test]
+fn async_gap_nullable_context_argument_exempt() {
+    // Argument uses require the non-nullable declared form (upstream
+    // Dart SDK source, pkg/linter/lib/src/rules/
+    // use_build_context_synchronously.dart:1424,
+    // `argType.isBuildContext(skipNullable: isGetter)`); nullable
+    // arguments carry no row.
+    //
+    // Runtime trace of the exemption (the gap pass over the recorded
+    // buffer): the formal's `Type` row parks `Ctx { nullable: true }` and
+    // `Formal` declares it; `await g();` closes one crossing (gap 1, both
+    // verdict slots Gap); `print(context)` streams Ident(print) as Other,
+    // then Ident(context) resolving to the `Ctx { nullable: true }` kind —
+    // `ArgumentsEnd` reads each argument's kind and the nullable arm is
+    // the exemption (only `Ctx { nullable: false }` and `StVal` record a
+    // use), so no row is buffered or emitted; `Send` and `ExprStmt` pop
+    // inert markers. The non-nullable twin (`async_gap_argument_use_
+    // uses_post_argument_state`) flips only the declaration's `?` and rows.
+    let source = r"
+void f(BuildContext? context) async {
+  await g();
+  print(context);
+}
+";
+    assert!(async_rows(source).is_empty());
+}
+
+#[test]
+fn async_gap_target_verdict_latched_at_evaluation() {
+    // The invocation target's verdict latches when the receiver
+    // evaluates: the later argument await (gap 2) does not affect it.
+    let source = r"
+void f(BuildContext context) async {
+  await g();
+  context.read(await g2());
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 1, false, false)]
+    );
+}
+
+#[test]
+fn async_gap_while_condition_await_gaps_body() {
+    let source = r"
+void f(BuildContext context) async {
+  while (await g()) {
+    context.read();
+  }
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 1, false, false)]
+    );
+}
+
+#[test]
+fn async_gap_gap_at_anchors_await_keyword() {
+    let source = r"
+void f(BuildContext context) async {
+  await g();
+  context.read();
+}
+";
+    let await_offset = source
+        .find("await")
+        .map_or(0, |i| u32::try_from(i).unwrap_or(u32::MAX));
+    let rows = facts_of(source);
+    let anchored = rows.into_iter().any(|fact| match fact {
+        FlowFact::AsyncContextUse { gap_at, .. } => gap_at.range.offset == await_offset,
+        _ => false,
+    });
+    assert!(anchored);
+}
+
+#[test]
+fn async_gap_await_in_guard_reopens_gap() {
+    // An await inside the guard expression folds the condition's async
+    // state to asynchronous (the awaited value carries `G::Gap` through
+    // the `&&` table): the guarded branch sits behind the crossing, and
+    // the mounted check earlier in the condition does not silence the
+    // use.
+    let source = r"
+void f(BuildContext context) async {
+  if (context.mounted == true && await g()) {
+    context.read();
+  }
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 1, false, false)]
+    );
+}
+
+#[test]
+fn async_gap_pure_guard_without_await_stays_guarded() {
+    // No await anywhere: the purely syntactic guard keeps its verdict —
+    // no over-correction from the awaited-value gap.
+    let source = r"
+void f(BuildContext context) async {
+  if (context.mounted) {
+    context.read();
+  }
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 0, true, false)]
+    );
+}
+
+#[test]
+fn async_gap_guard_await_without_use_no_rows() {
+    // The same guard-await shape with no context use in the branch: no
+    // row, no panic.
+    let source = r"
+void f(BuildContext context) async {
+  if (context.mounted == true && await g()) {
+    g2();
+  }
+}
+";
+    assert!(async_rows(source).is_empty());
+}
+
+#[test]
+fn async_gap_await_before_mounted_check_still_guards() {
+    // Upstream isAnd ordering: `asynchronous && mountedCheck` folds to
+    // mountedCheck (the `(G::Gap, _)` arm feeds the later check), so the
+    // branch stays guarded — the await before the check does not flag
+    // the use.
+    let source = r"
+void f(BuildContext context) async {
+  if (await g() && context.mounted) {
+    context.read();
+  }
+}
+";
+    assert_eq!(
+        async_rows(source),
+        vec![("context".into(), AsyncOrigin::Context, 0, true, false)]
+    );
+}
+
+// —— promoted-type-at-condition query rows (#1349) ————————————————————
+
+/// The condition-operand query rows of a source: `(anchored snippet,
+/// offset, ty)` per row, in fact order.
+fn condition_rows(source: &str) -> Vec<(String, u32, crate::ty::Ty)> {
+    facts_of(source)
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::ConditionType { span, ty, .. } => Some((
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
+                    .to_string(),
+                span.range.offset,
+                ty,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The matched-type query rows of a source: `(anchored snippet, offset,
+/// ty, written-argument tree)` per row, in fact order.
+fn matched_rows(source: &str) -> Vec<(String, u32, crate::ty::Ty, u32)> {
+    facts_of(source)
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::MatchedType { span, ty, args } => Some((
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
+                    .to_string(),
+                span.range.offset,
+                ty,
+                args,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The condition operand's row carries the flow type at its evaluation
+/// point: a declared read rows with the declared type, and a `&&` right
+/// operand rows with the promotion standing under the left's true branch
+/// (official `checkForNonBoolCondition` per operand —
+/// bool_expression_verifier.dart:45-73). The `is`-test left operand is
+/// not a reference and rows nothing.
+#[test]
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+fn condition_rows_carry_the_flow_type_at_condition_operands() {
+    let (flow, _) = analyze("void f(bool? b) { if (b) {} }");
+    let rows = condition_rows("void f(bool? b) { if (b) {} }");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "b");
+    assert!(rows[0].2.nullable, "{:?}", rows[0].2);
+    let crate::ty::Base::Name(id) = rows[0].2.base else {
+        panic!("expected a named type, got {:?}", rows[0].2);
+    };
+    assert_eq!(flow.0.borrow().name_lexeme(id), "bool");
+
+    // The right operand evaluates under the left's promotion; the left
+    // operand (`x is bool`) is a test, not a reference, and rows nothing.
+    let source = "void f(bool? x) { if (x is bool && x) {} }";
+    let (flow, _) = analyze(source);
+    let rows = condition_rows(source);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "x");
+    assert_eq!(rows[0].1, source.rfind('x').unwrap() as u32, "{rows:?}");
+    assert!(!rows[0].2.nullable, "the right operand sees the promotion");
+    let crate::ty::Base::Name(id) = rows[0].2.base else {
+        panic!("expected a named type, got {:?}", rows[0].2);
+    };
+    assert_eq!(flow.0.borrow().name_lexeme(id), "bool");
+}
+
+/// One row per statement-head condition across the official query
+/// contexts: if, while, do-while, assert (message or not), conditional
+/// expression, C-style `for` condition, and the collection if-element.
+#[test]
+fn condition_rows_fire_at_every_condition_context() {
+    let source = "\
+void f(bool? b) {
+  if (b) {}
+  while (b) {}
+  do {} while (b);
+  assert(b, 'm');
+  var x = b ? 1 : 2;
+  for (; b; ) {}
+  var l = [if (b) 1];
+}";
+    let rows = condition_rows(source);
+    assert_eq!(rows.len(), 7, "{rows:?}");
+    assert!(
+        rows.iter()
+            .all(|(snippet, _, ty)| snippet == "b" && ty.nullable)
+    );
+}
+
+/// A parenthesized operand keeps its read's anchor: `((b))` rows at the
+/// innermost identifier (the last `b` in the source — the earlier ones
+/// are the `bool` spelling and the parameter).
+#[test]
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+fn condition_rows_anchor_parenthesized_operands_at_the_read() {
+    let source = "void f(bool? b) { if ((b)) {} }";
+    let rows = condition_rows(source);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "b");
+    assert_eq!(rows[0].1, source.rfind('b').unwrap() as u32, "{rows:?}");
+}
+
+/// Each boolean operator operand rows at its own evaluation point: the
+/// left pre-split, the right under the left's taken branch; nested
+/// operators row their own operands.
+#[test]
+fn condition_rows_cover_each_boolean_operand() {
+    let source = "void f(bool? a, bool? b) { if (a && b) {} }";
+    let rows = condition_rows(source);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].0, "a");
+    assert_eq!(rows[1].0, "b");
+    // Nested: `a || (b && c)` rows a, b, c — nothing for the compounds.
+    let nested = "void f(bool? a, bool? b, bool? c) { if (a || (b && c)) {} }";
+    let rows = condition_rows(nested);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(
+        rows.iter()
+            .map(|(snippet, _, _)| snippet.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b", "c"]
+    );
+}
+
+/// Non-reference operands carry no flow-visible type and row nothing:
+/// calls, comparisons, and assignments-as-conditions (no read anchor).
+#[test]
+fn condition_rows_skip_non_reference_operands() {
+    for source in [
+        "void f() { if (g()) {} }",
+        "void f(int? x) { if (x == null) {} }",
+        "void f(bool? b) { if (b = g()) {} }",
+        "void f(bool? b) { if (!b) {} }",
+    ] {
+        assert!(condition_rows(source).is_empty(), "{source:?}");
+    }
+}
+
+/// The matched-type row carries the scrutinee's flow type at the clause
+/// match: unpromoted it is the declared type, and every in-scope check
+/// before the switch shows through (official `getMatchedValueType`,
+/// flow_analysis.dart:8753-8760). Statement clauses anchor at the `case`
+/// keyword; a `default` clause matches no pattern and rows nothing.
+#[test]
+fn matched_type_rows_carry_the_scrutinee_promotion_at_case_clauses() {
+    let source = "void f(int? x) { switch (x) { case 1: break; } }";
+    let (flow, _) = analyze(source);
+    let rows = matched_rows(source);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "case");
+    assert!(rows[0].2.nullable, "unpromoted: the declared type");
+    let crate::ty::Base::Name(id) = rows[0].2.base else {
+        panic!("expected a named type, got {:?}", rows[0].2);
+    };
+    assert_eq!(flow.0.borrow().name_lexeme(id), "int");
+
+    // A null check before the switch promotes the scrutinee; the clause
+    // sees the promoted type.
+    let promoted = "void f(int? x) { if (x != null) { switch (x) { case 1: break; } } }";
+    let rows = matched_rows(promoted);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(!rows[0].2.nullable, "promoted non-null at the match");
+
+    // A default clause rows nothing.
+    let default = "void f(int? x) { switch (x) { default: break; } }";
+    assert!(matched_rows(default).is_empty(), "{default:?}");
+}
+
+/// Every case head in a group rows on its own; the row reads the chain
+/// the clause branched from, so an earlier clause's guard-false outcome
+/// is in and the clause's own pattern and guard are not.
+#[test]
+fn matched_type_rows_cover_each_head_under_the_chain() {
+    let source = "\
+void f(int? x) {
+  switch (x) {
+    case 1:
+    case 2:
+      break;
+    case 3 when x > 0:
+      break;
+  }
+}";
+    let rows = matched_rows(source);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(
+        rows.iter()
+            .all(|(snippet, _, ty, _)| snippet == "case" && ty.nullable)
+    );
+}
+
+/// The row's written-argument tree stages the promoted spelling exactly
+/// as written: `List<int>?` promoted by a null check carries the
+/// non-null `List<int>` beside the interned `int` tree.
+#[test]
+fn matched_type_rows_carry_the_written_argument_tree() {
+    let source = "void f(List<int>? l) { if (l != null) { switch (l) { case 1: break; } } }";
+    let (flow, _) = analyze(source);
+    let rows = matched_rows(source);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(!rows[0].2.nullable);
+    let tree = flow.0.borrow().type_args_at(rows[0].3).to_vec();
+    assert_eq!(tree.len(), 1, "{tree:?}");
+    let crate::ty::Base::Name(id) = tree[0].base else {
+        panic!("expected a named argument, got {:?}", tree[0]);
+    };
+    assert_eq!(flow.0.borrow().name_lexeme(id), "int");
+    assert!(!tree[0].nullable);
+}
+
+/// Switch-expression alternatives row too, anchored at each
+/// alternative's first token (the parser delivers no `case` keyword
+/// face there); the match-time row rides the pattern close's latch.
+#[test]
+fn matched_type_rows_fire_at_switch_expression_alternatives() {
+    let source = "void f(int? x) { var y = switch (x) { 1 => 1, _ => 2 }; }";
+    let rows = matched_rows(source);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0].0, "1");
+    assert_eq!(rows[1].0, "_");
+    assert!(rows[0].1 < rows[1].1, "clauses anchor in source order");
+    assert!(rows.iter().all(|(_, _, ty, _)| ty.nullable));
+}
+
+/// A non-reference scrutinee has no promotion key and rows nothing.
+#[test]
+fn matched_type_rows_require_a_reference_scrutinee() {
+    let source = "void f() { switch (g()) { case 1: break; } }";
+    assert!(matched_rows(source).is_empty(), "{source:?}");
+}
+
+// —— property promotion facts (PromotedPropertyRead, #1409) ————————————————
+
+/// Snippets of property-promotion reads, rendered as the member name's
+/// source text for readable assertions.
+fn promoted_property_snippets(source: &str) -> Vec<String> {
+    facts_of(source)
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::PromotedPropertyRead { span } => Some(
+                source
+                    [span.range.offset as usize..(span.range.offset + span.range.length) as usize]
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Pin 1's flow face: after `c._b != null`, the tested property's read in
+/// the then-branch carries a promotion row anchored at the member name
+/// token (the official `_handleProperty` promotion lookup,
+/// `flow_analysis.dart:9010-9054`). Eligibility — that `_b` is a private
+/// final field at all — is the semantic consumer's question.
+#[test]
+fn property_read_promotes_after_a_null_check() {
+    let source = "class C { final bool? _b; }\nvoid f(C c) { if (c._b != null) { c._b; } }";
+    assert_eq!(promoted_property_snippets(source), ["_b"]);
+}
+
+/// Pin 4's flow face: the slot key includes the receiver, so `c1`'s test
+/// promotes only its own key — the same member on another receiver stays
+/// unpromoted.
+#[test]
+fn property_promotion_keys_on_the_receiver() {
+    let source =
+        "class C { final bool? _b; }\nvoid f(C c1, C c2) { if (c1._b != null) { c2._b; c1._b; } }";
+    assert_eq!(promoted_property_snippets(source), ["_b"]);
+}
+
+/// Pin 6's flow face: `== null` and the negated test take the inversion
+/// face (the property is non-null on the FALSE arm only) — a read in the
+/// then-branch or after the join stays unpromoted.
+#[test]
+fn property_promotion_rejects_the_inverse_test() {
+    let eq_null = "class C { final bool? _b; }\nvoid f(C c) { if (c._b == null) { c._b; } }";
+    assert!(
+        promoted_property_snippets(eq_null).is_empty(),
+        "{eq_null:?}"
+    );
+    let negated = "class C { final bool? _b; }\nvoid f(C c) { if (!(c._b != null)) { c._b; } }";
+    assert!(
+        promoted_property_snippets(negated).is_empty(),
+        "{negated:?}"
+    );
+}
+
+/// Pin 5's flow face: the promotion lives on the then-branch state only;
+/// the end-if join intersects the branches' chains (the official
+/// joinPromotionInfo common-prefix rule, `flow_analysis.dart:5830-5940`)
+/// and drops it.
+#[test]
+fn property_promotion_drops_after_a_single_arm_join() {
+    let source = "class C { final bool? _b; }\nvoid f(C c, bool x) { if (x) { if (c._b != null) {} } c._b; }";
+    assert!(promoted_property_snippets(source).is_empty(), "{source:?}");
+}
+
+/// The receiver-invalidation sweep: a receiver write bumps its variable
+/// version, so dependent property promotions do not carry — no finality
+/// exception (the official `write` on the receiver's version checks no
+/// finality, `flow_analysis.dart:4802-4866`).
+#[test]
+fn property_promotion_drops_on_receiver_reassignment() {
+    let source =
+        "class C { final bool? _b; }\nvoid f(C c) { if (c._b != null) { c = C(); c._b; } }";
+    assert!(promoted_property_snippets(source).is_empty(), "{source:?}");
+}
+
+/// Pin 7's flow face: explicit `this._b` and the implicit-`this` bare
+/// `_b` both resolve their receiver to the `this` identity (the official
+/// `ThisPropertyTarget`, `flow_analysis.dart:5977-5990`, and
+/// `thisExpression`, :8149-8153).
+#[test]
+fn this_receiver_properties_promote() {
+    let explicit = "class C { final bool? _b; void m() { if (this._b != null) { this._b; } } }";
+    assert_eq!(promoted_property_snippets(explicit), ["_b"]);
+    let implicit = "class C { final bool? _b; void m() { if (_b != null) { _b; } } }";
+    assert_eq!(promoted_property_snippets(implicit), ["_b"]);
+}
+
+/// Pin 8's flow face: `late` is not a gate the flow layer sees — it tracks
+/// the read shape the same way and the semantic eligibility gate carries
+/// the promotability verdict (upstream `field_promotability.dart:70-76`
+/// never consults `late`; `late final` private fields promote).
+#[test]
+fn late_final_fields_track_at_the_flow_layer() {
+    let source = "class C { late final int? _x; }\nvoid f(C c) { if (c._x != null) { c._x; } }";
+    assert_eq!(promoted_property_snippets(source), ["_x"]);
+}
+
+/// The byte-invariance guard: local-variable promotion faces are unchanged
+/// by the property machinery — the same var rows fire with and without an
+/// interleaved property read, and the property read's row stays a separate
+/// fact kind.
+///
+/// Adjudication of the #1409 contradiction with
+/// `property_promotion_keys_on_the_receiver` (both cannot hold under one
+/// gate): a promotion row requires a standing promotion ON THAT PROPERTY
+/// KEY, established only by a test of the property itself (official
+/// `_equalityCheck`'s `_EqualityCheckIsNullCheck` → `tryMarkNonNullable`,
+/// flow_analysis.dart:4046-4076; read back per read by `_handleProperty`,
+/// :9010-9054). The `x != null` check here promotes the local `x` alone —
+/// `c.g` was never tested, so no property row stands on it and the
+/// expected property-row list is empty.
+#[test]
+fn local_variable_faces_unchanged_alongside_property_reads() {
+    let pure = "void f(int? x) { if (x != null) { x.isEven; } }";
+    let mixed = "class C { int? g; }\nvoid f(C c, int? x) { if (x != null) { c.g; x.isEven; } }";
+    let pure_tys = promoted_tys(pure);
+    let mixed_tys = promoted_tys(mixed);
+    assert_eq!(pure_tys, mixed_tys, "var promotion rows must not shift");
+    assert!(!pure_tys.is_empty(), "guard needs a live promotion");
+    assert!(pure_tys.iter().all(|ty| !ty.nullable));
+    // No property key was tested in either source, so no property row
+    // stands anywhere (see the adjudication note above).
+    assert!(promoted_property_snippets(pure).is_empty());
+    assert!(promoted_property_snippets(mixed).is_empty());
+    // The diagnostic faces (dead code / unassigned) stay empty in both;
+    // the promotion rows above are the query face, not diagnostics.
+    for source in [pure, mixed] {
+        assert!(
+            facts_of(source).iter().all(|fact| !matches!(
+                fact,
+                FlowFact::DeadCode { .. } | FlowFact::UnassignedRead { .. }
+            )),
+            "{source:?}"
+        );
+    }
+}
+
+/// Pin 11's flow face: the catch entry's conservative join sweeps property
+/// slots with the models — a receiver written in the try body kills the
+/// pre-try promotion on the catch path too (official `FlowModel.
+/// conservativeJoin`, `flow_analysis.dart:3786-3830`, invoked from
+/// `tryCatchStatement_bodyEnd`, :8163-8181).
+#[test]
+fn property_promotion_drops_into_a_catch() {
+    let source = "class C { final bool? _b; }\nvoid f(C c) { if (c._b != null) { try { c = C(); } catch (e) { c._b; } } }";
+    assert!(promoted_property_snippets(source).is_empty(), "{source:?}");
+}
+
+/// Pin 12's flow face: the switch's labeled-case entry conservative join
+/// sweeps property slots with the models — a receiver written in any case
+/// body kills the promotion carried into the switch on the jump-target
+/// path.
+#[test]
+fn property_promotion_drops_into_a_labeled_case() {
+    let source = "class C { final bool? _b; }\nvoid f(C c, int x) { if (c._b != null) { switch (x) { L: case 1: c._b; break; case 2: c = C(); break; } } }";
+    assert!(promoted_property_snippets(source).is_empty(), "{source:?}");
+}
+
+/// The capture-blocking pin: a closure writing the receiver between the
+/// test and the use permanently kills the promotion — the closure entry's
+/// conservative join stamps the slots CAPTURED and the official
+/// `_handleProperty` lookup gate on the captured target version
+/// (`flow_analysis.dart:9021-9026`) blocks the read's promotion lookup.
+#[test]
+fn property_promotion_dies_when_a_closure_writes_the_receiver() {
+    let source = "class C { final bool? _b; }\nvoid f(C c) { if (c._b != null) { g() { c = C(); }; if (c._b) {} } }";
+    assert!(promoted_property_snippets(source).is_empty(), "{source:?}");
+}
+
+/// The catch-sweep bounds pin: the property slot is FIRST interned inside
+/// the try body (the null check), so the pre-try snapshot the catch entry
+/// sweeps has a shorter slot extent than the intern list — the sweep
+/// fills the gap with fresh models before writing (the resizing face of
+/// [`sweep_state_props`]). The receiver is write-captured by the closure,
+/// so the sweep's captured arm materializes the capture on the fresh slot
+/// instead of indexing past the snapshot, and the catch read stays
+/// unpromoted (#1432).
+#[test]
+fn catch_sweep_reaches_slots_interned_inside_the_try_body() {
+    let source = "class C { final bool? _b; }\nvoid f(C c) { try { if (c._b != null) {} g() { c = C(); }; } catch (e) { c._b; } }";
+    assert!(promoted_property_snippets(source).is_empty(), "{source:?}");
+}
+
+// —— matched-case promotion (case-body promotion of the switched variable)
+
+/// (`snippet`, promoted-type name) pairs of the ReadType rows, in fact
+/// order — the matched-case promotion face's assertion view. Non-named
+/// flow types (declared `dynamic`/untyped reads) render as an empty name.
+fn read_type_names(source: &str) -> Vec<(String, String)> {
+    let (flow, facts) = analyze(source);
+    let flow = flow.0.borrow();
+    facts
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::ReadType { span, ty, .. } => {
+                let name = match ty.base {
+                    crate::ty::Base::Name(id) => flow.name_lexeme(id).to_string(),
+                    _ => String::new(),
+                };
+                Some((
+                    source[span.range.offset as usize
+                        ..(span.range.offset + span.range.length) as usize]
+                        .to_string(),
+                    name,
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every read named `needle`, in fact order.
+fn reads_of(source: &str, needle: &str) -> Vec<String> {
+    read_type_names(source)
+        .into_iter()
+        .filter(|(snippet, _)| snippet == needle)
+        .map(|(_, name)| name)
+        .collect()
+}
+
+/// A matched object pattern promotes the switched variable through its
+/// case body (official `promoteForPattern` through `analyzeObjectPattern`,
+/// shared type_analyzer.dart:1749-1772): `option.value` in the
+/// issue60264.dart shape resolves on the pattern's head type. Each clause
+/// promotes to its own head — the second body reads `None`, not `Some` —
+/// and the post-switch read falls back to the declared type: the failed
+/// match arms joined the unmatched chain, and the body exits joined to it
+/// (`switch_end`), so the promotion cannot leak past the switch.
+#[test]
+fn matched_object_pattern_promotes_the_switched_variable() {
+    let source = "void f<T>(Option<T> option) {\n\
+                  \x20 switch (option) {\n\
+                  \x20   case Some():\n\
+                  \x20     option;\n\
+                  \x20   case None():\n\
+                  \x20     option;\n\
+                  \x20 }\n\
+                  \x20 option;\n\
+                  }";
+    assert_eq!(
+        reads_of(source, "option"),
+        ["Option", "Some", "None", "Option"],
+        "{source:?}"
+    );
+}
+
+/// The guard-scope boundary (official order: pattern → guard → body,
+/// shared type_analyzer.dart:2564-2605): the guard of the SAME clause
+/// runs after its pattern's promotion — the promotion is live there by
+/// design — while a LATER clause's guard runs under the chained
+/// unmatched state and sees only its own pattern's promotion, never an
+/// earlier clause's.
+#[test]
+fn case_guard_sees_its_own_promotion_and_not_an_earlier_clauses() {
+    let source = "void f<T>(Option<T> option, bool g) {\n\
+                  \x20 switch (option) {\n\
+                  \x20   case Some() when g:\n\
+                  \x20     option;\n\
+                  \x20   case None() when option != null:\n\
+                  \x20     option;\n\
+                  \x20 }\n\
+                  }";
+    // Clause 1: scrutinee read (declared), body read (Some). Clause 2's
+    // guard runs after `None()` promoted its own matched path — the read
+    // carries None; clause 1's Some leaked nowhere.
+    assert_eq!(
+        reads_of(source, "option"),
+        ["Option", "Some", "None", "None"],
+        "{source:?}"
+    );
+}
+
+/// A shared case body joins its heads' matched states
+/// (`switch_endAlternatives`): two conflicting head promotions keep only
+/// the common chain prefix — nothing — so the shared body reads the
+/// declared type.
+#[test]
+fn shared_case_body_joins_away_conflicting_promotions() {
+    let source = "void f<T>(Option<T> option) {\n\
+                  \x20 switch (option) {\n\
+                  \x20   case Some():\n\
+                  \x20   case None():\n\
+                  \x20     option;\n\
+                  \x20 }\n\
+                  }";
+    assert_eq!(
+        reads_of(source, "option"),
+        ["Option", "Option"],
+        "{source:?}"
+    );
+}
+
+/// A clause head that promotes nothing leaves the body at the declared
+/// type: constant patterns carry no head type (only the `null` constant's
+/// non-null face promotes, a separate face).
+#[test]
+fn constant_case_promotes_nothing() {
+    let source = "void f(int x) {\n\
+                  \x20 switch (x) {\n\
+                  \x20   case 1:\n\
+                  \x20     x;\n\
+                  \x20 }\n\
+                  }";
+    assert_eq!(reads_of(source, "x"), ["int", "int"], "{source:?}");
+}
+
+/// An explicit-type re-assignment inside the body demotes per the
+/// official write rules (`_demoteViaAssignment`): the written type
+/// satisfies no chain entry, so the promotion drops and the later read
+/// carries the declared type.
+#[test]
+fn body_write_demotes_the_case_promotion() {
+    let source = "void f<T>(Option<T> option, Option<T> other) {\n\
+                  \x20 switch (option) {\n\
+                  \x20   case Some():\n\
+                  \x20     option = other;\n\
+                  \x20     option;\n\
+                  \x20 }\n\
+                  }";
+    assert_eq!(
+        reads_of(source, "option"),
+        ["Option", "Option"],
+        "{source:?}"
+    );
+}
+
+/// A non-variable scrutinee carries no promotion key: the head event
+/// promotes nothing and the body reads stay at their declared types (the
+/// cannotMatch unreachability face for literal scrutinees is not mounted
+/// — the flow layer holds no static type for the non-reference
+/// scrutinee).
+#[test]
+fn literal_scrutinee_promotes_nothing() {
+    let source = "void f(option) {\n\
+                  \x20 switch (null) {\n\
+                  \x20   case Some():\n\
+                  \x20     option;\n\
+                  \x20 }\n\
+                  }";
+    let (_, name) = read_type_names(source).into_iter().next().unwrap();
+    assert_eq!(name, "", "{source:?}");
+}
+
+/// Switch-expression alternatives run the same promotion machinery
+/// (`analyzeSwitchExpression`'s pattern → guard → expression order): each
+/// arm sees its own head's promotion and the post-expression read sees
+/// the declared type.
+#[test]
+fn switch_expression_alternatives_promote_and_chain() {
+    let source = "void f<T>(Option<T> option) {\n\
+                  \x20 var v = switch (option) {\n\
+                  \x20   Some() => option,\n\
+                  \x20   None() => option,\n\
+                  \x20 };\n\
+                  \x20 option;\n\
+                  }";
+    assert_eq!(
+        reads_of(source, "option"),
+        ["Option", "Some", "None", "Option"],
+        "{source:?}"
+    );
+}
+
+/// A nested object pattern constrains its own field, not the matched
+/// value: only the top-level head promotes (the official sub-pattern
+/// face runs under pushPropertySubpattern).
+#[test]
+fn nested_object_pattern_promotes_only_the_head() {
+    let source = "void f(foo) {\n\
+                  \x20 switch (foo) {\n\
+                  \x20   case Foo(f: Bar()):\n\
+                  \x20     foo;\n\
+                  \x20 }\n\
+                  }";
+    assert_eq!(reads_of(source, "foo"), ["", "Foo"], "{source:?}");
+}
+
+/// The if-case's matched value is the same promotion key: the pattern
+/// promotes the scrutinee through the then-branch only — the join at the
+/// if's close restores the declared type (official `ifCaseStatement`).
+#[test]
+fn if_case_promotes_the_scrutinee_through_the_then_branch() {
+    let source = "void f<T>(Option<T> option) {\n\
+                  \x20 if (option case Some()) {\n\
+                  \x20   option;\n\
+                  \x20 }\n\
+                  \x20 option;\n\
+                  }";
+    assert_eq!(
+        reads_of(source, "option"),
+        ["Option", "Some", "Option"],
+        "{source:?}"
+    );
+}
+
+/// #1758 probe: the function-typed formal `f` declares a flow variable —
+/// `f()?[x]` on a nullable-returning formal splits the short-circuit path
+/// (the statement after stays live); a non-nullable return evaluates the
+/// index unconditionally.
+#[test]
+fn probe_fn_typed_formal_null_aware() {
+    assert_eq!(
+        dead_snippets("void g(List<int>? f()) { f()?[throw '']; 0; }"),
+        Vec::<String>::new()
+    );
+}
+
+/// #1758 probe 2: a plain nullable local's `?[...]` DOES split — the
+/// statement after `x?[throw '']` stays live.
+#[test]
+fn probe_nullable_var_index_aware() {
+    assert_eq!(
+        dead_snippets("void g(List<int>? x) { x?[throw '']; 0; }"),
+        Vec::<String>::new()
+    );
+}
+
+/// #1758 probe 3: the invocation shape — `f()?.remainder(throw '')` on a
+/// nullable-returning formal splits; the statement after stays live.
+#[test]
+fn probe_nullable_var_invoke_aware() {
+    assert_eq!(
+        dead_snippets("void g(int? f()) { f()?.remainder(throw ''); 0; }"),
+        Vec::<String>::new()
+    );
+}
+
+/// #1758: the unreachable twins — a non-nullable-returning formal's `?.`
+/// kills the skip path, so the statement after dies (oracle anchors the
+/// `0;` row).
+#[test]
+fn probe_nonnull_var_null_aware_dead() {
+    assert_eq!(
+        dead_snippets("void g(int x) { x?.remainder(throw ''); 0; }"),
+        ["0;"]
+    );
+    assert_eq!(
+        dead_snippets("void g(int f()) { f()?.remainder(throw ''); 0; }"),
+        ["0;"]
+    );
+    assert_eq!(
+        dead_snippets("void g(List<int> f()) { f()?[throw '']; 0; }"),
+        ["0;"]
+    );
+}
+
+/// #1758: the chained member tail — `x?.a.b(throw _)` on a nullable
+/// receiver splits and rejoins at the statement end; nothing dies. The
+/// assignment RHS inside a shorted region (`c?.f = throw _`) rejoins the
+/// same way.
+#[test]
+fn probe_nullable_var_chain_tail() {
+    assert_eq!(
+        dead_snippets("void g(int? f()) { f()?.hashCode.remainder(throw ''); 0; }"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        dead_snippets("class C { int f = 0; }\nvoid g(C? c) { c?.f = throw ''; 0; }"),
+        Vec::<String>::new()
+    );
+    // The cascade twins (`?..`) rejoin at the cascade's own end — a
+    // section-side `throw` cannot kill the receiver-was-null path.
+    assert_eq!(
+        dead_snippets("void g(List<int>? f()) { f()?..hashCode.remainder(throw ''); 0; }"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        dead_snippets("class C { int f = 0; }\nvoid g(C? c) { c?..f = throw ''; 0; }"),
+        Vec::<String>::new()
+    );
+}
+
+// —— why-not-promoted facts (#1830) ————————————————————————————————————————
+
+/// The source text under a fact span (UTF-16 == ASCII in the fixtures).
+fn span_text(source: &str, range: dartq_source::SourceRange) -> &str {
+    &source[range.offset as usize..(range.offset + range.length) as usize]
+}
+
+/// The why-not-promoted rows of a source, paired with the flow that
+/// interned their entry rows (the producer consumption path: match the
+/// row, read its reasons through `non_promotion_context`) and the full
+/// fact list for failure messages.
+fn why_rows(
+    source: &str,
+) -> (
+    std::rc::Rc<std::cell::RefCell<Flow<'_>>>,
+    Vec<FlowFact>,
+    Vec<FlowFact>,
+) {
+    let (flow, facts) = analyze(source);
+    let rows = facts
+        .iter()
+        .filter(|fact| matches!(fact, FlowFact::WhyNotPromoted { .. }))
+        .copied()
+        .collect();
+    (flow.0.clone(), facts, rows)
+}
+
+/// The `NonPromotedPropertyRead` rows of a source beside the flow and the
+/// full fact list.
+fn prop_rows(
+    source: &str,
+) -> (
+    std::rc::Rc<std::cell::RefCell<Flow<'_>>>,
+    Vec<FlowFact>,
+    Vec<FlowFact>,
+) {
+    let (flow, facts) = analyze(source);
+    let rows = facts
+        .iter()
+        .filter(|fact| matches!(fact, FlowFact::NonPromotedPropertyRead { .. }))
+        .copied()
+        .collect();
+    (flow.0.clone(), facts, rows)
+}
+
+/// `DemoteViaExplicitWrite`'s variable face: a promotion dropped by an
+/// assignment records the write as the reason link, and the later read on
+/// the same path reports it (official `whyNotPromoted`'s variable arm,
+/// `flow_analysis.dart:8832-8857`; the context row anchors at the write
+/// node, `assignment_expression_resolver.dart:322-329`). The read stays
+/// on the demotion's own path: the if-join rebuilds the model and drops
+/// the history (official `_identicalOrNew`).
+#[test]
+fn why_not_promoted_names_the_demoting_write() {
+    let source = "void f() { int? x; if (x is int) { x = null; x; } }";
+    let (flow, facts, rows) = why_rows(source);
+    assert_eq!(rows.len(), 1, "{facts:?}");
+    let FlowFact::WhyNotPromoted {
+        span,
+        current,
+        current_args,
+        ..
+    } = rows[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!(span_text(source, span.range), "x");
+    // The flow type at the read is the declared `int?` (the write left it
+    // unpromoted); the entry type is the dropped `int`.
+    assert!(matches!(
+        current,
+        crate::ty::Ty {
+            base: crate::ty::Base::Name(_),
+            nullable: true
+        }
+    ));
+    assert_eq!(current_args, crate::ty::EMPTY_ARGS);
+    let flow = flow.borrow();
+    let context = flow.non_promotion_context(&rows[0]).unwrap();
+    assert_eq!(context.len(), 1);
+    assert!(matches!(
+        context[0].ty,
+        crate::ty::Ty {
+            base: crate::ty::Base::Name(_),
+            nullable: false
+        }
+    ));
+    assert_eq!(context[0].args, crate::ty::EMPTY_ARGS);
+    let crate::facts::NonPromotionCause::ExplicitWrite { span: write } = context[0].cause else {
+        panic!("{:?}", context[0].cause)
+    };
+    assert_eq!(span_text(source, write), "x = null");
+}
+
+/// `DemoteViaSuspension`: an `await` inside a local function drops the
+/// promotions of the variables the function reads and the enclosing
+/// function writes, and the read after the suspension reports the
+/// suspension node as the reason (official `suspension`,
+/// `flow_analysis.dart:7909-7948`; the context row anchors at the await
+/// expression). A variable written solely by the enclosing function is
+/// NOT write-captured inside the closure
+/// (`flow_analysis.dart:8707-8713`), so the promotion can stand before
+/// the suspension drops it.
+#[test]
+fn why_not_promoted_names_the_suspension() {
+    let source = "void f() async { int? x; cb() async { if (x is int) { await h(); x; } } x = 1; }";
+    let (flow, facts, rows) = why_rows(source);
+    assert_eq!(rows.len(), 1, "{facts:?}");
+    let FlowFact::WhyNotPromoted { span, .. } = rows[0] else {
+        unreachable!()
+    };
+    assert_eq!(span_text(source, span.range), "x");
+    let flow = flow.borrow();
+    let context = flow.non_promotion_context(&rows[0]).unwrap();
+    assert_eq!(context.len(), 1);
+    let crate::facts::NonPromotionCause::Suspension { span: node } = context[0].cause else {
+        panic!("{:?}", context[0].cause)
+    };
+    assert_eq!(span_text(source, node), "await h()");
+}
+
+/// The suspension face needs the local-function nesting: an `await` in
+/// the async body itself cannot let an enclosing function resume, so
+/// nothing demotes and the read carries no why-not-promoted row
+/// (official `_enclosingFunctionExpressionInfoStack` gate).
+#[test]
+fn await_outside_a_local_function_demotes_nothing() {
+    let source = "void f() async { int? x; if (x is int) { await h(); x; } }";
+    let (_flow, _facts, rows) = why_rows(source);
+    assert!(rows.is_empty(), "{rows:?}");
+}
+
+/// A read whose promotion stands, or one whose variable carries no
+/// demotion history, emits no row — the rows mark failed promotions
+/// only.
+#[test]
+fn reads_without_dropped_promotions_carry_no_row() {
+    let standing = "void f() { int? x; if (x is int) { x; } }";
+    let (_flow, _facts, rows) = why_rows(standing);
+    assert!(rows.is_empty(), "{standing:?}");
+    let never_promoted = "void f() { int? x; x = null; x; }";
+    let (_flow, _facts, rows) = why_rows(never_promoted);
+    assert!(rows.is_empty(), "{never_promoted:?}");
+}
+
+/// The property mirror (`_getNonPromotionReasons`'s `_PropertyReference`
+/// arm, `flow_analysis.dart:8766-8815`): a receiver write sweeps the
+/// standing property promotion into the slot's evidence, and the
+/// unpromoted read reports it — the identity row carrying the member
+/// name and the receiver's declaration anchor. A read with no recorded
+/// evidence (never tested or promoted) emits no row.
+#[test]
+fn non_promoted_property_read_reports_the_swept_evidence() {
+    let class_decl = "class C { final int? _b; } ";
+    let bare = format!("{class_decl}void f(C c) {{ c._b; }}");
+    let (_flow, _facts, rows) = prop_rows(&bare);
+    assert!(rows.is_empty(), "{rows:?}");
+
+    let source = format!("{class_decl}void f(C c) {{ if (c._b != null) {{ c = C(); c._b; }} }}");
+    let (flow, facts, rows) = prop_rows(&source);
+    assert_eq!(rows.len(), 1, "{facts:?}");
+    let FlowFact::NonPromotedPropertyRead {
+        span,
+        name,
+        receiver,
+        ..
+    } = rows[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!(span_text(&source, span.range), "_b");
+    assert_eq!(flow.borrow().name_lexeme(name), "_b");
+    let crate::facts::PropReceiver::Local(anchor) = receiver else {
+        panic!("{receiver:?}")
+    };
+    // The receiver's declaration anchor: the formal parameter's name
+    // token (`c` in `f(C c)`).
+    assert_eq!(span_text(&source, anchor), "c");
+    // The evidence: the would-be promoted type (the non-null marker),
+    // tagged `PropertyEvidence` — the inherent-vs-conflict verdict is the
+    // consumer's element-layer question.
+    let flow = flow.borrow();
+    let context = flow.non_promotion_context(&rows[0]).unwrap();
+    assert_eq!(context.len(), 1);
+    assert_eq!(context[0].ty, crate::ty::Ty::UNKNOWN);
+    assert_eq!(
+        context[0].cause,
+        crate::facts::NonPromotionCause::PropertyEvidence
+    );
+}
+
+/// The increment face of the write anchor: `x++` demotes the promoted
+/// type the written `num` no longer satisfies and the row anchors at the
+/// whole postfix expression (the official `postIncDec` node,
+/// increment_or_decrement_resolver.dart:344-349).
+#[test]
+fn why_not_promoted_anchors_the_increment_expression() {
+    let source = "void f() { num x = 1; if (x is int) { x++; x; } }";
+    let (flow, facts, rows) = why_rows(source);
+    assert_eq!(rows.len(), 1, "{facts:?}");
+    let flow = flow.borrow();
+    let context = flow.non_promotion_context(&rows[0]).unwrap();
+    assert_eq!(context.len(), 1);
+    let crate::facts::NonPromotionCause::ExplicitWrite { span: write } = context[0].cause else {
+        panic!("{:?}", context[0].cause)
+    };
+    assert_eq!(span_text(source, write), "x++");
+}
+
+/// Bounded growth: repeated reads of one demoted state share one arena
+/// row (equal chains intern once) — the arena stays at the reserved empty
+/// row plus the one demotion context. A write that demotes nothing adds
+/// no links, and the official's no-change-write quirk erases the prior
+/// link outright (`flow_analysis.dart:4838-4846`, mirrored in
+/// `State::write`), so a following read carries no row.
+#[test]
+fn non_promotion_rows_dedup_and_stay_bounded() {
+    let source = "void f() { int? x; if (x is int) { x = null; x; x; x; } }";
+    let (flow, facts, rows) = why_rows(source);
+    assert_eq!(rows.len(), 3, "{facts:?}");
+    let ids: Vec<u32> = rows
+        .iter()
+        .map(|fact| match fact {
+            FlowFact::WhyNotPromoted { entries, .. } => *entries,
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(ids, [ids[0], ids[0], ids[0]], "equal chains share one row");
+    {
+        let flow = flow.borrow();
+        assert_eq!(
+            flow.non_promotion_context(&rows[0]).unwrap().len(),
+            1,
+            "one demotion: one link"
+        );
+    }
+    // The quirk: a second no-demotion write erases the link, and reads
+    // after it carry no row.
+    let after = "void f() { int? x; if (x is int) { x = null; x; x = null; x; } }";
+    let (_flow, _facts, rows) = why_rows(after);
+    assert_eq!(rows.len(), 1, "{_facts:?}");
+}
+
+/// The entry rows are compact copyable payloads — a `u32`-keyed arena of
+/// small structs, no heap per fact row.
+#[test]
+fn non_promotion_entries_are_compact_copyable() {
+    fn assert_copy<T: Copy + 'static>() {}
+    assert_copy::<crate::facts::NonPromotionEntry>();
+    assert_copy::<crate::facts::NonPromotionCause>();
+    assert_copy::<crate::facts::PropReceiver>();
+    assert_copy::<crate::facts::NonPromotionReason>();
+    assert_copy::<crate::facts::PropertyNonPromotability>();
+    // Three u32-ish fields (type, argument tree, cause) plus the cause's
+    // own anchor — still a register-passable, no-heap payload.
+    assert!(std::mem::size_of::<crate::facts::NonPromotionEntry>() <= 32);
+    assert!(std::mem::size_of::<crate::facts::NonPromotionCause>() <= 16);
+    // The resolved reasons stay register-passable too (the widest variant
+    // carries one span).
+    assert!(std::mem::size_of::<crate::facts::NonPromotionReason>() <= 16);
+}
+
+/// The helper dispatch: the three why-not-promoted faces resolve to their
+/// entry rows (index 0 = the official empty-map path), every other fact
+/// row answers `None`.
+#[test]
+fn non_promotion_context_dispatches_the_promotion_faces() {
+    let (flow, _facts) = analyze("void f() {}");
+    let flow = flow.0.borrow();
+    let empty: &[crate::facts::NonPromotionEntry] = &[];
+    assert_eq!(
+        flow.non_promotion_context(&FlowFact::ThisNotPromoted {
+            span: tspan(0),
+            entries: 0,
+        }),
+        Some(empty)
+    );
+    assert_eq!(
+        flow.non_promotion_context(&FlowFact::NonPromotedPropertyRead {
+            span: tspan(0),
+            name: 0,
+            receiver: crate::facts::PropReceiver::This,
+            entries: 0,
+        }),
+        Some(empty)
+    );
+    assert_eq!(
+        flow.non_promotion_context(&FlowFact::DeadCode { span: tspan(0) }),
+        None
+    );
+}
+
+/// The resolved reasons (the producer's render input): the recorded
+/// write-demotion link passes through with its anchor, and the verdict
+/// input is not consulted for a variable row (`None` here would mean
+/// "conflict" for a property row, yet the answer stays `ExplicitWrite`).
+#[test]
+fn non_promotion_reasons_pass_the_write_link_through() {
+    let source = "void f() { int? x; if (x is int) { x = null; x; } }";
+    let (flow, _facts, rows) = why_rows(source);
+    assert_eq!(rows.len(), 1);
+    let flow = flow.borrow();
+    let reasons = flow.non_promotion_reasons(&rows[0], None);
+    assert_eq!(reasons.len(), 1);
+    let crate::facts::NonPromotionReason::ExplicitWrite { span } = reasons[0] else {
+        panic!("{:?}", reasons[0])
+    };
+    assert_eq!(span_text(source, span), "x = null");
+}
+
+/// The suspension link passes through the same way, anchor intact.
+#[test]
+fn non_promotion_reasons_pass_the_suspension_link_through() {
+    let source = "void f() async { int? x; cb() async { if (x is int) { await h(); x; } } x = 1; }";
+    let (flow, _facts, rows) = why_rows(source);
+    assert_eq!(rows.len(), 1);
+    let flow = flow.borrow();
+    let reasons = flow.non_promotion_reasons(&rows[0], None);
+    assert_eq!(reasons.len(), 1);
+    let crate::facts::NonPromotionReason::Suspension { span } = reasons[0] else {
+        panic!("{:?}", reasons[0])
+    };
+    assert_eq!(span_text(source, span), "await h()");
+}
+
+/// The property family resolves through the element verdict — the mirror
+/// of upstream's `whyPropertyIsNotPromotable` split
+/// (`flow_analysis.dart:8796-8806`): `Some(why)` is the inherent reason,
+/// `None` the non-inherent conflict; both branches on one recorded row.
+#[test]
+fn non_promotion_reasons_split_the_property_verdict() {
+    let source = "class C { final int? _b; } void f(C c) { if (c._b != null) { c = C(); c._b; } }";
+    let (flow, _facts, rows) = prop_rows(source);
+    assert_eq!(rows.len(), 1);
+    let flow = flow.borrow();
+    assert_eq!(
+        flow.non_promotion_reasons(
+            &rows[0],
+            Some(crate::facts::PropertyNonPromotability::NotFinal),
+        ),
+        vec![crate::facts::NonPromotionReason::PropertyInherent {
+            why: crate::facts::PropertyNonPromotability::NotFinal
+        }]
+    );
+    assert_eq!(
+        flow.non_promotion_reasons(&rows[0], None),
+        vec![crate::facts::NonPromotionReason::PropertyConflict]
+    );
+}
+
+/// The `this` variant and the empty-arena path: a `ThisNotPromoted` row
+/// over the reserved empty entries renders nothing, and the recorded
+/// `this` tag maps to [`crate::facts::NonPromotionReason::This`]. No
+/// source fixture produces the row — the engine tracks no `this`
+/// type-test face (this-promotion is upstream's experimental-off flag),
+/// so the arm is exercised through the recorded-cause mapping directly.
+#[test]
+fn non_promotion_reasons_map_this_and_answer_empty_without_entries() {
+    let (flow, _facts) = analyze("void f() {}");
+    let flow = flow.0.borrow();
+    assert!(
+        flow.non_promotion_reasons(
+            &FlowFact::ThisNotPromoted {
+                span: tspan(0),
+                entries: 0
+            },
+            None,
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        crate::facts::NonPromotionReason::resolve(
+            crate::facts::NonPromotionCause::ThisNotPromoted,
+            None
+        ),
+        crate::facts::NonPromotionReason::This
     );
 }

@@ -12,7 +12,7 @@
 
 use rustc_hash::FxHashSet;
 
-use crate::ty::{Classification, Ty, TypeOps};
+use crate::ty::{Ty, TypeOps};
 
 /// Absent list / null reference marker.
 pub(crate) const NIL: u32 = u32::MAX;
@@ -135,6 +135,51 @@ pub(crate) struct Lists {
     cells: Vec<(Ty, u32, u32)>,
 }
 
+/// A cons-cell pool for non-promotion history chains (upstream
+/// `NonPromotionHistory`, `flow_analysis.dart:4529-4549`): one cell per
+/// dropped promoted type, newest demotion first, shared freely across
+/// states like the type chains. Cells carry `(ty, args, cause, next)` —
+/// compact copyable data only (no heap, no strings on the hot path).
+/// Property slots store their cleared promoted types here too, tagged
+/// [`crate::facts::NonPromotionCause::PropertyEvidence`] — the flat-slot
+/// form of upstream's `_nonPromotableProperties` version chain
+/// (`flow_analysis.dart:5684, 5707-5719`); the `PropertyNotPromoted`
+/// verdict itself is decided by the consumer's element layer.
+#[derive(Default)]
+pub(crate) struct Reasons {
+    cells: Vec<(Ty, u32, crate::facts::NonPromotionCause, u32)>,
+}
+
+impl Reasons {
+    pub(crate) fn cons(
+        &mut self,
+        ty: Ty,
+        args: u32,
+        cause: crate::facts::NonPromotionCause,
+        next: u32,
+    ) -> u32 {
+        self.cells.push((ty, args, cause, next));
+        u32::try_from(self.cells.len()).expect("reason cell count fits u32") - 1
+    }
+
+    /// The chain as a slice walk (front to back — most recent demotion
+    /// first, the official linked-list order `flow_analysis.dart:8844-8850`).
+    pub(crate) fn iter(
+        &self,
+        id: u32,
+    ) -> impl Iterator<Item = (Ty, u32, crate::facts::NonPromotionCause)> + '_ {
+        let mut cur = id;
+        std::iter::from_fn(move || {
+            if cur == NIL {
+                return None;
+            }
+            let (ty, args, cause, next) = self.cells[cur as usize];
+            cur = next;
+            Some((ty, args, cause))
+        })
+    }
+}
+
 impl Lists {
     pub(crate) fn cons(&mut self, ty: Ty, args: u32, next: u32) -> u32 {
         self.cells.push((ty, args, next));
@@ -195,6 +240,14 @@ pub(crate) struct VarModel {
     pub assigned: bool,
     /// Definitely unassigned (only meaningful pre-first-write).
     pub unassigned: bool,
+    /// Non-promotion history chain into the interpreter's [`Reasons`]
+    /// pool (official `nonPromotionHistory`, `flow_analysis.dart:4686`):
+    /// one entry per dropped promoted type, most recent first. For
+    /// property slots the same field holds the cleared promoted types as
+    /// [`crate::facts::NonPromotionCause::PropertyEvidence`] — the flat-slot form of upstream's
+    /// `_nonPromotableProperties` version chain (`flow_analysis.dart:5684`,
+    /// `5711-5719`).
+    pub history: u32,
 }
 
 /// The write-version sentinel for write-captured variables.
@@ -209,20 +262,48 @@ impl VarModel {
             version: 0,
             assigned: false,
             unassigned: true,
+            history: NIL,
         }
     }
 
     pub(crate) fn captured(&self) -> bool {
         self.version == CAPTURED
     }
+
+    /// Field equality on the official `PromotionModel` payload only —
+    /// upstream's `_identicalOrNew` compares promotedTypes/tested/assigned/
+    /// unassigned/version and drops `nonPromotionHistory` whenever a fresh
+    /// joined model is built (`flow_analysis.dart:5355-5385`): `history`
+    /// does not participate, matching the official shape where the history
+    /// is a side record, not a state field.
+    fn same_flow(&self, other: &Self) -> bool {
+        self.promoted == other.promoted
+            && self.tested == other.tested
+            && self.version == other.version
+            && self.assigned == other.assigned
+            && self.unassigned == other.unassigned
+    }
 }
 
 /// One point in the flow: a reachability node plus the per-variable models
-/// (official `FlowModel`).
+/// (official `FlowModel`), and the per-property promotion slots beside them
+/// (the Rust-native form of the official property versions nested under a
+/// value version — `flow_analysis.dart:5675-5685`: each promotable property
+/// of a value carries its own promotion model in the same promotion-info
+/// machinery; the flat slot list is keyed through the interpreter's property
+/// table, `Interp::prop_slot`).
 #[derive(Clone, Debug)]
 pub(crate) struct State {
     pub reach: u32,
     pub models: Vec<VarModel>,
+    /// Promotion models of property keys, slot-indexed in lockstep with
+    /// the interpreter's property table. The same [`VarModel`] machinery
+    /// runs over them (promotions, joins, the finally attach); `version`
+    /// stays 0 except the receiver-captured sentinel, which permanently
+    /// blocks promotion lookups (official `_handleProperty`'s
+    /// target-version gate, `flow_analysis.dart:9021-9026`, plus the
+    /// `tryMarkNonNullable` write-capture bail, :4055-4057).
+    pub props: Vec<VarModel>,
 }
 
 impl State {
@@ -230,6 +311,7 @@ impl State {
         Self {
             reach: initial_reach,
             models: Vec::new(),
+            props: Vec::new(),
         }
     }
 
@@ -249,12 +331,29 @@ impl State {
         self
     }
 
+    pub(crate) fn prop(&self, slot: u32) -> VarModel {
+        self.props
+            .get(slot as usize)
+            .copied()
+            .unwrap_or_else(VarModel::fresh)
+    }
+
+    fn with_prop(mut self, slot: u32, model: VarModel) -> Self {
+        let index = slot as usize;
+        if index >= self.props.len() {
+            self.props.resize(index + 1, VarModel::fresh());
+        }
+        self.props[index] = model;
+        self
+    }
+
     /// Splits control flow (official `FlowModel.split`).
     pub(crate) fn split(self, reach: &mut ReachArena) -> Self {
         let r = reach.split(self.reach);
         Self {
             reach: r,
             models: self.models,
+            props: self.props,
         }
     }
 
@@ -264,6 +363,7 @@ impl State {
         Self {
             reach: r,
             models: self.models,
+            props: self.props,
         }
     }
 
@@ -274,6 +374,7 @@ impl State {
         Self {
             reach: reach.unsplit_to(self.reach, target),
             models: self.models,
+            props: self.props,
         }
     }
 
@@ -282,6 +383,7 @@ impl State {
         Self {
             reach: r,
             models: self.models,
+            props: self.props,
         }
     }
 
@@ -302,26 +404,37 @@ impl State {
     /// interest (the declared type's non-null form or a previously tested
     /// type) when the written value matches. `declared_args` is the
     /// declared type's written-argument tree — the declared non-null
-    /// candidate's rows (#1010).
+    /// candidate's rows (#1010). `write_span` is the write expression's own
+    /// range — the `DemoteViaExplicitWrite.node` anchor (upstream passes
+    /// the assignment node, `assignment_expression_resolver.dart:324`);
+    /// `None` for writes that are not the official's real-write events
+    /// (declaration initializers, the declared for-in head — upstream's
+    /// `declare`/`_initialize` carry no demotion reason).
+    #[expect(clippy::too_many_arguments)] // one slot per fact dimension of the official write event
     pub(crate) fn write(
         self,
         ops: &dyn TypeOps,
         lists: &mut Lists,
+        reasons: &mut Reasons,
         var: u32,
         declared: Ty,
         declared_args: u32,
         written: Ty,
         promote_to_interest: bool,
+        write_span: Option<dartq_source::SourceRange>,
     ) -> Self {
         let model = self.model(var);
         if model.captured() {
-            // Write-captured: stays captured, assigned, unpromoted
-            // (official `PromotionModel.write` capture arm).
+            // Write-captured: stays captured, assigned, unpromoted — and the
+            // history drops with it (the official capture arm builds a fresh
+            // `PromotionModel` without `nonPromotionHistory`,
+            // flow_analysis.dart:4811-4818).
             return self.with_model(
                 var,
                 VarModel {
                     assigned: true,
                     unassigned: false,
+                    history: NIL,
                     ..model
                 },
             );
@@ -334,12 +447,34 @@ impl State {
         // the mirror order — most-specific first — so the kept prefix of the
         // official list is a suffix here). Rebuild the kept suffix in order.
         let nodes: Vec<(Ty, u32)> = lists.iter_entries(model.promoted).collect();
+        let keep_from = nodes
+            .iter()
+            .position(|&(ty, _)| ops.is_subtype(written, ty))
+            .unwrap_or(nodes.len());
         let mut promoted = NIL;
-        if let Some(keep_from) = nodes.iter().position(|&(ty, _)| ops.is_subtype(written, ty)) {
-            for (ty, args) in nodes[keep_from..].iter().rev() {
-                promoted = lists.cons(*ty, *args, promoted);
+        for (ty, args) in nodes[keep_from..].iter().rev() {
+            promoted = lists.cons(*ty, *args, promoted);
+        }
+        // Each dropped entry appends its non-promotion link, most specific
+        // first — the official append order (`flow_analysis.dart:4901-4923`
+        // iterates `numElementsToKeep` downward = most-specific first). The
+        // reason attaches only to real writes: the official's
+        // `nonPromotionReason` is null for declare/initialize writes (the
+        // `assert(false)` arm at :4914-4916), which would record nothing.
+        let mut history = model.history;
+        if let Some(span) = write_span {
+            for (ty, args) in &nodes[..keep_from] {
+                history = reasons.cons(
+                    *ty,
+                    *args,
+                    crate::facts::NonPromotionCause::ExplicitWrite { span },
+                    history,
+                );
             }
         }
+        // The rebuilt chain id before type-of-interest re-promotion (see
+        // the no-change early return below).
+        let post_demote = promoted;
         if promote_to_interest && !promoted_is(lists, promoted, written) {
             // Types of interest: the declared type's non-null form, then the
             // tested types and their non-null forms (official
@@ -381,6 +516,17 @@ impl State {
                 promoted = add_promoted(ops, lists, promoted, promoted_to, args);
             }
         }
+        // A write that changed nothing (no demotion, no re-promotion) on an
+        // already-assigned variable takes the official's identical-model
+        // early return (`flow_analysis.dart:4838-4846`), which builds a
+        // fresh `PromotionModel` without `nonPromotionHistory` — the prior
+        // history drops with it (an upstream quirk mirrored verbatim:
+        // `x = 1` after `x = null` erases the earlier demotion link).
+        let history = if keep_from == 0 && promoted == post_demote && model.assigned {
+            NIL
+        } else {
+            history
+        };
         self.with_model(
             var,
             VarModel {
@@ -389,6 +535,7 @@ impl State {
                 version: model.version.wrapping_add(1).max(1),
                 assigned: true,
                 unassigned: false,
+                history,
             },
         )
     }
@@ -427,9 +574,41 @@ impl State {
         )
     }
 
+    /// Records the non-null promotion on a property slot (the property
+    /// mirror of the null-check face of [`State::finish_type_test`] —
+    /// official `tryMarkNonNullable` through `_finishTypeTest`,
+    /// `flow_analysis.dart:4046-4073`; the upstream call passes no tested
+    /// type, so only the promotion chain moves). A receiver-captured slot
+    /// promotes nothing (the official `info.writeCaptured` bail, :4055-4057
+    /// — the receiver's value version association is permanently gone).
+    /// `marker` is the non-null face of the property's marker type; a chain
+    /// that already heads with it is the `isValidPromotionStep` no-op.
+    pub(crate) fn promote_prop_non_null(
+        self,
+        ops: &dyn TypeOps,
+        lists: &mut Lists,
+        slot: u32,
+        marker: Ty,
+    ) -> Self {
+        let model = self.prop(slot);
+        if model.captured() {
+            return self;
+        }
+        let promoted = add_promoted(ops, lists, model.promoted, marker, crate::ty::EMPTY_ARGS);
+        if promoted == model.promoted {
+            return self;
+        }
+        self.with_prop(slot, VarModel { promoted, ..model })
+    }
+
     /// Joins two states (official `FlowModel.join` + `joinPromotionInfo`):
     /// reachable if either is; assigned if either is; unassigned only if
     /// both are; promotions keep the common (less specific) chain prefix.
+    /// The property slots join under the same per-key rule (official
+    /// `joinPromotionInfo` walks property keys beside variable keys,
+    /// `flow_analysis.dart:5830-5940`), over the union of the two sides'
+    /// slot extents — a promotion survives a merge only when it stands on
+    /// every incoming path.
     pub(crate) fn join(
         first: Option<Self>,
         second: Option<Self>,
@@ -458,21 +637,41 @@ impl State {
             let b = second.model(var);
             models.push(join_model(a, b, lists));
         }
+        let slots = first.props.len().max(second.props.len());
+        let mut props = Vec::with_capacity(slots);
+        for slot in 0..slots {
+            let slot = u32::try_from(slot).expect("property slot count fits u32");
+            let a = first.prop(slot);
+            let b = second.prop(slot);
+            props.push(join_model(a, b, lists));
+        }
         Self {
             reach: first.reach,
             models,
+            props,
         }
     }
 
     /// Conservative join at loop heads and closure entries (official
     /// `FlowModel.conservativeJoin`): written variables lose promotions
     /// (finals keep them) and definite-unassignedness; captured variables
-    /// become write-captured and lose all promotions.
+    /// become write-captured and lose all promotions. `reason` is the
+    /// official `getNonPromotionReason` payload — `Some` only at
+    /// suspension points (the official's sole call site,
+    /// `flow_analysis.dart:7935-7947`): each dropped promoted type appends
+    /// a `DemoteViaSuspension` link. Every other conservative join passes
+    /// `None`, which drops the history outright — the official's
+    /// `discardPromotionsAndMarkNotUnassigned` with a null reason leaves
+    /// `nonPromotionHistory` null (`flow_analysis.dart:4732-4741`), so a
+    /// loop head or closure entry erases earlier demotion links.
     pub(crate) fn conservative_join(
         self,
         written: &FxHashSet<u32>,
         captured: &FxHashSet<u32>,
         finals: &FxHashSet<u32>,
+        lists: &Lists,
+        reasons: &mut Reasons,
+        reason: Option<crate::facts::NonPromotionCause>,
     ) -> Self {
         let mut this = self;
         for &var in written {
@@ -482,15 +681,33 @@ impl State {
             }
             let new = if finals.contains(&var) {
                 // Final variables keep promotions (their value cannot
-                // change) but are no longer definitely unassigned.
+                // change) but are no longer definitely unassigned
+                // (official `markNotUnassigned` — the history rides
+                // through `..model`).
                 VarModel {
                     unassigned: false,
                     ..model
                 }
             } else {
+                // Non-final demotion: every dropped promoted type appends
+                // its reason link, most specific first (official
+                // `discardPromotionsAndMarkNotUnassigned`,
+                // `flow_analysis.dart:4734-4741`); no reason → the whole
+                // history drops.
+                let history = match reason {
+                    Some(demotion) => {
+                        let mut history = model.history;
+                        for (ty, args) in lists.iter_entries(model.promoted) {
+                            history = reasons.cons(ty, args, demotion, history);
+                        }
+                        history
+                    }
+                    None => NIL,
+                };
                 VarModel {
                     promoted: NIL,
                     unassigned: false,
+                    history,
                     ..model
                 }
             };
@@ -509,6 +726,9 @@ impl State {
                     version: CAPTURED,
                     assigned: model.assigned,
                     unassigned: false,
+                    // Official `writeCapture`: the history dies with the
+                    // promotions (`flow_analysis.dart:4872-4880`).
+                    history: NIL,
                 },
             );
         }
@@ -540,6 +760,10 @@ impl State {
                 var,
                 VarModel {
                     tested: merged,
+                    // The official `inheritTested` constructor omits
+                    // `nonPromotionHistory` — a changed tested set drops it
+                    // (`flow_analysis.dart:5054-5068`).
+                    history: NIL,
                     ..a
                 },
             );
@@ -548,7 +772,11 @@ impl State {
     }
 }
 
-/// Joins two per-variable models (official `PromotionModel.join`).
+/// Joins two per-variable models (official `PromotionModel.join` +
+/// `_identicalOrNew`, `flow_analysis.dart:5084-5146, 5355-5385`): when the
+/// joined payload equals one side's, that side's model — history included —
+/// survives verbatim; a genuinely new joined model drops the history
+/// (the official constructor omits `nonPromotionHistory`).
 fn join_model(a: VarModel, b: VarModel, lists: &mut Lists) -> VarModel {
     if a == b {
         return a;
@@ -563,7 +791,7 @@ fn join_model(a: VarModel, b: VarModel, lists: &mut Lists) -> VarModel {
         join_promoted(a.promoted, b.promoted, lists)
     };
     let tested = union_tested(a.tested, b.tested, lists);
-    VarModel {
+    let joined = VarModel {
         promoted,
         tested,
         version: if captured {
@@ -573,6 +801,17 @@ fn join_model(a: VarModel, b: VarModel, lists: &mut Lists) -> VarModel {
         },
         assigned: a.assigned && b.assigned,
         unassigned: a.unassigned && b.unassigned,
+        history: NIL,
+    };
+    // Official `_identicalOrNew`: a side whose five official fields match
+    // the join result returns its own model (its history survives); a
+    // rebuilt model carries none.
+    if a.same_flow(&joined) {
+        a
+    } else if b.same_flow(&joined) {
+        b
+    } else {
+        joined
     }
 }
 
@@ -706,17 +945,25 @@ pub(crate) fn attach_finally_model(
         // Keep the try-exit promotions and assignment facts, but the value
         // version advances to the finally-exit version (writes in the
         // finally block did not touch it — versions equal — so keep it).
+        // Official `_identicalOrNew` (`flow_analysis.dart:8614-8626,
+        // 5355-5385`): when the rebuilt payload matches one side, that
+        // side's model — history included — returns; a genuinely rebuilt
+        // model carries none.
         let _ = lists;
-        VarModel {
+        let joined = VarModel {
             promoted: after_try.promoted,
             tested: after_try.tested,
             version: after_finally.version,
             assigned: after_try.assigned || after_finally.assigned,
             unassigned: after_try.unassigned && after_finally.unassigned,
+            history: NIL,
+        };
+        if after_try.same_flow(&joined) {
+            after_try
+        } else if after_finally.same_flow(&joined) {
+            after_finally
+        } else {
+            joined
         }
     }
-}
-
-pub(crate) fn is_non_nullable(ops: &dyn TypeOps, t: Ty) -> bool {
-    ops.classify(t) == Classification::NonNullable
 }
