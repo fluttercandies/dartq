@@ -4,18 +4,10 @@
 # in this workspace. Do not override with `cargo build -j N`.
 [build]
 jobs = 2
-# sccache wraps rustc: compilation results are content-addressed and reused
-# across lanes/sessions (cargo check metadata caching is the big win with 7
-# parallel lanes). Incremental invocations pass through uncached; correctness
-# is unaffected. Requires `sccache` on PATH (brew install sccache).
-rustc-wrapper = "sccache"
-# Incremental rustc invocations are not cacheable — the official Rust
-# caching notes REQUIRE disabling incremental (Rust.md:10 in the
-# upstream sccache repo), and the stats breakdown confirms
-# incremental calls pass straight through. Disabling it makes every
-# compilation content-addressed: the dominant workload here (seven
-# parallel lanes re-running cargo check over mostly-unchanged crates)
-# turns whole dependency graphs into cross-lane cache hits. Note bin/
-# proc-macro crates still miss (link step is never cached, Rust.md:11);
-# their lib deps remain cacheable.
+# Incremental compilation is disabled: the dominant workload here (many
+# parallel lanes re-running cargo check over mostly-unchanged crates) stays
+# memory- and disk-bounded, and content-addressed compilation reuse (when a
+# wrapper like sccache is enabled locally via the RUSTC_WRAPPER environment
+# variable) requires it. The workspace itself pins no wrapper: a fresh
+# clone builds with the plain toolchain, no extra prerequisites.
 incremental = false
