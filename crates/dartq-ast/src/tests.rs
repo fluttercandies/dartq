@@ -1,7 +1,7 @@
 //! Unit tests: builder invariants (post-order, contiguous child ranges,
 //! pairing table, payload slots, error propagation, speculation rollback),
 //! table accessors, span derivation, and the kind-table lockstep guards
-//! (layout spec §8 R4).
+//!.
 
 #![allow(clippy::cast_possible_truncation)] // ids/offsets are u32 by design
 #![allow(clippy::enum_glob_use)] // tests read best over the full kind set
@@ -132,7 +132,7 @@ fn fielded_leaf_patterns() {
 
 #[test]
 fn shared_begin_pairs() {
-    // A `(`-opened structure seals as either shape (collapse map §2 #12/#13).
+    // A `(`-opened structure seals as either shape.
     // The canonical open is the wider RecordLiteral (#151 flip): it reserves
     // the const slot; ParenthesizedExpression narrow-seals under it.
     let mut b = AstBuilder::new();
@@ -283,7 +283,7 @@ fn pairing_table_shape() {
     // Same-kind pairing is the default.
     assert!(accepts_begin(Block, Block));
     assert!(!accepts_begin(Block, IfStatement));
-    // The five shared-begin groups (collapse map §2 #6, #7, #10, #11, #12/#13).
+    // The five shared-begin groups.
     assert!(accepts_begin(TopLevelFields, Fields));
     assert!(accepts_begin(TopLevelFields, TopLevelFields));
     assert!(accepts_begin(ForIn, ForStatement));
@@ -352,7 +352,7 @@ fn canonical_begin_is_never_narrower_than_its_ends() {
 #[test]
 fn payload_width_ceiling() {
     use NodeKind::*;
-    // The spec tolerates exactly one fat outlier (layout spec §1.5); no
+    // The spec tolerates exactly one fat outlier; no
     // other kind may reach it. #174 brought the outlier down from 7 to 5.
     let mut max = 0u8;
     for raw in 0..NodeKind::KIND_COUNT {
@@ -363,18 +363,17 @@ fn payload_width_ceiling() {
 }
 
 /// The ratified payload-width column of the collapse map,
-/// transcribed kind for kind in the map's domain order: the §3 per-domain
+/// transcribed kind for kind in the map's domain order: the per-domain
 /// payload columns at final width — i.e. after the derivable-word rulings
-/// recorded in §1 (the #151 width-0 elimination list and the #174
-/// second-pass ledger) — with §6's fat-10 table cross-checking the widest
-/// kinds. This table is the authority transcript; [`payload_len`] is the
+/// (the #151 width-0 elimination list and the #174 second-pass ledger) —
+/// with the fat-10 table cross-checking the widest kinds. This table is the authority transcript; [`payload_len`] is the
 /// implementation, and [`payload_width_lockstep`] is the mechanical lock
 /// between them. Trailing comments cite the map note that fixes the width
-/// where it is not simply the §3 field count.
+/// where it is not simply the kind's field count.
 const COLLAPSE_MAP_WIDTHS: &[(NodeKind, u8)] = {
     use NodeKind::*;
     &[
-        // §3.1 Compilation unit and directives.
+        // Group 3.1: compilation unit and directives.
         (CompilationUnit, 0),
         (TopLevelDeclaration, 0),
         (LibraryName, 1),
@@ -389,7 +388,7 @@ const COLLAPSE_MAP_WIDTHS: &[(NodeKind, u8)] = {
         (ConditionalUri, 2), // 3→2 #174: `if` = span head
         (DottedName, 0),     // #151 elimination list
         (ScriptTag, 0),      // #151 elimination list
-        // §3.2 Top-level and class-like declarations.
+        // Group 3.2: top-level and class-like declarations.
         (DeclarationBody, 0),
         (ClassDeclaration, 4),         // 6→4 #174
         (MixinDeclaration, 3),         // 5→3 #174
@@ -405,7 +404,7 @@ const COLLAPSE_MAP_WIDTHS: &[(NodeKind, u8)] = {
         (PrimaryConstructorBody, 3),
         (RecoverDeclarationHeader, 1),
         (InvalidTopLevelDeclaration, 0),
-        // §3.3 Members.
+        // Group 3.3: members.
         (TopLevelFields, 0), // 2→0 #174
         (TopLevelMethod, 1), // 3→1 #174
         (Fields, 1),         // 3→1 #174
@@ -413,7 +412,7 @@ const COLLAPSE_MAP_WIDTHS: &[(NodeKind, u8)] = {
         (Constructor, 4),    // 6→4 #174
         (Factory, 2),        // 4→2 #174
         (RedirectingFactoryBody, 0),
-        (FormalParameter, 5),          // 7→5 #174; the ≤48 B fat outlier (§6)
+        (FormalParameter, 5),          // 7→5 #174; the ≤48 B fat outlier
         (FormalParameters, 0),         // #151 elimination list
         (OptionalFormalParameters, 0), // #151 elimination list
         (NoFormalParameters, 0),       // #151 elimination list
@@ -428,7 +427,7 @@ const COLLAPSE_MAP_WIDTHS: &[(NodeKind, u8)] = {
         (MetadataStar, 0),
         (Metadata, 1),
         (InvalidMember, 0),
-        // §3.4 Statements.
+        // Group 3.4: statements.
         (Block, 0),
         (InvalidTopLevelBlock, 0),
         (LabeledStatement, 0),
@@ -463,7 +462,7 @@ const COLLAPSE_MAP_WIDTHS: &[(NodeKind, u8)] = {
         (PatternVarDeclStatement, 1), // 3→1 #174
         (PatternAssignment, 1),
         (InvalidStatement, 0),
-        // §3.5 Expressions.
+        // Group 3.5: expressions.
         (Arguments, 0), // #151 elimination list
         (NamedArgument, 1),
         (Send, 0), // #151: span endpoints
@@ -524,12 +523,12 @@ const COLLAPSE_MAP_WIDTHS: &[(NodeKind, u8)] = {
         (ExtraneousExpression, 0),
         (Spread, 0),           // #151 elimination list
         (NullAwareElement, 0), // #151 elimination list
-        // §3.6 Control-flow sugar in collections.
+        // Group 3.6: control-flow sugar in collections.
         (ForControlFlow, 2),  // 3→2 #174
         (IfControlFlow, 0),   // #151 elimination list
         (ThenControlFlow, 0), // #151 elimination list
         (ElseControlFlow, 0), // #151 elimination list
-        // §3.7 Patterns.
+        // Group 3.7: patterns.
         (PatternGuard, 0), // #151 elimination list
         (BinaryPattern, 1),
         (ConstantPattern, 0), // 1→0 #174
@@ -540,16 +539,16 @@ const COLLAPSE_MAP_WIDTHS: &[(NodeKind, u8)] = {
         (MapPattern, 0), // 2→0 #174
         (MapPatternEntry, 1),
         (ListPattern, 0),             // 2→0 #174
-        (RelationalPattern, 0),       // #151 elimination list
+        (RelationalPattern, 1), // operator token: precedes the post-order anchor (upstream RelationalPatternImpl.operator)
         (AssignedVariablePattern, 0), // #151 elimination list
         (DeclaredVariablePattern, 1), // 2→1 #174
-        (WildcardPattern, 1),         // 2→1 #174
+        (WildcardPattern, 1),   // 2→1 #174
         (PatternField, 1),
         (NamedRecordField, 1),
         (RestPattern, 2),
         (NullAssertPattern, 0), // #151 elimination list
         (NullCheckPattern, 0),  // #151 elimination list
-        // §3.8 Types.
+        // Group 3.8: types.
         (Type, 0),     // 2→0 #174
         (NoType, 0),   // #151 elimination list
         (VoidType, 0), // #151 elimination list
@@ -564,9 +563,9 @@ const COLLAPSE_MAP_WIDTHS: &[(NodeKind, u8)] = {
         (TypeVariables, 0),   // #151 elimination list
         (NoTypeVariables, 0), // #151 elimination list
         (NativeClause, 0),    // #151 elimination list
-        // §3.9 Function bodies and error sentinels.
+        // Group 3.9: function bodies and error sentinels.
         (EmptyBody, 0),          // #151 elimination list
-        (ExpressionBody, 4),     // §3.9/§6: arrow/end + async/star (AsyncModifier back-fill)
+        (ExpressionBody, 4),     // arrow/end + async/star (AsyncModifier back-fill)
         (NoBody, 0),             // #151 elimination list
         (SkippedBody, 1),        // 3→1 #174
         (NativeFunctionBody, 0), // 2→0 #174
@@ -942,6 +941,29 @@ fn payload_bearing_constructions() {
     assert_eq!(ast.payload(13), &[2, 17, u32::MAX]);
 }
 
+/// The relational pattern carries its operator as payload word 0: the
+/// parser fires the event after the operand parsed (official parser
+/// :11810-11815), so the node anchors at the operand's head and the
+/// operator — which precedes it in the token stream — is not
+/// span-derivable. Upstream `RelationalPatternImpl` holds it as a field,
+/// exactly like the sibling `BinaryPattern`/`CastPattern` operator words.
+/// The `case == 'x':` builder crash (#1723) was this write hitting a
+/// width-0 slot.
+#[test]
+fn relational_pattern_carries_the_operator_word() {
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.leaf(NodeKind::LiteralInt, 1); // the operand, completed before the event
+    b.begin(NodeKind::RelationalPattern, 1); // anchored at the operand head
+    b.patch(0, 2); // the operator token
+    b.end(NodeKind::RelationalPattern, 2);
+    b.end(NodeKind::CompilationUnit, 2);
+    let ast = b.finish();
+    assert_eq!(ast.kind(1), NodeKind::RelationalPattern);
+    assert_eq!(ast.payload(1), &[2]);
+    assert!(!ast.is_error(1));
+}
+
 #[test]
 fn error_flag_propagates_to_all_ancestors() {
     let mut b = AstBuilder::new();
@@ -1037,6 +1059,46 @@ fn rollback_undoes_patches_into_pre_mark_slots() {
 }
 
 #[test]
+fn rollback_restores_modifiers_set_before_the_mark() {
+    // The modifier leak: `set_modifiers` on a node begun BEFORE the mark
+    // mutates an OpenNode field the open-stack truncation cannot reach —
+    // ghost bits survived the rollback, and `first_modifier` then reported
+    // a token the rolled-back parse never had. `rollback` must restore the
+    // node's pre-mark bits (the modifier-undo log).
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::ClassDeclaration, 0);
+    b.set_modifiers(0b10); // abstract bit, committed before the mark
+    let marker: Marker = b.mark();
+    b.begin(NodeKind::Block, 1);
+    b.set_modifiers(0b100); // speculated bits on a post-mark node
+    b.end(NodeKind::Block, 1);
+    b.set_modifiers(0b100); // speculated write into the pre-mark class node
+    b.rollback(marker);
+    b.rollback(marker); // the undo entries drained: re-rollback is a no-op
+
+    // The committed suffix builds on; the class seals with exactly its
+    // pre-mark modifier set.
+    b.set_modifiers(0b1000); // base bit
+    b.patch(0, 7);
+    b.patch(1, TOKEN_NONE);
+    b.patch(2, TOKEN_NONE);
+    b.patch(3, TOKEN_NONE);
+    b.end(NodeKind::ClassDeclaration, 2);
+    b.end(NodeKind::CompilationUnit, 2);
+    let ast = b.finish();
+
+    // Post-order: [class, unit] — the speculated block was discarded with
+    // the rollback.
+    assert_eq!(ast.len(), 2);
+    assert_eq!(
+        derived::mod_flags(&ast, 0),
+        0b10 | 0b1000,
+        "the speculated modifier write into the committed node must be undone"
+    );
+}
+
+#[test]
 #[cfg(debug_assertions)]
 #[should_panic(expected = "unpatched payload word")]
 fn rollback_of_the_only_patch_leaves_no_ghost_seal() {
@@ -1075,6 +1137,47 @@ fn unmaterialized_narrow_seal_allocates_no_pool_words() {
         ast.len() * 24,
         "headers only: no pool word was ever allocated for the slot"
     );
+}
+
+#[test]
+fn top_level_fields_seal_allocates_no_pool_words() {
+    // The bridge builds top-level fields as the shared `Fields` open sealed
+    // as the width-0 `TopLevelFields` with NO patch: the member-kind word
+    // was unreadable dead weight (one pool word + one undo entry per
+    // declaration), so the slot must never materialize.
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::Fields, 0);
+    b.set_modifiers(0b10); // the #174 header-bit home of the old ModSet
+    b.leaf(NodeKind::LiteralInt, 1); // a member
+    b.end(NodeKind::TopLevelFields, 2);
+    b.end(NodeKind::CompilationUnit, 2);
+    let ast = b.finish();
+
+    assert_eq!(ast.len(), 3);
+    assert!(ast.payload(1).is_empty(), "width-0 seal, no dead word");
+    assert_eq!(
+        ast.memory_footprint(),
+        ast.len() * 24,
+        "headers only: no pool word for the member-kind word"
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "strictly inside a completed subtree")]
+fn begin_with_first_child_rejects_a_mid_subtree_start() {
+    // A start one past a completed subtree's head row is strictly inside
+    // that subtree: adopting from it would split the subtree's rows between
+    // its owner and the adopting node — the well-nestedness assertion trips
+    // instead of silently breaking parent/window consistency.
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::Block, 0);
+    b.leaf(NodeKind::LiteralInt, 0); // rows 1-2: the block's children
+    b.leaf(NodeKind::LiteralInt, 1);
+    b.end(NodeKind::Block, 2); // row 3: the subtree spans [1, 3]
+    b.begin_with_first_child(NodeKind::SwitchCase, 1, 2); // chops the block
 }
 
 #[test]
@@ -1210,6 +1313,144 @@ fn begin_with_first_child_takes_an_explicit_segment_start() {
     kids.reverse();
     // The pre-segment leaf stays outside; the segment leaf is the child.
     assert_eq!(kids, [NodeKind::LiteralInt, NodeKind::EmptyStatement]);
+}
+
+// ---- bridge-desync degrades -----------------------------------------------
+
+/// Bridge events with no node to act on are arena-safe no-ops in release
+/// builds: the impossible write is dropped, the builder stays consistent.
+/// Debug builds panic at the pairing asserts instead (the twin below).
+#[cfg(not(debug_assertions))]
+#[test]
+fn empty_stack_bridge_events_degrade_to_no_ops() {
+    let mut b = AstBuilder::new();
+    b.set_modifiers(0b10); // no open node: dropped
+    b.patch(0, 1); // no open node: dropped
+    b.end(NodeKind::Block, 0); // no matching begin: dropped
+    b.begin_adopting(NodeKind::BinaryExpression, 0, 1); // nothing completed: plain begin
+    b.patch(0, 2); // lands in the adopted node's slot
+    b.end(NodeKind::BinaryExpression, 1);
+    let ast = b.finish();
+    assert_eq!(ast.len(), 1);
+    assert_eq!(ast.kind(0), NodeKind::BinaryExpression);
+    assert_eq!(ast.children(0), 0..0);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "without an open node")]
+fn empty_stack_bridge_events_trip_the_debug_invariant() {
+    let mut b = AstBuilder::new();
+    b.set_modifiers(0b10);
+}
+
+/// `mark_error` with no node open marks nothing (a bridge bug): a flag
+/// with no target has nowhere to land, and the builder stays consistent.
+/// Debug builds trip the pairing assert instead (the twin below).
+#[cfg(not(debug_assertions))]
+#[test]
+fn empty_stack_mark_error_degrades_to_no_op() {
+    let mut b = AstBuilder::new();
+    b.mark_error(); // no open node: dropped
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.leaf(NodeKind::LiteralInt, 0);
+    b.end(NodeKind::CompilationUnit, 1);
+    let ast = b.finish();
+    assert_eq!(ast.len(), 2);
+    assert!(!ast.is_error(0));
+    assert!(!ast.is_error(1));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "mark_error without an open node")]
+fn empty_stack_mark_error_trips_the_debug_invariant() {
+    let mut b = AstBuilder::new();
+    b.mark_error();
+}
+
+/// Adoption-desync parameters degrade to the plain-begin shape in release
+/// builds — the node still opens, so its paired `end` pops the right node —
+/// and the adoption walk never leaves the arena. Debug builds panic at the
+/// invariant asserts instead (the twin below).
+#[cfg(not(debug_assertions))]
+#[test]
+fn adoption_desyncs_degrade_to_plain_begins() {
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.leaf(NodeKind::EmptyStatement, 0); // row 0
+    b.begin_adopting(NodeKind::BinaryExpression, 1, 0); // siblings = 0
+    b.end(NodeKind::BinaryExpression, 1); // row 1
+    b.begin_adopting(NodeKind::BinaryExpression, 1, 9); // walk past the head
+    b.end(NodeKind::BinaryExpression, 1); // row 2
+    b.begin_with_first_child(NodeKind::SwitchCase, 1, 99); // past the tail
+    b.end(NodeKind::SwitchCase, 2); // row 3
+    b.end(NodeKind::CompilationUnit, 2); // row 4
+    let ast = b.finish();
+    assert_eq!(ast.len(), 5);
+    assert_eq!(ast.children(1), 1..1, "siblings = 0 adopts nothing");
+    assert_eq!(
+        ast.children(2),
+        0..2,
+        "the oversized walk clamps at the head"
+    );
+    assert_eq!(
+        ast.children(3),
+        3..3,
+        "the tail clamp reads as a plain begin"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "with no siblings to adopt")]
+fn adoption_desyncs_trip_the_debug_invariant() {
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin_adopting(NodeKind::BinaryExpression, 0, 0);
+}
+
+/// A node token id outside the table (the pre-fold / stale-id class) reads
+/// as a zero-width span pinned at the EOF token in release builds —
+/// under-report, never a panic. Debug builds trip the read-boundary assert
+/// instead (the twin below).
+#[cfg(not(debug_assertions))]
+#[test]
+fn out_of_table_token_ids_degrade_to_eof_pinned_zero_width() {
+    let mut files = FileTable::new();
+    let big = scan_of("a b c", &mut files, "big.dart");
+    let small = scan_of("a", &mut files, "small.dart");
+
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.leaf(NodeKind::LiteralInt, 2); // token 2 exists only in the big table
+    b.end(NodeKind::CompilationUnit, 3);
+    let ast = b.finish();
+
+    // Reading against the small table (2 tokens: `a`, Eof at offset 1):
+    // the head read misses and the whole span degrades.
+    assert_eq!(small.tokens.last().byte_offset, 1);
+    assert_eq!(byte_span(&small.tokens, &ast, 0), 1..1);
+    assert_eq!(utf16_span("a", &small.tokens, &ast, 0), 1..1);
+
+    // The same node against its own table reads normally.
+    assert_eq!(byte_span(&big.tokens, &ast, 0), 4..5);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "past the token table")]
+fn out_of_table_token_ids_trip_the_debug_boundary() {
+    let mut files = FileTable::new();
+    let small = scan_of("a", &mut files, "small.dart");
+
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.leaf(NodeKind::LiteralInt, 2);
+    b.end(NodeKind::CompilationUnit, 3);
+    let ast = b.finish();
+
+    let _ = byte_span(&small.tokens, &ast, 0);
 }
 
 #[test]

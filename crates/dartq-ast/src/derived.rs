@@ -22,9 +22,9 @@ fn token_at(tokens: &TokenTable, index: u32) -> Option<TokenKind> {
     tokens.get(index as usize).map(|token| token.kind)
 }
 
-/// The kind's modifier-set bits (`ModSet`, collapse map §1) stored in the
+/// The kind's modifier-set bits stored in the
 /// `NodeHeader.flags` modifier mask (bits 1..=7) — semantics are the
-/// class/member families of map §1, encoded by the parser lane. Zero means
+/// class/member modifier families, encoded by the parser lane. Zero means
 /// no modifier.
 #[must_use]
 pub fn mod_flags(ast: &SyntaxTable, id: u32) -> u16 {
@@ -38,6 +38,12 @@ pub fn mod_flags(ast: &SyntaxTable, id: u32) -> u16 {
 /// (`parseTopLevelDeclarationImpl` for the class family,
 /// `parseFormalParameter`/`parseTopLevelMemberImpl` for members): a
 /// non-empty modifier set starts the span.
+///
+/// Known exception — modified constructors: the bridge anchors
+/// [`NodeKind::Constructor`] at the declared name (the official event
+/// carries no head-modifier token), so a non-zero modifier set there
+/// reports the *name* token, not a modifier. Do not call this on
+/// `Constructor` rows.
 #[must_use]
 pub fn first_modifier(ast: &SyntaxTable, id: u32) -> Option<TokenRef> {
     (mod_flags(ast, id) != 0).then(|| {
@@ -94,12 +100,15 @@ pub fn last_token(tokens: &TokenTable, ast: &SyntaxTable, id: u32) -> Option<Tok
 /// derivation (`ConstantsPattern`/`VariablesDeclaration`/`CatchClause`/
 /// `DeclaredVariablePattern`/`WildcardPattern` optional keywords). Sound
 /// where the grammar lets nothing else start the node with that token, which
-/// holds for each row (map §3): e.g. `CatchClause` starts with `on` iff the
-/// `on` form was parsed (`handleCatchBlock(onKeyword, ..)`,
-/// `parser_impl.dart:10861`).
+/// holds for each row: e.g. `CatchClause` starts with `on` iff the
+/// `on` form was parsed (`handleCatchBlock(onKeyword,..)`,
+/// `parser_impl.dart:10861`). A fully synthetic span (`first_token ==
+/// end_token`) is `false` — same guard as [`question`]; its zero-width head
+/// would otherwise read whatever token comes next.
 #[must_use]
 pub fn head_is(tokens: &TokenTable, ast: &SyntaxTable, id: u32, keyword: Keyword) -> bool {
-    token_at(tokens, ast.token_range(id).start) == Some(TokenKind::Keyword(keyword))
+    let range = ast.token_range(id);
+    range.start < range.end && token_at(tokens, range.start) == Some(TokenKind::Keyword(keyword))
 }
 
 /// `ForInParts`/`ForControlFlow` `for` — the eliminated token. Rule:

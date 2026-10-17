@@ -1,7 +1,7 @@
 //! dartq-ast — the compact arena AST. Nodes hold token-range references,
 //! never stored offsets: spans derive from the token table at access time
 //! ([`byte_span`]/[`utf16_span`]), so byte and UTF-16 coordinates are both
-//! available for free and zero-copy (PRD §6.3, layout spec §2).
+//! available for free and zero-copy.
 //!
 //! # Layout
 //!
@@ -11,8 +11,8 @@
 //! Every node pays only for the payload width its kind declares; words
 //! derivable from the row's own tokens (span head, closing `;`/bracket,
 //! head-when-present keyword, nullable `?`, `ModSet` first token) are not
-//! stored at all — the derived-field accessors recompute them (map §1,
-//! #151 + #174). Parents are not stored but derived by a short forward walk.
+//! stored at all — the derived-field accessors recompute them (#151 +
+//! #174). Parents are not stored but derived by a short forward walk.
 //! Targets pinned by the spec and asserted at compile time and by the corpus
 //! metrics test: 24 B header, ≤30 B average per node, ≤1.5 MB of AST per MB
 //! of source.
@@ -29,7 +29,7 @@
 //! - [`AstKey`] — content-addressed cache identity; identical keys share one
 //!   unit across workspaces/contexts.
 //! - Traversal is `match node.kind` + an explicit stack — deliberately no
-//!   visitor trait (ast-design-spec §7).
+//!   visitor trait.
 //!
 //! Provenance: the layout is the adjudicated #92 header/pool split, the
 //! variant set applies the #31 collapse rulings to the official 377 node
@@ -59,13 +59,13 @@ pub use table::SyntaxTable;
 
 /// Index into [`SyntaxTable`]. The root is the highest id (post-order).
 /// Arena-local and unstable across processes — snapshots persist semantic
-/// ids only (layout spec §4).
+/// ids only.
 pub type NodeId = u32;
 
 /// Index into the unified token table: scanned tokens keep their scanner
 /// ids; parser-inserted tokens are appended into the scanner's table by
 /// `dartq_scanner::TokenTable::append_inserted` at parse end (Eof re-seated
-/// last), so the AST sees one contiguous table (layout spec §2). Same space
+/// last), so the AST sees one contiguous table. Same space
 /// as the parser's `TokenId`.
 ///
 /// Sequencing contract: until the parser runs that append, an inserted id
@@ -80,7 +80,7 @@ pub type NodeId = u32;
 pub type TokenRef = u32;
 
 /// Payload-word sentinel for an absent optional token — the
-/// `Option<TokenRef>` encoding (collapse map §1 notation, #151). Every
+/// `Option<TokenRef>` encoding. Every
 /// optional word is written explicitly (`patch`ed with a real token or
 /// [`TOKEN_NONE`]); a missed write is impossible to miss in debug builds
 /// (the slot is poison-filled and swept at seal time) and release trusts the
@@ -95,7 +95,7 @@ pub const TOKEN_NONE: TokenRef = u32::MAX;
 
 const _: () = assert!(
     core::mem::size_of::<table::NodeHeader>() == 24,
-    "NodeHeader must stay exactly 24 bytes (layout spec §1.3)"
+    "NodeHeader must stay exactly 24 bytes (the ratified layout)"
 );
 const _: () = assert!(
     core::mem::align_of::<table::NodeHeader>() == 4,

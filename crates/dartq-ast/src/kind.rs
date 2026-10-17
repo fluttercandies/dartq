@@ -21,15 +21,15 @@
 #![allow(clippy::enum_glob_use)] // the width/pairing tables read best over the full kind set
 
 /// The discriminant of one AST node. `u16`-sized by design (part of the
-/// 24-byte [`crate::table`] node header); space for future milestone
+/// 24-byte `crate::table` node header); space for future milestone
 /// extensions is ample.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum NodeKind {
-    // §3.1 Compilation unit and directives (Begin 12 / Handle 6 / End 13).
+    // Group 3.1: compilation unit and directives (Begin 12 / Handle 6 / End 13).
     CompilationUnit,
     /// Wrapper attributing a top-level name Identifier (any of the five
-    /// official preludes opens it; collapse map §2 #1-5).
+    /// official preludes opens it; one of the five shared-begin groups).
     TopLevelDeclaration,
     LibraryName,
     LibraryAugmentation,
@@ -42,9 +42,12 @@ pub enum NodeKind {
     Hide,
     ConditionalUri,
     DottedName,
+    /// Dead today: the unit parser consumes the `#!` line without a
+    /// listener event, so the bridge cannot build this leaf; kept as the
+    /// collapse-map row for the official node.
     ScriptTag,
 
-    // §3.2 Top-level and class-like declarations (Begin 16 / Handle 23 / End 11).
+    // Group 3.2: top-level and class-like declarations (Begin 16 / Handle 23 / End 11).
     /// Class/mixin/extension/extension-type body wrapper (member count is
     /// the children length).
     DeclarationBody,
@@ -63,7 +66,7 @@ pub enum NodeKind {
     RecoverDeclarationHeader,
     InvalidTopLevelDeclaration,
 
-    // §3.3 Members (Begin 20 / Handle 8 / End 21).
+    // Group 3.3: members (Begin 20 / Handle 8 / End 21).
     TopLevelFields,
     TopLevelMethod,
     Fields,
@@ -75,6 +78,8 @@ pub enum NodeKind {
     FormalParameters,
     OptionalFormalParameters,
     NoFormalParameters,
+    /// Dead today: no listener event builds this kind; kept as the
+    /// collapse-map row for the official node.
     ImplicitFormalParameters,
     FunctionTypedFormalParameter,
     VariablesDeclaration,
@@ -87,8 +92,10 @@ pub enum NodeKind {
     Metadata,
     InvalidMember,
 
-    // §3.4 Statements (Begin 27 / Handle 20 / End 29).
+    // Group 3.4: statements (Begin 27 / Handle 20 / End 29).
     Block,
+    /// Dead today: no recovery path emits this sentinel; kept as the
+    /// collapse-map row for the official node.
     InvalidTopLevelBlock,
     LabeledStatement,
     Label,
@@ -123,7 +130,7 @@ pub enum NodeKind {
     PatternAssignment,
     InvalidStatement,
 
-    // §3.5 Expressions (Begin 22 / Handle 53 / End 24).
+    // Group 3.5: expressions (Begin 22 / Handle 53 / End 24).
     Arguments,
     NamedArgument,
     Send,
@@ -139,6 +146,9 @@ pub enum NodeKind {
     ConstExpression,
     ConstLiteral,
     NewExpression,
+    /// Dead today: `new`-as-identifier resolves through `Identifier` (the
+    /// expression-continuation context), never this leaf; kept as the
+    /// collapse-map row for the official handle.
     NewAsIdentifier,
     AwaitExpression,
     InvalidAwaitExpression,
@@ -171,6 +181,8 @@ pub enum NodeKind {
     BlockBody,
     FunctionName,
     FunctionExpression,
+    /// Dead today: no listener event builds this kind; kept as the
+    /// collapse-map row for the official node.
     AnonymousMethodInvocation,
     Identifier,
     NoIdentifier,
@@ -180,18 +192,22 @@ pub enum NodeKind {
     ThisExpression,
     Operator,
     OperatorName,
+    /// Dead today: no recovery path emits this sentinel; kept as the
+    /// collapse-map row for the official node.
     InvalidExpression,
+    /// Dead today: no recovery path emits this sentinel; kept as the
+    /// collapse-map row for the official node.
     ExtraneousExpression,
     Spread,
     NullAwareElement,
 
-    // §3.6 Control-flow sugar in collections (Begin 2 / Handle 2 / End 4).
+    // Group 3.6: control-flow sugar in collections (Begin 2 / Handle 2 / End 4).
     ForControlFlow,
     IfControlFlow,
     ThenControlFlow,
     ElseControlFlow,
 
-    // §3.7 Patterns (Begin 4 / Handle 18 / End 4).
+    // Group 3.7: patterns (Begin 4 / Handle 18 / End 4).
     PatternGuard,
     BinaryPattern,
     ConstantPattern,
@@ -212,7 +228,7 @@ pub enum NodeKind {
     NullAssertPattern,
     NullCheckPattern,
 
-    // §3.8 Types (Begin 8 / Handle 9 / End 8).
+    // Group 3.8: types (Begin 8 / Handle 9 / End 8).
     /// A named type reference (the official `TypeHandle` family — the
     /// highest-frequency leaf).
     Type,
@@ -230,18 +246,29 @@ pub enum NodeKind {
     NoTypeVariables,
     NativeClause,
 
-    // §3.9 Function bodies and error sentinels (Handle 13).
+    // Group 3.9: function bodies and error sentinels (Handle 13).
     EmptyBody,
     ExpressionBody,
+    /// Dead today: missing bodies resolve to `EmptyBody`/`SkippedBody`; no
+    /// listener event builds this kind — kept as the collapse-map row for
+    /// the official node.
     NoBody,
     /// Diet-parsed body carrying the skipped span (declarations milestone).
     SkippedBody,
     NativeFunctionBody,
     InvalidFunctionBody,
+    /// Dead today: no recovery path emits this sentinel; kept as the
+    /// collapse-map row for the official node.
     InvalidTypeReference,
     RecoverableError,
     ExperimentNotEnabled,
+    /// Dead today: scanner-error faces are never stored — diagnostics flow
+    /// through the listener and the AST carries only the error flag; kept
+    /// as the collapse-map row for the official handle.
     ErrorToken,
+    /// Dead today: scanner-error faces are never stored — diagnostics flow
+    /// through the listener and the AST carries only the error flag; kept
+    /// as the collapse-map row for the official handle.
     UnescapeError,
 }
 
@@ -277,16 +304,15 @@ impl NodeKind {
 /// Node flag bits (`NodeHeader.flags`). A node carries an error bit when an
 /// error was marked inside it, directly or through propagation from a
 /// descendant at end-event time; "does this declaration contain errors" is
-/// then a flag read, not a diagnostics join (layout spec §3).
+/// then a flag read, not a diagnostics join.
 ///
-/// Bits 1..=7 carry the kind's modifier set (`ModSet`, collapse map §1) —
+/// Bits 1..=7 carry the kind's modifier set —
 /// #174 eliminated the two-word `ModSet` payload by moving its `flags: u16`
 /// here and deriving its `first` token (`flags != 0` ⇒ the first modifier is
 /// the node's span head: the official parser always computes declaration
 /// begin tokens as the first token after metadata, so a non-empty modifier
 /// set starts the span; `flags == 0` ⇒ absent, [`crate::TOKEN_NONE`]
-/// semantics). Bit *semantics* are the modifier families of collapse map §1
-/// (class: augment/abstract/sealed/base/interface/final/mixin; member:
+/// semantics). Bit *semantics* are the modifier families (class: augment/abstract/sealed/base/interface/final/mixin; member:
 /// augment/external/static/covariant/late/varFinalOrConst) — the parser lane
 /// assigns bit values inside the mask.
 pub(crate) mod flags {
@@ -301,16 +327,16 @@ pub(crate) mod flags {
 /// Number of shared-pool `u32` words the kind's payload occupies (zero for
 /// span-only and token-leaf kinds — the span token pair lives in the header,
 /// and a token leaf's token *is* its span head, so both store no payload
-/// word; layout spec §1.3, #151). Per-variant fields are the collapse map §3
-/// payload columns minus every derivable word: the #151 span-head pass, then
+/// word; the #151 layout pass). Per-variant fields are the payload
+/// columns minus every derivable word: the #151 span-head pass, then
 /// the #174 second pass (span-head tokens, end-of-span `;`/bracket tokens,
 /// head-when-present keywords, `ModSet` into [`flags`], the nullable `?`),
-/// each with its upstream SDK citation in the collapse map §1/§3. The
+/// each traceable to its upstream SDK source. The
 /// widest kind is [`NodeKind::FormalParameter`] at 5 words, the single
-/// tolerated outlier of the ≤30 B/node average (layout spec §1.5).
+/// tolerated outlier of the ≤30 B/node average.
 ///
 /// Width 0 by shape: fieldless kinds, the ~64 #151 span-head eliminations
-/// (map §1), and the #174 eliminations `TopLevelFields` (`ModSet`),
+///, and the #174 eliminations `TopLevelFields` (`ModSet`),
 /// `Type` (`?`), `MapPattern`/`ListPattern` (braces), `NativeFunctionBody`
 /// (native + `;`), `ConstantPattern` (`const`).
 ///
@@ -327,10 +353,9 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         // ModSet → header bits (#174): class/extends/with/implements and
         // kind/(new|get_set)/param/initializers remain. ExpressionBody:
         // arrow/end plus async/star back-filled from AsyncModifierHandle —
-        // no derivable word (collapse map §3.9 ExpressionFunctionBodyHandle
-        // row and §6 fat-10 table: 4 words).
-        // ForParts/ForInParts: the `for` token is the span head (map §3.4:
-        // ForLoopPartsHandle/ForInLoopPartsHandle begin at it), derived;
+        // no derivable word (ExpressionFunctionBodyHandle layout: 4 words).
+        // ForParts/ForInParts: the `for` token is the span head
+        // (ForLoopPartsHandle/ForInLoopPartsHandle begin at it), derived;
         // lparen/left_sep/right_sep + update_count, and
         // await/lparen/pattern_kw/in, remain (width 5→4).
         ClassDeclaration
@@ -356,7 +381,7 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         // ConditionalUri: `if` is the span head; CatchClause: `on` is
         // head-when-present; ConstructorReference: `start` is the span head;
         // OperatorName: `operator` is the span head; ForControlFlow: `for`
-        // follows `await` (both #174, map §3).
+        // follows `await`.
         | ConditionalUri
         | CatchClause
         | ConstructorReference
@@ -384,7 +409,7 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         | Fields
         // Break/Continue: keyword = span head, `;` = last span token;
         // has_target is not derivable (`break 123;` recovery keeps a
-        // non-identifier between keyword and `;`, map §3.4).
+        // non-identifier between keyword and `;`).
         | Break
         | Continue
         // PatternVarDeclStatement: keyword = span head, `;` = last token,
@@ -430,6 +455,11 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         | Qualified
         | BinaryPattern
         | CastPattern
+        // The operator precedes the node's post-order anchor (the event
+        // fires after the operand parsed, official parser :11810-11815),
+        // so it is not span-derivable — upstream RelationalPatternImpl
+        // carries it as a field.
+        | RelationalPattern
         | MapPatternEntry
         | PatternField
         | NamedRecordField
@@ -438,10 +468,10 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         // original fieldless set plus the #151 derivable-word0 eliminations
         // and `Send`/`ExpressionStatement` (span endpoints). Second block:
         // the #174 eliminations — `TopLevelFields` (ModSet → header bits),
-        // `Type` (`?` = last span token, map §3.8), `MapPattern`/
+        // `Type`, `MapPattern`/
         // `ListPattern` (braces = span endpoints), `NativeFunctionBody`
         // (native = span head, `;` = last token), `ConstantPattern`
-        // (`const` = head-when-present, map §3.7).
+        //.
         CompilationUnit
         | TopLevelDeclaration
         | Part
@@ -528,7 +558,6 @@ pub(crate) fn payload_len(kind: NodeKind) -> u8 {
         | PatternGuard
         | RecordPattern
         | ParenthesizedPattern
-        | RelationalPattern
         | AssignedVariablePattern
         | NullAssertPattern
         | NullCheckPattern
@@ -648,8 +677,8 @@ pub fn leaf_shape(kind: NodeKind) -> LeafShape {
 }
 
 /// Whether a node opened as `open` may legally seal as `end` — the Rust-side
-/// form of the official begin/end pairing compatibility table (collapse map
-/// §2, 13 groups). All groups collapse to same-kind pairing except the five
+/// form of the official begin/end pairing compatibility table (13
+/// groups). All groups collapse to same-kind pairing except the five
 /// whose begin cannot decide the end shape up front (shared-begin ends);
 /// every other `end` accepts only a node opened as the same kind.
 ///
@@ -664,7 +693,7 @@ pub fn leaf_shape(kind: NodeKind) -> LeafShape {
 pub(crate) fn accepts_begin(end: NodeKind, open: NodeKind) -> bool {
     use NodeKind::*;
     match (end, open) {
-        // Collapse map §2 #6, #7, #10, #11, #12/#13.
+        // The five shared-begin exception groups.
         (TopLevelFields, Fields | TopLevelFields)
         | (ForIn, ForStatement | ForIn)
         | (InvalidAwaitExpression, AwaitExpression | InvalidAwaitExpression)

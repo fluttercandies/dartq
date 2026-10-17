@@ -1,6 +1,6 @@
 //! The AST cache identity: identical keys share one parsed unit across
 //! workspaces and contexts — the AST is shareable, semantics is not
-//! (layout spec §4).
+//!.
 
 use dartq_language::FeatureSet;
 use dartq_source::ContentId;
@@ -26,7 +26,7 @@ impl FeatureSetId {
 }
 
 /// Parser behavior version: starts at 1 and bumps on any parser behavior or
-/// diagnostic change; feeds `EngineSemanticVersion` (layout spec §4).
+/// diagnostic change; feeds `EngineSemanticVersion`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ParserVersion(u32);
 
@@ -50,7 +50,7 @@ impl ParserVersion {
 /// Cache key of a parsed unit: content identity + feature fingerprint +
 /// parser version. A unit is a pure function of its key; there is no AST
 /// serialization in M1 — L1 LRU evicts whole units and they are recomputed
-/// (layout spec §4).
+///.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AstKey {
     /// Blake3-128 content digest of the source bytes.

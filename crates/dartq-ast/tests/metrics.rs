@@ -1,11 +1,11 @@
-//! Corpus density metrics (layout spec §1.5, risk R2): scan the m0-syntax
+//! Corpus density metrics: scan the m0-syntax
 //! corpus with the dartq scanner, drive the builder with the spec's
 //! structural node model (0.35-0.45 nodes/token, midpoint; ~1 extra pool
 //! word per node), and assert the two hard ceilings:
 //!
 //! 1. ≤30 B average per node — measured on the real built tables.
 //! 2. ≤1.5 MB of AST per MB of source — evaluated at the budget's
-//!    definition point (spec §1.2: SDK-average 8.0 B/token ≈ 125k
+//!    definition point (SDK-average 8.0 B/token ≈ 125k
 //!    tokens/MB, ×0.40 nodes/token = 50k nodes/MB). The m0-syntax corpus is
 //!    a syntax-coverage set whose token density is far above the SDK
 //!    average, so its raw per-source-byte number is reported for reference
@@ -38,11 +38,11 @@ use dartq_ast::{AstBuilder, NodeKind};
 use dartq_scanner::{ScanConfig, TokenTable, scan};
 use dartq_source::FileTable;
 
-/// Midpoint of the structural estimate 0.35-0.45 nodes/token (layout spec §1.2).
+/// Midpoint of the structural estimate 0.35-0.45 nodes/token.
 const NODES_PER_TOKEN: f64 = 0.40;
 
 /// SDK-average bytes per token measured over 370 real SDK files (6.6 MB,
-/// layout spec §1.2) — the token-density anchor the MB/MB budget is defined
+/// the measurement below) — the token-density anchor the MB/MB budget is defined
 /// against (~125k tokens per MB of source ⇒ 50k nodes per MB).
 const BYTES_PER_TOKEN_SDK_AVERAGE: f64 = 8.0;
 
