@@ -1,34 +1,33 @@
 //! The dartq engine facade: one analysis context, two-phase content
-//! updates, and topologically ordered library recompute (engine-api-spec
-//! §1, incremental-l1-spec §3).
+//! updates, and topologically ordered library recompute.
 //!
-//! # Shape (§1.1–§1.5)
+//! # Shape
 //!
 //! * One [`Engine`] binds the immutable context — content store, SDK
 //!   snapshot, package identity table, and the pub config the URI layer
 //!   resolves against. Context change = new Engine.
 //! * [`Engine::set_content`] / [`Engine::remove_file`] only enqueue into the
 //!   pending overlay (official `changeFile`: enqueue, never compute);
-//!   [`Engine::apply_pending`] is the barrier that runs the ContentId gate,
+//!   [`Engine::apply_pending`] is the barrier that runs the `ContentId` gate,
 //!   the per-file facts recompute, and the L1 cascade.
 //! * [`Engine::analyze`] applies as its fixed first phase, recomputes dirty
 //!   libraries in import-edge topological order on the batch fan-out, and
 //!   returns the merged, canonically sorted diagnostic set.
 //! * [`EngineEvent`]s arrive on a synchronous `FnMut` callback, in work
 //!   order; the returned diagnostics are in canonical order — the two are
-//!   deliberately distinct (§5 risk 1).
+//!   deliberately distinct.
 //!
-//! # Module layout (§1.6)
+//! # Module layout
 //!
 //! `state` (residency + overlay + reverse edges), `l1` (apply), `pipeline`
-//! (analyze), `cycle` (the import-cycle condensation, PRD §11.2), `budget`
-//! (the §17.1 memory-budget runtime), `store` (the §17.2
+//! (analyze), `cycle`, `budget`
+//! (the memory-budget runtime), `store` (the
 //! L3 content-addressed store), `event`, `cancel`, `query` (the `query
-//! symbol` face, PRD
-//! §20.3), `semdiag` (the default semantic diagnoser, #236),
-//! `analysis_options` (the merged options per governing directory, PRD §12), `context` +
+//! symbol` face), `semdiag` (the default semantic diagnoser, #236),
+//! `reachability` (the per-declaration entry-reachability pass, #1199),
+//! `analysis_options`, `context` +
 //! `scheduler` (the multi-context runtime substrate — contexts, overlays,
-//! scheduling, cancellation — PRD §16).
+//! scheduling, cancellation —).
 //!
 //! # The semantic diagnostics seam (#120/#121)
 //!
@@ -50,13 +49,16 @@ pub mod event;
 pub mod l1;
 pub mod pipeline;
 pub mod query;
+pub mod reachability;
 pub mod scheduler;
+mod sdk_faces_gen;
 pub mod semdiag;
 pub mod state;
 pub mod store;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
+use std::time::SystemTime;
 
 use dartq_diagnostics::Diagnostic;
 use dartq_index::{FileCapture, LibraryIndex};
@@ -69,7 +71,8 @@ use dartq_snapshot::{
     SnapshotStore,
 };
 use dartq_source::{
-    FileId, FileTable, LineIndex, MemorySourceStore, PooledSourceStore, SourceStore, StringTable,
+    FileId, FileTable, LineIndex, MemorySourceStore, MmapSourceStore, OpenError,
+    PooledMappedSourceStore, PooledSourceStore, SourceStore, SourceText, StringTable,
 };
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -77,9 +80,13 @@ use thiserror::Error;
 
 pub use cancel::{CancellationToken, Cancelled};
 pub use context::{ContextConfig, ContextId, ContextKey, OverlayChange, Runtime};
-pub use dartq_source::ContentPool;
+pub use dartq_source::{ContentPool, MappedContentPool};
 pub use event::{EngineEvent, RevalidateGate};
-pub use query::{DeclHit, DeclKind, RefHit, RefKind, SymbolAnswer};
+pub use query::{
+    CompletionAnswer, CompletionItem, CompletionOrigin, DeclHit, DeclKind, PositionAnswer, RefHit,
+    RefKind, ReferenceKind, SymbolAnswer, UseHit,
+};
+pub use reachability::Reachability;
 pub use scheduler::{DrainReport, Task, Tier};
 pub use state::persist::PersistedFacts;
 pub use state::{DirectiveFacts, DirectiveKind, FeatureGrants, LibraryId, ScannedFace, UnitFacts};
@@ -90,8 +97,19 @@ pub use state::{DirectiveFacts, DirectiveKind, FeatureGrants, LibraryId, Scanned
 /// otherwise; the constant is the single source of the default.
 pub const DEFAULT_TARGET: &str = "vm";
 
-/// Everything immutable across the engine's lifetime (§1.1): the M1 slice
-/// of PRD §5.4's six context fields — store, SDK, packages — plus the pub
+/// The warm-start staging map's per-ingest entry cap. One staged payload is
+/// the persisted facts face, 2–4 KB owned bytes (est., the memory audit's
+/// F8 band), so the cap holds the staging map to ≈ 0.25–0.5 GB even for a
+/// pathological snapshot — an earlier bound than the armed memory budget's
+/// 2 GiB tier-3 ladder. A 10⁵-identity workspace (99,598 entries at the
+/// measured face) stages whole; identities past the cap skip staging and
+/// their files cold-recompute — staging is an accelerator, so the output
+/// face is byte-identical either way. Head entries win (snapshot order =
+/// the saving pass's path order), keeping the pick deterministic.
+const WARM_START_STAGING_CAP: usize = 1 << 17;
+
+/// Everything immutable across the engine's lifetime: the M1 slice
+/// of the six context fields — store, SDK, packages — plus the pub
 /// config + config directory the URI-resolution table derives from. The
 /// fork dimensions the context salt pins (#482) — target segment, declared
 /// variables — are first-class fields (#483) and ride the config into the
@@ -104,16 +122,16 @@ pub struct EngineConfig {
     /// store handle; byte-level sharing across engines/contexts is opt-in
     /// through one [`ContentPool`] ([`pooled_memory_store`]): stores wired
     /// to the same pool hold every distinct content exactly once between
-    /// them — the multi-context store face (§16.1's shared content store,
+    /// them — the multi-context store face (the shared content store,
     /// the M3 note this field's doc drafted). The handle itself stays
     /// per-engine, so reads keep the zero-copy `get` contract and each
     /// engine's own amortized GC path. [`memory_store`] is the standalone
     /// default.
     pub store: Box<dyn SourceStore + Send + Sync>,
-    /// SDK snapshot (PRD §7); loading hard-errors on a crippled SDK before
+    /// SDK snapshot; loading hard-errors on a crippled SDK before
     /// construction (dartq-sdk doc).
     pub sdk: SdkSnapshot,
-    /// Package identity table over one resolution (PRD §8); carries the
+    /// Package identity table over one resolution; carries the
     /// per-package language versions the engine derives per-file feature
     /// sets from.
     pub packages: PackageTable,
@@ -150,8 +168,8 @@ pub struct EngineConfig {
 #[derive(Debug, Error)]
 pub enum EngineError {
     /// `remove_file` of a path the engine never interned and does not
-    /// track (deliberate deviation from the official silent no-op,
-    /// incremental-l1-spec §1.2: dartq reports explicitly).
+    /// track (deliberate deviation from the official silent no-op:
+    /// dartq reports explicitly).
     #[error("unknown path: {0}")]
     UnknownPath(PathBuf),
     /// Runtime addressing of a context that is not open: never opened,
@@ -166,11 +184,33 @@ pub enum EngineError {
     PackageConfig(#[from] PubError),
 }
 
-/// The analysis driver (§1).
+/// The analysis driver.
 pub struct Engine {
     state: state::EngineState,
     graph: Option<pipeline::ResolvedGraph>,
     semdiag: Option<Arc<dyn SemanticDiagnoser>>,
+    /// The captured pubspecs' mtimes at capture time — the read guard for
+    /// [`Engine::capture_pubspecs`]: a pubspec is re-read only when its
+    /// mtime moved since the last capture.
+    pubspec_mtimes: FxHashMap<PathBuf, SystemTime>,
+    /// The nested-pubspec scan's already-probed directories, tagged with
+    /// the residency epoch their scan covered (the generation-tag memo —
+    /// the moving counter is [`state::EngineState::residency_epoch`]). A
+    /// directory is probed once per engine, so a daemon turn's cost is
+    /// O(new dirs), not O(workspace); a pubspec created later in an
+    /// already-scanned directory is picked up by the next fresh run (the
+    /// oracle's own workspace discovery snapshots per context build the
+    /// same way).
+    pubspec_dirs_scanned: FxHashMap<PathBuf, u64>,
+    /// The residency epoch the nested-pubspec scan last covered. A turn
+    /// whose [`state::EngineState::residency_epoch`] still equals this
+    /// grew no new resident files, so it cannot surface an unscanned
+    /// directory — the turn's whole resident-set walk is skipped in O(1).
+    nested_scan_epoch: u64,
+    /// Test instrumentation: how many scan passes actually ran (the gate
+    /// opened). The warm-turn pin asserts it stays put.
+    #[cfg(test)]
+    nested_scan_passes: u32,
 }
 
 impl Engine {
@@ -192,16 +232,21 @@ impl Engine {
             config.store,
             config.target,
             config.declared_variables,
-            config.experiments,
+            &config.experiments,
         )?;
         Ok(Self {
             state,
             graph: None,
             semdiag,
+            pubspec_mtimes: FxHashMap::default(),
+            pubspec_dirs_scanned: FxHashMap::default(),
+            nested_scan_epoch: 0,
+            #[cfg(test)]
+            nested_scan_passes: 0,
         })
     }
 
-    /// Arms (or disarms) the memory-budget runtime (PRD §17.1). A limit
+    /// Arms (or disarms) the memory-budget runtime. A limit
     /// turns on sampled-RSS accounting at the phase and library boundaries
     /// of every later [`Self::analyze`]: over budget, the engine descends
     /// the degradation ladder one tier per boundary — shedding
@@ -214,19 +259,34 @@ impl Engine {
         self.state.budget = limit_mib.map(budget::MemoryBudget::new);
     }
 
-    /// Arms (or disarms) the `--trace-events` JSONL sink (PRD §17.4): every
-    /// later apply/analyze appends one JSON object per engine event — §17.4
-    /// taxonomy names, stable field order, flushed per event so a killed CI
+    /// Arms (or disarms) the `--trace-events` JSONL sink: every
+    /// later apply/analyze appends one JSON object per engine event —
+    /// stable taxonomy names, stable field order, flushed per event so a killed CI
     /// run keeps its tail. `None` (the default) constructs nothing and the
     /// output face is byte-identical to an untraced run.
     pub fn set_trace_sink(&mut self, sink: Option<event::TraceSink>) {
         self.state.trace = sink;
     }
 
-    /// Arms (or re-arms) the L3 content-addressed store (PRD §17.2): the
+    /// Drops the standing condensation and marks the structure dirty, so
+    /// the next analyze re-derives it wholesale — every cycle folds fresh,
+    /// the pre-salvage shape. The rebuilt values are
+    /// byte-identical either way (the salvage moves fold cost only), which
+    /// makes this the wholesale baseline the incremental benchmarks A/B the
+    /// salvaged curve against.
+    /// Calling it outside that measurement posture is meaningless: the
+    /// mapping is pure derived data, rebuilt at the structure gate.
+    #[doc(hidden)]
+    pub fn clear_condensation(&mut self) {
+        self.state.condensation = crate::cycle::Condensation::default();
+        self.state.structure_dirty = true;
+    }
+
+    /// Arms (or re-arms) the L3 content-addressed store: the
     /// persistent, cross-session global under `config.root` that every
     /// later apply batch's changed contents persist into (write batch =
-    /// puts, then flush — manifest save + cap enforcement). Opening
+    /// puts, then flush — journal append + amortized compaction + cap
+    /// enforcement). Opening
     /// degrades gracefully — a torn manifest rebuilds by mtime and never
     /// blocks startup — so the only failure is a store directory that
     /// cannot exist; a caller that treats that as a warning keeps
@@ -240,7 +300,7 @@ impl Engine {
     /// exist.
     pub fn open_content_store(
         &mut self,
-        config: store::StoreConfig,
+        config: &store::StoreConfig,
     ) -> Result<(), store::StoreError> {
         self.state.l3 = Some(store::ContentStore::open(config)?);
         Ok(())
@@ -272,13 +332,13 @@ impl Engine {
     /// The bytes decode as UTF-8 eagerly (the whole pipeline downstream is
     /// `&str`); invalid sequences become U+FFFD. Oracle parity: the analyzer
     /// read layer (`FileContentCache._read`,
-    /// pkg/analyzer/lib/src/dart/analysis/file_content_cache.dart) decodes
+    /// `pkg/analyzer/lib/src/dart/analysis/file_content_cache.dart`) decodes
     /// strictly and on any decode failure marks the file nonexistent
     /// (`exists = false`, empty content) — an undecodable file contributes
     /// zero diagnostics. The `encoding` diagnostic ("Unable to decode bytes
-    /// as UTF-8.", pkg/_fe_analyzer_shared/lib/src/messages/diagnostic.g.dart,
+    /// as UTF-8.", pkg/_`fe_analyzer_shared/lib/src/messages/diagnostic.g.dart`,
     /// scanner-path translation at pkg/analyzer/lib/src/dart/scanner/
-    /// translate_error_token.dart) belongs to the compiler's byte-scanner
+    /// `translate_error_token.dart`) belongs to the compiler's byte-scanner
     /// path and is never reached by `dart analyze`; probed on 3.13.1: FF FE
     /// in a comment, inside a string literal, and in a code position all
     /// yield zero rows. dartq keeps analyzing the lossy text: the scanner
@@ -294,11 +354,19 @@ impl Engine {
     /// so all spans are relative to the stripped text). A second BOM is
     /// content and reaches the scanner as an ordinary U+FEFF.
     pub fn set_content(&mut self, path: &Path, bytes: &[u8]) -> FileId {
+        self.set_source(path, SourceText::canonical(bytes))
+    }
+
+    /// Enqueues pre-canonicalized text (the overlay face): `text` is already
+    /// the engine's canonical form — one leading BOM stripped, invalid UTF-8
+    /// lossily decoded — and is stored as-is, with no second decode (a
+    /// leading BOM in already-canonical text stays content). The lease's
+    /// content id is the identity residency derives on apply.
+    pub(crate) fn set_source(&mut self, path: &Path, text: SourceText) -> FileId {
         let file = self.state.files.intern(path);
         if !self.state.pending.contains_key(&file) {
             self.state.pending_order.push(file);
         }
-        let text = String::from_utf8_lossy(strip_one_bom(bytes)).into_owned();
         self.state
             .pending
             .insert(file, state::PendingChange::Set(text));
@@ -307,7 +375,7 @@ impl Engine {
 
     /// Enqueues a removal. Unknown path — never interned and not pending —
     /// is an explicit error (official `changeFile` silently no-ops; dartq
-    /// reports, incremental-l1-spec §1.2).
+    /// reports explicitly).
     ///
     /// # Errors
     ///
@@ -326,11 +394,38 @@ impl Engine {
         Err(EngineError::UnknownPath(path.to_path_buf()))
     }
 
+    /// Records the session live-path ceiling trip (#1887): one residency
+    /// degrade row naming the ceiling, anchored at `anchor` — the refused
+    /// batch's representative path. A path the session never interned is
+    /// interned for the row's anchor only: an id, never content or
+    /// residency, so the refusal stays a refusal. At-most-once emission is
+    /// the caller's discipline (the daemon trips the row once per session);
+    /// the log's (file, face) dedup holds regardless.
+    pub fn note_live_path_ceiling(&mut self, anchor: &Path) {
+        let file = self
+            .state
+            .files
+            .try_file_id(anchor)
+            .unwrap_or_else(|| self.state.files.intern(anchor));
+        self.state.residency_degrades.record_ceiling(file);
+    }
+
     /// Barrier: drains the pending queue and runs the L1 cascade
-    /// (§3.2 steps 1–5). Events fire only for a non-empty queue.
+    ///. Events fire only for a non-empty queue.
     pub fn apply_pending(&mut self, on_event: &mut dyn FnMut(EngineEvent)) -> AffectedReport {
         let outcome = l1::apply(&mut self.state, on_event);
         pipeline::flush_l3(&mut self.state, &outcome.changed);
+        // The batch's moved files join the structure gate's refresh input:
+        // an out-of-analyze apply leaves the analyze's own applied sets
+        // empty, and without this record the gate would reuse a standing
+        // graph that lacks the batch's formed libraries (the daemon's
+        // write face — every overlay apply lands here).
+        self.state
+            .structure_changed
+            .extend(outcome.changed.iter().copied());
+        self.state
+            .structure_removed
+            .extend(outcome.removed.iter().copied());
         AffectedReport {
             changed: outcome.changed,
             removed: outcome.removed,
@@ -344,8 +439,9 @@ impl Engine {
     /// canonically sorted (path bytes, offset, code name) — the superset the
     /// incremental-equals-full oracle contract needs (deviation note in
     /// engine-api-spec: the drafted per-`targets` return cannot satisfy the
-    /// byte-equality arm, so `targets` drives only the AnalyzeFile
-    /// amplification events).
+    /// byte-equality arm, so `targets` drives only the `AnalyzeFile`
+    /// amplification events). The owned twin of [`Self::analyze_shared`]:
+    /// the same pipeline, the rows cloned out of the standing buffer.
     ///
     /// # Errors
     ///
@@ -365,9 +461,62 @@ impl Engine {
             targets,
             on_event,
             cancel,
-        )?;
-        self.append_options_diagnostics(&mut diagnostics);
+        )?
+        .as_ref()
+        .clone();
+        self.capture_nested_pubspecs();
+        let rows = self.option_issue_rows();
+        if !rows.is_empty() {
+            // The engine rows leave the pipeline canonically sorted; the
+            // merged set stays canonical for the rows' (rare, cold) addition.
+            diagnostics.extend(rows);
+            diagnostics.sort_by(|a, b| pipeline::compare_canonical(&self.state.files, a, b));
+        }
         Ok(self.apply_severity_options(diagnostics))
+    }
+
+    /// The shared-output twin of [`Self::analyze`] (#1387): the identical
+    /// contract and faces, with the merged rows handed over as one
+    /// refcounted `Arc<Vec<Diagnostic>>` instead of an owned clone. A cycle
+    /// in which no contributor re-analyzed — the interactive keystroke's
+    /// dominant shape — returns a bump on the standing buffer, so the
+    /// per-cycle cost no longer carries a clone per diagnostic row; the
+    /// holding caller keeps the rows valid across cycles and gives that up
+    /// only at the next rebuild that cannot move them (the splice's
+    /// full-merge arm). The options-file and severity faces run exactly as
+    /// in [`Self::analyze`]; when neither has anything to apply (the common
+    /// case) the Arc returns untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when a checkpoint fired: completed libraries keep their
+    /// cached results, the rest stay dirty.
+    pub fn analyze_shared(
+        &mut self,
+        targets: &[FileId],
+        on_event: &mut dyn FnMut(EngineEvent),
+        cancel: &CancellationToken,
+    ) -> Result<Arc<Vec<Diagnostic>>, Cancelled> {
+        self.capture_pubspecs();
+        let shared = pipeline::analyze(
+            &mut self.state,
+            &mut self.graph,
+            self.semdiag.as_deref(),
+            targets,
+            on_event,
+            cancel,
+        )?;
+        self.capture_nested_pubspecs();
+        let rows = self.option_issue_rows();
+        if rows.is_empty() && !self.severity_overrides_present() {
+            return Ok(shared);
+        }
+        let mut diagnostics = shared.as_ref().clone();
+        if !rows.is_empty() {
+            diagnostics.extend(rows);
+            diagnostics.sort_by(|a, b| pipeline::compare_canonical(&self.state.files, a, b));
+        }
+        Ok(Arc::new(self.apply_severity_options(diagnostics)))
     }
 
     /// Captures the workspace's pubspec files for the pubspec lint face
@@ -375,9 +524,14 @@ impl Engine {
     /// `pubspec.yaml` joins the file table with text and line index held
     /// beside it (the options-file shape — reported rows resolve positions
     /// through the [`Engine::content`]/[`Engine::line_index`] fallbacks,
-    /// never through Dart residency). Refreshed every analyze pass, so the
-    /// captured text is the analyzed one and the lint stage scans exactly
-    /// these bytes. One bounded read per package per pass.
+    /// never through Dart residency). Guarded by mtime: one stat per
+    /// package per pass, one read per pubspec whose mtime actually moved
+    /// since the last capture, so the captured text is still the analyzed
+    /// one and the lint stage scans exactly these bytes (a failed read
+    /// records no mtime, so it retries the next pass — the pre-guard
+    /// posture for that file). The nested package boundaries join through
+    /// [`Self::capture_nested_pubspecs`], after the pass that makes their
+    /// files resident.
     fn capture_pubspecs(&mut self) {
         let table = &self.state.packages;
         let mut dirs: Vec<PathBuf> = Vec::new();
@@ -392,62 +546,211 @@ impl Engine {
             }));
         }
         for dir in dirs {
-            let path = dir.join("pubspec.yaml");
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let file = self.state.files.intern(&path);
-            let index = dartq_source::LineIndex::new(&text);
-            self.state
-                .reported
-                .insert(file, (Arc::from(text.as_str()), index));
+            self.capture_pubspec_at(&dir);
         }
     }
 
-    /// Appends the options-file self-diagnostics (#457) to an output set:
-    /// one row per issue recorded during each distinct loaded file's merge,
-    /// attributed to the options file itself (the official reports every
-    /// options diagnostic on the initial file — `include_walker.dart` reports
-    /// include-chain rows at the initial include span, `parse_model` reports
-    /// local rows at their nodes). The rows ride the same severity face as
-    /// everything else (`analyzer.errors` re-levels or filters them by their
-    /// own code names, the official `computeSeverity` scope). The loaded
-    /// files are interned here even without issues so the CLI's
-    /// `undefined_lint` face can attribute against the same table.
+    /// Captures the nested package boundaries' pubspecs for the pubspec
+    /// lint face: a folder-local `pubspec.yaml` under a package root is a
+    /// package boundary for everything below it (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/workspace/pub.dart` `findPackageFor` :341-351
+    /// — the workspace walks a file's ancestors for the nearest
+    /// folder-local pubspec and roots a package there), and the oracle's
+    /// driver lints every `pubspec.yaml` under the analysis roots — the
+    /// CLI adds each walked file and the driver's `_kindOf` classifies the
+    /// path `FileKind.pubspec`. dartq derives the candidate directories
+    /// from the resident files' ancestry (the same universe the analysis
+    /// covers) and mounts each boundary's pubspec through the same
+    /// mtime-guarded reported-set shape as
+    /// [`Self::capture_pubspecs`].
     ///
-    /// Cold path: runs only when some options file recorded issues.
-    fn append_options_diagnostics(&mut self, diagnostics: &mut Vec<Diagnostic>) {
+    /// Runs after the pipeline's apply (residency current), so a fresh
+    /// engine's first pass sees the files discovery just made resident.
+    /// The pass is gated on residency growth
+    /// ([`state::EngineState::residency_epoch`]): only a newly resident
+    /// file can surface an unscanned directory, so a turn without growth
+    /// — the daemon's warm keystroke — skips the resident-set walk
+    /// entirely (O(1)), and a growth turn pays one walk over the resident
+    /// set to pick up its new directories. The epoch-tagged per-directory
+    /// memo ([`Self::pubspec_dirs_scanned`]) keeps that walk's work at
+    /// O(new dirs) — a directory is probed once per engine, never
+    /// re-statted.
+    fn capture_nested_pubspecs(&mut self) {
+        // The epoch gate: no residency growth since the last covered pass
+        // means no new directories can exist — the walk below would
+        // re-hash every resident path for nothing.
+        let epoch = self.state.residency_epoch;
+        if epoch == self.nested_scan_epoch {
+            return;
+        }
+        self.nested_scan_epoch = epoch;
+        #[cfg(test)]
+        {
+            self.nested_scan_passes += 1;
+        }
+        let table = &self.state.packages;
+        let mut mounted: FxHashSet<PathBuf> = FxHashSet::default();
+        if let Some(root) = table.root().and_then(|name| table.get(name.as_str())) {
+            mounted.insert(root.root.clone());
+        }
+        if let Some(members) = table.workspace_members() {
+            mounted.extend(members.iter().filter_map(|name| {
+                table
+                    .get(name.as_str())
+                    .map(|identity| identity.root.clone())
+            }));
+        }
+        // The not-yet-scanned directories, one entry per resident file's
+        // parent: the walk below stats each exactly once per engine. The
+        // `queued` frontier dedupes at push time — a fresh directory
+        // holding many new files queues (and walks its chain) once. It
+        // exists only within the growth pass and is bounded by the new
+        // directories, never by the resident set.
+        let mut to_scan: Vec<PathBuf> = Vec::new();
+        {
+            let mut queued: FxHashSet<&Path> = FxHashSet::default();
+            for file in self.state.residency.keys() {
+                let Some(path) = self.state.files.path(*file) else {
+                    continue;
+                };
+                let Some(dir) = path.parent() else {
+                    continue;
+                };
+                if !self.pubspec_dirs_scanned.contains_key(dir) && queued.insert(dir) {
+                    to_scan.push(dir.to_path_buf());
+                }
+            }
+        }
+        let mut nested: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+        for start in to_scan {
+            // The containing package root cuts the walk: everything below
+            // it is the boundary search's reach, everything above is the
+            // workspace's (the root's own pubspec is already mounted).
+            let Some(bound) = self
+                .state
+                .packages
+                .containing(&start)
+                .map(|identity| identity.root.clone())
+            else {
+                continue;
+            };
+            let mut current = start;
+            loop {
+                // Membership still decides (a directory is probed once per
+                // engine); the recorded tag is the residency epoch this
+                // walk covered the directory at.
+                if self
+                    .pubspec_dirs_scanned
+                    .insert(current.clone(), epoch)
+                    .is_some()
+                {
+                    break; // an earlier start scanned this chain's head
+                }
+                if !mounted.contains(&current) && current.join("pubspec.yaml").is_file() {
+                    nested.insert(current.clone());
+                }
+                let Some(parent) = current.parent() else {
+                    break;
+                };
+                if !parent.starts_with(&bound) {
+                    break;
+                }
+                current = parent.to_path_buf();
+            }
+        }
+        for dir in nested {
+            self.capture_pubspec_at(&dir);
+        }
+    }
+
+    /// The mtime-guarded mount of one directory's `pubspec.yaml` into the
+    /// reported set — the body both captures share (the doc on
+    /// [`Self::capture_pubspecs`] carries the contract).
+    fn capture_pubspec_at(&mut self, dir: &Path) {
+        let path = dir.join("pubspec.yaml");
+        let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified()) else {
+            return;
+        };
+        if self.pubspec_mtimes.get(&path) == Some(&modified) {
+            return;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        self.pubspec_mtimes.insert(path.clone(), modified);
+        let file = self.state.files.intern(&path);
+        let index = dartq_source::LineIndex::new(&text);
+        self.state
+            .reported
+            .insert(file, (Arc::from(text.as_str()), index));
+    }
+
+    /// Every `pubspec.yaml` the captures mounted — the root package's,
+    /// every workspace member's, and every nested package boundary's —
+    /// in sorted order. The pubspec lint face's enumeration; the face
+    /// reads each back through [`Engine::content`] (a pubspec deleted
+    /// after its capture keeps serving its last read text, the same
+    /// post-delete posture the resident file set has).
+    #[must_use]
+    pub fn captured_pubspecs(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self.pubspec_mtimes.keys().cloned().collect();
+        paths.sort();
+        paths
+    }
+
+    /// Builds the options-file self-diagnostics rows (#457): one row per
+    /// issue recorded during each distinct loaded file's merge, attributed
+    /// to the options file itself (the official reports every options
+    /// diagnostic on the initial file — `include_walker.dart` reports
+    /// include-chain rows at the initial include span, `parse_model` reports
+    /// local rows at their nodes). Every loaded options file is interned on
+    /// each call — even the issue-free ones — so the CLI's `undefined_lint`
+    /// face can attribute against the same table; callers append the
+    /// returned rows and re-sort canonically (the engine rows leave the
+    /// pipeline sorted). Rows emit in options-file path order, one row set
+    /// per distinct loaded path — locally canonical, never hash order.
+    /// Empty in the common case.
+    fn option_issue_rows(&mut self) -> Vec<Diagnostic> {
         // Intern every loaded options file once (the CLI's `undefined_lint`
         // face attributes against the same table), keeping the
-        // issue-carrying ones deduplicated by their shared load.
-        let mut seen = FxHashSet::default();
-        let mut loaded: Vec<(FileId, &analysis_options::AnalysisOptions)> = Vec::new();
-        for options in self.state.options.values() {
+        // issue-carrying ones keyed by their loaded path.
+        let mut loaded: Vec<(FileId, &PathBuf, &analysis_options::AnalysisOptions)> = Vec::new();
+        for (root, options) in self.state.options.iter() {
             if options.file_path.as_os_str().is_empty() {
                 continue;
             }
             let file = self.state.files.intern(&options.file_path);
-            if !options.issues.is_empty() && seen.insert(Arc::as_ptr(options)) {
-                loaded.push((file, options));
+            if !options.issues.is_empty() {
+                loaded.push((file, root, options));
             }
         }
-        if loaded.is_empty() {
-            return;
-        }
-        let mut rows: Vec<Diagnostic> = loaded
+        // One row set per distinct options-file path, emitted in path order
+        // (#1851): entries sharing a load alias to one path, and equal paths
+        // from distinct loads tie-break to the lowest governing root — a
+        // unique map key, so the winner never depends on hash iteration
+        // order.
+        loaded
+            .sort_unstable_by(|a, b| a.2.file_path.cmp(&b.2.file_path).then_with(|| a.1.cmp(b.1)));
+        loaded.dedup_by(|a, b| a.2.file_path == b.2.file_path);
+        loaded
             .into_iter()
-            .flat_map(|(file, options)| {
+            .flat_map(|(file, _, options)| {
                 options
                     .issues
                     .iter()
                     .map(move |issue| issue.to_diagnostic(file))
             })
-            .collect();
-        rows.sort_by(|a, b| pipeline::compare_canonical(&self.state.files, a, b));
-        // The engine rows leave the pipeline canonically sorted; the merged
-        // set stays canonical for the rows' (rare, cold) addition.
-        diagnostics.extend(rows);
-        diagnostics.sort_by(|a, b| pipeline::compare_canonical(&self.state.files, a, b));
+            .collect()
+    }
+
+    /// Whether any governing options entry declares an `analyzer.errors`
+    /// severity override — the identity gate both output faces take before
+    /// re-leveling rows.
+    fn severity_overrides_present(&self) -> bool {
+        self.state
+            .options
+            .values()
+            .any(|options| options.has_severity_overrides())
     }
 
     /// Applies the governing `analysis_options` severity face to an output
@@ -465,24 +768,19 @@ impl Engine {
         // The identity fast path: no root declares an `errors` section, so
         // every row's processed severity is its declared one (cannot-ignore
         // gates ignore-comment suppression, not this face).
-        if !self
-            .state
-            .options
-            .values()
-            .any(|options| options.has_severity_overrides())
-        {
+        if !self.severity_overrides_present() {
             return diagnostics;
         }
-        let mut roots: Vec<&PathBuf> = self.state.options.keys().collect();
-        roots.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
         diagnostics
             .into_iter()
             .filter_map(|mut diagnostic| {
                 let path = self.state.files.path(diagnostic.file)?;
-                let options = roots
-                    .iter()
-                    .find(|root| path.starts_with(**root))
-                    .and_then(|root| self.state.options.get(*root));
+                // The discovery rule as a lookup: a path prefix is unique
+                // per depth, so the deepest ancestor holding loaded
+                // options is exactly the longest `options`-keyed root
+                // containing the file's path — one hash probe per ancestor
+                // level instead of a scan over every root per row.
+                let options = path.ancestors().find_map(|dir| self.state.options.get(dir));
                 diagnostic.severity = match options {
                     Some(options) => {
                         options.processed_severity(diagnostic.code.name, diagnostic.severity)?
@@ -519,7 +817,7 @@ impl Engine {
         self.state.settled_face(file).map(|face| face.version)
     }
 
-    /// The `query symbol` face (PRD §20.3): every declaration of `name`
+    /// The `query symbol` face: every declaration of `name`
     /// across the workspace plus every resolved reference to those
     /// declarations, answered from the maintained index state (the per-file
     /// captures and per-library reference surfaces analyze keeps fresh at
@@ -537,7 +835,59 @@ impl Engine {
         query::symbols(&self.state, name)
     }
 
-    /// PRD §17.2 discovery face: package roots (from the identity table)
+    /// The `query callers` face: every declaration whose body invokes
+    /// `name` — the caller→callee walk over the maintained index state,
+    /// each invocation site projected to its enclosing declaration (the
+    /// rust-analyzer call-hierarchy two-step: use rows first, enclosing
+    /// declaration second). One row per caller symbol however many of its
+    /// sites invoke the name; rows borrow the engine's interned spellings.
+    ///
+    /// [`query`]'s module docs and `query::callers` carry the freshness,
+    /// answer-domain, and cost contracts; like [`Self::query_symbols`] it
+    /// is a pure read of the latest analyze's state, its only side effect
+    /// interning `name`.
+    #[must_use]
+    pub fn query_callers(&self, name: &str) -> Vec<DeclHit<'_>> {
+        query::callers(&self.state, name)
+    }
+
+    /// The position-resolution face: what the maintained index rows hold
+    /// under `offset` (UTF-16 code units, the engine's external
+    /// convention) in `file` — the shared substrate the
+    /// cursor-interactive faces (goto-def, hover, rename, completion
+    /// context) resolve through. [`query`]'s module docs and
+    /// `query::resolve_at` carry the freshness, answer-domain, and cost
+    /// contracts; like [`Self::query_symbols`] it is a pure read of the
+    /// latest analyze's state, with no side effects at all.
+    #[must_use]
+    pub fn resolve_at(&self, file: FileId, offset: u32) -> Option<PositionAnswer<'_>> {
+        query::resolve_at(&self.state, file, offset)
+    }
+
+    /// The built-in completion face: the candidates the maintained index
+    /// proves visible at `offset` (UTF-16 code units, the engine's
+    /// external convention) in `file`, prefix-filtered by the identifier
+    /// fragment immediately before the cursor. There is no plugin escape —
+    /// the plugin protocol rejects a `completions` capability by
+    /// construction — so this face is the whole completion story, and its
+    /// candidate domain is the resolution graph at M1 fidelity: the file's
+    /// own library-scope declarations, the distinct target names of its
+    /// own resolved references, and the import prefixes it arms. Members,
+    /// locals, and other names-table residents offer no candidate (the
+    /// same boundary [`Engine::resolve_at`] documents); a member-access
+    /// cursor answers the empty set.
+    ///
+    /// [`query`]'s module docs and `query::complete_at` carry the
+    /// freshness, answer-domain, word-extraction, and cost contracts;
+    /// like [`Self::resolve_at`] it is a pure read of the latest
+    /// analyze's state — the word extraction reads the analyzed
+    /// snapshot's own text — with no side effects at all.
+    #[must_use]
+    pub fn complete_at(&self, file: FileId, offset: u32) -> Option<CompletionAnswer<'_>> {
+        query::complete_at(&self.state, file, offset)
+    }
+
+    /// discovery face: package roots (from the identity table)
     /// plus `lib`/`bin`/`test`/`tool` per root and root-level `*.dart`
     /// files; never a blind tree walk. The only built-in exclusion is the
     /// oracle's dot rule, checked on every child path — directories and
@@ -574,7 +924,7 @@ impl Engine {
 
         let mut stats = DiscoveryStats::default();
         for root in &roots {
-            // The governing options (PRD §12.2): the root's entry plus every
+            // The governing options: the root's entry plus every
             // nested options directory under it. Excluded paths leave the
             // analysis set — directories are not descended into, files are
             // not interned — so neither diagnostics nor lints ever see
@@ -670,47 +1020,58 @@ impl Engine {
             // serial walk's enqueue order was never stable run-to-run;
             // sorting pins discovery to one deterministic path order.
             accepted.sort();
-            // Cold-path I/O: read every accepted file's bytes and count its
-            // LOC in parallel — `fs::read` is I/O-bound and rayon's blocking
-            // pool absorbs that (the sanctioned parallel form, same as the
-            // l1 batch fan-out). The walk and its acceptance predicate stay
-            // serial on purpose: the predicate is pure and the walk's
-            // `queue` stack is inherently sequential. Reads run in bounded
-            // batches of 256, each batch enqueued and dropped before the
-            // next one reads: peak transient memory is one batch's bytes,
-            // not the whole workspace's (~2x source bytes on a cold load,
-            // on top of the pending store's standing 1x). Sorting precedes
-            // chunking, so the enqueue order, the byte-stable differential
-            // face, and the first-failure-in-sorted-order error surface are
-            // unchanged; per file the intern/`set_content` path and the
-            // stats are identical to the unbatched form.
+            // Cold-path I/O: load every accepted file as a mapping and count
+            // its LOC in parallel — `open_mapped` is I/O-bound (page-cache
+            // faults) and rayon's blocking pool absorbs that (the sanctioned
+            // parallel form, same as the l1 batch fan-out). The walk and its
+            // acceptance predicate stay serial on purpose: the predicate is
+            // pure and the walk's `queue` stack is inherently sequential.
+            // Loads run in bounded batches of 256, each batch enqueued and
+            // dropped before the next one loads: peak transient memory is
+            // one batch's mappings, not the whole workspace's (the mapping
+            // store then shares the leases into the CAS table by refcount at
+            // apply — the text never copies off the page cache; an owned
+            // store copies once at apply's `put_text`, the read being the
+            // map). Sorting precedes chunking, so the enqueue order, the
+            // byte-stable differential face, and the
+            // first-failure-in-sorted-order error surface are unchanged; per
+            // file the intern/enqueue path and the stats are identical to
+            // the unbatched form.
             for batch in accepted.chunks(256) {
-                let reads: Vec<std::io::Result<(Vec<u8>, u64)>> = batch
+                let reads: Vec<Result<(SourceText, u64), OpenError>> = batch
                     .par_iter()
                     .map(|path| {
-                        std::fs::read(path).map(|bytes| {
+                        dartq_source::open_mapped(path).map(|text| {
                             let loc = u64::from(
-                                u32::try_from(bytes.iter().filter(|&&b| b == b'\n').count())
+                                u32::try_from(memchr::memchr_iter(b'\n', text.as_bytes()).count())
                                     .unwrap_or(u32::MAX),
                             );
-                            (bytes, loc)
+                            (text, loc)
                         })
                     })
                     .collect();
-                // Enqueue in the same sorted order the reads were issued in.
+                // Enqueue in the same sorted order the loads were issued in.
                 // The pending overlay is last-wins per path, so content would
                 // land identically in any order, but a fixed enqueue order
-                // keeps the differential harness byte-stable. A read failure
+                // keeps the differential harness byte-stable. A load failure
                 // surfaces at its sorted position with everything before it
                 // already enqueued — the surfaced error is the first in sorted
                 // order (the old serial version surfaced whichever read failed
                 // first in platform-dependent read_dir order, itself never
-                // stable).
+                // stable). The span-capacity rejections are not failures: the
+                // file is recorded for the notice face and skipped, and the
+                // walk continues (an over-capacity file must cost a notice,
+                // not the run).
                 for (path, read) in batch.iter().zip(reads) {
-                    let (bytes, loc) = read?;
-                    stats.loc_total += loc;
-                    stats.file_count += 1;
-                    self.set_content(path, &bytes);
+                    match read {
+                        Ok((text, loc)) => {
+                            stats.loc_total += loc;
+                            stats.file_count += 1;
+                            self.set_source(path, text);
+                        }
+                        Err(OpenError::TooLarge { .. }) => stats.oversized.push(path.clone()),
+                        Err(OpenError::Io(error)) => return Err(error),
+                    }
                 }
             }
         }
@@ -795,13 +1156,24 @@ impl Engine {
 
     /// The maintained capture of a resident file — the declaration surface
     /// plus raw reference sites analyze recaptures per changed file
-    /// (index-design-spec §8) — or `None` before the file's first analyze
+    /// — or `None` before the file's first analyze
     /// covers it. The raw-row read face the index-backed queries assemble
     /// over: [`Engine::query_symbols`]'s substrate at row fidelity, the
     /// rows' `StringId`s native to [`Engine::strings`].
     #[must_use]
     pub fn file_capture(&self, file: FileId) -> Option<&FileCapture> {
-        self.state.captures.get(&file).map(Arc::as_ref)
+        self.state.capture(file).map(Arc::as_ref)
+    }
+
+    /// How many resident files' raw reference sites are mounted in the
+    /// site cache — the occupancy hook of the `#1859` LRU (capped
+    /// oldest-first; shed files' captures keep their declaration surface
+    /// and re-derive sites on the next library build). The
+    /// memory-accounting face reads it beside the per-structure byte
+    /// getters.
+    #[must_use]
+    pub fn sites_occupancy(&self) -> usize {
+        self.state.sites_occupancy()
     }
 
     /// Every live library's maintained reference surface, ascending by
@@ -809,10 +1181,43 @@ impl Engine {
     /// dropped with the library at retirement, the fresh partition
     /// [`Engine::query_symbols`] reads.
     pub fn library_surfaces(&self) -> impl Iterator<Item = (LibraryId, &LibraryIndex)> + '_ {
-        self.state
-            .library_surfaces
-            .iter()
-            .map(|(library, surface)| (*library, surface))
+        self.state.surfaces()
+    }
+
+    /// The per-declaration reachability map (#1199) — the engine-level
+    /// pass the `unreachable_from_main` lint shell mounts on
+    /// ([`reachability`] for the entry, edge, and attribution contract).
+    /// Lazy and memoized (#1383): the analyze only arms the rebuild, the
+    /// first read after it pays the build (salvaged per unit — only the
+    /// units whose inputs moved re-derive), and every further read clones
+    /// the standing map, so the read-after-write posture stays
+    /// [`Engine::query_symbols`]'s: the map reflects the latest completed
+    /// analyze. A read that lands after an apply no analyze has absorbed
+    /// serves the standing map instead of building over in-flight
+    /// residency. `None` before the first analyze. Never panics: a poisoned
+    /// memo mutex recovers its guard (the crate's
+    /// `unwrap_or_else(PoisonError::into_inner)` policy), and a build over
+    /// state whose pairing contracts broke degrades to the salvaged
+    /// partial map instead of crashing the read.
+    #[must_use]
+    pub fn reachability(&self) -> Option<Arc<Reachability>> {
+        let mut memo = self
+            .state
+            .reachability
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !memo.armed || memo.applied {
+            // Never armed (no analyze completed), or an apply is in flight:
+            // serve whatever the last completed analyze left behind — for a
+            // cold engine that is `None`, for a warm one the standing map.
+            return memo.map.clone();
+        }
+        if memo.stale || memo.map.is_none() {
+            let prev = memo.map.take();
+            memo.map = Some(crate::reachability::build(&self.state, prev));
+            memo.stale = false;
+        }
+        memo.map.clone()
     }
 
     /// The engine's intern table — the one table every resident fact's
@@ -841,6 +1246,36 @@ impl Engine {
         self.state.store.len_bytes()
     }
 
+    /// Bytes the store serves out of read-only file mappings — the
+    /// evictable page-cache share of [`stored_bytes`](Self::stored_bytes).
+    /// Heap-only stores answer `0`; the serial-phase PSS probe reads this
+    /// to split resident-anonymous bytes from file-backed ones.
+    #[must_use]
+    pub fn stored_mapped_bytes(&self) -> u64 {
+        self.state.store.mapped_bytes()
+    }
+
+    /// Exact byte footprint of the per-target adjacency indexes (reverse
+    /// import edges, part-directive offers, import/export sources) — the S6
+    /// graph-maps segment of the RSS decomposition probe. Exact under the
+    /// row-level CSR layout: slot arena at reserved capacity plus each live
+    /// row's boxed payload.
+    #[must_use]
+    pub fn graph_maps_bytes(&self) -> u64 {
+        self.state.graph_maps_bytes()
+    }
+
+    /// Exact byte footprint of the two postings directories (name →
+    /// declaring files, name → libraries with resolved uses) — the S2
+    /// extension the RSS decomposition probe pins: hash slots at capacity
+    /// plus the unit lists' reserved bytes
+    /// ([`dartq_index::Postings::bytes`]).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn postings_bytes(&self) -> u64 {
+        (self.state.decl_postings.bytes() + self.state.ref_postings.bytes()) as u64
+    }
+
     /// The library owning `file` (defining or part), if resident.
     #[must_use]
     pub fn library_of(&self, file: FileId) -> Option<LibraryId> {
@@ -848,7 +1283,7 @@ impl Engine {
     }
 
     /// The defining file of a live library. Singleton convention
-    /// (incremental-oracle-cases §4): a singleton library's sole member is its
+    ///: a singleton library's sole member is its
     /// defining file — the face the incremental oracle's `invalidated` →
     /// defining-path projection reads through.
     #[must_use]
@@ -880,7 +1315,7 @@ impl Engine {
         pipeline::file_reference_csr(&self.state)
     }
 
-    /// The generation header facts snapshots key on (PRD §5.5/§5.6): the
+    /// The generation header facts snapshots key on: the
     /// container format version, the engine's `FACTS_SEMANTIC_VERSION`,
     /// the SDK identity, the package-graph fingerprint, and the context
     /// salt (the remaining fork dimensions — target, declared variables,
@@ -921,11 +1356,23 @@ impl Engine {
     /// stay empty: the facts payload is self-contained (per-entry string
     /// slices and file paths), so no generation-wide id space is needed.
     ///
+    /// The flush is O(changed), not O(residency) (#1386): keys the store
+    /// already holds under the current tables stamp
+    /// ([`SnapshotStore::written_keys`]) are claimed in the manifest but
+    /// never projected — within a generation the payload is a pure
+    /// function of the key, so their frames on disk are already exact and
+    /// the projection, the encode, and the incumbent read are all skipped.
+    /// Only facts that moved since the store last recorded their key (and
+    /// keys the store has no record of, e.g. a cold store's first flush)
+    /// pay [`PersistedFacts::of`].
+    ///
     /// # Errors
     ///
     /// Propagates [`SaveError`] — a failed flush is a future miss (the
     /// accelerator invariant), never a correctness loss.
     pub fn save_facts_snapshot(&self, store: &SnapshotStore) -> Result<usize, SaveError> {
+        let header = self.snapshot_header();
+        let tables = RemapTables::default();
         let mut files: Vec<FileId> = self.state.residency.keys().copied().collect();
         files.sort_unstable_by(|a, b| {
             let path = |file: FileId| {
@@ -936,7 +1383,11 @@ impl Engine {
             };
             path(*a).cmp(path(*b))
         });
-        let mut entries: Vec<Entry<PersistedFacts>> = Vec::with_capacity(files.len());
+        // The manifest walk: one slot per distinct key, in path order —
+        // the first occurrence's facts are the deterministic payload pick.
+        // Projection is deferred past the store query so only unrecorded
+        // keys pay it.
+        let mut unique: Vec<(EntryKey, &state::UnitFacts)> = Vec::with_capacity(files.len());
         let mut claimed: FxHashSet<EntryKey> = FxHashSet::default();
         for file in files {
             let facts = &self.state.residency[&file];
@@ -946,45 +1397,65 @@ impl Engine {
                 feature_fingerprint: key.feature_fingerprint,
                 semantic_version: key.semantic_version,
             };
-            if !claimed.insert(key) {
-                continue;
+            if claimed.insert(key) {
+                unique.push((key, facts));
             }
-            entries.push(Entry {
-                key,
-                payload: PersistedFacts::of(facts, &self.state.strings, &self.state.files),
-            });
         }
-        let saved = entries.len();
-        store.save(&self.snapshot_header(), &RemapTables::default(), &entries)?;
-        Ok(saved)
+        let keys: Vec<EntryKey> = unique.iter().map(|(key, _)| *key).collect();
+        let written: FxHashSet<EntryKey> = store
+            .written_keys(&header, &tables, &keys)
+            .into_iter()
+            .collect();
+        let changed: Vec<Entry<PersistedFacts>> = unique
+            .iter()
+            .filter(|(key, _)| !written.contains(key))
+            .map(|(key, facts)| Entry {
+                key: *key,
+                payload: PersistedFacts::of(facts, &self.state.strings, &self.state.files),
+            })
+            .collect();
+        store.save_delta(&header, &tables, &keys, &changed)?;
+        Ok(keys.len())
     }
 
     /// Warm start (the M3 load face): stages a loaded facts generation for
-    /// the next apply. Staging is keyed by the entry triple; the apply's
-    /// lookup IS the content-hash verification — an entry serves only a
-    /// file whose live content id equals the key's hash, and everything
-    /// stale drops at that first apply. Ingestion is grow-only: it seeds
-    /// recomputes, never touching residency (#377). The loaded header and
-    /// remap tables are the store's match gate — consumed by `load`, not
-    /// needed here.
+    /// the apply's lookups. Staging is keyed by the entry triple; the apply's
+    /// lookup IS the content-hash verification — an entry serves only a file
+    /// whose live content id equals the key's hash, and a served entry is
+    /// claimed (removed) at that moment (#1387): entries no batch claims
+    /// stay staged for a later one — a file reverting to staged content is
+    /// exactly the undo hit the retention keeps — until the budget's tier-3
+    /// shed or the next ingest replaces them. Ingestion never touches
+    /// residency (#377). The loaded header and remap tables are the store's
+    /// match gate — consumed by `load`, not needed here.
+    ///
+    /// The ingest *replaces* the staged generation instead of extending it:
+    /// every superseded payload (a key the new snapshot does not re-stage)
+    /// leaves at the refresh, so repeated ingests can never pile staging
+    /// maps under a long-lived daemon — the pile's only other exit was the
+    /// armed budget's 2 GiB tier-3, far above the staging face. Retention
+    /// is per generation: this ingest's unclaimed entries stand across
+    /// applies until claimed, shed, or replaced by the next ingest, which
+    /// is the documented exit list. [`WARM_START_STAGING_CAP`] bounds a
+    /// single pathological snapshot the same way; identities past the cap
+    /// skip staging (an accelerator miss, never an output change).
     ///
     /// Returns the number of staged entries.
     pub fn ingest_facts_snapshot(&mut self, snapshot: Snapshot<PersistedFacts>) -> usize {
-        let staged = snapshot.entries.len();
-        self.state.warm_start.extend(
-            snapshot
-                .entries
-                .into_iter()
-                .map(|entry| (entry.key, entry.payload)),
-        );
+        let mut staging: FxHashMap<EntryKey, PersistedFacts> = FxHashMap::default();
+        for entry in snapshot.entries.into_iter().take(WARM_START_STAGING_CAP) {
+            staging.insert(entry.key, entry.payload);
+        }
+        let staged = staging.len();
+        self.state.warm_start = staging;
         staged
     }
 }
 
-/// What one [`Engine::apply_pending`] changed (§1.2).
+/// What one [`Engine::apply_pending`] changed.
 #[derive(Debug, Default)]
 pub struct AffectedReport {
-    /// Files whose ContentId differed from residency (gate passed, work done).
+    /// Files whose `ContentId` differed from residency (gate passed, work done).
     pub changed: Vec<FileId>,
     /// Files removed by this apply.
     pub removed: Vec<FileId>,
@@ -992,18 +1463,24 @@ pub struct AffectedReport {
     pub invalidated: Vec<LibraryId>,
 }
 
-/// Discovery counters (§3 metrics hook, PRD §17.2).
+/// Discovery counters.
 #[derive(Debug, Default)]
 pub struct DiscoveryStats {
     /// Discovered `.dart` files.
     pub file_count: usize,
     /// Total lines across the discovered set.
     pub loc_total: u64,
+    /// Discovered-but-rejected `.dart` files: each exceeds the engine's
+    /// 32-bit span capacity ([`dartq_source::MAX_SOURCE_BYTES`]) and never
+    /// enters the set (not interned, not analyzed — the exclusion
+    /// posture). The faces surface these as stderr notices; the counts
+    /// above never include them.
+    pub oversized: Vec<PathBuf>,
 }
 
 /// Flat CSR arrays: `offsets[i]..offsets[i+1]` slice `edges` for node `i`.
 /// Both views are plain `&[u32]` — the zero-copy export face for external
-/// compute backends (GPU posture ADR, engine-api-spec §3 rider).
+/// compute backends.
 #[derive(Debug, Clone, Default)]
 pub struct CsrGraph {
     offsets: Vec<u32>,
@@ -1088,6 +1565,25 @@ pub struct LibraryView<'a> {
     /// derives the face itself (`l1::scan_unit`) — the map never blocks a
     /// diagnoser that scans its own tokens.
     pub scanned: FxHashMap<FileId, Arc<crate::state::ScannedFace>>,
+    /// The per-library `class-modifiers` posture (#1294): each live
+    /// library's defining file's settled language version (the `@dart`
+    /// override applied) resolved through the feature registry
+    /// (`class-modifiers`, `enabledIn: 3.0.0`), built once per analyze
+    /// beside the element index. Libraries absent from the map answer the
+    /// modern posture ([`dartq_resolution::LibraryClassModifiers`]).
+    pub class_modifiers: &'a dartq_resolution::LibraryClassModifiers,
+    /// The default fold's member-level memo handle (#1384): the engine's
+    /// fold map plus this library's identity inputs (graph generation,
+    /// cycle fingerprint, strict modes, posture epoch). The shipped
+    /// [`semdiag::Diagnoser`] consults it per member; a custom diagnoser
+    /// that folds differently simply ignores it. Crate-internal — external
+    /// diagnosers consume the view read-only.
+    pub(crate) memo: crate::semdiag::MemoHandle<'a>,
+    /// The residency-pairing degrade log (stability lane #1459): the fold
+    /// records the members it skips on a residency/store pairing miss (a
+    /// bounded, deduped row per (file, face) pair). Crate-internal, same
+    /// discipline as [`LibraryView::memo`].
+    pub(crate) degrades: &'a crate::state::ResidencyDegrades,
 }
 
 /// The semantic diagnostics plug point (#120/#121).
@@ -1096,21 +1592,35 @@ pub struct LibraryView<'a> {
 /// `dartq_semantic::diagnose_with`); a caller may substitute its own. Per-library
 /// calls arrive on the batch fan-out workers, so implementations must be
 /// `Send + Sync` and stateless across calls; diagnostics append into `out`
-/// and carry no ordering obligations (the engine sorts canonically).
+/// and carry no ordering obligations (the engine sorts canonically). Rows
+/// are refcounted (#1501): appends cost a bump against rows the engine
+/// already owns (the facts' syntax rows, the member-fold memo's products),
+/// and freshly built rows wrap once in [`Arc::new`] — the engine's stores
+/// share those bytes instead of copying them.
 pub trait SemanticDiagnoser: Send + Sync {
     /// Appends this library's semantic diagnostics to `out`.
-    fn diagnose_library(&self, library: LibraryView<'_>, out: &mut Vec<Diagnostic>);
+    fn diagnose_library(&self, library: LibraryView<'_>, out: &mut Vec<Arc<Diagnostic>>);
 }
 
-/// The M1 default store constructor (`MemorySourceStore`, §1.1).
+/// The M1 default store constructor.
 #[must_use]
 pub fn memory_store() -> Box<dyn SourceStore + Send + Sync> {
     Box::new(MemorySourceStore::new())
 }
 
+/// The file-backed CAS store constructor (`MmapSourceStore`): loaded files
+/// ride read-only memory mappings — canonical text never copied off the
+/// page cache, identical contents held once. The workspace-load default;
+/// heap-only deployments (sandboxed test fixtures, overlay-only sessions)
+/// keep [`memory_store`].
+#[must_use]
+pub fn mmap_store() -> Box<dyn SourceStore + Send + Sync> {
+    Box::new(MmapSourceStore::new())
+}
+
 /// A store wired to `pool`: every distinct content the engine puts lands in
 /// the pool's shared storage, so N contexts constructed over one pool hold
-/// each content exactly once between them (§16.1's shared content store —
+/// each content exactly once between them (the shared content store —
 /// the multi-context RSS face). Reads stay zero-copy through the context's
 /// own view; each context's GC drops only its own handles, and the pool
 /// reclaims storage no context references anymore (reference-counted
@@ -1124,14 +1634,17 @@ pub fn pooled_memory_store(pool: &ContentPool) -> Box<dyn SourceStore + Send + S
     Box::new(PooledSourceStore::new(pool))
 }
 
-/// Drops exactly one leading UTF-8 BOM (`EF BB BF`, U+FEFF) — oracle
-/// read-layer parity (upstream Dart SDK source, `_fe_analyzer_shared`
-/// utf.dart Before-BOM state machine via the analyzer file read): the
-/// scanner runs on
-/// BOM-less text and every span is relative to the stripped text. Exactly
-/// one is dropped; a second BOM is content.
-pub(crate) fn strip_one_bom(bytes: &[u8]) -> &[u8] {
-    bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
+/// The pooled store's mmap-backed sibling (`PooledMappedSourceStore`): same
+/// cross-context dedup contract as [`pooled_memory_store`] — every context
+/// wired to one [`MappedContentPool`] holds each distinct content exactly
+/// once, through one refcounted slot — but a [`SourceText`] mapping lease
+/// is shared into the pool instead of copied, so canonical file text stays
+/// on evictable page-cache pages rather than the anonymous heap. The
+/// daemon's opt-in shared-store posture; [`pooled_memory_store`] remains
+/// the heap-only default.
+#[must_use]
+pub fn pooled_mmap_store(pool: &MappedContentPool) -> Box<dyn SourceStore + Send + Sync> {
+    Box::new(PooledMappedSourceStore::new(pool))
 }
 
 #[cfg(test)]
@@ -1141,27 +1654,6 @@ mod tests {
 
     use dartq_language::Feature;
     use dartq_pub::{LockFile, Pubspec, build_graph};
-
-    #[test]
-    fn bom_stripped_once() {
-        assert_eq!(strip_one_bom("\u{FEFF}var x;".as_bytes()), b"var x;");
-        // BOM-less input passes through untouched.
-        assert_eq!(strip_one_bom(b"var x;"), b"var x;");
-    }
-
-    #[test]
-    fn double_bom_leaves_second_as_content() {
-        assert_eq!(
-            strip_one_bom("\u{FEFF}\u{FEFF}x".as_bytes()),
-            // One BOM dropped, the second survives as content (EF BB BF 78).
-            "\u{FEFF}x".as_bytes()
-        );
-    }
-
-    #[test]
-    fn bom_only_strips_to_empty() {
-        assert_eq!(strip_one_bom("\u{FEFF}".as_bytes()), b"");
-    }
 
     /// A throwaway single-package workspace + synthetic core-only SDK — the
     /// l1/semdiag test fixture shape trimmed to what [`Engine::new`] binds —
@@ -1238,6 +1730,92 @@ mod tests {
         (root, engine)
     }
 
+    /// The ingest's stale policy: a fresh generation REPLACES the staged
+    /// one (superseded payloads leave at the refresh instead of piling
+    /// under a long-lived daemon — the audit's F-B), and a snapshot larger
+    /// than [`WARM_START_STAGING_CAP`] stages its head deterministically.
+    #[test]
+    fn ingest_replaces_the_staged_generation_and_caps_the_snapshot() {
+        let (root, mut engine) = facade_engine();
+        let file = engine.set_content(&root.join("lib/a.dart"), b"int a() => 1;\n");
+        engine.apply_pending(&mut |_| {});
+        let payload = PersistedFacts::of(
+            &engine.state.residency[&file],
+            &engine.state.strings,
+            &engine.state.files,
+        );
+        let key = |hash: u8| EntryKey {
+            content_hash: [hash; 16],
+            feature_fingerprint: 0,
+            semantic_version: 0,
+        };
+        // Generation 1, staged directly (the ingest's product face).
+        engine.state.warm_start.insert(key(1), payload.clone());
+        engine.state.warm_start.insert(key(2), payload.clone());
+
+        // Generation 2 carries one fresh key: the superseded generation-1
+        // keys leave at the refresh.
+        let snapshot = Snapshot {
+            header: GenerationHeader {
+                format_version: SNAPSHOT_FORMAT_VERSION,
+                semantic_version: 0,
+                sdk_identity: String::new(),
+                package_graph_fingerprint: [0; 16],
+                context_salt: [0; 16],
+            },
+            tables: RemapTables::default(),
+            entries: vec![Entry {
+                key: key(3),
+                payload: payload.clone(),
+            }],
+        };
+        assert_eq!(
+            engine.ingest_facts_snapshot(snapshot),
+            1,
+            "the fresh generation staged its one entry"
+        );
+        assert!(engine.state.warm_start.contains_key(&key(3)));
+        assert!(
+            !engine.state.warm_start.contains_key(&key(1))
+                && !engine.state.warm_start.contains_key(&key(2)),
+            "the superseded generation left at the refresh"
+        );
+
+        // The cap: a snapshot one entry past it stages exactly the cap, and
+        // the head entries win (deterministic pick; a missing tail entry is
+        // an accelerator miss, never an output change).
+        let entries: Vec<Entry<PersistedFacts>> = (0..=WARM_START_STAGING_CAP)
+            .map(|i| {
+                let mut hash = [0u8; 16];
+                hash[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                Entry {
+                    key: EntryKey {
+                        content_hash: hash,
+                        feature_fingerprint: 0,
+                        semantic_version: 0,
+                    },
+                    payload: payload.clone(),
+                }
+            })
+            .collect();
+        let snapshot = Snapshot {
+            header: GenerationHeader {
+                format_version: SNAPSHOT_FORMAT_VERSION,
+                semantic_version: 0,
+                sdk_identity: String::new(),
+                package_graph_fingerprint: [0; 16],
+                context_salt: [0; 16],
+            },
+            tables: RemapTables::default(),
+            entries,
+        };
+        assert_eq!(
+            engine.ingest_facts_snapshot(snapshot),
+            WARM_START_STAGING_CAP,
+            "the cap staged the snapshot's head, one entry short of the input"
+        );
+    }
+
     /// The public settled-face accessor (#722 seam) through the facade: a
     /// `set_content`-interned but not-yet-applied file answers `None` (not
     /// resident — the caller-fallback signal); after `apply_pending` the
@@ -1262,6 +1840,159 @@ mod tests {
         );
     }
 
+    /// The residency-epoch gate on the nested-pubspec scan (#1527): a
+    /// turn without residency growth runs no scan pass at all — the warm
+    /// daemon keystroke pays O(1) here — while a growth turn reopens the
+    /// gate exactly once and still mounts the nested boundary (the memo's
+    /// first-stat-per-directory contract holds across the gate). The
+    /// `nested_scan_passes` instrumentation counts actual passes.
+    #[test]
+    fn warm_turns_skip_the_nested_pubspec_scan() {
+        let (root, mut engine) = facade_engine();
+        let nested_dir = root.join("packages/sub");
+        std::fs::create_dir_all(nested_dir.join("lib")).expect("nested dirs");
+        std::fs::write(
+            nested_dir.join("pubspec.yaml"),
+            "name: sub\nversion: 0.1.0\n",
+        )
+        .expect("nested pubspec");
+        // Two files share the fresh directory: the first pass queues and
+        // walks it once (the to_scan dedup face).
+        engine.set_content(&nested_dir.join("lib/a.dart"), b"void a() {}\n");
+        engine.set_content(&nested_dir.join("lib/b.dart"), b"void b() {}\n");
+        engine.apply_pending(&mut |_| {});
+        assert!(engine.state.residency_epoch > engine.nested_scan_epoch);
+        engine.capture_nested_pubspecs();
+        assert_eq!(engine.nested_scan_passes, 1);
+        assert_eq!(engine.nested_scan_epoch, engine.state.residency_epoch);
+        assert!(
+            engine
+                .captured_pubspecs()
+                .contains(&nested_dir.join("pubspec.yaml")),
+            "the growth pass mounts the nested boundary"
+        );
+        let memo = engine.pubspec_dirs_scanned.clone();
+        // Warm turn: no residency growth — the whole pass is skipped.
+        engine.capture_nested_pubspecs();
+        assert_eq!(engine.nested_scan_passes, 1, "warm turn scans nothing");
+        assert_eq!(engine.pubspec_dirs_scanned, memo);
+        // The next residency growth reopens the gate exactly once.
+        engine.set_content(&root.join("lib/c.dart"), b"void c() {}\n");
+        engine.apply_pending(&mut |_| {});
+        assert!(engine.state.residency_epoch > engine.nested_scan_epoch);
+        engine.capture_nested_pubspecs();
+        assert_eq!(engine.nested_scan_passes, 2);
+    }
+
+    /// The shared-output face (#1387), end to end through the facade: the
+    /// rows are byte-identical to the owned face on every path, and a
+    /// zero-dirty cycle hands back the same standing allocation — one
+    /// refcount, no row clones (`Arc::ptr_eq`). After an edit the rebuild
+    /// runs under both the splice arm (the previous share dropped first, so
+    /// the old rows move) and its full-merge fallback (a share still held),
+    /// and the shared face stays row-equal to the owned face across both.
+    /// The spliced rebuild pins against a fresh engine's cold analyze — a
+    /// wholesale merge from scratch, not a re-serve of the standing cache,
+    /// which would green-light a truncated splice against its own
+    /// truncation.
+    #[test]
+    fn shared_analyze_matches_the_owned_face_and_shares_the_standing_rows() {
+        let (root, mut engine) = facade_engine();
+        let lib = root.join("lib");
+        // Each file carries its own `dart:math` miss: the synthetic SDK
+        // registers only `core`, so the import does not resolve — one
+        // `uri_does_not_exist` row per file, so the sharing has rows to save.
+        engine.set_content(
+            &lib.join("a.dart"),
+            b"import 'dart:math' show zork;\nint a() => 1;\n",
+        );
+        engine.set_content(
+            &lib.join("b.dart"),
+            b"import 'dart:math' show werm;\nint b() => 2;\n",
+        );
+        let cancel = CancellationToken::new();
+        let events = &mut |_: EngineEvent| {};
+
+        let owned = engine.analyze(&[], events, &cancel).expect("cold");
+        assert_eq!(
+            owned.len(),
+            2,
+            "one uri_does_not_exist row per file (the synthetic SDK \
+             registers only core, so dart:math misses): {owned:?}"
+        );
+
+        // Zero-dirty cycles: the shared face serves the standing buffer.
+        let first = engine.analyze_shared(&[], events, &cancel).expect("shared");
+        let second = engine
+            .analyze_shared(&[], events, &cancel)
+            .expect("shared again");
+        assert_eq!(first.as_ref(), &owned, "shared rows equal the owned face");
+        assert_eq!(second.as_ref(), &owned);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the standing buffer is shared, not re-cloned"
+        );
+        // The owned face over the same state agrees row-for-row: the shared
+        // face's identity path changed nothing observable.
+        assert_eq!(engine.analyze(&[], events, &cancel).expect("owned"), *first);
+
+        // An edit rebuilds the merge. With the previous shares still held,
+        // the splice cannot move the old rows and falls back to the full
+        // merge — the degrade-to-clone arm — and the shared face stays
+        // byte-equal to the owned face.
+        engine.set_content(
+            &lib.join("a.dart"),
+            b"import 'dart:math' show zork;\nint a() => 1;\nint extra() => 3;\n",
+        );
+        let edited_shared = engine
+            .analyze_shared(&[], events, &cancel)
+            .expect("edited shared");
+        let edited_owned = engine.analyze(&[], events, &cancel).expect("edited owned");
+        assert_eq!(edited_shared.as_ref(), &edited_owned);
+        // Dropping the held shares lets the next rebuild splice. The oracle
+        // is a fresh engine's cold analyze of the same final state: a
+        // wholesale merge from scratch, with no standing cache to share the
+        // splice's failure modes (a re-analyze here would be served from
+        // the standing buffer — truncation against truncation).
+        drop(first);
+        drop(second);
+        drop(edited_shared);
+        engine.set_content(
+            &lib.join("b.dart"),
+            b"import 'dart:math' show werm;\nint b() => 2;\nint more() => 4;\n",
+        );
+        let spliced_shared = engine
+            .analyze_shared(&[], events, &cancel)
+            .expect("spliced shared");
+        let (fresh_root, mut fresh_engine) = facade_engine();
+        fresh_engine.set_content(
+            &fresh_root.join("lib/a.dart"),
+            b"import 'dart:math' show zork;\nint a() => 1;\nint extra() => 3;\n",
+        );
+        let fresh_b = fresh_engine.set_content(
+            &fresh_root.join("lib/b.dart"),
+            b"import 'dart:math' show werm;\nint b() => 2;\nint more() => 4;\n",
+        );
+        let cold = fresh_engine
+            .analyze(&[], events, &cancel)
+            .expect("oracle cold analyze");
+        assert_eq!(
+            spliced_shared.as_ref(),
+            &cold,
+            "the spliced rebuild matches a from-scratch full merge"
+        );
+        // The re-analyzed contributor's presence pins from the oracle's own
+        // rows: b.dart sorts last, so its fresh row — its own `dart:math`
+        // miss (the synthetic SDK registers only core, and an unresolved
+        // target skips the shown-name check, so no `werm` row exists) — is
+        // exactly the tail the weave's exit edge must drain.
+        let tail = cold.last().expect("the oracle holds both misses");
+        assert_eq!(
+            tail.file, fresh_b,
+            "the trailing contributor's fresh row is the drained tail: {cold:?}"
+        );
+    }
+
     /// The fingerprint-keyed reuse gate (g485 W2), end to end: an API-face
     /// edit that lands *without* an analyze carries its closure forward as
     /// invalidated, and the undo restores every face the closure was
@@ -1282,7 +2013,9 @@ mod tests {
 
         engine.set_content(&lib.join("a.dart"), a_src.as_bytes());
         engine.set_content(&lib.join("b.dart"), b_src.as_bytes());
-        let baseline = engine.analyze(&[], &mut |_: EngineEvent| {}, &cancel).expect("cold");
+        let baseline = engine
+            .analyze(&[], &mut |_: EngineEvent| {}, &cancel)
+            .expect("cold");
         assert!(baseline.is_empty(), "the fixture analyzes clean");
 
         // The face move lands as bare applies (no analyze): the closure
@@ -1294,10 +2027,8 @@ mod tests {
         engine.apply_pending(events);
 
         // The gated analyze: one recompute (the edited library), one reuse.
-        let trace = std::env::temp_dir().join(format!(
-            "dartq-engine-w2-undo-{}.jsonl",
-            std::process::id()
-        ));
+        let trace =
+            std::env::temp_dir().join(format!("dartq-engine-w2-undo-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&trace);
         engine.set_trace_sink(Some(event::TraceSink::create(&trace).expect("sink opens")));
         let undone = engine.analyze(&[], events, &cancel).expect("undo analyze");
@@ -1333,7 +2064,9 @@ mod tests {
         let mut engine = facade_engine().1;
         engine.set_content(&lib.join("a.dart"), a_src.as_bytes());
         engine.set_content(&lib.join("b.dart"), b_src.as_bytes());
-        engine.analyze(&[], &mut |_: EngineEvent| {}, &cancel).expect("cold");
+        engine
+            .analyze(&[], &mut |_: EngineEvent| {}, &cancel)
+            .expect("cold");
         engine.set_content(&lib.join("a.dart"), a_moved.as_bytes());
         engine.apply_pending(events);
         let trace2 = trace.with_extension("moved.jsonl");
@@ -1357,5 +2090,192 @@ mod tests {
         );
         let _ = std::fs::remove_file(&trace);
         let _ = std::fs::remove_file(&trace2);
+    }
+
+    /// The multi-apply clobber pin (#1567): a dependency's signature face
+    /// move that lands as an out-of-analyze apply, followed by a second
+    /// body-only apply before the next analyze, must survive the wait — the
+    /// dirty flag means "any signature-bearing face moved since the last
+    /// analyze", so applies accumulate and a body-only batch cannot retire
+    /// an earlier apply's move. Under the overwrite, the gated analyze
+    /// skipped the condensation rebuild and the reuse gate served the
+    /// cascade-invalidated importer's pre-move recorded run. Pinned against
+    /// a fresh cold engine over the same final contents: the stale serve
+    /// would hand back the importer's clean run while the oracle reports the
+    /// moved signature's broken shown name.
+    #[test]
+    fn body_only_apply_between_face_moves_keeps_the_cascade_recompute() {
+        let (root, mut engine) = facade_engine();
+        let lib = root.join("lib");
+        // The face move renames the dependency's declaration while the
+        // importer pins its shown name to the old one — so the move
+        // genuinely moves the importer's rows (`undefined_shown_name`: the
+        // rename drops `dep` from the export scope). A return-type edit
+        // would not: the engine reports no row for it, and both the gated
+        // and the oracle run would stay empty, pinning nothing.
+        let dep_stable = "int dep() => 1;\n";
+        let dep_moved = "int dep2() => 1;\n";
+        let dep_body = "int dep2() => 11;\n";
+        let importer = "import 'dep.dart' show dep;\nint use() => dep();\n";
+        let events = &mut |_: EngineEvent| {};
+        let cancel = CancellationToken::new();
+
+        engine.set_content(&lib.join("dep.dart"), dep_stable.as_bytes());
+        let use_id = engine.set_content(&lib.join("use.dart"), importer.as_bytes());
+        let baseline = engine
+            .analyze(&[], &mut |_: EngineEvent| {}, &cancel)
+            .expect("cold");
+        assert!(baseline.is_empty(), "the stable fixture analyzes clean");
+
+        // Apply A: the dependency's declaration face moves (the rename) —
+        // the importer cascade-invalidates with
+        // its recorded run retained. Apply B: a body-only literal edit.
+        engine.set_content(&lib.join("dep.dart"), dep_moved.as_bytes());
+        engine.apply_pending(events);
+        assert!(
+            engine.state.structure_dirty,
+            "the face move marks the structure dirty"
+        );
+        engine.set_content(&lib.join("dep.dart"), dep_body.as_bytes());
+        engine.apply_pending(events);
+        assert!(
+            engine.state.structure_dirty,
+            "the body-only apply must not retire the pending face move"
+        );
+
+        let warm = engine.analyze(&[], events, &cancel).expect("gated analyze");
+
+        // The oracle: a fresh cold engine over the same final contents, same
+        // interning order.
+        let (fresh_root, mut fresh) = facade_engine();
+        fresh.set_content(&fresh_root.join("lib/dep.dart"), dep_body.as_bytes());
+        fresh.set_content(&fresh_root.join("lib/use.dart"), importer.as_bytes());
+        let cold = fresh
+            .analyze(&[], &mut |_: EngineEvent| {}, &cancel)
+            .expect("oracle cold analyze");
+        assert!(
+            cold.iter().any(|row| row.file == use_id),
+            "the moved signature must genuinely move the importer's \
+             diagnostics, or this pin proves nothing: {cold:?}"
+        );
+        // The rows' messages embed each engine's own fixture root: the
+        // shown-name warning renders the resolved target's absolute URI
+        // (`directive_library_uri`), and warm/cold run over different temp
+        // dirs. The comparison projects every field verbatim except that
+        // one root prefix, normalized to a placeholder.
+        let visible = |rows: &[Diagnostic], root: &Path| -> Vec<_> {
+            let uri = format!("file://{}", root.display());
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.severity,
+                        row.code.name,
+                        row.message.replace(uri.as_str(), "<fixture>"),
+                        row.file,
+                        (row.range.offset, row.range.length),
+                        row.correction.clone(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            visible(&warm, &root),
+            visible(&cold, &fresh_root),
+            "the gated analyze recomputes the cascade"
+        );
+    }
+
+    /// The options-rows face's local determinism (#1851): rows emit in
+    /// options-file path order, one row set per distinct loaded path.
+    /// Entries sharing a path collapse even when their loads don't share an
+    /// Arc, and the winner between distinct loads of one path is the
+    /// lowest governing root (a unique map key) — never hash iteration
+    /// order.
+    #[test]
+    fn option_rows_emit_path_sorted_with_path_keyed_dedup() {
+        let (root, mut engine) = facade_engine();
+        let empty = |root: &Path| {
+            PackageConfig::parse(r#"{"configVersion": 2, "packages": []}"#)
+                .map(|config| (config, root.to_path_buf()))
+                .expect("empty config")
+        };
+        // One options file loaded twice with different contents: same
+        // file_path, distinct Arcs — the tie-break face the shared-Arc
+        // alias cannot distinguish. The rewrite swaps the broken include
+        // target, so the two loads carry different row messages.
+        std::fs::write(
+            root.join("analysis_options.yaml"),
+            "include: missing.yaml\n",
+        )
+        .expect("options");
+        let (config, config_dir) = empty(&root);
+        let first = Arc::new(analysis_options::AnalysisOptions::load(
+            &root.join("analysis_options.yaml"),
+            &config,
+            &config_dir,
+        ));
+        std::fs::write(
+            root.join("analysis_options.yaml"),
+            "include: replaced.yaml\n",
+        )
+        .expect("options");
+        let (config, config_dir) = empty(&root);
+        let second = Arc::new(analysis_options::AnalysisOptions::load(
+            &root.join("analysis_options.yaml"),
+            &config,
+            &config_dir,
+        ));
+        // A second distinct path, sorting after the root file's.
+        std::fs::create_dir_all(root.join("lib")).expect("lib dir");
+        std::fs::write(
+            root.join("lib/analysis_options.yaml"),
+            "include: also_missing.yaml\n",
+        )
+        .expect("nested options");
+        let (config, config_dir) = empty(&root);
+        let nested = Arc::new(analysis_options::AnalysisOptions::load(
+            &root.join("lib/analysis_options.yaml"),
+            &config,
+            &config_dir,
+        ));
+        assert!(
+            !first.issues.is_empty() && !second.issues.is_empty() && !nested.issues.is_empty(),
+            "the broken includes must record real rows"
+        );
+
+        // Three governing entries: two keys aliasing one path (distinct
+        // loads — `root` sorts before `zkey`), one carrying the nested
+        // path. The assembled map's synthesized default at `root` is
+        // replaced.
+        engine.state.options.insert(root.clone(), first);
+        engine.state.options.insert(root.join("zkey"), second);
+        engine.state.options.insert(root.join("lib"), nested);
+
+        let rows = engine.option_issue_rows();
+        assert_eq!(
+            rows.len(),
+            2,
+            "aliased paths collapse to one row set each: {rows:?}"
+        );
+        // Path-sorted emission: the root file's row set before the lib
+        // file's, whatever the map's iteration order was.
+        let paths: Vec<_> = rows
+            .iter()
+            .map(|row| engine.state.files.path(row.file).expect("interned"))
+            .collect();
+        assert!(paths[0] < paths[1], "rows emit path-sorted: {paths:?}");
+        // The dedup winner at the aliased path is the lowest governing
+        // root's load — the `missing.yaml` spelling, not the `zkey`
+        // entry's `replaced.yaml` rewrite.
+        assert!(
+            rows[0].message.contains("'missing.yaml'") && !rows[0].message.contains("replaced"),
+            "the lowest governing root's load wins the aliased path: {:?}",
+            rows[0].message
+        );
+        assert!(
+            rows[1].message.contains("'also_missing.yaml'"),
+            "the second path's row set follows: {:?}",
+            rows[1].message
+        );
     }
 }

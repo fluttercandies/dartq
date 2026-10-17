@@ -1,15 +1,15 @@
-//! `apply_pending`: the ContentId gate → facts recompute → the
+//! `apply_pending`: the `ContentId` gate → facts recompute → the
 //! identity-keyed library-graph delta → cascade closure
-//! (incremental-l1-spec §3.2 steps 1–5).
+//!.
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, Severity};
-use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
+use dartq_language::{
+    DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion, MIN_LANGUAGE_VERSION_CONSTRAINT,
+};
 use dartq_package::PackageTable as IdentityTable;
-use dartq_parser::{Message, Parser, ParserFeatures, ParserListener, TokenSpan};
+use dartq_parser::{Message, MultiplexListener, Parser, ParserFeatures, ParserListener, TokenSpan};
 use dartq_resolution::{
     CombinatorClause, Combinators, Configuration, ResolvedTarget, SelectedUri, UriResolution,
     UriResolver, resolve_conditional,
@@ -17,17 +17,20 @@ use dartq_resolution::{
 use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, ScanResult, TokenKind, TokenTable, scan};
 use dartq_sdk::AllowedExperiments;
 use dartq_snapshot::EntryKey;
-use dartq_source::{ContentId, FileId, FileTable, SourceRange, StringTable, utf16_len_of};
+use dartq_source::{
+    ContentId, FileId, FileTable, MAX_SOURCE_BYTES, SourceRange, SourceText, StringId, StringTable,
+    utf16_len_of,
+};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::event::{EngineEvent, RevalidateGate};
+use crate::event::{EngineEvent, KNOWN_ONLY_GRANT, RevalidateGate};
 use crate::state::{
     DirectiveFacts, DirectiveKind, EngineState, FACTS_SEMANTIC_VERSION, FactsKey, FeatureGrants,
-    LibraryId, LibraryInfo, PendingChange, ScannedFace, UnitFacts,
+    ImportEdge, LibraryId, LibraryInfo, PendingChange, ScannedFace, TargetRows, UnitFacts,
 };
 
-/// The outcome of one apply (engine-api-spec §1.2 `AffectedReport` payload).
+/// The outcome of one apply.
 #[derive(Debug, Default)]
 pub(crate) struct ApplyOutcome {
     pub changed: Vec<FileId>,
@@ -46,6 +49,7 @@ impl ApplyOutcome {
 /// Event sequence for a non-empty queue: `OverlayApplied`, then
 /// `FileRevalidated` per touched file (ascending `FileId`), then one
 /// `CascadeInvalidated` (possibly empty). An empty queue emits nothing.
+#[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 pub(crate) fn apply(
     state: &mut EngineState,
     on_event: &mut dyn FnMut(EngineEvent),
@@ -56,9 +60,12 @@ pub(crate) fn apply(
 
     // Step 1: the ContentId gate (official defers the comparison to here,
     // never to set_content — a rewrite with identical bytes is a legal no-op).
+    // The id comes off the pending lease (hashed once at canonicalization/
+    // load); `put_text` shares the lease into the store with no second hash
+    // and, for mapping-backed stores, no copy.
     let order = std::mem::take(&mut state.pending_order);
     let mut pending = std::mem::take(&mut state.pending);
-    let mut changed: Vec<(FileId, dartq_source::ContentId, String)> = Vec::new();
+    let mut changed: Vec<(FileId, dartq_source::ContentId, SourceText)> = Vec::new();
     let mut removed: Vec<FileId> = Vec::new();
     let mut gate_hits: Vec<FileId> = Vec::new();
     // Previous facts of every touched file — the OLD face the graph delta
@@ -68,10 +75,28 @@ pub(crate) fn apply(
     for file in order {
         match pending.remove(&file) {
             Some(PendingChange::Set(text)) => {
+                // The span-capacity gate: this funnel is the one point
+                // every intake (mmap discovery, `set_content`, the manager
+                // overlay) passes through on the way to residency, so
+                // holding the line here keeps every downstream position
+                // derivation — line starts, UTF-16 offsets, range ends —
+                // inside u32 by construction. A rejected set is dropped
+                // whole: the file keeps its previous residency (or stays
+                // absent), the rest of the batch proceeds, and the
+                // rejection rides the event face.
+                if text.len() > MAX_SOURCE_BYTES {
+                    if let Some(path) = state.files.path(file) {
+                        on_event(EngineEvent::SourceRejected {
+                            path: path.to_path_buf(),
+                            len: text.len() as u64,
+                        });
+                    }
+                    continue;
+                }
                 if let Some(previous) = state.residency.get(&file) {
                     old_facts.insert(file, Arc::clone(previous));
                 }
-                let content = state.store.put(text.as_bytes());
+                let content = state.store.put_text(&text);
                 if state
                     .residency
                     .get(&file)
@@ -87,7 +112,7 @@ pub(crate) fn apply(
                     old_facts.insert(file, previous);
                     // The maintained index inputs drop with residency: a
                     // removed file's capture must not serve a later query.
-                    state.captures.remove(&file);
+                    state.clear_capture(file);
                     // The canonical-URI memo drops with residency too
                     // (bounded, audit #398 F10 — the map previously grew
                     // monotonically with every path ever resident). Eviction
@@ -98,6 +123,9 @@ pub(crate) fn apply(
                     // identical string and no library identity can fork
                     // across the gap.
                     state.canonical_uris.remove(&file);
+                    // The semdiag fold memo tracks residency (#1384): the
+                    // removed member's entry goes with it.
+                    state.clear_semdiag_fold(file);
                     removed.push(file);
                 }
             }
@@ -106,13 +134,6 @@ pub(crate) fn apply(
     }
     debug_assert!(pending.is_empty(), "drained entries must all be consumed");
     let changed_files: Vec<FileId> = changed.iter().map(|(file, _, _)| *file).collect();
-    // The recapture queue: every changed file's declaration spans may have
-    // moved (a body edit under a stable signature keeps its library clean
-    // but shifts offsets), so recapture tracks changed files, not dirty
-    // libraries. Gate hits (identical bytes) recapture nothing.
-    for file in &changed_files {
-        state.mark_captures_dirty(*file);
-    }
 
     on_event(EngineEvent::OverlayApplied {
         changed: changed_files.clone(),
@@ -124,12 +145,12 @@ pub(crate) fn apply(
 
     // Steps 2–3: facts recompute for gate-passing files (parallel scan/parse/
     // collect, sequential URI resolution), then residency update. The
-    // pre-apply signatures are captured first — the L2 gate (PRD §11.3)
+    // pre-apply signatures are captured first — the L2 gate
     // compares them against the recomputed ones to classify the cascade.
     let recomputed = recompute_facts(state, &changed);
     let old_signatures: FxHashMap<FileId, dartq_semantic::ApiSignature> = recomputed
         .iter()
-        .filter_map(|(file, _, _)| {
+        .filter_map(|(file, _, _, _)| {
             state
                 .residency
                 .get(file)
@@ -140,7 +161,7 @@ pub(crate) fn apply(
         .into_iter()
         .map(|file| (file, RevalidateGate::ContentIdHit))
         .collect();
-    gates.extend(recomputed.iter().map(|(file, _facts, cache_hit)| {
+    gates.extend(recomputed.iter().map(|(file, _facts, cache_hit, _)| {
         (
             *file,
             RevalidateGate::Parsed {
@@ -148,8 +169,20 @@ pub(crate) fn apply(
             },
         )
     }));
-    for (file, facts, _) in &recomputed {
-        state.residency.insert(*file, Arc::clone(facts));
+    // Recapture bookkeeping: every changed file's declaration spans may
+    // have moved (a body edit under a stable signature keeps its library
+    // clean but shifts offsets), so recapture tracks changed files, not
+    // dirty libraries. Files whose capture rode the apply-side multiplexed
+    // parse store directly; the recompute-derivated rest (batch siblings,
+    // cross-batch hits, warm starts — no parse ran for them) queue for the
+    // analyze-phase recapture. Gate hits (identical bytes) are not in the
+    // changed set at all.
+    for (file, facts, _, capture) in &recomputed {
+        state.admit_residency(*file, Arc::clone(facts));
+        match capture {
+            Some(capture) => state.set_capture(*file, Arc::clone(capture)),
+            None => state.mark_captures_dirty(*file),
+        }
     }
     gates.sort_unstable_by_key(|(file, _)| *file);
     for (file, gate) in &gates {
@@ -169,9 +202,33 @@ pub(crate) fn apply(
     // a body/comment edit with a stable face does not.
     let sig_changed: Vec<FileId> = recomputed
         .iter()
-        .filter(|(file, facts, _)| old_signatures.get(file) != Some(&facts.api_signature))
-        .map(|(file, _, _)| *file)
+        .filter(|(file, facts, _, _)| old_signatures.get(file) != Some(&facts.api_signature))
+        .map(|(file, _, _, _)| *file)
         .collect();
+
+    // The semdiag fold memo's posture epoch (#1384): the per-library
+    // `class-modifiers` posture and the members' settled feature sets are
+    // the one fold input no per-library cycle fingerprint folds — an
+    // `// @dart` header is a comment, so it moves the settled feature face
+    // (and with it other libraries' posture answers) under a standing
+    // signature. Any changed file whose settled face moved — or whose
+    // previous settled face is no longer derivable (an evicted scanned
+    // entry, warm-started facts) — bumps the epoch once, forking every
+    // memo key conservatively. Pure comment/body/signature churn leaves
+    // the settled face standing and pays two cache probes.
+    let posture_moved = changed.iter().any(|(file, _, _)| {
+        let old_face = old_facts.get(file).and_then(|facts| {
+            state.cached_scanned(facts_key(&state.grants(), *file, facts.content))
+        });
+        let new_face = state.settled_face(*file);
+        match (old_face, new_face) {
+            (Some(old), Some(new)) => old.features.fingerprint() != new.features.fingerprint(),
+            _ => true,
+        }
+    });
+    if posture_moved {
+        state.semdiag_posture_epoch += 1;
+    }
 
     // Steps 4–5: library-graph delta, dirty seeds, importer closure. The
     // closure output *replaces* the phase-2 work queue
@@ -188,7 +245,7 @@ pub(crate) fn apply(
     // `state.invalidated ⊆ live()`; a union would resurrect ids retired by
     // an intervening remove, and analyze unwraps every queued id's info.
     //
-    // The closure is signature-gated (L2, PRD §11.3): seeds are the owners of
+    // The closure is signature-gated: seeds are the owners of
     // signature-changed files, and both live owners of every file whose
     // membership moved (a `part of` detach strands the losing library's
     // importers on stale facts; a claim transfer hands its part to a
@@ -197,11 +254,16 @@ pub(crate) fn apply(
     // any membership entry.
     let (invalidated, retired_any) =
         maintain_and_close(state, &changed, &removed, &old_facts, &sig_changed);
-    state.invalidated = invalidated.clone();
+    state.invalidated.clone_from(&invalidated);
     // The resolution graph rebuilds only when its inputs moved: a
     // signature-bearing face (element or directive), a removal, or a library
     // retirement. A body edit with a stable face leaves the graph byte-identical.
-    state.structure_dirty = retired_any || !removed.is_empty() || !sig_changed.is_empty();
+    // Accumulate, never overwrite (#1567): batches landing between two
+    // analyzes accumulate — a later body-only apply must not retire an
+    // earlier apply's move, or the gated analyze skips the condensation
+    // rebuild and the reuse gate serves fingerprints folded under pre-move
+    // faces. The analyze phase consumes and clears the flag once.
+    state.structure_dirty |= retired_any || !removed.is_empty() || !sig_changed.is_empty();
     on_event(EngineEvent::CascadeInvalidated {
         libraries: invalidated.clone(),
     });
@@ -220,12 +282,45 @@ pub(crate) fn apply(
             sink.cascade_invalidated(&libraries);
         }
     }
+    // The version-skew degrade telemetry (#1304): the grant lanes queue one
+    // record per never-reported unknown whitelist name; the drain emits
+    // them after the standard apply sequence — at most one event per
+    // unknown name per engine, never per file. A record derived outside an
+    // apply (none today; every grant lane runs under one) rides the next
+    // non-empty apply's drain.
+    for record in state.feature_grants.take_skew() {
+        if let Some(sink) = state.trace.as_mut() {
+            sink.experiment_degrade(&record.sdk_version, &record.unknown);
+        }
+        on_event(EngineEvent::ExperimentDegrade {
+            sdk_version: record.sdk_version,
+            unknown: record.unknown,
+            granted: KNOWN_ONLY_GRANT,
+        });
+    }
+    // The residency-pairing degrade telemetry (stability lane #1459): the
+    // derived passes queue one row per (file, face) pairing miss they
+    // salvaged over — the map serves the miss, the analyze never aborts.
+    // The drain emits each pair once per engine (the report set dedupes),
+    // trace-only so the event goldens stay byte-stable (the g485 D3
+    // posture).
+    for (file, face) in state.residency_degrades.take() {
+        if let Some(sink) = state.trace.as_mut()
+            && let Some(path) = state.files.path(file)
+        {
+            sink.residency_degrade(&path.to_string_lossy(), face);
+        }
+    }
     // Amortized store collection: this apply's replaced and removed
     // residency contents are the new dead candidates (gate hits carry none
     // — their put deduplicated); facts-cache evictions tallied themselves
     // during the recompute. Runs after the residency rewrite above, so the
     // replaced contents are already unreferenced if the sweep fires.
     state.collect_garbage(changed.len() + removed.len());
+    // The reachability memo's in-flight window (#1383): residency moved
+    // without the drain/recompute pass, so reads serve the standing map
+    // until the next analyze's gate clears it.
+    state.mark_reachability_applied();
     ApplyOutcome {
         changed: changed_files,
         removed,
@@ -234,8 +329,9 @@ pub(crate) fn apply(
 }
 
 /// Recomputes the facts of every gate-passing file: fan-out over the
-/// pure per-file work (language version → scan → directive diet walk → parse
-/// diagnostics → element collection), then a sequential URI-resolution pass
+/// pure per-file work (language version → scan → directive diet walk → one
+/// multiplexed parse feeding diagnostics, element collection, and index
+/// capture), then a sequential URI-resolution pass
 /// (it interns directive targets into the shared `FileTable`).
 ///
 /// A file whose `(content, feature fingerprint)` key already sits in the
@@ -248,15 +344,40 @@ pub(crate) fn apply(
 /// file, and its directives re-resolve against its own path — a relative
 /// `import 'u.dart'` resolves differently per directory, so the cache holds
 /// exactly the pure `(content, feature set)` face, pre-resolution.
-/// Changed files parse **twice** at M1 — once for recovery diagnostics
-/// through the engine's listener, once inside `dartq_semantic::collect`,
-/// which hardcodes its own listener. The waste is bounded to changed files
-/// and is on record as the reason #120/#121 should land a combined listener
-/// face.
+/// The cold-apply fan-out's in-flight bound: misses per compute→resolve
+/// chunk. One chunk's batch products — a facts face (~0.6–0.9 KB), a
+/// scanned face (~20 B/token × 60–120 tokens), and a capture (~0.8–1.6 KB)
+/// per miss — peak at ≈ 4,096 × ~5 KB ≈ 20 MB, where the unchunked fan-out
+/// held every miss's products for the whole apply (the scanned faces alone
+/// bracket ~120–240 MB at the 10⁵-file face). Only the in-flight bound
+/// moves: chunks consume `misses` consecutively, so the resolution pass,
+/// the cache-insertion sequence, and the LRU caps' eviction order are
+/// exactly the unchunked ones — the persisted face is byte-identical.
+const APPLY_FANOUT_CHUNK: usize = 4096;
+
+/// One recomputed file face: file id, parsed facts, whether the file's
+/// exports changed (the signature delta), and the index capture when queued.
+type RecomputedFacts = (
+    FileId,
+    Arc<UnitFacts>,
+    bool,
+    Option<Arc<dartq_index::FileCapture>>,
+);
+/// The per-file compute outcome without its file id (the batch slot face).
+type FactsFace = (Arc<UnitFacts>, bool, Option<Arc<dartq_index::FileCapture>>);
+
+/// Changed files parse **once** on the apply side: the multiplexer
+/// ([`MultiplexListener`]) fans that parse's events out to the recovery
+/// diagnostics, the element collector, and the index capturer. The
+/// analyze-side semdiag fold keeps its own parse (graph-dependent), so a
+/// changed file costs at most two parses per cycle; the capture rides the
+/// apply parse, and only recompute-derivated files (batch siblings,
+/// cross-batch hits, warm starts) queue for the analyze-phase recapture.
+#[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 fn recompute_facts(
     state: &mut EngineState,
-    changed: &[(FileId, ContentId, String)],
-) -> Vec<(FileId, Arc<UnitFacts>, bool)> {
+    changed: &[(FileId, ContentId, SourceText)],
+) -> Vec<RecomputedFacts> {
     // Language version per file: the owning package's version (the engine's
     // single source of truth for file → package attribution).
     let versions: Vec<LanguageVersion> = changed
@@ -267,7 +388,7 @@ fn recompute_facts(
     // Cache lookups up front (read-only); misses dispatch to the fan-out
     // below, deduplicated by key so a batch computes each distinct
     // `(content, feature set)` once.
-    let mut slots: Vec<Option<(Arc<UnitFacts>, bool)>> = Vec::with_capacity(changed.len());
+    let mut slots: Vec<Option<FactsFace>> = Vec::with_capacity(changed.len());
     slots.resize_with(changed.len(), || None);
     let mut misses: Vec<(usize, FactsKey)> = Vec::new();
     // FactsKey → batch slot of the first miss carrying it.
@@ -304,20 +425,6 @@ fn recompute_facts(
     // the pure fan-out: no shared mutable state but the StringTable's
     // interning lock.
     let sources: Vec<&str> = changed.iter().map(|(_, _, text)| text.as_str()).collect();
-    let computed: Vec<(usize, FactsKey, UnitFacts, ScannedFace)> = misses
-        .par_iter()
-        .map(|(index, key)| {
-            let (facts, face) = compute_unit(
-                changed[*index].0,
-                changed[*index].1,
-                sources[*index],
-                versions[*index],
-                &state.strings,
-                &state.grants(),
-            );
-            (*index, *key, facts, face)
-        })
-        .collect();
 
     // Warm-start materialization (#482): each matched payload comes off the
     // staging map — the keyed removal is the content-hash verification —
@@ -325,8 +432,11 @@ fn recompute_facts(
     // same-content batch (one payload, several consumers) removes it once;
     // the extras clone the payload (identical bytes at two paths, rare and
     // bounded by the batch). Grow-only: ingestion seeds recomputes, it
-    // never touches residency (#377).
-    let mut warmed: Vec<(usize, UnitFacts)> = Vec::with_capacity(warm.len());
+    // never touches residency (#377). The block runs before any resolution:
+    // materialization interns the payload paths into the file table, and
+    // that intern order — materialize first, resolve second — is what pins
+    // the persisted file-id assignment.
+    let mut warmed: Vec<(usize, FactsKey, UnitFacts)> = Vec::with_capacity(warm.len());
     if !warm.is_empty() {
         // One registry per load: materialize runs per entry, and a
         // per-entry `CodeRegistry::builtin()` would rebuild the ~270-entry
@@ -350,25 +460,38 @@ fn recompute_facts(
             };
             warmed.push((
                 first,
-                materialize_warm(first_payload, state, sources[first], &codes),
+                key,
+                materialize_warm(
+                    first_payload,
+                    state,
+                    sources[first],
+                    changed[first].1,
+                    &codes,
+                ),
             ));
             if let Some(template) = rest {
                 for index in slots {
                     warmed.push((
                         index,
-                        materialize_warm(template.clone(), state, sources[index], &codes),
+                        key,
+                        materialize_warm(
+                            template.clone(),
+                            state,
+                            sources[index],
+                            changed[index].1,
+                            &codes,
+                        ),
                     ));
                 }
             }
         }
     }
-    // The staging map is single-shot, and this — after the last read in the
-    // pass — is its drain: whatever no changed file claimed, including the
-    // entire staged set when this batch matched no snapshot file, was stale
-    // against this batch and drops here unconditionally. Stale entries never
-    // survive an apply (the contract on `EngineState::warm_start`), so the
-    // payloads never pin residency past the pass; the next ingest re-seeds.
-    state.warm_start.clear();
+    // Unclaimed staging entries stand (#1387): the lookup key IS the
+    // content hash, so a stale entry can never serve a file whose content
+    // moved — it waits for a later batch whose content reverts to the staged
+    // identity (an undo is exactly that hit), and leaves only when claimed
+    // above, shed by the budget's tier-3, or replaced by the next ingest.
+    // The old single-shot drain dropped precisely these revert hits.
 
     // Sequential URI resolution over the shared FileTable: each template
     // resolves for its own file, then each sibling derives from the
@@ -379,95 +502,162 @@ fn recompute_facts(
     // after this pass; removals left it at the drain). Field borrows stay
     // disjoint: the closure reads residency, the resolver writes files.
     let batch: FxHashSet<FileId> = changed.iter().map(|(file, _, _)| *file).collect();
-    let resident = |id: FileId| state.residency.contains_key(&id) || batch.contains(&id);
-    let mut resolver = UriResolver::new(
-        &state.uri_packages,
-        &state.sdk,
-        &state.target,
-        &state.declared_variables,
-        &mut state.files,
-        &resident,
-    );
-    let mut to_cache: Vec<(FactsKey, Arc<UnitFacts>)> = Vec::with_capacity(computed.len());
-    // Scanned faces wait for the resolver's `&mut FileTable` borrow to end
-    // (same deferred-insert discipline as `to_cache`).
-    let mut scanned_to_cache: Vec<(FactsKey, ScannedFace)> = Vec::with_capacity(computed.len());
-    for (index, key, mut facts, face) in computed {
-        // The scan face persists under the same key (batch siblings and
-        // cross-batch hits share it): the semdiag fold and the index
-        // captures parse through these tokens instead of re-scanning every
-        // member of every dirty library (the audit's per-analyze
-        // re-scan multiplication).
-        scanned_to_cache.push((key, face));
-        // The cache holds the pure face, pre-resolution: resolution is a
-        // per-file step, so caching its results would serve one file's
-        // targets (and URI diagnostics) to every same-content successor.
-        to_cache.push((key, Arc::new(UnitFacts::clone(&facts))));
-        for sibling in siblings.remove(&index).unwrap_or_default() {
-            let derived = derive_facts(
-                &facts,
-                changed[sibling].0,
-                &mut resolver,
+
+    // The fan-out runs in bounded chunks of [`APPLY_FANOUT_CHUNK`] misses:
+    // each chunk computes in parallel, resolves, and flushes the deferred
+    // cache vectors before the next chunk computes. The batch products —
+    // one facts face, one scanned face, and one capture per miss — live for
+    // a single chunk instead of the whole apply (the cold-apply transient
+    // shrinks by the chunking factor), while everything observable stays in
+    // the unchunked order: chunks consume `misses` consecutively, so the
+    // resolution pass, the cache-insertion sequence, and the LRU caps'
+    // eviction order are exactly the unchunked ones. The resolver is
+    // per-chunk because its memos freeze the analyzed world (`residency` +
+    // `batch`, both unchanged across chunks) — a fresh instance answers
+    // identically and only re-pays the memo warm-up — and dropping it
+    // releases the `&mut FileTable` borrow the cache flush needs.
+    for chunk in misses.chunks(APPLY_FANOUT_CHUNK) {
+        let computed: Vec<(
+            usize,
+            FactsKey,
+            UnitFacts,
+            ScannedFace,
+            dartq_index::FileCapture,
+        )> = chunk
+            .par_iter()
+            .map(|(index, key)| {
+                let (facts, capture, face) = compute_unit(
+                    changed[*index].0,
+                    changed[*index].1,
+                    sources[*index],
+                    versions[*index],
+                    &state.strings,
+                    &state.grants(),
+                );
+                (*index, *key, facts, face, capture)
+            })
+            .collect();
+        let mut to_cache: Vec<(FactsKey, Arc<UnitFacts>)> = Vec::with_capacity(computed.len());
+        // Scanned faces wait for the resolver's `&mut FileTable` borrow to
+        // end (same deferred-insert discipline as `to_cache`).
+        let mut scanned_to_cache: Vec<(FactsKey, ScannedFace)> = Vec::with_capacity(computed.len());
+        {
+            let resident = |id: FileId| state.residency.contains_key(&id) || batch.contains(&id);
+            let mut resolver = UriResolver::new(
+                &state.uri_packages,
+                &state.sdk,
                 &state.declared_variables,
+                &mut state.files,
+                &resident,
             );
-            slots[sibling] = Some((Arc::new(derived), true));
+            for (index, key, mut facts, face, capture) in computed {
+                // The scan face persists under the same key (batch siblings
+                // and cross-batch hits share it): the semdiag fold and the
+                // index captures parse through these tokens instead of
+                // re-scanning every member of every dirty library (the
+                // audit's per-analyze re-scan multiplication).
+                scanned_to_cache.push((key, face));
+                // The cache holds the pure face, pre-resolution: resolution
+                // is a per-file step, so caching its results would serve one
+                // file's targets (and URI diagnostics) to every
+                // same-content successor.
+                to_cache.push((key, Arc::new(UnitFacts::clone(&facts))));
+                for sibling in siblings.remove(&index).unwrap_or_default() {
+                    let derived = derive_facts(
+                        &facts,
+                        changed[sibling].0,
+                        &mut resolver,
+                        &state.declared_variables,
+                    );
+                    slots[sibling] = Some((Arc::new(derived), true, None));
+                }
+                resolve_unit(
+                    &mut facts,
+                    changed[index].0,
+                    &mut resolver,
+                    &state.declared_variables,
+                );
+                slots[index] = Some((Arc::new(facts), false, Some(Arc::new(capture))));
+            }
         }
-        resolve_unit(
-            &mut facts,
-            changed[index].0,
-            &mut resolver,
-            &state.declared_variables,
-        );
-        slots[index] = Some((Arc::new(facts), false));
+        for (key, face) in scanned_to_cache {
+            state.cache_scanned(key, face);
+        }
+        for (key, facts) in to_cache {
+            state.cache_facts(key, facts);
+        }
     }
     // Cross-batch hits (#303): the served face was computed for another
     // file's identity — its diagnostics point there and its directives
     // resolved against that file's path. Re-run the per-file derivation
     // (same helper as the batch siblings) so the hit lands fully
-    // re-attributed: the AstKey triple is path-free by contract (PRD §5.3),
+    // re-attributed: the AstKey triple is path-free by contract,
     // making this a hit-site duty.
-    for (index, facts) in hits {
-        let derived = derive_facts(
-            &facts,
-            changed[index].0,
-            &mut resolver,
+    // The warm-start re-derivation (#482) rides the same resolver: the
+    // materialized face attributes and resolves against the snapshot's
+    // *saved* file; every baked diagnostic belongs to the unit, so
+    // re-attributing all of them to the consuming file is exact, and the
+    // URI diagnostic tail rebuilds one-for-one with the re-resolved coded
+    // directives (resolve_unit's construction invariant: exactly one pushed
+    // diagnostic per coded directive, after every other diagnostic) — a
+    // same-content file at another path re-resolves against its own
+    // directory.
+    let mut warm_to_cache: Vec<(FactsKey, Arc<UnitFacts>)> = Vec::with_capacity(warmed.len());
+    {
+        let resident = |id: FileId| state.residency.contains_key(&id) || batch.contains(&id);
+        let mut resolver = UriResolver::new(
+            &state.uri_packages,
+            &state.sdk,
             &state.declared_variables,
+            &mut state.files,
+            &resident,
         );
-        slots[index] = Some((Arc::new(derived), true));
-    }
-    // Warm-start re-derivation (#482): the materialized face attributes and
-    // resolves against the snapshot's *saved* file; every baked diagnostic
-    // belongs to the unit, so re-attributing all of them to the consuming
-    // file is exact, and the URI diagnostic tail rebuilds one-for-one with
-    // the re-resolved coded directives (resolve_unit's construction
-    // invariant: exactly one pushed diagnostic per coded directive, after
-    // every other diagnostic) — a same-content file at another path
-    // re-resolves against its own directory.
-    for (index, mut facts) in warmed {
-        for diagnostic in &mut facts.diagnostics {
-            diagnostic.file = changed[index].0;
+        for (index, facts) in hits {
+            let derived = derive_facts(
+                &facts,
+                changed[index].0,
+                &mut resolver,
+                &state.declared_variables,
+            );
+            slots[index] = Some((Arc::new(derived), true, None));
         }
-        let uri_tail = facts
-            .directives
-            .iter()
-            .filter(|directive| directive.code.is_some())
-            .count();
-        facts
-            .diagnostics
-            .truncate(facts.diagnostics.len() - uri_tail);
-        resolve_unit(
-            &mut facts,
-            changed[index].0,
-            &mut resolver,
-            &state.declared_variables,
-        );
-        slots[index] = Some((Arc::new(facts), true));
+        for (index, key, mut facts) in warmed {
+            // Re-attribution re-clones only rows pointing elsewhere (the S4
+            // dedup: shared rows are immutable); a same-path materialization
+            // keeps every handle.
+            let file = changed[index].0;
+            for diagnostic in &mut facts.diagnostics {
+                if diagnostic.file != file {
+                    let mut row = (**diagnostic).clone();
+                    row.file = file;
+                    *diagnostic = Arc::new(row);
+                }
+            }
+            let uri_tail = facts
+                .directives
+                .iter()
+                .filter(|directive| directive.code.is_some())
+                .count();
+            facts
+                .diagnostics
+                .truncate(facts.diagnostics.len() - uri_tail);
+            // The materialized face is pure and pre-resolution — cache it
+            // like a computed face (cross-profile source-stats sharing,
+            // #1298 T2): the line index and identity it carries cost one
+            // build per content per session, and a later batch with the
+            // same content takes the facts-cache hit instead of
+            // re-materializing.
+            warm_to_cache.push((key, Arc::new(UnitFacts::clone(&facts))));
+            resolve_unit(
+                &mut facts,
+                changed[index].0,
+                &mut resolver,
+                &state.declared_variables,
+            );
+            slots[index] = Some((Arc::new(facts), true, None));
+        }
     }
-    drop(resolver);
-    for (key, face) in scanned_to_cache {
-        state.cache_scanned(key, face);
-    }
-    for (key, facts) in to_cache {
+    for (key, facts) in warm_to_cache {
         state.cache_facts(key, facts);
     }
 
@@ -475,8 +665,8 @@ fn recompute_facts(
         .iter()
         .zip(slots)
         .map(|((file, _, _), slot)| {
-            let (facts, cache_hit) = slot.expect("every changed file ends with facts");
-            (*file, facts, cache_hit)
+            let (facts, cache_hit, capture) = slot.expect("every changed file ends with facts");
+            (*file, facts, cache_hit, capture)
         })
         .collect()
 }
@@ -495,16 +685,19 @@ fn snapshot_key(key: FactsKey) -> EntryKey {
 /// Materializes one warm-start payload against the live tables (#482):
 /// re-interns the string slice into the engine's table, mints file ids
 /// through the engine's own file table, and rebuilds the line index from
-/// the batch source. The post-resolution directive targets and attributed
-/// diagnostics re-derive per consumer under the shared resolver (the
-/// re-derivation pass in [`recompute_facts`]).
+/// the batch source. `content` is the batch's own content id — the same
+/// bytes' hash the apply gate already computed, so the snapshot path never
+/// re-hashes the source. The post-resolution directive targets and
+/// attributed diagnostics re-derive per consumer under the shared resolver
+/// (the re-derivation pass in [`recompute_facts`]).
 fn materialize_warm(
     payload: crate::state::persist::PersistedFacts,
     state: &mut EngineState,
     source: &str,
+    content: ContentId,
     codes: &CodeRegistry,
 ) -> UnitFacts {
-    payload.materialize(source, &state.strings, codes, &mut |path| {
+    payload.materialize(source, content, &state.strings, codes, &mut |path| {
         state.files.intern(path)
     })
 }
@@ -521,16 +714,24 @@ fn derive_facts(
     resolver: &mut UriResolver<'_>,
     declared: &FxHashMap<String, String>,
 ) -> UnitFacts {
+    // The template clone is now a handle copy per row (the S4 dedup);
+    // re-attribution re-clones only the rows pointing at another file —
+    // the same byte traffic the former full deep clone paid, and nothing
+    // more when the hit lands at its own path.
     let mut derived = UnitFacts::clone(template);
     for diagnostic in &mut derived.diagnostics {
-        diagnostic.file = file;
+        if diagnostic.file != file {
+            let mut row = (**diagnostic).clone();
+            row.file = file;
+            *diagnostic = Arc::new(row);
+        }
     }
     resolve_unit(&mut derived, file, resolver, declared);
     derived
 }
 
 /// The file's language version: the owning package's version, or the
-/// default when the file belongs to no package (engine-api-spec §1.1) — the
+/// default when the file belongs to no package — the
 /// engine's single source of truth for file → package attribution, shared by
 /// the apply recompute and the semantic-seam fold.
 pub(crate) fn language_version_for(
@@ -542,8 +743,10 @@ pub(crate) fn language_version_for(
         .path(file)
         .and_then(|path| packages.containing(path))
         .and_then(|identity| identity.language_version)
-        .map(dartq_pub::LanguageVersion::into_inner)
-        .unwrap_or(DEFAULT_LANGUAGE_VERSION)
+        .map_or(
+            DEFAULT_LANGUAGE_VERSION,
+            dartq_pub::LanguageVersion::into_inner,
+        )
 }
 
 /// The borrowed per-file grant faces: everything the feature-set merge
@@ -551,7 +754,7 @@ pub(crate) fn language_version_for(
 /// four disjoint state fields ([`EngineState::grants`] builds it).
 pub(crate) struct Grants<'a> {
     /// The memoized grant tables and SDK-library reverse map.
-    pub grants: &'a FeatureGrants,
+    pub tables: &'a FeatureGrants,
     /// The SDK's parsed `allowed_experiments.json`.
     pub experiments: &'a AllowedExperiments,
     /// File → owning package attribution.
@@ -566,13 +769,13 @@ impl Grants<'_> {
     /// #708 P2-1). A no-grant engine returns the baseline unchanged, so the
     /// empty-whitelist corpora stay byte-identical to the pre-grant face.
     pub(crate) fn granted(&self, file: FileId, version: LanguageVersion) -> FeatureSet {
-        self.grants
+        self.tables
             .granted(self.experiments, self.packages, self.files, file, version)
     }
 }
 
 /// The facts/scanned cache key of a resident file: the `AstKey` triple
-/// (PRD §5.3) derived from the file's content and its granted feature
+/// derived from the file's content and its granted feature
 /// fingerprint. The single derivation both the apply recompute and
 /// the drained consumers share, so a cache entry is always found under the
 /// key it was stored under.
@@ -585,11 +788,15 @@ pub(crate) fn facts_key(grants: &Grants<'_>, file: FileId, content: ContentId) -
     }
 }
 
-/// The pure per-file pipeline: the shared scan face ([`scan_unit`]), then
-/// directive diet walk, parse diagnostics, element collection. Returns the
-/// facts plus the scan face (tokens + settled feature set) — the face
-/// persists in the scanned cache so the analyze-phase consumers parse these
-/// tokens instead of re-scanning the file.
+/// The pure per-file pipeline: the shared scan face ([`scan_unit`]) — its
+/// lexical diagnostics ride into the facts — then
+/// ONE multiplexed parse — parse-recovery diagnostics, element collection,
+/// and index capture consume the same event stream (the parse-once
+/// fan-out; the analyze-side semdiag fold keeps its own graph-dependent
+/// parse) — then the directive diet walk. Returns the facts plus the
+/// file's capture and the scan face (tokens + settled feature set) — the
+/// face persists in the scanned cache so the analyze-phase consumers parse
+/// these tokens instead of re-scanning the file.
 fn compute_unit(
     file: FileId,
     content: ContentId,
@@ -597,20 +804,55 @@ fn compute_unit(
     version: LanguageVersion,
     strings: &StringTable,
     grants: &Grants<'_>,
-) -> (UnitFacts, ScannedFace) {
+) -> (UnitFacts, dartq_index::FileCapture, ScannedFace) {
     let (feature_set, settled_version, scanned, mut diagnostics) =
         scan_unit(text, version, file, grants);
-    diagnostics.extend(parse_diagnostics(file, text, &scanned.tokens, feature_set));
-    // The single allocation of the element model: every later consumer
-    // (duplicate bake, api signature, facts clones, the semdiag fold)
-    // shares this `Arc` (#308).
-    let elements = Arc::new(dartq_semantic::collect(
+    // The scan face's lexical rows ride into the facts (the CLI check face
+    // extends them the same way). Unmatched begin groups are NOT scanner
+    // rows: the scanner records the `(begin, synthetic close)` pairs on the
+    // token table and the parse below reports them at their post-parse
+    // positions (the official `UnmatchedToken` translation reads
+    // `begin.endGroup.charOffset` after the parse), so they arrive in the
+    // parse-phase segment. Extended before the parse so the vec keeps
+    // pipeline-phase order — scan, parse-recovery (unmatched groups
+    // included), duplicate — leaving resolve_unit's URI rows the tail the
+    // warm-start rebuild slices. No dedup and no filtering: the output face
+    // sorts canonically, and row identity is oracle-adjudicated (the
+    // unmatched pass dedupes only identical rows among itself, the official
+    // downstream behavior).
+    diagnostics.extend(scanned.diagnostics);
+    // The parse-once fan-out: recovery diagnostics, the element model, and
+    // the index capture each observe the single parse's events, in the
+    // order they would in a solo parse. Parsing is the dominant per-file
+    // cost after scanning, so three full passes over the same tokens
+    // collapse to one.
+    let mut diag = DiagCollector::new(file);
+    let mut decl = dartq_semantic::DeclarationCollector::new(text, &scanned.tokens, strings);
+    let mut capture = dartq_index::Capturer::new(file, text, &scanned.tokens, strings);
+    Parser::new(
         text,
         &scanned.tokens,
         ParserFeatures::from_feature_set(feature_set),
+        // Real three-consumer fan-out (recovery diagnostics, element model,
+        // index capture over one parse): the nested mux stays, borrowed.
+        &mut MultiplexListener::new(
+            &mut diag,
+            &mut MultiplexListener::new(&mut decl, &mut capture),
+        ),
+    )
+    .parse_unit();
+    diagnostics.extend(diag.finish());
+    // The single allocation of the element model: every later consumer
+    // (duplicate bake, api signature, facts clones, the semdiag fold)
+    // shares this `Arc` (#308).
+    let elements = Arc::new(decl.finish());
+    let capture = capture.finish();
+    diagnostics.extend(duplicate_diagnostics(
+        file,
+        &elements,
         strings,
+        &capture.index,
     ));
-    diagnostics.extend(duplicate_diagnostics(file, &elements, strings));
     let (directives, directive_region) = extract_directives(text, &scanned.tokens, strings);
     let face = directive_face(text, &scanned.tokens, directive_region);
 
@@ -619,7 +861,10 @@ fn compute_unit(
         api_signature: unit_signature(&elements, &face, strings),
         directives,
         elements,
-        diagnostics,
+        // The rows move into their refcounted store form once here (the
+        // S4 dedup, #1501): every later consumer — the per-library
+        // results, the facts-cache clones — holds handles, never copies.
+        diagnostics: diagnostics.into_iter().map(Arc::new).collect(),
         line_index: scanned.line_index,
     };
     let scanned_face = ScannedFace {
@@ -627,10 +872,10 @@ fn compute_unit(
         features: feature_set,
         version: settled_version,
     };
-    (facts, scanned_face)
+    (facts, capture, scanned_face)
 }
 
-/// The file's API signature (PRD §11.3, #282): the canonical element-face
+/// The file's API signature: the canonical element-face
 /// hash folded with the directive-region lexemes, one blake3 pass over both
 /// faces. Computed once per changed file inside the parallel recompute and
 /// cached on the facts — never a per-query cost.
@@ -689,7 +934,7 @@ fn directive_face(text: &str, tokens: &TokenTable, region_end: usize) -> Vec<u8>
 ///
 /// An override above the latest known version is officially rejected, not
 /// clamped (official scanner `_languageVersionChanged`): the
-/// `invalid_language_version_override` STATIC_WARNING pins at the comment
+/// `invalid_language_version_override` `STATIC_WARNING` pins at the comment
 /// lexeme and the override is dropped (`_overrideVersion = null`) — the
 /// feature set stays the granted package/default-derived one and no rescan
 /// runs. The warning rides back for the diagnostics face to bake; the
@@ -726,10 +971,34 @@ pub(crate) fn scan_unit(
                 span,
                 None,
             ));
-        } else if over != version {
-            settled = over;
-            feature_set = grants.granted(file, over);
-            scanned = scan(text, scan_config(feature_set), file);
+        } else {
+            // The floor is a verifier check, not a scanner drop
+            // (`error_verifier.dart:5787-5809`): the override stays
+            // effective — the settled version and the feature grants move
+            // to it exactly like the in-range case — and the ERROR rides
+            // beside it.
+            if over.is_below_floor() {
+                let code = dartq_diagnostics::ILLEGAL_LANGUAGE_VERSION_OVERRIDE;
+                let span = scanned
+                    .language_version_override_span
+                    .expect("scanner records the comment span with every override");
+                warnings.push(Diagnostic::new(
+                    code.dtype.severity(),
+                    code,
+                    format!("The language version must be {MIN_LANGUAGE_VERSION_CONSTRAINT}."),
+                    file,
+                    span,
+                    Some(
+                        "Try removing the language version override and migrating the code."
+                            .to_owned(),
+                    ),
+                ));
+            }
+            if over != version {
+                settled = over;
+                feature_set = grants.granted(file, over);
+                scanned = scan(text, scan_config(feature_set), file);
+            }
         }
     }
     (feature_set, settled, scanned, warnings)
@@ -795,9 +1064,12 @@ fn resolve_unit(
     for directive in &facts.directives {
         if let Some(code) = directive.code {
             let (uri, span) = selected_uri(directive, declared);
-            facts
-                .diagnostics
-                .push(uri_diagnostic(code, uri.unwrap_or_default(), span, file));
+            facts.diagnostics.push(Arc::new(uri_diagnostic(
+                code,
+                uri.unwrap_or_default(),
+                span,
+                file,
+            )));
         }
     }
 }
@@ -927,33 +1199,6 @@ pub(crate) fn duplicate_diagnostic(
     )
 }
 
-/// Parse-recovery diagnostics through the engine's listener (pass 1 of 2;
-/// see `recompute_facts` for the two-pass note). The listener moves into the
-/// parser (the trait is not object-safe over `&mut` here), so diagnostics
-/// flow through a shared `Rc<RefCell>` — the same pattern
-/// `dartq_semantic::collect` uses.
-fn parse_diagnostics(
-    file: FileId,
-    text: &str,
-    tokens: &TokenTable,
-    feature_set: FeatureSet,
-) -> Vec<Diagnostic> {
-    let diags = Rc::new(RefCell::new(Vec::new()));
-    Parser::new(
-        text,
-        tokens,
-        ParserFeatures::from_feature_set(feature_set),
-        DiagCollector {
-            file,
-            diags: Rc::clone(&diags),
-        },
-    )
-    .parse_unit();
-    Rc::try_unwrap(diags)
-        .expect("parser released its listener")
-        .into_inner()
-}
-
 /// Collects parse events into engine diagnostics. `handle_recoverable_error`
 /// rides the parser's registry messages; `handle_experiment_not_enabled`
 /// renders its bare feature flag through the parser's
@@ -964,12 +1209,26 @@ fn parse_diagnostics(
 /// report's begin token).
 struct DiagCollector {
     file: FileId,
-    diags: Rc<RefCell<Vec<Diagnostic>>>,
+    diags: Vec<Diagnostic>,
+}
+
+impl DiagCollector {
+    fn new(file: FileId) -> Self {
+        Self {
+            file,
+            diags: Vec::new(),
+        }
+    }
+
+    /// The parse-recovery diagnostics, in arrival order.
+    fn finish(self) -> Vec<Diagnostic> {
+        self.diags
+    }
 }
 
 impl ParserListener for DiagCollector {
     fn handle_recoverable_error(&mut self, message: Message, start: TokenSpan, _end: TokenSpan) {
-        self.diags.borrow_mut().push(Diagnostic::new(
+        self.diags.push(Diagnostic::new(
             Severity::Error,
             message.code,
             message.text,
@@ -986,7 +1245,7 @@ impl ParserListener for DiagCollector {
         _end: TokenSpan,
     ) {
         let message = dartq_parser::experiment_not_enabled_message(flag);
-        self.diags.borrow_mut().push(Diagnostic::new(
+        self.diags.push(Diagnostic::new(
             Severity::Error,
             message.code,
             message.text,
@@ -1000,32 +1259,58 @@ impl ParserListener for DiagCollector {
 /// Folds the collector's capture-time duplicate log into the unit's baked
 /// diagnostics as the frozen `duplicate_definition` row: ERROR at the second
 /// declaration's name token, setters named by their bare identifier (the
-/// same construction `dartq_semantic::diagnose` uses — one source of truth
-/// is the log, both faces render it identically). The log is a pure function
-/// of the unit's content and feature set, so it bakes beside the syntax
-/// diagnostics; a wired `SemanticDiagnoser` that runs `diagnose` must not
-/// re-fold the same entries (its adapter owes the dedup to this face).
+/// same construction `dartq_semantic::diagnose` renders — the shared
+/// [`dartq_semantic::duplicate_definition_diagnostics`] is the single row
+/// shape, this bake is the single source the semdiag fold defers to). The
+/// log is a pure function of the unit's content and feature set, so it
+/// bakes beside the syntax diagnostics; a wired `SemanticDiagnoser` that
+/// runs `diagnose` must not re-fold the same entries (its adapter owes the
+/// dedup to this face). The first-declaration context row resolves from
+/// the capture's declaration rows ([`capture_first_decl`]); a
+/// non-declaration face (named formals) degrades to the plain row.
 fn duplicate_diagnostics(
     file: FileId,
     elements: &dartq_semantic::FileElements,
     strings: &StringTable,
+    capture: &dartq_index::FileIndex,
 ) -> Vec<Diagnostic> {
-    elements
-        .duplicates()
+    dartq_semantic::duplicate_definition_diagnostics(file, elements, strings, |name, duplicate| {
+        capture_first_decl(capture, name, duplicate)
+    })
+}
+
+/// The capture-grade first-declaration lookup for the duplicate log: the
+/// equal-name run carries every declaration's own name-token span with its
+/// container anchor, so the duplicate's row pins the scope and the run's
+/// earliest same-scope row is the kept declaration. Named formals have no
+/// rows (`capture.rs` — the formals table is #119's) and a top-level
+/// function's type-parameter list carries no container anchor, so those
+/// faces degrade to the plain row rather than a foreign anchor.
+fn capture_first_decl(
+    index: &dartq_index::FileIndex,
+    name: StringId,
+    duplicate: SourceRange,
+) -> Option<SourceRange> {
+    let rows = index.by_name(name)?;
+    let dup_row = rows
         .iter()
-        .map(|duplicate| {
-            let text = strings.resolve(duplicate.name);
-            let display = text.strip_suffix('=').unwrap_or(text);
-            Diagnostic::new(
-                dartq_semantic::codes::SemanticCode::DuplicateDefinition.severity(),
-                dartq_semantic::codes::SemanticCode::DuplicateDefinition.code_info(),
-                dartq_semantic::codes::SemanticCode::DuplicateDefinition.message(display, ""),
-                file,
-                duplicate.range,
-                None,
-            )
-        })
-        .collect()
+        .find(|row| row.range.offset == duplicate.offset && row.range.length == duplicate.length)?;
+    if dup_row.kind == dartq_index::DeclKind::TypeParam
+        && dup_row.container == dartq_index::DeclRow::NONE
+    {
+        return None;
+    }
+    let same_scope = |row: &dartq_index::DeclRow| {
+        row.container == dup_row.container
+            && row.unnamed_extension_member == dup_row.unnamed_extension_member
+            && (dup_row.kind != dartq_index::DeclKind::TypeParam
+                || row.kind == dartq_index::DeclKind::TypeParam)
+    };
+    // The run is `(name, offset)`-ascending: the first same-scope row is
+    // the kept declaration, which every later duplicate anchors at.
+    rows.iter()
+        .find(|row| row.range.offset < duplicate.offset && same_scope(row))
+        .map(|row| row.range)
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,10 +1336,8 @@ fn extract_directives(
 ) -> (Vec<DirectiveFacts>, usize) {
     let mut directives = Vec::new();
     let mut i = 0;
-    loop {
-        let Some(token) = tokens.get(i) else { break };
+    while let Some(token) = tokens.get(i) {
         match token.kind {
-            TokenKind::Eof => break,
             TokenKind::Semicolon | TokenKind::ScriptTag => i += 1,
             TokenKind::At => i = skip_annotation(tokens, i + 1),
             TokenKind::Keyword(Keyword::Library) => {
@@ -1089,7 +1372,82 @@ fn extract_directives(
     (directives, i)
 }
 
-/// The token kind at `i`, if any.
+/// Reads the URI literal starting at `i`. Adjacent string literals
+/// concatenate into one URI (`import 'li' 'b/a.dart';` resolves `lib/a.dart`).
+/// The oracle's assembly is the directive uri's `StringLiteral.stringValue`
+/// (`file_state.dart:1017,1147`): `AdjacentStringsImpl._appendStringValue`
+/// concatenates the per-segment values, each segment decoding its own
+/// raw/cooked body (ast.dart:195-200), and any interpolation segment makes
+/// the whole literal shapeless (`StringInterpolationImpl._appendStringValue`
+/// throws → `null`, ast.dart:51023). Returns the uri text, its UTF-16 span
+/// (the whole adjacent region; zero when shapeless), and the index just past
+/// the literal region.
+fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<Box<str>>, SourceRange, usize) {
+    let interpolated = |kind: Option<TokenKind>| {
+        matches!(
+            kind,
+            Some(
+                TokenKind::StringInterpolationExpression | TokenKind::StringInterpolationIdentifier
+            )
+        )
+    };
+    if kind_at(tokens, i) != Some(TokenKind::String) {
+        return (
+            None,
+            SourceRange {
+                offset: 0,
+                length: 0,
+            },
+            i,
+        );
+    }
+    // Concatenate the run of adjacent plain `String` segments. An
+    // undecodable segment (malformed escape) leaves the region shapeless —
+    // under-report, never a false positive.
+    let mut j = i;
+    let mut value = String::new();
+    let mut decodable = true;
+    let span_offset = tokens.get(i).expect("kind_at checked").utf16_offset;
+    // Always overwritten by the first iteration (segment `i` is a `String`).
+    let mut span_end = span_offset;
+    while let Some(TokenKind::String) = kind_at(tokens, j) {
+        let lexeme = tokens.lexeme(text, j);
+        let token = tokens.get(j).expect("kind_at checked");
+        span_end = token.utf16_offset + utf16_len_of(lexeme);
+        match string_literal_value(lexeme) {
+            Some(segment) => value.push_str(&segment),
+            None => decodable = false,
+        }
+        j += 1;
+    }
+    if interpolated(kind_at(tokens, j)) {
+        // Skip the whole segment chain: `String` pieces and `${ … }` groups
+        // (group-aware, so a `;` inside the interpolation cannot mislead).
+        loop {
+            match kind_at(tokens, j) {
+                Some(TokenKind::String | TokenKind::StringInterpolationIdentifier) => j += 1,
+                Some(TokenKind::StringInterpolationExpression) => {
+                    j = tokens.matching_end(j).map_or(j + 1, |end| end + 1);
+                }
+                _ => break,
+            }
+        }
+        return (
+            None,
+            SourceRange {
+                offset: 0,
+                length: 0,
+            },
+            j,
+        );
+    }
+    let span = SourceRange {
+        offset: span_offset,
+        length: span_end - span_offset,
+    };
+    (decodable.then(|| value.into_boxed_str()), span, j)
+}
+
 fn kind_at(tokens: &TokenTable, i: usize) -> Option<TokenKind> {
     tokens.get(i).map(|token| token.kind)
 }
@@ -1166,87 +1524,6 @@ fn walk_library(
     end
 }
 
-/// Reads the URI literal starting at `i`. Adjacent string literals
-/// concatenate into one URI (`import 'li' 'b/a.dart';` resolves `lib/a.dart`).
-/// The oracle's assembly is the directive uri's `StringLiteral.stringValue`
-/// (file_state.dart:1017,1147): `AdjacentStringsImpl._appendStringValue`
-/// concatenates the per-segment values, each segment decoding its own
-/// raw/cooked body (ast.dart:195-200), and any interpolation segment makes
-/// the whole literal shapeless (`StringInterpolationImpl._appendStringValue`
-/// throws → `null`, ast.dart:51023). Returns the uri text, its UTF-16 span
-/// (the whole adjacent region; zero when shapeless), and the index just past
-/// the literal region.
-fn read_uri(text: &str, tokens: &TokenTable, i: usize) -> (Option<Box<str>>, SourceRange, usize) {
-    let interpolated = |kind: Option<TokenKind>| {
-        matches!(
-            kind,
-            Some(
-                TokenKind::StringInterpolationExpression | TokenKind::StringInterpolationIdentifier
-            )
-        )
-    };
-    if kind_at(tokens, i) != Some(TokenKind::String) {
-        return (
-            None,
-            SourceRange {
-                offset: 0,
-                length: 0,
-            },
-            i,
-        );
-    }
-    // Concatenate the run of adjacent plain `String` segments. An
-    // undecodable segment (malformed escape) leaves the region shapeless —
-    // under-report, never a false positive.
-    let mut j = i;
-    let mut value = String::new();
-    let mut decodable = true;
-    let span_offset = tokens.get(i).expect("kind_at checked").utf16_offset;
-    // Always overwritten by the first iteration (segment `i` is a `String`).
-    let mut span_end = span_offset;
-    loop {
-        match kind_at(tokens, j) {
-            Some(TokenKind::String) => {
-                let lexeme = tokens.lexeme(text, j);
-                let token = tokens.get(j).expect("kind_at checked");
-                span_end = token.utf16_offset + utf16_len_of(lexeme);
-                match string_literal_value(lexeme) {
-                    Some(segment) => value.push_str(&segment),
-                    None => decodable = false,
-                }
-                j += 1;
-            }
-            _ => break,
-        }
-    }
-    if interpolated(kind_at(tokens, j)) {
-        // Skip the whole segment chain: `String` pieces and `${ … }` groups
-        // (group-aware, so a `;` inside the interpolation cannot mislead).
-        loop {
-            match kind_at(tokens, j) {
-                Some(TokenKind::String | TokenKind::StringInterpolationIdentifier) => j += 1,
-                Some(TokenKind::StringInterpolationExpression) => {
-                    j = tokens.matching_end(j).map_or(j + 1, |end| end + 1);
-                }
-                _ => break,
-            }
-        }
-        return (
-            None,
-            SourceRange {
-                offset: 0,
-                length: 0,
-            },
-            j,
-        );
-    }
-    let span = SourceRange {
-        offset: span_offset,
-        length: span_end - span_offset,
-    };
-    (decodable.then(|| value.into_boxed_str()), span, j)
-}
-
 /// `import`/`export`: uri, conditional-uri clauses (`if (test) uri`),
 /// `[deferred] [as p]` (import shapes only in practice, tolerated on both),
 /// combinator list, `;`.
@@ -1289,12 +1566,12 @@ fn walk_import_export(
                 i += 1;
             }
             Some(TokenKind::Keyword(Keyword::As)) => {
-                if let Some(next) = kind_at(tokens, i + 1) {
-                    if is_name_token(next) || matches!(next, TokenKind::Keyword(_)) {
-                        prefix = Some(strings.intern(tokens.lexeme(text, i + 1)));
-                        i += 2;
-                        continue;
-                    }
+                if let Some(next) = kind_at(tokens, i + 1)
+                    && (is_name_token(next) || matches!(next, TokenKind::Keyword(_)))
+                {
+                    prefix = Some(strings.intern(tokens.lexeme(text, i + 1)));
+                    i += 2;
+                    continue;
                 }
                 i += 1;
             }
@@ -1349,7 +1626,7 @@ fn walk_import_export(
 }
 
 /// One diet-walk `if (dottedName (== 'string')?) 'uri'` clause, mirroring the
-/// official `parseConditionalUri` decision order (parser_impl.dart:1095):
+/// official `parseConditionalUri` decision order (`parser_impl.dart:1095)`:
 /// the paren group (a missing `(` reads the bare name the official's
 /// `insertParens` would wrap, :1102-1109), the dotted name, the optional
 /// `==` value, the group close (garbage inside a real group is jumped over
@@ -1618,7 +1895,7 @@ impl UnitFace {
                 match directive.kind {
                     DirectiveKind::Part => face.part_targets.push(target),
                     DirectiveKind::Import | DirectiveKind::Export => {
-                        face.import_targets.push(target)
+                        face.import_targets.push(target);
                     }
                     DirectiveKind::PartOf | DirectiveKind::Library => {}
                 }
@@ -1629,7 +1906,7 @@ impl UnitFace {
 }
 
 /// Applies the identity-keyed library-graph delta for one batch and derives
-/// the post-closure dirty set (§3.2 steps 3–5).
+/// the post-closure dirty set.
 ///
 /// The changed set is known (the gate passed it), so maintenance touches
 /// only what moved:
@@ -1664,13 +1941,15 @@ impl UnitFace {
 /// path-smallest qualifying claimant or fall back to singletons, and every
 /// resident file belongs to exactly one library. Returns the invalidated
 /// set and whether any library was retired.
+#[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 fn maintain_and_close(
     state: &mut EngineState,
-    changed: &[(FileId, ContentId, String)],
+    changed: &[(FileId, ContentId, SourceText)],
     removed: &[FileId],
     old_facts: &FxHashMap<FileId, Arc<UnitFacts>>,
     sig_changed: &[FileId],
 ) -> (Vec<LibraryId>, bool) {
+    const NO_TARGETS: &[FileId] = &[];
     let changed_set: FxHashSet<FileId> = changed.iter().map(|(file, _, _)| *file).collect();
     let removed_set: FxHashSet<FileId> = removed.iter().copied().collect();
     // Old and new faces. A file entering residency here has no old face —
@@ -1697,7 +1976,6 @@ fn maintain_and_close(
     // Offers come only from defining files (claims are only ever made by
     // them); import sources from every file. Both indexes are raw, so the
     // maintenance is a pure face diff.
-    const NO_TARGETS: &[FileId] = &[];
     let mut affected_parts: FxHashSet<FileId> = FxHashSet::default();
     for (file, old, new) in &changed_faces {
         let old_defining_offers: &[FileId] = match old {
@@ -1827,7 +2105,7 @@ fn maintain_and_close(
     for library in &retired {
         state.libraries.retire(*library);
         state.results.remove(library);
-        state.library_surfaces.remove(library);
+        state.clear_surface(*library);
     }
 
     // Phase 4 — the affected component set and the reverse-edge rewrite.
@@ -1844,12 +2122,10 @@ fn maintain_and_close(
         affected.insert(*owner);
     }
     // A removed target's importers lose their dependency (the target is no
-    // longer resident) — captured before the entry drops.
+    // longer resident) — captured before the row drops.
     for (file, _) in &removed_faces {
-        if let Some(importers) = state.importers.get(file) {
-            for library in importers.keys() {
-                affected.insert(*library);
-            }
+        for edge in state.importers.row(*file) {
+            affected.insert(edge.library);
         }
     }
     // A target whose owning library id moved flips the dependency column of
@@ -1858,20 +2134,16 @@ fn maintain_and_close(
         if old_owner.is_some() && changed_set.contains(file) {
             continue; // covered by the changed-file pass below
         }
-        if *old_owner != Some(*new_owner)
-            && let Some(importers) = state.importers.get(file)
-        {
-            for library in importers.keys() {
-                affected.insert(*library);
+        if *old_owner != Some(*new_owner) {
+            for edge in state.importers.row(*file) {
+                affected.insert(edge.library);
             }
         }
     }
     for (file, old_owner, new_owner) in &changed_owners {
-        if *old_owner != Some(*new_owner)
-            && let Some(importers) = state.importers.get(file)
-        {
-            for library in importers.keys() {
-                affected.insert(*library);
+        if *old_owner != Some(*new_owner) {
+            for edge in state.importers.row(*file) {
+                affected.insert(edge.library);
             }
         }
     }
@@ -1883,12 +2155,23 @@ fn maintain_and_close(
             .filter(|(_, old, _)| old.is_none())
             .map(|(file, _, _)| *file),
     ) {
-        let offerers: Vec<FileId> = state
-            .part_offers
-            .get(&file)
-            .map(|offers| offers.iter().copied().collect())
-            .unwrap_or_default();
-        for offerer in offerers {
+        let offerers = state.part_offers.row(file);
+        for &offerer in offerers {
+            if let Some(&library) = state.library_of_file.get(&offerer) {
+                affected.insert(library);
+            }
+        }
+    }
+    // A changed part file's membership spans every matching library, not
+    // just the ownership winner: each offerer's library recomputes so the
+    // name-form join re-reads the part's current facts into its content.
+    // The Phase 5 identity comparison keeps a membership-stable library
+    // byte-exact (no info write, no dirty), so the over-approximation costs
+    // one identity compare per touched library and never forks the
+    // invalidated set.
+    for file in &affected_parts {
+        let offerers = state.part_offers.row(*file);
+        for &offerer in offerers {
             if let Some(&library) = state.library_of_file.get(&offerer) {
                 affected.insert(library);
             }
@@ -1906,12 +2189,8 @@ fn maintain_and_close(
         if old.is_some() {
             continue;
         }
-        let sources: Vec<FileId> = state
-            .import_sources
-            .get(file)
-            .map(|sources| sources.iter().copied().collect())
-            .unwrap_or_default();
-        for source in sources {
+        let sources = state.import_sources.row(*file);
+        for &source in sources {
             if changed_set.contains(&source) || moved_set.contains(&source) {
                 continue;
             }
@@ -1923,27 +2202,23 @@ fn maintain_and_close(
             // carries for `file` (import/export resolved targets, source
             // order, duplicates kept; order is irrelevant to a count)
             // without materializing the face's two vectors per pair.
-            let occurrences = state
-                .residency
-                .get(&source)
-                .map(|facts| {
-                    facts
-                        .directives
-                        .iter()
-                        .filter(|directive| {
-                            matches!(
-                                directive.kind,
-                                DirectiveKind::Import | DirectiveKind::Export
-                            )
-                        })
-                        .filter_map(|directive| match directive.target {
-                            ResolvedTarget::Resolved(target) => Some(target),
-                            _ => None,
-                        })
-                        .filter(|target| target == file)
-                        .count()
-                })
-                .unwrap_or(0);
+            let occurrences = state.residency.get(&source).map_or(0, |facts| {
+                facts
+                    .directives
+                    .iter()
+                    .filter(|directive| {
+                        matches!(
+                            directive.kind,
+                            DirectiveKind::Import | DirectiveKind::Export
+                        )
+                    })
+                    .filter_map(|directive| match directive.target {
+                        ResolvedTarget::Resolved(target) => Some(target),
+                        _ => None,
+                    })
+                    .filter(|target| target == file)
+                    .count()
+            });
             for _ in 0..occurrences {
                 add_edge(&mut state.importers, *file, owner);
             }
@@ -2002,7 +2277,7 @@ fn maintain_and_close(
         }
     }
     for (file, _) in &removed_faces {
-        state.importers.remove(file);
+        state.importers.remove_row(*file);
     }
     for (file, old_owner, new_owner) in &movers {
         if changed_set.contains(file) {
@@ -2054,32 +2329,27 @@ fn maintain_and_close(
                 info.part_targets.clone(),
             )
         });
-        match previous {
-            Some((defining, content, deps, part_targets)) => {
-                let fresh = build_library_info(state, *library, defining);
-                if fresh.part_targets != part_targets {
-                    targets_moved.insert(*library);
-                }
-                if fresh.content != content
-                    || fresh.deps != deps
-                    || fresh.part_targets != part_targets
-                {
-                    identity_moved.insert(*library);
-                    state.libraries.set_info(*library, fresh);
-                }
+        if let Some((defining, content, deps, part_targets)) = previous {
+            let fresh = build_library_info(state, *library, defining);
+            if fresh.part_targets != part_targets {
+                targets_moved.insert(*library);
             }
-            None => {
-                // Formed this batch (a fresh intern or a recycled slot): no
-                // previous identity to compare — everything about it is new,
-                // so it is dirty by construction.
-                let defining = library_keys
-                    .get(library)
-                    .copied()
-                    .expect("an info-less live library was formed by this batch");
-                let fresh = build_library_info(state, *library, defining);
+            if fresh.content != content || fresh.deps != deps || fresh.part_targets != part_targets
+            {
                 identity_moved.insert(*library);
                 state.libraries.set_info(*library, fresh);
             }
+        } else {
+            // Formed this batch (a fresh intern or a recycled slot): no
+            // previous identity to compare — everything about it is new,
+            // so it is dirty by construction.
+            let defining = library_keys
+                .get(library)
+                .copied()
+                .expect("an info-less live library was formed by this batch");
+            let fresh = build_library_info(state, *library, defining);
+            identity_moved.insert(*library);
+            state.libraries.set_info(*library, fresh);
         }
     }
 
@@ -2109,7 +2379,7 @@ fn maintain_and_close(
 /// The file's canonical URI, memoized ([`EngineState::canonical_uris`]): a
 /// pure function of the immutable interned path, so a miss recomputes
 /// exactly the string a previous residency held and no library identity can
-/// fork across an eviction gap (audit #398 F10). canonical_uri never probes
+/// fork across an eviction gap (audit #398 F10). `canonical_uri` never probes
 /// existence (the state.rs face contract), so the resident filter is inert
 /// — the documented no-probe closure.
 fn canonical_uri_memo(state: &mut EngineState, file: FileId) -> Arc<str> {
@@ -2141,10 +2411,10 @@ fn intern_library_key(
 
 /// Interned-path byte order — the claim-precedence total order (the oracle
 /// picks the path-smallest claimant, file_state.dart:2176-2192). Stable
-/// across the incremental and full arms because paths are the FileTable's
-/// own universe (#287): FileId interning order and canonical-URI bytes both
+/// across the incremental and full arms because paths are the `FileTable`'s
+/// own universe (#287): `FileId` interning order and canonical-URI bytes both
 /// reorder under mid-sequence file creation and percent-encoding.
-fn path_key<'a>(state: &'a EngineState, file: FileId) -> &'a [u8] {
+fn path_key(state: &EngineState, file: FileId) -> &[u8] {
     state
         .files
         .path(file)
@@ -2158,8 +2428,7 @@ fn path_key<'a>(state: &'a EngineState, file: FileId) -> &'a [u8] {
 /// candidates cannot tie because interned paths are unique per file.
 fn resolve_claim(state: &EngineState, part: FileId) -> Option<FileId> {
     let mut winner: Option<FileId> = None;
-    for candidate in state.part_offers.get(&part).into_iter().flatten() {
-        let candidate = *candidate;
+    for &candidate in state.part_offers.row(part) {
         let library_name = declared_library_name(&state.residency[&candidate]);
         if may_claim(state, candidate, library_name, part)
             && winner.is_none_or(|current| path_key(state, candidate) < path_key(state, current))
@@ -2183,6 +2452,12 @@ fn build_library_info(
 ) -> LibraryInfo {
     let uri = canonical_uri_memo(state, defining);
     let defining_facts = &state.residency[&defining];
+    let library_name = declared_library_name(defining_facts);
+    // Membership, not ownership: a name-form part joins EVERY library whose
+    // declared name matches (`may_claim` is the per-library include test),
+    // so a second equally-named library still sees the part's members in its
+    // namespace. The path-smallest `library_of_file` winner stays the
+    // attribution owner and is irrelevant here.
     let parts: Vec<FileId> = defining_facts
         .directives
         .iter()
@@ -2191,7 +2466,11 @@ fn build_library_info(
             ResolvedTarget::Resolved(target) => Some(target),
             _ => None,
         })
-        .filter(|target| *target != defining && state.library_of_file.get(target) == Some(&library))
+        .filter(|target| {
+            *target != defining
+                && state.residency.contains_key(target)
+                && may_claim(state, defining, library_name, *target)
+        })
         .collect();
     let mut members = Vec::with_capacity(parts.len() + 1);
     members.push(defining);
@@ -2220,10 +2499,12 @@ fn build_library_info(
                     // membership: neither content nor deps sees them, so
                     // their residency flip rides on the identity explicitly
                     // (removing such a target must re-bake
-                    // `uri_does_not_exist` against the absent URI).
+                    // `uri_does_not_exist` against the absent URI). The
+                    // member test is the same per-library `may_claim` join
+                    // the parts list uses, so a member never double-rides.
                     if state.residency.contains_key(&target)
                         && target != defining
-                        && state.library_of_file.get(&target) != Some(&library)
+                        && !may_claim(state, defining, library_name, target)
                     {
                         part_targets.push(target);
                     }
@@ -2241,7 +2522,7 @@ fn build_library_info(
         // never a copy of the URI bytes.
         uri,
         defining,
-        parts: parts.into(),
+        parts,
         content,
         deps,
         part_targets: part_targets.into(),
@@ -2262,10 +2543,12 @@ fn library_survives(state: &EngineState, library: LibraryId) -> bool {
 
 /// Paired set-index maintenance (the raw offer/source projections): the
 /// file's old target set subtracted, the new one added; an unchanged face
-/// touches nothing. Empty entries drop, so the indexes stay bounded by the
-/// live directive set.
+/// touches nothing. Empty rows drop, so the indexes stay bounded by the
+/// live directive set. Rows stay sorted by [`FileId`]: every consumer either
+/// collects the row wholesale or reduces over it, so the sorted order is a
+/// strict upgrade on the old hash order, never a semantic input.
 fn reindex(
-    index: &mut FxHashMap<FileId, FxHashSet<FileId>>,
+    index: &mut TargetRows<FileId>,
     source: FileId,
     old_targets: &[FileId],
     new_targets: &[FileId],
@@ -2276,58 +2559,53 @@ fn reindex(
     let old_set: FxHashSet<FileId> = old_targets.iter().copied().collect();
     let new_set: FxHashSet<FileId> = new_targets.iter().copied().collect();
     for target in old_set.difference(&new_set) {
-        if let Some(sources) = index.get_mut(target) {
-            sources.remove(&source);
-            if sources.is_empty() {
-                index.remove(target);
+        index.edit_row(*target, |row| {
+            if let Ok(position) = row.binary_search(&source) {
+                row.remove(position);
             }
-        }
+        });
     }
     for target in new_set.difference(&old_set) {
-        index.entry(*target).or_default().insert(source);
+        index.edit_row(*target, |row| {
+            if let Err(position) = row.binary_search(&source) {
+                row.insert(position, source);
+            }
+        });
     }
 }
 
 /// One reverse-edge insert. The adjacency counts multiplicity: two members
 /// of one library importing the same target is a count of two, so one of
-/// them re-targeting away leaves the edge exact.
-fn add_edge(
-    importers: &mut FxHashMap<FileId, FxHashMap<LibraryId, u32>>,
-    target: FileId,
-    library: LibraryId,
-) {
-    *importers
-        .entry(target)
-        .or_default()
-        .entry(library)
-        .or_insert(0) += 1;
+/// them re-targeting away leaves the edge exact. Rows stay sorted by
+/// [`LibraryId`].
+fn add_edge(importers: &mut TargetRows<ImportEdge>, target: FileId, library: LibraryId) {
+    importers.edit_row(target, |row| {
+        match row.binary_search_by_key(&library, |edge| edge.library) {
+            Ok(position) => row[position].count += 1,
+            Err(position) => row.insert(position, ImportEdge { library, count: 1 }),
+        }
+    });
 }
 
 /// The paired remove: decrements the multiplicity and drops entries as they
 /// empty, so no zero-count ghost survives. An absent edge is a delta
 /// asymmetry — debug builds trap on it.
-fn remove_edge(
-    importers: &mut FxHashMap<FileId, FxHashMap<LibraryId, u32>>,
-    target: FileId,
-    library: LibraryId,
-) {
+fn remove_edge(importers: &mut TargetRows<ImportEdge>, target: FileId, library: LibraryId) {
     debug_assert!(
         importers
-            .get(&target)
-            .is_some_and(|libraries| libraries.contains_key(&library)),
+            .row(target)
+            .iter()
+            .any(|edge| edge.library == library),
         "removing an absent reverse edge (delta asymmetry)"
     );
-    if let Some(libraries) = importers.get_mut(&target) {
-        if let Some(count) = libraries.get_mut(&library) {
-            *count -= 1;
-            if *count == 0 {
-                libraries.remove(&library);
+    importers.edit_row(target, |row| {
+        if let Ok(position) = row.binary_search_by_key(&library, |edge| edge.library) {
+            row[position].count -= 1;
+            if row[position].count == 0 {
+                row.remove(position);
             }
         }
-        if libraries.is_empty() {
-            importers.remove(&target);
-        }
-    }
+    });
 }
 
 /// Rewrites one file's outgoing reverse edges from its old face to its new
@@ -2338,7 +2616,7 @@ fn remove_edge(
 /// an asymmetry surfaces as a ghost edge, which the incremental-vs-full
 /// oracle gate and the debug assert in [`remove_edge`] both catch.
 fn retarget_edges(
-    importers: &mut FxHashMap<FileId, FxHashMap<LibraryId, u32>>,
+    importers: &mut TargetRows<ImportEdge>,
     old_owner: Option<LibraryId>,
     old_targets: &[FileId],
     new_owner: LibraryId,
@@ -2402,7 +2680,7 @@ fn multiset_delta(old: &[FileId], new: &[FileId]) -> (Vec<FileId>, Vec<FileId>) 
 /// The name a defining file's `library` directive declares, `None` when the
 /// directive is absent or unnamed — the oracle's `LibraryFileKind.name`
 /// (file_state.dart:1831-1834). An unnamed library matches no name-form part.
-fn declared_library_name(facts: &UnitFacts) -> Option<&str> {
+pub(crate) fn declared_library_name(facts: &UnitFacts) -> Option<&str> {
     facts.directives.iter().find_map(|directive| {
         if directive.kind == DirectiveKind::Library {
             directive.name.as_deref().filter(|name| !name.is_empty())
@@ -2412,21 +2690,30 @@ fn declared_library_name(facts: &UnitFacts) -> Option<&str> {
     })
 }
 
-/// Whether `defining_file`'s `part` directive may claim the part file
-/// `target`, mirroring the oracle's per-kind `isPartOf`:
+/// Whether a library defined by `defining_file` includes the part file
+/// `target` — the per-library include test that doubles as the claim
+/// qualifier `resolve_claim` picks the path-smallest winner over, mirroring
+/// the oracle's per-kind `isPartOf`:
 ///
 /// * Name form — the includer's declared library name equals the part-of
 ///   name and both files live in the same package (analyzer
 ///   `PartOfNameFileKind::isPartOf`, file_state.dart:2222-2225; the analyzer
-///   matches names globally over sibling-directory discovery, the M1 engine
-///   bounds the scan to one package, incremental-l1-spec §7.1).
+///   matches names globally over sibling-directory discovery; the M1 engine
+///   bounds the scan to one package). Inclusion is per library: the element
+///   layer links a name-matched part into EVERY matching library (upstream
+///   Dart SDK source, pkg/analyzer/lib/src/dart/element/element.dart
+///   `PartIncludeWithFile.includedPart` is per-library `isPartOf`, linked
+///   per library by library_analyzer.dart `_buildPartInclude`) — the
+///   path-smallest winner only picks the attribution owner, never an
+///   exclusive membership.
 /// * URI form — the part file's own `part of` URI must resolve back to the
-///   claiming defining file (`PartOfUriKnownFileKind::isPartOf`,
-///   file_state.dart:2262-2265); the include alone is no proof. An
+///   defining file (`PartOfUriKnownFileKind::isPartOf`,
+///   file_state.dart:2262-2265); the include alone is no proof. Exclusive by
+///   construction: the URI resolves to exactly one defining file. An
 ///   unresolvable URI (`PartOfUriUnknownFileKind`, file_state.dart:2283-2291)
 ///   or a shapeless one (interpolated — no resolvable string) stays
 ///   unclaimed.
-fn may_claim(
+pub(crate) fn may_claim(
     state: &EngineState,
     defining_file: FileId,
     library_name: Option<&str>,
@@ -2452,7 +2739,7 @@ fn same_package(state: &EngineState, a: FileId, b: FileId) -> bool {
     owner(a) == owner(b)
 }
 
-/// The post-closure dirty set (§3.2 step 5, L2-refined per PRD §11.3):
+/// The post-closure dirty set:
 /// touched libraries whose identity moved or that have no cached result,
 /// plus the importer closure fanned out **only from the propagation seeds**
 /// — the owners of `sig_changed` files, both live owners of every changed
@@ -2475,6 +2762,7 @@ fn same_package(state: &EngineState, a: FileId, b: FileId) -> bool {
 /// endpoints' part-target moves (a newly formed winner stays unseeded: its
 /// importers dirty by identity and do not propagate), and a result-less
 /// library never seeds.
+#[expect(clippy::too_many_arguments)] // each argument is a distinct invalidation face; a bundling struct would only relocate the list
 fn close(
     state: &mut EngineState,
     sig_changed: &[FileId],
@@ -2532,6 +2820,24 @@ fn close(
         {
             work.push(library);
         }
+        // A part's signature is part of EVERY member library's face, not
+        // just the ownership winner's: the name-form membership links the
+        // part into each matching library, so each including library fans
+        // out. `may_claim` is the membership predicate, so a dangling
+        // include's library carries no member face and stays unseeded —
+        // the seed set stays exactly the full rebuild's recompute span.
+        for &offerer in state.part_offers.row(*file) {
+            let Some(&holder) = state.library_of_file.get(&offerer) else {
+                continue;
+            };
+            let name = declared_library_name(&state.residency[&offerer]);
+            if may_claim(state, offerer, name, *file)
+                && state.libraries.info(holder).is_some()
+                && queued.insert(holder)
+            {
+                work.push(holder);
+            }
+        }
     }
     // Membership-change seeds: changed files whose ownership moved (both
     // live owners), and libraries whose part-target identity moved — the
@@ -2563,12 +2869,10 @@ fn close(
     while let Some(library) = work.pop() {
         let info = state.libraries.info(library).expect("seed is live");
         for file in std::iter::once(info.defining).chain(info.parts.iter().copied()) {
-            if let Some(importers) = state.importers.get(&file) {
-                for importer in importers.keys() {
-                    dirty.insert(*importer);
-                    if queued.insert(*importer) {
-                        work.push(*importer);
-                    }
+            for edge in state.importers.row(file) {
+                dirty.insert(edge.library);
+                if queued.insert(edge.library) {
+                    work.push(edge.library);
                 }
             }
         }
@@ -2579,7 +2883,7 @@ fn close(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2589,21 +2893,32 @@ mod tests {
 
     use super::*;
 
+    /// The `allowed_experiments.json` shape the fixture's synthetic SDK
+    /// ships: an empty whitelist (the zero-behavior baseline), the known
+    /// `enhanced-parts` grant (#708 P2-1), or that grant plus a fabricated
+    /// future experiment — the version-skew degrade face (#1304).
+    enum Whitelist {
+        Empty,
+        Known,
+        Skewed,
+    }
+
     /// A throwaway one-package workspace ("t") with a synthetic VM SDK —
     /// the in-module twin of `tests/common/mod.rs`, which lib tests cannot
-    /// import. The analyzed files themselves are overlay-only (the
-    /// `Engine::set_content` discipline); only the pub/SDK scaffolding
-    /// touches disk.
-    struct Fixture {
-        root: PathBuf,
+    /// import. Shared with the pipeline module's stateful cache tests (the
+    /// same in-module twin discipline). The analyzed files themselves are
+    /// overlay-only (the `Engine::set_content` discipline); only the pub/SDK
+    /// scaffolding touches disk.
+    pub(crate) struct Fixture {
+        pub(crate) root: PathBuf,
         config_dir: PathBuf,
         config: Arc<PackageConfig>,
         packages: IdentityTable,
     }
 
     impl Fixture {
-        fn new() -> Self {
-            Self::new_inner(false)
+        pub(crate) fn new() -> Self {
+            Self::new_inner(Whitelist::Empty)
         }
 
         /// The same workspace with `enhanced-parts` granted to package `t`
@@ -2611,10 +2926,16 @@ mod tests {
         /// above the experiment's 3.6 release, so the grant sticks at the
         /// package version (audit #708 P2-1).
         fn new_with_grants() -> Self {
-            Self::new_inner(true)
+            Self::new_inner(Whitelist::Known)
         }
 
-        fn new_inner(granted: bool) -> Self {
+        /// The grants workspace whose whitelist also names a fabricated
+        /// future experiment — the version-skew degrade face (#1304).
+        fn new_with_skewed_grants() -> Self {
+            Self::new_inner(Whitelist::Skewed)
+        }
+
+        fn new_inner(whitelist: Whitelist) -> Self {
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             let root = std::env::temp_dir().join(format!(
                 "dartq-engine-l1-{}-{}",
@@ -2622,20 +2943,25 @@ mod tests {
                 COUNTER.fetch_add(1, Ordering::Relaxed)
             ));
             let _ = std::fs::remove_dir_all(&root);
-            let (sdk_constraint, sdk_floor, config_version, experiments_json) = if granted {
-                (
-                    "^3.7.0",
-                    "3.7.0",
-                    "3.7",
-                    r#"{"version": 1, "experimentSets": {"sdkExperiments": ["enhanced-parts"]}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {"t": {"experimentSet": "sdkExperiments"}}}"#,
-                )
-            } else {
-                (
+            let (sdk_constraint, sdk_floor, config_version, experiments_json) = match whitelist {
+                Whitelist::Empty => (
                     "^3.5.0",
                     "3.5.0",
                     "3.5",
                     r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
-                )
+                ),
+                Whitelist::Known => (
+                    "^3.7.0",
+                    "3.7.0",
+                    "3.7",
+                    r#"{"version": 1, "experimentSets": {"sdkExperiments": ["enhanced-parts"]}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {"t": {"experimentSet": "sdkExperiments"}}}"#,
+                ),
+                Whitelist::Skewed => (
+                    "^3.7.0",
+                    "3.7.0",
+                    "3.7",
+                    r#"{"version": 1, "experimentSets": {"sdkExperiments": ["enhanced-parts", "future-flag"]}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {"t": {"experimentSet": "sdkExperiments"}}}"#,
+                ),
             };
             let write = |relative: &str, content: &str| {
                 let path = root.join(relative);
@@ -2702,7 +3028,7 @@ mod tests {
             }
         }
 
-        fn state(&self) -> EngineState {
+        pub(crate) fn state(&self) -> EngineState {
             self.state_with(FxHashMap::default())
         }
 
@@ -2717,7 +3043,7 @@ mod tests {
                 crate::memory_store(),
                 "vm".to_owned(),
                 declared,
-                Vec::new(),
+                &[],
             )
             .expect("engine state")
         }
@@ -2725,14 +3051,14 @@ mod tests {
 
     /// Enqueues a content overlay (the `Engine::set_content` discipline:
     /// intern, append to the order on first sight, last write wins).
-    fn set(state: &mut EngineState, path: &Path, text: &str) -> FileId {
+    pub(crate) fn set(state: &mut EngineState, path: &Path, text: &str) -> FileId {
         let file = state.files.intern(path);
         if !state.pending.contains_key(&file) {
             state.pending_order.push(file);
         }
         state
             .pending
-            .insert(file, PendingChange::Set(text.to_owned()));
+            .insert(file, PendingChange::Set(SourceText::owned(text.to_owned())));
         file
     }
 
@@ -2801,12 +3127,68 @@ mod tests {
         );
     }
 
+    /// Name-form membership is per-library, not the exclusive claim: two
+    /// libraries declaring the same name both carry the part in their member
+    /// sets (the oracle's element layer links a name-matched part into every
+    /// matching library — upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/element.dart
+    /// `PartIncludeWithFile.includedPart`, linked per library by
+    /// library_analyzer.dart `_buildPartInclude`), so each library's
+    /// namespace sees the part's members. The attribution ownership entry
+    /// stays the path-smallest claimant's.
+    #[test]
+    fn name_form_part_joins_every_matching_library() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let first = set(
+            &mut state,
+            &lib.join("n1.dart"),
+            "library dup;\npart 'p.dart';\nint f() => 1;\n",
+        );
+        let second = set(
+            &mut state,
+            &lib.join("n2.dart"),
+            "library dup;\npart 'p.dart';\nint h() => 1;\n",
+        );
+        let part = set(
+            &mut state,
+            &lib.join("p.dart"),
+            "part of dup;\nint g() => 1;\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        let lib_first = state.library_of_file[&first];
+        let lib_second = state.library_of_file[&second];
+        assert_ne!(
+            lib_first, lib_second,
+            "two defining libraries stay distinct"
+        );
+        assert_eq!(
+            state.library_of_file[&part], lib_first,
+            "the path-smallest claimant stays the attribution owner"
+        );
+        for library in [lib_first, lib_second] {
+            assert_eq!(
+                state
+                    .libraries
+                    .info(library)
+                    .expect("live")
+                    .parts
+                    .as_slice(),
+                &[part],
+                "every matching library includes the part as a member"
+            );
+        }
+    }
+
     /// Conditional imports fork end-to-end (#512): the diet walk captures
     /// the `if` clauses, resolution selects the first clause the context's
     /// declared variables match (source order), and only the SELECTED
     /// candidate is read — an unmatched branch's missing target stays
     /// silent, a selected one is diagnosed at its own literal.
     #[test]
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     fn conditional_import_forks_by_declared_variables() {
         let fixture = Fixture::new();
         let lib = fixture.root.join("lib");
@@ -2873,7 +3255,7 @@ mod tests {
     }
 
     /// The parser's registry-verbatim correctionMessage rides through the
-    /// DiagCollector into engine diagnostics (#727): the `base_enum`
+    /// `DiagCollector` into engine diagnostics (#727): the `base_enum`
     /// modifier row carries "Try removing the keyword 'base'." unmodified.
     #[test]
     fn parse_diagnostic_carries_the_registry_correction() {
@@ -2905,10 +3287,11 @@ mod tests {
     /// deduped head+context anchor; probed 3.13.1 against a `// @dart=3.9`
     /// file — same selection, `getExperimentNotEnabledMessage`).
     #[test]
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     fn experiment_gate_reports_at_the_shorthand_dot() {
         let fixture = Fixture::new();
         let mut state = fixture.state();
-        let source = "enum E { a }\nvoid main() { var x = E.a == .a; }\n";
+        let source = "enum E { a }\nvoid main() { var x = E.a ==.a; }\n";
         let main = set(&mut state, &fixture.root.join("lib/main.dart"), source);
         apply(&mut state, &mut |_| {});
         let facts = &state.residency[&main];
@@ -2982,6 +3365,37 @@ mod tests {
             expected.extend_from_slice(lexeme.as_bytes());
         }
         assert_eq!(face, expected);
+    }
+
+    /// The duplicate bake carries the oracle's first-definition context
+    /// row: the capture-grade resolver ([`capture_first_decl`]) anchors at
+    /// the kept declaration's name token.
+    #[test]
+    fn duplicate_bake_carries_the_first_definition_context() {
+        let text = "var x = 0;\nvar x = 1;\n";
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let file = state.files.intern(Path::new("/dup.dart"));
+        let grants = state.grants();
+        let strings = StringTable::new();
+        let (feature_set, _, scanned, _) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file, &grants);
+        let features = ParserFeatures::from_feature_set(feature_set);
+        let mut decl = dartq_semantic::DeclarationCollector::new(text, &scanned.tokens, &strings);
+        let capture = dartq_index::capture(file, text, &scanned.tokens, features, &strings);
+        Parser::new(text, &scanned.tokens, features, &mut decl).parse_unit();
+        let elements = decl.finish();
+        let rows = duplicate_diagnostics(file, &elements, &strings, &capture.index);
+        assert_eq!(rows.len(), 1);
+        let context = rows[0]
+            .context
+            .as_ref()
+            .expect("the first-definition context row");
+        assert_eq!(&*context[0].message, "The first definition of this name.");
+        assert_eq!(
+            context[0].range.offset,
+            u32::try_from("var ".len()).unwrap()
+        );
+        assert_eq!(context[0].range.length, 1);
     }
 
     /// A raw U+0001 inside a directive's string literal (legal source — the
@@ -3106,6 +3520,81 @@ mod tests {
         );
     }
 
+    /// The version-skew degrade (#1304): a whitelist naming a fabricated
+    /// future experiment keeps the lenient grant — no abort, the known
+    /// experiment sticks (#1293's posture) — and reports exactly one
+    /// `ExperimentDegrade` carrying the name, the SDK version, and the
+    /// known-only posture, once across both owners that derived the skewed
+    /// whitelist; a second apply re-deriving both owners over fresh
+    /// content emits nothing.
+    #[test]
+    fn unknown_experiment_degrades_with_one_event() {
+        let fixture = Fixture::new_with_skewed_grants();
+        let mut state = fixture.state();
+        let package_file = set(
+            &mut state,
+            &fixture.root.join("lib/granted.dart"),
+            "var x = 1;\n",
+        );
+        let _sdk_file = set(
+            &mut state,
+            &fixture.root.join("sdk/lib/core/bool.dart"),
+            "var s = 1;\n",
+        );
+        let mut events = Vec::new();
+        apply(&mut state, &mut |event| events.push(event));
+
+        // (a) The lenient grant stands: the known experiment sticks at the
+        // package version, the unknown one is skipped without an abort.
+        let version = language_version_for(&state.packages, &state.files, package_file);
+        assert!(
+            state
+                .grants()
+                .granted(package_file, version)
+                .is_enabled(Feature::EnhancedParts),
+            "the known grant sticks under the skew"
+        );
+
+        // (b) Exactly one event per unknown name, once across both owners
+        // and the whole run.
+        let skews: Vec<(String, Vec<String>, &str)> = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::ExperimentDegrade {
+                    sdk_version,
+                    unknown,
+                    granted,
+                } => Some((sdk_version.clone(), unknown.clone(), *granted)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(skews.len(), 1, "one degrade per unknown name: {events:?}");
+        assert_eq!(skews[0].0, "3.13.1", "the SDK version that named it");
+        assert_eq!(skews[0].1, ["future-flag".to_owned()]);
+        assert_eq!(skews[0].2, KNOWN_ONLY_GRANT);
+
+        // The second analysis re-derives both owners over fresh content;
+        // the memo plus the report set keep it silent.
+        let mut again = Vec::new();
+        set(
+            &mut state,
+            &fixture.root.join("lib/other.dart"),
+            "var y = 2;\n",
+        );
+        set(
+            &mut state,
+            &fixture.root.join("sdk/lib/core/int.dart"),
+            "var t = 3;\n",
+        );
+        apply(&mut state, &mut |event| again.push(event));
+        assert!(
+            again
+                .iter()
+                .all(|event| !matches!(event, EngineEvent::ExperimentDegrade { .. })),
+            "no duplicate degrade: {again:?}"
+        );
+    }
+
     /// The no-grant fixture stays exactly on the version baseline — the
     /// zero-behavior-change guarantee the empty-whitelist differential
     /// depends on.
@@ -3171,13 +3660,60 @@ mod tests {
         );
     }
 
+    /// The official override floor (`analysis_options.dart:183-185`,
+    /// `>= 2.12.0`; upstream test `illegal_language_version_override_test.
+    /// dart:29-34`): a below-floor `// @dart` settles to the written version
+    /// — a verifier row, not a scanner drop (`error_verifier.dart:5787-5809`)
+    /// — and rides the `illegal_language_version_override` ERROR at the
+    /// comment lexeme; 2.12 and above stay clean.
+    #[test]
+    fn below_floor_override_settles_and_reports() {
+        let text = "// @dart = 2.9\nint a = 0;\n";
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let file = state.files.intern(Path::new("/floor.dart"));
+        let grants = state.grants();
+        let (features, settled, _, warnings) =
+            scan_unit(text, DEFAULT_LANGUAGE_VERSION, file, &grants);
+        assert_eq!(settled, LanguageVersion::new(2, 9));
+        assert_eq!(
+            features.fingerprint(),
+            FeatureSet::for_language_version(LanguageVersion::new(2, 9)).fingerprint(),
+            "the override stays effective: features re-derive at the written version"
+        );
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code.name, "illegal_language_version_override");
+        assert_eq!(warnings[0].severity, Severity::Error);
+        assert_eq!(warnings[0].range.offset, 0);
+        assert_eq!(warnings[0].range.length, 14);
+        assert_eq!(
+            warnings[0].message,
+            "The language version must be >=2.12.0."
+        );
+        assert_eq!(
+            warnings[0].correction.as_deref(),
+            Some("Try removing the language version override and migrating the code.")
+        );
+
+        let (_, settled, _, warnings) = scan_unit(
+            "// @dart = 2.12\nvar x = 1;\n",
+            DEFAULT_LANGUAGE_VERSION,
+            file,
+            &grants,
+        );
+        assert_eq!(settled, LanguageVersion::new(2, 12));
+        assert!(warnings.is_empty(), "the floor itself is allowed");
+    }
+
+    /// One library's structural row: id, defining file, parts, deps, and
+    /// part targets.
+    type GraphShapeRow = (LibraryId, FileId, Vec<FileId>, Vec<LibraryId>, Vec<FileId>);
+
     /// The structural graph face of the live library set: membership,
     /// defining file, parts, deps, and part targets — everything the delta
     /// must keep exact except the per-member content identity (which moves
     /// on every member edit by design).
-    fn graph_shape(
-        state: &EngineState,
-    ) -> Vec<(LibraryId, FileId, Vec<FileId>, Vec<LibraryId>, Vec<FileId>)> {
+    fn graph_shape(state: &EngineState) -> Vec<GraphShapeRow> {
         let mut shape: Vec<_> = state
             .libraries
             .iter_infos()
@@ -3185,7 +3721,7 @@ mod tests {
                 (
                     id,
                     info.defining,
-                    info.parts.to_vec(),
+                    info.parts.clone(),
                     info.deps.clone(),
                     info.part_targets.to_vec(),
                 )
@@ -3305,25 +3841,139 @@ mod tests {
             .try_file_id(&lib.join("b.dart"))
             .expect("b.dart interned");
         assert_eq!(
-            state.importers.get(&a),
-            Some(&[(owner, 1)].into_iter().collect())
+            state.importers.row(a),
+            &[ImportEdge {
+                library: owner,
+                count: 1
+            }]
         );
 
         set(&mut state, &lib.join("main.dart"), "import 'b.dart';\n");
         apply(&mut state, &mut |_| {});
 
         assert!(
-            state.importers.get(&a).is_none(),
+            !state.importers.has(a),
             "the old edge is gone without a ghost: {:?}",
-            state.importers.get(&a)
+            state.importers.row(a)
         );
         assert_eq!(
-            state.importers.get(&b),
-            Some(&[(owner, 1)].into_iter().collect()),
+            state.importers.row(b),
+            &[ImportEdge {
+                library: owner,
+                count: 1
+            }],
             "the new edge carries the importing library"
         );
         assert_eq!(state.importers.len(), 1, "no other reverse edge exists");
         assert_eq!(state.library_of_file[&main], owner, "the owner id stands");
+    }
+
+    /// Row-level CSR equivalence (#1779): the compact projections read back
+    /// exactly what the paired delta wrote — edge multiplicity counts each
+    /// member's contribution, rows iterate in sorted key order, emptied rows
+    /// drop outright, and the residency-flip fan-out seeds edges from
+    /// `import_sources` without any directive-face move on the source side.
+    #[test]
+    fn csr_rows_track_multiplicity_order_and_residency_flips() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        // Two members of one library both importing `t.dart`: the edge's
+        // multiplicity must read 2 (the map's `count` column), and the two
+        // importers' rows must agree.
+        let target = set(&mut state, &lib.join("t.dart"), "int t() => 0;\n");
+        let main = set(
+            &mut state,
+            &lib.join("main.dart"),
+            "import 't.dart';\npart 'p.dart';\n",
+        );
+        set(
+            &mut state,
+            &lib.join("p.dart"),
+            "part of 'main.dart';\nimport 't.dart';\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        let owner = state.library_of_file[&main];
+        assert_eq!(
+            state.importers.row(target),
+            &[ImportEdge {
+                library: owner,
+                count: 2
+            }],
+            "one edge per source member, multiplicity folded"
+        );
+        assert_eq!(
+            state.import_sources.row(target).len(),
+            2,
+            "both source files project"
+        );
+
+        // Sorted-order pin: a second library importing the same target lands
+        // in `LibraryId` order, regardless of hash placement — the read the
+        // importer closure consumes wholesale.
+        let other = set(&mut state, &lib.join("other.dart"), "import 't.dart';\n");
+        apply(&mut state, &mut |_| {});
+        let other_owner = state.library_of_file[&other];
+        let mut sorted = [(owner, 2u32), (other_owner, 1u32)];
+        sorted.sort_unstable_by_key(|(library, _)| *library);
+        assert_eq!(
+            state.importers.row(target),
+            &[
+                ImportEdge {
+                    library: sorted[0].0,
+                    count: sorted[0].1
+                },
+                ImportEdge {
+                    library: sorted[1].0,
+                    count: sorted[1].1
+                },
+            ],
+            "two libraries' edges share one row, sorted by id"
+        );
+
+        // One member dropping its import decrements that library's edge to
+        // 1 (no ghost entry at 0 — emptied elements leave the row).
+        set(&mut state, &lib.join("p.dart"), "part of 'main.dart';\n");
+        apply(&mut state, &mut |_| {});
+        let expected: Vec<ImportEdge> = sorted
+            .into_iter()
+            .map(|(library, count)| ImportEdge {
+                library,
+                count: if library == owner { count - 1 } else { count },
+            })
+            .collect();
+        assert_eq!(
+            state.importers.row(target),
+            expected.as_slice(),
+            "the surviving edges keep their counts"
+        );
+
+        // Residency flip: removing `t.dart` drops its rows everywhere; a
+        // re-add re-seeds the edge from `import_sources` alone (the sources'
+        // faces never moved).
+        remove(&mut state, target);
+        apply(&mut state, &mut |_| {});
+        assert!(
+            !state.importers.has(target),
+            "the removed target's row dropped"
+        );
+        assert!(
+            state.import_sources.row(target).len() == 2,
+            "raw sources persist across the residency flip"
+        );
+        set(&mut state, &lib.join("t.dart"), "int t() => 1;\n");
+        apply(&mut state, &mut |_| {});
+        let readded = state
+            .files
+            .try_file_id(&lib.join("t.dart"))
+            .expect("re-interned");
+        let reseeded: Vec<ImportEdge> = state.importers.row(readded).to_vec();
+        assert_eq!(
+            reseeded.len(),
+            2,
+            "the flip re-seeded one edge per standing source: {reseeded:?}"
+        );
     }
 
     /// Structural retirement: deleting a library's last file retires the
@@ -3357,49 +4007,308 @@ mod tests {
             "the cached result went with the retirement"
         );
         assert!(
-            !state.library_surfaces.contains_key(&owner),
+            state.surfaces().all(|(id, _)| id != owner),
             "the reference surface went with the retirement"
         );
     }
 
-    /// The warm-start staging map is single-shot per apply: a batch that
-    /// matches no staged entry must still drain it. Otherwise a snapshot
-    /// ingest whose payloads go unconsumed — an apply touching no snapshot
-    /// file — pins the entire staged payload set for the session (a second
-    /// full residency copy), and only the budget's tier-3 path would ever
-    /// clear it. The staged key here is the real shape ingest seeds (facts
-    /// projected off a resident file) with the content hash corrupted, so
-    /// no batch can ever claim it.
+    /// The capture arena's absence semantics (the dense-id slots): a
+    /// removal drops the capture outright, and re-adding the same path
+    /// reuses its id's `None` slot — the file id is immortal, so the
+    /// slot is refilled, never re-keyed. The refill lands with the
+    /// analyze-phase recapture: the re-added bytes hit the facts cache
+    /// (no parse ran at the apply), so the capture queues exactly like
+    /// the cache-served paths, and the drain fills the same id's slot.
     #[test]
-    fn warm_start_drains_when_the_batch_touches_no_snapshot_file() {
+    fn removing_a_file_drops_its_capture_and_the_slot_is_reusable() {
         let fixture = Fixture::new();
         let mut state = fixture.state();
         let lib = fixture.root.join("lib");
         let main = set(&mut state, &lib.join("main.dart"), "void main() {}\n");
         apply(&mut state, &mut |_| {});
+        let captured = state.capture(main).expect("the apply stored a capture");
+        assert_eq!(captured.file, main, "the capture carries its own file");
 
-        // Stage an ingest-shaped payload under a key no batch can match:
-        // the resident file's own entry key with its content hash flipped.
-        let content = state.residency[&main].content;
-        let mut staged = snapshot_key(facts_key(&state.grants(), main, content));
-        staged.content_hash[0] ^= 0xff;
-        let payload = crate::state::persist::PersistedFacts::of(
-            &state.residency[&main],
-            &state.strings,
-            &state.files,
-        );
-        state.warm_start.insert(staged, payload);
-        assert_eq!(state.warm_start.len(), 1, "the payload is staged");
-
-        // An apply whose batch claims none of it: `other.dart` computes
-        // cold (cache and staging both miss) — and the staging map must
-        // still come out drained.
-        let other = set(&mut state, &lib.join("other.dart"), "library other;\n");
+        remove(&mut state, main);
         apply(&mut state, &mut |_| {});
-        assert!(state.residency.contains_key(&other), "the apply ran");
         assert!(
-            state.warm_start.is_empty(),
-            "unclaimed staged payloads never survive an apply"
+            state.capture(main).is_none(),
+            "the capture dropped with residency"
         );
+
+        set(&mut state, &lib.join("main.dart"), "void main() {}\n");
+        apply(&mut state, &mut |_| {});
+        // The re-add served its facts from the cache, so the capture waits
+        // for the analyze-phase recapture (the apply-side store only rides
+        // a parse).
+        crate::pipeline::drain_captures(&mut state);
+        let recaptured = state.capture(main).expect("the re-added file recaptured");
+        assert_eq!(recaptured.file, main, "the same id's slot was refilled");
+    }
+
+    /// Strict-mode resolution determinism (the options lookup contract):
+    /// the deepest governing entry wins, same-length sibling prefixes
+    /// never interfere with each other's files, and not the `options` map's insertion (iteration) order. The containing keys
+    /// of a path are its ancestors — pairwise nested — so an
+    /// equal-depth tie cannot exist; this pins the invariant against a
+    /// future scan or index that reintroduces order dependence.
+    #[test]
+    fn strict_modes_pin_the_deepest_entry_regardless_of_insertion_order() {
+        use crate::analysis_options::AnalysisOptions;
+        use dartq_semantic::StrictModes;
+
+        let fixture = Fixture::new();
+        let base = fixture.root.join("pkg");
+        let nested = base.join("nested");
+        // `sibling` matches `base`'s component count but never contains
+        // its files; its flags differ so any leakage is visible.
+        let sibling = fixture.root.join("sibling");
+        let options = |strict: bool| {
+            let mut options = AnalysisOptions::default();
+            options.strict_casts = Some(strict);
+            options.strict_raw_types = (!strict).then_some(true);
+            Arc::new(options)
+        };
+
+        let built = |insertion_reversed: bool| {
+            let mut state = fixture.state();
+            let mut entries = vec![
+                (base.clone(), options(true)),
+                (nested.clone(), options(false)),
+                (sibling.clone(), options(true)),
+            ];
+            if insertion_reversed {
+                entries.reverse();
+            }
+            for (dir, options) in entries {
+                state.options.insert(dir, options);
+            }
+            let under_base = set(&mut state, &base.join("f.dart"), "var x = 0;\n");
+            let under_nested = set(&mut state, &nested.join("g.dart"), "var y = 0;\n");
+            (state, under_base, under_nested)
+        };
+
+        for insertion_reversed in [false, true] {
+            let (state, under_base, under_nested) = built(insertion_reversed);
+            // Deepest entry wins: `base` governs its own file (the
+            // fixture root's entry also contains it, shallower), `nested`
+            // overrides `base` for its own.
+            assert_eq!(
+                state.strict_modes_for(under_base),
+                StrictModes {
+                    casts: true,
+                    inference: false,
+                    raw_types: false,
+                },
+                "the base entry governs, the sibling's flags never leak"
+            );
+            assert_eq!(
+                state.strict_modes_for(under_nested),
+                // The nested entry's own flags win wholesale: `options(false)`
+                // carries `strict_casts = Some(false)` AND
+                // `strict_raw_types = Some(true)` (the leak-visibility
+                // design above), so both columns answer from `nested` —
+                // `base`'s `raw_types = None` baseline must not leak in.
+                StrictModes {
+                    casts: false,
+                    inference: false,
+                    raw_types: true,
+                },
+                "the nested entry overrides its ancestor's"
+            );
+            // Repeated resolution agrees, every time.
+            let first = state.strict_modes_for(under_base);
+            for _ in 0..4 {
+                assert_eq!(state.strict_modes_for(under_base), first);
+            }
+        }
+    }
+
+    /// Warm-start staging survives unclaimed applies (#1387): a batch that
+    /// matches no staged entry leaves the staging map standing — the lookup
+    /// key IS the content hash, so a stale entry can never serve a moved
+    /// file, and the entries an apply does claim are removed at the claim.
+    /// The old single-shot drain dropped precisely the later-batch hits
+    /// (a file reverting to staged content). The warm arm here is a fresh
+    /// engine state, the real daemon shape: empty caches, staged payloads.
+    #[test]
+    fn warm_start_retains_unclaimed_entries_until_claimed_or_shed() {
+        let fixture = Fixture::new();
+        let mut source = fixture.state();
+        let lib = fixture.root.join("lib");
+        let a = set(&mut source, &lib.join("a.dart"), "int shared() => 1;\n");
+        apply(&mut source, &mut |_| {});
+
+        // The real ingest shape: `a`'s facts projected under its live key
+        // (the key is path-free, so another file with the same bytes and
+        // package can claim it) plus the same key with its hash corrupted —
+        // an entry no batch can ever claim.
+        let content = source.residency[&a].content;
+        let live = snapshot_key(facts_key(&source.grants(), a, content));
+        let mut dead = live;
+        dead.content_hash[0] ^= 0xff;
+        let mut state = fixture.state();
+        state.warm_start.insert(
+            live,
+            crate::state::persist::PersistedFacts::of(
+                &source.residency[&a],
+                &source.strings,
+                &source.files,
+            ),
+        );
+        state.warm_start.insert(
+            dead,
+            crate::state::persist::PersistedFacts::of(
+                &source.residency[&a],
+                &source.strings,
+                &source.files,
+            ),
+        );
+
+        // Batch 1: `b` lands with different bytes — nothing claims, and both
+        // staged entries stand.
+        let _ = set(&mut state, &lib.join("b.dart"), "int mine() => 2;\n");
+        apply(&mut state, &mut |_| {});
+        assert_eq!(
+            state.warm_start.len(),
+            2,
+            "unclaimed staged entries survive the apply"
+        );
+
+        // Batch 2: `b` reverts to the staged bytes — its live key matches
+        // the staged identity, the claim removes the entry, and the payload
+        // serves the recompute. The unclaimable entry stands until the
+        // tier-3 shed or the next ingest.
+        let _ = set(&mut state, &lib.join("b.dart"), "int shared() => 1;\n");
+        apply(&mut state, &mut |_| {});
+        assert_eq!(state.warm_start.len(), 1, "the claim removed its entry");
+        assert!(
+            state.warm_start.contains_key(&dead),
+            "the unclaimable entry stands until shed"
+        );
+    }
+
+    /// The chunked cold-apply fan-out ([`APPLY_FANOUT_CHUNK`]): a batch
+    /// larger than one chunk lands every miss with its own resolved face,
+    /// and a same-content straddler classified into the second chunk still
+    /// dedupes into template + derived sibling — the sibling derives from
+    /// the template's pre-resolution face with its own path attribution, so
+    /// chunking moves only the in-flight bound, never the batch's
+    /// observable face.
+    #[test]
+    fn multi_chunk_apply_lands_every_miss_and_dedupes_across_chunks() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        // One chunk of distinct misses plus a tail in the second chunk; the
+        // straddler repeats the first file's bytes from inside the second
+        // chunk (same key → sibling of chunk 1's template, never a miss).
+        // The unresolved relative import gives every face a URI row, so the
+        // derivation's re-attribution is visible.
+        let total = APPLY_FANOUT_CHUNK + 4;
+        let mut files = Vec::with_capacity(total);
+        for i in 0..total - 1 {
+            let text = format!("import 'missing_{i}.dart';\nint f{i}() => {i};\n");
+            files.push(set(&mut state, &lib.join(format!("u{i:05}.dart")), &text));
+        }
+        files.push(set(
+            &mut state,
+            &lib.join("straddle.dart"),
+            "import 'missing_0.dart';\nint f0() => 0;\n",
+        ));
+        apply(&mut state, &mut |_| {});
+
+        assert_eq!(
+            state.residency.len(),
+            total,
+            "every miss across both chunks landed in residency"
+        );
+        let template = &state.residency[&files[0]];
+        let straddler = &state.residency[&files[total - 1]];
+        assert_eq!(
+            straddler.diagnostics.len(),
+            template.diagnostics.len(),
+            "the straddling sibling derived the template's row count"
+        );
+        for row in &straddler.diagnostics {
+            assert_eq!(
+                row.file,
+                files[total - 1],
+                "the derived row re-attributed to the straddler's own file"
+            );
+        }
+        assert_eq!(
+            straddler.api_signature, template.api_signature,
+            "same bytes, same baked signature across the chunk boundary"
+        );
+    }
+
+    /// Scanner lexical diagnostics ride through the engine's analyze path
+    /// into the unit facts (#1325): `compute_unit` extends the unit's
+    /// diagnostics with the scan face's rows, so the `$`-EOF unterminated
+    /// family surfaces here with the scanner-pinned anchors (the
+    /// `bare_dollar` probe in the scanner's string suite —
+    /// `missing_identifier` one unit past the `$`, the unterminated row
+    /// back at the quote, both at length 1).
+    #[test]
+    fn scanner_diagnostics_reach_the_unit_facts() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let main = set(&mut state, &fixture.root.join("lib/main.dart"), "'$\n");
+        apply(&mut state, &mut |_| {});
+        let facts = &state.residency[&main];
+
+        let missing = facts
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "missing_identifier")
+            .expect("the $-form's missing_identifier row flows through");
+        assert_eq!(missing.range.offset, 2);
+        assert_eq!(missing.range.length, 1);
+        assert_eq!(missing.message, "Expected an identifier.");
+
+        let unterminated = facts
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "unterminated_string_literal")
+            .expect("the unterminated string row flows through");
+        assert_eq!(unterminated.range.offset, 1);
+        assert_eq!(unterminated.range.length, 1);
+        assert_eq!(unterminated.message, "Unterminated string literal.");
+    }
+
+    /// The scanner's illegal-character rows flow through the analyze path
+    /// too (#1325): non-ASCII in identifier position fires one
+    /// `illegal_character` per character, pinned at its own UTF-16 unit
+    /// (the scanner's `illegal_non_ascii_identifier_recovery` pins mirrored
+    /// at the engine boundary).
+    #[test]
+    fn illegal_character_rows_reach_the_unit_facts() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let main = set(
+            &mut state,
+            &fixture.root.join("lib/main.dart"),
+            "var 한글;\n",
+        );
+        apply(&mut state, &mut |_| {});
+        let facts = &state.residency[&main];
+
+        let rows: Vec<_> = facts
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "illegal_character")
+            .collect();
+        assert_eq!(
+            rows.len(),
+            2,
+            "one row per character: {:?}",
+            facts.diagnostics
+        );
+        assert_eq!(rows[0].range.offset, 4);
+        assert_eq!(rows[1].range.offset, 5);
+        for row in &rows {
+            assert_eq!(row.range.length, 1);
+        }
     }
 }
