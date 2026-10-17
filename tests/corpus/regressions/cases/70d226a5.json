@@ -1189,55 +1189,6 @@
       "message": "Expected to find ';'."
     },
     {
-      "code": "expected_token",
-      "line": 46,
-      "column": 24,
-      "length": 1,
-      "message": "Expected to find ';'."
-    },
-    {
-      "code": "expected_token",
-      "line": 47,
-      "column": 12,
-      "length": 6,
-      "message": "Expected to find ':'."
-    },
-    {
-      "code": "expected_token",
-      "line": 47,
-      "column": 24,
-      "length": 1,
-      "message": "Expected to find ';'."
-    },
-    {
-      "code": "expected_token",
-      "line": 47,
-      "column": 24,
-      "length": 1,
-      "message": "Expected to find ';'."
-    },
-    {
-      "code": "expected_token",
-      "line": 68,
-      "column": 18,
-      "length": 6,
-      "message": "Expected to find ':'."
-    },
-    {
-      "code": "expected_token",
-      "line": 68,
-      "column": 30,
-      "length": 1,
-      "message": "Expected to find ';'."
-    },
-    {
-      "code": "expected_token",
-      "line": 68,
-      "column": 30,
-      "length": 1,
-      "message": "Expected to find ';'."
-    },
-    {
       "code": "invalid_constant_const_prefix",
       "line": 53,
       "column": 18,
@@ -1309,6 +1260,13 @@
     },
     {
       "code": "invalid_constant_const_prefix",
+      "line": 63,
+      "column": 25,
+      "length": 5,
+      "message": "The expression can't be prefixed by 'const' to form a constant pattern."
+    },
+    {
+      "code": "invalid_constant_const_prefix",
       "line": 64,
       "column": 18,
       "length": 1,
@@ -1316,9 +1274,9 @@
     },
     {
       "code": "invalid_constant_const_prefix",
-      "line": 66,
-      "column": 18,
-      "length": 1,
+      "line": 65,
+      "column": 31,
+      "length": 5,
       "message": "The expression can't be prefixed by 'const' to form a constant pattern."
     },
     {
@@ -1330,9 +1288,9 @@
     },
     {
       "code": "invalid_constant_const_prefix",
-      "line": 70,
-      "column": 24,
-      "length": 1,
+      "line": 110,
+      "column": 25,
+      "length": 12,
       "message": "The expression can't be prefixed by 'const' to form a constant pattern."
     },
     {
@@ -1434,13 +1392,6 @@
       "message": "The empty record literal is not supported as a constant pattern."
     },
     {
-      "code": "invalid_constant_pattern_empty_record_literal",
-      "line": 99,
-      "column": 24,
-      "length": 1,
-      "message": "The empty record literal is not supported as a constant pattern."
-    },
-    {
       "code": "invalid_constant_pattern_generic",
       "line": 105,
       "column": 24,
@@ -1504,6 +1455,13 @@
       "message": "Only negation of a numeric literal is supported as a constant pattern."
     },
     {
+      "code": "invalid_constant_pattern_negation",
+      "line": 42,
+      "column": 20,
+      "length": 5,
+      "message": "Only negation of a numeric literal is supported as a constant pattern."
+    },
+    {
       "code": "invalid_constant_pattern_unary",
       "line": 50,
       "column": 12,
@@ -1539,39 +1497,25 @@
       "message": "Expected an identifier, but got ':'."
     },
     {
-      "code": "missing_identifier",
-      "line": 47,
-      "column": 12,
-      "length": 6,
-      "message": "Expected an identifier, but got 'assert'."
-    },
-    {
-      "code": "missing_identifier",
-      "line": 47,
-      "column": 25,
-      "length": 1,
-      "message": "Expected an identifier, but got ':'."
-    },
-    {
-      "code": "missing_identifier",
-      "line": 68,
-      "column": 18,
-      "length": 6,
-      "message": "Expected an identifier, but got 'assert'."
-    },
-    {
-      "code": "missing_identifier",
-      "line": 68,
-      "column": 31,
-      "length": 1,
-      "message": "Expected an identifier, but got ':'."
-    },
-    {
       "code": "named_function_expression",
       "line": 67,
       "column": 23,
       "length": 3,
       "message": "A function expression can't have a name."
+    },
+    {
+      "code": "undefined_getter",
+      "line": 107,
+      "column": 30,
+      "length": 3,
+      "message": "The getter 'new' isn't defined for the type 'GenericClass'."
+    },
+    {
+      "code": "undefined_getter",
+      "line": 113,
+      "column": 37,
+      "length": 3,
+      "message": "The getter 'new' isn't defined for the type 'GenericClass'."
     },
     {
       "code": "unexpected_token",
@@ -1581,26 +1525,33 @@
       "message": "Unexpected text ':'."
     },
     {
-      "code": "unexpected_token",
-      "line": 47,
-      "column": 25,
-      "length": 1,
-      "message": "Unexpected text ':'."
+      "code": "unused_element",
+      "line": 67,
+      "column": 23,
+      "length": 3,
+      "message": "The declaration 'fun' isn't referenced."
     },
     {
-      "code": "unexpected_token",
-      "line": 68,
-      "column": 31,
-      "length": 1,
-      "message": "Unexpected text ':'."
+      "code": "unused_local_variable",
+      "line": 46,
+      "column": 17,
+      "length": 3,
+      "message": "The value of the local variable 'fun' isn't used."
+    },
+    {
+      "code": "wrong_number_of_type_arguments_constructor",
+      "line": 81,
+      "column": 30,
+      "length": 5,
+      "message": "The constructor 'GenericClass.GenericClass' doesn't have type parameters."
     }
   ],
   "source": "// Copyright (c) 2023, the Dart project authors.  Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\nimport 'const_patterns.dart' as prefix;\n\nconst int value = 42;\n\nvoid func() {}\n\nclass Class {\n  const Class([a]);\n\n  const Class.named();\n\n  call() {}\n\n  test(o) async {\n    const dynamic local = 0;\n    dynamic variable = 0;\n    switch (o) {\n      case true: // Ok\n      case null: // Ok\n      case this: // Error\n      case this(): // Error\n      case super(): // Error\n      case 42: // Ok\n      case -42: // Ok\n      case 42.5: // Ok\n      case -42.5: // Ok\n      case 'foo': // Ok\n      case 'foo' 'bar': // Ok\n      case value: // Ok\n      case value!: // Ok\n      case value?: // Ok\n      case value as int: // Ok\n      case -value: // Error\n      case local: // Ok\n      case -local: // Error\n      case func: // Ok\n      case prefix.value: // Ok\n      case -prefix.value: // Error\n      case prefix.Class.named: // Ok\n      case 1 + 2: // Error\n      case 1 * 2: // Error\n      case void fun() {}: // Error\n      case assert(false): // Error\n      case switch (o) { _ => true }: // Error\n      case await 0: // Error\n      case !false: // Error\n      case ~0: // Error\n      case ++variable: // Error\n      case const 0: // Error\n      case const 0x0: // Error\n      case const 0.5: // Error\n      case const true: // Error\n      case const null: // Error\n      case const -0: // Error\n      case const 'foo': // Error\n      case const #a: // Error\n      case const value: // Error\n      case const local: // Error\n      case const prefix.value: // Error\n      case const -prefix.value: // Error\n      case const prefix.Class.named: // Error\n      case const 1 + 2: // Error\n      case const void fun() {}: // Error\n      case const assert(false): // Error\n      case const switch (o) { _ => true }: // Error\n      case const await 0: // Error\n      case const !false: // Error\n      case const ~0: // Error\n      case const ++variable: // Error\n      case const Class(): // Ok\n      case const Class(0): // Ok\n      case const GenericClass(): // Ok\n      case const GenericClass(a: 0): // Ok\n      case const GenericClass<int>(): // Ok\n      case const GenericClass<int>(a: 0): // Ok\n      case const GenericClass<int>.new(): // Ok\n      case const GenericClass<int>.new(a: 1): // Ok\n      case const []: // Ok\n      case const <int>[]: // Ok\n      case const {}: // Ok\n      case const <int, String>{}: // Ok\n      case const const Class(): // Error\n      case const const Class(0): // Error\n      case const const GenericClass(): // Error\n      case const const GenericClass(a: 0): // Error\n      case const const GenericClass<int>(): // Error\n      case const const GenericClass<int>(a: 0): // Error\n      case const const []: // Error\n      case const const <int>[]: // Error\n      case const const {}: // Error\n      case const const <int, String>{}: // Error\n      case const new Class(): // Error\n      case new Class(): // Error\n      case const (): // Error\n      case const const (): // Error\n      case const (1): // Ok\n      case const (-1): // Ok\n      case const (value): // Ok\n      case const (-value): // Ok\n      case const (1 + 2): // Ok\n      case GenericClass<int>: // Error\n      case prefix.GenericClass<int>: // Error\n      case GenericClass<int>.new: // Error\n      case prefix.GenericClass<int>.new: // Error\n      case const GenericClass<int>: // Error\n      case const prefix.GenericClass<int>: // Error\n      case const (GenericClass<int>): // Ok\n      case const (prefix.GenericClass<int>): // Ok\n      case const (GenericClass<int>.new): // Ok\n      case const (prefix.GenericClass<int>.new): // Ok\n       print(0);\n    }\n  }\n}\n\nclass GenericClass<T> {\n  const GenericClass({a});\n}\n",
-  "captured_at": 1791787153,
+  "captured_at": 1792065400,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -1610,8 +1561,8 @@
     "--edits",
     "tests/corpus/regressions/cases/70d226a5.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
     "--daemon-cmd",
-    "./target/release/dartq daemon --dir {dir}"
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
   ]
 }

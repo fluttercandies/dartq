@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/src/patterns/wildcard_inPatternAssignment_usingVar.dart","length":31,"line":1,"new_text":"void f() {\n  [a, var _] = y;\n}\n"}

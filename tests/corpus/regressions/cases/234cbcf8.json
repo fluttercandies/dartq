@@ -1,0 +1,56 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/invalid_this_in_initializer.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "invalid_this_in_initializer",
+      "line": 6,
+      "column": 9,
+      "length": 4,
+      "message": "Can only use 'this' in an initializer for field initialization (e.g. 'this.x = something') and constructor redirection (e.g. 'this()' or 'this.namedConstructor())"
+    },
+    {
+      "code": "recursive_constructor_redirect",
+      "line": 6,
+      "column": 9,
+      "length": 6,
+      "message": "Constructors can't redirect to themselves either directly or indirectly."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "invalid_this_in_initializer",
+      "line": 6,
+      "column": 9,
+      "length": 4,
+      "message": "Can only use 'this' in an initializer for field initialization (e.g. 'this.x = something') and constructor redirection (e.g. 'this()' or 'this.namedConstructor())"
+    },
+    {
+      "code": "undefined_getter",
+      "line": 6,
+      "column": 16,
+      "length": 3,
+      "message": "The getter 'foo' isn't defined for the type 'B'."
+    }
+  ],
+  "source": "// Targets invalid_this_in_initializer: 'this' in an initializer can only be\n// used for field initialization or constructor redirection.\nclass A {}\n\nclass B extends A {\n  B() : this().foo;\n}\n",
+  "captured_at": 1792056733,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp3-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/234cbcf8.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

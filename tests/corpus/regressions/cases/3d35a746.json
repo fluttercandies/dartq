@@ -1,0 +1,140 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/constructor_recovery_set.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "duplicate_constructor",
+      "line": 11,
+      "column": 7,
+      "length": 5,
+      "message": "The constructor with name 'x' is already defined."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 5,
+      "column": 15,
+      "length": 18,
+      "message": "'initializer' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 11,
+      "column": 17,
+      "length": 18,
+      "message": "'initializer' isn't a field in the enclosing class."
+    },
+    {
+      "code": "member_with_class_name",
+      "line": 2,
+      "column": 7,
+      "length": 3,
+      "message": "A class member can't have the same name as the enclosing class."
+    },
+    {
+      "code": "setter_constructor",
+      "line": 5,
+      "column": 3,
+      "length": 3,
+      "message": "Constructors can't be a setter."
+    },
+    {
+      "code": "setter_constructor",
+      "line": 8,
+      "column": 3,
+      "length": 3,
+      "message": "Constructors can't be a setter."
+    },
+    {
+      "code": "setter_constructor",
+      "line": 11,
+      "column": 3,
+      "length": 3,
+      "message": "Constructors can't be a setter."
+    },
+    {
+      "code": "wrong_number_of_parameters_for_setter",
+      "line": 2,
+      "column": 7,
+      "length": 3,
+      "message": "Setters must declare exactly one required positional parameter."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "member_with_class_name",
+      "line": 2,
+      "column": 7,
+      "length": 3,
+      "message": "A class member can't have the same name as the enclosing class."
+    },
+    {
+      "code": "setter_constructor",
+      "line": 5,
+      "column": 3,
+      "length": 3,
+      "message": "Constructors can't be a setter."
+    },
+    {
+      "code": "setter_constructor",
+      "line": 8,
+      "column": 3,
+      "length": 3,
+      "message": "Constructors can't be a setter."
+    },
+    {
+      "code": "setter_constructor",
+      "line": 11,
+      "column": 3,
+      "length": 3,
+      "message": "Constructors can't be a setter."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 5,
+      "column": 15,
+      "length": 11,
+      "message": "Undefined name 'initializer'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 11,
+      "column": 17,
+      "length": 11,
+      "message": "Undefined name 'initializer'."
+    },
+    {
+      "code": "wrong_number_of_parameters_for_setter",
+      "line": 2,
+      "column": 7,
+      "length": 3,
+      "message": "Setters must declare exactly one required positional parameter."
+    },
+    {
+      "code": "wrong_number_of_parameters_for_setter",
+      "line": 2,
+      "column": 7,
+      "length": 3,
+      "message": "Setters must declare exactly one required positional parameter."
+    }
+  ],
+  "source": "class Foo {\n  set Foo() {\n    // Not OK.\n  }\n  set Foo() : initializer = true {\n    // Not OK.\n  }\n  set Foo.x() {\n    // Not OK.\n  }\n  set Foo.x() : initializer = true {\n    // Not OK.\n  }\n}",
+  "captured_at": 1792056733,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp3-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/3d35a746.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

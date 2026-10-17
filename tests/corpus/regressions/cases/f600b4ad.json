@@ -177,6 +177,6 @@
     "--dartq-cmd",
     "./target/release/dartq check --format=machine",
     "--daemon-cmd",
-    "./target/release/dartq daemon --dir {dir}"
+    "./target/release/dartq daemon {dir}"
   ]
 }

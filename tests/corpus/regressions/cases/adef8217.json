@@ -1,0 +1,49 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/redirecting_constructor_with_body.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "redirecting_constructor_with_body",
+      "line": 4,
+      "column": 22,
+      "length": 1,
+      "message": "Redirecting constructors can't have a body."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "redirecting_constructor_with_body",
+      "line": 4,
+      "column": 22,
+      "length": 1,
+      "message": "Redirecting constructors can't have a body."
+    },
+    {
+      "code": "undefined_method",
+      "line": 4,
+      "column": 14,
+      "length": 5,
+      "message": "The method 'other' isn't defined for the type 'C'."
+    }
+  ],
+  "source": "// Targets redirecting_constructor_with_body: redirecting constructors\n// cannot have a body.\nclass C {\n  C() : this.other() {}\n\n  C.other();\n}\n",
+  "captured_at": 1792056733,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp3-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/adef8217.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

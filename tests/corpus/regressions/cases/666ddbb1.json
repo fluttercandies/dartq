@@ -2001,18 +2001,648 @@
   ],
   "dartq": [
     {
-      "code": "const_field_without_initializer",
+      "code": "const_not_initialized",
       "line": 35,
       "column": 26,
       "length": 5,
-      "message": "The const variable 'field' must be initialized."
+      "message": "The constant 'field' must be initialized."
     },
     {
-      "code": "const_field_without_initializer",
+      "code": "const_not_initialized",
       "line": 36,
       "column": 26,
       "length": 5,
-      "message": "The const variable 'field' must be initialized."
+      "message": "The constant 'field' must be initialized."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 3,
+      "column": 20,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 4,
+      "column": 20,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 6,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 6,
+      "column": 24,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 7,
+      "column": 11,
+      "length": 8,
+      "message": "The name 'external' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 7,
+      "column": 25,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 8,
+      "column": 12,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 8,
+      "column": 25,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 10,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 11,
+      "column": 11,
+      "length": 8,
+      "message": "The name 'external' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 11,
+      "column": 24,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 12,
+      "column": 24,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 14,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 14,
+      "column": 27,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 15,
+      "column": 11,
+      "length": 8,
+      "message": "The name 'external' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 15,
+      "column": 28,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 16,
+      "column": 28,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 18,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 19,
+      "column": 11,
+      "length": 8,
+      "message": "The name 'external' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 19,
+      "column": 24,
+      "length": 6,
+      "message": "The name 'setter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 20,
+      "column": 24,
+      "length": 6,
+      "message": "The name 'setter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 22,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 22,
+      "column": 28,
+      "length": 6,
+      "message": "The name 'setter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 23,
+      "column": 11,
+      "length": 8,
+      "message": "The name 'external' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 23,
+      "column": 29,
+      "length": 6,
+      "message": "The name 'setter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 24,
+      "column": 12,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 24,
+      "column": 29,
+      "length": 6,
+      "message": "The name 'setter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 26,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 27,
+      "column": 11,
+      "length": 8,
+      "message": "The name 'external' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 27,
+      "column": 24,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 28,
+      "column": 12,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 28,
+      "column": 24,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 30,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 30,
+      "column": 25,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 31,
+      "column": 11,
+      "length": 8,
+      "message": "The name 'external' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 31,
+      "column": 26,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 32,
+      "column": 12,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 32,
+      "column": 26,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 34,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 34,
+      "column": 25,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 35,
+      "column": 11,
+      "length": 8,
+      "message": "The name 'external' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 35,
+      "column": 26,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 36,
+      "column": 12,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 36,
+      "column": 26,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 38,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 38,
+      "column": 23,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 39,
+      "column": 11,
+      "length": 8,
+      "message": "The name 'external' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 39,
+      "column": 24,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 40,
+      "column": 20,
+      "length": 3,
+      "message": "The name 'int' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 40,
+      "column": 24,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 42,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 42,
+      "column": 28,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 43,
+      "column": 20,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 44,
+      "column": 11,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 44,
+      "column": 20,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 46,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 46,
+      "column": 30,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 47,
+      "column": 11,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 47,
+      "column": 22,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 48,
+      "column": 11,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 48,
+      "column": 22,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 50,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 50,
+      "column": 28,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 51,
+      "column": 11,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 51,
+      "column": 20,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 52,
+      "column": 11,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 52,
+      "column": 20,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 54,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 57,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 58,
+      "column": 23,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 60,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 63,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 64,
+      "column": 26,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 66,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 69,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 70,
+      "column": 27,
+      "length": 6,
+      "message": "The name 'setter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 72,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 73,
+      "column": 22,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 75,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 76,
+      "column": 24,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 78,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 79,
+      "column": 24,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 81,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 82,
+      "column": 22,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 84,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 85,
+      "column": 27,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 87,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 88,
+      "column": 29,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 90,
+      "column": 11,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 91,
+      "column": 27,
+      "length": 5,
+      "message": "The name 'field' is already defined."
     },
     {
       "code": "expected_token",
@@ -2510,14 +3140,21 @@
       "column": 22,
       "length": 5,
       "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 61,
+      "column": 32,
+      "length": 4,
+      "message": "A value of type 'Null' can't be returned from the method 'getter' because it has a return type of 'augment'."
     }
   ],
   "source": "class Class {\n  augment augment method() {}\n  augment external method();\n  external augment method();\n\n  augment augment void method() {}\n  augment external void method();\n  external augment void method();\n\n  augment augment get getter => null;\n  augment external get getter;\n  external augment get getter;\n\n  augment augment int get getter => 0;\n  augment external int get getter;\n  external augment int get getter;\n\n  augment augment set setter(value) {}\n  augment external set setter(value);\n  external augment set setter(value);\n\n  augment augment void set setter(value) {}\n  augment external void set setter(value);\n  external augment void set setter(value);\n\n  augment augment var field;\n  augment external var field;\n  external augment var field;\n\n  augment augment final field = 0;\n  augment external final field;\n  external augment final field;\n\n  augment augment const field = 0;\n  augment external const field;\n  external augment const field;\n\n  augment augment int field;\n  augment external int field;\n  external augment int field;\n\n  augment augment late var field;\n  augment late var field;\n  augment late var field;\n\n  augment augment late final field;\n  augment late final field;\n  augment late final field;\n\n  augment augment late int field;\n  augment late int field;\n  augment late int field;\n\n  augment augment static method() {}\n  static augment method() {}\n\n  augment augment static void method() {}\n  static augment void method() {}\n\n  augment augment static get getter => null;\n  static augment get getter => null;\n\n  augment augment static int get getter => 0;\n  static augment int get getter => 0;\n\n  augment augment static set setter(value) {}\n  static augment set setter(value) {}\n\n  augment augment static void set setter(value) {}\n  static augment void set setter(value) {}\n\n  augment augment static var field;\n  static augment var field;\n\n  augment augment static final field = 0;\n  static augment final field = 0;\n\n  augment augment static const field = 0;\n  static augment const field = 0;\n\n  augment augment static int field;\n  static augment int field;\n\n  augment augment static late var field;\n  static augment late var field;\n\n  augment augment static late final field;\n  static augment late final field;\n\n  augment augment static late int field;\n  static augment late int field;\n}\n",
-  "captured_at": 1791787153,
+  "captured_at": 1792056733,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-sp3-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -2527,8 +3164,8 @@
     "--edits",
     "tests/corpus/regressions/cases/666ddbb1.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
     "--daemon-cmd",
-    "./target/release/dartq daemon --dir {dir}"
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
   ]
 }

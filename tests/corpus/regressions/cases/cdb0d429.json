@@ -1,7 +1,7 @@
 {
   "schema": "regression-case-v1",
   "file": "lib/nonempty_interp_body_after.dart",
-  "corpus": "/tmp/dartq_sii_probes",
+  "corpus": "tests/corpus/sii-probes",
   "oracle": [
     {
       "code": "expected_token",
@@ -37,7 +37,7 @@
   "source": "var s = '${x}abc\n",
   "captured_at": 1791810281,
   "source_run": {
-    "report": "release-night/sii-probes/oracle.machine",
+    "report": "tests/corpus/sii-probes (capturing run: oracle machine-format dump over this corpus, 2026-10-12)",
     "dartq_cmd": "static scanner-axis prediction (dartq not executed in lane #921; replay_command measures it live)",
     "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
@@ -45,12 +45,12 @@
     "target/debug/harness",
     "replay",
     "--corpus-dir",
-    "/tmp/dartq_sii_probes",
+    "tests/corpus/sii-probes",
     "--edits",
     "tests/corpus/regressions/cases/cdb0d429.edits.jsonl",
     "--dartq-cmd",
     "./target/release/dartq analyze --format=machine",
     "--daemon-cmd",
-    "./target/release/dartq daemon --dir {dir}"
+    "./target/release/dartq daemon {dir}"
   ]
 }

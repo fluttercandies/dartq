@@ -1,0 +1,41 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/flow_analysis/type_promotion/data/loop_type_of_interest.dart",
+  "corpus": "m0",
+  "oracle": [],
+  "dartq": [
+    {
+      "code": "undefined_function",
+      "line": 12,
+      "column": 12,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    },
+    {
+      "code": "undefined_function",
+      "line": 37,
+      "column": 10,
+      "length": 1,
+      "message": "The function 'f' isn't defined."
+    }
+  ],
+  "source": "// Copyright (c) 2020, the Dart project authors. Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\n// This test verifies that a type comparison happening in the body of a loop\n// causes the type to be of interest after the loop, regardless of the type of\n// loop.\n\ndoLoop(Object o, bool f()) {\n  do {\n    if (o is int) print('');\n  } while (f());\n  o = 1;\n  /*int*/\n  o;\n}\n\nforEachLoop(Object o, List values) {\n  for (var _ in values) {\n    if (o is int) print('');\n  }\n  o = 1;\n  /*int*/\n  o;\n}\n\nforLoop(Object o, int count) {\n  for (int i = 0; i < count; i++) {\n    if (o is int) print('');\n  }\n  o = 1;\n  /*int*/\n  o;\n}\n\nwhileloop(Object o, bool f()) {\n  while (f()) {\n    if (o is int) print('');\n  }\n  o = 1;\n  /*int*/\n  o;\n}\n",
+  "captured_at": 1792065400,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0",
+    "--edits",
+    "tests/corpus/regressions/cases/5b633f45.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

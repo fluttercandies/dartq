@@ -1,0 +1,70 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/patterns/syntheticIdentifier_insideSwitchExpression.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "expected_token",
+      "line": 1,
+      "column": 34,
+      "length": 2,
+      "message": "Expected to find '=>'."
+    },
+    {
+      "code": "expected_token",
+      "line": 1,
+      "column": 34,
+      "length": 2,
+      "message": "Expected to find '}'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 1,
+      "column": 34,
+      "length": 2,
+      "message": "Expected an identifier."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "expected_token",
+      "line": 1,
+      "column": 34,
+      "length": 2,
+      "message": "Expected '=>' before this."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 1,
+      "column": 34,
+      "length": 2,
+      "message": "Expected an identifier, but got 'if'."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 1,
+      "column": 30,
+      "length": 1,
+      "message": "A value of type 'Object?' can't be returned from the function 'f' because it has a return type of 'void'."
+    }
+  ],
+  "source": "void f(Object? x) => switch (x) {if};\n",
+  "captured_at": 1792065400,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/379084a4.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

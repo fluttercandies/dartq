@@ -139,6 +139,20 @@
   ],
   "dartq": [
     {
+      "code": "const_with_non_constant_argument",
+      "line": 6,
+      "column": 8,
+      "length": 3,
+      "message": "Arguments of a constant creation must be constant expressions."
+    },
+    {
+      "code": "const_with_non_constant_argument",
+      "line": 14,
+      "column": 8,
+      "length": 3,
+      "message": "Arguments of a constant creation must be constant expressions."
+    },
+    {
       "code": "expected_identifier_but_got_keyword",
       "line": 2,
       "column": 3,
@@ -228,14 +242,28 @@
       "column": 8,
       "length": 1,
       "message": "Expected '}' before this."
+    },
+    {
+      "code": "undefined_function",
+      "line": 6,
+      "column": 12,
+      "length": 1,
+      "message": "The function 'x' isn't defined."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 14,
+      "column": 12,
+      "length": 1,
+      "message": "Undefined name 'x'."
     }
   ],
   "source": "enum const E1() {\n  this() {}\n}\n\nenum const E2() {\n  this(int x) : assert(1 > 2) {}\n}\n\nenum const E3() {\n  this();\n}\n\nenum const E4() {\n  this(int x) : assert(1 > 2);\n}\n\nenum const E5() { // missing constants\n  this : assert(1 > 2);\n}\n\nenum const E6() { // missing constants\n  this {}\n}\n",
-  "captured_at": 1791787153,
+  "captured_at": 1792065400,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -245,8 +273,8 @@
     "--edits",
     "tests/corpus/regressions/cases/652d8966.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
     "--daemon-cmd",
-    "./target/release/dartq daemon --dir {dir}"
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
   ]
 }

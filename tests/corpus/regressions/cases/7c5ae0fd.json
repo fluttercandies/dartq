@@ -1392,6 +1392,580 @@
   ],
   "dartq": [
     {
+      "code": "duplicate_definition",
+      "line": 3,
+      "column": 16,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 5,
+      "column": 19,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 7,
+      "column": 3,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 7,
+      "column": 20,
+      "length": 6,
+      "message": "The name 'setter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 8,
+      "column": 3,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 9,
+      "column": 3,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 9,
+      "column": 17,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 10,
+      "column": 3,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 10,
+      "column": 17,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 11,
+      "column": 11,
+      "length": 3,
+      "message": "The name 'int' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 11,
+      "column": 15,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 12,
+      "column": 20,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 13,
+      "column": 11,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 13,
+      "column": 22,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 14,
+      "column": 11,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 14,
+      "column": 20,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 16,
+      "column": 18,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 17,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 17,
+      "column": 23,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 18,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 18,
+      "column": 22,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 19,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 19,
+      "column": 26,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 20,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 20,
+      "column": 22,
+      "length": 6,
+      "message": "The name 'setter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 21,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 21,
+      "column": 27,
+      "length": 6,
+      "message": "The name 'setter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 22,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 22,
+      "column": 22,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 23,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 23,
+      "column": 24,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 24,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 24,
+      "column": 24,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 25,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 25,
+      "column": 22,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 26,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 26,
+      "column": 27,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 27,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 27,
+      "column": 29,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 28,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 28,
+      "column": 27,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 33,
+      "column": 16,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 35,
+      "column": 19,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 37,
+      "column": 3,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 37,
+      "column": 20,
+      "length": 6,
+      "message": "The name 'setter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 38,
+      "column": 3,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 39,
+      "column": 3,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 39,
+      "column": 17,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 40,
+      "column": 3,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 40,
+      "column": 17,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 41,
+      "column": 11,
+      "length": 3,
+      "message": "The name 'int' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 41,
+      "column": 15,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 42,
+      "column": 20,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 43,
+      "column": 11,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 43,
+      "column": 22,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 44,
+      "column": 11,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 44,
+      "column": 20,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 46,
+      "column": 18,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 47,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 47,
+      "column": 23,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 48,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 48,
+      "column": 22,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 49,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 49,
+      "column": 26,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 50,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 50,
+      "column": 22,
+      "length": 6,
+      "message": "The name 'setter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 51,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 51,
+      "column": 27,
+      "length": 6,
+      "message": "The name 'setter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 52,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 52,
+      "column": 22,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 53,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 53,
+      "column": 24,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 54,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 54,
+      "column": 24,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 55,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 55,
+      "column": 22,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 56,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 56,
+      "column": 27,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 57,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 57,
+      "column": 29,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 58,
+      "column": 11,
+      "length": 6,
+      "message": "The name 'static' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 58,
+      "column": 27,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
       "code": "expected_token",
       "line": 3,
       "column": 3,
@@ -1796,14 +2370,28 @@
       "column": 15,
       "length": 5,
       "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 4,
+      "column": 25,
+      "length": 4,
+      "message": "A value of type 'Null' can't be returned from the method 'getter' because it has a return type of 'augment'."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 34,
+      "column": 25,
+      "length": 4,
+      "message": "A value of type 'Null' can't be returned from the method 'getter' because it has a return type of 'augment'."
     }
   ],
   "source": "class Class {\n  augment method() {}\n  augment void method() {}\n  augment get getter => null;\n  augment int get getter => 0;\n  augment set setter(value) {}\n  augment void set setter(value) {}\n  augment var field;\n  augment final field = 0;\n  augment const field = 0;\n  augment int field;\n  augment late var field;\n  augment late final field;\n  augment late int field;\n\n  augment static method() {}\n  augment static void method() {}\n  augment static get getter => null;\n  augment static int get getter => 0;\n  augment static set setter(value) {}\n  augment static void set setter(value) {}\n  augment static var field;\n  augment static final field = 0;\n  augment static const field = 0;\n  augment static int field;\n  augment static late var field;\n  augment static late final field;\n  augment static late int field;\n}\n\nmixin Mixin {\n  augment method() {}\n  augment void method() {}\n  augment get getter => null;\n  augment int get getter => 0;\n  augment set setter(value) {}\n  augment void set setter(value) {}\n  augment var field;\n  augment final field = 0;\n  augment const field = 0;\n  augment int field;\n  augment late var field;\n  augment late final field;\n  augment late int field;\n\n  augment static method() {}\n  augment static void method() {}\n  augment static get getter => null;\n  augment static int get getter => 0;\n  augment static set setter(value) {}\n  augment static void set setter(value) {}\n  augment static var field;\n  augment static final field = 0;\n  augment static const field = 0;\n  augment static int field;\n  augment static late var field;\n  augment static late final field;\n  augment static late int field;\n}\n\n",
-  "captured_at": 1791787153,
+  "captured_at": 1792056733,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-sp3-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -1813,8 +2401,8 @@
     "--edits",
     "tests/corpus/regressions/cases/7c5ae0fd.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
     "--daemon-cmd",
-    "./target/release/dartq daemon --dir {dir}"
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
   ]
 }

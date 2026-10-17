@@ -1,0 +1,539 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/flow_analysis/reachability/data/if_null.dart",
+  "corpus": "m0",
+  "oracle": [
+    {
+      "code": "dead_code",
+      "line": 15,
+      "column": 5,
+      "length": 20,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 21,
+      "column": 25,
+      "length": 2,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 28,
+      "column": 25,
+      "length": 2,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 49,
+      "column": 22,
+      "length": 20,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 54,
+      "column": 70,
+      "length": 2,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 73,
+      "column": 10,
+      "length": 20,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 78,
+      "column": 30,
+      "length": 2,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 96,
+      "column": 31,
+      "length": 1,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 112,
+      "column": 16,
+      "length": 20,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 117,
+      "column": 36,
+      "length": 2,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 139,
+      "column": 18,
+      "length": 20,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 144,
+      "column": 38,
+      "length": 2,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 166,
+      "column": 39,
+      "length": 1,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 179,
+      "column": 37,
+      "length": 20,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 184,
+      "column": 57,
+      "length": 2,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 210,
+      "column": 58,
+      "length": 1,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 225,
+      "column": 8,
+      "length": 20,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 234,
+      "column": 28,
+      "length": 2,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 252,
+      "column": 29,
+      "length": 1,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 268,
+      "column": 14,
+      "length": 20,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 273,
+      "column": 34,
+      "length": 2,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 295,
+      "column": 8,
+      "length": 20,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 300,
+      "column": 28,
+      "length": 2,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 318,
+      "column": 29,
+      "length": 1,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 331,
+      "column": 24,
+      "length": 20,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 336,
+      "column": 44,
+      "length": 2,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 362,
+      "column": 45,
+      "length": 1,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 15,
+      "column": 24,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 21,
+      "column": 25,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 28,
+      "column": 25,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 49,
+      "column": 41,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 54,
+      "column": 70,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 73,
+      "column": 29,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 78,
+      "column": 30,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 96,
+      "column": 31,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 112,
+      "column": 35,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 117,
+      "column": 36,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 139,
+      "column": 37,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 144,
+      "column": 38,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 166,
+      "column": 39,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 179,
+      "column": 56,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 184,
+      "column": 57,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 210,
+      "column": 58,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 225,
+      "column": 27,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 234,
+      "column": 28,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 252,
+      "column": 29,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 268,
+      "column": 33,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 273,
+      "column": 34,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 295,
+      "column": 27,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 300,
+      "column": 28,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 318,
+      "column": 29,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 331,
+      "column": 43,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 336,
+      "column": 44,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 362,
+      "column": 45,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "dead_code",
+      "line": 15,
+      "column": 5,
+      "length": 20,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 15,
+      "column": 24,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 21,
+      "column": 25,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 229,
+      "column": 12,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 234,
+      "column": 28,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 290,
+      "column": 12,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "dead_null_aware_expression",
+      "line": 300,
+      "column": 28,
+      "length": 1,
+      "message": "The left operand can't be null, so the right operand is never executed."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 286,
+      "column": 4,
+      "length": 3,
+      "message": "The operator '[]' isn't defined for the type 'HasProperty'."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 290,
+      "column": 4,
+      "length": 3,
+      "message": "The operator '[]' isn't defined for the type 'HasProperty'."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 290,
+      "column": 4,
+      "length": 3,
+      "message": "The operator '[]=' isn't defined for the type 'HasProperty'."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 295,
+      "column": 4,
+      "length": 3,
+      "message": "The operator '[]' isn't defined for the type 'HasProperty'."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 300,
+      "column": 4,
+      "length": 3,
+      "message": "The operator '[]' isn't defined for the type 'HasProperty'."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 300,
+      "column": 4,
+      "length": 3,
+      "message": "The operator '[]=' isn't defined for the type 'HasProperty'."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 304,
+      "column": 5,
+      "length": 3,
+      "message": "The operator '[]' isn't defined for the type 'HasProperty'."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 308,
+      "column": 5,
+      "length": 3,
+      "message": "The operator '[]' isn't defined for the type 'HasProperty'."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 308,
+      "column": 5,
+      "length": 3,
+      "message": "The operator '[]=' isn't defined for the type 'HasProperty'."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 313,
+      "column": 5,
+      "length": 3,
+      "message": "The operator '[]' isn't defined for the type 'HasProperty'."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 318,
+      "column": 5,
+      "length": 3,
+      "message": "The operator '[]' isn't defined for the type 'HasProperty'."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 318,
+      "column": 5,
+      "length": 3,
+      "message": "The operator '[]=' isn't defined for the type 'HasProperty'."
+    }
+  ],
+  "source": "// Copyright (c) 2020, the Dart project authors. Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\nvoid variable_if_null_reachable(int? i) {\n  i ?? 0;\n}\n\nvoid variable_if_null_assign_reachable(int? i) {\n  i ??= 0;\n}\n\nvoid variable_if_null_unreachable(int i) {\n  // Unreachable since Dart 3.9.\n  i ?? /*unreachable*/ 0;\n}\n\nvoid variable_if_null_assign_unreachable(int i) {\n  // Unreachable since Dart 3.9.\n  /*cfe.update: unreachable*/\n  i ??= /*unreachable*/ 0;\n}\n\nvoid variable_if_null_assign_unreachable_due_to_promotion(int? i) {\n  if (i == null) return;\n  // Unreachable since Dart 3.9.\n  /*cfe.update: unreachable*/\n  i ??= /*unreachable*/ 0;\n}\n\n/*member: topLevelNullable:doesNotComplete*/\nint? get topLevelNullable => 0;\nvoid set topLevelNullable(int? value) {}\n\n/*member: topLevelNonNullGet:doesNotComplete*/\nint get topLevelNonNullGet => 0;\nvoid set topLevelNonNullGet(int? value) {}\n\nvoid top_level_if_null_reachable() {\n  topLevelNullable ?? 0;\n}\n\nvoid top_level_if_null_assign_reachable() {\n  topLevelNullable ??= 0;\n}\n\nvoid top_level_if_null_unreachable() {\n  // Unreachable since Dart 3.9.\n  topLevelNonNullGet ?? /*unreachable*/ 0;\n}\n\nvoid top_level_if_null_assign_unreachable() {\n  // Unreachable since Dart 3.9.\n  topLevelNonNullGet /*cfe.update: unreachable*/ ??= /*unreachable*/ 0;\n}\n\nclass HasProperty<T> {\n  /*member: HasProperty.prop:doesNotComplete*/\n  T get prop => throw '';\n  set prop(T? value) {}\n}\n\nvoid property_if_null_reachable(HasProperty<int?> x) {\n  x.prop ?? 0;\n}\n\nvoid property_if_null_assign_reachable(HasProperty<int?> x) {\n  x.prop ??= 0;\n}\n\nvoid property_if_null_unreachable(HasProperty<int> x) {\n  // Unreachable since Dart 3.9.\n  x.prop ?? /*unreachable*/ 0;\n}\n\nvoid property_if_null_assign_unreachable(HasProperty<int> x) {\n  // Unreachable since Dart 3.9.\n  x.prop ??= /*unreachable*/ 0;\n}\n\nvoid null_aware_property_if_null_reachable(HasProperty<int?>? x) {\n  x?.prop ?? 0;\n}\n\nvoid null_aware_property_if_null_assign_reachable(HasProperty<int?>? x) {\n  x?.prop ??= 0;\n}\n\nvoid null_aware_property_if_null_not_shortened(HasProperty<int>? x) {\n  // Reachable since `??` doesn't participate in null shortening.\n  x?.prop ?? 0;\n}\n\nvoid null_aware_property_if_null_assign_unreachable(HasProperty<int>? x) {\n  // Reachable since Dart 3.9.\n  x?.prop ??= /*unreachable*/ 0;\n}\n\nclass SuperIntQuestionProperty extends HasProperty<int?> {\n  void if_null_reachable() {\n    super.prop ?? 0;\n  }\n\n  void if_null_assign_reachable() {\n    super.prop ??= 0;\n  }\n}\n\nclass SuperIntProperty extends HasProperty<int> {\n  void if_null_unreachable() {\n    // Unreachable since Dart 3.9.\n    super.prop ?? /*unreachable*/ 0;\n  }\n\n  void if_null_assign_unreachable() {\n    // Unreachable since Dart 3.9.\n    super.prop ??= /*unreachable*/ 0;\n  }\n}\n\nextension ExtensionProperty<T> on HasProperty<T> {\n  /*member: ExtensionProperty|get#extendedProp:doesNotComplete*/\n  T get extendedProp => prop;\n  set extendedProp(T? value) {\n    prop = value;\n  }\n}\n\nvoid extended_property_if_null_reachable(HasProperty<int?> x) {\n  x.extendedProp ?? 0;\n}\n\nvoid extended_property_if_null_assign_reachable(HasProperty<int?> x) {\n  x.extendedProp ??= 0;\n}\n\nvoid extended_property_if_null_unreachable(HasProperty<int> x) {\n  // Unreachable since Dart 3.9.\n  x.extendedProp ?? /*unreachable*/ 0;\n}\n\nvoid extended_property_if_null_assign_unreachable(HasProperty<int> x) {\n  // Unreachable since Dart 3.9.\n  x.extendedProp ??= /*unreachable*/ 0;\n}\n\nvoid null_aware_extended_property_if_null_reachable(HasProperty<int?>? x) {\n  x?.extendedProp ?? 0;\n}\n\nvoid null_aware_extended_property_if_null_assign_reachable(\n  HasProperty<int?>? x,\n) {\n  x?.extendedProp ??= 0;\n}\n\nvoid null_aware_extended_property_if_null_not_shortened(HasProperty<int>? x) {\n  // Reachable because `??` doesn't participate in null shortening.\n  x?.extendedProp ?? 0;\n}\n\nvoid null_aware_extended_property_if_null_assign_unreachable(\n  HasProperty<int>? x,\n) {\n  // Unreachable since Dart 3.9.\n  x?.extendedProp ??= /*unreachable*/ 0;\n}\n\nvoid explicit_extended_property_if_null_reachable(HasProperty<int?> x) {\n  ExtensionProperty(x).extendedProp ?? 0;\n}\n\nvoid explicit_extended_property_if_null_assign_reachable(HasProperty<int?> x) {\n  ExtensionProperty(x).extendedProp ??= 0;\n}\n\nvoid explicit_extended_property_if_null_unreachable(HasProperty<int> x) {\n  // Unreachable since Dart 3.9.\n  ExtensionProperty(x).extendedProp ?? /*unreachable*/ 0;\n}\n\nvoid explicit_extended_property_if_null_assign_unreachable(HasProperty<int> x) {\n  // Unreachable since Dart 3.9.\n  ExtensionProperty(x).extendedProp ??= /*unreachable*/ 0;\n}\n\nvoid null_aware_explicit_extended_property_if_null_reachable(\n  HasProperty<int?>? x,\n) {\n  ExtensionProperty(x)?.extendedProp ?? 0;\n}\n\nvoid null_aware_explicit_extended_property_if_null_assign_reachable(\n  HasProperty<int?>? x,\n) {\n  ExtensionProperty(x)?.extendedProp ??= 0;\n}\n\nvoid null_aware_explicit_extended_property_if_null_not_shortened(\n  HasProperty<int>? x,\n) {\n  // Reachable because `??` doesn't participate in null shortening.\n  ExtensionProperty(x)?.extendedProp ?? 0;\n}\n\nvoid null_aware_explicit_extended_property_if_null_assign_unreachable(\n  HasProperty<int>? x,\n) {\n  // Unreachable since Dart 3.9.\n  ExtensionProperty(x)?.extendedProp ??= /*unreachable*/ 0;\n}\n\nclass Indexable<T> {\n  /*member: Indexable.[]:doesNotComplete*/\n  T operator [](int index) => throw '';\n  operator []=(int index, T? value) {}\n}\n\nvoid index_if_null_reachable(Indexable<int?> x) {\n  x[0] ?? 0;\n}\n\nvoid index_if_null_unreachable(Indexable<int> x) {\n  // Unreachable since Dart 3.9.\n  x[0] ?? /*unreachable*/ 0;\n}\n\nvoid index_if_null_assign_reachable(Indexable<int?> x) {\n  x[0] ??= 0;\n}\n\nvoid index_if_null_assign_unreachable(Indexable<int> x) {\n  // Unreachable since Dart 3.9.\n  x[0] ??= /*unreachable*/ 0;\n}\n\nvoid null_aware_index_if_null_reachable(Indexable<int?>? x) {\n  x?[0] ?? 0;\n}\n\nvoid null_aware_index_if_null_unreachable(Indexable<int>? x) {\n  // Reachable because `??` doesn't participate in null shortening.\n  x?[0] ?? 0;\n}\n\nvoid null_aware_index_if_null_assign_reachable(Indexable<int?>? x) {\n  x?[0] ??= 0;\n}\n\nvoid null_aware_index_if_null_assign_unreachable(Indexable<int>? x) {\n  // Unreachable since Dart 3.9.\n  x?[0] ??= /*unreachable*/ 0;\n}\n\nclass SuperIntQuestionIndex extends Indexable<int?> {\n  void if_null_reachable() {\n    super[0] ?? 0;\n  }\n\n  void if_null_assign_reachable() {\n    super[0] ??= 0;\n  }\n}\n\nclass SuperIntIndex extends Indexable<int> {\n  void if_null_unreachable() {\n    // Unreachable since Dart 3.9.\n    super[0] ?? /*unreachable*/ 0;\n  }\n\n  void if_null_assign_unreachable() {\n    // Unreachable since Dart 3.9.\n    super[0] ??= /*unreachable*/ 0;\n  }\n}\n\nextension ExtensionIndex<T> on HasProperty<T> {\n  /*member: ExtensionIndex|[]:doesNotComplete*/\n  T operator [](int index) => prop;\n  operator []=(int index, T? value) {\n    prop = value;\n  }\n}\n\nvoid extended_index_if_null_reachable(HasProperty<int?> x) {\n  x[0] ?? 0;\n}\n\nvoid extended_index_if_null_assign_reachable(HasProperty<int?> x) {\n  x[0] ??= 0;\n}\n\nvoid extended_index_if_null_unreachable(HasProperty<int> x) {\n  // Unreachable since Dart 3.9.\n  x[0] ?? /*unreachable*/ 0;\n}\n\nvoid extended_index_if_null_assign_unreachable(HasProperty<int> x) {\n  // Unreachable since Dart 3.9.\n  x[0] ??= /*unreachable*/ 0;\n}\n\nvoid null_aware_extended_index_if_null_reachable(HasProperty<int?>? x) {\n  x?[0] ?? 0;\n}\n\nvoid null_aware_extended_index_if_null_assign_reachable(HasProperty<int?>? x) {\n  x?[0] ??= 0;\n}\n\nvoid null_aware_extended_index_if_null_not_shortened(HasProperty<int>? x) {\n  // Reachable because `??` doesn't participate in null shortening.\n  x?[0] ?? 0;\n}\n\nvoid null_aware_extended_index_if_null_assign_unreachable(HasProperty<int>? x) {\n  // Unreachable since Dart 3.9.\n  x?[0] ??= /*unreachable*/ 0;\n}\n\nvoid explicit_extended_index_if_null_reachable(HasProperty<int?> x) {\n  ExtensionIndex(x)[0] ?? 0;\n}\n\nvoid explicit_extended_index_if_null_assign_reachable(HasProperty<int?> x) {\n  ExtensionIndex(x)[0] ??= 0;\n}\n\nvoid explicit_extended_index_if_null_unreachable(HasProperty<int> x) {\n  // Unreachable since Dart 3.9.\n  ExtensionIndex(x)[0] ?? /*unreachable*/ 0;\n}\n\nvoid explicit_extended_index_if_null_assign_unreachable(HasProperty<int> x) {\n  // Unreachable since Dart 3.9.\n  ExtensionIndex(x)[0] ??= /*unreachable*/ 0;\n}\n\nvoid null_aware_explicit_extended_index_if_null_reachable(\n  HasProperty<int?>? x,\n) {\n  ExtensionIndex(x)?[0] ?? 0;\n}\n\nvoid null_aware_explicit_extended_index_if_null_assign_reachable(\n  HasProperty<int?>? x,\n) {\n  ExtensionIndex(x)?[0] ??= 0;\n}\n\nvoid null_aware_explicit_extended_index_if_null_not_shortened(\n  HasProperty<int>? x,\n) {\n  // Reachable because `??` doesn't participate in null shortening.\n  ExtensionIndex(x)?[0] ?? 0;\n}\n\nvoid null_aware_explicit_extended_index_if_null_assign_unreachable(\n  HasProperty<int>? x,\n) {\n  // Unreachable since Dart 3.9.\n  ExtensionIndex(x)?[0] ??= /*unreachable*/ 0;\n}\n",
+  "captured_at": 1792065400,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0",
+    "--edits",
+    "tests/corpus/regressions/cases/ab02e65e.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

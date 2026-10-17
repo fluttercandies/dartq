@@ -25,14 +25,21 @@
       "column": 1,
       "length": 0,
       "message": "Expected to find '}'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 3,
+      "column": 11,
+      "length": 1,
+      "message": "Undefined name 'A'."
     }
   ],
   "source": "void f(Object? x) {\n  (switch (x) {\n    const A() => 0,\n    _ => 1,\n  });\n",
-  "captured_at": 1791787153,
+  "captured_at": 1792065400,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -42,8 +49,8 @@
     "--edits",
     "tests/corpus/regressions/cases/a7c0c7f0.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
     "--daemon-cmd",
-    "./target/release/dartq daemon --dir {dir}"
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
   ]
 }

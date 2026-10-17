@@ -1,0 +1,147 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/flow_analysis/type_promotion/data/write_capture.dart",
+  "corpus": "m0",
+  "oracle": [
+    {
+      "code": "unused_element",
+      "line": 229,
+      "column": 3,
+      "length": 3,
+      "message": "The declaration 'foo' isn't referenced."
+    },
+    {
+      "code": "unused_element",
+      "line": 245,
+      "column": 3,
+      "length": 3,
+      "message": "The declaration 'bar' isn't referenced."
+    },
+    {
+      "code": "unused_label",
+      "line": 139,
+      "column": 5,
+      "length": 2,
+      "message": "The label 'L' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 28,
+      "column": 9,
+      "length": 1,
+      "message": "The value of the local variable 'x' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 53,
+      "column": 12,
+      "length": 1,
+      "message": "The value of the local variable 'x' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 71,
+      "column": 11,
+      "length": 1,
+      "message": "The value of the local variable 'x' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 99,
+      "column": 14,
+      "length": 1,
+      "message": "The value of the local variable 'x' isn't used."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "dead_code",
+      "line": 47,
+      "column": 3,
+      "length": 27,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 48,
+      "column": 5,
+      "length": 7,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 92,
+      "column": 3,
+      "length": 27,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 93,
+      "column": 5,
+      "length": 7,
+      "message": "Dead code."
+    },
+    {
+      "code": "undefined_function",
+      "line": 6,
+      "column": 3,
+      "length": 8,
+      "message": "The function 'callback' isn't defined."
+    },
+    {
+      "code": "unused_element",
+      "line": 229,
+      "column": 3,
+      "length": 3,
+      "message": "The declaration 'foo' isn't referenced."
+    },
+    {
+      "code": "unused_element",
+      "line": 245,
+      "column": 3,
+      "length": 3,
+      "message": "The declaration 'bar' isn't referenced."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 28,
+      "column": 9,
+      "length": 1,
+      "message": "The value of the local variable 'x' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 53,
+      "column": 12,
+      "length": 1,
+      "message": "The value of the local variable 'x' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 71,
+      "column": 11,
+      "length": 1,
+      "message": "The value of the local variable 'x' isn't used."
+    }
+  ],
+  "source": "// Copyright (c) 2019, the Dart project authors. Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\nT f<T>(T x, void callback()) {\n  callback();\n  return x;\n}\n\ndoLoop(Object a, Object b, Object c) {\n  do {\n    if (a is int) a;\n    if (b is int) b;\n    if (c is int) /*int*/ c;\n    f(0, () {\n      a = '';\n    });\n  } while (f(true, () {\n    b = '';\n  }));\n  f(0, () {\n    c = '';\n  });\n}\n\nforLoop(Object a, Object b, Object c, Object d, Object e) {\n  for (\n    var x = f(0, () {\n      a = '';\n    });\n    f(true, () {\n      b = '';\n    });\n    f(0, () {\n      c = '';\n    })\n  ) {\n    if (a is int) a;\n    if (b is int) b;\n    if (c is int) c;\n    if (d is int) d;\n    if (e is int) /*int*/ e;\n    f(0, () {\n      d = '';\n    });\n  }\n  f(0, () {\n    e = '';\n  });\n}\n\nforEachLoop(Object a, Object b, Object c) {\n  for (var x in f([], () {\n    a = '';\n  })) {\n    if (a is int) a;\n    if (b is int) b;\n    if (c is int) /*int*/ c;\n    f(0, () {\n      b = '';\n    });\n  }\n  f(0, () {\n    c = '';\n  });\n}\n\nforElement(Object a, Object b, Object c, Object d, Object e) {\n  [\n    for (\n      var x = f(0, () {\n        a = '';\n      });\n      f(true, () {\n        b = '';\n      });\n      f(0, () {\n        c = '';\n      })\n    )\n      [\n        a is int ? a : null,\n        b is int ? b : null,\n        c is int ? c : null,\n        d is int ? d : null,\n        e is int ? /*int*/ e : null,\n        f(0, () {\n          d = '';\n        }),\n      ],\n  ];\n  f(0, () {\n    e = '';\n  });\n}\n\nforEachElement(Object a, Object b, Object c) {\n  [\n    for (var x in () {\n      a = '';\n      return [];\n    }())\n      [\n        a is int ? a : null,\n        b is int ? b : null,\n        c is int ? /*int*/ c : null,\n        f(0, () {\n          b = '';\n        }),\n      ],\n  ];\n  f(0, () {\n    c = '';\n  });\n}\n\nswitchWithoutLabels(Object a, Object b, Object c) {\n  switch (f(0, () {\n    a = '';\n  })) {\n    case 0:\n      if (a is int) a;\n      if (b is int) /*int*/ b;\n      if (c is int) /*int*/ c;\n      f(0, () {\n        b = '';\n      });\n      break;\n  }\n  f(0, () {\n    c = '';\n  });\n}\n\nswitchWithLabels(Object a, Object b, Object c) {\n  switch (f(0, () {\n    a = '';\n  })) {\n    L:\n    case 0:\n      if (a is int) a;\n      if (b is int) b;\n      if (c is int) /*int*/ c;\n      f(0, () {\n        b = '';\n      });\n      break;\n  }\n  f(0, () {\n    c = '';\n  });\n}\n\ntryCatch(Object a, Object b, Object c) {\n  try {\n    if (a is int) /*int*/ a;\n    if (b is int) /*int*/ b;\n    if (c is int) /*int*/ c;\n    f(0, () {\n      a = '';\n    });\n    return;\n  } catch (_) {\n    if (a is int) a;\n    if (b is int) /*int*/ b;\n    if (c is int) /*int*/ c;\n    f(0, () {\n      b = '';\n    });\n  }\n  if (a is int) a;\n  if (b is int) b;\n  if (c is int) /*int*/ c;\n  f(0, () {\n    c = '';\n  });\n}\n\ntryFinally(Object a, Object b, Object c) {\n  try {\n    if (a is int) /*int*/ a;\n    if (b is int) /*int*/ b;\n    if (c is int) /*int*/ c;\n    f(0, () {\n      a = '';\n    });\n  } finally {\n    if (a is int) a;\n    if (b is int) /*int*/ b;\n    if (c is int) /*int*/ c;\n    f(0, () {\n      b = '';\n    });\n  }\n  if (a is int) a;\n  if (b is int) b;\n  if (c is int) /*int*/ c;\n  f(0, () {\n    c = '';\n  });\n}\n\nwhileLoop(Object a, Object b, Object c) {\n  while (f(true, () {\n    a = '';\n  })) {\n    if (a is int) a;\n    if (b is int) b;\n    if (c is int) /*int*/ c;\n    f(0, () {\n      b = '';\n    });\n  }\n  f(0, () {\n    c = '';\n  });\n}\n\nlocalFunction(Object a, Object b, Object c) {\n  if (a is! int) return;\n  if (b is! int) return;\n  if (c is! int) return;\n  /*int*/\n  a;\n  /*int*/\n  b;\n  /*int*/\n  c;\n  foo() {\n    /*int*/\n    a;\n    b;\n    c;\n    if (b is int) /*int*/ b;\n    if (c is int) c;\n  }\n\n  b = '';\n  /*int*/\n  a;\n  b;\n  /*int*/\n  c;\n  if (b is int) /*int*/ b;\n  bar() {\n    /*int*/\n    a;\n    b;\n    c;\n    if (b is int) /*int*/ b;\n    if (c is int) c;\n    c = '';\n  }\n\n  /*int*/\n  a;\n  b;\n  c;\n  if (b is int) /*int*/ b;\n  if (c is int) c;\n}\n\nclosure(Object a, Object b, Object c) {\n  if (a is! int) return;\n  if (b is! int) return;\n  if (c is! int) return;\n  /*int*/\n  a;\n  /*int*/\n  b;\n  /*int*/\n  c;\n  f(0, () {\n    /*int*/\n    a;\n    b;\n    c;\n    if (b is int) /*int*/ b;\n    if (c is int) c;\n  });\n  b = '';\n  /*int*/\n  a;\n  b;\n  /*int*/\n  c;\n  if (b is int) /*int*/ b;\n  f(0, () {\n    /*int*/\n    a;\n    b;\n    c;\n    if (b is int) /*int*/ b;\n    if (c is int) c;\n    c = '';\n  });\n  /*int*/\n  a;\n  b;\n  c;\n  if (b is int) /*int*/ b;\n  if (c is int) c;\n}\n",
+  "captured_at": 1792065400,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0",
+    "--edits",
+    "tests/corpus/regressions/cases/838e1af9.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

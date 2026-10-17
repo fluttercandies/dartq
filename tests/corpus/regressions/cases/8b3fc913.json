@@ -412,6 +412,132 @@
   ],
   "dartq": [
     {
+      "code": "duplicate_definition",
+      "line": 2,
+      "column": 14,
+      "length": 6,
+      "message": "The name 'method' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 4,
+      "column": 17,
+      "length": 6,
+      "message": "The name 'getter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 6,
+      "column": 1,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 6,
+      "column": 18,
+      "length": 6,
+      "message": "The name 'setter' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 7,
+      "column": 1,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 8,
+      "column": 1,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 8,
+      "column": 15,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 9,
+      "column": 1,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 9,
+      "column": 15,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 10,
+      "column": 9,
+      "length": 3,
+      "message": "The name 'int' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 10,
+      "column": 13,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 11,
+      "column": 18,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 12,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 12,
+      "column": 20,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 13,
+      "column": 9,
+      "length": 4,
+      "message": "The name 'late' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 13,
+      "column": 18,
+      "length": 5,
+      "message": "The name 'field' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 14,
+      "column": 1,
+      "length": 7,
+      "message": "The name 'augment' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 15,
+      "column": 24,
+      "length": 5,
+      "message": "The name 'Class' is already defined."
+    },
+    {
       "code": "expected_representation_field",
       "line": 17,
       "column": 38,
@@ -517,7 +643,7 @@
       "message": "Expected to find ';'."
     },
     {
-      "code": "final_field_without_initializer",
+      "code": "final_not_initialized",
       "line": 12,
       "column": 20,
       "length": 5,
@@ -592,14 +718,21 @@
       "column": 24,
       "length": 13,
       "message": "An extension type declaration must have a primary constructor declaration."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 3,
+      "column": 23,
+      "length": 4,
+      "message": "A value of type 'Null' can't be returned from the function 'getter' because it has a return type of 'augment'."
     }
   ],
   "source": "augment method() {}\naugment void method() {}\naugment get getter => null;\naugment int get getter => 0;\naugment set setter(value) {}\naugment void set setter(value) {}\naugment var field;\naugment final field = 0;\naugment const field = 0;\naugment int field;\naugment late var field;\naugment late final field;\naugment late int field;\naugment class Class {}\naugment abstract class Class {}\naugment mixin Mixin {}\naugment extension type ExtensionType {}\n",
-  "captured_at": 1791787153,
+  "captured_at": 1792056733,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-sp3-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -609,8 +742,8 @@
     "--edits",
     "tests/corpus/regressions/cases/8b3fc913.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
     "--daemon-cmd",
-    "./target/release/dartq daemon --dir {dir}"
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
   ]
 }

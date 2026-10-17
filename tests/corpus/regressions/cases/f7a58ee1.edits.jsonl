@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/src/error_recovery/issue_48380_2_comma.dart","length":102,"line":1,"new_text":"enum E<F> {\n  v<int>/*about to write () or .foo()*/,\n  v<int>.foo();\n\n  const E();\n  const E.foo();\n}\n"}

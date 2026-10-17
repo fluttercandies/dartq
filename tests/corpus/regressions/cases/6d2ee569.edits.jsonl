@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/src/also-nnbd/use_required_in_non_nnbd.dart","length":213,"line":1,"new_text":"void foo1({required int x1}) {\n  print(x);\n}\n\nvoid foo2({required x2}) {\n  print(x);\n}\n\nvoid foo3({required required x3}) {\n  print(x);\n}\n\nclass Foo {\n  void foo4({required covariant int x4}) {\n    print(x);\n  }\n}"}

@@ -141,8 +141,8 @@
     {
       "code": "missing_const_final_var_or_type",
       "line": 9,
-      "column": 5,
-      "length": 1,
+      "column": 1,
+      "length": 4,
       "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
     },
     {
@@ -155,23 +155,23 @@
     {
       "code": "missing_const_final_var_or_type",
       "line": 30,
-      "column": 7,
-      "length": 1,
+      "column": 3,
+      "length": 4,
       "message": "Variables must be declared using the keywords 'const', 'final', 'var' or a type name."
     },
     {
-      "code": "missing_identifier",
-      "line": 9,
-      "column": 5,
-      "length": 1,
-      "message": "Expected an identifier."
+      "code": "undefined_identifier",
+      "line": 17,
+      "column": 8,
+      "length": 2,
+      "message": "Undefined name 'y5'."
     },
     {
-      "code": "missing_identifier",
-      "line": 30,
-      "column": 7,
-      "length": 1,
-      "message": "Expected an identifier."
+      "code": "undefined_identifier",
+      "line": 19,
+      "column": 3,
+      "length": 4,
+      "message": "Undefined name 'late'."
     },
     {
       "code": "unexpected_token",
@@ -186,14 +186,42 @@
       "column": 1,
       "length": 1,
       "message": "Unexpected text ';'."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 13,
+      "column": 7,
+      "length": 2,
+      "message": "The value of the local variable 'y1' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 14,
+      "column": 12,
+      "length": 2,
+      "message": "The value of the local variable 'y2' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 15,
+      "column": 18,
+      "length": 2,
+      "message": "The value of the local variable 'y3' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 16,
+      "column": 18,
+      "length": 2,
+      "message": "The value of the local variable 'y4' isn't used."
     }
   ],
   "source": "// https://github.com/dart-lang/sdk/issues/44379\n\nint x1;\nlate int x2;\nlate List<int> x3;\nlate final int x4;\nlate x5;\n; // Meant to confuse so `.next`-ing makes it look like the end of a field.\nlate;\n; // Meant to confuse so `.next`-ing makes it look like the end of a field.\n\nmain(List<String> args) {\n  int y1;\n  late int y2;\n  late List<int> y3;\n  late final int y4;\n  late y5;\n  ; // Meant to confuse so `.next`-ing makes it look like the end of a field.\n  late;\n  ; // Meant to confuse so `.next`-ing makes it look like the end of a field.\n}\n\nclass Foo {\n  int z1;\n  late int z2;\n  late List<int> x3;\n  late final int z4;\n  late z5;\n  ; // Meant to confuse so `.next`-ing makes it look like the end of a field.\n  late;\n  ; // Meant to confuse so `.next`-ing makes it look like the end of a field.\n}",
-  "captured_at": 1791787153,
+  "captured_at": 1792065400,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -203,8 +231,8 @@
     "--edits",
     "tests/corpus/regressions/cases/95f9e610.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
     "--daemon-cmd",
-    "./target/release/dartq daemon --dir {dir}"
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
   ]
 }

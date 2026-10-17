@@ -1,0 +1,1386 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/primary_constructors/new_in_initializer.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "const_constructor_with_body",
+      "line": 4,
+      "column": 15,
+      "length": 0,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 6,
+      "column": 22,
+      "length": 0,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 8,
+      "column": 28,
+      "length": 0,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 10,
+      "column": 28,
+      "length": 0,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 3,
+      "column": 16,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 4,
+      "column": 9,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 5,
+      "column": 3,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 5,
+      "column": 16,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 6,
+      "column": 9,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 6,
+      "column": 22,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 7,
+      "column": 22,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 8,
+      "column": 9,
+      "length": 9,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 8,
+      "column": 28,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 9,
+      "column": 3,
+      "length": 9,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 9,
+      "column": 22,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 10,
+      "column": 9,
+      "length": 9,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 10,
+      "column": 28,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 3,
+      "column": 22,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 3,
+      "column": 23,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 4,
+      "column": 26,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 4,
+      "column": 27,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 5,
+      "column": 22,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 6,
+      "column": 28,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 7,
+      "column": 28,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 7,
+      "column": 29,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 8,
+      "column": 34,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 8,
+      "column": 35,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 9,
+      "column": 28,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 10,
+      "column": 34,
+      "length": 1,
+      "message": "Expected a class member."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 4,
+      "column": 15,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_token",
+      "line": 3,
+      "column": 20,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 4,
+      "column": 24,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 5,
+      "column": 20,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 26,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 7,
+      "column": 26,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 8,
+      "column": 32,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 9,
+      "column": 26,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 10,
+      "column": 32,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 3,
+      "column": 11,
+      "length": 5,
+      "message": "'' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 5,
+      "column": 11,
+      "length": 5,
+      "message": "'' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 6,
+      "column": 17,
+      "length": 5,
+      "message": "'' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 7,
+      "column": 17,
+      "length": 5,
+      "message": "'' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 8,
+      "column": 23,
+      "length": 5,
+      "message": "'' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 9,
+      "column": 17,
+      "length": 5,
+      "message": "'' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 10,
+      "column": 23,
+      "length": 5,
+      "message": "'' isn't a field in the enclosing class."
+    },
+    {
+      "code": "invalid_constant",
+      "line": 6,
+      "column": 17,
+      "length": 5,
+      "message": "Invalid constant value."
+    },
+    {
+      "code": "invalid_constant",
+      "line": 8,
+      "column": 23,
+      "length": 5,
+      "message": "Invalid constant value."
+    },
+    {
+      "code": "invalid_constant",
+      "line": 10,
+      "column": 23,
+      "length": 5,
+      "message": "Invalid constant value."
+    },
+    {
+      "code": "invalid_constructor_name",
+      "line": 4,
+      "column": 15,
+      "length": 4,
+      "message": "The name of a constructor must match the name of the enclosing class."
+    },
+    {
+      "code": "invalid_reference_to_this",
+      "line": 3,
+      "column": 11,
+      "length": 4,
+      "message": "Invalid reference to 'this' expression."
+    },
+    {
+      "code": "invalid_reference_to_this",
+      "line": 5,
+      "column": 11,
+      "length": 4,
+      "message": "Invalid reference to 'this' expression."
+    },
+    {
+      "code": "invalid_reference_to_this",
+      "line": 6,
+      "column": 17,
+      "length": 4,
+      "message": "Invalid reference to 'this' expression."
+    },
+    {
+      "code": "invalid_reference_to_this",
+      "line": 7,
+      "column": 17,
+      "length": 4,
+      "message": "Invalid reference to 'this' expression."
+    },
+    {
+      "code": "invalid_reference_to_this",
+      "line": 8,
+      "column": 23,
+      "length": 4,
+      "message": "Invalid reference to 'this' expression."
+    },
+    {
+      "code": "invalid_reference_to_this",
+      "line": 9,
+      "column": 17,
+      "length": 4,
+      "message": "Invalid reference to 'this' expression."
+    },
+    {
+      "code": "invalid_reference_to_this",
+      "line": 10,
+      "column": 23,
+      "length": 4,
+      "message": "Invalid reference to 'this' expression."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 3,
+      "column": 11,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 5,
+      "column": 11,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 6,
+      "column": 17,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 7,
+      "column": 17,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 8,
+      "column": 23,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 9,
+      "column": 17,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 10,
+      "column": 23,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 3,
+      "column": 16,
+      "length": 3,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 4,
+      "column": 15,
+      "length": 4,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 5,
+      "column": 16,
+      "length": 3,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 6,
+      "column": 22,
+      "length": 3,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 7,
+      "column": 22,
+      "length": 3,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 8,
+      "column": 28,
+      "length": 3,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 9,
+      "column": 22,
+      "length": 3,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 10,
+      "column": 28,
+      "length": 3,
+      "message": "A function body must be provided."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 3,
+      "column": 16,
+      "length": 3,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 3,
+      "column": 22,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 4,
+      "column": 26,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 5,
+      "column": 16,
+      "length": 3,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 5,
+      "column": 22,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 5,
+      "column": 24,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 6,
+      "column": 22,
+      "length": 3,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 6,
+      "column": 28,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 6,
+      "column": 30,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 7,
+      "column": 22,
+      "length": 3,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 7,
+      "column": 28,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 8,
+      "column": 28,
+      "length": 3,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 8,
+      "column": 34,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 9,
+      "column": 22,
+      "length": 3,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 9,
+      "column": 28,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 9,
+      "column": 30,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 10,
+      "column": 28,
+      "length": 3,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 10,
+      "column": 34,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 10,
+      "column": 36,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 3,
+      "column": 16,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 4,
+      "column": 15,
+      "length": 4,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 5,
+      "column": 16,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 5,
+      "column": 24,
+      "length": 1,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 6,
+      "column": 22,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 6,
+      "column": 30,
+      "length": 1,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 7,
+      "column": 22,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 8,
+      "column": 28,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 9,
+      "column": 22,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 9,
+      "column": 30,
+      "length": 1,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 10,
+      "column": 28,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 10,
+      "column": 36,
+      "length": 1,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 3,
+      "column": 20,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 4,
+      "column": 24,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 5,
+      "column": 20,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 6,
+      "column": 26,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 7,
+      "column": 26,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 8,
+      "column": 32,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 9,
+      "column": 26,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 10,
+      "column": 32,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "unused_element",
+      "line": 2,
+      "column": 7,
+      "length": 0,
+      "message": "The declaration '<unnamed>' isn't referenced."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "const_constructor_with_body",
+      "line": 4,
+      "column": 15,
+      "length": 4,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 6,
+      "column": 22,
+      "length": 3,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 8,
+      "column": 28,
+      "length": 3,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 10,
+      "column": 28,
+      "length": 3,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 6,
+      "column": 30,
+      "length": 1,
+      "message": "The name '{' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 9,
+      "column": 30,
+      "length": 1,
+      "message": "The name '{' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 10,
+      "column": 36,
+      "length": 1,
+      "message": "The name '{' is already defined."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 3,
+      "column": 22,
+      "length": 1,
+      "message": "Expected a class member, but got '0'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 3,
+      "column": 23,
+      "length": 1,
+      "message": "Expected a class member, but got ';'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 4,
+      "column": 26,
+      "length": 1,
+      "message": "Expected a class member, but got '0'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 4,
+      "column": 27,
+      "length": 1,
+      "message": "Expected a class member, but got ';'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 5,
+      "column": 22,
+      "length": 1,
+      "message": "Expected a class member, but got '0'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 6,
+      "column": 28,
+      "length": 1,
+      "message": "Expected a class member, but got '0'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 7,
+      "column": 28,
+      "length": 1,
+      "message": "Expected a class member, but got '0'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 7,
+      "column": 29,
+      "length": 1,
+      "message": "Expected a class member, but got ';'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 8,
+      "column": 34,
+      "length": 1,
+      "message": "Expected a class member, but got '0'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 8,
+      "column": 35,
+      "length": 1,
+      "message": "Expected a class member, but got ';'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 9,
+      "column": 28,
+      "length": 1,
+      "message": "Expected a class member, but got '0'."
+    },
+    {
+      "code": "expected_class_member",
+      "line": 10,
+      "column": 34,
+      "length": 1,
+      "message": "Expected a class member, but got '0'."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 4,
+      "column": 15,
+      "length": 4,
+      "message": "'this' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_token",
+      "line": 3,
+      "column": 20,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 4,
+      "column": 24,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 5,
+      "column": 20,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 6,
+      "column": 26,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 7,
+      "column": 26,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 8,
+      "column": 32,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 9,
+      "column": 26,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "expected_token",
+      "line": 10,
+      "column": 32,
+      "length": 1,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "invalid_constructor_name",
+      "line": 4,
+      "column": 15,
+      "length": 4,
+      "message": "The name of a constructor must match the name of the enclosing class."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 3,
+      "column": 11,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 5,
+      "column": 11,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 6,
+      "column": 17,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 7,
+      "column": 17,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 8,
+      "column": 23,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 9,
+      "column": 17,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_assignment_in_initializer",
+      "line": 10,
+      "column": 23,
+      "length": 4,
+      "message": "Expected an assignment after the field name."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 3,
+      "column": 16,
+      "length": 3,
+      "message": "Expected a function body, but got 'new'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 4,
+      "column": 15,
+      "length": 4,
+      "message": "Expected a function body, but got 'this'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 5,
+      "column": 16,
+      "length": 3,
+      "message": "Expected a function body, but got 'new'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 6,
+      "column": 22,
+      "length": 3,
+      "message": "Expected a function body, but got 'new'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 7,
+      "column": 22,
+      "length": 3,
+      "message": "Expected a function body, but got 'new'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 8,
+      "column": 28,
+      "length": 3,
+      "message": "Expected a function body, but got 'new'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 9,
+      "column": 22,
+      "length": 3,
+      "message": "Expected a function body, but got 'new'."
+    },
+    {
+      "code": "missing_function_body",
+      "line": 10,
+      "column": 28,
+      "length": 3,
+      "message": "Expected a function body, but got 'new'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 3,
+      "column": 16,
+      "length": 3,
+      "message": "Expected an identifier, but got 'new'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 3,
+      "column": 22,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 4,
+      "column": 26,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 5,
+      "column": 16,
+      "length": 3,
+      "message": "Expected an identifier, but got 'new'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 5,
+      "column": 22,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 5,
+      "column": 24,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 6,
+      "column": 22,
+      "length": 3,
+      "message": "Expected an identifier, but got 'new'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 6,
+      "column": 28,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 6,
+      "column": 30,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 7,
+      "column": 22,
+      "length": 3,
+      "message": "Expected an identifier, but got 'new'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 7,
+      "column": 28,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 8,
+      "column": 28,
+      "length": 3,
+      "message": "Expected an identifier, but got 'new'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 8,
+      "column": 34,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 9,
+      "column": 22,
+      "length": 3,
+      "message": "Expected an identifier, but got 'new'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 9,
+      "column": 28,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 9,
+      "column": 30,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 10,
+      "column": 28,
+      "length": 3,
+      "message": "Expected an identifier, but got 'new'."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 10,
+      "column": 34,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_identifier",
+      "line": 10,
+      "column": 36,
+      "length": 1,
+      "message": "Expected an identifier."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 3,
+      "column": 16,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 4,
+      "column": 15,
+      "length": 4,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 5,
+      "column": 16,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 5,
+      "column": 24,
+      "length": 0,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 6,
+      "column": 22,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 6,
+      "column": 30,
+      "length": 0,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 7,
+      "column": 22,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 8,
+      "column": 28,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 9,
+      "column": 22,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 9,
+      "column": 30,
+      "length": 0,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 10,
+      "column": 28,
+      "length": 3,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "missing_method_parameters",
+      "line": 10,
+      "column": 36,
+      "length": 0,
+      "message": "Methods must have an explicit list of parameters."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 3,
+      "column": 20,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 4,
+      "column": 24,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 5,
+      "column": 20,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 6,
+      "column": 26,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 7,
+      "column": 26,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 8,
+      "column": 32,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 9,
+      "column": 26,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    },
+    {
+      "code": "redirection_in_non_factory_constructor",
+      "line": 10,
+      "column": 32,
+      "length": 1,
+      "message": "Only factory constructor can specify '=' redirection."
+    }
+  ],
+  "source": "// TODO(johnniwinther): Improve error recovery.\nclass C {\n  new() : this.new = 0;\n  const new() this.new = 0;\n  new() : this.new = 0 {}\n  const new() : this.new = 0 {}\n  new named() : this.new = 0;\n  const new named() : this.new = 0;\n  new named() : this.new = 0 {}\n  const new named() : this.new = 0 {}\n}",
+  "captured_at": 1792065400,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/ccf7f50c.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

@@ -1,0 +1,294 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/primary_constructors/constructor_head.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "const_constructor_with_body",
+      "line": 8,
+      "column": 16,
+      "length": 1,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 9,
+      "column": 24,
+      "length": 1,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 16,
+      "column": 21,
+      "length": 1,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 17,
+      "column": 29,
+      "length": 1,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 3,
+      "column": 3,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 4,
+      "column": 3,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 5,
+      "column": 3,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 6,
+      "column": 9,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 7,
+      "column": 9,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 8,
+      "column": 9,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 9,
+      "column": 9,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 11,
+      "column": 3,
+      "length": 9,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 12,
+      "column": 3,
+      "length": 9,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 13,
+      "column": 3,
+      "length": 9,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 14,
+      "column": 9,
+      "length": 9,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 15,
+      "column": 9,
+      "length": 9,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 16,
+      "column": 9,
+      "length": 9,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 17,
+      "column": 9,
+      "length": 9,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 3,
+      "column": 12,
+      "length": 5,
+      "message": "'x' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 5,
+      "column": 12,
+      "length": 5,
+      "message": "'x' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 7,
+      "column": 18,
+      "length": 5,
+      "message": "'x' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 9,
+      "column": 18,
+      "length": 5,
+      "message": "'x' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 11,
+      "column": 17,
+      "length": 5,
+      "message": "'x' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 13,
+      "column": 17,
+      "length": 5,
+      "message": "'x' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 15,
+      "column": 23,
+      "length": 5,
+      "message": "'x' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 17,
+      "column": 23,
+      "length": 5,
+      "message": "'x' isn't a field in the enclosing class."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "const_constructor_with_body",
+      "line": 8,
+      "column": 16,
+      "length": 1,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 9,
+      "column": 24,
+      "length": 1,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 16,
+      "column": 21,
+      "length": 1,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 17,
+      "column": 29,
+      "length": 1,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 3,
+      "column": 12,
+      "length": 1,
+      "message": "Undefined name 'x'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 5,
+      "column": 12,
+      "length": 1,
+      "message": "Undefined name 'x'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 7,
+      "column": 18,
+      "length": 1,
+      "message": "Undefined name 'x'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 9,
+      "column": 18,
+      "length": 1,
+      "message": "Undefined name 'x'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 11,
+      "column": 17,
+      "length": 1,
+      "message": "Undefined name 'x'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 13,
+      "column": 17,
+      "length": 1,
+      "message": "Undefined name 'x'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 15,
+      "column": 23,
+      "length": 1,
+      "message": "Undefined name 'x'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 17,
+      "column": 23,
+      "length": 1,
+      "message": "Undefined name 'x'."
+    }
+  ],
+  "source": "class C {\n  new ();\n  new () : x = 0;\n  new () {}\n  new () : x = 0 {}\n  const new ();\n  const new () : x = 0;\n  const new () {}\n  const new () : x = 0 {}\n  new named();\n  new named() : x = 0;\n  new named() {}\n  new named() : x = 0 {}\n  const new named();\n  const new named() : x = 0;\n  const new named() {}\n  const new named() : x = 0 {}\n}",
+  "captured_at": 1792056733,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp3-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/2f1058d6.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/missing_star_after_sync.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "body_might_complete_normally",
+      "line": 3,
+      "column": 15,
+      "length": 1,
+      "message": "The body might complete normally, causing 'null' to be returned, but the return type, 'Iterable<int>', is a potentially non-nullable type."
+    },
+    {
+      "code": "missing_star_after_sync",
+      "line": 3,
+      "column": 19,
+      "length": 4,
+      "message": "The modifier 'sync' must be followed by a star ('*')."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "missing_star_after_sync",
+      "line": 3,
+      "column": 19,
+      "length": 4,
+      "message": "The modifier 'sync' must be followed by a star ('*')."
+    },
+    {
+      "code": "undefined_class",
+      "line": 3,
+      "column": 1,
+      "length": 8,
+      "message": "Undefined class 'Iterable'."
+    }
+  ],
+  "source": "// Targets missing_star_after_sync: the modifier 'sync' must be followed by a\n// star ('*').\nIterable<int> f() sync {}\n",
+  "captured_at": 1792065400,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/bd520ad4.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

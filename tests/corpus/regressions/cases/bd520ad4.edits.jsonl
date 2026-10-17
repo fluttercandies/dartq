@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/missing_star_after_sync.dart","length":119,"line":1,"new_text":"// Targets missing_star_after_sync: the modifier 'sync' must be followed by a\n// star ('*').\nIterable<int> f() sync {}\n"}

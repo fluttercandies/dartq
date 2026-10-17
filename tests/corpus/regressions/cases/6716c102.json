@@ -195,18 +195,25 @@
       "message": "Directives must appear before any declarations."
     },
     {
+      "code": "duplicate_definition",
+      "line": 32,
+      "column": 42,
+      "length": 4,
+      "message": "The name 'dart' is already defined."
+    },
+    {
       "code": "expected_executable",
       "line": 8,
       "column": 12,
       "length": 1,
-      "message": "Expected a declaration, but got ':'."
+      "message": "Expected a method, getter, setter or operator declaration."
     },
     {
       "code": "expected_executable",
       "line": 32,
       "column": 41,
       "length": 1,
-      "message": "Expected a declaration, but got '.'."
+      "message": "Expected a method, getter, setter or operator declaration."
     },
     {
       "code": "expected_string_literal",
@@ -254,7 +261,7 @@
       "code": "invalid_literal_in_configuration",
       "line": 12,
       "column": 41,
-      "length": 2,
+      "length": 1,
       "message": "The literal in a configuration can't contain interpolation."
     },
     {
@@ -300,6 +307,13 @@
       "message": "Expected an identifier."
     },
     {
+      "code": "undefined_identifier",
+      "line": 12,
+      "column": 42,
+      "length": 1,
+      "message": "Undefined name 'x'."
+    },
+    {
       "code": "unterminated_string_literal",
       "line": 26,
       "column": 15,
@@ -312,14 +326,28 @@
       "column": 8,
       "length": 8,
       "message": "Target of URI doesn't exist: 'a.dart'."
+    },
+    {
+      "code": "uri_with_interpolation",
+      "line": 1,
+      "column": 1,
+      "length": 0,
+      "message": "URIs can't use string interpolation."
+    },
+    {
+      "code": "uri_with_interpolation",
+      "line": 26,
+      "column": 16,
+      "length": 0,
+      "message": "URIs can't use string interpolation."
     }
   ],
   "source": "// Targets the library-directive / URI family (analyzer ParserErrorCode,\n// pinned snapshot syntax-codes.tsv; the analyzer sources are not vendored\n// in this repo).\n// Targets non_identifier_library_name (TSV:246).\nlibrary 1;\n\n// Targets non_string_literal_as_uri (TSV:248).\nimport dart:core;\n\n// Targets invalid_literal_in_configuration (TSV:175): the configuration\n// value literal can't contain interpolation.\nimport 'a.dart' if (dart.library.io == '$x') 'b.dart';\n\n// Never-fires face (pre-review reclassification): missing_quote (TSV:219,\n// \"Expected quote (' or \\\").\") has no emit site anywhere in the SDK — it\n// exists only as a generated diagnostic definition\n// (pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart) — and dartq has no\n// emit site for it either. No shape can surface it; documented gap by\n// construction, like the native family.\n//\n// The scanner-tier face of the quote family is unterminated_string_literal\n// (TSV:288): an unterminated literal is closed at end of line, and both\n// sides report the same scanner code (fasta UnterminatedString ->\n// analyzer unterminated_string_literal; dartq scanner strings.rs emits the\n// same recovery code).\nimport 'a.dart;\n\n// The non-quoted default URI below plausibly yields\n// non_string_literal_as_uri (TSV:248) from the oracle — the same face as\n// the 'import dart:core;' shape above. Kept as overlap documentation; the\n// pre-review label targeting missing_quote on this shape was wrong.\nexport 'c.dart' if (dart.library.html) d.dart;\n\nvoid f() {}\n",
-  "captured_at": 1791787153,
+  "captured_at": 1792065400,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -329,8 +357,8 @@
     "--edits",
     "tests/corpus/regressions/cases/6716c102.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
     "--daemon-cmd",
-    "./target/release/dartq daemon --dir {dir}"
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
   ]
 }

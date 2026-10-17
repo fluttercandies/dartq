@@ -1,0 +1,602 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/flow_analysis/type_promotion/data/promotion_in_dead_code.dart",
+  "corpus": "m0",
+  "oracle": [
+    {
+      "code": "dead_code",
+      "line": 15,
+      "column": 3,
+      "length": 40,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 22,
+      "column": 3,
+      "length": 49,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 29,
+      "column": 3,
+      "length": 65,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 39,
+      "column": 3,
+      "length": 65,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 50,
+      "column": 3,
+      "length": 43,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 65,
+      "column": 7,
+      "length": 27,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 74,
+      "column": 3,
+      "length": 71,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 86,
+      "column": 7,
+      "length": 55,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 95,
+      "column": 3,
+      "length": 40,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 107,
+      "column": 7,
+      "length": 24,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 115,
+      "column": 3,
+      "length": 45,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 122,
+      "column": 3,
+      "length": 46,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 129,
+      "column": 3,
+      "length": 53,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 136,
+      "column": 3,
+      "length": 54,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 143,
+      "column": 3,
+      "length": 62,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 152,
+      "column": 3,
+      "length": 78,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 162,
+      "column": 3,
+      "length": 39,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 169,
+      "column": 3,
+      "length": 54,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 178,
+      "column": 3,
+      "length": 65,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 186,
+      "column": 3,
+      "length": 37,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 193,
+      "column": 3,
+      "length": 42,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 200,
+      "column": 3,
+      "length": 44,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 207,
+      "column": 3,
+      "length": 47,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 214,
+      "column": 3,
+      "length": 65,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 221,
+      "column": 3,
+      "length": 72,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 232,
+      "column": 3,
+      "length": 63,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 239,
+      "column": 3,
+      "length": 51,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 246,
+      "column": 3,
+      "length": 39,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 253,
+      "column": 3,
+      "length": 65,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 263,
+      "column": 3,
+      "length": 65,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 273,
+      "column": 3,
+      "length": 112,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 286,
+      "column": 3,
+      "length": 95,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 298,
+      "column": 3,
+      "length": 79,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 309,
+      "column": 3,
+      "length": 79,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 320,
+      "column": 3,
+      "length": 58,
+      "message": "Dead code."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "dead_code",
+      "line": 15,
+      "column": 3,
+      "length": 40,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 15,
+      "column": 13,
+      "length": 14,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 22,
+      "column": 3,
+      "length": 49,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 22,
+      "column": 8,
+      "length": 28,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 22,
+      "column": 21,
+      "length": 14,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 29,
+      "column": 3,
+      "length": 65,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 39,
+      "column": 3,
+      "length": 65,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 50,
+      "column": 3,
+      "length": 43,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 65,
+      "column": 7,
+      "length": 48,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 74,
+      "column": 3,
+      "length": 71,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 86,
+      "column": 7,
+      "length": 76,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 95,
+      "column": 3,
+      "length": 40,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 107,
+      "column": 7,
+      "length": 45,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 115,
+      "column": 3,
+      "length": 45,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 115,
+      "column": 21,
+      "length": 11,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 122,
+      "column": 3,
+      "length": 46,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 122,
+      "column": 29,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 129,
+      "column": 3,
+      "length": 53,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 136,
+      "column": 3,
+      "length": 54,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 143,
+      "column": 3,
+      "length": 62,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 152,
+      "column": 3,
+      "length": 78,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 162,
+      "column": 3,
+      "length": 39,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 169,
+      "column": 3,
+      "length": 54,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 178,
+      "column": 3,
+      "length": 65,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 186,
+      "column": 3,
+      "length": 37,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 193,
+      "column": 3,
+      "length": 42,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 200,
+      "column": 3,
+      "length": 44,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 207,
+      "column": 3,
+      "length": 47,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 214,
+      "column": 3,
+      "length": 65,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 214,
+      "column": 19,
+      "length": 9,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 221,
+      "column": 3,
+      "length": 72,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 232,
+      "column": 3,
+      "length": 63,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 232,
+      "column": 19,
+      "length": 9,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 239,
+      "column": 3,
+      "length": 51,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 239,
+      "column": 9,
+      "length": 29,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 239,
+      "column": 23,
+      "length": 14,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 246,
+      "column": 3,
+      "length": 39,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 246,
+      "column": 12,
+      "length": 14,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 253,
+      "column": 3,
+      "length": 65,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 263,
+      "column": 3,
+      "length": 65,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 273,
+      "column": 3,
+      "length": 112,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 286,
+      "column": 3,
+      "length": 95,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 298,
+      "column": 3,
+      "length": 79,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 309,
+      "column": 3,
+      "length": 79,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 320,
+      "column": 3,
+      "length": 58,
+      "message": "Dead code."
+    },
+    {
+      "code": "invalid_assignment",
+      "line": 106,
+      "column": 17,
+      "length": 3,
+      "message": "A value of type 'String' can't be assigned to a variable of type 'bool'."
+    },
+    {
+      "code": "invalid_null_aware_operator",
+      "line": 232,
+      "column": 29,
+      "length": 2,
+      "message": "The receiver can't be null, so the null-aware operator '?.' is unnecessary."
+    }
+  ],
+  "source": "// Copyright (c) 2020, the Dart project authors. Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\n// These tests verify that the kinds of constructs we expect to cause type\n// promotion continue to function properly even when used inside unreachable\n// code.\n\nabstract class C {\n  void f(Object x, Object y);\n}\n\nandExpression_alwaysFalse(Object o) {\n  return;\n  o is! int && (throw 'x');\n  /*int*/\n  o;\n}\n\nandExpression_alwaysTrue(Object o) {\n  return;\n  true && (o is int || (throw 'x'));\n  /*int*/\n  o;\n}\n\nandExpression_lhsAlwaysTrue(Object o) {\n  return;\n  if (true && o is! int) {\n    o;\n  } else {\n    /*int*/\n    o;\n  }\n}\n\nandExpression_rhsAlwaysTrue(Object o) {\n  return;\n  if (o is! int && true) {\n    o;\n  } else {\n    /*int*/\n    o;\n  }\n}\n\nassertAlwaysThrows(Object o, Object p, bool Function(Object, Object) f) {\n  if (o is! int) return;\n  return;\n  assert(f(o = p, throw 'x'));\n  /*int*/\n  o;\n}\n\nclass AssertAlwaysThrows_Constructor {\n  Object a;\n  Object b;\n\n  AssertAlwaysThrows_Constructor(\n    Object o,\n    Object p,\n    bool Function(Object, Object) f,\n  ) : a = o is int ? true : throw 'x',\n      b = throw 'x',\n      assert(f(o = p, throw 'x')) {\n    /*int*/\n    o;\n  }\n}\n\nassertFailsButMessageRepromotes(Object? o) {\n  if (o is! int) return;\n  return;\n  assert((o = null) != null, o is int ? 'ok' : throw 'x');\n  /*int*/\n  o;\n}\n\nclass AssertFailsButMessageRepromotes_Constructor {\n  Object a;\n  Object b;\n\n  AssertFailsButMessageRepromotes_Constructor(Object? o)\n    : a = o is int ? true : throw 'x',\n      b = throw 'x',\n      assert((o = null) != null, o is int ? 'ok' : throw 'x') {\n    /*int*/\n    o;\n  }\n}\n\nassertMessageDepromotesButAlwaysThrows(Object o, Object p, bool b) {\n  if (o is! int) return;\n  return;\n  assert(b, throw (o = p));\n  /*int*/\n  o;\n}\n\nclass AssertMessageDepromotesButAlwaysThrows {\n  Object a;\n  Object b;\n\n  AssertMessageDepromotesButAlwaysThrows(Object o, Object p, bool b)\n    : a = o is int ? true : throw 'x',\n      b = throw 'x',\n      assert(b, throw (o = p)) {\n    /*int*/\n    o;\n  }\n}\n\nconditionalIs(Object o) {\n  return;\n  o is int ? null : throw 'bad';\n  /*int*/\n  o;\n}\n\nconditionalIsNot(Object o) {\n  return;\n  o is! int ? throw 'bad' : null;\n  /*int*/\n  o;\n}\n\nconditionalJoinFalse(Object o, bool b) {\n  return;\n  if (b ? o is! int : o is! int) return;\n  /*int*/\n  o;\n}\n\nconditionalJoinTrue(Object o, bool b) {\n  return;\n  if (!(b ? o is int : o is int)) return;\n  /*int*/\n  o;\n}\n\ndoBreak(Object o) {\n  return;\n  do {\n    if (o is int) break;\n  } while (true);\n  /*int*/\n  o;\n}\n\ndoContinue(Object o) {\n  return;\n  do {\n    if (o is int) continue;\n    return;\n  } while (false);\n  /*int*/\n  o;\n}\n\ndoCondition(Object o) {\n  return;\n  do {} while (o is! int);\n  /*int*/\n  o;\n}\n\nforBreak(Object o) {\n  return;\n  for (;;) {\n    if (o is int) break;\n  }\n  /*int*/\n  o;\n}\n\nforContinue(Object o) {\n  return;\n  for (; ; /*int*/ o) {\n    if (o is int) continue;\n    return;\n  }\n}\n\nifIsNot(Object o) {\n  return;\n  if (o is! int) return;\n  /*int*/\n  o;\n}\n\nifIsNot_listElement(Object o) {\n  return;\n  [if (o is! int) throw 'x'];\n  /*int*/\n  o;\n}\n\nifIsNot_setElement(Object o) {\n  return;\n  ({if (o is! int) throw 'x'});\n  /*int*/\n  o;\n}\n\nifIsNot_mapElement(Object o) {\n  return;\n  ({if (o is! int) 0: throw 'x'});\n  /*int*/\n  o;\n}\n\nifNull(Object o, Object? p, Object q, void Function(Object, Object) f) {\n  return;\n  (o is int ? p : throw 'x') ?? f(o = q, throw 'x');\n  /*int*/\n  o;\n}\n\nlabeledStatement(Object o) {\n  return;\n  label:\n  {\n    if (o is int) break label;\n    return;\n  }\n  /*int*/\n  o;\n}\n\nnullAwareAccess(Object o, C? p, Object q) {\n  return;\n  (o is int ? p : throw 'x')?.f(o = q, throw 'x');\n  /*int*/\n  o;\n}\n\norExpression_alwaysFalse(Object o) {\n  return;\n  false || (o is! int && (throw 'x'));\n  /*int*/\n  o;\n}\n\norExpression_alwaysTrue(Object o) {\n  return;\n  o is int || (throw 'x');\n  /*int*/\n  o;\n}\n\norExpression_lhsAlwaysFalse(Object o) {\n  return;\n  if (false || o is int) {\n    /*int*/\n    o;\n  } else {\n    o;\n  }\n}\n\norExpression_rhsAlwaysFalse(Object o) {\n  return;\n  if (o is int || false) {\n    /*int*/\n    o;\n  } else {\n    o;\n  }\n}\n\nswitchPromoteInCase(Object o, int i) {\n  return;\n  switch (i) {\n    case 0:\n      if (o is! int) return;\n      break;\n    default:\n      return;\n  }\n  /*int*/\n  o;\n}\n\nswitchPromoteInImplicitDefault(Object o, int i, Object p) {\n  return;\n  if (o is! int) return;\n  switch (i) {\n    case 0:\n      o = p;\n      return;\n  }\n  /*int*/\n  o;\n}\n\ntryCatchPromoteInTry(Object o) {\n  return;\n  try {\n    if (o is! int) return;\n  } catch (_) {\n    return;\n  }\n  /*int*/\n  o;\n}\n\ntryCatchPromoteInCatch(Object o) {\n  return;\n  try {\n    return;\n  } catch (_) {\n    if (o is! int) return;\n  }\n  /*int*/\n  o;\n}\n\nwhileBreak(Object o) {\n  return;\n  while (true) {\n    if (o is int) break;\n  }\n  /*int*/\n  o;\n}\n",
+  "captured_at": 1792056733,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp3-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0",
+    "--edits",
+    "tests/corpus/regressions/cases/31a46a73.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

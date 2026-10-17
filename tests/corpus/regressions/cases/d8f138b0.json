@@ -1,0 +1,322 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/error_recovery/issue_26810_and.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "binary_operator_written_out",
+      "line": 2,
+      "column": 37,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 4,
+      "column": 43,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 7,
+      "column": 41,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 9,
+      "column": 47,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 12,
+      "column": 28,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 14,
+      "column": 34,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 16,
+      "column": 36,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 19,
+      "column": 32,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 21,
+      "column": 38,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 25,
+      "column": 9,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 25,
+      "column": 18,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 29,
+      "column": 31,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 29,
+      "column": 46,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 30,
+      "column": 22,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 33,
+      "column": 3,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
+      "code": "expected_token",
+      "line": 38,
+      "column": 7,
+      "length": 3,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 29,
+      "column": 23,
+      "length": 13,
+      "message": "'foo' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 29,
+      "column": 38,
+      "length": 13,
+      "message": "'bar' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 33,
+      "column": 23,
+      "length": 11,
+      "message": "'foo' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 33,
+      "column": 36,
+      "length": 11,
+      "message": "'bar' isn't a field in the enclosing class."
+    },
+    {
+      "code": "not_a_type",
+      "line": 38,
+      "column": 5,
+      "length": 1,
+      "message": "x isn't a type."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 38,
+      "column": 7,
+      "length": 3,
+      "message": "The value of the local variable 'and' isn't used."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "binary_operator_written_out",
+      "line": 2,
+      "column": 37,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 4,
+      "column": 43,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 7,
+      "column": 41,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 9,
+      "column": 47,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 12,
+      "column": 28,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 14,
+      "column": 34,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 16,
+      "column": 36,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 19,
+      "column": 32,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 21,
+      "column": 38,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 25,
+      "column": 9,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 25,
+      "column": 18,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 29,
+      "column": 31,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 29,
+      "column": 46,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "binary_operator_written_out",
+      "line": 30,
+      "column": 22,
+      "length": 3,
+      "message": "Binary operator 'and' is written as '&' instead of the written out word."
+    },
+    {
+      "code": "expected_token",
+      "line": 38,
+      "column": 7,
+      "length": 3,
+      "message": "Expected to find ';'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 29,
+      "column": 23,
+      "length": 3,
+      "message": "Undefined name 'foo'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 29,
+      "column": 38,
+      "length": 3,
+      "message": "Undefined name 'bar'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 33,
+      "column": 23,
+      "length": 3,
+      "message": "Undefined name 'foo'."
+    },
+    {
+      "code": "undefined_identifier",
+      "line": 33,
+      "column": 36,
+      "length": 3,
+      "message": "Undefined name 'bar'."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 38,
+      "column": 7,
+      "length": 3,
+      "message": "The value of the local variable 'and' isn't used."
+    }
+  ],
+  "source": "abstract class Key {\n  int get a => runtimeType.hashCode and null.hashCode;\n  int get b => runtimeType.hashCode & null.hashCode;\n  int get c { return runtimeType.hashCode and null.hashCode; }\n  int get d { return runtimeType.hashCode & null.hashCode; }\n\n  int get e => 1 + runtimeType.hashCode and null.hashCode + 3;\n  int get f => 1 + runtimeType.hashCode & null.hashCode + 3;\n  int get g { return 1 + runtimeType.hashCode and null.hashCode + 3; }\n  int get h { return 1 + runtimeType.hashCode & null.hashCode + 3; }\n\n  int i(int x, int y) => x and y;\n  int j(int x, int y) => x & y;\n  int k(int x, int y) { return x and y; }\n  int l(int x, int y) { return x & y; }\n  int m(int x, int y) { int z =  x and y; return z; }\n  int n(int x, int y) { int z = x & y; return z; }\n\n  int o(int x, int y) => 1 + x and y + 3;\n  int p(int x, int y) => 1 + x & y + 3;\n  int q(int x, int y) { return 1 + x and y + 3; }\n  int r(int x, int y) { return 1 + x & y + 3; }\n\n  s(int x, int y) {\n    s(x and y, x and y);\n    s(x & y, x & y);\n  }\n\n  Key(int x, int y) : foo = x and y, bar = x and y {\n    print(\"hello ${x and y}\");\n  }\n\n  Key(int x, int y) : foo = x & y, bar = x & y {\n    print(\"hello ${x & y}\");\n  }\n\n  not_currently_working(int x, int y) {\n    x and y;\n    x & y;\n  }\n}\n",
+  "captured_at": 1792056733,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp3-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/d8f138b0.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

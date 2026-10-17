@@ -1,0 +1,91 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/function_type_assignability.dart",
+  "corpus": "tests/corpus/m1-semantic",
+  "oracle": [
+    {
+      "code": "argument_type_not_assignable",
+      "line": 87,
+      "column": 15,
+      "length": 7,
+      "message": "The argument type 'void Function(int)' can't be assigned to the parameter type 'void Function(num)'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 93,
+      "column": 20,
+      "length": 7,
+      "message": "The argument type 'void Function(int)' can't be assigned to the parameter type 'void Function(int?)'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 99,
+      "column": 16,
+      "length": 8,
+      "message": "The argument type 'int? Function()' can't be assigned to the parameter type 'int Function()'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 107,
+      "column": 18,
+      "length": 11,
+      "message": "The argument type 'void Function(int)' can't be assigned to the parameter type 'void Function(int, int)'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 108,
+      "column": 18,
+      "length": 11,
+      "message": "The argument type 'void Function(int, int)' can't be assigned to the parameter type 'void Function(int)'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 117,
+      "column": 12,
+      "length": 11,
+      "message": "The argument type 'void Function(int)' can't be assigned to the parameter type 'void Function({int x})'. "
+    },
+    {
+      "code": "argument_type_not_assignable",
+      "line": 118,
+      "column": 12,
+      "length": 14,
+      "message": "The argument type 'void Function({required int x})' can't be assigned to the parameter type 'void Function({int x})'. "
+    },
+    {
+      "code": "missing_default_value_for_parameter",
+      "line": 73,
+      "column": 26,
+      "length": 1,
+      "message": "The parameter 'x' can't have a value of 'null' because of its type, but the implicit default value is 'null'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "missing_default_value_for_parameter",
+      "line": 73,
+      "column": 26,
+      "length": 1,
+      "message": "The parameter 'x' can't have a value of 'null' because of its type, but the implicit default value is 'null'."
+    }
+  ],
+  "source": "// Targets argument_type_not_assignable (the F7 face: function-type\n// assignability at call sites) on arguments that are closures or\n// tear-offs checked against the parameter's declared function type:\n// return-side covariance, formal-side contravariance, the int?/int\n// null-safety pair in both directions, required-formal count, and the\n// named-vs-positional / required-flag shapes, with the sound\n// counterparts pinned as deliberate silences. Trigger conditions: the\n// pinned assignability table (function-subtype relations on argument\n// function types). Hand-crafted from the code semantics; no official\n// test file.\n//\n// Upstream anchors (upstream Dart SDK source):\n// - pkg/analyzer/lib/src/dart/element/subtype.dart: _isFunctionSubtypeOf\n//   :86 — return covariance :98, formal contravariance :112 (the target\n//   formal's type must be a subtype of the source formal's type), named\n//   required-flag :143, named coverage :157, leftover required\n//   positionals :168, leftover target formals :177; Right-Top (void as\n//   the target return type accepts any return type) in _isSubtypeOf\n//   :281-288.\n// - pkg/analyzer/lib/src/dart/element/type_system.dart: isAssignableTo\n//   :890 — with default strict-casts, non-dynamic downcasts are disabled\n//   :917-924, so argument assignability reduces to subtyping here.\n// - pkg/analyzer/lib/src/generated/error_detection_helpers.dart:\n//   checkForArgumentTypeNotAssignableForArgument :67 gates each resolved\n//   argument on isAssignableTo :110 and reports\n//   diag.argumentTypeNotAssignable :426 (diagnostic name\n//   argument_type_not_assignable, COMPILE_TIME_ERROR).\n//\n// Oracle rows: counts approximate — this header was authored from the\n// upstream source, no dart run happened in the authoring lane; the\n// serial N2 differential leg pins the exact rows (code, line, column,\n// message). Expected: 7 argument_type_not_assignable rows at the call\n// sites marked ERROR below; every site marked SILENT must produce no\n// row.\nvoid useIntParam(void Function(int) f) => f(1);\n\nvoid useNumParam(void Function(num) f) => f(1.5);\n\nvoid useNullableParam(void Function(int?) f) => f(null);\n\nvoid useIntReturn(int Function() f) => print(f());\n\nvoid useNullableIntReturn(int? Function() f) => print(f());\n\nvoid useOneRequired(void Function(int) f) => f(1);\n\nvoid useTwoRequired(void Function(int, int) f) => f(1, 2);\n\nvoid useNamed(void Function({int x}) f) => f();\n\nvoid useRequiredNamed(void Function({required int x}) f) => f(x: 1);\n\nvoid useVoidReturn(void Function() f) => f();\n\nint fromNum(num n) => n.toInt();\n\nint justInt() => 1;\n\nint? maybeInt() => null;\n\nvoid onlyInt(int x) {}\n\nvoid nullableOk(int? x) {}\n\nvoid oneRequired(int a) {}\n\nvoid twoRequired(int a, int b) {}\n\nvoid positionalX(int x) {}\n\nvoid requiredNamedX({required int x}) {}\n\nvoid optionalNamedX({int x}) {}\n\nvoid main() {\n  // (a) Assignable controls: an exact-shape closure and a tear-off whose\n  // formal widens int to num. Contravariance accepts the supertype\n  // (subtype.dart:112, int <: num), return int <: void is Right-Top\n  // (subtype.dart:281), so both are SILENT.\n  useIntParam((int x) {});\n  useIntParam(fromNum);\n\n  // (b) Formal contravariance violation: the target accepts num, the\n  // argument accepts only int; subtype.dart:112 needs num <: int and\n  // fails, so this reports. The widening direction is the silent control\n  // in (a): accepting more than demanded is sound and never reports.\n  useNumParam(onlyInt); // ERROR argument_type_not_assignable\n\n  // (g) int?/int null-safety pair, both directions: an argument accepting\n  // only int where int? is demanded reports (int? <: int fails at\n  // subtype.dart:112); an argument accepting int? where only int is\n  // demanded is a sound upcast and stays SILENT.\n  useNullableParam(onlyInt); // ERROR argument_type_not_assignable\n  useIntParam(nullableOk); // SILENT\n\n  // (c) Return covariance: the argument's return type must be a subtype\n  // of the target's (subtype.dart:98). Returning int? where int is\n  // demanded reports; returning int where int? is demanded is SILENT.\n  useIntReturn(maybeInt); // ERROR argument_type_not_assignable\n  useNullableIntReturn(justInt); // SILENT\n\n  // (d) Required-formal count, both ways: a two-required-formal target\n  // rejects a one-formal argument (leftover target formals,\n  // subtype.dart:177) and a one-formal target rejects a\n  // two-required-formal argument (leftover required positionals,\n  // subtype.dart:168).\n  useTwoRequired(oneRequired); // ERROR argument_type_not_assignable\n  useOneRequired(twoRequired); // ERROR argument_type_not_assignable\n\n  // (e) Named-shape mismatch: a positional argument where the target\n  // declares a named formal reports (subtype.dart:118); a required-named\n  // argument where the target's named formal is optional reports\n  // (subtype.dart:143, callers may omit x). The reverse — an\n  // optional-named argument where the target's formal is required — is\n  // sound because the call site always passes x (subtype.dart:145) and\n  // stays SILENT.\n  useNamed(positionalX); // ERROR argument_type_not_assignable\n  useNamed(requiredNamedX); // ERROR argument_type_not_assignable\n  useRequiredNamed(optionalNamedX); // SILENT\n\n  // (f) A void-return target accepts any return type: Right-Top makes\n  // int <: void hold (subtype.dart:281-288), so this is a deliberate\n  // SILENCE, not a missed check.\n  useVoidReturn(justInt); // SILENT\n}\n",
+  "captured_at": 1792065476,
+  "source_run": {
+    "report": "target/evidence/gate-m1/m1-r5-sp4/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m1-semantic",
+    "--edits",
+    "tests/corpus/regressions/cases/c3ee9065.edits.jsonl",
+    "--dartq-cmd",
+    "./target/debug/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/debug/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

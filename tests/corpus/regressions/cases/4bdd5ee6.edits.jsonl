@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/src/error_recovery/method_called_with.dart","length":126,"line":1,"new_text":"class C {\n  int with() => 7;\n  int with = 7;\n  int get with => 7;\n  void set with(int x) {}\n}\n\nint with() => 7;\nint with = 7;\n"}

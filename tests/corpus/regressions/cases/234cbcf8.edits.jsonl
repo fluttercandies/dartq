@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/invalid_this_in_initializer.dart","length":192,"line":1,"new_text":"// Targets invalid_this_in_initializer: 'this' in an initializer can only be\n// used for field initialization or constructor redirection.\nclass A {}\n\nclass B extends A {\n  B() : this().foo;\n}\n"}

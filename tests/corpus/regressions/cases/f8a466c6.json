@@ -49,8 +49,8 @@
     "--edits",
     "tests/corpus/regressions/cases/f8a466c6.edits.jsonl",
     "--dartq-cmd",
-    "./target/debug/dartq analyze --format=machine --sdk $HOME/fvm/default/bin/cache/dart-sdk",
+    "./target/debug/dartq analyze --format=machine --sdk $DART_SDK",
     "--daemon-cmd",
-    "./target/debug/dartq daemon --dir {dir} --sdk $HOME/fvm/default/bin/cache/dart-sdk"
+    "./target/debug/dartq daemon {dir} --sdk $DART_SDK"
   ]
 }

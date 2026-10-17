@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/targeted/abstract_final_interface_class.dart","length":154,"line":1,"new_text":"// Targets abstract_final_interface_class: an 'abstract' class cannot be\n// declared as both 'final' and 'interface'.\nabstract final interface class C {}\n"}

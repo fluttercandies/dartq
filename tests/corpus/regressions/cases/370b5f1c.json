@@ -32,14 +32,28 @@
       "column": 3,
       "length": 3,
       "message": "Expected to find ';'."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 7,
+      "column": 28,
+      "length": 2,
+      "message": "A value of type 'int' can't be returned from the function 'main' because it has a return type of 'void'."
+    },
+    {
+      "code": "unused_element",
+      "line": 7,
+      "column": 7,
+      "length": 9,
+      "message": "The declaration 'getNumber' isn't referenced."
     }
   ],
   "source": "import 'dart:io';\n\nvoid main(List<String> args) async {\n  final proc = await Process.start('', []);\n  proc.stdout. // we're typing here!\n\n  int getNumber() { return 42; }\n}\n",
-  "captured_at": 1791787153,
+  "captured_at": 1792065400,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -49,8 +63,8 @@
     "--edits",
     "tests/corpus/regressions/cases/370b5f1c.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
     "--daemon-cmd",
-    "./target/release/dartq daemon --dir {dir}"
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
   ]
 }

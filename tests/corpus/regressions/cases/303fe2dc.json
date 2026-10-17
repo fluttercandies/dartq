@@ -1,0 +1,1057 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/inline_class/extends_with.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "extension_type_extends",
+      "line": 1,
+      "column": 27,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 4,
+      "column": 27,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 5,
+      "column": 27,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 6,
+      "column": 27,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 9,
+      "column": 27,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 10,
+      "column": 28,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 11,
+      "column": 43,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 14,
+      "column": 43,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 15,
+      "column": 43,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 16,
+      "column": 43,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 19,
+      "column": 43,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 20,
+      "column": 43,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 22,
+      "column": 28,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 22,
+      "column": 40,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 23,
+      "column": 28,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_implements_disallowed_type",
+      "line": 11,
+      "column": 39,
+      "length": 3,
+      "message": "Extension types can't implement 'InvalidType'."
+    },
+    {
+      "code": "extension_type_implements_disallowed_type",
+      "line": 12,
+      "column": 39,
+      "length": 3,
+      "message": "Extension types can't implement 'InvalidType'."
+    },
+    {
+      "code": "extension_type_implements_disallowed_type",
+      "line": 13,
+      "column": 39,
+      "length": 3,
+      "message": "Extension types can't implement 'InvalidType'."
+    },
+    {
+      "code": "extension_type_implements_disallowed_type",
+      "line": 14,
+      "column": 39,
+      "length": 3,
+      "message": "Extension types can't implement 'InvalidType'."
+    },
+    {
+      "code": "extension_type_implements_disallowed_type",
+      "line": 15,
+      "column": 39,
+      "length": 3,
+      "message": "Extension types can't implement 'InvalidType'."
+    },
+    {
+      "code": "extension_type_implements_disallowed_type",
+      "line": 16,
+      "column": 39,
+      "length": 3,
+      "message": "Extension types can't implement 'InvalidType'."
+    },
+    {
+      "code": "extension_type_implements_disallowed_type",
+      "line": 17,
+      "column": 39,
+      "length": 3,
+      "message": "Extension types can't implement 'InvalidType'."
+    },
+    {
+      "code": "extension_type_implements_disallowed_type",
+      "line": 18,
+      "column": 39,
+      "length": 3,
+      "message": "Extension types can't implement 'InvalidType'."
+    },
+    {
+      "code": "extension_type_implements_disallowed_type",
+      "line": 19,
+      "column": 39,
+      "length": 3,
+      "message": "Extension types can't implement 'InvalidType'."
+    },
+    {
+      "code": "extension_type_implements_disallowed_type",
+      "line": 20,
+      "column": 39,
+      "length": 3,
+      "message": "Extension types can't implement 'InvalidType'."
+    },
+    {
+      "code": "extension_type_implements_disallowed_type",
+      "line": 21,
+      "column": 39,
+      "length": 3,
+      "message": "Extension types can't implement 'InvalidType'."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 2,
+      "column": 27,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 3,
+      "column": 27,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 4,
+      "column": 39,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 5,
+      "column": 39,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 7,
+      "column": 27,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 8,
+      "column": 27,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 9,
+      "column": 39,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 10,
+      "column": 40,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 12,
+      "column": 43,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 13,
+      "column": 43,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 14,
+      "column": 55,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 15,
+      "column": 55,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 17,
+      "column": 43,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 18,
+      "column": 43,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 19,
+      "column": 55,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 20,
+      "column": 55,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "multiple_implements_clauses",
+      "line": 16,
+      "column": 55,
+      "length": 10,
+      "message": "Each class or mixin definition can have at most one implements clause."
+    },
+    {
+      "code": "multiple_implements_clauses",
+      "line": 17,
+      "column": 52,
+      "length": 10,
+      "message": "Each class or mixin definition can have at most one implements clause."
+    },
+    {
+      "code": "multiple_implements_clauses",
+      "line": 18,
+      "column": 57,
+      "length": 10,
+      "message": "Each class or mixin definition can have at most one implements clause."
+    },
+    {
+      "code": "multiple_implements_clauses",
+      "line": 19,
+      "column": 64,
+      "length": 10,
+      "message": "Each class or mixin definition can have at most one implements clause."
+    },
+    {
+      "code": "multiple_implements_clauses",
+      "line": 20,
+      "column": 69,
+      "length": 10,
+      "message": "Each class or mixin definition can have at most one implements clause."
+    },
+    {
+      "code": "multiple_implements_clauses",
+      "line": 21,
+      "column": 43,
+      "length": 10,
+      "message": "Each class or mixin definition can have at most one implements clause."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "extension_type_extends",
+      "line": 1,
+      "column": 27,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 4,
+      "column": 27,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 5,
+      "column": 27,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 6,
+      "column": 27,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 9,
+      "column": 27,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 10,
+      "column": 28,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 11,
+      "column": 43,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 14,
+      "column": 43,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 15,
+      "column": 43,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 16,
+      "column": 43,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 19,
+      "column": 43,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 20,
+      "column": 43,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 22,
+      "column": 28,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 22,
+      "column": 40,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_extends",
+      "line": 23,
+      "column": 28,
+      "length": 7,
+      "message": "An extension type declaration can't have an 'extends' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 2,
+      "column": 27,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 3,
+      "column": 27,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 4,
+      "column": 39,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 5,
+      "column": 39,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 7,
+      "column": 27,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 8,
+      "column": 27,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 9,
+      "column": 39,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 10,
+      "column": 40,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 12,
+      "column": 43,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 13,
+      "column": 43,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 14,
+      "column": 55,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 15,
+      "column": 55,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 17,
+      "column": 43,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 18,
+      "column": 43,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 19,
+      "column": 55,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "extension_type_with",
+      "line": 20,
+      "column": 55,
+      "length": 4,
+      "message": "An extension type declaration can't have a 'with' clause."
+    },
+    {
+      "code": "multiple_implements_clauses",
+      "line": 16,
+      "column": 55,
+      "length": 10,
+      "message": "Each class or mixin definition can have at most one implements clause."
+    },
+    {
+      "code": "multiple_implements_clauses",
+      "line": 17,
+      "column": 52,
+      "length": 10,
+      "message": "Each class or mixin definition can have at most one implements clause."
+    },
+    {
+      "code": "multiple_implements_clauses",
+      "line": 18,
+      "column": 57,
+      "length": 10,
+      "message": "Each class or mixin definition can have at most one implements clause."
+    },
+    {
+      "code": "multiple_implements_clauses",
+      "line": 19,
+      "column": 64,
+      "length": 10,
+      "message": "Each class or mixin definition can have at most one implements clause."
+    },
+    {
+      "code": "multiple_implements_clauses",
+      "line": 20,
+      "column": 69,
+      "length": 10,
+      "message": "Each class or mixin definition can have at most one implements clause."
+    },
+    {
+      "code": "multiple_implements_clauses",
+      "line": 21,
+      "column": 43,
+      "length": 10,
+      "message": "Each class or mixin definition can have at most one implements clause."
+    },
+    {
+      "code": "undefined_class",
+      "line": 1,
+      "column": 35,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 2,
+      "column": 32,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 3,
+      "column": 32,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 3,
+      "column": 37,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 4,
+      "column": 35,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 4,
+      "column": 44,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 5,
+      "column": 35,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 5,
+      "column": 44,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 5,
+      "column": 49,
+      "length": 3,
+      "message": "Undefined class 'Baz'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 6,
+      "column": 35,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 6,
+      "column": 50,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 7,
+      "column": 32,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 7,
+      "column": 47,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 8,
+      "column": 32,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 8,
+      "column": 37,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 8,
+      "column": 52,
+      "length": 3,
+      "message": "Undefined class 'Baz'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 9,
+      "column": 35,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 9,
+      "column": 44,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 9,
+      "column": 59,
+      "length": 3,
+      "message": "Undefined class 'Baz'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 10,
+      "column": 36,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 10,
+      "column": 45,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 10,
+      "column": 50,
+      "length": 3,
+      "message": "Undefined class 'Baz'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 10,
+      "column": 65,
+      "length": 3,
+      "message": "Undefined class 'Boz'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 11,
+      "column": 39,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 11,
+      "column": 51,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 12,
+      "column": 39,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 12,
+      "column": 48,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 13,
+      "column": 39,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 13,
+      "column": 48,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 13,
+      "column": 53,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 14,
+      "column": 39,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 14,
+      "column": 51,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 14,
+      "column": 60,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 15,
+      "column": 39,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 15,
+      "column": 51,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 15,
+      "column": 60,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 15,
+      "column": 65,
+      "length": 3,
+      "message": "Undefined class 'Baz'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 16,
+      "column": 39,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 16,
+      "column": 51,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 16,
+      "column": 66,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 17,
+      "column": 39,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 17,
+      "column": 48,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 17,
+      "column": 63,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 18,
+      "column": 39,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 18,
+      "column": 48,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 18,
+      "column": 53,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 18,
+      "column": 68,
+      "length": 3,
+      "message": "Undefined class 'Baz'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 19,
+      "column": 39,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 19,
+      "column": 51,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 19,
+      "column": 60,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 19,
+      "column": 75,
+      "length": 3,
+      "message": "Undefined class 'Baz'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 20,
+      "column": 39,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 20,
+      "column": 51,
+      "length": 3,
+      "message": "Undefined class 'Foo'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 20,
+      "column": 60,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 20,
+      "column": 65,
+      "length": 3,
+      "message": "Undefined class 'Baz'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 20,
+      "column": 80,
+      "length": 3,
+      "message": "Undefined class 'Boz'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 21,
+      "column": 39,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 21,
+      "column": 54,
+      "length": 3,
+      "message": "Undefined class 'Boz'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 22,
+      "column": 36,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 22,
+      "column": 48,
+      "length": 3,
+      "message": "Undefined class 'Boz'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 23,
+      "column": 36,
+      "length": 3,
+      "message": "Undefined class 'Bar'."
+    },
+    {
+      "code": "undefined_class",
+      "line": 23,
+      "column": 41,
+      "length": 3,
+      "message": "Undefined class 'Boz'."
+    }
+  ],
+  "source": "extension type ET1(int i) extends Foo {}\nextension type ET2(int i) with Foo {}\nextension type ET3(int i) with Foo, Bar {}\nextension type ET4(int i) extends Foo with Bar {}\nextension type ET5(int i) extends Foo with Bar, Baz {}\nextension type ET6(int i) extends Foo implements Bar {}\nextension type ET7(int i) with Foo implements Bar {}\nextension type ET8(int i) with Foo, Bar implements Baz {}\nextension type ET9(int i) extends Foo with Bar implements Baz {}\nextension type ET10(int i) extends Foo with Bar, Baz implements Boz {}\nextension type ET11(int i) implements Bar extends Foo {}\nextension type ET12(int i) implements Bar with Foo {}\nextension type ET13(int i) implements Bar with Foo, Bar {}\nextension type ET14(int i) implements Bar extends Foo with Bar {}\nextension type ET15(int i) implements Bar extends Foo with Bar, Baz {}\nextension type ET16(int i) implements Bar extends Foo implements Bar {}\nextension type ET17(int i) implements Bar with Foo implements Bar {}\nextension type ET18(int i) implements Bar with Foo, Bar implements Baz {}\nextension type ET19(int i) implements Bar extends Foo with Bar implements Baz {}\nextension type ET20(int i) implements Bar extends Foo with Bar, Baz implements Boz {}\nextension type ET21(int i) implements Bar implements Boz {}\nextension type ET22(int i) extends Bar extends Boz {}\nextension type ET23(int i) extends Bar, Boz {}\n",
+  "captured_at": 1792056733,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp3-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/303fe2dc.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

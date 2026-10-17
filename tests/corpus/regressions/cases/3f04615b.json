@@ -76,13 +76,6 @@
       "message": "Expected to find ';'."
     },
     {
-      "code": "expected_token",
-      "line": 20,
-      "column": 13,
-      "length": 2,
-      "message": "Expected to find ';'."
-    },
-    {
       "code": "missing_function_body",
       "line": 10,
       "column": 19,
@@ -97,25 +90,11 @@
       "message": "A function body must be provided."
     },
     {
-      "code": "missing_function_body",
-      "line": 20,
-      "column": 13,
-      "length": 0,
-      "message": "Expected a function body, but got '('."
-    },
-    {
       "code": "missing_function_parameters",
       "line": 20,
       "column": 13,
       "length": 2,
       "message": "Functions must have an explicit list of parameters."
-    },
-    {
-      "code": "missing_identifier",
-      "line": 20,
-      "column": 13,
-      "length": 2,
-      "message": "Expected an identifier, but got '=>'."
     },
     {
       "code": "missing_method_parameters",
@@ -125,19 +104,47 @@
       "message": "Methods must have an explicit list of parameters."
     },
     {
+      "code": "return_of_invalid_type",
+      "line": 20,
+      "column": 16,
+      "length": 1,
+      "message": "A value of type 'int' can't be returned from the function 'getterInFunction' because it has a return type of 'void'."
+    },
+    {
       "code": "unexpected_token",
       "line": 25,
       "column": 3,
       "length": 3,
       "message": "Unexpected text 'set'."
+    },
+    {
+      "code": "unused_element",
+      "line": 20,
+      "column": 11,
+      "length": 1,
+      "message": "The declaration 'g' isn't referenced."
+    },
+    {
+      "code": "unused_element",
+      "line": 25,
+      "column": 7,
+      "length": 1,
+      "message": "The declaration 's' isn't referenced."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 20,
+      "column": 7,
+      "length": 3,
+      "message": "The value of the local variable 'get' isn't used."
     }
   ],
   "source": "// Targets the accessor family (analyzer ParserErrorCode, pinned snapshot\n// syntax-codes.tsv; the analyzer sources are not vendored in this repo).\n// Targets missing_get (TSV:207): a '=>' member without 'get'.\nclass MissingGet {\n  int x => 1;\n}\n\n// Targets static_getter_without_body (TSV:271).\nclass StaticGetterWithoutBody {\n  static int get x;\n}\n\n// Targets static_setter_without_body (TSV:273).\nclass StaticSetterWithoutBody {\n  static set x(int v);\n}\n\n// Targets getter_in_function (TSV:145).\nvoid getterInFunction() {\n  int get g => 1;\n}\n\n// Targets setter_in_function (TSV:268).\nvoid setterInFunction() {\n  set s(int v) {}\n}\n",
-  "captured_at": 1791787153,
+  "captured_at": 1792065400,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -147,8 +154,8 @@
     "--edits",
     "tests/corpus/regressions/cases/3f04615b.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
     "--daemon-cmd",
-    "./target/release/dartq daemon --dir {dir}"
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
   ]
 }

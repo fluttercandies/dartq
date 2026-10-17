@@ -1,0 +1,273 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/src/primary_constructors/new_qualified_name.dart",
+  "corpus": "m0-syntax",
+  "oracle": [
+    {
+      "code": "const_constructor_with_body",
+      "line": 8,
+      "column": 36,
+      "length": 1,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 9,
+      "column": 23,
+      "length": 1,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 3,
+      "column": 7,
+      "length": 7,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 4,
+      "column": 7,
+      "length": 7,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 5,
+      "column": 7,
+      "length": 7,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 6,
+      "column": 13,
+      "length": 7,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 7,
+      "column": 13,
+      "length": 7,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 8,
+      "column": 13,
+      "length": 7,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "duplicate_constructor",
+      "line": 9,
+      "column": 13,
+      "length": 7,
+      "message": "The constructor with name 'named' is already defined."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 3,
+      "column": 19,
+      "length": 10,
+      "message": "'i' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 4,
+      "column": 19,
+      "length": 10,
+      "message": "'i' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 7,
+      "column": 25,
+      "length": 10,
+      "message": "'i' isn't a field in the enclosing class."
+    },
+    {
+      "code": "initializer_for_non_existent_field",
+      "line": 8,
+      "column": 25,
+      "length": 10,
+      "message": "'i' isn't a field in the enclosing class."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 2,
+      "column": 7,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 3,
+      "column": 7,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 4,
+      "column": 7,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 5,
+      "column": 7,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 6,
+      "column": 13,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 7,
+      "column": 13,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 8,
+      "column": 13,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 9,
+      "column": 13,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "const_constructor_with_body",
+      "line": 8,
+      "column": 36,
+      "length": 1,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "const_constructor_with_body",
+      "line": 9,
+      "column": 23,
+      "length": 1,
+      "message": "Const constructors can't have a body."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 2,
+      "column": 7,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 3,
+      "column": 7,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 4,
+      "column": 7,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 5,
+      "column": 7,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 6,
+      "column": 13,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 7,
+      "column": 13,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 8,
+      "column": 13,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "new_constructor_qualified_name",
+      "line": 9,
+      "column": 13,
+      "length": 1,
+      "message": "Constructors declared with the 'new' keyword can't have qualified names."
+    },
+    {
+      "code": "undefined_setter",
+      "line": 3,
+      "column": 24,
+      "length": 1,
+      "message": "The setter 'i' isn't defined for the type 'C'."
+    },
+    {
+      "code": "undefined_setter",
+      "line": 4,
+      "column": 24,
+      "length": 1,
+      "message": "The setter 'i' isn't defined for the type 'C'."
+    },
+    {
+      "code": "undefined_setter",
+      "line": 7,
+      "column": 30,
+      "length": 1,
+      "message": "The setter 'i' isn't defined for the type 'C'."
+    },
+    {
+      "code": "undefined_setter",
+      "line": 8,
+      "column": 30,
+      "length": 1,
+      "message": "The setter 'i' isn't defined for the type 'C'."
+    }
+  ],
+  "source": "class C {\n  new C.named();\n  new C.named() : this.i = 0;\n  new C.named() : this.i = 0 {}\n  new C.named() {}\n  const new C.named();\n  const new C.named() : this.i = 0;\n  const new C.named() : this.i = 0 {}\n  const new C.named() {}\n}\n",
+  "captured_at": 1792056733,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp3-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0-syntax",
+    "--edits",
+    "tests/corpus/regressions/cases/02512415.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}

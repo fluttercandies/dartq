@@ -1,6 +1,6 @@
 # Regression cases
 
-Persisted differential-testing failures (PRD 19.1: every diff between dartq
+Persisted differential-testing failures (the charter: every diff between dartq
 and the oracle auto-persists as a regression case instead of evaporating
 with the run's console output).
 
@@ -86,3 +86,19 @@ comparison surfaces the divergence (replay exits 1 with the step listed).
 4. **Prune** with `--list-known`: entries marked STALE match no persisted
    case anymore (fixed or re-titled) — remove them. NO-EVIDENCE means no
    persisted cases exist yet; nothing may be claimed stale off zero data.
+
+## Derivation pin (`cases/` is a hard gate input)
+
+`cases/` is not only evidence for `known-diffs.json`: it is the hard
+input of the sem2 derivation pin. The pin test
+`sem2_codes_file_matches_derivation` (tests/harness/src/main.rs)
+re-derives `tests/harness/sem2_codes.txt` live — the union of the
+oracle and dartq row codes over every `cases/*.json` minus the five
+frozen gate universes — and asserts set equality against the file. Any
+deletion or addition of cases must therefore be derivation-aware:
+after touching `cases/`, re-run the pin and consciously re-freeze the
+codes file if the derived set moved (deleting a case with unique codes
+changes the file). The four keyword-named-declaration error-recovery
+nails (`keyword_named_*`: formal parameters, class methods, typedefs,
+top-level methods) are intentional one-per-shape coverage of the
+keyword matrix, not duplicates — do not consolidate them.

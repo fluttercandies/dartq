@@ -1,0 +1,83 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/exhaustiveness/data/issue51897.dart",
+  "corpus": "m0",
+  "oracle": [],
+  "dartq": [
+    {
+      "code": "argument_type_not_assignable",
+      "line": 59,
+      "column": 16,
+      "length": 4,
+      "message": "The argument type 'Null' can't be assigned to the parameter type 'T'. "
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 15,
+      "column": 12,
+      "length": 4,
+      "message": "The matched value type 'T' can never be equal to this constant of type 'bool'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 17,
+      "column": 12,
+      "length": 5,
+      "message": "The matched value type 'T' can never be equal to this constant of type 'bool'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 19,
+      "column": 12,
+      "length": 4,
+      "message": "The matched value type 'T' can never be equal to this constant of type 'Null'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 50,
+      "column": 10,
+      "length": 4,
+      "message": "The matched value type 'T' can never be equal to this constant of type 'bool'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 52,
+      "column": 10,
+      "length": 5,
+      "message": "The matched value type 'T' can never be equal to this constant of type 'bool'."
+    },
+    {
+      "code": "constant_pattern_never_matches_value_type",
+      "line": 54,
+      "column": 10,
+      "length": 4,
+      "message": "The matched value type 'T' can never be equal to this constant of type 'Null'."
+    },
+    {
+      "code": "pattern_never_matches_value_type",
+      "line": 34,
+      "column": 12,
+      "length": 4,
+      "message": "The matched value type 'T' can never match the required type 'bool'."
+    }
+  ],
+  "source": "// Copyright (c) 2023, the Dart project authors.  Please see the AUTHORS file\n// for details. All rights reserved. Use of this source code is governed by a\n// BSD-style license that can be found in the LICENSE file.\n\ntest1<T>(T t) {\n  if (t is bool?) {\n    /*\n     checkingOrder={bool?,bool,Null,true,false},\n     expandedSubtypes={true,false,Null},\n     subtypes={bool,Null},\n     type=bool?\n    */\n    switch (t) {\n      /*space=true*/\n      case true:\n      /*space=false*/\n      case false:\n      /*space=Null*/\n      case null:\n    }\n  }\n}\n\ntest2<T>(T t) {\n  if (t is bool?) {\n    /*\n     checkingOrder={bool?,bool,Null,true,false},\n     expandedSubtypes={true,false,Null},\n     subtypes={bool,Null},\n     type=bool?\n    */\n    switch (t) {\n      /*space=bool*/\n      case bool():\n      /*space=Null*/\n      case Null():\n    }\n  }\n}\n\ntest3<T extends bool?>(T t) {\n  /*\n   checkingOrder={bool?,bool,Null,true,false},\n   expandedSubtypes={true,false,Null},\n   subtypes={bool,Null},\n   type=bool?\n  */\n  switch (t) {\n    /*space=true*/\n    case true:\n    /*space=false*/\n    case false:\n    /*space=Null*/\n    case null:\n  }\n}\n\nmain() {\n  test1<bool?>(null);\n  test2<bool?>(true);\n  test3(true);\n}\n",
+  "captured_at": 1792065400,
+  "source_run": {
+    "report": "target/evidence/gate-m0/trend-w5-sp4-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/m0",
+    "--edits",
+    "tests/corpus/regressions/cases/add4479f.edits.jsonl",
+    "--dartq-cmd",
+    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "--daemon-cmd",
+    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+  ]
+}
