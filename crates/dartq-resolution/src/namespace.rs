@@ -1,55 +1,68 @@
-//! Namespace construction and lookup over the library graph
-//! (the resolution design contract §1/§5, module `namespace.rs`) —
-//! the dartq face of the analyzer's `NamespaceBuilder`
-//! (`analyzer-8.4.1 lib/src/dart/resolver/scope.dart:140-283`) applied over
-//! [`crate::library_graph`]'s export scopes.
+//! Namespace lookup over the library graph — the query-time namespace
+//! combinator
+//! — the dartq face of the analyzer's `NamespaceBuilder`
+//! (`analyzer-8.4.1 lib/src/dart/resolver/scope.dart:140-283`) composed over
+//! [`crate::library_graph`]'s export scopes at lookup time.
 //!
 //! # What is precomputed
 //!
-//! Everything. [`Namespaces::build`] eagerly materializes, per library:
+//! Only the compact import tables — never merged namespaces (#1068). The
+//! previous shape eagerly materialized, per library, the merged import
+//! namespace and per-prefix tables; at the memory charter's red line (10⁵
+//! libraries in 0.5–8 GB) that duplication dominates — every consumer of
+//! `dart:core` held its own map over the same thousand-plus names. This
+//! shape stores one 16-byte row per import directive in four flat arrays
+//! ([`Namespaces`]): the row carries the `as` prefix id, the resolved
+//! target, and a range over the directive's combinator clauses. A lookup
+//! composes the namespace on the fly — walk the library's rows in directive
+//! source order, filter each through its clauses, and probe the target's
+//! export scope in the graph. Memory is O(import directives), bounded by
+//! the input; there are no per-library maps and no string work on the hot
+//! path (rows are interned ids; clause name sets arrive sorted and
+//! setter-expanded from [`crate::library_graph::Combinators::build`], so
+//! filtering is binary search over `u32`s).
 //!
-//! - the **import namespace**: the merged face of all un-prefixed imports,
-//!   each filtered by its directive combinators at build time (§1 — the
-//!   oracle filters during construction, `NamespaceBuilder
-//!   .createImportNamespaceForDirective` + `_applyCombinators`,
-//!   scope.dart:159-170/227-244), and
-//! - one **prefix table** per distinct `as` prefix, merged across all
-//!   imports sharing it, keyed by prefix name — the analyzer's
-//!   `_prefixElements` map (`LibraryFragmentScope._`,
-//!   scope.dart:343-353). Every named prefix registers, even when its
-//!   import's target resolves to nothing (the table is then empty:
-//!   `_buildLibraryImportPrefixes` has no resolution gating,
-//!   `element.dart:7529-7536`). Prefixes live *outside* the combined import
-//!   namespace: `_lookupCombined` consults `_prefixElements` first and
-//!   returns the prefix unconditionally, before the import namespace
-//!   (scope.dart:455-471), and `p.x` always goes through the prefix's
-//!   table (`PrefixScope`, scope.dart:352-357) — a prefix name never
-//!   merges into, or conflicts with, imported names.
-//!
-//! Lookup is therefore pure `FxHashMap` hits on interned keys: no string
-//! work, no allocation.
+//! The oracle filters during construction (`NamespaceBuilder
+//!.createImportNamespaceForDirective` + `_applyCombinators`,
+//! scope.dart:159-170/227-244); composing per probe at query time applies
+//! the identical per-import filter with identical per-import timing, so the
+//! observable result is the same without holding the merged product.
 //!
 //! # Ambiguity
 //!
 //! Import merging follows the lazy rule (Dart 18.1; `front_end`
-//! `computeAmbiguousDeclarationForImport`, spec §1): the **same** target
+//! `computeAmbiguousDeclarationForImport`): the **same** target
 //! arriving through several paths is one entry; **different** targets under
 //! one name make the entry ambiguous with all candidates kept — the
 //! diagnosis surfaces at the use point (`ambiguous_import`), never at build
-//! time, and this layer only exposes it through [`Lookup::Ambiguous`].
+//! time. Because the composition walks imports in source order on every
+//! probe, the full candidate set is discovered per lookup and returned
+//! **owned** ([`Lookup::Ambiguous`]) — an allocation is paid only on the
+//! ambiguous (error) path; hits and misses allocate nothing.
 //!
 //! Lookup order is the oracle's scope chain (`LibraryFragmentScope.lookup`,
 //! scope.dart:419-433): the name-coupled locals layer first (a local face
 //! under either spelling of a base name shadows imports for both), then
-//! prefixes (the `_prefixElements` branch of `_lookupCombined`), then the
-//! merged import namespace. The deeper chain (type-parameter scopes,
+//! prefixes (the `_prefixElements` branch of `_lookupCombined` returns the
+//! prefix unconditionally, before the import namespace — scope.dart:455-471),
+//! then the un-prefixed imports in first-come-wins per-import composition.
+//! Bare `_` never hits the prefix branch: with `wildcard_variables` (Dart
+//! 3.7+ default-on; pinned here) `_shouldTryPrefixElement` skips it
+//! (scope.dart:486-494). The deeper chain (type-parameter scopes,
 //! part-local scopes) is the semantic layer's.
 //!
-//! # Deviations from the spec sketch (§5), pinned here
+//! # Why no merge cache
 //!
-//! - `NameEntry::Ambiguous` keeps **all** candidates, not `[DefSource; 2]` —
-//!   the oracle's `ambiguous_import` message template lists every defining
-//!   library (`diagnostic.g.dart:396`), and truncating would lose them.
+//! Direction (c) of #1068 — a bounded LRU of merged tables for hot
+//! libraries — was considered and rejected: a library's composition walk is
+//! bounded by its own import count (rows are contiguous 16-byte records,
+//! typically a few dozen per library), so the walk is already cache-local
+//! with no unbounded growth anywhere. A cache would add invalidation and a
+//! capacity knob without a measured need; revisit only if the serial-phase
+//! benchmark shows walk latency above budget.
+//!
+//! # Deviations from the spec sketch, pinned here
+//!
 //! - Targets are declaring files, not `DefId`s: this layer has no element
 //!   table, and `(file, lookup-key name)` identifies a top-level declaration
 //!   for the semantic layer to resolve.
@@ -61,15 +74,24 @@
 //!   `library_graph.rs` already pins) — becomes relevant only once SDK
 //!   namespaces exist and is deferred with that graft.
 //! - The spec's `Namespace`/`Scope` type split is folded into one index
-//!   ([`Namespaces`]) with the chain order fixed (local → imports): M1 has a
-//!   single two-level chain, and a parent-delegation abstraction would model
-//!   nothing that varies yet.
+//!   ([`Namespaces`]) with the chain order fixed (locals → prefixes →
+//!   imports): M1 has a single two-level chain, and a parent-delegation
+//!   abstraction would model nothing that varies yet.
 
 use dartq_source::{FileId, StringId};
-use rustc_hash::FxHashMap;
-use std::collections::hash_map;
 
-use crate::library_graph::{LibraryGraph, LibraryId, LocalLookup};
+use crate::library_graph::{CombinatorClause, LibraryGraph, LibraryId, LocalLookup};
+
+/// Row sentinel: the import directive carries no `as` prefix. Ids are
+/// sequential `u32`s issued by the interners, so the sentinel is reachable
+/// only with 2³²−1 distinct interned names — not a real workspace.
+const NO_PREFIX: u32 = u32::MAX;
+
+/// Row sentinel: the directive's URI resolved to no library of the analysis
+/// set (`dart:`, missing, or not a library) — the row still registers its
+/// prefix but contributes no names. Same reachability argument as
+/// [`NO_PREFIX`].
+const NO_TARGET: u32 = u32::MAX;
 
 /// One lookup target in a namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,71 +106,158 @@ pub enum NamespaceEntry {
     Prefix,
 }
 
-/// A namespace entry under one name: a single target, or the full candidate
-/// set of a lazily-ambiguous name (Dart 18.1 — importing a name from several
-/// libraries is only an error when the name is used).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NameEntry {
-    /// One target.
-    Single(NamespaceEntry),
-    /// Two or more distinct targets; all candidates, in arrival (import
-    /// source) order.
-    Ambiguous(Box<[NamespaceEntry]>),
-}
-
 /// The outcome of a namespace lookup — the shape the semantic layer's
 /// `undefined_*` family consumes: a hit, a lazily-ambiguous name (reported at
-/// the use point as `ambiguous_import`), or a miss.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Lookup<'a> {
+/// the use point as `ambiguous_import`), or a miss. The ambiguous variant is
+/// owned because the composition walk materializes the candidate set per
+/// probe; it is the only allocating outcome and only on the error path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lookup {
     /// The name resolves to one target.
     Found(NamespaceEntry),
-    /// The name is ambiguous between two or more distinct targets.
-    Ambiguous(&'a [NamespaceEntry]),
+    /// The name is ambiguous between two or more distinct targets; all
+    /// candidates, in arrival (import source) order.
+    Ambiguous(Box<[NamespaceEntry]>),
     /// The name is not in the namespace at all.
     NotFound,
 }
 
-/// The namespaces of a graph's libraries: per library, the merged import
-/// namespace and the prefix tables keyed by prefix name.
-#[derive(Debug)]
-pub struct Namespaces {
-    libs: Vec<LibraryNamespaces>,
+/// One compact per-directive import row: everything namespace lookup needs
+/// from a resolved `import`, flattened out of the graph edge (whose
+/// [`crate::library_graph::Combinators`] also carries diagnostic faces this
+/// layer never reads). 16 bytes; one per directive, in source order.
+#[derive(Clone, Copy, Debug)]
+struct ImportRow {
+    /// The `as` prefix name id, or [`NO_PREFIX`]. Comparison-only: lookups
+    /// match raw ids, the id is never resolved back to a name.
+    prefix: u32,
+    /// The resolved target library's id, or [`NO_TARGET`].
+    target: u32,
+    /// The directive's combinator clauses as a range into
+    /// [`Namespaces::clauses`]. An empty range is the unfiltered directive —
+    /// the common case, decided with no work at all.
+    clauses: (u32, u32),
 }
 
+/// One combinator clause of an import row: the kind and a sorted,
+/// deduplicated, setter-expanded name-id range into
+/// [`Namespaces::filter_names`] — binary-search membership, exactly the
+/// stored face of [`crate::library_graph::CombinatorClause`].
+#[derive(Clone, Copy, Debug)]
+struct FilterClause {
+    /// `true` for `hide` (drop the listed names), `false` for `show` (keep
+    /// only the listed names).
+    hide: bool,
+    /// The clause's name ids as a range into [`Namespaces::filter_names`].
+    names: (u32, u32),
+}
+
+/// The namespace combinator over a graph's libraries: compact per-library
+/// import tables (CSR — contiguous rows grouped by [`LibraryId`] with an
+/// offset index) composed into lookups at query time.
+///
+/// Sized entirely by the graph's import directives at
+/// [`Namespaces::build`]; nothing grows afterwards. Steady-state bytes are
+/// reportable via [`Namespaces::memory_bytes`] (the memory charter's counted
+/// metric).
 #[derive(Debug)]
-struct LibraryNamespaces {
-    /// Bare-name entries of the merged import namespace (un-prefixed
-    /// imports). Prefixes are deliberately not here — the oracle keeps them
-    /// in a separate `_prefixElements` map (scope.dart:348-358).
-    names: FxHashMap<StringId, NameEntry>,
-    /// Prefix name → its merged table (across all imports sharing the
-    /// prefix), the [`Prefix`] face of [`NamespaceEntry`].
-    prefixes: FxHashMap<StringId, FxHashMap<StringId, NameEntry>>,
-    /// The interned `_` when one of the library's imports registers that
-    /// prefix — the wildcard gate of the bare-name prefix branch (see
-    /// [`Namespaces::lookup`]).
-    wildcard_prefix: Option<StringId>,
+pub struct Namespaces {
+    /// All import rows, grouped by library in [`LibraryId`] order, source
+    /// order within a library — the composition's iteration order.
+    rows: Vec<ImportRow>,
+    /// Per-library offsets into `rows`: library `i` occupies
+    /// `rows[offs[i]..offs[i+1]]`; `len == graph.len + 1`.
+    offs: Vec<u32>,
+    /// All combinator clauses, grouped by row in row order.
+    clauses: Vec<FilterClause>,
+    /// All clause name ids (sorted, deduplicated, setter-expanded within
+    /// each clause), grouped by clause.
+    filter_names: Vec<u32>,
 }
 
 impl Namespaces {
-    /// Builds the namespaces of every library in `graph`: imports merged in
-    /// directive source order, combinators applied per import, prefixes
-    /// merged across imports into per-name tables. Sized entirely by the
-    /// graph; nothing grows afterwards.
+    /// Flattens `graph`'s import directives into the compact row tables.
+    /// O(total directives + total clause names); no export scope is read and
+    /// no merged table is built — composition happens per lookup.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the directive, clause, or clause-name count exceeds
+    /// [`u32::MAX`] — a program bug at any realistic scale.
     #[must_use]
     pub fn build(graph: &LibraryGraph) -> Self {
-        let libs = (0..graph.len())
-            .map(|index| build_library(graph, LibraryId::from_index(index)))
-            .collect();
-        Self { libs }
+        let mut rows: Vec<ImportRow> = Vec::new();
+        let mut offs: Vec<u32> = Vec::with_capacity(graph.len() + 1);
+        let mut clauses: Vec<FilterClause> = Vec::new();
+        let mut filter_names: Vec<u32> = Vec::new();
+        offs.push(0);
+        for index in 0..graph.len() {
+            // Positional walk: `offs` is indexed by LibraryId (the
+            // graph's library iteration order is contractually
+            // unspecified, only `0..len` addressing is).
+            for edge in graph.import_edges(LibraryId::from_index(index)) {
+                // The prefix registers unconditionally, target resolved or
+                // not: `_buildLibraryImportPrefixes` (element.dart:7529-7536)
+                // sweeps every import's prefix with no resolution gating,
+                // and only the prefix's NAME table stays empty when the URI
+                // carries no library (`PrefixScope` admits only
+                // `DirectiveUriWithLibraryImpl` imports, scope.dart:530-535).
+                let clause_start =
+                    u32::try_from(clauses.len()).expect("more than u32::MAX combinator clauses");
+                for clause in edge.combinators.clauses() {
+                    let names_start = u32::try_from(filter_names.len())
+                        .expect("more than u32::MAX combinator names");
+                    let (names, hide) = match clause {
+                        CombinatorClause::Show(names) => (names, false),
+                        CombinatorClause::Hide(names) => (names, true),
+                    };
+                    filter_names.extend(names.iter().map(|name| name.index()));
+                    clauses.push(FilterClause {
+                        hide,
+                        names: (
+                            names_start,
+                            u32::try_from(filter_names.len())
+                                .expect("more than u32::MAX combinator names"),
+                        ),
+                    });
+                }
+                rows.push(ImportRow {
+                    prefix: edge.prefix.map_or(NO_PREFIX, StringId::index),
+                    target: edge.target.map_or(NO_TARGET, LibraryId::index),
+                    clauses: (
+                        clause_start,
+                        u32::try_from(clauses.len())
+                            .expect("more than u32::MAX combinator clauses"),
+                    ),
+                });
+            }
+            offs.push(u32::try_from(rows.len()).expect("more than u32::MAX import directives"));
+        }
+        Self {
+            rows,
+            offs,
+            clauses,
+            filter_names,
+        }
+    }
+
+    /// The steady-state memory of the compact tables, counted as
+    /// `size_of` sums over the four arrays (the memory charter's counted
+    /// metric; allocator overhead and the graph's own edges excluded).
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        self.rows.len() * size_of::<ImportRow>()
+            + self.offs.len() * size_of::<u32>()
+            + self.clauses.len() * size_of::<FilterClause>()
+            + self.filter_names.len() * size_of::<u32>()
     }
 
     /// Bare-name lookup in `lib`'s scope chain (`LibraryFragmentScope.lookup`,
     /// scope.dart:419-433): the name-coupled locals layer first, then a
     /// registered prefix — the `_prefixElements` branch of `_lookupCombined`
     /// returns the prefix unconditionally, before the import namespace
-    /// (scope.dart:455-471) — then the merged import namespace.
+    /// (scope.dart:455-471) — then the un-prefixed imports composed
+    /// first-come-wins.
     ///
     /// The locals link is all-or-nothing per base name: `_lookupLibrary`
     /// hands back the getter/setter pair and `_lookupCombined` is never
@@ -164,23 +273,35 @@ impl Namespaces {
     /// Panics when `lib` is not a [`LibraryId`] of the graph `self` was built
     /// from — a caller bug (ids only come from that graph).
     #[must_use]
-    pub fn lookup(&self, graph: &LibraryGraph, lib: LibraryId, name: StringId) -> Lookup<'_> {
+    pub fn lookup(&self, graph: &LibraryGraph, lib: LibraryId, name: StringId) -> Lookup {
         match graph.local(lib, name) {
             LocalLookup::Found(file) => return Lookup::Found(NamespaceEntry::Decl(file)),
             LocalLookup::Shadowed => return Lookup::NotFound,
             LocalLookup::Absent => {}
         }
-        let lib_ns = &self.libs[lib.index() as usize];
-        if lib_ns.prefixes.contains_key(&name) && lib_ns.wildcard_prefix != Some(name) {
+        let rows = self.rows_of(lib);
+        // Prefix branch: unconditional on registration, ahead of any
+        // imported top-level name (scope.dart:455-471) — hence a separate
+        // pass before the import walk. The wildcard gate skips it for bare
+        // `_` (scope.dart:486-494).
+        if graph.wildcard_prefix(lib) != Some(name)
+            && rows.iter().any(|row| row.prefix == name.index())
+        {
             return Lookup::Found(NamespaceEntry::Prefix);
         }
-        to_lookup(lib_ns.names.get(&name))
+        fold(
+            rows.iter()
+                .filter(|row| row.prefix == NO_PREFIX)
+                .filter_map(|row| self.probe(graph, row, name)),
+        )
     }
 
     /// `prefix.name` lookup in `lib`: the prefix's merged table, whenever the
     /// prefix is registered — independent of any same-named imported
     /// declaration (`p.x` goes through `PrefixScope`, scope.dart:352-357,
-    /// regardless of bare-name collisions).
+    /// regardless of bare-name collisions). "Merged" is composed here the
+    /// same way as the bare namespace: the same-prefix imports in directive
+    /// source order, combinators applied per import, first-come-wins.
     ///
     /// Returns [`Lookup::NotFound`] when `prefix` is not a registered prefix
     /// of `lib`, or registers no `name` (a `p.x` through a non-prefix is not
@@ -190,115 +311,96 @@ impl Namespaces {
     ///
     /// Same contract as [`Self::lookup`].
     #[must_use]
-    pub fn lookup_prefixed(&self, lib: LibraryId, prefix: StringId, name: StringId) -> Lookup<'_> {
-        let lib_ns = &self.libs[lib.index() as usize];
-        to_lookup(
-            lib_ns
-                .prefixes
-                .get(&prefix)
-                .and_then(|table| table.get(&name)),
+    pub fn lookup_prefixed(
+        &self,
+        graph: &LibraryGraph,
+        lib: LibraryId,
+        prefix: StringId,
+        name: StringId,
+    ) -> Lookup {
+        let prefix = prefix.index();
+        fold(
+            self.rows_of(lib)
+                .iter()
+                .filter(|row| row.prefix == prefix)
+                .filter_map(|row| self.probe(graph, row, name)),
         )
     }
-}
 
-/// Builds one library's namespaces over `graph`'s import edges (§1: imports
-/// merge in directive source order; combinator filtering is build-time).
-fn build_library(graph: &LibraryGraph, lib: LibraryId) -> LibraryNamespaces {
-    let mut names = MergeTable::default();
-    let mut prefixes: FxHashMap<StringId, MergeTable> = FxHashMap::default();
-    let wildcard_prefix = graph.wildcard_prefix(lib);
-    for edge in graph.import_edges(lib) {
-        // The prefix registers unconditionally: `_buildLibraryImportPrefixes`
-        // (element.dart:7529-7536) sweeps every import's prefix with no
-        // resolution gating, and `LibraryFragmentScope._` (scope.dart:343-353)
-        // enters each named prefix into `_prefixElements` — only the prefix's
-        // NAME table stays empty when the URI carries no library
-        // (`PrefixScope` admits only `DirectiveUriWithLibraryImpl` imports,
-        // scope.dart:530-535).
-        // `Option<&mut _>` is not `Copy`: reborrow through `as_deref_mut` so
-        // the table survives every iteration of the name loop.
-        let mut table: Option<&mut MergeTable> = edge
-            .prefix
-            .map(|prefix| prefixes.entry(prefix).or_default());
-        let Some(target) = edge.target else {
-            continue; // prefix registered above; it simply has no names
-        };
-        for (name, entry) in graph.export_scope(target) {
-            if !edge.combinators.allows(name) {
-                continue;
-            }
-            let entry = NamespaceEntry::Decl(entry.file);
-            match table.as_deref_mut() {
-                Some(table) => table.merge(name, entry),
-                None => names.merge(name, entry),
-            }
+    /// `lib`'s row range — the CSR slice its imports occupy.
+    fn rows_of(&self, lib: LibraryId) -> &[ImportRow] {
+        let index = lib.index() as usize;
+        &self.rows[self.offs[index] as usize..self.offs[index + 1] as usize]
+    }
+
+    /// One row's contribution to a composition walk: combinator filter, then
+    /// the target's export scope probe. Rows with an unresolved target
+    /// contribute nothing (their prefix registered, their table is empty —
+    /// `PrefixScope`, scope.dart:530-535).
+    fn probe(
+        &self,
+        graph: &LibraryGraph,
+        row: &ImportRow,
+        name: StringId,
+    ) -> Option<NamespaceEntry> {
+        if row.target == NO_TARGET || !self.allows(row, name) {
+            return None;
         }
+        let target = LibraryId::from_index(row.target as usize);
+        graph
+            .exported(target, name)
+            .map(|entry| NamespaceEntry::Decl(entry.file))
     }
-    // Box each staged candidate set once, when the build ends — the merge
-    // loop grows them by append only.
-    LibraryNamespaces {
-        names: names.finish(),
-        prefixes: prefixes
-            .into_iter()
-            .map(|(prefix, table)| (prefix, table.finish()))
-            .collect(),
-        wildcard_prefix,
+
+    /// Whether `name` survives `row`'s clauses, applied in source order —
+    /// the stored twin of [`crate::library_graph::Combinators::allows`]: a
+    /// `show` the name is not in rejects it; a `hide` containing it rejects
+    /// it; later clauses see what earlier clauses left. An unfiltered row
+    /// (no clauses) passes with no work.
+    fn allows(&self, row: &ImportRow, name: StringId) -> bool {
+        let id = name.index();
+        self.clauses[row.clauses.0 as usize..row.clauses.1 as usize]
+            .iter()
+            .all(|clause| {
+                let names = &self.filter_names[clause.names.0 as usize..clause.names.1 as usize];
+                if clause.hide {
+                    names.binary_search(&id).is_err()
+                } else {
+                    names.binary_search(&id).is_ok()
+                }
+            })
     }
 }
 
-/// One merging table (the bare-name namespace or a prefix's) with the
-/// staging buffer for its conflicts: the same target through several paths
-/// is one entry; distinct targets make the name ambiguous, and the growing
-/// candidate set stages as a `Vec` so the k-th arrival neither allocates
-/// nor re-copies the earlier ones. [`Self::finish`] boxes each set once.
-#[derive(Default)]
-struct MergeTable {
-    names: FxHashMap<StringId, NameEntry>,
-    staged: FxHashMap<StringId, Vec<NamespaceEntry>>,
-}
-
-impl MergeTable {
-    /// Import-merge conflict rule (Dart 18.1; `front_end`
-    /// `computeAmbiguousDeclarationForImport`, spec §1). Never replaces an
-    /// existing candidate — the first arrival anchors the order.
-    fn merge(&mut self, name: StringId, entry: NamespaceEntry) {
-        match self.names.entry(name) {
-            hash_map::Entry::Vacant(slot) => {
-                slot.insert(NameEntry::Single(entry));
-            }
-            hash_map::Entry::Occupied(slot) => {
-                if slot.get() != &NameEntry::Single(entry) {
-                    let candidates = self.staged.entry(name).or_insert_with(|| match slot.get() {
-                        NameEntry::Single(existing) => vec![*existing],
-                        // Unreachable mid-build: `Ambiguous` is
-                        // materialized only by [`Self::finish`].
-                        NameEntry::Ambiguous(_) => Vec::new(),
-                    });
-                    if !candidates.contains(&entry) {
-                        candidates.push(entry);
-                    }
+/// Folds one composition walk's ordered hits into the lookup outcome — the
+/// import-merge conflict rule (Dart 18.1; `front_end`
+/// `computeAmbiguousDeclarationForImport`): the first arrival
+/// anchors, the same target arriving again dedupes to one entry, and
+/// distinct targets make the name ambiguous with every candidate kept in
+/// arrival order.
+fn fold(hits: impl Iterator<Item = NamespaceEntry>) -> Lookup {
+    let mut first: Option<NamespaceEntry> = None;
+    // Empty until a genuine second candidate appears — the ambiguity error
+    // path; hits and misses allocate nothing.
+    let mut rest: Vec<NamespaceEntry> = Vec::new();
+    for hit in hits {
+        match first {
+            None => first = Some(hit),
+            Some(existing) if existing == hit => {}
+            Some(_) => {
+                if !rest.contains(&hit) {
+                    rest.push(hit);
                 }
             }
         }
     }
-
-    /// The table's final stored form: staged candidate sets boxed over
-    /// their anchor entries.
-    fn finish(self) -> FxHashMap<StringId, NameEntry> {
-        let mut names = self.names;
-        for (name, candidates) in self.staged {
-            names.insert(name, NameEntry::Ambiguous(candidates.into_boxed_slice()));
-        }
-        names
-    }
-}
-
-/// The shared `Option<&NameEntry>` → [`Lookup`] projection.
-fn to_lookup(entry: Option<&NameEntry>) -> Lookup<'_> {
-    match entry {
+    match first {
         None => Lookup::NotFound,
-        Some(NameEntry::Single(target)) => Lookup::Found(*target),
-        Some(NameEntry::Ambiguous(candidates)) => Lookup::Ambiguous(candidates),
+        Some(first) if rest.is_empty() => Lookup::Found(first),
+        Some(first) => {
+            rest.insert(0, first);
+            Lookup::Ambiguous(rest.into_boxed_slice())
+        }
     }
 }
 
@@ -308,6 +410,12 @@ mod tests {
     use crate::library_graph::{CombinatorClause, Combinators, ImportEdge, LibraryGraphBuilder};
     use dartq_source::{FileTable, StringTable};
     use std::path::Path;
+
+    /// The owned [`Lookup::Ambiguous`] value over `candidates`, in order —
+    /// the test face of the composition walk's output.
+    fn ambiguous(candidates: &[NamespaceEntry]) -> Lookup {
+        Lookup::Ambiguous(Box::from(candidates))
+    }
 
     /// Shared per-test context. The string table is leaked for `'static` so
     /// the builder can hold it alongside the rig (every `StringTable` method
@@ -365,11 +473,11 @@ mod tests {
     }
 
     /// The import namespace is the imported library's export face filtered by
-    /// the directive combinators at build time (`NamespaceBuilder
+    /// the directive combinators at probe time (`NamespaceBuilder
     /// .createImportNamespaceForDirective` + `_applyCombinators`,
-    /// resolver/scope.dart:159-170/227-244; combinator timing per spec §1).
+    /// resolver/scope.dart:159-170/227-244; combinator timing matches it).
     #[test]
-    fn import_combinators_filter_at_build() {
+    fn import_combinators_filter_at_probe() {
         let mut rig = Rig::new();
         let target = rig.builder.intern("package:t/t.dart");
         let consumer = rig.builder.intern("package:c/c.dart");
@@ -391,13 +499,13 @@ mod tests {
         assert_eq!(
             namespaces.lookup(&graph, consumer, strings.intern("beta")),
             Lookup::NotFound,
-            "filtered at build time, not at lookup time"
+            "filtered per import, so the name never surfaces"
         );
     }
 
     /// Local declarations shadow imported names: the library namespace is
     /// consulted before the import namespace (`front_end` scope chain, spec
-    /// §1 — `CompilationUnitScope` over the import scope).
+    /// — `CompilationUnitScope` over the import scope).
     #[test]
     fn locals_shadow_imports() {
         let mut rig = Rig::new();
@@ -414,6 +522,36 @@ mod tests {
             namespaces.lookup(&graph, consumer, strings.intern("shared")),
             Lookup::Found(NamespaceEntry::Decl(c_file)),
             "the local declaration wins"
+        );
+    }
+
+    /// Locals shadow a registered prefix, too: the locals layer precedes the
+    /// `_prefixElements` branch of `_lookupCombined`
+    /// (scope.dart:419-433/455-471), so a local top-level `p` wins bare `p`
+    /// over `import 'x' as p` — while `p.x` still resolves through the
+    /// prefix's own table (`PrefixScope`, scope.dart:352-357), which the
+    /// bare-name chain never reaches.
+    #[test]
+    fn locals_shadow_prefix() {
+        let mut rig = Rig::new();
+        let target = rig.builder.intern("package:t/t.dart");
+        let consumer = rig.builder.intern("package:c/c.dart");
+        let t_file = rig.file("t.dart");
+        let c_file = rig.file("c.dart");
+        rig.declare(target, "x", t_file);
+        rig.declare(consumer, "p", c_file);
+        rig.import(consumer, Some(target), Some("p"), Combinators::unfiltered());
+        let (strings, graph, namespaces) = rig.settle();
+
+        assert_eq!(
+            namespaces.lookup(&graph, consumer, strings.intern("p")),
+            Lookup::Found(NamespaceEntry::Decl(c_file)),
+            "the local declaration beats the registered prefix"
+        );
+        assert_eq!(
+            namespaces.lookup_prefixed(&graph, consumer, strings.intern("p"), strings.intern("x")),
+            Lookup::Found(NamespaceEntry::Decl(t_file)),
+            "`p.x` still resolves through the prefix table"
         );
     }
 
@@ -437,7 +575,7 @@ mod tests {
 
         assert_eq!(
             namespaces.lookup(&graph, consumer, strings.intern("clash")),
-            Lookup::Ambiguous(&[NamespaceEntry::Decl(f1), NamespaceEntry::Decl(f2)]),
+            ambiguous(&[NamespaceEntry::Decl(f1), NamespaceEntry::Decl(f2)]),
         );
     }
 
@@ -486,7 +624,7 @@ mod tests {
 
         assert_eq!(
             namespaces.lookup(&graph, consumer, strings.intern("clash")),
-            Lookup::Ambiguous(&[
+            ambiguous(&[
                 NamespaceEntry::Decl(files[0]),
                 NamespaceEntry::Decl(files[1]),
                 NamespaceEntry::Decl(files[2]),
@@ -518,16 +656,60 @@ mod tests {
             "one prefix entry for both same-prefix imports"
         );
         assert_eq!(
-            namespaces.lookup_prefixed(consumer, strings.intern("p"), strings.intern("alpha")),
+            namespaces.lookup_prefixed(
+                &graph,
+                consumer,
+                strings.intern("p"),
+                strings.intern("alpha")
+            ),
             Lookup::Found(NamespaceEntry::Decl(f1))
         );
         assert_eq!(
-            namespaces.lookup_prefixed(consumer, strings.intern("p"), strings.intern("beta")),
+            namespaces.lookup_prefixed(
+                &graph,
+                consumer,
+                strings.intern("p"),
+                strings.intern("beta")
+            ),
             Lookup::Found(NamespaceEntry::Decl(f2))
         );
         assert_eq!(
-            namespaces.lookup_prefixed(consumer, strings.intern("p"), strings.intern("gamma")),
+            namespaces.lookup_prefixed(
+                &graph,
+                consumer,
+                strings.intern("p"),
+                strings.intern("gamma")
+            ),
             Lookup::NotFound
+        );
+    }
+
+    /// Same-prefix imports compose first-come-wins: two `as p` imports
+    /// bringing distinct declarations of one name make `p.name` ambiguous
+    /// with both candidates, in import source order — the prefix table's
+    /// merge is the same lazy rule as the bare namespace's.
+    #[test]
+    fn prefixed_imports_first_come_wins_on_clash() {
+        let mut rig = Rig::new();
+        let l1 = rig.builder.intern("package:l1/l1.dart");
+        let l2 = rig.builder.intern("package:l2/l2.dart");
+        let consumer = rig.builder.intern("package:c/c.dart");
+        let f1 = rig.file("l1.dart");
+        let f2 = rig.file("l2.dart");
+        rig.declare(l1, "clash", f1);
+        rig.declare(l2, "clash", f2);
+        rig.import(consumer, Some(l1), Some("p"), Combinators::unfiltered());
+        rig.import(consumer, Some(l2), Some("p"), Combinators::unfiltered());
+        let (strings, graph, namespaces) = rig.settle();
+
+        assert_eq!(
+            namespaces.lookup_prefixed(
+                &graph,
+                consumer,
+                strings.intern("p"),
+                strings.intern("clash")
+            ),
+            ambiguous(&[NamespaceEntry::Decl(f1), NamespaceEntry::Decl(f2)]),
         );
     }
 
@@ -562,12 +744,12 @@ mod tests {
             "l2 is imported only `as p`: `x` is not in the bare namespace"
         );
         assert_eq!(
-            namespaces.lookup_prefixed(consumer, strings.intern("p"), strings.intern("x")),
+            namespaces.lookup_prefixed(&graph, consumer, strings.intern("p"), strings.intern("x")),
             Lookup::Found(NamespaceEntry::Decl(f2)),
             "`p.x` resolves through the prefix table"
         );
         assert_eq!(
-            namespaces.lookup_prefixed(consumer, strings.intern("p"), strings.intern("y")),
+            namespaces.lookup_prefixed(&graph, consumer, strings.intern("p"), strings.intern("y")),
             Lookup::NotFound
         );
     }
@@ -599,9 +781,33 @@ mod tests {
             "the prefix registers without a target"
         );
         assert_eq!(
-            namespaces.lookup_prefixed(consumer, strings.intern("p"), strings.intern("x")),
+            namespaces.lookup_prefixed(&graph, consumer, strings.intern("p"), strings.intern("x")),
             Lookup::NotFound,
             "the prefix's name table stays empty"
+        );
+    }
+
+    /// A library with no imports at all: empty tables — every bare and
+    /// prefixed lookup misses (the composition walk runs over zero rows).
+    #[test]
+    fn library_without_imports_misses_everywhere() {
+        let mut rig = Rig::new();
+        let lone = rig.builder.intern("package:lone/lone.dart");
+        let only_file = rig.file("lone.dart");
+        rig.declare(lone, "only", only_file);
+        let (strings, graph, namespaces) = rig.settle();
+
+        assert_eq!(
+            namespaces.lookup(&graph, lone, strings.intern("only")),
+            Lookup::Found(NamespaceEntry::Decl(only_file)),
+        );
+        assert_eq!(
+            namespaces.lookup(&graph, lone, strings.intern("absent")),
+            Lookup::NotFound
+        );
+        assert_eq!(
+            namespaces.lookup_prefixed(&graph, lone, strings.intern("nope"), strings.intern("x")),
+            Lookup::NotFound
         );
     }
 
@@ -720,7 +926,7 @@ mod tests {
             "the wildcard `_` skips the prefix branch"
         );
         assert_eq!(
-            namespaces.lookup_prefixed(consumer, strings.intern("_"), strings.intern("x")),
+            namespaces.lookup_prefixed(&graph, consumer, strings.intern("_"), strings.intern("x")),
             Lookup::Found(NamespaceEntry::Decl(t_file)),
             "`_.x` still resolves through the prefix table"
         );
@@ -744,7 +950,7 @@ mod tests {
             Lookup::Found(NamespaceEntry::Decl(f1))
         );
         assert_eq!(
-            namespaces.lookup_prefixed(consumer, strings.intern("p"), strings.intern("x")),
+            namespaces.lookup_prefixed(&graph, consumer, strings.intern("p"), strings.intern("x")),
             Lookup::NotFound
         );
     }

@@ -1,5 +1,5 @@
 //! Conditional-URI selection for configurable import/export directives
-//! (PRD §9.4), pinned to the differential oracle — `dart analyze` — not the
+//!, pinned to the differential oracle — `dart analyze` — not the
 //! CFE.
 //!
 //! # Oracle pin (frozen)
@@ -89,9 +89,9 @@ pub enum SelectedUri {
     Configuration(usize),
 }
 
-/// Selects the configured URI of a directive (PRD §9.4, the oracle pin):
+/// Selects the configured URI of a directive:
 /// source order, first configuration whose full dotted name is declared in
-/// `declared` with exactly the tested value ([`Configuration::expected`];
+/// `declared` with exactly the tested value (`Configuration::expected`;
 /// `file_state.dart:738-764`); otherwise the primary URI
 /// ([`SelectedUri::Primary`], `file_state.dart:759`).
 ///

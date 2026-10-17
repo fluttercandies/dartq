@@ -86,6 +86,7 @@
 //! error_verifier.dart:7424-7437), and it is gated only on library
 //! equality — no `_mayIgnoreClassModifiers` exemption.
 
+use crate::LibraryId;
 use dartq_diagnostics::DiagnosticType;
 
 /// The declaration kind a modifier set belongs to — the official
@@ -158,24 +159,82 @@ impl ClassModifiers {
 }
 
 /// The library facts the platform-exemption gate reads
-/// (`_mayIgnoreClassModifiers`, base_or_final_type_verifier.dart:164-173):
-/// platform (`dart:`) membership and the library's `class-modifiers`
-/// feature state.
+/// (`_mayIgnoreClassModifiers`): platform (`dart:`) membership, the
+/// `dart:ffi` identity, and the library's `class-modifiers` feature state.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct LibraryFeatureFacts {
     /// `libraryElement.isInSdk`.
     pub is_sdk: bool,
+    /// `superLibrary._isDartFfiLibrary` (error_verifier.dart:8876 — the
+    /// library's name is `dart.ffi`, the `dart:ffi` platform library).
+    pub is_dart_ffi: bool,
     /// `featureSet.isEnabled(Feature.class_modifiers)`.
     pub has_class_modifiers: bool,
 }
 
-/// `_mayIgnoreClassModifiers` (base_or_final_type_verifier.dart:164-173;
-/// the `error_verifier` carries the same gate for its outside-library
-/// checks): only modifiers in platform libraries can be ignored — when the
-/// *supertype's* library is the SDK and the *use-site* library is either
-/// the SDK itself or predates class modifiers.
+/// The per-library `class-modifiers` posture: each analyzed library's
+/// `featureSet.isEnabled(Feature.class_modifiers)` — the defining file's
+/// settled language version (the `@dart` override applied) resolved through
+/// the feature registry (`class-modifiers`, `enabledIn: 3.0.0`). The
+/// engine builds one map per analyze over its live libraries; libraries
+/// absent from the map answer the modern posture (`true`) — what the
+/// synthetic `dart:` faces (no defining file) and any unattributed node
+/// carry upstream.
+#[derive(Clone, Debug, Default)]
+pub struct LibraryClassModifiers {
+    has: rustc_hash::FxHashMap<LibraryId, bool>,
+}
+
+impl LibraryClassModifiers {
+    /// Records `lib`'s posture.
+    pub fn insert(&mut self, lib: LibraryId, has_class_modifiers: bool) {
+        self.has.insert(lib, has_class_modifiers);
+    }
+
+    /// `featureSet.isEnabled(Feature.class_modifiers)` of `lib`.
+    #[must_use]
+    pub fn is_enabled(&self, lib: LibraryId) -> bool {
+        self.has.get(&lib).copied().unwrap_or(true)
+    }
+}
+
+/// `_mayIgnoreClassModifiers` (error_verifier.dart:8468-8482) — the
+/// outside-library family's copy: only modifiers in platform libraries can
+/// be ignored — when the *supertype's* library is the SDK, never `dart:ffi`
+/// (:8473-8475, the carve-out sitting before the platform-use-site branch,
+/// so even SDK use sites do not ignore dart:ffi modifiers), and the
+/// *use-site* library is either the SDK itself or predates class modifiers.
+/// The subtype-requirement family reads a second upstream copy without the
+/// carve-out ([`may_ignore_in_subtype_requirement`]).
 #[must_use]
 pub fn may_ignore_class_modifiers(
+    super_library: LibraryFeatureFacts,
+    use_library: LibraryFeatureFacts,
+) -> bool {
+    // Only modifiers in platform libraries can be ignored (:8471-8472).
+    if !super_library.is_sdk {
+        return false;
+    }
+    // Modifiers in 'dart:ffi' can't be ignored in pre-feature code
+    // (:8473-8475).
+    if super_library.is_dart_ffi {
+        return false;
+    }
+    // Other platform libraries can ignore modifiers (:8477-8478).
+    if use_library.is_sdk {
+        return true;
+    }
+    // Libraries predating class modifiers can ignore platform modifiers
+    // (:8481).
+    !use_library.has_class_modifiers
+}
+
+/// `_mayIgnoreClassModifiers` (base_or_final_type_verifier.dart:164-173) —
+/// the subtype-requirement family's own copy
+/// ([`subtype_restriction_violation`]'s :208-210 step). It carries no
+/// `dart:ffi` carve-out: the two upstream texts differ, and each family
+/// mirrors its own.
+fn may_ignore_in_subtype_requirement(
     super_library: LibraryFeatureFacts,
     use_library: LibraryFeatureFacts,
 ) -> bool {
@@ -386,7 +445,7 @@ pub struct SuperFacts {
     /// The supertype's library == the use site's library.
     pub same_library: bool,
     /// `may_ignore_class_modifiers(supertype_library, use_library)` —
-    /// precomputed by the caller (base_or_final_type_verifier.dart:164-173).
+    /// precomputed by the caller (error_verifier.dart:8468-8482).
     pub may_ignore: bool,
 }
 
@@ -599,8 +658,9 @@ pub fn subtype_restriction_violation(input: &SubtypeRestrictionInput) -> Option<
     }
     // (3) :204-206.
     let ancestor = input.explicit_base_or_final?;
-    // (4) :208-210 — the ancestor's library is the gate's super library.
-    if may_ignore_class_modifiers(ancestor.library, input.element_library) {
+    // (4) :208-210 — the ancestor's library is the gate's super library;
+    // the subtype verifier's copy of the gate has no dart:ffi carve-out.
+    if may_ignore_in_subtype_requirement(ancestor.library, input.element_library) {
         return None;
     }
     // (5) :240-256.
@@ -1100,14 +1160,22 @@ mod tests {
 
     const SDK: LibraryFeatureFacts = LibraryFeatureFacts {
         is_sdk: true,
+        is_dart_ffi: false,
+        has_class_modifiers: true,
+    };
+    const SDK_FFI: LibraryFeatureFacts = LibraryFeatureFacts {
+        is_sdk: true,
+        is_dart_ffi: true,
         has_class_modifiers: true,
     };
     const USER: LibraryFeatureFacts = LibraryFeatureFacts {
         is_sdk: false,
+        is_dart_ffi: false,
         has_class_modifiers: true,
     };
     const PRE_MODIFIERS: LibraryFeatureFacts = LibraryFeatureFacts {
         is_sdk: false,
+        is_dart_ffi: false,
         has_class_modifiers: false,
     };
 
@@ -1166,6 +1234,25 @@ mod tests {
         assert!(may_ignore_class_modifiers(SDK, PRE_MODIFIERS));
         // SDK supertype, modern user library: no.
         assert!(!may_ignore_class_modifiers(SDK, USER));
+        // The dart:ffi carve-out (error_verifier.dart:8473-8475): the
+        // branch sits before the platform-use-site branch (:8477-8478), so
+        // dart:ffi modifiers are never ignorable — not in pre-feature code
+        // and not from an SDK use site either.
+        assert!(!may_ignore_class_modifiers(SDK_FFI, PRE_MODIFIERS));
+        assert!(!may_ignore_class_modifiers(SDK_FFI, SDK));
+        assert!(!may_ignore_class_modifiers(SDK_FFI, USER));
+    }
+
+    #[test]
+    fn subtype_requirement_gate_has_no_ffi_carve_out() {
+        // base_or_final_type_verifier.dart:164-173 — the subtype family's
+        // copy of the gate predates the dart:ffi carve-out, so a pre-feature
+        // use site ignores platform modifiers whatever the platform library
+        // is; the carve-out stays the outside-library family's behavior.
+        assert!(may_ignore_in_subtype_requirement(SDK_FFI, PRE_MODIFIERS));
+        assert!(may_ignore_in_subtype_requirement(SDK_FFI, SDK));
+        assert!(!may_ignore_in_subtype_requirement(SDK_FFI, USER));
+        assert!(!may_ignore_in_subtype_requirement(USER, PRE_MODIFIERS));
     }
 
     #[test]

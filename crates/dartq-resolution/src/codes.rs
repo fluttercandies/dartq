@@ -1,7 +1,6 @@
-//! The M1 resolution diagnostic code table, frozen at
-//! the resolution design contract §4.2.
+//! The M1 resolution diagnostic code table, frozen at design time.
 //!
-//! One variant per §4.2 row. Every row carries the official analyzer code
+//! One variant per frozen row. Every row carries the official analyzer code
 //! name (`analyzerCode`), its `UPPERCASE` machine form, the verbatim oracle
 //! message template from
 //! `upstream Dart SDK source, pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart` (line
@@ -40,7 +39,7 @@
 
 use dartq_diagnostics::DiagnosticType;
 
-/// The §4.2 frozen resolution diagnostic code set.
+/// The frozen resolution diagnostic code set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResolutionCode {
     /// import/export: target source is null (unknown `dart:` library, unknown
@@ -72,7 +71,7 @@ pub enum ResolutionCode {
     PartOfNonPart,
     /// `part of` name/URI does not match the enclosing library
     /// (diagnostic.g.dart:13921). URI shape always reports; name shape only
-    /// when enhanced-parts is disabled (§2.6).
+    /// when enhanced-parts is disabled.
     PartOfDifferentLibrary,
     /// `part of name` and the enclosing library has no `library name`
     /// directive (diagnostic.g.dart:13967).
@@ -373,7 +372,7 @@ impl ResolutionCode {
 mod tests {
     use super::*;
 
-    /// The frozen table: §4.2's sixteen rows less `unsupported_dart_ext`,
+    /// The frozen table: the sixteen rows less `unsupported_dart_ext`,
     /// deduplicated into [`ResolutionCode::UseOfNativeExtension`] on
     /// re-anchor (analyzer-8.4.1 `error/codes.g.dart:7666`).
     #[test]

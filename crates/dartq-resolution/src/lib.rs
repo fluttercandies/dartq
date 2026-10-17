@@ -9,7 +9,7 @@
 //!   scheme dispatch (`dart:`/`package:`/`file:`), interning to
 //!   [`dartq_source::FileId`], and the [`ResolvedTarget`] projection.
 //! - [`conditional`] — conditional-URI selection for configurable
-//!   import/export directives (PRD §9.4): first-match-wins selection over
+//!   import/export directives: first-match-wins selection over
 //!   the declared-variables map with the oracle's primary-URI fallback.
 //! - [`library_graph`] — interned library nodes keyed by canonical URI,
 //!   import/export edges, and the eager export-scope fixpoint pinned to the
@@ -17,10 +17,12 @@
 //!   re-exports resolve first-come-wins), plus the M2 cross-library
 //!   modifier facts (per-class declared modifiers and the
 //!   name → declaring-libraries index).
-//! - [`namespace`] — import-namespace and prefix-table construction with
-//!   build-time combinator filtering, and the `Found`/`Ambiguous`/`NotFound`
-//!   lookup face the `undefined_*` diagnostics consume.
-//! - [`codes`] — the frozen §4.2 resolution diagnostic code table.
+//! - [`namespace`] — the query-time namespace combinator over compact
+//!   per-library import tables (CSR rows, no merged maps), composing the
+//!   `Found`/`Ambiguous`/`NotFound` lookup face the `undefined_*`
+//!   diagnostics consume; oracle chain order locals → prefixes → imports
+//!   first-come-wins.
+//! - [`codes`] — the frozen resolution diagnostic code table.
 //! - [`modifiers`] — the M2 class-modifier decisions (ticket #281):
 //!   declaration-site combination legality, cross-library use-site
 //!   restrictions, the base/final subtype requirement, induced modifiers,
@@ -48,15 +50,15 @@ pub use library_graph::{
 };
 pub use modifiers::{
     ClassModifiers, DeclKind, DeclarationViolation, ExplicitBaseFinal, ImplementsStep,
-    InducedModifier, LibraryFeatureFacts, ModifierCode, ModifierCodeInfo, ModifierHierarchy,
-    ModifierKeyword, Relation, SubtypeRestrictionInput, SuperFacts, base_implemented_candidate,
-    declaration_violations, final_extends_violation, final_implements_candidate,
-    final_mixin_constraint_violation, induced_modifier, interface_extends_violation,
-    may_ignore_class_modifiers, nearest_explicit_base_or_final, sealed_supertype_violation,
-    subtype_restriction_violation,
+    InducedModifier, LibraryClassModifiers, LibraryFeatureFacts, ModifierCode, ModifierCodeInfo,
+    ModifierHierarchy, ModifierKeyword, Relation, SubtypeRestrictionInput, SuperFacts,
+    base_implemented_candidate, declaration_violations, final_extends_violation,
+    final_implements_candidate, final_mixin_constraint_violation, induced_modifier,
+    interface_extends_violation, may_ignore_class_modifiers, nearest_explicit_base_or_final,
+    sealed_supertype_violation, subtype_restriction_violation,
 };
-pub use namespace::{Lookup, NameEntry, NamespaceEntry, Namespaces};
+pub use namespace::{Lookup, NamespaceEntry, Namespaces};
 pub use uri::{
     DirectiveKind, PackageTable, RawUri, ResolvedTarget, ResolvedUri, UnresolvedKind,
-    UriResolution, UriResolver, parse_directive_uri,
+    UriResolution, UriResolver, compose_canonical_uri, parse_directive_uri,
 };

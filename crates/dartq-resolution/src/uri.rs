@@ -1,14 +1,15 @@
 //! Directive URI parsing, classification, and resolution to interned file
-//! targets (the resolution design contract §4.1/§5 module 1).
+//! targets.
 //!
 //! The pipeline mirrors the analyzer's: parse the directive URI string with
 //! Dart `Uri.parse` validity rules, resolve relative strings against the
 //! containing file's canonical URI (`file_state.dart:766-796`), then dispatch
-//! the absolute URI by scheme — `dart:` through the SDK's `libraries.json`
-//! table, `package:` through the `package_config` (package name → lib dir),
+//! the absolute URI by scheme — `dart:` through the SDK's flat
+//! `libraries.dart` existence table, `package:` through the `package_config`
+//! (package name → lib dir),
 //! `file:` to a path, everything else unresolvable (`file_state.dart:1458-
 //! 1497`). Resolution is infallible: every failure mode is a classification
-//! ([`ResolvedUri::Unresolved`]) plus the §4.2 diagnostic code the oracle
+//! ([`ResolvedUri::Unresolved`]) plus the diagnostic code the oracle
 //! would emit for it.
 //!
 //! One oracle subtlety is load-bearing here: the containing file's canonical
@@ -21,15 +22,15 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-use dartq_pub::{PackageConfig, PubError, normalize};
+use dartq_pub::{PackageConfig, PubError, ResolvedPackage, normalize};
 use dartq_sdk::SdkSnapshot;
 use dartq_source::{FileId, FileTable};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::codes::ResolutionCode;
 use crate::conditional::{Configuration, SelectedUri, resolve_conditional};
 
-/// How a directive URI resolved (§5 core types).
+/// How a directive URI resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolvedUri {
     /// A `dart:` URI mapped through the SDK library table.
@@ -55,7 +56,7 @@ pub enum ResolvedUri {
     Unresolved(UnresolvedKind),
 }
 
-/// Why a directive URI has no target (§5 core types).
+/// Why a directive URI has no target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnresolvedKind {
     /// The URI string does not parse (`Uri.parse` `FormatException`), or the
@@ -83,11 +84,11 @@ pub enum UnresolvedKind {
     NotLibrary,
     /// The selected URI is `dart-ext:`; reported as
     /// `use_of_native_extension` (additive to the spec draft, which has no
-    /// carrier for the §4.2 row).
+    /// carrier for the row).
     DartExt,
 }
 
-/// Engine-facing projection of a [`ResolvedUri`] (§5, engine-api-spec §1):
+/// Engine-facing projection of a [`ResolvedUri`]:
 /// `Dart` → [`ResolvedTarget::External`] (SDK content, outside the analysis
 /// set), `Package`/`File` → [`ResolvedTarget::Resolved`] (a file target, even
 /// when the file is missing — the missing-ness rides on
@@ -110,7 +111,7 @@ pub struct UriResolution {
     pub uri: ResolvedUri,
     /// The engine-facing projection.
     pub target: ResolvedTarget,
-    /// The §4.2 diagnostic code the oracle emits for this outcome, or `None`
+    /// The diagnostic code the oracle emits for this outcome, or `None`
     /// when the target is fine.
     pub code: Option<ResolutionCode>,
 }
@@ -129,11 +130,29 @@ pub enum DirectiveKind {
 }
 
 /// The `package:` resolution face of a parsed package config: package name →
-/// lib dir (§5 interface table, `dartq-pub` row).
+/// lib dir.
 ///
 /// Built once per analysis context; lookups are [`FxHashMap`] hits on the
 /// per-directive hot path. Also owns the generated-file face the analyzer
 /// layers onto `package:` targets (`.dart_tool/build/generated`).
+///
+/// The lookup face is per-context (the pub universe separation): every
+/// nested self-resolved context root — a config entry whose package root
+/// carries its own `pubspec.yaml` together with its own
+/// `.dart_tool/package_config.json` — resolves against the package set that
+/// root's own config materializes, and files outside every nested root
+/// resolve against the root config AS WRITTEN (re-read from disk: the
+/// assembly's nested-root extension joins entries pub never wrote into the
+/// root config, and those stay invisible outside their own context). The
+/// oracle splits the analyzed tree into exactly these context roots
+/// (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/context/context_locator.dart `_createContextRoots`:
+/// a locally different packages file splits the root), so a cross-package
+/// name visible only in a SIBLING's universe stays undefined here — the
+/// flat union would resolve it. Canonical-URI spelling stays flat (the
+/// `lib_dirs` scan): every nested root is an entry of this table (the
+/// assembly's nested-root extension), so `package:` spellings match what
+/// the owning context's own map produces.
 ///
 /// Root/lib-dir resolution is [`PackageConfig::resolve`], dartq-pub's
 /// single shared face — duplicate names are a hard error (pub's
@@ -160,6 +179,18 @@ pub struct PackageTable {
     /// Directory holding `.dart_tool/` — the base of the generated-file
     /// fallback.
     workspace_root: PathBuf,
+    /// The context-root universe: the root config as written — the packages
+    /// file the oracle parses for the root context, re-read from disk so the
+    /// assembly's nested-root extension cannot widen it. Built only when
+    /// nested contexts exist; `None` (the common shape) leaves every lookup
+    /// on the flat `indices`, the exact pre-separation behavior behind one
+    /// `None` test.
+    root_universe: Option<ContextUniverse>,
+    /// Nested self-resolved context roots, deepest first: the canonical
+    /// package root and the universe its own `package_config.json`
+    /// materializes. Bounded by the config entry count — discovery reads
+    /// one file per entry root and walks no directories.
+    contexts: Vec<(PathBuf, ContextUniverse)>,
 }
 
 /// A lib dir in the spelling universe the identity layer keys files under:
@@ -188,11 +219,12 @@ impl PackageTable {
     /// grammar, or a `packageUri` escaping its root; a broken config,
     /// reported loudly.
     pub fn new(config: &PackageConfig, config_dir: &Path) -> Result<Self, PubError> {
+        let resolved = config.resolve(config_dir)?;
         let mut lib_dirs: Vec<(PathBuf, Box<str>)> = Vec::new();
-        for resolved in config.resolve(config_dir)? {
+        for package in &resolved {
             lib_dirs.push((
-                canonical_dir(&resolved.lib_dir),
-                Box::from(resolved.name.as_str()),
+                canonical_dir(&package.lib_dir),
+                Box::from(package.name.as_str()),
             ));
         }
         lib_dirs.sort_by_key(|(dir, _)| std::cmp::Reverse(dir.components().count()));
@@ -204,10 +236,79 @@ impl PackageTable {
         let workspace_root = config_dir
             .parent()
             .map_or_else(|| config_dir.to_path_buf(), Path::to_path_buf);
+        // Per-context universe discovery: a config entry whose package root
+        // carries its own `pubspec.yaml` AND its own
+        // `.dart_tool/package_config.json` is a separate context root (the
+        // oracle's split trigger — see the struct docs). Discovery rides the
+        // config's own entries: the assembly's nested-root extension
+        // guarantees every self-resolved root under the analyzed tree is an
+        // entry, and a `--packages` run skips that extension (the oracle's
+        // `_defaultPackageConfigFile` short-circuit) so no entry carries its
+        // own config and the table stays one flat universe, exactly there.
+        let mut contexts: Vec<(PathBuf, ContextUniverse)> = Vec::new();
+        for package in &resolved {
+            let root = canonical_dir(&package.root);
+            let nested_dir = root.join(".dart_tool");
+            let nested_config = nested_dir.join("package_config.json");
+            if !root.join("pubspec.yaml").is_file() || !nested_config.is_file() {
+                continue;
+            }
+            // A nested config that exists but cannot back a universe is that
+            // context's `Packages.empty` floor: every `package:` URI from
+            // under the root stays unresolved — the oracle's parse-failure
+            // catch-all (upstream Dart SDK source,
+            // pkg/analyzer/lib/src/context/packages.dart
+            // `parsePackageConfigJsonFile`), never a fall back to this
+            // table's universe.
+            let universe = std::fs::read_to_string(&nested_config)
+                .ok()
+                .and_then(|text| PackageConfig::parse(&text).ok())
+                .and_then(|nested| nested.resolve(&nested_dir).ok())
+                .map_or_else(
+                    || ContextUniverse::empty(root.clone()),
+                    |entries| ContextUniverse::new(&entries, root.clone()),
+                );
+            contexts.push((root, universe));
+        }
+        if contexts.is_empty() {
+            return Ok(Self {
+                lib_dirs,
+                indices,
+                workspace_root,
+                root_universe: None,
+                contexts,
+            });
+        }
+        contexts.sort_by_key(|(root, _)| std::cmp::Reverse(root.components().count()));
+        let nested_roots: FxHashSet<PathBuf> =
+            contexts.iter().map(|(root, _)| root.clone()).collect();
+        // The context-root universe is the root config AS WRITTEN (the
+        // oracle parses each context's packages file as written): re-read
+        // from disk, the written truth the extension must not widen — a
+        // package the extension joined stays invisible outside its own
+        // context, a package pub wrote into the root config stays visible.
+        // A config that raced the assembly (deleted or corrupted after
+        // acceptance) falls back to the given config minus the nested
+        // roots — the conservative shape. Unreachable under `--packages`:
+        // the override skips the extension, so no context exists here.
+        let written = std::fs::read_to_string(config_dir.join("package_config.json"))
+            .ok()
+            .and_then(|text| PackageConfig::parse(&text).ok())
+            .and_then(|written| written.resolve(config_dir).ok())
+            .unwrap_or_else(|| {
+                resolved
+                    .iter()
+                    .filter(|package| !nested_roots.contains(&canonical_dir(&package.root)))
+                    .cloned()
+                    .collect()
+            });
+        let root_universe = ContextUniverse::new(&written, workspace_root.clone());
         Ok(Self {
             lib_dirs,
             indices,
             workspace_root,
+            root_universe: Some(root_universe),
+            contexts,
         })
     }
 
@@ -216,6 +317,101 @@ impl PackageTable {
     pub fn lib_dir(&self, name: &str) -> Option<&Path> {
         let index = *self.indices.get(name)?;
         Some(self.lib_dirs[index].0.as_path())
+    }
+
+    /// The `package:` universe governing `container`: the deepest nested
+    /// self-resolved context root containing the file, else the context-root
+    /// set. `None` when no nested context exists — the flat set is the one
+    /// universe, and one early return keeps the common shape's hot path
+    /// unchanged.
+    fn universe_for(&self, container: &Path) -> Option<&ContextUniverse> {
+        if self.contexts.is_empty() {
+            return None;
+        }
+        self.contexts
+            .iter()
+            .find(|(root, _)| container.strip_prefix(root).is_ok())
+            .map(|(_, universe)| universe)
+            .or(self.root_universe.as_ref())
+    }
+}
+
+/// One analysis context's `package:` universe: the package name → lib-dir
+/// map its own `package_config.json` materializes, plus the context root the
+/// generated-file fallback probes (`<root>/.dart_tool/build/generated`).
+/// The rust-analyzer shape (upstream rust-analyzer source,
+/// crates/hir-expand / the crate graph): each crate resolves names through
+/// its own dependency closure, never a workspace-global table.
+#[derive(Debug)]
+struct ContextUniverse {
+    lib_dirs: FxHashMap<Box<str>, PathBuf>,
+    workspace_root: PathBuf,
+}
+
+impl ContextUniverse {
+    /// Indexes the context config's resolved entries. Lib dirs pass through
+    /// [`canonical_dir`], the same spelling discipline as the flat table, so
+    /// the two faces can never diverge on one path's spelling.
+    fn new<'p>(
+        entries: impl IntoIterator<Item = &'p ResolvedPackage>,
+        workspace_root: PathBuf,
+    ) -> Self {
+        Self {
+            lib_dirs: entries
+                .into_iter()
+                .map(|package| {
+                    (
+                        Box::from(package.name.as_str()),
+                        canonical_dir(&package.lib_dir),
+                    )
+                })
+                .collect(),
+            workspace_root,
+        }
+    }
+
+    /// The oracle's `Packages.empty` floor: a context whose own config
+    /// cannot be read, parsed, or resolved resolves nothing.
+    fn empty(workspace_root: PathBuf) -> Self {
+        Self {
+            lib_dirs: FxHashMap::default(),
+            workspace_root,
+        }
+    }
+
+    /// The lib dir of package `name`, or `None` for a package outside this
+    /// context's universe.
+    fn lib_dir(&self, name: &str) -> Option<&Path> {
+        self.lib_dirs.get(name).map(PathBuf::as_path)
+    }
+}
+
+/// The `package:` universe one resolution consults: the flat table
+/// ([`UniverseRef::Flat`], no nested context anywhere) or the container's
+/// context's own set ([`UniverseRef::Scoped`]).
+#[derive(Clone, Copy)]
+enum UniverseRef<'a> {
+    Flat(&'a PackageTable),
+    Scoped(&'a ContextUniverse),
+}
+
+impl<'a> UniverseRef<'a> {
+    /// The universe's lib dir for package `name`; `None` names a package
+    /// outside the container's context — `uri_does_not_exist`.
+    fn lib_dir(self, name: &str) -> Option<&'a Path> {
+        match self {
+            Self::Flat(table) => table.lib_dir(name),
+            Self::Scoped(universe) => universe.lib_dir(name),
+        }
+    }
+
+    /// The universe's generated-file base — the context root the
+    /// `.dart_tool/build/generated` fallback probes under.
+    fn workspace_root(self) -> &'a Path {
+        match self {
+            Self::Flat(table) => table.workspace_root.as_path(),
+            Self::Scoped(universe) => universe.workspace_root.as_path(),
+        }
     }
 }
 
@@ -229,7 +425,6 @@ impl PackageTable {
 pub struct UriResolver<'a> {
     packages: &'a PackageTable,
     sdk: &'a SdkSnapshot,
-    target: Box<str>,
     /// The declared-variables context of conditional evaluation
     /// (`_fsState._declaredVariables`, `file_state.dart:738-764`): the
     /// `-D name=value` pairs configurable directives test against — empty
@@ -244,6 +439,10 @@ pub struct UriResolver<'a> {
     /// outside residency.
     resident: &'a dyn Fn(FileId) -> bool,
     bases: FxHashMap<FileId, BaseUri>,
+    /// Per-container context universe memo (the pub universe separation): one
+    /// context-root scan per file — the memoized answer every directive of
+    /// the file resolves against — in the same per-file shape as `bases`.
+    universes: FxHashMap<FileId, UniverseRef<'a>>,
     /// Canonical URIs memoized per `FileTable`-normalized path for this
     /// resolver's lifetime — the package table cannot change under a live
     /// resolver, so [`Self::canonical_uri`] pays its package scan once per
@@ -278,7 +477,7 @@ enum Composed<'a> {
     /// A `dart:` URI split at the library boundary: the path's first segment
     /// (`core` for both `dart:core` and `dart:core/bool.dart`; an authority
     /// form leaves it empty, which no SDK table lists) and the raw part
-    /// remainder — exactly the pair [`SdkSnapshot::library_to_path`]
+    /// remainder — exactly the pair [`SdkSnapshot::flat_library_to_path`]
     /// consumes.
     Dart {
         library: Cow<'a, str>,
@@ -308,7 +507,7 @@ fn package_of<'p>(packages: &'p PackageTable, path: &Path) -> Option<(&'p str, S
 
 /// The canonical URI string of `path` (`pathToUri` face) against `memo` —
 /// the one implementation of the spelling, memoized per `FileTable`
-/// -normalized path. [`container_base`] reaches it through field-disjoint
+/// -normalized path. `container_base` reaches it through field-disjoint
 /// borrows (the base computation runs while `files` holds the container's
 /// interned path).
 fn canonical_uri_memo(
@@ -327,7 +526,7 @@ fn canonical_uri_memo(
 /// The pure spelling computation behind [`canonical_uri_memo`] and
 /// [`UriResolver::canonical_uri`]: `package:` inside a package lib dir
 /// (deepest match wins), `file://` otherwise.
-fn compose_canonical_uri(packages: &PackageTable, path: &Path) -> Box<str> {
+pub fn compose_canonical_uri(packages: &PackageTable, path: &Path) -> Box<str> {
     if let Some((package, rel)) = package_of(packages, path) {
         Box::from(format!("package:{package}/{}", encode_uri_path(&rel)))
     } else {
@@ -380,7 +579,6 @@ impl<'a> UriResolver<'a> {
     pub fn new(
         packages: &'a PackageTable,
         sdk: &'a SdkSnapshot,
-        target: &str,
         declared: &'a FxHashMap<String, String>,
         files: &'a mut FileTable,
         resident: &'a dyn Fn(FileId) -> bool,
@@ -388,11 +586,11 @@ impl<'a> UriResolver<'a> {
         Self {
             packages,
             sdk,
-            target: Box::from(target),
             declared,
             files,
             resident,
             bases: FxHashMap::default(),
+            universes: FxHashMap::default(),
             canonical: FxHashMap::default(),
             existence: FxHashMap::default(),
         }
@@ -418,6 +616,26 @@ impl<'a> UriResolver<'a> {
                 .is_some_and(|id| (self.resident)(id));
         self.existence.insert(path.to_path_buf(), found);
         found
+    }
+
+    /// The context universe `container`'s `package:` lookups consult,
+    /// memoized per container: the deepest nested self-resolved root
+    /// containing the file, else the context-root set, else — no nested
+    /// context anywhere — the flat table.
+    fn universe_of(&mut self, container: FileId) -> UniverseRef<'a> {
+        if let Some(&known) = self.universes.get(&container) {
+            return known;
+        }
+        let universe = self
+            .files
+            .path(container)
+            .and_then(|path| self.packages.universe_for(path));
+        let reference = match universe {
+            Some(universe) => UniverseRef::Scoped(universe),
+            None => UniverseRef::Flat(self.packages),
+        };
+        self.universes.insert(container, reference);
+        reference
     }
 
     /// The [`FileTable`] targets were interned into.
@@ -504,7 +722,8 @@ impl<'a> UriResolver<'a> {
             };
         };
         if !raw.scheme.is_empty() {
-            return self.land(compose_absolute(raw));
+            let universe = self.universe_of(container);
+            return self.land(compose_absolute(raw), universe);
         }
         // Field-disjoint borrows: the memoized base is read out of `bases`
         // before `land` mutates the other memos and `files`.
@@ -517,14 +736,15 @@ impl<'a> UriResolver<'a> {
             self.bases.insert(container, base);
         }
         let composed = compose_relative(&self.bases[&container], raw);
-        self.land(composed)
+        let universe = self.universe_of(container);
+        self.land(composed, universe)
     }
 
     /// The canonical URI of `path` (`pathToUri` face): `package:` inside a
     /// package lib dir (deepest match wins), `file://` otherwise. This is the
     /// library-identity string the library-graph layer keys on — and the one
     /// implementation of the spelling, so a change to it cannot desync the
-    /// composition base ([`container_base`] derives from it). Memoized per
+    /// composition base (`container_base` derives from it). Memoized per
     /// `FileTable`-normalized path for this resolver's lifetime (the package
     /// table cannot change under a live resolver); the returned borrow shares
     /// that lifetime, and callers needing a longer horizon cache the owned
@@ -548,8 +768,10 @@ impl<'a> UriResolver<'a> {
     }
 
     /// Lands a composed absolute URI on a target: scheme dispatch, existence,
-    /// generated-file fallback, interning, and the §4.2 code.
-    fn land(&mut self, composed: Composed<'_>) -> UriResolution {
+    /// generated-file fallback, interning, and the code. `universe` is
+    /// the container's context universe — the only face a `package:` target
+    /// resolves through.
+    fn land(&mut self, composed: Composed<'_>, universe: UniverseRef<'a>) -> UriResolution {
         match composed {
             Composed::DartExt => UriResolution {
                 uri: ResolvedUri::Unresolved(UnresolvedKind::DartExt),
@@ -557,7 +779,13 @@ impl<'a> UriResolver<'a> {
                 code: Some(ResolutionCode::UseOfNativeExtension),
             },
             Composed::Dart { library, part } => {
-                match self.sdk.library_to_path(&self.target, &library, &part) {
+                // Existence is the SDK's flat face — the oracle's
+                // `libraries.dart` map, flat across all target segments
+                // (`SdkSnapshot::flat_library_to_path`); the oracle never
+                // consults platform flags or per-segment tables for `dart:`
+                // URI existence, so neither does resolution. Part paths join
+                // the same table's library path.
+                match self.sdk.flat_library_to_path(&library, &part) {
                     Some(file) => UriResolution {
                         uri: ResolvedUri::Dart {
                             library: library.into_owned().into_boxed_str(),
@@ -566,8 +794,8 @@ impl<'a> UriResolver<'a> {
                         target: ResolvedTarget::External,
                         code: None,
                     },
-                    // Unknown dart: library (or target): source is null —
-                    // `uri_does_not_exist` per §4.2.
+                    // Unknown dart: library: source is null —
+                    // `uri_does_not_exist` per the URI-layer contract.
                     None => UriResolution {
                         uri: ResolvedUri::Unresolved(UnresolvedKind::NotExist),
                         target: ResolvedTarget::Missing,
@@ -597,21 +825,28 @@ impl<'a> UriResolver<'a> {
                     code,
                 }
             }
-            Composed::Package { package, rel } => self.land_package(package, &rel),
+            Composed::Package { package, rel } => self.land_package(universe, package, &rel),
         }
     }
 
-    /// Lands a `package:` target: lib-dir lookup, the generated-file
-    /// fallback, and the missing-file code. The package name is cloned only
-    /// into the returned [`ResolvedUri::Package`] — an unknown package (the
-    /// lookup miss) allocates nothing.
-    fn land_package(&mut self, package: Cow<'_, str>, rel: &str) -> UriResolution {
+    /// Lands a `package:` target: lib-dir lookup in the container's context
+    /// universe (the pub universe separation — a package outside it is
+    /// unresolvable however global the table), the generated-file fallback
+    /// under the universe's own context root, and the missing-file code. The
+    /// package name is cloned only into the returned [`ResolvedUri::Package`]
+    /// — an unknown package (the lookup miss) allocates nothing.
+    fn land_package(
+        &mut self,
+        universe: UniverseRef<'a>,
+        package: Cow<'_, str>,
+        rel: &str,
+    ) -> UriResolution {
         let unresolvable = || UriResolution {
             uri: ResolvedUri::Unresolved(UnresolvedKind::NotExist),
             target: ResolvedTarget::Missing,
             code: Some(ResolutionCode::UriDoesNotExist),
         };
-        let Some(lib_dir) = self.packages.lib_dir(&package) else {
+        let Some(lib_dir) = universe.lib_dir(&package) else {
             return unresolvable();
         };
         let Some(decoded) = decode_uri_path(rel) else {
@@ -622,11 +857,11 @@ impl<'a> UriResolver<'a> {
             // Generated-file face: `.dart_tool/build/generated/<pkg>/lib/`
             // + the raw (undecoded) rel path, verbatim from the resolver
             // chain; used only when present (build output, never an overlay
-            // — the probe stays disk-only).
+            // — the probe stays disk-only). The fallback probes the
+            // universe's own context root, the context's generated face.
             let built = join_rel(
-                &self
-                    .packages
-                    .workspace_root
+                &universe
+                    .workspace_root()
                     .join(".dart_tool/build/generated")
                     .join(package.as_ref())
                     .join("lib"),
@@ -669,7 +904,7 @@ impl<'a> UriResolver<'a> {
     }
 }
 
-/// The §4.2 code for a known-path-but-missing file: generated-suffix paths
+/// The code for a known-path-but-missing file: generated-suffix paths
 /// report `uri_has_not_been_generated`, everything else `uri_does_not_exist`
 /// (`library_analyzer.dart:694-700`).
 fn missing_file_code(path: &Path) -> ResolutionCode {
@@ -727,7 +962,7 @@ pub struct RawUri<'a> {
 ///
 /// [`InvalidUriSyntax`] where Dart throws `FormatException` — reported as
 /// `invalid_uri`.
-pub fn parse_directive_uri<'a>(uri: &'a str) -> Result<RawUri<'a>, InvalidUriSyntax> {
+pub fn parse_directive_uri(uri: &str) -> Result<RawUri<'_>, InvalidUriSyntax> {
     // `Uri.parse` routes any string starting with a case-insensitive `data:`
     // to `UriData._parse` before the general scanner runs (uri.dart:931-939),
     // so the path character tables never apply to it.
@@ -850,7 +1085,10 @@ fn parse_data_uri(uri: &str) -> Result<RawUri<'_>, InvalidUriSyntax> {
         return Err(InvalidUriSyntax); // "Invalid base64 data" / padding
     }
     Ok(RawUri {
-        scheme: lowered_scheme(&uri[..5]),
+        // The oracle spells the scheme without the colon: `Uri.parse`'s
+        // `data:` face builds `_DataUri` → `super._internal("data", …)`
+        // (uri.dart:5122-5126).
+        scheme: lowered_scheme(&uri[..4]),
         authority: None,
         path: Cow::Borrowed(&uri[5..]),
     })
@@ -1102,7 +1340,7 @@ fn compose_absolute(raw: RawUri<'_>) -> Composed<'_> {
             // `dart:core` and `dart:core/bool.dart`); an authority form
             // (`dart://x/core`) leaves it empty, which no SDK table lists.
             // One split, no re-join: the pair moves structurally into
-            // `land` and on to the SDK's `library_to_path`.
+            // `land` and on to the SDK's `flat_library_to_path`.
             let (library, part) = split_path_cow(raw.path);
             Composed::Dart { library, part }
         }
@@ -1345,7 +1583,7 @@ mod tests {
         assert_eq!(dart.scheme.as_ref(), "dart");
 
         let file = parse_directive_uri("file:///tmp/x.dart").expect("file");
-        assert_eq!(file.authority.as_deref(), Some(""));
+        assert_eq!(file.authority, Some(""));
         assert_eq!(file.path.as_ref(), "/tmp/x.dart");
 
         let data = parse_directive_uri("data:text/plain,main(){}").expect("data");
@@ -1395,10 +1633,10 @@ mod tests {
     #[test]
     fn host_and_empty_authority_are_kept_for_dispatch() {
         let hosted = parse_directive_uri("package://host/a.dart").expect("hosted");
-        assert_eq!(hosted.authority.as_deref(), Some("host"));
+        assert_eq!(hosted.authority, Some("host"));
         assert_eq!(hosted.path.as_ref(), "/a.dart");
         let empty = parse_directive_uri("package:///a.dart").expect("empty");
-        assert_eq!(empty.authority.as_deref(), Some(""));
+        assert_eq!(empty.authority, Some(""));
         assert_eq!(empty.path.as_ref(), "/a.dart");
     }
 
@@ -1574,14 +1812,7 @@ mod tests {
         declared: &'a FxHashMap<String, String>,
         files: &'a mut FileTable,
     ) -> UriResolver<'a> {
-        UriResolver::new(
-            &fixture.packages,
-            &fixture.snapshot,
-            "vm",
-            declared,
-            files,
-            &|_| false,
-        )
+        UriResolver::new(&fixture.packages, &fixture.snapshot, declared, files, &|_| false)
     }
 
     /// [`resolver_with`] under the oracle-default empty context.
@@ -1958,9 +2189,25 @@ mod tests {
         assert_eq!(file, fixture.sdk.root.join("lib/core/bool.dart"));
         assert_eq!(part.target, ResolvedTarget::External);
 
-        // Unknown dart library (and unknown on this target): source null.
-        let unknown =
+        // Existence is the SDK's flat face, not the vm segment's table: the
+        // synthetic SDK lists only core/io on `vm`, and `dart:mirrors`
+        // still resolves through the generated flat table (metadata-level
+        // resolution — the path need not exist on disk).
+        let mirrors =
             resolver.resolve(container, Some("dart:mirrors"), DirectiveKind::ImportExport);
+        assert_eq!(
+            mirrors.uri,
+            ResolvedUri::Dart {
+                library: "mirrors".into(),
+                file: fixture.sdk.root.join("lib/mirrors/mirrors.dart"),
+            }
+        );
+        assert_eq!(mirrors.target, ResolvedTarget::External);
+
+        // `web_sql` is on disk in the SDK tree but tabulated by neither the
+        // oracle's flat table nor dartq's: source null —
+        // `uri_does_not_exist` per the URI-layer contract.
+        let unknown = resolver.resolve(container, Some("dart:web_sql"), DirectiveKind::ImportExport);
         assert_eq!(
             unknown.uri,
             ResolvedUri::Unresolved(UnresolvedKind::NotExist)
@@ -2413,5 +2660,261 @@ mod tests {
             DirectiveKind::ImportExport,
         );
         assert_eq!(code_of(&resolution), ResolutionCode::UriWithInterpolation);
+    }
+
+    // ---- per-context universes: the pub universe separation ----
+
+    static NESTED_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    /// A nested-root workspace: `app` is the analyzed root (its as-written
+    /// config lists only itself), `app/nested` carries its own pubspec and
+    /// its own `package_config.json` listing itself plus `nested_dep` (a
+    /// sibling dir only nested's config sees), and the in-memory extended
+    /// config adds the nested entry — the exact shape the assembly's
+    /// nested-root extension produces. Returns the canonical root and the
+    /// extended [`PackageConfig`].
+    fn nested_workspace(tag: &str, nested_config_text: &str) -> (PathBuf, PackageConfig) {
+        let root = std::env::temp_dir().join(format!(
+            "dartq-resolution-nested-{tag}-{}-{}",
+            std::process::id(),
+            NESTED_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            fs::write(&path, content).expect("file");
+        };
+        // The as-written truth: only `app`.
+        write("app/lib/main.dart", "// fixture\n");
+        write(
+            "app/.dart_tool/package_config.json",
+            r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+        );
+        // The nested self-resolved root, with its own dep closure.
+        write(
+            "app/nested/pubspec.yaml",
+            "name: nested\nenvironment:\n  sdk: ^3.2.0\n",
+        );
+        write("app/nested/lib/n.dart", "// fixture\n");
+        write("app/dep/lib/d.dart", "// fixture\n");
+        write(
+            "app/nested/.dart_tool/package_config.json",
+            nested_config_text,
+        );
+        let root = root.canonicalize().expect("canonical root");
+        // The extended config the assembly hands the engine: the as-written
+        // entry plus the nested root (rootUri relative to `app/.dart_tool`).
+        let extended = PackageConfig::parse(
+            r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../", "languageVersion": "3.5"}, {"name": "nested", "rootUri": "../nested", "languageVersion": "3.2"}], "generator": "pub"}"#,
+        )
+.expect("valid extended config");
+        (root, extended)
+    }
+
+    /// The nested boundary: each context resolves `package:` URIs against
+    /// its OWN universe. Root files see only the as-written root config —
+    /// the extension-added nested entry stays invisible (the oracle reports
+    /// `uri_does_not_exist` there). Nested files resolve their own config's
+    /// closure — including `nested_dep`, which exists ONLY in nested's
+    /// config: the flat union had the opposite failure (it resolved
+    /// cross-context names the oracle rejects and never knew this dep).
+    /// Canonical spelling stays flat: the nested file spells
+    /// `package:nested/n.dart` through the same table.
+    #[test]
+    fn nested_context_resolves_only_its_own_universe() {
+        let (root, extended) = nested_workspace(
+            "boundary",
+            r#"{"configVersion": 2, "packages": [{"name": "nested", "rootUri": "../"}, {"name": "nested_dep", "rootUri": "../../dep"}], "generator": "pub"}"#,
+        );
+        let config_dir = root.join("app/.dart_tool");
+        let table = PackageTable::new(&extended, &config_dir).expect("indexable config");
+        let snapshot = SdkFixture::new().load();
+        let declared = FxHashMap::default();
+        let mut files = FileTable::new();
+        let app = files.intern(&root.join("app/lib/main.dart"));
+        let nested = files.intern(&root.join("app/nested/lib/n.dart"));
+
+        let mut resolver =
+            UriResolver::new(&table, &snapshot, &declared, &mut files, &|_| false);
+
+        // Root context: its own package resolves; nothing from the
+        // sibling's universe does.
+        let own = resolver.resolve(
+            app,
+            Some("package:app/main.dart"),
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(own.code, None, "the root config as written resolves");
+        let sibling = resolver.resolve(
+            app,
+            Some("package:nested/n.dart"),
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(
+            (sibling.uri.clone(), sibling.target),
+            (
+                ResolvedUri::Unresolved(UnresolvedKind::NotExist),
+                ResolvedTarget::Missing
+            ),
+            "the extension-added nested entry is invisible outside its context"
+        );
+        assert_eq!(code_of(&sibling), ResolutionCode::UriDoesNotExist);
+        let sibling_dep = resolver.resolve(
+            app,
+            Some("package:nested_dep/d.dart"),
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(code_of(&sibling_dep), ResolutionCode::UriDoesNotExist);
+
+        // Nested context: its own config's closure resolves — the dep only
+        // its config lists included — and the root package does not.
+        let own = resolver.resolve(
+            nested,
+            Some("package:nested/n.dart"),
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(own.code, None, "the nested config resolves its own name");
+        let dep = resolver.resolve(
+            nested,
+            Some("package:nested_dep/d.dart"),
+            DirectiveKind::ImportExport,
+        );
+        // Both targets land in the lib dirs the nested config materializes:
+        // `nested` through `../` and `nested_dep` through `../../dep`, each
+        // relative to nested's own `.dart_tool`. The two identities are
+        // distinct packages — the pin is the exact landing of each.
+        let ResolvedUri::Package { package, rel, file } = own.uri.clone() else {
+            panic!("expected a package target");
+        };
+        assert_eq!(package.as_ref(), "nested");
+        assert_eq!(rel, PathBuf::from("n.dart"));
+        assert_eq!(file, root.join("app/nested/lib/n.dart"));
+        let ResolvedUri::Package { package, rel, file } = dep.uri.clone() else {
+            panic!("expected a package target");
+        };
+        assert_eq!(package.as_ref(), "nested_dep");
+        assert_eq!(rel, PathBuf::from("d.dart"));
+        assert_eq!(file, root.join("app/dep/lib/d.dart"));
+        assert_eq!(dep.code, None, "nested's own dep closure resolves");
+        let root_package = resolver.resolve(
+            nested,
+            Some("package:app/main.dart"),
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(
+            code_of(&root_package),
+            ResolutionCode::UriDoesNotExist,
+            "the root package is outside the nested context's universe"
+        );
+
+        // The spelling face is unchanged: nested files still spell through
+        // the flat table.
+        assert_eq!(
+            resolver.canonical_uri(&root.join("app/nested/lib/n.dart")),
+            "package:nested/n.dart"
+        );
+    }
+
+    /// A nested config that exists but cannot be parsed is that context's
+    /// `Packages.empty` floor: every `package:` URI from under the root
+    /// stays unresolved — never a fall back to the flat universe — while
+    /// the root context keeps resolving its own config.
+    #[test]
+    fn corrupt_nested_config_degrades_to_empty_context() {
+        let (root, extended) = nested_workspace("corrupt", "{not json");
+        let config_dir = root.join("app/.dart_tool");
+        let table = PackageTable::new(&extended, &config_dir).expect("indexable config");
+        let snapshot = SdkFixture::new().load();
+        let declared = FxHashMap::default();
+        let mut files = FileTable::new();
+        let app = files.intern(&root.join("app/lib/main.dart"));
+        let nested = files.intern(&root.join("app/nested/lib/n.dart"));
+        let mut resolver =
+            UriResolver::new(&table, &snapshot, &declared, &mut files, &|_| false);
+        let own = resolver.resolve(
+            app,
+            Some("package:app/main.dart"),
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(own.code, None, "the root context is unaffected");
+        let from_nested = resolver.resolve(
+            nested,
+            Some("package:nested/n.dart"),
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(
+            code_of(&from_nested),
+            ResolutionCode::UriDoesNotExist,
+            "the empty-context floor, not the flat fallback"
+        );
+    }
+
+    /// A package the root config lists AS WRITTEN stays visible to root
+    /// files even when it carries its own `.dart_tool/package_config.json`
+    /// (an independently resolved path dep): the oracle's root context
+    /// parses its config as written, so `package:dep` resolves from root
+    /// files — while the dep's own files resolve only its own universe.
+    /// Pins the as-written re-read against the naive
+    /// extended-minus-nested shape, which would hide `dep` from the root.
+    #[test]
+    fn path_dep_with_own_config_stays_visible_to_the_root_context() {
+        let root = std::env::temp_dir().join(format!(
+            "dartq-resolution-nested-pathdep-{}-{}",
+            std::process::id(),
+            NESTED_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            fs::write(&path, content).expect("file");
+        };
+        write("app/lib/main.dart", "// fixture\n");
+        // The root config AS WRITTEN lists both app and dep.
+        write(
+            "app/.dart_tool/package_config.json",
+            r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../"}, {"name": "dep", "rootUri": "../dep"}], "generator": "pub"}"#,
+        );
+        write(
+            "app/dep/pubspec.yaml",
+            "name: dep\nenvironment:\n  sdk: ^3.2.0\n",
+        );
+        write("app/dep/lib/d.dart", "// fixture\n");
+        write(
+            "app/dep/.dart_tool/package_config.json",
+            r#"{"configVersion": 2, "packages": [{"name": "dep", "rootUri": "../"}], "generator": "pub"}"#,
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let config_dir = root.join("app/.dart_tool");
+        let config = PackageConfig::parse(
+            &fs::read_to_string(config_dir.join("package_config.json")).expect("config"),
+        )
+        .expect("valid config");
+        let table = PackageTable::new(&config, &config_dir).expect("indexable config");
+        let snapshot = SdkFixture::new().load();
+        let declared = FxHashMap::default();
+        let mut files = FileTable::new();
+        let app = files.intern(&root.join("app/lib/main.dart"));
+        let dep = files.intern(&root.join("app/dep/lib/d.dart"));
+        let mut resolver =
+            UriResolver::new(&table, &snapshot, &declared, &mut files, &|_| false);
+        // Root context: the as-written dep entry resolves.
+        let from_root =
+            resolver.resolve(app, Some("package:dep/d.dart"), DirectiveKind::ImportExport);
+        assert_eq!(from_root.code, None, "the root config as written lists dep");
+        // Dep's context: its own universe only.
+        let own = resolver.resolve(dep, Some("package:dep/d.dart"), DirectiveKind::ImportExport);
+        assert_eq!(own.code, None);
+        let root_package = resolver.resolve(
+            dep,
+            Some("package:app/main.dart"),
+            DirectiveKind::ImportExport,
+        );
+        assert_eq!(
+            code_of(&root_package),
+            ResolutionCode::UriDoesNotExist,
+            "the root package is outside dep's universe"
+        );
     }
 }

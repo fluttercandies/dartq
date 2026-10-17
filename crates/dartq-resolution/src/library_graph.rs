@@ -1,6 +1,6 @@
-//! The library graph: interned library nodes, import/export edges, and the
-//! eager export-scope fixpoint (the resolution design contract §3/§5,
-//! module `library_graph.rs`).
+//! The library graph: interned library nodes, import/export edges, part-graph
+//! unit membership, and the eager export-scope fixpoint (module
+//! `library_graph.rs`).
 //!
 //! Nodes are libraries keyed by their canonical identity string
 //! ([`crate::UriResolver::canonical_uri`] — `package:` inside package lib
@@ -12,8 +12,8 @@
 //! `target: None` — it contributes no names, matching the oracle's name-table
 //! filter (`PrefixScope` admits only `DirectiveUriWithLibraryImpl` imports,
 //! `element/scope.dart:530-535`); an import-side `as` prefix still registers
-//! with an empty table downstream (the namespace layer's contract). The §4.2
-//! codes for such directives stay with the caller's
+//! with an empty table downstream (the namespace layer's contract). The
+//! resolution codes for such directives stay with the caller's
 //! [`crate::UriResolution`]; this layer only computes namespaces — except
 //! for the directive-combinator static warnings
 //! ([`LibraryGraph::undefined_combinator_names`]), whose emit-side decision
@@ -50,7 +50,7 @@
 //!   libraries in registration (discovery) order, then the newly-added-name
 //!   worklist drains LIFO (`link.dart:167-206`).
 //!
-//! ## Deviation from the spec sketch (§5), oracle wins
+//! ## Deviation from the spec sketch, oracle wins
 //!
 //! The spec sketch orders the fixpoint as Tarjan SCC condensation plus a
 //! per-SCC iteration. The pinned oracle (`summary2/link.dart:144-218`
@@ -83,7 +83,7 @@ use std::collections::hash_map;
 use crate::modifiers::ClassModifiers;
 
 /// An interned library node: the resolution layer's logical identity
-/// (spec §5; the engine's arena `LibraryId` is a separate, downstream type).
+///.
 /// Issued by [`LibraryGraphBuilder::intern`]; indexes the [`LibraryGraph`]
 /// vectors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -162,6 +162,10 @@ impl Combinators {
     /// duplicates preserved); the spans are the zero-length range at offset 0
     /// — this constructor receives no capture. The span-carrying constructor
     /// is [`Self::with_spans`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the input carries more than `u32::MAX` clauses.
     pub fn new(clauses: impl IntoIterator<Item = CombinatorClause>, strings: &StringTable) -> Self {
         let clauses: Vec<CombinatorClause> = clauses.into_iter().collect();
         let written: Vec<WrittenName> = clauses
@@ -223,6 +227,14 @@ impl Combinators {
             .collect();
         let clauses = clauses.into_iter().map(|(clause, _)| clause).collect();
         Self::build(clauses, written, strings)
+    }
+
+    /// The clause list — the crate-internal read the namespace layer's CSR
+    /// flattening walks ([`crate::namespace`]). The sets are already sorted,
+    /// deduplicated, and setter-expanded ([`Self::build`]), so flattening
+    /// preserves the binary-search membership face.
+    pub(crate) fn clauses(&self) -> &[CombinatorClause] {
+        &self.clauses
     }
 
     /// The unfiltered list — the no-combinator common case.
@@ -287,7 +299,7 @@ impl Combinators {
     /// [`Self::written`] with each token's clause index — `(name, hidden,
     /// span, clause)` per token, in written order, duplicates preserved.
     /// The facts-snapshot projection face (#719): clause boundaries are
-    /// observable ([`Self::clauses_written`]'s per-clause duplicate-combinator
+    /// observable (`Self::clauses_written`'s per-clause duplicate-combinator
     /// seen-set and [`Self::written_shapes_equal`]'s clause identity), and
     /// adjacent same-kind clauses are indistinguishable on the bare
     /// [`Self::written`] face, so the snapshot must carry the boundary for a
@@ -396,7 +408,7 @@ fn expand_names(names: &[StringId], strings: &StringTable) -> Box<[StringId]> {
     expanded.into_boxed_slice()
 }
 
-/// One resolved `import` directive as a graph edge (spec §2.5/§5).
+/// One resolved `import` directive as a graph edge.
 ///
 /// The caller resolves the directive URI upstream and maps the outcome: a
 /// library of the analysis set becomes `Some`, an external (`dart:`),
@@ -411,11 +423,11 @@ pub struct ImportEdge {
     pub target: Option<LibraryId>,
     /// The `as` prefix name, if any (interned).
     pub prefix: Option<StringId>,
-    /// Whether the import is `deferred` (§2.5: recorded, never evaluated —
+    /// Whether the import is `deferred` (recorded, never evaluated —
     /// `loadLibrary` synthesis is the semantic layer's job).
     pub deferred: bool,
     /// The directive's filters, applied at namespace-build time
-    /// ([`crate::namespace`]; §1 — combinator filtering is build-time).
+    ///.
     pub combinators: Combinators,
 }
 
@@ -530,6 +542,11 @@ pub struct LibraryGraphBuilder<'t> {
 
 struct NodeBuilder {
     uri: Box<str>,
+    /// The library's compilation units in registration order — the library's
+    /// own file first, then each part ([`LibraryGraph::unit_files`]). One
+    /// push per unit, no dedup: a file belongs to exactly one library, and
+    /// the caller's fold yields each unit once.
+    units: Vec<FileId>,
     decls: Vec<(StringId, FileId)>,
     imports: Vec<ImportEdge>,
     exports: Vec<ExportEdge>,
@@ -567,12 +584,22 @@ impl<'t> LibraryGraphBuilder<'t> {
         self.by_uri.insert(Box::from(canonical_uri), id);
         self.nodes.push(NodeBuilder {
             uri: Box::from(canonical_uri),
+            units: Vec::new(),
             decls: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
             classes: Vec::new(),
         });
         id
+    }
+
+    /// Records `file` as one compilation unit of `lib` — the library's own
+    /// file for the defining unit, one call per `part` directive as the
+    /// caller folds the part tree. O(1): a single push; the unit face holds
+    /// no names and joins no fixpoint. The read side is
+    /// [`LibraryGraph::unit_files`].
+    pub fn unit(&mut self, lib: LibraryId, file: FileId) {
+        self.nodes[lib.index() as usize].units.push(file);
     }
 
     /// Records one top-level declaration `name` of `lib`, declared in `file`
@@ -721,6 +748,14 @@ impl<'t> LibraryGraphBuilder<'t> {
         // keep the first, matching [`LibraryGraphBuilder::declare`]'s
         // first-wins contract.
         let mut declarations: FxHashMap<StringId, Vec<LibraryId>> = FxHashMap::default();
+        // The unit → owning-library reverse map
+        // ([`LibraryGraph::library_of_file`]): one entry per registered
+        // unit — bounded by the input, built once here so a query is one
+        // hash hit instead of a scan over every library's `unit_files`.
+        let mut file_lib: FxHashMap<FileId, LibraryId> = FxHashMap::with_capacity_and_hasher(
+            nodes.iter().map(|node| node.units.len()).sum(),
+            FxBuildHasher,
+        );
         let nodes = nodes
             .into_iter()
             .zip(scopes)
@@ -745,8 +780,15 @@ impl<'t> LibraryGraphBuilder<'t> {
                 for &name in classes.keys() {
                     declarations.entry(name).or_default().push(lib);
                 }
+                // A file belongs to exactly one library (the module
+                // contract), so every entry is fresh; first-wins keeps the
+                // declared duplicate posture should a caller fold twice.
+                for &file in &node.units {
+                    file_lib.entry(file).or_insert(lib);
+                }
                 LibraryNode {
                     uri: node.uri,
+                    units: node.units,
                     imports: node.imports,
                     exports: node.exports,
                     export_scope,
@@ -759,6 +801,7 @@ impl<'t> LibraryGraphBuilder<'t> {
         LibraryGraph {
             nodes,
             declarations,
+            file_lib,
         }
     }
 }
@@ -882,10 +925,19 @@ pub struct LibraryGraph {
     /// Class-declaration name → declaring libraries, in library
     /// registration order ([`LibraryGraph::declaring_libraries`]).
     declarations: FxHashMap<StringId, Vec<LibraryId>>,
+    /// Registered unit → owning library ([`LibraryGraph::library_of_file`]):
+    /// one entry per registered unit, built at [`LibraryGraphBuilder::finish`].
+    file_lib: FxHashMap<FileId, LibraryId>,
 }
 
 struct LibraryNode {
     uri: Box<str>,
+    /// The part-graph truth of `lib`'s membership: the library's own file and
+    /// its parts, in registration order ([`LibraryGraph::unit_files`]). Not
+    /// derived from `export_scope`, which re-exports foreign files and drops
+    /// declaration-less units — the oracle's unit set is the part graph
+    /// (`RuleContext.allUnits`, fed by the `_libraryFiles` insertion order).
+    units: Vec<FileId>,
     imports: Vec<ImportEdge>,
     exports: Vec<ExportEdge>,
     export_scope: FxHashMap<StringId, ExportEntry>,
@@ -925,6 +977,32 @@ impl LibraryGraph {
     #[must_use]
     pub fn uri(&self, lib: LibraryId) -> &str {
         &self.nodes[lib.index() as usize].uri
+    }
+
+    /// `lib`'s compilation units — the library's own file plus its parts —
+    /// in registration order: the defining unit first, then each part in the
+    /// caller's fold order (part-directive declaration order). O(1): a slice
+    /// over the node's storage, no allocation, deterministic total order.
+    /// This is the part-graph truth behind the oracle's per-library unit walk
+    /// (`RuleContext.allUnits` — the defining unit and all parts;
+    /// `library_analyzer.dart` `_resolveDirectives` parses the defining unit
+    /// first, then each part in declaration order, and `_computeLints`
+    /// publishes `_libraryFiles` in that insertion order) — deliberately NOT
+    /// derived from [`LibraryGraph::export_scope`], which excludes
+    /// declaration-less units and includes re-exported foreign files.
+    #[must_use]
+    pub fn unit_files(&self, lib: LibraryId) -> &[FileId] {
+        &self.nodes[lib.index() as usize].units
+    }
+
+    /// The library `file` is a registered compilation unit of — the reverse
+    /// face of [`LibraryGraph::unit_files`]. One hash hit on the interned
+    /// file id, no scan over the nodes; `None` when the file registered no
+    /// unit with any library (a file outside the analysis set — the map
+    /// carries only registered units, so the answer is never fabricated).
+    #[must_use]
+    pub fn library_of_file(&self, file: FileId) -> Option<LibraryId> {
+        self.file_lib.get(&file).copied()
     }
 
     /// The resolved import edges of `lib`, in directive source order.
@@ -1070,7 +1148,7 @@ impl LibraryGraph {
     /// when either face is non-null (`element/scope.dart:419-433/455-471`),
     /// with setters keyed by the base name (`_addSetter` strips the trailing
     /// `=`, scope.dart:801-806). dartq precomputes that coupling per
-    /// spelling ([`LocalSlot`]), keeping the check a single hash hit.
+    /// spelling (`LocalSlot`), keeping the check a single hash hit.
     #[must_use]
     pub fn local(&self, lib: LibraryId, name: StringId) -> LocalLookup {
         match self.nodes[lib.index() as usize].locals.get(&name) {
@@ -1642,7 +1720,7 @@ mod tests {
     }
 
     /// Export cycles converge: a and b export each other; both faces carry
-    /// both names (link.dart `both` set + worklist, spec §3.1).
+    /// both names.
     #[test]
     fn export_cycle_reaches_fixpoint() {
         let mut rig = Rig::new();
@@ -2034,7 +2112,7 @@ mod tests {
     }
 
     /// Import edges are recorded with prefix, deferred, and combinators for
-    /// downstream consumption (§2.5: deferred is recorded, never evaluated).
+    /// downstream consumption.
     #[test]
     fn import_edges_record_their_directive_state() {
         let strings = StringTable::new();
@@ -2096,6 +2174,102 @@ mod tests {
         let graph = LibraryGraphBuilder::new(&strings).finish();
         assert!(graph.is_empty());
         assert_eq!(graph.libraries().count(), 0);
+    }
+
+    // ---- part-graph unit membership ----
+
+    /// `unit_files` answers the library's own file plus its parts, in
+    /// registration order — defining unit first, then each part in fold
+    /// order, the oracle's `allUnits` walk (`_resolveDirectives` parses the
+    /// defining unit, then each part in declaration order). Per library: a
+    /// partless sibling answers only itself, and a repeat read is the same
+    /// zero-copy slice (deterministic, no allocation).
+    #[test]
+    fn unit_files_answer_defining_then_parts_per_library() {
+        let mut rig = Rig::new();
+        let a = rig.builder.intern("package:a/a.dart");
+        let lib_b = rig.builder.intern("package:b/b.dart");
+        let a_file = rig.file("a.dart");
+        let a_part1 = rig.file("a_part1.dart");
+        let a_part2 = rig.file("a_part2.dart");
+        rig.builder.unit(a, a_file);
+        rig.builder.unit(a, a_part1);
+        rig.builder.unit(a, a_part2);
+        let b_file = rig.file("b.dart");
+        rig.builder.unit(lib_b, b_file);
+        // The unit face is independent of the declaration face: parts need
+        // no top-level declarations to count as units.
+        rig.declare(a, "aName", a_file);
+        let graph = rig.builder.finish();
+
+        assert_eq!(
+            graph.unit_files(a),
+            [a_file, a_part1, a_part2].as_slice(),
+            "defining unit first, parts in fold order"
+        );
+        assert_eq!(graph.unit_files(lib_b), [b_file].as_slice());
+        assert!(
+            std::ptr::eq(graph.unit_files(a), graph.unit_files(a)),
+            "slice over the node storage, not a fresh buffer"
+        );
+    }
+
+    /// A node interned only as a directive-edge target is never described —
+    /// no units, per the module contracts (the read is total, an empty
+    /// slice, not a panic).
+    #[test]
+    fn undescribed_nodes_answer_no_units() {
+        let mut rig = Rig::new();
+        let a = rig.builder.intern("package:a/a.dart");
+        let c = rig.builder.intern("package:c/c.dart"); // edge target only
+        let a_file = rig.file("a.dart");
+        rig.builder.unit(a, a_file);
+        rig.builder.import(a, import_edge(Some(c)));
+        let graph = rig.builder.finish();
+
+        assert!(graph.unit_files(c).is_empty());
+        assert_eq!(graph.unit_files(a), [a_file].as_slice());
+    }
+
+    /// The unit → owning-library reverse map: a library's defining unit and
+    /// its parts all answer their own library, a second library's unit
+    /// answers its own, and an unregistered file answers nothing — one
+    /// hash hit per query, the read the semantic layer's URI face is built
+    /// on. Consistent with the [`LibraryGraph::unit_files`] face it
+    /// reverses.
+    #[test]
+    fn library_of_file_answers_the_owning_library() {
+        let mut rig = Rig::new();
+        let lib = rig.builder.intern("package:t/main.dart");
+        let defining = rig.file("main.dart");
+        let part_a = rig.file("part_a.dart");
+        let part_b = rig.file("part_b.dart");
+        rig.builder.unit(lib, defining);
+        rig.builder.unit(lib, part_a);
+        rig.builder.unit(lib, part_b);
+        let other = rig.builder.intern("package:t/kit.dart");
+        let other_file = rig.file("kit.dart");
+        rig.builder.unit(other, other_file);
+        // Minted from the same table, never registered as a unit.
+        let stray = rig.file("stray.dart");
+        let graph = rig.builder.finish();
+
+        assert_eq!(graph.library_of_file(defining), Some(lib));
+        assert_eq!(graph.library_of_file(part_a), Some(lib));
+        assert_eq!(graph.library_of_file(part_b), Some(lib));
+        assert_eq!(graph.library_of_file(other_file), Some(other));
+        assert_eq!(
+            graph.library_of_file(stray),
+            None,
+            "a file outside the analysis set carries no identity"
+        );
+        assert!(
+            graph
+                .unit_files(lib)
+                .iter()
+                .all(|&file| graph.library_of_file(file) == Some(lib)),
+            "the map agrees with the unit face it reverses"
+        );
     }
 
     // ---- cross-library modifier facts (ticket #281) ----
