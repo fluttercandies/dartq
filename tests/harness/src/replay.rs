@@ -43,7 +43,7 @@
 //! when every step was equal. Individual clean steps are legitimate; only
 //! a sequence-level zero across both arms is judged.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write as IoWrite};
 use std::path::{Path, PathBuf};
@@ -115,7 +115,10 @@ pub(crate) fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>, St
 
 /// Path → `file://` URI, percent-encoding everything outside the URI
 /// unreserved set (the daemon's `uri::from_path` counterpart, so the two
-/// faces agree on paths containing spaces or non-ASCII).
+/// faces agree on paths containing spaces or non-ASCII). Test-only since
+/// the overlay port: staging speaks plain paths, and only the analyze
+/// answer's URIs (decoded by `replay_edit::file_uri_to_path`) remain.
+#[cfg(test)]
 pub(crate) fn path_to_uri(path: &Path) -> String {
     let text = path.display().to_string();
     let mut uri = String::from("file://");
@@ -132,13 +135,13 @@ pub(crate) fn path_to_uri(path: &Path) -> String {
 
 /// The live-session half: a `dartq daemon` child spoken to over framed
 /// stdio. The reader thread owns stdout; requests are answered by matching
-/// ids while server notifications (publishDiagnostics) flow past. stderr
-/// lands in a temp file for failure tails; teardown is ordered shutdown →
-/// exit → reap, with a process-group kill on every other path (Drop
+/// ids while server notifications (`dartq/diagnostics` pushes) flow past.
+/// stderr lands in a temp file for failure tails; teardown is a stdin EOF
+/// plus the reap, with a process-group kill on every other path (Drop
 /// included, so an error return can never leak the daemon).
 struct DaemonClient {
     child: std::process::Child,
-    stdin: std::process::ChildStdin,
+    stdin: Option<std::process::ChildStdin>,
     frames: std::sync::mpsc::Receiver<Option<String>>,
     stderr: TempCapture,
     next_id: u64,
@@ -200,7 +203,7 @@ impl DaemonClient {
         });
         Ok(Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             frames,
             stderr,
             next_id: 1,
@@ -271,49 +274,28 @@ impl DaemonClient {
     }
 
     fn send(&mut self, body: &Value) -> Result<(), String> {
-        write_frame(&mut self.stdin, &body.to_string())
-            .map_err(|e| format!("writing to the daemon: {e}"))
-    }
-
-    fn notify(&mut self, method: &str, params: &Value) -> Result<(), String> {
-        self.send(&json!({"jsonrpc": "2.0", "method": method, "params": params}))
-    }
-
-    /// LSP lifecycle: `initialize` (the daemon gates everything on it) →
-    /// `initialized`.
-    fn initialize(&mut self) -> Result<(), String> {
-        let params = json!({
-            "processId": Value::Null,
-            "rootUri": Value::Null,
-            "capabilities": {},
-        });
-        self.call("initialize", &params).map(|_| ())?;
-        self.notify("initialized", &json!({}))
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "daemon stdin already closed".to_string())?;
+        write_frame(stdin, &body.to_string()).map_err(|e| format!("writing to the daemon: {e}"))
     }
 
     /// Ordered teardown; the process-group kill covers every abnormal path.
+    /// The post-LSP daemon has no shutdown exchange: the session ends when
+    /// the client closes its input stream, so teardown is a stdin EOF plus
+    /// the reap.
     fn shutdown(&mut self) -> Result<(), String> {
-        let result = self
-            .call("shutdown", &Value::Null)
-            .and_then(|_| self.notify("exit", &json!({})));
-        match result {
-            Ok(()) => {
-                let waited = self.child.wait().map_err(|e| e.to_string())?;
-                self.clean_shutdown = true;
-                if waited.success() {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "daemon exited with {waited}; stderr tail:\n{}",
-                        self.stderr_tail()
-                    ))
-                }
-            }
-            Err(e) => {
-                kill_driver(&mut self.child);
-                let _ = self.child.wait();
-                Err(e)
-            }
+        drop(self.stdin.take());
+        let waited = self.child.wait().map_err(|e| e.to_string())?;
+        self.clean_shutdown = true;
+        if waited.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "daemon exited with {waited}; stderr tail:\n{}",
+                self.stderr_tail()
+            ))
         }
     }
 }
@@ -734,32 +716,35 @@ fn resolve_template(template: &str, dir: &Path) -> (String, Vec<String>) {
     (program, resolved)
 }
 
-/// didOpen one workspace file from its on-disk bytes (the overlay must
-/// start from the universe's current content) and track it as opened.
-fn open_document(
+/// The replay's single overlay agent: one session, one staged view, every
+/// step merging into it (the overlay face's whole-file semantics).
+const REPLAY_AGENT: &str = "replay";
+
+/// Stages one file for the replay agent: whole-file replacement text, or
+/// `None` for a tombstone (the agent's view excludes the path). The
+/// overlay face merges per path server-side, so first touch and re-edit
+/// stage identically — there is no open/close state machine to maintain.
+fn stage_overlay(
     daemon: &mut DaemonClient,
     copy: &Path,
     file: &str,
-    version: &mut i64,
-    opened: &mut BTreeSet<String>,
-    texts: &mut BTreeMap<String, String>,
+    content: Option<&str>,
 ) -> Result<(), String> {
-    let path = copy.join(file);
-    let text =
-        std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    *version += 1;
-    daemon.notify(
-        "textDocument/didOpen",
-        &json!({"textDocument": {
-            "uri": path_to_uri(&path),
-            "languageId": "dart",
-            "version": *version,
-            "text": text,
-        }}),
-    )?;
-    opened.insert(file.to_owned());
-    texts.insert(file.to_owned(), text);
-    Ok(())
+    let key = copy.join(file).display().to_string();
+    let mut files = serde_json::Map::new();
+    files.insert(
+        key,
+        match content {
+            Some(text) => json!(text),
+            None => Value::Null,
+        },
+    );
+    daemon
+        .call(
+            "dartq/overlay.set",
+            &json!({"agentId": REPLAY_AGENT, "files": Value::Object(files)}),
+        )
+        .map(|_| ())
 }
 
 /// Writes one file's bytes to the copy — the full-recompute face reads the
@@ -771,8 +756,9 @@ fn write_copy_file(file: &Path, text: &str, step_no: usize) -> Result<(), String
 
 /// The edit sequence against one daemon session and one materialized copy.
 /// The daemon's `{dir}` IS the copy, so every step keeps the two arms on
-/// one workspace universe: the notification rides the session overlay, the
-/// bytes land on the copy's disk for the fresh per-step batch run.
+/// one workspace universe: the overlay staging rides the session's agent
+/// view, the bytes land on the copy's disk for the fresh per-step batch
+/// run.
 #[expect(clippy::too_many_lines)] // the step dispatch mirrors the edit-sequence grammar; each arm is one step kind
 fn run_steps(
     daemon: &mut DaemonClient,
@@ -780,9 +766,7 @@ fn run_steps(
     copy: &Path,
     edits: &[replay_edit::EditStep],
 ) -> Result<(Vec<StepReport>, bool), String> {
-    let mut opened: BTreeSet<String> = BTreeSet::new();
     let mut texts: BTreeMap<String, String> = BTreeMap::new();
-    let mut version: i64 = 0;
     let mut steps = Vec::with_capacity(edits.len());
     let mut all_equal = true;
     for (idx, step) in edits.iter().enumerate() {
@@ -797,31 +781,22 @@ fn run_steps(
                         edit.file
                     ));
                 }
-                // Live side: didOpen on first touch (the overlay must start
-                // from the on-disk bytes), then the whole-text didChange.
-                if !opened.contains(&edit.file) {
-                    open_document(
-                        daemon,
-                        copy,
-                        &edit.file,
-                        &mut version,
-                        &mut opened,
-                        &mut texts,
-                    )?;
+                // Live side: the overlay carries the post-edit whole text;
+                // the pre-edit base is the tracked text (first touch reads
+                // the on-disk bytes).
+                let new_text = match texts.get(&edit.file) {
+                    Some(current) => replay_edit::apply_edit(current, edit),
+                    None => {
+                        let on_disk = std::fs::read_to_string(&path).map_err(|e| {
+                            format!("reading {}: {e}", path.display())
+                        })?;
+                        replay_edit::apply_edit(&on_disk, edit)
+                    }
                 }
-                let new_text = replay_edit::apply_edit(&texts[&edit.file], edit)
-                    .map_err(|e| format!("step {step_no}: {e}"))?;
-                version += 1;
-                let uri = path_to_uri(&path);
-                daemon.notify(
-                    "textDocument/didChange",
-                    &json!({
-                                           "textDocument": {"uri": uri, "version": version},
-                    "contentChanges": [{"text": new_text.clone()}],
-                                       }),
-                )?;
-                texts.insert(edit.file.clone(), new_text.clone());
+                .map_err(|e| format!("step {step_no}: {e}"))?;
                 write_copy_file(&path, &new_text, step_no)?;
+                stage_overlay(daemon, copy, &edit.file, Some(&new_text))?;
+                texts.insert(edit.file.clone(), new_text);
             }
             replay_edit::EditStep::Remove { file } => {
                 let path = copy.join(file);
@@ -832,24 +807,13 @@ fn run_steps(
                          file can be removed"
                     ));
                 }
-                // didClose only acts on session-opened documents (the
-                // session no-ops otherwise), so open the file first when
-                // this session never touched it; the staged Set is
-                // superseded by the Remove at the same drain.
-                if !opened.contains(file) {
-                    open_document(daemon, copy, file, &mut version, &mut opened, &mut texts)?;
-                }
-                // The on-disk delete MUST land before the didClose: the
-                // session stages a removal only when its disk read finds
-                // the file gone — over an existing file it stages the
-                // on-disk bytes (a revert), resurrecting the file.
+                // The on-disk delete lands first (the batch face reads the
+                // disk state), then the tombstone drops the path from the
+                // agent view — the overlay face's explicit removal, no
+                // open/close bookkeeping required.
                 std::fs::remove_file(&path)
                     .map_err(|e| format!("step {step_no}: removing {}: {e}", path.display()))?;
-                daemon.notify(
-                    "textDocument/didClose",
-                    &json!({"textDocument": {"uri": path_to_uri(&path)}}),
-                )?;
-                opened.remove(file);
+                stage_overlay(daemon, copy, file, None)?;
                 texts.remove(file);
             }
             replay_edit::EditStep::Create { file, text } => {
@@ -869,24 +833,17 @@ fn run_steps(
                     })?;
                 }
                 write_copy_file(&path, text, step_no)?;
-                version += 1;
-                daemon.notify(
-                    "textDocument/didOpen",
-                    &json!({"textDocument": {
-                        "uri": path_to_uri(&path),
-                        "languageId": "dart",
-                        "version": version,
-                        "text": text,
-                    }}),
-                )?;
-                opened.insert(file.clone());
+                stage_overlay(daemon, copy, file, Some(text))?;
                 texts.insert(file.clone(), text.clone());
             }
         }
 
-        // Incremental face: the post-step whole-workspace pull.
-        let incremental =
-            normalize_lsp_workspace(&daemon.call("dartq/analyze", &json!({}))?, copy)?;
+        // Incremental face: the post-step whole-workspace pull over the
+        // replay agent's overlay view.
+        let incremental = normalize_lsp_workspace(
+            &daemon.call("dartq/analyze", &json!({"agentId": REPLAY_AGENT}))?,
+            copy,
+        )?;
 
         // Full-recompute face: the same universe on disk, analyzed fresh
         // by the batch driver.
@@ -977,7 +934,6 @@ pub(crate) fn replay_entry(args: &[String]) -> Result<(String, bool), Outcome> {
     let (program, daemon_args) = resolve_template(&opts.daemon_cmd, &copy);
     let mut daemon = DaemonClient::spawn(&program, &daemon_args).map_err(Outcome::Error)?;
     let result = (|| -> Result<(Vec<StepReport>, bool), String> {
-        daemon.initialize()?;
         run_steps(&mut daemon, &batch, &copy, &edits)
     })();
     let shutdown_result = daemon.shutdown();

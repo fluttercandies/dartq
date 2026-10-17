@@ -433,3 +433,108 @@ fn overlay_commit_writes_back_over_rpc() {
 
     fs::remove_dir_all(&workspace.root).ok();
 }
+
+/// The tombstone face of `overlay.set`: a `null` content entry excludes
+/// the path from the agent's view (a base-resident file leaves the view),
+/// the base view stays immune, a follow-up content staging resurrects the
+/// path in the agent's view (tombstone → content merges both directions),
+/// and a commit makes the declared end state real on disk — the tombstoned
+/// file is deleted. Also pinned: the parse boundary — a content value that
+/// is neither a string nor `null` answers INVALID_PARAMS.
+#[test]
+fn tombstone_excludes_view_and_commit_deletes() {
+    let _guard = workspace_lock();
+    let workspace = Workspace::new(BROKEN_MAIN);
+    let main_dart = workspace.path("lib/main.dart");
+    let mut h = spawn(&workspace, &store_root("overlay-tombstone"));
+
+    // The parse boundary: a number is neither content nor a tombstone.
+    h.step(
+        &request(
+            2,
+            "dartq/overlay.set",
+            json!({"agentId": "T", "files": {"lib/main.dart": 42}}),
+        ),
+        1,
+    );
+    let error = answer_error(&h, 2);
+    assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
+    assert!(
+        error["message"].as_str().unwrap_or("").contains("null"),
+        "the error names the accepted forms (string or null): {error}"
+    );
+
+    // The tombstone: T's view excludes main.dart, so its uri error is
+    // gone; the base view still carries it.
+    h.step(
+        &request(
+            3,
+            "dartq/overlay.set",
+            json!({"agentId": "T", "files": {"lib/main.dart": null}}),
+        ),
+        1,
+    );
+    h.burst(
+        &[
+            request(4, "dartq/analyze", json!({"agentId": "T"})),
+            request(5, "dartq/analyze", json!({})),
+        ],
+        2,
+    );
+    assert!(
+        codes(&answer_result(&h, 4)).is_empty(),
+        "the tombstoned file's rows leave the agent view: {:?}",
+        answer_result(&h, 4)
+    );
+    assert_eq!(
+        codes(&answer_result(&h, 5)),
+        ["uri_does_not_exist"],
+        "the base view is immune to the tombstone: {:?}",
+        answer_result(&h, 5)
+    );
+
+    // Tombstone → content re-stages: the merge works both directions, and
+    // the agent view serves the staged text (clean, not the disk bytes).
+    h.step(
+        &request(
+            6,
+            "dartq/overlay.set",
+            json!({"agentId": "T", "files": {"lib/main.dart": CLEAN_MAIN}}),
+        ),
+        1,
+    );
+    h.step(&request(7, "dartq/analyze", json!({"agentId": "T"})), 1);
+    assert!(
+        codes(&answer_result(&h, 7)).is_empty(),
+        "a content staging replaces the tombstone: {:?}",
+        answer_result(&h, 7)
+    );
+
+    // Back to the tombstone, then commit: the declared end state excludes
+    // the file, so the commit deletes it from the worktree and the base
+    // view drops its rows.
+    h.step(
+        &request(
+            8,
+            "dartq/overlay.set",
+            json!({"agentId": "T", "files": {"lib/main.dart": null}}),
+        ),
+        1,
+    );
+    h.step(&request(9, "dartq/overlay.commit", json!({"agentId": "T"})), 1);
+    assert!(
+        !main_dart.exists(),
+        "the committed tombstone deletes the worktree file"
+    );
+    h.step(&request(10, "dartq/analyze", json!({})), 1);
+    assert!(
+        codes(&answer_result(&h, 10)).is_empty(),
+        "the base view drops the deleted file's rows: {:?}",
+        answer_result(&h, 10)
+    );
+
+    let (code, _) = h.join_ended();
+    assert_eq!(code, 0);
+
+    fs::remove_dir_all(&workspace.root).ok();
+}

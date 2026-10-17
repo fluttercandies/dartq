@@ -404,14 +404,59 @@ const MAX_QUEUED_FIX_MAILS: usize = 1;
 /// never be served stale.
 #[derive(Default)]
 struct AgentOverlay {
-    files: FxHashMap<PathBuf, OverlayFile>,
+    files: FxHashMap<PathBuf, OverlayEntry>,
 }
 
-struct OverlayFile {
-    bytes: Vec<u8>,
-    /// The session cursor at which this content was staged (the delta
-    /// answer's changed-file cursor for this agent's view of the path).
-    set_at: u64,
+/// One staged entry in an agent's overlay: whole-file replacement bytes,
+/// or a tombstone — the agent's view excludes the path (a base-resident
+/// file is removed from the view at wear time; a committed tombstone
+/// deletes the worktree file, the agent's declared end state).
+enum OverlayEntry {
+    Content { bytes: Vec<u8>, set_at: u64 },
+    Removed { set_at: u64 },
+}
+
+impl OverlayEntry {
+    /// The delta-cursor stamp (the changed-file cursor for this agent's
+    /// view of the path).
+    fn set_at(&self) -> u64 {
+        match self {
+            Self::Content { set_at, .. } | Self::Removed { set_at } => *set_at,
+        }
+    }
+
+    /// The staged byte length — a tombstone is a marker, not content.
+    fn len(&self) -> usize {
+        match self {
+            Self::Content { bytes, .. } => bytes.len(),
+            Self::Removed { .. } => 0,
+        }
+    }
+
+    /// The staged replacement bytes; `None` for a tombstone.
+    fn content(&self) -> Option<&[u8]> {
+        match self {
+            Self::Content { bytes, .. } => Some(bytes),
+            Self::Removed { .. } => None,
+        }
+    }
+}
+
+/// One `dartq/overlay.set` entry as parsed: replacement bytes, or the
+/// `null` tombstone (the agent's view excludes the path).
+pub enum StagedFile {
+    Bytes(Vec<u8>),
+    Removed,
+}
+
+impl StagedFile {
+    /// The staged byte length — a tombstone is a marker, not content.
+    fn len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Removed => 0,
+        }
+    }
 }
 
 /// The base content a worn path must be restored to.
@@ -1557,15 +1602,18 @@ impl Session {
     }
 
     /// `dartq/overlay.set`: stages (merging per path) one agent's content
-    /// deltas. Lazy — no analysis runs here; the next request naming the
-    /// agent materializes the view. Bumps the delta cursor once.
+    /// deltas — whole-file replacement bytes, or a `null` tombstone that
+    /// excludes the path from the agent's view. Lazy — no analysis runs
+    /// here; the next request naming the agent materializes the view.
+    /// Bumps the delta cursor once.
     ///
     /// Every path is confined to the workspace root before anything lands
     /// (`confine_to_workspace` — the write-face trust boundary, #947 F4),
     /// and the agent's post-merge staged set is bounded
-    /// (`MAX_OVERLAY_FILES` / `MAX_OVERLAY_BYTES`, #947 F3) and every
-    /// agent's combined staging is bounded (`MAX_OVERLAY_TOTAL_BYTES`,
-    /// #962 P3-2). A rejection
+    /// (`MAX_OVERLAY_FILES` / `MAX_OVERLAY_BYTES`, #947 F3 — tombstones
+    /// count as files but carry no bytes) and every agent's combined
+    /// staging is bounded (`MAX_OVERLAY_TOTAL_BYTES`, #962 P3-2). A
+    /// rejection
     /// is atomic: nothing stages, and a new agent's table entry is not
     /// created.
     ///
@@ -1579,7 +1627,7 @@ impl Session {
     pub fn set_overlay(
         &mut self,
         agent: &str,
-        files: Vec<(PathBuf, Vec<u8>)>,
+        files: Vec<(PathBuf, StagedFile)>,
     ) -> Result<(), SessionError> {
         if !self.agents.contains_key(agent) && self.agents.len() >= MAX_AGENTS {
             return Err(SessionError::InvalidParams(format!(
@@ -1589,12 +1637,14 @@ impl Session {
         if files.is_empty() {
             return Ok(());
         }
-        let staged: Vec<(PathBuf, Vec<u8>)> = files
+        let staged: Vec<(PathBuf, StagedFile)> = files
             .into_iter()
-            .map(|(path, bytes)| Ok((confine_to_workspace(&self.workspace_root, &path)?, bytes)))
+            .map(|(path, file)| Ok((confine_to_workspace(&self.workspace_root, &path)?, file)))
             .collect::<Result<_, SessionError>>()?;
         // The per-agent bounds, computed over the merged view (an incoming
-        // path overwrites its staged entry) before anything is inserted.
+        // entry overwrites its staged predecessor — either direction,
+        // content→tombstone or tombstone→content) before anything is
+        // inserted.
         let existing = self.agents.get(agent);
         let (mut count, mut total) = existing.map_or((0usize, 0usize), |overlay| {
             (
@@ -1602,17 +1652,17 @@ impl Session {
                 overlay
                     .files
                     .values()
-                    .fold(0usize, |sum, file| sum.saturating_add(file.bytes.len())),
+                    .fold(0usize, |sum, file| sum.saturating_add(file.len())),
             )
         });
-        for (path, bytes) in &staged {
+        for (path, file) in &staged {
             if let Some(prev) = existing.and_then(|overlay| overlay.files.get(path)) {
                 total = total
-                    .saturating_sub(prev.bytes.len())
-                    .saturating_add(bytes.len());
+                    .saturating_sub(prev.len())
+                    .saturating_add(file.len());
             } else {
                 count += 1;
-                total = total.saturating_add(bytes.len());
+                total = total.saturating_add(file.len());
             }
         }
         if count > MAX_OVERLAY_FILES {
@@ -1637,7 +1687,7 @@ impl Session {
             .iter()
             .filter(|(id, _)| id.as_str() != agent)
             .flat_map(|(_, overlay)| overlay.files.values())
-            .fold(0usize, |sum, file| sum.saturating_add(file.bytes.len()));
+            .fold(0usize, |sum, file| sum.saturating_add(file.len()));
         if others.saturating_add(total) > MAX_OVERLAY_TOTAL_BYTES {
             return Err(SessionError::InvalidParams(format!(
                 "session overlay exceeds the {} MiB total cap ({}); clear or commit first",
@@ -1647,14 +1697,17 @@ impl Session {
         }
         let entry = self.agents.entry(agent.to_owned()).or_default();
         self.cursor += 1;
-        for (path, bytes) in staged {
-            entry.files.insert(
-                path,
-                OverlayFile {
+        for (path, file) in staged {
+            let staged_entry = match file {
+                StagedFile::Bytes(bytes) => OverlayEntry::Content {
                     bytes,
                     set_at: self.cursor,
                 },
-            );
+                StagedFile::Removed => OverlayEntry::Removed {
+                    set_at: self.cursor,
+                },
+            };
+            entry.files.insert(path, staged_entry);
         }
         Ok(())
     }
@@ -1733,11 +1786,17 @@ impl Session {
         }
         // The clone is bounded by the per-agent byte cap (#947 F3), so the
         // 2× staged-bytes transient peak is small by construction.
-        let committed: Vec<(PathBuf, Vec<u8>)> = overlay
-            .files
-            .iter()
-            .map(|(path, file)| (path.clone(), file.bytes.clone()))
-            .collect();
+        // Content entries write back; tombstones delete — the agent's
+        // declared end state excludes the path, and the commit is that
+        // end state made real on disk.
+        let mut committed: Vec<(PathBuf, Vec<u8>)> = Vec::with_capacity(overlay.files.len());
+        let mut deleted: Vec<PathBuf> = Vec::new();
+        for (path, file) in &overlay.files {
+            match file.content() {
+                Some(bytes) => committed.push((path.clone(), bytes.to_vec())),
+                None => deleted.push(path.clone()),
+            }
+        }
         // The write boundary re-checks the confinement canonically (#947
         // F4): staging validated the paths lexically, but a symlink planted
         // in the worktree since could aim a write outside the root.
@@ -1745,13 +1804,31 @@ impl Session {
         for (path, _) in &committed {
             ensure_canonical_child(&canonical_root, path)?;
         }
+        for path in &deleted {
+            ensure_canonical_child(&canonical_root, path)?;
+        }
         // Write-back first: nothing merges until every file is on disk.
         for (path, bytes) in &committed {
             write_committed(path, bytes)?;
         }
-        let count = committed.len();
+        // A tombstone's target may already be gone from the worktree —
+        // the commit's end state is absence either way, so a NotFound
+        // delete is success (the same idempotence `overlay.clear` has).
+        for path in &deleted {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(SessionError::Io(error));
+                }
+            }
+        }
+        let count = committed.len() + deleted.len();
         for (path, bytes) in committed {
             self.stage(OverlayChange::Set { path, bytes });
+        }
+        for path in deleted {
+            self.stage(OverlayChange::Remove { path });
         }
         // Invariant: the lookup repeats the `agents.get(agent)` proven above; nothing
         // removes the entry in between.
@@ -2720,7 +2797,7 @@ impl Session {
             self.agents[agent]
                 .files
                 .iter()
-                .map(|(path, file)| (path.clone(), file.set_at))
+                .map(|(path, file)| (path.clone(), file.set_at()))
                 .collect()
         });
         let changes = commands::Changes::new(&self.changed, agent_changed);
@@ -2908,13 +2985,19 @@ impl Session {
         if self.agents.is_empty() {
             return Vec::new();
         }
-        let mut staged: FxHashMap<&Path, &OverlayFile> = FxHashMap::default();
+        let mut staged: FxHashMap<&Path, &OverlayEntry> = FxHashMap::default();
         for overlay in self.agents.values() {
             for (path, file) in &overlay.files {
+                // Tombstones carry no text to parse — the plugin cycle
+                // sees the path's removal through the base view's own
+                // staging, never through a staged-buffer push.
+                if file.content().is_none() {
+                    continue;
+                }
                 staged
                     .entry(path.as_path())
                     .and_modify(|held| {
-                        if file.set_at > held.set_at {
+                        if file.set_at() > held.set_at() {
                             *held = file;
                         }
                     })
@@ -2924,9 +3007,12 @@ impl Session {
         let mut overlays: Vec<(String, String)> = staged
             .into_iter()
             .map(|(path, file)| {
+                let bytes = file
+                    .content()
+                    .expect("tombstones are skipped at collection");
                 (
                     path.to_string_lossy().into_owned(),
-                    SourceText::canonical(&file.bytes).as_str().to_owned(),
+                    SourceText::canonical(bytes).as_str().to_owned(),
                 )
             })
             .collect();
@@ -3300,7 +3386,7 @@ impl Session {
         // out by the restore.
         engine.apply_pending(&mut rejection_collector(&mut rejections));
         for (path, file) in &overlay.files {
-            // Capture before this path's own set_content; earlier paths'
+            // Capture before this path's own mutation; earlier paths'
             // ops only pend, so the resident content is still the base.
             let base = match engine
                 .file_table()
@@ -3311,7 +3397,18 @@ impl Session {
                 None => WornBase::Absent,
             };
             worn.push((path.clone(), base));
-            engine.set_content(path, &file.bytes);
+            match file {
+                OverlayEntry::Content { bytes, .. } => {
+                    engine.set_content(path, bytes);
+                }
+                // A tombstone removes the path from the agent's view; the
+                // captured `WornBase` restores it after the turn. Absent
+                // targets no-op (an already-absent path has nothing to
+                // remove — `remove_file` answers the miss harmlessly).
+                OverlayEntry::Removed { .. } => {
+                    let _ = engine.remove_file(path);
+                }
+            }
         }
         self.worn = Some((context, worn));
         // After the engine borrow ends: the barrier's rejections (#1549)

@@ -136,7 +136,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::session::SessionError;
+use crate::session::{SessionError, StagedFile};
 use crate::wire;
 
 /// The response contract version: the frozen v1, mirrored from
@@ -420,9 +420,10 @@ struct CompatParams {
     verbosity: Verbosity,
 }
 
-/// One agent's staged overlay: its name plus a whole-file replacement
-/// buffer per path.
-pub(crate) type StagedOverlay = (String, Vec<(PathBuf, Vec<u8>)>);
+/// One agent's staged overlay: its name plus the staged entries —
+/// whole-file replacement buffers, or tombstones (`null` content — the
+/// agent's view excludes the path) — per path.
+pub(crate) type StagedOverlay = (String, Vec<(PathBuf, StagedFile)>);
 
 /// Decodes one `dartq/*` request's parameters. Relative paths resolve
 /// against `root`; `Err` is the `INVALID_PARAMS` message.
@@ -712,13 +713,15 @@ pub(crate) fn reject_disk_view_only(params: &Value, method: &str) -> Result<(), 
 }
 
 /// Decodes `dartq/overlay.set` params: `{agentId, files: {path → content}}`.
-/// Relative paths resolve against `root`; contents are whole-file
-/// replacement text.
+/// A content value is whole-file replacement text; `null` is a tombstone —
+/// the agent's view excludes the path (a base-resident file leaves the
+/// view at wear time; a committed tombstone deletes the worktree file).
+/// Relative paths resolve against `root`.
 ///
 /// # Errors
 ///
-/// A missing or non-string `agentId`, a missing or non-object `files`, or a
-/// non-string path or content.
+/// A missing or non-string `agentId`, a missing or non-object `files`, or
+/// a non-string-non-null path content.
 pub(crate) fn parse_overlay_set(params: &Value, root: &Path) -> Result<StagedOverlay, String> {
     let agent = overlay_agent(params, "set")?;
     let files = match params.get("files") {
@@ -728,15 +731,17 @@ pub(crate) fn parse_overlay_set(params: &Value, root: &Path) -> Result<StagedOve
     };
     let mut staged = Vec::with_capacity(files.len());
     for (path, content) in files {
-        let Value::String(content) = content else {
-            return Err(format!(
-                "files[{path}] must be a string (whole-file content)"
-            ));
+        let staged_file = match content {
+            Value::String(content) => StagedFile::Bytes(content.as_bytes().to_vec()),
+            Value::Null => StagedFile::Removed,
+            _ => {
+                return Err(format!(
+                    "files[{path}] must be a string (whole-file content) or null (remove from \
+                     the view)"
+                ));
+            }
         };
-        staged.push((
-            resolve(root, PathBuf::from(path)),
-            content.as_bytes().to_vec(),
-        ));
+        staged.push((resolve(root, PathBuf::from(path)), staged_file));
     }
     Ok((agent, staged))
 }
