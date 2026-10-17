@@ -15,6 +15,7 @@ pub mod emit;
 pub mod generator;
 pub mod manifest;
 pub mod plan;
+pub mod replay;
 pub mod rng;
 
 #[cfg(test)]

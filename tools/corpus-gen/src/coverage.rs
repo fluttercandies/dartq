@@ -49,14 +49,36 @@ pub enum Cell {
     ExportCombinators,
     FactoryRedirectCross,
     PackageUriImport,
+    /// Adversarial pathological single file (1a).
+    PathoSingle,
+    /// Unicode edge content in strings/comments/URI literals (1b).
+    UnicodeContent,
+    /// Recovery-storm stacked-damage file (1c).
+    RecoveryStorm,
+    /// `// @dart = major.minor` language-version banner (1d).
+    DartVersionBanner,
+    /// Cross-version package import edge (1d).
+    CrossVersionImport,
+    /// `analyzer.enable-experiment` manifest face (1d).
+    EnableExperiment,
+    /// Pub-workspace member artifact: `resolution: workspace` pubspec,
+    /// `workspace_ref.json` or the shared root `package_config.json` (1e).
+    WorkspaceLayout,
 }
 
 /// Number of matrix cells.
-pub const CELL_COUNT: usize = 35;
+pub const CELL_COUNT: usize = 42;
 
 /// Scene cells are the first [`SCENE_CELL_COUNT`] entries of [`CELL_LIST`];
 /// the rotation scheduler cycles through them.
 pub const SCENE_CELL_COUNT: usize = 28;
+
+/// Cells present in every run regardless of faces — the first
+/// [`UNCONDITIONAL_CELL_COUNT`] entries of [`CELL_LIST`]. The four
+/// version/workspace cells (1d/1e) are face-gated: they only move when
+/// `--layout workspace` or `--version-ladder` is on, so the default-run
+/// coverage gate asserts only the unconditional range.
+pub const UNCONDITIONAL_CELL_COUNT: usize = 38;
 
 /// Index of the gated scene cell (requires a core package import).
 pub const CELL_CORE_VALUE_USE: usize = 19;
@@ -98,6 +120,13 @@ pub const CELL_LIST: [Cell; CELL_COUNT] = [
     Cell::ExportCombinators,
     Cell::FactoryRedirectCross,
     Cell::PackageUriImport,
+    Cell::PathoSingle,
+    Cell::UnicodeContent,
+    Cell::RecoveryStorm,
+    Cell::DartVersionBanner,
+    Cell::CrossVersionImport,
+    Cell::EnableExperiment,
+    Cell::WorkspaceLayout,
 ];
 
 /// Stable names for the cells, in [`CELL_LIST`] order (used by tests and
@@ -138,6 +167,13 @@ pub const CELL_NAMES: [&str; CELL_COUNT] = [
     "export_combinators",
     "factory_redirect_cross",
     "package_uri_import",
+    "patho_single",
+    "unicode_content",
+    "recovery_storm",
+    "dart_version_banner",
+    "cross_version_import",
+    "enable_experiment",
+    "workspace_layout",
 ];
 
 /// Per-cell emission counters collected during one generation run.

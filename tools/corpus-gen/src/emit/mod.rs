@@ -11,10 +11,16 @@ macro_rules! dw {
     };
 }
 
+mod adversarial;
 mod scenes_a;
 mod scenes_b;
 mod scenes_c;
 mod special;
+
+/// The `--flutter-app` face (#2063): the in-corpus flutter stub package and
+/// the real widget-shape emitters. `pub(crate)` so the crate tests can read
+/// the surface tables they pin.
+pub(crate) mod flutter;
 
 use std::fmt::Write as _;
 
@@ -37,9 +43,9 @@ pub fn render(ctx: &mut RenderCtx<'_>, item: &FileSpec) -> String {
     let mut w = String::with_capacity(4 * 1024);
     match &item.kind {
         FileKind::RootPubspec => special::root_pubspec(&mut w, ctx),
-        FileKind::PackagePubspec(package) => special::package_pubspec(&mut w, *package),
+        FileKind::PackagePubspec(package) => special::package_pubspec(&mut w, ctx, *package),
         FileKind::MainEntry => special::main_entry(&mut w, ctx),
-        FileKind::Rotation { header } => rotation(&mut w, ctx, *header),
+        FileKind::Rotation { header, banner } => rotation(&mut w, ctx, *header, *banner),
         FileKind::FeatureBarrel(_) => special::feature_barrel(&mut w, ctx, feature_package(item)),
         FileKind::FacetHub(p) => special::facet_hub(&mut w, ctx, *p),
         FileKind::FacetStub(p) => special::facet_stub(&mut w, *p),
@@ -48,10 +54,21 @@ pub fn render(ctx: &mut RenderCtx<'_>, item: &FileSpec) -> String {
         FileKind::NarrowGateway(p) => special::narrow_gateway(&mut w, ctx, *p),
         FileKind::Gateway(p) => special::gateway(&mut w, ctx, *p),
         FileKind::WidgetHost { package, index } => {
-            special::widget_host(&mut w, ctx, *package, *index)
+            // #2063: under the flutter-app face the host/part slots carry
+            // real StatefulWidget/State shapes over the stub surface; the
+            // plain render() pair stays the default.
+            if ctx.plan.flutter_app {
+                flutter::widget_host(&mut w, *package, *index);
+            } else {
+                special::widget_host(&mut w, ctx, *package, *index);
+            }
         }
         FileKind::WidgetPart { package, index } => {
-            special::widget_part(&mut w, ctx, *package, *index)
+            if ctx.plan.flutter_app {
+                flutter::widget_part(&mut w, *package, *index);
+            } else {
+                special::widget_part(&mut w, ctx, *package, *index);
+            }
         }
         FileKind::CoreBarrel => special::core_barrel(&mut w, ctx),
         FileKind::LazyLib => special::lazy_lib(&mut w),
@@ -64,6 +81,23 @@ pub fn render(ctx: &mut RenderCtx<'_>, item: &FileSpec) -> String {
         FileKind::FunctionTypes => special::function_types(&mut w),
         FileKind::CoreValueLib => special::core_value_lib(&mut w),
         FileKind::TestFile(ordinal) => special::test_file(&mut w, ctx, *ordinal),
+        FileKind::Patho(index) => adversarial::patho(&mut w, ctx, *index),
+        FileKind::UnicodeScene(index) => adversarial::unicode_scene(&mut w, ctx, *index),
+        FileKind::ErrStorm { package, file } => {
+            adversarial::errstorm(&mut w, ctx, *package, *file);
+        }
+        FileKind::ErrStormPubspec(package) => adversarial::errstorm_pubspec(&mut w, *package),
+        FileKind::WorkspaceRef { depth } => special::workspace_ref(&mut w, ctx, *depth),
+        FileKind::RootPackageConfig => special::root_package_config(&mut w, ctx),
+        FileKind::VendoredPubspec(index) => special::vendored_pubspec(&mut w, *index),
+        FileKind::VendoredLib(index) => special::vendored_lib(&mut w, *index),
+        FileKind::FlutterStubPubspec => flutter::stub_pubspec(&mut w),
+        FileKind::FlutterWidgetsLib => flutter::widgets_lib(&mut w),
+        FileKind::FlutterStubPart(index) => flutter::stub_part(&mut w, *index),
+        FileKind::PackageAnalysisOptions(package) => {
+            special::package_analysis_options(&mut w, ctx, *package);
+        }
+        FileKind::RootAnalysisOptions => special::root_analysis_options(&mut w, ctx),
     }
     w
 }
@@ -75,6 +109,21 @@ fn feature_package(item: &FileSpec) -> u32 {
         FileKind::FeatureBarrel(PackageId::Feature(p)) => *p,
         _ => unreachable!("FeatureBarrel is only planned for feature packages"),
     }
+}
+
+/// Dart type name for a vendored package (1e): `vendored_ext` ->
+/// `VendoredExt`.
+pub(crate) fn vendored_type_name(package: &str) -> String {
+    package
+        .split('_')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => String::new(),
+            }
+        })
+        .collect()
 }
 
 fn line_count(text: &str) -> usize {
@@ -91,9 +140,30 @@ fn size_target(ordinal: usize, rng: &mut SplitMix64) -> usize {
     }
 }
 
-fn rotation(w: &mut String, ctx: &mut RenderCtx<'_>, header: Header) {
+fn rotation(w: &mut String, ctx: &mut RenderCtx<'_>, header: Header, banner: Option<(u32, u32)>) {
     let ordinal = ctx.rotation_ordinal;
     ctx.rotation_ordinal += 1;
+    // The `// @dart =` banner must sit inside the file's leading comment
+    // block — before the generated notice — or the scanner ignores it (1d).
+    if let Some((major, minor)) = banner {
+        dw!(w, "// @dart = {major}.{minor}\n");
+        ctx.coverage.hit(Cell::DartVersionBanner);
+    }
+    // Flutter-app face (#2063): every 4th rotation file becomes a real
+    // widget scene over the stub surface instead of a plain scene file.
+    // Scene files skip the header machinery entirely and import only the
+    // stub surface: the cadence CAN collide with a Core header (the
+    // iterator-side rotation_counter skips the AppDir files the render-side
+    // ordinal counts, so a core-package rotation with counter % 4 == 0 can
+    // sit at ordinal % 4 == 2), and carrying the package:core import would
+    // reference CoreValue — undeclared in the flutter stub — or dangle as
+    // unused. DeferredCore (AppDir, ordinal % 16 == 7 -> % 4 == 3) and
+    // cross-version edges (file % 8 == 1) never coincide with the cadence.
+    if ctx.plan.flutter_app && ordinal % 4 == 2 {
+        flutter::rotation_scene(w, ordinal);
+        ctx.coverage.hit(Cell::PackageUriImport);
+        return;
+    }
     dw!(
         w,
         "// Generated by corpus-gen. Deterministic corpus; do not edit.\n"
@@ -109,7 +179,15 @@ fn rotation(w: &mut String, ctx: &mut RenderCtx<'_>, header: Header) {
                 w,
                 "\nimport 'package:core/core.dart' deferred as core_lazy;\n"
             );
+            ctx.coverage.hit(Cell::DeferredImport);
+        }
+        Header::CrossVersion(target) => {
+            dw!(
+                w,
+                "\nimport 'package:feature_{target:04}/feature_{target:04}.dart';\n"
+            );
             ctx.coverage.hit(Cell::PackageUriImport);
+            ctx.coverage.hit(Cell::CrossVersionImport);
         }
     }
 
