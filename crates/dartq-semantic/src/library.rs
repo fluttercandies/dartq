@@ -29,8 +29,17 @@
 //! [`member_lookup`] resolves a container by name (file-local first, then
 //! the namespace) and walks superclass name edges, returning the first hit.
 //! A miss is **not** proof of undefined: the caller must still check the
-//! extension pool ([`FileElements::extension_member`]) of the library's
+//! extension pool ([`FileElements::extension_faces`]) of the library's
 //! files before reporting an instance-scope `undefined_*`.
+//!
+//! # Interface-membership walk
+//!
+//! [`implements_interface`] answers the transitive supertype question a
+//! rule asks as `type.implementsInterface(name, library)` (upstream Dart
+//! SDK source, pkg/linter/lib/src/extensions.dart:324-331) over the
+//! declared supertype graph — the same name-level edge discipline the
+//! member walk applies, plus a small `dart:core` face for the names no
+//! index can carry.
 //!
 //! # The part/part-of seam
 //!
@@ -44,11 +53,11 @@
 //! milestone lands, the file→library fold moves behind this same API.
 
 use dartq_resolution::{LibraryGraph, LibraryId, LocalLookup, Lookup, NamespaceEntry, Namespaces};
-use dartq_source::{FileId, StringId};
+use dartq_source::{FileId, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
-use crate::model::{Container, FileElements, MemberEntry, MicroKind, TopDecl};
+use crate::model::{Container, ContainerKind, FileElements, MemberEntry, MicroKind, TopDecl, Ty};
 
 /// Per-file element models, keyed by file. Sized by the analyzed file set.
 ///
@@ -187,7 +196,7 @@ impl LibraryScopes {
 }
 
 /// The outcome of an in-library scoped lookup ([`lookup_scoped`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScopedHit<'a> {
     /// Not defined in the current file nor the import face.
     NotFound,
@@ -197,8 +206,9 @@ pub enum ScopedHit<'a> {
     /// Resolved through the library namespace to one target.
     Found(NamespaceEntry),
     /// Ambiguous between distinct targets — reportable as `ambiguous_import`
-    /// at the use point, with every candidate kept.
-    Ambiguous(&'a [NamespaceEntry]),
+    /// at the use point, with every candidate kept. The candidates are owned
+    /// (the namespace layer's ambiguous set is built per probe, #1068).
+    Ambiguous(Box<[NamespaceEntry]>),
 }
 
 /// The in-library scope chain for `name`: the current file's declarations
@@ -299,6 +309,36 @@ pub(crate) fn resolve_container<'a>(
     }
 }
 
+/// Resolves a container through an import prefix: `prefix` must be a
+/// registered `as` prefix of `lib` and `name` a name in its merged table —
+/// all same-prefix imports in directive order, combinator filtered,
+/// first-come-wins ([`Namespaces::lookup_prefixed`], the oracle's
+/// `PrefixScope` composition, scope.dart:352-357). The bare-scope walk
+/// ([`resolve_container`]) cannot serve a prefixed spelling: it resolves in
+/// the diagnosing library's own scope, so a prefixed creation head
+/// (`new p.C.named()`) would read a same-named local container in the wrong
+/// scope and a missing one as unresolved.
+///
+/// `None` under-reports: an unregistered prefix, a prefix whose target
+/// contributes nothing to the graph, a name the prefix's table lacks, and
+/// a resolved name that is not an indexed container.
+pub(crate) fn prefixed_container<'a>(
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &'a ElementIndex,
+    lib: LibraryId,
+    prefix: StringId,
+    name: StringId,
+) -> Option<(&'a Container, FileId)> {
+    match namespaces.lookup_prefixed(graph, lib, prefix, name) {
+        Lookup::Found(NamespaceEntry::Decl(owner)) => {
+            let container = index.get(owner).and_then(|f| f.container(name))?;
+            Some((container, owner))
+        }
+        _ => None,
+    }
+}
+
 /// Looks up `member` on `container`'s instance/static face: the container's
 /// member set, then the mixin-application order (its own `with` mixins,
 /// last-applied first — `class X extends S with M1, M2` is the official
@@ -309,13 +349,14 @@ pub(crate) fn resolve_container<'a>(
 ///
 /// # Cross-pool boundary (G4 phase 2, funnel F3)
 ///
-/// The returned entry is owned by the resolving file's [`ArgPool`]: a
-/// cross-file hit carries that unit's [`ArgListId`] slots. This walk has no
+/// The returned entry is owned by the resolving file's
+/// [`crate::model::ArgPool`]: a cross-file hit carries that unit's
+/// [`crate::model::ArgListId`] slots. This walk has no
 /// diagnosing-engine state to project into, so a caller that drives the
 /// diagnostic engine must route the hit through the engine's boundary
-/// ([`crate::diagnose`]'s `Engine` boundary — the F1/F2 funnels' projection)
+/// ([`mod@crate::diagnose`]'s `Engine` boundary — the F1/F2 funnels' projection)
 /// before its declared types reach rows or message text; the diagnosing
-/// engine itself reaches member faces through [`Engine`]-owned walks and
+/// engine itself reaches member faces through `Engine`-owned walks and
 /// never calls this free function.
 ///
 /// A `None` here is **not** proof of undefined — before reporting an
@@ -332,6 +373,32 @@ pub fn member_lookup<'a>(
     container: StringId,
     member: StringId,
 ) -> Option<&'a MemberEntry> {
+    member_lookup_defining(
+        graph, namespaces, index, lib, file, container, member, false,
+    )
+    .map(|(_, entry)| entry)
+}
+
+/// [`member_lookup`] with the walk facts its by-name callers drop: the name
+/// of the container that declares the hit (the anchor itself when the hit
+/// is a self-declaration), and `concrete_only` — abstract entries are
+/// skipped and the walk continues (the official `getMember(concrete: …)`
+/// cut; concreteness is the entry's `is_abstract` bit, the only concreteness
+/// dimension the model carries). Crate-visible: the declaration-side
+/// L-family queries need the defining container to tell an inherited hit
+/// from a self-declaration.
+pub(crate) fn member_lookup_defining<'a>(
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &'a ElementIndex,
+    lib: LibraryId,
+    file: FileId,
+    container: StringId,
+    member: StringId,
+    concrete_only: bool,
+) -> Option<(StringId, &'a MemberEntry)> {
+    let acceptable =
+        |entry: &'a MemberEntry| (!concrete_only || !entry.is_abstract).then_some(entry);
     let mut name = container;
     let mut seen: FxHashSet<StringId> = FxHashSet::default();
     let mut owner = file;
@@ -342,8 +409,8 @@ pub fn member_lookup<'a>(
         }
         let (found, found_owner) =
             resolve_container(graph, namespaces, index, scope_lib, owner, name)?;
-        if let Some(entry) = found.members.get(&member) {
-            return Some(entry);
+        if let Some(entry) = found.members.get(&member).and_then(acceptable) {
+            return Some((name, entry));
         }
         // The stacked applications shadow the superclass chain in reverse
         // declaration order (the later application wins). The mixin and
@@ -358,14 +425,281 @@ pub fn member_lookup<'a>(
             if let Some(entry) =
                 resolve_container(graph, namespaces, index, owner_lib, found_owner, *mixin)
                     .and_then(|(mixin_container, _)| mixin_container.members.get(&member))
+                    .and_then(acceptable)
             {
-                return Some(entry);
+                return Some((*mixin, entry));
             }
         }
         name = found.superclass?;
         owner = found_owner;
         scope_lib = owner_lib;
     }
+}
+
+/// Whether any container on `container`'s supertype chain — the `with`
+/// mixins (application order) and the direct superclass, transitively; the
+/// same chain [`member_lookup`] walks — declares at least one instance
+/// member. The anchor's own members are not supertype members and do not
+/// count; a class written without `extends` sits at the written chain's end
+/// (the implicit `Object` root is outside the name-level model — its
+/// members never count, the way the official
+/// `avoid_classes_with_only_static_members` gate excludes
+/// `dart:core Object`).
+///
+/// Returns `None` when the chain is unknowable: the anchor does not resolve,
+/// or a written superclass/mixin name resolves to nothing indexed (an SDK
+/// type, an unanalyzed dependency) — that face could carry instance members,
+/// so the caller stays silent. `Some(false)` means every supertype on the
+/// written chain is indexed and none declares an instance member.
+pub(crate) fn supertype_has_instance_members(
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    lib: LibraryId,
+    file: FileId,
+    container: StringId,
+) -> Option<bool> {
+    let (mut found, mut found_owner) =
+        resolve_container(graph, namespaces, index, lib, file, container)?;
+    let mut name = container;
+    let mut scope_lib = lib;
+    let mut seen: FxHashSet<StringId> = FxHashSet::default();
+    seen.insert(container);
+    loop {
+        let owner_lib = owner_library(graph, lib, found_owner, name).unwrap_or(scope_lib);
+        // A `with` name that does not resolve leaves the chain's member face
+        // unknown — `?` answers `None`, not "absent".
+        for mixin in found.with_clause.iter().rev() {
+            if !seen.insert(*mixin) {
+                return None; // malformed cyclic chain
+            }
+            let (mixin_container, _) =
+                resolve_container(graph, namespaces, index, owner_lib, found_owner, *mixin)?;
+            if mixin_container
+                .members
+                .values()
+                .any(|entry| !entry.is_static)
+            {
+                return Some(true);
+            }
+        }
+        let Some(super_name) = found.superclass else {
+            return Some(false); // the written chain ends with no instance member on it
+        };
+        if !seen.insert(super_name) {
+            return None; // malformed cyclic chain
+        }
+        (found, found_owner) =
+            resolve_container(graph, namespaces, index, owner_lib, found_owner, super_name)?;
+        if found.members.values().any(|entry| !entry.is_static) {
+            return Some(true);
+        }
+        name = super_name;
+        scope_lib = owner_lib;
+    }
+}
+
+/// The `dart:core` interface-membership face for names outside the indexed
+/// set: `(type, interface)` pairs whose membership is definitional —
+/// `Iterable` is itself, and the direct supertype of `List` and `Set`
+/// (upstream Dart SDK source, sdk/lib/core/{iterable,list,set}.dart). An
+/// unindexed name is answered only when it appears here as implementing
+/// `interface`; every other unindexed name (an unanalyzed dependency, an
+/// SDK type absent from the table) leaves the question open. The table
+/// carries no negative facts: an unindexed name never answers `false`,
+/// only the open direction.
+const CORE_INTERFACE_IMPLS: [(&str, &str); 3] = [
+    ("Iterable", "Iterable"),
+    ("List", "Iterable"),
+    ("Set", "Iterable"),
+];
+
+/// Whether the name implements the interface, per
+/// [`CORE_INTERFACE_IMPLS`] — the core face's definite hit.
+fn core_implements(core: &[(StringId, StringId)], ty: StringId, interface: StringId) -> bool {
+    core.iter()
+        .any(|(name, iface)| *name == ty && *iface == interface)
+}
+
+/// The written supertype edges of `container` — the face the
+/// interface-membership walk expands: the direct superclass, the `with`
+/// mixins, and the `implements` interfaces for the class family; a mixin's
+/// declared `on` constraints joined with its own `implements` clause (a
+/// constraint type is a supertype of the mixin, and of every application
+/// that satisfies it); the `implements` clause alone for the remaining
+/// kinds (an extension type's representation is not a supertype — the
+/// erasure face handles it — and an extension is not a type at all). The
+/// implicit `Object` root is outside the name-level model and never an
+/// edge, so the walk ends where the written chain ends.
+fn supertype_edges(container: &Container) -> impl Iterator<Item = StringId> + '_ {
+    let mixin_constraints = (container.kind == ContainerKind::Mixin)
+        .then(|| container.on_clause.iter())
+        .into_iter()
+        .flatten();
+    container
+        .superclass
+        .iter()
+        .chain(container.with_clause.iter())
+        .chain(container.implements_clause.iter())
+        .chain(mixin_constraints)
+        .copied()
+}
+
+/// Whether `name` implements `interface` — the transitive supertype
+/// question `type.implementsInterface(interface, 'dart.core')` answers
+/// (upstream Dart SDK source, pkg/linter/lib/src/extensions.dart:324-331):
+/// the interface spelling itself, then the declared supertype graph
+/// ([`supertype_edges`]) walked transitively, cross-file, each hop
+/// resolving through its declaring container's library — the same
+/// discipline [`member_lookup`]'s walk applies to superclass names.
+///
+/// The three-valued contract: `Some(true)` on a definite hit (an edge
+/// spelled `interface` outside the indexed set — the core spelling — or a
+/// [`CORE_INTERFACE_IMPLS`] hit anywhere on the graph); `Some(false)` only
+/// when every reached name is an indexed container and no edge hits; `None`
+/// when any reached name is outside both the index and the core face (that
+/// face could implement the interface — the open direction outranks a
+/// tentative `false`, a definite `true` outranks the open one). A written
+/// supertype cycle is impossible in code the oracle analyzes; the seen-set
+/// makes it terminate as an ordinary shared node.
+pub(crate) fn implements_interface(
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    strings: &StringTable,
+    lib: LibraryId,
+    file: FileId,
+    name: StringId,
+    interface: StringId,
+) -> Option<bool> {
+    // The core face, pre-interned once per query: the walk compares ids,
+    // never re-resolves spellings per node.
+    let core: Vec<(StringId, StringId)> = CORE_INTERFACE_IMPLS
+        .iter()
+        .map(|(ty, iface)| (strings.intern(ty), strings.intern(iface)))
+        .collect();
+    // The seed: the name as the diagnosing scope resolves it, erased
+    // through the representation type for an extension type. An unindexed
+    // seed is answered by the core face alone — the name could implement
+    // anything else.
+    let seed: (StringId, FileId, LibraryId);
+    match resolve_container(graph, namespaces, index, lib, file, name) {
+        Some((container, owner)) if container.kind == ContainerKind::ExtensionType => {
+            // Extension-type erasure: the interface check runs against the
+            // representation type, not the declared clause
+            // (`typeForInterfaceCheck`'s `extensionTypeErasure`,
+            // extensions.dart:295). An uncaptured or unnameable
+            // representation formal leaves the question open.
+            let Some(Ty::Named { name: rep_name, .. }) =
+                container.primary_formals.first().map(|r| r.formal.ty)
+            else {
+                return None;
+            };
+            seed = (
+                rep_name,
+                owner,
+                owner_library(graph, lib, owner, name).unwrap_or(lib),
+            );
+        }
+        Some((_, owner)) => seed = (name, owner, lib),
+        None => {
+            return core_implements(&core, name, interface).then_some(true);
+        }
+    }
+    let (start, start_file, start_lib) = seed;
+    let Some((container, owner)) =
+        resolve_container(graph, namespaces, index, start_lib, start_file, start)
+    else {
+        return core_implements(&core, start, interface).then_some(true);
+    };
+    let mut answer = Some(false);
+    let mut seen: FxHashSet<StringId> = FxHashSet::default();
+    seen.insert(start);
+    let mut queue: Vec<(StringId, FileId, LibraryId, &Container)> = Vec::new();
+    queue.push((start, owner, start_lib, container));
+    while let Some((current, current_owner, scope_lib, container)) = queue.pop() {
+        let owner_lib = owner_library(graph, lib, current_owner, current).unwrap_or(scope_lib);
+        for edge in supertype_edges(container) {
+            if !seen.insert(edge) {
+                continue;
+            }
+            match resolve_container(graph, namespaces, index, owner_lib, current_owner, edge) {
+                Some((next, next_owner)) => queue.push((edge, next_owner, owner_lib, next)),
+                // An indexed name spelled `interface` is a user type, never
+                // the core spelling (the oracle compares the defining
+                // library, extensions.dart:335-340) — it walked above. Only
+                // an unindexed edge can be the core face; any other
+                // unindexed edge could implement the interface, and the
+                // definite answer dies (a later definite `true` still
+                // outranks it).
+                None => {
+                    if core_implements(&core, edge, interface) {
+                        return Some(true);
+                    }
+                    answer = None;
+                }
+            }
+        }
+    }
+    answer
+}
+
+/// Whether `name` can enter `lib`'s unit scope through an import: an
+/// `as` prefix spelled `name` (import prefixes are library-scope names,
+/// upstream Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
+/// scope_analyzer.dart), or an unprefixed import whose target's export
+/// scope carries `name` under the directive's combinators — the same
+/// merge [`LibraryScopes::build`] runs over the import face, scoped to
+/// the one-name question a shadowing check asks (a prefixed import
+/// contributes its prefix spelling alone; its target's exports stay
+/// outside the unit scope).
+///
+/// The direction is conservative: an unprefixed import whose target
+/// contributes nothing to the graph (an unresolvable URI, an unanalyzed
+/// dependency) answers `true` — that library could export any name.
+/// `false` therefore means "no indexed import carries the name", never a
+/// proof of absence everywhere.
+pub(crate) fn import_shadows(graph: &LibraryGraph, lib: LibraryId, name: StringId) -> bool {
+    graph
+        .import_edges(lib)
+        .iter()
+        .any(|edge| match edge.prefix {
+            Some(prefix) => prefix == name,
+            None => match edge.target {
+                None => true, // the target's export set is unknowable
+                Some(target) => {
+                    edge.combinators.allows(name) && graph.exported(target, name).is_some()
+                }
+            },
+        })
+}
+
+/// Whether the container `name` resolves to — file-local first, then the
+/// library namespace, cross-file exactly like [`member_lookup`]'s anchor
+/// resolution — carries an annotation whose spelled name is `annotation`.
+/// The name-level cut of the JS-interop classification, which reads the
+/// class element's own metadata (`metadata.hasJS`, upstream Dart SDK
+/// source, pkg/linter/lib/src/rules/
+/// invalid_runtime_check_with_js_interop_types.dart
+/// `_jsTypeForStaticInterop`): only the resolved container's own
+/// annotation rows answer, the supertype chain is not walked.
+///
+/// `None` = the name does not resolve to an indexed container (an SDK
+/// type, an unanalyzed dependency) — that container could carry the
+/// annotation, so the caller stays silent. A prefix-qualified annotation
+/// keeps its dot-joined spelling (`@p.JS()` stores `p.JS`), so it does
+/// not match a bare `JS` query — the under-report direction.
+pub(crate) fn container_has_annotation(
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    lib: LibraryId,
+    file: FileId,
+    container: StringId,
+    annotation: StringId,
+) -> Option<bool> {
+    let (found, _) = resolve_container(graph, namespaces, index, lib, file, container)?;
+    Some(found.annotations.iter().any(|a| a.name == annotation))
 }
 
 #[cfg(test)]

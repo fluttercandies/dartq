@@ -32,7 +32,7 @@
 //! but the structures this face needs — the written *bound* of each
 //! declared type parameter, the per-site argument subtrees it checks, and
 //! the shapes the slot cannot represent (function types, record types,
-//! a headless group) — are captured as [`TypeTree`]s from the parse events
+//! a headless group) — are captured as `TypeTree`s from the parse events
 //! while a bound window (a `<...>` type-variables group) or a container
 //! header window (extends/with/implements clauses) is open. The engine
 //! routes `handle_type` and the group events into the open sink; any
@@ -60,9 +60,9 @@ use dartq_source::{SourceRange, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use dartq_types::{
-    Boundedness, CoreDecls, ParamFacts, ParamFactsTable, TypeDeclId, TypeHierarchy, TypeId,
-    TypeKind, TypeParamId, TypeSystem, TypeTable, UninternedType, Variance,
-    instantiate_type_formals_to_bounds, is_well_bounded,
+    Boundedness, CoreDecls, NamedMember, ParamFacts, ParamFactsTable, TypeDeclId, TypeHierarchy,
+    TypeId, TypeKind, TypeParamId, TypeSystem, TypeTable, UninternedFunction, UninternedType,
+    Variance, instantiate_type_formals_to_bounds, is_well_bounded, replace_top_bottom,
 };
 
 // The written-type capture is shared with the collector's pool feeding
@@ -85,6 +85,7 @@ pub(crate) struct HeaderSink {
 
 /// Which clause completed. `On` trees are constraints, not supertypes —
 /// claimed and discarded.
+#[derive(Clone, Copy)]
 pub(crate) enum Clause {
     /// `extends T` (the named-mixin-application head included): the
     /// given type count.
@@ -159,6 +160,187 @@ struct BoundsIndex {
     /// the M1 face cannot answer. Sticky across scopes: a name is
     /// bounded if any of its declarations was, the safe direction.
     bounded_params: FxHashSet<StringId>,
+    /// Captured function-type aliases (`typedef A<X> = X Function(X);`),
+    /// keyed by the alias name (keep-first like the containers). The
+    /// bounds snapshot expands an alias head through its captured RHS —
+    /// the only alias face the M1 decision order observes (#1351).
+    aliases: FxHashMap<StringId, AliasCapture>,
+}
+
+/// One function-type alias's captured declaration: its type parameters
+/// (the same shape as a container's — name, written bound, poison bit)
+/// and the RHS the head expands to.
+struct AliasCapture {
+    params: Vec<(StringId, Option<TypeTree>, bool)>,
+    rhs: Box<AliasRhs>,
+}
+
+/// The captured RHS of a function-type alias: the shape the snapshot's
+/// expansion substitutes the alias's parameters into.
+enum AliasRhs {
+    /// `X Function(Y)`: the return type and the formal types as written.
+    /// Named-formal names and their `required` bits are captured (the
+    /// expansion's `UninternedFunction` needs both); optional-positional
+    /// formals fold into the positional list with the required count
+    /// alongside (`None` = every positional formal required).
+    Fn {
+        ret: Option<TypeTree>,
+        positional: Vec<TypeTree>,
+        named: Vec<(StringId, TypeTree, bool)>,
+        required_positional: Option<usize>,
+    },
+    /// `List<X>`: a named-type RHS expands by substitution like an
+    /// interface head.
+    Named(TypeTree),
+}
+
+impl AliasRhs {
+    /// Whether some formal's type mentions one of the alias's own
+    /// parameters — the contravariant-occurrence shape whose inverted
+    /// bounds pass fails (`enum E<T extends A<T>, U>` with
+    /// `A<X> = X Function(X)`; the return-only alias
+    /// `A<X> = X Function()` inverts clean and never fires).
+    fn param_in_formals(&self, params: &[StringId]) -> bool {
+        let mentions = |tree: &TypeTree| tree_mentions(tree, params);
+        match self {
+            AliasRhs::Fn {
+                ret: _,
+                positional,
+                named,
+                required_positional: _,
+            } => positional.iter().any(mentions) || named.iter().any(|(_, tree, _)| mentions(tree)),
+            AliasRhs::Named(_) => false,
+        }
+    }
+
+    /// Whether any captured tree is poisoned: the alias never expands.
+    fn poisoned(&self) -> bool {
+        let mentions_poison = |tree: &TypeTree| tree.poisoned;
+        match self {
+            AliasRhs::Fn {
+                ret,
+                positional,
+                named,
+                required_positional: _,
+            } => {
+                ret.as_ref().is_some_and(mentions_poison)
+                    || positional.iter().any(mentions_poison)
+                    || named.iter().any(|(_, tree, _)| mentions_poison(tree))
+            }
+            AliasRhs::Named(tree) => tree.poisoned,
+        }
+    }
+}
+
+/// Whether a written tree mentions any of the parameter names (the head
+/// itself or any argument root; a poisoned tree answers `true` — the
+/// conservative direction for the caller's gate).
+fn tree_mentions(tree: &TypeTree, params: &[StringId]) -> bool {
+    if tree.poisoned {
+        return true;
+    }
+    if let Some((positional, named)) = &tree.record {
+        return positional
+            .iter()
+            .chain(named.iter().map(|(_, ty)| ty))
+            .any(|field| tree_mentions(field, params));
+    }
+    params.contains(&tree.head) || tree.args.iter().any(|arg| tree_mentions(arg, params))
+}
+
+/// Maps an alias's captured RHS in the alias's own parameter scope: the
+/// expansion keeps the alias's parameter ids as its leaves, so a use
+/// site substitutes the written arguments into it (the official
+/// resolves the alias element and instantiates; `instantiateTypeAliasToBounds`
+/// covers the bare form through the same substitution). `None` = some
+/// tree did not map (a foreign head, an argument arity mismatch, or a
+/// co-alias not yet expanded); the build loop retries the next round and
+/// drops a never-mapping alias — uses then read `dynamic`, the
+/// under-report direction.
+fn expand_alias(
+    capture: &AliasCapture,
+    ctx: &MapCtx<'_, '_>,
+    scope: &FxHashMap<StringId, TypeParamId>,
+) -> Option<TypeId> {
+    match &*capture.rhs {
+        AliasRhs::Fn {
+            ret,
+            positional,
+            named,
+            required_positional,
+        } => {
+            // An unwritten return type reads `dynamic` (`Function` bare).
+            // A tree that fails to map defers the whole alias.
+            let ret = match ret {
+                Some(tree) => ctx.map_tree(tree, scope)?,
+                None => ctx.table.intern(UninternedType::Dynamic, false),
+            };
+            let positional = positional
+                .iter()
+                .map(|tree| ctx.map_tree(tree, scope))
+                .collect::<Option<Vec<_>>>()?;
+            let named = named
+                .iter()
+                .map(|(name, tree, required)| {
+                    Some(NamedMember {
+                        name: ctx.strings.resolve(*name).to_string(),
+                        ty: ctx.map_tree(tree, scope)?,
+                        required: *required,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let required_positional =
+                u32::try_from(required_positional.unwrap_or(positional.len())).ok()?;
+            ctx.table
+                .intern_function(
+                    UninternedFunction {
+                        return_type: ret,
+                        type_parameters: Vec::new(),
+                        positional,
+                        named,
+                        required_positional,
+                    },
+                    false,
+                )
+                .ok()
+        }
+        AliasRhs::Named(tree) => ctx.map_tree(tree, scope),
+    }
+}
+
+/// The alias-RHS capture cursor: which region of the function type the
+/// completed type trees belong to.
+#[derive(Clone, Copy, PartialEq)]
+enum AliasRegion {
+    /// Before the formals: the return type (claimed at the formals
+    /// boundary).
+    Ret,
+    /// Inside the formals region — `named` selects the `{...}` group
+    /// over the required/`[...]` positional list.
+    Formals { named: bool },
+}
+
+/// The open alias capture: the tree sink for the RHS plus the region
+/// cursor. Named-formal names attach at the formal's end event, popping
+/// the tree that formal's type pushed.
+struct AliasSink {
+    name: StringId,
+    /// The declaring group's captured parameters (joined at the group's
+    /// close — the name precedes its own `<...>` group).
+    params: Vec<(StringId, Option<TypeTree>, bool)>,
+    sink: TreeSink,
+    region: Option<AliasRegion>,
+    ret: Option<TypeTree>,
+    positional: Vec<TypeTree>,
+    named: Vec<(StringId, TypeTree, bool)>,
+    /// The positional formals captured before the first `[` group (the
+    /// expansion's `requiredPositional`); `None` means every positional
+    /// formal is required.
+    required_positional: Option<usize>,
+    /// The RHS parsed a function-type formals region.
+    fn_seen: bool,
+    /// Recovery debris: the alias never expands.
+    poisoned: bool,
 }
 
 /// A mapped ITB violation: what to emit and where.
@@ -171,6 +353,11 @@ pub(crate) struct BoundedIssue {
     pub parameter: String,
     /// The substituted bound display.
     pub bound: String,
+    /// The inverted type's display when the report rode the super-bounded
+    /// pass — the `contextMessages` row's `'<X<invArgs>>'` text
+    /// (`type_arguments_verifier.dart:455-463`). `None` on the
+    /// extension-type face, which skips the super pass upstream too.
+    pub inverted_type: Option<String>,
 }
 
 /// The engine's boundedness state: the parse-time capture plus the lazy
@@ -191,6 +378,10 @@ pub(crate) struct Bounds<'a> {
     header: Option<(StringId, HeaderSink)>,
     /// The outermost explicit type-argument site capture.
     site: Option<TreeSink>,
+    /// The open `typedef A<X> = ...` RHS capture (#1351). Top-level
+    /// declarations cannot nest, so one slot serves; a container's
+    /// `VarHeader`-equivalent overwrite path never coexists with it.
+    alias: Option<AliasSink>,
     snapshot: Option<Snapshot<'a>>,
 }
 
@@ -215,18 +406,17 @@ impl<'a> Bounds<'a> {
         let Some(sink) = self.bound_sink.as_mut() else {
             return;
         };
-        let (bound, poisoned) = if !has_bound {
-            (None, false)
-        } else {
+        let (bound, poisoned) = if has_bound {
             let mut roots = sink.take_done();
             match roots.len() {
-                0 => (None, true),
                 1 => {
                     let poisoned = roots[0].poisoned;
                     (roots.pop(), poisoned)
                 }
                 _ => (None, true),
             }
+        } else {
+            (None, false)
         };
         self.window.push((name, bound, poisoned));
     }
@@ -235,7 +425,9 @@ impl<'a> Bounds<'a> {
     /// The parser completes the variables in reverse declaration order,
     /// so the window reverses back — a capture's parameter order is the
     /// written one. Names bounded here latch the sticky bounded-parameter
-    /// set — function scopes included.
+    /// set — function scopes included. An open alias capture adopts the
+    /// window as its declaring parameters (#1351: the typedef's name
+    /// precedes the group, so the close always lands inside its capture).
     pub(crate) fn end_type_variables(&mut self) {
         let mut window = std::mem::take(&mut self.window);
         self.bound_sink = None;
@@ -245,7 +437,16 @@ impl<'a> Bounds<'a> {
                 self.index.bounded_params.insert(*name);
             }
         }
+        self.alias_type_variables(&window);
         self.pending = (!window.is_empty()).then_some(window);
+    }
+
+    /// The latched window of the last closed type-variable group (#1314
+    /// FAM10): function headers adopt it by their declaring name at the
+    /// close event — the container adoption consumes its own window, so a
+    /// function's latch is always its own.
+    pub(crate) fn pending_window(&self) -> Option<&[(StringId, Option<TypeTree>, bool)]> {
+        self.pending.as_deref()
     }
 
     /// The container begin event: adopts the latch when the declaring
@@ -391,6 +592,207 @@ impl<'a> Bounds<'a> {
         }
     }
 
+    /// Poisons the open alias capture (#1351): the RHS parsed a shape the
+    /// model cannot represent (a record type). The RHS's own function
+    /// type poisons through [`Self::alias_formal_boundary`] instead —
+    /// [`Self::poison`] deliberately leaves the alias alone, or every
+    /// `X Function(...)` RHS would die at its own `Function(`.
+    pub(crate) fn alias_poison(&mut self) {
+        if let Some(alias) = self.alias.as_mut() {
+            alias.poisoned = true;
+        }
+    }
+
+    // —— #1351: the function-type-alias RHS capture ————————————————————
+
+    /// A typedef's declaring name completed: the RHS capture opens. The
+    /// parameters join when the declaring group's window closes (the name
+    /// precedes its own `<...>` group); any stale capture dies here —
+    /// top-level declarations cannot nest.
+    pub(crate) fn begin_alias(&mut self, name: StringId) {
+        self.alias = Some(AliasSink {
+            name,
+            params: Vec::new(),
+            sink: TreeSink::default(),
+            region: Some(AliasRegion::Ret),
+            ret: None,
+            positional: Vec::new(),
+            named: Vec::new(),
+            required_positional: None,
+            fn_seen: false,
+            poisoned: false,
+        });
+    }
+
+    /// The declaring group's window closed while an alias capture is
+    /// open: the window is the typedef's own parameters (the name always
+    /// precedes the group). The latch itself behaves exactly as before —
+    /// the token-order guard already kept a typedef's window from any
+    /// container's adoption. The sink resets here too: the bound window's
+    /// trees joined the parameters, and everything captured from here on
+    /// is the RHS (`=` separates the two; the window close is the only
+    /// event between them). A function-type *bound* left debris the
+    /// boundary already claimed — the reset clears its `fn_seen`/`ret`
+    /// traces as well; the poison bit stays sticky.
+    pub(crate) fn alias_type_variables(&mut self, window: &[(StringId, Option<TypeTree>, bool)]) {
+        if let Some(alias) = self.alias.as_mut() {
+            alias.params = window.to_vec();
+            alias.sink = TreeSink::default();
+            alias.ret = None;
+            alias.fn_seen = false;
+        }
+    }
+
+    /// A simple type head completed inside the open alias capture.
+    pub(crate) fn alias_leaf(&mut self, head: StringId, nullable: bool, range: SourceRange) {
+        if let Some(alias) = self.alias.as_mut() {
+            alias.sink.leaf(head, nullable, range);
+        }
+    }
+
+    /// A type-argument group opened inside the open alias capture.
+    pub(crate) fn alias_begin_group(&mut self, head: Option<(StringId, SourceRange)>) {
+        if let Some(alias) = self.alias.as_mut() {
+            alias.sink.begin_group(head);
+        }
+    }
+
+    /// A type-argument group closed inside the open alias capture.
+    pub(crate) fn alias_end_group(&mut self, end: SourceRange) {
+        if let Some(alias) = self.alias.as_mut() {
+            alias.sink.end_group(end);
+        }
+    }
+
+    /// The RHS's function-type head event: `fn_seen` marks the RHS a
+    /// function type (a named RHS finalizes differently at the close). The
+    /// parser fires this before the return type parses (upstream Dart SDK
+    /// source, pkg/_fe_analyzer_shared/lib/src/parser/type_info_impl.dart,
+    /// `ComplexTypeInfo.parseType`'s pass 1 — outermost `Function` first),
+    /// so the return's trees keep joining the sink; the return is claimed
+    /// at the formals' open. A second head event inside the RHS is a
+    /// nested function type (a function-typed formal) — outside the
+    /// capture's model.
+    pub(crate) fn alias_formal_boundary(&mut self) {
+        let Some(alias) = self.alias.as_mut() else {
+            return;
+        };
+        if alias.region != Some(AliasRegion::Ret) || alias.fn_seen {
+            alias.poisoned = true;
+            return;
+        }
+        alias.fn_seen = true;
+    }
+
+    /// The RHS function type's formal list opened: the trees completed so
+    /// far are the return type (none written — bare `Function` — reads
+    /// `dynamic` at the expansion). Non-function RHS formals lists and
+    /// already-closed captures leave the cursor alone.
+    pub(crate) fn alias_formals_region_open(&mut self) {
+        let Some(alias) = self.alias.as_mut() else {
+            return;
+        };
+        if !alias.fn_seen || alias.region != Some(AliasRegion::Ret) {
+            return;
+        }
+        match alias.sink.done.len() {
+            0 => alias.ret = None,
+            1 => alias.ret = alias.sink.done.pop(),
+            _ => alias.poisoned = true,
+        }
+        alias.region = Some(AliasRegion::Formals { named: false });
+    }
+
+    /// `[` or `{` opened inside the formals region: the group's spelling
+    /// selects the named list; the positional group latches the
+    /// required-positional count (optional formals follow it).
+    pub(crate) fn alias_optional_group(&mut self, opener: &str) {
+        let Some(alias) = self.alias.as_mut() else {
+            return;
+        };
+        if !alias
+            .region
+            .is_some_and(|region| matches!(region, AliasRegion::Formals { .. }))
+        {
+            return;
+        }
+        if opener == "[" && alias.required_positional.is_none() {
+            alias.required_positional = Some(alias.positional.len());
+        }
+        alias.region = Some(AliasRegion::Formals {
+            named: opener == "{",
+        });
+    }
+
+    /// One formal completed: the trees since the previous formal are its
+    /// type (exactly one; nested groups merged through the sink). A
+    /// named-group formal whose "name" token is the type head itself (the
+    /// same offset — `{int}`) reads back positional.
+    pub(crate) fn alias_formal_end(&mut self, name: StringId, name_offset: u32, required: bool) {
+        let Some(alias) = self.alias.as_mut() else {
+            return;
+        };
+        if !matches!(alias.region, Some(AliasRegion::Formals { .. })) {
+            alias.poisoned = true;
+            return;
+        }
+        if alias.sink.done.len() != 1 {
+            alias.poisoned = true;
+            return;
+        }
+        let tree = alias.sink.done.pop().expect("one root");
+        let AliasRegion::Formals { named } = alias.region.expect("checked above") else {
+            return;
+        };
+        if named && name_offset != tree.range.offset {
+            alias.named.push((name, tree, required));
+        } else {
+            alias.positional.push(tree);
+        }
+    }
+
+    /// The formals region closed: stray trees past this point poison.
+    pub(crate) fn alias_formals_closed(&mut self) {
+        if let Some(alias) = self.alias.as_mut() {
+            alias.region = None;
+        }
+    }
+
+    /// The typedef closed: the capture finalizes into the index
+    /// (keep-first like the containers). A poisoned capture, a
+    /// function-type RHS with debris, or a named RHS that is not exactly
+    /// one root all drop — the alias never expands (the under-report).
+    pub(crate) fn end_alias(&mut self) {
+        let Some(mut alias) = self.alias.take() else {
+            return;
+        };
+        let stray = alias.sink.done.len();
+        let rhs = if alias.fn_seen {
+            (stray == 0).then(|| AliasRhs::Fn {
+                ret: alias.ret,
+                positional: alias.positional,
+                named: alias.named,
+                required_positional: alias.required_positional,
+            })
+        } else if stray == 1 {
+            alias.sink.done.pop().map(AliasRhs::Named)
+        } else {
+            None
+        };
+        if let Some(rhs) = rhs
+            && !alias.poisoned
+            && !rhs.poisoned()
+        {
+            self.index
+                .aliases
+                .entry(alias.name)
+                .or_insert(AliasCapture {
+                    params: alias.params,
+                    rhs: Box::new(rhs),
+                });
+        }
+    }
+
     // —— checks ————————————————————————————————————————————————————————
 
     /// The G1 face (`_checkForTypeArgumentNotMatchingBounds`): the
@@ -401,7 +803,7 @@ impl<'a> Bounds<'a> {
         &mut self,
         strings: &'a StringTable,
         head: StringId,
-        args: Vec<TypeTree>,
+        args: &[TypeTree],
         in_scope_params: &[StringId],
     ) -> Vec<BoundedIssue> {
         // A type parameter shadows any container of the same name, and
@@ -438,13 +840,13 @@ impl<'a> Bounds<'a> {
         let ctx = snapshot.ctx();
         let scope = ctx.param_scope(in_scope_params);
         let mut mapped_args = Vec::with_capacity(args.len());
-        for arg in &args {
+        for arg in args {
             let Some(ty) = ctx.map_tree(arg, &scope) else {
                 return Vec::new();
             };
             if !snapshot.type_is_safe(ty) {
                 return Vec::new();
-            }
+            };
             mapped_args.push(ty);
         }
         let instantiation = snapshot.table.intern(
@@ -458,15 +860,28 @@ impl<'a> Bounds<'a> {
         // (:750-752); annotation sites allow it.
         let system = snapshot.system();
         match is_well_bounded(&system, &snapshot.facts, instantiation, allow_super) {
-            Boundedness::NotWellBounded(issues) => issues
-                .into_iter()
-                .map(|issue| BoundedIssue {
-                    range: args[issue.index].range,
-                    argument: snapshot.display(issue.argument),
-                    parameter: snapshot.param_text(issue.parameter),
-                    bound: snapshot.display(issue.bound),
-                })
-                .collect(),
+            Boundedness::NotWellBounded(issues) => {
+                // The context face (`type_arguments_verifier.dart:427-465`):
+                // where the super-bounded pass ran, every report carries the
+                // inverted type's row — and the issues ARE the inverted
+                // pass's there (`is_well_bounded` reports those), so the
+                // display re-runs the same inversion. The extension-type
+                // face skips the pass upstream too, and the raw-type row
+                // keys on absent written arguments, which this capture's
+                // sites always have.
+                let inverted = allow_super
+                    .then(|| snapshot.display(replace_top_bottom(&system, instantiation)));
+                issues
+                    .into_iter()
+                    .map(|issue| BoundedIssue {
+                        range: args[issue.index].range,
+                        argument: snapshot.display(issue.argument),
+                        parameter: snapshot.param_text(issue.parameter),
+                        bound: snapshot.display(issue.bound),
+                        inverted_type: inverted.clone(),
+                    })
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -484,6 +899,46 @@ impl<'a> Bounds<'a> {
             || capture.bounds.iter().any(|(_, poisoned)| *poisoned)
         {
             return false;
+        }
+        // The alias-bound gate (#1351): the official preserves an alias
+        // bound's spelling through the inverted (super-bounded) pass and
+        // unaliases inside the subtype test — the decision order observes
+        // the alias identity. The snapshot's model has no alias kinds, so
+        // the map fully expands; the expansion answers the regular pass
+        // and every non-divergent argument, but a self-referential bound
+        // over a contravariant-occurrence alias passes the expanded
+        // inverted pass where the official fails (`enum E<T extends
+        // A<T>, U>` with `A<X> = X Function(X)`: the preserved spelling
+        // tests `Never Function(dynamic) <: Never` inverted — false —
+        // while the expansion's dynamic-topped shape passes). This gate
+        // re-derives exactly that shape at the written level: a bound
+        // applying a captured alias (arity-matched) to an argument
+        // mentioning the enum's own parameter, where the alias's formals
+        // — not its return — use the alias's own parameters (the
+        // return-only alias `A<X> = X Function()` inverts clean and the
+        // expanded pass answers it correctly).
+        for (param, (bound, poisoned)) in capture.params.iter().zip(&capture.bounds) {
+            let Some(tree) = bound else {
+                continue;
+            };
+            if *poisoned || tree.poisoned {
+                continue;
+            }
+            let Some(alias) = self.index.aliases.get(&tree.head) else {
+                continue;
+            };
+            if tree.args.len() != alias.params.len() {
+                continue;
+            }
+            let self_referential = tree
+                .args
+                .iter()
+                .any(|arg| tree_mentions(arg, std::slice::from_ref(param)));
+            let alias_params: Vec<StringId> =
+                alias.params.iter().map(|(name, _, _)| *name).collect();
+            if self_referential && alias.rhs.param_in_formals(&alias_params) {
+                return true;
+            }
         }
         let snapshot = self.snapshot(strings);
         let Some(decl) = snapshot.registry.get(&name).copied() else {
@@ -505,6 +960,25 @@ impl<'a> Bounds<'a> {
         matches!(
             is_well_bounded(&system, &snapshot.facts, values_element, true),
             Boundedness::NotWellBounded(_)
+        )
+    }
+
+    /// A container's captured type parameters (name, written bound, poison
+    /// bit) in declaration order — the creation-inference face's parameter
+    /// names (#1351). `None` when the head has no capture; owned, so the
+    /// caller's later mutations never fight the borrow.
+    pub(crate) fn container_params(
+        &self,
+        name: StringId,
+    ) -> Option<Vec<(StringId, Option<TypeTree>, bool)>> {
+        let capture = self.index.containers.get(&name)?;
+        Some(
+            capture
+                .params
+                .iter()
+                .zip(&capture.bounds)
+                .map(|(param, (bound, poisoned))| (*param, bound.clone(), *poisoned))
+                .collect(),
         )
     }
 
@@ -604,6 +1078,11 @@ struct Snapshot<'a> {
     unsafe_decls: FxHashSet<TypeDeclId>,
     /// The parameter bounds face (in-file and builtin parameters).
     facts: ParamFactsTable,
+    /// The captured aliases' expansions (declaration → RHS type); empty
+    /// when the file declares no function-type alias (#1351).
+    alias_expansions: FxHashMap<TypeDeclId, TypeId>,
+    /// Every captured alias's declaration id (the unexpanded-head guard).
+    alias_decls: FxHashSet<TypeDeclId>,
     /// Site-side type-parameter allocation: an in-scope parameter name
     /// maps to one id for the file's lifetime (name-keyed — same-name
     /// parameters in distinct scopes share it, which can only answer
@@ -621,6 +1100,16 @@ struct MapCtx<'a, 'b> {
     registry: &'b FxHashMap<StringId, TypeDeclId>,
     decl_params: &'b FxHashMap<TypeDeclId, Vec<TypeParamId>>,
     facts: &'b ParamFactsTable,
+    /// The captured aliases' expansions: declaration → the RHS mapped in
+    /// the alias's own parameter scope (a function or interface type
+    /// whose type-parameter leaves are the alias's own parameter ids).
+    /// `map_tree` expands an alias head by substituting the call-site
+    /// arguments into it (#1351); an alias absent here never expands.
+    alias_expansions: &'b FxHashMap<TypeDeclId, TypeId>,
+    /// Every captured alias's declaration id: the guard that keeps an
+    /// unexpanded alias head out of the interface arm — the hierarchy has
+    /// no such declaration and a subtype walk would reject it.
+    alias_decls: &'b FxHashSet<TypeDeclId>,
     lazy_params: &'b RefCell<FxHashMap<StringId, (TypeParamId, String)>>,
     next_param: &'b Cell<u32>,
 }
@@ -668,12 +1157,19 @@ impl MapCtx<'_, '_> {
             return None;
         }
         let text = self.strings.resolve(tree.head);
+        // A user-declared `class Never`/`Null`/`FutureOr` shadows the
+        // dart:core face — the official resolves the written name through
+        // the ordinary scope chain before the builtin answers. The
+        // registry wins; only its miss falls to the builtin map.
+        // (`dynamic`/`void` are keywords and can never be declared.)
+        let shadowed =
+            matches!(text, "Null" | "Never" | "FutureOr") && self.registry.contains_key(&tree.head);
         match text {
-            "dynamic" => Some(self.table.intern(UninternedType::Dynamic, false)),
-            "void" => Some(self.table.intern(UninternedType::Void, false)),
-            "Null" => Some(self.table.intern(UninternedType::Null, false)),
-            "Never" => Some(self.table.intern(UninternedType::Never, tree.nullable)),
-            "FutureOr" => {
+            "dynamic" if !shadowed => Some(self.table.intern(UninternedType::Dynamic, false)),
+            "void" if !shadowed => Some(self.table.intern(UninternedType::Void, false)),
+            "Null" if !shadowed => Some(self.table.intern(UninternedType::Null, false)),
+            "Never" if !shadowed => Some(self.table.intern(UninternedType::Never, tree.nullable)),
+            "FutureOr" if !shadowed => {
                 if tree.args.len() != 1 {
                     return None;
                 }
@@ -685,6 +1181,40 @@ impl MapCtx<'_, '_> {
             }
             _ => match self.registry.get(&tree.head) {
                 Some(&decl) => {
+                    // An alias declaration without an expansion (a chain
+                    // still pending, a cycle, a poisoned RHS) is not
+                    // modelable as an interface: the hierarchy has no
+                    // such declaration. `None` = the enclosing check
+                    // suppresses (the under-report direction).
+                    if self.alias_decls.contains(&decl) {
+                        return None;
+                    }
+                    // An alias head expands to its captured RHS with the
+                    // written arguments substituted in (the official
+                    // resolves the alias element and instantiates it —
+                    // `instantiateTypeAliasToBounds` for the bare form,
+                    // the alias's own `instantiate` otherwise). The
+                    // decision order observes only the expanded shape;
+                    // the alias identity itself never outlives the map
+                    // (the under-report posture: an unexpanded alias
+                    // suppresses its check).
+                    if let Some(&expansion) = self.alias_expansions.get(&decl) {
+                        let params = self.decl_params.get(&decl)?;
+                        let args = if tree.args.len() == params.len() {
+                            let mut args = Vec::with_capacity(tree.args.len());
+                            for arg in &tree.args {
+                                args.push(self.map_tree(arg, scope)?);
+                            }
+                            args
+                        } else if tree.args.is_empty() {
+                            self.bounds_instantiation(decl)?
+                        } else {
+                            return None;
+                        };
+                        let map: Vec<(TypeParamId, TypeId)> =
+                            params.iter().copied().zip(args).collect();
+                        return Some(self.table.substitute(expansion, &map));
+                    }
                     let params = self.decl_params.get(&decl)?;
                     let args = if tree.args.len() == params.len() {
                         let mut args = Vec::with_capacity(tree.args.len());
@@ -712,6 +1242,7 @@ impl MapCtx<'_, '_> {
 }
 
 impl<'a> Snapshot<'a> {
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     fn build(index: &BoundsIndex, strings: &'a StringTable) -> Self {
         let table = TypeTable::new();
         let object = TypeDeclId::from_raw(OBJECT_RAW);
@@ -743,7 +1274,7 @@ impl<'a> Snapshot<'a> {
             let decl = TypeDeclId::from_raw(next_decl);
             next_decl += 1;
             let mut param_ids = Vec::with_capacity(params.len());
-            for param in params.iter() {
+            for param in *params {
                 let id = TypeParamId::from_raw(next_param.get());
                 next_param.set(next_param.get() + 1);
                 param_ids.push(id);
@@ -801,12 +1332,21 @@ impl<'a> Snapshot<'a> {
         // to `dynamic`, the under-report direction), then the mapped
         // bounds apply.
         let scratch_facts = ParamFactsTable::new();
+        // The pre-alias map passes (container bounds, supertype edges)
+        // run with no expansions and no alias declarations in the
+        // registry: the aliases have not registered yet, and a bound
+        // referencing one is not modelable here — the container takes
+        // the under-report direction.
+        let empty_alias_expansions: FxHashMap<TypeDeclId, TypeId> = FxHashMap::default();
+        let empty_alias_decls: FxHashSet<TypeDeclId> = FxHashSet::default();
         let ctx = MapCtx {
             table: &table,
             strings,
             registry: &registry,
             decl_params: &decl_params,
             facts: &scratch_facts,
+            alias_expansions: &empty_alias_expansions,
+            alias_decls: &empty_alias_decls,
             lazy_params: &RefCell::new(FxHashMap::default()),
             next_param: &next_param,
         };
@@ -851,6 +1391,8 @@ impl<'a> Snapshot<'a> {
             registry: &registry,
             decl_params: &decl_params,
             facts: &facts,
+            alias_expansions: &empty_alias_expansions,
+            alias_decls: &empty_alias_decls,
             lazy_params: &RefCell::new(FxHashMap::default()),
             next_param: &next_param,
         };
@@ -931,7 +1473,7 @@ impl<'a> Snapshot<'a> {
             .build(&table)
             .expect("the bare core hierarchy is always valid"),
         };
-        for (decl, _) in file_scopes.iter() {
+        for decl in file_scopes.keys() {
             if hierarchy.decl(*decl).is_none() {
                 unsafe_decls.insert(*decl);
             }
@@ -953,6 +1495,107 @@ impl<'a> Snapshot<'a> {
             }
         }
 
+        // The captured aliases (#1351): registered for the expansion map
+        // only — an alias never enters a subtype walk as itself, so it
+        // needs no hierarchy face. Each RHS maps in the alias's own
+        // parameter scope; a bound or RHS referencing a not-yet-expanded
+        // alias defers to the next round (a chain terminates, a cycle
+        // drops — the under-report direction).
+        let mut alias_expansions: FxHashMap<TypeDeclId, TypeId> = FxHashMap::default();
+        let mut alias_decls: FxHashSet<TypeDeclId> = FxHashSet::default();
+        let mut alias_scopes: FxHashMap<TypeDeclId, FxHashMap<StringId, TypeParamId>> =
+            FxHashMap::default();
+        for (name, capture) in &index.aliases {
+            let decl = TypeDeclId::from_raw(next_decl);
+            next_decl += 1;
+            let mut param_ids = Vec::with_capacity(capture.params.len());
+            let mut scope: FxHashMap<StringId, TypeParamId> = FxHashMap::default();
+            for param in &capture.params {
+                let id = TypeParamId::from_raw(next_param.get());
+                next_param.set(next_param.get() + 1);
+                param_ids.push(id);
+                scope.insert(param.0, id);
+                param_text.insert(id, strings.resolve(param.0).to_string());
+            }
+            registry.insert(*name, decl);
+            decl_params.insert(decl, param_ids);
+            alias_scopes.insert(decl, scope);
+            alias_decls.insert(decl);
+        }
+        let mut pending: Vec<(StringId, &AliasCapture)> =
+            index.aliases.iter().map(|(name, c)| (*name, c)).collect();
+        let mut rounds = index.aliases.len() + 1;
+        while !pending.is_empty() && rounds > 0 {
+            rounds -= 1;
+            let mut deferred: Vec<(StringId, &AliasCapture)> = Vec::new();
+            for (name, capture) in pending.drain(..) {
+                let Some(&decl) = registry.get(&name) else {
+                    continue;
+                };
+                let Some(scope) = alias_scopes.get(&decl) else {
+                    continue;
+                };
+                // The expansion and the parameter-bounds mapping run in a
+                // scope that drops the `ctx` before the results apply —
+                // the map and the facts face update after the borrow.
+                let outcome = {
+                    let ctx = MapCtx {
+                        table: &table,
+                        strings,
+                        registry: &registry,
+                        decl_params: &decl_params,
+                        facts: &scratch_facts,
+                        alias_expansions: &alias_expansions,
+                        alias_decls: &alias_decls,
+                        lazy_params: &RefCell::new(FxHashMap::default()),
+                        next_param: &next_param,
+                    };
+                    match expand_alias(capture, &ctx, scope) {
+                        Some(ty) => {
+                            let mapped_bounds = decl_params
+                                .get(&decl)
+                                .into_iter()
+                                .flatten()
+                                .zip(capture.params.iter())
+                                .map(|(&id, (_, bound, poisoned))| {
+                                    let mapped = match (bound, poisoned) {
+                                        (Some(tree), false) => {
+                                            ctx.map_tree(tree, scope).unwrap_or_else(|| {
+                                                table.intern(UninternedType::Dynamic, false)
+                                            })
+                                        }
+                                        _ => table.intern(UninternedType::Dynamic, false),
+                                    };
+                                    (id, mapped)
+                                })
+                                .collect::<Vec<_>>();
+                            Some((ty, mapped_bounds))
+                        }
+                        None => None,
+                    }
+                };
+                match outcome {
+                    Some((ty, mapped_bounds)) => {
+                        alias_expansions.insert(decl, ty);
+                        for (id, mapped) in mapped_bounds {
+                            facts.set(
+                                id,
+                                ParamFacts {
+                                    variance: Variance::Covariant,
+                                    bound: Some(mapped),
+                                },
+                            );
+                        }
+                    }
+                    None => deferred.push((name, capture)),
+                }
+            }
+            if deferred.len() == pending.len() && !deferred.is_empty() {
+                break; // no progress: an alias cycle, the drops are final
+            }
+            pending = deferred;
+        }
+
         Snapshot {
             strings,
             table,
@@ -963,6 +1606,8 @@ impl<'a> Snapshot<'a> {
             param_text,
             unsafe_decls,
             facts,
+            alias_expansions,
+            alias_decls,
             lazy_params: RefCell::new(FxHashMap::default()),
             next_param,
         }
@@ -979,6 +1624,8 @@ impl<'a> Snapshot<'a> {
             registry: &self.registry,
             decl_params: &self.decl_params,
             facts: &self.facts,
+            alias_expansions: &self.alias_expansions,
+            alias_decls: &self.alias_decls,
             lazy_params: &self.lazy_params,
             next_param: &self.next_param,
         }
@@ -1018,12 +1665,11 @@ impl<'a> Snapshot<'a> {
         let suffix = if t.is_nullable() { "?" } else { "" };
         match t.kind() {
             TypeKind::Never => format!("Never{suffix}"),
-            TypeKind::Dynamic => "dynamic".to_string(),
-            TypeKind::Void => "void".to_string(),
-            TypeKind::Null => "Null".to_string(),
             // The error sentinel never enters this face (poisoned trees
             // suppress first); render the neutral top type.
-            TypeKind::Invalid => "dynamic".to_string(),
+            TypeKind::Dynamic | TypeKind::Invalid => "dynamic".to_string(),
+            TypeKind::Void => "void".to_string(),
+            TypeKind::Null => "Null".to_string(),
             TypeKind::TypeParameter { parameter } => {
                 format!("{}{suffix}", self.param_text(parameter))
             }
@@ -1032,7 +1678,7 @@ impl<'a> Snapshot<'a> {
             }
             TypeKind::Interface { decl, args } => {
                 let name = self.decl_text.get(&decl).cloned().unwrap_or_default();
-                if args.len() == 0 {
+                if args.is_empty() {
                     format!("{name}{suffix}")
                 } else {
                     let rendered: Vec<String> = (0..args.len())
@@ -1183,7 +1829,7 @@ mod tests {
         bounds.begin_group(Some((c, range(70, 1))), true);
         bounds.leaf(int_box, false, range(72, 6));
         let (head, args) = close_site(&mut bounds, range(78, 1));
-        let issues = bounds.check_site(&strings, head, args, &[]);
+        let issues = bounds.check_site(&strings, head, &args, &[]);
         assert!(issues.is_empty());
     }
 
@@ -1213,7 +1859,7 @@ mod tests {
         bounds.begin_group(Some((c, range(39, 1))), true);
         bounds.leaf(string, false, range(41, 6));
         let (head, args) = close_site(&mut bounds, range(47, 1));
-        let issues = bounds.check_site(&strings, head, args, &[]);
+        let issues = bounds.check_site(&strings, head, &args, &[]);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].argument, "String");
         assert_eq!(issues[0].parameter, "T");

@@ -1,5 +1,5 @@
-//! The persistence projection of the element model (M3 facts snapshots,
-//! PRD §17.2): plain-data mirrors of the [`crate::model`] types whose
+//! The persistence projection of the element model (the M3 facts
+//! snapshots): plain-data mirrors of the [`crate::model`] types whose
 //! `StringId`s are projected onto indexes into one per-entry string slice.
 //!
 //! Arena ids are process-local and [`StringId`] has no numeric constructor,
@@ -73,6 +73,10 @@ pub enum PersistedTy {
     Unknown,
     Null,
     Dynamic,
+    /// Additive after the format shipped: a pre-`Never` payload could not
+    /// capture the bottom type (no producer existed), so the absent variant
+    /// decodes nothing differently (#539 additive-field discipline).
+    Never,
     Void,
     Named {
         name: u32,
@@ -83,6 +87,27 @@ pub enum PersistedTy {
         /// additive-field discipline; the #701 argument slot).
         #[serde(default)]
         args: Vec<PersistedTy>,
+    },
+    /// A record type: the positional fields then the named `(name, field)`
+    /// pairs, content-keyed exactly like `Named` (the #1511 face; a
+    /// pre-record payload could not produce the variant, so the additive
+    /// arm decodes nothing differently).
+    Record {
+        nullable: bool,
+        positional: Vec<PersistedTy>,
+        named: Vec<(u32, PersistedTy)>,
+    },
+    /// A function type: the nullable flag, the type-parameter count, the
+    /// return type, the positional formals, and the named `(name, formal)`
+    /// pairs, content-keyed exactly like `Record` (the function-shape
+    /// face; a pre-function payload could not produce the variant, so the
+    /// additive arm decodes nothing differently).
+    Function {
+        nullable: bool,
+        type_params: u16,
+        return_ty: Box<PersistedTy>,
+        positional: Vec<PersistedTy>,
+        named: Vec<(u32, PersistedTy)>,
     },
 }
 
@@ -121,6 +146,14 @@ pub struct PersistedFormal {
     pub name: u32,
     pub ty: PersistedTy,
     pub required: bool,
+    /// Additive after the format shipped: `default` so payloads persisted
+    /// before the columns existed decode modifier-less and default-less —
+    /// exact, since a pre-slot binary captured neither (the #539
+    /// additive-field discipline).
+    #[serde(default)]
+    pub covariant: bool,
+    #[serde(default)]
+    pub default_value: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +163,7 @@ pub struct PersistedFormals {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(clippy::struct_excessive_bools)] // flags mirror the official member modifier set
 pub struct PersistedMemberEntry {
     pub kind: PersistedMemberKind,
     pub is_static: bool,
@@ -141,9 +175,22 @@ pub struct PersistedMemberEntry {
     pub var_ty: PersistedTy,
     pub return_ty: PersistedTy,
     pub formals: Option<Box<PersistedFormals>>,
+    /// Additive after the format shipped: `default` so payloads persisted
+    /// before the field existed decode with no member metadata (the #539
+    /// additive-field discipline; the member annotation star).
+    #[serde(default)]
+    pub annotations: Vec<PersistedAnnotation>,
+    /// Additive after the format shipped: `default` so payloads persisted
+    /// before the field existed decode span-less (the #539
+    /// additive-field discipline; the member's name-token anchor — the
+    /// context-row faces resolve through it, and a span-less member degrades
+    /// those rows to plain rows).
+    #[serde(default)]
+    pub name_range: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(clippy::struct_excessive_bools)] // flags mirror the official container modifier set
 pub struct PersistedContainer {
     pub kind: PersistedContainerKind,
     pub is_abstract: bool,
@@ -182,13 +229,19 @@ pub struct PersistedContainer {
     pub annotations: Vec<PersistedAnnotation>,
 }
 
-/// One declaration annotation in payload form: the dot-joined name id and
-/// the annotation's own span (`@` through the name's last segment).
+/// One declaration annotation in payload form: the dot-joined name id, the
+/// annotation's own span (`@` through the name's last segment), and the
+/// argument group's interned source text when one parsed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedAnnotation {
     pub name: u32,
     pub offset: u32,
     pub length: u32,
+    /// Additive after the format shipped: `None` so payloads persisted
+    /// before the field existed decode argument-less (the #539
+    /// additive-field discipline).
+    #[serde(default)]
+    pub args_text: Option<u32>,
 }
 
 /// One extension application face in payload form (the implicit-application
@@ -197,6 +250,11 @@ pub struct PersistedAnnotation {
 pub struct PersistedExtensionFace {
     pub name: Option<u32>,
     pub on_type: Option<u32>,
+    /// Additive after the format shipped (the #539 discipline): the `on`
+    /// type was written nullable — the applicability/specificity split
+    /// reads it.
+    #[serde(default)]
+    pub on_type_nullable: bool,
     pub members: Vec<(u32, PersistedMemberEntry)>,
 }
 
@@ -208,6 +266,12 @@ pub struct PersistedRepFormal {
     pub required: bool,
     pub name_offset: u32,
     pub name_length: u32,
+    /// Additive after the format shipped (the #539 discipline): the
+    /// embedded formal's modifier bit and default-value text.
+    #[serde(default)]
+    pub covariant: bool,
+    #[serde(default)]
+    pub default_value: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +329,7 @@ impl<'a> Slice<'a> {
         }
     }
 
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     fn id(&mut self, id: StringId) -> u32 {
         if let Some(&at) = self.at.get(&id) {
             return at;
@@ -284,6 +349,7 @@ impl<'a> Slice<'a> {
             Ty::Unknown => PersistedTy::Unknown,
             Ty::Null => PersistedTy::Null,
             Ty::Dynamic => PersistedTy::Dynamic,
+            Ty::Never => PersistedTy::Never,
             Ty::Void => PersistedTy::Void,
             Ty::Named {
                 name,
@@ -295,6 +361,62 @@ impl<'a> Slice<'a> {
                     name: self.id(name),
                     nullable,
                     args: args.iter().map(|arg| self.ty(arg)).collect(),
+                }
+            }
+            Ty::Record { shape, nullable } => {
+                // The shape interns its named set sorted by the producer's
+                // StringId — canonical per producer universe, not byte-stable
+                // across producers (intern order varies by run). Decode
+                // re-interns canonically, so identity survives: a differently
+                // ordered payload costs a spurious cache miss, never a wrong hit.
+                let (positional, named) = {
+                    let shape = self.type_args.record_shape(shape);
+                    (
+                        shape.positional.to_vec(),
+                        shape
+                            .named
+                            .iter()
+                            .map(|(n, t)| (*n, *t))
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                PersistedTy::Record {
+                    nullable,
+                    positional: positional.iter().map(|ty| self.ty(ty)).collect(),
+                    named: named
+                        .into_iter()
+                        .map(|(name, ty)| (self.id(name), self.ty(&ty)))
+                        .collect(),
+                }
+            }
+            Ty::Function { shape, nullable } => {
+                // The shape interns its named set sorted by the producer's
+                // StringId — canonical per producer universe, not byte-stable
+                // across producers (intern order varies by run). Decode
+                // re-interns canonically, so identity survives: a differently
+                // ordered payload costs a spurious cache miss, never a wrong hit.
+                let (type_params, return_ty, positional, named) = {
+                    let shape = self.type_args.function_shape(shape);
+                    (
+                        shape.type_params,
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape
+                            .named
+                            .iter()
+                            .map(|(n, t)| (*n, *t))
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                PersistedTy::Function {
+                    nullable,
+                    type_params,
+                    return_ty: Box::new(self.ty(&return_ty)),
+                    positional: positional.iter().map(|ty| self.ty(ty)).collect(),
+                    named: named
+                        .into_iter()
+                        .map(|(name, ty)| (self.id(name), self.ty(&ty)))
+                        .collect(),
                 }
             }
         }
@@ -312,7 +434,22 @@ impl<'a> Slice<'a> {
             name: self.id(formal.name),
             ty: self.ty(&formal.ty),
             required: formal.required,
+            covariant: formal.covariant,
+            default_value: formal.default_value.map(|text| self.id(text)),
         }
+    }
+
+    /// One annotation star (a container's or a member's) in written order.
+    fn annotations(&mut self, annotations: &[Annotation]) -> Vec<PersistedAnnotation> {
+        annotations
+            .iter()
+            .map(|annotation| PersistedAnnotation {
+                name: self.id(annotation.name),
+                offset: annotation.range.offset,
+                length: annotation.range.length,
+                args_text: annotation.args_text.map(|text| self.id(text)),
+            })
+            .collect()
     }
 
     fn member(&mut self, entry: &MemberEntry) -> PersistedMemberEntry {
@@ -335,6 +472,9 @@ impl<'a> Slice<'a> {
                 .formals
                 .as_ref()
                 .map(|formals| Box::new(self.formals(formals))),
+            annotations: self.annotations(&entry.annotations),
+            name_range: (entry.name_range.offset != u32::MAX)
+                .then(|| (entry.name_range.offset, entry.name_range.length)),
         }
     }
 }
@@ -362,6 +502,7 @@ impl PersistedElements {
             .map(|face| PersistedExtensionFace {
                 name: face.name.map(|name| s.id(name)),
                 on_type: face.on_type.map(|name| s.id(name)),
+                on_type_nullable: face.on_type_nullable,
                 members: face
                     .members
                     .iter()
@@ -423,7 +564,7 @@ impl PersistedElements {
             .collect();
         let at_name = |at: u32| ids[at as usize];
         let mut type_args = ArgPool::default();
-        let elements = FileElements {
+        FileElements {
             decls: self
                 .decls
                 .into_iter()
@@ -441,8 +582,9 @@ impl PersistedElements {
                 .extension_faces
                 .into_iter()
                 .map(|face| ExtensionFace {
-                    name: face.name.map(|at| at_name(at)),
-                    on_type: face.on_type.map(|at| at_name(at)),
+                    name: face.name.map(&at_name),
+                    on_type: face.on_type.map(&at_name),
+                    on_type_nullable: face.on_type_nullable,
                     members: face
                         .members
                         .into_iter()
@@ -483,8 +625,7 @@ impl PersistedElements {
                 })
                 .collect(),
             type_args,
-        };
-        elements
+        }
     }
 }
 
@@ -571,6 +712,8 @@ impl PersistedContainer {
                     required: rep.formal.required,
                     name_offset: rep.name_range.offset,
                     name_length: rep.name_range.length,
+                    covariant: rep.formal.covariant,
+                    default_value: rep.formal.default_value.map(|text| s.id(text)),
                 })
                 .collect(),
             enum_constants: s.ids(&container.enum_constants),
@@ -581,15 +724,7 @@ impl PersistedContainer {
                 .iter()
                 .map(|(name, formals)| (s.id(*name), Box::new(s.formals(formals))))
                 .collect(),
-            annotations: container
-                .annotations
-                .iter()
-                .map(|annotation| PersistedAnnotation {
-                    name: s.id(annotation.name),
-                    offset: annotation.range.offset,
-                    length: annotation.range.length,
-                })
-                .collect(),
+            annotations: s.annotations(&container.annotations),
         }
     }
 
@@ -639,6 +774,8 @@ impl PersistedContainer {
                         name: ids[rep.name as usize],
                         ty: into_ty(rep.ty, ids, pool),
                         required: rep.required,
+                        covariant: rep.covariant,
+                        default_value: rep.default_value.map(|at| ids[at as usize]),
                     },
                     name_range: SourceRange {
                         offset: rep.name_offset,
@@ -676,6 +813,7 @@ impl PersistedContainer {
                         offset: annotation.offset,
                         length: annotation.length,
                     },
+                    args_text: annotation.args_text.map(|at| ids[at as usize]),
                 })
                 .collect(),
         }
@@ -706,6 +844,23 @@ impl PersistedMemberEntry {
             formals: self
                 .formals
                 .map(|formals| Box::new(into_formals(*formals, ids, pool))),
+            annotations: self
+                .annotations
+                .into_iter()
+                .map(|annotation| Annotation {
+                    name: ids[annotation.name as usize],
+                    range: SourceRange {
+                        offset: annotation.offset,
+                        length: annotation.length,
+                    },
+                    args_text: annotation.args_text.map(|at| ids[at as usize]),
+                })
+                .collect(),
+            name_range: self
+                .name_range
+                .map_or(MemberEntry::MISSING_NAME_RANGE, |(offset, length)| {
+                    SourceRange { offset, length }
+                }),
         }
     }
 }
@@ -715,6 +870,7 @@ fn into_ty(ty: PersistedTy, ids: &[StringId], pool: &mut ArgPool) -> Ty {
         PersistedTy::Unknown => Ty::Unknown,
         PersistedTy::Null => Ty::Null,
         PersistedTy::Dynamic => Ty::Dynamic,
+        PersistedTy::Never => Ty::Never,
         PersistedTy::Void => Ty::Void,
         PersistedTy::Named {
             name,
@@ -727,6 +883,39 @@ fn into_ty(ty: PersistedTy, ids: &[StringId], pool: &mut ArgPool) -> Ty {
                 .collect();
             pool.named(ids[name as usize], nullable, &args)
         }
+        PersistedTy::Record {
+            nullable,
+            positional,
+            named,
+        } => {
+            let positional: Vec<Ty> = positional
+                .into_iter()
+                .map(|ty| into_ty(ty, ids, pool))
+                .collect();
+            let named: Vec<(StringId, Ty)> = named
+                .into_iter()
+                .map(|(name, ty)| (ids[name as usize], into_ty(ty, ids, pool)))
+                .collect();
+            pool.record(&positional, &named, nullable)
+        }
+        PersistedTy::Function {
+            nullable,
+            type_params,
+            return_ty,
+            positional,
+            named,
+        } => {
+            let return_ty = into_ty(*return_ty, ids, pool);
+            let positional: Vec<Ty> = positional
+                .into_iter()
+                .map(|ty| into_ty(ty, ids, pool))
+                .collect();
+            let named: Vec<(StringId, Ty)> = named
+                .into_iter()
+                .map(|(name, ty)| (ids[name as usize], into_ty(ty, ids, pool)))
+                .collect();
+            pool.function(type_params, return_ty, &positional, &named, nullable)
+        }
     }
 }
 
@@ -735,22 +924,25 @@ fn into_formals(formals: PersistedFormals, ids: &[StringId], pool: &mut ArgPool)
         name: ids[formal.name as usize],
         ty: into_ty(formal.ty, ids, pool),
         required: formal.required,
+        covariant: formal.covariant,
+        default_value: formal.default_value.map(|at| ids[at as usize]),
     };
     Formals {
-        positional: formals.positional.into_iter().map(|f| into(f)).collect(),
-        named: formals.named.into_iter().map(|f| into(f)).collect(),
+        positional: formals.positional.into_iter().map(&mut into).collect(),
+        named: formals.named.into_iter().map(into).collect(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ArgListId, MemberEntry};
+    use crate::model::MemberEntry;
 
     /// A representative model — every column populated — survives the
     /// payload round trip: the API signature (which hashes the whole face)
     /// is reproduced byte-exact, and the capture-time logs compare equal.
     #[test]
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     fn model_round_trips_through_the_payload() {
         let strings = StringTable::new();
         let name = |text: &str| strings.intern(text);
@@ -759,12 +951,16 @@ mod tests {
             length: 3,
         };
         let mut elements = FileElements::default();
-        // One args-bearing declared type rides the round trip: the member's
-        // return type is `List<int>` (a nested payload column), the formal's
-        // `int?` stays argument-less (the reserved empty slot).
+        // Declared types with nested columns ride the round trip: the
+        // member's return type is `List<int>` (a nested payload column),
+        // the positional formal's type is `String Function(int)?` (the
+        // function-shape columns), the named formal's `int` stays
+        // argument-less (the reserved empty slot).
         let int = Ty::named(name("int"));
         let pool = elements.type_args_mut();
         let list_int = pool.named(name("List"), false, std::slice::from_ref(&int));
+        let string = Ty::named(name("String"));
+        let string_fn = pool.function(0, string, std::slice::from_ref(&int), &[], true);
         let member = move |text: &str| MemberEntry {
             kind: MemberKind::Method,
             is_static: false,
@@ -778,21 +974,27 @@ mod tests {
             formals: Some(Box::new(Formals {
                 positional: Box::new([Formal {
                     name: name("x"),
-                    ty: Ty::Named {
-                        name: name("int"),
-                        nullable: true,
-                        args: ArgListId::EMPTY,
-                    },
+                    ty: string_fn,
                     required: true,
+                    covariant: true,
+                    default_value: None,
                 }]),
                 named: Box::new([Formal {
                     name: name("y"),
                     ty: Ty::Unknown,
                     required: false,
+                    covariant: false,
+                    default_value: Some(name("3")),
                 }]),
             })),
+            annotations: Box::new([Annotation {
+                name: name("override"),
+                range,
+                args_text: None,
+            }]),
+            name_range: range,
         };
-        elements.decls.insert(
+        elements.decls = [(
             name("main"),
             TopDecl {
                 kind: MicroKind::TopLevelFn,
@@ -801,8 +1003,10 @@ mod tests {
                 return_ty: Ty::Void,
                 formals: None,
             },
-        );
-        elements.containers.insert(
+        )]
+        .into_iter()
+        .collect();
+        elements.containers = [(
             name("C"),
             Container {
                 kind: ContainerKind::Class,
@@ -827,6 +1031,8 @@ mod tests {
                         name: name("rep"),
                         ty: Ty::named(name("int")),
                         required: true,
+                        covariant: false,
+                        default_value: None,
                     },
                     name_range: range,
                 }]),
@@ -848,13 +1054,17 @@ mod tests {
                         offset: 0,
                         length: 7,
                     },
+                    args_text: Some(name("('v')")),
                 }]),
             },
-        );
+        )]
+        .into_iter()
+        .collect();
         elements.container_order.push(name("C"));
         elements.extension_faces.push(ExtensionFace {
             name: Some(name("E")),
             on_type: Some(name("int")),
+            on_type_nullable: false,
             members: [(name("e"), member("e"))].into_iter().collect(),
         });
         elements.duplicates.push(DuplicateDecl {
@@ -904,6 +1114,123 @@ mod tests {
                 .return_ty
                 .render(&strings, restored.type_args()),
             "List<int>"
+        );
+        // The function-shape columns ride the same way: equal id, equal
+        // display (`String Function(int)?`).
+        let restored_formals = restored_member.formals.as_deref().expect("formals");
+        assert_eq!(restored_formals.positional[0].ty, string_fn);
+        assert_eq!(
+            restored_formals.positional[0]
+                .ty
+                .render(&strings, restored.type_args()),
+            "String Function(int)?"
+        );
+        // The #1637 capture columns ride the payload: the member's star,
+        // the formals' covariant bits, and the default-value texts.
+        assert_eq!(restored_member.annotations.len(), 1);
+        assert_eq!(restored_member.annotations[0].name, name("override"));
+        assert_eq!(restored_member.annotations[0].args_text, None);
+        assert!(restored_formals.positional[0].covariant);
+        assert_eq!(restored_formals.positional[0].default_value, None);
+        assert!(!restored_formals.named[0].covariant);
+        assert_eq!(restored_formals.named[0].default_value, Some(name("3")));
+        // The name-token anchor rides too: the round trip preserves it
+        // exactly (the context-row faces resolve through it).
+        assert_eq!(restored_member.name_range, range);
+    }
+
+    /// The restore path normalizes the payload's name rows to the map's
+    /// sorted invariant (#1778): a payload whose rows arrive in arbitrary
+    /// order (a foreign-produced or hand-edited payload) decodes to the
+    /// identical model — row order, hashed face, and map equality — so the
+    /// restored side never carries the payload's accident of order.
+    #[test]
+    fn restore_normalizes_shuffled_name_rows() {
+        let strings = StringTable::new();
+        let name = |text: &str| strings.intern(text);
+        let member = || MemberEntry {
+            kind: MemberKind::Method,
+            is_static: false,
+            is_abstract: false,
+            is_external: false,
+            is_final: false,
+            type_params: 0,
+            type_param_names: Box::new([]),
+            var_ty: Ty::Unknown,
+            return_ty: Ty::Void,
+            formals: Some(Box::new(Formals {
+                positional: Box::new([]),
+                named: Box::new([]),
+            })),
+            annotations: Box::default(),
+            name_range: MemberEntry::MISSING_NAME_RANGE,
+        };
+        let mut elements = FileElements::default();
+        elements.decls = [
+            (name("zeta"), TopDecl::bare(MicroKind::TopLevelFn)),
+            (name("alpha"), TopDecl::bare(MicroKind::TopLevelVar)),
+        ]
+        .into_iter()
+        .collect();
+        elements.containers = [(
+            name("C"),
+            Container {
+                kind: ContainerKind::Class,
+                is_abstract: false,
+                is_base: false,
+                is_final: false,
+                is_interface: false,
+                is_mixin_class: false,
+                superclass: None,
+                members: [(name("b"), member()), (name("a"), member())]
+                    .into_iter()
+                    .collect(),
+                type_params: 0,
+                sealed: false,
+                with_clause: Vec::new(),
+                implements_clause: Vec::new(),
+                on_clause: Vec::new(),
+                header_residue: Vec::new(),
+                primary_formals: Box::new([]),
+                enum_constants: Vec::new(),
+                constructors: Box::new([]),
+                has_unnamed_constructor: true,
+                ctor_formals: [(
+                    name("C"),
+                    Box::new(Formals {
+                        positional: Box::new([]),
+                        named: Box::new([]),
+                    }),
+                )]
+                .into_iter()
+                .collect(),
+                annotations: Box::new([]),
+            },
+        )]
+        .into_iter()
+        .collect();
+        elements.container_order.push(name("C"));
+
+        // The payload's name rows deliberately leave in the opposite of the
+        // map's order: restore must normalize, not preserve.
+        let mut payload = PersistedElements::of(&elements, &strings);
+        payload.decls.reverse();
+        payload.containers[0].1.members.reverse();
+        payload.containers[0].1.ctor_formals.reverse();
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let decoded: PersistedElements = serde_json::from_slice(&bytes).expect("deserialize");
+        let restored = decoded.into_elements(&strings);
+
+        assert_eq!(restored.decls, elements.decls, "decl rows normalize sorted");
+        let restored_c = restored.container(name("C")).expect("container C");
+        let member_ids: Vec<StringId> = restored_c.members.iter().map(|(key, _)| *key).collect();
+        let mut sorted = member_ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(member_ids, sorted, "member rows iterate ascending by id");
+        assert_eq!(
+            restored.api_signature(&strings),
+            elements.api_signature(&strings),
+            "the hashed element face is payload-order free"
         );
     }
 }

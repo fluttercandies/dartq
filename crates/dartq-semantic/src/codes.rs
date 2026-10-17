@@ -20,10 +20,11 @@
 //! * `wrong_number_of_parameters_for_setter` is a *syntactic* row
 //!   (`diagnostic.g.dart:18561-18571`, `SYNTACTIC_ERROR` at :18568; fired
 //!   from `pkg/analyzer/lib/src/fasta/ast_builder.dart:6477,6510` in the
-//!   oracle): the trigger lives
-//!   in the parser there, and dartq's parser does not emit it yet — the
-//!   semantic layer owns the check until the parser lands it (remove this
-//!   site then, or the code double-reports);
+//!   oracle): the trigger lives in the parser there, and dartq's parser
+//!   now mirrors it at the setter name — the registry row survives for the
+//!   persisted-model round-trip rendering, and the collector-side capture
+//!   entry is retired (a log row would double the parse row in the merged
+//!   report);
 //! * `invalid_null_aware_operator` is the frozen set's only `STATIC_WARNING`
 //!   (`diagnostic.g.dart`).
 //!
@@ -61,11 +62,11 @@
 //! diagnostic model consumes.
 //!
 //! Frozen gate rows this table deliberately does not carry (each
-//! under-reports, never false-positives; see the [`crate::diagnose`] module
+//! under-reports, never false-positives; see the [`mod@crate::diagnose`] module
 //! docs): `undefined_referenced_parameter` (`@UseResult(unless:)`-specific
 //! check, `annotation_verifier.dart:519-541`) and `undefined_hidden_name` /
 //! `undefined_shown_name` (`STATIC_WARNING` tier; the parser consumes
-//! directives diet-style and resolution's [`Combinators`] exposes no clause
+//! directives diet-style and resolution's [`dartq_resolution::Combinators`] exposes no clause
 //! enumeration — both arrive with the directive milestone). The
 //! constructor-selector rows (`undefined_constructor_in_initializer` /
 //! `undefined_enum_constructor`) joined in #350 with the constructor-name
@@ -74,12 +75,12 @@
 //! row and #350 added its emit site (the function-type display renders from
 //! the captured member signature). Every other frozen gate
 //! row is carried: the `wrong_number_of_type_arguments*` family (including
-//! `_element`, with emit sites in [`crate::diagnose`]) and
+//! `_element`, with emit sites in [`mod@crate::diagnose`]) and
 //! `wrong_number_of_parameters_for_operator` are implemented above, and
 //! `uri_does_not_exist` lives in the M0 official registry
 //! (`dartq-diagnostics`), emitted by the resolution layer.
 
-use dartq_diagnostics::{CodeInfo, DiagnosticType, Severity};
+use dartq_diagnostics::{CodeInfo, DiagnosticType, Severity, message_template};
 
 /// One implemented frozen semantic code: its official descriptor and the
 /// verbatim oracle message, parameterized at the emit site.
@@ -92,7 +93,7 @@ pub enum SemanticCode {
     /// false positive.
     DuplicateDefinition,
     /// `Undefined name '{0}' used as an annotation.` — the emit site is
-    /// [`crate::diagnose`]'s annotation check (a fully missing
+    /// [`mod@crate::diagnose`]'s annotation check (a fully missing
     /// `MetadataReference` name), and upstream removed the
     /// diagnostic in 3.14 (`removedIn: "3.14"` — absent from the pinned
     /// 3.15-main registry, only `messages.yaml` retains the text). The row
@@ -139,6 +140,12 @@ pub enum SemanticCode {
     /// `The name '{0}' is being referenced through the prefix '{1}', but it
     /// isn't defined in any of the libraries imported using that prefix.`
     UndefinedPrefixedName,
+    /// `The prefix '{0}' can't be used here because it's shadowed by a
+    /// local declaration.` — a prefixed type whose head names a local
+    /// scope element (`prefixShadowedByLocalDeclaration`, the
+    /// importPrefix gate's fall-through,
+    /// named_type_resolver.dart:117/:188).
+    PrefixShadowedByLocalDeclaration,
     /// `The setter '{0}' isn't defined for the type '{1}'.`
     UndefinedSetter,
     /// `UNDEFINED_SUPER_MEMBER`: one code name with a per-member-shape message
@@ -195,12 +202,24 @@ pub enum SemanticCode {
     /// `enumInstantiatedToBoundsIsNotWellBounded`, diagnostic.g.dart
     /// :4910-4919).
     EnumInstantiatedToBoundsIsNotWellBounded,
+    /// `The enum must have at least one enum constant.` — a non-augmentation
+    /// enum declaration whose element list is empty
+    /// (`enumWithoutConstants`, diagnostic.g.dart:4966-4974; the emit site
+    /// is `error_verifier.dart`'s enum-declaration check, which reports at
+    /// `node.namePart.typeName` when `!isAugmentation && constants.isEmpty`).
+    EnumWithoutConstants,
     /// `A value of type '{0}' can't be assigned to a variable of type '{1}'.`
     InvalidAssignment,
     /// `The argument type '{0}' can't be assigned to the parameter type
     /// '{1}'. {2}` — `{2}` is the record-shape appendix, empty at M1
     /// (records are M2), rendered as the template does.
     ArgumentTypeNotAssignable,
+    /// `The type of the argument to the extension override '{0}' isn't
+    /// assignable to the extended type '{1}'.` — the explicit extension
+    /// override's receiver check (`extension_override_argument_not_assignable`,
+    /// diagnostic.g.dart:5758-5768; emitted at the whole receiver expression,
+    /// `extension_member_resolver.dart:290-313`).
+    ExtensionOverrideArgumentNotAssignable,
     /// `A value of type '{0}' can't be returned from the {host} '{2}'
     /// because it has a return type of '{1}'.` — one analyzerCode with a
     /// per-host message (`uniqueName` `..._FROM_FUNCTION`/`_FROM_METHOD`).
@@ -238,6 +257,10 @@ pub enum SemanticCode {
     /// an argument of a const creation / enum constant (the
     /// `_validateConstantArguments` site default, `constant_verifier.dart:843`).
     ConstWithNonConstantArgument,
+    /// `The constructor being called isn't a const constructor.` — a
+    /// `const`-prefixed creation whose resolved constructor declares no
+    /// `const` (`error_verifier.dart` `_checkForConstWithNonConst`).
+    ConstWithNonConst,
     /// `The values in a const list literal must be constants.`
     NonConstantListElement,
     /// `The values in a const set literal must be constants.`
@@ -246,6 +269,18 @@ pub enum SemanticCode {
     NonConstantMapElement,
     /// `The fields in a const record literal must be constants.`
     NonConstantRecordField,
+    /// `The expression of a constant pattern must be a valid constant.` —
+    /// a `ConstantPattern` node's expression that fails const-evaluation
+    /// (`constantPatternWithNonConstantExpression`, diagnostic.g.dart
+    /// :2528-2538; `visitConstantPattern`'s `_evaluateAndReportError`
+    /// default, constant_verifier.dart:128-142).
+    ConstantPatternWithNonConstantExpression,
+    /// `Case expressions must be constant.` — a legacy (`< 3.0`, patterns
+    /// disabled) switch-statement `case e:` whose expression fails
+    /// const-evaluation (`nonConstantCaseExpression`, diagnostic.g.dart
+    /// :12650-12658; `CaseExpression`'s constant requirement,
+    /// constant_verifier.dart's switch-case visit).
+    NonConstantCaseExpression,
     /// `In constant expressions, operands of this operator must be of type
     /// 'bool'.`
     ConstEvalTypeBool,
@@ -267,6 +302,14 @@ pub enum SemanticCode {
     /// `In constant expressions, operands of this operator must be of type
     /// 'String'.`
     ConstEvalTypeString,
+    /// `A nullable expression can't be used as a condition.` — a condition
+    /// operand whose flow-aware static type is `bool?` (the official
+    /// `checkForNonBoolExpression` fallback, upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/error/bool_expression_verifier.dart:45-90`,
+    /// fired per condition operand at every `&&`/`||` node and at the
+    /// if/if-element/while/do-while/C-`for`/assert/conditional condition
+    /// heads).
+    UncheckedUseOfNullableValue,
     /// `Evaluation of this constant expression throws an exception.`
     ConstEvalThrowsException,
     /// `Evaluation of this constant expression throws an
@@ -420,7 +463,7 @@ pub enum SemanticCode {
     //    `unused_local_elements_verifier.dart`) ————————————————————————————
     /// `The value of the local variable '{0}' isn't used.` — a local
     /// variable (pattern-declared included) no read of which resolves to it
-    /// (`_visitLocalVariableElement`, unused_local_elements_verifier.dart:
+    /// (`_visitLocalVariableElement`, `unused_local_elements_verifier.dart`:
     /// 1259-1280). Writes alone and statement-discarded reads do not count;
     /// `_`-wildcard names are exempt.
     UnusedLocalVariable,
@@ -429,11 +472,12 @@ pub enum SemanticCode {
     /// member with no library-level reference (`_visitLocalFunctionElement`
     /// /`_visitTopLevelFunctionElement`/`_visitClassElement`/
     /// `_visitMethodElement`/`_visitPropertyAccessorElement`/
-    /// `_visitConstructorElement`, unused_local_elements_verifier.dart).
+    /// `_visitConstructorElement`, `unused_local_elements_verifier.dart`).
     UnusedElement,
     /// `The value of the field '{0}' isn't used.` — a private field no
-    /// library-level read resolves to (`_visitFieldElement`, unused_local_
-    /// elements_verifier.dart:1240-1247): writes never count, reads do.
+    /// library-level read resolves to (`_visitFieldElement`,
+    /// `unused_local_elements_verifier.dart:1240-1247`): writes never
+    /// count, reads do.
     UnusedField,
     /// `A value for optional parameter '{0}' isn't ever given.` — an
     /// optional parameter of a non-publicly-accessible executable that no
@@ -444,7 +488,7 @@ pub enum SemanticCode {
     // —— #504/#505: the catch-variable rows (same traversal) ————————————————
     /// `The exception variable '{0}' isn't used, so the 'catch' clause can
     /// be removed.` — an `on T catch (e)` exception variable with no stack
-    /// trace sibling and no body reference (unused_local_elements_verifier.
+    /// trace sibling and no body reference (`unused_local_elements_verifier`.
     /// dart:1262-1268; a plain `catch (e)` auto-uses its variable).
     UnusedCatchClause,
     /// `The stack trace variable '{0}' isn't used and can be removed.` — a
@@ -466,7 +510,7 @@ pub enum SemanticCode {
     /// `The value of '{0}' should be used.` — an invocation of a
     /// `@UseResult`/`@useResult` declaration (package:meta) whose value
     /// the enclosing expression discards (`_check` +
-    /// `_isUsed`, use_result_verifier.dart); `{0}` is the element display
+    /// `_isUsed`, `use_result_verifier.dart`); `{0}` is the element display
     /// name — the class name for an unnamed constructor, whose row spans
     /// the whole `A()` invocation. The annotation's reason never renders
     /// (the verifier reads constant field `message`; meta's field is
@@ -495,13 +539,13 @@ pub enum SemanticCode {
     /// clause through the last one.
     DeadCodeCatchFollowingCatch,
     /// `The label '{0}' isn't used.` — a label no `break`/`continue` in its
-    /// label scope targets (`_withLabelTracker`, dead_code_verifier.dart:
+    /// label scope targets (`_withLabelTracker`, `dead_code_verifier.dart`:
     /// 163-176).
     UnusedLabel,
     // —— #506: the provably-check cluster (all `STATIC_WARNING`) ——————————
     /// `Unnecessary cast.` — an `e as T` whose operand type already equals
     /// `T` structurally, with neither side `dynamic` nor the target a bare
-    /// `Function` (`_isUnnecessaryCast`, best_practices_verifier.dart:
+    /// `Function` (`_isUnnecessaryCast`, `best_practices_verifier.dart`:
     /// 1708-1741).
     UnnecessaryCast,
     /// `The '!' will have no effect because the receiver can't be null.` —
@@ -532,7 +576,7 @@ pub enum SemanticCode {
     NullCheckAlwaysFails,
     /// `The operand can't be 'null', so the condition is always 'false'.` —
     /// an `e == null` whose operand is provably never null
-    /// (`_checkForInvariantNullComparison`, best_practices_verifier.dart:
+    /// (`_checkForInvariantNullComparison`, `best_practices_verifier.dart`:
     /// 1216-1281); one registry code across the operator pair, unique
     /// names `unnecessary_null_comparison_never_null_false/true`.
     UnnecessaryNullComparisonFalse,
@@ -543,7 +587,7 @@ pub enum SemanticCode {
     //    `STATIC_WARNING`) ————————————————————————————————————————————————
     /// `The matched value type '{0}' can never be equal to this constant of
     /// type '{1}'.` — a constant pattern whose type the matched value's
-    /// type provably never equals (`_canBeEqual`, constant_verifier.dart:
+    /// type provably never equals (`_canBeEqual`, `constant_verifier.dart`:
     /// 561-596, fired from `visitConstantPattern` :140-165).
     ConstantPatternNeverMatchesValueType,
     /// `The matched value type '{0}' can never match the required type
@@ -557,7 +601,7 @@ pub enum SemanticCode {
     UnnecessaryCastPattern,
     /// `The null-check pattern will have no effect because the matched type
     /// isn't nullable.` — a `p?` over a non-nullable matched type
-    /// (`matchedTypeIsStrictlyNonNullable`, shared_type_analyzer.dart:
+    /// (`matchedTypeIsStrictlyNonNullable`, `shared_type_analyzer.dart`:
     /// 134-139).
     UnnecessaryNullCheckPattern,
     /// `The null-assert pattern will have no effect because the matched
@@ -652,8 +696,8 @@ pub enum SemanticCode {
     /// `A potentially nullable type can't be used in an 'on' clause because
     /// it isn't valid to throw a nullable expression.` — an `on T?` (or
     /// `on dynamic`) catch clause (`_checkForNullableTypeInCatchClause`,
-    /// best_practices_verifier.dart:1377-1391; `isPotentiallyNullable` =
-    /// `!isNonNullable`, type_system.dart:1260).
+    /// `best_practices_verifier.dart`:1377-1391; `isPotentiallyNullable` =
+    /// `!isNonNullable`, `type_system.dart`:1260).
     NullableTypeInCatchClause,
     /// `A double can't equal 'double.nan', so the condition is always
     /// 'false'.` — an `==` comparison against `double.nan`
@@ -772,6 +816,266 @@ pub enum SemanticCode {
     /// exempt, as is every public name — `_isReadMember`'s public-instance
     /// arm answers used). `diagnostic.g.dart` :18040-18055.
     UnusedFieldFromPrimaryConstructor,
+    // —— #1285: the call-site argument-count cluster (all
+    //    `COMPILE_TIME_ERROR`) ————————————————————————————————————————————
+    /// `Too many positional arguments: {0} expected, but {1} found.` — a
+    /// resolved callee applied more positional arguments than it declares
+    /// (`{0}` = the positional capacity, required + optional;
+    /// `{1}` = the positional arguments given), reported at the first
+    /// surplus positional argument (`TypeAnalyzerImpl.
+    /// resolveArgumentsToParameters`, upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/resolver/type_analyzer.dart`; registry row
+    /// `extra_positional_arguments`, `diagnostic.g.dart` :6295-6310).
+    /// Unresolved callees and constructor lists never reach the check.
+    ExtraPositionalArguments,
+    /// The same verdict when the callee declares named parameters beyond the
+    /// distinct named arguments the call already gives (`namedParameterCount
+    /// > namedArgumentCount` — the surplus positionals could have been
+    /// passed by name). One registry name per verdict text; the
+    /// `correctionMessage` splits the pair.
+    /// `diagnostic.g.dart` :6312-6327.
+    ExtraPositionalArgumentsCouldBeNamed,
+    /// `{0} positional arguments expected, but {1} found.` — a resolved
+    /// callee received fewer positional arguments than it requires, reported
+    /// after the last positional argument (`_reportNotEnoughPositionalArguments`,
+    /// same function; the message arity is constant there, the face here).
+    /// One registry name across the four faces (the `sharedName` split,
+    /// `uniqueName` `..._singular` / `..._plural` / `..._name_singular` /
+    /// `..._name_plural`, `diagnostic.g.dart` :13438-13492): the face is the
+    /// callee-name availability (unqualified invocations name the callee;
+    /// qualified member and prefixed shapes stay nameless) crossed with the
+    /// required count's plurality.
+    NotEnoughPositionalArguments(ArgCountShape),
+    // —— #1314 FAM7: the optional-parameter default-value cluster (all
+    //    `COMPILE_TIME_ERROR`) ————————————————————————————————————————————
+    /// `The parameter '{0}' can't have a value of 'null' because of its
+    /// type, but the implicit default value is 'null'.` — an optional named
+    /// parameter without a default whose written type is potentially
+    /// non-nullable (`_checkUseOfDefaultValuesInParameters`,
+    /// error_verifier.dart:8327-8419, the named face via
+    /// `missingDefaultValueForParameter`; reported at the parameter's name
+    /// token). The written-type decision mirrors the oracle's
+    /// `isPotentiallyNonNullable` over the annotation the M1 model keeps:
+    /// a bare written type is potentially non-nullable, `dynamic`/`void`
+    /// and `?`-suffixed ones are not, and an in-scope type parameter's head
+    /// suppresses (its resolved nullability rests on the bound the
+    /// name-level model does not keep).
+    MissingDefaultValueForParameter,
+    /// The positional-optional face of the same analyzerCode
+    /// (`missingDefaultValueForParameterPositional`, `sharedName`
+    /// `missingDefaultValueForParameter`, messages.yaml :11434-11440): the
+    /// problem text is identical, the correctionMessage drops the
+    /// `'required'` arm.
+    MissingDefaultValueForParameterPositional,
+    /// `Using a colon as the separator before a default value is no longer
+    /// supported.` — an optional named parameter's `:`-separated default
+    /// value, reported at the colon (`_checkForColonDefaultValue`,
+    /// best_practices_verifier.dart:1065-1082, the language-version ≥ 3.0
+    /// arm; every formal-parameter shape visits it ungated by the owning
+    /// executable).
+    ObsoleteColonForDefaultValue,
+    // —— #1314 FAM13: the type-position context faces (all
+    //    `COMPILE_TIME_ERROR`) ————————————————————————————————————————————
+    /// `The name '{0}' isn't a type, so it can't be used as a type
+    /// argument.` — an unresolved simple name in a type-argument list
+    /// reports this context face instead of `undefined_class` (the
+    /// resolver's context chain, named_type_resolver.dart:720-770: catch
+    /// clause, `as` operand, `is` operand, then the type-argument list —
+    /// the first matching context reports and returns).
+    NonTypeAsTypeArgument,
+    /// `The name '{0}' isn't a class.` — an unresolved simple name heading
+    /// an instance creation reports this context face instead of
+    /// `undefined_class` (`newWithNonType`/`constWithNonType`, the
+    /// `creation_with_non_type` sharedName, messages.yaml :4587-4599).
+    CreationWithNonType,
+    /// `Couldn't infer type parameter '{0}'.{1}` — generic inference left a
+    /// type parameter unsolved or solved it to a type violating the
+    /// invocation's context (`couldNotInfer`, diagnostic.g.dart :3478-3485;
+    /// the generic inferrer's failure report, generic_inferrer.dart). `{1}`
+    /// carries the structured reason text.
+    CouldNotInfer,
+    /// `The name '{0}' isn't a type and can't be used in an on-catch
+    /// clause.` — an unresolved catch `on`-clause exception type reports
+    /// this face instead of `undefined_class` (`nonTypeInCatchClause`,
+    /// messages.yaml :13748-13753; the F-P recovered-clause rows route
+    /// here per the differential).
+    NonTypeInCatchClause,
+    // —— #1314 FAM14: the class-clause context faces (all
+    //    `COMPILE_TIME_ERROR`, diagnostic.g.dart :7504/:11541/:11705/:11730)
+    //    ————————————————————————————————————————————————————————————————————
+    /// `Classes can only mix in mixins and classes.` — an unresolved or
+    /// non-class name in a `with` clause reports this context face
+    /// (scope_analyzer.dart `_resolveType`, the `WithClause` arm).
+    MixinOfNonClass,
+    /// `Classes and mixins can only implement other classes and mixins.`
+    /// — the `implements` clause counterpart (the `ImplementsClause` arm).
+    ImplementsNonClass,
+    /// `Only classes and mixins can be used as superclass constraints.`
+    /// — the mixin `on` clause counterpart (the `MixinOnClause` arm); the
+    /// oracle keeps the resolver's `undefined_class` alongside it for an
+    /// unresolved constraint name.
+    MixinSuperClassConstraintNonInterface,
+    /// `Mixin can only be applied to class.` — a named mixin application's
+    /// superclass face (the `ClassTypeAlias` and extends-with-`with` arms).
+    MixinWithNonClassSuperclass,
+    /// `Classes can only extend other classes.` — the `extends` clause
+    /// counterpart (the `ExtendsClause` arm of the same clause switch); the
+    /// recovered extends-after-implements tail reports its unresolvable
+    /// heads here.
+    ExtendsNonClass,
+    // —— #1314 FAM18: the uninitialized-non-nullable faces (both
+    //    `COMPILE_TIME_ERROR`, diagnostic.g.dart :13503/:13540) ——————————
+    /// `The non-nullable variable '{0}' must be initialized.` — a
+    /// non-nullable typed, non-final, non-late, non-const variable without
+    /// an initializer (top-level variables, static fields).
+    NotInitializedNonNullableVariable,
+    /// `Non-nullable instance field '{0}' must be initialized.` — the
+    /// instance-field counterpart; the declaring container has no
+    /// generative constructor (one would own the
+    /// `ConstructorFieldsVerifier` face).
+    NotInitializedNonNullableInstanceField,
+    /// `The implicitly invoked unnamed constructor from '{0}' has required
+    /// parameters.` — a generative constructor with no explicit
+    /// super initializer whose superclass's unnamed constructor declares
+    /// required parameters (`implicit_super_initializer_missing_arguments`,
+    /// diagnostic.g.dart:9734).
+    ImplicitSuperInitializerMissingArguments,
+    /// `Enums can only declare final fields.` — a non-final instance field
+    /// in an enum body (`non_final_field_in_enum`,
+    /// diagnostic.g.dart:12821).
+    NonFinalFieldInEnum,
+    // —— the constructor-initializer faces (all `COMPILE_TIME_ERROR`) ————
+    /// `The initializer type '{0}' can't be assigned to the field type
+    /// '{1}'.` — a constructor-initializer list owns its assignability
+    /// question (`field_initializer_not_assignable`,
+    /// diagnostic.g.dart:6615; the const-constructor variant shares the
+    /// code name with the `... in a const constructor.` message suffix and
+    /// its own uniqueName — the emit site picks the constness).
+    FieldInitializerNotAssignable,
+    /// `'{0}' isn't a field in the enclosing class.` — a
+    /// `ConstructorFieldInitializer` whose name misses the field set, or
+    /// resolves to a getter/setter
+    /// (`initializer_for_non_existent_field`, diagnostic.g.dart:8208;
+    /// error_verifier.dart `_checkForInvalidField`).
+    InitializerForNonExistentField,
+    /// `'{0}' isn't a field in the enclosing class.` — an initializing
+    /// formal (`this.name`) whose name is not a field of the immediately
+    /// enclosing class — an inherited field does not count, a getter/
+    /// setter-only name counts as missing
+    /// (`initializing_formal_for_non_existent_field`,
+    /// diagnostic.g.dart:8259; error_verifier.dart `_checkForValidField`).
+    InitializingFormalForNonExistentField,
+    /// `No associated named super constructor parameter.` — a `super.name`
+    /// formal in the named section whose superclass's unnamed constructor
+    /// declares no matching named parameter
+    /// (`super_formal_parameter_without_associated_named`,
+    /// diagnostic.g.dart:15971; error_verifier.dart
+    /// `_checkForValidSuperFormalParameter`).
+    SuperFormalParameterWithoutAssociatedNamed,
+    /// `No associated positional super constructor parameter.` — a
+    /// `super.name` formal whose superclass's unnamed constructor has no
+    /// positional parameter at this formal's own positional index
+    /// (`super_formal_parameter_without_associated_positional`,
+    /// diagnostic.g.dart:15985; error_verifier.dart
+    /// `_checkForValidSuperFormalParameter`).
+    SuperFormalParameterWithoutAssociatedPositional,
+    /// `Constructors can't redirect to themselves either directly or
+    /// indirectly.` — a generative constructor's
+    /// `RedirectingConstructorInvocation` participates in a redirect cycle
+    /// (`recursive_constructor_redirect`, diagnostic.g.dart:14638;
+    /// error_verifier.dart `_checkForRecursiveConstructorRedirect`).
+    RecursiveConstructorRedirect,
+    // —— the final-field faces (both `COMPILE_TIME_ERROR`) ———————————————
+    /// `The final variable '{0}' must be initialized.` — a non-late `final`
+    /// declaration without an initializer in the declaration walk
+    /// (`final_not_initialized`, diagnostic.g.dart:6856; the instance-field
+    /// no-constructor arm and the static/top-level arm — the top-level
+    /// spelling stays parser-owned, `final_not_initialized`'s shared CFE
+    /// face).
+    FinalNotInitialized,
+    /// `All final variables must be initialized, but '{0}' isn't.` — the
+    /// `ConstructorFieldsVerifier` face, one row per generative constructor
+    /// over the sorted uninitialized-final name list
+    /// (`final_not_initialized_constructor`, diagnostic.g.dart:6872; the
+    /// two- and three-plus-name variants share the code name with their own
+    /// message texts, picked by the name count).
+    FinalNotInitializedConstructor,
+    // —— the ST-sweep wave faces (all `COMPILE_TIME_ERROR`) ——————————————————
+    /// `Class '{0}' can't define static member '{1}' and have instance
+    /// member '{0}.{1}' with the same name.` — one row per static member
+    /// whose base name collides with an instance member of the same
+    /// container (`conflicting_static_and_instance`,
+    /// member_duplicate_definition_verifier.dart:195-230/:430-470; emitted
+    /// at the static member's name, `values` exempt).
+    ConflictingStaticAndInstance,
+    /// `Only static fields can be declared as const.` — an instance field
+    /// group carrying `const` (`const_instance_field`,
+    /// error_verifier.dart:1260-1268, one row per group at the `const`
+    /// keyword).
+    ConstInstanceField,
+    /// `The return type of the setter must be 'void' or absent.` — a
+    /// written setter return-type annotation that is not `void`
+    /// (`non_void_return_for_setter`, error_verifier.dart:7015-7025, at the
+    /// written annotation).
+    NonVoidReturnForSetter,
+    /// `'{0}' isn't a type.` — a name in type position resolving to a
+    /// non-type element (`not_a_type`, named_type_resolver.dart:199/:596,
+    /// the plain resolver path; local variables and local functions route
+    /// to `referenced_before_declaration` instead and stay out of scope
+    /// here).
+    NotAType,
+    /// `Conditions must have a static type of 'bool'.` — an `if`, `while`,
+    /// or `for` condition whose static type is known and not `bool`
+    /// (`non_bool_condition`, error_verifier.dart:5655/:5687/:5733 via
+    /// `checkCollection`/`_checkForUseOfVoidResult` neighbors).
+    NonBoolCondition,
+    /// `A negation operand must have a static type of 'bool'.` — the `!`
+    /// prefix operator's operand type is known and not `bool`
+    /// (`non_bool_negation_expression`, error_verifier.dart:6374-6386,
+    /// anchored from the operator's end to the operand's end).
+    NonBoolNegationExpression,
+    /// `An expression whose value is always 'null' can't be dereferenced.`
+    /// — an invocation whose callee expression statically evaluates to
+    /// `null` (`invalid_use_of_null_value`,
+    /// function_expression_invocation_resolver.dart:142-144, the null
+    /// receiver face of the needs-getter error).
+    InvalidUseOfNullValue,
+    /// `The expression doesn't evaluate to a function, so it can't be
+    /// invoked.` — an invocation whose callee expression has a known
+    /// non-function, non-callable static type
+    /// (`invocation_of_non_function_expression`,
+    /// function_expression_invocation_resolver.dart:137-140, at the callee
+    /// expression).
+    InvocationOfNonFunctionExpression,
+    /// `Invalid reference to 'this' expression.` — `this` outside an
+    /// instance member of a class-family container (`invalid_reference_to_this`,
+    /// type_analyzer.dart:4608 `isThisAccessible` via
+    /// element_resolver.dart:357-374).
+    InvalidReferenceToThis,
+    /// `Invalid context for 'super' invocation.` — `super` outside an
+    /// instance context of a class-family container
+    /// (`super_in_invalid_context`, element_resolver.dart:365 with the
+    /// `SuperContext` classification, super_context.dart).
+    SuperInInvalidContext,
+}
+
+/// The message face of [`SemanticCode::NotEnoughPositionalArguments`]: the
+/// oracle picks the singular/plural text by the required count and the
+/// name/no-name text by the invocation node's shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ArgCountShape {
+    /// `1 positional argument expected, but 0 found.` — one required
+    /// positional, nameless invocation shape.
+    Singular,
+    /// `{0} positional arguments expected, but {1} found.` — two or more
+    /// required positionals, nameless invocation shape.
+    Plural,
+    /// `1 positional argument expected by '{0}', but 0 found.` — one
+    /// required positional, unqualified invocation (`{0}` = the callee).
+    NameSingular,
+    /// `{0} positional arguments expected by '{2}', but {1} found.` — two or
+    /// more required positionals, unqualified invocation.
+    NamePlural,
 }
 
 /// The executable-kind word the per-host oracle templates pick: the return
@@ -783,6 +1087,12 @@ pub enum ExecKind {
     Function,
     /// `method`.
     Method,
+    /// `constructor` — the factory/constructor return-check host
+    /// (`returnOfInvalidTypeFromConstructor`, upstream Dart SDK source,
+    /// pkg/analyzer/messages.yaml:16809-16819). The element face of
+    /// [`SemanticCode::WrongNumberOfTypeArgumentsElement`] has no
+    /// constructor row and never receives it.
+    Constructor,
 }
 
 impl ExecKind {
@@ -792,6 +1102,7 @@ impl ExecKind {
         match self {
             Self::Function => "function",
             Self::Method => "method",
+            Self::Constructor => "constructor",
         }
     }
 }
@@ -810,10 +1121,28 @@ pub enum SuperShape {
     Setter,
 }
 
+/// Renders a registry-covered row's message from the dartq-diagnostics table
+/// (the generated `message_template` match — the emission-path single
+/// source). A name absent there is a static-table drift: the exhaustive
+/// `registry_backed_rows_stay_in_sync_with_the_table` test walks every
+/// [`SemanticCode`] variant against the registry and fails the suite loudly,
+/// so the runtime path never sees a drifted name. Invariant: the caller's
+/// name is registry-covered; on drift this degrades to the raw official
+/// name — an under-reported message text, never a panic on the emission
+/// path and never an empty or default text.
+fn registry_message(name: &str) -> String {
+    match message_template(name) {
+        Some(template) => template.to_owned(),
+        // Drift degrade: the loud failure lives in the sync test, not here.
+        None => name.to_owned(),
+    }
+}
+
 impl SemanticCode {
     /// The stable official descriptor: name, machine form, family type, and
     /// the published-docs flag.
     #[must_use]
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     pub fn code_info(self) -> CodeInfo {
         let (name, machine) = match self {
             Self::DuplicateDefinition => ("duplicate_definition", "DUPLICATE_DEFINITION"),
@@ -852,6 +1181,10 @@ impl SemanticCode {
             }
             Self::UndefinedOperator => ("undefined_operator", "UNDEFINED_OPERATOR"),
             Self::UndefinedPrefixedName => ("undefined_prefixed_name", "UNDEFINED_PREFIXED_NAME"),
+            Self::PrefixShadowedByLocalDeclaration => (
+                "prefix_shadowed_by_local_declaration",
+                "PREFIX_SHADOWED_BY_LOCAL_DECLARATION",
+            ),
             Self::UndefinedSetter => ("undefined_setter", "UNDEFINED_SETTER"),
             // The analyzer registry keeps one `analyzerCode` for the whole
             // super-member family; the shape lives in the `uniqueName`.
@@ -897,10 +1230,15 @@ impl SemanticCode {
                 "enum_instantiated_to_bounds_is_not_well_bounded",
                 "ENUM_INSTANTIATED_TO_BOUNDS_IS_NOT_WELL_BOUNDED",
             ),
+            Self::EnumWithoutConstants => ("enum_without_constants", "ENUM_WITHOUT_CONSTANTS"),
             Self::InvalidAssignment => ("invalid_assignment", "INVALID_ASSIGNMENT"),
             Self::ArgumentTypeNotAssignable => (
                 "argument_type_not_assignable",
                 "ARGUMENT_TYPE_NOT_ASSIGNABLE",
+            ),
+            Self::ExtensionOverrideArgumentNotAssignable => (
+                "extension_override_argument_not_assignable",
+                "EXTENSION_OVERRIDE_ARGUMENT_NOT_ASSIGNABLE",
             ),
             Self::ReturnOfInvalidType(_) => ("return_of_invalid_type", "RETURN_OF_INVALID_TYPE"),
             Self::InvalidNullAwareOperator => {
@@ -926,6 +1264,7 @@ impl SemanticCode {
                 "const_with_non_constant_argument",
                 "CONST_WITH_NON_CONSTANT_ARGUMENT",
             ),
+            Self::ConstWithNonConst => ("const_with_non_const", "CONST_WITH_NON_CONST"),
             Self::NonConstantListElement => {
                 ("non_constant_list_element", "NON_CONSTANT_LIST_ELEMENT")
             }
@@ -934,6 +1273,14 @@ impl SemanticCode {
             Self::NonConstantRecordField => {
                 ("non_constant_record_field", "NON_CONSTANT_RECORD_FIELD")
             }
+            Self::NonConstantCaseExpression => (
+                "non_constant_case_expression",
+                "NON_CONSTANT_CASE_EXPRESSION",
+            ),
+            Self::ConstantPatternWithNonConstantExpression => (
+                "constant_pattern_with_non_constant_expression",
+                "CONSTANT_PATTERN_WITH_NON_CONSTANT_EXPRESSION",
+            ),
             Self::ConstEvalTypeBool => ("const_eval_type_bool", "CONST_EVAL_TYPE_BOOL"),
             Self::ConstEvalTypeBoolInt => ("const_eval_type_bool_int", "CONST_EVAL_TYPE_BOOL_INT"),
             Self::ConstEvalTypeBoolNumString => (
@@ -946,6 +1293,10 @@ impl SemanticCode {
                 ("const_eval_type_num_string", "CONST_EVAL_TYPE_NUM_STRING")
             }
             Self::ConstEvalTypeString => ("const_eval_type_string", "CONST_EVAL_TYPE_STRING"),
+            Self::UncheckedUseOfNullableValue => (
+                "unchecked_use_of_nullable_value",
+                "UNCHECKED_USE_OF_NULLABLE_VALUE",
+            ),
             Self::ConstEvalThrowsException => {
                 ("const_eval_throws_exception", "CONST_EVAL_THROWS_EXCEPTION")
             }
@@ -1181,6 +1532,121 @@ impl SemanticCode {
                 "unused_field_from_primary_constructor",
                 "UNUSED_FIELD_FROM_PRIMARY_CONSTRUCTOR",
             ),
+            // The #1285 argument-count cluster: the extra pair keeps one name
+            // per verdict; the not-enough row is one registry name across the
+            // four faces (the `sharedName` split — the face lives in the
+            // message shape).
+            Self::ExtraPositionalArguments => {
+                ("extra_positional_arguments", "EXTRA_POSITIONAL_ARGUMENTS")
+            }
+            Self::ExtraPositionalArgumentsCouldBeNamed => (
+                "extra_positional_arguments_could_be_named",
+                "EXTRA_POSITIONAL_ARGUMENTS_COULD_BE_NAMED",
+            ),
+            Self::NotEnoughPositionalArguments(_) => (
+                "not_enough_positional_arguments",
+                "NOT_ENOUGH_POSITIONAL_ARGUMENTS",
+            ),
+            // The #1314 FAM7 cluster: the positional face shares the named
+            // one's registry name (the `sharedName` split, messages.yaml
+            // :11379/:11434).
+            Self::MissingDefaultValueForParameter
+            | Self::MissingDefaultValueForParameterPositional => (
+                "missing_default_value_for_parameter",
+                "MISSING_DEFAULT_VALUE_FOR_PARAMETER",
+            ),
+            Self::ObsoleteColonForDefaultValue => (
+                "obsolete_colon_for_default_value",
+                "OBSOLETE_COLON_FOR_DEFAULT_VALUE",
+            ),
+            // The #1314 FAM13 type-position context faces.
+            Self::NonTypeAsTypeArgument => {
+                ("non_type_as_type_argument", "NON_TYPE_AS_TYPE_ARGUMENT")
+            }
+            Self::CreationWithNonType => ("creation_with_non_type", "CREATION_WITH_NON_TYPE"),
+            Self::CouldNotInfer => ("could_not_infer", "COULD_NOT_INFER"),
+            Self::NonTypeInCatchClause => ("non_type_in_catch_clause", "NON_TYPE_IN_CATCH_CLAUSE"),
+            // The #1314 FAM14 class-clause context faces.
+            Self::MixinOfNonClass => ("mixin_of_non_class", "MIXIN_OF_NON_CLASS"),
+            Self::ImplementsNonClass => ("implements_non_class", "IMPLEMENTS_NON_CLASS"),
+            Self::MixinSuperClassConstraintNonInterface => (
+                "mixin_super_class_constraint_non_interface",
+                "MIXIN_SUPER_CLASS_CONSTRAINT_NON_INTERFACE",
+            ),
+            Self::MixinWithNonClassSuperclass => (
+                "mixin_with_non_class_superclass",
+                "MIXIN_WITH_NON_CLASS_SUPERCLASS",
+            ),
+            Self::ExtendsNonClass => ("extends_non_class", "EXTENDS_NON_CLASS"),
+            // The #1314 FAM18 uninitialized-non-nullable faces.
+            Self::NotInitializedNonNullableVariable => (
+                "not_initialized_non_nullable_variable",
+                "NOT_INITIALIZED_NON_NULLABLE_VARIABLE",
+            ),
+            Self::NotInitializedNonNullableInstanceField => (
+                "not_initialized_non_nullable_instance_field",
+                "NOT_INITIALIZED_NON_NULLABLE_INSTANCE_FIELD",
+            ),
+            Self::ImplicitSuperInitializerMissingArguments => (
+                "implicit_super_initializer_missing_arguments",
+                "IMPLICIT_SUPER_INITIALIZER_MISSING_ARGUMENTS",
+            ),
+            Self::NonFinalFieldInEnum => ("non_final_field_in_enum", "NON_FINAL_FIELD_IN_ENUM"),
+            // The constructor-initializer and final-field faces.
+            Self::FieldInitializerNotAssignable => (
+                "field_initializer_not_assignable",
+                "FIELD_INITIALIZER_NOT_ASSIGNABLE",
+            ),
+            Self::InitializerForNonExistentField => (
+                "initializer_for_non_existent_field",
+                "INITIALIZER_FOR_NON_EXISTENT_FIELD",
+            ),
+            Self::InitializingFormalForNonExistentField => (
+                "initializing_formal_for_non_existent_field",
+                "INITIALIZING_FORMAL_FOR_NON_EXISTENT_FIELD",
+            ),
+            Self::SuperFormalParameterWithoutAssociatedNamed => (
+                "super_formal_parameter_without_associated_named",
+                "SUPER_FORMAL_PARAMETER_WITHOUT_ASSOCIATED_NAMED",
+            ),
+            Self::SuperFormalParameterWithoutAssociatedPositional => (
+                "super_formal_parameter_without_associated_positional",
+                "SUPER_FORMAL_PARAMETER_WITHOUT_ASSOCIATED_POSITIONAL",
+            ),
+            Self::RecursiveConstructorRedirect => (
+                "recursive_constructor_redirect",
+                "RECURSIVE_CONSTRUCTOR_REDIRECT",
+            ),
+            Self::FinalNotInitialized => ("final_not_initialized", "FINAL_NOT_INITIALIZED"),
+            Self::ConflictingStaticAndInstance => (
+                "conflicting_static_and_instance",
+                "CONFLICTING_STATIC_AND_INSTANCE",
+            ),
+            Self::ConstInstanceField => ("const_instance_field", "CONST_INSTANCE_FIELD"),
+            Self::NonVoidReturnForSetter => {
+                ("non_void_return_for_setter", "NON_VOID_RETURN_FOR_SETTER")
+            }
+            Self::NotAType => ("not_a_type", "NOT_A_TYPE"),
+            Self::NonBoolCondition => ("non_bool_condition", "NON_BOOL_CONDITION"),
+            Self::NonBoolNegationExpression => (
+                "non_bool_negation_expression",
+                "NON_BOOL_NEGATION_EXPRESSION",
+            ),
+            Self::InvalidUseOfNullValue => {
+                ("invalid_use_of_null_value", "INVALID_USE_OF_NULL_VALUE")
+            }
+            Self::InvocationOfNonFunctionExpression => (
+                "invocation_of_non_function_expression",
+                "INVOCATION_OF_NON_FUNCTION_EXPRESSION",
+            ),
+            Self::InvalidReferenceToThis => {
+                ("invalid_reference_to_this", "INVALID_REFERENCE_TO_THIS")
+            }
+            Self::SuperInInvalidContext => ("super_in_invalid_context", "SUPER_IN_INVALID_CONTEXT"),
+            Self::FinalNotInitializedConstructor => (
+                "final_not_initialized_constructor",
+                "FINAL_NOT_INITIALIZED_CONSTRUCTOR",
+            ),
         };
         let dtype = self.dtype();
         // Unpublished rows: the function variant is the only wrong-number
@@ -1209,6 +1675,9 @@ impl SemanticCode {
                 // (diagnostic.g.dart:14548-14559; the W2a cast row does —
                 // :1849).
                 | Self::ReceiverOfTypeNever
+                // `enumWithoutConstants` carries no published docs
+                // (diagnostic.g.dart:4966-4974 — no `hasPublishedDocs` flag).
+                | Self::EnumWithoutConstants
         );
         CodeInfo::new(name, machine, dtype, published)
     }
@@ -1330,6 +1799,8 @@ impl SemanticCode {
 
     /// The verbatim oracle `problemMessage` with placeholders filled.
     #[must_use]
+    #[expect(clippy::match_same_arms)] // rows follow the official code listing; bodies coincide by arity
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     pub fn message(self, a0: &str, a1: &str) -> String {
         match self {
             Self::DuplicateDefinition => format!("The name '{a0}' is already defined."),
@@ -1457,12 +1928,25 @@ impl SemanticCode {
                 format!("Undefined name '{a0}' used as an annotation.")
             }
             Self::UndefinedClass => format!("Undefined class '{a0}'."),
+            Self::PrefixShadowedByLocalDeclaration => {
+                format!("The prefix '{a0}' can't be used here because it's shadowed by a local declaration.")
+            }
             Self::UndefinedConstructorInInitializer => {
                 format!("The class '{a0}' doesn't have a constructor named '{a1}'.")
             }
-            Self::UndefinedEnumConstructor => {
-                format!("The enum doesn't have a constructor named '{a0}'.")
-            }
+            // One code name, two oracle faces (sharedName
+            // `undefinedEnumConstructor`, upstream Dart SDK source,
+            // pkg/analyzer/messages.yaml:18602-18698): the named row and the
+            // parameter-less unnamed row. The unnamed-constructor verdict
+            // The two upstream uniqueNames share this code: the constant's
+            // close flush (no selector written — `a1` marks it) is the
+            // unnamed face; a selector the constant wrote, synthetic or
+            // resolved, is the named face (`name` holds the written
+            // spelling, `''` for a parser-inserted selector).
+            Self::UndefinedEnumConstructor => match a1 {
+                "unnamed" => "The enum doesn't have an unnamed constructor.".to_string(),
+                _ => format!("The enum doesn't have a constructor named '{a0}'."),
+            },
             Self::UndefinedEnumConstant => {
                 format!("There's no constant named '{a0}' in '{a1}'.")
             }
@@ -1515,9 +1999,11 @@ impl SemanticCode {
                     format!("The setter '{a0}' isn't defined in a superclass of '{a1}'.")
                 }
             },
-            // No-argument rows: verbatim texts.
+            // The registry-backed row: rendered from the dartq-diagnostics
+            // table (the emission-path single source); the previous local
+            // literal is pinned in both crates' tests.
             Self::WrongNumberOfParametersForSetter => {
-                "Setters must declare exactly one required positional parameter.".to_string()
+                registry_message("wrong_number_of_parameters_for_setter")
             }
             // The #279 constant-evaluation family: no-argument rows (the
             // pinned registry `diagnostic.g.dart` texts).
@@ -1526,6 +2012,9 @@ impl SemanticCode {
             }
             Self::ConstWithNonConstantArgument => {
                 "Arguments of a constant creation must be constant expressions.".to_string()
+            }
+            Self::ConstWithNonConst => {
+                "The constructor being called isn't a const constructor.".to_string()
             }
             Self::NonConstantListElement => {
                 "The values in a const list literal must be constants.".to_string()
@@ -1538,6 +2027,12 @@ impl SemanticCode {
             }
             Self::NonConstantRecordField => {
                 "The fields in a const record literal must be constants.".to_string()
+            }
+            Self::ConstantPatternWithNonConstantExpression => {
+                "The expression of a constant pattern must be a valid constant.".to_string()
+            }
+            Self::NonConstantCaseExpression => {
+                "Case expressions must be constant.".to_string()
             }
             Self::ConstEvalTypeBool => {
                 "In constant expressions, operands of this operator must be of type 'bool'."
@@ -1566,6 +2061,21 @@ impl SemanticCode {
             Self::ConstEvalTypeString => {
                 "In constant expressions, operands of this operator must be of type 'String'."
                     .to_string()
+            }
+            // The shared code carries per-site problem messages
+            // (messages.yaml, the uncheckedUseOfNullableValue family): the
+            // property-access face takes the member's name
+            // (uncheckedUseOfNullableValueInPropertyAccess), the condition
+            // face renders bare.
+            Self::UncheckedUseOfNullableValue if !a0.is_empty() => {
+                format!("The property '{a0}' can't be unconditionally accessed because the receiver can be 'null'.")
+            }
+            Self::UncheckedUseOfNullableValue => {
+                "A nullable expression can't be used as a condition.".to_string()
+            }
+            // The no-argument enum-shape row (diagnostic.g.dart:4969).
+            Self::EnumWithoutConstants => {
+                "The enum must have at least one enum constant.".to_string()
             }
             Self::ConstEvalThrowsException => {
                 "Evaluation of this constant expression throws an exception.".to_string()
@@ -1608,16 +2118,16 @@ impl SemanticCode {
             }
             Self::InheritsAbstractMemberFour => self.message4(a0, a1, "", ""),
             Self::InheritsAbstractMemberFivePlus => self.message5(a0, a1, "", "", ""),
-            Self::MemberWithClassName => {
-                "A class member can't have the same name as the enclosing class.".to_string()
-            }
-            Self::ExpectedRepresentationType => "Expected a representation type.".to_string(),
+            // Registry-backed rows, same face as the setter row above.
+            Self::MemberWithClassName => registry_message("member_with_class_name"),
+            Self::ExpectedRepresentationType => registry_message("expected_representation_type"),
             // No-argument flow row (diagnostic.g.dart:3546).
             Self::DeadCode => "Dead code.".to_string(),
             Self::WrongNumberOfTypeArgumentsConstructor
             | Self::WrongNumberOfTypeArgumentsEnum
             | Self::InvalidAssignment
             | Self::ArgumentTypeNotAssignable
+            | Self::ExtensionOverrideArgumentNotAssignable
             | Self::ReturnOfInvalidType(_)
             | Self::InvalidNullAwareOperator => self.message3(a0, a1, ""),
             // Three-argument rows route through `message3` — including the
@@ -1737,19 +2247,159 @@ impl SemanticCode {
             Self::NonConstCallToLiteralConstructor => format!(
                 "This instance creation must be 'const', because the {a0} constructor is marked as '@literal'."
             ),
+            // The #1285 argument-count rows: the extra pair shares one
+            // problemMessage (the `correctionMessage` splits the verdict);
+            // the not-enough faces pick their text by shape. The name-plural
+            // face routes through `message3` (real emissions go through
+            // `emit3`).
+            Self::ExtraPositionalArguments | Self::ExtraPositionalArgumentsCouldBeNamed => {
+                format!("Too many positional arguments: {a0} expected, but {a1} found.")
+            }
+            Self::NotEnoughPositionalArguments(ArgCountShape::Singular) => {
+                "1 positional argument expected, but 0 found.".to_string()
+            }
+            Self::NotEnoughPositionalArguments(ArgCountShape::Plural) => {
+                format!("{a0} positional arguments expected, but {a1} found.")
+            }
+            Self::NotEnoughPositionalArguments(ArgCountShape::NameSingular) => {
+                format!("1 positional argument expected by '{a0}', but 0 found.")
+            }
+            Self::NotEnoughPositionalArguments(ArgCountShape::NamePlural) => {
+                self.message3(a0, a1, "")
+            }
+            // The #1314 FAM7 rows: the default-value pair shares one problem
+            // template (messages.yaml :11383/:11439 — the face lives in the
+            // correctionMessage); the colon row carries no arguments.
+            Self::MissingDefaultValueForParameter
+            | Self::MissingDefaultValueForParameterPositional => {
+                format!(
+                    "The parameter '{a0}' can't have a value of 'null' because of its type, but the implicit default value is 'null'."
+                )
+            }
+            Self::ObsoleteColonForDefaultValue => {
+                "Using a colon as the separator before a default value is no longer supported."
+                    .to_string()
+            }
+            // The #1314 FAM13 type-position context faces (messages.yaml
+            // :11455-11458 region and :4592).
+            Self::NonTypeAsTypeArgument => {
+                format!(
+                    "The name '{a0}' isn't a type, so it can't be used as a type argument."
+                )
+            }
+            Self::CreationWithNonType => format!("The name '{a0}' isn't a class."),
+            Self::CouldNotInfer => format!("Couldn't infer type parameter '{a0}'.{a1}"),
+            Self::NonTypeInCatchClause => format!(
+                "The name '{a0}' isn't a type and can't be used in an on-catch clause."
+            ),
+            // The #1314 FAM14 class-clause context faces (fixed text,
+            // diagnostic.g.dart :7506/:11544/:11707/:11731).
+            Self::MixinOfNonClass => "Classes can only mix in mixins and classes.".to_string(),
+            Self::ImplementsNonClass => {
+                "Classes and mixins can only implement other classes and mixins.".to_string()
+            }
+            Self::MixinSuperClassConstraintNonInterface => {
+                "Only classes and mixins can be used as superclass constraints.".to_string()
+            }
+            Self::MixinWithNonClassSuperclass => "Mixin can only be applied to class.".to_string(),
+            Self::ExtendsNonClass => "Classes can only extend other classes.".to_string(),
+            // The #1314 FAM18 uninitialized-non-nullable faces
+            // (diagnostic.g.dart :13505/:13542).
+            Self::NotInitializedNonNullableVariable => {
+                format!("The non-nullable variable '{a0}' must be initialized.")
+            }
+            Self::NotInitializedNonNullableInstanceField => {
+                format!("Non-nullable instance field '{a0}' must be initialized.")
+            }
+            Self::ImplicitSuperInitializerMissingArguments => format!(
+                "The implicitly invoked unnamed constructor from '{a0}' has required parameters."
+            ),
+            Self::NonFinalFieldInEnum => "Enums can only declare final fields.".to_string(),
+            // The constructor-initializer and final-field faces
+            // (diagnostic.g.dart :6622/:8211/:14644/:6858/:6874). The
+            // final-constructor row picks its text by the name count: one
+            // name (`a1` empty), two (`a1` filled), three-plus (through
+            // `message3`, the third slot the remaining count).
+            Self::FieldInitializerNotAssignable => {
+                format!("The initializer type '{a0}' can't be assigned to the field type '{a1}'.")
+            }
+            Self::InitializerForNonExistentField => {
+                format!("'{a0}' isn't a field in the enclosing class.")
+            }
+            Self::InitializingFormalForNonExistentField => {
+                format!("'{a0}' isn't a field in the enclosing class.")
+            }
+            Self::SuperFormalParameterWithoutAssociatedNamed => {
+                "No associated named super constructor parameter.".to_string()
+            }
+            Self::SuperFormalParameterWithoutAssociatedPositional => {
+                "No associated positional super constructor parameter.".to_string()
+            }
+            Self::RecursiveConstructorRedirect => {
+                "Constructors can't redirect to themselves either directly or indirectly."
+                    .to_string()
+            }
+            Self::FinalNotInitialized => {
+                format!("The final variable '{a0}' must be initialized.")
+            }
+            Self::FinalNotInitializedConstructor if a1.is_empty() => {
+                format!("All final variables must be initialized, but '{a0}' isn't.")
+            }
+            Self::FinalNotInitializedConstructor => {
+                format!("All final variables must be initialized, but '{a0}' and '{a1}' aren't.")
+            }
+            // `{0}` (the container name) appears twice in the template; the
+            // two-argument face renders it directly.
+            Self::ConflictingStaticAndInstance => format!(
+                "Class '{a0}' can't define static member '{a1}' and have instance member \
+                 '{a0}.{a1}' with the same name."
+            ),
+            Self::ConstInstanceField => "Only static fields can be declared as const.".to_string(),
+            Self::NonVoidReturnForSetter => {
+                "The return type of the setter must be 'void' or absent.".to_string()
+            }
+            Self::NotAType => format!("'{a0}' isn't a type."),
+            Self::NonBoolCondition => "Conditions must have a static type of 'bool'.".to_string(),
+            Self::NonBoolNegationExpression => {
+                "A negation operand must have a static type of 'bool'.".to_string()
+            }
+            Self::InvalidUseOfNullValue => {
+                "An expression whose value is always 'null' can't be dereferenced.".to_string()
+            }
+            Self::InvocationOfNonFunctionExpression => {
+                "The expression doesn't evaluate to a function, so it can't be invoked."
+                    .to_string()
+            }
+            Self::InvalidReferenceToThis => "Invalid reference to 'this' expression.".to_string(),
+            Self::SuperInInvalidContext => "Invalid context for 'super' invocation.".to_string(),
         }
     }
 
     /// The verbatim oracle `problemMessage` for the three-placeholder
     /// templates (`{0}`, `{1}`, `{2}`); unused placeholders pass `""`.
     #[must_use]
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     pub fn message3(self, a0: &str, a1: &str, a2: &str) -> String {
         match self {
+            // The three-plus-name final-constructor variant
+            // (diagnostic.g.dart:6917 — the third slot the remaining count).
+            Self::FinalNotInitializedConstructor => {
+                format!(
+                    "All final variables must be initialized, but '{a0}', '{a1}', and {a2} others aren't."
+                )
+            }
             // The #612 member-face row: the parameter's own keyword leads,
             // then its name, then the position's keyword
             // (diagnostic.g.dart:18811-18812).
             Self::WrongTypeParameterVariancePosition => {
                 format!("The '{a0}' type parameter '{a1}' can't be used in an '{a2}' position.")
+            }
+            // The #1285 name-plural face (registry template
+            // `notEnoughPositionalArgumentsNamePlural`, diagnostic.g.dart
+            // :13438-13444): the required count, the found count, then the
+            // callee name.
+            Self::NotEnoughPositionalArguments(ArgCountShape::NamePlural) => {
+                format!("{a0} positional arguments expected by '{a2}', but {a1} found.")
             }
             Self::WrongNumberOfParametersForOperator => {
                 format!("Operator '{a0}' should declare exactly {a1} parameters, but {a2} found.")
@@ -1796,11 +2446,20 @@ impl SemanticCode {
                     "The argument type '{a0}' can't be assigned to the parameter type '{a1}'. {a2}"
                 )
             }
+            // `{0}` is the receiver type, `{1}` the extended type
+            // (diagnostic.g.dart:5760-5762).
+            Self::ExtensionOverrideArgumentNotAssignable => {
+                format!(
+                    "The type of the argument to the extension override '{a0}' isn't assignable to the extended type '{a1}'."
+                )
+            }
+            // One template shape under sharedName `returnOfInvalidType`; the
+            // host word picks the oracle face — `function`/`method`/
+            // `constructor` (`returnOfInvalidTypeFromFunction`/`FromMethod`/
+            // `FromConstructor`, upstream Dart SDK source,
+            // pkg/analyzer/messages.yaml:16809-16867).
             Self::ReturnOfInvalidType(host) => {
-                let host = match host {
-                    ExecKind::Function => "function",
-                    ExecKind::Method => "method",
-                };
+                let host = host.word();
                 format!(
                     "A value of type '{a0}' can't be returned from the {host} '{a2}' because it has a return type of '{a1}'."
                 )
@@ -1918,6 +2577,7 @@ impl SemanticCode {
     /// exhaustiveness rows, diagnostic.g.dart:13018/:13079). Rows without a
     /// correction answer `None`.
     #[must_use]
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     pub fn correction_message(self, a2: &str) -> Option<String> {
         match self {
             // The W6 @sealed contract rows' verbatim oracle correctionMessages
@@ -2120,6 +2780,134 @@ impl SemanticCode {
             Self::NonConstCallToLiteralConstructor => {
                 Some("Try adding a 'const' keyword.".to_string())
             }
+            // The #1285 argument-count rows' verbatim oracle
+            // correctionMessages (diagnostic.g.dart :6298 and :6315-6318;
+            // the not-enough plurality split :13440/:13456 and
+            // :13476/:13488).
+            Self::ExtraPositionalArguments => {
+                Some("Try removing the extra arguments.".to_string())
+            }
+            Self::ExtraPositionalArgumentsCouldBeNamed => Some(
+                "Try removing the extra positional arguments, or specifying the name \
+                 for named arguments."
+                    .to_string(),
+            ),
+            Self::NotEnoughPositionalArguments(ArgCountShape::Singular)
+            | Self::NotEnoughPositionalArguments(ArgCountShape::NameSingular) => {
+                Some("Try adding the missing argument.".to_string())
+            }
+            Self::NotEnoughPositionalArguments(ArgCountShape::Plural)
+            | Self::NotEnoughPositionalArguments(ArgCountShape::NamePlural) => {
+                Some("Try adding the missing arguments.".to_string())
+            }
+            // The #1314 FAM7 rows' verbatim oracle correctionMessages
+            // (messages.yaml :11384/:11440/:14667 — the positional face
+            // drops the `'required'` arm).
+            Self::MissingDefaultValueForParameter => Some(
+                "Try adding either an explicit non-'null' default value or the 'required' modifier."
+                    .to_string(),
+            ),
+            Self::MissingDefaultValueForParameterPositional => {
+                Some("Try adding an explicit non-'null' default value.".to_string())
+            }
+            Self::ObsoleteColonForDefaultValue => {
+                Some("Try replacing the colon with an equal sign.".to_string())
+            }
+            // The #1314 FAM13 type-position context faces' verbatim oracle
+            // correctionMessages (messages.yaml `nonTypeAsTypeArgument` and
+            // `newWithNonType`).
+            Self::NonTypeAsTypeArgument => Some(format!(
+                "Try correcting the name to an existing type, or defining a type named '{a2}'."
+            )),
+            Self::CreationWithNonType | Self::NonTypeInCatchClause => {
+                Some("Try correcting the name to match an existing class.".to_string())
+            }
+            // The oracle's `undefinedClass` correctionMessage (messages.yaml
+            // :18433; the `{0}` is the written name — the emit helpers pass
+            // it in the a2 slot).
+            Self::UndefinedClass => Some(format!(
+                "Try changing the name to the name of an existing class, or creating a class with the name '{a2}'."
+            )),
+            // The #1314 FAM14 clause faces' verbatim oracle corrections
+            // (diagnostic.g.dart :7507-7508 for the implements face,
+            // messages.yaml `extendsNonClass` for the extends face).
+            Self::ImplementsNonClass => Some(
+                "Try specifying a class or mixin, or remove the name from the list."
+                    .to_string(),
+            ),
+            // The `extends_non_class` correction (messages.yaml
+            // `extendsNonClass.correctionMessage`); the remaining FAM14
+            // clause faces carry none.
+            Self::ExtendsNonClass => Some(
+                "Try specifying a different superclass, or removing the extends clause."
+                    .to_string(),
+            ),
+            // The #1314 FAM18 uninitialized-non-nullable corrections
+            // (diagnostic.g.dart :13506-13507/:13542).
+            Self::NotInitializedNonNullableVariable => {
+                Some("Try adding an initializer expression.".to_string())
+            }
+            Self::NotInitializedNonNullableInstanceField => Some(
+                "Try adding an initializer expression, or a generative constructor \
+                 that initializes it, or mark it 'late'."
+                    .to_string(),
+            ),
+            Self::ImplicitSuperInitializerMissingArguments => Some(
+                "Try adding an explicit super parameter with the required arguments."
+                    .to_string(),
+            ),
+            Self::NonFinalFieldInEnum => Some("Try making the field final.".to_string()),
+            // The constructor-initializer and final-field corrections
+            // (diagnostic.g.dart :6617(no)/:8212/:14647/:6859/:6875).
+            Self::InitializerForNonExistentField => Some(
+                "Try correcting the name to match an existing field, or defining a \
+                 field named '{a2}'."
+                    .to_string(),
+            ),
+            Self::InitializingFormalForNonExistentField => Some(
+                "Try correcting the name to match an existing field, or defining a \
+                 field named '{a2}'."
+                    .to_string(),
+            ),
+            Self::SuperFormalParameterWithoutAssociatedNamed => Some(
+                "Try changing the name to the name of an existing named super \
+                 constructor parameter, or creating such named parameter."
+                    .to_string(),
+            ),
+            Self::SuperFormalParameterWithoutAssociatedPositional => Some(
+                "Try using a normal parameter, or adding more positional parameters \
+                 to the super constructor."
+                    .to_string(),
+            ),
+            Self::RecursiveConstructorRedirect => Some(
+                "Try changing one of the constructors in the loop to not redirect."
+                    .to_string(),
+            ),
+            Self::FinalNotInitialized => Some("Try initializing the variable.".to_string()),
+            Self::FinalNotInitializedConstructor => {
+                Some("Try adding an initializer for the field.".to_string())
+            }
+            // The FAM15 row's verbatim oracle correction (diagnostic.g.dart,
+            // the uncheckedUseOfNullableValue family) — the property-access
+            // face carries its own text.
+            Self::UncheckedUseOfNullableValue if !a2.is_empty() => Some(
+                "Try making the access conditional (using '?.') or adding a null check to the target ('!')."
+                    .to_string(),
+            ),
+            Self::UncheckedUseOfNullableValue => Some(
+                "Try checking that the value isn't 'null' before using it as a condition."
+                    .to_string(),
+            ),
+            // The `enum_without_constants` correction (diagnostic.g.dart
+            // :4970).
+            Self::EnumWithoutConstants => {
+                Some("Try declaring an enum constant.".to_string())
+            }
+            // The `constant_pattern_with_non_constant_expression`
+            // correction (diagnostic.g.dart :2533).
+            Self::ConstantPatternWithNonConstantExpression => {
+                Some("Try making the expression a valid constant.".to_string())
+            }
             _ => None,
         }
     }
@@ -2194,6 +2982,7 @@ mod tests {
     /// name), carries its oracle tier, and its descriptor round-trips
     /// through the frozen M1 gate list.
     #[test]
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     fn rows_are_official_named_and_tiered() {
         let codes = [
             SemanticCode::DuplicateDefinition,
@@ -2229,17 +3018,30 @@ mod tests {
             SemanticCode::WrongNumberOfTypeArgumentsFunction,
             SemanticCode::WrongNumberOfTypeArgumentsElement(ExecKind::Function),
             SemanticCode::WrongNumberOfTypeArgumentsElement(ExecKind::Method),
+            SemanticCode::TypeArgumentNotMatchingBounds,
+            SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded,
+            SemanticCode::EnumWithoutConstants,
             SemanticCode::InvalidAssignment,
             SemanticCode::ArgumentTypeNotAssignable,
+            SemanticCode::ExtensionOverrideArgumentNotAssignable,
             SemanticCode::ReturnOfInvalidType(ExecKind::Function),
             SemanticCode::ReturnOfInvalidType(ExecKind::Method),
+            SemanticCode::ReturnOfInvalidType(ExecKind::Constructor),
             SemanticCode::InvalidNullAwareOperator,
+            // The switch-exhaustiveness cluster.
+            SemanticCode::NonExhaustiveSwitchStatement,
+            SemanticCode::NonExhaustiveSwitchExpression,
+            SemanticCode::UnreachableSwitchCase,
+            SemanticCode::UnreachableSwitchDefault,
             SemanticCode::ConstInitializedWithNonConstantValue,
             SemanticCode::ConstWithNonConstantArgument,
+            SemanticCode::ConstWithNonConst,
             SemanticCode::NonConstantListElement,
             SemanticCode::NonConstantSetElement,
             SemanticCode::NonConstantMapElement,
             SemanticCode::NonConstantRecordField,
+            SemanticCode::ConstantPatternWithNonConstantExpression,
+            SemanticCode::NonConstantCaseExpression,
             SemanticCode::ConstEvalTypeBool,
             SemanticCode::ConstEvalTypeBoolInt,
             SemanticCode::ConstEvalTypeBoolNumString,
@@ -2247,6 +3049,7 @@ mod tests {
             SemanticCode::ConstEvalTypeNum,
             SemanticCode::ConstEvalTypeNumString,
             SemanticCode::ConstEvalTypeString,
+            SemanticCode::UncheckedUseOfNullableValue,
             SemanticCode::ConstEvalThrowsException,
             SemanticCode::ConstEvalThrowsIdbze,
             SemanticCode::ConstEvalPrimitiveEquality,
@@ -2288,6 +3091,8 @@ mod tests {
             SemanticCode::UnusedLabel,
             SemanticCode::UnusedImport,
             SemanticCode::UnusedShownName,
+            SemanticCode::UnusedResult,
+            SemanticCode::UndefinedReferencedParameter,
             SemanticCode::DeadNullAwareExpression,
             SemanticCode::DeadCodeCatchFollowingCatch,
             // The #506 provably-check cluster and the #507 disjointness
@@ -2306,6 +3111,15 @@ mod tests {
             SemanticCode::UnnecessaryCastPattern,
             SemanticCode::UnnecessaryNullCheckPattern,
             SemanticCode::UnnecessaryNullAssertPattern,
+            // The #480 strict-mode rows, the #612 variance family, and the
+            // #702 @sealed contract.
+            SemanticCode::StrictRawType,
+            SemanticCode::InferenceFailureOnFunctionReturnType,
+            SemanticCode::WrongTypeParameterVariancePosition,
+            SemanticCode::WrongExplicitTypeParameterVarianceInSuperinterface,
+            SemanticCode::WrongTypeParameterVarianceInSuperinterface,
+            SemanticCode::MixinOnSealedClass,
+            SemanticCode::SubtypeOfSealedClass,
             // The #743 W1-micro cluster.
             SemanticCode::DeadCodeOnCatchSubtype,
             SemanticCode::NullArgumentToNonNullType,
@@ -2328,6 +3142,36 @@ mod tests {
             SemanticCode::UnnecessaryNoSuchMethod,
             // The #749 W7 face.
             SemanticCode::NonConstCallToLiteralConstructor,
+            // The #911 primary-constructor face.
+            SemanticCode::UnusedFieldFromPrimaryConstructor,
+            // The #1285 argument-count cluster.
+            SemanticCode::ExtraPositionalArguments,
+            SemanticCode::ExtraPositionalArgumentsCouldBeNamed,
+            SemanticCode::NotEnoughPositionalArguments(ArgCountShape::Singular),
+            SemanticCode::NotEnoughPositionalArguments(ArgCountShape::Plural),
+            SemanticCode::NotEnoughPositionalArguments(ArgCountShape::NameSingular),
+            SemanticCode::NotEnoughPositionalArguments(ArgCountShape::NamePlural),
+            // The #1314 default-value, type-position, class-clause, and
+            // uninitialized-non-nullable clusters.
+            SemanticCode::MissingDefaultValueForParameter,
+            SemanticCode::MissingDefaultValueForParameterPositional,
+            SemanticCode::ObsoleteColonForDefaultValue,
+            SemanticCode::NonTypeAsTypeArgument,
+            SemanticCode::CreationWithNonType,
+            SemanticCode::NonTypeInCatchClause,
+            SemanticCode::MixinOfNonClass,
+            SemanticCode::ImplementsNonClass,
+            SemanticCode::MixinSuperClassConstraintNonInterface,
+            SemanticCode::MixinWithNonClassSuperclass,
+            SemanticCode::ExtendsNonClass,
+            SemanticCode::NotInitializedNonNullableVariable,
+            SemanticCode::NotInitializedNonNullableInstanceField,
+            SemanticCode::ImplicitSuperInitializerMissingArguments,
+            SemanticCode::NonFinalFieldInEnum,
+            // The N7 field-/super-formal faces.
+            SemanticCode::InitializingFormalForNonExistentField,
+            SemanticCode::SuperFormalParameterWithoutAssociatedNamed,
+            SemanticCode::SuperFormalParameterWithoutAssociatedPositional,
         ];
         for code in codes {
             let info = code.code_info();
@@ -2454,6 +3298,7 @@ mod tests {
         SemanticCode::ArgumentTypeNotAssignable,
         SemanticCode::ReturnOfInvalidType(ExecKind::Function),
         SemanticCode::ReturnOfInvalidType(ExecKind::Method),
+        SemanticCode::ReturnOfInvalidType(ExecKind::Constructor),
         SemanticCode::InvalidNullAwareOperator,
         SemanticCode::NonExhaustiveSwitchStatement,
         SemanticCode::NonExhaustiveSwitchExpression,
@@ -2461,6 +3306,7 @@ mod tests {
         SemanticCode::UnreachableSwitchDefault,
         SemanticCode::ConstInitializedWithNonConstantValue,
         SemanticCode::ConstWithNonConstantArgument,
+        SemanticCode::ConstWithNonConst,
         SemanticCode::NonConstantListElement,
         SemanticCode::NonConstantSetElement,
         SemanticCode::NonConstantMapElement,
@@ -2545,6 +3391,7 @@ mod tests {
     /// `UNDEFINED_SUPER_MEMBER` shapes, and the batch-2 wrong-number and
     /// nullability templates.
     #[test]
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     fn messages_are_verbatim() {
         assert_eq!(
             SemanticCode::DuplicateDefinition.message("C", ""),
@@ -2575,6 +3422,18 @@ mod tests {
             SemanticCode::UndefinedEnumConstructor.message("other", ""),
             "The enum doesn't have a constructor named 'other'."
         );
+        // The unnamed face (the constant's close flush marks `a1` —
+        // `unnamed` — to pick the parameter-less oracle row, verbatim).
+        assert_eq!(
+            SemanticCode::UndefinedEnumConstructor.message("", "unnamed"),
+            "The enum doesn't have an unnamed constructor."
+        );
+        // A selector the constant wrote stays the named face, even when the
+        // parser inserted it (the `''` recovery spelling).
+        assert_eq!(
+            SemanticCode::UndefinedEnumConstructor.message("", ""),
+            "The enum doesn't have a constructor named ''."
+        );
         assert_eq!(
             SemanticCode::WrongNumberOfParametersForOperator.message3("+", "1", "2"),
             "Operator '+' should declare exactly 1 parameters, but 2 found."
@@ -2583,9 +3442,21 @@ mod tests {
             SemanticCode::WrongNumberOfParametersForOperatorMinus.message3("3", "", ""),
             "Operator '-' should declare 0 or 1 parameter, but 3 found."
         );
+        // The registry-backed rows: rendered from the dartq-diagnostics
+        // table; these literals are the migration's byte-identity pins (the
+        // registry-side pins live in dartq-diagnostics'
+        // `message_template_covers_the_table_and_pins_emit_rows`).
         assert_eq!(
             SemanticCode::WrongNumberOfParametersForSetter.message("", ""),
             "Setters must declare exactly one required positional parameter."
+        );
+        assert_eq!(
+            SemanticCode::MemberWithClassName.message("", ""),
+            "A class member can't have the same name as the enclosing class."
+        );
+        assert_eq!(
+            SemanticCode::ExpectedRepresentationType.message("", ""),
+            "Expected a representation type."
         );
         assert_eq!(
             SemanticCode::WrongNumberOfTypeArguments.message3("C", "2", "1"),
@@ -2636,6 +3507,12 @@ mod tests {
         assert_eq!(
             SemanticCode::ReturnOfInvalidType(ExecKind::Function).message3("int", "void", "f"),
             "A value of type 'int' can't be returned from the function 'f' because it has a return type of 'void'."
+        );
+        // The constructor face (the factory return check): the host word is
+        // "constructor" (returnOfInvalidTypeFromConstructor).
+        assert_eq!(
+            SemanticCode::ReturnOfInvalidType(ExecKind::Constructor).message3("int", "E", "E"),
+            "A value of type 'int' can't be returned from the constructor 'E' because it has a return type of 'E'."
         );
         assert_eq!(
             SemanticCode::InvalidNullAwareOperator.message("?.", "."),
@@ -2879,6 +3756,414 @@ mod tests {
                 "Try adding a return statement, or if no value is ever returned, try changing the return type to 'void'."
                     .to_string()
             )
+        );
+    }
+
+    /// The rows whose message text renders from the dartq-diagnostics table
+    /// (the `registry_message` call sites — the emission-path single
+    /// source). The sync test below keeps this mirror exactly equal to the
+    /// registry's coverage of `SemanticCode` names.
+    const REGISTRY_BACKED: &[&str] = &[
+        "wrong_number_of_parameters_for_setter",
+        "member_with_class_name",
+        "expected_representation_type",
+    ];
+
+    /// The exhaustive enum walk: one arm per `SemanticCode` variant, no
+    /// wildcard — a new variant fails this match's compilation (E0004) until
+    /// it joins the walk. The runtime no longer panics on codes↔registry
+    /// drift (`registry_message` degrades to the raw name), so this
+    /// compile-time gate is what forces every new row's registry
+    /// relationship to be declared here, loudly, at test time.
+    #[expect(clippy::too_many_lines)] // the exhaustive per-variant walk
+    fn registry_walk(code: &SemanticCode) -> CodeInfo {
+        match code {
+            SemanticCode::AmbiguousExtensionMemberTwo
+            | SemanticCode::AmbiguousExtensionMemberThreeOrMore
+            | SemanticCode::ArgumentTypeNotAssignable
+            | SemanticCode::BodyMightCompleteNormallyNullable
+            | SemanticCode::CastFromNullAlwaysFails
+            | SemanticCode::CastFromNullableAlwaysFails
+            | SemanticCode::ConstEvalMethodInvocation
+            | SemanticCode::ConstEvalPrimitiveEquality
+            | SemanticCode::ConstEvalThrowsException
+            | SemanticCode::ConstEvalThrowsIdbze
+            | SemanticCode::ConstEvalTypeBool
+            | SemanticCode::ConstEvalTypeBoolInt
+            | SemanticCode::ConstEvalTypeBoolNumString
+            | SemanticCode::ConstEvalTypeInt
+            | SemanticCode::ConstEvalTypeNum
+            | SemanticCode::ConstEvalTypeNumString
+            | SemanticCode::ConstEvalTypeString
+            | SemanticCode::ConstInitializedWithNonConstantValue
+            | SemanticCode::ConstWithNonConst
+            | SemanticCode::ConstWithNonConstantArgument
+            | SemanticCode::ConstantPatternNeverMatchesValueType
+            | SemanticCode::ConstantPatternWithNonConstantExpression
+            | SemanticCode::NonConstantCaseExpression
+            | SemanticCode::CouldNotInfer
+            | SemanticCode::CreationWithNonType
+            | SemanticCode::DeadCode
+            | SemanticCode::DeadCodeCatchFollowingCatch
+            | SemanticCode::DeadCodeOnCatchSubtype
+            | SemanticCode::DeadNullAwareExpression
+            | SemanticCode::DuplicateDefinition
+            | SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded
+            | SemanticCode::EnumWithoutConstants
+            | SemanticCode::EqualElementsInSet
+            | SemanticCode::EqualKeysInMap
+            | SemanticCode::ExpectedRepresentationType
+            | SemanticCode::ExtensionOverrideArgumentNotAssignable
+            | SemanticCode::ExtensionTypeDeclaresMemberOfObject
+            | SemanticCode::ExtensionTypeRepresentationDependsOnItself
+            | SemanticCode::ExtraPositionalArguments
+            | SemanticCode::ExtraPositionalArgumentsCouldBeNamed
+            | SemanticCode::ExtendsNonClass
+            | SemanticCode::ImplementsNonClass
+            | SemanticCode::InconsistentInheritance
+            | SemanticCode::InconsistentInheritanceGetterAndMethod
+            | SemanticCode::InferenceFailureOnFunctionReturnType
+            | SemanticCode::InheritsAbstractMemberFivePlus
+            | SemanticCode::InheritsAbstractMemberFour
+            | SemanticCode::InheritsAbstractMemberOne
+            | SemanticCode::InheritsAbstractMemberThree
+            | SemanticCode::InheritsAbstractMemberTwo
+            | SemanticCode::InvalidAssignment
+            | SemanticCode::InvalidImplementationOverride
+            | SemanticCode::InvalidImplementationOverrideSetter
+            | SemanticCode::InvalidNullAwareOperator
+            | SemanticCode::InvalidOverride
+            | SemanticCode::InvalidOverrideSetter
+            | SemanticCode::MemberWithClassName
+            | SemanticCode::MissingDefaultValueForParameter
+            | SemanticCode::MissingDefaultValueForParameterPositional
+            | SemanticCode::MissingOverrideOfMustBeOverriddenOne
+            | SemanticCode::MissingOverrideOfMustBeOverriddenThreePlus
+            | SemanticCode::MissingOverrideOfMustBeOverriddenTwo
+            | SemanticCode::MixinOfNonClass
+            | SemanticCode::MixinOnSealedClass
+            | SemanticCode::MixinSuperClassConstraintNonInterface
+            | SemanticCode::MixinWithNonClassSuperclass
+            | SemanticCode::MustCallSuper
+            | SemanticCode::NonConstCallToLiteralConstructor
+            | SemanticCode::NonConstantListElement
+            | SemanticCode::NonConstantMapElement
+            | SemanticCode::NonConstantRecordField
+            | SemanticCode::NonConstantSetElement
+            | SemanticCode::NonExhaustiveSwitchExpression
+            | SemanticCode::NonExhaustiveSwitchStatement
+            | SemanticCode::NonNullableEqualsParameter
+            | SemanticCode::NonTypeAsTypeArgument
+            | SemanticCode::NonTypeInCatchClause
+            | SemanticCode::FieldInitializerNotAssignable
+            | SemanticCode::FinalNotInitialized
+            | SemanticCode::FinalNotInitializedConstructor
+            | SemanticCode::InitializerForNonExistentField
+            | SemanticCode::InitializingFormalForNonExistentField
+            | SemanticCode::SuperFormalParameterWithoutAssociatedNamed
+            | SemanticCode::SuperFormalParameterWithoutAssociatedPositional
+            | SemanticCode::RecursiveConstructorRedirect
+            | SemanticCode::NotInitializedNonNullableInstanceField
+            | SemanticCode::ImplicitSuperInitializerMissingArguments
+            | SemanticCode::NonFinalFieldInEnum
+            | SemanticCode::NotInitializedNonNullableVariable
+            | SemanticCode::NullArgumentToNonNullType
+            | SemanticCode::NullCheckAlwaysFails
+            | SemanticCode::NullableTypeInCatchClause
+            | SemanticCode::ObsoleteColonForDefaultValue
+            | SemanticCode::OverrideOnNonOverridingField
+            | SemanticCode::OverrideOnNonOverridingGetter
+            | SemanticCode::OverrideOnNonOverridingMethod
+            | SemanticCode::OverrideOnNonOverridingSetter
+            | SemanticCode::PatternNeverMatchesValueType
+            | SemanticCode::ReceiverOfTypeNever
+            | SemanticCode::RecursiveCompileTimeConstant
+            | SemanticCode::StrictRawType
+            | SemanticCode::SubtypeOfSealedClass
+            | SemanticCode::TypeArgumentNotMatchingBounds
+            | SemanticCode::TypeCheckWithNotNull
+            | SemanticCode::TypeCheckWithNull
+            | SemanticCode::UncheckedUseOfNullableValue
+            | SemanticCode::UndefinedAnnotation
+            | SemanticCode::UndefinedClass
+            | SemanticCode::UndefinedConstructorInInitializer
+            | SemanticCode::UndefinedEnumConstant
+            | SemanticCode::UndefinedEnumConstructor
+            | SemanticCode::UndefinedExtensionGetter
+            | SemanticCode::UndefinedExtensionMethod
+            | SemanticCode::UndefinedExtensionOperator
+            | SemanticCode::UndefinedExtensionSetter
+            | SemanticCode::UndefinedFunction
+            | SemanticCode::UndefinedGetter
+            | SemanticCode::UndefinedIdentifier
+            | SemanticCode::UndefinedIdentifierAwait
+            | SemanticCode::UndefinedMethod
+            | SemanticCode::UndefinedNamedParameter
+            | SemanticCode::UndefinedOperator
+            | SemanticCode::UndefinedPrefixedName
+            | SemanticCode::UndefinedReferencedParameter
+            | SemanticCode::UndefinedSetter
+            | SemanticCode::PrefixShadowedByLocalDeclaration
+            | SemanticCode::UnnecessaryCast
+            | SemanticCode::UnnecessaryCastPattern
+            | SemanticCode::UnnecessaryNanComparisonFalse
+            | SemanticCode::UnnecessaryNanComparisonTrue
+            | SemanticCode::UnnecessaryNoSuchMethod
+            | SemanticCode::UnnecessaryNonNullAssertion
+            | SemanticCode::UnnecessaryNullAssertPattern
+            | SemanticCode::UnnecessaryNullCheckPattern
+            | SemanticCode::UnnecessaryNullComparisonFalse
+            | SemanticCode::UnnecessaryNullComparisonTrue
+            | SemanticCode::UnnecessaryQuestionMark
+            | SemanticCode::UnnecessaryTypeCheckFalse
+            | SemanticCode::UnnecessaryTypeCheckTrue
+            | SemanticCode::UnnecessaryWildcardPattern
+            | SemanticCode::UnreachableSwitchCase
+            | SemanticCode::UnreachableSwitchDefault
+            | SemanticCode::UnusedCatchClause
+            | SemanticCode::UnusedCatchStack
+            | SemanticCode::UnusedElement
+            | SemanticCode::UnusedElementParameter
+            | SemanticCode::UnusedField
+            | SemanticCode::UnusedFieldFromPrimaryConstructor
+            | SemanticCode::UnusedImport
+            | SemanticCode::UnusedLabel
+            | SemanticCode::UnusedLocalVariable
+            | SemanticCode::UnusedResult
+            | SemanticCode::UnusedShownName
+            | SemanticCode::WrongExplicitTypeParameterVarianceInSuperinterface
+            | SemanticCode::WrongNumberOfParametersForOperator
+            | SemanticCode::WrongNumberOfParametersForOperatorMinus
+            | SemanticCode::WrongNumberOfParametersForSetter
+            | SemanticCode::WrongNumberOfTypeArguments
+            | SemanticCode::WrongNumberOfTypeArgumentsConstructor
+            | SemanticCode::WrongNumberOfTypeArgumentsEnum
+            | SemanticCode::WrongNumberOfTypeArgumentsExtension
+            | SemanticCode::WrongNumberOfTypeArgumentsFunction
+            | SemanticCode::WrongTypeParameterVarianceInSuperinterface
+            | SemanticCode::WrongTypeParameterVariancePosition
+            | SemanticCode::UndefinedSuperMember(_)
+            | SemanticCode::WrongNumberOfTypeArgumentsElement(_)
+            | SemanticCode::ReturnOfInvalidType(_)
+            | SemanticCode::NotEnoughPositionalArguments(_)
+            | SemanticCode::ConflictingStaticAndInstance
+            | SemanticCode::ConstInstanceField
+            | SemanticCode::NonVoidReturnForSetter
+            | SemanticCode::NotAType
+            | SemanticCode::NonBoolCondition
+            | SemanticCode::NonBoolNegationExpression
+            | SemanticCode::InvalidUseOfNullValue
+            | SemanticCode::InvocationOfNonFunctionExpression
+            | SemanticCode::InvalidReferenceToThis
+            | SemanticCode::SuperInInvalidContext => code.code_info(),
+        }
+    }
+
+    /// Every `SemanticCode` variant, payload shapes materialized — the sync
+    /// walk below asserts the registry relationship per rendered name.
+    /// Compiler-enforced completeness rides on [`registry_walk`]: a new
+    /// variant cannot compile until it joins that match, and this list
+    /// materializes its shapes for the runtime assertions.
+    #[expect(clippy::too_many_lines)] // the full materialized code table
+    fn all_codes() -> Vec<SemanticCode> {
+        vec![
+            SemanticCode::AmbiguousExtensionMemberTwo,
+            SemanticCode::AmbiguousExtensionMemberThreeOrMore,
+            SemanticCode::ArgumentTypeNotAssignable,
+            SemanticCode::BodyMightCompleteNormallyNullable,
+            SemanticCode::CastFromNullAlwaysFails,
+            SemanticCode::CastFromNullableAlwaysFails,
+            SemanticCode::ConstEvalMethodInvocation,
+            SemanticCode::ConstEvalPrimitiveEquality,
+            SemanticCode::ConstEvalThrowsException,
+            SemanticCode::ConstEvalThrowsIdbze,
+            SemanticCode::ConstEvalTypeBool,
+            SemanticCode::ConstEvalTypeBoolInt,
+            SemanticCode::ConstEvalTypeBoolNumString,
+            SemanticCode::ConstEvalTypeInt,
+            SemanticCode::ConstEvalTypeNum,
+            SemanticCode::ConstEvalTypeNumString,
+            SemanticCode::ConstEvalTypeString,
+            SemanticCode::ConstInitializedWithNonConstantValue,
+            SemanticCode::ConstWithNonConst,
+            SemanticCode::ConstWithNonConstantArgument,
+            SemanticCode::ConstantPatternNeverMatchesValueType,
+            SemanticCode::ConstantPatternWithNonConstantExpression,
+            SemanticCode::NonConstantCaseExpression,
+            SemanticCode::CreationWithNonType,
+            SemanticCode::DeadCode,
+            SemanticCode::DeadCodeCatchFollowingCatch,
+            SemanticCode::DeadCodeOnCatchSubtype,
+            SemanticCode::DeadNullAwareExpression,
+            SemanticCode::DuplicateDefinition,
+            SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded,
+            SemanticCode::EnumWithoutConstants,
+            SemanticCode::EqualElementsInSet,
+            SemanticCode::EqualKeysInMap,
+            SemanticCode::ExpectedRepresentationType,
+            SemanticCode::ExtensionOverrideArgumentNotAssignable,
+            SemanticCode::ExtensionTypeDeclaresMemberOfObject,
+            SemanticCode::ExtensionTypeRepresentationDependsOnItself,
+            SemanticCode::ExtraPositionalArguments,
+            SemanticCode::ExtraPositionalArgumentsCouldBeNamed,
+            SemanticCode::ExtendsNonClass,
+            SemanticCode::ImplementsNonClass,
+            SemanticCode::InconsistentInheritance,
+            SemanticCode::InconsistentInheritanceGetterAndMethod,
+            SemanticCode::InferenceFailureOnFunctionReturnType,
+            SemanticCode::InheritsAbstractMemberFivePlus,
+            SemanticCode::InheritsAbstractMemberFour,
+            SemanticCode::InheritsAbstractMemberOne,
+            SemanticCode::InheritsAbstractMemberThree,
+            SemanticCode::InheritsAbstractMemberTwo,
+            SemanticCode::InvalidAssignment,
+            SemanticCode::InvalidImplementationOverride,
+            SemanticCode::InvalidImplementationOverrideSetter,
+            SemanticCode::InvalidNullAwareOperator,
+            SemanticCode::InvalidOverride,
+            SemanticCode::InvalidOverrideSetter,
+            SemanticCode::MemberWithClassName,
+            SemanticCode::MissingDefaultValueForParameter,
+            SemanticCode::MissingDefaultValueForParameterPositional,
+            SemanticCode::MissingOverrideOfMustBeOverriddenOne,
+            SemanticCode::MissingOverrideOfMustBeOverriddenThreePlus,
+            SemanticCode::MissingOverrideOfMustBeOverriddenTwo,
+            SemanticCode::MixinOfNonClass,
+            SemanticCode::MixinOnSealedClass,
+            SemanticCode::MixinSuperClassConstraintNonInterface,
+            SemanticCode::MixinWithNonClassSuperclass,
+            SemanticCode::MustCallSuper,
+            SemanticCode::NonConstCallToLiteralConstructor,
+            SemanticCode::NonConstantListElement,
+            SemanticCode::NonConstantMapElement,
+            SemanticCode::NonConstantRecordField,
+            SemanticCode::NonConstantSetElement,
+            SemanticCode::NonExhaustiveSwitchExpression,
+            SemanticCode::NonExhaustiveSwitchStatement,
+            SemanticCode::NonNullableEqualsParameter,
+            SemanticCode::NonTypeAsTypeArgument,
+            SemanticCode::NotEnoughPositionalArguments(ArgCountShape::Singular),
+            SemanticCode::NotEnoughPositionalArguments(ArgCountShape::Plural),
+            SemanticCode::NotEnoughPositionalArguments(ArgCountShape::NameSingular),
+            SemanticCode::NotEnoughPositionalArguments(ArgCountShape::NamePlural),
+            SemanticCode::NotInitializedNonNullableInstanceField,
+            SemanticCode::ImplicitSuperInitializerMissingArguments,
+            SemanticCode::NonFinalFieldInEnum,
+            SemanticCode::NotInitializedNonNullableVariable,
+            SemanticCode::NullArgumentToNonNullType,
+            SemanticCode::NullCheckAlwaysFails,
+            SemanticCode::NullableTypeInCatchClause,
+            SemanticCode::ObsoleteColonForDefaultValue,
+            SemanticCode::OverrideOnNonOverridingField,
+            SemanticCode::OverrideOnNonOverridingGetter,
+            SemanticCode::OverrideOnNonOverridingMethod,
+            SemanticCode::OverrideOnNonOverridingSetter,
+            SemanticCode::PatternNeverMatchesValueType,
+            SemanticCode::ReceiverOfTypeNever,
+            SemanticCode::RecursiveCompileTimeConstant,
+            SemanticCode::ReturnOfInvalidType(ExecKind::Function),
+            SemanticCode::ReturnOfInvalidType(ExecKind::Method),
+            SemanticCode::ReturnOfInvalidType(ExecKind::Constructor),
+            SemanticCode::StrictRawType,
+            SemanticCode::SubtypeOfSealedClass,
+            SemanticCode::TypeArgumentNotMatchingBounds,
+            SemanticCode::TypeCheckWithNotNull,
+            SemanticCode::TypeCheckWithNull,
+            SemanticCode::UncheckedUseOfNullableValue,
+            SemanticCode::UndefinedAnnotation,
+            SemanticCode::UndefinedClass,
+            SemanticCode::UndefinedConstructorInInitializer,
+            SemanticCode::UndefinedEnumConstant,
+            SemanticCode::UndefinedEnumConstructor,
+            SemanticCode::UndefinedExtensionGetter,
+            SemanticCode::UndefinedExtensionMethod,
+            SemanticCode::UndefinedExtensionOperator,
+            SemanticCode::UndefinedExtensionSetter,
+            SemanticCode::UndefinedFunction,
+            SemanticCode::UndefinedGetter,
+            SemanticCode::UndefinedIdentifier,
+            SemanticCode::UndefinedIdentifierAwait,
+            SemanticCode::UndefinedMethod,
+            SemanticCode::UndefinedNamedParameter,
+            SemanticCode::UndefinedOperator,
+            SemanticCode::UndefinedPrefixedName,
+            SemanticCode::UndefinedReferencedParameter,
+            SemanticCode::UndefinedSetter,
+            SemanticCode::UndefinedSuperMember(SuperShape::Getter),
+            SemanticCode::UndefinedSuperMember(SuperShape::Method),
+            SemanticCode::UndefinedSuperMember(SuperShape::Operator),
+            SemanticCode::UndefinedSuperMember(SuperShape::Setter),
+            SemanticCode::UnnecessaryCast,
+            SemanticCode::UnnecessaryCastPattern,
+            SemanticCode::UnnecessaryNanComparisonFalse,
+            SemanticCode::UnnecessaryNanComparisonTrue,
+            SemanticCode::UnnecessaryNoSuchMethod,
+            SemanticCode::UnnecessaryNonNullAssertion,
+            SemanticCode::UnnecessaryNullAssertPattern,
+            SemanticCode::UnnecessaryNullCheckPattern,
+            SemanticCode::UnnecessaryNullComparisonFalse,
+            SemanticCode::UnnecessaryNullComparisonTrue,
+            SemanticCode::UnnecessaryQuestionMark,
+            SemanticCode::UnnecessaryTypeCheckFalse,
+            SemanticCode::UnnecessaryTypeCheckTrue,
+            SemanticCode::UnnecessaryWildcardPattern,
+            SemanticCode::UnreachableSwitchCase,
+            SemanticCode::UnreachableSwitchDefault,
+            SemanticCode::UnusedCatchClause,
+            SemanticCode::UnusedCatchStack,
+            SemanticCode::UnusedElement,
+            SemanticCode::UnusedElementParameter,
+            SemanticCode::UnusedField,
+            SemanticCode::UnusedFieldFromPrimaryConstructor,
+            SemanticCode::UnusedImport,
+            SemanticCode::UnusedLabel,
+            SemanticCode::UnusedLocalVariable,
+            SemanticCode::UnusedResult,
+            SemanticCode::UnusedShownName,
+            SemanticCode::WrongExplicitTypeParameterVarianceInSuperinterface,
+            SemanticCode::WrongNumberOfParametersForOperator,
+            SemanticCode::WrongNumberOfParametersForOperatorMinus,
+            SemanticCode::WrongNumberOfParametersForSetter,
+            SemanticCode::WrongNumberOfTypeArguments,
+            SemanticCode::WrongNumberOfTypeArgumentsConstructor,
+            SemanticCode::WrongNumberOfTypeArgumentsElement(ExecKind::Function),
+            SemanticCode::WrongNumberOfTypeArgumentsElement(ExecKind::Method),
+            SemanticCode::WrongNumberOfTypeArgumentsEnum,
+            SemanticCode::WrongNumberOfTypeArgumentsExtension,
+            SemanticCode::WrongNumberOfTypeArgumentsFunction,
+            SemanticCode::WrongTypeParameterVarianceInSuperinterface,
+            SemanticCode::WrongTypeParameterVariancePosition,
+        ]
+    }
+
+    /// The batch-G codes↔registry sync gate: the runtime `registry_message`
+    /// path degrades to the raw name on table drift, so this test is the
+    /// loud failure. The exhaustive walk asserts, for every variant's
+    /// official name, that registry coverage is exactly the
+    /// [`REGISTRY_BACKED`] mirror — a renamed, dropped, or newly
+    /// registry-backed row fails here instead of panicking at emission.
+    #[test]
+    fn registry_backed_rows_stay_in_sync_with_the_table() {
+        for code in all_codes() {
+            let info = registry_walk(&code);
+            assert_eq!(
+                message_template(info.name).is_some(),
+                REGISTRY_BACKED.contains(&info.name),
+                "{}: registry coverage drifted from the registry-backed mirror",
+                info.name
+            );
+        }
+        for name in REGISTRY_BACKED {
+            assert!(
+                message_template(name).is_some(),
+                "{name}: registry-backed row absent from the dartq-diagnostics table"
+            );
+        }
+        // The runtime degrade posture: an absent name renders the raw name
+        // (an under-reported text), never a panic on the emission path.
+        assert_eq!(
+            registry_message("no_such_official_code"),
+            "no_such_official_code"
         );
     }
 }

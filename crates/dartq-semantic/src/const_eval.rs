@@ -1,4 +1,4 @@
-//! The M2 constant-evaluation subset (#279, PRD §10.2): a bounded,
+//! The M2 constant-evaluation subset (#279): a bounded,
 //! compile-time evaluator over the parser's event stream that decides
 //! whether a const-context expression is constant, and which
 //! `constEval*`/`non_constant_*` diagnostic the oracle reports when it is
@@ -141,7 +141,15 @@ pub enum ConstFault {
     TypeNumString,
     /// `const_eval_type_string` — string concatenation right operand.
     TypeString,
-    /// `const_eval_throws_exception` — evaluation throws.
+    /// `const_eval_throws_exception` — evaluation throws. The wrapped
+    /// context face (#1876 W5) pairs this variant with the verdict's fault
+    /// span (the throw site — every production site passes the operator
+    /// node's span, the entity the upstream context row anchors at) and
+    /// the inner formatted message, which is constant: every generic
+    /// runtime path in upstream `value.dart` throws
+    /// `EvaluationException(diag.constEvalThrowsException)` itself, so the
+    /// inner text is that code's problemMessage. The emitter reads the
+    /// pairing at `Engine::emit_const_fault`.
     ThrowsException,
     /// `const_eval_throws_idbze` — integer division by zero.
     ThrowsIdbze,
@@ -306,6 +314,7 @@ pub fn eval(node: &Node, lookup: &dyn ConstLookup) -> Verdict {
     fold(node, lookup, 0)
 }
 
+#[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
     if depth > MAX_EVAL_DEPTH {
         return Verdict::Constant;
@@ -456,6 +465,7 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
 /// primitives are identical when their types and values coincide (`1` and
 /// `1.0` are not identical); enum instances are identical to themselves
 /// only.
+#[expect(clippy::float_cmp)] // oracle identity is exact double equality (NaN cannot intern)
 fn primarily_identical(a: &ConstantValue, b: &ConstantValue) -> bool {
     match (a, b) {
         (ConstantValue::Null, ConstantValue::Null) => true,
@@ -547,8 +557,21 @@ fn eval_binary(
 /// The eager operator matrix, mirroring `DartObjectImpl`'s per-state
 /// methods (`value.dart`): the operand-type asserts decide which
 /// `constEval*` fault fires, in the oracle's assert order (left first).
+#[expect(
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::float_cmp
+)] // operator table mirrors value.dart's listing; VM casts, exact equality
 fn binary_values(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantValue) -> Verdict {
-    use BinOp::*;
+    // Every operator variant appears in the matrix below; the explicit
+    // list keeps the `enum_glob_use` gate honest.
+    use BinOp::{
+        Add, And, BitAnd, BitOr, BitXor, Div, Eq, Ge, Gt, IfNull, IntDiv, Le, Lt, Mod, Mul, Ne, Or,
+        Shl, Shr, Sub, Ushr,
+    };
     // String repetition (`'ab' * 3`) is a spec constant the subset cannot
     // value (escapes undecoded) — defer; the oracle's StringState keeps it
     // clean, so the numeric operand fault must never fire here.
@@ -601,19 +624,20 @@ fn binary_values(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantVa
                     _ => x ^ y,
                 }))
             }
-            (ConstantValue::Int(_), ConstantValue::Int(_)) => {
-                let (ConstantValue::Int(x), ConstantValue::Int(y)) = (a, b) else {
-                    unreachable!()
-                };
+            (ConstantValue::Int(x), ConstantValue::Int(y)) => {
                 Verdict::Value(ConstantValue::Int(match op {
                     BitAnd => x & y,
                     BitOr => x | y,
                     _ => x ^ y,
                 }))
             }
-            (ConstantValue::Null, ConstantValue::Bool(_) | ConstantValue::Int(_))
-            | (ConstantValue::Bool(_) | ConstantValue::Int(_), ConstantValue::Null)
-            | (ConstantValue::Null, ConstantValue::Null) => Verdict::Constant,
+            (
+                ConstantValue::Null,
+                ConstantValue::Bool(_) | ConstantValue::Int(_) | ConstantValue::Null,
+            )
+            | (ConstantValue::Bool(_) | ConstantValue::Int(_), ConstantValue::Null) => {
+                Verdict::Constant
+            }
             _ => Verdict::Fault(ConstFault::TypeBoolInt, span),
         },
         Shl | Shr | Ushr => match (a, b) {
@@ -669,7 +693,6 @@ fn binary_values(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantVa
             // (`BoolState.isIdentical` falls through to FALSE).
             let eq = match (a, b) {
                 (ConstantValue::Null, ConstantValue::Null) => true,
-                (ConstantValue::Null, _) | (_, ConstantValue::Null) => false,
                 // Two const-creation instances: field identity is beyond
                 // the subset — defer (a user `==` override may also lift
                 // the gate).
@@ -693,27 +716,40 @@ fn binary_values(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantVa
                         name: n2,
                     },
                 ) => c1 == c2 && n1 == n2,
-                // A creation instance against a known-state operand:
-                // distinct runtime identities.
-                (ConstantValue::Created(_), _) | (_, ConstantValue::Created(_)) => false,
-                // Cross-primitive pairs.
-                (ConstantValue::Bool(_), _)
-                | (_, ConstantValue::Bool(_))
-                | (ConstantValue::Int(_), _)
-                | (_, ConstantValue::Int(_))
-                | (ConstantValue::Double(_), _)
-                | (_, ConstantValue::Double(_))
-                | (ConstantValue::Str(_), _)
-                | (_, ConstantValue::Str(_))
-                | (ConstantValue::Enum { .. }, _)
-                | (_, ConstantValue::Enum { .. }) => false,
+                // Any remaining pair with a null, const-creation, or
+                // non-comparable-value side answers false silently
+                // (`BoolState.isIdentical` falls through to FALSE).
+                (
+                    ConstantValue::Null
+                    | ConstantValue::Created(_)
+                    | ConstantValue::Bool(_)
+                    | ConstantValue::Int(_)
+                    | ConstantValue::Double(_)
+                    | ConstantValue::Str(_)
+                    | ConstantValue::Enum { .. },
+                    _,
+                )
+                | (
+                    _,
+                    ConstantValue::Null
+                    | ConstantValue::Created(_)
+                    | ConstantValue::Bool(_)
+                    | ConstantValue::Int(_)
+                    | ConstantValue::Double(_)
+                    | ConstantValue::Str(_)
+                    | ConstantValue::Enum { .. },
+                ) => false,
                 // Collections, type literals, symbols, records lack
                 // primitive equality.
                 _ => return Verdict::Fault(ConstFault::PrimitiveEquality, span),
             };
             Verdict::Value(ConstantValue::Bool(if op == Eq { eq } else { !eq }))
         }
-        And | Or | IfNull => unreachable!("lazy operators handled in eval_binary"),
+        // Invariant: the lazy operators are evaluated in `eval_binary`
+        // (short-circuit), so this eager arm never sees them; a future
+        // `BinOp` variant degrades to "not a constant" instead of panicking
+        // on the emission path.
+        And | Or | IfNull => Verdict::NotConstant(span),
     }
 }
 
@@ -728,12 +764,14 @@ fn is_num_or_null(v: &ConstantValue) -> bool {
 /// The numeric kernel: int/int stays int (except `/`, always double),
 /// any double widens, exactly as `IntState`/`DoubleState` do. Dart int
 /// arithmetic wraps (64-bit two's complement, the VM semantics).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names
+)] // Dart int arithmetic wraps and `/` widens (VM semantics)
 fn numeric(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantValue) -> Verdict {
-    use BinOp::*;
-    if matches!((a, b), (ConstantValue::Int(_), ConstantValue::Int(_))) {
-        let (ConstantValue::Int(x), ConstantValue::Int(y)) = (a, b) else {
-            unreachable!()
-        };
+    use BinOp::{Add, Div, Ge, Gt, IntDiv, Le, Lt, Mod, Mul, Sub};
+    if let (ConstantValue::Int(x), ConstantValue::Int(y)) = (a, b) {
         let v = match op {
             Add => x.wrapping_add(*y),
             Sub => x.wrapping_sub(*y),
@@ -763,12 +801,19 @@ fn numeric(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantValue) -
             Gt => return Verdict::Value(ConstantValue::Bool(x > y)),
             Le => return Verdict::Value(ConstantValue::Bool(x <= y)),
             Ge => return Verdict::Value(ConstantValue::Bool(x >= y)),
-            _ => unreachable!("non-arithmetic op in numeric kernel"),
+            // Invariant: `binary_values` routes only the arithmetic/comparison
+            // ops here; a future `BinOp` variant degrades to "not a constant"
+            // instead of panicking on the emission path.
+            _ => return Verdict::NotConstant(span),
         };
         Verdict::Value(ConstantValue::Int(v))
     } else {
-        let x = as_f64(a);
-        let y = as_f64(b);
+        let (Some(x), Some(y)) = (as_f64(a), as_f64(b)) else {
+            // Invariant: `binary_values` feeds the kernel only num operands
+            // (`is_num` gate), so both conversions succeed; a future
+            // `ConstantValue` variant degrades to "not a constant".
+            return Verdict::NotConstant(span);
+        };
         let v = match op {
             Add => x + y,
             Sub => x - y,
@@ -795,17 +840,23 @@ fn numeric(op: BinOp, span: SourceRange, a: &ConstantValue, b: &ConstantValue) -
             Gt => return Verdict::Value(ConstantValue::Bool(x > y)),
             Le => return Verdict::Value(ConstantValue::Bool(x <= y)),
             Ge => return Verdict::Value(ConstantValue::Bool(x >= y)),
-            _ => unreachable!("non-arithmetic op in numeric kernel"),
+            // Invariant: only the arithmetic/comparison ops reach the double
+            // kernel; a future `BinOp` variant degrades to "not a constant".
+            _ => return Verdict::NotConstant(span),
         };
         Verdict::Value(ConstantValue::Double(v))
     }
 }
 
-fn as_f64(v: &ConstantValue) -> f64 {
+#[expect(clippy::cast_precision_loss)] // span arithmetic narrows under the scanner u32 offset cap
+fn as_f64(v: &ConstantValue) -> Option<f64> {
     match v {
-        ConstantValue::Int(x) => *x as f64,
-        ConstantValue::Double(x) => *x,
-        _ => unreachable!("numeric kernel fed a non-num"),
+        ConstantValue::Int(x) => Some(*x as f64),
+        ConstantValue::Double(x) => Some(*x),
+        // Invariant: the numeric kernel's caller gates on `is_num`, so only
+        // Int/Double arrive; a future `ConstantValue` variant returns `None`
+        // and the kernel degrades to "not a constant", never a panic.
+        _ => None,
     }
 }
 
@@ -843,6 +894,12 @@ pub enum WindowKind {
     /// window, where the creation is implicitly `const` and the oracle is
     /// silent.
     LiteralCtor,
+    /// A constant pattern's expression (the `ConstantPattern` node — bare
+    /// in a `case`/if-case or `const`-prefixed): the root verdict reports
+    /// `constant_pattern_with_non_constant_expression`
+    /// (`constant_verifier.dart`'s `visitConstantPattern` →
+    /// `_evaluateAndReportError`, :128-142).
+    ConstantPattern,
 }
 
 struct Window {
@@ -855,6 +912,10 @@ struct Window {
     /// operands cannot be told apart here — the dup check skips the whole
     /// literal instead, under-reporting by design).
     ctl_elements: u32,
+    /// The creation head a `ConstructorReference` identifier latched (a
+    /// type head never reaches the operand stack, so a ctor-invocation
+    /// window's [`ClosedArgs::callee`] would otherwise close `None`).
+    head: Option<StringId>,
 }
 
 /// One open argument list: the callee node latched at `begin_arguments`
@@ -938,6 +999,7 @@ fn split_set_or_map(staged: Vec<Node>, has_set_entry: bool) -> SetOrMap {
 impl ConstCapture {
     /// `identical_id` is the interned `identical` spelling — the one
     /// invocation the subset evaluates.
+    #[must_use]
     pub fn new(identical_id: StringId) -> Self {
         Self {
             identical_id,
@@ -954,6 +1016,7 @@ impl ConstCapture {
         }
     }
 
+    #[must_use]
     pub fn open(&self) -> bool {
         !self.windows.is_empty()
     }
@@ -1030,6 +1093,7 @@ impl ConstCapture {
     }
 
     /// Whether a literal-constructor candidate window is innermost.
+    #[must_use]
     pub fn top_is_literal_ctor(&self) -> bool {
         self.windows
             .last()
@@ -1040,7 +1104,7 @@ impl ConstCapture {
     /// captured argument trees (empty without such a window on top). A
     /// candidate nested in an enclosing candidate or dup literal leaves a
     /// non-constant placeholder on the parent stack
-    /// ([`Self::non_const_dup_placeholder`]'s shape widened to both
+    /// (`Self::non_const_dup_placeholder`'s shape widened to both
     /// non-const kinds). The dup face needs the non-constant reading. The
     /// candidate parent is a known under-report against the oracle there:
     /// its `canBeConst` probe re-wraps the whole creation in `const`, the
@@ -1072,13 +1136,55 @@ impl ConstCapture {
         args
     }
 
+    /// Opens a constant-pattern window (the `ConstantPattern` node's
+    /// expression — `case e:` and `if (x case e)` alike, bare or
+    /// `const`-prefixed). No nesting rule: the oracle's
+    /// `visitConstantPattern` evaluates every constant pattern's
+    /// expression, and a constant pattern inside another constant
+    /// pattern's *expression* (a `const` collection literal's elements are
+    /// sub-patterns, not this node) cannot occur — the window nests by
+    /// construction.
+    pub fn open_constant_pattern(&mut self) {
+        self.open_window(WindowKind::ConstantPattern);
+    }
+
+    /// Whether a constant-pattern window is innermost (the engine only
+    /// evaluates when it owns the top — a nested constant pattern's close
+    /// fires before its parent's).
+    #[must_use]
+    pub fn top_is_constant_pattern(&self) -> bool {
+        self.windows
+            .last()
+            .is_some_and(|w| w.kind == WindowKind::ConstantPattern)
+    }
+
+    /// Closes a constant-pattern window, returning its root node for the
+    /// caller to evaluate — mirrors [`Self::close_initializer`] (the engine
+    /// supplies the [`ConstLookup`], so the borrows stay split). `None`
+    /// without such a window on top.
+    pub fn close_constant_pattern(&mut self) -> Option<Node> {
+        if !self.top_is_constant_pattern() {
+            return None;
+        }
+        self.apply_unaries();
+        let base = self.base();
+        let root = self.take_root();
+        self.stack.truncate(base);
+        self.drop_latches_above(base);
+        self.windows.pop();
+        // The closed window's node does not join a parent window's
+        // operands — a pattern expression is a leaf context, nothing below
+        // reads it.
+        root
+    }
+
     /// A spread/if/for element opened inside the innermost window (the
     /// dup check's wholesale-skip latch; no other window kind reads it).
     pub fn begin_ctl_element(&mut self) {
-        if let Some(window) = self.windows.last_mut() {
-            if window.kind == WindowKind::NonConstDup {
-                window.ctl_elements += 1;
-            }
+        if let Some(window) = self.windows.last_mut()
+            && window.kind == WindowKind::NonConstDup
+        {
+            window.ctl_elements += 1;
         }
     }
 
@@ -1087,7 +1193,22 @@ impl ConstCapture {
             kind,
             base: self.stack.len(),
             ctl_elements: 0,
+            head: None,
         });
+    }
+
+    /// Latches the creation head on the open ctor-invocation window (the
+    /// `const C` head is a type reference — the operand stack never sees
+    /// it, and the window's close needs the name for the
+    /// `const_with_non_const` target face).
+    pub fn note_ctor_head(&mut self, name: StringId) {
+        if let Some(window) = self
+            .windows
+            .last_mut()
+            .filter(|w| w.kind == WindowKind::CtorInvocation && w.head.is_none())
+        {
+            window.head = Some(name);
+        }
     }
 
     /// Closes an initializer window, returning its root node for the
@@ -1125,7 +1246,7 @@ impl ConstCapture {
     /// `None` unless a [`WindowKind::NonConstDup`] window is on top (the
     /// const windows close through [`Self::literal_set_or_map`]). A
     /// literal nested in an enclosing dup literal leaves an opaque
-    /// placeholder on the parent stack ([`Self::non_const_dup_placeholder`]).
+    /// placeholder on the parent stack (`Self::non_const_dup_placeholder`).
     pub fn close_non_const_dup(
         &mut self,
         count: usize,
@@ -1150,7 +1271,7 @@ impl ConstCapture {
     /// element/entry pairing would drift (a map value slot would swallow
     /// the next key). The dup check skips the node — the oracle's
     /// `computeConstantValue` fails on the same shapes. No-op unless a
-    /// NonConstDup window is on top.
+    /// `NonConstDup` window is on top.
     fn non_const_dup_placeholder(&mut self, span: SourceRange) {
         if self.top_is_non_const_dup() {
             self.push(
@@ -1271,15 +1392,22 @@ impl ConstCapture {
         }
     }
 
-    /// A postfix `++`/`--` (its operand is already pushed).
+    /// A postfix `++`/`--` (its operand is already pushed). The captured
+    /// node spans operand-through-operator (`o++`), matching the oracle's
+    /// non-constant-pattern anchor.
     pub fn unary_postfix(&mut self, span: SourceRange) {
         if self.open() {
             let base = self.base();
-            self.pop_clamped(base);
+            let start = self
+                .pop_clamped(base)
+                .map_or(span.offset, |operand| operand.span.offset);
             self.push(
                 Node {
                     expr: Expr::Other,
-                    span,
+                    span: SourceRange {
+                        offset: start,
+                        length: span.end().saturating_sub(start),
+                    },
                 },
                 true,
             );
@@ -1361,13 +1489,12 @@ impl ConstCapture {
         let Some((mark, _)) = self.cond_latches.pop() else {
             return;
         };
-        let (els, then, cond) = match (
+        let (Some(els), Some(then), Some(cond)) = (
             self.pop_clamped(mark),
             self.pop_clamped(mark),
             self.pop_clamped(mark),
-        ) {
-            (Some(e), Some(t), Some(c)) => (e, t, c),
-            _ => return,
+        ) else {
+            return;
         };
         let span = SourceRange {
             offset: cond.span.offset,
@@ -1556,14 +1683,14 @@ impl ConstCapture {
     /// Under a non-const duplicate window the literal is a foreign element
     /// of the enclosing dup literal, not a const-checked face: its
     /// operands drain and nothing checks.
-    pub fn literal_list(&mut self, count: usize, _span: SourceRange) -> Option<Vec<Node>> {
+    pub fn literal_list(&mut self, count: usize, span: SourceRange) -> Option<Vec<Node>> {
         if !self.open() {
             return None;
         }
         if self.top_is_non_const_dup() {
             self.apply_unaries_at(self.depth);
             self.pop_operands(count);
-            self.non_const_dup_placeholder(_span);
+            self.non_const_dup_placeholder(span);
             return None;
         }
         self.apply_unaries_at(self.depth);
@@ -1618,14 +1745,14 @@ impl ConstCapture {
     /// for per-element checking. Under a non-const duplicate window the
     /// record is a foreign element of the enclosing dup literal: its
     /// operands drain and nothing checks.
-    pub fn record_literal(&mut self, count: usize, _span: SourceRange) -> Option<Vec<Node>> {
+    pub fn record_literal(&mut self, count: usize, span: SourceRange) -> Option<Vec<Node>> {
         if !self.open() {
             return None;
         }
         if self.top_is_non_const_dup() {
             self.apply_unaries_at(self.depth);
             self.pop_operands(count);
-            self.non_const_dup_placeholder(_span);
+            self.non_const_dup_placeholder(span);
             return None;
         }
         self.apply_unaries_at(self.depth);
@@ -1738,8 +1865,16 @@ impl ConstCapture {
         if creation && self.args.iter().all(|l| l.window_seq < level.window_seq) {
             let callee = level.callee.as_ref();
             let span = callee.map_or(ORIGIN, |c| c.span);
+            // The creation head rides the window (`note_ctor_head`) when a
+            // type head named it; an expression callee reaches here through
+            // the operand stack instead.
+            let head = self
+                .windows
+                .last()
+                .and_then(|w| w.head)
+                .or_else(|| callee.and_then(head_name));
             return Some(ClosedArgs {
-                callee: callee.and_then(|c| head_name(c)),
+                callee: head,
                 span: SourceRange {
                     offset: span.offset,
                     length: end.end().saturating_sub(span.offset),
@@ -1797,15 +1932,27 @@ impl ConstCapture {
             // is resolution-shape-specific (property access vs method),
             // out of the M2 subset: defer. Under a literal-ctor candidate
             // window there is no enclosing const window to defer to: a
-            // runtime member call is simply not constant-evaluatable.
+            // runtime member call is simply not constant-evaluatable. A
+            // constant-pattern window answers its own question — `this()`
+            // / `super()` / `x.y()` in a case operand is provably not a
+            // constant expression, so the leaf marks the whole invocation
+            // (callee start through the closing paren) non-constant.
+            let non_constant = self.top_is_literal_ctor() || self.top_is_constant_pattern();
             self.push(
                 Node {
-                    expr: if self.top_is_literal_ctor() {
+                    expr: if non_constant {
                         Expr::Other
                     } else {
                         Expr::Opaque
                     },
-                    span: node.span,
+                    span: if non_constant {
+                        SourceRange {
+                            offset: node.span.offset,
+                            length: end.end().saturating_sub(node.span.offset),
+                        }
+                    } else {
+                        node.span
+                    },
                 },
                 true,
             );
@@ -1919,6 +2066,14 @@ impl ConstCapture {
         }
     }
 
+    /// Takes the capture stack's top node (the const constructor's
+    /// field-initializer RHS, stashed before the assignment folds it —
+    /// the #1351 creation-time walk reads it from the engine's own
+    /// stash). `None` when the recovery left nothing.
+    pub fn take_top_node(&mut self) -> Option<Node> {
+        self.stack.pop()
+    }
+
     // —— depth-bearing brackets ——————————————————————————————————————
 
     pub fn parenthesized_begin(&mut self) {
@@ -2018,15 +2173,15 @@ mod tests {
             self.strings.intern(name)
         }
 
-        fn node(&self, expr: Expr, offset: u32) -> Node {
+        fn node(expr: Expr, offset: u32) -> Node {
             Node {
                 expr,
                 span: SourceRange { offset, length: 1 },
             }
         }
 
-        fn value_node(&self, v: ConstantValue) -> Node {
-            self.node(Expr::Value(v), 0)
+        fn value_node(v: ConstantValue) -> Node {
+            Self::node(Expr::Value(v), 0)
         }
 
         fn eval(&self, node: &Node) -> Verdict {
@@ -2034,9 +2189,9 @@ mod tests {
         }
 
         fn bin(&self, op: BinOp, l: ConstantValue, r: ConstantValue) -> Verdict {
-            let left = self.value_node(l);
-            let right = self.value_node(r);
-            let node = self.node(
+            let left = Self::value_node(l);
+            let right = Self::value_node(r);
+            let node = Self::node(
                 Expr::Binary {
                     op,
                     left: Box::new(left),
@@ -2091,8 +2246,8 @@ mod tests {
 
     #[test]
     fn int_arithmetic_wraps_and_div_always_doubles() {
-        let world = w();
         use BinOp::*;
+        let world = w();
         assert_eq!(
             world.bin(Add, ConstantValue::Int(1), ConstantValue::Int(2)),
             Verdict::Value(ConstantValue::Int(3))
@@ -2113,10 +2268,10 @@ mod tests {
             Verdict::Value(ConstantValue::Double(1.5))
         );
         // Unary minus wraps too (`-(-2^63)` stays `-2^63`).
-        let neg = world.node(
+        let neg = World::node(
             Expr::Unary {
                 op: UnOp::Neg,
-                operand: Box::new(world.value_node(ConstantValue::Int(i64::MIN))),
+                operand: Box::new(World::value_node(ConstantValue::Int(i64::MIN))),
             },
             0,
         );
@@ -2128,8 +2283,8 @@ mod tests {
 
     #[test]
     fn division_by_zero_faults_match_the_oracle() {
-        let world = w();
         use BinOp::*;
+        let world = w();
         // `~/ 0` is the IntegerDivisionByZeroException throw
         // (value.dart `integerDivide`).
         assert_eq!(
@@ -2145,8 +2300,8 @@ mod tests {
 
     #[test]
     fn modulo_takes_the_divisor_sign_domain_like_dart() {
-        let world = w();
         use BinOp::*;
+        let world = w();
         // Dart `%` takes the divisor's sign domain: `-5 % 3 == 1`.
         assert_eq!(
             world.bin(Mod, ConstantValue::Int(-5), ConstantValue::Int(3)),
@@ -2164,8 +2319,8 @@ mod tests {
 
     #[test]
     fn shifts_follow_the_vm_rules() {
-        let world = w();
         use BinOp::*;
+        let world = w();
         // Counts ≥ 64: `<<` zeroes, `>>` sign-fills, `>>>` zeroes.
         assert_eq!(
             world.bin(Shl, ConstantValue::Int(1), ConstantValue::Int(64)),
@@ -2200,8 +2355,8 @@ mod tests {
 
     #[test]
     fn plus_faults_follow_the_state_assert_order() {
-        let world = w();
         use BinOp::*;
+        let world = w();
         // String + String concatenates.
         assert_eq!(
             world.bin(
@@ -2232,8 +2387,8 @@ mod tests {
 
     #[test]
     fn equality_is_primitive_and_cross_numeric() {
-        let world = w();
         use BinOp::*;
+        let world = w();
         // Dart: `1 == 1.0` is true, `identical(1, 1.0)` is not.
         assert_eq!(
             world.bin(Eq, ConstantValue::Int(1), ConstantValue::Double(1.0)),
@@ -2276,8 +2431,8 @@ mod tests {
 
     #[test]
     fn bitwise_ops_split_bool_and_int() {
-        let world = w();
         use BinOp::*;
+        let world = w();
         assert_eq!(
             world.bin(
                 BitAnd,
@@ -2296,10 +2451,10 @@ mod tests {
             Verdict::Fault(ConstFault::TypeBoolInt, span(7))
         );
         // `~` on a non-int faults with const_eval_type_int.
-        let not = world.node(
+        let not = World::node(
             Expr::Unary {
                 op: UnOp::BitNot,
-                operand: Box::new(world.value_node(ConstantValue::Double(1.0))),
+                operand: Box::new(World::value_node(ConstantValue::Double(1.0))),
             },
             3,
         );
@@ -2316,11 +2471,11 @@ mod tests {
         let world = w();
         // `false && <provably non-const>`: the right operand never
         // evaluates — no diagnostic (evaluation.dart `lazyAnd`).
-        let false_and_nc = world.node(
+        let false_and_nc = World::node(
             Expr::Binary {
                 op: BinOp::And,
-                left: Box::new(world.value_node(ConstantValue::Bool(false))),
-                right: Box::new(world.node(Expr::Ident(world.id("nc")), 9)),
+                left: Box::new(World::value_node(ConstantValue::Bool(false))),
+                right: Box::new(World::node(Expr::Ident(world.id("nc")), 9)),
             },
             7,
         );
@@ -2329,11 +2484,11 @@ mod tests {
             Verdict::Value(ConstantValue::Bool(false))
         );
         // `true || <non-const>`: same.
-        let true_or_nc = world.node(
+        let true_or_nc = World::node(
             Expr::Binary {
                 op: BinOp::Or,
-                left: Box::new(world.value_node(ConstantValue::Bool(true))),
-                right: Box::new(world.node(Expr::Ident(world.id("nc")), 9)),
+                left: Box::new(World::value_node(ConstantValue::Bool(true))),
+                right: Box::new(World::node(Expr::Ident(world.id("nc")), 9)),
             },
             7,
         );
@@ -2343,11 +2498,11 @@ mod tests {
         );
         // A non-bool left operand faults with const_eval_type_bool at the
         // operand's span.
-        let int_and = world.node(
+        let int_and = World::node(
             Expr::Binary {
                 op: BinOp::And,
-                left: Box::new(world.value_node(ConstantValue::Int(1))),
-                right: Box::new(world.value_node(ConstantValue::Bool(true))),
+                left: Box::new(World::value_node(ConstantValue::Int(1))),
+                right: Box::new(World::value_node(ConstantValue::Bool(true))),
             },
             7,
         );
@@ -2357,11 +2512,11 @@ mod tests {
         );
         // `??`: a non-null left short-circuits; a null left takes the
         // right.
-        let ifnull = world.node(
+        let ifnull = World::node(
             Expr::Binary {
                 op: BinOp::IfNull,
-                left: Box::new(world.value_node(ConstantValue::Null)),
-                right: Box::new(world.value_node(ConstantValue::Int(2))),
+                left: Box::new(World::value_node(ConstantValue::Null)),
+                right: Box::new(World::value_node(ConstantValue::Int(2))),
             },
             7,
         );
@@ -2372,22 +2527,22 @@ mod tests {
     fn conditional_takes_one_branch_and_checks_bool() {
         let world = w();
         // A known condition skips the dead branch's non-constancy.
-        let cond = world.node(
+        let cond = World::node(
             Expr::Cond {
-                cond: Box::new(world.value_node(ConstantValue::Bool(true))),
-                then: Box::new(world.value_node(ConstantValue::Int(1))),
-                els: Box::new(world.node(Expr::Ident(world.id("nc")), 9)),
+                cond: Box::new(World::value_node(ConstantValue::Bool(true))),
+                then: Box::new(World::value_node(ConstantValue::Int(1))),
+                els: Box::new(World::node(Expr::Ident(world.id("nc")), 9)),
             },
             7,
         );
         assert_eq!(world.eval(&cond), Verdict::Value(ConstantValue::Int(1)));
         // A non-bool condition faults at the condition's span
         // (applyBooleanConversion → const_eval_type_bool).
-        let bad = world.node(
+        let bad = World::node(
             Expr::Cond {
-                cond: Box::new(world.value_node(ConstantValue::Int(1))),
-                then: Box::new(world.value_node(ConstantValue::Int(1))),
-                els: Box::new(world.value_node(ConstantValue::Int(2))),
+                cond: Box::new(World::value_node(ConstantValue::Int(1))),
+                then: Box::new(World::value_node(ConstantValue::Int(1))),
+                els: Box::new(World::value_node(ConstantValue::Int(2))),
             },
             7,
         );
@@ -2404,11 +2559,11 @@ mod tests {
         let world = w();
         // `'a${[1]}'`: a list operand faults with
         // const_eval_type_bool_num_string at the interpolation.
-        let interp = world.node(
+        let interp = World::node(
             Expr::Interp {
                 parts: vec![
-                    world.value_node(ConstantValue::Str("a".into())),
-                    world.value_node(ConstantValue::Instance(InstanceKind::List)),
+                    World::value_node(ConstantValue::Str("a".into())),
+                    World::value_node(ConstantValue::Instance(InstanceKind::List)),
                 ],
             },
             7,
@@ -2418,10 +2573,10 @@ mod tests {
             Verdict::Fault(ConstFault::TypeBoolNumString, span(0))
         );
         // Adjacent strings concatenate.
-        let adjacent = world.node(
+        let adjacent = World::node(
             Expr::Adjacent(vec![
-                world.value_node(ConstantValue::Str("a".into())),
-                world.value_node(ConstantValue::Str("b".into())),
+                World::value_node(ConstantValue::Str("a".into())),
+                World::value_node(ConstantValue::Str("b".into())),
             ]),
             7,
         );
@@ -2431,9 +2586,9 @@ mod tests {
         );
         // A clean interpolation defers its value (escapes are undecoded —
         // a fabricated text would be wrong where values are observable).
-        let clean = world.node(
+        let clean = World::node(
             Expr::Interp {
-                parts: vec![world.value_node(ConstantValue::Str("a".into()))],
+                parts: vec![World::value_node(ConstantValue::Str("a".into()))],
             },
             7,
         );
@@ -2445,8 +2600,8 @@ mod tests {
     /// numeric operand fault must never fire.
     #[test]
     fn string_repetition_defers_instead_of_faulting() {
-        let world = w();
         use BinOp::*;
+        let world = w();
         assert_eq!(
             world.bin(Mul, ConstantValue::Str("ab".into()), ConstantValue::Int(3)),
             Verdict::Constant
@@ -2468,12 +2623,12 @@ mod tests {
     #[test]
     fn opaque_leaves_defer_through_enclosing_operators() {
         let world = w();
-        assert_eq!(world.eval(&world.node(Expr::Opaque, 3)), Verdict::Constant);
-        let add = world.node(
+        assert_eq!(world.eval(&World::node(Expr::Opaque, 3)), Verdict::Constant);
+        let add = World::node(
             Expr::Binary {
                 op: BinOp::Add,
-                left: Box::new(world.node(Expr::Opaque, 0)),
-                right: Box::new(world.value_node(ConstantValue::Int(1))),
+                left: Box::new(World::node(Expr::Opaque, 0)),
+                right: Box::new(World::value_node(ConstantValue::Int(1))),
             },
             7,
         );
@@ -2500,12 +2655,12 @@ mod tests {
     fn identical_evaluates_other_calls_do_not() {
         let world = w();
         // identical(e1, e2): same enum constant → true.
-        let call = world.node(
+        let call = World::node(
             Expr::Call {
                 name: world.id("identical"),
                 args: vec![
-                    world.node(Expr::Ident(world.id("e1")), 0),
-                    world.node(Expr::Ident(world.id("e2")), 0),
+                    World::node(Expr::Ident(world.id("e1")), 0),
+                    World::node(Expr::Ident(world.id("e2")), 0),
                 ],
             },
             7,
@@ -2515,10 +2670,10 @@ mod tests {
             Verdict::Value(ConstantValue::Bool(false))
         );
         // Any other invocation is provably non-constant.
-        let other = world.node(
+        let other = World::node(
             Expr::Call {
                 name: world.id("other"),
-                args: vec![world.value_node(ConstantValue::Int(1))],
+                args: vec![World::value_node(ConstantValue::Int(1))],
             },
             7,
         );
@@ -2532,30 +2687,30 @@ mod tests {
         let world = w();
         // An opaque constant (a foreign const) in arithmetic: the result
         // defers — never a wrong verdict.
-        let add_unknown = world.node(
+        let add_unknown = World::node(
             Expr::Binary {
                 op: BinOp::Add,
-                left: Box::new(world.node(Expr::Ident(world.id("foreign")), 0)),
-                right: Box::new(world.value_node(ConstantValue::Int(1))),
+                left: Box::new(World::node(Expr::Ident(world.id("foreign")), 0)),
+                right: Box::new(World::value_node(ConstantValue::Int(1))),
             },
             7,
         );
         assert_eq!(world.eval(&add_unknown), Verdict::Constant);
         // An enum constant's member reads defer (synthesized faces).
-        let member = world.node(
+        let member = World::node(
             Expr::Member {
-                recv: Box::new(world.node(Expr::Ident(world.id("e1")), 0)),
+                recv: Box::new(World::node(Expr::Ident(world.id("e1")), 0)),
                 name: world.id("index"),
             },
             7,
         );
         assert_eq!(world.eval(&member), Verdict::Constant);
         // Enum constants are values with identity.
-        let same = world.node(
+        let same = World::node(
             Expr::Binary {
                 op: BinOp::Eq,
-                left: Box::new(world.node(Expr::Ident(world.id("e1")), 0)),
-                right: Box::new(world.node(Expr::Ident(world.id("e1")), 0)),
+                left: Box::new(World::node(Expr::Ident(world.id("e1")), 0)),
+                right: Box::new(World::node(Expr::Ident(world.id("e1")), 0)),
             },
             7,
         );
@@ -2567,11 +2722,11 @@ mod tests {
         let world = w();
         // `1 + nc`: the NotConstant verdict anchors at `nc` (the oracle's
         // error entity), not at the binary.
-        let add = world.node(
+        let add = World::node(
             Expr::Binary {
                 op: BinOp::Add,
-                left: Box::new(world.value_node(ConstantValue::Int(1))),
-                right: Box::new(world.node(Expr::Ident(world.id("nc")), 9)),
+                left: Box::new(World::value_node(ConstantValue::Int(1))),
+                right: Box::new(World::node(Expr::Ident(world.id("nc")), 9)),
             },
             7,
         );
@@ -2586,9 +2741,9 @@ mod tests {
     #[test]
     fn deep_trees_terminate() {
         let world = w();
-        let mut node = world.value_node(ConstantValue::Int(1));
+        let mut node = World::value_node(ConstantValue::Int(1));
         for i in 0..1000 {
-            node = world.node(
+            node = World::node(
                 Expr::Unary {
                     op: UnOp::Neg,
                     operand: Box::new(node),
@@ -2597,9 +2752,9 @@ mod tests {
             );
         }
         assert_eq!(world.eval(&node), Verdict::Constant);
-        let mut node = world.value_node(ConstantValue::Int(1));
+        let mut node = World::value_node(ConstantValue::Int(1));
         for i in 0..99 {
-            node = world.node(
+            node = World::node(
                 Expr::Unary {
                     op: UnOp::Neg,
                     operand: Box::new(node),
@@ -2608,6 +2763,54 @@ mod tests {
             );
         }
         assert_eq!(world.eval(&node), Verdict::Value(ConstantValue::Int(-1)));
+    }
+
+    /// The batch-H degrade posture: the kernel wildcard arms return "not a
+    /// constant" instead of panicking. Three fallbacks are constructible
+    /// cheaply today — a non-num operand through `numeric`'s double kernel
+    /// (the `as_f64` degrade; `binary_values` gates on `is_num`, but the
+    /// free function accepts any operands), the eager arm's lazy-operator
+    /// wildcard through a direct `binary_values` call, and the int kernel's
+    /// op wildcard via `Eq` (one arm shared with every other non-arithmetic
+    /// op). Only a future `BinOp` or `ConstantValue` variant needs a
+    /// variant that does not exist yet, and stays desk-pinned to the same
+    /// posture.
+    #[test]
+    fn kernel_wildcards_degrade_to_not_constant() {
+        let span = span(3);
+        // A non-num operand takes the double kernel's `as_f64` degrade.
+        assert_eq!(
+            numeric(
+                BinOp::Add,
+                span,
+                &ConstantValue::Str("s".into()),
+                &ConstantValue::Str("t".into()),
+            ),
+            Verdict::NotConstant(span)
+        );
+        // The eager arm's lazy-operator wildcard degrades the same way (the
+        // short-circuit evaluation happens in `eval_binary`).
+        assert_eq!(
+            binary_values(
+                BinOp::And,
+                span,
+                &ConstantValue::Bool(true),
+                &ConstantValue::Bool(false),
+            ),
+            Verdict::NotConstant(span)
+        );
+        // The int kernel's op wildcard: `Eq` routes to `binary_values`'
+        // equality arm in production, but a direct kernel call constructs
+        // the degrade.
+        assert_eq!(
+            numeric(
+                BinOp::Eq,
+                span,
+                &ConstantValue::Int(1),
+                &ConstantValue::Int(2),
+            ),
+            Verdict::NotConstant(span)
+        );
     }
 
     fn span(offset: u32) -> SourceRange {

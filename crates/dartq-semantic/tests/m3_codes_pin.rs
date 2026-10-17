@@ -22,7 +22,7 @@ const M3_UNUSED_CODES_FREEZE: &str = "../../tests/harness/m3_unused_codes.txt";
 
 /// The usage-analysis `unused_*` family (`unused_local_elements_verifier.dart`
 /// plus the import/`useResult`/label siblings — the 11 registry
-/// STATIC_WARNING names the M2 freeze excludes). Variants, not strings:
+/// `STATIC_WARNING` names the M2 freeze excludes). Variants, not strings:
 /// removing or renaming a registry variant breaks this list, which is the
 /// strongest possible implementation-sync signal.
 const USAGE_FAMILY: &[SemanticCode] = &[

@@ -11,7 +11,7 @@
 //!
 //! The oracle resolves the annotation through the ordinary scope chain and
 //! tests the resolved element (`_isPackageMetaGetter` /
-//! `_isTopGetter`, analyzer `element.dart:2100-2130`): a GetterElement with
+//! `_isTopGetter`, analyzer `element.dart:2100-2130`): a `GetterElement` with
 //! the getter's name whose library is named `meta`. The resolution step
 //! itself is the scope chain (bare identifier: the file's top-level
 //! declarations first, then the unprefixed import namespace,
@@ -109,30 +109,45 @@ pub struct AnnotationArg {
     /// The written label (`parameterDefined:`), `None` for a positional
     /// argument.
     pub label: Option<StringId>,
-    /// The string face: the value the argument evaluates to (a string
-    /// literal's cooked text, or the const value of a reference) plus the
-    /// written expression's own span (a literal's span includes the
-    /// quotes) — the official report anchor. `None` when the value is
-    /// absent or not a string.
+    /// The value face: the argument's cooked string value (a string
+    /// literal's cooked text) plus the written expression's own span (a
+    /// literal's span includes the quotes) — the official report anchor.
+    /// `None` when the value is absent or not a string literal.
     pub string: Option<(StringId, SourceRange)>,
+    /// The written face of a bare reference argument: the source text plus
+    /// the written span. The official walk messages this text for a
+    /// non-literal argument (the `toString` fallback,
+    /// `annotation_verifier.dart:534-537`) while the gate value resolves
+    /// from the caller's const environment.
+    pub reference: Option<(StringId, SourceRange)>,
 }
 
-/// The written `parameterDefined` face of `@UseResult.unless` from
-/// package:meta: `Some((value, span))` when `annotation` resolves to the
-/// named constructor `unless` of meta's `UseResult` class for `lib` and
-/// `args` carries a string-valued `parameterDefined` argument — the value
-/// is the constant the oracle's `computeConstantValue` reads, the span
-/// the written expression (a literal's span includes the quotes), the
-/// official report anchor. `None` for every other shape: an unresolved
-/// import, a non-meta same-name resolution, the unnamed `UseResult` face,
-/// another selector, a missing or non-string `parameterDefined`.
+/// The `parameterDefined` face of a recognized `@UseResult.unless`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum UnlessFace {
+    /// A string-literal argument: the cooked value is both the official
+    /// gate (`computeConstantValue`'s `toStringValue`) and the message
+    /// face (the `SimpleStringLiteral` arm), the span the written literal.
+    Literal { value: StringId, span: SourceRange },
+    /// A reference argument: the written name is the message face (the
+    /// `toString` fallback); the gate value resolves from the const
+    /// environment at the check.
+    Reference { name: StringId, span: SourceRange },
+}
+
+/// The `parameterDefined` face of `@UseResult.unless` from package:meta:
+/// `Some(face)` when `annotation` resolves to the named constructor
+/// `unless` of meta's `UseResult` class for `lib` and `args` carries a
+/// `parameterDefined` argument. `None` for every other shape: an
+/// unresolved import, a non-meta same-name resolution, the unnamed
+/// `UseResult` face, another selector, or a missing `parameterDefined`.
 pub fn use_result_unless(
     annotation: &Annotation,
     args: &[AnnotationArg],
     strings: &StringTable,
     graph: &LibraryGraph,
     lib: LibraryId,
-) -> Option<(StringId, SourceRange)> {
+) -> Option<UnlessFace> {
     // The written name is head + selector (`UseResult.unless`) behind an
     // optional prefix (`meta.UseResult.unless`); a selector-less spelling
     // is the unnamed face and never carries `unless`.
@@ -160,15 +175,24 @@ pub fn use_result_unless(
     }
     // The official walk takes the written expression under the
     // `parameterDefined` label (`annotation_verifier.dart:706-710`); the
-    // string value itself is the caller's const-eval capture.
+    // value face is the caller's const-eval capture, the written face the
+    // source text of that expression.
     let label = strings.intern("parameterDefined");
-    args.iter().find_map(|arg| match (arg.label, &arg.string) {
-        (Some(l), Some((value, range))) if l == label => Some((*value, *range)),
-        _ => None,
-    })
+    args.iter()
+        .find_map(|arg| match (arg.label, &arg.string, &arg.reference) {
+            (Some(l), Some((value, span)), _) if l == label => Some(UnlessFace::Literal {
+                value: *value,
+                span: *span,
+            }),
+            (Some(l), None, Some((name, span))) if l == label => Some(UnlessFace::Reference {
+                name: *name,
+                span: *span,
+            }),
+            _ => None,
+        })
 }
 
-/// [`use_result_unless`] without the value: the written expression's span
+/// [`use_result_unless`] without the face: the written expression's span
 /// only.
 pub fn use_result_unless_parameter_defined(
     annotation: &Annotation,
@@ -177,7 +201,9 @@ pub fn use_result_unless_parameter_defined(
     graph: &LibraryGraph,
     lib: LibraryId,
 ) -> Option<SourceRange> {
-    use_result_unless(annotation, args, strings, graph, lib).map(|(_, range)| range)
+    use_result_unless(annotation, args, strings, graph, lib).map(|face| match face {
+        UnlessFace::Literal { span, .. } | UnlessFace::Reference { span, .. } => span,
+    })
 }
 
 /// The shared name-level resolution mirror: whether `spelling` denotes
@@ -304,6 +330,7 @@ mod tests {
                         offset: 0,
                         length: 8,
                     },
+                    args_text: None,
                 },
                 getter,
                 &self.strings,
@@ -326,6 +353,16 @@ mod tests {
             )
         }
 
+        fn unless_face(&self, spelling: &str, args: &[AnnotationArg]) -> Option<UnlessFace> {
+            use_result_unless(
+                &self.ann(spelling),
+                args,
+                &self.strings,
+                &self.graph,
+                self.lib,
+            )
+        }
+
         fn ann(&self, spelling: &str) -> Annotation {
             Annotation {
                 name: self.strings.intern(spelling),
@@ -333,6 +370,7 @@ mod tests {
                     offset: 0,
                     length: 8,
                 },
+                args_text: None,
             }
         }
 
@@ -349,6 +387,17 @@ mod tests {
             AnnotationArg {
                 label: Some(self.strings.intern(label)),
                 string: value.map(|(v, range)| (self.strings.intern(v), range)),
+                reference: None,
+            }
+        }
+
+        /// A bare reference argument (`parameterDefined: s`) with its
+        /// written name and span.
+        fn referenced(&self, name: &'static str, range: SourceRange) -> AnnotationArg {
+            AnnotationArg {
+                label: Some(self.strings.intern("parameterDefined")),
+                string: None,
+                reference: Some((self.strings.intern(name), range)),
             }
         }
 
@@ -356,6 +405,7 @@ mod tests {
             AnnotationArg {
                 label: None,
                 string: value.map(|(v, range)| (self.strings.intern(v), range)),
+                reference: None,
             }
         }
     }
@@ -578,7 +628,7 @@ mod tests {
         );
     }
 
-    /// `show UseResult` allows the face; `show literal` (UseResult
+    /// `show UseResult` allows the face; `show literal` (`UseResult`
     /// filtered out) and `hide UseResult` both drop it.
     #[test]
     fn unless_respects_combinators() {
@@ -706,6 +756,33 @@ mod tests {
         assert_eq!(
             rig.unless_span("UseResult.unless", &[rig.param_defined(None)]),
             None
+        );
+    }
+
+    /// A bare reference argument keeps the literal path silent (the value
+    /// face is absent) and surfaces as the `Reference` face: the written
+    /// name and span — the official `toString` fallback's message face;
+    /// the gate value stays with the caller's const environment.
+    #[test]
+    fn unless_reference_face_carries_the_written_name() {
+        let rig = Rig::new(&[Import::unprefixed("package:meta/meta.dart")], &[]);
+        assert_eq!(
+            rig.unless_span("UseResult.unless", &[rig.referenced("s", SPAN)]),
+            Some(SPAN)
+        );
+        assert_eq!(
+            rig.unless_face("UseResult.unless", &[rig.referenced("s", SPAN)]),
+            Some(UnlessFace::Reference {
+                name: rig.strings.intern("s"),
+                span: SPAN,
+            })
+        );
+        assert_eq!(
+            rig.unless_face("UseResult.unless", &[rig.param_defined(Some(("p", SPAN)))]),
+            Some(UnlessFace::Literal {
+                value: rig.strings.intern("p"),
+                span: SPAN,
+            })
         );
     }
 }

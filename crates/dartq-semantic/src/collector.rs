@@ -4,10 +4,11 @@
 //!
 //! # Capture mechanics
 //!
-//! The parser takes its listener by value and hands back nothing, so the
-//! collector's state lives behind an `Rc<RefCell<Builder>>` shared between
-//! the listener and [`collect`]; the per-event cost is one `RefCell` flag
-//! check. Capture keys off declaration-carrying events only — expression
+//! The parser takes its listener by value and hands back nothing, so
+//! [`collect`] keeps the collector in its own scope and lends it to the
+//! parse through the multiplexer: the builder is a plain owned field, every
+//! event pays no share-count or borrow-flag check at all. Capture keys off
+//! declaration-carrying events only — expression
 //! and reference identifier contexts are ignored, so bodies contribute
 //! nothing:
 //!
@@ -58,7 +59,7 @@
 //!   at `handle_no_type` — every declaration head (typed or not) runs one
 //!   `parse_type`, so the arm never leaks across declarations. The
 //!   written-type capture (#728) rides the same discipline: an annotation
-//!   site's argument group feeds a [`TreeSink`], the completing head
+//!   site's argument group feeds a `TreeSink`, the completing head
 //!   finalizes a single-root tree beside the armed type, and the
 //!   consuming declaration (`take_armed`) interns it bottom-up through
 //!   [`FileElements::type_args_mut`] — the pool's only intern entry, so
@@ -75,9 +76,12 @@
 //! rewritten to `name=` at capture (one interning per setter — capture-time
 //! cost, not lookup-time).
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
+use crate::capture::{TreeSink, TypeTree};
+use crate::model::{
+    Annotation, ArgListId, ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl,
+    Entry, ExtensionFace, FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind,
+    NameMapBuilder, RepFormal, TopDecl, Ty,
+};
 use dartq_parser::{
     DeclarationKind, FormalParameterKind, IdentifierContext, Parser, ParserFeatures, ParserListener,
 };
@@ -85,14 +89,6 @@ use dartq_parser::{MemberKind as ParserMemberKind, TokenSpan as Token};
 use dartq_resolution::{ClassModifiers, DeclKind};
 use dartq_scanner::{Keyword, TokenKind, TokenTable};
 use dartq_source::{StringId, StringTable};
-use rustc_hash::FxHashMap;
-
-use crate::capture::{TreeSink, TypeTree};
-use crate::model::{
-    Annotation, ArgListId, ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl,
-    ExtensionFace, FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind, RepFormal,
-    TopDecl, Ty,
-};
 
 use dartq_source::SourceRange;
 
@@ -123,7 +119,9 @@ struct OpenContainer {
     is_final: bool,
     is_interface: bool,
     is_mixin_class: bool,
-    members: FxHashMap<StringId, MemberEntry>,
+    /// The member name set so far (sorted-insert; sealed into the
+    /// finished [`Container::members`] at the close).
+    members: NameMapBuilder<MemberEntry>,
     type_params: u16,
     /// The `sealed` modifier was present on the class header.
     sealed: bool,
@@ -140,14 +138,16 @@ struct OpenContainer {
     primary_formals: Vec<RepFormal>,
     /// The enum's constants in declaration order.
     enum_constants: Vec<StringId>,
-    /// The named constructor selectors declared so far, and whether an
-    /// unnamed constructor exists (explicit or the implicit default).
+    /// The named constructor selectors declared so far, and whether a
+    /// declared constructor is unnamed (the implicit default joins at the
+    /// container's close, where an empty `ctor_named` without the flag
+    /// means no constructor was declared at all).
     ctor_named: Vec<StringId>,
     ctor_has_unnamed: bool,
     /// The constructors' formal-parameter tables by lookup spelling (the
     /// selector for `A.named`, the container's name for `A()`); flushed
     /// into the finished [`Container::ctor_formals`].
-    ctor_formals: FxHashMap<StringId, Box<Formals>>,
+    ctor_formals: NameMapBuilder<Box<Formals>>,
     /// The declaration's metadata star (`crate::model::Annotation`),
     /// drained from the builder's pending buffer at the open.
     annotations: Vec<Annotation>,
@@ -165,6 +165,7 @@ struct CtorCapture {
 /// clause-boundary events (`handle_class_with_clause` /
 /// `handle_enum_with_clause` / `handle_mixin_on` / `handle_implements`)
 /// decide it.
+#[derive(Clone, Copy)]
 enum HeaderClause {
     With,
     Implements,
@@ -174,6 +175,7 @@ enum HeaderClause {
 /// The attribution a clause boundary event applies to the buffered window:
 /// the names the event claims join the clause list, the rest are residue
 /// (`Container::header_residue`) — never consulted as super-faces.
+#[derive(Clone, Copy)]
 enum ClauseClaim {
     /// The clause keyword's offset (`handle_*_with_clause`): names written
     /// after the keyword belong to the clause, names before it are the
@@ -203,6 +205,9 @@ struct PendingMember {
     type_param_names: Vec<StringId>,
     return_ty: Ty,
     formals: Option<Box<Formals>>,
+    /// The member's own metadata star, claimed at `begin_method` (the star
+    /// precedes the begin) so body-local metadata never joins it.
+    annotations: Vec<Annotation>,
 }
 
 /// A top-level executable between `begin_top_level_method` and its end; the
@@ -218,14 +223,27 @@ struct PendingTop {
 struct PendingTypedef {
     name: Option<(StringId, SourceRange)>,
     type_params: u16,
+    /// The declaration wrote a `<T>` list (`end_type_variables` latches it
+    /// directly — the `type_params` count routes through
+    /// [`Builder::attach_type_param_count`], whose `executable_header_done`
+    /// gate a preceding typedef's own formal-shape probe already closed).
+    saw_type_params: bool,
 }
 
 /// The capture state shared between the listener and [`collect`].
+#[expect(clippy::struct_excessive_bools)] // latch flags mirror the parser's event stream
 struct Builder<'src, 'tab> {
     source: &'src str,
     tokens: &'tab TokenTable,
     strings: &'src StringTable,
     file: FileElements,
+    /// Top-level declarations captured so far; sealed into the model's
+    /// `FileElements::decls` at [`Builder::finish`].
+    decls: NameMapBuilder<TopDecl>,
+    /// Named containers closed so far; sealed into the model's
+    /// `FileElements::containers` at [`Builder::finish`] (the open
+    /// containers live on [`Builder::containers`]).
+    named_containers: NameMapBuilder<Container>,
     containers: Vec<OpenContainer>,
     /// A class-family header is open (`with`/`implements` type names route
     /// to [`Builder::header_interfaces`]).
@@ -250,6 +268,9 @@ struct Builder<'src, 'tab> {
     /// (the first honest `handle_type` name); consumed at
     /// [`Builder::close_container`] into the [`ExtensionFace`].
     extension_on_type: Option<StringId>,
+    /// The latched on-type was written nullable (`on C?`) — the capture
+    /// rides the completing `handle_type` question token.
+    extension_on_type_nullable: bool,
     /// The open field group's `abstract`/`external` modifiers (`begin_fields`
     /// latches, `end_fields` clears).
     field_abstract: bool,
@@ -279,6 +300,12 @@ struct Builder<'src, 'tab> {
     /// The current type-parameter list's nesting depth (the executable's
     /// own list is depth 1).
     type_group_depth: u32,
+    /// The open type-argument group's nesting depth (`begin_type_arguments`
+    /// raises, `end_type_arguments` lowers; the parser emits them as
+    /// balanced pairs per `<...>` group, nested groups recursing).
+    /// Identifiers inside a group are argument positions, never header
+    /// clause faces.
+    type_arg_depth: u32,
     /// Names in the current depth-1 type-parameter list (`duplicate_definition`
     /// compares per list, `duplicate_definition_verifier.dart:124-135`).
     type_var_group: Vec<StringId>,
@@ -311,6 +338,9 @@ struct Builder<'src, 'tab> {
     /// The open annotation-site capture: one [`TreeSink`] fed by the
     /// type events while an annotation's argument group is open.
     capture: Option<TreeSink>,
+    /// The record level's node count at the open field entry — the hole
+    /// latch [`TreeSink::record_entry_end`] checks against.
+    record_entry_mark: usize,
     /// The type head awaiting its argument group (`List` of `List<int>`),
     /// armed at the `TypeReference` identifier and consumed at
     /// `begin_type_arguments` or the head's own completion.
@@ -319,11 +349,17 @@ struct Builder<'src, 'tab> {
     field_group_ty: Option<Ty>,
     /// The metadata star of the declaration that opens next, in written
     /// order (`crate::model::Annotation`). Sealed at `end_metadata`,
-    /// drained by the next `open_container`; every other top-level
-    /// declaration boundary clears it — annotations belong to the
-    /// declaration they directly precede. Member annotations (inside an
-    /// open container) never buffer.
+    /// claimed by the declaration it precedes — a container open, a member
+    /// begin (`begin_method`), an enum-value name, or a field group latch —
+    /// and dropped at every other declaration boundary: annotations bind to
+    /// the declaration they directly precede.
     pending_annotations: Vec<Annotation>,
+    /// The open field group's metadata star, latched at `begin_fields` (the
+    /// group's star precedes the group, not its first name) and copied into
+    /// every [`MemberEntry`] the group's names build (`@meta int a, b;`
+    /// annotates both). Cleared at the group's end; the top-level-variable
+    /// branch never reads it, which is exactly the old drop.
+    field_annotations: Vec<Annotation>,
     /// The annotation being parsed (open between `begin_metadata` and
     /// `end_metadata`): the head name latches at `MetadataReference`,
     /// qualified segments join, `end_metadata` seals the entry. `None`
@@ -338,12 +374,15 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             tokens,
             strings,
             file: FileElements::default(),
+            decls: NameMapBuilder::default(),
+            named_containers: NameMapBuilder::default(),
             containers: Vec::new(),
             in_class_header: false,
             header_interfaces: Vec::new(),
             header_residue: Vec::new(),
             header_capture_open: false,
             extension_on_type: None,
+            extension_on_type_nullable: false,
             field_abstract: false,
             field_external: false,
             field_final: false,
@@ -357,6 +396,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             positional_formals: Vec::new(),
             named_formals: Vec::new(),
             type_group_depth: 0,
+            type_arg_depth: 0,
             type_var_group: Vec::new(),
             type_param_count: 0,
             header_type_params: 0,
@@ -366,9 +406,11 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             armed_ty: None,
             armed_tree: None,
             capture: None,
+            record_entry_mark: 0,
             pending_type_head: None,
             field_group_ty: None,
             pending_annotations: Vec::new(),
+            field_annotations: Vec::new(),
             open_annotation: None,
         }
     }
@@ -415,9 +457,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
 
     /// Declares a top-level name, logging a duplicate when taken.
     fn declare_top(&mut self, name: StringId, range: SourceRange, decl: TopDecl) {
-        match self.file.decls.entry(name) {
-            std::collections::hash_map::Entry::Occupied(_) => self.record_duplicate(name, range),
-            std::collections::hash_map::Entry::Vacant(slot) => {
+        match self.decls.entry(name) {
+            Entry::Occupied(_) => self.record_duplicate(name, range),
+            Entry::Vacant(slot) => {
                 slot.insert(decl);
             }
         }
@@ -455,6 +497,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             {
                 self.named_from_tree(name, nullable, tree)
             }
+            (_, Some(tree)) if tree.record.is_some() && !tree.poisoned => {
+                self.record_from_tree(tree)
+            }
+            (_, Some(tree)) if tree.function.is_some() && !tree.poisoned => {
+                self.function_from_tree(tree)
+            }
             _ => ty,
         }
     }
@@ -467,11 +515,72 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.file.type_args_mut().named(name, nullable, &args)
     }
 
+    /// Builds a record `Ty` from a captured record tree: each field tree
+    /// converts through [`Self::arg_ty`], except a comma-hole leaf
+    /// (`head == StringId::NONE` — the recovery splices an `InvalidType`
+    /// field, upstream `pkg/analyzer`'s record conversion), which rides
+    /// the list as [`Ty::Unknown`].
+    fn record_from_tree(&mut self, tree: TypeTree) -> Ty {
+        let (positional, named) = tree.record.expect("record arm gated");
+        let positional: Vec<Ty> = positional
+            .into_iter()
+            .map(|field| self.record_field_ty(field))
+            .collect();
+        let named: Vec<(StringId, Ty)> = named
+            .into_iter()
+            .map(|(name, field)| (name, self.record_field_ty(field)))
+            .collect();
+        self.file
+            .type_args_mut()
+            .record(&positional, &named, tree.nullable)
+    }
+
+    fn record_field_ty(&mut self, tree: TypeTree) -> Ty {
+        if tree.head == StringId::NONE {
+            return Ty::Unknown;
+        }
+        self.arg_ty(tree)
+    }
+
+    /// Builds a function `Ty` from a captured function tree: the return
+    /// tree converts through [`Self::arg_ty`] (`None` is the bare
+    /// `Function(...)` head's implicit `dynamic`), each formal tree the
+    /// same way, then the shape interns canonically.
+    fn function_from_tree(&mut self, tree: TypeTree) -> Ty {
+        let fn_tree = tree.function.expect("function arm gated");
+        let ret = fn_tree.ret.map_or(Ty::Dynamic, |ret| self.arg_ty(*ret));
+        let positional: Vec<Ty> = fn_tree
+            .positional
+            .into_iter()
+            .map(|formal| self.arg_ty(formal))
+            .collect();
+        let named: Vec<(StringId, Ty)> = fn_tree
+            .named
+            .into_iter()
+            .map(|(name, formal)| (name, self.arg_ty(formal)))
+            .collect();
+        self.file.type_args_mut().function(
+            fn_tree.type_params,
+            ret,
+            &positional,
+            &named,
+            tree.nullable,
+        )
+    }
+
     /// One argument subtree. The head canonicalizes exactly like the
     /// annotation head ([`DeclarationCollector::handle_type`]'s match —
     /// `dynamic`/`void`/`Null` keep their dedicated [`Ty`] shapes); a
-    /// subtree with arguments recurses, a leaf stays pool-free.
+    /// subtree with arguments recurses, a leaf stays pool-free. A nested
+    /// function shape converts through its own arm (a poisoned one
+    /// suppresses to [`Ty::Unknown`]).
     fn arg_ty(&mut self, tree: TypeTree) -> Ty {
+        if tree.function.is_some() {
+            if tree.poisoned {
+                return Ty::Unknown;
+            }
+            return self.function_from_tree(tree);
+        }
         match self.strings.resolve(tree.head) {
             "dynamic" => Ty::Dynamic,
             "void" => Ty::Void,
@@ -489,14 +598,16 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.field_group_ty.expect("latched above")
     }
 
-    /// Latches the head identifier of the annotation being parsed
-    /// (top-level only — member annotations are not the container face;
-    /// the W7 constructor face rides the diagnoser's own annotation
-    /// latch).
+    /// Latches the head identifier of the annotation being parsed (the
+    /// star binds to whatever declaration follows, top-level or member —
+    /// the claim points decide the face it lands on; the W7 constructor
+    /// face rides the diagnoser's own annotation latch).
     fn note_annotation_head(&mut self, name: StringId, range: SourceRange) {
-        if self.containers.is_empty() {
-            self.open_annotation = Some(Annotation { name, range });
-        }
+        self.open_annotation = Some(Annotation {
+            name,
+            range,
+            args_text: None,
+        });
     }
 
     /// Joins one qualified segment into the open annotation's name
@@ -515,21 +626,71 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     }
 
     /// Seals the open annotation into the pending star, `@` through the
-    /// name's last segment. The parser fires `end_metadata` exactly once
-    /// per `begin_metadata` (linear `parse_metadata`), so `take` sees the
-    /// entry when one was captured and `None` for nameless junk.
-    fn seal_annotation(&mut self, at_offset: u32) {
+    /// name's last segment, folding the argument group's verbatim source
+    /// text when one parsed (the signature face hashes it, so an
+    /// argument-only edit flips the L2 gate). The parser fires
+    /// `end_metadata` exactly once per `begin_metadata` (linear
+    /// `parse_metadata`), so `take` sees the entry when one was captured
+    /// and `None` for nameless junk.
+    fn seal_annotation(&mut self, at_offset: u32, end: Token) {
         if let Some(mut open) = self.open_annotation.take() {
+            open.args_text = self.annotation_args_text(end);
             open.range.length += open.range.offset - at_offset;
             open.range.offset = at_offset;
             self.pending_annotations.push(open);
         }
     }
 
-    /// Drops the pending star: every top-level declaration boundary other
-    /// than a container opening claims (and discards) the annotations that
-    /// precede it — annotations bind to the declaration they directly
-    /// precede.
+    /// The interned `(...)` source text of the sealed annotation's
+    /// argument group, `None` when the metadata ended without a scanned,
+    /// balanced group: no arguments (the parser fired `handle_no_arguments`
+    /// and `end` is the unconsumed follower), or recovery-degenerate shapes
+    /// (synthetic closers are not in the token table) — the argument-less
+    /// direction.
+    fn annotation_args_text(&self, end: Token) -> Option<StringId> {
+        let close = self.tokens.get(end.id as usize)?;
+        if close.kind != TokenKind::CloseParen {
+            return None;
+        }
+        let mut depth = 0u32;
+        let mut index = end.id;
+        let open = loop {
+            let token = self.tokens.get(index as usize)?;
+            match token.kind {
+                TokenKind::CloseParen => depth += 1,
+                TokenKind::OpenParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break token;
+                    }
+                }
+                _ => {}
+            }
+            index = index.checked_sub(1)?;
+        };
+        Some(
+            self.strings
+                .intern(&self.source[open.byte_range().start..close.byte_range().end]),
+        )
+    }
+
+    /// The interned source text from `start`'s beginning through `end`'s
+    /// beginning — the default-value slice (`= 3`'s expression as written;
+    /// trailing spacing inside the slice is part of the face, the
+    /// conservative direction). `None` when either boundary is not in the
+    /// token table (a synthetic recovery token carries no honest span) or
+    /// recovery inverted the order — a malformed slice must answer
+    /// argument-less, never panic the capture.
+    fn intern_span_text(&self, start: Token, end: Token) -> Option<StringId> {
+        let from = self.tokens.get(start.id as usize)?.byte_range().start;
+        let to = self.tokens.get(end.id as usize)?.byte_range().start;
+        (from <= to).then(|| self.strings.intern(&self.source[from..to]))
+    }
+
+    /// Drops the pending star: a declaration boundary that claims no
+    /// annotations (directives, top-level executables, typedefs, member
+    /// ends — anything whose star binds to nothing) discards what pended
+    /// before it.
     fn drop_pending_annotations(&mut self) {
         self.pending_annotations.clear();
     }
@@ -592,6 +753,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             ContainerKind::Extension | ContainerKind::ExtensionType
         );
         self.extension_on_type = None;
+        self.extension_on_type_nullable = false;
         self.containers.push(OpenContainer {
             name,
             kind,
@@ -601,7 +763,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             is_final: false,
             is_interface: false,
             is_mixin_class: false,
-            members: FxHashMap::default(),
+            members: NameMapBuilder::default(),
             type_params: header_type_params,
             sealed: false,
             with_clause: Vec::new(),
@@ -611,8 +773,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             primary_formals: Vec::new(),
             enum_constants: Vec::new(),
             ctor_named: Vec::new(),
-            ctor_has_unnamed: true,
-            ctor_formals: FxHashMap::default(),
+            ctor_has_unnamed: false,
+            ctor_formals: NameMapBuilder::default(),
             annotations,
         });
         // The `extends` head latches on class-family declarations only
@@ -629,6 +791,11 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.in_class_header = false;
         self.header_capture_open = false;
         self.header_interfaces.clear();
+        // A trailing star (recovery residue after the last member) binds to
+        // nothing once the body closed — drop it before it could leak into
+        // the next container's own star.
+        self.drop_pending_annotations();
+        self.field_annotations.clear();
         let extension_on_type = self.extension_on_type.take();
         let Some(open) = self.containers.pop() else {
             return;
@@ -643,7 +810,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             self.file.extension_faces.push(ExtensionFace {
                 name: None,
                 on_type: extension_on_type,
-                members,
+                on_type_nullable: self.extension_on_type_nullable,
+                members: members.finish(),
             });
             return;
         }
@@ -653,12 +821,18 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             self.file.extension_faces.push(ExtensionFace {
                 name: open.name.map(|(name, _)| name),
                 on_type: extension_on_type,
-                members: members.clone(),
+                on_type_nullable: self.extension_on_type_nullable,
+                members: members.clone().finish(),
             });
         }
         if let Some((name, _range)) = open.name {
             self.file.container_order.push(name);
-            self.file.containers.entry(name).or_insert(Container {
+            // The unnamed face: an unnamed constructor was declared, or
+            // none was at all — the implicit default stands (a named-only
+            // declaration kills it). Read before `ctor_named` moves into
+            // `constructors`.
+            let has_unnamed_constructor = open.ctor_has_unnamed || open.ctor_named.is_empty();
+            self.named_containers.or_insert_with(name, || Container {
                 kind: open.kind,
                 is_abstract: open.is_abstract,
                 is_base: open.is_base,
@@ -666,7 +840,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 is_interface: open.is_interface,
                 is_mixin_class: open.is_mixin_class,
                 superclass: open.superclass,
-                members,
+                members: members.finish(),
                 type_params: open.type_params,
                 sealed: open.sealed,
                 with_clause: open.with_clause,
@@ -676,8 +850,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 primary_formals: open.primary_formals.into_boxed_slice(),
                 enum_constants: open.enum_constants,
                 constructors: open.ctor_named.into_boxed_slice(),
-                has_unnamed_constructor: open.ctor_has_unnamed,
-                ctor_formals: open.ctor_formals,
+                has_unnamed_constructor,
+                ctor_formals: open.ctor_formals.finish(),
                 annotations: open.annotations.into_boxed_slice(),
             });
         }
@@ -767,19 +941,34 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         }
     }
 
-    /// Routes a class-header type reference: the `extends` head latches the
-    /// superclass candidate (a qualified `p.S` through the continuation),
-    /// and past it the `with`/`implements` names buffer toward the
-    /// container's interface edges. Inside an extension header window, the
-    /// first plain reference latches the `on` type and the qualified
-    /// continuation overwrites it (`on p.T` keeps `T`, the model's `p.S`
-    /// convention).
+    /// Routes a class-header type reference: the type's name is the plain
+    /// identifier or the continuation of a qualified `p.T` (the prefix
+    /// token itself fires `PrefixedTypeReference`, which is not routed
+    /// here). The extends head takes the still-open super slot (`extends
+    /// p.S` keeps `S`); every later header name — a with/implements/on
+    /// clause face, including a named mixin application's `with p.M` after
+    /// the head latched — buffers toward the clause events. Inside an
+    /// extension header window, the first plain reference latches the `on`
+    /// type and the qualified continuation overwrites it (`on p.T` keeps
+    /// `T`, the model's `p.S` convention). Identifiers inside a clause
+    /// type's `<...>` argument list are argument positions and never route
+    /// (the `type_arg_depth` gate).
     fn note_header_reference(
         &mut self,
         context: IdentifierContext,
         name: Option<StringId>,
         offset: u32,
     ) {
+        // Argument-position identifiers (`List<int>`'s `int`, `Map<K, V>`'s
+        // entries at any nesting depth) fire `TypeReference` like a clause
+        // face, but they are parts of the enclosing type — never clause
+        // entries and never an on-name. The parser delivers the groups as
+        // balanced `begin_type_arguments`/`end_type_arguments` event pairs
+        // (a merged `>>` closer splits one `>` per group), so the depth is
+        // exact.
+        if self.type_arg_depth > 0 {
+            return;
+        }
         // The extension on-type latch (a container is always open here).
         if self.header_capture_open
             && self
@@ -801,16 +990,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             return;
         }
         match context {
-            IdentifierContext::TypeReference => {
+            IdentifierContext::TypeReference | IdentifierContext::TypeReferenceContinuation => {
                 if self.header_super_open && self.super_candidate.is_none() {
                     self.super_candidate = name;
                 } else if self.in_class_header {
                     self.buffer_header_interface(name, offset);
                 }
-            }
-            IdentifierContext::TypeReferenceContinuation if self.header_super_open => {
-                // Qualified `p.S`: the continuation names the type.
-                self.super_candidate = name;
             }
             _ => {}
         }
@@ -843,8 +1028,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     }
 
     /// The member's arity-violation log entry, when the declaration's
-    /// parameter shape is wrong (`error_verifier.dart:5688-5740` for
-    /// operators, `ast_builder.dart:6283-6291` for setters).
+    /// parameter shape is wrong (`error_verifier.dart:5688-5740` for the
+    /// operator count table). Setters are absent by design: the parse tier
+    /// owns that face outright (the `_ensureSetterFormalParameter` mirror,
+    /// upstream Dart SDK source, pkg/analyzer/lib/src/fasta/ast_builder.dart
+    /// :6464-6495 — the parser reports it at the setter name), and a second
+    /// capture-time log row would double it in the merged report.
     fn member_arity_violation(
         &self,
         spelling: StringId,
@@ -855,12 +1044,6 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             u16::try_from(f.positional.len() + f.named.len()).unwrap_or(u16::MAX)
         });
         match kind {
-            MemberKind::Setter => {
-                let ok = formals.is_some_and(|f| {
-                    f.named.is_empty() && f.positional.len() == 1 && f.positional[0].required
-                });
-                (!ok).then_some(ArityViolation::Setter)
-            }
             MemberKind::Method => {
                 let text = self.strings.resolve(spelling);
                 if text == "-" {
@@ -960,13 +1143,44 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         while !self.containers.is_empty() {
             self.close_container();
         }
-        self.file
+        let file = self.file;
+        FileElements {
+            decls: self.decls.finish(),
+            containers: self.named_containers.finish(),
+            container_order: file.container_order,
+            extension_faces: file.extension_faces,
+            duplicates: file.duplicates,
+            arity_violations: file.arity_violations,
+            type_args: file.type_args,
+        }
     }
 }
 
-/// The [`ParserListener`] implementation feeding a shared [`Builder`].
-struct DeclarationCollector<'src, 'tab> {
-    builder: Rc<RefCell<Builder<'src, 'tab>>>,
+/// The [`ParserListener`] implementation feeding a `Builder`: driven
+/// through the parse multiplexer — standalone in [`collect`], or fanned
+/// out with the engine's other apply-side consumers — and finished into
+/// the element model once the parse ends.
+pub struct DeclarationCollector<'src, 'tab> {
+    builder: Builder<'src, 'tab>,
+}
+
+impl<'src, 'tab> DeclarationCollector<'src, 'tab> {
+    /// Builds the collector over the `source`/`tokens` pair the parser
+    /// reads, interning every declaration name into `strings`.
+    pub fn new(source: &'src str, tokens: &'tab TokenTable, strings: &'src StringTable) -> Self {
+        Self {
+            builder: Builder::new(source, tokens, strings),
+        }
+    }
+
+    /// Reclaims the element model. The multiplexer only borrows the
+    /// collector, so [`collect`] and the engine's fan-out both call this
+    /// on a listener whose parse has fully ended — the builder hands over
+    /// by value.
+    #[must_use]
+    pub fn finish(self) -> FileElements {
+        self.builder.finish()
+    }
 }
 
 /// Parses one compilation unit and returns what it declares.
@@ -974,35 +1188,15 @@ struct DeclarationCollector<'src, 'tab> {
 /// `tokens` must be the scan of `source` (the parser reads lexemes through
 /// the same pair); `strings` receives every interned declaration name and
 /// must be the table the caller resolves ids against afterwards.
-///
-/// # Panics
-///
-/// Panics never in practice: the single `expect` reclaims the shared
-/// builder after the parser (its sole co-owner) is dropped, so the strong
-/// count is 1 by construction.
 pub fn collect(
     source: &str,
     tokens: &TokenTable,
     features: ParserFeatures,
     strings: &StringTable,
 ) -> FileElements {
-    let builder = Rc::new(RefCell::new(Builder::new(source, tokens, strings)));
-    let mut parser = Parser::new(
-        source,
-        tokens,
-        features,
-        DeclarationCollector {
-            builder: Rc::clone(&builder),
-        },
-    );
-    parser.parse_unit();
-    drop(parser);
-    // The parser held the only other strong reference and is gone, so the
-    // unwrap cannot fail.
-    Rc::into_inner(builder)
-        .expect("the parser released its listener")
-        .into_inner()
-        .finish()
+    let mut collector = DeclarationCollector::new(source, tokens, strings);
+    Parser::new(source, tokens, features, &mut collector).parse_unit();
+    collector.finish()
 }
 
 /// The declared class-modifier facts of one container — the resolution
@@ -1014,12 +1208,13 @@ pub fn collect(
 pub fn container_modifiers(container: &Container) -> ClassModifiers {
     ClassModifiers {
         kind: match container.kind {
-            ContainerKind::Class => DeclKind::Class,
-            ContainerKind::Mixin => DeclKind::Mixin,
-            ContainerKind::Enum => DeclKind::Enum,
             // Extensions and extension types are not class-modifier
             // carriers; the flags are always false on them.
-            ContainerKind::Extension | ContainerKind::ExtensionType => DeclKind::Class,
+            ContainerKind::Class | ContainerKind::Extension | ContainerKind::ExtensionType => {
+                DeclKind::Class
+            }
+            ContainerKind::Mixin => DeclKind::Mixin,
+            ContainerKind::Enum => DeclKind::Enum,
         },
         is_abstract: container.is_abstract,
         is_base: container.is_base,
@@ -1035,39 +1230,39 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     // fires its metadata first and no declaration event after — its
     // annotations bind to the directive and drop here.
     fn begin_import(&mut self, _token: Token) {
-        self.builder.borrow_mut().drop_pending_annotations();
+        self.builder.drop_pending_annotations();
     }
 
     fn begin_export(&mut self, _token: Token) {
-        self.builder.borrow_mut().drop_pending_annotations();
+        self.builder.drop_pending_annotations();
     }
 
     fn begin_part(&mut self, _token: Token) {
-        self.builder.borrow_mut().drop_pending_annotations();
+        self.builder.drop_pending_annotations();
     }
 
     fn begin_library_name(&mut self, _token: Token) {
-        self.builder.borrow_mut().drop_pending_annotations();
+        self.builder.drop_pending_annotations();
     }
 
     fn begin_library_augmentation(&mut self, _augment_kw: Token, _library_keyword: Token) {
-        self.builder.borrow_mut().drop_pending_annotations();
+        self.builder.drop_pending_annotations();
     }
 
     fn begin_class_declaration(
         &mut self,
         _begin: Token,
         abstract_kw: Option<Token>,
-        _sealed_kw: Option<Token>,
-        _base_kw: Option<Token>,
-        _interface_kw: Option<Token>,
-        _final_kw: Option<Token>,
+        sealed_kw: Option<Token>,
+        base_kw: Option<Token>,
+        interface_kw: Option<Token>,
+        final_kw: Option<Token>,
         _augment_kw: Option<Token>,
-        _mixin_kw: Option<Token>,
+        mixin_kw: Option<Token>,
         name: Token,
     ) {
-        let sealed = _sealed_kw.is_some();
-        let builder = &mut *self.builder.borrow_mut();
+        let sealed = sealed_kw.is_some();
+        let builder = &mut self.builder;
         let name = builder.capture_name(name);
         builder.open_container(ContainerKind::Class, name, MicroKind::Class);
         if sealed {
@@ -1077,15 +1272,15 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             builder.mark_abstract();
         }
         builder.mark_modifier(|open| {
-            open.is_base = _base_kw.is_some();
-            open.is_interface = _interface_kw.is_some();
-            open.is_final = _final_kw.is_some();
-            open.is_mixin_class = _mixin_kw.is_some();
+            open.is_base = base_kw.is_some();
+            open.is_interface = interface_kw.is_some();
+            open.is_final = final_kw.is_some();
+            open.is_mixin_class = mixin_kw.is_some();
         });
     }
 
     fn handle_class_header(&mut self, _begin: Token, _class: Token, _native: Option<Token>) {
-        self.builder.borrow_mut().end_header_window();
+        self.builder.end_header_window();
     }
 
     /// An unannotated declaration boundary: the star carried no
@@ -1093,44 +1288,45 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     /// (recovery residue between declarations included).
     fn end_metadata_star(&mut self, count: usize) {
         if count == 0 {
-            self.builder.borrow_mut().drop_pending_annotations();
+            self.builder.drop_pending_annotations();
         }
     }
 
     /// Seals the open annotation: the span widens back to the `@` sign
-    /// (`begin`), the official annotation-anchored report position.
-    fn end_metadata(&mut self, begin: Token, _period_before_name: Option<Token>, _end: Token) {
+    /// (`begin`), the official annotation-anchored report position; the
+    /// argument group's text rides along when the group parsed (`end`).
+    fn end_metadata(&mut self, begin: Token, _period_before_name: Option<Token>, end: Token) {
         let at_offset = begin.range.offset;
-        self.builder.borrow_mut().seal_annotation(at_offset);
+        self.builder.seal_annotation(at_offset, end);
     }
 
     fn end_class_declaration(&mut self, _begin: Token, _end: Token) {
-        self.builder.borrow_mut().close_container();
+        self.builder.close_container();
     }
 
     fn begin_named_mixin_application(
         &mut self,
         _begin: Token,
         abstract_kw: Option<Token>,
-        _sealed_kw: Option<Token>,
-        _base_kw: Option<Token>,
-        _interface_kw: Option<Token>,
-        _final_kw: Option<Token>,
+        sealed_kw: Option<Token>,
+        base_kw: Option<Token>,
+        interface_kw: Option<Token>,
+        final_kw: Option<Token>,
         _augment_kw: Option<Token>,
         _mixin_kw: Option<Token>,
         name: Token,
     ) {
-        let builder = &mut *self.builder.borrow_mut();
+        let builder = &mut self.builder;
         let name = builder.capture_name(name);
         builder.open_container(ContainerKind::Class, name, MicroKind::Class);
         if abstract_kw.is_some() {
             builder.mark_abstract();
         }
         builder.mark_modifier(|open| {
-            open.is_base = _base_kw.is_some();
-            open.is_interface = _interface_kw.is_some();
-            open.is_final = _final_kw.is_some();
-            open.sealed = _sealed_kw.is_some();
+            open.is_base = base_kw.is_some();
+            open.is_interface = interface_kw.is_some();
+            open.is_final = final_kw.is_some();
+            open.sealed = sealed_kw.is_some();
         });
     }
 
@@ -1142,7 +1338,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _implements: Option<Token>,
         _end: Token,
     ) {
-        let builder = &mut *self.builder.borrow_mut();
+        let builder = &mut self.builder;
         // No header-closing event fires for a mixin application: the
         // buffered `with`/`implements` names commit here, before the
         // container closes and would drop them.
@@ -1158,7 +1354,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         mixin: Token,
         name: Token,
     ) {
-        let builder = &mut *self.builder.borrow_mut();
+        let builder = &mut self.builder;
         let name = builder.capture_name(name);
         builder.open_container(ContainerKind::Mixin, name, MicroKind::Mixin);
         // `base` is the only legal mixin modifier, and the plain-`mixin`
@@ -1179,7 +1375,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     }
 
     fn end_mixin_declaration(&mut self, _begin: Token, _end: Token) {
-        self.builder.borrow_mut().close_container();
+        self.builder.close_container();
     }
 
     fn begin_enum_declaration(
@@ -1189,7 +1385,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _enum_keyword: Token,
         name: Token,
     ) {
-        let builder = &mut *self.builder.borrow_mut();
+        let builder = &mut self.builder;
         let name = builder.capture_name(name);
         builder.open_container(ContainerKind::Enum, name, MicroKind::Enum);
     }
@@ -1202,7 +1398,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _member_count: usize,
         _end: Token,
     ) {
-        self.builder.borrow_mut().close_container();
+        self.builder.close_container();
     }
 
     fn handle_enum_header(
@@ -1211,11 +1407,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _enum_keyword: Token,
         _left_brace: Token,
     ) {
-        self.builder.borrow_mut().end_header_window();
+        self.builder.end_header_window();
     }
 
     fn handle_mixin_header(&mut self, _mixin: Token) {
-        self.builder.borrow_mut().end_header_window();
+        self.builder.end_header_window();
     }
 
     fn begin_extension_declaration(
@@ -1224,7 +1420,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _extension_keyword: Token,
         name: Option<Token>,
     ) {
-        let builder = &mut *self.builder.borrow_mut();
+        let builder = &mut self.builder;
         let name = name.and_then(|token| builder.capture_name(token));
         builder.open_container(ContainerKind::Extension, name, MicroKind::Extension);
     }
@@ -1236,7 +1432,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _on: Option<Token>,
         _end: Token,
     ) {
-        self.builder.borrow_mut().close_container();
+        self.builder.close_container();
     }
 
     fn begin_extension_type_declaration(
@@ -1245,7 +1441,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _extension_keyword: Token,
         name: Token,
     ) {
-        let builder = &mut *self.builder.borrow_mut();
+        let builder = &mut self.builder;
         let name = builder.capture_name(name);
         builder.open_container(ContainerKind::ExtensionType, name, MicroKind::Extension);
     }
@@ -1258,14 +1454,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _type_keyword: Token,
         _end: Token,
     ) {
-        self.builder.borrow_mut().close_container();
+        self.builder.close_container();
     }
 
     fn handle_class_extends(&mut self, _extends: Option<Token>, _count: usize) {
         // The supertype's type events fired before this event (official
         // `parseClassExtendsSeenExtendsClause`), so the buffered header
         // reference — present only with `extends` — is the edge.
-        self.builder.borrow_mut().commit_super_candidate();
+        self.builder.commit_super_candidate();
     }
 
     fn handle_named_mixin_application_with_clause(&mut self, with: Token) {
@@ -1273,7 +1469,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // this event; the `with` list itself is not the superclass. Names
         // written before the `with` keyword are head-overflow residue.
         let offset = with.range.offset;
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         builder.commit_super_candidate();
         builder.commit_header_clause(HeaderClause::With, ClauseClaim::Keyword(offset));
     }
@@ -1281,31 +1477,27 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn handle_class_with_clause(&mut self, with_keyword: Token) {
         let offset = with_keyword.range.offset;
         self.builder
-            .borrow_mut()
             .commit_header_clause(HeaderClause::With, ClauseClaim::Keyword(offset));
     }
 
     fn handle_enum_with_clause(&mut self, with_keyword: Token) {
         let offset = with_keyword.range.offset;
         self.builder
-            .borrow_mut()
             .commit_header_clause(HeaderClause::With, ClauseClaim::Keyword(offset));
     }
 
     fn handle_mixin_on(&mut self, _on: Option<Token>, count: usize) {
         self.builder
-            .borrow_mut()
             .commit_header_clause(HeaderClause::On, ClauseClaim::Trailing(count));
     }
 
     fn handle_implements(&mut self, _implements: Option<Token>, count: usize) {
         self.builder
-            .borrow_mut()
             .commit_header_clause(HeaderClause::Implements, ClauseClaim::Trailing(count));
     }
 
     fn begin_class_or_mixin_or_extension_body(&mut self, kind: DeclarationKind, _token: Token) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         // The header window closes with the body: extension on-types and
         // extension-type representation formals stop being captured. The
         // kind is informational here — the container's own kind decides.
@@ -1314,27 +1506,27 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     }
 
     fn handle_no_class_body(&mut self, _semicolon: Token) {
-        self.builder.borrow_mut().header_capture_open = false;
+        self.builder.header_capture_open = false;
     }
 
     fn handle_no_mixin_body(&mut self, _semicolon: Token) {
-        self.builder.borrow_mut().header_capture_open = false;
+        self.builder.header_capture_open = false;
     }
 
     fn handle_no_enum_body(&mut self, _semicolon: Token) {
-        self.builder.borrow_mut().header_capture_open = false;
+        self.builder.header_capture_open = false;
     }
 
     fn handle_no_extension_body(&mut self, _semicolon: Token) {
-        self.builder.borrow_mut().header_capture_open = false;
+        self.builder.header_capture_open = false;
     }
 
     fn handle_no_extension_type_body(&mut self, _semicolon: Token) {
-        self.builder.borrow_mut().header_capture_open = false;
+        self.builder.header_capture_open = false;
     }
 
     fn handle_type(&mut self, name: Token, question: Option<Token>) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         // Built-in spellings canonicalize exactly like the diagnoser's
         // listener: verdict consumers (`bare_info_of`, the formal tables)
         // would otherwise hand assignability faces an as-written `Named`
@@ -1369,21 +1561,32 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 args: ArgListId::EMPTY,
             },
         });
+        // The extension on-latch carries the written type's nullability:
+        // the header window is still open here (the latch's own
+        // `note_header_reference` never sees the `?`), and the completing
+        // spelling matching the latched name pins the flag to that type —
+        // body members never reach this (the window closed with the body).
+        if self.builder.header_capture_open
+            && spelling.is_some()
+            && self.builder.extension_on_type == spelling
+        {
+            self.builder.extension_on_type_nullable = question.is_some();
+        }
     }
     fn handle_no_type(&mut self, _last_consumed: Token) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         builder.armed_ty = None;
         builder.armed_tree = None;
     }
 
-    fn handle_void_keyword(&mut self, _token: Token) {
-        let mut builder = self.builder.borrow_mut();
+    fn handle_void_keyword(&mut self, token: Token) {
+        let builder = &mut self.builder;
         // A `void` type argument (`List<void>`) is a leaf of the open
         // capture like any named head; outside a capture a stale tree
         // cannot survive the arm.
         let void_id = builder.strings.intern("void");
         if let Some(site) = builder.capture.as_mut() {
-            site.leaf(void_id, false, _token.range);
+            site.leaf(void_id, false, token.range);
         } else {
             builder.armed_tree = None;
         }
@@ -1391,13 +1594,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     }
 
     fn handle_void_keyword_with_type_arguments(&mut self, _token: Token) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         builder.armed_tree = None;
         builder.armed_ty = Some(Ty::Void);
     }
 
     fn begin_type_arguments(&mut self, _token: Token) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
+        builder.type_arg_depth += 1;
         let head = builder.pending_type_head.take();
         match (&mut builder.capture, head) {
             (Some(site), Some((head, range))) => site.begin_group(Some((head, range))),
@@ -1415,7 +1619,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     }
 
     fn end_type_arguments(&mut self, _count: usize, begin: Token, end: Token) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
+        debug_assert!(
+            builder.type_arg_depth > 0,
+            "unbalanced type-argument events",
+        );
+        builder.type_arg_depth -= 1;
         if let Some(site) = builder.capture.as_mut() {
             site.end_group(SourceRange {
                 offset: begin.range.offset,
@@ -1425,23 +1634,123 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     }
 
     fn begin_function_type(&mut self, _begin: Token) {
-        // Function-type shapes are outside the model's `Ty`: poison the
-        // open capture (the conversion stays argument-less).
-        let mut builder = self.builder.borrow_mut();
+        // The function-type capture: the shape's columns open their own
+        // level (lazily — the written return type and the formal list fold
+        // into a first-class `Ty::Function`, not a poison).
+        let builder = &mut self.builder;
+        builder
+            .capture
+            .get_or_insert_with(TreeSink::default)
+            .begin_function();
+    }
+
+    /// A function-type annotation closed: the level seals and the root
+    /// arms like a completed record (`take_armed` interns the shape). The
+    /// written `?` rides the variant's `nullable`.
+    fn end_function_type(&mut self, function: Token, question: Option<Token>) {
+        let builder = &mut self.builder;
+        let range = SourceRange {
+            offset: function.range.offset,
+            length: question.map_or(function.range, |q| q.range).end() - function.range.offset,
+        };
         if let Some(site) = builder.capture.as_mut() {
-            site.poison();
+            site.end_function(question.is_some(), range);
+        }
+        // A top-level function annotation arms itself: no `handle_type`
+        // head ever completes the whole shape, so the root moves onto the
+        // armed slot here — `take_armed` interns it like a completed
+        // named tree.
+        if let Some(site) = builder.capture.as_mut()
+            && site.stack.is_empty()
+            && site.done.len() == 1
+        {
+            let mut site = builder.capture.take().expect("checked above");
+            let tree = site.done.pop().expect("one root");
+            builder.armed_tree = Some(tree);
+            builder.armed_ty = None; // `take_armed` converts the function arm.
         }
     }
 
     fn begin_record_type(&mut self, _left_paren: Token) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
+        // The record-type capture: the field list opens its own level
+        // (lazily — a bare `(int, int) x;` fires no argument-group event,
+        // so the sink starts here), and the completed node feeds the
+        // declaration's written type like a named head does (#1511: the
+        // record shape is a first-class `Ty`, not a poison).
+        builder
+            .capture
+            .get_or_insert_with(TreeSink::default)
+            .begin_record();
+    }
+
+    fn end_record_type(
+        &mut self,
+        left_paren: Token,
+        question: Option<Token>,
+        _count: usize,
+        _has_named_fields: bool,
+    ) {
+        let builder = &mut self.builder;
+        let end = question.map_or(left_paren.range, |q| SourceRange {
+            offset: left_paren.range.offset,
+            length: q.range.end() - left_paren.range.offset,
+        });
+        let range = SourceRange {
+            offset: left_paren.range.offset,
+            length: end.end() - left_paren.range.offset,
+        };
         if let Some(site) = builder.capture.as_mut() {
-            site.poison();
+            site.end_record(question.is_some(), range);
+        }
+        // A top-level record annotation arms itself: no `handle_type` head
+        // ever fires for it (the record is the whole type), so the root
+        // moves onto the armed slot here — `take_armed` interns it like a
+        // completed named tree.
+        if let Some(site) = builder.capture.as_mut()
+            && site.stack.is_empty()
+            && site.done.len() == 1
+        {
+            let mut site = builder.capture.take().expect("checked above");
+            let tree = site.done.pop().expect("one root");
+            builder.armed_tree = Some(tree);
+            builder.armed_ty = None; // `take_armed` converts the record arm.
         }
     }
 
+    fn begin_record_type_entry(&mut self, _first: Token) {
+        let builder = &mut self.builder;
+        builder.record_entry_mark = builder
+            .capture
+            .as_ref()
+            .map_or(0, |site| site.record_entry_mark());
+    }
+
+    fn end_record_type_entry(&mut self, last: Token) {
+        let builder = &mut self.builder;
+        if let Some(site) = builder.capture.as_mut() {
+            site.record_entry_end(builder.record_entry_mark, last.range);
+        }
+    }
+
+    fn handle_no_name(&mut self, token: Token) {
+        let builder = &mut self.builder;
+        if let Some(site) = builder.capture.as_mut() {
+            site.record_field_name(None);
+        }
+        let _ = token;
+    }
+
+    fn end_record_type_named_fields(&mut self, count: usize, _left_brace: Token) {
+        let builder = &mut self.builder;
+        if let Some(site) = builder.capture.as_mut() {
+            site.record_named_region(count);
+        }
+    }
+
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     fn handle_identifier(&mut self, token: Token, context: IdentifierContext) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         // Resolve the name and its span up front: the branches below hold
         // borrows into the builder's state.
         let name_with_range = builder.capture_name(token);
@@ -1500,8 +1809,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                             },
                         );
                     } else if let Some(open) = builder.containers.last_mut() {
+                        // The group's latched star rides every group member
+                        // (`@meta int a, b;` annotates both).
+                        let annotations = builder.field_annotations.clone().into_boxed_slice();
                         match open.members.entry(name) {
-                            std::collections::hash_map::Entry::Vacant(slot) => {
+                            Entry::Vacant(slot) => {
                                 slot.insert(MemberEntry {
                                     kind: MemberKind::Field,
                                     is_static,
@@ -1513,14 +1825,16 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                     var_ty: ty,
                                     return_ty: Ty::UNKNOWN,
                                     formals: None,
+                                    annotations,
+                                    name_range: range,
                                 });
                             }
                             // Same-bit collision: the second field is a
                             // duplicate. Keep-first; a cross-bit coexistence
                             // is `conflicting_static_and_instance`'s
                             // business, not a duplicate.
-                            std::collections::hash_map::Entry::Occupied(existing) => {
-                                if existing.get().is_static == is_static {
+                            Entry::Occupied(existing) => {
+                                if existing.is_static == is_static {
                                     builder.record_duplicate(name, range);
                                 }
                             }
@@ -1536,8 +1850,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     // Enum constants are static fields; a collision is a
                     // same-bit duplicate.
                     open.enum_constants.push(name);
+                    // The constant's own star (each value parses its
+                    // metadata right before its name).
+                    let annotations =
+                        std::mem::take(&mut builder.pending_annotations).into_boxed_slice();
                     match open.members.entry(name) {
-                        std::collections::hash_map::Entry::Vacant(slot) => {
+                        Entry::Vacant(slot) => {
                             slot.insert(MemberEntry {
                                 kind: MemberKind::Field,
                                 is_static: true,
@@ -1549,10 +1867,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 var_ty: Ty::UNKNOWN,
                                 return_ty: Ty::UNKNOWN,
                                 formals: None,
+                                annotations,
+                                name_range: range,
                             });
                         }
-                        std::collections::hash_map::Entry::Occupied(existing) => {
-                            if existing.get().is_static {
+                        Entry::Occupied(existing) => {
+                            if existing.is_static {
                                 builder.record_duplicate(name, range);
                             }
                         }
@@ -1577,21 +1897,33 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     builder.note_annotation_segment(name, range);
                 }
             }
+            IdentifierContext::RecordFieldDeclaration => {
+                // The field's written name arrives after its type node —
+                // the sink attaches it to the last entry (upstream fires
+                // `handleIdentifier` under the record-field context, while
+                // a missing name arrives via `handleNoName` instead).
+                if let Some(site) = builder.capture.as_mut() {
+                    site.record_field_name(name);
+                }
+            }
             _ => {}
         }
     }
 
     fn begin_type_variables(&mut self, _token: Token) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         builder.type_group_depth += 1;
         if builder.type_group_depth == 1 {
             builder.type_param_count = 0;
         }
         builder.type_var_group.clear();
+        if let Some(site) = builder.capture.as_mut() {
+            site.type_variables_begin();
+        }
     }
 
     fn begin_type_variable(&mut self, token: Token) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         if let Some((name, range)) = builder.capture_name(token) {
             // `duplicate_definition` compares type parameters per list
             // (`duplicate_definition_verifier.dart:124-135`); the unit-wide
@@ -1602,23 +1934,32 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 builder.type_var_group.push(name);
             }
             builder
-                .file
                 .decls
-                .entry(name)
-                .or_insert(TopDecl::bare(MicroKind::TypeParam));
+                .or_insert_with(name, || TopDecl::bare(MicroKind::TypeParam));
             if builder.type_group_depth == 1 {
                 builder.type_param_count += 1;
+            }
+            if let Some(site) = builder.capture.as_mut() {
+                site.function_type_variable();
             }
         }
     }
 
     fn end_type_variables(&mut self, _begin: Token, _end: Token) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
+        if builder.type_group_depth == 1
+            && let Some(pending) = &mut builder.pending_typedef
+        {
+            pending.saw_type_params = true;
+        }
         if builder.type_group_depth == 1 && !builder.attach_type_param_count() {
             // A container header: the count carries into the container's
             // `begin_*_declaration` open (official order — the type
             // variables parse before `beginClassDeclaration`).
             builder.header_type_params = builder.type_param_count;
+        }
+        if let Some(site) = builder.capture.as_mut() {
+            site.type_variables_end();
         }
         builder.type_group_depth -= 1;
     }
@@ -1627,21 +1968,24 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         &mut self,
         _kind: DeclarationKind,
         _augment_kw: Option<Token>,
-        _abstract_kw: Option<Token>,
-        _external_kw: Option<Token>,
+        abstract_kw: Option<Token>,
+        external_kw: Option<Token>,
         static_kw: Option<Token>,
         _covariant_kw: Option<Token>,
         _late_kw: Option<Token>,
         _var_final_or_const: Option<Token>,
         _last_consumed: Token,
     ) {
-        let mut builder = self.builder.borrow_mut();
-        // A top-level variable group claims its preceding annotations
-        // (fields parse inside an open container, where nothing pends).
-        builder.drop_pending_annotations();
+        let builder = &mut self.builder;
+        // The star preceding the group latches here — it precedes the
+        // group, not its first name, and every name the group declares
+        // carries it (`@meta int a, b;` annotates both). The
+        // top-level-variable branch never reads the latch, which is that
+        // face's drop.
+        builder.field_annotations = std::mem::take(&mut builder.pending_annotations);
         builder.field_static = Some(static_kw.is_some());
-        builder.field_abstract = _abstract_kw.is_some();
-        builder.field_external = _external_kw.is_some();
+        builder.field_abstract = abstract_kw.is_some();
+        builder.field_external = external_kw.is_some();
         builder.field_final = _var_final_or_const
             .and_then(|t| builder.tokens.get(t.id as usize))
             .is_some_and(|tok| &builder.source[tok.byte_range()] == "final");
@@ -1661,7 +2005,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _begin: Token,
         _end: Token,
     ) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         builder.field_static = None;
         builder.field_group_ty = None;
         builder.armed_ty = None;
@@ -1669,6 +2013,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
+        // The group closed: its star latch clears with it, and anything a
+        // closure initializer buffered (local-declaration metadata) binds
+        // to nothing.
+        builder.field_annotations.clear();
+        builder.drop_pending_annotations();
     }
 
     fn end_top_level_fields(
@@ -1684,7 +2033,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _begin: Token,
         _end: Token,
     ) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         builder.field_static = None;
         builder.field_group_ty = None;
         builder.armed_ty = None;
@@ -1692,6 +2041,8 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
+        builder.field_annotations.clear();
+        builder.drop_pending_annotations();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1699,7 +2050,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         &mut self,
         _kind: DeclarationKind,
         _augment_kw: Option<Token>,
-        _external_kw: Option<Token>,
+        external_kw: Option<Token>,
         static_kw: Option<Token>,
         _covariant_kw: Option<Token>,
         _var_final_or_const: Option<Token>,
@@ -1707,20 +2058,24 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         name: Token,
         _enclosing_declaration_name: Option<&str>,
     ) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         let shape = builder
             .capture_name(name)
             .map(|(n, range)| (builder.member_shape(get_or_set, n), range))
             .map(|((spelling, kind), range)| (spelling, kind, range));
+        // The star preceding the member belongs to it; body-local metadata
+        // (locals, closures) pends after this claim and drops at the end.
+        let annotations = std::mem::take(&mut builder.pending_annotations);
         builder.pending_member = Some(PendingMember {
             shape,
             is_static: static_kw.is_some(),
-            is_external: _external_kw.is_some(),
+            is_external: external_kw.is_some(),
             has_body: false,
             type_params: 0,
             type_param_names: Vec::new(),
             return_ty: Ty::UNKNOWN,
             formals: None,
+            annotations,
         });
         builder.executable_header_done = false;
     }
@@ -1731,13 +2086,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     /// can only mislabel an abstract member concrete: the under-report
     /// direction.
     fn begin_block_function_body(&mut self, _token: Token) {
-        if let Some(pending) = self.builder.borrow_mut().pending_member.as_mut() {
+        if let Some(pending) = self.builder.pending_member.as_mut() {
             pending.has_body = true;
         }
     }
 
     fn handle_expression_function_body(&mut self, _arrow: Token, _end: Option<Token>) {
-        if let Some(pending) = self.builder.borrow_mut().pending_member.as_mut() {
+        if let Some(pending) = self.builder.pending_member.as_mut() {
             pending.has_body = true;
         }
     }
@@ -1751,7 +2106,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _begin_initializers: Option<Token>,
         _end: Token,
     ) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         if let Some(pending) = builder.pending_member.take()
             && let Some((name, kind, range)) = pending.shape
         {
@@ -1772,20 +2127,25 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     var_ty: Ty::UNKNOWN,
                     return_ty: pending.return_ty,
                     formals: pending.formals,
+                    annotations: pending.annotations.into_boxed_slice(),
+                    name_range: range,
                 };
                 match open.members.entry(name) {
-                    std::collections::hash_map::Entry::Vacant(slot) => {
+                    Entry::Vacant(slot) => {
                         slot.insert(entry);
                     }
                     // Same-bit collisions are duplicates; cross-bit ones are not.
-                    std::collections::hash_map::Entry::Occupied(existing) => {
-                        if existing.get().is_static == pending.is_static {
+                    Entry::Occupied(existing) => {
+                        if existing.is_static == pending.is_static {
                             builder.record_duplicate(name, range);
                         }
                     }
                 }
             }
         }
+        // Anything buffered inside the body (local-declaration metadata)
+        // binds to no member — drop it with the executable.
+        builder.drop_pending_annotations();
         builder.executable_header_done = false;
     }
 
@@ -1795,7 +2155,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _augment: Option<Token>,
         _external: Option<Token>,
     ) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         builder.drop_pending_annotations();
         builder.pending_top = Some(PendingTop {
             name: None,
@@ -1807,7 +2167,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     }
 
     fn end_top_level_method(&mut self, _begin: Token, get_or_set: Option<Token>, _end: Token) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         // Anything buffered inside the body (local-declaration metadata)
         // binds to no container — drop it with the executable.
         builder.drop_pending_annotations();
@@ -1858,11 +2218,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     }
 
     fn begin_typedef(&mut self, _token: Token) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         builder.drop_pending_annotations();
         builder.pending_typedef = Some(PendingTypedef {
             name: None,
             type_params: 0,
+            saw_type_params: false,
         });
     }
 
@@ -1880,7 +2241,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _name: Token,
         _enclosing_declaration_name: Option<&str>,
     ) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
+        // The star preceding the constructor binds to no modeled row (the
+        // model keeps no constructor entry) — claim it so it can neither
+        // leak into the next member nor into the next container's star.
+        builder.drop_pending_annotations();
         // `A()` (or the head recovered): the unnamed shape until a
         // `A.named` continuation says otherwise. The formal table's key is
         // the head token's name — the class name, which is exactly the
@@ -1902,7 +2267,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _begin_initializers: Option<Token>,
         _end: Token,
     ) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         if let Some(capture) = builder.ctor_open.take()
             && let Some(open) = builder.containers.last_mut()
         {
@@ -1911,9 +2276,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     open.ctor_named.push(name);
                 }
             }
-            // Any unnamed constructor (this one, or the implicit default the
-            // container opened with) keeps the unnamed face.
-            open.ctor_has_unnamed &= capture.has_unnamed;
+            // The unnamed face stands when ANY declared constructor is
+            // unnamed (`E(); E.named();` keeps `E()`); a named-only
+            // declaration drops it. The no-declared-constructor case folds
+            // into the close (`ctor_named` stays empty there), which reads
+            // the implicit default.
+            open.ctor_has_unnamed |= capture.has_unnamed;
         }
         // The captured formal table joins the container's constructor
         // formals under its lookup spelling (a redirecting or body-less
@@ -1924,26 +2292,41 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         {
             open.ctor_formals.insert(key, formals);
         }
+        // Anything buffered inside the body or the parameter list
+        // (local-declaration and parameter metadata) binds to no modeled
+        // row — drop it with the constructor.
+        builder.drop_pending_annotations();
     }
 
     fn end_typedef(
         &mut self,
         _augment: Option<Token>,
         _typedef: Token,
-        _equals: Option<Token>,
+        equals: Option<Token>,
         _end: Token,
     ) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         if let Some(pending) = builder.pending_typedef.take()
             && let Some((name, range)) = pending.name
         {
+            // The alias's right-hand type is the still-armed annotation: the
+            // RHS parses after the name and completes before this event, so
+            // `take_armed` answers it (modern `=` form only — the old-style
+            // function-typed spelling carries its shape in no single armed
+            // annotation, and a parameterized alias needs its substitution
+            // face before the RHS can stand for uses). The diagnoser's alias
+            // fold resolves uses through this type.
+            let var_ty = match (equals, pending.saw_type_params) {
+                (Some(_), false) => builder.take_armed(),
+                _ => Ty::UNKNOWN,
+            };
             builder.declare_top(
                 name,
                 range,
                 TopDecl {
                     kind: MicroKind::TypeAlias,
                     type_params: pending.type_params,
-                    var_ty: Ty::UNKNOWN,
+                    var_ty,
                     return_ty: Ty::UNKNOWN,
                     formals: None,
                 },
@@ -1951,8 +2334,35 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         }
     }
 
+    /// An old-style function-typed formal's shape head fired (`bool f(int)`
+    /// — the parser probes the shape, then re-walks it emitting the same
+    /// events the modern form uses): the capture opens its own level, and
+    /// the written return type plus the re-walked formal list fold into
+    /// the same `Ty::Function` the modern spelling produces.
+    fn begin_function_typed_formal_parameter(&mut self, _token: Token) {
+        let builder = &mut self.builder;
+        builder
+            .capture
+            .get_or_insert_with(TreeSink::default)
+            .begin_function();
+    }
+
+    /// The old-style function-typed formal closed: the level seals and the
+    /// root arms exactly like `end_function_type` — the formal's own
+    /// `end_formal_parameter` reads the interned shape.
+    fn end_function_typed_formal_parameter(&mut self, token: Token, question: Option<Token>) {
+        self.end_function_type(token, question);
+    }
+
     fn begin_formal_parameters(&mut self, _token: Token, _kind: ParserMemberKind) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
+        // A formal list under a function-type level is the shape's own
+        // formal region: everything before it is the written return type.
+        if let Some(site) = builder.capture.as_mut()
+            && site.top_is_function()
+        {
+            site.function_formals_begin();
+        }
         if builder.formal_depth == 0 {
             builder.positional_formals.clear();
             builder.named_formals.clear();
@@ -1969,7 +2379,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _end: Token,
         _kind: ParserMemberKind,
     ) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         builder.formal_depth -= 1;
         if builder.formal_depth == 0 {
             builder.attach_formals();
@@ -1977,12 +2387,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     }
 
     fn handle_no_formal_parameters(&mut self, _token: Token, _kind: ParserMemberKind) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         builder.executable_header_done = true;
     }
 
     fn handle_async_modifier(&mut self, _async_kw: Option<Token>, _star: Option<Token>) {
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         builder.executable_header_done = true;
     }
 
@@ -1990,19 +2400,34 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn end_formal_parameter(
         &mut self,
         var_or_final: Option<Token>,
+        covariant_kw: Option<Token>,
         this_keyword: Option<Token>,
         super_keyword: Option<Token>,
         _period_after_this_or_super: Option<Token>,
         name: Token,
-        _initializer_start: Option<Token>,
-        _initializer_end: Option<Token>,
+        initializer_start: Option<Token>,
+        initializer_end: Option<Token>,
         kind: FormalParameterKind,
         member_kind: ParserMemberKind,
     ) {
-        if self.builder.borrow().formal_depth != 1 {
+        if self.builder.formal_depth != 1 {
+            // A formal inside a function-type shape (depth ≥ 2): its
+            // name/kind feeds the shape's columns — named formals trail
+            // the positional ones, exactly like record fields.
+            let builder = &mut self.builder;
+            let named = matches!(
+                kind,
+                FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
+            );
+            let formal_name = named.then(|| builder.name_of(name)).flatten();
+            if let Some(site) = builder.capture.as_mut()
+                && site.top_is_function()
+            {
+                site.function_formal_end(named, formal_name);
+            }
             return;
         }
-        let mut builder = self.builder.borrow_mut();
+        let builder = &mut self.builder;
         let Some((name, range)) = builder.capture_name(name) else {
             return;
         };
@@ -2011,6 +2436,15 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             kind,
             FormalParameterKind::RequiredPositional | FormalParameterKind::RequiredNamed
         );
+        // The default value's verbatim text, `=`/`:` separator through the
+        // expression (the renderer spells it back; the separator itself is
+        // outside the start token). A synthetic boundary token (recovery)
+        // is not in the token table — the argument-less direction.
+        let default_value = match (initializer_start, initializer_end) {
+            (Some(start), Some(end)) => builder.intern_span_text(start, end),
+            _ => None,
+        };
+        let covariant = covariant_kw.is_some();
         // A class/enum primary-constructor formal with a `var`/`final`
         // keyword declares an instance field (`FieldFormalParameterElement
         // .isDeclaring`): bodies read it bare and instances through the
@@ -2029,7 +2463,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 .is_some_and(|open| matches!(open.kind, ContainerKind::Class | ContainerKind::Enum))
         {
             let open = builder.containers.last_mut().expect("checked above");
-            open.members.entry(name).or_insert(MemberEntry {
+            open.members.or_insert_with(name, || MemberEntry {
                 kind: MemberKind::Field,
                 is_static: false,
                 is_abstract: false,
@@ -2040,9 +2474,17 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 var_ty: ty,
                 return_ty: Ty::UNKNOWN,
                 formals: None,
+                annotations: Box::default(),
+                name_range: range,
             });
         }
-        let formal = Formal { name, ty, required };
+        let formal = Formal {
+            name,
+            ty,
+            required,
+            covariant,
+            default_value,
+        };
         if matches!(
             kind,
             FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
@@ -2069,7 +2511,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         {
             let open = builder.containers.last_mut().expect("checked above");
             open.primary_formals.push(RepFormal {
-                formal: Formal { name, ty, required },
+                formal,
                 name_range: range,
             });
         }
@@ -2148,6 +2590,44 @@ mod tests {
         assert_eq!(kind("varTop"), MicroKind::TopLevelVar);
         // Type parameters land in the name set tagged typeParam.
         assert_eq!(kind("T"), MicroKind::TypeParam);
+    }
+
+    /// The alias right-hand type capture: a modern non-parameterized
+    /// `typedef` keeps its RHS type (the diagnoser's alias fold resolves
+    /// uses through it), a parameterized and an old-style spelling keep
+    /// `Unknown` (their use faces are not modeled).
+    #[test]
+    fn captures_typedef_alias_right_hand_type() {
+        let strings = StringTable::new();
+        let elements = build(
+            "typedef IntAlias = int; \
+             typedef F = void Function(); \
+             typedef G<T> = int; \
+             typedef Old(int x);",
+            &strings,
+        );
+        assert_eq!(
+            elements
+                .decl(id(&strings, "IntAlias"))
+                .expect("IntAlias")
+                .var_ty,
+            Ty::named(id(&strings, "int"))
+        );
+        assert!(
+            matches!(
+                elements.decl(id(&strings, "F")).expect("F").var_ty,
+                Ty::Function { .. }
+            ),
+            "the function-typed RHS capture answers"
+        );
+        assert_eq!(
+            elements.decl(id(&strings, "G")).expect("G").var_ty,
+            Ty::UNKNOWN
+        );
+        assert_eq!(
+            elements.decl(id(&strings, "Old")).expect("Old").var_ty,
+            Ty::UNKNOWN
+        );
     }
 
     /// Member sets: method/getter/setter/field with the static/instance bit,
@@ -2321,6 +2801,178 @@ mod tests {
         assert!(gg.formals.is_none());
     }
 
+    /// Old-style function-typed formals capture the written function
+    /// shape (`bool f(int)`): the shape folds into a first-class
+    /// [`Ty::Function`] — return type, formals, and the trailing `?` —
+    /// never the bare return head nor `Unknown`. The next ordinary formal
+    /// keeps its own written type, and a formal with no written type at
+    /// all stays `Unknown`.
+    #[test]
+    fn function_typed_formals_capture_the_written_shape() {
+        let strings = StringTable::new();
+        let elements = build(
+            "void h(void cb(int inner), bool ok) {} \
+             void k(List<int>? g()) {} \
+             void n(int a, bool b) {}",
+            &strings,
+        );
+        let positional = |name: &str| {
+            elements
+                .decl(id(&strings, name))
+                .expect(name)
+                .formals
+                .as_deref()
+                .expect("formals")
+                .positional
+                .to_vec()
+        };
+        let h = positional("h");
+        assert_eq!(h.len(), 2);
+        // `void cb(int inner)`: the whole shape is the formal's type.
+        assert_eq!(h[0].name, id(&strings, "cb"));
+        assert_eq!(
+            h[0].ty.render(&strings, elements.type_args()),
+            "void Function(int)"
+        );
+        assert_eq!(h[1].ty, Ty::named(id(&strings, "bool")));
+        let k = positional("k");
+        assert_eq!(k[0].name, id(&strings, "g"));
+        // `List<int>? g()`: the return type rides the shape (`?` on the
+        // return, not on the function type).
+        assert_eq!(
+            k[0].ty.render(&strings, elements.type_args()),
+            "List<int>? Function()"
+        );
+        let n = positional("n");
+        assert_eq!(n[0].ty, Ty::named(id(&strings, "int")));
+        assert_eq!(n[1].ty, Ty::named(id(&strings, "bool")));
+    }
+
+    /// Generic function-type annotations capture the written shape the
+    /// same way: `void Function(num) f` folds through
+    /// `end_function_type`'s arm — the `Function` head fires no type
+    /// event, so the arming comes from the sealed level, and the shape
+    /// carries the written return type and formal columns. The next
+    /// ordinary formal keeps its own written type, and the named section
+    /// captures identically.
+    #[test]
+    fn generic_function_type_formals_capture_the_written_shape() {
+        let strings = StringTable::new();
+        let elements = build(
+            "void h(void Function(num) f, bool ok) {} \
+             void k(int Function() g) {} \
+             void m({void Function({int x})? cb}) {}",
+            &strings,
+        );
+        let positional = |name: &str| {
+            elements
+                .decl(id(&strings, name))
+                .expect(name)
+                .formals
+                .as_deref()
+                .expect("formals")
+                .positional
+                .to_vec()
+        };
+        let h = positional("h");
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].name, id(&strings, "f"));
+        assert_eq!(
+            h[0].ty.render(&strings, elements.type_args()),
+            "void Function(num)"
+        );
+        assert_eq!(h[1].ty, Ty::named(id(&strings, "bool")));
+        // An empty nested group is the reserved shape's identity
+        // (`dynamic Function()`).
+        let k = positional("k");
+        assert_eq!(
+            k[0].ty.render(&strings, elements.type_args()),
+            "int Function()"
+        );
+        let named = elements
+            .decl(id(&strings, "m"))
+            .expect("m")
+            .formals
+            .as_deref()
+            .expect("formals")
+            .named
+            .to_vec();
+        assert_eq!(named[0].name, id(&strings, "cb"));
+        assert_eq!(
+            named[0].ty.render(&strings, elements.type_args()),
+            "void Function({int x})?"
+        );
+    }
+
+    /// The function-typed-formal capture's golden pins (the collector
+    /// capture-order audit's five shapes), each self-contained so a
+    /// capture rewrite cannot silently regress the fold order. Pins 1-2
+    /// discriminate the nesting chain (a nested formal's shape folds into
+    /// the outer shape's column, never replaces it), pins 3-5 guard the
+    /// boundary faces (a body closure must not retrofit the closed table;
+    /// a `List<int>?` return rides the shape; the modern annotation and
+    /// the untyped follower keep their own faces).
+    #[test]
+    fn function_typed_formal_shape_golden_pins() {
+        let strings = StringTable::new();
+        let elements = build(
+            "void h(void cb(int inner), bool ok) {} \
+             void f(void cb(void inner2(int z))) {} \
+             void g(void cb(int x)) { [1].map((int y) => y); } \
+             void k(List<int>? g()) {} \
+             void m(void Function(num) p, q) {}",
+            &strings,
+        );
+        let positional = |name: &str| {
+            elements
+                .decl(id(&strings, name))
+                .unwrap_or_else(|| panic!("decl {name}"))
+                .formals
+                .as_deref()
+                .unwrap_or_else(|| panic!("formals {name}"))
+                .positional
+                .to_vec()
+        };
+        let render = |ty: Ty| ty.render(&strings, elements.type_args());
+        // Pin 1 — single level: `cb` carries the whole written shape, the
+        // follower keeps its own type, and the nested `inner` folds into
+        // the shape's column.
+        let h = positional("h");
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].name, id(&strings, "cb"));
+        assert_eq!(render(h[0].ty), "void Function(int)");
+        assert_eq!(h[1].name, id(&strings, "ok"));
+        assert_eq!(h[1].ty, Ty::named(id(&strings, "bool")));
+        // Pin 2 — two-level nesting: the inner shape folds into the outer
+        // shape's formal column.
+        let f = positional("f");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].name, id(&strings, "cb"));
+        assert_eq!(render(f[0].ty), "void Function(void Function(int))");
+        // Pin 3 — body closure: the table closed at `g`'s own `)`; the
+        // closure's `(int y)` arms at depth 0 afterwards and must not
+        // retrofit or extend it.
+        let g = positional("g");
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].name, id(&strings, "cb"));
+        assert_eq!(render(g[0].ty), "void Function(int)");
+        // Pin 4 — the `List<int>?` return type rides the shape (the `?`
+        // stays on the return).
+        let k = positional("k");
+        assert_eq!(k.len(), 1);
+        assert_eq!(k[0].name, id(&strings, "g"));
+        assert_eq!(render(k[0].ty), "List<int>? Function()");
+        // Pin 5 — the modern `void Function(num)` annotation folds the
+        // same; the untyped follower `q` has no written type and stays
+        // `Unknown`.
+        let m = positional("m");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].name, id(&strings, "p"));
+        assert_eq!(render(m[0].ty), "void Function(num)");
+        assert_eq!(m[1].name, id(&strings, "q"));
+        assert_eq!(m[1].ty, Ty::UNKNOWN);
+    }
+
     /// #591 capture-half discriminator: the typed-return × plain-method
     /// shape behind the `undefined_member_matrix` corpus miss must carry the
     /// depth-0 formal table, exactly like the `void`-return and no-return
@@ -2451,8 +3103,9 @@ mod tests {
         );
     }
 
-    /// Declaration-arity violations: operator parameter counts (including
-    /// the minus special case) and the setter shape rule.
+    /// Declaration-arity violations: the operator parameter count table,
+    /// including the minus special case. Setters exercise the parse tier's
+    /// ownership (their shapes carry no capture-time entry).
     #[test]
     fn captures_arity_violations() {
         let strings = StringTable::new();
@@ -2475,7 +3128,7 @@ mod tests {
             .iter()
             .map(|a| a.violation)
             .collect();
-        assert_eq!(vs.len(), 7, "{vs:?}");
+        assert_eq!(vs.len(), 4, "{vs:?}");
         assert!(vs.contains(&ArityViolation::Operator {
             name: id(&strings, "+"),
             expected: 1,
@@ -2492,9 +3145,15 @@ mod tests {
             found: 2,
         }));
         assert!(vs.contains(&ArityViolation::OperatorMinus { found: 2 }));
-        assert_eq!(
-            vs.iter().filter(|v| **v == ArityViolation::Setter).count(),
-            3
+        // Setters carry no capture-time entry: the parse tier reports the
+        // `wrong_number_of_parameters_for_setter` row at the name (upstream
+        // Dart SDK source, pkg/analyzer/lib/src/fasta/ast_builder.dart
+        // :6464-6495), and a log entry here would double it in the merged
+        // report — every violating shape (`(a, b)`, `([a])`, `({a})`, `()`)
+        // reaches the parse gate, so the log stays operator-only.
+        assert!(
+            vs.iter().all(|v| !matches!(v, ArityViolation::Setter)),
+            "{vs:?}"
         );
     }
 
@@ -2504,6 +3163,13 @@ mod tests {
     /// spellings, static bit preserved.
     #[test]
     fn captures_extension_application_faces() {
+        fn face_member<'a>(
+            face: &'a crate::model::ExtensionFace,
+            name: &str,
+            strings: &StringTable,
+        ) -> Option<&'a crate::model::MemberEntry> {
+            face.members.get(&id(strings, name))
+        }
         let strings = StringTable::new();
         let elements = build(
             "extension Named on int { void nm() {} static int ns = 0; } \
@@ -2521,13 +3187,6 @@ mod tests {
             .find(|f| f.name == Some(id(&strings, "Named")))
             .expect("named face");
         assert_eq!(named.on_type, Some(id(&strings, "int")));
-        fn face_member<'a>(
-            face: &'a crate::model::ExtensionFace,
-            name: &str,
-            strings: &StringTable,
-        ) -> Option<&'a crate::model::MemberEntry> {
-            face.members.get(&id(strings, name))
-        }
         assert_eq!(
             face_member(named, "nm", &strings).map(|m| m.kind),
             Some(MemberKind::Method)
@@ -2579,6 +3238,92 @@ mod tests {
         assert_eq!(e.header_residue, vec![id(&strings, "B")]);
     }
 
+    /// Prefixed clause names keep the continuation (`implements p.A`
+    /// buffers `A`, the model's bare-name convention — the same discipline
+    /// as the qualified extends head). The prefix token fires
+    /// `PrefixedTypeReference`, which the collector never routed, and the
+    /// continuation was super-window-only — every with/implements/on face
+    /// lost the prefixed entry entirely.
+    #[test]
+    fn prefixed_clause_names_keep_the_continuation() {
+        let strings = StringTable::new();
+        let elements = build(
+            "class T {} mixin M {} class A {} \
+             class C extends p.S implements p.A {} \
+             class W with p.M implements p.A {} \
+             mixin N on p.T implements p.A {} \
+             enum E with p.M implements p.A { one }",
+            &strings,
+        );
+        let c = elements.container(id(&strings, "C")).expect("C");
+        assert_eq!(c.superclass, Some(id(&strings, "S")));
+        assert_eq!(c.implements_clause, vec![id(&strings, "A")]);
+        let w = elements.container(id(&strings, "W")).expect("W");
+        assert_eq!(w.with_clause, vec![id(&strings, "M")]);
+        assert_eq!(w.implements_clause, vec![id(&strings, "A")]);
+        let n = elements.container(id(&strings, "N")).expect("N");
+        assert_eq!(n.on_clause, vec![id(&strings, "T")]);
+        assert_eq!(n.implements_clause, vec![id(&strings, "A")]);
+        let e = elements.container(id(&strings, "E")).expect("E");
+        assert_eq!(e.with_clause, vec![id(&strings, "M")]);
+        assert_eq!(e.implements_clause, vec![id(&strings, "A")]);
+    }
+
+    /// A named mixin application's `with p.M` cannot steal the head's
+    /// super slot: the head `S` latched first, so the qualified with-name
+    /// buffers into the with clause (the continuation used to overwrite
+    /// the candidate unconditionally, leaving superclass = M and an empty
+    /// with clause).
+    #[test]
+    fn prefixed_with_name_keeps_the_mixin_application_head() {
+        let strings = StringTable::new();
+        let elements = build("class S {} mixin M {} class C = S with p.M;", &strings);
+        let c = elements.container(id(&strings, "C")).expect("C");
+        assert_eq!(c.superclass, Some(id(&strings, "S")));
+        assert_eq!(c.with_clause, vec![id(&strings, "M")]);
+    }
+
+    /// Generic clause types keep only their head names: identifiers inside
+    /// a clause type's argument list are argument positions, not clause
+    /// faces (`implements List<int>` buffers exactly [List], nested
+    /// `Map<K, V>` arguments at any depth stay out). The arguments used to
+    /// join the clause buffer as extra entries and the clause events'
+    /// trailing-count claim then picked the wrong tail.
+    #[test]
+    fn generic_clause_types_keep_only_their_heads() {
+        let strings = StringTable::new();
+        let elements = build(
+            "class C implements List<int> {} \
+             class W with M<A>, N<Map<K, V>> {} \
+             mixin Mx on p.T<R> {}",
+            &strings,
+        );
+        let c = elements.container(id(&strings, "C")).expect("C");
+        assert_eq!(c.implements_clause, vec![id(&strings, "List")]);
+        assert!(c.header_residue.is_empty(), "{:?}", c.header_residue);
+        let w = elements.container(id(&strings, "W")).expect("W");
+        assert_eq!(w.with_clause, vec![id(&strings, "M"), id(&strings, "N")]);
+        assert!(w.header_residue.is_empty(), "{:?}", w.header_residue);
+        let mx = elements.container(id(&strings, "Mx")).expect("Mx");
+        assert_eq!(mx.on_clause, vec![id(&strings, "T")]);
+        assert!(mx.header_residue.is_empty(), "{:?}", mx.header_residue);
+    }
+
+    /// The `extends` head still latches the head name only: `extends S<T>`
+    /// keeps superclass = S with the argument staying out of the clause
+    /// window entirely (no residue — the argument used to fall through the
+    /// occupied super slot into the clause buffer).
+    #[test]
+    fn generic_extends_head_latches_only_the_head() {
+        let strings = StringTable::new();
+        let elements = build("class C extends S<T> {}", &strings);
+        let c = elements.container(id(&strings, "C")).expect("C");
+        assert_eq!(c.superclass, Some(id(&strings, "S")));
+        assert!(c.with_clause.is_empty());
+        assert!(c.implements_clause.is_empty());
+        assert!(c.header_residue.is_empty(), "{:?}", c.header_residue);
+    }
+
     /// An extension's `on` type latches through the continuation for
     /// qualified references (`on p.T` keeps `T`).
     #[test]
@@ -2601,8 +3346,8 @@ mod tests {
         let rep = &e.primary_formals[0];
         assert_eq!(rep.formal.name, id(&strings, "x"));
         assert_eq!(rep.formal.ty, Ty::named(id(&strings, "int")));
-        assert!(e.members.get(&id(&strings, "m")).is_some());
-        assert!(e.members.get(&id(&strings, "x")).is_none());
+        assert!(e.members.contains_key(&id(&strings, "m")));
+        assert!(!e.members.contains_key(&id(&strings, "x")));
     }
 
     /// Constructor formals join the container facts under their lookup
@@ -2709,14 +3454,13 @@ mod tests {
         assert_eq!(f.render(&strings, elements.type_args()), "List<List<int>>");
     }
 
-    /// A poisoned tree stays argument-less: a function type inside the
-    /// argument list is a shape the model cannot represent, so the
-    /// declared type keeps the pre-feeding form exactly.
+    /// A function type inside an argument list nests as a first-class
+    /// column: the declared type carries the argument it was written
+    /// with, and the shape interns exactly once.
     #[test]
-    fn poisoned_trees_stay_argument_less() {
+    fn function_type_arguments_stay_nested() {
         let strings = StringTable::new();
         let elements = build("class C { Map<String, void Function()> f; }", &strings);
-        let map = id(&strings, "Map");
         let f = elements
             .container(id(&strings, "C"))
             .expect("C")
@@ -2725,14 +3469,12 @@ mod tests {
             .expect("f")
             .var_ty;
         assert_eq!(
-            f,
-            Ty::Named {
-                name: map,
-                nullable: false,
-                args: ArgListId::EMPTY,
-            }
+            f.render(&strings, elements.type_args()),
+            "Map<String, void Function()>"
         );
-        assert!(elements.type_args().is_empty(), "nothing interned");
+        // One interned entry: the argument list (the function shape
+        // interns in the pool's function column).
+        assert_eq!(elements.type_args().len(), 1);
     }
 
     /// Only declarations intern: an `is`/`as` type inside a body arms a
@@ -2794,8 +3536,9 @@ mod tests {
     }
 
     /// A member's metadata is not the container face: the class carrying
-    /// it and the next declaration both stay clean (the member star never
-    /// buffers, so nothing leaks into the following container).
+    /// it and the next declaration both stay clean — but the member entry
+    /// itself now claims the star (the #1637 substrate). A member star
+    /// reaches [`MemberEntry`] and only [`MemberEntry`].
     #[test]
     fn member_annotations_never_reach_containers() {
         let strings = StringTable::new();
@@ -2804,6 +3547,129 @@ mod tests {
             let container = elements.container(id(&strings, name)).expect(name);
             assert!(container.annotations.is_empty(), "{name}");
         }
+        let a = elements.container(id(&strings, "A")).expect("A");
+        let m = a.members.get(&id(&strings, "m")).expect("m");
+        assert_eq!(m.annotations.len(), 1);
+        assert_eq!(m.annotations[0].name, id(&strings, "override"));
+        assert_eq!(m.annotations[0].range.offset, 10);
+    }
+
+    /// Every member kind claims its own star: methods at `begin_method`,
+    /// each enum constant at its name, and a field group's star rides
+    /// every group member (`@meta int a, b;` annotates both). A
+    /// body-local star (a local declaration's metadata) never leaks into
+    /// the next member.
+    #[test]
+    fn member_annotations_claim_into_member_entries() {
+        let strings = StringTable::new();
+        let elements = build(
+            "enum E { @v1 a, @v2 b }\n\
+             class C {\n\
+             @m1 int x, y;\n\
+             @m2 void m() { @local var q = 0; }\n\
+             int clean = 0;\n\
+             }",
+            &strings,
+        );
+        let e = elements.container(id(&strings, "E")).expect("E");
+        let names = ["a", "b"];
+        for (constant, star) in names.iter().zip(["v1", "v2"]) {
+            let entry = e.members.get(&id(&strings, constant)).expect(constant);
+            assert_eq!(entry.annotations.len(), 1, "{constant}");
+            assert_eq!(entry.annotations[0].name, id(&strings, star));
+        }
+        let c = elements.container(id(&strings, "C")).expect("C");
+        // The group star rides both group members; the unannotated
+        // `clean` stays clean.
+        for name in ["x", "y"] {
+            let entry = c.members.get(&id(&strings, name)).expect(name);
+            assert_eq!(entry.annotations.len(), 1, "{name}");
+            assert_eq!(entry.annotations[0].name, id(&strings, "m1"));
+        }
+        let m = c.members.get(&id(&strings, "m")).expect("m");
+        assert_eq!(m.annotations.len(), 1);
+        assert_eq!(m.annotations[0].name, id(&strings, "m2"));
+        let clean = c.members.get(&id(&strings, "clean")).expect("clean");
+        assert!(clean.annotations.is_empty(), "body-local star dropped");
+    }
+
+    /// The `covariant` modifier rides the `end_formal_parameter` seam into
+    /// the captured rows (positional and named tables), and an extension
+    /// type's representation formal captures the same bit.
+    #[test]
+    fn formal_covariant_bit_rounds_the_seam() {
+        let strings = StringTable::new();
+        let elements = build(
+            "class C {\n\
+             void m(covariant int a, int b, {covariant int n = 1, int o}) {}\n\
+             }\n\
+             extension type E(covariant final int r) {}",
+            &strings,
+        );
+        let c = elements.container(id(&strings, "C")).expect("C");
+        let formals = c
+            .members
+            .get(&id(&strings, "m"))
+            .expect("m")
+            .formals
+            .as_deref()
+            .expect("m's formal table");
+        let covariant = |name: &str| {
+            formals
+                .named_formal(id(&strings, name))
+                .or_else(|| {
+                    formals
+                        .positional
+                        .iter()
+                        .find(|f| f.name == id(&strings, name))
+                })
+                .map(|f| f.covariant)
+                .unwrap_or_else(|| panic!("formal {name}"))
+        };
+        assert!(covariant("a"), "written covariant captures true");
+        assert!(!covariant("b"), "unmodified formal stays false");
+        assert!(covariant("n"), "a named formal captures the bit too");
+        assert!(!covariant("o"));
+        let e = elements.container(id(&strings, "E")).expect("E");
+        assert!(e.primary_formals[0].formal.covariant);
+    }
+
+    /// A default value interns the initializer's verbatim source text
+    /// (`=`/`:` separator outside the slice); a formal without one answers
+    /// `None` — including the extension-type representation formal.
+    #[test]
+    fn formal_default_value_interns_the_written_text() {
+        let strings = StringTable::new();
+        let source = "void f({int x = 3, int y = 1 + 2, int z}) {}\n\
+                      void g([int w = 4]) {}\n\
+                      extension type E(int r) {}";
+        let elements = build(source, &strings);
+        let resolve = |text: Option<StringId>| text.map(|at| strings.resolve(at).to_string());
+        let formals = elements
+            .decl(id(&strings, "f"))
+            .and_then(|decl| decl.formals.clone())
+            .expect("f's formals");
+        let default_of = |name: &str| {
+            resolve(
+                formals
+                    .named_formal(id(&strings, name))
+                    .and_then(|row| row.default_value),
+            )
+        };
+        assert_eq!(default_of("x").as_deref(), Some("3"));
+        assert_eq!(default_of("y").as_deref(), Some("1 + 2"));
+        assert_eq!(default_of("z"), None, "no initializer captures None");
+        let g = elements
+            .decl(id(&strings, "g"))
+            .and_then(|decl| decl.formals.clone())
+            .expect("g's formals");
+        assert_eq!(
+            resolve(g.positional[0].default_value).as_deref(),
+            Some("4"),
+            "the legacy `:` positional captures too"
+        );
+        let e = elements.container(id(&strings, "E")).expect("E");
+        assert_eq!(e.primary_formals[0].formal.default_value, None);
     }
 
     /// A non-container declaration claims (and discards) the metadata

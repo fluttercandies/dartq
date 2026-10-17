@@ -152,7 +152,8 @@ mod tests {
     use dartq_language::{FeatureSet, LanguageVersion};
     use dartq_parser::ParserFeatures;
     use dartq_resolution::{
-        CombinatorClause, Combinators, ImportEdge, LibraryGraph, LibraryGraphBuilder, Namespaces,
+        CombinatorClause, Combinators, ImportEdge, LibraryClassModifiers, LibraryGraph,
+        LibraryGraphBuilder, Namespaces,
     };
     use dartq_scanner::{ScanConfig, ScanResult};
     use dartq_source::{FileId, FileTable, StringTable};
@@ -210,6 +211,8 @@ mod tests {
             &namespaces,
             &index,
             StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            true,
         );
         (face, strings)
     }
@@ -301,6 +304,8 @@ mod tests {
                 &self.namespaces,
                 &self.index,
                 StrictModes::default(),
+                &LibraryClassModifiers::default(),
+                true,
             );
             let (_, face_b) = diagnose_unit(
                 &self.source_b,
@@ -313,6 +318,8 @@ mod tests {
                 &self.namespaces,
                 &self.index,
                 StrictModes::default(),
+                &LibraryClassModifiers::default(),
+                true,
             );
             (face_a, face_b)
         }
