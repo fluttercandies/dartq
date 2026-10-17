@@ -1,4 +1,4 @@
-//! The interface hierarchy snapshot (spec §6, R5).
+//! The interface hierarchy snapshot.
 //!
 //! The type system never reaches back into the semantic layer: class
 //! declarations, their type parameters, and their direct supertypes are
@@ -479,7 +479,7 @@ enum Visit {
 /// `Done` coloring and the reported cycle path are exactly the recursive
 /// form's, but the walk cannot overflow the thread stack on deep-but-valid
 /// hierarchies — the same guarantee the Kahn sweep in [`class_depths`] was
-/// built for (PRD targets 10⁵-file workspaces).
+/// built for.
 fn detect_cycles(
     decls: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
     edges: &[(TypeDeclId, TypeDeclId, TypeId)],

@@ -1,5 +1,5 @@
 //! Nullability API surface: suffix mapping, semantic nullability predicates,
-//! and assignability (spec §1.2, §2.2, §2.3).
+//! and assignability.
 
 mod common;
 

@@ -25,7 +25,7 @@
 //!   `argument <: bound` (:74-119); the super-bounded pass replaces top
 //!   and bottom in the whole type and re-runs the regular pass on the
 //!   inverted arguments (:121-129) — a type that fails regular but passes
-//!   inverted is *super-bounded* (spec §15.2).
+//!   inverted is *super-bounded*.
 //! * `pkg/analyzer/lib/src/error/type_arguments_verifier.dart:476-535` —
 //!   the reporting flow the semantic layer wires to
 //!   `type_argument_not_matching_bounds` (diagnostic.g.dart:16320-16331):

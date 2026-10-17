@@ -8,7 +8,7 @@ use core::fmt;
 /// hands out ids through canonical interning, so two ids are equal exactly
 /// when the types are structurally equal. This turns the analyzer's
 /// structural `==` (`type.dart:876-889`, `type.dart:1589`) into an O(1) id
-/// comparison without changing the semantics (spec §1.3, [DESIGN]).
+/// comparison without changing the semantics.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TypeId(u32);
 
@@ -32,11 +32,12 @@ impl fmt::Display for TypeDeclId {
     }
 }
 
-/// Identity of a class/mixin declaration whose instances are [`TypeKind::Interface`].
+/// Identity of a class/mixin declaration whose instances are
+/// [`crate::TypeKind::Interface`].
 ///
 /// Allocated by the layers above (resolution/semantic); this crate treats it
 /// as an opaque handle and resolves declarations only through an injected
-/// [`crate::TypeHierarchy`] snapshot (spec §6, R5: no reverse dependency on
+/// [`crate::TypeHierarchy`] snapshot (R5: no reverse dependency on
 /// the semantic layer).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TypeDeclId(u32);

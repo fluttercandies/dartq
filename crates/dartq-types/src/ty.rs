@@ -1,6 +1,6 @@
 //! The type skeleton: ten kinds plus the nullability dimension.
 //!
-//! Mirrors the analyzer's concrete type inventory (spec §1.1, all anchors in
+//! Mirrors the analyzer's concrete type inventory (all anchors in
 //! `pkg/analyzer/lib/src/dart/element/type.dart`):
 //!
 //! | dartq kind | analyzer class | anchor |
@@ -19,7 +19,7 @@
 //! Nullability is a dimension carried by every type, not an independent
 //! variant: `T?` is `T` with the question projection (`withNullability`,
 //! type.dart:1558/1567-1569). The unit kinds normalize their nullability away
-//! at interning time (spec §4.2): `dynamic` is always stored non-`?`
+//! at interning time: `dynamic` is always stored non-`?`
 //! (type.dart:90-92), and `Never?` is interned as `Null` (official `Never?`
 //! behaves as `Null`, type.dart:1207-1209).
 
@@ -65,7 +65,7 @@ pub enum TypeKind {
     },
     /// A type parameter (`type.dart:1631`). M1 carries no promoted bound —
     /// promotion is flow analysis (M2, `dartq-flow`) — and no declared
-    /// bound: bounds live on the element side (spec §4.1).
+    /// bound: bounds live on the element side.
     TypeParameter {
         /// The declared type parameter.
         parameter: TypeParamId,
@@ -84,7 +84,7 @@ pub enum TypeKind {
         base: TypeId,
     },
     /// A record type (`type.dart:1296`). Skeleton only: M1 interning and
-    /// structural equality, no subtype/LUB rules (spec §5, PRD §10.2).
+    /// structural equality, no subtype/LUB rules.
     Record {
         /// The pooled shape.
         shape: RecordShapeId,
@@ -94,8 +94,8 @@ pub enum TypeKind {
 /// An interned type: a [`TypeKind`] plus the nullability dimension.
 ///
 /// Comparison contract: identity is [`crate::TypeId`] — equal ids are
-/// structurally equal by the interner's canonical-key contract (spec §4.3,
-/// the analyzer's structural `==`, type.dart:876-889). `Type`/`TypeKind`
+/// structurally equal by the interner's canonical-key contract (the
+/// analyzer's structural `==`, type.dart:876-889). `Type`/`TypeKind`
 /// deliberately carry no `PartialEq`: kinds hold pool *positions*, not
 /// values, so a derived comparison would be arity-only fake equality.
 /// Structural questions go through the subtype/equivalence queries

@@ -156,7 +156,7 @@ impl ParamFacts {
 /// The types crate treats parameters as opaque
 /// [`TypeParamId`](crate::TypeParamId) handles; bounds and variance
 /// keywords arrive from the layer above exactly like supertype edges
-/// (spec §6, R5). An unregistered parameter reads as
+///. An unregistered parameter reads as
 /// [`ParamFacts::LEGACY`] — the official getter's `?? covariant` with a
 /// null bound (element.dart:11560-11562) — so the snapshot only needs
 /// entries for parameters that carry a keyword or a bound.
@@ -210,13 +210,13 @@ impl ParamFactsTable {
 /// * a function type: the meet of the return type with
 ///   `contravariant.combine(…)` over the parameter types, forced to
 ///   `invariant` when `parameter` occurs in any of the signature's own
-///   type-parameter bounds (variance_builder.dart:121-151 — "if [variable]
+///   type-parameter bounds (variance_builder.dart:121-151 — "if \[variable]
 ///   is referenced in a bound at all, it makes the variance … invariant");
 /// * a record type: the meet over all field types
 ///   (variance_builder.dart:111-117);
 /// * unit kinds: `unrelated` (`variance_builder.dart:118`).
 ///
-/// Recursion is bounded by [`DEPTH_LIMIT`] like the other type-operation
+/// Recursion is bounded by `DEPTH_LIMIT` like the other type-operation
 /// walks; a tripped budget answers `unrelated` at the frame that tripped.
 #[must_use]
 pub fn variance_in_type(
@@ -339,20 +339,24 @@ fn variance_in_type_bounded(
 /// interface's arguments to another's under the target declaration's
 /// declared parameter variances, positionally.
 ///
-/// # Panics
-/// Panics when a declared variance is [`Variance::Unrelated`] — declared
+/// A declared [`Variance::Unrelated`] answers [`None`] — declared
 /// variances are only `in`/`out`/`inout` plus the legacy default, so the
 /// official `StateError` for an unknown variance (`subtype.dart:71-77`)
-/// maps to this caller-contract assertion. Panics when the argument lists
-/// differ in length (the walk's arity precondition,
-/// `subtype.dart:48-50`).
+/// maps to this undecidable-relation result instead of a crash. The wired
+/// caller decides what an undecidable pair means (conservative rejection
+/// or a diagnostic); answering `true`/`false` here would silently corrupt
+/// the subtype relation.
+///
+/// # Panics
+/// Panics when the argument lists differ in length (the walk's arity
+/// precondition, `subtype.dart:48-50`).
 #[must_use]
 pub fn arguments_related(
     sys: &TypeSystem<'_>,
     variances: &[Variance],
     sub: &[TypeId],
     sup: &[TypeId],
-) -> bool {
+) -> Option<bool> {
     assert_eq!(
         sub.len(),
         sup.len(),
@@ -369,28 +373,26 @@ pub fn arguments_related(
         match variance {
             Variance::Covariant => {
                 if !sys.is_subtype(sub_argument, super_argument) {
-                    return false;
+                    return Some(false);
                 }
             }
             Variance::Contravariant => {
                 if !sys.is_subtype(super_argument, sub_argument) {
-                    return false;
+                    return Some(false);
                 }
             }
             Variance::Invariant => {
                 if !sys.is_subtype(sub_argument, super_argument)
                     || !sys.is_subtype(super_argument, sub_argument)
                 {
-                    return false;
+                    return Some(false);
                 }
             }
-            Variance::Unrelated => panic!(
-                "type parameter {i} has unknown variance `unrelated` for subtype checking \
-                 (declared variances are `in`/`out`/`inout`; subtype.dart:71-77)"
-            ),
+            // Undecidable, not a relation: see the doc comment.
+            Variance::Unrelated => return None,
         }
     }
-    true
+    Some(true)
 }
 
 #[cfg(test)]
@@ -579,45 +581,40 @@ mod tests {
         let int = itf(&table, INT, &[]);
         // int <: num: covariant pair agrees, contravariant pair flips,
         // invariant pair accepts only the symmetric order.
-        assert!(arguments_related(
-            &sys,
-            &[Variance::Covariant],
-            &[int],
-            &[num]
-        ));
-        assert!(!arguments_related(
-            &sys,
-            &[Variance::Contravariant],
-            &[int],
-            &[num]
-        ));
-        assert!(arguments_related(
-            &sys,
-            &[Variance::Contravariant],
-            &[num],
-            &[int]
-        ));
-        assert!(arguments_related(
-            &sys,
-            &[Variance::Invariant],
-            &[int],
-            &[int]
-        ));
-        assert!(!arguments_related(
-            &sys,
-            &[Variance::Invariant],
-            &[int],
-            &[num]
-        ));
+        assert_eq!(
+            arguments_related(&sys, &[Variance::Covariant], &[int], &[num]),
+            Some(true)
+        );
+        assert_eq!(
+            arguments_related(&sys, &[Variance::Contravariant], &[int], &[num]),
+            Some(false)
+        );
+        assert_eq!(
+            arguments_related(&sys, &[Variance::Contravariant], &[num], &[int]),
+            Some(true)
+        );
+        assert_eq!(
+            arguments_related(&sys, &[Variance::Invariant], &[int], &[int]),
+            Some(true)
+        );
+        assert_eq!(
+            arguments_related(&sys, &[Variance::Invariant], &[int], &[num]),
+            Some(false)
+        );
     }
 
     #[test]
-    #[should_panic(expected = "unknown variance `unrelated`")]
-    fn unrelated_declared_variance_is_a_caller_contract_violation() {
+    fn unrelated_declared_variance_answers_none() {
         let (table, hierarchy) = fixture();
         let sys = TypeSystem::new(&table, &hierarchy);
         let num = itf(&table, NUM, &[]);
-        let _ = arguments_related(&sys, &[Variance::Unrelated], &[num], &[num]);
+        // A computed variance fed into a declared slot is the undecidable
+        // shape: `None`, not a crash (the official StateError at
+        // subtype.dart:71-77, structured).
+        assert_eq!(
+            arguments_related(&sys, &[Variance::Unrelated], &[num], &[num]),
+            None
+        );
     }
 
     /// The depth budget keeps pathological nesting from overflowing the

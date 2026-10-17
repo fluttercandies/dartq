@@ -1,4 +1,4 @@
-//! The subtype rule table (spec §2), ported from
+//! The subtype rule table, ported from
 //! `subtype.dart:262-523`. Test names cite the rule numbers.
 
 mod common;
@@ -140,7 +140,7 @@ fn rule7_left_nullable() {
     assert!(!sys.is_subtype(fx.int_question(), fx.null()));
     assert!(sys.is_subtype(fx.int_question(), fx.dynamic()));
     // Nullable source into a non-null target is the invalid-assignment core
-    // (spec §2.1): `S? <: T` requires `Null <: T` as well.
+    //: `S? <: T` requires `Null <: T` as well.
     assert!(!sys.is_subtype(
         fx.list_of(fx.int_question(), false),
         fx.list_of(fx.int(), false)
@@ -204,7 +204,7 @@ fn rule12_interface_walk() {
     assert!(!sys.is_subtype(fx.num(), fx.int()));
     assert!(sys.is_subtype(fx.cat(), fx.animal()));
     assert!(sys.is_subtype(fx.cat(), fx.itf(fx.d.object, &[], false)));
-    // Covariant arguments (spec §2.1: `List<int> <: List<int?>`; class
+    // Covariant arguments (`List<int> <: List<int?>`; class
     // parameters are covariant, element.dart:11560-11561).
     assert!(sys.is_subtype(fx.list_of(fx.int(), false), fx.list_of(fx.num(), false)));
     assert!(sys.is_subtype(

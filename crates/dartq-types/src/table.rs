@@ -1,4 +1,4 @@
-//! Canonical type interning (spec §4.3).
+//! Canonical type interning.
 //!
 //! The canonical key of a type is its structure: the table maps structural
 //! equality onto a single [`TypeId`], mirroring the analyzer's structural
@@ -34,7 +34,7 @@ type InternerMap<V> = FxHashMap<u64, V>;
 
 /// Interning table for types. Not `Sync`: all interning and lookups go
 /// through a single-threaded `RefCell` state (the compiler is
-/// single-threaded; the PRD's arena/parallelism story revisits this in M2).
+/// single-threaded; the arena/parallelism roadmap revisits this in M2).
 ///
 /// Append-only pools keep [`TypeId`] and [`PoolRange`] stable for the
 /// lifetime of the table. Interned children make structural hashing and

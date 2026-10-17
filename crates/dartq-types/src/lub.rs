@@ -1,5 +1,5 @@
-//! Least upper bound (spec §4.4: interface superclass chain + nullability
-//! merge; `FutureOr` merging included, GLB/closure merging deferred to M2).
+//! Least upper bound (interface superclass chain + nullability merge;
+//! `FutureOr` merging included, GLB/closure merging deferred to M2).
 //!
 //! Port of `LeastUpperBoundHelper._computeLeastUpperBound`
 //! (`least_upper_bound.dart:391-672`) with the documented M1 fallbacks:

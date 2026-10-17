@@ -16,7 +16,7 @@ use crate::ty::TypeKind;
 pub enum TypeError {
     /// The legacy `*` suffix (pre-2.12 libraries; see
     /// `nullability_suffix.dart:20-35`) cannot appear in a dartq type: the
-    /// compiler rejects language versions below 2.12 (PRD §3.7), so legacy
+    /// compiler rejects language versions below 2.12, so legacy
     /// types never exist.
     #[error(
         "legacy `*` nullability suffix is not supported: dartq only accepts \

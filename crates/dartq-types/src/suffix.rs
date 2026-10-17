@@ -10,7 +10,7 @@ use crate::error::TypeError;
 /// `Null`, `dynamic`, and `void` carry no `?` yet behave as nullable in the
 /// subtyping rules, and `S?` reads as `S ∪ Null`
 /// (nullability_suffix.dart:9-13). Internally a dartq type stores the
-/// two-state projection as a `bool` (spec §1.2/§4.1); this enum exists at the
+/// two-state projection as a `bool`; this enum exists at the
 /// API boundary for analyzer parity.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum NullabilitySuffix {
@@ -31,7 +31,7 @@ impl NullabilitySuffix {
     /// # Errors
     /// Returns [`TypeError::LegacyNullability`] for
     /// [`NullabilitySuffix::Star`]: dartq is a null-safe-only compiler
-    /// (PRD §3.7), so legacy types never exist.
+    ///, so legacy types never exist.
     pub fn as_nullable(self) -> Result<bool, TypeError> {
         match self {
             Self::Question => Ok(true),

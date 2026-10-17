@@ -3,7 +3,7 @@
 //! Direct port of the analyzer's rule table
 //! (`pkg/analyzer/lib/src/dart/element/subtype.dart:262-523`): the rule order
 //! below is the source order, and short-circuiting matches it exactly.
-//! M1 omissions (spec §5) are marked inline: no promoted bounds, no declared
+//! M1 omissions are marked inline: no promoted bounds, no declared
 //! bounds on type parameters, no variance annotations (class parameters are
 //! covariant, `element.dart:11560-11561`), no extension types, no
 //! `UnknownInferredType`.
@@ -1113,7 +1113,12 @@ impl<'a> TypeSystem<'a> {
     /// (subtype.dart:215-221). Traversal order — LIFO pops over
     /// declaration-order supertype pushes — is part of the observable
     /// answer: the first frontier entry whose declaration matches `d1`
-    /// decides via `arguments_subtype`.
+    /// decides via `arguments_subtype`. First-match is order-sensitive but
+    /// sound under Dart's single-instantiation invariant: a class cannot
+    /// hold two different instantiations of the same generic class in its
+    /// supertype closure (malformed hierarchies are rejected during
+    /// resolution), so on well-formed snapshots every matching frontier
+    /// entry decides alike and the result matches upstream `allSupertypes`.
     fn interface_walk(
         &self,
         d1: TypeDeclId,

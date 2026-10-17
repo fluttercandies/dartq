@@ -23,14 +23,14 @@
 //! below 2.12, so no legacy types can exist ([`NullabilitySuffix::Star`] is
 //! an explicit construction error).
 //!
-//! ## Canonical interning: O(1) equality (spec §1.3/§4.3)
+//! ## Canonical interning: O(1) equality
 //!
 //! The analyzer's semantic baseline is pure structural equality
 //! (`InterfaceTypeImpl.==`, type.dart:876-889; `isStructurallyEqualTo`
 //! delegates to `==`, type.dart:1589). dartq interns on that same structure:
 //! the canonical key *is* the structure, so [`TypeId`] equality and hashing
 //! are structural equality and hashing, in O(1). This is a dartq
-//! engineering decision (PRD §10.4/§10.5) — it does not change any subtype,
+//! engineering decision — it does not change any subtype,
 //! assignability, or LUB answer, so byte-for-byte differential testing
 //! against `dart analyze` is unaffected. Interned children make structural
 //! hashing/equality of compound types shallow: equal children are
@@ -40,16 +40,16 @@
 //! dartq counterpart of the analyzer's warning against low-level
 //! `withNullability` manipulation (type.dart:1608-1612). Bulk data (type
 //! arguments, parameters, signatures) lives in append-only side tables so a
-//! stored kind stays within the 16-32 byte budget (spec §4.2, PRD §10.5).
+//! stored kind stays within the 16-32 byte budget.
 //!
 //! ## The hierarchy is injected, not discovered
 //!
 //! Declarations are opaque [`TypeDeclId`] handles; supertype edges arrive as
 //! an immutable [`TypeHierarchy`] snapshot built and validated by the layer
-//! above. This keeps the dependency direction `types ← semantic` (spec §6,
-//! R5): no reverse dependency, no cycles.
+//! above. This keeps the dependency direction `types ← semantic` (R5):
+//! no reverse dependency, no cycles.
 //!
-//! ## M1 boundaries (spec §5)
+//! ## M1 boundaries
 //!
 //! Implemented: `T?` syntax and the two-state suffix, the subtype rules
 //! 0a/0c/1-7/10-13 of `subtype.dart:262-523` (rule 14 — record subtyping —
@@ -84,6 +84,7 @@ mod exhaustive;
 mod generic_function;
 mod hierarchy;
 mod ids;
+mod inference;
 mod instantiate_to_bound;
 mod lub;
 mod provably;
@@ -104,6 +105,10 @@ pub use generic_function::{
 };
 pub use hierarchy::{CoreDecls, DeclInfo, TypeHierarchy, TypeHierarchyBuilder};
 pub use ids::{FunctionSigId, RecordShapeId, TypeDeclId, TypeId, TypeParamId};
+pub use inference::{
+    InferenceLattice, MergedTypeConstraint, choose_final_type, choose_preliminary_type,
+    choose_type_contravariant,
+};
 pub use instantiate_to_bound::{
     BoundsInstantiation, get_free_parameters, instantiate_interface_to_bounds,
     instantiate_type_formals_to_bounds,

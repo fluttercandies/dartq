@@ -1,5 +1,5 @@
 //! Hierarchy snapshot validation: one test per [`TypeError`] path raised by
-//! [`TypeHierarchyBuilder::build`] (spec §6, R5). `TypeError` carries no
+//! [`TypeHierarchyBuilder::build`]. `TypeError` carries no
 //! `PartialEq` (its `SupertypeNotInterface` payload is a pool-position
 //! [`TypeKind`]), so errors are asserted by matching.
 
