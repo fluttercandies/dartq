@@ -7,9 +7,9 @@
 
 use dartq_ast::NodeKind;
 
-use crate::engine::Check;
+use crate::engine::{Check, narrow_u32};
 use crate::registry::{Group, RuleSpec};
-use crate::rules::{NONE_TOKEN, first_child, slice, token_seq_equal};
+use crate::rules::{NONE_TOKEN, slice, token_seq_equal};
 
 /// The domain's incoming registrations: a new standalone rule appends its
 /// `SPEC` reference here (name order) and joins the registry through the
@@ -18,14 +18,1655 @@ use crate::rules::{NONE_TOKEN, first_child, slice, token_seq_equal};
 /// the pin-test wave list (`tests/registry_pin.rs`).
 pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
 
+/// A row's own token span as the semantic query face's `SourceRange` —
+/// the analysis queries' span contract (a row and its fold row share the
+/// identifier token's own range). UTF-16 — the fold rows' coordinate
+/// convention; the queries match on the start offset, the length rides
+/// along for construction.
+pub(crate) fn query_site(c: &Check<'_>, row: u32) -> dartq_source::SourceRange {
+    let span = c.utf16_span(row);
+    dartq_source::SourceRange {
+        offset: span.start,
+        length: span.end - span.start,
+    }
+}
+
+pub(crate) mod literal_only_boolean_expressions {
+    use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec, query_site};
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/literal_only_boolean_expressions.dart`
+    /// — a `do`/`for`/`if`/`while` condition (or a `when` guard) composed
+    /// only of literals reports at the statement (`_onlyLiterals`
+    /// :14-41 + the visitor :69-113): literals count, a string literal
+    /// counts iff its computed constant value is non-`null` (:23), a `!`
+    /// prefix recurses into its operand, a binary recurses into both
+    /// operands (`??` into the left alone), and an `is` recurses unless
+    /// the type resolves to a type parameter (:36). `while (true)` passes
+    /// (:101-105, dart-lang/linter#453), and an `if` with a case clause
+    /// passes whole (:86).
+    ///
+    /// dartq faces over the production tiling: the dispatch rows are the
+    /// condition containers — [`NodeKind::ParenthesizedCondition`] under the
+    /// `if`/`while`/`do` statements (the upstream direct-condition faces),
+    /// [`NodeKind::ForParts`] for the `for` face (the condition rows sit
+    /// between the two separator payload tokens), and
+    /// [`NodeKind::SwitchCaseWhenClause`] for the guard. The operand walk
+    /// runs over piece runs: a trailing `UnaryPrefix` piece is its operand's
+    /// postfix notation (the handler fires after the operand parses), and a
+    /// binary's operand runs split at the operator token over its own
+    /// window. The string constant-value gate (:23) reads the literal's
+    /// interpolation rows: a plain literal (or an adjacent-strings run) is
+    /// valued, and an interpolated literal is valued iff every
+    /// interpolation expression is itself literal-only — anything else
+    /// stays silent (the conservative `computeConstantValue` direction).
+    /// The case-clause skip (:86) reads the clause keyword the condition
+    /// row's payload carries. The `is` type face (:36) resolves through the
+    /// semantic model — a declared container (same file or imported)
+    /// recurses — with the unshadowed core names and same-file types as the
+    /// name-table face; a type-parameter or prefixed type stays silent (the
+    /// type-parameter bail's conservative face — the model publishes no
+    /// type-position binding, so a type parameter is undecidable from an
+    /// unresolvable name and both keep silent). Message: `diagnostic.g.dart`
+    /// `literalOnlyBooleanExpressions`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "literal_only_boolean_expressions",
+        group: Group::Standalone,
+        problem: "The Boolean expression has a constant value.",
+        correction: "Try changing the expression.",
+        kinds: &[
+            NodeKind::ParenthesizedCondition,
+            NodeKind::ForParts,
+            NodeKind::SwitchCaseWhenClause,
+        ],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let node = c.node();
+        match c.kind(node) {
+            NodeKind::ParenthesizedCondition => {
+                let Some(parent) = c.ancestor(1) else {
+                    return;
+                };
+                if !matches!(
+                    c.kind(parent),
+                    NodeKind::IfStatement | NodeKind::WhileStatement | NodeKind::DoWhileStatement
+                ) {
+                    return;
+                }
+                // The case-clause skip (:86): `if (e case p)` carries the
+                // clause keyword in the condition row's payload word 0.
+                if c.payload(node).first().is_some_and(|&kw| kw != NONE_TOKEN) {
+                    return;
+                }
+                let run = c.collect_direct(node);
+                // `while (true) { }` passes (:101-105).
+                if c.kind(parent) == NodeKind::WhileStatement
+                    && let [only] = run[..]
+                    && c.kind(only) == NodeKind::LiteralBool
+                    && c.lexeme(c.head_token(only)) == "true"
+                {
+                    return;
+                }
+                if only_literals(c, analysis, &run) {
+                    let range = c.utf16_span(parent);
+                    c.report(range, &[]);
+                }
+            }
+            NodeKind::ForParts => {
+                let run = for_parts_condition(c, node);
+                if only_literals(c, analysis, &run) {
+                    let span = match c.ancestor(1) {
+                        Some(parent) if c.kind(parent) == NodeKind::ForStatement => {
+                            c.utf16_span(parent)
+                        }
+                        _ => c.utf16_span(node),
+                    };
+                    c.report(span, &[]);
+                }
+            }
+            NodeKind::SwitchCaseWhenClause => {
+                let run = c.collect_direct(node);
+                if only_literals(c, analysis, &run) {
+                    let range = c.utf16_span(node);
+                    c.report(range, &[]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The `_onlyLiterals` walk (:14-41) over a piece run. A trailing
+    /// `UnaryPrefix` piece is its operand's prefix marker — under the
+    /// production tiling the operand completes after the marker's owner
+    /// seals, so the operand is the run's tail when the marker closes the
+    /// run, and otherwise the node the marker's next token-sibling
+    /// expression resolves to (see [`unary_operand`]); a run of string
+    /// literals (the adjacent-strings face — upstream `AdjacentStrings`
+    /// is a `StringLiteral`) decides through the constant-value gate; a
+    /// single row dispatches by kind; anything longer stays silent.
+    fn only_literals(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32]) -> bool {
+        // A lone `UnaryPrefix` marker: the operand completed outside its
+        // owner's sealed window — resolve through the marker's
+        // token-sibling scan before the trailing-marker peel below would
+        // drop the marker to an empty run.
+        if let &[only] = run
+            && c.kind(only) == NodeKind::UnaryPrefix
+        {
+            return unary_operand(c, only)
+                .is_some_and(|operand| only_literals(c, analysis, &[operand]));
+        }
+        let run = match run.split_last() {
+            Some((last, head)) if c.kind(*last) == NodeKind::UnaryPrefix => head,
+            _ => run,
+        };
+        if !run.is_empty()
+            && run
+                .iter()
+                .all(|&row| c.kind(row) == NodeKind::StringLiteral)
+        {
+            return run.iter().all(|&row| string_valued(c, analysis, row));
+        }
+        let &[only] = run else {
+            return false;
+        };
+        match c.kind(only) {
+            NodeKind::LiteralBool
+            | NodeKind::LiteralDouble
+            | NodeKind::LiteralInt
+            | NodeKind::LiteralNull
+            | NodeKind::SymbolLiteral
+            | NodeKind::ListLiteral
+            // `[]`/`{}` are `Literal`s upstream (`is! StringLiteral` → true).
+            | NodeKind::SetOrMapLiteral => true,
+            NodeKind::StringLiteral => string_valued(c, analysis, only),
+            // `const []` parses as a const-tagged literal — the content
+            // decides (the upstream `ListLiteral` face).
+            NodeKind::ConstLiteral => only_literals(c, analysis, &c.collect_direct(only)),
+            NodeKind::ParenthesizedExpression => {
+                only_literals(c, analysis, &c.collect_direct(only))
+            }
+            NodeKind::BinaryExpression => {
+                let Some((left, right)) = binary_operand_runs(c, only) else {
+                    return false;
+                };
+                let op = c
+                    .payload(only)
+                    .first()
+                    .map(|&op| c.lexeme(op))
+                    .unwrap_or_default();
+                // `??` recurses into the left operand alone (:23-25).
+                if op == "??" {
+                    return only_literals(c, analysis, &left);
+                }
+                only_literals(c, analysis, &left) && only_literals(c, analysis, &right)
+            }
+            NodeKind::IsExpression => {
+                // The type-parameter bail (:27-30): an unresolvable type
+                // name stays silent; a resolved container, a core name, or
+                // a same-file type recurses into the operand.
+                let kids = c.collect_direct(only);
+                let Some(type_row) = kids
+                    .iter()
+                    .copied()
+                    .find(|&kid| c.kind(kid) == NodeKind::Type)
+                else {
+                    return false;
+                };
+                if !is_type_resolves(c, analysis, type_row) {
+                    return false;
+                }
+                // The operand escapes the sealed `is` window — under the
+                // adopted-begin tiling the left operand completes before
+                // the `is` marker opens, so it tiles as an earlier sibling
+                // in the enclosing statement chain (the `unary_operand`
+                // idiom), never inside the `IsExpression` row itself.
+                let Some(operand) = is_operand(c, only) else {
+                    return false;
+                };
+                only_literals(c, analysis, &[operand])
+            }
+            _ => false,
+        }
+    }
+
+    /// The string constant-value gate (:23): a literal is valued iff its
+    /// computed constant is non-`null`. A plain literal always is; an
+    /// interpolated literal is valued iff every interpolation expression is
+    /// itself literal-only (the conservative `computeConstantValue`
+    /// direction — an unverifiable interpolation keeps the whole condition
+    /// silent).
+    fn string_valued(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, literal: u32) -> bool {
+        // The interpolation rows tile in the literal's construction window
+        // (D4: the literal's token span anchors at its head).
+        let kids = c.collect_direct(literal);
+        if kids.is_empty() {
+            return true;
+        }
+        let mut groups: Vec<Vec<u32>> = Vec::new();
+        let mut current: Vec<u32> = Vec::new();
+        for row in kids {
+            current.push(row);
+            // An invocation interpolation's root send covers its whole
+            // piece run — that boundary closes the group. A bare literal or
+            // identifier interpolation (`'${1}'`) carries no send and keeps
+            // its single piece open until the literal's own end.
+            if c.kind(row) == NodeKind::Send {
+                let span = c.byte_span(row);
+                if current
+                    .iter()
+                    .all(|&part| c.byte_span(part).end <= span.end)
+                {
+                    let mut group = std::mem::take(&mut current);
+                    // Strip the interpolation's own completion pair.
+                    while let Some(&last) = group.last()
+                        && matches!(
+                            c.kind(last),
+                            NodeKind::Send
+                                | NodeKind::NoArguments
+                                | NodeKind::NoTypeArguments
+                                | NodeKind::TypeArguments
+                                | NodeKind::DotAccess
+                        )
+                    {
+                        group.pop();
+                    }
+                    groups.push(group);
+                }
+            }
+        }
+        // A trailing non-send group is a bare expression interpolation —
+        // its own face decides (a `Send`-less literal is verifiable).
+        if !current.is_empty() {
+            groups.push(std::mem::take(&mut current));
+        }
+        groups
+            .into_iter()
+            .all(|group| !group.is_empty() && only_literals(c, analysis, &group))
+    }
+
+    /// Whether the `is` type name resolves to a non-type-parameter type
+    /// (:36 — `element is TypeParameterElement` bails): the semantic
+    /// container face first (same-file and imported classes, enums, mixins,
+    /// extensions), then the unshadowed core names and the same-file types.
+    fn is_type_resolves(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        type_row: u32,
+    ) -> bool {
+        if analysis
+            .resolve_constructor(query_site(c, type_row), None)
+            .is_some()
+        {
+            return true;
+        }
+        let name = c.lexeme(c.head_token(type_row));
+        if matches!(
+            name,
+            "bool"
+                | "double"
+                | "int"
+                | "num"
+                | "Object"
+                | "String"
+                | "dynamic"
+                | "Never"
+                | "Null"
+                | "Function"
+                | "Type"
+                | "Symbol"
+                | "Iterable"
+                | "List"
+                | "Map"
+                | "Set"
+        ) {
+            return true;
+        }
+        super::same_file::declares_type(c, name)
+    }
+
+    /// The operand runs of a binary row, split at the operator token over
+    /// the row's own direct children (the `slice::binary_operands` shape).
+    /// Direct children only — a nested interpolation row inside a string
+    /// literal stays inside its literal's subtree and never pollutes the
+    /// operand split.
+    fn binary_operand_runs(c: &Check<'_>, binary: u32) -> Option<(Vec<u32>, Vec<u32>)> {
+        let op_token = c.payload(binary).first().copied()?;
+        let op_start = c.unit.tokens.get(op_token as usize)?.byte_offset as usize;
+        let rows = c.collect_direct(binary);
+        let split = rows.partition_point(|&row| c.byte_span(row).end <= op_start);
+        if split == 0 || split == rows.len() {
+            return None;
+        }
+        Some((rows[..split].to_vec(), rows[split..].to_vec()))
+    }
+
+    /// The left operand of an `is`/`as` test: under the adopted-begin
+    /// tiling the operand completes before the `is` marker's owner opens,
+    /// so it escapes to the enclosing chain — an earlier sibling whose span
+    /// ends at the test row's head token (the `unary_operand` idiom, matched
+    /// by span-end rather than head-order).
+    fn is_operand(c: &Check<'_>, is_row: u32) -> Option<u32> {
+        let is_head = c.head_token(is_row);
+        let is_start = c.unit.tokens.get(is_head as usize)?.byte_offset as usize;
+        let mut level = is_row;
+        loop {
+            let parent = c.unit.ast.parent(level)?;
+            // The operand is the expression sibling ending closest before
+            // the `is` marker's own start (whitespace separates them).
+            let mut best: Option<(usize, u32)> = None;
+            for sibling in c.collect_direct(parent) {
+                if sibling == level || sibling == is_row {
+                    continue;
+                }
+                let span = c.byte_span(sibling);
+                if span.end <= is_start && best.is_none_or(|(e, _)| span.end > e) {
+                    best = Some((span.end, sibling));
+                }
+            }
+            if let Some((_, row)) = best {
+                return Some(row);
+            }
+            level = parent;
+        }
+    }
+
+    /// The operand of a lone `UnaryPrefix` marker (`!e`, `-e`, `~e`): under
+    /// the production tiling the marker is a leaf piece while its operand
+    /// completes into the enclosing window — `( ! true )` tiles
+    /// `UnaryPrefix` inside `ParenthesizedCondition` and the `LiteralBool`
+    /// as its parent's earlier sibling (the adopted-begin face: the
+    /// operand's head token follows the marker's, but its row id can sit
+    /// before the marker's owner). The walk scans the enclosing chain's
+    /// children for the first expression row whose head token follows the
+    /// marker's — a single row, never a run.
+    fn unary_operand(c: &Check<'_>, marker: u32) -> Option<u32> {
+        let marker_head = c.head_token(marker);
+        let mut level = marker;
+        loop {
+            let parent = c.unit.ast.parent(level)?;
+            for sibling in c.collect_direct(parent) {
+                if sibling != level && c.head_token(sibling) > marker_head {
+                    return Some(sibling);
+                }
+            }
+            level = parent;
+        }
+    }
+
+    /// The condition rows of a `for` parts row: the pieces between the two
+    /// separator payload tokens (`lparen/left_sep/right_sep` words). The
+    /// `ForParts` leaf is childless — the condition tiles as the
+    /// `ForStatement`'s own children, so the walk scans the parent's
+    /// direct rows for the pieces whose byte spans sit inside the
+    /// separator window.
+    fn for_parts_condition(c: &Check<'_>, parts: u32) -> Vec<u32> {
+        let payload = c.payload(parts);
+        let Some(&left_sep) = payload.get(1) else {
+            return Vec::new();
+        };
+        let Some(&right_sep) = payload.get(2) else {
+            return Vec::new();
+        };
+        let (Some(left_end), Some(right_start)) = (
+            c.unit
+                .tokens
+                .get(left_sep as usize)
+                .map(|t| (t.byte_offset + t.byte_len) as usize),
+            c.unit
+                .tokens
+                .get(right_sep as usize)
+                .map(|t| t.byte_offset as usize),
+        ) else {
+            return Vec::new();
+        };
+        let Some(parent) = c.unit.ast.parent(parts) else {
+            return Vec::new();
+        };
+        let inside: Vec<u32> = c
+            .collect_direct(parent)
+            .into_iter()
+            .filter(|&row| {
+                let span = c.byte_span(row);
+                span.start >= left_end && span.end <= right_start
+            })
+            .collect();
+        // The parser emits the condition's `ExpressionStatement` wrapper
+        // beside the operand itself (same operand span, trailing `;` — the
+        // completion-order window puts both at the `ForStatement` level).
+        // The operand is the semantic piece; drop the statement-width
+        // wrapper when it strictly contains another window row's span.
+        inside
+            .iter()
+            .copied()
+            .filter(|&row| {
+                if c.kind(row) != NodeKind::ExpressionStatement {
+                    return true;
+                }
+                let span = c.byte_span(row);
+                !inside.iter().any(|&other| {
+                    if other == row {
+                        return false;
+                    }
+                    let o = c.byte_span(other);
+                    o.start >= span.start
+                        && o.end <= span.end
+                        && (o.start > span.start || o.end < span.end)
+                })
+            })
+            .collect()
+    }
+}
+
+pub(crate) mod avoid_bool_literals_in_conditional_expressions {
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+    use dartq_semantic::model::Ty;
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/avoid_bool_literals_in_conditional_expressions.dart`
+    /// — a conditional expression whose two arms (`unParenthesized`, :43-44)
+    /// are both statically `bool` (`staticType == boolType`, :46-47 — exact,
+    /// non-nullable: `dynamic` and `bool?` arms keep the rule silent)
+    /// reports at the whole conditional when an arm is a `bool` literal.
+    /// The upstream visitor fires `reportAtNode(node)` once per literal arm
+    /// (:48-49); the oracle's observable output carries exactly ONE
+    /// diagnostic at the conditional span even when both arms are literals
+    /// (`b ? true : false` measures one row), so dartq pins the observable:
+    /// at most one emission per conditional. The registration is the
+    /// conditional EXPRESSION (`addConditionalExpression`, :34) —
+    /// if-statements are not targets.
+    ///
+    /// dartq faces over the production tiling: the arms are the direct
+    /// children's head-token segments split at the `?`/`:` payload
+    /// separators (a bare send's leaf span rides its follower token, so
+    /// head tokens — not spans — partition; rows left of `?` are the
+    /// condition), each read through the paren wrappers to its root row.
+    /// A `true`/`false` literal answers `bool` by its own face; every
+    /// other arm reads the semantic type — the flow read at a bare
+    /// identifier (declared or promoted, so a `bool?` promoted inside
+    /// `if (b)` answers, as the analyzer's staticType does), or the
+    /// resolution face over the run (a bare send through the callee, a
+    /// single-name access through the member — cross-file declarations
+    /// included). A missing or unknown face answers `false`: the gate
+    /// stays silent for unresolved and inferred-`var` arms (the
+    /// documented under-report family), and the rule reads the semantic
+    /// face (the wave posture: no face, no report — the engine contract).
+    ///
+    /// Message: `diagnostic.g.dart`
+    /// `avoidBoolLiteralsInConditionalExpressions`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_bool_literals_in_conditional_expressions",
+        group: Group::Standalone,
+        problem: "Conditional expressions with a 'bool' literal can be simplified.",
+        correction: "Try rewriting the expression to use either '&&' or '||'.",
+        kinds: &[NodeKind::Conditional],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let node = c.node();
+        let payload = c.payload(node);
+        let Some(&question) = payload.first() else {
+            return;
+        };
+        let Some(&colon) = payload.get(1) else {
+            return;
+        };
+        // The then/else arms over the direct children, split at the `?`/`:`
+        // separators by head token. A bare tear-off send's wrapper pieces
+        // (`NoTypeArguments`, `NoArguments`) ride the `?`/`:` separator
+        // tokens, so their heads can straddle the split — keep them with
+        // the arm (`head <= colon` for the then-run); `send_parts` walks
+        // them back to the selector either way.
+        let mut then_run = Vec::new();
+        let mut else_run = Vec::new();
+        for row in c.collect_direct(node) {
+            let head = c.head_token(row);
+            if head < question {
+                continue;
+            }
+            if head <= colon {
+                then_run.push(row);
+            } else {
+                else_run.push(row);
+            }
+        }
+        // `thenExp.staticType == boolType && elseExp.staticType == boolType`
+        // (:46-47): both arms must be `bool`-typed.
+        if !arm_is_bool(c, analysis, &then_run) || !arm_is_bool(c, analysis, &else_run) {
+            return;
+        }
+        // The oracle observable: ONE report at the whole conditional when
+        // an arm is a `bool` literal. The upstream visitor fires per
+        // literal arm (:48-49), and the measured `dart analyze` output
+        // carries a single diagnostic at the conditional span — dartq pins
+        // the observable, not the per-arm internal pair.
+        let literal_arm = |run: &[u32]| {
+            faces::run_root(c, run).is_some_and(|root| c.kind(root) == NodeKind::LiteralBool)
+        };
+        if !literal_arm(&then_run) && !literal_arm(&else_run) {
+            return;
+        }
+        let Some(range) = conditional_extent(c, node, question) else {
+            return;
+        };
+        c.report(range, &[]);
+    }
+
+    /// The whole conditional's UTF-16 extent: the production row opens at
+    /// the `?` (the condition completed before the Conditional's slot, so
+    /// the covered start sits past the condition's first token) and its
+    /// covered end can swallow an enclosing terminator — the start is the
+    /// condition run's earliest head, the end the else run's last real
+    /// row's end.
+    fn conditional_extent(
+        c: &Check<'_>,
+        node: u32,
+        question: u32,
+    ) -> Option<core::ops::Range<u32>> {
+        let start = condition_start(c, node, question)
+            .map(|token| crate::rules::utf16_token_span(c, token).start)?;
+        let end = super::prefer_if_null_operators::conditional_end(c, node);
+        Some(start..end)
+    }
+
+    /// The condition's first token: the condition completed before the
+    /// Conditional's slot, so its pieces tile as the owner's rows before
+    /// the node — statement-run bounded, then token-adjacency bounded back
+    /// to the `?` ([`slice::contiguous_tail`]). Hand-built trees carry the
+    /// condition rows among the node's children (`head < question`).
+    fn condition_start(c: &Check<'_>, node: u32, question: u32) -> Option<u32> {
+        let inline: Vec<u32> = c
+            .collect_direct(node)
+            .into_iter()
+            .filter(|&row| c.head_token(row) < question)
+            .collect();
+        if let Some(token) = slice::run_start_token(c, &inline) {
+            return Some(token);
+        }
+        let parent = c.ancestor(1)?;
+        let kids = c.collect_direct(parent);
+        let pos = kids.iter().position(|&kid| kid == node)?;
+        let run = slice::statement_run(c, &kids[..pos]);
+        slice::run_start_token(c, slice::contiguous_tail(c, &run, question))
+    }
+
+    /// The `staticType == boolType` face (:39-40): an exact non-nullable
+    /// `bool`. A `true`/`false` literal answers by its own face; a bare
+    /// identifier answers at its flow read (declared or promoted), and
+    /// every other run shape reads the resolution face (a bare send
+    /// through the callee, a single-name access through the member).
+    /// Missing or unknown faces answer `false` — the under-report
+    /// direction (dynamic, nullable, unresolved, inferred-`var` arms).
+    fn arm_is_bool(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32]) -> bool {
+        let is_bool = |ty: Option<Ty>| {
+            matches!(ty, Some(Ty::Named { name, nullable: false, .. })
+                if analysis.strings().resolve(name) == "bool")
+        };
+        let Some(root) = faces::run_root(c, run) else {
+            return false;
+        };
+        if c.kind(root) == NodeKind::LiteralBool {
+            return true;
+        }
+        if c.kind(root) == NodeKind::Identifier {
+            return is_bool(analysis.type_of(query_site(c, root)));
+        }
+        is_bool(faces::expr_type(c, analysis, run))
+    }
+}
+
+pub(crate) mod unnecessary_parenthesis {
+    use super::{Check, Group, NodeKind, RuleSpec};
+    use crate::rules::{first_child, slice};
+
+    /// The source-head row of the paren's inner expression (the outermost
+    /// container row when the inner is one — its subtree starts at the
+    /// window start).
+    fn inner_head(c: &Check<'_>, node: u32) -> Option<NodeKind> {
+        first_child(c, node).map(|head| c.kind(head))
+    }
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_parenthesis.dart`
+    /// — a parenthesized expression reports when removing the parentheses
+    /// keeps the meaning (:39-232, the decision order preserved below). The
+    /// dartq faces over the production tiling (the paren row is a container:
+    /// its children tile the inner expression; the enclosing owner slice
+    /// carries the access-chain and statement pieces):
+    ///
+    /// - bail faces ported exactly: constant-pattern parent (:41), spread
+    ///   position (the childless `Spread` piece precedes the paren, :45),
+    ///   nested parens (:67), condition segments — the upstream
+    ///   if/while/do/switch direct-parent faces (:68-73) all land as the
+    ///   [`NodeKind::ParenthesizedCondition`] parent here — a conditional
+    ///   inner (:73), cascade positions (inner or ancestor, :104-107), a
+    ///   bare constructor-field-initializer position with a function
+    ///   expression inside (:119-131, the `=>` token face), the
+    ///   `==`/`!=`-under-assignment family (:133-139), a statement-initial
+    ///   switch expression (:146-149), the whitespace-readability family
+    ///   (:151-166 with the exemption set), the operator parents (:169-176),
+    ///   directly-invoked parens (the `FunctionExpressionInvocation` face
+    ///   :178-180), the prefix/postfix access targets (:181-192), and the
+    ///   statement-initial set-or-map literal (:195-197).
+    /// - report faces ported: the single-positional-argument parent (:69),
+    ///   the one-token inner (:113-121 over a 3-token paren), and the
+    ///   null-aware chain inner (the `containsNullAwareInvocationInChain`
+    ///   extension, extensions.dart:211-224, over a chain-head piece run) —
+    ///   each with the upstream parent-name exemptions
+    ///   (`hashCode`/`runtimeType` accessors, `noSuchMethod`/`toString`
+    ///   invocations, a `!` postfix, :75-101).
+    ///
+    /// The record-typed parameter exemptions (:75-86
+    /// `correspondingParameter.type is RecordType`) read the same-file
+    /// written type of the corresponding formal: the callee resolves as a
+    /// bare name to exactly one same-file top-level function whose formal
+    /// at the argument's position (or named label) carries a written
+    /// [`NodeKind::RecordType`]. A `TypeLiteral` inner (:105-106) is the
+    /// `name<...>` shape whose name binds to no same-file value (a
+    /// same-file value spells a generic tear-off, a `FunctionReference`
+    /// the official keeps reporting); the extension-nullable bail
+    /// (:117-124, :132-139) judges the accessor per RESOLVED member over
+    /// the receiver's written type
+    /// ([`super::same_file::nullable_extension_member`]): the applicable
+    /// same-file declarers split by `on`-type nullability (a non-nullable
+    /// `on` type is always the more specific application and reports), a
+    /// resolved interface member — same-file chain or the semantic
+    /// member walk — reports, and an accessor no same-file face declares
+    /// keeps the parens (it may resolve through an import, where the
+    /// upstream resolver stays silent over a nullable on type).
+    ///
+    /// Documented gaps: a member or prefixed callee (`obj.g((3))`,
+    /// `p.G((3))`) stays unresolved and reports; a generic tear-off of a
+    /// value imported from another file bails as a type literal (the
+    /// name carries no same-file value binding); an accessor carried by
+    /// an imported non-nullable extension, or genuinely undefined, keeps
+    /// the parens (the import-through keep — the under-report family);
+    /// extension applicability reads at written-name level, so a
+    /// subclass receiver misses a superclass-on-type extension. The
+    /// null-aware-index-in-then-arm bail (:144-157) is not read.
+    /// Message: `diagnostic.g.dart` `unnecessaryParenthesis`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_parenthesis",
+        group: Group::Standalone,
+        problem: "Unnecessary use of parentheses.",
+        correction: "Try removing the parentheses.",
+        kinds: &[NodeKind::ParenthesizedExpression],
+        check,
+    };
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one flat exemption ladder per parent shape; splitting it                   would scatter the official line citations"
+    )]
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(parent) = c.ancestor(1) else {
+            return;
+        };
+        let parent_kind = c.kind(parent);
+        // `case const (a + b):` (:41).
+        if parent_kind == NodeKind::ConstantPattern {
+            return;
+        }
+        let owner_kids = c.collect_direct(parent);
+        let Some(pos) = owner_kids.iter().position(|&kid| kid == node) else {
+            return;
+        };
+        // `[...(p as List)]` (:45) — the childless spread piece precedes.
+        if pos > 0 && c.kind(owner_kids[pos - 1]) == NodeKind::Spread {
+            return;
+        }
+        // `(int,) r = (3);` (:47-53) — the same-file written record type of
+        // the variable keeps the parentheses.
+        if matches!(
+            parent_kind,
+            NodeKind::VariableInitializer | NodeKind::InitializedIdentifier
+        ) && variable_declares_record_type(c)
+            && inner_head(c, node) != Some(NodeKind::RecordLiteral)
+        {
+            return;
+        }
+        // `g((3)); => g((int,) i) { }` / `g(i: (3)); =>
+        // g({required (int,) i}) { }` (:75-86) — the same-file written
+        // record type of the corresponding parameter keeps the parentheses.
+        if parent_kind == NodeKind::Arguments
+            && inner_head(c, node) != Some(NodeKind::RecordLiteral)
+            && argument_parameter_declares_record_type(c, node, parent)
+        {
+            return;
+        }
+        let inner = c.collect_direct(node);
+        let Some(&inner_first) = inner.first() else {
+            return;
+        };
+        // Always-report set (:67-73): nested parens, single positional
+        // argument, and the condition segments (the upstream
+        // if/while/do/switch direct parents).
+        if parent_kind == NodeKind::ParenthesizedExpression
+            || parent_kind == NodeKind::ParenthesizedCondition
+            || (parent_kind == NodeKind::Arguments && slice::arguments(c, &owner_kids).len() == 1)
+        {
+            report(c, node);
+            return;
+        }
+        // `(foo ? bar : baz)` (:73).
+        if inner_head(c, node) == Some(NodeKind::Conditional) {
+            return;
+        }
+        // `(List<int>).toString()` (:105-106): the inner is a type literal —
+        // `name<...>` whose name binds to no same-file value.
+        if type_literal_inner(c, node) {
+            return;
+        }
+        // The one-token / null-aware-chain report block (:78-102), with the
+        // parent-name exemptions.
+        let one_token = c.unit.ast.token_range(node).len() == 3
+            && matches!(
+                c.kind(inner_first),
+                NodeKind::Identifier
+                    | NodeKind::LiteralBool
+                    | NodeKind::LiteralDouble
+                    | NodeKind::LiteralInt
+                    | NodeKind::LiteralNull
+                    | NodeKind::StringLiteral
+            );
+        let null_aware_chain = chain_head(c, inner_first) && has_null_aware_token(c, node);
+        if one_token || null_aware_chain {
+            // `(String).hashCode` / `(String).runtimeType` (:82-88).
+            if let Some(name) = access_selector_name(c, &owner_kids, pos) {
+                if matches!(name, "hashCode" | "runtimeType") {
+                    return;
+                }
+                // `(String).noSuchMethod()` / `(String).toString()` (:77-81).
+                if matches!(name, "noSuchMethod" | "toString")
+                    && owner_kids[pos + 2..]
+                        .iter()
+                        .any(|&piece| c.kind(piece) == NodeKind::Arguments)
+                {
+                    return;
+                }
+                // The extension-nullable bail (:117-124, :132-139):
+                // parentheses are required to stop null-aware shorting
+                // when the accessor resolves to an extension member whose
+                // `on` type is nullable — judged per resolved member over
+                // the receiver's written type ([`super::same_file::
+                // nullable_extension_member`]); an accessor no same-file
+                // face declares may resolve through imports, and the same
+                // keep covers it.
+                if super::same_file::nullable_extension_member(c, node, name) {
+                    return;
+                }
+            }
+            // `(p)!` (:93-95).
+            if owner_kids
+                .get(pos + 1)
+                .is_some_and(|&piece| c.kind(piece) == NodeKind::UnaryPostfix)
+                && c.payload(owner_kids[pos + 1])
+                    .first()
+                    .is_some_and(|&op| c.lexeme(op) == "!")
+            {
+                return;
+            }
+            report(c, node);
+            return;
+        }
+        // `(Foo.new)` (:103-108) — the invocation-with-type-arguments
+        // exemption is the documented corner.
+        if inner_head(c, node) == Some(NodeKind::ConstructorReference) {
+            report(c, node);
+            return;
+        }
+        // `a..b = (c..d)` (:104-107): any cascade position keeps the parens.
+        if c.kind(inner_first) == NodeKind::Cascade
+            || c.path.iter().rev().any(|&a| c.kind(a) == NodeKind::Cascade)
+        {
+            return;
+        }
+        // The constructor-field-initializer `=>` guard (:119-131).
+        if bare_in_initializer(c) && has_token_lexeme(c, node, "=>") {
+            return;
+        }
+        // `foo = (a == b)` / `return (count != 0)` (:133-139).
+        if inner_head(c, node) == Some(NodeKind::BinaryExpression) {
+            let binary = first_child(c, node).expect("the head kind matched above");
+            let op = c
+                .payload(binary)
+                .first()
+                .map(|&op| c.lexeme(op))
+                .unwrap_or_default();
+            if matches!(op, "==" | "!=")
+                && (matches!(
+                    parent_kind,
+                    NodeKind::Assignment
+                        | NodeKind::InitializedIdentifier
+                        | NodeKind::VariableInitializer
+                        | NodeKind::ReturnStatement
+                        | NodeKind::YieldStatement
+                ) || c
+                    .path
+                    .iter()
+                    .rev()
+                    .any(|&a| c.kind(a) == NodeKind::Initializer))
+            {
+                return;
+            }
+        }
+        // A statement-initial switch expression (:146-149).
+        let statement_owned = owner_kids[pos + 1..].iter().any(|&sib| {
+            c.kind(sib) == NodeKind::ExpressionStatement
+                && c.utf16_span(sib).start <= c.utf16_span(node).start
+                && c.utf16_span(sib).end >= c.utf16_span(node).end
+        });
+        if statement_owned && inner_head(c, node) == Some(NodeKind::SwitchExpression) {
+            return;
+        }
+        // The whitespace-readability family (:151-166): keep the parens
+        // unless an exemption parent answers.
+        if whitespace_inner(c, first_child(c, node)) {
+            let exempt = matches!(
+                parent_kind,
+                NodeKind::Assignment
+                    | NodeKind::RecordLiteral
+                    | NodeKind::ReturnStatement
+                    | NodeKind::YieldStatement
+                    | NodeKind::InitializedIdentifier
+                    | NodeKind::VariableInitializer
+            ) || c
+                .path
+                .iter()
+                .rev()
+                .any(|&a| c.kind(a) == NodeKind::Initializer)
+                || parent_kind == NodeKind::Arguments
+                || has_arrow_body(c, parent);
+            if !exempt {
+                return;
+            }
+        }
+        // The operator parents (:169-176).
+        if matches!(
+            parent_kind,
+            NodeKind::BinaryExpression
+                | NodeKind::Conditional
+                | NodeKind::AsExpression
+                | NodeKind::IsExpression
+        ) {
+            return;
+        }
+        // `(p++).toString()` / `(++p).toString()` (:188-192).
+        if access_selector_name(c, &owner_kids, pos).is_some()
+            && matches!(
+                c.kind(inner_first),
+                NodeKind::UnaryPostfix | NodeKind::UnaryPrefix
+            )
+        {
+            return;
+        }
+        // Directly-invoked parens (the FunctionExpressionInvocation face,
+        // :178-180; the prefixed-identifier corner under-reports).
+        if owner_kids.get(pos + 1).is_some_and(|&piece| {
+            matches!(
+                c.kind(piece),
+                NodeKind::Arguments
+                    | NodeKind::NoArguments
+                    | NodeKind::TypeArguments
+                    | NodeKind::NoTypeArguments
+            )
+        }) {
+            return;
+        }
+        // `({1, 2, 3}).forEach(print);` (:195-197).
+        if statement_owned && inner_head(c, node) == Some(NodeKind::SetOrMapLiteral) {
+            return;
+        }
+        report(c, node);
+    }
+
+    fn report(c: &mut Check<'_>, node: u32) {
+        let range = c.utf16_span(node);
+        c.report(range, &[]);
+    }
+
+    /// Whether the enclosing variable declaration carries a written record
+    /// type: the nearest preceding [`NodeKind::RecordType`] sibling of the
+    /// declaration row in the owner slice.
+    fn variable_declares_record_type(c: &Check<'_>) -> bool {
+        let Some(&vars) = c
+            .path
+            .iter()
+            .rev()
+            .find(|&&a| c.kind(a) == NodeKind::VariablesDeclaration)
+        else {
+            return false;
+        };
+        let Some(owner) = c.unit.ast.parent(vars) else {
+            return false;
+        };
+        let kids = c.collect_direct(owner);
+        let Some(pos) = kids.iter().position(|&kid| kid == vars) else {
+            return false;
+        };
+        kids[..pos]
+            .iter()
+            .rev()
+            .any(|&kid| c.kind(kid) == NodeKind::RecordType)
+    }
+
+    /// Whether the parenthesized argument sits at a formal whose same-file
+    /// written type is a record type — the lexical stand-in for the
+    /// official's `correspondingParameter.type is RecordType` (:75-86).
+    /// The callee resolves as a bare name to exactly one same-file
+    /// top-level function; a receiver run before the callee head (member
+    /// and prefixed faces) or a computed callee leaves the correspondence
+    /// unresolved and the caller keeps its report posture.
+    fn argument_parameter_declares_record_type(c: &Check<'_>, paren: u32, args: u32) -> bool {
+        // The send's owner slice: the argument list at `pos`, the bare
+        // callee head before the type-argument wrappers.
+        let Some(owner) = c.unit.ast.parent(args) else {
+            return false;
+        };
+        let kids = c.collect_direct(owner);
+        let Some(pos) = kids.iter().position(|&kid| kid == args) else {
+            return false;
+        };
+        let Some(mut head) = pos.checked_sub(1) else {
+            return false;
+        };
+        loop {
+            match c.kind(kids[head]) {
+                NodeKind::TypeArguments | NodeKind::NoTypeArguments => {
+                    let Some(prev) = head.checked_sub(1) else {
+                        return false;
+                    };
+                    head = prev;
+                }
+                NodeKind::Identifier => break,
+                _ => return false,
+            }
+        }
+        // The bare-callee face only: pieces of the statement's own run
+        // before the head are a receiver (`obj.g(...)`).
+        if !slice::statement_run(c, &kids[..head]).is_empty() {
+            return false;
+        }
+        let name = c.lexeme(c.head_token(kids[head]));
+        let Some(function) = same_file_top_level_function(c, name) else {
+            return false;
+        };
+        let rows = slice::parameter_assignments::parameter_rows(c, function);
+        // The argument's own group over the argument list's children: a
+        // named group matches its formal by label, a positional group by
+        // its index over the positional groups.
+        let arg_kids = c.collect_direct(args);
+        let Some(arg_pos) = arg_kids.iter().position(|&kid| kid == paren) else {
+            return false;
+        };
+        let groups = slice::arguments(c, &arg_kids);
+        let Some(group) = groups.iter().find(|range| range.contains(&arg_pos)) else {
+            return false;
+        };
+        let named = arg_kids[group.start..group.end]
+            .iter()
+            .any(|&piece| c.kind(piece) == NodeKind::NamedArgument);
+        if named {
+            let Some(name_pos) = slice::named_arg_name(c, &arg_kids, group.end - 1) else {
+                return false;
+            };
+            let label = c.lexeme(c.head_token(arg_kids[name_pos]));
+            rows.iter().any(|&(row, _)| {
+                slice::parameter_assignments::parameter_name(c, row) == Some(label)
+                    && written_record_type(c, row)
+            })
+        } else {
+            let index = groups
+                .iter()
+                .take_while(|range| *range != group)
+                .filter(|range| {
+                    !arg_kids[range.start..range.end]
+                        .iter()
+                        .any(|&piece| c.kind(piece) == NodeKind::NamedArgument)
+                })
+                .count();
+            rows.get(index)
+                .is_some_and(|&(row, _)| written_record_type(c, row))
+        }
+    }
+
+    /// The one same-file top-level function carrying `name`, `None` when
+    /// the name is declared zero or several times at the top level (the
+    /// library-unique spelling is what makes the correspondence exact).
+    fn same_file_top_level_function(c: &Check<'_>, name: &str) -> Option<u32> {
+        let root = c.path.first().copied()?;
+        let ctx = dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32;
+        let mut functions = Vec::new();
+        for top in c.collect_direct(root) {
+            for inner in c.collect_direct(top) {
+                if c.kind(inner) == NodeKind::TopLevelMethod
+                    && c.collect_direct(inner).into_iter().any(|kid| {
+                        c.kind(kid) == NodeKind::Identifier
+                            && c.payload(kid).first() == Some(&ctx)
+                            && c.lexeme(c.head_token(kid)) == name
+                    })
+                {
+                    functions.push(inner);
+                }
+            }
+        }
+        (functions.len() == 1).then(|| functions.remove(0))
+    }
+
+    /// Whether the formal's written type is a record type — the direct type
+    /// child (the parameter tiling keeps the annotation inside the row) or,
+    /// the variable-face tiling, a RecordType owner sibling immediately
+    /// before the row.
+    fn written_record_type(c: &Check<'_>, row: u32) -> bool {
+        if c.collect_direct(row)
+            .into_iter()
+            .any(|kid| c.kind(kid) == NodeKind::RecordType)
+        {
+            return true;
+        }
+        let Some(parent) = c.unit.ast.parent(row) else {
+            return false;
+        };
+        let kids = c.collect_direct(parent);
+        let Some(pos) = kids.iter().position(|&kid| kid == row) else {
+            return false;
+        };
+        pos > 0 && c.kind(kids[pos - 1]) == NodeKind::RecordType
+    }
+
+    /// Whether the paren's inner is a type literal — `(name<...>)`: an
+    /// identifier directly after `(`, a `<` right after it, and a matching
+    /// `>` closing before `)`. The name must bind to no same-file value
+    /// ([`super::same_file::declares_value`]): a same-file value spells a
+    /// generic tear-off (`(fn<int>)`), which the official keeps reporting
+    /// (a `FunctionReference`, not a `TypeLiteral`, :105-106).
+    fn type_literal_inner(c: &Check<'_>, node: u32) -> bool {
+        let extent = c.unit.ast.token_range(node);
+        if extent.len() < 5 {
+            return false; // `( name < > )` minimum
+        }
+        let lparen = extent.start;
+        if c.lexeme(lparen) != "(" {
+            return false;
+        }
+        let name = lparen + 1;
+        if c.lexeme(name + 1) != "<" {
+            return false;
+        }
+        let rparen = extent.end - 1;
+        if c.lexeme(rparen) != ")" || c.lexeme(rparen - 1) != ">" {
+            return false;
+        }
+        !super::same_file::declares_value(c, node, c.lexeme(name))
+    }
+
+    /// Whether `inner_first` can head an access chain (the
+    /// `containsNullAwareInvocationInChain` entry faces: a chain walks
+    /// PropertyAccess/MethodInvocation/Index targets only — a container
+    /// inner never qualifies, extensions.dart:211-224).
+    fn chain_head(c: &Check<'_>, inner_first: u32) -> bool {
+        matches!(
+            c.kind(inner_first),
+            NodeKind::Identifier | NodeKind::ThisExpression | NodeKind::SuperExpression
+        )
+    }
+
+    /// Whether the paren's token range carries a null-aware link token
+    /// (`?.`, `?..`, `?[` — the chain faces of the upstream walk).
+    fn has_null_aware_token(c: &Check<'_>, node: u32) -> bool {
+        c.unit
+            .ast
+            .token_range(node)
+            .any(|token| matches!(c.lexeme(token), "?." | "?.." | "?["))
+    }
+
+    /// The name of the selector that follows the paren in the owner slice,
+    /// when a covering access marker confirms the paren is the target.
+    fn access_selector_name<'a>(
+        c: &'a Check<'_>,
+        owner_kids: &[u32],
+        pos: usize,
+    ) -> Option<&'a str> {
+        let selector = *owner_kids.get(pos + 1)?;
+        if c.kind(selector) != NodeKind::Identifier {
+            return None;
+        }
+        owner_kids[pos + 2..]
+            .iter()
+            .copied()
+            .find(|&piece| {
+                c.kind(piece) == NodeKind::DotAccess
+                    && c.utf16_span(piece).start <= c.utf16_span(selector).start
+                    && c.utf16_span(piece).end >= c.utf16_span(selector).end
+            })
+            .map(|_| c.lexeme(c.head_token(selector)))
+    }
+
+    /// Whether the paren sits bare inside a constructor field initializer:
+    /// the [`NodeKind::Initializer`] ancestor is reached before any body or
+    /// argument boundary (the `isBareInConstructorFieldInitializer` walk,
+    /// :136-149).
+    fn bare_in_initializer(c: &Check<'_>) -> bool {
+        for &ancestor in c.path.iter().rev().skip(1) {
+            match c.kind(ancestor) {
+                NodeKind::Initializer => return true,
+                NodeKind::Block
+                | NodeKind::BlockBody
+                | NodeKind::ExpressionBody
+                | NodeKind::Arguments
+                | NodeKind::FormalParameters
+                | NodeKind::Method
+                | NodeKind::TopLevelMethod
+                | NodeKind::Constructor
+                | NodeKind::Factory
+                | NodeKind::FunctionExpression
+                | NodeKind::LocalFunctionDeclaration
+                | NodeKind::NamedFunctionExpression => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Whether the node's token range carries `lexeme`.
+    fn has_token_lexeme(c: &Check<'_>, node: u32, lexeme: &str) -> bool {
+        c.unit
+            .ast
+            .token_range(node)
+            .any(|token| c.lexeme(token) == lexeme)
+    }
+
+    /// The `directlyContainsWhitespace` faces (:216-233): the container
+    /// inners plus the `new`-keyword and `const`-literal shapes.
+    fn whitespace_inner(c: &Check<'_>, head: Option<u32>) -> bool {
+        let Some(head) = head else {
+            return false;
+        };
+        match c.kind(head) {
+            NodeKind::AsExpression
+            | NodeKind::Assignment
+            | NodeKind::AwaitExpression
+            | NodeKind::BinaryExpression
+            | NodeKind::IsExpression
+            | NodeKind::SwitchExpression
+            | NodeKind::NewExpression => true,
+            _ => crate::rules::const_keyword(c, head).is_some(),
+        }
+    }
+
+    /// Whether the declaration row carries an arrow body (the childless
+    /// `ExpressionBody` handle leaves the row as the expression's owner).
+    fn has_arrow_body(c: &Check<'_>, declaration: u32) -> bool {
+        c.collect_direct(declaration)
+            .into_iter()
+            .any(|kid| c.kind(kid) == NodeKind::ExpressionBody)
+    }
+}
+
+pub(crate) mod prefer_int_literals {
+    use dartq_semantic::{BindingKind, model::Ty};
+
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+    use crate::rules::{body_members, type_face};
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_int_literals.dart`
+    /// — a double literal whose value is an exact integer reports when the
+    /// context demands a double (:36-58 `visitDoubleLiteral` +
+    /// `hasTypeDouble`): there the `int` rewrite keeps the static type. The
+    /// official context faces port over the production tiling:
+    /// - the parameter faces (:40-43, :50-54 `correspondingParameter`) —
+    ///   the argument's formal type, resolved for a member invocation
+    ///   through the semantic member walk (cross-file classes included)
+    ///   and for a bare callee through the same-file declarations gated on
+    ///   the callee's binding; a named argument reads its formal by name;
+    /// - the variable-declaration face (:69-75) — the written type is the
+    ///   nearest preceding `Type` sibling of the declaration row;
+    /// - the `return` face (:52-56) — the `ReturnStatement` container owns
+    ///   the literal, and the innermost enclosing declaration with a written
+    ///   return type answers (an anonymous function boundary has none and
+    ///   stays silent, the `hasReturnTypeDouble` `FunctionExpression` bail);
+    /// - the arrow-body face (:60-63) — the childless `ExpressionBody`
+    ///   handle leaves the expression pieces as the declaration row's own
+    ///   children, so the parent row with an arrow body answers;
+    /// - the typed-list face (:44-49) — the `TypeArguments` sibling precedes
+    ///   the [`NodeKind::ListLiteral`] row in the owner slice.
+    ///
+    /// The `-` prefix face (:18-23) needs no separate read: the negated
+    /// literal tiles in the same owner as the `UnaryPrefix` piece, so the
+    /// owner-context faces answer the prefix's context identically.
+    /// Approximations (documented, under-report): a constructor callee
+    /// (`C(1.0)`), an imported bare function, a function-typed variable's
+    /// invocation, and a generic callee's unbound parameter type
+    /// (`void g<T>(T x)` — the written `T` is not `double`) resolve to
+    /// nothing and stay silent. Message: `diagnostic.g.dart`
+    /// `preferIntLiterals`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_int_literals",
+        group: Group::Standalone,
+        problem: "Unnecessary use of a 'double' literal.",
+        correction: "Try using an 'int' literal.",
+        kinds: &[NodeKind::LiteralDouble],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let node = c.node();
+        // `value != value.truncate()` bails (:47-52, the UnsupportedError
+        // arm included): the lexeme must fold to a finite double equal to
+        // its own truncation.
+        let digits: String = c
+            .lexeme(c.head_token(node))
+            .chars()
+            .filter(|&ch| ch != '_')
+            .collect();
+        let Ok(value) = digits.parse::<f64>() else {
+            return;
+        };
+        #[expect(
+            clippy::float_cmp,
+            reason = "integrality test on an exactly-parsed f64; both sides                       are exact binary values, no rounding involved"
+        )]
+        if !value.is_finite() || value != value.trunc() {
+            return;
+        }
+        if context_demands_double(c, analysis) {
+            let range = c.utf16_span(node);
+            c.report(range, &[]);
+        }
+    }
+
+    /// The parent dispatch of `hasTypeDouble` (:39-76) over the production
+    /// tiling; `false` keeps the literal silent.
+    fn context_demands_double(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>) -> bool {
+        let Some(parent) = c.ancestor(1) else {
+            return false;
+        };
+        match c.kind(parent) {
+            // `return e;` (:52-56).
+            NodeKind::ReturnStatement => innermost_return_type_is_double(c),
+            // The arrow-body declarations (:60-63): `Method`/`TopLevelMethod`
+            // rows own their arrow expression pieces; the arrow-body child
+            // tells the position apart from every other member-level piece.
+            NodeKind::Method | NodeKind::TopLevelMethod => {
+                has_arrow_body(c, parent) && return_type_is_double(c, parent)
+            }
+            // `double x = e;` (:69-75) — the initializer containers. The
+            // same owner also tiles `<double>[e]` (:44-49): the literal
+            // completes before the `ListLiteral` row and sits as its sibling
+            // inside the initializer, so the typed-list face reads the owner
+            // too and wins on a preceding `TypeArguments`+`ListLiteral` run.
+            NodeKind::VariableInitializer | NodeKind::InitializedIdentifier => {
+                list_context_is_double(c, c.node(), parent) || variable_type_is_double(c)
+            }
+            // `<double>[e]` (:44-49) — the nested-literal arm (the literal
+            // inside an already-tiled `ListLiteral` owner).
+            NodeKind::ListLiteral => list_element_type_is_double(c, parent),
+            // `g(1.0)` / `g(x: 1.0)` (:40-43, :50-54).
+            NodeKind::Arguments => argument_formal_is_double(c, analysis),
+            _ => false,
+        }
+    }
+
+    /// The argument's formal is `double` (:40-43, :50-54
+    /// `correspondingParameter?.type`): the literal sits in one argument
+    /// group of the enclosing `Arguments` row; the callee's formal table
+    /// answers positional-by-index or named-by-name. `double?` counts (the
+    /// upstream `isDartCoreDouble` reads through nullability).
+    fn argument_formal_is_double(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>) -> bool {
+        let Some(args) = c.ancestor(1) else {
+            return false;
+        };
+        let pieces = c.collect_direct(args);
+        let ranges = slice::arguments(c, &pieces);
+        let Some(pos) = pieces.iter().position(|&kid| kid == c.node()) else {
+            return false;
+        };
+        let Some(index) = ranges.iter().position(|range| range.contains(&pos)) else {
+            return false;
+        };
+        let named = c.kind(pieces[ranges[index].end - 1]) == NodeKind::NamedArgument;
+        let query = if named {
+            FormalQuery::Named(c.lexeme(c.head_token(pieces[ranges[index].start])))
+        } else {
+            // This group's 0-based index among the positional groups.
+            FormalQuery::Positional(
+                ranges[..index]
+                    .iter()
+                    .filter(|range| c.kind(pieces[range.end - 1]) != NodeKind::NamedArgument)
+                    .count(),
+            )
+        };
+        formal_is_double(c, analysis, query).unwrap_or(false)
+    }
+
+    /// The argument-position query against a callee's formal table.
+    enum FormalQuery<'a> {
+        Positional(usize),
+        Named(&'a str),
+    }
+
+    /// Whether the queried formal of the invocation at the enclosing
+    /// `Arguments` row is `double`. A member invocation resolves through
+    /// the semantic member walk (cross-file classes included); a bare
+    /// callee resolves over the same-file declarations, gated on the
+    /// binding face (`Decl` — a local, type-parameter, prefix, or member
+    /// binding of the name is a different callable). `None` = the callee
+    /// carries no formal face.
+    fn formal_is_double(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        query: FormalQuery<'_>,
+    ) -> Option<bool> {
+        let args = c.ancestor(1)?;
+        let parent = c.unit.ast.parent(args)?;
+        // The invocation face: a `Send` sibling right after the argument
+        // list (the send row completes after it).
+        let siblings = c.collect_direct(parent);
+        let pos = siblings.iter().position(|&kid| kid == args)?;
+        let &send = siblings.get(pos + 1)?;
+        if c.kind(send) != NodeKind::Send {
+            return None;
+        }
+        let (head, arguments) = slice::send_parts(c, &siblings, pos + 1)?;
+        // A tear-off send carries no invocation.
+        arguments?;
+        let selector_row = siblings[head];
+        let name = c.lexeme(c.head_token(selector_row));
+        if slice::access_marker(c, &siblings, pos + 1, NodeKind::DotAccess).is_some() {
+            let selector = c.head_token(selector_row);
+            let receiver = faces::single_receiver(c, &siblings[..head], selector)?;
+            let member =
+                analysis.member_of(query_site(c, receiver), analysis.strings().intern(name))?;
+            let formals = member.entry.formals.as_deref()?;
+            let ty = match query {
+                FormalQuery::Positional(index) => formals.positional.get(index)?.ty,
+                FormalQuery::Named(arg) => formals.named_formal(analysis.strings().intern(arg))?.ty,
+            };
+            return Some(is_double_ty(analysis, ty));
+        }
+        // The bare face: the binding gate, then the same-file declarations.
+        if !matches!(
+            analysis
+                .binding_of(query_site(c, selector_row))
+                .map(|b| b.kind),
+            Some(BindingKind::Decl)
+        ) {
+            return None;
+        }
+        same_file_formal_is_double(c, name, query)
+    }
+
+    /// `isDartCoreDouble` over the semantic type (nullability reads
+    /// through).
+    fn is_double_ty(analysis: &dartq_semantic::Analysis<'_>, ty: Ty) -> bool {
+        let Ty::Named { name, .. } = ty else {
+            return false;
+        };
+        analysis.strings().resolve(name) == "double"
+    }
+
+    /// The same-file callable `name` — a top-level function, a local
+    /// function on the path, or the implicit-`this` method of the enclosing
+    /// class-like — resolved to its declaration row.
+    fn same_file_callable(c: &Check<'_>, name: &str) -> Option<u32> {
+        let root = c.unit.ast.root()?;
+        let ctx = dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32;
+        for top in c.collect_direct(root) {
+            if c.kind(top) != NodeKind::TopLevelDeclaration {
+                continue;
+            }
+            for decl in c.collect_direct(top) {
+                if c.kind(decl) != NodeKind::TopLevelMethod {
+                    continue;
+                }
+                let named = c.collect_direct(decl).into_iter().any(|kid| {
+                    c.kind(kid) == NodeKind::Identifier
+                        && c.payload(kid).first() == Some(&ctx)
+                        && c.lexeme(c.head_token(kid)) == name
+                });
+                if named {
+                    return Some(decl);
+                }
+            }
+        }
+        let local = c.path.iter().rev().copied().find(|&row| {
+            matches!(
+                c.kind(row),
+                NodeKind::LocalFunctionDeclaration | NodeKind::NamedFunctionExpression
+            ) && crate::rules::declarations::member_declaration_name(c, row)
+                .is_some_and(|n| c.lexeme(c.head_token(n)) == name)
+        });
+        if let Some(row) = local {
+            return Some(row);
+        }
+        let class_row = c.path.iter().rev().copied().find(|&row| {
+            matches!(
+                c.kind(row),
+                NodeKind::ClassDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::ExtensionDeclaration
+                    | NodeKind::ExtensionTypeDeclaration
+            )
+        })?;
+        body_members(c, class_row).into_iter().find(|&member| {
+            c.kind(member) == NodeKind::Method
+                && !crate::rules::member_matches(c, member, crate::rules::MemberQuery::Method, name)
+                    .is_empty()
+        })
+    }
+
+    /// Whether the queried formal of the same-file callable is written
+    /// `double` (the row-walk face behind the bare-callee argument query).
+    fn same_file_formal_is_double(
+        c: &Check<'_>,
+        name: &str,
+        query: FormalQuery<'_>,
+    ) -> Option<bool> {
+        let decl = same_file_callable(c, name)?;
+        let params = c
+            .collect_direct(decl)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)?;
+        formal_row_is_double(c, params, query)
+    }
+
+    /// The queried formal's written type over a parameter-list row is
+    /// `double` (`isDartCoreDoubleTypeAnnotation` :77-79 — a written name;
+    /// nullability does not change the core-type verdict).
+    fn formal_row_is_double(c: &Check<'_>, params: u32, query: FormalQuery<'_>) -> Option<bool> {
+        let mut positional: Vec<u32> = Vec::new();
+        let mut named: Vec<(&str, u32)> = Vec::new();
+        for kid in c.collect_direct(params) {
+            match c.kind(kid) {
+                NodeKind::FormalParameter => positional.push(kid),
+                NodeKind::OptionalFormalParameters => {
+                    for inner in c.collect_direct(kid) {
+                        if c.kind(inner) != NodeKind::FormalParameter {
+                            continue;
+                        }
+                        let named_kind = c.payload(inner).get(4)
+                            == Some(&(dartq_parser::FormalParameterKind::OptionalNamed as u32));
+                        if named_kind {
+                            let formal = c.payload(inner).get(1).copied()?;
+                            named.push((c.lexeme(formal), inner));
+                        } else {
+                            positional.push(inner);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let param = match query {
+            FormalQuery::Positional(index) => *positional.get(index)?,
+            FormalQuery::Named(arg) => named.into_iter().find(|(formal, _)| *formal == arg)?.1,
+        };
+        let type_row = c
+            .collect_direct(param)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Type)?;
+        Some(type_face(c, type_row).name == Some("double"))
+    }
+
+    /// The written return type of the innermost enclosing declaration with
+    /// one (:52-56): the first function-like row outside the return, so an
+    /// anonymous function boundary (no written return type) stays silent.
+    fn innermost_return_type_is_double(c: &Check<'_>) -> bool {
+        let mut seen_return = false;
+        for &ancestor in c.path.iter().rev().skip(1) {
+            match c.kind(ancestor) {
+                NodeKind::ReturnStatement => seen_return = true,
+                NodeKind::Method | NodeKind::TopLevelMethod if seen_return => {
+                    return return_type_is_double(c, ancestor);
+                }
+                NodeKind::FunctionExpression
+                | NodeKind::LocalFunctionDeclaration
+                | NodeKind::NamedFunctionExpression
+                | NodeKind::Constructor
+                | NodeKind::Factory
+                    if seen_return =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Whether the declaration row carries an arrow body (the `ExpressionBody`
+    /// child of the childless-handle shape, bridge
+    /// `handleExpressionFunctionBody`).
+    fn has_arrow_body(c: &Check<'_>, declaration: u32) -> bool {
+        c.collect_direct(declaration)
+            .into_iter()
+            .any(|kid| c.kind(kid) == NodeKind::ExpressionBody)
+    }
+
+    /// The written return type of a `Method`/`TopLevelMethod` row is `double`
+    /// (the `isDartCoreDoubleTypeAnnotation` face :77-79 — a written name;
+    /// nullability does not change the core-type verdict). The return type
+    /// tiles in the declaration's leading children (the `Type`/`VoidType`
+    /// row before the name and parameter list); a `Type` child answers.
+    fn return_type_is_double(c: &Check<'_>, declaration: u32) -> bool {
+        c.collect_direct(declaration)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Type)
+            .is_some_and(|head| type_face(c, head).name == Some("double"))
+    }
+
+    /// The written type of the enclosing declaration row is `double`: the
+    /// nearest preceding `Type` sibling in the owner slice (the
+    /// `block_binding` production shape — locals keep the type as a block
+    /// piece; fields and top-level variables as a member piece).
+    fn variable_type_is_double(c: &Check<'_>) -> bool {
+        let Some(&vars) = c
+            .path
+            .iter()
+            .rev()
+            .find(|&&a| c.kind(a) == NodeKind::VariablesDeclaration)
+        else {
+            return false;
+        };
+        let Some(type_row) = preceding_type_row(c, vars) else {
+            return false;
+        };
+        type_face(c, type_row).name == Some("double")
+    }
+
+    /// The nearest preceding type-row sibling of `row` in its owner's child
+    /// list.
+    fn preceding_type_row(c: &Check<'_>, row: u32) -> Option<u32> {
+        let owner = c.unit.ast.parent(row)?;
+        let kids = c.collect_direct(owner);
+        let pos = kids.iter().position(|&kid| kid == row)?;
+        kids[..pos]
+            .iter()
+            .rev()
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::Type)
+    }
+
+    /// The typed-list face over an owner slice (`<double>[e]` :44-49): the
+    /// literal completes before the `ListLiteral` row completes, so it tiles
+    /// as a sibling of the `TypeArguments` + `ListLiteral` pair in the
+    /// owner (`VariableInitializer`) — the literal's own list marker is the
+    /// `ListLiteral` row that follows it and is preceded by a `TypeArguments`.
+    fn list_context_is_double(c: &Check<'_>, node: u32, owner: u32) -> bool {
+        let kids = c.collect_direct(owner);
+        let Some(pos) = kids.iter().position(|&kid| kid == node) else {
+            return false;
+        };
+        // The typed-list run is `TypeArguments` … literal … `ListLiteral`:
+        // the element literal tiles between the argument row and the
+        // completing `ListLiteral` marker in the owner slice.
+        let args_ok = pos
+            .checked_sub(1)
+            .and_then(|i| kids.get(i))
+            .is_some_and(|&args| {
+                c.kind(args) == NodeKind::TypeArguments && type_args_is_double(c, args)
+            });
+        args_ok
+            && kids
+                .get(pos + 1)
+                .is_some_and(|&kid| c.kind(kid) == NodeKind::ListLiteral)
+    }
+
+    /// The `TypeArguments` row's single type is `double` (:45-48).
+    fn type_args_is_double(c: &Check<'_>, args: u32) -> bool {
+        let types: Vec<u32> = c
+            .collect_direct(args)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::Type)
+            .collect();
+        types.len() == 1 && type_face(c, types[0]).name == Some("double")
+    }
+
+    /// The single type argument of the typed list literal is `double`
+    /// (:44-49): the `TypeArguments` sibling precedes the literal row in the
+    /// owner slice (the `type_arguments_sibling` production shape).
+    fn list_element_type_is_double(c: &Check<'_>, list: u32) -> bool {
+        let Some(owner) = c.unit.ast.parent(list) else {
+            return false;
+        };
+        let kids = c.collect_direct(owner);
+        let Some(pos) = kids.iter().position(|&kid| kid == list) else {
+            return false;
+        };
+        let Some(&args) = pos
+            .checked_sub(1)
+            .and_then(|i| kids.get(i))
+            .filter(|&&args| c.kind(args) == NodeKind::TypeArguments)
+        else {
+            return false;
+        };
+        type_args_is_double(c, args)
+    }
+}
+
 pub(crate) mod unnecessary_new {
     use super::{Check, Group, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/unnecessary_new.dart:37-45` —
     /// every `new` keyword of an instance creation reports at the keyword
     /// (`reportAtToken(keyword)`). `new` is the span head (`NewExpression`
-    /// is a width-0 kind: the derivable word lives in `header.first_token`,
-    /// collapse map §3.5 `NewExpressionEnd` row + the §1 elimination note).
+    /// is a width-0 kind: the derivable word is eliminated into
+    /// `header.first_token`).
     /// Message: `diagnostic.g.dart` `unnecessaryNew`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "unnecessary_new",
@@ -38,12 +1679,9 @@ pub(crate) mod unnecessary_new {
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        let start = c
-            .unit
-            .tokens
-            .get(c.head_token(node) as usize)
-            .expect("span head outside the token table")
-            .utf16_offset;
+        let Some(start) = c.utf16_of_token(c.head_token(node)) else {
+            return;
+        };
         c.report(start..start, &[]);
     }
 }
@@ -54,7 +1692,7 @@ pub(crate) mod unnecessary_null_in_if_null_operators {
     /// Official: `pkg/linter/lib/src/rules/unnecessary_null_in_if_null_operators.dart:34-49`
     /// — `a ?? null` (or `null ?? a`) reports at the `null` literal, right
     /// operand first. The operator is payload word 0, operands the two
-    /// children (collapse map §3.5 `BinaryExpression` row). Message:
+    /// children (the `BinaryExpression` payload). Message:
     /// `diagnostic.g.dart` `unnecessaryNullInIfNullOperators`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "unnecessary_null_in_if_null_operators",
@@ -104,6 +1742,18 @@ pub(crate) mod prefer_is_not_operator {
     /// (`parent is ParenthesizedExpression && parent.parent is
     /// PrefixExpression`, :38-54). Message: `diagnostic.g.dart`
     /// `preferIsNotOperator`.
+    ///
+    /// dartq faces over the production tiling: the `!` prefix is a
+    /// childless leaf emitted after its operand completes, so the check
+    /// rides the `is` expression's paren container and reads the row that
+    /// follows it in the owner window — the bare [`NodeKind::UnaryPrefix`]
+    /// leaf, or a container that adopted it as its head child (the
+    /// parenthesized condition of an `if`/`while`/`for` adopts the leaf
+    /// alone; a binary's adopted-begin lays the leaf back as its first
+    /// child when the paren operand finalizes lazily). A direct chain
+    /// (paren directly under the prefix) is the official shape, so a
+    /// double paren `!((x is int))` stays silent, as does a postfix
+    /// operand (`x!.m`).
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_is_not_operator",
         group: Group::Recommended,
@@ -116,7 +1766,7 @@ pub(crate) mod prefer_is_not_operator {
     fn check(c: &mut Check<'_>) {
         let node = c.node();
         // `node.notOperator != null` bails (:39-42): payload word 0 is the
-        // `not` flag (collapse map §3.5 IsExpression row).
+        // `not` flag of the `IsExpression` payload.
         if c.payload(node).first().copied().unwrap_or(0) != 0 {
             return;
         }
@@ -126,30 +1776,44 @@ pub(crate) mod prefer_is_not_operator {
         if c.kind(paren) != NodeKind::ParenthesizedExpression {
             return;
         }
-        let Some(prefix) = c.ancestor(2) else {
+        let Some(owner) = c.ancestor(2) else {
             return;
         };
-        if c.kind(prefix) != NodeKind::UnaryPrefix {
+        let kids = c.collect_direct(owner);
+        let Some(pos) = kids.iter().position(|&kid| kid == paren) else {
+            return;
+        };
+        // The prefix read: the row after the paren carries the `!` —
+        // directly, or as an adopting container's head child.
+        let bang = match kids.get(pos + 1) {
+            Some(&only) if c.kind(only) == NodeKind::UnaryPrefix => only,
+            Some(&container)
+                if matches!(
+                    c.kind(container),
+                    NodeKind::ParenthesizedCondition | NodeKind::BinaryExpression
+                ) =>
+            {
+                match c.collect_direct(container).first() {
+                    Some(&head) if c.kind(head) == NodeKind::UnaryPrefix => head,
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+        // Prefix `!` only (`operator.type == TokenType.BANG`, :46-48).
+        if c.lexeme(c.head_token(bang)) != "!" {
             return;
         }
-        // Prefix `!` only (`operator.type == TokenType.BANG`, :46-48). The
-        // operator is the `UnaryPrefix` span head (width-0 kind, collapse
-        // map §3.5 UnaryPrefixExpressionHandle row + the §1 elimination
-        // note).
-        if c.lexeme(c.head_token(prefix)) != "!" {
-            return;
-        }
-        let range = c.utf16_span(prefix);
+        // The official reports at the prefix expression: from the `!`
+        // through the paren's close.
+        let range = c.utf16_span(bang).start..c.utf16_span(paren).end;
         c.report(range, &[]);
     }
 }
 
 pub(crate) mod unnecessary_type_check {
-    use super::{Check, Group, NodeKind, RuleSpec};
-    use crate::rules::slice::{access_run, statement_run};
-    use crate::rules::{
-        TypeFace, class_declaration_name, last_child, type_face, type_face_of_field,
-    };
+    use super::{Group, RuleSpec};
+    use crate::rules::not_dispatched;
 
     /// Official: the `unnecessary_type_check` diagnostic — an `x is T` whose
     /// answer the static types fix at a constant reports at the check
@@ -159,194 +1823,26 @@ pub(crate) mod unnecessary_type_check {
     /// `pkg/linter/lib/src/rules/unnecessary_type_check.dart`); the templates
     /// live in `pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart`
     /// (`unnecessaryTypeCheckTrue` / `unnecessaryTypeCheckFalse`, one
-    /// registry name across the polarity pair). dartq splits the same way:
-    /// the semantic tier owns the always-on diagnostic, this is its
-    /// lint-tier face — [`Group::Diagnostic`], opt-in by name, never in the
-    /// default posture.
+    /// registry name across the polarity pair, both `STATIC_WARNING` with
+    /// published docs, :17642-17666).
     ///
-    /// Gates (producer order): `x is dynamic` is constant whichever the
-    /// operand — reports before every other gate (:1010-1015); `is Null` is
-    /// the separate `type_check_with_null` family except the `null` literal
-    /// itself, whose check is constant (`Null <: Null`, :1017-1036);
-    /// otherwise a provable subtype (`isSubtypeOf(leftType, rightType)`)
-    /// reports, `is!` carrying the complement's polarity. The
-    /// subtype-negative verdict never reports (`null is int` stays silent).
-    ///
-    /// Approximations (documented): the operand face is the syntax-knowable
-    /// slice — scalar literals, the `null` literal (`Null`), `this` (the
-    /// enclosing class-like name), and the same-class instance field (bare
-    /// or `this.`-qualified, the `void_checks` field face; a bare name
-    /// shadowed by a local over-reports — the user-shadowed family). The
-    /// check face is the written type row; the name-level subtype relation
-    /// is same-name (type arguments equal name+nullable — the
-    /// invariance-safe shape, covariant matches under-report) plus the
-    /// built-in lattice edges `int`/`double` → `num` and every named type →
-    /// `Object`, nullability gating first (`T?` never subtypes a
-    /// non-nullable check). Faces from parameters, locals, and imports are
-    /// invisible (under-report) — the promotion face the oracle flags
-    /// (`n is! int` after a promotion) needs flow analysis and stays with
-    /// the semantic tier, as do initializer positions whose run carries
-    /// declaration rows. An unresolved operand under the `dynamic` gate
-    /// reports where the official's `InvalidType` gate (:1008-1010) stays
-    /// silent (over-report, the erroneous family).
+    /// Mirror posture ([`Group::Diagnostic`], `kinds: &[]` — the pubspec
+    /// `path:` family's shape): the oracle's verifier is an always-on
+    /// analysis pass (`library_analyzer.dart:481`), not a lint the enable
+    /// set gates, so the emission lives with the semantic tier's fold (the
+    /// `check_type_check` walk) and this registration exists only for the
+    /// name-resolution faces — the options/ignore faces resolve the name
+    /// and the template renders oracle-exact — never as an AST run arm
+    /// (a run row would double the semantic tier's and carry the wrong
+    /// lint tier).
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "unnecessary_type_check",
         group: Group::Diagnostic,
         problem: "Unnecessary type check; the result is always 'true'.",
-        correction: CORRECTION,
-        kinds: &[NodeKind::IsExpression],
-        check,
+        correction: "Try correcting the type check, or removing the type check.",
+        kinds: &[],
+        check: not_dispatched,
     };
-
-    /// The `is!` polarity template (`unnecessaryTypeCheckFalse`).
-    const FALSE_PROBLEM: &str = "Unnecessary type check; the result is always 'false'.";
-    const CORRECTION: &str = "Try correcting the type check, or removing the type check.";
-
-    fn check(c: &mut Check<'_>) {
-        let node = c.node();
-        let negated = c.payload(node).first().copied().unwrap_or(0) != 0;
-        // The check face: the type rows tile inside the window (opened at
-        // the operator), the `Type` row sealing last.
-        let Some(type_row) = last_child(c, node) else {
-            return;
-        };
-        let check_face = type_face(c, type_row);
-        // `is CannotResolveType` — the InvalidType gate's clean shape is a
-        // faceless row (function types).
-        let Some(check_name) = check_face.name else {
-            return;
-        };
-        // The operand rows: the tested expression tiles before the `is`
-        // byte in the parent window (the validated read in
-        // unnecessary_to_list_in_spreads), bounded at the enclosing block's
-        // last statement row. Also the report anchor — the official
-        // `.at(node)` covers the operand, which the arena node (span-only
-        // from the operator) does not.
-        let Some(operand) = operand_rows(c) else {
-            return;
-        };
-        let range = c.utf16_span(operand[0]).start..c.utf16_span(node).end;
-        // `x is dynamic` — constant whichever the operand.
-        if check_name == "dynamic" {
-            report(c, range, negated);
-            return;
-        }
-        // `is Null` — the constant `null is Null` reports; every other
-        // shape belongs to the type_check_with_null family (not this
-        // rule), judged syntactically on the operand's tail row.
-        if check_name == "Null" {
-            if matches!(operand.last(), Some(&row) if c.kind(row) == NodeKind::LiteralNull) {
-                report(c, range, negated);
-            }
-            return;
-        }
-        // The subtype arm: a provable subtype is constant-true. One
-        // trailing `(...)` wrapper unwraps (the wrapper is not the
-        // official's `NullLiteral`, so the `is Null` arm above stays
-        // pre-unwrap).
-        let mut rows = operand;
-        if let Some(&last) = rows.last()
-            && c.kind(last) == NodeKind::ParenthesizedExpression
-        {
-            rows.pop();
-            rows.extend(c.collect_direct(last));
-        }
-        let Some(face) = operand_face(c, &rows) else {
-            return;
-        };
-        if name_subtype(&face, &check_face) {
-            report(c, range, negated);
-        }
-    }
-
-    fn report(c: &mut Check<'_>, range: core::ops::Range<u32>, negated: bool) {
-        if negated {
-            c.report_texts(range, FALSE_PROBLEM, CORRECTION, &[]);
-        } else {
-            c.report(range, &[]);
-        }
-    }
-
-    /// The operand rows in the parent window: the siblings tiling before
-    /// the node, bounded at the last statement row.
-    fn operand_rows(c: &Check<'_>) -> Option<Vec<u32>> {
-        let node = c.node();
-        let is_byte = c.byte_span(node).start;
-        let parent = c.ancestor(1)?;
-        let kids = c.collect_direct(parent);
-        let pos = kids.iter().position(|&kid| kid == node)?;
-        let rows: Vec<u32> = statement_run(c, &kids[..pos])
-            .into_iter()
-            .filter(|&kid| c.byte_span(kid).end <= is_byte)
-            .collect();
-        (!rows.is_empty()).then_some(rows)
-    }
-
-    /// The operand's written-type face over the access run (the childless
-    /// access markers and the bare-name send group stripped): a scalar
-    /// literal, `this` (the enclosing class-like name), or the same-class
-    /// instance field — bare `<field>` or `this.<field>`.
-    fn operand_face<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<TypeFace<'a>> {
-        let named = |name: &'a str| TypeFace {
-            name: Some(name),
-            nullable: false,
-            is_void: false,
-            is_future_or_void: false,
-            is_function_type: false,
-            type_arguments: Vec::new(),
-        };
-        match access_run(c, rows).as_slice() {
-            [single] => match c.kind(*single) {
-                NodeKind::LiteralInt => Some(named("int")),
-                NodeKind::LiteralDouble => Some(named("double")),
-                NodeKind::StringLiteral => Some(named("String")),
-                NodeKind::LiteralBool => Some(named("bool")),
-                NodeKind::LiteralNull => Some(named("Null")),
-                NodeKind::ThisExpression => {
-                    let class_row = c.path.iter().rev().find_map(|&a| {
-                        matches!(
-                            c.kind(a),
-                            NodeKind::ClassDeclaration
-                                | NodeKind::MixinDeclaration
-                                | NodeKind::EnumDeclaration
-                                | NodeKind::ExtensionDeclaration
-                        )
-                        .then_some(a)
-                    })?;
-                    Some(named(class_declaration_name(c, class_row)?))
-                }
-                NodeKind::Identifier => type_face_of_field(c, c.lexeme(c.head_token(*single))),
-                _ => None,
-            },
-            [target, name]
-                if c.kind(*target) == NodeKind::ThisExpression
-                    && c.kind(*name) == NodeKind::Identifier =>
-            {
-                type_face_of_field(c, c.lexeme(c.head_token(*name)))
-            }
-            _ => None,
-        }
-    }
-
-    /// The name-level subtype relation on the written faces: nullability
-    /// gates first, then the same-name arm (type arguments equal) and the
-    /// built-in lattice edges.
-    fn name_subtype(operand: &TypeFace<'_>, check: &TypeFace<'_>) -> bool {
-        let (Some(operand_name), Some(check_name)) = (operand.name, check.name) else {
-            return false;
-        };
-        if operand.nullable && !check.nullable {
-            return false;
-        }
-        if operand_name == check_name {
-            return operand.type_arguments == check.type_arguments;
-        }
-        match check_name {
-            "Object" => true,
-            "num" => operand_name == "int" || operand_name == "double",
-            _ => false,
-        }
-    }
 }
 
 pub(crate) mod prefer_adjacent_string_concatenation {
@@ -382,12 +1878,9 @@ pub(crate) mod prefer_adjacent_string_concatenation {
         if !string_pair {
             return;
         }
-        let start = c
-            .unit
-            .tokens
-            .get(op as usize)
-            .expect("op token outside the token table")
-            .utf16_offset;
+        let Some(start) = c.utf16_of_token(op) else {
+            return;
+        };
         c.report(start..start, &[]);
     }
 }
@@ -400,6 +1893,17 @@ pub(crate) mod avoid_single_cascade_in_expression_statements {
     /// reports at the cascade, with the equivalent `.`-operator spelled in
     /// the message (`?.` for a `?..` section, `avoid_single_cascade...dart:40-51`).
     /// Message: `diagnostic.g.dart` `avoidSingleCascadeInExpressionStatements`.
+    ///
+    /// dartq faces over the production tiling: the cascade's window holds
+    /// its sections' selector pieces beside the childless `CascadeAccess`
+    /// markers (`buffer..write('x')` yields `[Send, CascadeAccess]`), so
+    /// the section count reads the marker rows; the statement face reads
+    /// the span-only `ExpressionStatement` leaf that trails the cascade
+    /// rows in the owner window (the statement's expression completes
+    /// before the leaf is stamped), and the leaf's span must cover the
+    /// cascade's. The official reports at the cascade expression — the
+    /// production row opens at the `..`, so the statement head (the
+    /// target) bounds the start.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "avoid_single_cascade_in_expression_statements",
         group: Group::Recommended,
@@ -411,45 +1915,79 @@ pub(crate) mod avoid_single_cascade_in_expression_statements {
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        let (count, section) = {
-            let kids = c.direct_children(node);
-            (kids.len(), kids.first().copied())
-        };
-        if count != 1 {
+        // The sections: the direct `CascadeAccess` markers (the selector
+        // pieces tile beside them inside the cascade's window).
+        let sections: Vec<u32> = c
+            .collect_direct(node)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::CascadeAccess)
+            .collect();
+        let [section] = sections.as_slice() else {
             return;
-        }
+        };
+        // The statement face: the span-only `ExpressionStatement` leaf
+        // trails the cascade rows in the owner window and covers the
+        // cascade's extent. A multi-section cascade tiles each `..x` as
+        // its own `Cascade` sibling (`a..b()..c()` keeps an earlier
+        // `Cascade` left of the last one) — only the sole-section shape
+        // reports.
         let Some(parent) = c.ancestor(1) else {
             return;
         };
-        if c.kind(parent) != NodeKind::ExpressionStatement {
+        let kids = c.collect_direct(parent);
+        let Some(pos) = kids.iter().position(|&kid| kid == node) else {
+            return;
+        };
+        if kids[..pos]
+            .iter()
+            .any(|&kid| c.kind(kid) == NodeKind::Cascade)
+        {
             return;
         }
-        let section = section.expect("count == 1 checked above");
+        let Some(&statement) = kids.get(pos + 1) else {
+            return;
+        };
+        if c.kind(statement) != NodeKind::ExpressionStatement
+            || c.utf16_span(statement).start > c.utf16_span(node).start
+            || c.utf16_span(statement).end < c.utf16_span(node).end
+        {
+            return;
+        }
         // The section's cascade operator decides the message argument
         // (avoid_single_cascade...dart:40-51): `?..` prints as `?.`.
-        let operator = if c.kind(section) == NodeKind::CascadeAccess
-            && c.payload(section).get(1).copied().unwrap_or(0) != 0
-        {
+        let operator = if c.payload(*section).get(1).copied().unwrap_or(0) != 0 {
             "?."
         } else {
             "."
         };
-        let range = c.utf16_span(node);
+        let range = c.utf16_span(statement).start..c.utf16_span(node).end;
         c.report(range, &[operator]);
     }
 }
 
 pub(crate) mod prefer_conditional_assignment {
-    use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec, first_child, token_seq_equal};
+    use super::prefer_null_aware_method_calls::then_branch_run;
+    use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec};
 
-    /// Official: `pkg/linter/lib/src/rules/prefer_conditional_assignment.dart:23-88`
-    /// — an `if` without `else` whose condition is a null check `x == null`
-    /// (either side null) and whose then-statement assigns to `x` reports at
-    /// the `if`. The equality operand identity is the anchored token-lexeme
-    /// sequence comparison (the official
-    /// `canonicalElementsFromIdentifiersAreEqual` is element-based; the
-    /// difference is confined to renames across scopes a lint cannot see
-    /// either). Message: `diagnostic.g.dart` `preferConditionalAssignment`.
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_conditional_assignment.dart`
+    /// — an `if` without `else` (`visitIfStatement` :70-79) whose condition
+    /// is a null check `x == null` — either side after peeling the whole
+    /// condition and each operand's parens (`_getExpressionCondition`
+    /// :37-48) — and whose then arm is one expression statement assigning
+    /// to `x` (`_checkStatement` :27-34, `_checkExpression` :20-24)
+    /// reports at the `if` extent. The assignment carries no operator gate
+    /// (`+=` and chained `x = y = 1`'s outer assignment fire), and the
+    /// identity rides the identifier-chain walk
+    /// (`canonicalElementsFromIdentifiersAreEqual`,
+    /// `util/dart_type_utilities.dart:96-126`): both sides must be
+    /// identifier chains — a bare name, a prefixed name, or a property
+    /// chain (a wrapped chain target reads through its container parens,
+    /// the walk's per-target `unParenthesized`) — so `this.x`, `a[0]`, and
+    /// invocation targets never pass.
+    /// The token-lexeme sequence comparison stands in for the element
+    /// identity; the difference is confined to renames across scopes a
+    /// lint cannot see either. Message: `diagnostic.g.dart`
+    /// `preferConditionalAssignment`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_conditional_assignment",
         group: Group::Recommended,
@@ -461,97 +1999,401 @@ pub(crate) mod prefer_conditional_assignment {
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        // `node.elseStatement != null` bails (:70-72).
+        // `node.elseStatement != null` bails (:71-73).
         if c.payload(node).first().copied() != Some(NONE_TOKEN) {
             return;
         }
-        let Some(operand) = condition_null_operand(c, node) else {
+        let kids = c.collect_direct(node);
+        let Some(cond_pos) = kids
+            .iter()
+            .position(|&kid| c.kind(kid) == NodeKind::ParenthesizedCondition)
+        else {
             return;
         };
-        // The then arm is the direct child after the condition wrapper
-        // (collapse map §3.4: ParenthesizedCondition delimits the condition
-        // segment, ThenStatementEnd D1).
-        let then = c.collect_direct(node).get(1).copied();
-        let Some(then) = then else {
+        // `if (expr case pattern)` — the pattern face has no expression
+        // condition to test.
+        if c.payload(kids[cond_pos]).first().copied() != Some(NONE_TOKEN) {
+            return;
+        }
+        // The condition binary: the adopted condition's tail row, peeling
+        // paren containers (`rawExpression.unParenthesized`, :38).
+        let Some(mut condition) = c.collect_direct(kids[cond_pos]).last().copied() else {
             return;
         };
-        if !assigns_to(c, then, operand) {
+        while c.kind(condition) == NodeKind::ParenthesizedExpression {
+            let Some(inner) = c.collect_direct(condition).last().copied() else {
+                return;
+            };
+            condition = inner;
+        }
+        if c.kind(condition) != NodeKind::BinaryExpression {
+            return;
+        }
+        let Some(op) = c.payload_word(condition, 0) else {
+            return;
+        };
+        // `operator.type == TokenType.EQ_EQ` (:40) — `!=` never fires.
+        if c.lexeme(op) != "==" {
+            return;
+        }
+        // The window rows split at the operator; each side's root peels
+        // its wrapped parens. Upstream order (:40-46): the right `null`
+        // takes the left operand, else the mirrored left `null` takes the
+        // right one.
+        let left: Vec<u32> = c
+            .children(condition)
+            .filter(|&row| c.head_token(row) < op)
+            .collect();
+        let right: Vec<u32> = c
+            .children(condition)
+            .filter(|&row| c.head_token(row) >= op)
+            .collect();
+        let Some(left_root) = left
+            .last()
+            .copied()
+            .and_then(|root| unparenthesized_tail(c, root))
+        else {
+            return;
+        };
+        let Some(right_root) = right
+            .last()
+            .copied()
+            .and_then(|root| unparenthesized_tail(c, root))
+        else {
+            return;
+        };
+        let operand_is_left = if c.kind(right_root) == NodeKind::LiteralNull {
+            true
+        } else if c.kind(left_root) == NodeKind::LiteralNull {
+            false
+        } else {
+            return;
+        };
+        // The operand run: the binary's own window rows on the operand
+        // side, prefixed with every ancestor level's pieces left of the
+        // operator. The adopted-begin parks the operand's completion
+        // pieces at whatever enclosing row absorbed them — the condition
+        // container, a wrapped `(...)` level between, or the `if` row
+        // itself (`x == null` keeps the `x` send-group's receiver pieces
+        // as direct `IfStatement` children; `a.b == null` parks the whole
+        // receiver chain there). The walk ends at `node` — no operand
+        // piece can escape above the statement.
+        let mut operand: Vec<u32> = if operand_is_left {
+            left.clone()
+        } else {
+            right.clone()
+        };
+        {
+            let mut batches: Vec<Vec<u32>> = Vec::new();
+            let mut level = condition;
+            while let Some(parent) = c.unit.ast.parent(level) {
+                let owner_kids = c.collect_direct(parent);
+                let Some(pos) = owner_kids.iter().position(|&kid| kid == level) else {
+                    break;
+                };
+                batches.push(
+                    owner_kids[..pos]
+                        .iter()
+                        .copied()
+                        .filter(|&row| c.head_token(row) < op)
+                        .collect(),
+                );
+                if parent == node {
+                    break;
+                }
+                level = parent;
+            }
+            for batch in batches.into_iter().rev() {
+                let mut prefixed = batch;
+                prefixed.extend(core::mem::take(&mut operand));
+                operand = prefixed;
+            }
+        }
+
+        // `_checkStatement` (:27-34): one expression statement — a bare
+        // statement or the single-statement block unwrap.
+        let Some(branch) = then_branch_run(c, &kids[cond_pos + 1..]) else {
+            return;
+        };
+        // `_checkExpression` (:20-24) has no operator gate: the branch's
+        // last `AssignmentExpression` row (root-last, so the outer
+        // assignment of a chain `x = y = 1`) is the tested expression.
+        let Some(assign_pos) = branch
+            .iter()
+            .rposition(|&row| c.kind(row) == NodeKind::Assignment)
+        else {
+            return;
+        };
+        let assign = branch[assign_pos];
+        let Some(assign_op) = c.payload_word(assign, 0) else {
+            return;
+        };
+        // `expression.leftHandSide`: the owner-side pieces before the
+        // assignment row plus its adopted window's rows, both cut at the
+        // operator token; a wrapped LHS keeps its container row at the
+        // tail — peeled below.
+        let mut lhs: Vec<u32> = branch[..assign_pos]
+            .iter()
+            .copied()
+            .filter(|&row| c.head_token(row) < assign_op)
+            .collect();
+        lhs.extend(
+            c.children(assign)
+                .filter(|&row| c.head_token(row) < assign_op),
+        );
+
+        // `canonicalElementsFromIdentifiersAreEqual`
+        // (`util/dart_type_utilities.dart:96-126`): both sides fold to
+        // their canonical identifier-name chains — parens peel, markers
+        // contribute their selector, and a selector whose token the run
+        // already carries as an identifier row is the completion
+        // duplicate. `this.x`, `super.x`, `a[0]`, and invocation targets
+        // fold to nothing and never match.
+        let operand_chain = identifier_chain(c, &operand);
+        let lhs_chain = identifier_chain(c, &lhs);
+        if operand_chain.is_none() || operand_chain != lhs_chain {
             return;
         }
         let range = c.utf16_span(node);
         c.report(range, &[]);
     }
 
-    /// `_getExpressionCondition` (:48-61): the condition (unparenthesized)
-    /// must be `==` with one null side; the other side is the operand.
-    fn condition_null_operand(c: &Check<'_>, if_node: u32) -> Option<u32> {
-        let cond_wrapper = first_child(c, if_node)?;
-        let mut condition = first_child(c, cond_wrapper)?;
-        while c.kind(condition) == NodeKind::ParenthesizedExpression {
-            condition = first_child(c, condition)?;
+    /// The row's root after peeling wrapped `(...)` containers — the
+    /// row-level `unParenthesized` (:38). `None` past an empty recovery
+    /// window.
+    fn unparenthesized_tail(c: &Check<'_>, mut root: u32) -> Option<u32> {
+        while c.kind(root) == NodeKind::ParenthesizedExpression {
+            let window = c.children(root);
+            root = window
+                .end
+                .checked_sub(1)
+                .filter(|&last| last >= window.start)?;
         }
-        if c.kind(condition) != NodeKind::BinaryExpression {
-            return None;
-        }
-        if c.lexeme(op_token(c, condition)) != "==" {
-            return None;
-        }
-        let kids = c.collect_direct(condition);
-        if kids.len() < 2 {
-            return None;
-        }
-        if c.kind(kids[1]) == NodeKind::LiteralNull {
-            Some(kids[0])
-        } else if c.kind(kids[0]) == NodeKind::LiteralNull {
-            Some(kids[1])
-        } else {
-            None
-        }
+        Some(root)
     }
 
-    /// `_checkStatement` (:33-45): an expression statement assigning to
-    /// `operand`, unwrapping single-statement blocks.
-    fn assigns_to(c: &Check<'_>, statement: u32, operand: u32) -> bool {
-        match c.kind(statement) {
-            NodeKind::ExpressionStatement => {
-                let Some(expr) = first_child(c, statement) else {
-                    return false;
-                };
-                if c.kind(expr) != NodeKind::Assignment {
-                    return false;
-                }
-                if c.lexeme(op_token(c, expr)) != "=" {
-                    return false;
-                }
-                let Some(lhs) = first_child(c, expr) else {
-                    return false;
-                };
-                token_seq_equal(c, lhs, operand)
-            }
-            NodeKind::Block => {
-                let kids = c.collect_direct(statement);
-                kids.len() == 1 && assigns_to(c, kids[0], operand)
-            }
-            _ => false,
-        }
+    /// The run's canonical identifier-name chain — the production-tiling
+    /// stand-in for `canonicalElementsFromIdentifiersAreEqual`
+    /// (`util/dart_type_utilities.dart:96-126`). Identifier rows name
+    /// themselves; a dot-access marker names the token after its own dot
+    /// (payload word 0), unless that token already sits in the run as an
+    /// identifier row (the LHS tiling stamps the selector beside the
+    /// marker, the condition tiling leaves it only on the marker — the
+    /// token check equates both tilings). Parens peel recursively; the
+    /// send-group markers carry no element; any other row (`this`, index,
+    /// arguments, a literal target) is not an identifier chain and folds
+    /// to `None`.
+    fn identifier_chain(c: &Check<'_>, run: &[u32]) -> Option<Vec<String>> {
+        let mut names = Vec::new();
+        let mut row_tokens = Vec::new();
+        chain_names(c, run, &mut names, &mut row_tokens)?;
+        (!names.is_empty()).then_some(names)
     }
 
-    fn op_token(c: &Check<'_>, node: u32) -> u32 {
-        c.payload(node)
-            .first()
-            .copied()
-            .expect("binary/assignment payload carries the operator")
+    fn chain_names(
+        c: &Check<'_>,
+        run: &[u32],
+        names: &mut Vec<String>,
+        row_tokens: &mut Vec<u32>,
+    ) -> Option<()> {
+        for &row in run {
+            match c.kind(row) {
+                NodeKind::Identifier => {
+                    // A wrapped subtree's pieces tile beside the container
+                    // in the same run — a paren recursion would re-count the
+                    // name; the head token dedupes it.
+                    let head = c.head_token(row);
+                    if !row_tokens.contains(&head) {
+                        row_tokens.push(head);
+                        names.push(c.lexeme(head).to_owned());
+                    }
+                }
+                NodeKind::DotAccess => {
+                    let dot = c.payload(row).first().copied()?;
+                    let selector = c.unit.tokens.get(dot as usize + 1)?;
+                    let name = c.unit.tokens.lexeme(c.unit.source, dot as usize + 1);
+                    if !row_tokens.contains(&(dot + 1)) {
+                        let _ = selector;
+                        names.push(name.to_owned());
+                        row_tokens.push(dot + 1);
+                    }
+                }
+                NodeKind::ParenthesizedExpression => {
+                    chain_names(c, &c.collect_direct(row), names, row_tokens)?;
+                }
+                NodeKind::Send | NodeKind::NoTypeArguments | NodeKind::NoArguments => {}
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
+
+        fn run(source: &str) -> Vec<crate::engine::Lint> {
+            Fixture::parse(source).run(&one_rule("prefer_conditional_assignment"))
+        }
+
+        /// Bare statement form: one report at the whole `if` extent.
+        #[test]
+        fn bare_statement_form_reports_at_the_if() {
+            let source = "void f(int? x, int s) {\n  if (x == null) x = s;\n}\n";
+            let lints = run(source);
+            assert_eq!(lints.len(), 1);
+            let f = Fixture::parse(source);
+            let if_kw = tok(&f.source, &f.tokens, "if", 0);
+            assert_eq!(lints[0].range.start, utf16_at(&f, if_kw));
+        }
+
+        /// The corpus face: a brace-less `if` assigning a string literal
+        /// over a nullable parameter reports at the whole `if` extent
+        /// (34 chars of `if (label == null) label = 'none';`).
+        #[test]
+        fn corpus_if_null_assign_reports() {
+            let f = Fixture::parse(
+                "void f(String? label) {\n  if (label == null) label = 'none';\n}\n",
+            );
+            let lints = f.run(&one_rule("prefer_conditional_assignment"));
+            assert_eq!(lints.len(), 1);
+            assert_eq!(lints[0].range.end - lints[0].range.start, 34);
+        }
+
+        /// The single-statement block unwrap reports once.
+        #[test]
+        fn single_statement_block_form_reports() {
+            let source = "void f(int? x, int s) {\n  if (x == null) {\n    x = s;\n  }\n}\n";
+            assert_eq!(run(source).len(), 1);
+        }
+
+        /// The whole condition wrapped in extra parens reports (one peel
+        /// step over the adopted condition's tail).
+        #[test]
+        fn wrapped_condition_reports() {
+            let source = "void f(int? x, int s) {\n  if ((x == null)) x = s;\n}\n";
+            assert_eq!(run(source).len(), 1);
+        }
+
+        /// Both operands wrapped: the null side's root and the operand run
+        /// peel their containers (`(x) == (null)` fires).
+        #[test]
+        fn wrapped_sides_report() {
+            let source = "void f(int? x, int s) {\n  if ((x) == (null)) x = s;\n}\n";
+            assert_eq!(run(source).len(), 1);
+        }
+
+        /// A prefixed chain matches itself on both sides.
+        #[test]
+        fn chain_target_reports() {
+            let source =
+                "class C {\n  String? b;\n}\nvoid f(C a) {\n  if (a.b == null) a.b = '';\n}\n";
+            assert_eq!(run(source).len(), 1);
+        }
+
+        /// A parenthesized chain target matches itself: the container row
+        /// rides mid-run before the selector pair, and the chain walk
+        /// unparenthesizes it (the upstream per-target `unParenthesized`).
+        #[test]
+        fn parenthesized_target_reports() {
+            let source =
+                "class C {\n  String? b;\n}\nvoid f(C a) {\n  if ((a).b == null) (a).b = '';\n}\n";
+            assert_eq!(run(source).len(), 1);
+        }
+
+        /// The parenthesized target matches its unwrapped forms in both
+        /// directions — the same canonical chain.
+        #[test]
+        fn mixed_parenthesized_forms_report() {
+            for source in [
+                "class C {\n  String? b;\n}\nvoid f(C a) {\n  if (a.b == null) (a).b = '';\n}\n",
+                "class C {\n  String? b;\n}\nvoid f(C a) {\n  if ((a).b == null) a.b = '';\n}\n",
+            ] {
+                assert_eq!(run(source).len(), 1, "{source}");
+            }
+        }
+
+        /// A double-wrapped target unparenthesizes recursively, matching
+        /// the singly wrapped shape.
+        #[test]
+        fn double_wrapped_target_reports() {
+            let source = "class C {\n  String? b;\n}\nvoid f(C a) {\n  if (((a)).b == null) ((a)).b = '';\n}\n";
+            assert_eq!(run(source).len(), 1);
+        }
+
+        /// A non-chain inner root keeps its container row: a `null` target
+        /// fails the identifier-chain gate and stays silent.
+        #[test]
+        fn parenthesized_target_gates() {
+            let source = "void f(int s) {\n  if ((null).b == null) (null).b = s;\n}\n";
+            assert!(run(source).is_empty());
+        }
+
+        /// An `else` clause (even empty), `!=`, an unrelated LHS, a
+        /// two-statement block, and a different chain target stay silent.
+        #[test]
+        fn silences() {
+            for source in [
+                "void f(int? x, int s) {\n  if (x == null) x = s; else {}\n}\n",
+                "void f(int? x, int s) {\n  if (x != null) x = s;\n}\n",
+                "void f(int? x, int y, int s) {\n  if (x == null) y = s;\n}\n",
+                "void f(int? x, int y, int s) {\n  if (x == null) {\n    x = s;\n    y = s;\n  }\n}\n",
+                "class C {\n  String? b, d;\n}\nvoid f(C a, C c) {\n  if (a.b == null) c.d = '';\n}\n",
+            ] {
+                assert!(run(source).is_empty(), "{source}");
+            }
+        }
+
+        /// No operator gate on the assignment: `+=` fires like `=`.
+        #[test]
+        fn compound_assignment_fires() {
+            let source = "void f(int? x) {\n  if (x == null) x += 1;\n}\n";
+            assert_eq!(run(source).len(), 1);
+        }
+
+        /// Index and invocation operands fail the identifier-chain gate;
+        /// `(x) = s` parses as a `PatternAssignment` and stays silent;
+        /// `this.x` never passes.
+        #[test]
+        fn shape_gates() {
+            assert!(
+                run("void f(List<int?> a, int s) {\n  if (a[0] == null) a[0] = s;\n}\n").is_empty()
+            );
+            assert!(
+                run("void f(int? Function(int) a, int i) {\n  if (a(i) == null) a(i) = 1;\n}\n")
+                    .is_empty()
+            );
+            // `(x) = s` is a pattern assignment, not an
+            // `AssignmentExpression` — the upstream `_checkExpression` gate
+            // keeps it silent.
+            assert!(run("void f(int? x, int s) {\n  if (x == null) (x) = s;\n}\n").is_empty());
+            assert!(run(
+                "class C {\n  int? x;\n  void f() {\n    if (this.x == null) this.x = 1;\n  }\n}\n"
+            )
+            .is_empty());
+        }
     }
 }
 
 pub(crate) mod prefer_if_null_operators {
-    use super::{Check, Group, NodeKind, RuleSpec, token_seq_equal};
+    use super::{Check, Group, NodeKind, RuleSpec, slice, token_seq_equal};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_if_null_operators.dart:22-63`
     /// — `x == null ? a : x` (or the `!=`/then mirror) reports at the
     /// conditional when the null-check operand and the non-null arm have the
     /// same token-lexeme sequence (the official `toString()` comparison).
-    /// Message: `diagnostic.g.dart` `preferIfNullOperators`.
+    ///
+    /// dartq faces over the production tiling: the arms are the direct
+    /// children's head-token segments split at the `?`/`:` payload
+    /// separators, and the condition is the null-check binary recovered
+    /// from the owner window — the parser opens the Conditional only at the
+    /// `?`, after the condition completed, so the condition rows sit
+    /// immediately before the Conditional's slot and the binary's own
+    /// window holds just the operands. The operand run is the non-null
+    /// side's pieces — the binary's adopted subtree plus the non-adopted
+    /// pieces below it — with the bare-name group's marker rows dropped
+    /// for the comparison. Message: `diagnostic.g.dart`
+    /// `preferIfNullOperators`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_if_null_operators",
         group: Group::Recommended,
@@ -563,65 +2405,560 @@ pub(crate) mod prefer_if_null_operators {
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        let Some((op, operand, arms)) = null_check_parts(c, node) else {
+        let Some((op, _binary, operand, condition, arms)) = null_check_parts(c, node) else {
             return;
         };
-        // `==` tests the else arm, `!=` the then arm (:49-52).
+        // `==` tests the else arm, `!=` the then arm (:47-49).
         let arm = if op == "==" { arms.1 } else { arms.0 };
-        if token_seq_equal(c, arm, operand) {
-            let range = c.utf16_span(node);
+        if runs_token_equal(c, &arm, &operand) {
+            // The official reports at the conditional expression; the
+            // production row opens at the `?`, so the condition's first
+            // token bounds the start — the operand runs' earliest head,
+            // never the binary's delta-tile anchor (a member operand's
+            // covered span opens at the selector). The node's covered end
+            // can swallow the enclosing terminator (a send group or access
+            // marker rides `;`/`)` …), so the end steps back over
+            // separators.
+            let Some(start) = slice::run_utf16_start(c, &condition) else {
+                return;
+            };
+            let range = start..conditional_end(c, node);
             c.report(range, &[]);
         }
     }
 
-    /// The `(operator, non-null operand, (then, else))` of a null-check
-    /// condition, or `None`.
+    /// The `(operator, condition binary, non-null operand run, condition
+    /// run, (then, else))` of a null-check conditional, or `None`. The runs
+    /// are unfiltered piece runs — the comparison helpers ([`real_rows`] /
+    /// [`runs_token_equal`]) drop the marker pieces. The condition run is
+    /// the binary's two operand runs together (both null-check sides).
     pub(super) fn null_check_parts<'a>(
         c: &'a Check<'a>,
         node: u32,
-    ) -> Option<(&'a str, u32, (u32, u32))> {
-        let kids = c.collect_direct(node);
-        if kids.len() < 3 {
+    ) -> Option<(&'a str, u32, Vec<u32>, Vec<u32>, (Vec<u32>, Vec<u32>))> {
+        let payload = c.payload(node);
+        let &question = payload.first()?;
+        let &colon = payload.get(1)?;
+        // The arms over the direct children, split at the `?`/`:` payload
+        // separators by head token; rows left of `?` exist only in
+        // hand-built trees (the condition among the node's children). The
+        // `:` boundary is inclusive: the then arm's stragglers (a send
+        // covering `[b, :]` or a `NoTypeArguments` wrapper anchored at the
+        // colon itself) head at or before the colon while the else's first
+        // piece heads strictly after it.
+        let mut condition_rows = Vec::new();
+        let mut then_run = Vec::new();
+        let mut else_run = Vec::new();
+        for row in c.collect_direct(node) {
+            let head = c.head_token(row);
+            if head < question {
+                condition_rows.push(row);
+            } else if head <= colon {
+                then_run.push(row);
+            } else {
+                else_run.push(row);
+            }
+        }
+        // The condition's null-check binary: the last row completed before
+        // the Conditional's slot — among the node's children (hand-built
+        // trees) or immediately before the node in the owner window
+        // (production parses).
+        let (binary, below) = match condition_rows.pop() {
+            Some(binary) => (binary, condition_rows),
+            None => {
+                let parent = c.ancestor(1)?;
+                let kids = c.collect_direct(parent);
+                let pos = kids.iter().position(|&kid| kid == node)?;
+                let before = pos.checked_sub(1)?;
+                (kids[before], kids[..before].to_vec())
+            }
+        };
+        if c.kind(binary) != NodeKind::BinaryExpression {
             return None;
         }
-        let condition = kids[0];
-        if c.kind(condition) != NodeKind::BinaryExpression {
-            return None;
-        }
-        let op = c.lexeme(
-            c.payload(condition)
-                .first()
-                .copied()
-                .expect("binary payload"),
-        );
+        let op_token = c.payload_word(binary, 0)?;
+        let op = c.lexeme(op_token);
         if op != "==" && op != "!=" {
             return None;
         }
-        let operands = c.collect_direct(condition);
-        if operands.len() < 2 {
-            return None;
-        }
-        let operand = if c.kind(operands[1]) == NodeKind::LiteralNull {
-            operands[0]
-        } else if c.kind(operands[0]) == NodeKind::LiteralNull {
-            operands[1]
+        // The operands: the binary-window rows split at the operator token.
+        // The left run keeps the whole adopted segment — a container
+        // operand's pieces AND its own row seal before the operator, so a
+        // `split_first` root would take the container's first interior row
+        // and drop the container row (the `(a) == null` misfire and the
+        // `a as int == null` miss). The owner-side pieces below the adopted
+        // window (a bare name's `Identifier` row, a member operand's
+        // receiver and selector pieces — the binary's covered span opens
+        // at the selector, so a `head >= binary_head` bound would drop the
+        // receiver) join statement-run bounded, then token-adjacency
+        // bounded ([`slice::contiguous_tail`]: the operand tiles
+        // contiguously back to the operator, cutting earlier expression
+        // siblings while statement rows stay cut by the statement run).
+        let window = c.collect_direct(binary);
+        let window_start = c.children(binary).start;
+        let run: Vec<u32> = crate::rules::slice::statement_run(c, &below)
+            .into_iter()
+            .filter(|&row| row < window_start)
+            .collect();
+        let kept = crate::rules::slice::contiguous_tail(c, &run, op_token);
+        let left: Vec<u32> = kept
+            .iter()
+            .copied()
+            .chain(
+                window
+                    .iter()
+                    .copied()
+                    .filter(|&row| c.head_token(row) < op_token),
+            )
+            .collect();
+        let right: Vec<u32> = window
+            .iter()
+            .copied()
+            .filter(|&row| c.head_token(row) >= op_token)
+            .collect();
+        // Upstream order (:39-45): the left `null` literal takes the right
+        // operand, else the right `null` literal takes the left operand.
+        // The gate reads each run's root row — the run tail, since a piece
+        // run seals root-last — so a wrapped literal keeps its container
+        // row (`(null) == x` never reads as a null test) while the
+        // bare-name group's markers riding the operator stay harmless.
+        let lhs_null = left
+            .last()
+            .is_some_and(|&row| c.kind(row) == NodeKind::LiteralNull);
+        let rhs_null = right
+            .last()
+            .is_some_and(|&row| c.kind(row) == NodeKind::LiteralNull);
+        // The condition run keeps both sides — the callers anchor report
+        // starts and comparison windows at its earliest head token.
+        let mut condition = left.clone();
+        condition.extend_from_slice(&right);
+        let operand = if lhs_null {
+            right
+        } else if rhs_null {
+            left
         } else {
             return None;
         };
-        Some((op, operand, (kids[1], kids[2])))
+        Some((op, binary, operand, condition, (then_run, else_run)))
+    }
+
+    /// The run's comparison rows: the bare-name send group's marker pieces
+    /// dropped (`NoTypeArguments` anchors at the follower token,
+    /// `NoArguments` is zero-width, the group's `Send` rides its follower),
+    /// the real expression rows kept in order.
+    pub(super) fn real_rows(c: &Check<'_>, run: &[u32]) -> Vec<u32> {
+        run.iter()
+            .copied()
+            .filter(|&row| {
+                !matches!(
+                    c.kind(row),
+                    NodeKind::NoTypeArguments | NodeKind::NoArguments | NodeKind::Send
+                )
+            })
+            .collect()
+    }
+
+    /// Whether two piece runs carry the same token-lexeme sequence — the
+    /// anchored stand-in for the official `toString()` comparisons — over
+    /// the runs' comparison rows ([`real_rows`]). A `DotAccess`/
+    /// `CascadeAccess` marker's covered range swallows its follower token
+    /// (`.b` covers `[b, next-operator]`), so it contributes only its own
+    /// pair — the operator token and the selector (`payload[0]`,
+    /// `payload[0]+1`).
+    pub(super) fn runs_token_equal(c: &Check<'_>, a: &[u32], b: &[u32]) -> bool {
+        let (a, b) = (real_rows(c, a), real_rows(c, b));
+        a.len() == b.len() && a.iter().zip(&b).all(|(&x, &y)| row_tokens_equal(c, x, y))
+    }
+
+    /// The per-row token compare behind [`runs_token_equal`].
+    fn row_tokens_equal(c: &Check<'_>, x: u32, y: u32) -> bool {
+        if c.kind(x) != c.kind(y) {
+            return false;
+        }
+        // `DotAccess`/`CascadeAccess` cover `[selector, follower]` — the
+        // follower rides the covered span but is not the access's own
+        // token; `payload[0]`/`payload[0]+1` name the operator and the
+        // selector. `Qualified` covers `[receiver, .]` exactly, so it
+        // falls through to the whole-range compare.
+        if matches!(c.kind(x), NodeKind::DotAccess | NodeKind::CascadeAccess) {
+            let own = |row: u32| -> Option<(u32, u32)> {
+                let dot = c.payload(row).first().copied()?;
+                Some((dot, dot + 1))
+            };
+            let Some((dx, nx)) = own(x) else { return false };
+            let Some((dy, ny)) = own(y) else { return false };
+            return c.lexeme(dx) == c.lexeme(dy) && c.lexeme(nx) == c.lexeme(ny);
+        }
+        token_seq_equal(c, x, y)
+    }
+
+    /// The UTF-16 end of a production `Conditional` row: the else arm's own
+    /// last token. The covered range swallows enclosing terminators (`;`,
+    /// `)`, `,`, `]`, `}`, and an outer conditional's or case label's `:`)
+    /// into the tiling's send groups and access markers, so the covered
+    /// `end` cannot be read directly — and stepping back over separators
+    /// would also cross the arm's own closer (`f(g() == null ? a : g())`
+    /// ends `))`, the inner `)` belonging to the arm). The bound is
+    /// therefore structural: the else run's last real row's own end token —
+    /// an access marker ends at its selector (`payload[0] + 1`), every
+    /// other real row at its range end.
+    pub(super) fn conditional_end(c: &Check<'_>, node: u32) -> u32 {
+        let Some(&colon) = c.payload(node).get(1) else {
+            return c.utf16_span(node).end;
+        };
+        let last = c
+            .collect_direct(node)
+            .into_iter()
+            .filter(|&row| c.head_token(row) > colon)
+            .filter(|&row| {
+                !matches!(
+                    c.kind(row),
+                    NodeKind::NoTypeArguments | NodeKind::NoArguments | NodeKind::Send
+                )
+            })
+            .last();
+        let Some(last) = last else {
+            return c.utf16_span(node).end;
+        };
+        let token = if matches!(c.kind(last), NodeKind::DotAccess | NodeKind::CascadeAccess) {
+            c.payload(last)
+                .first()
+                .map(|&dot| dot + 1)
+                .unwrap_or_else(|| c.unit.ast.token_range(last).end - 1)
+        } else {
+            c.unit.ast.token_range(last).end - 1
+        };
+        crate::rules::utf16_token_span(c, token).end
+    }
+
+    /// Whether the run is exactly the `null` literal (the upstream
+    /// `thenExpression is NullLiteral` / `elseExpression is NullLiteral`
+    /// gates). Zero-width send-group wrappers (`NoArguments` anchored at
+    /// the arm's first token) can tile beside the literal, so the check
+    /// reads the comparison rows.
+    pub(super) fn is_null_literal_run(c: &Check<'_>, run: &[u32]) -> bool {
+        matches!(real_rows(c, run).as_slice(), [only] if c.kind(*only) == NodeKind::LiteralNull)
+    }
+}
+
+pub(crate) mod prefer_null_aware_method_calls {
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice};
+    use crate::rules::NONE_TOKEN;
+    use dartq_semantic::{Binding, BindingKind};
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_null_aware_method_calls.dart`
+    /// — a `x != null` condition (a conditional expression whose else arm
+    /// is `null`, or an `if` without `else`) whose branch is one
+    /// expression statement invoking `x!()` reports at the invocation
+    /// (`_Visitor` :33-57 + `_check` :59-70): the `!` postfix must sit
+    /// directly on the condition's left operand (the `toSource()`
+    /// equality) and the invocation must be the bare postfix form — a
+    /// selector invocation (`x!.m()`) or a parenthesized operand never
+    /// matches, and the single-statement block unwrap (:51-55) is the
+    /// only branch shape past a bare expression statement.
+    ///
+    /// dartq faces over the production tiling: the dispatch rows are
+    /// [`NodeKind::Conditional`] and [`NodeKind::IfStatement`]; the
+    /// condition is the `!=`-over-a-trailing-`null` binary — recovered from
+    /// the owner window for the conditional (the parser opens the
+    /// Conditional only at the `?`, so the condition rows sit immediately
+    /// before its slot; the shared
+    /// [`super::prefer_if_null_operators::null_check_parts`] face) and the
+    /// adopted [`NodeKind::ParenthesizedCondition`] child for the `if` —
+    /// with the operand read as the `toSource()` token window from the
+    /// binary's head to the operator. The branch is the then arm's flat
+    /// piece run: the whole-extent `Send` leaf anchors the invocation at
+    /// the run's tail, the argument list sits before it (the `!`-then-`(`
+    /// gap marker skipped), the [`NodeKind::NonNullAssert`] leaf before the
+    /// operand rows, and the operand rows keep only the real chain pieces
+    /// (`Identifier`/`DotAccess`) for the semantic faces. The `if` branch
+    /// peels the single-statement block — exactly one statement, the
+    /// trailing `ExpressionStatement` leaf — and reads the invocation rows
+    /// tiled before it.
+    ///
+    /// The semantic face decides (the wave posture: no face, no report —
+    /// a semantic rule enabled without the mounted `Analysis` is a
+    /// driver-configuration error surfaced at the driver). The operand's
+    /// head identifier read answers twice. Resolution: the member face
+    /// (`member_of`) must resolve `p.m` on the receiver's same-library
+    /// container for the member shape, and the binding face (`binding_of`)
+    /// must resolve a bare `f` to a `Decl`/`Local`/`Member` target (a
+    /// prefixed or type-parameter target is not a plain callable) for the
+    /// bare shape. Nullability (family (a)): a definitely-non-null bare
+    /// read makes the null test provably dead and the suggestion vacuous.
+    /// Approximations (documented, under-report directions): an
+    /// unresolvable receiver (`dynamic`, unpublished member rows) and a
+    /// multi-dot chain (the face resolves through the head container's
+    /// member table) stay silent where the shape-only upstream reports —
+    /// the dominant typed-receiver corpus resolves — and a dead-check
+    /// bare shape stays silent for the same reason. Message:
+    /// `diagnostic.g.dart` `preferNullAwareMethodCalls`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_null_aware_method_calls",
+        group: Group::Standalone,
+        problem: "Use a null-aware invocation of the 'call' method rather than explicitly testing for 'null'.",
+        correction: "Try using '?.call()' to invoke the function.",
+        kinds: &[NodeKind::Conditional, NodeKind::IfStatement],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let node = c.node();
+        let Some((condition, run)) = (match c.kind(node) {
+            NodeKind::Conditional => conditional_face(c, node),
+            NodeKind::IfStatement => if_face(c, node),
+            _ => None,
+        }) else {
+            return;
+        };
+        // The invocation face over the branch run: the whole-extent `Send`
+        // leaf anchors the invocation at the run's tail, the argument list
+        // sits before it, the `!`-then-`(` gap marker before that, and the
+        // `NonNullAssert` leaf before the operand rows.
+        let Some((&send, rest)) = run.split_last() else {
+            return;
+        };
+        if c.kind(send) != NodeKind::Send {
+            return;
+        }
+        let Some((&arguments, callee)) = rest.split_last() else {
+            return;
+        };
+        if !matches!(
+            c.kind(arguments),
+            NodeKind::Arguments | NodeKind::NoArguments
+        ) {
+            return;
+        }
+        let callee = match callee.split_last() {
+            Some((&marker, callee))
+                if matches!(
+                    c.kind(marker),
+                    NodeKind::NoTypeArguments | NodeKind::TypeArguments
+                ) =>
+            {
+                callee
+            }
+            _ => callee,
+        };
+        let Some((&bang, operand_rows)) = callee.split_last() else {
+            return;
+        };
+        if c.kind(bang) != NodeKind::NonNullAssert {
+            return;
+        }
+        // The chain rows keep the access-shape faces: the bare-name group's
+        // markers (`NoTypeArguments`/`NoArguments`/the group's own `Send`)
+        // drop.
+        let chain: Vec<u32> = operand_rows
+            .iter()
+            .copied()
+            .filter(|&row| matches!(c.kind(row), NodeKind::Identifier | NodeKind::DotAccess))
+            .collect();
+        // The `toSource()` equality: the `!` operand's token window against
+        // the condition operand's. The operand head is the first operand
+        // row's head — `send`'s own range opens at `!` (the send was
+        // emitted over `bang`'s span by the argument-list selector), not
+        // at the operand.
+        let operand_window = c.head_token(operand_rows[0])..c.head_token(bang);
+        if !same_tokens(c, operand_window, condition) {
+            return;
+        }
+        // The semantic faces answer at the operand's head identifier read.
+        let Some(&head) = chain.first() else {
+            return;
+        };
+        if c.kind(head) != NodeKind::Identifier {
+            return;
+        }
+        let site = query_site(c, head);
+        let fires = match chain.split_last() {
+            // `p.m!()`: the trailing `DotAccess` marker carries the
+            // selector right after its payload dot (`token_range`'s last
+            // token is the swallowed `!` follower, not the selector); the
+            // member face resolves the same-library member on the
+            // receiver's container.
+            Some((&marker, _)) if c.kind(marker) == NodeKind::DotAccess => {
+                let Some(selector) = c.payload(marker).first().map(|&dot| dot + 1) else {
+                    return;
+                };
+                let name = analysis.strings().intern(c.lexeme(selector));
+                analysis.member_of(site, name).is_some()
+            }
+            // `f!()`: the bare binding face — a plain `Decl`/`Local`/
+            // `Member` target — plus the dead-check face (family (a)): a
+            // definitely-non-null read cannot make the test succeed.
+            _ => {
+                if chain.len() != 1 {
+                    return;
+                }
+                if analysis.is_definitely_non_null(site) {
+                    return;
+                }
+                matches!(
+                    analysis.binding_of(site),
+                    Some(Binding {
+                        kind: BindingKind::Decl | BindingKind::Local | BindingKind::Member,
+                        ..
+                    })
+                )
+            }
+        };
+        if fires {
+            // The official reports at the invocation (`x!()`) — the send
+            // leaf's own span opens at `!` (the send was emitted over the
+            // bang's span), so the range opens at the operand's head.
+            let range = c.utf16_span(operand_rows[0]).start..c.utf16_span(send).end;
+            c.report(range, &[]);
+        }
+    }
+
+    /// The conditional face (`visitConditionalExpression` :33-41): the
+    /// then arm is the invocation run, the else arm is the `null` literal,
+    /// and the condition is the `!=`-over-trailing-`null` binary recovered
+    /// from the owner window.
+    fn conditional_face(c: &Check<'_>, node: u32) -> Option<(core::ops::Range<u32>, Vec<u32>)> {
+        let (op, binary, operand, _condition, (then_run, else_run)) =
+            super::prefer_if_null_operators::null_check_parts(c, node)?;
+        if op != "!=" {
+            return None;
+        }
+        // `node.elseExpression is NullLiteral` (:38) — the exact single
+        // literal row.
+        if !super::prefer_if_null_operators::is_null_literal_run(c, &else_run) {
+            return None;
+        }
+        // `condition.rightOperand is NullLiteral` (:37): the binary's
+        // adopted right tail.
+        let rows = c.collect_direct(binary);
+        let (&rhs, _) = rows.split_last()?;
+        if c.kind(rhs) != NodeKind::LiteralNull {
+            return None;
+        }
+        let op_token = c.payload(binary).first().copied()?;
+        // The `leftOperand.toSource()` window opens at the condition's
+        // first token — the operand run's earliest head, never the
+        // binary's covered start (a member operand's covered span opens at
+        // the selector: `p.m != null` opens at `m`).
+        let head = slice::run_start_token(c, &operand)?;
+        Some((head..op_token, then_run))
+    }
+
+    /// The `if` face (`visitIfStatement` :43-57): no `else` clause; the
+    /// condition is the adopted `ParenthesizedCondition` child, and the
+    /// branch is one expression statement — a bare statement or the
+    /// single-statement block unwrap — whose invocation rows tile before
+    /// the statement leaf.
+    fn if_face(c: &Check<'_>, node: u32) -> Option<(core::ops::Range<u32>, Vec<u32>)> {
+        // `elseKeyword == null` (:49).
+        if c.payload(node).first().copied() != Some(NONE_TOKEN) {
+            return None;
+        }
+        let kids = c.collect_direct(node);
+        let condition_pos = kids
+            .iter()
+            .position(|&kid| c.kind(kid) == NodeKind::ParenthesizedCondition)?;
+        // The adopted condition: the window's tail row, peeling paren
+        // containers down to the null-check binary — the production window
+        // carries the operand pieces beside the binary, and a wrapped
+        // binary sits behind its `ParenthesizedExpression` row.
+        let mut condition = *c.collect_direct(kids[condition_pos]).last()?;
+        while c.kind(condition) == NodeKind::ParenthesizedExpression {
+            condition = *c.collect_direct(condition).last()?;
+        }
+        let branch_run = then_branch_run(c, &kids[condition_pos + 1..])?;
+        let window = condition_window(c, condition)?;
+        Some((window, branch_run))
+    }
+
+    /// The then branch's expression-statement run: the bare statement's
+    /// rows between the condition and its trailing `ExpressionStatement`
+    /// leaf, or the single-statement block's rows before its only
+    /// statement leaf (:51-55).
+    pub(super) fn then_branch_run(c: &Check<'_>, rest: &[u32]) -> Option<Vec<u32>> {
+        let (&last, rows) = rest.split_last()?;
+        if c.kind(last) == NodeKind::ExpressionStatement {
+            // The production leaf seals empty and its pieces tile flat
+            // beside it; a hand-built tree nests the expression inside —
+            // union both faces.
+            let mut run = rows.to_vec();
+            run.extend(c.collect_direct(last));
+            return Some(run);
+        }
+        if c.kind(last) == NodeKind::Block {
+            let statements = c.collect_direct(last);
+            let (&leaf, inner) = statements.split_last()?;
+            // Exactly one statement — the trailing expression-statement
+            // leaf; any other statement row is a second statement (or a
+            // non-expression one) and disqualifies the shape.
+            if c.kind(leaf) == NodeKind::ExpressionStatement
+                && !inner
+                    .iter()
+                    .any(|&row| crate::rules::is_statement_row(c, row))
+            {
+                return Some(inner.to_vec());
+            }
+        }
+        None
+    }
+
+    /// The condition operand's token window — the `!=`-over-trailing-`null`
+    /// binary's left operand (`condition.leftOperand.toSource()`): the
+    /// operand runs from the binary's head to the operator.
+    fn condition_window(c: &Check<'_>, condition: u32) -> Option<core::ops::Range<u32>> {
+        if c.kind(condition) != NodeKind::BinaryExpression {
+            return None;
+        }
+        let op = c.payload_word(condition, 0)?;
+        if c.lexeme(op) != "!=" {
+            return None;
+        }
+        let rows = c.collect_direct(condition);
+        let (&rhs, _) = rows.split_last()?;
+        if c.kind(rhs) != NodeKind::LiteralNull {
+            return None;
+        }
+        // The window opens at the left operand's first token — the
+        // operand run's earliest head bounded at the operator (the
+        // owner-side rows can carry enclosing strays), never the
+        // binary's covered start (a member operand opens at the
+        // selector: `p.m != null` opens at `m`).
+        let (left, _) = slice::binary_operands_at(c, condition)?;
+        Some(slice::operand_start_token(c, &left, op)?..op)
+    }
+
+    /// The `toSource()` equality at the token-lexeme level: equal-length
+    /// windows carrying the same lexeme sequence are the same source.
+    fn same_tokens(c: &Check<'_>, a: core::ops::Range<u32>, b: core::ops::Range<u32>) -> bool {
+        a.len() == b.len() && a.zip(b).all(|(x, y)| c.lexeme(x) == c.lexeme(y))
     }
 }
 
 pub(crate) mod prefer_null_aware_operators {
-    use super::{Check, Group, NodeKind, RuleSpec, token_seq_equal};
-    use dartq_scanner::TokenKind;
+    use super::{Check, Group, NodeKind, RuleSpec, slice};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_null_aware_operators.dart:22-76`
     /// — `a == null ? null : a.b` (`!=` mirrors to the then arm) reports when
     /// peeling accesses off the result expression reaches the null-check
-    /// operand. The peel and the comparison are the anchored token-lexeme
-    /// sequence form of the official `toString()` walk. Message:
-    /// `diagnostic.g.dart` `preferNullAwareOperators`.
+    /// operand. Message: `diagnostic.g.dart` `preferNullAwareOperators`.
+    ///
+    /// dartq faces over the production tiling: the shape gate rides
+    /// [`super::prefer_if_null_operators::null_check_parts`] (the arm
+    /// segments split at the `?`/`:` payload separators, the condition
+    /// recovered from the owner window), the result arm peels one access
+    /// per step — a trailing access marker (`a.b`, `a?.b`), a `!` postfix
+    /// (`a!`), or an invocation's `Send` anchor with its argument suffix
+    /// (the `MethodInvocation.target` receiver behind the callee's last
+    /// dot; a bare-callee `f()` invocation has no target and never peels)
+    /// — and each peeled run compares to the operand with the
+    /// marker-filtered token-lexeme walk (the anchored `toString()` form).
+    /// The bare `a == null ? null : a` form never matches (the comparison
+    /// runs only after a peel).
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_null_aware_operators",
         group: Group::Recommended,
@@ -633,22 +2970,30 @@ pub(crate) mod prefer_null_aware_operators {
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        let Some((op, operand, arms)) = super::prefer_if_null_operators::null_check_parts(c, node)
+        let Some((op, _binary, operand, condition, arms)) =
+            super::prefer_if_null_operators::null_check_parts(c, node)
         else {
             return;
         };
-        // `x == null ? null : y` / `x != null ? y : null` (:47-60).
+        // `x == null ? null : y` / `x != null ? y : null` (:45-58).
         let result = match op {
-            "==" if c.kind(arms.0) == NodeKind::LiteralNull => arms.1,
-            "!=" if c.kind(arms.1) == NodeKind::LiteralNull => arms.0,
+            "==" if super::prefer_if_null_operators::is_null_literal_run(c, &arms.0) => arms.1,
+            "!=" if super::prefer_if_null_operators::is_null_literal_run(c, &arms.1) => arms.0,
             _ => return,
         };
-        // Peel one access at a time; compare only after a peel (:61-74 — the
-        // bare `a == null ? null : a` form never matches).
+        // Peel one access at a time; compare only after a peel (:60-77 —
+        // the bare `a == null ? null : a` form never matches).
         let mut current = result;
-        while let Some(stripped) = peel(c, current) {
-            if token_seq_equal(c, stripped, operand) {
-                let range = c.utf16_span(node);
+        while let Some(stripped) = peel_step(c, &current) {
+            if super::prefer_if_null_operators::runs_token_equal(c, &stripped, &operand) {
+                // The official reports at the conditional expression; the
+                // production row opens at the `?`, so the condition's
+                // first token bounds the start — the operand runs'
+                // earliest head, never the binary's delta-tile anchor.
+                let Some(start) = slice::run_utf16_start(c, &condition) else {
+                    return;
+                };
+                let range = start..super::prefer_if_null_operators::conditional_end(c, node);
                 c.report(range, &[]);
                 return;
             }
@@ -656,38 +3001,71 @@ pub(crate) mod prefer_null_aware_operators {
         }
     }
 
-    /// One peel step (the official switch, :63-72): an access receiver, the
-    /// target of a prefixed invocation, or a `!` operand.
-    fn peel(c: &Check<'_>, node: u32) -> Option<u32> {
-        match c.kind(node) {
-            // `a.b`, `a?.b` → `a`.
+    /// One peel step (the official switch, :63-72): the rows behind a
+    /// trailing access marker, the operand rows behind a `!` postfix, or
+    /// the invocation target behind an invocation send's callee dot.
+    fn peel_step(c: &Check<'_>, run: &[u32]) -> Option<Vec<u32>> {
+        let (&last, stripped) = run.split_last()?;
+        match c.kind(last) {
+            // `a.b`, `a?.b` → the receiver rows: the marker comes last but
+            // its selector's send group (`b` + wrappers + `Send`) tiles
+            // immediately behind it — `a.b` peels to `a`, not `a` + the
+            // orphan `b` group. `a!` and `a.b!` strip the bang alone (the
+            // operand is the whole prefix).
             NodeKind::DotAccess | NodeKind::Qualified => {
-                let kids = c.collect_direct(node);
-                kids.first().copied()
+                // Selector send group trailing the marker: walk back over
+                // `Send`, an optional `Arguments`/`NoArguments`, an optional
+                // `TypeArguments`/`NoTypeArguments`, to the selector's
+                // `Identifier`. A zero-width `NoArguments` can tile outside
+                // the arm's piece run (anchored at the `:` boundary), so the
+                // slots walk by kind rather than fixed positions.
+                let mut start = stripped.len();
+                let prev = |i: usize| stripped.get(i.wrapping_sub(1)).copied();
+                let kind = |row: u32| c.kind(row);
+                if prev(start).is_some_and(|r| kind(r) == NodeKind::Send) {
+                    start -= 1;
+                }
+                if prev(start)
+                    .is_some_and(|r| matches!(kind(r), NodeKind::Arguments | NodeKind::NoArguments))
+                {
+                    start -= 1;
+                }
+                if prev(start).is_some_and(|r| {
+                    matches!(kind(r), NodeKind::TypeArguments | NodeKind::NoTypeArguments)
+                }) {
+                    start -= 1;
+                }
+                match prev(start).filter(|&r| kind(r) == NodeKind::Identifier) {
+                    // `a.b` peels to `a` — drop the selector group and the
+                    // marker. A receiver with no bare selector group
+                    // (`(x).b`) strips the marker alone.
+                    Some(_) if start < stripped.len() => Some(stripped[..start - 1].to_vec()),
+                    _ => Some(stripped.to_vec()),
+                }
             }
-            // `a.b()` → the invocation target behind the callee's last dot.
+            NodeKind::NonNullAssert => Some(stripped.to_vec()),
+            // `a.b()` → the invocation target behind the callee's last dot;
+            // a `NoArguments` tail is the bare-name group, whose bare-callee
+            // invocation has no target.
             NodeKind::Send => {
-                let kids = c.collect_direct(node);
-                let callee = kids.iter().copied().find(|&kid| {
-                    !matches!(
-                        c.kind(kid),
-                        NodeKind::Arguments | NodeKind::NoArguments | NodeKind::TypeApplication
+                let mut end = run.len().checked_sub(2)?;
+                if c.kind(run[end]) != NodeKind::Arguments {
+                    return None;
+                }
+                if let Some(prev) = end.checked_sub(1)
+                    && matches!(
+                        c.kind(run[prev]),
+                        NodeKind::NoTypeArguments | NodeKind::TypeArguments
                     )
-                })?;
-                match c.kind(callee) {
-                    NodeKind::DotAccess | NodeKind::Qualified => {
-                        c.collect_direct(callee).first().copied()
+                {
+                    end = prev;
+                }
+                match run.get(end.checked_sub(1)?).map(|&row| c.kind(row)) {
+                    Some(NodeKind::DotAccess | NodeKind::Qualified) => {
+                        Some(run[..end - 1].to_vec())
                     }
                     _ => None,
                 }
-            }
-            // `a!` → `a`.
-            NodeKind::UnaryPostfix => {
-                let op = c.payload(node).first().copied()?;
-                if c.unit.tokens.get(op as usize)?.kind != TokenKind::Bang {
-                    return None;
-                }
-                c.collect_direct(node).first().copied()
             }
             _ => None,
         }
@@ -695,7 +3073,7 @@ pub(crate) mod prefer_null_aware_operators {
 }
 
 pub(crate) mod unnecessary_null_aware_assignments {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, Group, NodeKind, RuleSpec, slice};
     use crate::rules::{first_child, last_child};
 
     /// Official: `pkg/linter/lib/src/rules/unnecessary_null_aware_assignments.dart:42-49`
@@ -722,7 +3100,7 @@ pub(crate) mod unnecessary_null_aware_assignments {
         let node = c.node();
         // `node.operator.type == QUESTION_QUESTION_EQ &&
         // node.rightHandSide.isNullLiteral` (:45-46).
-        if c.lexeme(c.payload(node).first().copied().expect("assignment op")) != "??=" {
+        if c.payload_word(node, 0).map(|op| c.lexeme(op)) != Some("??=") {
             return;
         }
         let Some(rhs) = last_child(c, node) else {
@@ -740,13 +3118,26 @@ pub(crate) mod unnecessary_null_aware_assignments {
         if c.path.iter().any(|&a| c.kind(a) == NodeKind::Cascade) {
             return;
         }
-        let range = c.utf16_span(node);
+        // The official reports at the whole assignment expression; the
+        // production row opens at the operator's tile anchor and swallows
+        // the trailing `;`, so the extent runs from the left operand's
+        // first token to the `null` literal's own end.
+        let Some(op_token) = c.payload_word(node, 0) else {
+            return;
+        };
+        let Some((left, _)) = slice::binary_operands(c) else {
+            return;
+        };
+        let Some(start) = slice::operand_utf16_start(c, &left, op_token) else {
+            return;
+        };
+        let range = start..c.utf16_span(rhs).end;
         c.report(range, &[]);
     }
 }
 
 pub(crate) mod prefer_contains {
-    use super::{Check, Group, NodeKind, RuleSpec, slice};
+    use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
 
     const USE_CONTAINS_PROBLEM: &str = "Unnecessary use of 'indexOf' to test for containment.";
     const USE_CONTAINS_CORRECTION: &str = "Try using 'contains'.";
@@ -765,10 +3156,14 @@ pub(crate) mod prefer_contains {
     /// resolution-backed face ([`slice::resolved_receiver_family`]) —
     /// string and collection literals decide, a bare-identifier receiver
     /// resolves its written type and must land in the `Iterable`/`String`
-    /// family, and anything else stays silent like the official
-    /// `parentType == null` bail. `getIntValue` reads int literal pieces
-    /// (decimal/hex, separators, a `-` prefix), so constant expressions
-    /// (`const k = -1`) under-report. Message: `diagnostic.g.dart`
+    /// family — and an opaque receiver reads the bridge static type when
+    /// mounted (a member receiver's declared type: `this.list.indexOf`,
+    /// `a.b.indexOf`); anything unresolvable stays silent like the
+    /// official `parentType == null` bail. `getIntValue` carries the
+    /// context (:66 — the official call passes it), so a same-file `const`
+    /// identifier answers through its constant value
+    /// ([`const_int_value`]); constants outside the file under-report.
+    /// Message: `diagnostic.g.dart`
     /// `preferContainsUseContains`/`preferContainsAlwaysFalse`/`preferContainsAlwaysTrue`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_contains",
@@ -781,7 +3176,10 @@ pub(crate) mod prefer_contains {
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        let op = c.lexeme(c.payload(node).first().copied().expect("binary op"));
+        let Some(op_token) = c.payload_word(node, 0) else {
+            return;
+        };
+        let op = c.lexeme(op_token);
         if !matches!(op, "==" | "!=" | ">" | ">=" | "<" | "<=") {
             return;
         }
@@ -792,13 +3190,14 @@ pub(crate) mod prefer_contains {
             return;
         };
         let (literal, effective_op) = {
-            // Right literal first (:66-71).
-            if let Some(value) = int_value(c, &right, 0)
+            // Right literal first (:66-71). The `getIntValue` read carries
+            // the context (a const identifier answers).
+            if let Some(value) = const_int_value(c, &right, 0)
                 && value <= 0
                 && is_unassigned_index_of(c, node, &left)
             {
                 (value, op)
-            } else if let Some(value) = int_value(c, &left, 0)
+            } else if let Some(value) = const_int_value(c, &left, 0)
                 && value <= 0
                 && is_unassigned_index_of(c, node, &right)
             {
@@ -894,6 +3293,158 @@ pub(crate) mod prefer_contains {
         .map(|v| if negative { -v } else { v })
     }
 
+    /// `getIntValue` (upstream Dart SDK source, pkg/linter/lib/src/ast.dart
+    /// :35-42, :274-288) as `prefer_contains` calls it — with a context, so
+    /// a `SimpleIdentifier` operand also answers through its constant
+    /// value. The literal face is [`int_value`]; the identifier face
+    /// resolves a same-file `const` local or top-level constant's
+    /// initializer (identifier chains recurse with a cycle guard). A
+    /// static-const class field read bare, and constants living in other
+    /// files, under-report — the constant walk is same-file.
+    fn const_int_value(c: &Check<'_>, pieces: &[u32], start: usize) -> Option<i64> {
+        if let Some(value) = int_value(c, pieces, start) {
+            return Some(value);
+        }
+        // The SimpleIdentifier operand: wrappers skip first, then a lone
+        // identifier that spans the whole operand (`-k` carries the negating
+        // prefix leaf after it; `p.k` carries a dotted face and never
+        // resolves to a bare name).
+        let mut i = start;
+        while matches!(
+            pieces.get(i),
+            Some(&piece)
+                if matches!(
+                    c.kind(piece),
+                    NodeKind::NoTypeArguments
+                        | NodeKind::TypeArguments
+                        | NodeKind::NoArguments
+                )
+        ) {
+            i += 1;
+        }
+        let row = *pieces.get(i)?;
+        if c.kind(row) != NodeKind::Identifier {
+            return None;
+        }
+        let mut negated = false;
+        let mut end_row = row;
+        if let Some(&post) = pieces.get(i + 1)
+            && c.kind(post) == NodeKind::UnaryPrefix
+            && c.lexeme(c.head_token(post)) == "-"
+        {
+            negated = true;
+            end_row = post;
+        }
+        // The identifier (or its `-k` wrapper) must end the operand — the
+        // bare-name group's wrapper pieces ride after it; strip them.
+        let Some(&tail) = slice::access_run(c, pieces).last() else {
+            return None;
+        };
+        if c.utf16_span(end_row).end != c.utf16_span(tail).end {
+            return None;
+        }
+        let name = c.lexeme(c.head_token(row));
+        let value = const_named_value(c, row, name, &mut Vec::new())?;
+        Some(if negated { -value } else { value })
+    }
+
+    /// The int value of the same-file `const` binding `name` at use site
+    /// `use_row`: a const local ([`same_file::local_const_initializer`]) or
+    /// a top-level `const` variable, its initializer tokens read as an int
+    /// literal or another constant name (cycle-guarded).
+    fn const_named_value(
+        c: &Check<'_>,
+        use_row: u32,
+        name: &str,
+        seen: &mut Vec<&'static str>,
+    ) -> Option<i64> {
+        // The guard needs 'static names; the lexemes live for the run.
+        let spelled: &'static str = leak_spelled(name);
+        if seen.contains(&spelled) {
+            return None;
+        }
+        seen.push(spelled);
+        let range = same_file::local_const_initializer(c, use_row, name)
+            .or_else(|| top_level_const_initializer(c, name))?;
+        const_int_tokens(c, range, seen)
+    }
+
+    /// The int value of an initializer token range: an optional `-`, then
+    /// an int literal (decimal or hex), or a bare name resolving as
+    /// another constant.
+    fn const_int_tokens(
+        c: &Check<'_>,
+        range: core::ops::Range<u32>,
+        seen: &mut Vec<&'static str>,
+    ) -> Option<i64> {
+        let mut token = range.start;
+        if token >= range.end {
+            return None;
+        }
+        let negated = c.lexeme(token) == "-";
+        if negated {
+            token += 1;
+            if token >= range.end {
+                return None;
+            }
+        }
+        let lexeme = c.lexeme(token);
+        let hex = lexeme.starts_with("0x") || lexeme.starts_with("0X");
+        let digits: String = lexeme.chars().filter(|&ch| ch != '_').collect();
+        let parsed = if hex {
+            digits.trim_start_matches("0x").trim_start_matches("0X")
+        } else {
+            &digits[..]
+        };
+        if let Ok(value) = i64::from_str_radix(parsed, if hex { 16 } else { 10 }) {
+            return Some(if negated { -value } else { value });
+        }
+        if lexeme
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            && !lexeme.is_empty()
+        {
+            return const_named_value(c, 0, lexeme, seen).map(|v| if negated { -v } else { v });
+        }
+        None
+    }
+
+    /// The initializer token range of the same-file top-level `const`
+    /// variable `name`.
+    fn top_level_const_initializer(c: &Check<'_>, name: &str) -> Option<core::ops::Range<u32>> {
+        let root = c.path.first().copied()?;
+        for top in c.collect_direct(root) {
+            for inner in c.collect_direct(top) {
+                if c.kind(inner) != NodeKind::TopLevelFields
+                    || !crate::rules::variables_declaration_keyword(c, inner)
+                        .is_some_and(|kw| c.lexeme(kw) == "const")
+                {
+                    continue;
+                }
+                for decl in c.collect_direct(inner) {
+                    if c.kind(decl) != NodeKind::VariablesDeclaration {
+                        continue;
+                    }
+                    for var in c.collect_direct(decl) {
+                        if c.kind(var) == NodeKind::InitializedIdentifier
+                            && crate::rules::initialized_identifier_name(c, var)
+                                .is_some_and(|tok| c.lexeme(tok) == name)
+                        {
+                            return crate::rules::flow::exhaustive_cases::initializer_range(c, var);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Extends the lookup name to `'static` for the cycle guard (the run's
+    /// lexemes outlive the query; the leak is bounded per distinct name).
+    fn leak_spelled(name: &str) -> &'static str {
+        Box::leak(name.to_owned().into_boxed_str())
+    }
+
     /// `_isUnassignedIndexOf` (:128-159): an `indexOf` invocation on a
     /// target over the operand's piece run, not assigned to a value, with a
     /// zero start index.
@@ -947,9 +3498,18 @@ pub(crate) mod prefer_contains {
             return false;
         }
         // The receiver type check (:143-149): `parentType == null` bails —
-        // a receiver without a same-file verdict stays silent.
-        if slice::resolved_receiver_family(c, pieces, head, slice::ITERABLE | slice::STRING)
-            != Some(true)
+        // the shared typed-receiver gate decides (literals, written bare
+        // names, wrapper-revealed names), a member receiver reads the
+        // bridge static type when mounted (`this.list.indexOf`,
+        // `a.b.indexOf`), and anything unresolvable stays silent like the
+        // official unresolvable-target bail.
+        if super::static_type_faces::receiver_family(
+            c,
+            c.semantics(),
+            pieces,
+            head,
+            slice::ITERABLE | slice::STRING,
+        ) != Some(true)
         {
             return false;
         }
@@ -960,12 +3520,16 @@ pub(crate) mod prefer_contains {
             if ranges.len() == 2 {
                 let range = ranges[1].clone();
                 // A named group carries its value between the name and the
-                // trailing marker; a positional group is the whole range.
-                let value: &[u32] = if c.kind(raw[range.end - 1]) == NodeKind::NamedArgument {
-                    &raw[range.start + 1..range.end - 1]
-                } else {
-                    &raw[range]
-                };
+                // trailing marker; a positional group is the whole range. A
+                // sub-marker group (len < 2) cannot hold both a name and a
+                // value — a nameless recovery `NamedArgument` reads as
+                // positional instead of slicing begin>end.
+                let value: &[u32] =
+                    if range.len() >= 2 && c.kind(raw[range.end - 1]) == NodeKind::NamedArgument {
+                        &raw[range.start + 1..range.end - 1]
+                    } else {
+                        &raw[range]
+                    };
                 let start_index = (value.len() == 1).then(|| value[0]);
                 let is_zero = start_index.is_some_and(|start| {
                     c.kind(start) == NodeKind::LiteralInt && c.lexeme(c.head_token(start)) == "0"
@@ -992,7 +3556,7 @@ pub(crate) mod unnecessary_const {
     /// `canUseParsedResult`, so the walk is the whole story). The visitor's
     /// `ConstantPattern` exemptions are structural with our payload layout: a
     /// constant pattern owns the `const` keyword itself (`ConstantPattern`
-    /// head-when-present, collapse map §3.7), so the wrapped expression
+    /// head-when-present), so the wrapped expression
     /// carries none and never dispatches. Dot-shorthand const invocations
     /// (`case const .new()`) are likewise pattern-owned and skip. Message:
     /// `diagnostic.g.dart` `unnecessaryConst`.
@@ -1021,12 +3585,9 @@ pub(crate) mod unnecessary_const {
         if !in_const_context(c) {
             return;
         }
-        let start = c
-            .unit
-            .tokens
-            .get(keyword as usize)
-            .expect("const keyword outside the token table")
-            .utf16_offset;
+        let Some(start) = c.utf16_of_token(keyword) else {
+            return;
+        };
         c.report(start..start, &[]);
     }
 }
@@ -1052,15 +3613,17 @@ pub(crate) mod prefer_is_empty {
     /// constant-on-the-left asymmetry.
     ///
     /// The receiver type check (`implementsInterface(Iterable/Map/String)`,
-    /// :229-234) reads through the shared literal face
-    /// ([`slice::receiver_implements_any`]) — collection/string/map literals
-    /// decide (a map literal reports like the official `Map` face), a record
-    /// literal is provably outside the family and passes, and an opaque
-    /// receiver keeps the documented presumption (a user `length` getter
-    /// over-reports). `getIntValue` reads int literal pieces, so constant
-    /// expressions under-report. The const-context bails (:93-108) port
-    /// through [`crate::rules::in_const_context`] and the const-constructor
-    /// initializer face. Messages: `diagnostic.g.dart`
+    /// :229-234) reads through the shared typed-receiver gate — collection/
+    /// string/map literals decide (a map literal reports like the official
+    /// `Map` face), a record literal is provably outside the family and
+    /// passes, a written bare-name receiver resolves (a user class
+    /// silences like the official non-`Iterable` type), a member receiver
+    /// reads the bridge static type when mounted, and an unresolvable
+    /// receiver bails like the official `type == null` face (the opaque
+    /// presumption is closed). `getIntValue` reads int literal pieces, so
+    /// constant expressions under-report. The const-context bails (:93-108)
+    /// port through [`crate::rules::in_const_context`] and the
+    /// const-constructor initializer face. Messages: `diagnostic.g.dart`
     /// `preferIsEmptyUseIsEmpty`/`preferIsEmptyUseIsNotEmpty`/
     /// `preferIsEmptyAlwaysFalse`/`preferIsEmptyAlwaysTrue`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
@@ -1079,7 +3642,10 @@ pub(crate) mod prefer_is_empty {
         let Some((left, right)) = slice::binary_operands(c) else {
             return;
         };
-        let op = c.lexeme(c.payload(node).first().copied().expect("binary op"));
+        let Some(op_token) = c.payload_word(node, 0) else {
+            return;
+        };
+        let op = c.lexeme(op_token);
         let (value, constant_on_right, length_access) = {
             // Right literal first (:64-71).
             if let Some(value) = super::prefer_contains::int_value(c, &right, 0) {
@@ -1145,8 +3711,19 @@ pub(crate) mod prefer_is_empty {
         if name == 0 {
             return false;
         }
-        slice::receiver_faces(c, pieces, name)
-            .is_none_or(|faces| faces & (slice::ITERABLE | slice::MAP | slice::STRING) != 0)
+        // The static type must implement one of the core families
+        // (:229-234) — the shared typed-receiver gate decides (literals,
+        // written bare names, wrapper-revealed names, member receivers
+        // through the bridge when mounted); an unresolvable receiver
+        // bails like the official `type == null` face.
+        super::static_type_faces::receiver_family(
+            c,
+            c.semantics(),
+            pieces,
+            name,
+            slice::ITERABLE | slice::MAP | slice::STRING,
+        )
+        .unwrap_or(false)
     }
 
     /// The constructor-initializer bail (:93-102): inside an initializer
@@ -1173,21 +3750,21 @@ pub(crate) mod prefer_is_empty {
 }
 
 pub(crate) mod prefer_is_not_empty {
-    use super::{Check, Group, NodeKind, RuleSpec, slice};
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_is_not_empty.dart:31-63` —
     /// `!x.isEmpty` reports at the prefix expression.
     ///
     /// The element checks (:57-62 — the property resolves to `isEmpty` and
-    /// its interface declares `isNotEmpty`) read through the shared literal
-    /// face: every core family carrying `isEmpty` also declares `isNotEmpty`,
-    /// so the name check plus the face query answers both. An opaque
-    /// receiver keeps the documented presumption (a user class with
-    /// `isEmpty` but no `isNotEmpty` over-reports). Operator-container and
-    /// statement owners bound the operand run exactly; a positional
-    /// argument list carries no separators, so a later argument's access
-    /// (`f(!x.length, y.isEmpty)`) false-fires — the documented residue.
-    /// Message: `diagnostic.g.dart` `preferIsNotEmpty`.
+    /// its interface declares `isNotEmpty`) read through the literal faces
+    /// plus the bridge member set when mounted: every core family carrying
+    /// `isEmpty` also declares `isNotEmpty`, and a receiver whose resolved
+    /// type declares `isEmpty` without `isNotEmpty` stays silent (the
+    /// documented user-class over-report closes); an unresolvable receiver
+    /// keeps the documented presumption. A positional argument list clips
+    /// the operand run at the argument boundaries — a later argument's
+    /// access no longer leaks into the run (the documented false-fire
+    /// face). Message: `diagnostic.g.dart` `preferIsNotEmpty`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_is_not_empty",
         group: Group::Core,
@@ -1215,7 +3792,24 @@ pub(crate) mod prefer_is_not_empty {
             return;
         };
         let bang_end = c.byte_span(node).end;
-        let kids = c.collect_direct(parent);
+        let mut kids = c.collect_direct(parent);
+        // A positional argument list carries no separators: the operand
+        // run is the bang's own argument — clip the sibling pieces at the
+        // argument boundaries (the documented false-fire face, a later
+        // argument's access leaking into the run).
+        if c.kind(parent) == NodeKind::Arguments {
+            let raw = kids.clone();
+            let ranges = slice::arguments(c, &raw);
+            if let Some(pos) = raw.iter().position(|&kid| kid == node) {
+                let clip = ranges
+                    .iter()
+                    .find(|range| range.contains(&pos))
+                    .or_else(|| ranges.iter().find(|range| range.start >= pos));
+                if let Some(range) = clip {
+                    kids = raw[range.clone()].to_vec();
+                }
+            }
+        }
         let run: Vec<u32> = match kids.iter().position(|&kid| kid == node) {
             Some(pos) if pos > 0 => kids[..pos].to_vec(),
             _ => {
@@ -1251,12 +3845,32 @@ pub(crate) mod prefer_is_not_empty {
         if c.lexeme(c.head_token(chain[name])) != "isEmpty" {
             return;
         }
-        // The interface declares `isNotEmpty` (:57-62): every core family
-        // with `isEmpty` does, so the face query decides.
-        if slice::receiver_faces(c, chain, name)
-            .is_some_and(|faces| faces & (slice::ITERABLE | slice::MAP | slice::STRING) == 0)
+        // The element checks (:57-62): the property resolves to `isEmpty`
+        // and its interface declares `isNotEmpty`. The literal faces
+        // decide closed (every core family carrying `isEmpty` declares
+        // `isNotEmpty`; a non-family literal resolves nothing and stays
+        // silent); a resolved member face decides the member set — a
+        // receiver type with `isEmpty` but no `isNotEmpty` stays silent
+        // (the documented user-class over-report closes); an
+        // unresolvable receiver keeps the documented presumption.
+        if let Some(faces) = slice::receiver_faces(c, chain, name) {
+            if faces & (slice::ITERABLE | slice::MAP | slice::STRING) == 0 {
+                return;
+            }
+        } else if let Some(analysis) = c.semantics()
+            && let Some(receiver) = slice::bare_receiver(c, chain, name)
         {
-            return;
+            let strings = analysis.strings();
+            let receiver_site = query_site(c, receiver);
+            if analysis
+                .member_of(receiver_site, strings.intern("isEmpty"))
+                .is_some()
+                && analysis
+                    .member_of(receiver_site, strings.intern("isNotEmpty"))
+                    .is_none()
+            {
+                return;
+            }
         }
         // The official reports at the prefix expression — from the `!`
         // through the member name. The completion marker's span trails one
@@ -1275,16 +3889,18 @@ pub(crate) mod avoid_function_literals_in_foreach_calls {
     /// — `x.forEach((e) { … })` reports at the method name.
     ///
     /// The receiver type check (`_isIterable`, :40-45) reads through the
-    /// shared literal face ([`slice::receiver_implements_any`]) — collection
-    /// literals decide (a map literal stays silent like the official
-    /// `Iterable`-only gate), an opaque receiver keeps the documented
-    /// presumption. The closure-arity stand-in remains for that opaque face:
-    /// a multi-parameter closure is the `Map.forEach` shape the syntax
-    /// cannot see (`map.forEach((k, v) …)` stays silent). The null-aware
-    /// chain bail (:87) reads the invocation's own marker word plus any
-    /// null-aware access over the receiver run — the access-chain lookups
-    /// farther out under-report on exotic chains. Message: `diagnostic.g.dart`
-    /// `avoidFunctionLiteralsInForeachCalls`.
+    /// resolution faces — collection literals and written bare-name types
+    /// decide (a user class provably outside `Iterable` stays silent), a
+    /// member receiver reads the bridge static type when mounted, and an
+    /// opaque receiver keeps the documented presumption. The
+    /// closure-arity stand-in remains for that opaque face: a
+    /// multi-parameter closure is the `Map.forEach` shape the syntax
+    /// cannot see (`map.forEach((k, v) …)` stays silent). A bare
+    /// `forEach(f)` invocation has no target and never dispatches
+    /// (:80). The null-aware chain bail (:87) reads the invocation's own
+    /// marker word plus any null-aware access over the receiver run — the
+    /// access-chain lookups farther out under-report on exotic chains.
+    /// Message: `diagnostic.g.dart` `avoidFunctionLiteralsInForeachCalls`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "avoid_function_literals_in_foreach_calls",
         group: Group::Recommended,
@@ -1305,6 +3921,11 @@ pub(crate) mod avoid_function_literals_in_foreach_calls {
         // to absent.
         let marker = slice::access_marker(c, &kids, pos, NodeKind::DotAccess);
         let Some((head, arguments)) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        // `target != null` (:80): a bare `forEach(f)` invocation has no
+        // target and never dispatches.
+        let Some(marker) = marker else {
             return;
         };
         let name = kids[head];
@@ -1337,11 +3958,11 @@ pub(crate) mod avoid_function_literals_in_foreach_calls {
         if has_method_chaining(c, &kids, head) {
             return;
         }
-        if chain_has_null_aware(c, &kids, head, marker) {
+        if chain_has_null_aware(c, &kids, head, Some(marker)) {
             return;
         }
-        // The receiver type check (:40-45).
-        if !slice::receiver_implements_any(c, &kids, head, slice::ITERABLE) {
+        // The receiver type check (:40-45 `_isIterable`).
+        if !receiver_is_iterable(c, &kids, head) {
             return;
         }
         // The closure-arity stand-in for the opaque `Map.forEach` face: a
@@ -1367,6 +3988,17 @@ pub(crate) mod avoid_function_literals_in_foreach_calls {
         }
         let range = c.utf16_span(name);
         c.report(range, &[]);
+    }
+
+    /// The receiver's `Iterable` verdict (`_isIterable`, :40-45 —
+    /// `type.implementsInterface('Iterable', 'dart.core')`): the shared
+    /// typed-receiver gate decides where the syntax can (literals,
+    /// written bare-name types — a user class is provably outside the
+    /// family; a member receiver through the bridge when mounted), and an
+    /// unresolvable receiver keeps the documented presumption.
+    fn receiver_is_iterable(c: &Check<'_>, kids: &[u32], head: usize) -> bool {
+        super::static_type_faces::receiver_family(c, c.semantics(), kids, head, slice::ITERABLE)
+            .unwrap_or(true)
     }
 
     /// `containsNullAwareInvocationInChain` (:87): the invocation's own
@@ -1403,9 +4035,9 @@ pub(crate) mod avoid_function_literals_in_foreach_calls {
 /// fallback family. `prefer_collection_literals` (collections.rs) reads the
 /// same scan for its typedef/shadow exemptions.
 pub(crate) mod same_file {
-    use super::{Check, NodeKind};
+    use super::{Check, NodeKind, query_site, slice};
 
-    /// Collapse map §1 `ModSet` member family: static is bit 3 (`mod_bits` in
+    /// `ModSet` member family: static is bit 3 (`mod_bits` in
     /// the bridge; [`dartq_ast::mod_flags`] reads the header bits back).
     pub(crate) const STATIC_BIT: u16 = 1 << 3;
 
@@ -1416,17 +4048,38 @@ pub(crate) mod same_file {
         name: u32,
         supers: Vec<u32>,
         clauses: Vec<u32>,
+        /// Whether the declaration binds the TYPE namespace for the lint
+        /// faces that consume this index — the upstream `_isTypeName`
+        /// element whitelist (ClassElement/ExtensionTypeElement/
+        /// TypeAliasElement/TypeParameterElement; `pkg/analyzer`
+        /// element.dart :1073/:2460). A `mixin` or `enum` declaration
+        /// still enters `classes` for the supertype-resolution walks but
+        /// stays out of `has_class`/`has_type`.
+        type_named: bool,
+    }
+
+    /// One same-file extension declaration: the member name tokens, the
+    /// `on` clause's written type name token, and whether that type is
+    /// written nullable.
+    pub(crate) struct ExtensionDecl {
+        members: Vec<u32>,
+        /// The `on` type's head name token (`None` when the clause never
+        /// produced an honest name — the face can never apply).
+        on_name: Option<u32>,
+        extended_nullable: bool,
     }
 
     /// The unit's type declarations: class-like shapes plus typedef names
     /// (a local typedef shadows any imported name in the combined
-    /// namespace), and the top-level value name tokens `declares_name`
-    /// answers from. Built once per run (the #703 F4 hoist — candidates no
-    /// longer re-walk the top-level declarations); the rows are token ids,
-    /// and name queries compare lexemes over them in declaration order.
+    /// namespace), the same-file extensions, and the top-level value name
+    /// tokens `declares_name` answers from. Built once per run (the #703 F4
+    /// hoist — candidates no longer re-walk the top-level declarations);
+    /// the rows are token ids, and name queries compare lexemes over them
+    /// in declaration order.
     pub(crate) struct Decls {
         classes: Vec<ClassDecl>,
         typedefs: Vec<u32>,
+        extensions: Vec<ExtensionDecl>,
         /// Top-level function/getter/setter/variable name tokens.
         values: Vec<u32>,
     }
@@ -1456,6 +4109,7 @@ pub(crate) mod same_file {
         let mut decls = Decls {
             classes: Vec::new(),
             typedefs: Vec::new(),
+            extensions: Vec::new(),
             values: Vec::new(),
         };
         let Some(root) = c.path.first().copied() else {
@@ -1485,6 +4139,9 @@ pub(crate) mod same_file {
                             decls.classes.push(decl);
                         }
                     }
+                    NodeKind::ExtensionDeclaration => {
+                        decls.extensions.push(extension_decl(c, inner));
+                    }
                     // Top-level function/getter/setter names (a written
                     // return type is a `TypeReference` identifier, filtered
                     // out here).
@@ -1510,10 +4167,15 @@ pub(crate) mod same_file {
     }
 
     impl Decls {
-        /// Whether a class-like declaration carries `name`.
+        /// Whether a class-like declaration carries `name` (the upstream
+        /// `_isTypeName` whitelist — a `mixin`/`enum` declaration is
+        /// scanned into `classes` for the supertype walks but does not
+        /// bind the type namespace).
         #[must_use]
         fn has_class(&self, c: &Check<'_>, name: &str) -> bool {
-            self.classes.iter().any(|d| c.lexeme(d.name) == name)
+            self.classes
+                .iter()
+                .any(|d| d.type_named && c.lexeme(d.name) == name)
         }
 
         /// Whether any type declaration (class-like or typedef) carries
@@ -1569,6 +4231,48 @@ pub(crate) mod same_file {
     pub(crate) fn resolve_super(c: &Check<'_>, name: &str, core: &[&'static str]) -> Verdict {
         let decls = scan(c);
         walk(c, &decls, name, true, core, &mut Vec::new())
+    }
+
+    /// The transitive written supertype name set of `name` (extends/with/
+    /// implements — the [`walk`] sequence) — the user-class-vs-user-class
+    /// comparability face the `unrelated_type_equality_checks` same-file
+    /// pair needs (`typesAreUnrelated` shares any supertype link).
+    /// `None` when the chain is incomplete: a supertype resolves outside
+    /// the file, and the unindexed link could reach the other name.
+    pub(crate) fn supertype_closure(c: &Check<'_>, name: &str) -> Option<Vec<String>> {
+        let decls = scan(c);
+        let mut names = Vec::new();
+        let mut unknown = false;
+        collect_chain(c, &decls, name, &mut names, &mut unknown, &mut Vec::new());
+        (!unknown).then_some(names)
+    }
+
+    /// The [`supertype_closure`] collector: every distinct supertype name
+    /// on the transitive chain; a not-same-file link marks the closure
+    /// incomplete.
+    fn collect_chain<'a>(
+        c: &Check<'a>,
+        decls: &Decls,
+        name: &'a str,
+        out: &mut Vec<String>,
+        unknown: &mut bool,
+        seen: &mut Vec<&'a str>,
+    ) {
+        if seen.contains(&name) {
+            return; // cyclic same-file chains are erroneous code
+        }
+        seen.push(name);
+        let Some(decl) = decls.classes.iter().find(|d| c.lexeme(d.name) == name) else {
+            *unknown = true;
+            return;
+        };
+        for token in decl.supers.iter().chain(decl.clauses.iter()) {
+            let spelled = c.lexeme(*token);
+            if !out.iter().any(|n| n == spelled) {
+                out.push(spelled.to_owned());
+            }
+            collect_chain(c, decls, spelled, out, unknown, seen);
+        }
     }
 
     /// The exact-name verdict: the static-call face matches
@@ -1634,7 +4338,11 @@ pub(crate) mod same_file {
         }
     }
 
-    /// The scope family of the innermost same-file value binding.
+    /// The scope family of the innermost same-file value binding. The
+    /// promotable split is upstream's: only locals and parameters are
+    /// `PromotableElementImpl` (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/element/element.dart` :3981/:8421/:9947);
+    /// every field or top-level variable read resolves to a `GetterElement`.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum BindingScope {
         /// A local declared in a block before the use.
@@ -1643,6 +4351,8 @@ pub(crate) mod same_file {
         Parameter,
         /// An instance field of the enclosing class-like scope.
         Field,
+        /// A static field of the enclosing class-like scope.
+        StaticField,
         /// A top-level variable.
         TopLevel,
     }
@@ -1651,7 +4361,7 @@ pub(crate) mod same_file {
     /// `(scope, written type row)` — the row `None` for an untyped binding,
     /// the lookup `None` when no same-file binding exists. The order is
     /// identifier resolution: locals declared before the use, parameters,
-    /// instance fields, top-level variables.
+    /// fields (instance and static), top-level variables.
     #[must_use]
     pub(crate) fn binding(
         c: &Check<'_>,
@@ -1696,8 +4406,13 @@ pub(crate) mod same_file {
                     {
                         return Some((BindingScope::Parameter, row));
                     }
-                    if let Some(row) = field_binding(c, c.path[i - 1], name) {
-                        return Some((BindingScope::Field, row));
+                    if let Some((is_static, row)) = field_binding(c, c.path[i - 1], name) {
+                        let scope = if is_static {
+                            BindingScope::StaticField
+                        } else {
+                            BindingScope::Field
+                        };
+                        return Some((scope, row));
                     }
                 }
                 NodeKind::CompilationUnit => {
@@ -1709,6 +4424,28 @@ pub(crate) mod same_file {
             }
         }
         None
+    }
+
+    /// [`binding`] for a rule dispatched AT a block row
+    /// (`cascade_invocations` keys on `Block`/`BlockBody`): the dispatched
+    /// block is itself a binding scope — the standard walk excludes
+    /// `path.last()`, which is exactly the row the statement-level rules
+    /// dispatch on. Falls through to [`binding`] for the outer scopes.
+    #[must_use]
+    pub(crate) fn binding_in_block(
+        c: &Check<'_>,
+        use_node: u32,
+        name: &str,
+    ) -> Option<(BindingScope, Option<u32>)> {
+        let node = c.node();
+        if matches!(
+            c.kind(node),
+            NodeKind::Block | NodeKind::BlockBody | NodeKind::SwitchCase
+        ) && let Some(row) = block_binding(c, node, c.byte_span(use_node).start, name)
+        {
+            return Some((BindingScope::Local, row));
+        }
+        binding(c, use_node, name)
     }
 
     /// The initializer range of the innermost `const` LOCAL binding of
@@ -1794,6 +4531,186 @@ pub(crate) mod same_file {
         scan(c).has_type(c, name)
     }
 
+    /// Whether `name` binds to a same-file VALUE at `use_node` — a local,
+    /// parameter, field, or top-level variable ([`binding`]), or a
+    /// top-level function/getter/setter (the values rows). The
+    /// type-literal faces use it to tell a type literal
+    /// (`(List<int>)`) from a same-file generic tear-off (`(fn<int>)`).
+    #[must_use]
+    pub(crate) fn declares_value(c: &Check<'_>, use_node: u32, name: &str) -> bool {
+        binding(c, use_node, name).is_some()
+            || scan(c).values.iter().any(|&tok| c.lexeme(tok) == name)
+    }
+
+    /// The resolve-then-judge verdict for the paren's trailing accessor
+    /// (the unnecessary_parenthesis null-aware-shorting faces, upstream
+    /// Dart SDK source, pkg/linter/lib/src/rules/unnecessary_parenthesis.dart
+    /// :117-124, :132-139): `true` keeps the parentheses, `false` lets the
+    /// one-token report stand. The accessor is judged per RESOLVED member
+    /// over the receiver's written type — never per name — so two
+    /// same-named members whose `on` types differ in nullability judge
+    /// independently:
+    ///
+    /// 1. a cross-file interface member (the semantic member walk) is not
+    ///    an extension application — upstream reports;
+    /// 2. a same-file class chain declaring the name wins over every
+    ///    extension application (the oracle resolves the interface face
+    ///    first) — upstream reports;
+    /// 3. the applicable same-file extension declarers split by `on`-type
+    ///    nullability: a non-nullable `on` type applies only where the
+    ///    nullable one does, so it is always the more specific resolution
+    ///    and upstream reports; a nullable-only split is the bail face —
+    ///    the parentheses are what stops the null-aware shorting;
+    /// 4. an accessor no same-file face declares may resolve through an
+    ///    import (another library's extension pool, which a file-local
+    ///    scan cannot see): upstream resolves through imports and stays
+    ///    silent over a nullable on type, so the same keep covers it (the
+    ///    genuinely undefined accessor under-reports by the same keep).
+    #[must_use]
+    pub(crate) fn nullable_extension_member(c: &Check<'_>, paren: u32, name: &str) -> bool {
+        // The bare-name receiver tiles in the four-piece send-group form
+        // (`parse_send` emits the full group for every bare name, inside
+        // the parentheses too) — strip the wrapper pieces before the
+        // single-row face matches.
+        let run = slice::access_run(c, &c.collect_direct(paren));
+        let Some(&head) = run.first() else {
+            return true;
+        };
+        // The cross-file class face (the semantic member walk first — the
+        // receiver's resolved type decides across files): a resolved
+        // interface member is never an extension application. The read row
+        // exists for a bare identifier receiver only.
+        if run.len() == 1
+            && c.kind(head) == NodeKind::Identifier
+            && let Some(analysis) = c.semantics()
+            && analysis
+                .member_of(query_site(c, head), analysis.strings().intern(name))
+                .is_some()
+        {
+            return false;
+        }
+        let Some((ty_name, ty_nullable)) = receiver_written_type(c, &run) else {
+            // The receiver's type is not decidable from this file (an
+            // imported head, a deeper chain, an untyped binding): the
+            // accessor may resolve through imports — keep the parens.
+            return true;
+        };
+        // Extensions never apply to `dynamic` (the oracle's element is
+        // null) — the one-token face reports.
+        if ty_name == "dynamic" {
+            return false;
+        }
+        // The interface member wins over every extension application.
+        if class_chain_declares(c, ty_name, name, &mut Vec::new()) {
+            return false;
+        }
+        // The same-file extension pool, judged per resolved member.
+        let scan = scan(c);
+        let mut nullable = 0usize;
+        let mut non_nullable = 0usize;
+        for decl in &scan.extensions {
+            let Some(on_name) = decl.on_name else {
+                continue;
+            };
+            // Applicability at name level: the written on type names the
+            // receiver's type, and a non-nullable on type never applies to
+            // a nullable receiver (`String? <: String` is false).
+            if c.lexeme(on_name) != ty_name
+                || (ty_nullable && !decl.extended_nullable)
+                || !decl.members.iter().any(|&tok| c.lexeme(tok) == name)
+            {
+                continue;
+            }
+            if decl.extended_nullable {
+                nullable += 1;
+            } else {
+                non_nullable += 1;
+            }
+        }
+        if non_nullable > 0 {
+            // The most specific resolution's on type is non-nullable —
+            // upstream falls through and reports.
+            return false;
+        }
+        if nullable > 0 {
+            // The resolved member's on type is nullable — the parentheses
+            // are required (:117-124, :132-139).
+            return true;
+        }
+        // No same-file face declares the accessor: an import may carry it.
+        // Upstream resolves through imports and keeps the parens over a
+        // nullable on type; the same keep covers the genuinely undefined
+        // accessor (the documented under-report).
+        true
+    }
+
+    /// The written type face of the parenthesized receiver run — the
+    /// `(name, nullable)` the accessor resolves against. Only a bare
+    /// identifier receiver is decidable here: it reads its innermost
+    /// binding. Every other shape — access chains, invocations, `this` —
+    /// stays `None` (the caller's conservative keep): the run is built by
+    /// [`slice::access_run`], which strips the access markers, so no access
+    /// member's type can be read off this run.
+    fn receiver_written_type<'a>(c: &'a Check<'a>, run: &[u32]) -> Option<(&'a str, bool)> {
+        let Some(&head) = run.first() else {
+            return None;
+        };
+        if c.kind(head) != NodeKind::Identifier {
+            return None;
+        }
+        let face = crate::rules::written_type_face(c, head, c.lexeme(c.head_token(head)))?;
+        Some((face.name?, face.nullable))
+    }
+
+    /// Whether the same-file class-like chain rooted at `name` declares
+    /// `member` — the interface face the oracle resolves before any
+    /// extension application. A cyclic chain is erroneous code; provably
+    /// no member behind it (the bounded `seen` guard).
+    fn class_chain_declares<'a>(
+        c: &'a Check<'a>,
+        name: &'a str,
+        member: &str,
+        seen: &mut Vec<&'a str>,
+    ) -> bool {
+        if seen.contains(&name) {
+            return false;
+        }
+        seen.push(name);
+        let decls = scan(c);
+        let Some(decl) = decls.classes.iter().find(|d| c.lexeme(d.name) == name) else {
+            return false;
+        };
+        if crate::rules::same_file_declaration(c, name)
+            .is_some_and(|row| body_declares_member(c, row, member))
+        {
+            return true;
+        }
+        decl.supers
+            .iter()
+            .any(|&sup| class_chain_declares(c, c.lexeme(sup), member, seen))
+    }
+
+    /// Whether the class-like `row` declares `member` in its own body
+    /// (methods and fields alike — a resolved static face reports the
+    /// same way upstream).
+    fn body_declares_member(c: &Check<'_>, row: u32, member: &str) -> bool {
+        crate::rules::body_members(c, row)
+            .into_iter()
+            .any(|kid| match c.kind(kid) {
+                NodeKind::Method => crate::rules::member_name(c, kid)
+                    .is_some_and(|name_row| c.lexeme(c.head_token(name_row)) == member),
+                NodeKind::Fields => c.collect_direct(kid).into_iter().any(|decl| {
+                    c.kind(decl) == NodeKind::VariablesDeclaration
+                        && c.collect_direct(decl).into_iter().any(|var| {
+                            c.kind(var) == NodeKind::InitializedIdentifier
+                                && crate::rules::initialized_identifier_name(c, var)
+                                    .is_some_and(|name_row| c.lexeme(name_row) == member)
+                        })
+                }),
+                _ => false,
+            })
+    }
+
     /// The explicit type of a local declared in `block` before `use_start`.
     /// The production shape: the name identifier carries the local-variable
     /// context word inside its `VariablesDeclaration` slice, typed by the
@@ -1814,9 +4731,7 @@ pub(crate) mod same_file {
         let mut written: Option<u32> = None;
         for kid in c.collect_direct(block) {
             match c.kind(kid) {
-                NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType => {
-                    written = Some(kid)
-                }
+                NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType => written = Some(kid),
                 NodeKind::VariablesDeclaration => {
                     // The name identifier: a direct child (hand-built trees)
                     // or nested inside an `InitializedIdentifier` row (the
@@ -1874,22 +4789,20 @@ pub(crate) mod same_file {
         None
     }
 
-    /// The explicit type of an instance field declared in the owner body.
-    #[expect(
-        clippy::option_option,
-        reason = "three states by design: name absent (outer None) vs \
-                  present-untyped vs present-typed; callers branch on the \
-                  outer layer first"
-    )]
-    fn field_binding(c: &Check<'_>, owner: u32, name: &str) -> Option<Option<u32>> {
+    /// The explicit type of a field declared in the owner body, paired with
+    /// whether the field is `static`. Statics bind the same namespace — a
+    /// `static` field read resolves to the field's getter element upstream,
+    /// and an innermost static shadows any outer binding.
+    fn field_binding(c: &Check<'_>, owner: u32, name: &str) -> Option<(bool, Option<u32>)> {
         for member in c.collect_direct(owner) {
-            if c.kind(member) != NodeKind::Fields
-                || dartq_ast::mod_flags(c.unit.ast, member) & STATIC_BIT != 0
-            {
+            if c.kind(member) != NodeKind::Fields {
                 continue;
             }
             if let Some(row) = fields_binding(c, member, name) {
-                return Some(row);
+                return Some((
+                    dartq_ast::mod_flags(c.unit.ast, member) & STATIC_BIT != 0,
+                    row,
+                ));
             }
         }
         None
@@ -1933,9 +4846,7 @@ pub(crate) mod same_file {
         let mut written: Option<u32> = None;
         for kid in c.collect_direct(fields) {
             match c.kind(kid) {
-                NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType => {
-                    written = Some(kid)
-                }
+                NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType => written = Some(kid),
                 NodeKind::Identifier
                     if c.payload(kid).first() == Some(&ctx)
                         && c.lexeme(c.head_token(kid)) == name =>
@@ -1983,6 +4894,15 @@ pub(crate) mod same_file {
             name,
             supers: Vec::new(),
             clauses: Vec::new(),
+            // The upstream `_isTypeName` element whitelist binds only
+            // ClassElement/ExtensionTypeElement/TypeAliasElement/
+            // TypeParameterElement; a `mixin` declaration stays out of
+            // `has_class` (but still feeds the supertype walks through
+            // `classes`).
+            type_named: !matches!(
+                c.kind(inner),
+                NodeKind::MixinDeclaration | NodeKind::EnumDeclaration
+            ),
         };
         if c.kind(inner) == NodeKind::ExtensionTypeDeclaration {
             // The implements names are the direct type-name identifiers
@@ -2014,10 +4934,117 @@ pub(crate) mod same_file {
         }
         Some(decl)
     }
+
+    /// One extension declaration's shape ([`ExtensionDecl`]): the `on`
+    /// type's nullability read lexically off the header tokens (the
+    /// built-in `on` keyword's next token names the extended type; a `?`
+    /// directly after it, or after a generic's closing `>`, spells the
+    /// nullable face), and the member names off the body rows — methods
+    /// through the method-declaration context identifier, fields through
+    /// the field-declaration context children (the validated
+    /// [`fields_binding`] tiling).
+    fn extension_decl(c: &Check<'_>, inner: u32) -> ExtensionDecl {
+        let end = c.unit.ast.token_range(inner).end;
+        let mut on_name = None;
+        let mut extended_nullable = false;
+        let mut token = c.head_token(inner);
+        for _ in 0..64 {
+            if token >= end {
+                break;
+            }
+            match c.lexeme(token) {
+                "{" | ";" => break,
+                "on" => {
+                    on_name = (token + 1 < end).then_some(token + 1);
+                    extended_nullable = written_nullable(c, token + 1, end);
+                    break;
+                }
+                _ => token += 1,
+            }
+        }
+        let mut members = Vec::new();
+        if let Some(body) = c
+            .collect_direct(inner)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::DeclarationBody)
+        {
+            let method_ctx = dartq_parser::IdentifierContext::MethodDeclaration as u32;
+            let field_ctx = dartq_parser::IdentifierContext::FieldDeclaration as u32;
+            for row in c.children(body) {
+                match c.kind(row) {
+                    NodeKind::Method => {
+                        if let Some(name) = c.collect_direct(row).into_iter().find(|&kid| {
+                            c.kind(kid) == NodeKind::Identifier
+                                && c.payload(kid).first() == Some(&method_ctx)
+                        }) {
+                            members.push(c.head_token(name));
+                        }
+                    }
+                    NodeKind::Fields => {
+                        for kid in c.collect_direct(row) {
+                            if c.kind(kid) == NodeKind::Identifier
+                                && c.payload(kid).first() == Some(&field_ctx)
+                            {
+                                members.push(c.head_token(kid));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ExtensionDecl {
+            members,
+            on_name,
+            extended_nullable,
+        }
+    }
+
+    /// Whether the extended-type spelling starting at `name` carries a
+    /// written `?` — directly (`String?`), past a generic's closing `>`
+    /// (`List<String>?`), or past a prefixed name's dots (`p.T?`).
+    /// Bounded by the header's token extent.
+    fn written_nullable(c: &Check<'_>, name: u32, end: u32) -> bool {
+        if name >= end {
+            return false;
+        }
+        match c.lexeme(name) {
+            "<" => {
+                let mut depth = 1usize;
+                let mut token = name + 1;
+                for _ in 0..64 {
+                    if token >= end {
+                        return false;
+                    }
+                    match c.lexeme(token) {
+                        "<" => depth += 1,
+                        ">" => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return token + 1 < end && c.lexeme(token + 1) == "?";
+                            }
+                        }
+                        _ => {}
+                    }
+                    token += 1;
+                }
+                false
+            }
+            "." => false, // degenerate (the walk anchored mid-prefix)
+            _ => {
+                // A prefixed name walks to its last identifier first.
+                let mut token = name;
+                while token + 2 < end && c.lexeme(token + 1) == "." {
+                    token += 2;
+                }
+                token + 1 < end && c.lexeme(token + 1) == "?"
+            }
+        }
+    }
 }
 
 pub(crate) mod null_closures {
-    use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, same_file, slice};
 
     /// Official: `pkg/linter/lib/src/rules/null_closures.dart` — a `null`
     /// passed in a closure position of a known core API reports at the
@@ -2200,25 +5227,43 @@ pub(crate) mod null_closures {
                     .find(|&k| c.kind(k) == NodeKind::Identifier),
                 _ => None,
             })?;
-        unnamed_slots(c, c.lexeme(c.head_token(callee)))
+        unnamed_slots(c, query_site(c, callee), c.lexeme(c.head_token(callee)))
     }
 
     /// The unnamed-creation table hit for one written type name, gated on
     /// the same-file superclass chain (`extendsClass`, extensions.dart
     /// :305-353): a same-file class shadows its core namesake, a same-file
-    /// subclass reports like the official.
-    fn unnamed_slots(c: &Check<'_>, name: &str) -> Option<Slots> {
+    /// subclass reports like the official, and a cross-file resolution is
+    /// a user class — the official supertype walk cannot reach
+    /// dart:async through it (the supertypes live outside this file), so
+    /// the written-name fallback stays silent for it.
+    fn unnamed_slots(c: &Check<'_>, site: dartq_source::SourceRange, name: &str) -> Option<Slots> {
         match same_file::resolve_super(c, name, CORE_TYPES) {
             same_file::Verdict::NotCore => None,
             same_file::Verdict::Core(core) => CONSTRUCTORS
                 .iter()
                 .find(|entry| entry.0.0 == core && entry.0.1.is_none())
                 .map(|entry| entry.1),
-            same_file::Verdict::Unknown => CONSTRUCTORS
-                .iter()
-                .find(|entry| entry.0.0 == name && entry.0.1.is_none())
-                .map(|entry| entry.1),
+            same_file::Verdict::Unknown => {
+                if resolves_declared_container(c, site) {
+                    return None;
+                }
+                CONSTRUCTORS
+                    .iter()
+                    .find(|entry| entry.0.0 == name && entry.0.1.is_none())
+                    .map(|entry| entry.1)
+            }
         }
+    }
+
+    /// Whether the written type name at `site` resolves as a declared
+    /// container through the bridge (a user class, same-file resolution
+    /// aside — the core library types are not in the graph and stay
+    /// unresolved). No mounted face answers `false` (the fallback keeps
+    /// the plain-run posture).
+    fn resolves_declared_container(c: &Check<'_>, site: dartq_source::SourceRange) -> bool {
+        c.semantics()
+            .is_some_and(|analysis| analysis.resolve_constructor(site, None).is_some())
     }
 
     /// The send face over the owner slice with the invocation send at
@@ -2230,40 +5275,51 @@ pub(crate) mod null_closures {
         }
         let member_face = slice::access_marker(c, kids, pos, NodeKind::DotAccess);
         match member_face {
-            None => unnamed_slots(c, c.lexeme(c.head_token(kids[head]))),
+            None => unnamed_slots(
+                c,
+                query_site(c, kids[head]),
+                c.lexeme(c.head_token(kids[head])),
+            ),
             Some(access) => member_slots(c, kids, head, access),
         }
     }
 
     /// The member-access faces over the owner slice with the selector at
-    /// `sel` and the `DotAccess` marker after the send: the receiver is
-    /// the bare-identifier tear-off group ending just before the selector
-    /// — anything else (a chained or computed receiver) bails
-    /// (conservative; the official resolves it through the element
-    /// model). The static and named-creation tables key on the written
-    /// receiver name (`Timer.periodic` — a class reference); otherwise
-    /// the instance face resolves the receiver's declared type (`xs.map`
-    /// — a value), Core verdicts only.
+    /// `sel` and the `DotAccess` marker after the send. The bare-receiver
+    /// faces stand (the static and named-creation tables key on the
+    /// written receiver name — `Timer.periodic`; the instance face
+    /// resolves the receiver's declared type through the same-file
+    /// all-supertypes chain). A chained or `this.` receiver reads its
+    /// bridge static type when mounted (`a.b.map(null)`,
+    /// `this.list.map(null)`) — the method table filters on the named
+    /// core class, and an unresolvable receiver stays silent like the
+    /// official `_getInstanceMethod` miss.
     fn member_slots(c: &Check<'_>, kids: &[u32], sel: usize, _access: u32) -> Option<Slots> {
-        let group_start = sel.checked_sub(4)?;
-        if !slice::is_tear_off_group(c, kids, group_start) {
-            return None;
-        }
         let member = c.lexeme(c.head_token(kids[sel]));
-        let written = c.lexeme(c.head_token(kids[group_start]));
-        named_slots(c, written, member).or_else(|| {
+        let group_start = sel.checked_sub(4)?;
+        if slice::is_tear_off_group(c, kids, group_start) {
+            let written = c.lexeme(c.head_token(kids[group_start]));
+            if let Some(slots) = named_slots(c, query_site(c, kids[group_start]), written, member) {
+                return Some(slots);
+            }
             let verdict = same_file::written_type(c, kids[group_start], written)
                 .map_or(same_file::Verdict::NotCore, |ty| {
                     same_file::resolve(c, ty, CORE_TYPES)
                 });
-            match verdict {
+            return match verdict {
                 same_file::Verdict::Core(core) => INSTANCE_METHODS
                     .iter()
                     .find(|entry| entry.0 == member && entry.1.contains(&core))
                     .map(|entry| entry.2),
                 same_file::Verdict::NotCore | same_file::Verdict::Unknown => None,
-            }
-        })
+            };
+        }
+        let analysis = c.semantics()?;
+        let core = super::static_type_faces::receiver_type_name(c, analysis, &kids[..sel])?;
+        INSTANCE_METHODS
+            .iter()
+            .find(|entry| entry.0 == member && entry.1.contains(&core.as_str()))
+            .map(|entry| entry.2)
     }
 
     /// `_checkNullArgForClosure` (:268-293): a `null` in a closure slot
@@ -2272,7 +5328,7 @@ pub(crate) mod null_closures {
     /// wrappers, then the arguments in order — a bare-identifier argument
     /// wraps in the four-piece tear-off group, and a named argument
     /// flattens as `name value… NamedArgument` (the marker anchors at the
-    /// colon, so the name is the identifier ending right at it).
+    /// value head, so the name is the identifier two tokens back).
     fn report_nulls(c: &mut Check<'_>, arguments: u32, positions: &[usize], named: &[&str]) {
         let pieces = c.collect_direct(arguments);
         let mut consumed = vec![false; pieces.len()];
@@ -2330,18 +5386,32 @@ pub(crate) mod null_closures {
     /// The named-creation / static-call face keyed on the written name
     /// before the dot: the named-creation table first, then the static
     /// table (the official splits them on the target's element — a class
-    /// element vs a top-level function; one written shape serves both).
-    fn named_slots(c: &Check<'_>, class_name: &str, member_name: &str) -> Option<Slots> {
+    /// element vs a top-level function; one written shape serves both). A
+    /// cross-file container resolution is a user class — the official
+    /// element identity (`element.name == function.type`) cannot hold for
+    /// it, so the written-name fallback stays silent.
+    fn named_slots(
+        c: &Check<'_>,
+        site: dartq_source::SourceRange,
+        class_name: &str,
+        member_name: &str,
+    ) -> Option<Slots> {
         let constructor = match same_file::resolve_super(c, class_name, CORE_TYPES) {
             same_file::Verdict::NotCore => None,
             same_file::Verdict::Core(core) => CONSTRUCTORS
                 .iter()
                 .find(|entry| entry.0.0 == core && entry.0.1 == Some(member_name))
                 .map(|entry| entry.1),
-            same_file::Verdict::Unknown => CONSTRUCTORS
-                .iter()
-                .find(|entry| entry.0.0 == class_name && entry.0.1 == Some(member_name))
-                .map(|entry| entry.1),
+            same_file::Verdict::Unknown => {
+                if resolves_declared_container(c, site) {
+                    None
+                } else {
+                    CONSTRUCTORS
+                        .iter()
+                        .find(|entry| entry.0.0 == class_name && entry.0.1 == Some(member_name))
+                        .map(|entry| entry.1)
+                }
+            }
         };
         constructor.or_else(|| match same_file::direct(c, class_name, CORE_TYPES) {
             same_file::Verdict::NotCore => None,
@@ -2349,17 +5419,23 @@ pub(crate) mod null_closures {
                 .iter()
                 .find(|entry| entry.0 == core && entry.1 == member_name)
                 .map(|entry| entry.2),
-            same_file::Verdict::Unknown => STATICS
-                .iter()
-                .find(|entry| entry.0 == class_name && entry.1 == member_name)
-                .map(|entry| entry.2),
+            same_file::Verdict::Unknown => {
+                if resolves_declared_container(c, site) {
+                    None
+                } else {
+                    STATICS
+                        .iter()
+                        .find(|entry| entry.0 == class_name && entry.1 == member_name)
+                        .map(|entry| entry.2)
+                }
+            }
         })
     }
 }
 
 pub(crate) mod unnecessary_this {
     use super::{Check, Group, NodeKind, RuleSpec, same_file};
-    use crate::rules::NONE_TOKEN;
+    use crate::rules::{NONE_TOKEN, utf16_token_span};
 
     /// Official: `pkg/linter/lib/src/rules/unnecessary_this.dart` — a `this.`
     /// qualifier reports at the `this` keyword unless shadowing makes it
@@ -2378,14 +5454,15 @@ pub(crate) mod unnecessary_this {
     /// inherited, or declared on the class itself and reachable through the
     /// instance interface) does the `this.` report.
     ///
-    /// Same-file approximation: the unit's own declarations bail through
-    /// [`same_file::declares_name`]; an unprefixed import bails when it can
-    /// provide the name (no combinators, or the name inside `show` /
-    /// outside `hide` — a combinatored import that provably excludes the
-    /// name keeps reporting). The import bail under-reports the official
-    /// face where the import's library does not actually export the name
-    /// (the conservative family: element identity is not derivable here).
-    /// Message: `diagnostic.g.dart` `unnecessaryThis`.
+    /// The unit's own declarations bail through [`same_file::declares_name`];
+    /// the import layer rides the semantic bridge's import face
+    /// ([`Analysis::import_shadows`]): a prefixed import contributes its
+    /// prefix spelling alone, an unprefixed import contributes its target's
+    /// combinator-filtered export set, and an out-of-graph target keeps the
+    /// conservative `true` — the `this.` silences, never reporting over a
+    /// possible shadow. A mount without semantics degrades to the no-bail
+    /// face (the lexical import guess is gone). Message:
+    /// `diagnostic.g.dart` `unnecessaryThis`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "unnecessary_this",
         group: Group::Recommended,
@@ -2406,14 +5483,14 @@ pub(crate) mod unnecessary_this {
     /// `visitConstructorFieldInitializer` (:31-35): the written `this` on a
     /// field initializer always reports — the bare `x = e;` form exists.
     /// The `Initializer` node owns the `this` prefix (its span head; the
-    /// `FieldInitializer` child begins at the `=`, collapse map §3.3 both
-    /// rows).
+    /// `FieldInitializer` child begins at the `=`). The official reports
+    /// at the `this` token (`reportAtToken(thisKeyword)`).
     fn check_field_initializer(c: &mut Check<'_>) {
         if c.lexeme(c.head_token(c.node())) != "this" {
             return;
         }
-        let start = c.utf16_span(c.node()).start;
-        c.report(start..start, &[]);
+        let range = utf16_token_span(c, c.head_token(c.node()));
+        c.report(range, &[]);
     }
 
     /// `visitThisExpression` (:37-64): `this.name` accesses only. The
@@ -2440,16 +5517,27 @@ pub(crate) mod unnecessary_this {
         if c.kind(selector) != NodeKind::Identifier {
             return;
         }
-        let access = kids[pos + 2..].iter().copied().find(|&kid| {
-            c.kind(kid) == NodeKind::DotAccess
-                && c.utf16_span(kid).start <= c.utf16_span(selector).start
-                && c.utf16_span(kid).end >= c.utf16_span(selector).end
-        });
-        let Some(access) = access else {
-            return;
+        // The `DotAccess` marker rides the expression piece run — a flat
+        // sibling for `this.width;`, or inside an adopted container's
+        // window for `this.width * 2` (the binary owns the marker). Walk
+        // the run's rows and each container's window for the marker whose
+        // span covers the selector.
+        let selector_span = c.utf16_span(selector);
+        let mut stack: Vec<u32> = kids[pos + 2..].to_vec();
+        let access = loop {
+            let Some(row) = stack.pop() else {
+                return;
+            };
+            if c.kind(row) == NodeKind::DotAccess {
+                let span = c.utf16_span(row);
+                if span.start <= selector_span.start && span.end >= selector_span.end {
+                    break row;
+                }
+            }
+            stack.extend(c.collect_direct(row));
         };
         // `!parent.isNullAware` (:49/:53) — the payload word is the
-        // `is_null_aware` bool (collapse map §3.5 DotAccess row).
+        // `is_null_aware` bool of the `DotAccess` payload.
         if c.payload(access).get(1).copied().unwrap_or(0) != 0 {
             return;
         }
@@ -2457,9 +5545,14 @@ pub(crate) mod unnecessary_this {
         if member_shadows(c, node, name_lexeme) {
             return;
         }
-        // The name scope (:66-83): unprefixed imports and unit
-        // declarations — a hit that is not the member bails.
-        if import_may_shadow(c, name_lexeme) {
+        // The library-scope half of the name scope (:66-83): the import
+        // face — an import bringing `name` into the unit scope makes the
+        // `this.` necessary. Out-of-graph targets answer the conservative
+        // `true`; a mount without semantics carries no import face and
+        // keeps reporting.
+        if let Some(analysis) = c.semantics()
+            && analysis.import_shadows(analysis.strings().intern(name_lexeme))
+        {
             return;
         }
         if same_file::declares_name(c, name_lexeme) {
@@ -2467,60 +5560,10 @@ pub(crate) mod unnecessary_this {
         }
         // No scope hit (`isNone`): the unqualified form resolves through
         // the instance interface — the enclosing class declares the member,
-        // or it is inherited (:87-95 element identity).
-        let start = c.utf16_span(node).start;
-        c.report(start..start, &[]);
-    }
-
-    /// Whether an unprefixed import can provide `name` in the unqualified
-    /// scope. A prefixed import never can; combinators narrow the face —
-    /// `show` lists are authoritative (only listed names enter scope), and
-    /// `hide` excludes the hidden names.
-    fn import_may_shadow(c: &Check<'_>, name: &str) -> bool {
-        let Some(root) = c.path.first().copied() else {
-            return false;
-        };
-        for top in c.collect_direct(root) {
-            for inner in c.collect_direct(top) {
-                if c.kind(inner) != NodeKind::Import {
-                    continue;
-                }
-                // The `as` prefix word (collapse map §3.1): present means
-                // the names are reachable only prefixed.
-                if c.payload(inner).first().copied().unwrap_or(NONE_TOKEN) != NONE_TOKEN {
-                    continue;
-                }
-                let mut shown = false;
-                let mut hidden = false;
-                for kid in c.collect_direct(inner) {
-                    match c.kind(kid) {
-                        NodeKind::Show => {
-                            if combinator_lists(c, kid, name) {
-                                // Authoritatively provided.
-                                return true;
-                            }
-                            shown = true;
-                        }
-                        NodeKind::Hide => {
-                            hidden = hidden || combinator_lists(c, kid, name);
-                        }
-                        _ => {}
-                    }
-                }
-                if !shown && !hidden {
-                    // An unfiltered import may export anything.
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    /// Whether a `show`/`hide` combinator lists `name`.
-    fn combinator_lists(c: &Check<'_>, combinator: u32, name: &str) -> bool {
-        c.collect_direct(combinator)
-            .into_iter()
-            .any(|kid| c.kind(kid) == NodeKind::Identifier && c.lexeme(c.head_token(kid)) == name)
+        // or it is inherited (:87-95 element identity). The official
+        // reports at the `this` token (`reportAtToken(node.thisKeyword)`).
+        let range = utf16_token_span(c, c.head_token(node));
+        c.report(range, &[]);
     }
 
     /// Whether any declaration visible between the use and the enclosing
@@ -2561,10 +5604,14 @@ pub(crate) mod unnecessary_this {
                 }
                 NodeKind::LocalFunctionDeclaration => {
                     // The function name binds from its declaration on; the
-                    // parameters scope the whole body.
-                    let names_decl = crate::rules::member_name(c, ancestor).is_some_and(|decl| {
-                        c.lexeme(c.head_token(decl)) == name && c.byte_span(decl).start < use_start
-                    });
+                    // parameters scope the whole body. The name nests under
+                    // `FunctionName` — `member_declaration_name` reaches it.
+                    let names_decl =
+                        crate::rules::declarations::member_declaration_name(c, ancestor)
+                            .is_some_and(|decl| {
+                                c.lexeme(c.head_token(decl)) == name
+                                    && c.byte_span(decl).start < use_start
+                            });
                     if names_decl || collect_member_parameters(c, ancestor).contains(&name) {
                         return true;
                     }
@@ -2643,7 +5690,9 @@ pub(crate) mod unnecessary_this {
 }
 
 pub(crate) mod prefer_interpolation_to_compose_strings {
-    use super::{Check, Group, NodeKind, RuleSpec, slice};
+    use dartq_scanner::TokenKind;
+
+    use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_interpolation_to_compose_strings.dart:32-88`
     /// — an adjacent `(literal, value)` pair in a `+` chain reports over the
@@ -2652,16 +5701,23 @@ pub(crate) mod prefer_interpolation_to_compose_strings {
     /// The left-operand String type check
     /// (`leftOperand.staticType.isDartCoreString`, :85) reads through the
     /// shared literal face ([`slice::literal_faces`]) — a string literal
-    /// operand decides, a provably non-string literal (a record) passes, and
-    /// an opaque operand keeps the documented presumption (a user `operator+`
-    /// class over-reports). Chains report once at the chain root; the
+    /// operand decides, a provably non-string literal (a record) passes,
+    /// and an opaque operand answers at its same-file written type (a
+    /// non-`String` binding is the user type — #792's
+    /// `test_variableNotString`), an untyped local's string-literal
+    /// initializer answering `String` first (the #1135 declaration-side
+    /// gate), the remaining untyped face presuming the user type when the
+    /// same file declares any `operator +` and the string presumption
+    /// otherwise. Chains report once at the chain root; the
     /// official's per-node re-visit would re-report inner pairs. The operand
     /// units are the chain's piece runs closed at expression tails; a
     /// multi-piece operand without an invocation tail (`x.y + 'a'`) splits
-    /// piece-wise — a documented divergence affecting the report span only.
-    /// Raw strings and both-literal pairs pass verbatim (:70-75); a
-    /// `toString` invocation with arguments passes (:78-82). Message:
-    /// `diagnostic.g.dart` `preferInterpolationToComposeStrings`.
+    /// piece-wise — a documented divergence affecting the report span only
+    /// (the gate reads the operand faces, never the span shape, so the
+    /// span stays un-normalized by design). Raw strings and both-literal
+    /// pairs pass verbatim (:70-75); a `toString` invocation with arguments
+    /// passes (:78-82). Message: `diagnostic.g.dart`
+    /// `preferInterpolationToComposeStrings`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_interpolation_to_compose_strings",
         group: Group::Recommended,
@@ -2675,12 +5731,13 @@ pub(crate) mod prefer_interpolation_to_compose_strings {
         let node = c.node();
         // Only the chain root flattens (the official `chainedAdditions` walk
         // re-reports from every inner node; once per chain is the anchor).
-        if c.lexeme(c.payload(node).first().copied().expect("binary op")) != "+" {
+        if c.payload_word(node, 0).map(|op| c.lexeme(op)) != Some("+") {
             return;
         }
         let is_inner_plus = c.ancestor(1).is_some_and(|parent| {
             c.kind(parent) == NodeKind::BinaryExpression
-                && c.lexeme(c.payload(parent).first().copied().expect("binary op")) == "+"
+                && c.payload_word(parent, 0)
+                    .is_none_or(|op| c.lexeme(op) == "+")
         });
         if is_inner_plus {
             return;
@@ -2694,7 +5751,7 @@ pub(crate) mod prefer_interpolation_to_compose_strings {
         let mut pieces = Vec::with_capacity(left.len() + right.len());
         for &kid in &left {
             if c.kind(kid) == NodeKind::BinaryExpression
-                && c.lexeme(c.payload(kid).first().copied().expect("binary op")) == "+"
+                && c.payload_word(kid, 0).map(|op| c.lexeme(op)) == Some("+")
             {
                 chain_pieces(c, kid, &mut pieces);
             } else {
@@ -2730,10 +5787,10 @@ pub(crate) mod prefer_interpolation_to_compose_strings {
             }
             // `leftOperand.staticType?.isDartCoreString` (:85): a string
             // literal decides, a provably non-string literal passes, the
-            // opaque face presumes.
+            // opaque face answers at the same-file written type.
             let string_left = match slice::literal_faces(c, left[0]) {
                 Some(faces) => faces & slice::STRING != 0,
-                None => true,
+                None => opaque_left_is_string(c, left),
             };
             if !string_left {
                 continue;
@@ -2755,7 +5812,7 @@ pub(crate) mod prefer_interpolation_to_compose_strings {
     fn chain_pieces(c: &Check<'_>, node: u32, out: &mut Vec<u32>) {
         for kid in c.collect_direct(node) {
             if c.kind(kid) == NodeKind::BinaryExpression
-                && c.lexeme(c.payload(kid).first().copied().expect("binary op")) == "+"
+                && c.payload_word(kid, 0).map(|op| c.lexeme(op)) == Some("+")
             {
                 chain_pieces(c, kid, out);
             } else {
@@ -2826,11 +5883,135 @@ pub(crate) mod prefer_interpolation_to_compose_strings {
         }
         arguments.is_some_and(|args| !c.collect_direct(args).is_empty())
     }
+
+    /// The opaque left operand's `isDartCoreString` face (:74): the
+    /// official reads the operand's static type. The same-file written
+    /// face: a binding with a written non-`String` type is the user type
+    /// (silent — #792), a written `String` reports, an untyped local whose
+    /// initializer is a plain string-literal run is dart:core `String`
+    /// (adjudication #1135's declaration-side gate — the file's
+    /// `operator +` never fires on a `String` receiver), and the remaining
+    /// untyped or unbound face presumes the user type when the same file
+    /// declares any `operator +` (a user-type `+` makes the operand's
+    /// static type that user type, never dart:core `String`), the string
+    /// presumption otherwise.
+    fn opaque_left_is_string(c: &Check<'_>, unit: &[u32]) -> bool {
+        if let Some(root) = unit
+            .iter()
+            .copied()
+            .find(|&p| c.kind(p) == NodeKind::Identifier)
+        {
+            let name = c.lexeme(c.head_token(root));
+            match same_file::written_type(c, root, name) {
+                Some("String") => return true,
+                Some(_) => return false,
+                None => {
+                    if inferred_string_local(c, root) {
+                        return true;
+                    }
+                }
+            }
+        }
+        !same_file_declares_plus(c)
+    }
+
+    /// Whether `row`'s name binds to an untyped local declared before the
+    /// use whose initializer is a plain string-literal run (a sole literal
+    /// or an adjacent chain — static type non-nullable `String`). The same
+    /// innermost-block walk the strings module's inferred-local face
+    /// runs; a written type never reaches here.
+    fn inferred_string_local(c: &Check<'_>, row: u32) -> bool {
+        let name = c.lexeme(c.head_token(row));
+        let use_start = c.byte_span(row).start;
+        for i in (0..c.path.len().saturating_sub(1)).rev() {
+            let ancestor = c.path[i];
+            if !matches!(c.kind(ancestor), NodeKind::Block | NodeKind::BlockBody) {
+                continue;
+            }
+            for kid in c.collect_direct(ancestor) {
+                if c.kind(kid) != NodeKind::VariablesDeclaration {
+                    continue;
+                }
+                for var in c
+                    .collect_direct(kid)
+                    .into_iter()
+                    .filter(|&var| c.kind(var) == NodeKind::InitializedIdentifier)
+                {
+                    let binds = crate::rules::initialized_identifier_name(c, var)
+                        .is_some_and(|tok| c.lexeme(tok) == name)
+                        && c.byte_span(var).start < use_start;
+                    if binds {
+                        let Some(range) =
+                            crate::rules::flow::exhaustive_cases::initializer_range(c, var)
+                        else {
+                            return false;
+                        };
+                        return range.start < range.end
+                            && (range.start..range.end).all(|token| {
+                                c.unit
+                                    .tokens
+                                    .get(token as usize)
+                                    .is_some_and(|t| t.kind == TokenKind::String)
+                            });
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the same file declares an `operator +` on a user type — a
+    /// class, mixin, enum, or extension type whose `+` is a member
+    /// declaration. Extensions are exempt: an extension `+` never changes
+    /// the receiver's static type (`'a' + x` stays `String` and reports).
+    fn same_file_declares_plus(c: &Check<'_>) -> bool {
+        let Some(&root) = c.path.first() else {
+            return false;
+        };
+        for top in c.collect_direct(root) {
+            for inner in c.collect_direct(top) {
+                if matches!(
+                    c.kind(inner),
+                    NodeKind::ClassDeclaration
+                        | NodeKind::MixinDeclaration
+                        | NodeKind::EnumDeclaration
+                        | NodeKind::ExtensionTypeDeclaration
+                ) && class_declares_plus(c, inner)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the declaration's members carry an `operator +`: the
+    /// [`NodeKind::OperatorName`] marker tiles beside its `Method` in the
+    /// declaration body's completion window (the production bridge keeps
+    /// it out of the method's own children), so the window scan reads the
+    /// marker's operator token (payload word 0) directly.
+    fn class_declares_plus(c: &Check<'_>, decl: u32) -> bool {
+        for member in c.children(decl) {
+            if c.kind(member) == NodeKind::OperatorName
+                && c.lexeme(
+                    c.payload(member)
+                        .first()
+                        .copied()
+                        .unwrap_or(crate::rules::NONE_TOKEN),
+                ) == "+"
+            {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 pub(crate) mod prefer_final_fields {
-    use super::{Check, Group, NodeKind, RuleSpec};
-    use crate::rules::NONE_TOKEN;
+    use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
+    use crate::rules::{
+        MemberQuery, NONE_TOKEN, body_members, member_matches, same_file_ancestors,
+    };
 
     /// Official: `pkg/linter/lib/src/rules/prefer_final_fields.dart` — a
     /// private non-`final` field never mutated reports when it is
@@ -2842,16 +6023,31 @@ pub(crate) mod prefer_final_fields {
     ///
     /// Approximations (documented — the official runs on resolved elements
     /// across the whole library; this is one unit, name-level):
-    /// - Mutations are bare-name writes: assignment targets (any operator)
-    ///   and `++`/`--` operands. Pattern-assignment writes (`(_x,) = ...`)
-    ///   and cascade-section writes (`.._x = 1`) are not scanned, so a field
-    ///   mutated only there over-reports; a same-named LOCAL mutated
-    ///   anywhere marks the field mutated and under-reports. Index writes
-    ///   (`_x[0] = 1`) do not count — matching the official, whose
-    ///   `writeElement` for them is the `[]=` method, not the field.
-    /// - Private-ness is the leading underscore; the setter-override
-    ///   exemption (`_overridesField`, :147-158) is element-bound and
-    ///   skipped, so a field overriding a superclass setter over-reports.
+    /// - Mutations are bare-name writes: assignment targets (any operator),
+    ///   `++`/`--` operands, and cascade-section write targets (`.._x = 1`
+    ///   — a section assignment is an `AssignmentExpression` upstream and
+    ///   its `writeElement` is the field). A write captured by a nearer
+    ///   same-file binding — a local, a parameter, a catch/for/case binder
+    ///   (the shadow-check face shared with the declarations.rs write
+    ///   scans) — does not count. Remaining element splits fold into the
+    ///   bare name: a `this._x` target, a same-named field of another
+    ///   class, and a cascade-section postfix (`o.._x++` — the postfix row
+    ///   wraps the whole cascade and reads no bare head) under-report.
+    ///   Index writes (`_x[0] = 1`) do not count — matching the official,
+    ///   whose `writeElement` for them is the `[]=` method, not the field.
+    ///   Pattern assignments (`(_x,) = ...`, `var (...) = ...`) do not
+    ///   count either — the official registers no pattern-assignment
+    ///   visitor (:41-48), so a field mutated only there reports, exactly
+    ///   as upstream.
+    /// - Private-ness is the leading underscore. The setter-override
+    ///   exemption (`_overridesField`, :147-158) reads the written
+    ///   extends/with/implements chain — the same-file ancestor walk, then
+    ///   the semantic bridge's inheritance arm under the `name=` setter
+    ///   spelling; unresolved chains over-report. A same-class `set _x` is
+    ///   no arm: the official `getOverridden` is supertype-only, and a
+    ///   non-final field beside a same-name setter is the front-end's
+    ///   setter-conflicts-with-declaration error, so no valid shape needs
+    ///   it.
     /// - The cross-unit half of the official library scan
     ///   (`_fieldsFromParameters` — primary-constructor declaring formals,
     ///   :114-131) is out of the substrate and under-reports.
@@ -2880,13 +6076,20 @@ pub(crate) mod prefer_final_fields {
         };
         let mut candidates: Vec<Candidate<'_>> = Vec::new();
         let mut mutated: Vec<&str> = Vec::new();
-        scan(c, root, None, &mut candidates, &mut mutated);
+        let mut path: Vec<u32> = Vec::new();
+        scan(c, root, None, &mut candidates, &mut mutated, &mut path);
         // A field row reachable from both the class row and a body
         // container yields the candidate twice; keep one.
         candidates.sort_by_key(|candidate| candidate.declaration);
         candidates.dedup_by_key(|candidate| candidate.declaration);
         for candidate in &candidates {
             if mutated.contains(&candidate.name) {
+                continue;
+            }
+            // `_overridesField` (:147-158): a field whose written
+            // supertype chain carries a setter of the same name never
+            // candidates.
+            if overrides_setter(c, candidate.class_row, candidate.name) {
                 continue;
             }
             // The constructors of the field's own class (:62-71). The class
@@ -2911,15 +6114,18 @@ pub(crate) mod prefer_final_fields {
     }
 
     /// The one-pass unit walk: candidates from `Fields` declarations and
-    /// mutations from bare-name writes. Enum and extension-type bodies are
-    /// skipped whole (the official excludes their fields, :98/:118-121);
-    /// top-level declarations are not fields and never match.
+    /// mutations from bare-name writes. `path` carries the enclosing nodes
+    /// of the visited row (the shadow gate reads it). Enum and
+    /// extension-type bodies are skipped whole (the official excludes
+    /// their fields, :98/:118-121); top-level declarations are not fields
+    /// and never match.
     fn scan<'a>(
         c: &Check<'a>,
         node: u32,
         class_row: Option<u32>,
         candidates: &mut Vec<Candidate<'a>>,
         mutated: &mut Vec<&'a str>,
+        path: &mut Vec<u32>,
     ) {
         match c.kind(node) {
             NodeKind::EnumDeclaration | NodeKind::ExtensionTypeDeclaration => return,
@@ -2931,7 +6137,9 @@ pub(crate) mod prefer_final_fields {
                 // neighbor. Walking the class row's window is correct under
                 // both layouts.
                 for kid in c.collect_direct(node) {
-                    scan(c, kid, Some(node), candidates, mutated);
+                    path.push(kid);
+                    scan(c, kid, Some(node), candidates, mutated, path);
+                    path.pop();
                 }
                 return;
             }
@@ -2943,7 +6151,9 @@ pub(crate) mod prefer_final_fields {
                 let mut kids = c.collect_direct(node);
                 kids.extend(crate::rules::rows_with_parent(c, node));
                 for kid in kids {
-                    scan(c, kid, class_row, candidates, mutated);
+                    path.push(kid);
+                    scan(c, kid, class_row, candidates, mutated, path);
+                    path.pop();
                 }
                 return;
             }
@@ -2989,10 +6199,54 @@ pub(crate) mod prefer_final_fields {
                 }
             }
             NodeKind::Assignment => {
-                if let Some(&lhs) = c.collect_direct(node).first()
-                    && c.kind(lhs) == NodeKind::Identifier
-                {
-                    mutated.push(c.lexeme(c.head_token(lhs)));
+                // A cascade-section write (`.._x = 1`): the section's send
+                // group and `CascadeAccess` marker tile inside the
+                // enclosing `Cascade` window as flat siblings before the
+                // assignment row (hand-built trees may instead adopt the
+                // marker as the assignment's first child). The write
+                // target is the section's bare send head — it selects the
+                // cascade target's member, not a scope-resolved name, so
+                // the shadow gate does not apply (the official
+                // `writeElement` is the field under any local namesake).
+                let marker = c
+                    .unit
+                    .ast
+                    .parent(node)
+                    .filter(|&parent| c.kind(parent) == NodeKind::Cascade)
+                    .and_then(|parent| {
+                        let siblings = c.collect_direct(parent);
+                        let pos = siblings.iter().position(|&sibling| sibling == node)?;
+                        siblings[..pos]
+                            .iter()
+                            .copied()
+                            .find(|&row| c.kind(row) == NodeKind::CascadeAccess)
+                    })
+                    .or_else(|| {
+                        c.collect_direct(node)
+                            .into_iter()
+                            .find(|&row| c.kind(row) == NodeKind::CascadeAccess)
+                    });
+                if let Some(marker) = marker {
+                    if let Some(head) = cascade_section_head(c, marker) {
+                        mutated.push(head);
+                    }
+                } else {
+                    // A bare-name write (`_x = 2`): the left operand run is
+                    // the owner pieces left of the operator — a
+                    // single-identifier chain. The direct-child face
+                    // covers the hand-built compact trees.
+                    let lhs = match c.collect_direct(node).first() {
+                        Some(&row) if c.kind(row) == NodeKind::Identifier => Some(row),
+                        _ => slice::binary_operands_at(c, node).and_then(|(left, _)| {
+                            match slice::access_run(c, &left)[..] {
+                                [only] if c.kind(only) == NodeKind::Identifier => Some(only),
+                                _ => None,
+                            }
+                        }),
+                    };
+                    if let Some(lhs) = lhs {
+                        push_write(c, path, mutated, lhs);
+                    }
                 }
             }
             NodeKind::UnaryPrefix | NodeKind::UnaryPostfix => {
@@ -3011,18 +6265,273 @@ pub(crate) mod prefer_final_fields {
                         NodeKind::UnaryPrefix => siblings.get(pos + 1),
                         _ => pos.checked_sub(1).and_then(|i| siblings.get(i)),
                     };
-                    if let Some(&operand) = operand
-                        && c.kind(operand) == NodeKind::Identifier
-                    {
-                        mutated.push(c.lexeme(c.head_token(operand)));
+                    if let Some(&operand) = operand {
+                        match c.kind(operand) {
+                            NodeKind::Identifier => push_write(c, path, mutated, operand),
+                            _ => {}
+                        }
                     }
                 }
             }
             _ => {}
         }
         for kid in c.collect_direct(node) {
-            scan(c, kid, class_row, candidates, mutated);
+            path.push(kid);
+            scan(c, kid, class_row, candidates, mutated, path);
+            path.pop();
         }
+    }
+
+    /// Records the bare-name write bound at `row` unless a nearer
+    /// same-file binding captures the name there (the official scan is
+    /// element-based: `writeElement` is the field only when no local
+    /// shadows it).
+    fn push_write<'a>(c: &Check<'a>, path: &[u32], mutated: &mut Vec<&'a str>, row: u32) {
+        let name = c.lexeme(c.head_token(row));
+        if !shadowed(c, path, name, c.byte_span(row).start) {
+            mutated.push(name);
+        }
+    }
+
+    /// The bare send-head row of a cascade section's write: the section's
+    /// send group seals right before the `CascadeAccess` marker in the
+    /// enclosing `Cascade`'s flat children, inside the marker's span. The
+    /// head is a childless `Send` leaf — an invocation section carries its
+    /// `Arguments` child, and a selector chain completes its `DotAccess`
+    /// after the marker, so neither answers the head shape.
+    fn cascade_section_head<'a>(c: &Check<'a>, marker: u32) -> Option<&'a str> {
+        let parent = c.unit.ast.parent(marker)?;
+        let siblings = c.collect_direct(parent);
+        let pos = siblings.iter().position(|&sibling| sibling == marker)?;
+        let head = *siblings.get(pos.checked_sub(1)?)?;
+        let (head_span, marker_span) = (c.byte_span(head), c.byte_span(marker));
+        (c.kind(head) == NodeKind::Send
+            && c.collect_direct(head).is_empty()
+            && head_span.start >= marker_span.start
+            && head_span.end <= marker_span.end)
+            .then(|| c.lexeme(c.head_token(head)))
+    }
+
+    /// `_overridesField` (:147-158): `getOverridden` answers the
+    /// interface's overridden map — every written supertype clause,
+    /// abstract members included, so the walks run with the concrete cut
+    /// off. The same-file arm matches instance setters over the ancestor
+    /// chain; the cross-file arm anchors the semantic bridge's
+    /// inheritance walk on the `name=` setter spelling (setters are
+    /// model-keyed under it). Unresolved chains answer false.
+    fn overrides_setter(c: &Check<'_>, class_row: u32, name: &str) -> bool {
+        let chain = same_file_ancestors(c, class_row, false);
+        if chain.iter().any(|&ancestor| {
+            body_members(c, ancestor).into_iter().any(|member| {
+                c.kind(member) == NodeKind::Method
+                    && dartq_ast::mod_flags(c.unit.ast, member) & same_file::STATIC_BIT == 0
+                    && !member_matches(c, member, MemberQuery::Setter, name).is_empty()
+            })
+        }) {
+            return true;
+        }
+        let spelled = format!("{name}=");
+        crate::rules::declarations::bridge_inherited_member(c, class_row, false, &spelled).is_some()
+    }
+
+    /// Whether a nearer same-file binding captures `name` at byte
+    /// position `at`: any enclosing scope on `path` that binds it —
+    /// innermost first. The mirror of the shadow-check face in
+    /// `crate::rules::declarations` (shared there by the
+    /// `recursive_getters` and `unnecessary_getters_setters` walks): the
+    /// official checks are element identities, so a same-lexeme target
+    /// captured by a nearer binding is a different element and must not
+    /// count. The binders the walk honors: local variables, local/named
+    /// functions (name and parameters), the enclosing member's own
+    /// parameters, catch parameters, for-loop variables, switch-case
+    /// pattern variables, and an if-case's pattern variables (then branch
+    /// only).
+    fn shadowed(c: &Check<'_>, path: &[u32], name: &str, at: usize) -> bool {
+        path.iter()
+            .rev()
+            .any(|&scope| scope_binds_at(c, scope, name, at))
+    }
+
+    /// [`scope_binds`] with the if-case precision: the binder family binds
+    /// the whole span, an if-case only its then branch.
+    fn scope_binds_at(c: &Check<'_>, node: u32, name: &str, at: usize) -> bool {
+        match c.kind(node) {
+            NodeKind::IfStatement => if_case_binds(c, node, name) && in_then_branch(c, node, at),
+            _ => scope_binds(c, node, name) && c.byte_span(node).contains(&at),
+        }
+    }
+
+    /// Whether `node` is one of the scope binders that capture `name` for
+    /// its whole span.
+    fn scope_binds(c: &Check<'_>, node: u32, name: &str) -> bool {
+        match c.kind(node) {
+            NodeKind::Block | NodeKind::BlockBody => c
+                .collect_direct(node)
+                .into_iter()
+                .any(|stmt| statement_binds(c, stmt, name)),
+            NodeKind::CatchClause | NodeKind::FunctionExpression => c
+                .collect_direct(node)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+                .is_some_and(|params| parameters_bind(c, params, name)),
+            // The enclosing member's own parameters: the walk starts at the
+            // unit root, so member rows sit on the path — a formal of the
+            // same name captures every bare write in the body.
+            NodeKind::Method
+            | NodeKind::Constructor
+            | NodeKind::Factory
+            | NodeKind::TopLevelMethod => c
+                .collect_direct(node)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+                .is_some_and(|params| parameters_bind(c, params, name)),
+            NodeKind::LocalFunctionDeclaration | NodeKind::NamedFunctionExpression => {
+                function_name_binds(c, node, name)
+                    || c.collect_direct(node)
+                        .into_iter()
+                        .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+                        .is_some_and(|params| parameters_bind(c, params, name))
+            }
+            NodeKind::ForIn | NodeKind::ForControlFlow => for_in_binds(c, node, name),
+            NodeKind::ForStatement => c
+                .collect_direct(node)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::ForParts)
+                .is_some_and(|parts| {
+                    c.collect_direct(parts)
+                        .into_iter()
+                        .any(|stmt| statement_binds(c, stmt, name))
+                }),
+            NodeKind::SwitchCase | NodeKind::SwitchExpressionCase => {
+                c.collect_direct(node).into_iter().any(|kid| {
+                    c.kind(kid) == NodeKind::DeclaredVariablePattern
+                        && c.payload(kid)
+                            .first()
+                            .is_some_and(|&v| v != NONE_TOKEN && c.lexeme(v) == name)
+                })
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `stmt` declares a binding of `name` at its own level (a
+    /// block sibling, or the initializer of a `for` parts list).
+    fn statement_binds(c: &Check<'_>, stmt: u32, name: &str) -> bool {
+        match c.kind(stmt) {
+            // The production `InitializedIdentifier` is width-0 at the
+            // name — the name is its span head, not a child row
+            // (`initialized_identifier_name` covers both tilings).
+            NodeKind::VariablesDeclaration => c.collect_direct(stmt).into_iter().any(|decl| {
+                c.kind(decl) == NodeKind::InitializedIdentifier
+                    && crate::rules::initialized_identifier_name(c, decl)
+                        .is_some_and(|n| c.lexeme(n) == name)
+            }),
+            NodeKind::LocalFunctionDeclaration | NodeKind::NamedFunctionExpression => {
+                function_name_binds(c, stmt, name)
+            }
+            NodeKind::PatternVarDeclStatement => pattern_binds(c, stmt, name),
+            NodeKind::LabeledStatement => c
+                .collect_direct(stmt)
+                .into_iter()
+                .any(|kid| c.kind(kid) != NodeKind::Label && statement_binds(c, kid, name)),
+            _ => false,
+        }
+    }
+
+    /// The name a local/named function binds (the `LocalFunctionDeclaration`-
+    /// stamped `Identifier`, reached through the `FunctionName` wrapper by
+    /// `member_declaration_name`).
+    fn function_name_binds(c: &Check<'_>, node: u32, name: &str) -> bool {
+        crate::rules::declarations::member_declaration_name(c, node)
+            .is_some_and(|n| c.lexeme(c.head_token(n)) == name)
+    }
+
+    /// Whether a pattern subtree declares `name` (`DeclaredVariablePattern`
+    /// payload word 0 carries the variable token).
+    fn pattern_binds(c: &Check<'_>, pattern: u32, name: &str) -> bool {
+        c.children(pattern).any(|descendant| {
+            c.kind(descendant) == NodeKind::DeclaredVariablePattern
+                && c.payload(descendant)
+                    .first()
+                    .is_some_and(|&v| v != NONE_TOKEN && c.lexeme(v) == name)
+        })
+    }
+
+    /// Whether a formal-parameter list declares a plain `name` formal: the
+    /// name is payload word 1, and a `this.x`/`super.x` receiver formal
+    /// (payload word 0) names the field itself — it never captures a bare
+    /// write (a constructor body's `_x = 1` beside `C(this._x)` writes the
+    /// field, whose `writeElement` upstream is the field).
+    fn parameters_bind(c: &Check<'_>, params: u32, name: &str) -> bool {
+        c.collect_direct(params).into_iter().any(|param| {
+            c.kind(param) == NodeKind::FormalParameter
+                && c.payload(param).first().copied().unwrap_or(NONE_TOKEN) == NONE_TOKEN
+                && c.payload(param)
+                    .get(1)
+                    .copied()
+                    .is_some_and(|tok| tok != NONE_TOKEN && c.lexeme(tok) == name)
+        })
+    }
+
+    /// The for-in loop variable binds inside the loop: the bare form is an
+    /// `Identifier` child completing before the parts' `in` token, the
+    /// `var x` form a `DeclaredVariablePattern` child.
+    fn for_in_binds(c: &Check<'_>, scope: u32, name: &str) -> bool {
+        let kids = c.collect_direct(scope);
+        let Some(in_token) = kids
+            .iter()
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::ForInParts)
+            .and_then(|parts| c.payload(parts).get(3).copied())
+            .filter(|&token| token != NONE_TOKEN)
+        else {
+            return false;
+        };
+        kids.into_iter().any(|kid| match c.kind(kid) {
+            NodeKind::DeclaredVariablePattern => c
+                .payload(kid)
+                .first()
+                .is_some_and(|&v| v < in_token && c.lexeme(v) == name),
+            NodeKind::Identifier => {
+                c.unit.ast.token_range(kid).end <= in_token && c.lexeme(c.head_token(kid)) == name
+            }
+            _ => false,
+        })
+    }
+
+    /// Whether an `IfStatement`'s case clause binds `name`: the `case`
+    /// keyword rides the `ParenthesizedCondition` payload word 0 and the
+    /// pattern rows sit before it.
+    fn if_case_binds(c: &Check<'_>, stmt: u32, name: &str) -> bool {
+        let kids = c.collect_direct(stmt);
+        let Some(cond_pos) = kids
+            .iter()
+            .position(|&kid| c.kind(kid) == NodeKind::ParenthesizedCondition)
+        else {
+            return false;
+        };
+        let has_case = c
+            .payload(kids[cond_pos])
+            .first()
+            .is_some_and(|&case| case != NONE_TOKEN);
+        has_case
+            && kids[..=cond_pos]
+                .iter()
+                .any(|&kid| pattern_binds(c, kid, name))
+    }
+
+    /// Whether the position `at` sits in `stmt`'s then branch — the only
+    /// branch an if-case pattern binding reaches.
+    fn in_then_branch(c: &Check<'_>, stmt: u32, at: usize) -> bool {
+        let kids = c.collect_direct(stmt);
+        let Some(cond_pos) = kids
+            .iter()
+            .position(|&kid| c.kind(kid) == NodeKind::ParenthesizedCondition)
+        else {
+            return false;
+        };
+        kids.get(cond_pos + 1)
+            .is_some_and(|then| c.byte_span(*then).contains(&at))
     }
 
     /// Whether `ctor` sets `name`: a `this.name` field formal or a field
@@ -3057,7 +6566,9 @@ pub(crate) mod prefer_final_fields {
 }
 
 pub(crate) mod await_only_futures {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use dartq_semantic::model::{ArgListId, Ty};
+
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces};
     use crate::rules::utf16_token_span;
 
     /// Official: `pkg/linter/lib/src/rules/await_only_futures.dart:38-56` —
@@ -3065,14 +6576,19 @@ pub(crate) mod await_only_futures {
     /// `Future` reports at the `await` keyword, with the type as the
     /// argument (:55).
     ///
-    /// Approximation (documented): the static-type face needs inference.
-    /// The ported face is the syntax-knowable slice: `await` on a scalar
-    /// literal (int / double / String / bool — the exact types), reading
-    /// through parenthesized expressions. `await null` never reports
-    /// (:39), unknown expressions (identifiers, calls, collections —
-    /// inference-bound) never report, the dominant under-report face. The
-    /// Dynamic/FutureOr/extension-type exemptions (:42-46) are unreachable
-    /// on the ported face. Message: `diagnostic.g.dart` `awaitOnlyFutures`.
+    /// The static-type faces: scalar literals (int / double / String /
+    /// bool — the exact types, reading through parenthesized expressions),
+    /// plus the bridge type face when mounted — the awaited expression's
+    /// type answers for an identifier read, a bare send (callee), or a
+    /// single-name member access; a decided non-`Future` type reports with
+    /// its rendered display (`await x;` over a `String` variable). The
+    /// official exemptions port: `await null` skips (:39), `dynamic` skips
+    /// (:43), `Future`/`FutureOr` assign (:44-45). A literal collection
+    /// reports through its own face (never a `Future` — `List`/`Set`/`Map`
+    /// with explicit or uniform element faces, `dynamic` fill otherwise). A
+    /// type with explicit type arguments, a chain beyond the first hop, and
+    /// the extension-type exemption (:46) under-report. Message:
+    /// `diagnostic.g.dart` `awaitOnlyFutures`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "await_only_futures",
         group: Group::Core,
@@ -3100,12 +6616,81 @@ pub(crate) mod await_only_futures {
             }
             root = inner.end - 1;
         }
-        let Some(type_name) = scalar_literal_type(c, root) else {
+        if let Some(type_name) = scalar_literal_type(c, root) {
+            // The `await` keyword is the width-0 kind's span head.
+            let range = utf16_token_span(c, c.head_token(node));
+            c.report(range, &[type_name]);
+            return;
+        }
+        // The collection-literal face: a literal collection is never a
+        // `Future` (`await []`, `await {1: 2}`) — the official reports the
+        // inferred type. The element displays read the scalar/read faces
+        // with a `dynamic` fill (a mixed or unfaceable element's LUB is
+        // not modeled — the display argument is best-effort, the report
+        // row itself is exact).
+        if matches!(
+            c.kind(root),
+            NodeKind::ListLiteral | NodeKind::SetOrMapLiteral
+        ) {
+            let Some(analysis) = c.semantics() else {
+                return;
+            };
+            let rows: Vec<u32> = (window.start..window.end)
+                .filter(|&row| {
+                    row != root && {
+                        let span = c.byte_span(row);
+                        let literal = c.byte_span(root);
+                        span.start >= literal.start && span.end <= literal.end
+                    }
+                })
+                .collect();
+            if let Some(display) = collection_display(c, analysis, root, &rows) {
+                let range = utf16_token_span(c, c.head_token(node));
+                c.report(range, &[display.as_str()]);
+            }
+            return;
+        }
+        // The bridge static-type face (the identifier / call / member
+        // access family).
+        let Some(analysis) = c.semantics() else {
             return;
         };
-        // The `await` keyword is the width-0 kind's span head.
+        let run: Vec<u32> = (window.start..window.end).collect();
+        let Some(ty) = static_type_faces::expr_type(c, analysis, &run) else {
+            return;
+        };
+        let display = match ty {
+            // The official bails (:43).
+            Ty::Dynamic => return,
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                let spelled = analysis.strings().resolve(name);
+                // Assignable to `Future<dynamic>` (:48-55); `FutureOr` skips
+                // (:44).
+                if spelled == "Future" || spelled == "FutureOr" {
+                    return;
+                }
+                // The display argument must be exact: a type with explicit
+                // arguments renders through the type-argument pool the
+                // analysis does not publish — under-report.
+                if args != ArgListId::EMPTY {
+                    return;
+                }
+                if nullable {
+                    format!("{spelled}?")
+                } else {
+                    spelled.to_owned()
+                }
+            }
+            // `Null` (the literal skipped above), `Never` (assignable), and
+            // `void` carry no awaited value face.
+            _ => return,
+        };
         let range = utf16_token_span(c, c.head_token(node));
-        c.report(range, &[type_name]);
+        c.report(range, &[display.as_str()]);
     }
 
     /// The exact static type of a scalar literal (`int`, `double`,
@@ -3120,11 +6705,250 @@ pub(crate) mod await_only_futures {
             _ => None,
         }
     }
+
+    /// The literal collection's display: `List`/`Set`/`Map` with its
+    /// element faces — explicit type arguments win, else the uniform
+    /// scalar/read element faces, else `dynamic` per slot. The rows are
+    /// the literal's interior tiles (entries, elements, wrappers) inside
+    /// the root's own span; on the production tiling the containers are
+    /// childless, so the key/value and element boundaries rebuild from the
+    /// sibling run — the `collection_elements`/`entry_sides` pattern: an
+    /// entry's marker seals last in its segment and `payload[0]` (the
+    /// colon) is the only reliable key/value split anchor.
+    fn collection_display(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        root: u32,
+        rows: &[u32],
+    ) -> Option<String> {
+        // A row swallowed by a nested literal belongs to that literal, not
+        // to this one (`{{1: 2}: 'a'}` — the inner `MapEntry` is not an
+        // entry of the outer map). Control-flow markers stay transparent:
+        // an `if` element's own rows tile flat inside this literal.
+        let nested = |row: u32| {
+            let span = c.byte_span(row);
+            rows.iter().any(|&other| {
+                other != row
+                    && matches!(
+                        c.kind(other),
+                        NodeKind::ListLiteral | NodeKind::SetOrMapLiteral
+                    )
+                    && {
+                        let outer = c.byte_span(other);
+                        outer.start <= span.start && span.end <= outer.end
+                    }
+            })
+        };
+        let has_entry = rows
+            .iter()
+            .copied()
+            .any(|row| c.kind(row) == NodeKind::MapEntry && !nested(row));
+        // The literal's explicit type arguments (`<int>[…]`, `<K, V>{…}`):
+        // hand-built trees carry the `TypeArguments` row as a child; the
+        // production tiling leaves it an owner-sibling sealing at the
+        // literal head (the literal span opens at `[`/`{`).
+        let typed: Vec<String> = c
+            .collect_direct(root)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::TypeArguments)
+            .or_else(|| {
+                let tokens = c.unit.ast.token_range(root);
+                let synthetic_head = c.token_is_synthetic(tokens.start);
+                let window = c.children(c.unit.ast.parent(root)?);
+                (window.start..window.end)
+                    .filter(|&row| c.kind(row) == NodeKind::TypeArguments)
+                    .filter(|&row| {
+                        let end = c.unit.ast.token_range(row).end;
+                        // The `[]` index-token literal anchors at synthetic
+                        // brackets past the `>` — its `TypeArguments`
+                        // sibling only satisfies the looser before-head
+                        // bound.
+                        end == tokens.start || (synthetic_head && end <= tokens.start)
+                    })
+                    .max_by_key(|&row| c.unit.ast.token_range(row).end)
+            })
+            .map(|args| {
+                c.collect_direct(args)
+                    .into_iter()
+                    .filter(|&row| c.kind(row) == NodeKind::Type)
+                    .map(|row| c.lexeme(c.head_token(row)).to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (kind, arity) = match c.kind(root) {
+            NodeKind::ListLiteral => ("List", 1usize),
+            NodeKind::SetOrMapLiteral => {
+                if has_entry || typed.len() == 2 {
+                    ("Map", 2)
+                } else if typed.len() == 1
+                    || rows
+                        .iter()
+                        .any(|&row| !matches!(c.kind(row), NodeKind::NoTypeArguments))
+                {
+                    ("Set", 1)
+                } else {
+                    // A bare `{}` carries no entries — the upstream
+                    // inference settles it as `Map<dynamic, dynamic>`.
+                    ("Map", 2)
+                }
+            }
+            _ => return None,
+        };
+        // Explicit type arguments decide (`<int>[…]`, `<K, V>{…}`).
+        if typed.len() == arity {
+            return Some(render_display(
+                kind,
+                &typed.iter().map(String::as_str).collect::<Vec<_>>(),
+            ));
+        }
+        let mut slots: Vec<Option<String>> = vec![None; arity];
+        // The display of one comma-separated element or one entry side: the
+        // run's last row is the root (completion order); `(...)` and `!`
+        // are transparent wrappers, and the bare-name send group reads
+        // through to its identifier.
+        let side_display = |side: &[u32]| -> Option<String> {
+            let mut side = side;
+            let mut nonnull = false;
+            let root = loop {
+                let &root = side.last()?;
+                match c.kind(root) {
+                    NodeKind::ParenthesizedExpression => side = &side[..side.len() - 1],
+                    NodeKind::NonNullAssert => {
+                        nonnull = true;
+                        side = &side[..side.len() - 1];
+                    }
+                    _ => break root,
+                }
+            };
+            let mut display = match c.kind(root) {
+                NodeKind::LiteralInt => "int".to_owned(),
+                NodeKind::LiteralDouble => "double".to_owned(),
+                NodeKind::StringLiteral => "String".to_owned(),
+                NodeKind::LiteralBool => "bool".to_owned(),
+                NodeKind::Send
+                    if side.len() >= 4 && slice::is_tear_off_group(c, side, side.len() - 4) =>
+                {
+                    identifier_display(c, analysis, side[side.len() - 4])?
+                }
+                NodeKind::Identifier => identifier_display(c, analysis, root)?,
+                // A nested literal spells its own collection face.
+                NodeKind::ListLiteral | NodeKind::SetOrMapLiteral => {
+                    let span = c.byte_span(root);
+                    let inner: Vec<u32> = rows
+                        .iter()
+                        .copied()
+                        .filter(|&row| {
+                            row != root && {
+                                let piece = c.byte_span(row);
+                                piece.start >= span.start && piece.end <= span.end
+                            }
+                        })
+                        .collect();
+                    collection_display(c, analysis, root, &inner)?
+                }
+                _ => return None,
+            };
+            if nonnull && display.ends_with('?') {
+                display.pop();
+            }
+            Some(display)
+        };
+        let fill = |slot: &mut Option<String>, displays: Vec<Option<String>>| {
+            let mut decided: Option<Option<String>> = None;
+            for display in displays.into_iter().flatten() {
+                match &decided {
+                    Some(Some(previous)) if *previous != display => {
+                        decided = Some(None); // mixed — the LUB is not modeled
+                    }
+                    Some(None) => {}
+                    _ => decided = Some(Some(display)),
+                }
+            }
+            if let Some(decided) = decided {
+                *slot = decided;
+            }
+        };
+        if kind == "Map" {
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            // Each `MapEntry` marker seals last in its own run; the pieces
+            // accumulated since the previous marker split at the colon.
+            let mut run_start = 0usize;
+            for (index, &row) in rows.iter().enumerate() {
+                if c.kind(row) != NodeKind::MapEntry || nested(row) {
+                    continue;
+                }
+                let run = &rows[run_start..index];
+                run_start = index + 1;
+                let Some(colon) = c.payload(row).first().copied() else {
+                    continue;
+                };
+                let split = run.partition_point(|&r| c.unit.ast.token_range(r).end <= colon + 1);
+                keys.push(side_display(&run[..split]));
+                values.push(side_display(&run[split..]));
+            }
+            fill(&mut slots[0], keys);
+            fill(&mut slots[1], values);
+        } else {
+            let elements = slice::comma_segments(c, root, rows)
+                .iter()
+                .map(|segment| side_display(segment))
+                .collect();
+            fill(&mut slots[0], elements);
+        }
+        let rendered: Vec<String> = slots
+            .into_iter()
+            .map(|slot| slot.unwrap_or_else(|| "dynamic".to_owned()))
+            .collect();
+        Some(render_display(
+            kind,
+            &rendered.iter().map(String::as_str).collect::<Vec<_>>(),
+        ))
+    }
+
+    /// The display of a bare-name read (`x`, the element or key/value
+    /// face): the semantic `type_of` over the identifier's own span; a
+    /// named type renders its name, `?` kept.
+    fn identifier_display(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        row: u32,
+    ) -> Option<String> {
+        match analysis.type_of(query_site(c, row))? {
+            Ty::Named { name, nullable, .. } => {
+                let mut display = analysis.strings().resolve(name).to_owned();
+                if nullable {
+                    display.push('?');
+                }
+                Some(display)
+            }
+            _ => None,
+        }
+    }
+
+    /// The `Kind<T, …>` rendering over slot names.
+    fn render_display(kind: &str, slots: &[&str]) -> String {
+        let mut display = String::from(kind);
+        display.push('<');
+        display.push_str(&slots.join(", "));
+        display.push('>');
+        display
+    }
 }
 
 pub(crate) mod unrelated_type_equality_checks {
-    use super::{Check, Group, NodeKind, RuleSpec};
-    use crate::rules::{slice, utf16_token_span};
+    use dartq_semantic::model::{ArgListId, Ty};
+
+    use super::{
+        Check, Group, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces,
+        switch_scrutinee_read,
+    };
+    use crate::rules::utf16_token_span;
+
+    /// The pattern-face problem text (`unrelatedTypeEqualityChecksInPattern`,
+    /// `diagnostic.g.dart:3727-3734`): the operand against the matched
+    /// value.
+    const PATTERN_PROBLEM: &str = "The type of the operand ('{0}') isn't a subtype or a supertype of the value being matched ('{1}').";
 
     /// Official: `pkg/linter/lib/src/rules/unrelated_type_equality_checks.dart`
     /// — an `==`/`!=` comparison (a bool-typed one, :47-49) whose operand
@@ -3132,29 +6956,42 @@ pub(crate) mod unrelated_type_equality_checks {
     /// left type)` (:62-66; the pattern face :69-83 needs the matched
     /// value type — unported).
     ///
-    /// Approximations (documented): the operand types are the syntax-
-    /// knowable slice — scalar literals (`int`, `double`, `String`,
-    /// `bool`) and `this` (the enclosing class's name). Both operands must
-    /// carry a face; anything else (identifiers, calls) stays silent. The
-    /// comparability relation (`typesAreUnrelated`) reduces on this face
-    /// to exact-name equality — no two distinct names in the ported set
-    /// stand in a subtype relation (`int`/`double` are unrelated exactly
-    /// as the official rule judges them; `num`/`Object` are unreachable as
-    /// literal types). `null` operands skip (:53-55). A user class may
-    /// override `==` returning non-`bool` — the official bool-typed gate
-    /// (:47) then silences where this face reports (over-report, the
-    /// user-shadowed family). Message: `diagnostic.g.dart`
+    /// The operand types: scalar literals (`int`, `double`, `String`,
+    /// `bool`), `this` (the enclosing class's name), a bare name whose
+    /// same-file written type (parameter, local, field, top-level) carries
+    /// a name — and the bridge static type when the written face has no
+    /// answer: a bare read row (an import-bound top-level) or an
+    /// invocation's callee return type (`f() == true`). The comparability
+    /// relation (`typesAreUnrelated`): same name related; `Object`/
+    /// `dynamic` relate to everything; the `num` family relates
+    /// `int`/`double`; the four scalar faces are final (nothing else
+    /// relates to them); any other pair with a same-file class-like name
+    /// stays silent — the supertype chain, or a cross-file link behind
+    /// it, can relate the names in ways this face cannot see. The bool
+    /// gate (:47-49) reads the left operand's resolved `==` override: a
+    /// non-`bool` declared return silences (a bare-name operand only; an
+    /// unresolvable or undecided override keeps the bool assumption).
+    /// `null` operands skip (:53-55). The pattern face (:69-83,
+    /// `visitRelationalPattern`): a relational pattern whose operand type
+    /// and matched value type are unrelated reports at the pattern — the
+    /// matched value type rides [`Analysis::matched_value_type`] keyed at
+    /// the switch scrutinee read's own span (an if-case carries no switch
+    /// ancestor and stays silent). Message: `diagnostic.g.dart`
     /// `unrelatedTypeEqualityChecksInExpression`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "unrelated_type_equality_checks",
         group: Group::Core,
         problem: "The type of the right operand ('{0}') isn't a subtype or a supertype of the left operand ('{1}').",
         correction: "Try changing one or both of the operands.",
-        kinds: &[NodeKind::BinaryExpression],
+        kinds: &[NodeKind::BinaryExpression, NodeKind::RelationalPattern],
         check,
     };
 
     fn check(c: &mut Check<'_>) {
+        if c.kind(c.node()) == NodeKind::RelationalPattern {
+            pattern_face(c);
+            return;
+        }
         let node = c.node();
         let Some(op) = c.payload(node).first().copied() else {
             return;
@@ -3166,25 +7003,219 @@ pub(crate) mod unrelated_type_equality_checks {
         let Some((left, right)) = slice::binary_operands(c) else {
             return;
         };
-        let left_type = operand_type(c, &left).map(str::to_owned);
-        let right_type = operand_type(c, &right).map(str::to_owned);
+        // The official bool gate (:47-49): the comparison's static type is
+        // `bool` unless the left operand's class overrides `==` with a
+        // non-`bool` return.
+        if equality_override_silences(c, &left) {
+            return;
+        }
+        let left_type = operand_type(c, &left).map(str::to_owned).or_else(|| {
+            c.semantics()
+                .and_then(|analysis| operand_static_name(c, analysis, &left))
+        });
+        let right_type = operand_type(c, &right).map(str::to_owned).or_else(|| {
+            c.semantics()
+                .and_then(|analysis| operand_static_name(c, analysis, &right))
+        });
         let (Some(left_type), Some(right_type)) = (left_type, right_type) else {
             return;
         };
-        if left_type == right_type {
+        if !unrelated(c, &left_type, &right_type) {
             return; // `_comparable` on the ported face
         }
         let range = utf16_token_span(c, op);
         c.report(range, &[right_type.as_str(), left_type.as_str()]);
     }
 
-    /// The operand's type face: a scalar literal or `this` (the enclosing
-    /// class-like name); `null` literals answer `Some("Null")` so the
-    /// caller's equality gate treats them as reported faces — except the
-    /// official skips them outright (:53-55), enforced here by `None`
-    /// being indistinguishable… they are excluded explicitly.
+    /// The relational-pattern face (:69-83): the operand's static type
+    /// against the matched value type, reported at the pattern
+    /// (`reportAtNode`). The operand rows precede the childless pattern
+    /// row (the operator token first, then the operand parsing — the
+    /// pattern row opens at the operand's first token and seals past it,
+    /// so the report runs from the operator through the row end).
+    fn pattern_face(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(op) = c.payload(node).first().copied() else {
+            return;
+        };
+        if !matches!(c.lexeme(op), "==" | "!=") {
+            return;
+        }
+        let Some(parent) = c.ancestor(1) else {
+            return;
+        };
+        let kids = c.collect_direct(parent);
+        let Some(pos) = kids.iter().position(|&kid| kid == node) else {
+            return;
+        };
+        // The operand's type: a scalar literal or a bare read row — the
+        // binary face's bridge shapes. A `null` operand or an undecidable
+        // run stays silent.
+        let run: Vec<u32> = kids[..pos].to_vec();
+        let Some(operand_ty) = operand_static_ty(c, &run) else {
+            return;
+        };
+        // The matched value type, keyed at the switch scrutinee read's own
+        // span; a non-lone-identifier scrutinee carries no row.
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let Some(scrutinee) = switch_scrutinee_read(c) else {
+            return;
+        };
+        let Some(matched_ty) = analysis.matched_value_type(query_site(c, scrutinee)) else {
+            return;
+        };
+        let (Some(operand), Some(matched)) = (
+            ty_display(analysis, operand_ty),
+            ty_display(analysis, matched_ty),
+        ) else {
+            return;
+        };
+        if !unrelated(c, &operand, &matched) {
+            return; // `_comparable(valueType, operandType)` (:82)
+        }
+        let range = utf16_token_span(c, op).start..c.utf16_span(node).end;
+        c.report_texts(
+            range,
+            PATTERN_PROBLEM,
+            "Try changing one or both of the operands.",
+            &[operand.as_str(), matched.as_str()],
+        );
+    }
+
+    /// The operand run's static type: a scalar literal, or the bridge read
+    /// face over a lone identifier (the `operandType` shapes this face's
+    /// display can render exactly).
+    fn operand_static_ty(c: &Check<'_>, run: &[u32]) -> Option<Ty> {
+        let named = |name: &'static str| -> Option<Ty> {
+            let analysis = c.semantics()?;
+            Some(Ty::Named {
+                name: analysis.strings().intern(name),
+                nullable: false,
+                args: ArgListId::EMPTY,
+            })
+        };
+        let root = static_type_faces::run_root(c, run)?;
+        match c.kind(root) {
+            NodeKind::LiteralInt => named("int"),
+            NodeKind::LiteralDouble => named("double"),
+            NodeKind::StringLiteral => named("String"),
+            NodeKind::LiteralBool => named("bool"),
+            _ => {
+                let identifier_run = slice::access_run(c, run);
+                let [only] = identifier_run.as_slice() else {
+                    return None;
+                };
+                if c.kind(*only) != NodeKind::Identifier {
+                    return None;
+                }
+                c.semantics()?.type_of(query_site(c, *only))
+            }
+        }
+    }
+
+    /// The exact display of a `Ty`: the resolved name with a `?` tail; a
+    /// type with explicit arguments renders only when the list is empty —
+    /// the display argument must be exact.
+    fn ty_display(analysis: &dartq_semantic::Analysis<'_>, ty: Ty) -> Option<String> {
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = ty
+        else {
+            return None;
+        };
+        if args != ArgListId::EMPTY {
+            return None;
+        }
+        let mut display = analysis.strings().resolve(name).to_owned();
+        if nullable {
+            display.push('?');
+        }
+        Some(display)
+    }
+
+    /// Whether the left operand's resolved `==` override declares a
+    /// non-`bool` return (the official gate's silhouette face): a
+    /// bare-name operand only — the override lookup needs the receiver's
+    /// own read row.
+    fn equality_override_silences(c: &Check<'_>, left: &[u32]) -> bool {
+        let Some(analysis) = c.semantics() else {
+            return false;
+        };
+        let only = match slice::access_run(c, left).as_slice() {
+            [only] if c.kind(*only) == NodeKind::Identifier => *only,
+            _ => return false,
+        };
+        let site = query_site(c, only);
+        if !matches!(analysis.type_of(site), Some(Ty::Named { .. })) {
+            return false;
+        }
+        match analysis.member_of(site, analysis.strings().intern("==")) {
+            Some(binding) => !matches!(
+                binding.entry.return_ty,
+                Ty::Named {
+                    name,
+                    nullable: false,
+                    ..
+                } if analysis.strings().resolve(name) == "bool"
+            ),
+            None => false,
+        }
+    }
+
+    /// The operand's static type name over the bridge when the written
+    /// face has no answer: a bare-name read row (`x == true` over an
+    /// import-bound top-level) or an invocation's callee return type
+    /// (`f() == true`). The display name only (an argument-carrying type
+    /// under-reports — the display argument must be exact).
+    fn operand_static_name(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        rows: &[u32],
+    ) -> Option<String> {
+        let run = slice::access_run(c, rows);
+        let ty = match run.as_slice() {
+            [only] if c.kind(*only) == NodeKind::Identifier => {
+                analysis.type_of(query_site(c, *only))?
+            }
+            [callee, arguments]
+                if c.kind(*callee) == NodeKind::Identifier
+                    && c.kind(*arguments) == NodeKind::Arguments =>
+            {
+                analysis.callee_type(query_site(c, *callee))?
+            }
+            _ => return None,
+        };
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = ty
+        else {
+            return None;
+        };
+        if args != ArgListId::EMPTY {
+            return None;
+        }
+        let mut display = analysis.strings().resolve(name).to_owned();
+        if nullable {
+            display.push('?');
+        }
+        Some(display)
+    }
+
+    /// The operand's type face: a scalar literal, `this` (the enclosing
+    /// class-like name), or a bare name's written type (the same-file
+    /// binding slice). `null` answers `None` — the official skips null
+    /// operands outright (:53-55).
     fn operand_type<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<&'a str> {
-        let [root] = rows else {
+        // The bare-name read tiles in the four-piece send-group form —
+        // strip the wrapper pieces before the single-row match.
+        let run = slice::access_run(c, rows);
+        let [root] = run.as_slice() else {
             return None; // a multi-row operand is a chain — no face
         };
         match c.kind(*root) {
@@ -3212,15 +7243,72 @@ pub(crate) mod unrelated_type_equality_checks {
                     })?;
                 Some(c.lexeme(c.head_token(name)))
             }
-            // `null` skips too (the official skips null operands); every
-            // other kind has no scalar face.
+            NodeKind::Identifier => {
+                let name = c.lexeme(c.head_token(*root));
+                crate::rules::written_type_face(c, c.node(), name)?.name
+            }
+            // every other kind has no scalar face
             _ => None,
         }
+    }
+
+    /// The comparability gate over the two face names (`typesAreRelated`):
+    /// same name related; `Object`/`dynamic` relate to everything; the
+    /// `num` family relates `int`/`double`; the four scalar faces are
+    /// final (nothing else relates to them); any other pair with a
+    /// same-file class-like name stays silent — the same-file supertype
+    /// chain, or a cross-file link behind it, can relate the names in
+    /// ways the syntax face cannot see.
+    fn unrelated(c: &Check<'_>, left: &str, right: &str) -> bool {
+        if left == right {
+            return false;
+        }
+        if matches!(left, "Object" | "dynamic") || matches!(right, "Object" | "dynamic") {
+            return false;
+        }
+        let num_related = |a: &str, b: &str| {
+            (a == "num" && matches!(b, "int" | "double"))
+                || (b == "num" && matches!(a, "int" | "double"))
+        };
+        if num_related(left, right) {
+            return false;
+        }
+        if matches!(left, "int" | "double" | "String" | "bool")
+            || matches!(right, "int" | "double" | "String" | "bool")
+        {
+            // A final scalar relates to nothing but its own name and
+            // `num` — the operand faces are provably unrelated.
+            return true;
+        }
+        let left_same = crate::rules::same_file_declaration(c, left).is_some();
+        let right_same = crate::rules::same_file_declaration(c, right).is_some();
+        if left_same && right_same {
+            // The written supertype closures decide (the official walk): a
+            // shared link relates the pair, complete closures without one
+            // are unrelated, an incomplete closure could relate it behind
+            // the unindexed link.
+            let (Some(left_chain), Some(right_chain)) = (
+                same_file::supertype_closure(c, left),
+                same_file::supertype_closure(c, right),
+            ) else {
+                return false;
+            };
+            let related = left_chain.iter().any(|name| name == right)
+                || right_chain.iter().any(|name| name == left)
+                || left_chain.iter().any(|name| right_chain.contains(name));
+            return !related;
+        }
+        if left_same || right_same {
+            return false;
+        }
+        true
     }
 }
 
 pub(crate) mod no_literal_bool_comparisons {
-    use super::{Check, Group, NodeKind, RuleSpec, same_file};
+    use dartq_semantic::model::Ty;
+
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, same_file};
     use crate::rules::{byte_span_of_token, slice};
 
     /// Official: `pkg/linter/lib/src/rules/no_literal_bool_comparisons.dart:44-62`
@@ -3231,13 +7319,15 @@ pub(crate) mod no_literal_bool_comparisons {
     /// invocation) bound to a written `bool` — parameter, local, field,
     /// top-level variable — or to a written `bool Function(…)` (the
     /// invocation face, the return type read), a bool literal on both
-    /// sides, and a member access `r.m` whose receiver binds to a
-    /// same-file class declaring a `bool` field or getter `m`. A written
-    /// `bool?` stays silent exactly like the official (:41, the
-    /// `isNonNullable` gate); inferred-`bool` locals (`var x = true`)
-    /// under-report, the documented type-inference family, and
-    /// `this.getter` under-reports (a receiver that is not a plain name).
-    /// Message: `diagnostic.g.dart` `noLiteralBoolComparisons`.
+    /// sides, and a member access `r.m` whose receiver's type carries a
+    /// non-nullable `bool` member `m` — the bridge member type when
+    /// mounted (any receiver the fold typed, same-file or cross-file),
+    /// `this.<member>` through the enclosing class, or the receiver's
+    /// same-file written class. A written `bool?` stays silent exactly
+    /// like the official (:41, the `isNonNullable` gate); inferred-`bool`
+    /// locals (`var x = true`) under-report — the fold publishes no
+    /// inferred type (the documented inference family). Message:
+    /// `diagnostic.g.dart` `noLiteralBoolComparisons`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "no_literal_bool_comparisons",
         group: Group::Standalone,
@@ -3252,10 +7342,7 @@ pub(crate) mod no_literal_bool_comparisons {
         let Some(op) = c.payload(node).first().copied() else {
             return;
         };
-        if !matches!(
-            c.lexeme(op),
-            "==" | "!=" | "|" | "||" | "&" | "&&" | "^"
-        ) {
+        if !matches!(c.lexeme(op), "==" | "!=" | "|" | "||" | "&" | "&&" | "^") {
             return;
         }
         let Some((left, right)) = slice::binary_operands(c) else {
@@ -3275,7 +7362,9 @@ pub(crate) mod no_literal_bool_comparisons {
 
     /// The bool-literal operand of a side, when the side is one.
     fn bool_literal(c: &Check<'_>, rows: &[u32]) -> Option<u32> {
-        rows.iter().copied().find(|&row| c.kind(row) == NodeKind::LiteralBool)
+        rows.iter()
+            .copied()
+            .find(|&row| c.kind(row) == NodeKind::LiteralBool)
     }
 
     /// The other-side verdict: a non-nullable `bool` over the written-type
@@ -3289,9 +7378,7 @@ pub(crate) mod no_literal_bool_comparisons {
         match run.as_slice() {
             // A bare name: the binding's written type (`bool`, or a
             // function type returning `bool` — the invocation face).
-            [only] if c.kind(*only) == NodeKind::Identifier => {
-                written_is_bool(c, *only)
-            }
+            [only] if c.kind(*only) == NodeKind::Identifier => written_is_bool(c, *only),
             // An invocation of a bare name: the callee's written return
             // type (`fn() == true`).
             [callee, arguments]
@@ -3339,8 +7426,11 @@ pub(crate) mod no_literal_bool_comparisons {
     }
 
     /// The member face over the raw operand rows: a `DotAccess` marker's
-    /// member name against a bare-identifier receiver, resolved through
-    /// the receiver's same-file class (fields and getters).
+    /// member name against a receiver whose type carries a non-nullable
+    /// `bool` member — the bridge member type when mounted (the receiver's
+    /// resolved declared type, same-file or cross-file), then `this.<m>`
+    /// through the enclosing class, then the receiver's same-file written
+    /// class.
     fn member_face(c: &Check<'_>, rows: &[u32]) -> bool {
         let Some(marker) = rows
             .iter()
@@ -3353,6 +7443,39 @@ pub(crate) mod no_literal_bool_comparisons {
             return false;
         };
         let name = c.lexeme(c.head_token(rows[name_index]));
+        // The bridge member type decides first: the receiver's declared
+        // type read (`u.flag`) resolves across files.
+        if let Some(analysis) = c.semantics()
+            && let Some(receiver) = slice::bare_receiver(c, rows, name_index)
+            && let Some(ty) =
+                analysis.member_type(query_site(c, receiver), analysis.strings().intern(name))
+            && let Ty::Named {
+                name: ty_name,
+                nullable: false,
+                ..
+            } = ty
+        {
+            return analysis.strings().resolve(ty_name) == "bool";
+        }
+        // `this.<member>`: the enclosing class-like scope's member.
+        let run = slice::access_run(c, rows);
+        if let [target, member] = run.as_slice()
+            && c.kind(*target) == NodeKind::ThisExpression
+        {
+            let Some(class_row) = c.path.iter().rev().find_map(|&a| {
+                matches!(
+                    c.kind(a),
+                    NodeKind::ClassDeclaration | NodeKind::MixinDeclaration
+                )
+                .then_some(a)
+            }) else {
+                return false;
+            };
+            let Some(class_name) = crate::rules::class_declaration_name(c, class_row) else {
+                return false;
+            };
+            return member_is_bool(c, class_name, c.lexeme(c.head_token(*member)));
+        }
         let Some(receiver) = slice::bare_receiver(c, rows, name_index) else {
             return false;
         };
@@ -3383,13 +7506,11 @@ pub(crate) mod no_literal_bool_comparisons {
                             NodeKind::Identifier
                                 if c.payload(kid).first()
                                     == Some(
-                                        &(dartq_parser::IdentifierContext::FieldDeclaration
-                                            as u32),
+                                        &(dartq_parser::IdentifierContext::FieldDeclaration as u32),
                                     )
                                     && c.lexeme(c.head_token(kid)) == name =>
                             {
-                                return written
-                                    .is_some_and(|row| non_null_bool_type(c, row));
+                                return written.is_some_and(|row| non_null_bool_type(c, row));
                             }
                             _ => {}
                         }
@@ -3422,37 +7543,76 @@ pub(crate) mod no_literal_bool_comparisons {
 }
 
 pub(crate) mod void_checks {
-    use super::{Check, Group, NodeKind, RuleSpec};
-    use crate::rules::{slice, type_face_of_field};
+    use dartq_semantic::model::{ArgListId, Ty};
+
+    use super::{
+        Check, Group, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces,
+        value_run_end,
+    };
+    use crate::rules::{TypeFace, type_face, type_face_of_field};
     /// Official: `pkg/linter/lib/src/rules/void_checks.dart` — a value
-    /// written where `void` is expected reports (:141-173, the
-    /// `_check` core). The ported face is the assignment branch
-    /// (:76-84): assigning to a `void`-typed target, reported at the
-    /// assignment (:156-158).
+    /// written where `void` (or `FutureOr<void>`) is expected reports
+    /// (:141-173, the `_check` core). The ported faces:
     ///
-    /// Approximations (documented): the target type is the same-class
-    /// field's written type, read off `this.<field>` (bare `<field>`
-    /// inside instance scope over-reports under shadowing — the user-
-    /// shadowed family). The right side's type is the syntax-knowable
-    /// scalar-literal face; unknown right sides never report (under-
-    /// report). `null` and dynamic right sides are acceptable when
-    /// expecting void (:55-65) — `null` skips. The `FutureOr<void>`
-    /// target branch (:158-161) ports through written `FutureOr<void>`
-    /// fields with the same literal faces (dynamic/null/`Future<void>`
-    /// are acceptable — the literals never are). The return, pattern,
-    /// argument and instance-creation branches (:67-103, :175-187) need
-    /// resolved types and stay unported. Message: `diagnostic.g.dart`
+    /// - the assignment branch (:76-84): assigning to a `void`- or
+    ///   `FutureOr<void>`-typed target, reported over the assignment
+    ///   (:156-158);
+    /// - the return branch (:106-133): a `FutureOr<void>` function's
+    ///   `return e;` whose value is not acceptable reports at the
+    ///   statement (:150-153). A plain `void` expectation never reports
+    ///   (:142-146: every non-dynamic value early-silents, and `dynamic`
+    ///   is void-acceptable), so only the `FutureOr<void>` face is live;
+    ///   a function literal's return needs the inferred function type and
+    ///   stays silent;
+    /// - the argument branches (:87-103): a `void` formal — a method or
+    ///   function invocation through the bridge signature, an instance
+    ///   creation through the resolved constructor formals — with a
+    ///   decidable non-acceptable value reports at the argument
+    ///   expression (:175-187).
+    ///
+    /// The acceptability cut is `isTypeAcceptableWhenExpectingVoid` /
+    /// `...FutureOrVoid` (:40-65): dynamic, `null`, `void`, `Never` and
+    /// the `Future`/`FutureOr` family pass — a `Future<T>` needs its type
+    /// argument, unreadable through the bridge, so the family
+    /// conservatively passes (the under-report direction); `Unknown`
+    /// (inferred) values pass. Assignment targets resolve
+    /// shadow-correct: the same-file binding walk decides a bare name (a
+    /// local of the same name shadows the field), a `this.` target is
+    /// the field itself. Value types read off the literal faces and the
+    /// bridge expression face; undecidable values stay silent. The
+    /// pattern branch (:68-74, `matchedValueType`) needs the pattern's
+    /// matched value type and stays unported. Message: `diagnostic.g.dart`
     /// `voidChecks`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "void_checks",
         group: Group::Core,
         problem: "Assignment to a variable of type 'void'.",
         correction: "Try removing the assignment or changing the type of the variable.",
-        kinds: &[NodeKind::Assignment],
+        kinds: &[
+            NodeKind::Assignment,
+            NodeKind::ReturnStatement,
+            NodeKind::Send,
+            NodeKind::NewExpression,
+            NodeKind::ImplicitCreation,
+        ],
         check,
     };
 
     fn check(c: &mut Check<'_>) {
+        match c.kind(c.node()) {
+            NodeKind::Assignment => assignment_face(c),
+            NodeKind::ReturnStatement => return_face(c),
+            NodeKind::Send | NodeKind::NewExpression | NodeKind::ImplicitCreation => {
+                argument_face(c)
+            }
+            _ => {}
+        }
+    }
+
+    /// The assignment face (:76-84): the target's written type decides —
+    /// `void` reports a decidable non-acceptable value, `FutureOr<void>`
+    /// runs the wider acceptability set (:40-53).
+    fn assignment_face(c: &mut Check<'_>) {
         let node = c.node();
         let Some(op) = c.payload(node).first().copied() else {
             return;
@@ -3463,54 +7623,348 @@ pub(crate) mod void_checks {
         let Some((left, right)) = slice::binary_operands(c) else {
             return;
         };
-        // The target: `this.<field>` or bare `<field>` (instance scope).
-        let name = field_name_of(c, &left);
-        let Some(name) = name else {
+        // The target: bare `<field>` or `this.<field>`.
+        let Some((name, this_prefixed)) = assigned_name(c, &left) else {
             return;
         };
-        let Some(face) = type_face_of_field(c, name) else {
+        // Shadow-correct target type: a bare name goes through the
+        // same-file binding walk (a local of the same name shadows the
+        // field); a `this.` target is the field itself.
+        let face = if this_prefixed {
+            type_face_of_field(c, name)
+        } else {
+            match same_file::binding(c, node, name) {
+                Some((_, Some(row))) => Some(type_face(c, row)),
+                // An untyped binding (`var x`) carries no verdict.
+                Some((_, None)) => None,
+                None => type_face_of_field(c, name),
+            }
+        };
+        let Some(face) = face else {
             return;
         };
-        // `isTypeAcceptableWhenExpectingVoid` (:55-65) on the literal
-        // faces: `null` is acceptable, the scalar literals are not.
-        let right_type = literal_null_or_scalar(c, &right);
+        if !face.is_void && !face.is_future_or_void {
+            return;
+        }
+        // The value's static type: the literal faces, the bridge expression
+        // face (a bare read, a callee return, a single-name member access),
+        // then the written-scalar face for an unmounted bridge. Undecidable
+        // values stay silent (`rightHandSide.staticType` null bails).
+        let Some(analysis) = c.semantics() else {
+            // The unmounted run keeps the written-scalar face: `null` is
+            // acceptable when expecting void (:57), any scalar is not.
+            if right_scalar_face(c, &right).is_some_and(|face| face != "Null") {
+                c.report(assignment_report_range(c, node, &left, &right), &[]);
+            }
+            return;
+        };
+        let right_type = literal_ty(c, analysis, &right)
+            .or_else(|| static_type_faces::expr_type(c, analysis, &right))
+            .or_else(|| {
+                right_scalar_face(c, &right).map(|name| Ty::Named {
+                    name: analysis.strings().intern(name),
+                    nullable: false,
+                    args: ArgListId::EMPTY,
+                })
+            });
         let Some(right_type) = right_type else {
             return;
         };
-        let mut void_target = face.is_void;
-        if face.is_future_or_void {
-            // `isTypeAcceptableWhenExpectingFutureOrVoid` (:40-53):
-            // dynamic/void-acceptable pass; the literals never do.
-            void_target = true;
-        }
-        if !void_target {
+        // The acceptability cut splits on the target (`_check` :141-173):
+        // a `void` target runs `isTypeAcceptableWhenExpectingVoid` (:55-65),
+        // a `FutureOr<void>` target the wider set (:30-43).
+        let acceptable = if face.is_void {
+            acceptable_when_void_expected(analysis, right_type)
+        } else {
+            acceptable_when_future_or_void_expected(analysis, right_type)
+        };
+        if acceptable {
             return;
         }
-        if right_type == "Null" {
-            return; // acceptable when expecting void (:57)
-        }
-        let range = c.utf16_span(node);
+        // The official reports at the assignment expression; the
+        // production row opens at the right side's head, so the left
+        // run's head bounds the start, and the row's span swallows the
+        // `;`, so the right run's last value row bounds the end.
+        let range = assignment_report_range(c, node, &left, &right);
         c.report(range, &[]);
     }
 
-    /// The assigned name off the left run: `this.<field>` or a bare
-    /// `<field>`. The run reads through the access-run form (the access
-    /// markers and the bare-name send group tile beside the chain rows).
-    fn field_name_of<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<&'a str> {
+    /// The reported span of an assignment expression: from the left run's
+    /// head to the right run's last value row (the container row's own
+    /// span swallows the statement's `;`, and the statement-level
+    /// completion wrappers — the send group's `Send` and its argument/
+    /// type-argument markers — finalize at that `;`).
+    fn assignment_report_range(
+        c: &Check<'_>,
+        node: u32,
+        left: &[u32],
+        right: &[u32],
+    ) -> core::ops::Range<u32> {
+        c.utf16_span(left[0]).start..value_run_end(c, right, node)
+    }
+
+    /// The return face (:106-133): only a `FutureOr<void>` written return
+    /// type ever reports (:142-146 silents every plain-`void` return).
+    /// The official reports at the return statement (:150-153).
+    fn return_face(c: &mut Check<'_>) {
+        let node = c.node();
+        // The enclosing function shape (a method, a top-level or local
+        // function declaration); a function literal's return needs the
+        // inferred function type and stays silent (:109-121).
+        let Some(function) = c.path.iter().rev().copied().find(|&a| {
+            matches!(
+                c.kind(a),
+                NodeKind::TopLevelMethod | NodeKind::Method | NodeKind::LocalFunctionDeclaration
+            )
+        }) else {
+            return;
+        };
+        let Some(face) = written_return_face(c, function) else {
+            return;
+        };
+        if !face.is_future_or_void {
+            return;
+        }
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        // The value's static type; `return;` carries none and stays
+        // silent (`node.expression?.staticType` is null).
+        let rows = c.collect_direct(node);
+        let Some(ty) = literal_ty(c, analysis, &rows)
+            .or_else(|| static_type_faces::expr_type(c, analysis, &rows))
+        else {
+            return;
+        };
+        if acceptable_when_future_or_void_expected(analysis, ty) {
+            return;
+        }
+        c.report(c.utf16_span(node), &[]);
+    }
+
+    /// The argument faces (:87-103): a `void` formal — a method or
+    /// function invocation through the bridge signature, an instance
+    /// creation through the resolved constructor formals — with a
+    /// decidable non-acceptable value reports at the argument expression
+    /// (:175-187).
+    fn argument_face(c: &mut Check<'_>) {
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let node = c.node();
+        let (formals, arguments) = match c.kind(node) {
+            NodeKind::Send => {
+                let Some((kids, pos)) = slice::owner_slice(c) else {
+                    return;
+                };
+                let Some((head, Some(arguments))) = slice::send_parts(c, &kids, pos) else {
+                    return;
+                };
+                // A constructor invocation tiles as a plain send (`K(1)`)
+                // — when no function signature answers, the resolved
+                // constructor's formals do (the official
+                // InstanceCreationExpression branch).
+                let formals = match analysis.function_signature_of(query_site(c, kids[head])) {
+                    Some(sig) => sig.formals,
+                    None => {
+                        let Some(binding) =
+                            analysis.resolve_constructor(query_site(c, kids[head]), None)
+                        else {
+                            return;
+                        };
+                        let Some(formals) = binding.formals else {
+                            return;
+                        };
+                        formals
+                    }
+                };
+                (formals, arguments)
+            }
+            NodeKind::NewExpression | NodeKind::ImplicitCreation => {
+                let kids = c.collect_direct(node);
+                let Some(args_pos) = kids
+                    .iter()
+                    .position(|&kid| c.kind(kid) == NodeKind::Arguments)
+                else {
+                    return;
+                };
+                let Some(callee) = kids[..args_pos].iter().rev().find_map(|&kid| {
+                    match c.kind(kid) {
+                        NodeKind::Identifier => Some(kid),
+                        // The explicit-new shape: the marker owns the
+                        // callee name.
+                        NodeKind::ConstructorReference => c
+                            .collect_direct(kid)
+                            .into_iter()
+                            .find(|&k| c.kind(k) == NodeKind::Identifier),
+                        _ => None,
+                    }
+                }) else {
+                    return;
+                };
+                let Some(binding) = analysis.resolve_constructor(query_site(c, callee), None)
+                else {
+                    return;
+                };
+                let Some(formals) = binding.formals else {
+                    return;
+                };
+                (formals, kids[args_pos])
+            }
+            _ => return,
+        };
+        let pieces = c.collect_direct(arguments);
+        let ranges = slice::arguments(c, &pieces);
+        let mut positional = 0usize;
+        for range in &ranges {
+            // The formal at the dispatch slot: positional by order, named
+            // by label. A named argument flattens as `name value…
+            // NamedArgument` (the marker anchors at the value head).
+            let (formal_ty, value) = if c.kind(pieces[range.end - 1]) == NodeKind::NamedArgument {
+                let Some(name_idx) = slice::named_arg_name(c, &pieces, range.end - 1) else {
+                    continue;
+                };
+                let label = analysis
+                    .strings()
+                    .intern(c.lexeme(c.head_token(pieces[name_idx])));
+                let Some(formal) = formals.named_formal(label) else {
+                    continue;
+                };
+                (formal.ty, &pieces[name_idx + 1..range.end - 1])
+            } else {
+                let Some(formal) = formals.positional.get(positional) else {
+                    break;
+                };
+                positional += 1;
+                (formal.ty, &pieces[range.start..range.end])
+            };
+            if formal_ty != Ty::Void {
+                continue;
+            }
+            // The value's static type; undecidable values stay silent
+            // (`expression.staticType` null bails).
+            let Some(ty) = literal_ty(c, analysis, value)
+                .or_else(|| static_type_faces::expr_type(c, analysis, value))
+            else {
+                continue;
+            };
+            if acceptable_when_void_expected(analysis, ty) {
+                continue;
+            }
+            let start = c.utf16_span(value[0]).start;
+            let end = value_run_end(c, value, *value.last().unwrap_or(&c.node()));
+            c.report(start..end, &[]);
+        }
+    }
+
+    /// The assigned name off the left run: `(name, this-prefixed)`. The
+    /// run reads through the access-run form (the access markers and the
+    /// bare-name send group tile beside the chain rows).
+    fn assigned_name<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<(&'a str, bool)> {
         match slice::access_run(c, rows).as_slice() {
             [single] if c.kind(*single) == NodeKind::Identifier => {
-                Some(c.lexeme(c.head_token(*single)))
+                Some((c.lexeme(c.head_token(*single)), false))
             }
             [target, name] if c.kind(*target) == NodeKind::ThisExpression => {
-                Some(c.lexeme(c.head_token(*name)))
+                Some((c.lexeme(c.head_token(*name)), true))
             }
             _ => None,
         }
     }
 
+    /// The written return type of a method-like row, as its full
+    /// [`TypeFace`] (the type row preceding the declaration name). Shared
+    /// with the `implicit_call_tearoffs` return face.
+    pub(crate) fn written_return_face<'a>(c: &'a Check<'_>, function: u32) -> Option<TypeFace<'a>> {
+        let kids = c.collect_direct(function);
+        let is_declaration_name = |kid: u32| {
+            c.kind(kid) == NodeKind::Identifier
+                && matches!(
+                    c.payload(kid).first().copied(),
+                    Some(ctx)
+                        if ctx == dartq_parser::IdentifierContext::MethodDeclaration as u32
+                            || ctx
+                                == dartq_parser::IdentifierContext::TopLevelFunctionDeclaration
+                                    as u32
+                )
+        };
+        let name = kids
+            .iter()
+            .copied()
+            .find(|&kid| is_declaration_name(kid))
+            .or_else(|| {
+                kids.iter()
+                    .copied()
+                    .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+            })?;
+        let (type_row, kind) = crate::rules::type_before(c, function, name)?;
+        // A function-typed return (`void Function() f()`) tiles as the
+        // `FunctionType` row — the caller's face gate decides whether it
+        // answers (the implicit_call_tearoffs return face does; the
+        // void_checks `FutureOr<void>` cut rejects it).
+        (matches!(kind, NodeKind::Type | NodeKind::FunctionType)).then(|| type_face(c, type_row))
+    }
+
+    /// The value type the literal faces answer: `null` and the scalar
+    /// literals (the `right_scalar_face` shape, as a [`Ty`]).
+    fn literal_ty(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        rows: &[u32],
+    ) -> Option<Ty> {
+        let run = slice::access_run(c, rows);
+        let [root] = run.as_slice() else {
+            return None;
+        };
+        let named = |name: &str| Ty::Named {
+            name: analysis.strings().intern(name),
+            nullable: false,
+            args: ArgListId::EMPTY,
+        };
+        match c.kind(*root) {
+            NodeKind::LiteralNull => Some(Ty::Null),
+            NodeKind::LiteralInt => Some(named("int")),
+            NodeKind::LiteralDouble => Some(named("double")),
+            NodeKind::StringLiteral => Some(named("String")),
+            NodeKind::LiteralBool => Some(named("bool")),
+            _ => None,
+        }
+    }
+
+    /// The acceptability cut the `void` expectation shares (:55-65):
+    /// dynamic, `null`, `void`, `Never` and the `Future` family pass. A
+    /// `Future<T>` needs its type argument — unreadable through the
+    /// bridge — so the family conservatively passes; `FutureOr` is **not**
+    /// void-acceptable upstream (:60-63 — only a `Future` head recurses)
+    /// and reports; `Unknown` (inferred) values pass.
+    fn acceptable_when_void_expected(analysis: &dartq_semantic::Analysis<'_>, ty: Ty) -> bool {
+        match ty {
+            Ty::Dynamic | Ty::Null | Ty::Void | Ty::Never | Ty::Unknown => true,
+            Ty::Named { name, .. } => analysis.strings().resolve(name) == "Future",
+            // A function-typed value is no `Future` head — it reports.
+            Ty::Record { .. } | Ty::Function { .. } => false,
+        }
+    }
+
+    /// The wider `FutureOr<void>` cut (:30-43): the void set plus
+    /// `FutureOr` itself (`type.isDartAsyncFutureOr`); a `FutureOr<T>`
+    /// needs its argument — unreadable — so the head conservatively passes.
+    fn acceptable_when_future_or_void_expected(
+        analysis: &dartq_semantic::Analysis<'_>,
+        ty: Ty,
+    ) -> bool {
+        match ty {
+            Ty::Named { name, .. } => {
+                matches!(analysis.strings().resolve(name), "Future" | "FutureOr")
+            }
+            _ => true,
+        }
+    }
+
     /// The right side's face: `Null` for a null literal, the scalar type
-    /// for scalar literals, `None` (no verdict) otherwise.
-    fn literal_null_or_scalar<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<&'a str> {
+    /// for scalar literals and for bare names whose same-file written
+    /// type is one of the scalars; `None` (no verdict) otherwise.
+    fn right_scalar_face<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<&'a str> {
         let run = slice::access_run(c, rows);
         let [root] = run.as_slice() else {
             return None;
@@ -3521,13 +7975,102 @@ pub(crate) mod void_checks {
             NodeKind::LiteralDouble => Some("double"),
             NodeKind::StringLiteral => Some("String"),
             NodeKind::LiteralBool => Some("bool"),
+            NodeKind::Identifier => {
+                let name = c.lexeme(c.head_token(*root));
+                match crate::rules::written_type_face(c, c.node(), name)?.name {
+                    Some(scalar @ ("int" | "double" | "String" | "bool")) => Some(scalar),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
 }
 
+/// The enclosing switch's scrutinee read row (the pattern-matched-type
+/// seam the `null_check_on_nullable_type_parameter` and
+/// `unrelated_type_equality_checks` pattern faces share): the scrutinee
+/// pieces tile flat as the switch statement/expression's direct rows
+/// before the case block (the production tiling) — a lone `Identifier`
+/// row is the bare variable-read scrutinee the matched-value face
+/// answers.
+fn switch_scrutinee_read(c: &Check<'_>) -> Option<u32> {
+    for &ancestor in c.path.iter().rev().skip(1) {
+        let boundary = match c.kind(ancestor) {
+            NodeKind::SwitchStatement => NodeKind::SwitchBlock,
+            NodeKind::SwitchExpression => NodeKind::SwitchExpressionBlock,
+            _ => continue,
+        };
+        let kids = c.collect_direct(ancestor);
+        let block_pos = kids.iter().position(|&kid| c.kind(kid) == boundary)?;
+        // The bare-scrutinee read tiles as a send group (4 pieces) with a
+        // trailing `ParenthesizedCondition` wrapper — the access run strips
+        // the send pieces; exactly one surviving identifier answers (a
+        // member-access scrutinee carries two and stays silent).
+        let run = slice::access_run(c, &kids[..block_pos]);
+        let mut ids = run
+            .iter()
+            .copied()
+            .filter(|&row| c.kind(row) == NodeKind::Identifier);
+        return match (ids.next(), ids.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// The span end of an expression run: the last non-completion-wrapper row
+/// (the statement-level `Send` and its argument/type-argument group
+/// markers finalize at the statement's `;`, which the container row
+/// swallows — the value expression's own rows bound the span).
+fn value_run_end(c: &Check<'_>, rows: &[u32], fallback: u32) -> u32 {
+    rows.iter()
+        .rev()
+        .find(|&&row| {
+            !matches!(
+                c.kind(row),
+                NodeKind::Send
+                    | NodeKind::NoArguments
+                    | NodeKind::NoTypeArguments
+                    | NodeKind::TypeArguments
+                    | NodeKind::DotAccess
+            )
+        })
+        .map_or_else(|| c.utf16_span(fallback).end, |&row| c.utf16_span(row).end)
+}
+
+/// The written-type row of a variable: the `Type`/`FunctionType` sibling of
+/// the variable row, over the two production shapes. Hand-built trees tile
+/// the type inside the declaration window before the variable row; the
+/// production parser opens the declaration at the NAME (the local-declaration
+/// lane passes the name token as the declaration head), so the type
+/// completes first and tiles as the declaration's left sibling in the
+/// enclosing window.
+fn written_type_sibling(c: &Check<'_>, var: u32, kinds: &[NodeKind]) -> Option<u32> {
+    let is_type = |row: u32| kinds.contains(&c.kind(row));
+    let owner = c.unit.ast.parent(var)?;
+    let members = c.collect_direct(owner);
+    if let Some(index) = members.iter().position(|&m| m == var)
+        && index > 0
+        && is_type(members[index - 1])
+    {
+        return Some(members[index - 1]);
+    }
+    let outer = c.unit.ast.parent(owner)?;
+    let outer_kids = c.collect_direct(outer);
+    let index = outer_kids.iter().position(|&m| m == owner)?;
+    let before = *outer_kids.get(index.checked_sub(1)?)?;
+    is_type(before).then_some(before)
+}
+
 pub(crate) mod null_check_on_nullable_type_parameter {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use dartq_semantic::model::Ty;
+
+    use super::{
+        Check, Group, NodeKind, RuleSpec, query_site, slice, switch_scrutinee_read,
+        written_type_sibling,
+    };
     use crate::rules::utf16_token_span;
 
     /// Official: `pkg/linter/lib/src/rules/null_check_on_nullable_type_parameter.dart`
@@ -3535,15 +8078,25 @@ pub(crate) mod null_check_on_nullable_type_parameter {
     /// `T?`, in a context whose expected type is that same `T?`, reports
     /// at the operator (:55-67).
     ///
-    /// Approximation (documented): the operand face is `this.<field>` or
-    /// bare `<field>` where the same-class field is written `T?` with `T`
-    /// a class type parameter. The context face (`getExpectedType`,
-    /// `unnecessary_null_checks.dart`) ports for the two syntax-knowable
-    /// sites: a `return` inside a method whose written return type is
-    /// `T?`, and a variable initializer whose declaration is written
-    /// `T?`. Other contexts (arguments, assignments) stay silent
-    /// (under-report). The pattern face (:48-52 — `matchedValueType`)
-    /// stays unported. Message: `diagnostic.g.dart`
+    /// The context face (`getExpectedType`, `unnecessary_null_checks.dart`)
+    /// ports for four syntax/resolution-knowable sites: a `return` whose
+    /// nearest function ancestor is a function shape — the official lookup
+    /// is `thisOrAncestorOfType<FunctionExpression>` (:36-41), which class
+    /// methods never satisfy (their returns carry no expected type, so
+    /// `T? m() { return f!; }` stays silent exactly like the oracle) — a
+    /// variable initializer whose declaration is written `T?`, an
+    /// assignment whose bare/`this.` target is written `T?` (the official
+    /// `writeType` face; a member-chain target under-reports), and an
+    /// argument whose callee's bridge signature formal is written `T?`
+    /// (positional by slot, named by label). The pattern face
+    /// (`visitNullAssertPattern`, :60-64 — `matchedValueType`) rides
+    /// [`Analysis::matched_value_type`] keyed at the switch scrutinee
+    /// read's own span: the matched type must be the nullable type
+    /// parameter itself. The operand face reads the written type: a bare
+    /// name through the shadow-correct same-file binding walk (a local, a
+    /// parameter, a top-level), a `this.`-prefixed operand the same-class
+    /// field face, and the head must be an in-scope type parameter
+    /// (class-like and method-like ancestors). Message: `diagnostic.g.dart`
     /// `nullCheckOnNullableTypeParameter`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "null_check_on_nullable_type_parameter",
@@ -3552,69 +8105,242 @@ pub(crate) mod null_check_on_nullable_type_parameter {
         correction: "Try explicitly testing for 'null'.",
         // The `!` tiles as the `NonNullAssert` token leaf (bridge
         // `handle_non_null_assert_expression`); `UnaryPostfix` is `++`/`--`.
-        kinds: &[NodeKind::NonNullAssert],
+        // The pattern `!` is the `NullAssertPattern` token leaf (bridge
+        // `handle_null_assert_pattern`).
+        kinds: &[NodeKind::NonNullAssert, NodeKind::NullAssertPattern],
         check,
     };
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
+        if c.kind(node) == NodeKind::NullAssertPattern {
+            check_pattern(c);
+            return;
+        }
         // `node.operator.type != BANG` bails (:56).
         if c.lexeme(c.head_token(node)) != "!" {
             return;
         }
-        // The operand rows precede the leaf (the owner-slice idiom).
-        let Some(parent) = c.ancestor(1) else {
+        // The operand rows precede the leaf (the owner-slice idiom). An
+        // assignment's window spans the left target too — the right run
+        // splits at the `=` ([`assignment_operand_rows`], the
+        // `void_checks` idiom keyed at the container row) minus the
+        // dispatch leaf.
+        let parent = c.ancestor(1);
+        let operand_rows: Vec<u32> = match parent {
+            Some(parent) if c.kind(parent) == NodeKind::Assignment => {
+                let Some((_, right)) = assignment_operands(c, parent) else {
+                    return;
+                };
+                let Some(bang) = c
+                    .unit
+                    .tokens
+                    .get(c.head_token(node) as usize)
+                    .map(|t| t.byte_offset as usize)
+                else {
+                    return;
+                };
+                right
+                    .into_iter()
+                    .filter(|&row| row != node && c.byte_span(row).end <= bang)
+                    .collect()
+            }
+            Some(parent) => {
+                let kids = c.collect_direct(parent);
+                let Some(pos) = kids.iter().position(|&kid| kid == c.node()) else {
+                    return;
+                };
+                kids[..pos].to_vec()
+            }
+            None => return,
+        };
+        let Some((name, this_prefixed)) = operand_field_name(c, &operand_rows) else {
             return;
         };
-        let kids = c.collect_direct(parent);
-        let Some(pos) = kids.iter().position(|&kid| kid == node) else {
+        // The operand's written type (`operand.staticType` is a nullable
+        // type parameter, :66): a bare name resolves shadow-correct through
+        // the same-file binding walk (a local, a parameter, a top-level);
+        // a `this.`-prefixed operand is the field itself; an unbound bare
+        // name falls back to the same-class field face. The head must be an
+        // in-scope type parameter (`isNullableTypeParameterType`).
+        let operand = if this_prefixed {
+            crate::rules::type_face_of_field(c, name)
+                .and_then(|face| Some((face.name?, face.nullable)))
+        } else {
+            written_target_type(c, node, name)
+        };
+        let Some((type_parameter, nullable)) = operand else {
             return;
         };
-        let name = operand_field_name(c, &kids[..pos]);
-        let Some(name) = name else {
-            return;
-        };
-        if !field_is_nullable_type_parameter(c, name) {
+        if !nullable || !in_scope_type_parameter_names(c).contains(&type_parameter) {
             return;
         }
-        if !context_expects_same_nullable(c, name) {
+        if !context_expects_same_nullable(c, type_parameter, (name, this_prefixed)) {
             return;
         }
         let range = utf16_token_span(c, c.head_token(node));
         c.report(range, &[]);
     }
 
-    /// The operand's field name: `this.<field>` or bare `<field>`, read
-    /// through the access-run form (the bare-name send group tiles beside
-    /// the chain rows inside the statement container).
-    fn operand_field_name<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<&'a str> {
+    /// `slice::binary_operands` keyed at an explicit operator container
+    /// row (the postfix `!` dispatch node is not the container, so the
+    /// generic helper — which reads the dispatch node's own payload —
+    /// cannot be used): the adopted window plus owner-sibling pieces,
+    /// split at the `=` token, with the lazy `Send` + `DotAccess`
+    /// completion pair pulled back to the left run. Returns `(left,
+    /// right)`.
+    fn assignment_operands(c: &Check<'_>, assignment: u32) -> Option<(Vec<u32>, Vec<u32>)> {
+        let op_token = c.payload(assignment).first().copied()?;
+        let op_start = c.unit.tokens.get(op_token as usize)?.byte_offset as usize;
+        let window = c.children(assignment);
+        let parent = c.unit.ast.parent(assignment)?;
+        let kids = c.collect_direct(parent);
+        let below: Vec<u32> = match kids.iter().position(|&kid| kid == assignment) {
+            Some(pos) if pos > 0 => slice::statement_run(c, &kids[..pos]),
+            _ => {
+                let grand = c.unit.ast.parent(parent)?;
+                let owner_kids = c.collect_direct(grand);
+                let container_pos = owner_kids.iter().position(|&kid| kid == parent)?;
+                slice::statement_run(c, &owner_kids[..container_pos])
+            }
+        };
+        let mut rows: Vec<u32> = below
+            .into_iter()
+            .filter(|&kid| kid < window.start)
+            .collect();
+        rows.extend(window.start..window.end);
+        let split = rows.partition_point(|&piece| c.byte_span(piece).end <= op_start);
+        if split == 0 || split == rows.len() {
+            return None;
+        }
+        let mut left = rows[..split].to_vec();
+        let mut right = rows[split..].to_vec();
+        if let Some(marker) = right.iter().position(|&piece| {
+            c.kind(piece) == NodeKind::DotAccess
+                && c.payload(piece).first().is_some_and(|&dot| {
+                    c.unit
+                        .tokens
+                        .get(dot as usize)
+                        .is_some_and(|t| (t.byte_offset as usize) < op_start)
+                })
+        }) && marker >= 1
+            && c.kind(right[marker - 1]) == NodeKind::Send
+        {
+            left.extend(right.drain(marker - 1..=marker));
+        }
+        if left.is_empty() || right.is_empty() {
+            return None;
+        }
+        Some((left, right))
+    }
+
+    /// `visitNullAssertPattern` (:60-64): the `!` pattern whose matched
+    /// value type is a nullable type-parameter type reports at the
+    /// operator token — the pattern leaf's own head
+    /// (`reportAtToken(node.operator)`). The matched type rides
+    /// [`Analysis::matched_value_type`], keyed at the scrutinee read's own
+    /// span (not the pattern's): the enclosing switch's scrutinee must be
+    /// a lone identifier read — the face's read-row shape; other
+    /// scrutinee shapes and untyped reads under-report — and the matched
+    /// name must be the enclosing class's type parameter (the
+    /// element-level `TypeParameterType` cut at the name level). An
+    /// if-case pattern carries no switch ancestor here and stays silent.
+    fn check_pattern(c: &mut Check<'_>) {
+        let Some(scrutinee) = switch_scrutinee_read(c) else {
+            return;
+        };
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let Some(Ty::Named {
+            name,
+            nullable: true,
+            ..
+        }) = analysis.matched_value_type(query_site(c, scrutinee))
+        else {
+            return;
+        };
+        let matched = analysis.strings().resolve(name);
+        // The element-level `TypeParameterType` cut at the name level: any
+        // in-scope type parameter (class-like and method-like ancestors)
+        // — a same-named class is not a type parameter and stays silent.
+        if !in_scope_type_parameter_names(c).contains(&matched) {
+            return;
+        }
+        let range = utf16_token_span(c, c.head_token(c.node()));
+        c.report(range, &[]);
+    }
+
+    /// The operand's field name and shape: `(name, this-prefixed)` —
+    /// `this.<field>` or bare `<field>`, read through the access-run form
+    /// (the bare-name send group tiles beside the chain rows inside the
+    /// statement container).
+    fn operand_field_name<'a>(c: &'a Check<'_>, rows: &[u32]) -> Option<(&'a str, bool)> {
         match crate::rules::slice::access_run(c, rows).as_slice() {
             [single] if c.kind(*single) == NodeKind::Identifier => {
-                Some(c.lexeme(c.head_token(*single)))
+                Some((c.lexeme(c.head_token(*single)), false))
             }
             [target, name] if c.kind(*target) == NodeKind::ThisExpression => {
-                Some(c.lexeme(c.head_token(*name)))
+                Some((c.lexeme(c.head_token(*name)), true))
             }
             _ => None,
         }
     }
 
-    /// Whether the same-class field is written `T?` with `T` a type
-    /// parameter of the enclosing class.
-    fn field_is_nullable_type_parameter(c: &Check<'_>, name: &str) -> bool {
-        let Some(class_row) = c
-            .path
-            .iter()
-            .rev()
-            .find_map(|&a| matches!(c.kind(a), NodeKind::ClassDeclaration).then_some(a))
-        else {
-            return false;
+    /// The type parameter names in scope at the dispatch node: every
+    /// class-like ancestor's type variables plus every method-like
+    /// ancestor's — a method sees both its own and the class's (`T?` in a
+    /// method body may name either; the same name answers the same verdict
+    /// at the use). Class tiling per [`class_type_parameter_names`]; a
+    /// method's `TypeVariables` tiles as the member row's immediate left
+    /// sibling in the enclosing window (the production parser opens the
+    /// member at the name, so `<T>` completes just before it), with
+    /// hand-built trees nesting it inside the row.
+    fn in_scope_type_parameter_names<'a>(c: &'a Check<'_>) -> Vec<&'a str> {
+        let ctx = dartq_parser::IdentifierContext::TypeVariableDeclaration as u32;
+        let variable_names = |c: &'a Check<'_>, variables: u32| -> Vec<&'a str> {
+            c.collect_direct(variables)
+                .into_iter()
+                .filter(|&kid| {
+                    c.kind(kid) == NodeKind::Identifier && c.payload(kid).first() == Some(&ctx)
+                })
+                .map(|name| c.lexeme(c.head_token(name)))
+                .collect()
         };
-        let type_parameters = class_type_parameter_names(c, class_row);
-        let Some(face) = crate::rules::type_face_of_field(c, name) else {
-            return false;
-        };
-        face.nullable && face.name.is_some_and(|t| type_parameters.contains(&t))
+        let mut names = Vec::new();
+        for &ancestor in c.path.iter() {
+            match c.kind(ancestor) {
+                NodeKind::ClassDeclaration
+                | NodeKind::MixinDeclaration
+                | NodeKind::EnumDeclaration => {
+                    names.extend(class_type_parameter_names(c, ancestor));
+                }
+                NodeKind::TopLevelMethod | NodeKind::Method => {
+                    let nested = c
+                        .collect_direct(ancestor)
+                        .into_iter()
+                        .find(|&kid| c.kind(kid) == NodeKind::TypeVariables);
+                    if let Some(variables) = nested {
+                        names.extend(variable_names(c, variables));
+                        continue;
+                    }
+                    let Some(owner) = c.unit.ast.parent(ancestor) else {
+                        continue;
+                    };
+                    let members = c.collect_direct(owner);
+                    let Some(index) = members.iter().position(|&kid| kid == ancestor) else {
+                        continue;
+                    };
+                    // The immediate left sibling: the member's own
+                    // `<T>` completes directly before its row.
+                    if index > 0 && c.kind(members[index - 1]) == NodeKind::TypeVariables {
+                        names.extend(variable_names(c, members[index - 1]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        names
     }
 
     /// The enclosing class's type parameter names. Production tiling: the
@@ -3660,23 +8386,27 @@ pub(crate) mod null_check_on_nullable_type_parameter {
             .collect()
     }
 
-    /// Whether the context at the site expects the same `T?`: the
-    /// nearest meaningful ancestor decides (a `return` face with the
-    /// enclosing method's written return type, or a variable initializer
-    /// face with the declaration's written type; a body boundary first
-    /// bails).
-    fn context_expects_same_nullable(c: &Check<'_>, name: &str) -> bool {
-        let Some(expected) = expected_type_type_parameter(c) else {
-            return false;
-        };
-        let Some(face) = crate::rules::type_face_of_field(c, name) else {
-            return false;
-        };
-        face.nullable && face.name == Some(expected)
+    /// Whether the context at the site expects the same nullable type
+    /// parameter `expected` (`promoteToNonNull(type) ==
+    /// promoteToNonNull(expectedType)`, :70-72): the nearest meaningful
+    /// ancestor decides. `operand` is the `!`'s operand `(name,
+    /// this-prefixed)` — the official assignment guard (`x = x!` promotes,
+    /// so no expected type) needs it.
+    fn context_expects_same_nullable(c: &Check<'_>, expected: &str, operand: (&str, bool)) -> bool {
+        expected_type_type_parameter(c, operand).is_some_and(|name| name == expected)
     }
 
-    /// The context's expected type-parameter name, when written `T?`.
-    fn expected_type_type_parameter<'a>(c: &'a Check<'_>) -> Option<&'a str> {
+    /// The context's expected type-parameter name, when written `T?`: the
+    /// nearest meaningful ancestor decides — a `return` with the enclosing
+    /// function's written return type, a variable initializer with the
+    /// declaration's written type, an assignment whose target's written
+    /// type is `T?` (the official `writeType` face), or an argument whose
+    /// callee's formal table (the bridge signature face) declares `T?`.
+    /// A body boundary first bails.
+    fn expected_type_type_parameter<'a>(
+        c: &'a Check<'_>,
+        operand: (&str, bool),
+    ) -> Option<&'a str> {
         for &ancestor in c.path.iter().rev().skip(1) {
             match c.kind(ancestor) {
                 NodeKind::VariableInitializer => {
@@ -3693,6 +8423,26 @@ pub(crate) mod null_check_on_nullable_type_parameter {
                         .filter(|face| face.1)
                         .map(|face| face.0);
                 }
+                NodeKind::Assignment => {
+                    // `x = <e>!;` — the target's written type (the
+                    // official writeType; a bare or `this.` target). The
+                    // official guard first: `x = x!` — a bare identifier
+                    // target with a bare same-named operand — promotes and
+                    // carries no expected type (:64-68).
+                    let Some((target, bare)) = assignment_target_name(c, ancestor) else {
+                        return None;
+                    };
+                    if bare && !operand.1 && target == operand.0 {
+                        return None;
+                    }
+                    let (name, nullable) = written_target_type(c, ancestor, target)?;
+                    return nullable.then_some(name);
+                }
+                NodeKind::Arguments => {
+                    // `f(<e>!);` — the callee's formal table declares the
+                    // expected type (the official `getExpectedType`).
+                    return argument_context_type_parameter(c, ancestor);
+                }
                 NodeKind::Block | NodeKind::BlockBody | NodeKind::ExpressionBody => {
                     return None; // a body boundary — no written context face
                 }
@@ -3702,13 +8452,112 @@ pub(crate) mod null_check_on_nullable_type_parameter {
         None
     }
 
-    /// The enclosing method-like row of a statement.
+    /// The bare or `this.`-qualified target name of an assignment whose
+    /// right side carries the dispatch node: the adopted window's left
+    /// run ([`assignment_operands`]; the window spans the left target, so
+    /// the owner siblings hold nothing of it). Answers `(name, bare)`.
+    fn assignment_target_name<'a>(c: &'a Check<'_>, assignment: u32) -> Option<(&'a str, bool)> {
+        let (left, _) = assignment_operands(c, assignment)?;
+        match slice::access_run(c, &left).as_slice() {
+            [single] if c.kind(*single) == NodeKind::Identifier => {
+                Some((c.lexeme(c.head_token(*single)), true))
+            }
+            [target, name] if c.kind(*target) == NodeKind::ThisExpression => {
+                Some((c.lexeme(c.head_token(*name)), false))
+            }
+            _ => None,
+        }
+    }
+
+    /// The written `(name, nullable)` of the assignment target: the
+    /// shadow-correct same-file binding first, then the same-class field
+    /// face.
+    fn written_target_type<'a>(
+        c: &'a Check<'_>,
+        use_node: u32,
+        name: &str,
+    ) -> Option<(&'a str, bool)> {
+        if let Some((_, Some(row))) = super::same_file::binding(c, use_node, name)
+            && c.kind(row) == NodeKind::Type
+        {
+            let head = c.head_token(row);
+            let nullable = c.byte_span(row).end > crate::rules::byte_span_of_token(c, head).end;
+            return Some((c.lexeme(head), nullable));
+        }
+        let face = crate::rules::type_face_of_field(c, name)?;
+        Some((face.name?, face.nullable))
+    }
+
+    /// The argument context: the callee's bridge signature formal type at
+    /// the dispatch node's own argument slot — a positional slot by index,
+    /// a named slot by label; the formal written `T?` answers its `T`.
+    fn argument_context_type_parameter<'a>(c: &'a Check<'_>, arguments: u32) -> Option<&'a str> {
+        let analysis = c.semantics()?;
+        let parent = c.unit.ast.parent(arguments)?;
+        let kids = c.collect_direct(parent);
+        let Some(pos) = kids.iter().position(|&kid| kid == arguments) else {
+            return None;
+        };
+        // The invocation send is the sibling right after the argument list
+        // (the production tiling).
+        if c.kind(*kids.get(pos.checked_add(1)?)?) != NodeKind::Send {
+            return None;
+        }
+        let (head, _) = crate::rules::slice::send_parts(c, &kids, pos + 1)?;
+        let sig = analysis.function_signature_of(query_site(c, kids[head]))?;
+        // The dispatch node's argument slot: the operand rows end at the
+        // piece before the leaf (a bare-read operand tiles as a send group
+        // and strands the `!` leaf outside its argument range, so the slot
+        // range is the one covering `node_pos - 1`). A named argument
+        // pairs `name … NamedArgument` immediately before the value range —
+        // the formal reads by label there; otherwise positionally by the
+        // count of preceding positional ranges.
+        let raw = c.collect_direct(arguments);
+        let ranges = crate::rules::slice::arguments(c, &raw);
+        let node_pos = raw.iter().position(|&kid| kid == c.node())?;
+        let index = ranges
+            .iter()
+            .position(|range| range.contains(&(node_pos - 1)))?;
+        let named_pair = index
+            .checked_sub(1)
+            .and_then(|prev| ranges.get(prev))
+            .filter(|prev| c.kind(raw[prev.end - 1]) == NodeKind::NamedArgument)
+            .map(|prev| prev.end);
+        let ty = if let Some(end) = named_pair {
+            let name_idx = crate::rules::slice::named_arg_name(c, &raw, end - 1)?;
+            let label = c.lexeme(c.head_token(raw[name_idx]));
+            sig.formals
+                .named_formal(analysis.strings().intern(label))?
+                .ty
+        } else {
+            let slot = ranges[..index]
+                .iter()
+                .filter(|r| c.kind(raw[r.end - 1]) != NodeKind::NamedArgument)
+                .count();
+            sig.formals.positional.get(slot)?.ty
+        };
+        match ty {
+            dartq_semantic::model::Ty::Named {
+                name,
+                nullable: true,
+                ..
+            } => Some(analysis.strings().resolve(name)),
+            _ => None,
+        }
+    }
+
+    /// The enclosing function-shaped row of a statement: the official
+    /// return-face lookup is `thisOrAncestorOfType<FunctionExpression>`
+    /// (`unnecessary_null_checks.dart:36-41`) — a class method never
+    /// qualifies (the analyzer nests a `FunctionExpression` only under
+    /// function declarations and literals), so its returns carry no
+    /// expected type and stay silent.
     fn enclosing_function(c: &Check<'_>, statement: u32) -> Option<u32> {
         let pos = c.path.iter().position(|&a| a == statement)?;
         c.path[..pos].iter().rev().copied().find(|&a| {
             matches!(
                 c.kind(a),
-                NodeKind::Method | NodeKind::TopLevelMethod | NodeKind::FunctionExpression
+                NodeKind::TopLevelMethod | NodeKind::FunctionExpression
             )
         })
     }
@@ -3716,17 +8565,9 @@ pub(crate) mod null_check_on_nullable_type_parameter {
     /// The written type sibling of a declaration row: `(name, nullable)`.
     type WrittenType<'a> = (&'a str, bool);
     fn written_declaration_type<'a>(c: &'a Check<'_>, decl: u32) -> Option<WrittenType<'a>> {
-        let owner = c.unit.ast.parent(decl)?;
-        let members = c.collect_direct(owner);
-        let index = members.iter().position(|&m| m == decl)?;
-        let type_row = index
-            .checked_sub(1)
-            .and_then(|i| members.get(i))
-            .copied()
-            .filter(|&row| matches!(c.kind(row), NodeKind::Type | NodeKind::VoidType))?;
-        let name_token = c.head_token(type_row);
-        let nullable =
-            c.byte_span(type_row).end > crate::rules::byte_span_of_token(c, name_token).end;
+        let row = written_type_sibling(c, decl, &[NodeKind::Type, NodeKind::VoidType])?;
+        let name_token = c.head_token(row);
+        let nullable = c.byte_span(row).end > crate::rules::byte_span_of_token(c, name_token).end;
         Some((c.lexeme(name_token), nullable))
     }
 
@@ -3768,40 +8609,80 @@ pub(crate) mod null_check_on_nullable_type_parameter {
 }
 
 pub(crate) mod implicit_call_tearoffs {
-    use super::{Check, Group, NodeKind, RuleSpec};
-    use crate::rules::{slice, type_face_of_field};
+    use dartq_semantic::model::MemberKind;
+
+    use super::{
+        Check, Group, NodeKind, RuleSpec, query_site, value_run_end, written_type_sibling,
+    };
+    use crate::rules::{TypeFace, slice};
 
     /// Official: `pkg/linter/lib/src/rules/implicit_call_tearoffs.dart` —
     /// the resolution-built `ImplicitCallReference` (an object with a
     /// `call` member used where a function is expected) reports at the
     /// node (:34-39).
     ///
-    /// Approximation (documented): the analyzer node never exists on this
-    /// substrate, so the ported face reconstructs it syntactically for the
-    /// assignment/initializer site: a written `FunctionType` target and a
-    /// right side of `this.<field>` (or bare `<field>` — the user-shadowed
-    /// family over-reports) whose same-class field type names a same-file
-    /// class declaring an instance `call` method. Argument, return and
-    /// collection sites, inferred targets and cross-file `call` classes
-    /// stay silent (the dominant under-report face). Message:
-    /// `diagnostic.g.dart` `implicitCallTearoffs`.
+    /// The ported faces:
+    ///
+    /// - the assignment/initializer site: a written function-type target
+    ///   (the declaration's `FunctionType` row, or the bare `Function`
+    ///   spelling unshadowed — a local target through the shadow-correct
+    ///   binding walk) and an operand whose type names a class with an
+    ///   instance `call` method — same-file through the class body,
+    ///   cross-file through the bridge member walk when mounted (a
+    ///   bare-read operand only: `this.<field>` carries no read row). The
+    ///   operand read is shadow-correct (a local of the same name shadows
+    ///   the field);
+    /// - the return site (:34-39 through the resolver's context walk): a
+    ///   written function-type return and an operand whose type has
+    ///   `call` — a `return e;` reports at the expression, an
+    ///   expression-body return at the body;
+    /// - the argument site for a same-file top-level callee: the written
+    ///   formal table (a `FunctionType` formal, a function-typed formal
+    ///   shape, or the bare `Function` spelling) and a decidable operand.
+    ///
+    /// The operand verdict shapes: a bare read (same-file written type,
+    /// then the bridge member walk), a `this.`-field (the field face, the
+    /// same-file class), and an instance creation (the resolved
+    /// container's member walk). Inferred targets (`var f = c`) and
+    /// cross-file/method callees stay silent — the fold models no
+    /// function-type `Ty` (the collector captures `Unknown`, rule 0c), so
+    /// the written row is the only face there. Message: `diagnostic.g.dart`
+    /// `implicitCallTearoffs`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "implicit_call_tearoffs",
         group: Group::Core,
         problem: "Implicit tear-off of the 'call' method.",
         correction: "Try explicitly tearing off the 'call' method.",
-        kinds: &[NodeKind::Assignment, NodeKind::VariableInitializer],
+        kinds: &[
+            NodeKind::Assignment,
+            NodeKind::VariableInitializer,
+            NodeKind::ReturnStatement,
+            NodeKind::ExpressionBody,
+            NodeKind::Send,
+        ],
         check,
     };
 
     fn check(c: &mut Check<'_>) {
+        match c.kind(c.node()) {
+            NodeKind::Assignment | NodeKind::VariableInitializer => context_face(c),
+            NodeKind::ReturnStatement | NodeKind::ExpressionBody => return_face(c),
+            NodeKind::Send => argument_face(c),
+            _ => {}
+        }
+    }
+
+    /// The assignment/initializer face: the context type — an assignment's
+    /// left target or an initializer's declared variable — written as a
+    /// function type.
+    fn context_face(c: &mut Check<'_>) {
         let node = c.node();
-        // The context type: an assignment's left field or an
-        // initializer's declared variable — both written `FunctionType`.
+        // The context type: an assignment's left target or an
+        // initializer's declared variable — written as a function type.
         let context_is_function = match c.kind(node) {
             NodeKind::VariableInitializer => {
                 let decl = c.unit.ast.parent(node);
-                decl.is_some_and(|decl| written_type_is_function(c, declaration_type_row(c, decl)))
+                decl.is_some_and(|decl| written_row_is_function(c, declaration_type_row(c, decl)))
             }
             NodeKind::Assignment => {
                 let Some(op) = c.payload(node).first().copied() else {
@@ -3817,18 +8698,15 @@ pub(crate) mod implicit_call_tearoffs {
                 let Some(name) = assigned_name(c, &left) else {
                     return;
                 };
-                let Some(face) = type_face_of_field(c, name) else {
-                    return;
-                };
-                face.is_function_type
+                target_is_function(c, node, name)
             }
             _ => false,
         };
         if !context_is_function {
             return;
         }
-        // The right side: `this.<field>` or bare `<field>`, whose field
-        // type names a same-file class with an instance `call` method.
+        // The right side: a bare read, a `this.<field>`, or a creation —
+        // whose type names a class with an instance `call` method.
         let rows = if c.kind(node) == NodeKind::VariableInitializer {
             c.collect_direct(node)
         } else {
@@ -3837,28 +8715,277 @@ pub(crate) mod implicit_call_tearoffs {
             };
             right
         };
-        let run = slice::access_run(c, &rows);
-        let Some(field) = assigned_name(c, &run) else {
-            return;
-        };
-        let Some(face) = type_face_of_field(c, field) else {
-            return;
-        };
-        let Some(type_name) = face.name else {
-            return;
-        };
-        if !same_file_class_has_call(c, type_name) {
+        if !operand_rows_have_call(c, node, &rows) {
             return;
         }
-        // Report at the expression (the official node face): the access
-        // run spans it in source order.
-        let start = c.utf16_span(run[0]).start;
-        let end = c.utf16_span(run[run.len() - 1]).end;
+        // Report at the expression (the official node face): the rows
+        // span it in source order — the run's last value row bounds the
+        // end (the send-group completion wrappers finalize at the `;`).
+        let start = c.utf16_span(rows[0]).start;
+        let end = value_run_end(c, &rows, node);
         c.report(start..end, &[]);
     }
 
-    /// The assigned name off an access run: `this.<field>` or bare
-    /// `<field>`.
+    /// The return face: a written function-type return and an operand
+    /// whose type has `call` reports at the returned expression (a
+    /// function literal's inferred return type stays silent).
+    fn return_face(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(function) = c.path.iter().rev().copied().find(|&a| {
+            matches!(
+                c.kind(a),
+                NodeKind::TopLevelMethod | NodeKind::Method | NodeKind::LocalFunctionDeclaration
+            )
+        }) else {
+            return;
+        };
+        let Some(face) = super::void_checks::written_return_face(c, function) else {
+            return;
+        };
+        if !face_is_function_typed(c, &face) {
+            return;
+        }
+        let rows = c.collect_direct(node);
+        let [first, ..] = rows.as_slice() else {
+            return; // `return;` carries no value
+        };
+        if !operand_rows_have_call(c, node, &rows) {
+            return;
+        }
+        let start = c.utf16_span(*first).start;
+        let end = value_run_end(c, &rows, node);
+        c.report(start..end, &[]);
+    }
+
+    /// The argument face for a same-file top-level callee: the written
+    /// formal table decides the function-typed slots (positional by
+    /// required order, named by label; an optional-positional formal
+    /// under-reports), and a decidable operand reports at the argument
+    /// value. A method or cross-file callee stays silent — the written
+    /// formal rows are not reachable through the fold (no function-type
+    /// `Ty`).
+    fn argument_face(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((head, Some(arguments))) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        if c.kind(kids[head]) != NodeKind::Identifier {
+            return;
+        }
+        let callee = c.lexeme(c.head_token(kids[head]));
+        let Some(function) = top_level_function_row(c, callee) else {
+            return;
+        };
+        let Some(params) = c
+            .collect_direct(function)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+        else {
+            return;
+        };
+        let formals = slice::parameter_assignments::parameter_rows(c, params);
+        let pieces = c.collect_direct(arguments);
+        let ranges = slice::arguments(c, &pieces);
+        let mut positional = 0usize;
+        for range in &ranges {
+            // The formal at the dispatch slot: positional by required
+            // order, named by label. A named argument flattens as
+            // `name value… NamedArgument` (the marker anchors at the
+            // colon).
+            let (formal, value) = if c.kind(pieces[range.end - 1]) == NodeKind::NamedArgument {
+                let Some(name_idx) = slice::named_arg_name(c, &pieces, range.end - 1) else {
+                    continue;
+                };
+                let label = c.lexeme(c.head_token(pieces[name_idx]));
+                let Some((row, _)) = formals.iter().find(|(row, _)| {
+                    slice::parameter_assignments::parameter_name(c, *row) == Some(label)
+                }) else {
+                    continue;
+                };
+                (*row, &pieces[name_idx + 1..range.end - 1])
+            } else {
+                let Some((row, _)) = formals
+                    .iter()
+                    .filter(|(_, optional)| !*optional)
+                    .nth(positional)
+                else {
+                    break;
+                };
+                positional += 1;
+                (*row, &pieces[range.start..range.end])
+            };
+            if !formal_is_function_typed(c, formal) {
+                continue;
+            }
+            if !operand_rows_have_call(c, node, value) {
+                continue;
+            }
+            let start = c.utf16_span(value[0]).start;
+            let end = value_run_end(c, value, *value.last().unwrap_or(&node));
+            c.report(start..end, &[]);
+        }
+    }
+
+    /// Whether a written type face is the function type: a `FunctionType`
+    /// row, or the bare `Function` spelling resolving outside the file (a
+    /// same-file declaration owns the name — the official element
+    /// identity cannot hold for it).
+    fn face_is_function_typed(c: &Check<'_>, face: &TypeFace<'_>) -> bool {
+        face.is_function_type
+            || face
+                .name
+                .is_some_and(|name| bare_function_spelling(c, name))
+    }
+
+    /// The bare `Function` spelling is the core function type only when no
+    /// same-file declaration owns the name.
+    fn bare_function_spelling(c: &Check<'_>, name: &str) -> bool {
+        name == "Function" && !super::same_file::declares_type(c, name)
+    }
+
+    /// Whether a written type row is the function type ([`TypeFace`]'s
+    /// two shapes).
+    fn written_row_is_function(c: &Check<'_>, row: Option<u32>) -> bool {
+        let Some(row) = row else {
+            return false;
+        };
+        match c.kind(row) {
+            NodeKind::FunctionType => true,
+            NodeKind::Type => bare_function_spelling(c, c.lexeme(c.head_token(row))),
+            _ => false,
+        }
+    }
+
+    /// Whether a formal parameter's written type is a function type: the
+    /// function-typed formal shape (`void g(int x)` as a parameter), a
+    /// `FunctionType` child, or the bare `Function` spelling.
+    fn formal_is_function_typed(c: &Check<'_>, formal: u32) -> bool {
+        if c.kind(formal) == NodeKind::FunctionTypedFormalParameter {
+            return true;
+        }
+        if c.kind(formal) != NodeKind::FormalParameter {
+            return false;
+        }
+        c.collect_direct(formal)
+            .into_iter()
+            .find(|&t| {
+                matches!(
+                    c.kind(t),
+                    NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType
+                )
+            })
+            .is_some_and(|row| written_row_is_function(c, Some(row)))
+    }
+
+    /// The same-file top-level function row carrying `name` (the
+    /// argument-face callee channel; a prefix-qualified or method callee
+    /// is out of the face).
+    fn top_level_function_row(c: &Check<'_>, name: &str) -> Option<u32> {
+        let ctx = dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32;
+        let root = c.unit.ast.root()?;
+        for top in c.collect_direct(root) {
+            if c.kind(top) != NodeKind::TopLevelDeclaration {
+                continue;
+            }
+            for kid in c.collect_direct(top) {
+                if c.kind(kid) != NodeKind::TopLevelMethod {
+                    continue;
+                }
+                let named = c.collect_direct(kid).into_iter().any(|k| {
+                    c.kind(k) == NodeKind::Identifier
+                        && c.payload(k).first() == Some(&ctx)
+                        && c.lexeme(c.head_token(k)) == name
+                });
+                if named {
+                    return Some(kid);
+                }
+            }
+        }
+        None
+    }
+
+    /// The operand verdict over a value's rows — the argument/return
+    /// faces' operand shapes: a bare read through
+    /// [`operand_type_has_call`], a `this.`-field through the field face
+    /// (the same-file class), a creation through the resolved container's
+    /// member walk. A bare-identifier argument can tile as the four-piece
+    /// tear-off group (the marker pieces are width-0 wrappers), so the
+    /// raw rows' leading `Identifier` stands in when the access run
+    /// empties.
+    fn operand_rows_have_call(c: &Check<'_>, use_node: u32, rows: &[u32]) -> bool {
+        let run = slice::access_run(c, rows);
+        if let [single] = run.as_slice()
+            && c.kind(*single) == NodeKind::Identifier
+        {
+            let name = c.lexeme(c.head_token(*single));
+            return operand_type_has_call(c, use_node, &run, name);
+        }
+        if let [target, name] = run.as_slice()
+            && c.kind(*target) == NodeKind::ThisExpression
+        {
+            return crate::rules::type_face_of_field(c, c.lexeme(c.head_token(*name)))
+                .and_then(|face| Some(face.name?))
+                .map(|type_name| same_file_class_has_call(c, type_name))
+                .unwrap_or(false);
+        }
+        if let Some(&first) = rows.first()
+            && c.kind(first) == NodeKind::Identifier
+            && rows.len() > 1
+            && rows[1..]
+                .iter()
+                .all(|&row| slice::is_send_group_piece(c, row))
+        {
+            let name = c.lexeme(c.head_token(first));
+            return operand_type_has_call(c, use_node, &[first], name);
+        }
+        creation_has_call(c, rows)
+    }
+
+    /// A creation operand (`C()`, `new C()`): the head resolves through
+    /// the bridge constructor face, and the container's member walk
+    /// answers the instance `call` method (cross-file classes included).
+    fn creation_has_call(c: &Check<'_>, run: &[u32]) -> bool {
+        let Some(analysis) = c.semantics() else {
+            return false;
+        };
+        let Some(args_pos) = run
+            .iter()
+            .position(|&row| c.kind(row) == NodeKind::Arguments)
+        else {
+            return false;
+        };
+        let Some(callee) = run[..args_pos]
+            .iter()
+            .rev()
+            .find_map(|&row| match c.kind(row) {
+                NodeKind::Identifier => Some(row),
+                // The explicit-new shape: the marker owns the callee name.
+                NodeKind::ConstructorReference => c
+                    .collect_direct(row)
+                    .into_iter()
+                    .find(|&k| c.kind(k) == NodeKind::Identifier),
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        let Some(binding) = analysis.resolve_constructor(query_site(c, callee), None) else {
+            // An implicit creation's head carries no type-use row (the
+            // parser tiles `C()` as a plain invocation, so the fold never
+            // records the container) — the same-file class body answers;
+            // a cross-file creation under-reports (the structural face).
+            return same_file_class_has_call(c, c.lexeme(c.head_token(callee)));
+        };
+        analysis
+            .inherited_member(binding.container, analysis.strings().intern("call"), false)
+            .is_some_and(|(_, entry)| entry.kind == MemberKind::Method && !entry.is_static)
+    }
+
+    /// The assigned target's name off an access run: `this.<field>` or
+    /// bare `<field>`.
     fn assigned_name<'a>(c: &'a Check<'_>, run: &[u32]) -> Option<&'a str> {
         match run {
             [single] if c.kind(*single) == NodeKind::Identifier => {
@@ -3871,23 +8998,74 @@ pub(crate) mod implicit_call_tearoffs {
         }
     }
 
-    /// The declaration's written type row (the sibling before the
-    /// declaration).
+    /// The declaration's written type row (the type sibling of the
+    /// variable row — [`written_type_sibling`]).
     fn declaration_type_row(c: &Check<'_>, decl: u32) -> Option<u32> {
-        let owner = c.unit.ast.parent(decl)?;
-        let members = c.collect_direct(owner);
-        let index = members.iter().position(|&m| m == decl)?;
-        index
-            .checked_sub(1)
-            .and_then(|i| members.get(i))
-            .copied()
-            .filter(|&row| matches!(c.kind(row), NodeKind::Type | NodeKind::FunctionType))
+        written_type_sibling(c, decl, &[NodeKind::Type, NodeKind::FunctionType])
     }
 
-    /// Whether the written row is a function type (the `FunctionType`
-    /// kind — `void Function()`, `int Function(String)`).
-    fn written_type_is_function(c: &Check<'_>, row: Option<u32>) -> bool {
-        row.is_some_and(|row| c.kind(row) == NodeKind::FunctionType)
+    /// The assignment target's context verdict, shadow-correct: the
+    /// innermost same-file binding's written row decides (a local
+    /// `void Function() g` target — the documented under-report face);
+    /// the same-class field face stands in when no binding answers.
+    fn target_is_function(c: &Check<'_>, use_node: u32, name: &str) -> bool {
+        if let Some((_, written)) = super::same_file::binding(c, use_node, name) {
+            return written.is_some_and(|row| written_row_is_function(c, Some(row)));
+        }
+        crate::rules::type_face_of_field(c, name)
+            .map(|face| face_is_function_typed(c, &face))
+            .unwrap_or(false)
+    }
+
+    /// The operand's type verdict: a class with an instance `call` method.
+    /// The type name reads shadow-correct (the innermost same-file
+    /// binding's written type — a local of the same name shadows the
+    /// same-class field, the documented over-report face). The class-with-
+    /// `call` check runs same-file first; a cross-file class name reads
+    /// through the bridge member walk when mounted and the operand is a
+    /// bare read (`this.<field>` carries no read row and stays silent —
+    /// the documented under-report face).
+    fn operand_type_has_call(c: &Check<'_>, use_node: u32, run: &[u32], name: &str) -> bool {
+        let type_name = match super::same_file::binding(c, use_node, name) {
+            Some((_, Some(row))) if c.kind(row) == NodeKind::Type => {
+                c.lexeme(c.head_token(row)).to_owned()
+            }
+            Some((_, Some(row))) if c.kind(row) == NodeKind::FunctionType => return false,
+            Some((_, None)) => return false,
+            _ => {
+                let Some(face) = crate::rules::type_face_of_field(c, name) else {
+                    return false;
+                };
+                let Some(type_name) = face.name else {
+                    return false;
+                };
+                type_name.to_owned()
+            }
+        };
+        if same_file_class_has_call(c, &type_name) {
+            return true;
+        }
+        // The cross-file face: the declared class body is in another file
+        // (an unshadowed, non-core name) — the bridge member walk
+        // resolves `call` through the graph.
+        let Some(analysis) = c.semantics() else {
+            return false;
+        };
+        if crate::rules::same_file_declaration(c, &type_name).is_some() {
+            return false;
+        }
+        let [single] = run else {
+            return false;
+        };
+        if c.kind(*single) != NodeKind::Identifier {
+            return false;
+        }
+        analysis
+            .member_of(query_site(c, *single), analysis.strings().intern("call"))
+            .is_some_and(|binding| {
+                binding.entry.kind == dartq_semantic::model::MemberKind::Method
+                    && !binding.entry.is_static
+            })
     }
 
     /// Whether the same-file class `name` declares an instance `call`
@@ -3914,7 +9092,9 @@ pub(crate) mod implicit_call_tearoffs {
 }
 
 pub(crate) mod invalid_runtime_check_with_js_interop_types {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use dartq_semantic::model::{ArgListId, Ty};
+
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice};
 
     const DART_IS_JS_PROBLEM: &str = "Runtime check between '{0}' and '{1}' checks whether a Dart value is a JS interop type, which might not be platform-consistent.";
     const DART_IS_JS_CORRECTION: &str =
@@ -3928,16 +9108,21 @@ pub(crate) mod invalid_runtime_check_with_js_interop_types {
     /// statically guaranteed reports (:360-398, eight diagnostic
     /// variants; the visit faces :400-437).
     ///
-    /// Approximation (documented): the interop classification
-    /// (`_isJsInteropType`, :43-72 — extension types, `@staticInterop`,
-    /// SDK web libraries) reduces on the syntax face to same-file classes
-    /// annotated `@JS`, in a file importing `dart:js_interop`. The ported
-    /// face is the dart-is/as-js slice: `this is JSClass` / `this as
-    /// JSClass` (the left type is the enclosing Dart class), reported at
-    /// the expression with `(dart type, js type)` (:400-437). Other left
-    /// expressions (no written type), cross-file interop types, the
-    /// catch-clause face and the js-side variants stay silent (the
-    /// dominant under-report face). Message: `diagnostic.g.dart`
+    /// The interop classification (`_isJsInteropType`, :43-72 — extension
+    /// types, `@staticInterop`, SDK web libraries) reduces on this
+    /// substrate to classes annotated `@JS` in a file importing
+    /// `dart:js_interop`: same-file through the class body, cross-file
+    /// through [`Analysis::container_has_annotation`] — the resolved
+    /// container's own annotation rows. An unresolvable container (`None`)
+    /// and a resolvable Dart type (`Some(false)`) stay silent. The ported
+    /// face is the dart-is/as-js slice with the
+    /// two left-expression faces: `this is JSClass` / `this as JSClass`
+    /// (the left type is the enclosing Dart class) and `x is JSClass` /
+    /// `x as JSClass` over a bare operand whose bridge read row names a
+    /// type (the display argument is exact — an argument-carrying type
+    /// stays silent), reported at the expression with `(dart type, js
+    /// type)` (:400-437). The catch-clause face and the js-side variants
+    /// stay silent. Message: `diagnostic.g.dart`
     /// `invalidRuntimeCheckWithJsInteropTypesDart{Is,As}Js`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "invalid_runtime_check_with_js_interop_types",
@@ -3956,33 +9141,78 @@ pub(crate) mod invalid_runtime_check_with_js_interop_types {
         let Some(parent) = c.ancestor(1) else {
             return;
         };
-        let kids = c.collect_direct(parent);
-        let Some(pos) = kids.iter().position(|&kid| kid == node) else {
-            return;
-        };
-        // Left face: a lone `this` (the enclosing Dart class) immediately
+        // Left faces: a lone `this` (the enclosing Dart class) immediately
         // before the operator container — an arrow body's signature rows
         // tile before it in the member window, so only the trailing `this`
         // is the tested expression and everything earlier must be
-        // signature.
-        let left: Vec<u32> = kids[..pos]
-            .iter()
-            .copied()
-            .filter(|&row| !matches!(c.kind(row), NodeKind::DotAccess | NodeKind::Qualified))
-            .collect();
+        // signature — or a bare operand whose bridge read row names a
+        // type.
+        // A condition container's own window holds only the operator
+        // container — the condition's operand rows tile flat in the
+        // statement owner's window (the same probe posture
+        // `avoid_double_and_int_checks` reads) — so a condition parent
+        // takes the left run from the grandparent statement: the rows
+        // inside the condition's token range that close before the
+        // operator. The arrow-body return-type window (`preceding`)
+        // exists only in the member-window shape.
+        let (left, preceding): (Vec<u32>, Vec<u32>) =
+            if c.kind(parent) == NodeKind::ParenthesizedCondition {
+                let Some(stmt) = c.ancestor(2) else {
+                    return;
+                };
+                let cond = c.unit.ast.token_range(parent);
+                let node_start = c.unit.ast.token_range(node).start;
+                let run: Vec<u32> = c
+                    .collect_direct(stmt)
+                    .into_iter()
+                    .filter(|&row| {
+                        let span = c.unit.ast.token_range(row);
+                        span.start >= cond.start
+                            && span.end <= node_start
+                            && !matches!(c.kind(row), NodeKind::DotAccess | NodeKind::Qualified)
+                    })
+                    .collect();
+                (run, Vec::new())
+            } else {
+                let kids = c.collect_direct(parent);
+                let Some(pos) = kids.iter().position(|&kid| kid == node) else {
+                    return;
+                };
+                (
+                    kids[..pos]
+                        .iter()
+                        .copied()
+                        .filter(|&row| {
+                            !matches!(c.kind(row), NodeKind::DotAccess | NodeKind::Qualified)
+                        })
+                        .collect(),
+                    kids[..pos].to_vec(),
+                )
+            };
         let Some(&root) = left.last() else {
             return;
         };
-        if c.kind(root) != NodeKind::ThisExpression {
-            return;
-        }
-        if left[..left.len() - 1]
-            .iter()
-            .any(|&row| !is_signature_row(c, row))
+        // The operand row decides both the display name and the report
+        // start — `IsExpression`/`AsExpression` containers anchor at the
+        // `is`/`as` operator, so `utf16_span(node)` would open at the
+        // operator; the official `reportAtNode` opens at the operand.
+        let (dart_type, operand_row): (Option<String>, u32) = if c.kind(root)
+            == NodeKind::ThisExpression
+            && left[..left.len() - 1]
+                .iter()
+                .all(|&row| is_signature_row(c, row))
         {
-            return;
-        }
-        let Some(dart_type) = enclosing_class_name(c) else {
+            (enclosing_class_name(c).map(str::to_owned), root)
+        } else {
+            let stripped = slice::access_run(c, &left);
+            match stripped.as_slice() {
+                [only] if c.kind(*only) == NodeKind::Identifier => {
+                    (typed_identifier_display(c, *only), *only)
+                }
+                _ => (None, root),
+            }
+        };
+        let Some(dart_type) = dart_type else {
             return;
         };
         // The tested type: the `Type` row naming a same-file `@JS` class,
@@ -3994,7 +9224,7 @@ pub(crate) mod invalid_runtime_check_with_js_interop_types {
         // type (token ids are source-ordered).
         let op_head = c.head_token(node);
         let mut candidates = c.collect_direct(node);
-        candidates.extend_from_slice(&kids[..pos]);
+        candidates.extend_from_slice(&preceding);
         let Some(type_row) = candidates
             .into_iter()
             .rev()
@@ -4003,26 +9233,69 @@ pub(crate) mod invalid_runtime_check_with_js_interop_types {
             return;
         };
         let js_type = c.lexeme(c.head_token(type_row));
-        if !imports_js_interop(c) || !same_file_js_class(c, js_type) {
+        if !imports_js_interop(c) {
             return;
         }
-        let (dart_type, js_type) = (dart_type.to_owned(), js_type.to_owned());
-        let range = c.utf16_span(node);
+        if !same_file_js_class(c, js_type) {
+            // The cross-file arm: the resolved container's own `@JS` rows.
+            // `None` — an unresolvable container could carry the
+            // annotation — and `Some(false)` — a resolvable Dart type —
+            // both stay silent; only a proven `@JS` proceeds.
+            let Some(analysis) = c.semantics() else {
+                return;
+            };
+            let strings = analysis.strings();
+            if analysis.container_has_annotation(strings.intern(js_type), strings.intern("JS"))
+                != Some(true)
+            {
+                return;
+            }
+        }
+        // The container anchors at the `is`/`as` operator (a delta-tile
+        // row — `token_range().start` is the operator token); the official
+        // `reportAtNode` opens at the operand. `head_token` on the operand
+        // row answers that start.
+        let range = crate::rules::utf16_token_span(c, c.head_token(operand_row)).start
+            ..c.utf16_span(node).end;
         if is_check {
             c.report_texts(
                 range,
                 DART_IS_JS_PROBLEM,
                 DART_IS_JS_CORRECTION,
-                &[dart_type.as_str(), js_type.as_str()],
+                &[dart_type.as_str(), js_type],
             );
         } else {
             c.report_texts(
                 range,
                 DART_AS_JS_PROBLEM,
                 DART_AS_JS_CORRECTION,
-                &[dart_type.as_str(), js_type.as_str()],
+                &[dart_type.as_str(), js_type],
             );
         }
+    }
+
+    /// The static type display of a bare operand read: the bridge read
+    /// row's named type (the display argument must be exact — an
+    /// argument-carrying type under-reports; `dynamic` and untyped reads
+    /// carry no Dart-type face).
+    fn typed_identifier_display(c: &Check<'_>, row: u32) -> Option<String> {
+        let analysis = c.semantics()?;
+        let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = analysis.type_of(query_site(c, row))?
+        else {
+            return None;
+        };
+        if args != ArgListId::EMPTY {
+            return None;
+        }
+        let mut display = analysis.strings().resolve(name).to_owned();
+        if nullable {
+            display.push('?');
+        }
+        Some(display)
     }
 
     /// The enclosing class-like declaration's name (the wrapper-aware
@@ -4148,16 +9421,19 @@ pub(crate) mod avoid_double_and_int_checks {
     /// — an else-if chain whose branches test the same simple identifier —
     /// `x is double` then `x is int` — with the identifier a formal
     /// parameter or local variable reports at the else condition. The
-    /// written types must resolve to `double` / `int` (:43-46); both
-    /// operands must be `SimpleIdentifier`s with equal names (:41-42), and
-    /// only the *if* operand's element kind is checked (:47-49).
+    /// written types must resolve to `double` / `int` (:43-46
+    /// `ifCondition.type.type`); both operands must be
+    /// `SimpleIdentifier`s with equal names (:41-42), and only the *if*
+    /// operand's element kind is checked (:47-49).
     ///
-    /// dartq faces: the written types are plain single-token `Type` rows
-    /// (a prefixed or parameterized spelling resolves elsewhere and stays
-    /// silent — documented); the binding face is the shadow-correct
-    /// same-file walk ([`binding`]), so a same-file-typed local/parameter
-    /// answers and an import-bound one under-reports (the crate's
-    /// documented posture).
+    /// dartq faces: the written type resolves through the written import
+    /// surface — the plain spelling, a prefixed spelling whose prefix
+    /// imports `dart:core` with combinators admitting the name, and a
+    /// same-file typedef alias chain ending on the name; a parameterized
+    /// spelling never resolves (`double`/`int` are not generic). The
+    /// binding face is the shadow-correct same-file walk ([`binding`]), so
+    /// a same-file-typed local/parameter answers and a catch/for-in/pattern
+    /// bound one under-reports (the crate's documented posture).
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "avoid_double_and_int_checks",
         group: Group::Standalone,
@@ -4179,7 +9455,7 @@ pub(crate) mod avoid_double_and_int_checks {
         let Some((if_operand, _if_is)) = condition_is_check(c, node, "double") else {
             return;
         };
-        let Some((else_operand, else_is)) = condition_is_check(c, else_if, "int") else {
+        let Some((else_operand, else_check)) = condition_is_check(c, else_if, "int") else {
             return;
         };
         // Equal simple names (:41-42); the if operand must bind to a local
@@ -4195,17 +9471,17 @@ pub(crate) mod avoid_double_and_int_checks {
             return;
         }
         // `reportAtNode(elseCondition)` (:50).
-        let range = c.utf16_span(else_is);
+        let range = c.utf16_span(else_check);
         c.report(range, &[]);
     }
 
     /// The `wanted`-typed `is` check of the condition: the condition's
-    /// `IsExpression` child with a plain single-token `Type` child named
-    /// `wanted`, paired with its operand row. The flat tiling parents
-    /// operand rows to the statement owner (probe), so the operand is the
-    /// window's `Identifier` row spanning from just past the condition's
-    /// open paren to the `is` keyword — the official `SimpleIdentifier`
-    /// face (a dotted operand leaves its head row short of the keyword).
+    /// `IsExpression` child with a `Type` child resolving to `wanted`,
+    /// paired with its operand row. The flat tiling parents operand rows to
+    /// the statement owner (probe), so the operand is the window's
+    /// `Identifier` row spanning from just past the condition's open paren
+    /// to the `is` keyword — the official `SimpleIdentifier` face (a dotted
+    /// operand leaves its head row short of the keyword).
     fn condition_is_check(c: &Check<'_>, if_stmt: u32, wanted: &str) -> Option<(u32, u32)> {
         let condition = c
             .collect_direct(if_stmt)
@@ -4219,10 +9495,10 @@ pub(crate) mod avoid_double_and_int_checks {
             .collect_direct(is_row)
             .into_iter()
             .find(|&kid| c.kind(kid) == NodeKind::Type)?;
-        let type_head = c.head_token(type_row);
-        if c.lexeme(type_head) != wanted || c.unit.ast.token_range(type_row).len() != 1 {
+        if !written_type_resolves(c, type_row, wanted) {
             return None;
         }
+        let type_head = c.head_token(type_row);
         let condition_start = c.unit.ast.token_range(condition).start;
         let is_kw = type_head.checked_sub(1)?;
         let operand = c.children(if_stmt).find(|&row| {
@@ -4234,6 +9510,149 @@ pub(crate) mod avoid_double_and_int_checks {
                     }
         })?;
         Some((operand, is_row))
+    }
+
+    /// Whether the written `is`-type row resolves to `wanted` (the official
+    /// `type.type == typeProvider.doubleType/intType`, :45-46): the plain
+    /// spelling, a prefixed spelling whose prefix imports `dart:core` and
+    /// whose combinators admit the name, or a same-file typedef alias
+    /// chain ending on the name. A parameterized spelling never resolves.
+    fn written_type_resolves(c: &Check<'_>, type_row: u32, wanted: &str) -> bool {
+        let tokens = c.unit.ast.token_range(type_row);
+        if tokens.len() == 1 {
+            // A lone head spelling is the plain face only when no dot
+            // precedes it (a prefixed annotation whose row covers the tail
+            // must not read as the core name).
+            if c.unit
+                .ast
+                .token_range(type_row)
+                .start
+                .checked_sub(1)
+                .is_some_and(|prev| c.lexeme(prev) == ".")
+            {
+                return false;
+            }
+            let head = c.lexeme(tokens.start);
+            return head == wanted || typedef_resolves(c, head, wanted, 0);
+        }
+        if tokens.len() == 3 && c.lexeme(tokens.start + 1) == "." {
+            let (prefix, name) = (c.lexeme(tokens.start), c.lexeme(tokens.start + 2));
+            return name == wanted && prefix_admits(c, prefix, wanted);
+        }
+        false
+    }
+
+    /// The same-file typedef alias chain (`typedef D = double;`): each hop
+    /// reads the aliased type's head name off the `Typedef` row (the
+    /// payload word 1 is the `=` token); bounded depth guards cycles.
+    fn typedef_resolves(c: &Check<'_>, name: &str, wanted: &str, depth: usize) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        let Some(alias) = same_file_typedef_alias(c, name) else {
+            return false;
+        };
+        alias == wanted || typedef_resolves(c, alias, wanted, depth + 1)
+    }
+
+    /// The aliased type's head name of the same-file `typedef name = …`.
+    fn same_file_typedef_alias<'a>(c: &'a Check<'_>, name: &str) -> Option<&'a str> {
+        let root = c.path.first().copied()?;
+        for top in c.collect_direct(root) {
+            for inner in c.collect_direct(top) {
+                if c.kind(inner) != NodeKind::Typedef {
+                    continue;
+                }
+                let Some(name_row) = c
+                    .collect_direct(inner)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::Identifier)
+                else {
+                    continue;
+                };
+                if c.lexeme(c.head_token(name_row)) != name {
+                    continue;
+                }
+                let eq = c
+                    .payload(inner)
+                    .get(1)
+                    .copied()
+                    .unwrap_or(crate::rules::NONE_TOKEN);
+                if eq == crate::rules::NONE_TOKEN {
+                    continue;
+                }
+                let type_row = c
+                    .collect_direct(inner)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::Type && c.head_token(kid) > eq)?;
+                return Some(c.lexeme(c.head_token(type_row)));
+            }
+        }
+        None
+    }
+
+    /// Whether the import prefixed `prefix` imports `dart:core` with
+    /// combinators admitting `name`.
+    fn prefix_admits(c: &Check<'_>, prefix: &str, name: &str) -> bool {
+        let Some(root) = c.path.first().copied() else {
+            return false;
+        };
+        for top in c.collect_direct(root) {
+            for inner in c.collect_direct(top) {
+                if c.kind(inner) != NodeKind::Import {
+                    continue;
+                }
+                // The `as` prefix word is payload word 0.
+                let prefix_token = c
+                    .payload(inner)
+                    .first()
+                    .copied()
+                    .unwrap_or(crate::rules::NONE_TOKEN);
+                if prefix_token == crate::rules::NONE_TOKEN || c.lexeme(prefix_token) != prefix {
+                    continue;
+                }
+                let uri = c
+                    .collect_direct(inner)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::StringLiteral);
+                let Some(uri) = uri else {
+                    continue;
+                };
+                let span = c.byte_span(uri);
+                let text =
+                    c.unit.source[span.start..span.end].trim_matches(|q| q == '\'' || q == '"');
+                if text != "dart:core" {
+                    continue;
+                }
+                // The combinator face: an authoritative `show` must list
+                // the name; a `hide` of the name excludes it.
+                let mut shown_any = false;
+                let mut shown = false;
+                let mut hidden = false;
+                for kid in c.collect_direct(inner) {
+                    match c.kind(kid) {
+                        NodeKind::Show => {
+                            shown_any = true;
+                            shown = shown
+                                || c.collect_direct(kid).into_iter().any(|entry| {
+                                    c.kind(entry) == NodeKind::Identifier
+                                        && c.lexeme(c.head_token(entry)) == name
+                                });
+                        }
+                        NodeKind::Hide => {
+                            hidden = hidden
+                                || c.collect_direct(kid).into_iter().any(|entry| {
+                                    c.kind(entry) == NodeKind::Identifier
+                                        && c.lexeme(c.head_token(entry)) == name
+                                });
+                        }
+                        _ => {}
+                    }
+                }
+                return (shown || !shown_any) && !hidden;
+            }
+        }
+        false
     }
 }
 
@@ -4260,6 +9679,12 @@ pub(crate) mod avoid_js_rounded_ints {
         };
         // Rust's `as` saturates exactly like the VM's `toInt` clamp on the
         // round trip.
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            reason = "the official rule is defined by the f64 round trip; \
+                      both casts are the semantics"
+        )]
         if (value as f64) as i64 != value {
             c.report(crate::rules::utf16_token_span(c, c.head_token(node)), &[]);
         }
@@ -4274,10 +9699,2531 @@ pub(crate) mod avoid_js_rounded_ints {
             .strip_prefix("0x")
             .or_else(|| digits.strip_prefix("0X"));
         if let Some(hex) = hex {
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "hexadecimal literals wrap modulo 2^64 (the VM face), \
+                          the official wrap semantics"
+            )]
             return u64::from_str_radix(hex, 16).ok().map(|v| v as i64);
         }
-        let value = u64::from_str_radix(&digits, 10).ok()?;
-        (value <= i64::MAX as u64).then_some(value as i64)
+        let value = digits.parse::<u64>().ok()?;
+        i64::try_from(value).ok()
+    }
+}
+
+pub(crate) mod unnecessary_statements {
+    use dartq_semantic::model::MemberKind;
+
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, same_file};
+    use crate::rules::{body_members, get_set_token, same_file_declaration, slice, type_face};
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_statements.dart`
+    /// — an expression statement, a C-style `for` initializer/updater, or a
+    /// cascade section that has no clear effect reports. The upstream walk
+    /// (`_ReportNoClearEffectVisitor`) never descends through `super` — every
+    /// unhandled node routes to `visitNode` and reports — so the verdict is
+    /// per expression form:
+    ///
+    /// - clear-effect forms stay silent: invocations, assignments, pattern
+    ///   assignments, awaits, throws, rethrows, casts (`as`, :57-59), postfix
+    ///   operators, prefix `++`/`--`, cascades, instance creations, and
+    ///   constructor invocations;
+    /// - `??`/`||`/`&&` walk the right operand only (:72-83); every other
+    ///   binary reports at the whole expression;
+    /// - conditional expressions walk both arms (:91-94);
+    /// - a bare name or member chain keeps the getter face (:129-176): a
+    ///   getter at its origin declaration stays silent (`GetterElement &&
+    ///   isOriginDeclaration`), everything else reports at the whole chain;
+    /// - every other form reports at its node (literals, lambdas, type
+    ///   tests, index accesses, parens, constructor tear-offs).
+    ///
+    /// The dartq faces over the production tiling (the statement row owns
+    /// its expression's piece run; the outermost-completing row is the
+    /// expression root):
+    ///
+    /// - the C-style `for` face (:209-217) reads the [`NodeKind::ForParts`]
+    ///   rows between the separator payload tokens — the initialization run
+    ///   and each comma-delimited updater walk separately;
+    /// - the cascade face (:192-198) reads each [`NodeKind::CascadeAccess`]
+    ///   section: a bare member-access section reports when the member's
+    ///   static type is a function type (:194 — the `..method` tear-off);
+    ///   invocation sections stay silent.
+    ///
+    /// The getter faces resolve in two layers: the semantic model first —
+    /// a member chain reads `member_of` over the receiver's resolved type
+    /// (a `Getter` entry stays silent, a `Method`/`Field` tear-off or read
+    /// reports; cross-file classes included), and a bare name reads its
+    /// binding (an in-scope type parameter or import prefix reports, an
+    /// unresolved name reports — upstream's `visitNode` face — a cross-file
+    /// top-level declaration stays silent because the binding face cannot
+    /// split a getter from a value, the conservative family) — then the
+    /// same-file walk answers what the model leaves open (own getters,
+    /// fields, methods, and the implicit-`this` scope). The cascade
+    /// function-type face composes the same way: a semantic `Method` entry
+    /// is a tear-off; a getter returning a function type answers only over
+    /// the same-file written type (the model carries no function-type `Ty`
+    /// — that sliver under-reports until the function-type face lands).
+    /// The upstream `node.parent is FunctionBody` bail (:202-204) is
+    /// structurally dead over the statement tiling (an `ExpressionStatement`
+    /// row always sits in a block-family owner). Message: `diagnostic.g.dart`
+    /// `unnecessaryStatements`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_statements",
+        group: Group::Standalone,
+        problem: "Unnecessary statement.",
+        correction: "Try completing the statement or breaking it up.",
+        kinds: &[
+            NodeKind::ExpressionStatement,
+            NodeKind::ForStatement,
+            NodeKind::Cascade,
+        ],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        match c.kind(c.node()) {
+            NodeKind::ExpressionStatement => {
+                let run = statement_run(c, c.node());
+                walk(c, analysis, &run);
+            }
+            NodeKind::ForStatement => check_for(c, analysis),
+            NodeKind::Cascade => check_cascade(c, analysis),
+            _ => {}
+        }
+    }
+
+    /// The expression-form dispatch over a piece run (:114-116 `visitNode`
+    /// verdicts). The root is the row whose span covers every other row of
+    /// the run — the outermost completion of the expression.
+    fn walk(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32]) {
+        let Some(root) = root_of(c, run) else {
+            return;
+        };
+        #[expect(
+            clippy::match_same_arms,
+            reason = "the explicit clear-effect set documents the upstream                       visitor's no-op visits; folding it into `_` erases the                       documented taxonomy"
+        )]
+        match c.kind(root) {
+            // The clear-effect set: the upstream empty-bodied visits that do
+            // not descend (:57-70, :86-88, :97-111, :119-121, :124-126,
+            // :162-164, :178-186). `Send` is the bridge's bare-identifier
+            // marker (`Identifier + NoTypeArguments + NoArguments + Send`)
+            // as well as a real invocation's completion row — only the
+            // `Arguments`-carrying send is a clear effect; the bare-name
+            // face falls through to the getter walk.
+            NodeKind::Send if run.iter().any(|&row| c.kind(row) == NodeKind::Arguments) => {}
+            NodeKind::Send => {
+                // The bare-name face: reduce the run through the send-group
+                // strip and dispatch on what remains (an `Identifier` walks
+                // the getter face).
+                let stripped = slice::access_run(c, run);
+                walk(c, analysis, &stripped);
+            }
+            NodeKind::Assignment
+            | NodeKind::PatternAssignment
+            | NodeKind::AwaitExpression
+            | NodeKind::ThrowExpression
+            | NodeKind::AsExpression
+            | NodeKind::Cascade
+            | NodeKind::NewExpression
+            | NodeKind::ImplicitCreation
+            | NodeKind::ConstExpression
+            | NodeKind::UnaryPostfix
+            | NodeKind::NonNullAssert => {}
+            // `--`/`++` are clear (:141-147); every other prefix reports.
+            NodeKind::UnaryPrefix => {
+                let clear = c
+                    .payload(root)
+                    .first()
+                    .is_some_and(|&op| matches!(c.lexeme(op), "--" | "++"));
+                if !clear {
+                    report(c, root, run);
+                }
+            }
+            // `??`/`||`/`&&` walk the right operand for control flow
+            // (:72-83); every other binary reports at the whole expression.
+            NodeKind::BinaryExpression => {
+                let controls = c
+                    .payload(root)
+                    .first()
+                    .is_some_and(|&op| matches!(c.lexeme(op), "??" | "||" | "&&"));
+                if controls {
+                    let right = binary_right_run(c, run, root);
+                    walk(c, analysis, &right);
+                } else {
+                    report(c, root, run);
+                }
+            }
+            // The arms walk; the condition does not (:91-94).
+            NodeKind::Conditional => {
+                for arm in arm_runs(c, run, root) {
+                    walk(c, analysis, &arm);
+                }
+            }
+            // `const []` is a literal face upstream (visitNode); the const
+            // literal's own content decides.
+            NodeKind::ConstLiteral => {
+                let inner = inner_run(c, run, root);
+                walk(c, analysis, &inner);
+            }
+            // The report-at-node set: literals, lambdas, type tests, index
+            // accesses, parens, constructor tear-offs (:114-116).
+            NodeKind::LiteralBool
+            | NodeKind::LiteralDouble
+            | NodeKind::LiteralInt
+            | NodeKind::LiteralNull
+            | NodeKind::StringLiteral
+            | NodeKind::ListLiteral
+            | NodeKind::SetOrMapLiteral
+            | NodeKind::RecordLiteral
+            | NodeKind::SymbolLiteral
+            | NodeKind::FunctionExpression
+            | NodeKind::IsExpression
+            | NodeKind::Indexed
+            | NodeKind::ParenthesizedExpression
+            | NodeKind::ConstructorReference => report(c, root, run),
+            // The getter faces (:129-176): a bare name and a member chain.
+            NodeKind::Identifier
+            | NodeKind::ThisExpression
+            | NodeKind::SuperExpression
+            | NodeKind::DotAccess
+            | NodeKind::Qualified => walk_access(c, analysis, run, root),
+            // Unmodeled shapes stay silent (the conservative family).
+            _ => {}
+        }
+    }
+
+    /// The expression run an `ExpressionStatement` covers: the bridge
+    /// stamps the statement as a childless leaf (`leaf_span` — `expr;`),
+    /// so its pieces tile as siblings under the enclosing block. The run
+    /// is the parent's direct rows whose spans sit strictly inside the
+    /// statement's span (the `;` end is exclusive — no piece reaches it).
+    fn statement_run(c: &Check<'_>, stmt: u32) -> Vec<u32> {
+        let Some(parent) = c.unit.ast.parent(stmt) else {
+            return Vec::new();
+        };
+        let span = c.byte_span(stmt);
+        c.collect_direct(parent)
+            .into_iter()
+            .filter(|&row| {
+                if row == stmt {
+                    return false;
+                }
+                let r = c.byte_span(row);
+                r.start >= span.start && r.end <= span.end
+            })
+            .collect()
+    }
+
+    /// The run's root row: the unique row whose span contains every other
+    /// row's span (sibling pieces never nest), falling back to the last row
+    /// (postfix completion order puts the root last).
+    fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
+        let root = *run.last()?;
+        run.iter()
+            .copied()
+            .find(|&row| {
+                let span = c.byte_span(row);
+                run.iter().all(|&other| {
+                    let other = c.byte_span(other);
+                    other.start >= span.start && other.end <= span.end
+                })
+            })
+            .or(Some(root))
+    }
+
+    /// Reports at the whole expression `root`: the run's earliest head
+    /// token bounds the start — a container root's own covered span opens
+    /// at its delta-tile anchor (the operator or the trailing leaf), never
+    /// at the operand head.
+    fn report(c: &mut Check<'_>, root: u32, run: &[u32]) {
+        let start = slice::run_utf16_start(c, run).unwrap_or(c.utf16_span(root).start);
+        let range = start..c.utf16_span(root).end;
+        c.report(range, &[]);
+    }
+
+    /// The `visitSimpleIdentifier`/`visitPrefixedIdentifier`/
+    /// `visitPropertyAccess` face (:129-176): a getter at its origin
+    /// declaration stays silent; everything else reports at the whole
+    /// chain. The bare-name face walks the same-file declarations first —
+    /// locals shadow, then top-level and enclosing-class getters — and the
+    /// semantic binding face answers the cross-file tail: an in-scope type
+    /// parameter or import prefix reports, an unresolved name reports (the
+    /// upstream `visitNode` verdict), and a cross-file top-level
+    /// declaration stays silent (the binding face cannot split a getter
+    /// from a value — the conservative family).
+    fn walk_access(
+        c: &mut Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        run: &[u32],
+        root: u32,
+    ) {
+        // A bare name: no access marker seals the run.
+        let marker = run
+            .iter()
+            .copied()
+            .rfind(|&row| c.kind(row) == NodeKind::DotAccess);
+        let Some(marker) = marker else {
+            let stripped = slice::access_run(c, run);
+            let Some(&only) = stripped.first() else {
+                return;
+            };
+            if stripped.len() != 1 || c.kind(only) != NodeKind::Identifier {
+                return;
+            }
+            let name = c.lexeme(c.head_token(only));
+            // A local/parameter/field/top-level variable binding reports
+            // (`test_localVariable`, `test_topLevelVariable`).
+            if same_file::binding(c, root, name).is_some() {
+                report(c, root, run);
+                return;
+            }
+            // An origin getter stays silent (:167-176 — the top-level and
+            // implicit-`this` faces).
+            if is_same_file_getter(c, root, name) {
+                return;
+            }
+            // Every other same-file declaration (function tear-off, setter,
+            // class) reports (:114-116).
+            if same_file::declares_name(c, name) {
+                report(c, root, run);
+                return;
+            }
+            // The semantic cross-file tail: a resolved type-parameter or
+            // prefix is not a getter (report); an unresolved name takes the
+            // upstream `visitNode` report; a cross-file declaration stays
+            // silent (getter-vs-value undecidable — the conservative
+            // family).
+            match analysis.binding_of(query_site(c, root)) {
+                Some(binding)
+                    if matches!(
+                        binding.kind,
+                        dartq_semantic::BindingKind::TypeParam
+                            | dartq_semantic::BindingKind::Prefix
+                    ) =>
+                {
+                    report(c, root, run);
+                }
+                Some(_) => {}
+                None => report(c, root, run),
+            }
+            return;
+        };
+        let Some(name_index) = slice::access_name_index(c, run, marker) else {
+            return;
+        };
+        let name = c.lexeme(c.head_token(run[name_index]));
+        // The `this.`/`super.` face: the enclosing class-like scope's
+        // member (:150-159 — a same-file origin getter passes).
+        if run.iter().any(|&row| {
+            matches!(
+                c.kind(row),
+                NodeKind::ThisExpression | NodeKind::SuperExpression
+            )
+        }) {
+            let getter = enclosing_class(c, root).is_some_and(|class_row| {
+                matches!(class_member(c, class_row, name), Some(Member::Getter))
+            });
+            if !getter {
+                report(c, root, run);
+            }
+            return;
+        }
+        // The bare-receiver face: the semantic member walk first — the
+        // receiver's resolved type decides across files; the same-file
+        // written-type channel answers what the model leaves open.
+        let Some(receiver) = slice::bare_receiver(c, run, name_index) else {
+            return;
+        };
+        let receiver_name = c.lexeme(c.head_token(receiver));
+        if let Some(member) =
+            analysis.member_of(query_site(c, receiver), analysis.strings().intern(name))
+        {
+            match member.entry.kind {
+                // The origin-getter face (:129-138, :150-159).
+                MemberKind::Getter => return,
+                // A field read or a method tear-off reports (:117-121,
+                // :139-147 — `test_instanceField`, `test_methodTearoff`).
+                MemberKind::Method | MemberKind::Field => {
+                    report(c, root, run);
+                    return;
+                }
+                MemberKind::Setter => {}
+            }
+        }
+        let Some(class_name) = same_file::written_type(c, receiver, receiver_name) else {
+            return;
+        };
+        let Some(class_row) = same_file_declaration(c, class_name) else {
+            return;
+        };
+        match class_member(c, class_row, name) {
+            // The origin-getter face (:129-138, :150-159); a name not
+            // declared on the same-file class — inherited or imported —
+            // joins the conservative silent face.
+            Some(Member::Getter) | None => {}
+            // A field or a method tear-off reports (:117-121, :139-147 —
+            // `test_instanceField`, `test_methodTearoff`).
+            Some(_) => report(c, root, run),
+        }
+    }
+
+    /// The same-file member verdicts the getter and cascade faces read.
+    enum Member {
+        Getter,
+        Field,
+        Method,
+        Setter,
+    }
+
+    /// The member `name` of the same-file class-like `class_row`, read off
+    /// the body rows (a `Method` getter/method/setter, a `Fields` field).
+    /// Static-ness does not change the verdict (an upstream static member
+    /// answers the same faces).
+    fn class_member(c: &Check<'_>, class_row: u32, name: &str) -> Option<Member> {
+        for member in body_members(c, class_row) {
+            match c.kind(member) {
+                NodeKind::Method => {
+                    // The stamped-name read — a written return type tiles a
+                    // `TypeReference` `Identifier` ahead of the name.
+                    let Some(name_row) = crate::rules::member_name(c, member) else {
+                        continue;
+                    };
+                    if c.lexeme(c.head_token(name_row)) != name {
+                        continue;
+                    }
+                    return match get_set_token(c, member) {
+                        Some("get") => Some(Member::Getter),
+                        Some(_) => Some(Member::Setter),
+                        None => Some(Member::Method),
+                    };
+                }
+                NodeKind::Fields => {
+                    for kid in c.collect_direct(member) {
+                        if c.kind(kid) == NodeKind::Identifier
+                            && c.lexeme(c.head_token(kid)) == name
+                            && c.payload(kid).first()
+                                == Some(&(dartq_parser::IdentifierContext::FieldDeclaration as u32))
+                        {
+                            return Some(Member::Field);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Whether `name` is a same-file origin getter at the use site: a
+    /// top-level getter, or an instance getter of the enclosing class-like
+    /// scope (the implicit-`this` face).
+    fn is_same_file_getter(c: &Check<'_>, use_node: u32, name: &str) -> bool {
+        let root = c.path.first().copied();
+        // The `get` TopLevelMethod's name is the
+        // `TopLevelFunctionDeclaration`-context identifier — the generic
+        // `member_name` head picks the return-type identifier for a typed
+        // getter, so the context read is required here.
+        let ctx = dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32;
+        if let Some(root) = root {
+            for top in c.collect_direct(root) {
+                for inner in c.collect_direct(top) {
+                    if c.kind(inner) != NodeKind::TopLevelMethod
+                        || get_set_token(c, inner) != Some("get")
+                    {
+                        continue;
+                    }
+                    let found = c.collect_direct(inner).into_iter().any(|kid| {
+                        c.kind(kid) == NodeKind::Identifier
+                            && c.payload(kid).first() == Some(&ctx)
+                            && c.lexeme(c.head_token(kid)) == name
+                    });
+                    if found {
+                        return true;
+                    }
+                }
+            }
+        }
+        enclosing_class(c, use_node).is_some_and(|class_row| {
+            matches!(class_member(c, class_row, name), Some(Member::Getter))
+        })
+    }
+
+    /// The innermost enclosing class-like declaration row of the use site.
+    fn enclosing_class(c: &Check<'_>, use_node: u32) -> Option<u32> {
+        let pos = c.path.iter().position(|&row| row == use_node)?;
+        c.path[..pos].iter().rev().copied().find(|&row| {
+            matches!(
+                c.kind(row),
+                NodeKind::ClassDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::EnumDeclaration
+                    | NodeKind::ExtensionDeclaration
+                    | NodeKind::ExtensionTypeDeclaration
+            )
+        })
+    }
+
+    /// The C-style `for` face (:209-217): the initialization expression and
+    /// every updater walk separately; a for-in header is not
+    /// `ForPartsWithExpression` and passes.
+    fn check_for(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let Some(parts) = c
+            .collect_direct(c.node())
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::ForParts)
+        else {
+            return;
+        };
+        let payload = c.payload(parts);
+        let Some(&left_sep) = payload.get(1) else {
+            return;
+        };
+        let Some(&right_sep) = payload.get(2) else {
+            return;
+        };
+        let (Some(left_start), Some(right_end)) = (
+            c.unit
+                .tokens
+                .get(left_sep as usize)
+                .map(|t| t.byte_offset as usize),
+            c.unit
+                .tokens
+                .get(right_sep as usize)
+                .map(|t| (t.byte_offset + t.byte_len) as usize),
+        ) else {
+            return;
+        };
+        // The initialization run: the pieces before the first separator.
+        let init: Vec<u32> = c
+            .collect_direct(parts)
+            .into_iter()
+            .filter(|&row| c.byte_span(row).end <= left_start)
+            .collect();
+        walk(c, analysis, &init);
+        // Each comma-delimited updater walks separately (:212-215).
+        let updater_rows: Vec<u32> = c
+            .collect_direct(parts)
+            .into_iter()
+            .filter(|&row| c.byte_span(row).start >= right_end)
+            .collect();
+        for run in comma_groups(c, &updater_rows) {
+            walk(c, analysis, &run);
+        }
+    }
+
+    /// The maximal row groups whose spans stay within a comma-delimited
+    /// token range (an updater list tiling).
+    fn comma_groups(c: &Check<'_>, rows: &[u32]) -> Vec<Vec<u32>> {
+        let Some((&first, rest)) = rows.split_first() else {
+            return Vec::new();
+        };
+        let start = c.byte_span(first).start;
+        let end = rest
+            .last()
+            .map_or_else(|| c.byte_span(first).end, |&row| c.byte_span(row).end);
+        let mut commas: Vec<usize> = c
+            .unit
+            .ast
+            .token_range(rows[0])
+            .filter_map(|token| {
+                let span = crate::rules::byte_span_of_token(c, token);
+                (c.lexeme(token) == "," && span.start >= start && span.end <= end)
+                    .then_some(span.start)
+            })
+            .collect();
+        commas.sort_unstable();
+        let mut groups: Vec<Vec<u32>> = vec![Vec::new()];
+        let mut comma = 0;
+        for &row in rows {
+            let span = c.byte_span(row);
+            while comma < commas.len() && span.start >= commas[comma] {
+                comma += 1;
+                groups.push(Vec::new());
+            }
+            groups.last_mut().expect("seeded above").push(row);
+        }
+        groups.retain(|group| !group.is_empty());
+        groups
+    }
+
+    /// The cascade section face (:192-198): a bare member-access section
+    /// whose member is a function type (a method tear-off — semantic or
+    /// same-file — or a getter/field declared with a written function type)
+    /// reports at the section; invocation and assignment sections stay
+    /// silent.
+    fn check_cascade(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let cascade = c.node();
+        let kids = c.collect_direct(cascade);
+        for &marker in &kids {
+            if c.kind(marker) != NodeKind::CascadeAccess {
+                continue;
+            }
+            let marker_span = c.byte_span(marker);
+            let section: Vec<u32> = kids
+                .iter()
+                .copied()
+                .filter(|&kid| {
+                    kid != marker && {
+                        let span = c.byte_span(kid);
+                        span.start >= marker_span.start && span.end <= marker_span.end
+                    }
+                })
+                .collect();
+            // `..method()` and `..x = e` sections pass (:194 — only a
+            // PropertyAccess section with a function type reports). The
+            // `Send` marker sits in every section's run (the bare-name
+            // send group tiles it beside the member identifier), so the
+            // invocation read is the `Arguments` piece — a `NoArguments`
+            // group is a bare access, not a call.
+            if section
+                .iter()
+                .any(|&row| matches!(c.kind(row), NodeKind::Arguments | NodeKind::Assignment))
+            {
+                continue;
+            }
+            if cascade_section_function_typed(c, analysis, marker) {
+                // The section marker's own span opens at the access's own
+                // tile — pass the marker as its own run (a leaf's head is
+                // its covered start).
+                report(c, marker, &[marker]);
+            }
+        }
+    }
+
+    /// Whether the bare-access section's member is a function type
+    /// (:194 `staticType is FunctionType`): the semantic member walk first
+    /// (a `Method` entry is a tear-off — cross-file classes included), then
+    /// the same-file written-type channel (a method tear-off, or a
+    /// getter/field whose written type is a function type).
+    fn cascade_section_function_typed(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        marker: u32,
+    ) -> bool {
+        let name = c.lexeme(c.head_token(marker));
+        // The target rows: the owner-slice pieces before the cascade row
+        // (the statement tiling keeps the target beside the cascade).
+        let Some(owner) = c.unit.ast.parent(c.node()) else {
+            return false;
+        };
+        let owner_kids = c.collect_direct(owner);
+        let Some(pos) = owner_kids.iter().position(|&kid| kid == c.node()) else {
+            return false;
+        };
+        let target = slice::statement_run(c, &owner_kids[..pos]);
+        let Some(&head) = target.first() else {
+            return false;
+        };
+        // The cascade target is the send-group of the receiver itself —
+        // `c..m` tiles `c`'s pieces as the `Identifier + NoTypeArguments +
+        // NoArguments + Send` group; `access_run` strips the markers to
+        // the receiver row. A `this` target reads the enclosing class-like
+        // scope.
+        let receiver_rows = slice::access_run(c, &target);
+        let Some(&receiver) = receiver_rows.first() else {
+            if c.kind(head) != NodeKind::ThisExpression {
+                return false;
+            }
+            let Some(class_row) = enclosing_class(c, head) else {
+                return false;
+            };
+            return member_function_typed(c, class_row, name);
+        };
+        // The semantic member face: a resolved `Method` entry is a
+        // tear-off (cross-file classes included). A getter/field entry
+        // falls through — the model carries no function-type `Ty`, so the
+        // written-type face below answers what it can.
+        if let Some(member) =
+            analysis.member_of(query_site(c, receiver), analysis.strings().intern(name))
+            && member.entry.kind == MemberKind::Method
+        {
+            return true;
+        }
+        let receiver_name = c.lexeme(c.head_token(receiver));
+        let Some(class_name) = same_file::written_type(c, receiver, receiver_name) else {
+            return false;
+        };
+        let Some(class_row) = same_file_declaration(c, class_name) else {
+            return false;
+        };
+        member_function_typed(c, class_row, name)
+    }
+
+    /// Whether the same-file class `class_row` declares `name` as a method
+    /// or a function-typed getter/field (the `staticType is FunctionType`
+    /// face, :194).
+    fn member_function_typed(c: &Check<'_>, class_row: u32, name: &str) -> bool {
+        for member in body_members(c, class_row) {
+            match c.kind(member) {
+                NodeKind::Method => {
+                    // The stamped-name read — a written return type tiles a
+                    // `TypeReference` `Identifier` ahead of the name.
+                    let Some(name_row) = crate::rules::member_name(c, member) else {
+                        continue;
+                    };
+                    if c.lexeme(c.head_token(name_row)) != name {
+                        continue;
+                    }
+                    match get_set_token(c, member) {
+                        // A method tear-off is a function type (:194).
+                        None => return true,
+                        // A getter's written return type decides.
+                        Some("get") => {
+                            if let Some((type_row, _)) =
+                                crate::rules::type_before(c, member, name_row)
+                                && type_face(c, type_row).is_function_type
+                            {
+                                return true;
+                            }
+                            return false;
+                        }
+                        Some(_) => return false,
+                    }
+                }
+                NodeKind::Fields => {
+                    let mut written = None;
+                    for kid in c.collect_direct(member) {
+                        match c.kind(kid) {
+                            NodeKind::Type | NodeKind::FunctionType | NodeKind::VoidType => {
+                                written = Some(kid);
+                            }
+                            NodeKind::Identifier
+                                if c.payload(kid).first()
+                                    == Some(
+                                        &(dartq_parser::IdentifierContext::FieldDeclaration as u32),
+                                    )
+                                    && c.lexeme(c.head_token(kid)) == name =>
+                            {
+                                return written
+                                    .is_some_and(|row| type_face(c, row).is_function_type);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// The right-operand run of the control-flow binary at `root`: the
+    /// container's window rows and owner-sibling pieces right of the
+    /// operator token (`slice::binary_operands`'s adopted shape, read from
+    /// the dispatch face).
+    fn binary_right_run(c: &Check<'_>, run: &[u32], root: u32) -> Vec<u32> {
+        let Some(&op_token) = c.payload(root).first() else {
+            return Vec::new();
+        };
+        let Some(token) = c.unit.tokens.get(op_token as usize) else {
+            return Vec::new();
+        };
+        let op_start = token.byte_offset as usize;
+        let mut right: Vec<u32> = run
+            .iter()
+            .copied()
+            .filter(|&row| row != root && c.byte_span(row).start >= op_start && row > root)
+            .collect();
+        let window = c.children(root);
+        right.extend(window.start..window.end);
+        right.retain(|&row| c.byte_span(row).start >= op_start);
+        right.sort_unstable();
+        right
+    }
+
+    /// The then/else arm runs of the conditional at `root`: the arm rows
+    /// plus the owner-sibling pieces inside each arm's span.
+    fn arm_runs(c: &Check<'_>, run: &[u32], root: u32) -> Vec<Vec<u32>> {
+        c.collect_direct(root)
+            .into_iter()
+            .skip(1)
+            .take(2)
+            .map(|arm| inner_run(c, run, arm))
+            .collect()
+    }
+
+    /// The rows of one expression: the owner-sibling pieces inside `root`'s
+    /// span plus its own completion window.
+    fn inner_run(c: &Check<'_>, run: &[u32], root: u32) -> Vec<u32> {
+        let span = c.byte_span(root);
+        let mut rows: Vec<u32> = run
+            .iter()
+            .copied()
+            .filter(|&row| {
+                row != root && {
+                    let other = c.byte_span(row);
+                    other.start >= span.start && other.end <= span.end
+                }
+            })
+            .collect();
+        let window = c.children(root);
+        rows.extend(window.start..window.end);
+        rows.sort_unstable();
+        rows
+    }
+}
+
+pub(crate) mod avoid_null_checks_in_equality_operators {
+    use super::{Check, Group, NodeKind, RuleSpec, slice, value_run_end};
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/avoid_null_checks_in_equality_operators.dart`
+    /// — inside an `operator ==` whose single parameter is nullable, the
+    /// body walk reports every null check against that parameter: a `??`
+    /// with the parameter on the left (:22-27), an `==`/`!=` against the
+    /// `null` literal on either side (:11-18), and a `?.` access or
+    /// invocation whose target is the parameter (:101-107, :109-115). A
+    /// non-`?` parameter bails (:69-73 — that face is the analyzer's
+    /// `nonNullableEqualsParameter`, dart-lang/linter#2864; a written
+    /// `dynamic` is not `?` and bails the same way).
+    ///
+    /// dartq faces over the production tiling: the expression rows
+    /// dispatch themselves (`BinaryExpression`, `DotAccess`) and gate at
+    /// the nearest enclosing method row — the operator name rides the
+    /// [`NodeKind::OperatorName`] sibling the member lane stamps before
+    /// the method row, the parameter list is the
+    /// [`NodeKind::FormalParameters`] child (one
+    /// [`NodeKind::FormalParameter`] — its name is payload word 1, the
+    /// written type the `Type` child). The canonical-element face runs
+    /// over the operand piece run (`slice::binary_operands` at the
+    /// operator byte split; the send-group strip reduces a bare name to
+    /// its identifier): parens unwrap (`(other) ?? null` reports — the
+    /// parenthesized operand keeps the binary's canonical element), then
+    /// the bare parameter identifier at the use site must survive the
+    /// parent-chain walk (a closer block local, closure parameter, or
+    /// catch parameter of the same name rejects it). The `?.` face reads
+    /// the [`NodeKind::DotAccess`] null-aware flag (payload word 1) and
+    /// reduces the receiver run the same way — an invocation's trailing
+    /// `Send` + argument list + selector sit right before the marker, a
+    /// bare property's receiver group does — so `other?.foo.bar()` fires
+    /// on `other?.foo` alone. Message: `diagnostic.g.dart`
+    /// `avoidNullChecksInEqualityOperators`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_null_checks_in_equality_operators",
+        group: Group::Standalone,
+        problem: "Unnecessary null comparison in implementation of '=='.",
+        correction: "Try removing the comparison.",
+        kinds: &[NodeKind::BinaryExpression, NodeKind::DotAccess],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let Some((method, param)) = equality_parameter(c) else {
+            return;
+        };
+        match c.kind(c.node()) {
+            NodeKind::BinaryExpression => check_binary(c, method, &param),
+            NodeKind::DotAccess => check_dot(c, method, &param),
+            _ => {}
+        }
+    }
+
+    /// The entry gate at the nearest enclosing method (:100-121): the
+    /// `==` operator name (:63), exactly one parameter (:64), and its
+    /// written type carrying a `?` tail (:69-73 — that face is the
+    /// analyzer's `nonNullableEqualsParameter`, dart-lang/linter#2864; a
+    /// written `dynamic` is not `?` and bails the same way). Rows outside
+    /// any method — or inside a method that fails the gate — stay silent.
+    fn equality_parameter(c: &Check<'_>) -> Option<(u32, String)> {
+        for depth in 1..256 {
+            let method = c.ancestor(depth)?;
+            if c.kind(method) != NodeKind::Method {
+                continue;
+            }
+            // The operator name tiles as the method row's preceding
+            // sibling in the member body (the declaration lane stamps it
+            // there before the method opens).
+            let owner = c.unit.ast.parent(method)?;
+            let kids = c.collect_direct(owner);
+            let pos = kids.iter().position(|&kid| kid == method)?;
+            let is_equals = pos > 0
+                && c.kind(kids[pos - 1]) == NodeKind::OperatorName
+                && c.lexeme(
+                    c.payload(kids[pos - 1])
+                        .first()
+                        .copied()
+                        .unwrap_or(crate::rules::NONE_TOKEN),
+                ) == "==";
+            if !is_equals {
+                return None;
+            }
+            // `parameters.length != 1` bail (:64).
+            let params = c
+                .collect_direct(method)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)?;
+            let parameters: Vec<u32> = c
+                .collect_direct(params)
+                .into_iter()
+                .filter(|&kid| c.kind(kid) == NodeKind::FormalParameter)
+                .collect();
+            let [parameter] = parameters[..] else {
+                return None;
+            };
+            // The parameter name: payload word 1 (the `parameter_binding` face).
+            let name_token = c.payload(parameter).get(1)?;
+            if *name_token == crate::rules::NONE_TOKEN {
+                return None;
+            }
+            // The nullability gate (:69-73): the written type carries a `?`
+            // tail; an untyped parameter (`dynamic` upstream) does not.
+            let written = c
+                .collect_direct(parameter)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::Type)?;
+            if !crate::rules::type_face(c, written).nullable {
+                return None;
+            }
+            return Some((method, c.lexeme(*name_token).to_owned()));
+        }
+        None
+    }
+
+    /// The binary faces (:11-27): `other ?? e`, and `other == null` /
+    /// `null == other` / the `!=` mirror. The report sits at the binary
+    /// row (its span head is the left operand's head — the official
+    /// `reportAtNode(node)`).
+    fn check_binary(c: &mut Check<'_>, method: u32, param: &str) {
+        let node = c.node();
+        let Some(op) = c.payload(node).first().copied() else {
+            return;
+        };
+        // The operand runs of the flattened container (:52-59).
+        let Some((left, right)) = slice::binary_operands(c) else {
+            return;
+        };
+        let fires = match c.lexeme(op) {
+            "??" => operand_is_parameter(c, &left, method, param),
+            "==" | "!=" => {
+                (run_is_null_literal(c, &right) && operand_is_parameter(c, &left, method, param))
+                    || (run_is_null_literal(c, &left)
+                        && operand_is_parameter(c, &right, method, param))
+            }
+            _ => false,
+        };
+        if fires {
+            // The official reports at the whole binary expression; the
+            // container row opens at the operator's tile anchor, so the
+            // extent runs from the left operand's first token (the run's
+            // operator-adjacent tail — a `!=` nested inside `&&` keeps the
+            // outer pieces out) to the right run's last value row.
+            let Some(start) = slice::operand_utf16_start(c, &left, op) else {
+                return;
+            };
+            let end = value_run_end(c, &right, node);
+            c.report(start..end, &[]);
+        }
+    }
+
+    /// The `visitPropertyAccess`/`visitMethodInvocation` faces (:80-95): a
+    /// `?.` access or invocation whose target is the parameter reports at
+    /// the receiver — both faces read the one null-aware marker, so a
+    /// chain reports once (the upstream `other?.foo.bar()` shape fires on
+    /// `other?.foo` alone).
+    fn check_dot(c: &mut Check<'_>, method: u32, param: &str) {
+        let node = c.node();
+        // The bridge's null-aware flag (payload word 1) is the `?.` gate.
+        if c.payload(node).get(1) != Some(&1) {
+            return;
+        }
+        // The receiver run: the pieces before the marker in the owner
+        // slice. An adopted window parks the receiver pieces at the
+        // container's parent (the `binary_operands` posture).
+        let Some(parent) = c.unit.ast.parent(node) else {
+            return;
+        };
+        let mut kids = c.collect_direct(parent);
+        let Some(mut pos) = kids.iter().position(|&kid| kid == node) else {
+            return;
+        };
+        if pos == 0
+            && let Some(grand) = c.unit.ast.parent(parent)
+        {
+            let owner_kids = c.collect_direct(grand);
+            let Some(container_pos) = owner_kids.iter().position(|&kid| kid == parent) else {
+                return;
+            };
+            kids = owner_kids[..container_pos].to_vec();
+            pos = kids.len();
+        }
+        let Some(receiver) = receiver_row(c, &kids[..pos], node) else {
+            return;
+        };
+        if c.kind(receiver) == NodeKind::Identifier
+            && c.lexeme(c.head_token(receiver)) == param
+            && resolves_to_parameter(c, receiver, method, param)
+        {
+            let range = c.utf16_span(receiver).start..c.utf16_span(node).end;
+            c.report(range, &[]);
+        }
+    }
+
+    /// The receiver row over the pieces before a null-aware marker: the
+    /// access completion parks its `Send` (the marker's own span), an
+    /// invocation's argument list, and the selector identifier (sharing
+    /// the marker's head token) right before the marker — invocation or
+    /// bare property alike. The scan strips those wrapper pieces and
+    /// answers the first surviving row — a bare name reduces to its
+    /// identifier, a chain keeps its access row (never a parameter).
+    fn receiver_row(c: &Check<'_>, pieces: &[u32], marker: u32) -> Option<u32> {
+        let mut end = pieces.len();
+        // The marker's own `Send` (same span) and an invocation's argument
+        // list park right before the marker.
+        if end > 0
+            && c.kind(pieces[end - 1]) == NodeKind::Send
+            && c.utf16_span(pieces[end - 1]) == c.utf16_span(marker)
+        {
+            end -= 1;
+            if end > 0
+                && matches!(
+                    c.kind(pieces[end - 1]),
+                    NodeKind::Arguments | NodeKind::NoArguments
+                )
+            {
+                end -= 1;
+            }
+        }
+        // Wrapper pieces sit between the selector and the access send.
+        while end > 0 && slice::is_send_group_piece(c, pieces[end - 1]) {
+            end -= 1;
+        }
+        // The selector identifier shares the marker's head token.
+        if end > 0
+            && c.kind(pieces[end - 1]) == NodeKind::Identifier
+            && c.head_token(pieces[end - 1]) == c.head_token(marker)
+        {
+            end -= 1;
+        }
+        // The receiver's own completion group.
+        while end > 0 && slice::is_send_group_piece(c, pieces[end - 1]) {
+            end -= 1;
+        }
+        pieces.get(end.checked_sub(1)?).copied()
+    }
+
+    /// `_isParameter` (:33-34) over the operand run: parens unwrap, the
+    /// send-group strip reduces a bare name to its identifier, and the
+    /// run's surviving tail must be the bare parameter identifier at the
+    /// use site (the operand completes at the run tail — the
+    /// `binary_operands` divergence parks earlier siblings' pieces in the
+    /// run head, so a head-prefix match would miss the face and a
+    /// whole-run match would read the wrong operand).
+    fn operand_is_parameter(c: &Check<'_>, run: &[u32], method: u32, param: &str) -> bool {
+        let mut rows = slice::access_run(c, run);
+        // `(other)` — the paren container wraps its own pieces.
+        if let Some(&tail) = rows.last()
+            && c.kind(tail) == NodeKind::ParenthesizedExpression
+        {
+            rows = slice::access_run(c, &c.collect_direct(tail));
+        }
+        let Some(&tail) = rows.last() else {
+            return false;
+        };
+        c.kind(tail) == NodeKind::Identifier
+            && c.lexeme(c.head_token(tail)) == param
+            && resolves_to_parameter(c, tail, method, param)
+    }
+
+    /// `isNullLiteral` (:28, :30): the operand run's surviving tail is the
+    /// bare null literal — a `(null)` paren keeps the official silent (the
+    /// operand is the paren expression).
+    fn run_is_null_literal(c: &Check<'_>, run: &[u32]) -> bool {
+        slice::access_run(c, run)
+            .last()
+            .is_some_and(|&tail| c.kind(tail) == NodeKind::LiteralNull)
+    }
+
+    /// The canonical-element identity face: no closer binding of the name
+    /// sits between the use site and the method's own parameter list. The
+    /// parent-chain walk rejects a block local, closure/nested-function
+    /// parameter, or catch parameter of the same name; reaching the
+    /// dispatched method confirms its parameter (exactly one, checked at
+    /// the entry face).
+    fn resolves_to_parameter(c: &Check<'_>, use_row: u32, method: u32, param_name: &str) -> bool {
+        let use_start = c.byte_span(use_row).start;
+        let mut current = use_row;
+        loop {
+            let Some(parent) = c.unit.ast.parent(current) else {
+                return false;
+            };
+            current = parent;
+            match c.kind(current) {
+                NodeKind::Block | NodeKind::BlockBody => {
+                    if block_shadows(c, current, use_start, param_name) {
+                        return false;
+                    }
+                }
+                NodeKind::FunctionExpression
+                | NodeKind::NamedFunctionExpression
+                | NodeKind::LocalFunctionDeclaration => {
+                    if params_contain(c, current, param_name) {
+                        return false;
+                    }
+                }
+                NodeKind::CatchClause => {
+                    let ctx = dartq_parser::IdentifierContext::CatchParameter as u32;
+                    if c.children(current).any(|row| {
+                        c.kind(row) == NodeKind::Identifier
+                            && c.payload(row).first() == Some(&ctx)
+                            && c.lexeme(c.head_token(row)) == param_name
+                    }) {
+                        return false;
+                    }
+                }
+                NodeKind::Method => {
+                    return current == method && params_contain(c, method, param_name);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether a block-local of `name` is declared before the use site
+    /// (the `block_binding` scan: the statement tiling keeps locals flat
+    /// in the owner slice).
+    fn block_shadows(c: &Check<'_>, block: u32, use_start: usize, name: &str) -> bool {
+        let ctx = dartq_parser::IdentifierContext::LocalVariableDeclaration as u32;
+        c.collect_direct(block).into_iter().any(|kid| {
+            c.kind(kid) == NodeKind::VariablesDeclaration
+                && c.collect_direct(kid).into_iter().any(|var| {
+                    let name_row = if c.kind(var) == NodeKind::Identifier {
+                        Some(var)
+                    } else {
+                        c.collect_direct(var)
+                            .into_iter()
+                            .find(|&piece| c.kind(piece) == NodeKind::Identifier)
+                    };
+                    name_row.is_some_and(|row| {
+                        c.payload(row).first() == Some(&ctx)
+                            && c.lexeme(c.head_token(row)) == name
+                            && c.byte_span(row).start < use_start
+                    })
+                })
+        })
+    }
+
+    /// Whether the owner's [`NodeKind::FormalParameters`] child binds
+    /// `name`.
+    fn params_contain(c: &Check<'_>, owner: u32, name: &str) -> bool {
+        c.collect_direct(owner)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+            .any(|params| {
+                c.collect_direct(params).into_iter().any(|kid| {
+                    c.kind(kid) == NodeKind::FormalParameter
+                        && c.payload(kid)
+                            .get(1)
+                            .copied()
+                            .filter(|&tok| tok != crate::rules::NONE_TOKEN)
+                            .is_some_and(|tok| c.lexeme(tok) == name)
+                })
+            })
+    }
+}
+
+pub(crate) mod noop_primitive_operations {
+    use dartq_semantic::model::Ty;
+
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+    use crate::rules::utf16_token_span;
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/noop_primitive_operations.dart`
+    /// — three noop families report:
+    ///
+    /// - a middle empty literal of an adjacent-strings group (:42-47 — the
+    ///   ends pass, sdk#55541; the literal `stringValue` must be the empty
+    ///   string, so an interpolated literal never fires);
+    /// - a `target.toString()` with no arguments and a non-`super` target
+    ///   inside a string interpolation (:97-105);
+    /// - typed invocations (:70-94): `toString` on a non-nullable core
+    ///   `String` receiver, the `int` invariants (`toInt`/`round`/`ceil`/
+    ///   `floor`/`truncate`) on a core `int` receiver (nullability does not
+    ///   gate — `isDartCoreInt` reads through `?`), and `toDouble` on a
+    ///   core `double` receiver; with no target, the core `print` face
+    ///   descends into its single argument for the same `toString` shape
+    ///   (:59-66 — `print(1.toString())`).
+    ///
+    /// dartq faces over the production tiling (the send-family handles are
+    /// childless leaves over flat owner slices; a member invocation tiles
+    /// `[receiver pieces, selector Identifier, Arguments | NoArguments,
+    /// Send, trailing same-span DotAccess marker]`): the dispatch rows are
+    /// [`NodeKind::Send`] and [`NodeKind::StringLiteral`]. The receiver
+    /// reads in two layers — a literal receiver decides closed through the
+    /// shared literal faces, everything else through the semantic model
+    /// ([`faces::expr_type`]: a bare name's read or callee row, a
+    /// single-name member chain, a receiver call), gated on the written
+    /// name not being a same-file declaration. Approximations (documented):
+    /// a member-chain receiver beyond the first hop, an unknown-type
+    /// (`var`) binding, and a written core-type name shadowed by a
+    /// same-file declaration stay silent; the core `print` identity is the
+    /// conservative name-table face — a bare unshadowed `print` is core
+    /// (any resolved binding of the name is a user declaration) — which
+    /// under-reports a shadowing import. Message: `diagnostic.g.dart`
+    /// `noopPrimitiveOperations`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "noop_primitive_operations",
+        group: Group::Standalone,
+        problem: "The expression has no effect and can be removed.",
+        correction: "Try removing the expression.",
+        kinds: &[NodeKind::Send, NodeKind::StringLiteral],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        match c.kind(c.node()) {
+            NodeKind::Send => check_send(c, analysis),
+            NodeKind::StringLiteral => check_string_literal(c),
+            _ => {}
+        }
+    }
+
+    /// The send faces (:57-95): the typed receiver families over a member
+    /// invocation, and the bare `print` descent into its single argument.
+    fn check_send(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((selector, arguments)) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        let name = c.lexeme(c.head_token(kids[selector]));
+        if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_none() {
+            // The bare-invocation face (:59-66): core `print` with exactly
+            // one argument descends for the toString shape. The identity is
+            // the conservative name-table face: any resolved binding of the
+            // bare name is a user declaration, not the core function.
+            if name != "print" || arguments.is_none() {
+                return;
+            }
+            if analysis.binding_of(query_site(c, kids[selector])).is_some() {
+                return;
+            }
+            // Exactly one argument (:60-61): the `Arguments` row is a single
+            // positional argument when no `NamedArgument` marker and no
+            // top-level comma tile in it — `slice::arguments` mis-splits a
+            // member-chain argument's send groups, so the count reads the
+            // comma token directly.
+            let args = arguments.expect("checked Some above");
+            let raw = c.collect_direct(args);
+            let single = c.unit.ast.token_range(args).all(|tok| {
+                c.unit
+                    .tokens
+                    .get(tok as usize)
+                    .is_none_or(|t| t.kind != dartq_scanner::TokenKind::Comma)
+            }) && !raw
+                .iter()
+                .any(|&row| c.kind(row) == NodeKind::NamedArgument);
+            if !single || raw.is_empty() {
+                return;
+            }
+            let run = &raw[..];
+            // The argument's root invocation: the widest `Send` inside the
+            // argument's piece range.
+            let Some(root) = run
+                .iter()
+                .copied()
+                .filter(|&row| c.kind(row) == NodeKind::Send)
+                .max_by_key(|&row| {
+                    let span = c.byte_span(row);
+                    span.end - span.start
+                })
+            else {
+                return;
+            };
+            if let Some(name_range) = noop_to_string_name(c, run, root) {
+                c.report(name_range, &[]);
+            }
+            return;
+        }
+        // The typed faces (:70-94): the member name decides the family.
+        // The upstream predicate reads no argument count and no null-aware
+        // marker — the receiver type alone decides, with the non-nullable
+        // gate on the `toString` family only.
+        let (wanted, non_null) = match name {
+            "toString" => ("String", true),
+            "toDouble" => ("double", false),
+            "toInt" | "round" | "ceil" | "floor" | "truncate" => ("int", false),
+            _ => return,
+        };
+        let Some((core, nullable)) = receiver_core_type(c, analysis, &kids, selector) else {
+            return;
+        };
+        if core != wanted || (non_null && nullable) {
+            return;
+        }
+        let name_range = utf16_token_span(c, c.head_token(kids[selector]));
+        c.report(name_range, &[]);
+    }
+
+    /// The receiver's core type name and nullability, or `None` when no
+    /// face answers: a literal decides closed (non-nullable), everything
+    /// else reads the semantic model — a bare name's read or callee row, a
+    /// single-name member chain, a receiver call — with the written core
+    /// spelling shadow-guarded against same-file declarations.
+    fn receiver_core_type(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        kids: &[u32],
+        selector: usize,
+    ) -> Option<(&'static str, bool)> {
+        let mut i = selector.checked_sub(1)?;
+        while matches!(
+            c.kind(kids[i]),
+            NodeKind::NoTypeArguments | NodeKind::TypeArguments
+        ) {
+            i = i.checked_sub(1)?;
+        }
+        match c.kind(kids[i]) {
+            NodeKind::StringLiteral => Some(("String", false)),
+            NodeKind::LiteralInt => Some(("int", false)),
+            NodeKind::LiteralDouble => Some(("double", false)),
+            _ => {
+                // A wrapped literal decides through the shared literal face.
+                if let Some(literal) = slice::literal_faces(c, kids[i]) {
+                    return (literal & slice::STRING != 0).then_some(("String", false));
+                }
+                // The bare-name receiver group immediately before the
+                // selector (`[name, NoTypeArguments, NoArguments, Send]`):
+                // the name's flow row answers. The whole-window piece run
+                // would read the earlier statements' strays.
+                if c.kind(kids[i]) == NodeKind::Send
+                    && i >= 3
+                    && slice::is_tear_off_group(c, kids, i - 3)
+                {
+                    let Ty::Named { name, nullable, .. } =
+                        analysis.type_of(query_site(c, kids[i - 3]))?
+                    else {
+                        return None;
+                    };
+                    let written = analysis.strings().resolve(name);
+                    if super::same_file::declares_name(c, written) {
+                        return None;
+                    }
+                    let core = match written {
+                        "String" => "String",
+                        "int" => "int",
+                        "double" => "double",
+                        _ => return None,
+                    };
+                    return Some((core, nullable));
+                }
+                let Ty::Named { name, nullable, .. } =
+                    faces::expr_type(c, analysis, &kids[..selector])?
+                else {
+                    return None;
+                };
+                let written = analysis.strings().resolve(name);
+                // A same-file declaration owns the spelling — not the core
+                // type.
+                if super::same_file::declares_name(c, written) {
+                    return None;
+                }
+                let core = match written {
+                    "String" => "String",
+                    "int" => "int",
+                    "double" => "double",
+                    _ => return None,
+                };
+                Some((core, nullable))
+            }
+        }
+    }
+
+    /// The `_checkToStringInvocation` face (:97-105): `run`'s send is a
+    /// member invocation whose member is `toString` with no arguments and a
+    /// present non-`super` target; returns the member-name range.
+    fn noop_to_string_name(c: &Check<'_>, run: &[u32], send: u32) -> Option<core::ops::Range<u32>> {
+        let pos = run.iter().position(|&row| row == send)?;
+        // A target is required (a bare `toString()` has no marker).
+        slice::access_marker(c, run, pos, NodeKind::DotAccess)?;
+        let (selector, arguments) = slice::send_parts(c, run, pos)?;
+        if c.lexeme(c.head_token(run[selector])) != "toString" {
+            return None;
+        }
+        if !zero_arguments(c, arguments) {
+            return None;
+        }
+        // The target is present and not `super`: the first receiver piece
+        // before the selector (wrappers skip back) decides.
+        let mut i = selector.checked_sub(1)?;
+        while matches!(
+            c.kind(run[i]),
+            NodeKind::NoTypeArguments | NodeKind::TypeArguments
+        ) {
+            i = i.checked_sub(1)?;
+        }
+        if c.kind(run[i]) == NodeKind::SuperExpression {
+            return None;
+        }
+        Some(utf16_token_span(c, c.head_token(run[selector])))
+    }
+
+    /// The upstream zero-argument face: no argument list marker (the
+    /// width-0 `NoArguments`) or an empty `()` pair.
+    fn zero_arguments(c: &Check<'_>, arguments: Option<u32>) -> bool {
+        match arguments {
+            None => true,
+            Some(args) => c.unit.ast.token_range(args).count() == 2,
+        }
+    }
+
+    /// The string-literal faces: the adjacent-strings middle empty literal,
+    /// then the interpolation face over the literal's own interpolation
+    /// expressions (their rows tile as the literal's children).
+    fn check_string_literal(c: &mut Check<'_>) {
+        let literal = c.node();
+        if middle_empty_literal(c) {
+            let range = c.utf16_span(literal);
+            c.report(range, &[]);
+            return;
+        }
+        let kids = c.collect_direct(literal);
+        for row in kids {
+            if c.kind(row) != NodeKind::Send {
+                continue;
+            }
+            let Some(parent) = c.unit.ast.parent(row) else {
+                continue;
+            };
+            let run = c.collect_direct(parent);
+            if let Some(name_range) = noop_to_string_name(c, &run, row) {
+                c.report(name_range, &[]);
+            }
+        }
+    }
+
+    /// The adjacent-strings middle face (:42-47): a literal with adjacent
+    /// string siblings on both sides whose own spelling is the empty
+    /// literal.
+    fn middle_empty_literal(c: &Check<'_>) -> bool {
+        let node = c.node();
+        // Adjacent strings tile across an adopted boundary: the last
+        // literal of `'a' '' 'b'` completes inside the `Assignment` row, so
+        // same-parent siblings miss it. The run is the enclosing statement's
+        // string literals in token order; the node is the middle when it is
+        // flanked on both sides by directly-adjacent spellings.
+        let mut scope = node;
+        let group: Vec<u32> = loop {
+            let Some(parent) = c.unit.ast.parent(scope) else {
+                return false;
+            };
+            let kids = c.collect_direct(parent);
+            let strings: Vec<u32> = kids
+                .iter()
+                .copied()
+                .filter(|&kid| c.kind(kid) == NodeKind::StringLiteral)
+                .collect();
+            if strings.contains(&node) {
+                // The group's right literal may live in a nested operator
+                // row — collect every string literal under this statement
+                // subtree in token order.
+                let mut all = Vec::new();
+                collect_string_literals(c, parent, &mut all);
+                if all.contains(&node) {
+                    break all;
+                }
+            }
+            scope = parent;
+        };
+        let Some(pos) = group.iter().position(|&kid| kid == node) else {
+            return false;
+        };
+        let adjacent = |left: u32, right: u32| {
+            c.unit.ast.token_range(left).end == c.unit.ast.token_range(right).start
+        };
+        let has_left = pos > 0 && adjacent(group[pos - 1], group[pos]);
+        let has_right = pos + 1 < group.len() && adjacent(group[pos], group[pos + 1]);
+        has_left && has_right && is_empty_literal(c, node)
+    }
+
+    /// Every `StringLiteral` row under `row`, in token order (subtree walk —
+    /// the adjacent-strings group's literals scatter across the adopted
+    /// operator boundary).
+    fn collect_string_literals(c: &Check<'_>, row: u32, out: &mut Vec<u32>) {
+        let mut kids: Vec<u32> = c.collect_direct(row);
+        kids.sort_by_key(|&kid| c.head_token(kid));
+        for kid in kids {
+            if c.kind(kid) == NodeKind::StringLiteral {
+                out.push(kid);
+            }
+            collect_string_literals(c, kid, out);
+        }
+    }
+
+    /// Whether the literal's spelling is the empty string: one string
+    /// segment that is only its quote run (`''`/`""` or the triple-quoted
+    /// forms; an interpolation's first segment is a lone opening quote and
+    /// fails the shape).
+    fn is_empty_literal(c: &Check<'_>, literal: u32) -> bool {
+        let spelling = c.lexeme(c.head_token(literal));
+        let body = spelling.strip_prefix('r').unwrap_or(spelling);
+        let Some(quote) = body.chars().next() else {
+            return false;
+        };
+        (quote == '\'' || quote == '"')
+            && body.chars().all(|ch| ch == quote)
+            && matches!(body.len(), 2 | 6)
+    }
+}
+
+pub(crate) mod unnecessary_lambdas {
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice};
+    use crate::rules::{NONE_TOKEN, get_set_token, variables_declaration_keyword};
+    use dartq_semantic::model::{ArgListId, Formal, Formals, Ty};
+    use dartq_semantic::{Analysis, FnSig};
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_lambdas.dart`
+    /// — a lambda whose whole body is one invocation forwarding exactly its
+    /// own parameters reports at the lambda (a tear-off will do), provided
+    /// the callee's function type is assignable to the lambda's own. The
+    /// registration is the function expression (:41); a named function
+    /// expression and an `async`/`sync*` body bail (:155-158). Bodies
+    /// (:160-186): a single-statement block whose statement is an
+    /// invocation or a `return` of one, an arrow body whose expression is
+    /// an invocation, or — constructor tear-offs enabled — an arrow body
+    /// whose expression is an instance creation (:181-185).
+    ///
+    /// The invocation face (:228-289): every argument is the lambda's own
+    /// parameter — positional in order, named by name, both counts equal
+    /// (`argumentsMatchParameters`, dart_type_utilities.dart:13-64); the
+    /// callee's static invoke type is assignable to the lambda's function
+    /// type (:246, `isAssignableTo(invocationType, nodeType)`); a
+    /// deferred-prefix callee or receiver bails (:255, :264,
+    /// `mightBeDeferred` :314-324); the bare callee (:260) or the receiver
+    /// (:283) is final (`isFinalNode` :50-79, `isFinal` :326-335 — a
+    /// parameter of the lambda, a non-`final` or `late` variable, and a
+    /// non-variable accessor are not); the receiver chain carries no
+    /// null-aware link (:282) and the invocation no explicit type
+    /// arguments (:285). The named-argument and variable-initializer
+    /// positions add a pure-subtype check of the tear-off against the
+    /// context type (:269-279): for a forwarding lambda that is the main
+    /// relation read without the permissive fallback, which is exactly how
+    /// the gate below reads it, so it adds no face. The constructor face
+    /// (:189-226): a non-`const`, non-deferred creation (:195-197) whose
+    /// constructor type is assignable to the lambda's (:208) and whose
+    /// arguments are bare identifiers naming the lambda's parameters by
+    /// index with equal counts (:212-223).
+    ///
+    /// dartq faces over the production tiling. The dispatch row is the
+    /// [`NodeKind::FunctionExpression`] (a named function expression is a
+    /// different row kind), the async/`sync*` gate scans the lambda's
+    /// tokens, and the body root is the widest row of its run (a wider
+    /// binary keeps the lambda silent, `test_nonFunctionCall`). The
+    /// arguments-match gate reads each argument's bare-identifier tear-off
+    /// group (parens unwrap) and requires it to resolve to the lambda's
+    /// own parameter (the parent-chain walk — the canonical-element
+    /// identity). The finality face resolves a bare receiver or callee to
+    /// its same-file binding: a closure or catch parameter, an enclosing
+    /// method parameter, a getter, and a non-`final` or `late final`
+    /// variable bail; a `final`/`const` variable, field, or function
+    /// proceeds; a non-bare receiver bails (`isFinalNode`'s shape gate);
+    /// the walk's terminal (cross-file and unresolved names) hands the
+    /// verdict to the signature gate.
+    ///
+    /// The assignability gate is the semantic face — the wave posture: no
+    /// face, no report (the engine contract). The callee's signature is
+    /// the model's function-type face ([`FnSig`]): a bare callee through
+    /// [`Analysis::function_signature_of`] (a top-level function or an
+    /// implicit-`this` method, cross-file capable), a `receiver.method`
+    /// callee through [`Analysis::member_of`] + [`FnSig::of_member`] (a
+    /// method only), a creation through [`Analysis::resolve_constructor`]
+    /// + [`FnSig::new`] over the constructor's formals (an undeclared
+    /// unnamed constructor composes the implicit default's empty table).
+    /// The lambda's own signature is [`FnSig::new`] over its written
+    /// formals — names, parser kinds, written types — with a Right-Top
+    /// return: for every forwarding shape the covariant return position
+    /// holds by construction, because the lambda's inferred return is the
+    /// LUB of its one returned expression, the callee's own return
+    /// (`body_inference_context.dart:183-207`), or the typing context's
+    /// `void` (:157-181), and an expression-statement block body's `Null`
+    /// (:197-199) only ever meets the permissive fallback upstream. The
+    /// verdict is [`FnSig::assignable_from`]'s tri-state: `Some(true)` —
+    /// provably assignable from written declarations — reports; `None`
+    /// (undecidable) and `Some(false)` (provably not) both stay silent,
+    /// the conservative under-report channel on the resolved face.
+    /// Upstream's permissive `parametersMatch` fallback (:107-151,
+    /// consulted at :247) is ported on the no-signature face: a callee
+    /// the model resolves to no function type — a local function, a
+    /// function-typed variable, an unresolved spelling (the dart:core
+    /// names the gate rows exercise) — takes the fallback's
+    /// non-`FunctionType` arm (:108-111, "We must assume is valid here")
+    /// and reports: in a compiling forward every invocable callee carries
+    /// a function-typed invocation type whose required counts the
+    /// arguments-match gate has already tied, so the arm cannot fail the
+    /// assignability relation. The bare creation head keeps its cut
+    /// below: a class-like name is the one bare callee whose invocation
+    /// is no function-type composition at all.
+    ///
+    /// Deliberate silences, every one a `None` face: an untyped lambda
+    /// formal (its type is inferred from the context upstream — not
+    /// modeled); a written `dynamic` lambda formal (the model leaf's
+    /// `dynamic`-downcast arm is `isAssignableTo`'s whole-type rule, not
+    /// the function-subtype parameter leaf's `isSubtypeOf`,
+    /// `subtype.dart:127` — a non-top target formal would over-prove); a
+    /// parameterized, prefixed, function-typed, record-typed, or `void`
+    /// written formal; a getter, field, or prefix callee (the member
+    /// face's accessor cut — no method signature composes); a generic
+    /// callee (its instantiation the model does not name); a
+    /// `receiver.method` whose receiver type the model cannot name; a
+    /// prefixed or unresolved creation head; a creation head published as
+    /// a value reference (the bare `C(a)` send, no type-use row) — of
+    /// which only the zero-argument shape is provable: a bare same-file
+    /// class-like name invoked with no arguments by a parameterless lambda
+    /// (`() => C()`, `test_constructorCall_noArgs`) is replaceable by
+    /// construction, since a compiling zero-argument call means the
+    /// constructor declares no required formal and optional leftovers on
+    /// the replacement side are admissible (`subtype.dart:141-146`,
+    /// :157-165). Message: `diagnostic.g.dart` `unnecessaryLambdas`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_lambdas",
+        group: Group::Standalone,
+        problem: "Closure should be a tearoff.",
+        correction: "Try using a tearoff rather than a closure.",
+        kinds: &[NodeKind::FunctionExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the assignability gate (:208, :246) reads the
+        // semantic face; face absent is the plain-run posture and stays
+        // silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let lambda = c.node();
+        // `node.body.keyword != null` bail (:156): an async/`sync*` lambda
+        // never reduces to a tear-off.
+        if c.unit
+            .ast
+            .token_range(lambda)
+            .any(|token| matches!(c.lexeme(token), "async" | "sync" | "await" | "yield"))
+        {
+            return;
+        }
+        // The body face: the single statement's run, or the arrow body's
+        // expression pieces (:160-186).
+        let Some((run, arrow)) = body_run(c, lambda) else {
+            return;
+        };
+        // The invocation face first (:163, :169, :178); the constructor
+        // face (:181-185) takes an arrow body whose root is a creation.
+        if let Some(root) = expression_root(c, &run, NodeKind::Send) {
+            check_invocation(c, analysis, lambda, &run, root);
+            return;
+        }
+        if arrow {
+            for kind in [NodeKind::ImplicitCreation, NodeKind::NewExpression] {
+                if let Some(root) = expression_root(c, &run, kind) {
+                    check_constructor(c, analysis, lambda, root);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The lambda's body piece run: the single statement of a block body
+    /// (`(arrow, false)`), or the arrow expression's pieces
+    /// (`(arrow, true)`) — the lambda's own rows past the parameter list
+    /// (the childless `ExpressionBody` handle leaves the expression pieces
+    /// as the lambda row's children). `None` when no face applies: a block
+    /// body with zero or several statements, an unhandled statement kind.
+    fn body_run(c: &Check<'_>, lambda: u32) -> Option<(Vec<u32>, bool)> {
+        let kids = c.collect_direct(lambda);
+        let params_end = kids
+            .iter()
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+            .map_or(0, |params| c.children(params).end);
+        if let Some(body) = kids
+            .iter()
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::BlockBody)
+        {
+            // The statement rows sit among the statement's own flat pieces
+            // (the send groups tile as siblings); count statement rows only.
+            // The `ExpressionStatement` is a childless leaf — its operand
+            // pieces are the body's flat children inside the statement's
+            // token window; a `ReturnStatement` owns its operand children.
+            let statements: Vec<u32> = c
+                .collect_direct(body)
+                .into_iter()
+                .filter(|&row| crate::rules::is_statement_row(c, row))
+                .collect();
+            let [only] = statements[..] else {
+                return None;
+            };
+            let run: Vec<u32> = match c.kind(only) {
+                NodeKind::ExpressionStatement => {
+                    let span = c.byte_span(only);
+                    c.collect_direct(body)
+                        .into_iter()
+                        .filter(|&row| {
+                            row != only
+                                && c.byte_span(row).start >= span.start
+                                && c.byte_span(row).end <= span.end
+                        })
+                        .collect()
+                }
+                NodeKind::ReturnStatement => c.collect_direct(only),
+                _ => return None,
+            };
+            return Some((run, false));
+        }
+        let arrow = kids
+            .iter()
+            .copied()
+            .any(|kid| c.kind(kid) == NodeKind::ExpressionBody);
+        if !arrow {
+            return None;
+        }
+        // The arrow expression's pieces: the lambda rows past the
+        // parameter list (the body expression completes after the
+        // parameters).
+        Some(((params_end..c.children(lambda).end).collect(), true))
+    }
+
+    /// The run's widest row of `kind` — the expression root — unless any
+    /// other *expression* row is strictly wider (the marker's same-span tie
+    /// stands). Container markers (`ExpressionBody`, `FormalParameters`)
+    /// span the whole body and are not operands, so they never out-vote a
+    /// real expression root.
+    fn expression_root(c: &Check<'_>, run: &[u32], kind: NodeKind) -> Option<u32> {
+        let root = run
+            .iter()
+            .copied()
+            .filter(|&row| c.kind(row) == kind)
+            .max_by_key(|&row| {
+                let span = c.byte_span(row);
+                span.end - span.start
+            })?;
+        let root_len = {
+            let span = c.byte_span(root);
+            span.end - span.start
+        };
+        run.iter()
+            .filter(|&&row| {
+                !matches!(
+                    c.kind(row),
+                    NodeKind::ExpressionBody
+                        | NodeKind::FormalParameters
+                        | NodeKind::NoFormalParameters
+                        | NodeKind::BlockBody
+                        | NodeKind::ExpressionStatement
+                        | NodeKind::ReturnStatement
+                )
+            })
+            .all(|&row| {
+                let span = c.byte_span(row);
+                span.end - span.start <= root_len
+            })
+            .then_some(root)
+    }
+
+    /// The invocation face (:228-289): the arguments match the lambda's
+    /// parameters, the chain carries no explicit type arguments or
+    /// null-aware link, the receiver (or bare callee) is final, and the
+    /// callee's signature is provably assignable to the lambda's.
+    fn check_invocation(
+        c: &mut Check<'_>,
+        analysis: &Analysis<'_>,
+        lambda: u32,
+        run: &[u32],
+        root: u32,
+    ) {
+        let Some(pos) = run.iter().position(|&row| row == root) else {
+            return;
+        };
+        let marker = slice::access_marker(c, run, pos, NodeKind::DotAccess);
+        let Some((selector, arguments)) = slice::send_parts(c, run, pos) else {
+            return;
+        };
+        // `node.typeArguments == null` bail (:285).
+        if run
+            .iter()
+            .any(|&row| c.kind(row) == NodeKind::TypeArguments)
+        {
+            return;
+        }
+        // `containsNullAwareInvocationInChain` bail (:282): any null-aware
+        // marker in the run's chain.
+        if run
+            .iter()
+            .any(|&row| c.kind(row) == NodeKind::DotAccess && c.payload(row).get(1) == Some(&1))
+        {
+            return;
+        }
+        // `argumentsMatchParameters` (:232-239).
+        let Some(arguments) = arguments else {
+            return;
+        };
+        let formals = lambda_formals(c, lambda);
+        if !arguments_match_parameters(c, lambda, &formals, arguments) {
+            return;
+        }
+        // The bare-callee face (`FunctionExpressionInvocation`, :254-262):
+        // the selector must be a bare name (only wrapper markers may sit
+        // between the name and the argument list).
+        if marker.is_none() {
+            // The bare callee's name is followed by its type-argument
+            // wrapper, then the argument list. The argument *content* send
+            // groups tile inside the `Arguments` token window — bound the
+            // bare-name check by token position, not row position.
+            let args_start = c.byte_span(arguments).start;
+            let between = &run[selector + 1..pos];
+            if between.iter().any(|&row| {
+                c.byte_span(row).start < args_start
+                    && !matches!(
+                        c.kind(row),
+                        NodeKind::NoTypeArguments | NodeKind::TypeArguments
+                    )
+            }) {
+                return;
+            }
+        }
+        // The finality face: the method receiver (:283) or the bare callee
+        // (:260).
+        let probe = match marker {
+            Some(_) => match slice::bare_receiver(c, run, selector) {
+                Some(receiver) if c.kind(receiver) == NodeKind::Identifier => receiver,
+                // `isFinalNode`'s shape gate: a compound target is not
+                // final.
+                _ => return,
+            },
+            None => run[selector],
+        };
+        if c.kind(probe) != NodeKind::Identifier {
+            return;
+        }
+        let name = c.lexeme(c.head_token(probe));
+        if matches!(binding_finality(c, probe, name), Finality::NotFinal) {
+            return;
+        }
+        // `invocationType` (:244-245, :266-267): the bare callee's own
+        // declaration, or the receiver's method (a getter or field never
+        // composes — the `methodName.element.isFinal` accessor cut, :284).
+        let target = match marker {
+            None => analysis.function_signature_of(query_site(c, probe)),
+            Some(_) => {
+                let method = analysis
+                    .strings()
+                    .intern(c.lexeme(c.head_token(run[selector])));
+                analysis
+                    .member_of(query_site(c, probe), method)
+                    .and_then(|member| FnSig::of_member(member.entry))
+            }
+        };
+        let fires = match target {
+            Some(target) => lambda_accepts(c, analysis, &formals, target),
+            // No callable face composes. A same-file class-like name is
+            // the creation head: only the zero-argument shape is provable
+            // (the constructor formals the model cannot name stay
+            // unprovable). Every other bare callee takes the
+            // `parametersMatch` non-`FunctionType` arm (:111-114, "We
+            // must assume is valid here"): an invocation type that
+            // composes no model function type cannot fail the
+            // assignability gate, and for a compiling forward the
+            // arguments-match, finality, type-argument, and null-aware
+            // gates above carry the verdict. A prefixed callee rides the
+            // member face and stays with the creation cut.
+            None => {
+                marker.is_none()
+                    && if same_file_class(c, name) {
+                        formals.is_empty() && zero_arguments(c, arguments)
+                    } else {
+                        true
+                    }
+            }
+        };
+        if fires {
+            let range = c.utf16_span(lambda);
+            c.report(range, &[]);
+        }
+    }
+
+    /// The upstream zero-argument face: no argument list marker (the
+    /// width-0 `NoArguments`) or an empty `()` pair.
+    fn zero_arguments(c: &Check<'_>, arguments: u32) -> bool {
+        c.kind(arguments) != NodeKind::Arguments || c.unit.ast.token_range(arguments).count() == 2
+    }
+
+    /// Whether `name` declares a same-file class-like type (the bare
+    /// creation head the model publishes as a value reference).
+    fn same_file_class(c: &Check<'_>, name: &str) -> bool {
+        crate::rules::same_file_declaration(c, name).is_some_and(|row| {
+            matches!(
+                c.kind(row),
+                NodeKind::ClassDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::EnumDeclaration
+                    | NodeKind::ExtensionDeclaration
+                    | NodeKind::ExtensionTypeDeclaration
+            )
+        })
+    }
+
+    /// The constructor face (:189-226): an arrow body over a `new` or
+    /// type-argumented creation whose constructor composes a signature
+    /// provably assignable to the lambda's (:208) and whose arguments are
+    /// bare identifiers naming the lambda's parameters by index with
+    /// equal counts (:212-223). The const form tiles as a
+    /// `ConstExpression` root and never reaches here (:195); a prefixed
+    /// head resolves no container (the deferred bail, :196).
+    fn check_constructor(c: &mut Check<'_>, analysis: &Analysis<'_>, lambda: u32, root: u32) {
+        let kids = c.collect_direct(root);
+        // The creation head: the type name (the type-use row the
+        // constructor face keys on) and the optional `.name` selector.
+        let Some(reference) = kids
+            .iter()
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::ConstructorReference)
+        else {
+            return;
+        };
+        let mut names = c
+            .collect_direct(reference)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::Identifier);
+        let Some(type_row) = names.next() else {
+            return;
+        };
+        let selector = names
+            .next()
+            .map(|row| analysis.strings().intern(c.lexeme(c.head_token(row))));
+        let Some(binding) = analysis.resolve_constructor(query_site(c, type_row), selector) else {
+            return;
+        };
+        if !binding.exists {
+            return;
+        }
+        let formals = lambda_formals(c, lambda);
+        let arguments = kids
+            .iter()
+            .copied()
+            .find(|&kid| matches!(c.kind(kid), NodeKind::Arguments | NodeKind::NoArguments));
+        if !constructor_arguments_match(c, &formals, arguments) {
+            return;
+        }
+        // The constructor's signature: its declared formals, else the
+        // implicit default constructor's empty table.
+        let implicit = Formals {
+            positional: Box::new([]),
+            named: Box::new([]),
+        };
+        let target = FnSig::new(
+            0,
+            Ty::named(binding.container),
+            binding.formals.unwrap_or(&implicit),
+        );
+        if lambda_accepts(c, analysis, &formals, target) {
+            let range = c.utf16_span(lambda);
+            c.report(range, &[]);
+        }
+    }
+
+    /// The constructor arguments face (:212-223): every argument is a bare
+    /// identifier (a named argument is not, :213), the counts are equal
+    /// (:217), and each names the lambda's parameter at the same index
+    /// (:219-223 — a lexeme comparison).
+    fn constructor_arguments_match(
+        c: &Check<'_>,
+        formals: &[LambdaFormal<'_>],
+        arguments: Option<u32>,
+    ) -> bool {
+        let Some(arguments) = arguments.filter(|&row| c.kind(row) == NodeKind::Arguments) else {
+            return formals.is_empty();
+        };
+        let raw = c.collect_direct(arguments);
+        let ranges = slice::arguments(c, &raw);
+        ranges.len() == formals.len()
+            && ranges.into_iter().zip(formals).all(|(range, formal)| {
+                c.kind(raw[range.end - 1]) != NodeKind::NamedArgument
+                    && bare_argument_name(c, &raw[range]) == Some(formal.name)
+            })
+    }
+
+    /// The assignability gate (:208, :246): the callee's signature stands
+    /// where the lambda's does — `Some(true)` only; `None` (undecidable
+    /// from written facts) and `Some(false)` both stay silent.
+    fn lambda_accepts(
+        c: &Check<'_>,
+        analysis: &Analysis<'_>,
+        formals: &[LambdaFormal<'_>],
+        target: FnSig<'_>,
+    ) -> bool {
+        let own = lambda_formal_table(c, analysis, formals);
+        FnSig::new(0, Ty::Void, &own).assignable_from(target) == Some(true)
+    }
+
+    /// The `argumentsMatchParameters` face (dart_type_utilities.dart:13-64):
+    /// every argument is the lambda's own parameter — positional in order
+    /// (:47, :51-55), named by name (:57-61), both counts equal (:47-49),
+    /// parens unwrap.
+    fn arguments_match_parameters(
+        c: &Check<'_>,
+        lambda: u32,
+        formals: &[LambdaFormal<'_>],
+        args: u32,
+    ) -> bool {
+        let positional_params: Vec<&str> = formals
+            .iter()
+            .filter(|formal| formal.is_positional())
+            .map(|formal| formal.name)
+            .collect();
+        let named_params: Vec<&str> = formals
+            .iter()
+            .filter(|formal| !formal.is_positional())
+            .map(|formal| formal.name)
+            .collect();
+        let raw = c.collect_direct(args);
+        let ranges = slice::arguments(c, &raw);
+        let mut positional = 0usize;
+        let mut named = 0usize;
+        for range in ranges {
+            let (arg_name, value): (Option<&str>, &[u32]) =
+                if c.kind(raw[range.end - 1]) == NodeKind::NamedArgument {
+                    (
+                        Some(c.lexeme(c.head_token(raw[range.start]))),
+                        &raw[range.start + 1..range.end - 1],
+                    )
+                } else {
+                    (None, &raw[range])
+                };
+            let Some(value_name) = bare_argument_name(c, value) else {
+                return false;
+            };
+            // The argument must be the lambda's own parameter (the
+            // canonical-element identity face): the bare identifier probe
+            // resolves past closer bindings to the lambda's parameter.
+            let Some(&probe) = value.iter().find(|&&row| {
+                c.kind(row) == NodeKind::Identifier && c.lexeme(c.head_token(row)) == value_name
+            }) else {
+                return false;
+            };
+            if !resolves_to_lambda_parameter(c, probe, lambda, formals, value_name) {
+                return false;
+            }
+            if let Some(arg_name) = arg_name {
+                if !named_params.contains(&arg_name) || value_name != arg_name {
+                    return false;
+                }
+                named += 1;
+            } else {
+                if positional >= positional_params.len()
+                    || positional_params[positional] != value_name
+                {
+                    return false;
+                }
+                positional += 1;
+            }
+        }
+        positional == positional_params.len() && named == named_params.len()
+    }
+
+    /// The bare-identifier argument name: the argument's piece run is a
+    /// single tear-off group ([`slice::is_tear_off_group`]), parens
+    /// unwrap.
+    fn bare_argument_name<'a>(c: &'a Check<'_>, value: &[u32]) -> Option<&'a str> {
+        let mut owned;
+        let mut pieces = value;
+        loop {
+            if pieces.len() == 1 && c.kind(pieces[0]) == NodeKind::ParenthesizedExpression {
+                owned = c.collect_direct(pieces[0]);
+                pieces = &owned;
+                continue;
+            }
+            break;
+        }
+        (pieces.len() == 4 && slice::is_tear_off_group(c, pieces, 0))
+            .then(|| c.lexeme(c.head_token(pieces[0])))
+    }
+
+    /// One formal of the lambda's parameter list: its name, its row, and
+    /// its parser kind (payload word 4 — required/optional × positional/
+    /// named).
+    struct LambdaFormal<'a> {
+        name: &'a str,
+        row: u32,
+        kind: u32,
+    }
+
+    impl LambdaFormal<'_> {
+        fn is_positional(&self) -> bool {
+            self.kind == dartq_parser::FormalParameterKind::RequiredPositional as u32
+                || self.kind == dartq_parser::FormalParameterKind::OptionalPositional as u32
+        }
+
+        fn is_required(&self) -> bool {
+            self.kind == dartq_parser::FormalParameterKind::RequiredPositional as u32
+                || self.kind == dartq_parser::FormalParameterKind::RequiredNamed as u32
+        }
+    }
+
+    /// The lambda's formals in declaration order (`node.parameters`): the
+    /// `(...)` group's own rows, then the nested `[...]`/`{...}` group's.
+    /// A nameless formal (recovery) is skipped.
+    fn lambda_formals<'a>(c: &'a Check<'_>, lambda: u32) -> Vec<LambdaFormal<'a>> {
+        let mut formals = Vec::new();
+        let Some(params) = c
+            .collect_direct(lambda)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+        else {
+            return formals;
+        };
+        let mut push = |row: u32| {
+            if c.kind(row) == NodeKind::FormalParameter
+                && let Some(name) = parameter_name(c, row)
+            {
+                let kind = c
+                    .payload(row)
+                    .get(4)
+                    .copied()
+                    .unwrap_or(dartq_parser::FormalParameterKind::RequiredPositional as u32);
+                formals.push(LambdaFormal { name, row, kind });
+            }
+        };
+        for kid in c.collect_direct(params) {
+            if c.kind(kid) == NodeKind::OptionalFormalParameters {
+                for inner in c.collect_direct(kid) {
+                    push(inner);
+                }
+            } else {
+                push(kid);
+            }
+        }
+        formals
+    }
+
+    /// The name token of a formal parameter (payload word 1).
+    fn parameter_name<'a>(c: &'a Check<'_>, parameter: u32) -> Option<&'a str> {
+        let &token = c.payload(parameter).get(1)?;
+        (token != NONE_TOKEN).then(|| c.lexeme(token))
+    }
+
+    /// The lambda's own formal table (`nodeType.formalParameters`, :242):
+    /// names and parser kinds as written, each type through
+    /// [`written_ty`].
+    fn lambda_formal_table(
+        c: &Check<'_>,
+        analysis: &Analysis<'_>,
+        formals: &[LambdaFormal<'_>],
+    ) -> Formals {
+        let mut positional = Vec::new();
+        let mut named = Vec::new();
+        for formal in formals {
+            let entry = Formal {
+                name: analysis.strings().intern(formal.name),
+                ty: written_ty(c, analysis, formal.row),
+                required: formal.is_required(),
+                covariant: false,
+                default_value: None,
+            };
+            if formal.is_positional() {
+                positional.push(entry);
+            } else {
+                named.push(entry);
+            }
+        }
+        Formals {
+            positional: positional.into_boxed_slice(),
+            named: named.into_boxed_slice(),
+        }
+    }
+
+    /// The written type of a lambda formal as the model's own `Ty` — only
+    /// the shapes the model's collector canonicalizes identically: a bare
+    /// name with an optional `?` (the argument-less `Named`), and `Null`.
+    /// Everything the comparison leaf cannot decide from written facts
+    /// stays [`Ty::Unknown`] (`None` downstream): an untyped formal (its
+    /// type is inferred from the context upstream), a parameterized type
+    /// (the argument slots are pool-bound), a prefixed name, a `void`,
+    /// function, or record type, and a written `dynamic` — the leaf's
+    /// `dynamic`-downcast arm is `isAssignableTo`'s whole-type rule, not
+    /// the function-subtype parameter leaf's `isSubtypeOf`
+    /// (`subtype.dart:127`), so a non-top target formal would over-prove.
+    fn written_ty(c: &Check<'_>, analysis: &Analysis<'_>, parameter: u32) -> Ty {
+        let kids = c.collect_direct(parameter);
+        let Some(index) = kids.iter().position(|&kid| {
+            matches!(
+                c.kind(kid),
+                NodeKind::Type
+                    | NodeKind::VoidType
+                    | NodeKind::FunctionType
+                    | NodeKind::RecordType
+                    | NodeKind::FunctionTypedFormalParameter
+            )
+        }) else {
+            return Ty::Unknown;
+        };
+        // The type-argument group seals before its head (`List<int>`).
+        if c.kind(kids[index]) != NodeKind::Type
+            || kids[..index]
+                .iter()
+                .any(|&kid| c.kind(kid) == NodeKind::TypeArguments)
+        {
+            return Ty::Unknown;
+        }
+        let mut tokens = c.unit.ast.token_range(kids[index]);
+        let Some(head) = tokens.next() else {
+            return Ty::Unknown;
+        };
+        let nullable = match (tokens.next(), tokens.next()) {
+            (None, _) => false,
+            (Some(tail), None) if c.lexeme(tail) == "?" => true,
+            // A prefixed name (`p.T`) or any wider spelling.
+            _ => return Ty::Unknown,
+        };
+        match c.lexeme(head) {
+            "dynamic" | "void" => Ty::Unknown,
+            "Null" => Ty::Null,
+            name => Ty::Named {
+                name: analysis.strings().intern(name),
+                nullable,
+                args: ArgListId::EMPTY,
+            },
+        }
+    }
+
+    /// The canonical-element identity face for an argument: no closer
+    /// binding of the name sits between the use site and the lambda's own
+    /// parameter list.
+    fn resolves_to_lambda_parameter(
+        c: &Check<'_>,
+        use_row: u32,
+        lambda: u32,
+        formals: &[LambdaFormal<'_>],
+        name: &str,
+    ) -> bool {
+        let mut current = use_row;
+        loop {
+            let Some(parent) = c.unit.ast.parent(current) else {
+                return false;
+            };
+            current = parent;
+            match c.kind(current) {
+                NodeKind::Block | NodeKind::BlockBody => {
+                    if block_binds(c, current, c.byte_span(use_row).start, name).is_some() {
+                        return false;
+                    }
+                }
+                NodeKind::FunctionExpression
+                | NodeKind::NamedFunctionExpression
+                | NodeKind::LocalFunctionDeclaration => {
+                    if current == lambda {
+                        return formals.iter().any(|formal| formal.name == name);
+                    }
+                    if params_binds(c, current, name) {
+                        return false;
+                    }
+                }
+                NodeKind::CatchClause => {
+                    let ctx = dartq_parser::IdentifierContext::CatchParameter as u32;
+                    if c.children(current).any(|row| {
+                        c.kind(row) == NodeKind::Identifier
+                            && c.payload(row).first() == Some(&ctx)
+                            && c.lexeme(c.head_token(row)) == name
+                    }) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether a closure's parameter list binds `name`.
+    fn params_binds(c: &Check<'_>, owner: u32, name: &str) -> bool {
+        c.collect_direct(owner)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+            .any(|params| {
+                c.collect_direct(params).into_iter().any(|kid| {
+                    c.kind(kid) == NodeKind::FormalParameter && parameter_name(c, kid) == Some(name)
+                })
+            })
+    }
+
+    /// The keyword token of the block-local of `name` declared before the
+    /// use site (the `block_binding` scan shape); a keyword-less typed
+    /// declaration (`K k = …;`) answers its head token, which
+    /// [`keyword_finality`] reads as not final (a mutable variable).
+    fn block_binds(c: &Check<'_>, block: u32, use_start: usize, name: &str) -> Option<u32> {
+        let ctx = dartq_parser::IdentifierContext::LocalVariableDeclaration as u32;
+        c.collect_direct(block).into_iter().find_map(|kid| {
+            if c.kind(kid) != NodeKind::VariablesDeclaration {
+                return None;
+            }
+            let binds = c.collect_direct(kid).into_iter().any(|var| {
+                let name_row = if c.kind(var) == NodeKind::Identifier {
+                    Some(var)
+                } else {
+                    c.collect_direct(var)
+                        .into_iter()
+                        .find(|&piece| c.kind(piece) == NodeKind::Identifier)
+                };
+                name_row.is_some_and(|row| {
+                    c.payload(row).first() == Some(&ctx)
+                        && c.lexeme(c.head_token(row)) == name
+                        && c.byte_span(row).start < use_start
+                })
+            });
+            binds
+                .then(|| variables_declaration_keyword(c, kid).unwrap_or_else(|| c.head_token(kid)))
+        })
+    }
+
+    /// The finality verdict of the binding `name` at the use site (the
+    /// upstream `isFinal` extension, :326-335, under `isFinalNode`'s
+    /// SimpleIdentifier arm, :70-76): a `final`/`const` variable, field,
+    /// or any function is final; a parameter, getter, `late` variable, or
+    /// mutable variable is not; the walk's terminal — the enclosing class's
+    /// own name (a constructor), cross-file and unresolved names — leaves
+    /// the verdict to the signature gate (`Unknown`).
+    fn binding_finality(c: &Check<'_>, use_row: u32, name: &str) -> Finality {
+        let use_start = c.byte_span(use_row).start;
+        let mut current = use_row;
+        loop {
+            let Some(parent) = c.unit.ast.parent(current) else {
+                return Finality::Unknown;
+            };
+            current = parent;
+            match c.kind(current) {
+                NodeKind::Block | NodeKind::BlockBody => {
+                    if let Some(keyword) = block_binds(c, current, use_start, name) {
+                        return keyword_finality(c, keyword);
+                    }
+                }
+                NodeKind::FunctionExpression
+                | NodeKind::NamedFunctionExpression
+                | NodeKind::LocalFunctionDeclaration => {
+                    if params_binds(c, current, name) {
+                        return Finality::NotFinal;
+                    }
+                }
+                NodeKind::CatchClause => {
+                    let ctx = dartq_parser::IdentifierContext::CatchParameter as u32;
+                    if c.children(current).any(|row| {
+                        c.kind(row) == NodeKind::Identifier
+                            && c.payload(row).first() == Some(&ctx)
+                            && c.lexeme(c.head_token(row)) == name
+                    }) {
+                        return Finality::NotFinal;
+                    }
+                }
+                NodeKind::Method
+                | NodeKind::Constructor
+                | NodeKind::Factory
+                | NodeKind::TopLevelMethod => {
+                    // The enclosing member's own parameters bind first.
+                    if params_binds(c, current, name) {
+                        return Finality::NotFinal;
+                    }
+                    // The unit-level member of that name: a getter is the
+                    // accessor face (not final); a function takes the
+                    // `_ => true` fallback. The stamped-name read only —
+                    // matching any `Identifier` would bind a return type
+                    // spelled like the use (`foo bar()` reading `foo` as a
+                    // member).
+                    if c.kind(current) == NodeKind::TopLevelMethod
+                        && crate::rules::member_name(c, current)
+                            .is_some_and(|kid| c.lexeme(c.head_token(kid)) == name)
+                    {
+                        return if get_set_token(c, current) == Some("get") {
+                            Finality::NotFinal
+                        } else {
+                            Finality::Final
+                        };
+                    }
+                }
+                NodeKind::ClassDeclaration
+                | NodeKind::MixinDeclaration
+                | NodeKind::EnumDeclaration
+                | NodeKind::ExtensionDeclaration
+                | NodeKind::ExtensionTypeDeclaration => {
+                    // The class's own name: a constructor, not a variable
+                    // — the creation faces decide.
+                    if crate::rules::class_declaration_name(c, current) == Some(name) {
+                        return Finality::Unknown;
+                    }
+                    if let Some(finality) = class_member_finality(c, current, name) {
+                        return finality;
+                    }
+                }
+                NodeKind::CompilationUnit => {
+                    for top in c.collect_direct(current) {
+                        for inner in c.collect_direct(top) {
+                            if c.kind(inner) == NodeKind::TopLevelFields
+                                && let Some(finality) = fields_finality(c, inner, name)
+                            {
+                                return finality;
+                            }
+                        }
+                    }
+                    // The same-file substrate ended without a verdict: a
+                    // top-level function, a cross-file or unresolved name
+                    // — the signature gate's resolution decides.
+                    return Finality::Unknown;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The finality of a `final`/`const`/`var` keyword token: `late`
+    /// preceding it demotes the verdict.
+    fn keyword_finality(c: &Check<'_>, keyword: u32) -> Finality {
+        match c.lexeme(keyword) {
+            "final" | "const" => {
+                let late = (keyword > 0)
+                    && c.unit
+                        .tokens
+                        .get(keyword as usize - 1)
+                        .is_some_and(|_| c.lexeme(keyword - 1) == "late");
+                if late {
+                    Finality::NotFinal
+                } else {
+                    Finality::Final
+                }
+            }
+            _ => Finality::NotFinal,
+        }
+    }
+
+    /// The finality of the class-like `name` member: a getter is the
+    /// accessor face (not final); a field reads its keyword; a method or
+    /// constructor binds nothing for this face (`None` continues the
+    /// walk).
+    fn class_member_finality(c: &Check<'_>, class_row: u32, name: &str) -> Option<Finality> {
+        for member in c.collect_direct(class_row) {
+            match c.kind(member) {
+                NodeKind::Fields => {
+                    if let Some(finality) = fields_finality(c, member, name) {
+                        return Some(finality);
+                    }
+                }
+                NodeKind::Method => {
+                    let binds = c.collect_direct(member).into_iter().any(|kid| {
+                        c.kind(kid) == NodeKind::Identifier && c.lexeme(c.head_token(kid)) == name
+                    });
+                    if binds {
+                        // A getter is the accessor face (not final); a
+                        // bound non-getter method is the tear-off face —
+                        // the bare invocation resolves the container's own
+                        // method first (implicit `this`), and the upstream
+                        // executable default fires (`methodName.element
+                        // .isFinal`, the extension's `_ => true` arm).
+                        return Some(if get_set_token(c, member) == Some("get") {
+                            Finality::NotFinal
+                        } else {
+                            Finality::Final
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The finality of the variable `name` in a `Fields`/`TopLevelFields`
+    /// declaration: the declaration's keyword decides (the
+    /// `variables_declaration_keyword` face). Both member tilings scan —
+    /// the name as a direct `Identifier` child or inside a
+    /// `VariablesDeclaration`.
+    fn fields_finality(c: &Check<'_>, fields: u32, name: &str) -> Option<Finality> {
+        let ctx = if c.kind(fields) == NodeKind::TopLevelFields {
+            dartq_parser::IdentifierContext::TopLevelVariableDeclaration as u32
+        } else {
+            dartq_parser::IdentifierContext::FieldDeclaration as u32
+        };
+        let binds = c.collect_direct(fields).into_iter().any(|kid| {
+            if c.kind(kid) == NodeKind::Identifier {
+                return c.payload(kid).first() == Some(&ctx) && c.lexeme(c.head_token(kid)) == name;
+            }
+            if c.kind(kid) != NodeKind::VariablesDeclaration {
+                return false;
+            }
+            c.collect_direct(kid).into_iter().any(|var| {
+                let name_row = if c.kind(var) == NodeKind::Identifier {
+                    Some(var)
+                } else {
+                    c.collect_direct(var)
+                        .into_iter()
+                        .find(|&piece| c.kind(piece) == NodeKind::Identifier)
+                };
+                name_row.is_some_and(|row| {
+                    c.payload(row).first() == Some(&ctx) && c.lexeme(c.head_token(row)) == name
+                })
+            })
+        });
+        binds.then(|| {
+            variables_declaration_keyword(c, fields)
+                .map_or(Finality::NotFinal, |keyword| keyword_finality(c, keyword))
+        })
+    }
+
+    /// The binding finality verdict: `NotFinal` bails; `Final` and
+    /// `Unknown` (the walk's terminal) proceed to the signature gate.
+    enum Finality {
+        Final,
+        NotFinal,
+        Unknown,
+    }
+}
+
+pub(crate) mod prefer_expression_function_bodies {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_expression_function_bodies.dart`
+    /// — a block function body whose statements are exactly one
+    /// `return` with an expression reports at the body (:29-37 — the
+    /// `expression == null` bail covers the plain `return;`, issue 4221;
+    /// several statements and non-return bodies pass).
+    ///
+    /// dartq faces over the production tiling: the dispatch row is the
+    /// [`NodeKind::BlockBody`] function-body container (a nested block
+    /// statement is a [`NodeKind::Block`] row and never dispatches), the
+    /// statements are its direct children, and the expression face is the
+    /// return's own completion window (`return;` builds no rows). Every
+    /// function-like owner reports — the upstream registers the body kind
+    /// with no owner gate, lambdas included. Message: `diagnostic.g.dart`
+    /// `preferExpressionFunctionBodies`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_expression_function_bodies",
+        group: Group::Standalone,
+        problem: "Unnecessary use of a block function body.",
+        correction: "Try using an expression function body.",
+        kinds: &[NodeKind::BlockBody],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let body = c.node();
+        let statements = c.collect_direct(body);
+        let [only] = statements[..] else {
+            return;
+        };
+        if c.kind(only) != NodeKind::ReturnStatement {
+            return;
+        }
+        // `uniqueStatement.expression == null` bail (:35): a plain
+        // `return;` builds no expression rows.
+        let window = c.children(only);
+        if window.start >= window.end {
+            return;
+        }
+        let range = c.utf16_span(body);
+        c.report(range, &[]);
     }
 }
 
@@ -4285,7 +12231,118 @@ pub(crate) mod avoid_js_rounded_ints {
 mod tests {
     use dartq_ast::NodeKind;
 
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{
+        Combinators, ImportEdge, LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder,
+        Namespaces,
+    };
+    use dartq_semantic::{ElementIndex, MicroKind, StrictModes, analyze_unit, collect};
+    use dartq_source::{FileTable, StringTable};
+
+    use crate::engine::{Lint, narrow_u32};
     use crate::testsupport::{Fixture, NONE, identifier, one_rule, tok, unit_of, utf16_at};
+
+    /// Runs `rule` over `source` with the semantic face mounted: the
+    /// source folded as the sole analyzed file of `package:t` — the
+    /// driver's per-file build shape (the #1049 face construction).
+    /// `dependency` analyzes a second `kit.dart` and imports it into the
+    /// file's library: `Some((text, None))` plain, `Some((text,
+    /// Some(prefix)))` deferred-prefixed, `None` no import edge. The
+    /// context tables leak (`'static`); the tests are one-shot processes.
+    fn run_semantic(
+        source: &str,
+        rule: &str,
+        dependency: Option<(&str, Option<&str>)>,
+    ) -> Vec<Lint> {
+        let fixture = Fixture::parse(source);
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut files = FileTable::new();
+        let file = files.intern(std::path::Path::new("lint_semantic.dart"));
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let scanned = dartq_scanner::scan(source, crate::testsupport::CONFIG, file);
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let elements = collect(source, &scanned.tokens, features, strings);
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib = builder.intern("package:t/lint_semantic.dart");
+        for (name, declaration) in elements.declarations() {
+            if declaration.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        if let Some((dependency, prefix)) = dependency {
+            let dep_file = files.intern(std::path::Path::new("kit.dart"));
+            let scanned_dep = dartq_scanner::scan(dependency, crate::testsupport::CONFIG, dep_file);
+            assert!(
+                scanned_dep.diagnostics.is_empty(),
+                "scanner diagnostics: {dependency:?}"
+            );
+            let dep_elements = collect(dependency, &scanned_dep.tokens, features, strings);
+            let dep_lib = builder.intern("package:t/kit.dart");
+            for (name, declaration) in dep_elements.declarations() {
+                if declaration.kind == MicroKind::TypeParam {
+                    continue;
+                }
+                builder.declare(dep_lib, name, dep_file);
+            }
+            index.insert(dep_file, dep_elements);
+            let (prefix, deferred) = match prefix {
+                Some(prefix) => (Some(strings.intern(prefix)), true),
+                None => (None, false),
+            };
+            builder.import(
+                lib,
+                ImportEdge {
+                    target: Some(dep_lib),
+                    prefix,
+                    deferred,
+                    combinators: Combinators::unfiltered(),
+                },
+            );
+        }
+        let graph: &'static LibraryGraph = Box::leak(Box::new(builder.finish()));
+        let namespaces: &'static Namespaces = Box::leak(Box::new(Namespaces::build(graph)));
+        let index: &'static ElementIndex = Box::leak(Box::new(index));
+        let analysis = analyze_unit(
+            source,
+            &scanned.tokens,
+            features,
+            strings,
+            file,
+            lib,
+            graph,
+            namespaces,
+            index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+        );
+        let unit = crate::engine::Unit {
+            source: &fixture.source,
+            tokens: &fixture.tokens,
+            ast: &fixture.ast,
+            lines: &fixture.lines,
+            path: Some(&fixture.path),
+            features: fixture.features,
+            version: fixture.version,
+            workspace: None,
+            reachability: None,
+            async_context_uses: None,
+            library_type_uses: None,
+        };
+        unit.run_with_semantics(
+            &one_rule(rule),
+            &rustc_hash::FxHashSet::default(),
+            Some(&analysis),
+        )
+    }
 
     /// `test/rules/unnecessary_new_test.dart` `test_new` — the keyword
     /// reports, zero-width at its start.
@@ -4402,77 +12459,78 @@ mod tests {
     }
 
     /// `test/rules/prefer_is_not_operator_test.dart` `test_notIs` — the
-    /// whole prefix expression reports.
+    /// whole prefix expression reports, in the statement context (the
+    /// production flat tiling: the `!` leaf follows the paren row).
     #[test]
     fn prefer_is_not_reports_the_prefix() {
-        let source = "!(a is int);";
-        // !0 (1 a2 is3 int4 )5 ;6
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                b.begin(NodeKind::UnaryPrefix, 0);
-                b.begin(NodeKind::ParenthesizedExpression, 1);
-                b.begin(NodeKind::IsExpression, 1);
-                b.patch(0, 0); // `is`, not `is!`
-                identifier(b, 2, 3);
-                b.leaf_span(NodeKind::Type, 4, 5);
-                b.end(NodeKind::IsExpression, 5);
-                b.end(NodeKind::ParenthesizedExpression, 6);
-                b.end(NodeKind::UnaryPrefix, 6);
-                b.end(NodeKind::ExpressionStatement, 7);
-            }),
-        );
+        let f = Fixture::parse("void f(Object a) {\n  !(a is int);\n}\n");
         let lints = f.run(&one_rule("prefer_is_not_operator"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
             lints[0].message,
             "Use the 'is!' operator rather than negating the value of the 'is' operator."
         );
-        assert_eq!(lints[0].range.start, utf16_at(&f, 0));
+        let bang = tok(&f.source, &f.tokens, "!", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 11); // `!(a is int)`
+    }
+
+    /// The corpus face: a parenthesized `is` under `!` inside an
+    /// `if` condition — the parenthesized condition adopts the `!` leaf
+    /// alone, read as its head child beside the paren row.
+    #[test]
+    fn prefer_is_not_reports_in_an_if_condition() {
+        let f = Fixture::parse("void f(Object a) {\n  if (!(a is int)) {\n    print(0);\n  }\n}\n");
+        let lints = f.run(&one_rule("prefer_is_not_operator"));
+        assert_eq!(lints.len(), 1);
+        let bang = tok(&f.source, &f.tokens, "!", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 11);
+    }
+
+    /// The adopted-begin binary lays the `!` leaf back as its first child
+    /// when the paren operand finalizes lazily (`!(a is int) && b`).
+    #[test]
+    fn prefer_is_not_reports_as_a_binary_left_operand() {
+        let f = Fixture::parse(
+            "void f(Object a, bool b) {\n  var r = !(a is int) && b;\n  print(r);\n}\n",
+        );
+        let lints = f.run(&one_rule("prefer_is_not_operator"));
+        assert_eq!(lints.len(), 1);
+        let bang = tok(&f.source, &f.tokens, "!", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, bang));
     }
 
     /// `is!` under a `!` already uses the operator (`test_isNot`).
     #[test]
     fn prefer_is_not_bare_is_bang_passes() {
-        let source = "!(a is! int);";
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                b.begin(NodeKind::UnaryPrefix, 0);
-                b.begin(NodeKind::ParenthesizedExpression, 1);
-                b.begin(NodeKind::IsExpression, 1);
-                b.patch(0, 1); // `is!`
-                identifier(b, 2, 3);
-                b.leaf_span(NodeKind::Type, 4, 5);
-                b.end(NodeKind::IsExpression, 5);
-                b.end(NodeKind::ParenthesizedExpression, 6);
-                b.end(NodeKind::UnaryPrefix, 6);
-                b.end(NodeKind::ExpressionStatement, 7);
-            }),
-        );
+        let f =
+            Fixture::parse("void f(Object a) {\n  if (!(a is! int)) {\n    print(0);\n  }\n}\n");
         assert!(f.run(&one_rule("prefer_is_not_operator")).is_empty());
     }
 
-    /// The parenthesized-`!` chain is required (prefer_is_not_operator.dart:
-    /// 38-54) — a bare `is` never dispatches.
+    /// The parenthesized-`!` chain is required (`prefer_is_not_operator.dart`:
+    /// 38-54) — a bare `is` never dispatches, a double paren breaks the
+    /// direct chain, and a non-bang prefix stays silent.
     #[test]
-    fn prefer_is_not_unwrapped_is_passes() {
-        let source = "a is int;";
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                b.begin(NodeKind::IsExpression, 0);
-                b.patch(0, 0);
-                identifier(b, 0, 1);
-                b.leaf_span(NodeKind::Type, 2, 3);
-                b.end(NodeKind::IsExpression, 3);
-                b.end(NodeKind::ExpressionStatement, 4);
-            }),
+    fn prefer_is_not_unwrapped_shapes_pass() {
+        assert!(
+            Fixture::parse("void f(Object a) {\n  if (a is int) {\n    print(0);\n  }\n}\n")
+                .run(&one_rule("prefer_is_not_operator"))
+                .is_empty()
         );
-        assert!(f.run(&one_rule("prefer_is_not_operator")).is_empty());
+        assert!(
+            Fixture::parse("void f(Object a) {\n  !((a is int));\n}\n")
+                .run(&one_rule("prefer_is_not_operator"))
+                .is_empty()
+        );
+        assert!(
+            Fixture::parse(
+                "void f(Object a) {\n  if (-(a is int).hashCode) {\n    print(0);\n  }\n}\n"
+            )
+            .run(&one_rule("prefer_is_not_operator"))
+            .is_empty()
+        );
     }
 
     /// `test/rules/prefer_adjacent_string_concatenation_test.dart`
@@ -4524,30 +12582,13 @@ mod tests {
     }
 
     /// `test/rules/avoid_single_cascade_in_expression_statements_test.dart`
-    /// `test_oneCascade` — message spells the `.` operator.
+    /// `test_oneCascade` — message spells the `.` operator; the report
+    /// covers the target through the section (the production row opens at
+    /// the `..`).
     #[test]
     fn single_cascade_reports_with_dot() {
-        let source = "a..b();";
-        // a0 ..1 b2 (3 )4 ;5 — the target precedes the cascade node; the
-        // cascade's children are its sections (collapse map §3.5 CascadeEnd).
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                identifier(b, 0, 1);
-                b.begin(NodeKind::Cascade, 1);
-                b.begin(NodeKind::CascadeAccess, 2);
-                b.patch(0, 2);
-                b.patch(1, 0);
-                b.begin(NodeKind::Send, 3);
-                b.begin(NodeKind::Arguments, 3);
-
-                b.end(NodeKind::Arguments, 5);
-                b.end(NodeKind::Send, 5);
-                b.end(NodeKind::CascadeAccess, 5);
-                b.end(NodeKind::Cascade, 5);
-                b.end(NodeKind::ExpressionStatement, 6);
-            }),
+        let f = Fixture::parse(
+            "void f() {\n  var buffer = StringBuffer();\n  buffer..write('x');\n  print(buffer);\n}\n",
         );
         let lints = f.run(&one_rule("avoid_single_cascade_in_expression_statements"));
         assert_eq!(lints.len(), 1);
@@ -4556,33 +12597,15 @@ mod tests {
             lints[0].correction,
             Some("Try using the operator '.'.".to_owned())
         );
-        assert_eq!(lints[0].range.start, utf16_at(&f, 1));
+        let buffer = tok(&f.source, &f.tokens, "buffer", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, buffer));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 18);
     }
 
     /// A `?..` section prints `?.` (avoid_single_cascade...dart:40-51).
     #[test]
     fn single_null_aware_cascade_suggests_qmark_dot() {
-        let source = "a?..b();";
-        // a0 ?..1 b2 (3 )4 ;5
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                identifier(b, 0, 1);
-                b.begin(NodeKind::Cascade, 1);
-                b.begin(NodeKind::CascadeAccess, 2);
-                b.patch(0, 2);
-                b.patch(1, 1);
-                b.begin(NodeKind::Send, 3);
-                b.begin(NodeKind::Arguments, 3);
-
-                b.end(NodeKind::Arguments, 5);
-                b.end(NodeKind::Send, 5);
-                b.end(NodeKind::CascadeAccess, 5);
-                b.end(NodeKind::Cascade, 5);
-                b.end(NodeKind::ExpressionStatement, 6);
-            }),
-        );
+        let f = Fixture::parse("void f() {\n  var a = A();\n  a?..b();\n}\n");
         let lints = f.run(&one_rule("avoid_single_cascade_in_expression_statements"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
@@ -4593,36 +12616,18 @@ mod tests {
 
     #[test]
     fn multi_section_cascade_passes() {
-        let source = "a..b()..c();";
-        // a0 ..1 b2 (3 )4 ..5 c6 (7 )8 ;9
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                identifier(b, 0, 1);
-                b.begin(NodeKind::Cascade, 1);
-                b.begin(NodeKind::CascadeAccess, 2);
-                b.patch(0, 2);
-                b.patch(1, 0);
-                b.begin(NodeKind::Send, 3);
-                b.begin(NodeKind::Arguments, 3);
-
-                b.end(NodeKind::Arguments, 5);
-                b.end(NodeKind::Send, 5);
-                b.end(NodeKind::CascadeAccess, 5);
-                b.begin(NodeKind::CascadeAccess, 5);
-                b.patch(0, 5);
-                b.patch(1, 0);
-                b.begin(NodeKind::Send, 6);
-                b.begin(NodeKind::Arguments, 7);
-
-                b.end(NodeKind::Arguments, 9);
-                b.end(NodeKind::Send, 9);
-                b.end(NodeKind::CascadeAccess, 9);
-                b.end(NodeKind::Cascade, 9);
-                b.end(NodeKind::ExpressionStatement, 10);
-            }),
+        let f = Fixture::parse("void f() {\n  var a = A();\n  a..b()..c();\n}\n");
+        assert!(
+            f.run(&one_rule("avoid_single_cascade_in_expression_statements"))
+                .is_empty()
         );
+    }
+
+    /// A cascade outside an expression statement keeps its meaning — an
+    /// initializer (or any non-statement owner) stays silent.
+    #[test]
+    fn cascade_initializer_passes() {
+        let f = Fixture::parse("void f() {\n  var a = A()..b();\n  print(a);\n}\n");
         assert!(
             f.run(&one_rule("avoid_single_cascade_in_expression_statements"))
                 .is_empty()
@@ -4821,46 +12826,205 @@ mod tests {
         assert!(f.run(&one_rule("prefer_if_null_operators")).is_empty());
     }
 
+    /// Production pins: the bare report shapes through the real bridge —
+    /// `a == null ? 1 : a` reports at the whole conditional.
+    #[test]
+    fn if_null_production_else_form_reports() {
+        let f = Fixture::parse("void f() {\n  a == null ? 1 : a;\n}\n");
+        let lints = f.run(&one_rule("prefer_if_null_operators"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "Use the '??' operator rather than '?:' when testing for 'null'."
+        );
+    }
+
+    /// The `!=` production mirror tests the then arm.
+    #[test]
+    fn if_null_production_then_form_reports() {
+        let f = Fixture::parse("void f() {\n  a != null ? a : 1;\n}\n");
+        assert_eq!(f.run(&one_rule("prefer_if_null_operators")).len(), 1);
+    }
+
+    /// The corpus face: a null-check conditional as a local initializer
+    /// with string arms reports at the whole conditional expression —
+    /// `label == null ? 'none' : label` (30 chars) from the condition
+    /// head, not the `?` the production row opens at.
+    #[test]
+    fn if_null_production_initializer_form_reports() {
+        let f = Fixture::parse(
+            "void f(String? label) {\n  var merged = label == null ? 'none' : label;\n  print(merged);\n}\n",
+        );
+        let lints = f.run(&one_rule("prefer_if_null_operators"));
+        assert_eq!(lints.len(), 1);
+        let label = tok(&f.source, &f.tokens, "label", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, label));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 30);
+    }
+
+    /// The expression-sibling bound: a null-check conditional nested as a
+    /// later argument/element keeps its left operand to its own pieces —
+    /// the leading sibling rows end at the `,`/`(` separators and never
+    /// join the operand run.
+    #[test]
+    fn if_null_production_expression_sibling_forms() {
+        for source in [
+            "void f(int? x, int a) {\n  f(0, x == null ? a : x);\n}\n",
+            "void f(int? x, int a) {\n  var v = [0, x == null ? a : x];\n}\n",
+            "int g({int? w, int? y}) => 0;\nvoid f(int? x, int a) {\n  g(w: 0, y: x == null ? a : x);\n}\n",
+        ] {
+            let lints = Fixture::parse(source).run(&one_rule("prefer_if_null_operators"));
+            assert_eq!(lints.len(), 1, "{source}");
+            assert_eq!(
+                lints[0].message,
+                "Use the '??' operator rather than '?:' when testing for 'null'."
+            );
+        }
+    }
+
+    /// The receiver chain of a member null check tiles below the binary's
+    /// adopted window (the covered span opens at the selector) and must
+    /// join the operand run — `a.b == null ? c : a.b` reports, in a
+    /// statement and in an argument position.
+    #[test]
+    fn if_null_production_receiver_chain_forms() {
+        for source in [
+            "class C { int? b; }\nvoid f(C a, int c) {\n  var v = a.b == null ? c : a.b;\n}\n",
+            "class C { int? b; }\nint g(int i) => i;\nvoid f(C a, int c) {\n  g(a.b == null ? c : a.b);\n}\n",
+        ] {
+            assert_eq!(
+                Fixture::parse(source)
+                    .run(&one_rule("prefer_if_null_operators"))
+                    .len(),
+                1,
+                "{source}"
+            );
+        }
+    }
+
+    /// Earlier statements' pieces still drop at the statement run — the
+    /// adjacency bound never re-admits a completed statement.
+    #[test]
+    fn if_null_production_statement_boundary_holds() {
+        let f = Fixture::parse("void f(int? x, int a) {\n  foo();\n  x == null ? a : x;\n}\n");
+        assert_eq!(f.run(&one_rule("prefer_if_null_operators")).len(), 1);
+    }
+
+    /// Range-end riders: the conditional's covered end can swallow the
+    /// enclosing terminator or step over an arm's own closer — the report
+    /// must end at the last arm's real token.
+    #[test]
+    fn if_null_production_range_end_riders() {
+        // `f()`'s own `)` is the arm's closer, not a swallowed follower —
+        // stepping back over it would crop the range into `f(`.
+        let f =
+            Fixture::parse("int g() => 0;\nvoid f(int? x) {\n  var v = x == null ? g() : x;\n}\n");
+        let lints = f.run(&one_rule("prefer_if_null_operators"));
+        assert_eq!(lints.len(), 1);
+        let x = tok(&f.source, &f.tokens, "x", 2);
+        assert_eq!(lints[0].range.end, utf16_at(&f, x) + 1, "end at else `x`");
+
+        // A nested conditional's outer `:` rides the inner row's covered
+        // span — the end must step back over it to the inner else `x`.
+        let f = Fixture::parse(
+            "void f(bool b, int? x, int a, int c) {\n  var v = b ? x == null ? a : x : c;\n}\n",
+        );
+        let lints = f.run(&one_rule("prefer_if_null_operators"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let x = tok(&f.source, &f.tokens, "x", 2);
+        assert_eq!(
+            lints[0].range.end,
+            utf16_at(&f, x) + 1,
+            "end at inner else `x`"
+        );
+
+        // The else's own closer rides inside the covered span too —
+        // `h(g() == null ? a : g())` ends `))` and the step-back must stop
+        // at the arm's own `)`, not crop into `g(`.
+        let f = Fixture::parse(
+            "int g() => 0;\nint h(int i) => i;\nvoid f(int a) {\n  h(g() == null ? a : g());\n}\n",
+        );
+        let lints = f.run(&one_rule("prefer_if_null_operators"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let close = tok(&f.source, &f.tokens, ")", 4);
+        assert_eq!(
+            lints[0].range.end,
+            utf16_at(&f, close) + 1,
+            "end at the arm's own `)`"
+        );
+    }
+
+    /// Report-start pins: the condition binary's covered span opens at its
+    /// delta-tile anchor (a member operand's selector, a postfix `!`'s own
+    /// token — never the operand head), so the report opens at the
+    /// operand run's earliest head. `a.b == null ? c : a.b` opens at `a`,
+    /// not at `b`; `x! == null ? a : x` opens at `x`, not at `!`.
+    #[test]
+    fn if_null_production_report_start_riders() {
+        let f = Fixture::parse(
+            "class C { int? b; }\nvoid f(C a, int c) {\n  var v = a.b == null ? c : a.b;\n}\n",
+        );
+        let lints = f.run(&one_rule("prefer_if_null_operators"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let a = tok(&f.source, &f.tokens, "a", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, a), "start at `a`");
+
+        let f = Fixture::parse("void f(int? x, int a) {\n  var v = x! == null ? a : x!;\n}\n");
+        let lints = f.run(&one_rule("prefer_if_null_operators"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let x = tok(&f.source, &f.tokens, "x", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, x), "start at `x`");
+
+        // The `null`-first mirror opens at `null`, not at the operand.
+        let f = Fixture::parse("void f(int? x, int a) {\n  var v = null == x ? a : x;\n}\n");
+        let lints = f.run(&one_rule("prefer_if_null_operators"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let null_tok = tok(&f.source, &f.tokens, "null", 0);
+        assert_eq!(
+            lints[0].range.start,
+            utf16_at(&f, null_tok),
+            "start at `null`"
+        );
+    }
+
+    /// prefer_null_aware_operators shares the same report-start anchor: the
+    /// conditional reports from the condition operand's head, not from the
+    /// binary's covered start.
+    #[test]
+    fn null_aware_production_report_start_rider() {
+        let f = Fixture::parse("void f() {\n  a.b == null ? null : a.b.c;\n}\n");
+        let lints = f.run(&one_rule("prefer_null_aware_operators"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let a = tok(&f.source, &f.tokens, "a", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, a), "start at `a`");
+    }
+
+    /// The whole-container faces report from the left operand's first
+    /// token: `x ??= null` opens at `x` (unnecessary_null_aware_assignments)
+    /// and `a.b + dyn` opens at `a` — never at the operator token the
+    /// container row anchors on.
+    #[test]
+    fn container_rows_report_from_the_operand_head() {
+        let f = Fixture::parse("void f(int? x) {\n  x ??= null;\n}\n");
+        let lints = f.run(&one_rule("unnecessary_null_aware_assignments"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let x = tok(&f.source, &f.tokens, "x", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, x), "start at `x`");
+        let nul = tok(&f.source, &f.tokens, "null", 0);
+        assert_eq!(
+            lints[0].range.end,
+            utf16_at(&f, nul) + 4,
+            "end at `null`, not the swallowed `;`"
+        );
+    }
+
     // —— prefer_null_aware_operators —————————————————————————————————————
 
-    /// `x == null ? null : x.b` reports (`test_prefixedIdentifier` family).
+    /// `x == null ? null : x.b` reports (`test_prefixedIdentifier` family):
+    /// one peel of the result run reaches the condition operand.
     #[test]
     fn null_aware_reports_the_access_form() {
-        let source = "a.b == null ? null : a.b.c;";
-        // a0 .1 b2 ==3 null4 ?5 null6 :7 a8 .9 b10 .11 c12 ;13
-        let f = Fixture::build(
-            source,
-            unit_of(|b, t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                b.begin(NodeKind::Conditional, 5);
-                b.patch(0, tok(source, t, "?", 0));
-                b.patch(1, tok(source, t, ":", 0));
-                b.begin(NodeKind::BinaryExpression, 0);
-                b.patch(0, tok(source, t, "==", 0));
-                b.begin(NodeKind::DotAccess, 0);
-                b.patch(0, 1);
-                b.patch(1, 0);
-                identifier(b, 0, 1);
-                identifier(b, 2, 3);
-                b.end(NodeKind::DotAccess, 3);
-                b.leaf(NodeKind::LiteralNull, 4);
-                b.end(NodeKind::BinaryExpression, 5);
-                b.leaf(NodeKind::LiteralNull, 6);
-                b.begin(NodeKind::DotAccess, 8);
-                b.patch(0, 9);
-                b.patch(1, 0);
-                b.begin(NodeKind::DotAccess, 8);
-                b.patch(0, 9);
-                b.patch(1, 0);
-                identifier(b, 8, 9);
-                identifier(b, 10, 11);
-                b.end(NodeKind::DotAccess, 11);
-                identifier(b, 12, 13);
-                b.end(NodeKind::DotAccess, 13);
-                b.end(NodeKind::Conditional, 13);
-                b.end(NodeKind::ExpressionStatement, 14);
-            }),
-        );
+        let f = Fixture::parse("void f() {\n  a.b == null ? null : a.b.c;\n}\n");
         let lints = f.run(&one_rule("prefer_null_aware_operators"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
@@ -4869,64 +13033,39 @@ mod tests {
         );
     }
 
-    /// A result with no peelable access passes (`a == null ? null : a`).
+    /// A result with no peelable access passes (`a == null ? null : a` —
+    /// the comparison runs only after a peel).
     #[test]
     fn null_aware_bare_identifier_passes() {
-        let source = "a == null ? null : a;";
-        let f = Fixture::build(
-            source,
-            unit_of(|b, t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                b.begin(NodeKind::Conditional, 3);
-                b.patch(0, tok(source, t, "?", 0));
-                b.patch(1, tok(source, t, ":", 0));
-                b.begin(NodeKind::BinaryExpression, 0);
-                b.patch(0, tok(source, t, "==", 0));
-                identifier(b, 0, 1);
-                b.leaf(NodeKind::LiteralNull, 2);
-                b.end(NodeKind::BinaryExpression, 3);
-                b.leaf(NodeKind::LiteralNull, 4);
-                identifier(b, 6, 7);
-                b.end(NodeKind::Conditional, 7);
-                b.end(NodeKind::ExpressionStatement, 8);
-            }),
-        );
+        let f = Fixture::parse("void f() {\n  a == null ? null : a;\n}\n");
         assert!(f.run(&one_rule("prefer_null_aware_operators")).is_empty());
     }
 
-    /// The `!=` mirror reports on the then arm (`test_notEqual`).
+    /// The `!=` mirror reports on the then arm (`test_notEqual`). The
+    /// official walk peels the result before the comparison, so the
+    /// matching shape is `a != null ? a.b : null` — `a.b != null ? a.b :
+    /// null` peels `a.b` to `a` and never matches.
     #[test]
     fn null_aware_not_equal_reports() {
-        // The official walk peels the result before the comparison
-        // (:76-93), so the matching shape is `a != null ? a.b : null` —
-        // `a.b != null ? a.b : null` peels `a.b` to `a` and never matches.
-        let source = "a != null ? a.b : null;";
-        // a0 !=1 null2 ?3 a4 .5 b6 :7 null8 ;9
-        let f = Fixture::build(
-            source,
-            unit_of(|b, _t| {
-                b.begin(NodeKind::ExpressionStatement, 0);
-                b.begin(NodeKind::Conditional, 3);
-                b.patch(0, 3);
-                b.patch(1, 7);
-                b.begin(NodeKind::BinaryExpression, 0);
-                b.patch(0, 1);
-                identifier(b, 0, 1);
-                b.leaf(NodeKind::LiteralNull, 2);
-                b.end(NodeKind::BinaryExpression, 3);
-                b.begin(NodeKind::DotAccess, 4);
-                b.patch(0, 5);
-                b.patch(1, 0);
-                identifier(b, 4, 5);
-                identifier(b, 6, 7);
-                b.end(NodeKind::DotAccess, 7);
-                b.leaf(NodeKind::LiteralNull, 8);
-                b.end(NodeKind::Conditional, 9);
-                b.end(NodeKind::ExpressionStatement, 10);
-            }),
+        let f = Fixture::parse("void f() {\n  a != null ? a.b : null;\n}\n");
+        assert_eq!(f.run(&one_rule("prefer_null_aware_operators")).len(), 1);
+        let f = Fixture::parse("void f() {\n  a.b != null ? a.b : null;\n}\n");
+        assert!(f.run(&one_rule("prefer_null_aware_operators")).is_empty());
+    }
+
+    /// The corpus face: `user == null ? null : user.handle` as a local
+    /// initializer — one peel reaches the operand; the report covers the
+    /// whole conditional (33 chars) from the condition head.
+    #[test]
+    fn null_aware_production_member_result_reports() {
+        let f = Fixture::parse(
+            "class P {\n  String handle = '';\n}\nvoid f(P? user) {\n  var picked = user == null ? null : user.handle;\n  print(picked);\n}\n",
         );
         let lints = f.run(&one_rule("prefer_null_aware_operators"));
         assert_eq!(lints.len(), 1);
+        let user = tok(&f.source, &f.tokens, "user", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, user));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 33);
     }
 
     // —— unnecessary_null_aware_assignments ———————————————————————————————
@@ -5118,7 +13257,7 @@ mod tests {
         assert!(f.run(&one_rule("prefer_contains")).is_empty());
 
         let f = Fixture::parse(
-            r#"
+            r"
 class User {
   int indexOf(Object e, [int s = 0]) => 0;
 }
@@ -5128,12 +13267,12 @@ void h(User u) {
     print(0);
   }
 }
-"#,
+",
         );
         assert!(f.run(&one_rule("prefer_contains")).is_empty());
 
         let f = Fixture::parse(
-            r#"
+            r"
 class List {}
 
 void k(List<int> xs) {
@@ -5141,7 +13280,7 @@ void k(List<int> xs) {
     print(0);
   }
 }
-"#,
+",
         );
         assert!(f.run(&one_rule("prefer_contains")).is_empty());
     }
@@ -5446,6 +13585,31 @@ void k(List<int> xs) {
         );
     }
 
+    /// The untyped local's literal initializer answers `String` before
+    /// the `operator +` presumption (the #1135 declaration-side gate):
+    /// the oracle row at `use_string_buffers.dart` — `var buffer = ''`
+    /// under a same-file user `+` — reports. A user-typed initializer
+    /// keeps the presumption silent.
+    #[test]
+    fn interpolation_inferred_string_left_operand_reports() {
+        let source = "class B {\n  B operator +(B other) => this;\n}\nvoid f() {\n  var buffer = '';\n  buffer = buffer + 'a';\n}\n";
+        let f = Fixture::parse(source);
+        let lints = f.run(&one_rule("prefer_interpolation_to_compose_strings"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Use interpolation to compose strings and values."
+        );
+
+        let user_typed = "class B {\n  B operator +(B other) => this;\n}\nvoid f() {\n  var b = B();\n  b = b + B();\n}\n";
+        let f = Fixture::parse(user_typed);
+        assert!(
+            f.run(&one_rule("prefer_interpolation_to_compose_strings"))
+                .is_empty(),
+            "{user_typed}"
+        );
+    }
+
     /// A `toString` invocation with arguments passes (sdk#52610), the chain
     /// reports once at the root, and the left-operand String face (:85)
     /// decides literal receivers — a string literal reports.
@@ -5471,6 +13635,39 @@ void k(List<int> xs) {
                 .len(),
             1,
             "the left literal is dart:core String"
+        );
+    }
+
+    /// #792 (`test_variableNotString`): a same-file user type declaring
+    /// `operator +` makes the opaque left operand's static type that user
+    /// type — the written-type face answers for a typed binding, the
+    /// untyped face presumes the user type, and a written `String`
+    /// binding still reports.
+    #[test]
+    fn interpolation_user_operator_plus_passes() {
+        let f = Fixture::parse(
+            "class A {\n  A operator +(String other) => this;\n}\n\nvoid f(A a) {\n  a + ' ';\n}\n",
+        );
+        assert!(
+            f.run(&one_rule("prefer_interpolation_to_compose_strings"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse(
+            "class A {\n  A operator +(String other) => this;\n}\n\nvoid f() {\n  var a = A();\n  a + ' ';\n}\n",
+        );
+        assert!(
+            f.run(&one_rule("prefer_interpolation_to_compose_strings"))
+                .is_empty()
+        );
+
+        let f = Fixture::parse(
+            "class A {\n  A operator +(String other) => this;\n}\n\nvoid f(String a) {\n  a + ' ';\n}\n",
+        );
+        assert_eq!(
+            f.run(&one_rule("prefer_interpolation_to_compose_strings"))
+                .len(),
+            1
         );
     }
 
@@ -5536,7 +13733,7 @@ void k(List<int> xs) {
     }
 
     /// A non-null closure passes, and a bare `map(null)` never matches —
-    /// the official bails with a null target (null_closures.dart:222).
+    /// the official bails with a null target (`null_closures.dart:222`).
     #[test]
     fn null_closures_non_null_and_bare_calls_pass() {
         let f = Fixture::parse("void f(List<int> list, void g(int e)) { list.map(g); }");
@@ -5548,7 +13745,7 @@ void k(List<int> xs) {
     }
 
     /// `Future.doWhile(null)` — the static face, positional slot 0 (the
-    /// official `Future.doWhile` entry, null_closures.dart:174).
+    /// official `Future.doWhile` entry, `null_closures.dart:174`).
     #[test]
     fn null_closures_reports_a_static_do_while_callback() {
         let f = Fixture::parse("void f() { Future.doWhile(null); }");
@@ -5622,8 +13819,8 @@ void k(List<int> xs) {
 
     // —— unnecessary_this ————————————————————————————————————————————————————
 
-    /// `this.x` in an instance method over a same-class field reports
-    /// zero-width at the `this` (`test/rules/unnecessary_this_test.dart`
+    /// `this.x` in an instance method over a same-class field reports at
+    /// the `this` token (`test/rules/unnecessary_this_test.dart`
     /// `test_UnnecessaryThis`); the inherited-member face reports the same
     /// way (`isNone` — no scope hit). Production-bridge fixtures: the field
     /// and method names ride the collapse-map contexts.
@@ -5633,10 +13830,9 @@ void k(List<int> xs) {
         let lints = f.run(&one_rule("unnecessary_this"));
         assert_eq!(lints.len(), 1, "same-class field: the `this.` reports");
         assert_eq!(lints[0].message, "Unnecessary 'this.' qualifier.");
-        assert_eq!(
-            lints[0].range.start,
-            utf16_at(&f, tok(&f.source, &f.tokens, "this", 0))
-        );
+        let this_kw = tok(&f.source, &f.tokens, "this", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, this_kw));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 4);
 
         // Inherited member — no declaration anywhere in the file.
         let f =
@@ -5648,41 +13844,51 @@ void k(List<int> xs) {
         );
     }
 
-    /// An unprefixed import can provide the member name in the unqualified
-    /// scope (:87-95 bail): no report. `show`/`hide` combinators narrow the
-    /// face — a name provably excluded keeps reporting; a prefixed import
-    /// never enters the scope.
+    /// The corpus face: a getter expression body's `this.<field>` — the
+    /// access pieces tile flat in the member window beside the
+    /// childless `ExpressionBody` handle, and the no-import file keeps
+    /// the scope gates open.
+    #[test]
+    fn unnecessary_this_reports_in_a_getter_expression_body() {
+        let f = Fixture::parse(
+            "class W {\n  int width = 0;\n  int get doubled => this.width * 2;\n}\n",
+        );
+        let lints = f.run(&one_rule("unnecessary_this"));
+        assert_eq!(lints.len(), 1);
+        let this_kw = tok(&f.source, &f.tokens, "this", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, this_kw));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 4);
+    }
+
+    /// The import face rides [`Analysis::import_shadows`] (the official
+    /// `resolveNameInScope` library-scope half, :87-95): an unprefixed
+    /// import whose target exports the member name makes the `this.`
+    /// necessary — no report; a prefixed import's target names stay
+    /// outside the unqualified scope. A fixture mount carries no import
+    /// semantics, so the face cannot contradict and the unqualified form
+    /// keeps reporting (the None-degradation path); the combinator
+    /// filtering lives in the graph face, not the rule.
     #[test]
     fn unnecessary_this_import_bails() {
-        let bailed = "import 'other.dart';\nclass A { void f() {} }\nclass B extends A { void g() { this.f(); } }";
-        let f = Fixture::parse(bailed);
+        let kit = "void f() {}\nclass Other {}\n";
+        let unprefixed = "import 'kit.dart';\nclass A { void f() {} }\nclass B extends A { void g() { this.f(); } }\n";
         assert!(
-            f.run(&one_rule("unnecessary_this")).is_empty(),
-            "the unprefixed import may provide `f` — the official bails"
+            run_semantic(unprefixed, "unnecessary_this", Some((kit, None))).is_empty(),
+            "the import carries `f` — the qualified form is necessary"
         );
 
-        let shown_away = "import 'other.dart' show Other;\nclass A { void f() {} }\nclass B extends A { void g() { this.f(); } }";
-        let f = Fixture::parse(shown_away);
+        let prefixed = "import 'kit.dart' as other;\nclass A { void f() {} }\nclass B extends A { void g() { this.f(); } }\n";
         assert_eq!(
-            f.run(&one_rule("unnecessary_this")).len(),
-            1,
-            "`show Other` provably excludes `f`"
-        );
-
-        let hidden = "import 'other.dart' hide f;\nclass A { void f() {} }\nclass B extends A { void g() { this.f(); } }";
-        let f = Fixture::parse(hidden);
-        assert_eq!(
-            f.run(&one_rule("unnecessary_this")).len(),
-            1,
-            "`hide f` provably excludes `f`"
-        );
-
-        let prefixed = "import 'other.dart' as other;\nclass A { void f() {} }\nclass B extends A { void g() { this.f(); } }";
-        let f = Fixture::parse(prefixed);
-        assert_eq!(
-            f.run(&one_rule("unnecessary_this")).len(),
+            run_semantic(prefixed, "unnecessary_this", Some((kit, Some("other")))).len(),
             1,
             "a prefixed import never enters the unqualified scope"
+        );
+
+        let f = Fixture::parse(unprefixed);
+        assert_eq!(
+            f.run(&one_rule("unnecessary_this")).len(),
+            1,
+            "no semantic mount: the import face cannot contradict"
         );
     }
 
@@ -5734,7 +13940,7 @@ void k(List<int> xs) {
     }
 
     // —— prefer_final_fields ——————————————————————————————————————————————
-    // Fixtures over the collapse-map §3.3 contracts (`Fields` >
+    // Fixtures over the bridge's `Fields` contracts (`Fields` >
     // `VariablesDeclaration` > `InitializedIdentifier` > `VariableInitializer`,
     // `Constructor` > `FormalParameters`/`Initializers`).
 
@@ -5770,7 +13976,7 @@ void k(List<int> xs) {
             b.end(NodeKind::ClassDeclaration, 8);
             b.end(NodeKind::TopLevelDeclaration, 9);
             extra(b, t);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         })
     }
 
@@ -5806,7 +14012,7 @@ void k(List<int> xs) {
     }
 
     /// An initialized private field reports on its declaration
-    /// (prefer_final_fields_test.dart `initialized`).
+    /// (`prefer_final_fields_test.dart` `initialized`).
     #[test]
     fn initialized_private_field_reports() {
         let f = field_fixture(|_b, _t| {});
@@ -5854,7 +14060,7 @@ void k(List<int> xs) {
             b.end(NodeKind::ClassDeclaration, 8);
             b.end(NodeKind::TopLevelDeclaration, 9);
             assignment_statement(b, 9, 10, 11);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         });
         assert!(field_hits(&f).is_empty());
     }
@@ -5894,7 +14100,7 @@ void k(List<int> xs) {
             b.leaf(NodeKind::UnaryPrefix, 9);
             identifier(b, 10, 11);
             b.end(NodeKind::ExpressionStatement, 12);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         });
         assert!(field_hits(&f).is_empty());
     }
@@ -5949,7 +14155,7 @@ void k(List<int> xs) {
             b.end(NodeKind::DeclarationBody, 13);
             b.end(NodeKind::ClassDeclaration, 14);
             b.end(NodeKind::TopLevelDeclaration, 14);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         });
         assert_eq!(field_hits(&f).len(), 1);
     }
@@ -6000,7 +14206,7 @@ void k(List<int> xs) {
             b.end(NodeKind::DeclarationBody, 14);
             b.end(NodeKind::ClassDeclaration, 15);
             b.end(NodeKind::TopLevelDeclaration, 15);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         });
         assert_eq!(field_hits(&bare).len(), 1);
         // `this.` form: the entry head is the `this` keyword; the name sits
@@ -6047,7 +14253,7 @@ void k(List<int> xs) {
                 b.end(NodeKind::DeclarationBody, 17);
                 b.end(NodeKind::ClassDeclaration, 18);
                 b.end(NodeKind::TopLevelDeclaration, 18);
-                b.end(NodeKind::CompilationUnit, t.len() as u32);
+                b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
             });
         assert_eq!(field_hits(&this_form).len(), 1);
     }
@@ -6115,7 +14321,7 @@ void k(List<int> xs) {
                 b.end(NodeKind::DeclarationBody, 20);
                 b.end(NodeKind::ClassDeclaration, 21);
                 b.end(NodeKind::TopLevelDeclaration, 21);
-                b.end(NodeKind::CompilationUnit, t.len() as u32);
+                b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
             },
         );
         assert!(field_hits(&f).is_empty());
@@ -6152,7 +14358,7 @@ void k(List<int> xs) {
             b.end(NodeKind::DeclarationBody, 8);
             b.end(NodeKind::ClassDeclaration, 8);
             b.end(NodeKind::TopLevelDeclaration, 9);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         });
         assert!(field_hits(&f).is_empty());
         // `final` keyword on the declaration.
@@ -6182,7 +14388,7 @@ void k(List<int> xs) {
             b.end(NodeKind::DeclarationBody, 9);
             b.end(NodeKind::ClassDeclaration, 9);
             b.end(NodeKind::TopLevelDeclaration, 10);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         });
         assert!(field_hits(&f).is_empty());
         // Unset, never assigned.
@@ -6209,7 +14415,7 @@ void k(List<int> xs) {
             b.end(NodeKind::DeclarationBody, 6);
             b.end(NodeKind::ClassDeclaration, 6);
             b.end(NodeKind::TopLevelDeclaration, 7);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         });
         assert!(field_hits(&f).is_empty());
         // Top-level declarations are not fields.
@@ -6226,7 +14432,7 @@ void k(List<int> xs) {
             b.end(NodeKind::InitializedIdentifier, 4);
             b.end(NodeKind::VariablesDeclaration, 5);
             b.end(NodeKind::TopLevelFields, 5);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         });
         assert!(field_hits(&f).is_empty());
     }
@@ -6285,7 +14491,7 @@ void k(List<int> xs) {
                 b.end(NodeKind::DeclarationBody, 18);
                 b.end(NodeKind::ClassDeclaration, 19);
                 b.end(NodeKind::TopLevelDeclaration, 19);
-                b.end(NodeKind::CompilationUnit, t.len() as u32);
+                b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
             },
         );
         assert!(field_hits(&f).is_empty());
@@ -6314,9 +14520,140 @@ void k(List<int> xs) {
             b.end(NodeKind::Fields, 6);
             b.end(NodeKind::EnumBody, 7);
             b.end(NodeKind::EnumDeclaration, 8);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         });
         assert!(field_hits(&f).is_empty());
+    }
+
+    // —— write-scan faces (production-bridge fixtures) ————————————————
+
+    /// A cascade-section write marks the field mutated (`.._x = 1` — the
+    /// section assignment is an `AssignmentExpression` upstream and its
+    /// `writeElement` is the field).
+    #[test]
+    fn cascade_section_write_blocks() {
+        let f =
+            Fixture::parse("class C {\n  int _x = 0;\n  void f(C o) {\n    o.._x = 1;\n  }\n}\n");
+        assert!(field_hits(&f).is_empty(), "{:?}", field_hits(&f));
+    }
+
+    /// A write in a later cascade section counts too; the section head is
+    /// found under the second cascade's window.
+    #[test]
+    fn cascade_later_section_write_blocks() {
+        let f = Fixture::parse(
+            "class C {\n  int _x = 0;\n  void f(C o) {\n    o..toString().._x = 1;\n  }\n}\n",
+        );
+        assert!(field_hits(&f).is_empty(), "{:?}", field_hits(&f));
+    }
+
+    /// A local namesake does not capture the section head: it selects the
+    /// cascade target's member, not a scope-resolved name, so the write
+    /// counts and the field stays silent (the official `writeElement` is
+    /// the field under any local namesake).
+    #[test]
+    fn cascade_section_write_ignores_local_namesake() {
+        let f = Fixture::parse(
+            "class C {\n  int _x = 0;\n  void f(C o) {\n    var _x = 0;\n    o.._x = 1;\n  }\n}\n",
+        );
+        assert!(field_hits(&f).is_empty(), "{:?}", field_hits(&f));
+    }
+
+    /// A bare-name write in a method body still blocks the report.
+    #[test]
+    fn method_body_write_blocks() {
+        let f = Fixture::parse("class C {\n  int _x = 0;\n  void f() {\n    _x = 2;\n  }\n}\n");
+        assert!(field_hits(&f).is_empty(), "{:?}", field_hits(&f));
+    }
+
+    /// A block local declared before the write captures the bare name —
+    /// the field stays unmutated and reports (the official scan is
+    /// element-based: the write's `writeElement` is the local).
+    #[test]
+    fn local_namesake_write_passes() {
+        let f = Fixture::parse(
+            "class C {\n  int _x = 0;\n  void f() {\n    var _x = 0;\n    _x = 2;\n  }\n}\n",
+        );
+        assert_eq!(field_hits(&f).len(), 1);
+    }
+
+    /// A parameter namesake captures the same way.
+    #[test]
+    fn parameter_namesake_write_passes() {
+        let f =
+            Fixture::parse("class C {\n  int _x = 0;\n  void f(int _x) {\n    _x = 2;\n  }\n}\n");
+        assert_eq!(field_hits(&f).len(), 1);
+    }
+
+    /// A field mutated only through a pattern assignment reports — the
+    /// official registers no pattern-assignment visitor
+    /// (`prefer_final_fields.dart` :41-48), so the oracle over-reports
+    /// here and the bare-name posture keeps parity.
+    #[test]
+    fn pattern_assignment_only_mutation_reports() {
+        let f =
+            Fixture::parse("class C {\n  int _x = 0;\n  void f() {\n    (_x,) = (1,);\n  }\n}\n");
+        assert_eq!(field_hits(&f).len(), 1);
+    }
+
+    /// `var` destructuring declares locals and never writes the field —
+    /// the field reports as upstream (no pattern visitor covers
+    /// `PatternVariableDeclaration` either).
+    #[test]
+    fn var_destructuring_namesake_reports() {
+        let f = Fixture::parse(
+            "class C {\n  int _x = 0;\n  void f() {\n    var (_x, _y) = (1, 2);\n  }\n}\n",
+        );
+        assert_eq!(field_hits(&f).len(), 1);
+    }
+
+    /// The setter-override exemption (`prefer_final_fields_test.dart`
+    /// `test_overrideSetter_extends`): the written supertype chain
+    /// carries a setter of the same name, so the field never candidates.
+    #[test]
+    fn inherited_setter_exempts() {
+        let f = Fixture::parse(
+            "class A {\n  set _a(bool a) {}\n}\n\nclass B extends A {\n  bool _a = false;\n}\n",
+        );
+        assert!(field_hits(&f).is_empty(), "{:?}", field_hits(&f));
+    }
+
+    /// The implements clause carries the exemption too
+    /// (`test_overrideSetter_implements`).
+    #[test]
+    fn interface_setter_exempts() {
+        let f = Fixture::parse(
+            "class A {\n  set _a(bool a) {}\n}\n\nclass B implements A {\n  bool _a = false;\n}\n",
+        );
+        assert!(field_hits(&f).is_empty(), "{:?}", field_hits(&f));
+    }
+
+    /// Without a supertype setter the field reports (the exemption's
+    /// negative pin).
+    #[test]
+    fn field_without_setter_reports() {
+        let f = Fixture::parse("class B {\n  bool _a = false;\n}\n");
+        assert_eq!(field_hits(&f).len(), 1);
+    }
+
+    /// The cross-file half of the exemption: the setter sits in the
+    /// imported library, so the semantic bridge's inheritance arm answers
+    /// under the `name=` setter spelling.
+    #[test]
+    fn cross_file_setter_exempts() {
+        let kit = "class A {\n  set _a(bool a) {}\n}\n";
+        let source = "import 'kit.dart';\n\nclass B extends A {\n  bool _a = false;\n}\n";
+        assert!(run_semantic(source, "prefer_final_fields", Some((kit, None))).is_empty());
+    }
+
+    /// A cross-file supertype without the setter keeps reporting (the
+    /// bridge arm's negative pin).
+    #[test]
+    fn cross_file_field_without_setter_reports() {
+        let kit = "class A {}\n";
+        let source = "import 'kit.dart';\n\nclass B extends A {\n  bool _a = false;\n}\n";
+        let lints = run_semantic(source, "prefer_final_fields", Some((kit, None)));
+        assert_eq!(lints.len(), 1, "{lints:?}");
     }
 
     // ---- #586 standard-set completions (production-bridge fixtures) ----
@@ -6364,6 +14701,38 @@ void k(List<int> xs) {
         );
     }
 
+    /// The corpus face: an `int` parameter compared against a bool
+    /// literal reports at the operator — the written-name operand face.
+    #[test]
+    fn unrelated_type_equality_reports_written_name_operand() {
+        let f =
+            Fixture::parse("void f(int someInt) {\n  var g4 = someInt == true;\n  print(g4);\n}\n");
+        let lints = f.run(&one_rule("unrelated_type_equality_checks"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The type of the right operand ('bool') isn't a subtype or a supertype of the left operand ('int')."
+        );
+        let eq = tok(&f.source, &f.tokens, "==", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, eq));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 2);
+    }
+
+    /// Two same-file class-typed operands report: the supertype walk
+    /// (`interfaceTypesAreUnrelated` shares only `Object`) finds no link
+    /// between them — the oracle reports (`typesAreUnrelated` bails only
+    /// on dynamic/bottom/related chains).
+    #[test]
+    fn unrelated_type_equality_same_file_names_report() {
+        let f = Fixture::parse(
+            "class A {}\nclass B {}\nvoid f(A a, B b) {\n  var r = a == b;\n  print(r);\n}\n",
+        );
+        let lints = f.run(&one_rule("unrelated_type_equality_checks"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let eq = tok(&f.source, &f.tokens, "==", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, eq));
+    }
+
     /// Assigning a non-null scalar to a `void` (or `FutureOr<void>`)
     /// field reports; `null` is acceptable when expecting void (:57).
     #[test]
@@ -6377,7 +14746,7 @@ void k(List<int> xs) {
         assert_eq!(lints[1].message, "Assignment to a variable of type 'void'.");
     }
 
-    /// A `==` comparison is not an assignment face — no void_checks
+    /// A `==` comparison is not an assignment face — no `void_checks`
     /// report (the coordinator boundary case).
     #[test]
     fn void_checks_equality_operand_stays_silent() {
@@ -6385,19 +14754,50 @@ void k(List<int> xs) {
         assert!(f.run(&one_rule("void_checks")).is_empty());
     }
 
-    /// `!` on a `T?` field in a `T?` context reports at the operator;
-    /// a different context type and no-`!` reads stay silent.
+    /// The corpus face: an `int` parameter written into a written
+    /// `FutureOr<void>` field reports at the assignment
+    /// (`drained = piece`, 15 chars).
+    #[test]
+    fn void_checks_reports_written_scalar_right_side() {
+        let f = Fixture::parse(
+            "import 'dart:async';\nclass VoidSink {\n  FutureOr<void> drained;\n  VoidSink(this.drained);\n  void pour(int piece) {\n    drained = piece;\n  }\n}\n",
+        );
+        let lints = f.run(&one_rule("void_checks"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Assignment to a variable of type 'void'.");
+        let drained = tok(&f.source, &f.tokens, "drained", 2);
+        assert_eq!(lints[0].range.start, utf16_at(&f, drained));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 15);
+    }
+
+    /// A written `dynamic` right side is acceptable when expecting void
+    /// (:55-65) — stays silent.
+    #[test]
+    fn void_checks_written_dynamic_right_side_passes() {
+        let f = Fixture::parse(
+            "import 'dart:async';\nclass C {\n  FutureOr<void> drained;\n  void pour(dynamic piece) {\n    drained = piece;\n  }\n}\n",
+        );
+        assert!(f.run(&one_rule("void_checks")).is_empty());
+    }
+
+    /// `!` on a `T?` field reports at the operator in the written-`T?`
+    /// variable-initializer context; a method return carries no expected
+    /// type (the official lookup requires a `FunctionExpression`-shaped
+    /// ancestor) and a different context type stays silent.
     #[test]
     fn null_check_on_nullable_type_parameter_reports_in_matching_context() {
         let f = Fixture::parse(
-            "class C<T> {\n  T? f;\n  T? m() { return this.f!; }\n  T? n() { return f!; }\n  T? ok() { return this.f; }\n  int? other() { return this.f!; }\n}",
+            "class C<T> {\n  T? f;\n  T? m() { return this.f!; }\n  void init() { T? t = this.f!; print(t); }\n  T? ok() { return this.f; }\n  int? other() { return this.f!; }\n}",
         );
         let lints = f.run(&one_rule("null_check_on_nullable_type_parameter"));
-        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(lints.len(), 1, "{lints:?}");
         assert_eq!(
             lints[0].message,
             "The null check operator shouldn't be used on a variable whose type is a potentially nullable type parameter."
         );
+        let bang = tok(&f.source, &f.tokens, "!", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 1);
     }
 
     /// A `FunctionType` target assigned a `call`-bearing object reports
@@ -6411,6 +14811,25 @@ void k(List<int> xs) {
         let lints = f.run(&one_rule("implicit_call_tearoffs"));
         assert_eq!(lints.len(), 1, "{lints:?}");
         assert_eq!(lints[0].message, "Implicit tear-off of the 'call' method.");
+    }
+
+    /// The corpus face: a local written `void Function()` target bound to
+    /// a bare or `this.` field whose type names a same-file `call` class
+    /// — the production type row tiles as the declaration's left sibling.
+    #[test]
+    fn implicit_call_tearoffs_reports_local_declaration_target() {
+        let f = Fixture::parse(
+            "class Callable {\n  void call() {}\n}\nclass TearoffSites {\n  Callable c = Callable();\n  void run() {\n    void Function() p = c;\n    void Function() q = this.c;\n    print(p);\n    print(q);\n  }\n}\n",
+        );
+        let lints = f.run(&one_rule("implicit_call_tearoffs"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(lints[0].message, "Implicit tear-off of the 'call' method.");
+        let bare = tok(&f.source, &f.tokens, "c", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, bare));
+        assert_eq!(lints[0].range.end - lints[0].range.start, 1);
+        let this_kw = tok(&f.source, &f.tokens, "this", 0);
+        assert_eq!(lints[1].range.start, utf16_at(&f, this_kw));
+        assert_eq!(lints[1].range.end - lints[1].range.start, 6);
     }
 
     /// `this is JSClass` / `this as JSClass` with a same-file `@JS`
@@ -6444,171 +14863,55 @@ void k(List<int> xs) {
         );
     }
 
+    /// The cross-file right face ([`Analysis::container_has_annotation`]):
+    /// a bare operand tested against an imported `@JS` container reports;
+    /// a resolvable unannotated container (`Some(false)`) and an
+    /// unresolvable type (`None`) stay silent. The cross-file verdict
+    /// needs the semantic mount — under a fixture mount the arm degrades
+    /// to silence (the same-file faces above stay the fixture-pinned
+    /// path).
+    #[test]
+    fn invalid_runtime_check_cross_file_right_face() {
+        let kit = "@JS()\nclass I {}\nclass Plain {}\n";
+        let source = "import 'dart:js_interop';\nimport 'kit.dart';\nclass Dart {}\nvoid f(Dart d) {\n  if (d is I) {}\n  if (d is Plain) {}\n  if (d is Missing) {}\n}\n";
+        let lints = run_semantic(
+            source,
+            "invalid_runtime_check_with_js_interop_types",
+            Some((kit, None)),
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Runtime check between 'Dart' and 'I' checks whether a Dart value is a JS interop type, which might not be platform-consistent."
+        );
+
+        let f = Fixture::parse(
+            "import 'dart:js_interop';\nclass Base {\n  bool check() => this is I;\n}\n",
+        );
+        assert!(
+            f.run(&one_rule("invalid_runtime_check_with_js_interop_types"))
+                .is_empty(),
+            "no semantic mount: the cross-file container face cannot answer"
+        );
+    }
+
     // —— unnecessary_type_check (`_checkAllTypeChecks`,
     // best_practices_verifier.dart:987-1041) ————————————————
 
-    /// A scalar literal against its own type is constant-true (`1 is int`)
-    /// — the whole check reports, anchored at the operand head.
+    /// The mirror posture: the emission is the semantic tier's always-on
+    /// fold (the oracle's `BestPracticesVerifier` pass), so the lint run
+    /// stays silent even with the name explicitly enabled — the spec's
+    /// AST arm is structurally off (`kinds: &[]`); a run row would double
+    /// the semantic tier's and carry the wrong lint tier.
     #[test]
-    fn type_check_reports_scalar_true() {
-        let f = Fixture::parse("void f() { 1 is int; }");
-        let lints = f.run(&one_rule("unnecessary_type_check"));
-        assert_eq!(lints.len(), 1, "{lints:?}");
-        assert_eq!(
-            lints[0].message,
-            "Unnecessary type check; the result is always 'true'."
-        );
-        assert_eq!(
-            lints[0].range.start,
-            utf16_at(&f, tok(&f.source, &f.tokens, "1", 0))
-        );
-        assert_eq!(
-            lints[0].correction.as_deref(),
-            Some("Try correcting the type check, or removing the type check.")
-        );
-    }
-
-    /// The `is!` polarity carries the complement template.
-    #[test]
-    fn type_check_reports_scalar_false_polarity() {
-        let f = Fixture::parse("void f() { 1 is! int; }");
-        let lints = f.run(&one_rule("unnecessary_type_check"));
-        assert_eq!(lints.len(), 1, "{lints:?}");
-        assert_eq!(
-            lints[0].message,
-            "Unnecessary type check; the result is always 'false'."
-        );
-    }
-
-    /// `x is dynamic` is constant whichever the operand (the DynamicType
-    /// arm fires before every other gate).
-    #[test]
-    fn type_check_reports_dynamic() {
-        let f = Fixture::parse("void f() { b is dynamic; }");
-        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
-        let f = Fixture::parse("void f() { b is! dynamic; }");
-        let lints = f.run(&one_rule("unnecessary_type_check"));
-        assert_eq!(lints.len(), 1);
-        assert_eq!(
-            lints[0].message,
-            "Unnecessary type check; the result is always 'false'."
-        );
-    }
-
-    /// An operand without a written face stays silent on the subtype arm
-    /// (unresolved names, parameters, member chains — under-report).
-    #[test]
-    fn type_check_faceless_operands_pass() {
-        for source in [
-            "void f() { b is int; }",
-            "void f(b) { b is! int; }",
-            "void f() { a.b is int; }",
-        ] {
+    fn unnecessary_type_check_is_a_semantic_mirror_not_a_lint_arm() {
+        for source in ["void f() { 1 is int; }", "void f() { b is dynamic; }"] {
             let f = Fixture::parse(source);
             assert!(
                 f.run(&one_rule("unnecessary_type_check")).is_empty(),
                 "{source}"
             );
         }
-    }
-
-    /// A same-class field against its written type is constant-true, bare
-    /// or `this.`-qualified; an unrelated check stays silent.
-    #[test]
-    fn type_check_field_face() {
-        let f = Fixture::parse("class C { int x; void m() { x is int; } }");
-        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
-        let f = Fixture::parse("class C { int x; void m() { this.x is int; } }");
-        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
-        let f = Fixture::parse("class C { int x; void m() { x is String; } }");
-        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
-        let f = Fixture::parse("class C { void m() { this.q is int; } }");
-        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
-    }
-
-    /// Nullability gates the same-name arm: `int? x; x is int` is not
-    /// constant (the operand may be null), the widening `x is int?` is.
-    #[test]
-    fn type_check_nullability_gates() {
-        let f = Fixture::parse("class C { int? x; void m() { x is int; } }");
-        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
-        let f = Fixture::parse("class C { int x; void m() { x is int?; } }");
-        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
-    }
-
-    /// `this is C` — the receiver's class against its own name.
-    #[test]
-    fn type_check_reports_this_face() {
-        let f = Fixture::parse("class C { void m() { this is C; } }");
-        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
-    }
-
-    /// The built-in lattice edges: `int` → `num`, everything → `Object`.
-    #[test]
-    fn type_check_reports_lattice_edges() {
-        let f = Fixture::parse("void f() { 1 is num; }");
-        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
-        let f = Fixture::parse("void f() { 'a' is Object; }");
-        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
-        let f = Fixture::parse("void f() { 1 is double; }");
-        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
-    }
-
-    /// `null is Null` is the constant arm (both polarities); `null is int`
-    /// never reports (no subtype-negative verdict) and a `Null`-typed
-    /// field belongs to the type_check_with_null family, not this rule.
-    #[test]
-    fn type_check_null_faces() {
-        let f = Fixture::parse("void f() { null is Null; }");
-        let lints = f.run(&one_rule("unnecessary_type_check"));
-        assert_eq!(lints.len(), 1);
-        assert_eq!(
-            lints[0].message,
-            "Unnecessary type check; the result is always 'true'."
-        );
-        let f = Fixture::parse("void f() { null is! Null; }");
-        let lints = f.run(&one_rule("unnecessary_type_check"));
-        assert_eq!(lints.len(), 1);
-        assert_eq!(
-            lints[0].message,
-            "Unnecessary type check; the result is always 'false'."
-        );
-        let f = Fixture::parse("void f() { null is int; }");
-        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
-        let f = Fixture::parse("class C { Null n; void m() { n is Null; } }");
-        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
-    }
-
-    /// A dynamic-typed field subtypes only `Object` (and `dynamic`).
-    #[test]
-    fn type_check_dynamic_field_face() {
-        let f = Fixture::parse("class C { dynamic d; void m() { d is Object; } }");
-        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
-        let f = Fixture::parse("class C { dynamic d; void m() { d is int; } }");
-        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
-    }
-
-    /// Type arguments must match name+nullable: `List<int> xs; xs is
-    /// List<int>` reports, the mismatched target stays silent (the official
-    /// judges the full types; the invariance-safe face under-reports the
-    /// covariant matches).
-    #[test]
-    fn type_check_generic_args_gate() {
-        let f = Fixture::parse("class C { List<int> xs; void m() { xs is List<int>; } }");
-        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
-        let f = Fixture::parse("class C { List<int> xs; void m() { xs is List<String>; } }");
-        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
-    }
-
-    /// A parenthesized operand unwraps on the subtype arm but stays
-    /// syntactic on the `is Null` arm — `(null) is Null` is the official's
-    /// `type_check_with_null` family, not the constant.
-    #[test]
-    fn type_check_parenthesized_operand() {
-        let f = Fixture::parse("void f() { (1) is int; }");
-        assert_eq!(f.run(&one_rule("unnecessary_type_check")).len(), 1);
-        let f = Fixture::parse("void f() { (null) is Null; }");
-        assert!(f.run(&one_rule("unnecessary_type_check")).is_empty());
     }
 
     // —— avoid_double_and_int_checks ————————————————————————————————————
@@ -6687,9 +14990,657 @@ void k(List<int> xs) {
         let f = Fixture::parse("var c = 9007199254740992;\nvar d = 1;");
         assert!(f.run(&one_rule("avoid_js_rounded_ints")).is_empty());
     }
+
+    // —— the lints semantic bridge, consumption wave 1 ————————————
+
+    /// The prefixed-receiver face: a `prefix.g(e)` callee composes no
+    /// member face (the prefix carries no receiver type — the deferred
+    /// import's `mightBeDeferred` bail, :264, and the non-deferred
+    /// prefix's documented `None` silence alike), and the plain run stays
+    /// silent (the wave posture). The remaining `unnecessary_lambdas`
+    /// pins live in the semantic `b4_expr_pins` module.
+    #[test]
+    fn unnecessary_lambdas_prefixed_receiver_stays_silent() {
+        let source = "import 'kit.dart' deferred as io;\nvoid f(List<int> xs) {\n  xs.forEach((int e) => io.g(e));\n}\n";
+        assert!(
+            Fixture::parse(source)
+                .run(&one_rule("unnecessary_lambdas"))
+                .is_empty(),
+            "the plain run stays silent"
+        );
+        assert!(
+            run_semantic(
+                source,
+                "unnecessary_lambdas",
+                Some(("void g(int e) {}\n", Some("io")))
+            )
+            .is_empty(),
+            "the prefixed callee composes no face"
+        );
+    }
+
+    /// The wave posture: the semantic rule is silent under the plain run
+    /// (`Check::semantics()` is `None` — the engine contract's
+    /// driver-configuration shape) and reports with the face mounted.
+    #[test]
+    fn prefer_null_aware_method_calls_requires_the_face() {
+        let source = "Function()? func;\nvoid f() {\n  func != null ? func!() : null;\n}\n";
+        let f = Fixture::parse(source);
+        assert!(
+            f.run(&one_rule("prefer_null_aware_method_calls"))
+                .is_empty()
+        );
+        // Message: upstream Dart SDK source,
+        // pkg/linter/lib/src/rules/prefer_null_aware_method_calls.dart.
+        let lints = run_semantic(source, "prefer_null_aware_method_calls", None);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Use a null-aware invocation of the 'call' method rather than explicitly testing for 'null'."
+        );
+    }
+
+    /// The branch faces: the conditional and `if` forms report at the
+    /// invocation; a non-`null` else arm, an `else` clause, a
+    /// two-statement block, a different target, and a bang before a
+    /// selector stay silent.
+    #[test]
+    fn prefer_null_aware_method_calls_branch_faces() {
+        let source = "Function()? func;\nvoid f() {\n  if (func != null) func!();\n}\n";
+        assert_eq!(
+            run_semantic(source, "prefer_null_aware_method_calls", None).len(),
+            1
+        );
+
+        // The single-statement block unwrap.
+        let source = "Function()? func;\nvoid f() {\n  if (func != null) {\n    func!();\n  }\n}\n";
+        assert_eq!(
+            run_semantic(source, "prefer_null_aware_method_calls", None).len(),
+            1
+        );
+
+        for source in [
+            // A non-`null` else arm is not the shape.
+            "Function()? func;\nvoid f() {\n  func != null ? func!() : func;\n}\n",
+            // An `else` clause disqualifies the `if` form.
+            "Function()? func;\nvoid f() {\n  if (func != null) func!(); else {}\n}\n",
+            // A two-statement block is not one expression statement.
+            "Function()? func;\nvoid f() {\n  if (func != null) {\n    func!();\n    func!();\n  }\n}\n",
+            // A different target never matches (the token-lexeme windows).
+            "Function()? f1, f2;\nvoid f() {\n  f1 != null ? f2!() : null;\n}\n",
+            // A bang before a selector is a method invocation, not the
+            // bare postfix call tile.
+            "Function()? func;\nvoid f() {\n  func != null ? func!.m() : null;\n}\n",
+            // A parenthesized operand carries its parens in the source
+            // comparison.
+            "Function()? func;\nvoid f() {\n  func != null ? (func)!() : null;\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "prefer_null_aware_method_calls", None).is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// Production pin: the `if` face recovers the condition binary from the
+    /// `ParenthesizedCondition` window's tail and reports exactly once, at
+    /// the invocation's whole-extent `Send` leaf.
+    #[test]
+    fn prefer_null_aware_method_calls_if_form_production_pin() {
+        let source = "Function()? v;\nvoid f() {\n  if (v != null) v!();\n}\n";
+        let lints = run_semantic(source, "prefer_null_aware_method_calls", None);
+        assert_eq!(lints.len(), 1);
+        let f = Fixture::parse(source);
+        let v = tok(&f.source, &f.tokens, "v", 2);
+        assert_eq!(lints[0].range.start, utf16_at(&f, v));
+    }
+
+    /// Tiling pin (audit checkpoint): in the production `x!()` then arm the
+    /// trailing invocation `Send` covers only `! ()` — the operand head the
+    /// token-equality window opens at is the bare-name group's `Identifier`
+    /// (`x`), tiled under the callee sequence before the `NonNullAssert`
+    /// leaf. The report must span `x!()` whole — the send's own range head
+    /// is `!`, a delta-tile anchor, never the operand head.
+    #[test]
+    fn prefer_null_aware_method_calls_operand_head_is_the_identifier() {
+        let source = "Function()? v;\nvoid f() {\n  v != null ? v!() : null;\n}\n";
+        let lints = run_semantic(source, "prefer_null_aware_method_calls", None);
+        assert_eq!(lints.len(), 1);
+        let f = Fixture::parse(source);
+        let v = tok(&f.source, &f.tokens, "v", 2);
+        assert_eq!(lints[0].range.start, utf16_at(&f, v));
+        let bang = tok(&f.source, &f.tokens, "!", 0);
+        assert_eq!(lints[0].range.end, utf16_at(&f, bang) + 3);
+    }
+
+    /// The semantic faces decide: the member face resolves a typed
+    /// receiver's member and the binding face resolves a bare variable;
+    /// a `dynamic` receiver, an unresolved bare name, and a
+    /// definitely-non-null dead-check read stay silent (the documented
+    /// under-report register).
+    #[test]
+    fn prefer_null_aware_method_calls_resolution_faces() {
+        // The member face: `p.m` resolves on the receiver's container.
+        let source = "class C {\n  int Function()? m;\n}\nvoid f(C p) {\n  p.m != null ? p.m!() : null;\n}\n";
+        assert_eq!(
+            run_semantic(source, "prefer_null_aware_method_calls", None).len(),
+            1
+        );
+
+        // The dead-check face: a definitely-non-null bare read makes the
+        // test provably false — the suggestion is vacuous (under-report).
+        let source = "void f() {\n  Function func = () {};\n  func != null ? func!() : null;\n}\n";
+        assert!(run_semantic(source, "prefer_null_aware_method_calls", None).is_empty());
+
+        // The dynamic receiver: no member face resolves (under-report).
+        let source = "void f(dynamic p) {\n  p.m != null ? p.m!() : null;\n}\n";
+        assert!(run_semantic(source, "prefer_null_aware_method_calls", None).is_empty());
+
+        // The unresolved bare name: no binding face resolves (the
+        // null-element arm keeps silent under the resolution posture).
+        let source = "void f() {\n  gone != null ? gone!() : null;\n}\n";
+        assert!(run_semantic(source, "prefer_null_aware_method_calls", None).is_empty());
+    }
+
+    /// The unnecessary_parenthesis imported-extension face: the accessor
+    /// resolving through an import to a nullable-on-type extension keeps
+    /// the parens (the upstream resolver sees imported libraries,
+    /// unnecessary_parenthesis.dart:120-124); the same shape resolving to
+    /// an imported class member reports (the resolved element is not an
+    /// extension application).
+    #[test]
+    fn paren_imported_extension_member_faces() {
+        let kit = "extension E on String? {\n  bool get g => false;\n}\n";
+        let source = "import 'kit.dart';\n\nvoid f(String? s) {\n  (s).g;\n}\n";
+        assert!(run_semantic(source, "unnecessary_parenthesis", Some((kit, None))).is_empty());
+
+        let kit = "class S {\n  bool get g => false;\n}\n";
+        let source = "import 'kit.dart';\n\nvoid f(S s) {\n  (s).g;\n}\n";
+        assert_eq!(
+            run_semantic(source, "unnecessary_parenthesis", Some((kit, None))).len(),
+            1
+        );
+    }
+
+    /// The semantic query coordinate pin: `query_site` feeds the
+    /// analysis queries in UTF-16 offsets (the fold rows' convention —
+    /// the bridge keys every row at its UTF-16 start). A non-BMP glyph
+    /// ahead of the queried reads (U+1F600: four UTF-8 bytes, two UTF-16
+    /// units) skews every later byte offset by +2, so byte-span queries
+    /// overshoot the read rows and miss — the `await` type face stays
+    /// silent under the old coordinates and reports 1 under UTF-16.
+    #[test]
+    fn semantic_query_coordinates_are_utf16() {
+        let source = "// \u{1F600} four-byte, two-unit glyph\nvoid f() async {\n  int x = 1;\n  await x;\n}\n";
+        assert_eq!(run_semantic(source, "await_only_futures", None).len(), 1);
+    }
+
+    /// The prefer_contains constant-identifier bound: `kLen` reads its
+    /// const initializer (the upstream `getIntValue` identifier face,
+    /// prefer_contains.dart over ast.dart `_getIntValue`) and the bound
+    /// works like the literal.
+    #[test]
+    fn prefer_contains_const_identifier_bound() {
+        // The bound rides an `indexOf` comparison inside the official
+        // -1/0 matrix (prefer_contains.dart :73-124) — a bound off the
+        // matrix or a non-indexOf operand stays silent upstream. `-1`
+        // also covers the prefixed-literal face of the const read.
+        let source = "const kMinusOne = -1;\nvoid f(List<int> l) {\n  if (l.indexOf(1) <= kMinusOne) {}\n}\n";
+        assert_eq!(run_semantic(source, "prefer_contains", None).len(), 1);
+    }
+
+    /// The prefer_contains receiver gate: a receiver resolvable as a
+    /// same-file non-iterable class stays silent (the official
+    /// `parentType` check).
+    #[test]
+    fn prefer_contains_non_iterable_receiver_silent() {
+        let source =
+            "class X { int get length => 0; }\nvoid f(X x) {\n  if (x.length <= 3) {}\n}\n";
+        assert!(run_semantic(source, "prefer_contains", None).is_empty());
+    }
+
+    /// The oracle-probed face (`dart analyze` on
+    /// `typedef IntAlias = int; void f(IntAlias x) { if (x is int) {} }`:
+    /// exactly one `unnecessary_type_check`, never
+    /// `avoid_double_and_int_checks` on a single is-check): the alias-typed
+    /// formal folds through the semantic tier's `unnecessary_type_check`
+    /// mirror (pinned by the semantic suite's
+    /// `unnecessary_type_check_folds_a_typed_formal_alias`) and this rule
+    /// stays silent — the else-if chain gate keeps a lone check exempt,
+    /// alias or not; the mirror's lint arm stays structurally off. A
+    /// `dynamic` operand never reports either.
+    #[test]
+    fn avoid_double_and_int_checks_typedef_alias() {
+        let source = "typedef IntAlias = int;\nvoid f(IntAlias x) {\n  if (x is int) {}\n}\n";
+        assert!(run_semantic(source, "avoid_double_and_int_checks", None).is_empty());
+        assert!(run_semantic(source, "unnecessary_type_check", None).is_empty());
+        let source = "void g(dynamic x) {\n  if (x is int) {}\n}\n";
+        assert!(run_semantic(source, "avoid_double_and_int_checks", None).is_empty());
+    }
+
+    /// The avoid_function_literals_in_foreach_calls receiver gate: an
+    /// `Iterable` receiver reports, a same-file non-iterable receiver
+    /// stays silent (the official `implementsIterable` bail).
+    #[test]
+    fn foreach_calls_iterable_gate() {
+        let source = "void f(List<int> l) {\n  l.forEach((e) {});\n}\n";
+        assert_eq!(
+            run_semantic(source, "avoid_function_literals_in_foreach_calls", None).len(),
+            1
+        );
+        let source = "class X {}\nvoid f(X x) {\n  x.forEach((e) {});\n}\n";
+        assert!(run_semantic(source, "avoid_function_literals_in_foreach_calls", None).is_empty());
+    }
+
+    /// The await_only_futures bridge type face: awaiting a non-`Future`
+    /// value reports; awaiting a `Future` stays silent.
+    #[test]
+    fn await_only_futures_static_type_gate() {
+        let source = "void f() async {\n  int x = 1;\n  await x;\n}\n";
+        assert_eq!(run_semantic(source, "await_only_futures", None).len(), 1);
+        let source = "Future<int> g() async => 1;\nvoid f() async {\n  await g();\n}\n";
+        assert!(run_semantic(source, "await_only_futures", None).is_empty());
+    }
+
+    /// The implicit_call_tearoffs faces: a written function-type target
+    /// and an operand whose type names a same-file class with an instance
+    /// `call` method reports; an operand without `call` stays silent.
+    #[test]
+    fn implicit_call_tearoffs_call_member_gate() {
+        let source = "class C {\n  void call() {}\n}\nvoid f() {\n  C c = C();\n  void Function() g = c;\n}\n";
+        assert_eq!(
+            run_semantic(source, "implicit_call_tearoffs", None).len(),
+            1
+        );
+        let source = "class D {}\nvoid f(D d) {\n  void Function() g = d;\n}\n";
+        assert!(run_semantic(source, "implicit_call_tearoffs", None).is_empty());
+    }
+
+    /// The no_literal_bool_comparisons member faces: `this.flag == true`
+    /// over a same-class `bool` member reports; a non-literal operand
+    /// stays silent.
+    #[test]
+    fn no_literal_bool_comparisons_this_member_face() {
+        let source = "class C {\n  bool flag = true;\n  bool other = false;\n  void m() {\n    if (this.flag == true) {}\n    if (this.flag == other) {}\n  }\n}\n";
+        assert_eq!(
+            run_semantic(source, "no_literal_bool_comparisons", None).len(),
+            1
+        );
+    }
+
+    /// The null_check_on_nullable_type_parameter context faces: a method
+    /// return carries no expected type (the official
+    /// `thisOrAncestorOfType<FunctionExpression>` miss — the declaration
+    /// wraps its function expression only for functions), while an
+    /// assignment target and an argument formal written `T?` report.
+    #[test]
+    fn null_check_type_parameter_contexts() {
+        let source = "class A {\n  T? m<T>(T? t) {\n    return t!;\n  }\n}\n";
+        assert!(run_semantic(source, "null_check_on_nullable_type_parameter", None).is_empty());
+        let source = "void g<T>(T? t) {\n  T? x;\n  x = t!;\n}\nvoid h<T>(T? p) {}\nvoid k<T>(T? t) {\n  h(t!);\n}\n";
+        assert_eq!(
+            run_semantic(source, "null_check_on_nullable_type_parameter", None).len(),
+            2
+        );
+        // The official assignment guard: `x = x!` promotes — the lookup
+        // returns no expected type (:64-68), silent.
+        let source = "void g<T>() {\n  T? x;\n  x = x!;\n}\n";
+        assert!(run_semantic(source, "null_check_on_nullable_type_parameter", None).is_empty());
+        // The w3-measured over-report face (members_family.dart:46): a
+        // class-method return carries no expected type upstream (the
+        // `thisOrAncestorOfType<FunctionExpression>` miss) — silent.
+        let source = "class Holder<T> {\n  T? held;\n  T? take() {\n    return held!;\n  }\n}\n";
+        assert!(run_semantic(source, "null_check_on_nullable_type_parameter", None).is_empty());
+    }
+
+    /// The pattern face (`visitNullAssertPattern`): `case var a!:` over a
+    /// `T?` scrutinee reports at the `!` — the matched value type is the
+    /// nullable type parameter, keyed at the scrutinee read's own span. A
+    /// non-type-parameter matched value and a non-lone-identifier
+    /// scrutinee stay silent (the face's read-row shape under-reports).
+    #[test]
+    fn null_check_pattern_matched_type_face() {
+        let source = "class C<T> {\n  void m(T? t) {\n    switch (t) {\n      case var a!:\n        print(a);\n        break;\n    }\n  }\n}\n";
+        let lints = run_semantic(source, "null_check_on_nullable_type_parameter", None);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+
+        let source = "class C<T> {\n  void m(String? s) {\n    switch (s) {\n      case var a!:\n        print(a);\n        break;\n    }\n  }\n}\n";
+        assert!(
+            run_semantic(source, "null_check_on_nullable_type_parameter", None).is_empty(),
+            "a class-typed matched value is not a type parameter"
+        );
+
+        let source = "class C<T> {\n  void m(T? t) {\n    switch (t.length) {\n      case var a!:\n        print(a);\n        break;\n    }\n  }\n}\n";
+        assert!(
+            run_semantic(source, "null_check_on_nullable_type_parameter", None).is_empty(),
+            "a member-access scrutinee is not a bare variable read"
+        );
+    }
+
+    /// The null_closures faces: a `this.`-field receiver reads the
+    /// field's written type (`List` puts `map`'s slot 0 in the table);
+    /// a cross-file user class named like a core type resolves through
+    /// the bridge and the written-name fallback stays silent.
+    #[test]
+    fn null_closures_this_receiver_and_user_container() {
+        let source =
+            "class C {\n  List<int> list = [];\n  void m() {\n    this.list.map(null);\n  }\n}\n";
+        assert_eq!(run_semantic(source, "null_closures", None).len(), 1);
+        let kit = "class Timer {\n  Timer(void Function() f);\n}\n";
+        let source = "import 'kit.dart';\n\nvoid g() {\n  Timer(null);\n}\n";
+        assert!(run_semantic(source, "null_closures", Some((kit, None))).is_empty());
+    }
+
+    /// The prefer_is_empty receiver gate: an `Iterable`/`Map`/`String`
+    /// receiver reports; a same-file class with a plain `length` getter
+    /// stays silent (the official `type == null` bail closes the opaque
+    /// presumption for a resolvable non-core receiver).
+    #[test]
+    fn prefer_is_empty_receiver_gate() {
+        let source = "void f(List<int> l) {\n  if (l.length == 0) {}\n}\n";
+        assert_eq!(run_semantic(source, "prefer_is_empty", None).len(), 1);
+        let source =
+            "class X { int get length => 0; }\nvoid f(X x) {\n  if (x.length == 0) {}\n}\n";
+        assert!(run_semantic(source, "prefer_is_empty", None).is_empty());
+    }
+
+    /// The prefer_is_not_empty member gate: a receiver whose type
+    /// provides `isEmpty` but no `isNotEmpty` stays silent (the official
+    /// `isNotEmpty`-provision check). The upstream registers a prefix
+    /// visitor only (`addPrefixExpression`, :31-56) — `x.isEmpty ==
+    /// false` is not a face of this rule (the boolean-literal comparison
+    /// belongs to `no_literal_bool_comparisons`), so both shapes stay
+    /// silent exactly like the oracle.
+    #[test]
+    fn prefer_is_not_empty_member_gate() {
+        let source = "void f(List<int> l) {\n  if (!l.isEmpty) {}\n}\n";
+        assert_eq!(
+            run_semantic(source, "prefer_is_not_empty", None).len(),
+            1,
+            "the prefix face over a core List reports"
+        );
+        let source = "void f(List<int> l) {\n  if (l.isEmpty == false) {}\n}\n";
+        assert!(
+            run_semantic(source, "prefer_is_not_empty", None).is_empty(),
+            "no binary `== false` arm upstream"
+        );
+        let source =
+            "class X { bool get isEmpty => true; }\nvoid f(X x) {\n  if (!x.isEmpty) {}\n}\n";
+        assert!(
+            run_semantic(source, "prefer_is_not_empty", None).is_empty(),
+            "a user class without `isNotEmpty` stays silent"
+        );
+    }
+
+    /// The unrelated_type_equality_checks faces: two unrelated same-file
+    /// classes report; sibling classes sharing a non-`Object` supertype
+    /// are comparable (the official supertype walk) and stay silent.
+    #[test]
+    fn unrelated_type_equality_checks_supertype_face() {
+        let source = "class X {}\nclass Y {}\nvoid f(X x, Y y) {\n  if (x == y) {}\n}\n";
+        assert_eq!(
+            run_semantic(source, "unrelated_type_equality_checks", None).len(),
+            1
+        );
+        let source = "class Base {}\nclass D1 extends Base {}\nclass D2 extends Base {}\nvoid f(D1 a, D2 b) {\n  if (a == b) {}\n}\n";
+        assert!(run_semantic(source, "unrelated_type_equality_checks", None).is_empty());
+    }
+
+    /// The void_checks assignment faces: a bare target resolves
+    /// shadow-correct (the local `int v` shadows the `void` field — the
+    /// official `writeType` face), a `this.`-target reports over the
+    /// field's written type.
+    #[test]
+    fn void_checks_assignment_target_resolution() {
+        let source =
+            "class C {\n  void v = null;\n  void m() {\n    int v = 1;\n    v = 2;\n  }\n}\n";
+        assert!(run_semantic(source, "void_checks", None).is_empty());
+        let source = "class C {\n  void v = null;\n  void m() {\n    this.v = 1;\n  }\n}\n";
+        assert_eq!(run_semantic(source, "void_checks", None).len(), 1);
+    }
+
+    /// The void_checks return face: only a `FutureOr<void>` written
+    /// return type ever reports (:142-146 silents every plain-`void`
+    /// return — `dynamic` is void-acceptable and everything else
+    /// early-silents). `null` is acceptable, the scalars are not.
+    #[test]
+    fn void_checks_future_or_void_return() {
+        let source = "FutureOr<void> f() {\n  return 1;\n}\n";
+        assert_eq!(run_semantic(source, "void_checks", None).len(), 1);
+        let source = "FutureOr<void> f() {\n  return null;\n}\n";
+        assert!(run_semantic(source, "void_checks", None).is_empty());
+        let source = "void f() {\n  return 1;\n}\n";
+        assert!(run_semantic(source, "void_checks", None).is_empty());
+    }
+
+    /// The void_checks argument faces: a `void` formal through the
+    /// bridge signature and through the resolved constructor formals
+    /// reports a decidable non-acceptable value at the argument;
+    /// `null` and a non-`void` formal stay silent.
+    #[test]
+    fn void_checks_void_formal_arguments() {
+        let source = "void h(void x) {}\nvoid g() {\n  h(1);\n}\n";
+        assert_eq!(run_semantic(source, "void_checks", None).len(), 1);
+        let source = "void h(void x) {}\nvoid h2(int x) {}\nvoid g() {\n  h(null);\n  h2(1);\n}\n";
+        assert!(run_semantic(source, "void_checks", None).is_empty());
+        // The implicit creation resolves through the semantic member
+        // chain (the `this`-face landing: an implicit-`this` bare member
+        // read answers like the explicit form, so `resolve_constructor`
+        // answers here) — the face reports, matching upstream's
+        // post-resolution `InstanceCreationExpression` answer.
+        let source = "class K {\n  K(void x);\n}\nvoid m() {\n  K(1);\n}\n";
+        assert_eq!(run_semantic(source, "void_checks", None).len(), 1);
+    }
+
+    /// The void_checks assignment value face over the bridge: a callee
+    /// return type decides where the scalar faces stay silent, and the
+    /// acceptability cut splits on the target — `FutureOr` is not
+    /// void-acceptable upstream (`isTypeAcceptableWhenExpectingVoid`
+    /// recurses only through a `Future` head), `dynamic` passes both
+    /// cuts.
+    #[test]
+    fn void_checks_assignment_bridge_value_face() {
+        let source = "class C {\n  FutureOr<void> drained;\n  int piece() => 1;\n  void pour() {\n    drained = piece();\n  }\n}\n";
+        assert_eq!(run_semantic(source, "void_checks", None).len(), 1);
+        let source = "class C {\n  void v = null;\n  FutureOr<int> h() => 1;\n  void m() {\n    this.v = h();\n  }\n}\n";
+        assert_eq!(run_semantic(source, "void_checks", None).len(), 1);
+        let source = "class C {\n  void v = null;\n  dynamic d() => null;\n  void m() {\n    this.v = d();\n  }\n}\n";
+        assert!(run_semantic(source, "void_checks", None).is_empty());
+    }
+
+    /// The null_check_on_nullable_type_parameter operand face through the
+    /// same-file binding walk: a local written `T?` is a nullable type
+    /// parameter operand (the field-face-only read under-reported it); a
+    /// class-typed local stays silent.
+    #[test]
+    fn null_check_binding_operand_face() {
+        let source = "void g<T>() {\n  T? x;\n  T? y;\n  y = x!;\n}\n";
+        assert_eq!(
+            run_semantic(source, "null_check_on_nullable_type_parameter", None).len(),
+            1
+        );
+        let source = "void g() {\n  String? s;\n  String? t;\n  t = s!;\n}\n";
+        assert!(run_semantic(source, "null_check_on_nullable_type_parameter", None).is_empty());
+    }
+
+    /// The unrelated_type_equality_checks pattern face
+    /// (`visitRelationalPattern`): a relational pattern whose operand
+    /// type and matched value type are unrelated reports at the pattern;
+    /// a related operand stays silent.
+    ///
+    /// The pattern face rides [`Analysis::matched_value_type`] like the
+    /// null-assert pattern face (pinned green over
+    /// `null_check_pattern_matched_type_face`); the operator lands in the
+    /// pattern row's payload word 0 (#1723).
+    #[test]
+    fn unrelated_type_equality_pattern_face() {
+        let source = "void f(int n) {\n  switch (n) {\n    case == 'x':\n      print(0);\n      break;\n  }\n}\n";
+        assert_eq!(
+            run_semantic(source, "unrelated_type_equality_checks", None).len(),
+            1
+        );
+        let source = "void f(int n) {\n  switch (n) {\n    case == 3:\n      print(0);\n      break;\n  }\n}\n";
+        assert!(run_semantic(source, "unrelated_type_equality_checks", None).is_empty());
+    }
+
+    /// The await_only_futures collection-literal faces: a literal
+    /// collection is never a `Future` (`await []`, a typed list, a map)
+    /// — the official reports the inferred type.
+    #[test]
+    fn await_only_futures_collection_literals() {
+        let source = "void f() async {\n  await [];\n}\n";
+        assert_eq!(run_semantic(source, "await_only_futures", None).len(), 1);
+        let source = "void f() async {\n  await <int>[1];\n}\n";
+        assert_eq!(run_semantic(source, "await_only_futures", None).len(), 1);
+        let source = "void f() async {\n  await {1: 2};\n}\n";
+        assert_eq!(run_semantic(source, "await_only_futures", None).len(), 1);
+    }
+
+    /// The collection-literal message face pins the inferred display:
+    /// `await {1: 2}` spells `Map<int, int>` — the entry sides come from
+    /// the sibling run (the `MapEntry` marker is childless on the
+    /// production tiling), not from `collect_direct` (upstream
+    /// `pkg/linter/lib/src/rules/await_only_futures.dart:55` reports the
+    /// resolved static type).
+    #[test]
+    fn await_only_futures_map_entry_display() {
+        let lints = run_semantic(
+            "void f() async {\n  await {1: 2};\n}\n",
+            "await_only_futures",
+            None,
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Uses 'await' on an instance of 'Map<int, int>', which is not a subtype of 'Future'."
+        );
+    }
+
+    /// Mixed entry faces: identifier sides read their static type, `!`
+    /// unwraps to the non-nullable side display, and a nested literal
+    /// spells its own collection face.
+    #[test]
+    fn await_only_futures_map_entry_nested_sides() {
+        let lints = run_semantic(
+            "void f() async {\n  bool b = true;\n  int? x = 0;\n  await {'k': b, 1: x!, [2]: {'n': 0.5}};\n}\n",
+            "await_only_futures",
+            None,
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Uses 'await' on an instance of 'Map<dynamic, dynamic>', which is not a subtype of 'Future'."
+        );
+    }
+
+    /// A bare-name value side unwraps its send group to the identifier's
+    /// type; a bare empty `{}` settles as `Map<dynamic, dynamic>` upstream.
+    #[test]
+    fn await_only_futures_map_identifier_and_empty() {
+        let lints = run_semantic(
+            "void f() async {\n  bool b = true;\n  await {1: b};\n  await {};\n}\n",
+            "await_only_futures",
+            None,
+        );
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Uses 'await' on an instance of 'Map<int, bool>', which is not a subtype of 'Future'."
+        );
+        assert_eq!(
+            lints[1].message,
+            "Uses 'await' on an instance of 'Map<dynamic, dynamic>', which is not a subtype of 'Future'."
+        );
+    }
+
+    /// Explicit type arguments win over the element faces: `<String, int>`
+    /// decides the map display and `<int>` the list's, even with no
+    /// elements to read.
+    #[test]
+    fn await_only_futures_typed_collection_display() {
+        let lints = run_semantic(
+            "void f() async {\n  await <String, int>{'a': 1};\n  await <int>[];\n}\n",
+            "await_only_futures",
+            None,
+        );
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Uses 'await' on an instance of 'Map<String, int>', which is not a subtype of 'Future'."
+        );
+        assert_eq!(
+            lints[1].message,
+            "Uses 'await' on an instance of 'List<int>', which is not a subtype of 'Future'."
+        );
+    }
+
+    /// A nested literal as a map key keeps the outer entry's own sides —
+    /// the inner `MapEntry` must not bleed into the outer display.
+    #[test]
+    fn await_only_futures_map_nested_literal_key() {
+        let lints = run_semantic(
+            "void f() async {\n  await {{1: 2}: 'a'};\n}\n",
+            "await_only_futures",
+            None,
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Uses 'await' on an instance of 'Map<Map<int, int>, String>', which is not a subtype of 'Future'."
+        );
+    }
+
+    /// The null_closures computed-receiver face: a bare send's callee
+    /// return type resolves the receiver's core class (`g().map(null)`
+    /// reaches the `Iterable.map` entry through the send face).
+    #[test]
+    fn null_closures_computed_receiver() {
+        let source = "List<int> g() => [];\nvoid f() {\n  g().map(null);\n}\n";
+        assert_eq!(run_semantic(source, "null_closures", None).len(), 1);
+        let source = "List<int> g() => [];\nvoid f() {\n  g().add(null);\n}\n";
+        assert!(run_semantic(source, "null_closures", None).is_empty());
+    }
+
+    /// The implicit_call_tearoffs return and argument faces: a written
+    /// function-type return with a `call`-carrying operand reports at the
+    /// returned expression, a same-file top-level callee's function-typed
+    /// formal reports at the argument value, and an operand without
+    /// `call` stays silent.
+    #[test]
+    fn implicit_call_tearoffs_return_and_argument_faces() {
+        let source = "class C {\n  void call() {}\n}\nvoid Function() f(C c) {\n  return c;\n}\n";
+        assert_eq!(
+            run_semantic(source, "implicit_call_tearoffs", None).len(),
+            1
+        );
+        let source = "class C {\n  void call() {}\n}\nvoid g(void Function() f) {}\nvoid h(C c) {\n  g(c);\n}\n";
+        assert_eq!(
+            run_semantic(source, "implicit_call_tearoffs", None).len(),
+            1
+        );
+        let source = "class D {}\nvoid g(void Function() f) {}\nvoid h(D d) {\n  g(d);\n}\n";
+        assert!(run_semantic(source, "implicit_call_tearoffs", None).is_empty());
+    }
+
+    /// The implicit_call_tearoffs bare-`Function` context and creation
+    /// operand: `Function p = C()` reports when `Function` resolves to
+    /// the core type and the creation's container carries `call`.
+    #[test]
+    fn implicit_call_tearoffs_function_target_and_creation() {
+        let source = "class C {\n  void call() {}\n}\nvoid f() {\n  Function p = C();\n}\n";
+        assert_eq!(
+            run_semantic(source, "implicit_call_tearoffs", None).len(),
+            1
+        );
+        let source = "class C {\n  void call() {}\n}\nvoid g(void Function() f) {}\nvoid h() {\n  g(C());\n}\n";
+        assert_eq!(
+            run_semantic(source, "implicit_call_tearoffs", None).len(),
+            1
+        );
+    }
 }
 
-/// The W3 (#992) production-bridge pins: no_literal_bool_comparisons over
+/// The W3 (#992) production-bridge pins: `no_literal_bool_comparisons` over
 /// real parser trees.
 #[cfg(test)]
 mod w3_pins {
@@ -6755,9 +15706,8286 @@ mod w3_pins {
         let f = Fixture::parse(
             "void f(bool? maybe, dynamic dyn, int n, bool v) {\n  var g1 = maybe ?? true;\n  var g2 = dyn == true;\n  var g3 = v || maybe;\n  var g4 = n == true;\n  var g5 = v == maybe;\n}\n",
         );
+        assert!(f.run(&one_rule("no_literal_bool_comparisons")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod w4_pins {
+    use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
+
+    /// `test_nullableParameter_neNull` and the `??` face report at the
+    /// comparison; the non-`?` parameter (the analyzer's
+    /// `nonNullableEqualsParameter` face) and a non-`==` operator stay
+    /// silent.
+    #[test]
+    fn avoid_null_checks_in_equality_operator_faces() {
+        let f = Fixture::parse(
+            "class C {\n  operator ==(Object? other) => other != null && other is C;\n}\n",
+        );
+        let lints = f.run(&one_rule("avoid_null_checks_in_equality_operators"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary null comparison in implementation of '=='."
+        );
+        let start = tok(&f.source, &f.tokens, "other", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, start));
+
+        // The parenthesized operand keeps the binary's canonical element.
+        let f = Fixture::parse("class C {\n  operator ==(Object? other) => (other) ?? null;\n}\n");
+        assert_eq!(
+            f.run(&one_rule("avoid_null_checks_in_equality_operators"))
+                .len(),
+            1
+        );
+
+        // A `?.` access on the parameter reports at the access.
+        let f = Fixture::parse(
+            "class C {\n  operator ==(Object? other) => other is C && other?.hashCode == 1;\n}\n",
+        );
+        let lints = f.run(&one_rule("avoid_null_checks_in_equality_operators"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let start = tok(&f.source, &f.tokens, "other", 2);
+        assert_eq!(lints[0].range.start, utf16_at(&f, start));
+
+        // Non-`?` and `dynamic` parameters are the analyzer's face, not
+        // this lint's.
+        for source in [
+            "class C {\n  operator ==(Object other) => other != null;\n}\n",
+            "class C {\n  operator ==(dynamic other) => other != null;\n}\n",
+        ] {
+            let f = Fixture::parse(source);
+            assert!(
+                f.run(&one_rule("avoid_null_checks_in_equality_operators"))
+                    .is_empty()
+            );
+        }
+
+        // The `null == other` mirror and the `?.` invocation face report
+        // once, at the same anchor the official reports (`reportAtNode` /
+        // the target head); a block body walks like the arrow body.
+        let f = Fixture::parse(
+            "class C {\n  bool operator ==(Object? other) {\n    return null == other;\n  }\n}\n",
+        );
+        let lints = f.run(&one_rule("avoid_null_checks_in_equality_operators"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let start = tok(&f.source, &f.tokens, "null", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, start));
+
+        let f =
+            Fixture::parse("class C {\n  bool operator ==(Object? other) => other?.foo();\n}\n");
+        let lints = f.run(&one_rule("avoid_null_checks_in_equality_operators"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let start = tok(&f.source, &f.tokens, "other", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, start));
+
+        // A chain receiver is not the parameter (the canonicalElement
+        // identity face).
+        let f = Fixture::parse("class C {\n  int m(C x, Object? other) => x.other?.foo();\n}\n");
         assert!(
-            f.run(&one_rule("no_literal_bool_comparisons"))
+            f.run(&one_rule("avoid_null_checks_in_equality_operators"))
                 .is_empty()
         );
+
+        // A non-`==` operator and a two-parameter `==` stay silent.
+        for source in [
+            "class C {\n  operator <(Object? other) => other != null;\n}\n",
+            "class C {\n  operator ==(Object? a, Object? b) => a != null;\n}\n",
+        ] {
+            let f = Fixture::parse(source);
+            assert!(
+                f.run(&one_rule("avoid_null_checks_in_equality_operators"))
+                    .is_empty()
+            );
+        }
+    }
+
+    /// The single-return block body reports at the body; a bare `return;`,
+    /// several statements, and a non-return body stay silent.
+    /// (`unnecessary_lambdas` moved to the semantic `b4_expr_pins` module
+    /// with its signature-gate faces.)
+    #[test]
+    fn prefer_expression_function_bodies_faces() {
+        let f = Fixture::parse("int f() {\n  return 1;\n}\n");
+        let lints = f.run(&one_rule("prefer_expression_function_bodies"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary use of a block function body."
+        );
+        // The body `{` is the fixture's only brace.
+        let start = tok(&f.source, &f.tokens, "{", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, start));
+
+        let f = Fixture::parse("class A {\n  get g {\n    return 7;\n  }\n}\n");
+        assert_eq!(
+            f.run(&one_rule("prefer_expression_function_bodies")).len(),
+            1
+        );
+
+        for source in [
+            "void f() {\n  return;\n}\n",
+            "int f() {\n  var a = 1;\n  return a;\n}\n",
+            "set x(int v) {\n  y = v;\n}\nvar y = 0;\n",
+            "int f() {\n  if (1 == 2) {\n    return 1;\n  }\n  return 0;\n}\n",
+        ] {
+            let f = Fixture::parse(source);
+            assert!(
+                f.run(&one_rule("prefer_expression_function_bodies"))
+                    .is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The removable parens report. (`avoid_bool_literals_in_conditional_expressions`,
+    /// `prefer_int_literals`, `literal_only_boolean_expressions`, and
+    /// `unnecessary_lambdas` moved to the semantic `b4_expr_pins` module
+    /// with their wave faces.)
+    #[test]
+    fn inherited_wave_faces() {
+        // The single positional argument and the condition paren report.
+        let f = Fixture::parse("void g(int a) {}\nvoid f(int a) {\n  g((a));\n}\n");
+        let lints = f.run(&one_rule("unnecessary_parenthesis"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Unnecessary use of parentheses.");
+        let f = Fixture::parse("void f(bool a) {\n  if ((a)) {}\n}\n");
+        assert_eq!(f.run(&one_rule("unnecessary_parenthesis")).len(), 1);
+        // A meaningful operator operand stays silent.
+        let f = Fixture::parse("void f(int a, int b) {\n  var x = (a + b) * 2;\n}\n");
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+    }
+
+    /// The record-parameter faces (`test_recordInside_param` /
+    /// `test_recordInside_namedParam`): the same-file written record type
+    /// of the corresponding formal keeps the parentheses (:75-86); the
+    /// typed-out parameter keeps the report. The variable face
+    /// (`(int,) r = (3);`, :47-53) stays exempt either way.
+    #[test]
+    fn record_parameter_faces() {
+        let f = Fixture::parse("void g((int,) i) {}\nvoid f() {\n  g((3));\n}\n");
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+
+        let f = Fixture::parse("void g({required (int,) i}) {}\nvoid f() {\n  g(i: (3));\n}\n");
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+
+        let f = Fixture::parse("void g((int,) i) {}\nvoid f() {\n  g(((3,)));\n}\n");
+        assert_eq!(f.run(&one_rule("unnecessary_parenthesis")).len(), 1);
+
+        let f = Fixture::parse("void g(int i) {}\nvoid f() {\n  g((3));\n}\n");
+        assert_eq!(f.run(&one_rule("unnecessary_parenthesis")).len(), 1);
+
+        let f = Fixture::parse("void g(int i) {}\nvoid f() {\n  g(i: (3));\n}\n");
+        assert_eq!(f.run(&one_rule("unnecessary_parenthesis")).len(), 1);
+
+        // The exempt variable face for contrast (:47-53).
+        let f = Fixture::parse("void f() {\n  (int,) r = (3);\n}\n");
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+    }
+
+    /// The type-literal inner face (`test_typeLiteralInside`):
+    /// `(List<int>).toString()` keeps the parentheses (:105-106), while a
+    /// same-file generic tear-off is a `FunctionReference` and reports.
+    #[test]
+    fn type_literal_inner_face() {
+        let f = Fixture::parse("void f() {\n  (List<int>).toString();\n}\n");
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+
+        let f = Fixture::parse("int g<T>(T x) => 0;\nvoid f() {\n  (g<int>).foo;\n}\n");
+        assert_eq!(f.run(&one_rule("unnecessary_parenthesis")).len(), 1);
+    }
+
+    /// The extension-nullable bail (`test_targetOfGetterInNullableExtension`
+    /// / `test_targetOfMethodInNullableExtension`): parentheses are
+    /// required when the accessor resolves to a same-file extension member
+    /// whose `on` type is written nullable (:117-124, :132-139); a
+    /// non-nullable `on` type keeps the report.
+    #[test]
+    fn nullable_extension_faces() {
+        let f = Fixture::parse(
+            "class C {\n  String? get s => 'yay';\n}\nextension on String? {\n  bool get g => false;\n}\nvoid f(C? c) {\n  (c?.s).g;\n}\n",
+        );
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+
+        let f = Fixture::parse(
+            "class C {\n  String? get s => 'yay';\n}\nextension on String? {\n  bool g() => false;\n}\nvoid f(C? c) {\n  (c?.s).g();\n}\n",
+        );
+        assert!(f.run(&one_rule("unnecessary_parenthesis")).is_empty());
+
+        let f = Fixture::parse(
+            "extension on String {\n  bool get g => false;\n}\nvoid f(String s) {\n  (s).g;\n}\n",
+        );
+        assert_eq!(f.run(&one_rule("unnecessary_parenthesis")).len(), 1);
+    }
+
+    /// The dual-nullability face: two same-named members judge
+    /// independently through the resolved receiver — the `String?`-on-type
+    /// member applies alone to a nullable receiver and keeps the parens
+    /// (:117-124, :132-139); both apply to a non-nullable receiver, the
+    /// non-nullable `on` type is the more specific resolution, and the
+    /// one-token report stands (:108-161).
+    #[test]
+    fn dual_nullability_same_name_faces() {
+        let f = Fixture::parse(
+            "extension A on String? {\n  bool get g => false;\n\n  bool m() => false;\n}\nextension B on String {\n  bool get g => false;\n\n  bool m() => false;\n}\nvoid f(String? s, String t) {\n  (s).g;\n  (s).m();\n  (t).g;\n  (t).m();\n}\n",
+        );
+        let lints = f.run(&one_rule("unnecessary_parenthesis"));
+        assert_eq!(lints.len(), 2, "{lints:?}");
+        // Both reports land on the non-nullable receiver's parens (after
+        // the two `m()` declarations and the `(s)` faces).
+        let third_paren = tok(&f.source, &f.tokens, "(", 6);
+        let fourth_paren = tok(&f.source, &f.tokens, "(", 7);
+        assert_eq!(lints[0].range.start, utf16_at(&f, third_paren));
+        assert_eq!(lints[1].range.start, utf16_at(&f, fourth_paren));
+    }
+
+    /// The interface-member precedence: an inherited same-file class
+    /// member resolves before any extension application (the oracle's
+    /// resolve-then-judge order) and reports even when a nullable
+    /// extension declares the same name over the subclass.
+    #[test]
+    fn class_member_precedes_extension() {
+        let f = Fixture::parse(
+            "class A {\n  bool get g => false;\n}\nclass B extends A {}\nextension on B? {\n  bool get g => false;\n}\nvoid f(B b) {\n  (b).g;\n}\n",
+        );
+        assert_eq!(f.run(&one_rule("unnecessary_parenthesis")).len(), 1);
+    }
+
+    /// Extensions never apply to `dynamic` (the oracle's accessor element
+    /// is null): the one-token face reports even when a same-file
+    /// extension declares the name over a nullable on type.
+    #[test]
+    fn dynamic_receiver_reports() {
+        let f = Fixture::parse(
+            "extension on String? {\n  bool get g => false;\n}\nvoid f(dynamic d) {\n  (d).g;\n}\n",
+        );
+        assert_eq!(f.run(&one_rule("unnecessary_parenthesis")).len(), 1);
+    }
+}
+
+/// The wildcard-name family: a multi-underscore parameter or local whose
+/// name the wildcard-variables feature (Dart 3.7) makes redundant.
+pub(crate) mod unnecessary_underscores {
+    use dartq_ast::NodeKind;
+
+    use super::{Check, Group, RuleSpec};
+    use crate::rules::utf16_token_span;
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/unnecessary_underscores.dart` — a formal
+    /// parameter or local variable whose name is two or more underscores
+    /// reports at the name when the body never references it: with the
+    /// wildcard-variables feature (Dart 3.7) a single `_` binds nothing,
+    /// so the extra underscores carry no meaning (the registration bails
+    /// without the feature, :33 — the gate consumes the
+    /// [`crate::engine::Features::wildcard_variables`] bit). Receiver
+    /// formals and primary-constructor declaring formals skip (the
+    /// `isDeclaring` field face, :60-62), as do fields, top-level
+    /// variables, and every declaration that is not a parameter or local
+    /// (:59, :106).
+    ///
+    /// Approximation (documented): the official reference test runs over
+    /// elements; the name-level face here counts any same-lexeme
+    /// `Identifier` in the enclosing function-like declaration's subtree
+    /// — a property access of the same name (`obj.__`) over-counts
+    /// (conservative, under-reports). The parameter face also reads the
+    /// declaration's own doc-comment `[name]` references
+    /// (collectReferences' `documentationComment`, :76-94); comment
+    /// references of other declarations are invisible to it. Message:
+    /// `diagnostic.g.dart` `unnecessaryUnderscores`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_underscores",
+        group: Group::Standalone,
+        problem: "Unnecessary use of multiple underscores.",
+        correction: "Try using '_'.",
+        kinds: &[NodeKind::FormalParameters, NodeKind::VariablesDeclaration],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The registration bail (:33): the feature is what turns the
+        // multi-underscore name into a plain spelling of `_`.
+        if !c.unit.features.wildcard_variables {
+            return;
+        }
+        match c.kind(c.node()) {
+            NodeKind::FormalParameters => parameters(c),
+            NodeKind::VariablesDeclaration => locals(c),
+            _ => {}
+        }
+    }
+
+    /// The parameter face (:53-101): every plain formal whose name is two
+    /// or more underscores and unreferenced in the enclosing declaration
+    /// reports at the name token.
+    fn parameters(c: &mut Check<'_>) {
+        // Primary-constructor formals declare fields — the `isDeclaring`
+        // field face skips them (:60-62, the primary-constructor corpus).
+        if c.path
+            .iter()
+            .rev()
+            .skip(1)
+            .take(3)
+            .any(|&a| c.kind(a) == NodeKind::PrimaryConstructor)
+        {
+            return;
+        }
+        let Some(owner_row) = function_owner(c) else {
+            return;
+        };
+        let owner_head = c.head_token(owner_row);
+        let node = c.node();
+        for param in c.collect_direct(node) {
+            if c.kind(param) != NodeKind::FormalParameter {
+                continue;
+            }
+            // A receiver formal (`this.__` / `super.__`) declares or
+            // forwards a member — never a plain parameter (:60-62).
+            if c.payload(param).first().copied() != Some(crate::rules::NONE_TOKEN) {
+                continue;
+            }
+            let Some(&name) = c.payload(param).get(1) else {
+                continue;
+            };
+            if !is_multi_underscore(c, name) || referenced(c, owner_row, name, owner_head, true) {
+                continue;
+            }
+            c.report(utf16_token_span(c, name), &[]);
+        }
+    }
+
+    /// The local face (:104-114): an `InitializedIdentifier` of a
+    /// `VariablesDeclaration` that is not a field or top-level variable,
+    /// named two or more underscores and unreferenced in the enclosing
+    /// declaration, reports at the name token.
+    fn locals(c: &mut Check<'_>) {
+        // Fields and top-level variables are their own elements, never
+        // locals (:59, :106).
+        if c.path
+            .iter()
+            .any(|&a| matches!(c.kind(a), NodeKind::Fields | NodeKind::TopLevelFields))
+        {
+            return;
+        }
+        let Some(owner_row) = function_owner(c) else {
+            return;
+        };
+        let owner_head = c.head_token(owner_row);
+        let node = c.node();
+        for var in c.collect_direct(node) {
+            if c.kind(var) != NodeKind::InitializedIdentifier {
+                continue;
+            }
+            let Some(name) = crate::rules::initialized_identifier_name(c, var) else {
+                continue;
+            };
+            if !is_multi_underscore(c, name) || referenced(c, owner_row, name, owner_head, false) {
+                continue;
+            }
+            c.report(utf16_token_span(c, name), &[]);
+        }
+    }
+
+    /// `isJustUnderscores` (:129-130): a name of two or more underscores.
+    fn is_multi_underscore(c: &Check<'_>, name: u32) -> bool {
+        let lexeme = c.lexeme(name);
+        lexeme.len() > 1 && lexeme.bytes().all(|byte| byte == b'_')
+    }
+
+    /// The enclosing function-like declaration the official reference
+    /// walks walks out to (`ConstructorDeclaration` / `FunctionDeclaration`
+    /// / `MethodDeclaration`, :71-94).
+    fn function_owner(c: &Check<'_>) -> Option<u32> {
+        c.path.iter().rev().skip(1).copied().find(|&a| {
+            matches!(
+                c.kind(a),
+                NodeKind::Method
+                    | NodeKind::TopLevelMethod
+                    | NodeKind::Constructor
+                    | NodeKind::Factory
+                    | NodeKind::LocalFunctionDeclaration
+                    | NodeKind::FunctionExpression
+            )
+        })
+    }
+
+    /// The name-level reference test: any same-lexeme `Identifier` in the
+    /// owner's subtree except the declaration's own name row; the
+    /// parameter face additionally reads the owner's doc comment
+    /// (collectReferences' `documentationComment`, :79-94).
+    fn referenced(c: &Check<'_>, owner: u32, name: u32, owner_head: u32, doc_face: bool) -> bool {
+        let lexeme = c.lexeme(name);
+        for row in c.children(owner) {
+            if c.kind(row) == NodeKind::Identifier
+                && c.head_token(row) != name
+                && c.lexeme(c.head_token(row)) == lexeme
+            {
+                return true;
+            }
+        }
+        if doc_face {
+            for comment in c.comments.attached(owner_head as usize) {
+                let text = &c.unit.source[comment.range.start as usize..comment.range.end as usize];
+                if text.contains(&format!("[{lexeme}]")) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
+
+        fn run(source: &str) -> Vec<crate::engine::Lint> {
+            Fixture::parse(source).run(&one_rule("unnecessary_underscores"))
+        }
+
+        /// `test_function_parameter_unused`.
+        #[test]
+        fn unused_multi_underscore_parameter_reports() {
+            let lints = run("void f(int _, int __) {}");
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            assert_eq!(lints[0].message, "Unnecessary use of multiple underscores.");
+            assert_eq!(lints[0].correction.as_deref(), Some("Try using '_'."));
+        }
+
+        /// `test_function_parameter_used` — the reference keeps the name.
+        #[test]
+        fn used_parameter_is_silent() {
+            assert!(run("void f(int _, int __) { print(__); }").is_empty());
+        }
+
+        /// `test_local_unused` / `test_local_used`.
+        #[test]
+        fn local_reports_when_unused_and_is_silent_when_used() {
+            assert_eq!(run("void f() { var __ = 0; }").len(), 1);
+            assert!(run("void f() { var __ = 0; print(__); }").is_empty());
+        }
+
+        /// `test_forPart_unused` / `test_forPart_used` — for-parts
+        /// declarations follow the local face.
+        #[test]
+        fn for_part_declaration_follows_the_local_face() {
+            assert_eq!(run("void f() { for (var __ = 0; ; ) {} }").len(), 1);
+            assert!(run("void f() { for (var __ = 0; ; ++__) {} }").is_empty());
+        }
+
+        /// `test_field_unused` / `test_topLevelVariable_unused` /
+        /// `test_enum_field_unused` — fields, top-level variables, and
+        /// enum elements are not the lint's face.
+        #[test]
+        fn fields_and_top_level_variables_are_silent() {
+            assert!(run("class C { int __ = 0; }").is_empty());
+            assert!(run("int __ = 0;").is_empty());
+            assert!(run("enum E { __, }").is_empty());
+        }
+
+        /// `test_method_unused` / `test_topLevelFunction_unused` /
+        /// `test_localFunction_unused` — declaration names are not the
+        /// lint's face.
+        #[test]
+        fn declaration_names_are_silent() {
+            assert!(run("class A { __() {} }").is_empty());
+            assert!(run("__() {}").is_empty());
+            assert!(run("f() { __() {} }").is_empty());
+        }
+
+        /// `test_function_parameter_unused_preWildcards` — the feature
+        /// gate (:33).
+        #[test]
+        fn wildcard_feature_off_is_silent() {
+            let mut f = Fixture::parse("void f(int _, int __) {}");
+            f.features.wildcard_variables = false;
+            assert!(f.run(&one_rule("unnecessary_underscores")).is_empty());
+        }
+
+        /// `test_commentReferenceFunction` — a doc-comment `[__]`
+        /// reference keeps the parameter name.
+        #[test]
+        fn doc_comment_reference_is_silent() {
+            assert!(run("/// This is a reference to [__].\nvoid f(int __) {}").is_empty());
+        }
+
+        /// `test_parameter_declaring_unused` — primary-constructor
+        /// declaring formals skip.
+        #[test]
+        fn primary_constructor_formals_are_silent() {
+            assert!(run("class C(final int _, final int __);").is_empty());
+        }
+
+        /// `test_localFunction_parameter_unused`.
+        #[test]
+        fn local_function_parameter_reports() {
+            assert_eq!(run("void f() { g(int __) {} }").len(), 1);
+        }
+
+        /// The report pins the parameter name token.
+        #[test]
+        fn report_pins_the_name_token() {
+            let source = "void f(int __) {}";
+            let f = Fixture::parse(source);
+            let lints = f.run(&one_rule("unnecessary_underscores"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            assert_eq!(
+                lints[0].range.start,
+                utf16_at(&f, tok(source, &f.tokens, "__", 0))
+            );
+        }
+    }
+}
+
+pub(crate) mod cascade_invocations {
+    use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
+    use crate::rules::{
+        byte_span_of_token, initialized_identifier_name, is_statement_row,
+        variables_declaration_keyword,
+    };
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/cascade_invocations.dart`
+    /// — consecutive statements on one cascadable reference report at the
+    /// joined run (`_checkStatements` :348-386): a block or switch-member
+    /// statement run classifies each statement as a cascadable box — a
+    /// single-variable declaration (non-`await` initializer :26-37), an
+    /// assignment over a bare target or a variable-prefix setter
+    /// (:179-202), a non-null-aware member invocation or property access
+    /// over a simple receiver (:215-249), or a cascade over a simple
+    /// target (:204-213) — and a run joins while the boxes share the
+    /// element and the capability bits hold (`canJoin` over the previous
+    /// `canReceive`, at least one `canBeCascaded`, :253-259). The report
+    /// covers the second statement through the last of the run — the
+    /// anchor statement stays out (:370-373).
+    ///
+    /// dartq faces over the production tiling: the statement run is the
+    /// statement rows of the block window (`Block` is the nested-statement
+    /// form, `BlockBody` every function/literal body — the bridge emits no
+    /// `Block` there; a switch member's run sits after the matched
+    /// expressions and the optional `when` clause). An `ExpressionStatement`
+    /// seals as a span-only leaf — its expression pieces tile as flat block
+    /// siblings inside its span, which [`statement_face`] reads off the
+    /// owner slice. The
+    /// critical-dependency gate (`_hasCriticalDependencies`) is the
+    /// name-level face: any `Identifier` lexeme equal to the anchor's
+    /// element inside the upstream criticalNodes spans — the assignment
+    /// right side, the selector + argument list, the accessor name, the
+    /// cascade sections, the variable initializer (its own name row
+    /// excluded) — blocks the join. The element-model gates are the
+    /// same-file channel: the invocation receiver, the setter prefix, and
+    /// the cascade target must bind to a same-file value (the upstream
+    /// non-static faces — a class-name receiver `C.m()` stays silent).
+    /// Approximations (documented): imported or untyped receivers stay
+    /// silent (under-report); the setter face accepts any same-file value
+    /// prefix (a static-setter prefix over-reports); the visitor's
+    /// sibling-executable and closure arms are out of the substrate; two
+    /// same-named elements (shadowing) join as one (over-report).
+    /// Message: `diagnostic.g.dart` `cascadeInvocations`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "cascade_invocations",
+        group: Group::Standalone,
+        problem: "Unnecessary duplication of receiver.",
+        correction: "Try using a cascade to avoid the duplication.",
+        kinds: &[NodeKind::Block, NodeKind::BlockBody, NodeKind::SwitchCase],
+        check,
+    };
+
+    /// One statement's cascadable face: the element it anchors or joins,
+    /// the upstream capability bits, the critical scan spans (the
+    /// upstream criticalNodes sets), and a span to exclude from the scan
+    /// (the declaration's own name row).
+    struct CascadeBox<'a> {
+        element: Option<&'a str>,
+        can_join: bool,
+        can_receive: bool,
+        can_be_cascaded: bool,
+        critical: Vec<core::ops::Range<usize>>,
+        skip: Option<core::ops::Range<usize>>,
+    }
+
+    impl CascadeBox<'_> {
+        fn null() -> Self {
+            Self {
+                element: None,
+                can_join: false,
+                can_receive: false,
+                can_be_cascaded: false,
+                critical: Vec::new(),
+                skip: None,
+            }
+        }
+    }
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let statements: Vec<u32> = match c.kind(node) {
+            // `Block` is the nested-statement `{ ... }`; `BlockBody` is
+            // every function/literal body — the production bridge emits
+            // `BlockBody` for a body context, never `Block`.
+            NodeKind::Block | NodeKind::BlockBody => c
+                .collect_direct(node)
+                .into_iter()
+                .filter(|&row| is_statement_row(c, row))
+                .collect(),
+            // The member's statements tile after the matched expressions
+            // (payload word 2) and the optional `when` clause.
+            NodeKind::SwitchCase => {
+                let expressions = c.payload(node).get(2).copied().unwrap_or(0) as usize;
+                let kids = c.collect_direct(node);
+                let mut start = expressions;
+                if kids
+                    .get(start)
+                    .is_some_and(|&row| c.kind(row) == NodeKind::SwitchCaseWhenClause)
+                {
+                    start += 1;
+                }
+                kids[start..]
+                    .iter()
+                    .copied()
+                    .filter(|&row| is_statement_row(c, row))
+                    .collect()
+            }
+            _ => return,
+        };
+        if statements.len() < 2 {
+            return;
+        }
+        let block_kids = c.collect_direct(node);
+        let mut previous = CascadeBox::null();
+        let mut previous_statement: Option<u32> = None;
+        let mut first: Option<u32> = None;
+        for &statement in &statements {
+            let current = statement_box(c, statement);
+            if compatible(
+                c,
+                &block_kids,
+                statement,
+                previous_statement,
+                &current,
+                &previous,
+            ) {
+                first = first.or(Some(statement));
+            } else if let (Some(first_stmt), Some(prev_stmt)) = (first, previous_statement) {
+                report_run(c, first_stmt, prev_stmt);
+                first = None;
+            }
+            previous = current;
+            previous_statement = Some(statement);
+        }
+        if let (Some(first_stmt), Some(prev_stmt)) = (first, previous_statement) {
+            report_run(c, first_stmt, prev_stmt);
+        }
+    }
+
+    fn report_run(c: &mut Check<'_>, first: u32, last: u32) {
+        let range = c.utf16_span(first).start..c.utf16_span(last).end;
+        c.report(range, &[]);
+    }
+
+    /// The upstream `compatibleWith` (:253-259) plus the critical gate.
+    fn compatible(
+        c: &Check<'_>,
+        block_kids: &[u32],
+        stmt: u32,
+        previous_statement: Option<u32>,
+        current: &CascadeBox<'_>,
+        previous: &CascadeBox<'_>,
+    ) -> bool {
+        let (Some(element), Some(previous_element)) = (current.element, previous.element) else {
+            return false;
+        };
+        if element != previous_element
+            || !previous.can_receive
+            || !current.can_join
+            || !(current.can_be_cascaded || previous.can_be_cascaded)
+        {
+            return false;
+        }
+        // `_hasCriticalDependencies` (:261-270): NEITHER box's critical
+        // spans may carry a reference to the element — the previous side
+        // is negated too (the upstream `!` wraps the whole scan).
+        !critical_hit(
+            c,
+            block_kids,
+            stmt,
+            &current.critical,
+            current.skip.as_ref(),
+            element,
+        ) && previous_statement.is_some_and(|prev_stmt| {
+            !critical_hit(
+                c,
+                block_kids,
+                prev_stmt,
+                &previous.critical,
+                previous.skip.as_ref(),
+                element,
+            )
+        })
+    }
+
+    /// Whether any `Identifier` row under `stmt`'s face carries `name`
+    /// inside one of `spans` (the subtree walk descends only inside the
+    /// spans, so the receiver itself never blocks its own join).
+    fn critical_hit(
+        c: &Check<'_>,
+        block_kids: &[u32],
+        stmt: u32,
+        spans: &[core::ops::Range<usize>],
+        skip: Option<&core::ops::Range<usize>>,
+        name: &str,
+    ) -> bool {
+        if spans.is_empty() {
+            return false;
+        }
+        let mut universe: Vec<u32> = block_kids.to_vec();
+        universe.extend(c.collect_direct(stmt));
+        let window = c.children(stmt);
+        universe.extend(window.start..window.end);
+        universe
+            .iter()
+            .copied()
+            .any(|row| subtree_hit(c, row, spans, skip, name))
+    }
+
+    fn subtree_hit(
+        c: &Check<'_>,
+        row: u32,
+        spans: &[core::ops::Range<usize>],
+        skip: Option<&core::ops::Range<usize>>,
+        name: &str,
+    ) -> bool {
+        let span = c.byte_span(row);
+        if Some(&span) == skip {
+            return false;
+        }
+        let inside = spans
+            .iter()
+            .any(|s| span.start >= s.start && span.end <= s.end);
+        if !inside {
+            return false;
+        }
+        if c.kind(row) == NodeKind::Identifier && c.lexeme(c.head_token(row)) == name {
+            return true;
+        }
+        let window = c.children(row);
+        (window.start..window.end).any(|kid| subtree_hit(c, kid, spans, skip, name))
+    }
+
+    fn statement_box<'a>(c: &Check<'a>, stmt: u32) -> CascadeBox<'a> {
+        match c.kind(stmt) {
+            NodeKind::VariablesDeclaration => var_box(c, stmt),
+            NodeKind::ExpressionStatement => expression_box(c, stmt),
+            _ => CascadeBox::null(),
+        }
+    }
+
+    /// `fromVariableDeclarationStatement` (:160-168): one variable with a
+    /// non-`await` initializer anchors a critical, `canReceive` box (a
+    /// `const` declaration cannot receive, :165).
+    fn var_box<'a>(c: &Check<'a>, stmt: u32) -> CascadeBox<'a> {
+        let vars: Vec<u32> = c
+            .collect_direct(stmt)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::InitializedIdentifier)
+            .collect();
+        let [var] = vars[..] else {
+            return CascadeBox::null();
+        };
+        // `await` binds looser than it looks (:27-33): an awaited
+        // initializer never anchors a run.
+        let awaited = c
+            .collect_direct(stmt)
+            .into_iter()
+            .chain(c.children(stmt))
+            .any(|row| c.kind(row) == NodeKind::AwaitExpression);
+        if awaited {
+            return CascadeBox::null();
+        }
+        let Some(name_token) = initialized_identifier_name(c, var) else {
+            return CascadeBox::null();
+        };
+        let const_decl =
+            variables_declaration_keyword(c, stmt).is_some_and(|kw| c.lexeme(kw) == "const");
+        CascadeBox {
+            element: Some(c.lexeme(name_token)),
+            can_join: false,
+            can_receive: !const_decl,
+            can_be_cascaded: false,
+            critical: vec![c.byte_span(var)],
+            skip: Some(byte_span_of_token(c, name_token)),
+        }
+    }
+
+    /// The statement's expression face: `collect_direct` when the
+    /// statement seals a window (`VariablesDeclaration`), else the owner
+    /// pieces the span-only `ExpressionStatement` leaf covers — its
+    /// expression rows tile as flat owner siblings inside the statement's
+    /// byte span.
+    fn statement_face(c: &Check<'_>, stmt: u32) -> Vec<u32> {
+        let kids = c.collect_direct(stmt);
+        if !kids.is_empty() {
+            return kids;
+        }
+        let Some(parent) = c.unit.ast.parent(stmt) else {
+            return Vec::new();
+        };
+        let span = c.byte_span(stmt);
+        c.collect_direct(parent)
+            .into_iter()
+            .filter(|&row| {
+                row != stmt && {
+                    let s = c.byte_span(row);
+                    s.start >= span.start && s.end <= span.end
+                }
+            })
+            .collect()
+    }
+
+    /// `fromExpressionStatement` (:139-158) over the statement's piece run.
+    fn expression_box<'a>(c: &Check<'a>, stmt: u32) -> CascadeBox<'a> {
+        let kids = statement_face(c, stmt);
+        if let Some(assign) = kids
+            .iter()
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::Assignment)
+        {
+            return assignment_box(c, assign);
+        }
+        // The outermost send is the invocation's selector group — the
+        // receiver's own tear-off send precedes it.
+        if let Some(pos) = kids.iter().rposition(|&kid| c.kind(kid) == NodeKind::Send) {
+            return invocation_box(c, stmt, &kids, pos);
+        }
+        if let Some(cascade) = kids
+            .iter()
+            .copied()
+            .find(|&kid| c.kind(kid) == NodeKind::Cascade)
+        {
+            return cascade_box(c, cascade);
+        }
+        property_box(c, &kids)
+    }
+
+    /// `fromAssignmentExpression` (:179-202): a bare target anchors a
+    /// critical box; a setter over a same-file variable prefix is fully
+    /// cascadable (:189-194). `??=` cannot receive (:185/:192).
+    fn assignment_box<'a>(c: &Check<'a>, assign: u32) -> CascadeBox<'a> {
+        // The shared operand split pulls the left member access's lazily
+        // sealed `Send` + `DotAccess` pair back across the operator byte.
+        let Some((left, right)) = slice::binary_operands_at(c, assign) else {
+            return CascadeBox::null();
+        };
+        let Some(&op) = c.payload(assign).first() else {
+            return CascadeBox::null();
+        };
+        let receives = c.lexeme(op) != "??=";
+        let right_span = merged_span(c, &right);
+        let Some(marker) = left
+            .iter()
+            .copied()
+            .find(|&row| c.kind(row) == NodeKind::DotAccess)
+        else {
+            // The bare-target face: exactly one identifier left of the `=`.
+            let [only] = left[..] else {
+                return CascadeBox::null();
+            };
+            if c.kind(only) != NodeKind::Identifier {
+                return CascadeBox::null();
+            }
+            return CascadeBox {
+                element: Some(c.lexeme(c.head_token(only))),
+                can_join: false,
+                can_receive: receives,
+                can_be_cascaded: false,
+                critical: right_span.into_iter().collect(),
+                skip: None,
+            };
+        };
+        // The setter face: the plain-dot prefix must bind to a same-file
+        // value (the upstream non-static variable gate). The marker's
+        // payload word 0 is the access-operator token.
+        if c.payload(marker)
+            .first()
+            .is_none_or(|&dot| c.lexeme(dot) != ".")
+        {
+            return CascadeBox::null();
+        }
+        let Some(prefix) = left
+            .iter()
+            .copied()
+            .find(|&row| c.kind(row) == NodeKind::Identifier)
+        else {
+            return CascadeBox::null();
+        };
+        let name = c.lexeme(c.head_token(prefix));
+        if same_file::binding_in_block(c, assign, name).is_none() {
+            return CascadeBox::null();
+        }
+        CascadeBox {
+            element: Some(name),
+            can_join: true,
+            can_receive: receives,
+            can_be_cascaded: true,
+            critical: right_span.into_iter().collect(),
+            skip: None,
+        }
+    }
+
+    /// `fromMethodInvocation` (:215-229): a same-file receiver's member
+    /// invocation joins; the critical spans cover the selector + argument
+    /// list only (the target is the element, never a blocker).
+    fn invocation_box<'a>(c: &Check<'a>, stmt: u32, kids: &[u32], pos: usize) -> CascadeBox<'a> {
+        let Some((head, Some(arguments))) = slice::send_parts(c, kids, pos) else {
+            return CascadeBox::null();
+        };
+        // A simple receiver directly before the selector (:219).
+        let Some(receiver) = slice::bare_receiver(c, kids, head) else {
+            return CascadeBox::null();
+        };
+        let name = c.lexeme(c.head_token(receiver));
+        if same_file::binding_in_block(c, stmt, name).is_none() {
+            return CascadeBox::null();
+        }
+        // The plain-operator gate (:69-70): a null-aware access stays out.
+        // The marker's payload word 0 is the access-operator token.
+        if let Some(marker) = kids
+            .iter()
+            .copied()
+            .find(|&row| c.kind(row) == NodeKind::DotAccess)
+            && c.payload(marker)
+                .first()
+                .is_some_and(|&dot| c.lexeme(dot) != ".")
+        {
+            return CascadeBox::null();
+        }
+        let start = c.byte_span(kids[head]).start;
+        #[expect(
+            clippy::single_range_in_vec_init,
+            reason = "the box's critical spans stay a Vec for the cascade                       face's variable list; this face has exactly one"
+        )]
+        let critical = vec![start..c.byte_span(arguments).end];
+        CascadeBox {
+            element: Some(name),
+            can_join: true,
+            can_receive: true,
+            can_be_cascaded: true,
+            critical,
+            skip: None,
+        }
+    }
+
+    /// `fromCascadeExpression` (:204-213): a same-file simple target joins.
+    fn cascade_box<'a>(c: &Check<'a>, cascade: u32) -> CascadeBox<'a> {
+        let kids = c.collect_direct(cascade);
+        let sections: Vec<core::ops::Range<usize>> = kids
+            .iter()
+            .copied()
+            .filter(|&row| c.kind(row) == NodeKind::CascadeAccess)
+            .map(|row| c.byte_span(row))
+            .collect();
+        let Some(target) = kids
+            .iter()
+            .copied()
+            .find(|&row| c.kind(row) != NodeKind::CascadeAccess)
+        else {
+            return CascadeBox::null();
+        };
+        if c.kind(target) != NodeKind::Identifier {
+            return CascadeBox::null();
+        }
+        let name = c.lexeme(c.head_token(target));
+        if same_file::binding_in_block(c, cascade, name).is_none() {
+            return CascadeBox::null();
+        }
+        CascadeBox {
+            element: Some(name),
+            can_join: true,
+            can_receive: true,
+            can_be_cascaded: true,
+            critical: sections,
+            skip: None,
+        }
+    }
+
+    /// `fromPropertyAccess`/`fromPrefixedIdentifier` (:150-157, :231-249):
+    /// a plain-dot accessor over a same-file bare receiver joins; the
+    /// critical span is the accessor name only.
+    fn property_box<'a>(c: &Check<'a>, kids: &[u32]) -> CascadeBox<'a> {
+        let Some(marker) = kids
+            .iter()
+            .copied()
+            .find(|&row| c.kind(row) == NodeKind::DotAccess)
+        else {
+            return CascadeBox::null();
+        };
+        if c.payload(marker)
+            .first()
+            .is_none_or(|&dot| c.lexeme(dot) != ".")
+        {
+            return CascadeBox::null();
+        }
+        let Some(name_index) = slice::access_name_index(c, kids, marker) else {
+            return CascadeBox::null();
+        };
+        let Some(receiver) = slice::bare_receiver(c, kids, name_index) else {
+            return CascadeBox::null();
+        };
+        let name = c.lexeme(c.head_token(receiver));
+        if same_file::binding_in_block(c, marker, name).is_none() {
+            return CascadeBox::null();
+        }
+        let critical = vec![c.byte_span(kids[name_index])];
+        CascadeBox {
+            element: Some(name),
+            can_join: true,
+            can_receive: true,
+            can_be_cascaded: true,
+            critical,
+            skip: None,
+        }
+    }
+
+    fn merged_span(c: &Check<'_>, rows: &[u32]) -> Option<core::ops::Range<usize>> {
+        let first = rows.first()?;
+        let mut span = c.byte_span(*first);
+        for row in rows {
+            let other = c.byte_span(*row);
+            span.start = span.start.min(other.start);
+            span.end = span.end.max(other.end);
+        }
+        Some(span)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
+
+        fn run(source: &str) -> Vec<crate::engine::Lint> {
+            Fixture::parse(source).run(&one_rule("cascade_invocations"))
+        }
+
+        /// `test_assignmentStatements` / `test_cascadeStatements` — a run
+        /// of assignments over one declaration reports from the second
+        /// statement through the last.
+        #[test]
+        fn assignment_run_over_a_declaration_reports() {
+            let source = "class A {\n  int y = 0;\n  int z = 0;\n}\nvoid f() {\n  var x = A();\n  x.y = 1;\n  x.z = 2;\n}\n";
+            let f = Fixture::parse(source);
+            let lints = f.run(&one_rule("cascade_invocations"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            assert_eq!(lints[0].message, "Unnecessary duplication of receiver.");
+            // The report starts at the second statement and ends with the
+            // last (:370-373) — the declaration anchor stays out.
+            assert_eq!(
+                lints[0].range.start,
+                utf16_at(&f, tok(source, &f.tokens, "x", 1))
+            );
+            assert_eq!(
+                lints[0].range.end,
+                utf16_at(&f, tok(source, &f.tokens, ";", 4)) + 1
+            );
+        }
+
+        /// `test_methodInvocations` — a chain of same-receiver invocations
+        /// joins; a different receiver breaks the run.
+        #[test]
+        fn invocation_run_joins_and_different_receiver_breaks() {
+            let source = "class A {\n  void m1() {}\n  void m2() {}\n}\nvoid f(A a) {\n  a.m1();\n  a.m2();\n}\n";
+            assert_eq!(run(source).len(), 1);
+
+            let source =
+                "class A {\n  void m1() {}\n}\nvoid f(A a, A b) {\n  a.m1();\n  b.m1();\n}\n";
+            assert!(run(source).is_empty());
+        }
+
+        /// The critical gate: a right side referencing the anchor's element
+        /// blocks the join (`x.y = probe(x);` — the assigned value depends
+        /// on the receiver), and a `const` declaration cannot receive.
+        #[test]
+        fn critical_references_block_the_join() {
+            let source = "class A {\n  int y = 0;\n  int z = 0;\n}\nbool probe(A a) => true;\nvoid f() {\n  var x = A();\n  x.y = probe(x);\n  x.z = 1;\n}\n";
+            assert!(run(source).is_empty());
+
+            let source =
+                "class A {\n  int y = 0;\n}\nvoid f() {\n  const x = A();\n  x.y = 1;\n}\n";
+            assert!(run(source).is_empty());
+        }
+    }
+}
+
+pub(crate) mod do_not_use_environment {
+    use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/do_not_use_environment.dart`
+    /// — an instance creation whose static type is `bool`/`int`/`String`
+    /// with the `fromEnvironment` named constructor, or `bool` with
+    /// `hasEnvironment`, reports at the constructor name
+    /// (`reportIfUsingEnvironment` :36-48). The official dispatch faces
+    /// are the resolved creation and the dot-shorthand invocation (:50-77);
+    /// the dartq face is the invocation send: a bare core-type receiver
+    /// (`bool`/`int`/`String`) before a `fromEnvironment`/`hasEnvironment`
+    /// selector. The element-model gates are the same-file channel: the
+    /// receiver must not bind to a same-file value and the unit must not
+    /// declare a type of the same name (the shadowed family stays silent,
+    /// matching the official's static-type face). The factory-constructor
+    /// gate (:65) is element-model and skipped.
+    /// Approximations (documented, under-report): user classes spelling a
+    /// `fromEnvironment` constructor under-report; the dot-shorthand form
+    /// (`.fromEnvironment`) under-report. Message: `diagnostic.g.dart`
+    /// `doNotUseEnvironment`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "do_not_use_environment",
+        group: Group::Standalone,
+        problem: "Invalid use of an environment declaration.",
+        correction: "Try removing the environment declaration usage.",
+        kinds: &[NodeKind::Send],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((head, Some(_arguments))) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        // The selector carries the constructor name; the receiver is the
+        // bare core-type name before it — the production tiling wraps it
+        // in the tear-off group ([`slice::bare_receiver`]), so the read
+        // goes through the group face, not raw sibling arithmetic.
+        let selector = c.lexeme(c.head_token(kids[head]));
+        let Some(receiver) = slice::bare_receiver(c, &kids, head) else {
+            return;
+        };
+        let receiver_name = c.lexeme(c.head_token(receiver));
+        let paired = match selector {
+            "fromEnvironment" => matches!(receiver_name, "bool" | "int" | "String"),
+            "hasEnvironment" => receiver_name == "bool",
+            _ => false,
+        };
+        if !paired {
+            return;
+        }
+        // The shadow gates: a same-file value binding or a same-file type
+        // declaration of the receiver's name is not the core type.
+        if same_file::binding(c, c.node(), receiver_name).is_some()
+            || same_file::declares_type(c, receiver_name)
+        {
+            return;
+        }
+        // The official reports at the constructor name — the receiver
+        // through the selector.
+        let range = c.utf16_span(receiver).start..c.utf16_span(kids[head]).end;
+        c.report(range, &[]);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::testsupport::{Fixture, one_rule};
+
+        fn run(source: &str) -> Vec<crate::engine::Lint> {
+            Fixture::parse(source).run(&one_rule("do_not_use_environment"))
+        }
+
+        /// The paired constructor faces (`bool`/`int`/`String` +
+        /// `fromEnvironment`, `bool` + `hasEnvironment`) report at the
+        /// constructor name; other constructors and cross pairs stay
+        /// silent (`test_environmentNoForbidden` shapes).
+        #[test]
+        fn environment_constructor_faces() {
+            let lints = run("void f() {\n  var k = bool.fromEnvironment('k');\n}\n");
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            assert_eq!(
+                lints[0].message,
+                "Invalid use of an environment declaration."
+            );
+
+            assert_eq!(
+                run("void f() {\n  var k = int.fromEnvironment('k');\n}\n").len(),
+                1
+            );
+            assert_eq!(
+                run("void f() {\n  var k = String.fromEnvironment('k');\n}\n").len(),
+                1
+            );
+            assert_eq!(
+                run("void f() {\n  var k = bool.hasEnvironment('k');\n}\n").len(),
+                1
+            );
+
+            for source in [
+                "void f() {\n  var k = bool.parse('true');\n}\n",
+                "void f() {\n  var k = int.hasEnvironment('k');\n}\n",
+                "void f() {\n  var k = value.fromEnvironment('k');\n}\n",
+            ] {
+                assert!(run(source).is_empty(), "{source}");
+            }
+        }
+    }
+}
+
+pub(crate) mod only_throw_errors {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/only_throw_errors.dart`
+    /// — a `throw` whose expression is a literal reports at the expression
+    /// (:49-60: `node.expression is Literal` — booleans, numbers, strings,
+    /// collections, `null`, symbols); every other operand defers to the
+    /// static-type face. The dartq face is the literal slice of that
+    /// dispatch, read through parenthesized wrappers (the type arm judges
+    /// the unparenthesized expression identically).
+    /// Approximation (documented, under-report): the typed arm
+    /// (`_isThrowable` :25-31) needs the element model — non-literal
+    /// operands (identifiers, invocations) stay silent, and a user
+    /// `Exception` subclass construction under-reports the same way.
+    /// Message: `diagnostic.g.dart` `onlyThrowErrors`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "only_throw_errors",
+        group: Group::Standalone,
+        problem: "Don't throw instances of classes that don't extend either 'Exception' or 'Error'.",
+        correction: "Try throwing a different class of object.",
+        kinds: &[NodeKind::ThrowExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The production tiling: throw is a childless adopted container
+        // (the row anchors at the `throw` token) — the operand tiles
+        // beside it in the enclosing window. The operand rows are the
+        // owner rows token-inside `(throw`, `;)`; the root is the last of
+        // them (a run seals in completion order, root last). A
+        // parenthesized operand keeps its own window, so the walk reads
+        // through wrappers.
+        let node = c.node();
+        let anchor_end = c.unit.ast.token_range(node).end;
+        let Some(parent) = c.unit.ast.parent(node) else {
+            return;
+        };
+        let mut ceiling = anchor_end;
+        while ceiling < c.unit.tokens.len() as u32 && c.lexeme(ceiling) != ";" {
+            ceiling += 1;
+        }
+        let Some(mut root) = c
+            .collect_direct(parent)
+            .into_iter()
+            .filter(|&row| {
+                c.kind(row) != NodeKind::ThrowExpression
+                    && c.unit.ast.token_range(row).start >= anchor_end
+                    && c.unit.ast.token_range(row).end <= ceiling
+            })
+            .max()
+        else {
+            return;
+        };
+        while c.kind(root) == NodeKind::ParenthesizedExpression {
+            let inner = c.children(root);
+            if inner.start >= inner.end {
+                return;
+            }
+            root = inner.end - 1;
+        }
+        if is_literal(c, root) {
+            let range = c.utf16_span(root);
+            c.report(range, &[]);
+        }
+    }
+
+    /// The upstream `is Literal` set (:51).
+    fn is_literal(c: &Check<'_>, row: u32) -> bool {
+        matches!(
+            c.kind(row),
+            NodeKind::LiteralBool
+                | NodeKind::LiteralInt
+                | NodeKind::LiteralDouble
+                | NodeKind::LiteralNull
+                | NodeKind::StringLiteral
+                | NodeKind::ListLiteral
+                | NodeKind::SetOrMapLiteral
+                | NodeKind::SymbolLiteral
+        )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::testsupport::{Fixture, one_rule};
+
+        fn run(source: &str) -> Vec<crate::engine::Lint> {
+            Fixture::parse(source).run(&one_rule("only_throw_errors"))
+        }
+
+        /// The literal faces report at the thrown expression (`throw 'bad'`,
+        /// `throw null` — a `NullLiteral` is a literal); the typed arm's
+        /// operand family (identifiers, constructor invocations) stays
+        /// silent (the documented under-report register).
+        #[test]
+        fn literal_throw_faces() {
+            let lints = run("void f() {\n  throw 'bad';\n}\n");
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            assert_eq!(
+                lints[0].message,
+                "Don't throw instances of classes that don't extend either 'Exception' or 'Error'."
+            );
+
+            assert_eq!(run("void f() {\n  throw null;\n}\n").len(), 1);
+            assert_eq!(run("void f() {\n  throw 42;\n}\n").len(), 1);
+
+            for source in [
+                "void f() {\n  throw Exception('bad');\n}\n",
+                "void f() {\n  throw state;\n}\n",
+            ] {
+                assert!(run(source).is_empty(), "{source}");
+            }
+        }
+    }
+}
+
+pub(crate) mod unnecessary_await_in_return {
+    use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
+    use crate::rules::{type_before, type_face, utf16_token_span};
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_await_in_return.dart`
+    /// — `return await e;` or an arrow `=> await e;` whose awaited type is
+    /// `Future` and whose enclosing function's return type is `Future`
+    /// reports at the `await` keyword (:44-88). The enclosing-function walk
+    /// stops at the first function-like declaration; a return inside a
+    /// `try` block never reports (:77-79 — removing the `await` there
+    /// changes behaviour).
+    ///
+    /// dartq faces over the production tiling: the return-position face is
+    /// the await's parent — a `return` statement, or an arrow-body
+    /// declaration — read through parenthesized wrappers (the upstream
+    /// `unParenthesized`). The awaited-type and return-type faces are the
+    /// same-file written-type channel: the awaited operand must be a bare
+    /// name bound to a written `Future`, and the nearest enclosing
+    /// declaration must carry a written `Future` return type — an
+    /// `async`-marked anonymous function stands in for its inferred
+    /// `Future`. Approximations (documented, under-report): invocation and
+    /// member-access operands, inferred or omitted return types, and
+    /// generic-type-argument mismatches stay silent.
+    /// Message: `diagnostic.g.dart` `unnecessaryAwaitInReturn`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_await_in_return",
+        group: Group::Standalone,
+        problem: "Unnecessary 'await'.",
+        correction: "Try removing the 'await'.",
+        kinds: &[NodeKind::AwaitExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // The ancestors nearest-first; the parenthesized wrappers are read
+        // through (the upstream `unParenthesized`).
+        let ancestors: Vec<u32> = c.path.iter().copied().rev().skip(1).collect();
+        let mut index = 0;
+        let Some(mut container) = ancestors.first().copied() else {
+            return;
+        };
+        while c.kind(container) == NodeKind::ParenthesizedExpression {
+            index += 1;
+            match ancestors.get(index) {
+                Some(&row) => container = row,
+                None => return,
+            }
+        }
+        // The return-position face (:44-54).
+        match c.kind(container) {
+            NodeKind::ReturnStatement => {}
+            NodeKind::Method
+            | NodeKind::TopLevelMethod
+            | NodeKind::FunctionExpression
+            | NodeKind::LocalFunctionDeclaration
+                if has_arrow_body(c, container) => {}
+            _ => return,
+        }
+        // The awaited-type face (:59-62): a bare name bound to a written
+        // `Future`. The operand tiles as a send group
+        // (`Identifier, NoTypeArguments, NoArguments, Send`) — strip it.
+        let window = c.children(node);
+        if window.start >= window.end {
+            return;
+        }
+        let run: Vec<u32> = window.collect();
+        let [only] = slice::access_run(c, &run)[..] else {
+            return;
+        };
+        if c.kind(only) != NodeKind::Identifier {
+            return;
+        }
+        let name = c.lexeme(c.head_token(only));
+        let Some((_, Some(ty))) = same_file::binding(c, node, name) else {
+            return;
+        };
+        if type_face(c, ty).name != Some("Future") {
+            return;
+        }
+        // The return-type walk (:64-87): the nearest function-like
+        // declaration outward; the `try`-block bail (:77-79).
+        for &row in &ancestors[index..] {
+            match c.kind(row) {
+                NodeKind::Block
+                    if c.unit
+                        .ast
+                        .parent(row)
+                        .is_some_and(|parent| c.kind(parent) == NodeKind::TryStatement) =>
+                {
+                    return;
+                }
+                NodeKind::Method | NodeKind::TopLevelMethod => {
+                    if return_type_is_future(c, row) {
+                        report(c, node);
+                    }
+                    return;
+                }
+                NodeKind::FunctionExpression => {
+                    if is_async_marked(c, row) {
+                        report(c, node);
+                    }
+                    return;
+                }
+                NodeKind::LocalFunctionDeclaration => {
+                    if return_type_is_future(c, row) || is_async_marked(c, row) {
+                        report(c, node);
+                    }
+                    return;
+                }
+                NodeKind::Constructor | NodeKind::Factory | NodeKind::CompilationUnit => return,
+                _ => {}
+            }
+        }
+    }
+
+    fn report(c: &mut Check<'_>, node: u32) {
+        // The report sits on the `await` keyword (:87).
+        let range = utf16_token_span(c, c.head_token(node));
+        c.report(range, &[]);
+    }
+
+    /// The childless `ExpressionBody` handle leaves the arrow expression as
+    /// the declaration row's own children.
+    fn has_arrow_body(c: &Check<'_>, declaration: u32) -> bool {
+        c.collect_direct(declaration)
+            .into_iter()
+            .any(|kid| c.kind(kid) == NodeKind::ExpressionBody)
+    }
+
+    /// The written return type of a `Method`/`TopLevelMethod`/
+    /// `LocalFunctionDeclaration` row is `Future` (the
+    /// `isDartAsyncFuture` face — nullability and type arguments do not
+    /// change the written-name verdict). A local function's name nests
+    /// under `FunctionName` — `member_declaration_name` covers all three.
+    fn return_type_is_future(c: &Check<'_>, declaration: u32) -> bool {
+        let Some(name) = crate::rules::declarations::member_declaration_name(c, declaration) else {
+            return false;
+        };
+        let Some((type_row, _)) = type_before(c, declaration, name) else {
+            return false;
+        };
+        type_face(c, type_row).name == Some("Future")
+    }
+
+    /// Whether the declaration's token range carries the `async` marker
+    /// (the inferred-`Future` return type of an `async` anonymous face).
+    fn is_async_marked(c: &Check<'_>, declaration: u32) -> bool {
+        c.unit
+            .ast
+            .token_range(declaration)
+            .any(|token| c.lexeme(token) == "async")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::testsupport::{Fixture, one_rule};
+
+        fn run(source: &str) -> Vec<crate::engine::Lint> {
+            Fixture::parse(source).run(&one_rule("unnecessary_await_in_return"))
+        }
+
+        /// The written-`Future` faces: a `return await` over a written
+        /// `Future` parameter in a `Future`-returning function reports at
+        /// the `await`; the arrow-body face reports the same way; a
+        /// non-`Future` awaited type, a non-`Future` return type, and a
+        /// non-return position stay silent.
+        #[test]
+        fn future_return_faces() {
+            let lints = run("Future<int> g(Future<int> x) async {\n  return await x;\n}\n");
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            assert_eq!(lints[0].message, "Unnecessary 'await'.");
+
+            assert_eq!(
+                run("Future<int> g(Future<int> x) async => await x;\n").len(),
+                1
+            );
+
+            for source in [
+                // The awaited name is not a written `Future`.
+                "Future<int> g(int x) async {\n  return await x;\n}\n",
+                // The return type is not a written `Future`.
+                "int g(Future<int> x) async {\n  return await x;\n}\n",
+                // Not the returned expression.
+                "Future<int> g(Future<int> x) async {\n  var y = await x;\n  return y;\n}\n",
+            ] {
+                assert!(run(source).is_empty(), "{source}");
+            }
+        }
+    }
+}
+
+pub(crate) mod use_if_null_to_convert_nulls_to_bools {
+    use super::{Check, Group, NodeKind, RuleSpec, same_file, slice, value_run_end};
+    use crate::rules::type_face;
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/use_if_null_to_convert_nulls_to_bools.dart`
+    /// — `x == true` (:50-57) or `x != false` (:59-64) where `x` is a
+    /// *nullable* `bool` reports at the comparison (the rewrite `x ?? true`
+    /// / `x ?? false` keeps the semantics only on that type). The written-
+    /// type face is the same-file channel: the left operand is a bare name
+    /// bound to a written `bool?` (the `isDartCoreBool` + `isNullable`
+    /// face — a non-nullable `bool` and an inferred or untyped name stay
+    /// silent exactly like the official). Approximations (documented,
+    /// under-report): member-access and invocation operands, and
+    /// parenthesized left operands, stay silent.
+    /// Message: `diagnostic.g.dart` `useIfNullToConvertNullsToBools`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "use_if_null_to_convert_nulls_to_bools",
+        group: Group::Standalone,
+        problem: "Use an if-null operator to convert a 'null' to a 'bool'.",
+        correction: "Try using an if-null operator.",
+        kinds: &[NodeKind::BinaryExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let Some(&op) = c.payload(node).first() else {
+            return;
+        };
+        let wanted = match c.lexeme(op) {
+            "==" => "true",
+            "!=" => "false",
+            _ => return,
+        };
+        let Some((left, right)) = slice::binary_operands(c) else {
+            return;
+        };
+        if !left_is_nullable_bool(c, node, &left) || !right_is_bool_literal(c, &right, wanted) {
+            return;
+        }
+        // The official reports at the comparison node (:57/:63); the
+        // container row opens at the operator's tile anchor, so the extent
+        // runs from the left operand run's first token to the right run's
+        // last value row.
+        let Some(start) = slice::operand_utf16_start(c, &left, op) else {
+            return;
+        };
+        let end = value_run_end(c, &right, node);
+        c.report(start..end, &[]);
+    }
+
+    /// The `isNullableBool` face (:44-47): a bare-name operand bound to a
+    /// written `bool?`.
+    fn left_is_nullable_bool(c: &Check<'_>, node: u32, rows: &[u32]) -> bool {
+        let run = slice::access_run(c, rows);
+        let [only] = run[..] else {
+            return false;
+        };
+        if c.kind(only) != NodeKind::Identifier {
+            return false;
+        }
+        let name = c.lexeme(c.head_token(only));
+        let Some((_, Some(ty))) = same_file::binding(c, node, name) else {
+            return false;
+        };
+        let face = type_face(c, ty);
+        face.name == Some("bool") && face.nullable
+    }
+
+    /// The literal half: exactly a `true` (for `==`) or `false` (for `!=`)
+    /// literal (:55-56/:61-62 — the other pairing never matches).
+    fn right_is_bool_literal(c: &Check<'_>, rows: &[u32], wanted: &str) -> bool {
+        let run = slice::access_run(c, rows);
+        let [only] = run[..] else {
+            return false;
+        };
+        c.kind(only) == NodeKind::LiteralBool && c.lexeme(c.head_token(only)) == wanted
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::testsupport::{Fixture, one_rule};
+
+        fn run(source: &str) -> Vec<crate::engine::Lint> {
+            Fixture::parse(source).run(&one_rule("use_if_null_to_convert_nulls_to_bools"))
+        }
+
+        /// The nullable-`bool` faces report at the comparison; a
+        /// non-nullable `bool`, a non-`bool` type, and the flipped literal
+        /// pairings stay silent.
+        #[test]
+        fn nullable_bool_comparison_faces() {
+            let lints = run("void f(bool? flag) {\n  if (flag == true) {}\n}\n");
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            assert_eq!(
+                lints[0].message,
+                "Use an if-null operator to convert a 'null' to a 'bool'."
+            );
+
+            assert_eq!(
+                run("void f(bool? flag) {\n  if (flag != false) {}\n}\n").len(),
+                1
+            );
+
+            for source in [
+                // The non-nullable gate (:47 — the rewrite changes nothing).
+                "void f(bool flag) {\n  if (flag == true) {}\n}\n",
+                // A non-`bool` type never matches (:46).
+                "void f(int? n) {\n  if (n == true) {}\n}\n",
+                // The flipped pairings are not the shape (:55-56, :61-62).
+                "void f(bool? flag) {\n  if (flag == false) {}\n}\n",
+                "void f(bool? flag) {\n  if (flag != true) {}\n}\n",
+            ] {
+                assert!(run(source).is_empty(), "{source}");
+            }
+        }
+    }
+}
+
+pub(crate) mod use_is_even_rather_than_modulo {
+    use super::{Check, Group, NodeKind, RuleSpec, same_file, slice, value_run_end};
+    use crate::rules::in_const_context;
+
+    /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/use_is_even_rather_than_modulo.dart`
+    /// — `x % 2 == 0` (or `== 1`) over `int` operands reports at the
+    /// comparison with `isEven`/`isOdd` (:37-81): the operator must be
+    /// `==` (:40), the node must not sit in a constant context (:41), the
+    /// right side is the literal `0`/`1` (:48, :67-68), the left side is a
+    /// `%` binary over the literal `2` (:54-60) with `int` operands
+    /// (:48-50, :63-65), and a `const` constructor's assert initializer is
+    /// exempt (:69-78 — `isEven` is not constant-evaluable there).
+    ///
+    /// dartq faces over the production tiling: the outer `==`'s left run
+    /// roots the `%` container, whose own operand rows split at the
+    /// operator token; the `int` face is the same-file written-type channel
+    /// over the modulo's bare-name operand (the right literal is `int` by
+    /// syntax). Approximations (documented, under-report): member-access
+    /// and compound modulo operands (`v.length % 2`, `a.b % 2`), a
+    /// non-bare-name left operand, and a hexadecimal `0x2` stay silent.
+    /// Message: `diagnostic.g.dart` `useIsEvenRatherThanModulo`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "use_is_even_rather_than_modulo",
+        group: Group::Standalone,
+        problem: "Use '{0}' rather than '% 2'.",
+        correction: "Try using '{0}'.",
+        kinds: &[NodeKind::BinaryExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // The operator gate (:40).
+        let Some(&op) = c.payload(node).first() else {
+            return;
+        };
+        if c.lexeme(op) != "==" {
+            return;
+        }
+        // The constant-context gate (:41).
+        if in_const_context(c) {
+            return;
+        }
+
+        // The `const` constructor's assert initializer (:69-78).
+        if in_const_constructor_assert(c) {
+            return;
+        }
+        let Some((left, right)) = slice::binary_operands(c) else {
+            return;
+        };
+        // The literal half (:48, :67-68).
+        let right_run = slice::access_run(c, &right);
+        let [literal] = right_run[..] else {
+            return;
+        };
+        if c.kind(literal) != NodeKind::LiteralInt {
+            return;
+        }
+        let name = match c.lexeme(c.head_token(literal)) {
+            "0" => "isEven",
+            "1" => "isOdd",
+            _ => return,
+        };
+        // The modulo half (:54-65).
+        let Some(modulo) = modulo_root(c, &left) else {
+            return;
+        };
+        let Some((operand, divisor)) = modulo_operands(c, modulo) else {
+            return;
+        };
+        if c.lexeme(c.head_token(divisor)) != "2" {
+            return;
+        }
+        let operand_name = c.lexeme(c.head_token(operand));
+        // The `int` face (:48-50): the written type of the bare-name
+        // operand (a `int?` read answers like the official — nullability
+        // does not change `isDartCoreInt`).
+        let Some((_, Some(ty))) = same_file::binding(c, node, operand_name) else {
+            return;
+        };
+        if type_face_name(c, ty) != Some("int") {
+            return;
+        }
+        // The official reports at the comparison with the member name
+        // (:80); the container row opens at the `==`'s tile anchor, so the
+        // extent runs from the left operand run's first token to the right
+        // run's last value row.
+        let Some(start) = slice::operand_utf16_start(c, &left, op) else {
+            return;
+        };
+        let end = value_run_end(c, &right, node);
+        c.report(start..end, &[name]);
+    }
+
+    /// The `%` container rooting the left run: the binary row whose span
+    /// contains every other left row in token space (the adopted
+    /// container's row span covers its operand tokens; a nested chain
+    /// roots at the outermost container, whose span covers the rest).
+    fn modulo_root(c: &Check<'_>, left: &[u32]) -> Option<u32> {
+        let root = left.iter().copied().rev().find(|&row| {
+            c.kind(row) == NodeKind::BinaryExpression
+                && left.iter().all(|&other| {
+                    other == row || {
+                        let inner = c.unit.ast.token_range(other);
+                        let outer = c.unit.ast.token_range(row);
+                        inner.start >= outer.start && inner.end <= outer.end
+                    }
+                })
+        })?;
+        let &op = c.payload(root).first()?;
+        (c.lexeme(op) == "%").then_some(root)
+    }
+
+    /// The modulo container's `(operand send, divisor)` rows: the window
+    /// rows split at the operator token, exactly one per side — the
+    /// operand side is the bare-name send group's Send (its head carries
+    /// the operand identifier; the identifier pieces tile in the owner
+    /// window), and a member or compound operand carries extra rows and
+    /// stays silent (the documented face).
+    fn modulo_operands(c: &Check<'_>, modulo: u32) -> Option<(u32, u32)> {
+        let &op = c.payload(modulo).first()?;
+        let mut rows: Vec<u32> = c.collect_direct(modulo);
+        let window = c.children(modulo);
+        rows.extend(window.start..window.end);
+        rows.sort_unstable();
+        rows.dedup();
+        let split = rows.partition_point(|&row| c.unit.ast.token_range(row).start <= op);
+        if split != 1 || rows.len() - split != 1 {
+            return None;
+        }
+        let (operand, divisor) = (rows[0], rows[split]);
+        if c.kind(operand) != NodeKind::Send || c.kind(divisor) != NodeKind::LiteralInt {
+            return None;
+        }
+        Some((operand, divisor))
+    }
+
+    /// The written head name of a type row (`bool`-face shape).
+    fn type_face_name<'a>(c: &'a Check<'a>, ty: u32) -> Option<&'a str> {
+        (c.kind(ty) == NodeKind::Type).then(|| c.lexeme(c.head_token(ty)))
+    }
+
+    /// The assert-initializer exemption (:69-78): a `%`-equality inside an
+    /// assert of a `const` constructor stays silent.
+    fn in_const_constructor_assert(c: &Check<'_>) -> bool {
+        let mut seen_assert = false;
+        for &ancestor in c.path.iter().rev().skip(1) {
+            match c.kind(ancestor) {
+                NodeKind::Assert => seen_assert = true,
+                NodeKind::Constructor | NodeKind::Factory => {
+                    return seen_assert && c.lexeme(c.head_token(ancestor)) == "const";
+                }
+                NodeKind::Method | NodeKind::TopLevelMethod | NodeKind::CompilationUnit => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use crate::testsupport::{Fixture, one_rule};
+
+        fn run(source: &str) -> Vec<crate::engine::Lint> {
+            Fixture::parse(source).run(&one_rule("use_is_even_rather_than_modulo"))
+        }
+
+        /// `x % 2 == 0/1` over an `int` name reports with `isEven`/`isOdd`;
+        /// other values, non-`int` and member-access operands, and the
+        /// constant context stay silent.
+        #[test]
+        fn modulo_two_equality_faces() {
+            let lints = run("void f(int v) {\n  var a = v % 2 == 0;\n  var b = v % 2 == 1;\n}\n");
+            assert_eq!(lints.len(), 2, "{lints:?}");
+            assert_eq!(lints[0].message, "Use 'isEven' rather than '% 2'.");
+            assert_eq!(lints[1].message, "Use 'isOdd' rather than '% 2'.");
+
+            for source in [
+                // A value other than 0/1 is not the shape (:67-68).
+                "void f(int v) {\n  var a = v % 2 == 2;\n}\n",
+                // A non-`int` operand stays silent (:48-50).
+                "void f(String v) {\n  var a = v.length % 2 == 0;\n}\n",
+                // The constant-context gate (:41).
+                "void f() {\n  const int v = 4;\n  const a = v % 2 == 0;\n}\n",
+            ] {
+                assert!(run(source).is_empty(), "{source}");
+            }
+        }
+    }
+}
+
+/// The static-type-consumer family's shared faces: the piece-run static
+/// type over the semantic query row (`Ty`), the exact single-name
+/// receiver of a member selector, the unparenthesized root, and the
+/// explicit-cast bail the official dynamic rules read. Every consumer
+/// keeps the wave posture: the face absent means the rule stays silent.
+pub(crate) mod static_type_faces {
+    use dartq_semantic::model::Ty;
+
+    use super::{Check, NodeKind, query_site, slice};
+
+    /// Reads through transparent `(...)` wrappers to the expression root
+    /// row (the content is the wrapper window's last row).
+    pub(crate) fn unparenthesized(c: &Check<'_>, mut root: u32) -> u32 {
+        while c.kind(root) == NodeKind::ParenthesizedExpression {
+            let window = c.children(root);
+            if window.start >= window.end {
+                break;
+            }
+            root = window.end - 1;
+        }
+        root
+    }
+
+    /// The expression root of a piece run: containers complete after their
+    /// subtree, so the last row roots the run; wrappers read through.
+    pub(crate) fn run_root(c: &Check<'_>, run: &[u32]) -> Option<u32> {
+        Some(unparenthesized(c, *run.last()?))
+    }
+
+    /// Whether the run's unparenthesized root is an explicit `as` cast —
+    /// the upstream `_isExplicitCast` bail (`node?.unParenthesized is
+    /// AsExpression`) every dynamic-consumer arm reads.
+    pub(crate) fn is_explicit_cast(c: &Check<'_>, run: &[u32]) -> bool {
+        run_root(c, run).is_some_and(|root| c.kind(root) == NodeKind::AsExpression)
+    }
+
+    /// The expression's static type over its piece run — the M1 faces:
+    /// an identifier read, a bare send (an invocation or a tear-off
+    /// reference, both answered through the callee face), and a
+    /// single-name member access. Everything else — chains beyond the
+    /// first hop, creations, literals — carries no face and answers
+    /// `None` (the under-report direction every caller keeps silent on).
+    pub(crate) fn expr_type(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        run: &[u32],
+    ) -> Option<Ty> {
+        let root = run_root(c, run)?;
+        if c.kind(root) == NodeKind::Send {
+            return send_type(c, analysis, run);
+        }
+        // The byte-split operand run can be the bare identifier alone
+        // (the group wrappers anchor forward and split right) — the
+        // plain flow-row read.
+        if c.kind(root) == NodeKind::Identifier {
+            return analysis.type_of(query_site(c, root));
+        }
+        // A bare-name group whose Send was split off (the operand run's
+        // byte split leaves the operator-straddling Send on the right) —
+        // the plain flow-row read at the run's last identifier.
+        if slice::is_send_group_piece(c, root) {
+            let stripped = slice::access_run(c, run);
+            let last = stripped.last()?;
+            return (c.kind(*last) == NodeKind::Identifier)
+                .then_some(analysis.type_of(query_site(c, *last)))?;
+        }
+        // A trailing whole-access marker without an invocation is the
+        // bare property-access tile.
+        access_type(c, analysis, run)
+    }
+
+    /// The send face: the selector identifier sits before the argument
+    /// list; a trailing whole-access marker proves a member receiver. A
+    /// bare name's tear-off group splits across an owner boundary (its
+    /// `NoArguments` piece can tile outside the run), so `send_parts`
+    /// fails on it — the single-`Identifier` prefix is a plain read and
+    /// answers at the flow row (`type_of`), not the callee face.
+    fn send_type(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        run: &[u32],
+    ) -> Option<Ty> {
+        let pos = run.iter().rposition(|&row| c.kind(row) == NodeKind::Send)?;
+        let plain_read = |c: &Check<'_>| {
+            // The plain read answers at the flow row (`type_of`) of the
+            // run's last identifier — the bare name the group carries
+            // (earlier statements' pieces may precede it in an owner
+            // window).
+            let prefix = slice::access_run(c, &run[..pos]);
+            let Some(&last) = prefix.last() else {
+                return None;
+            };
+            if c.kind(last) != NodeKind::Identifier {
+                return None;
+            }
+            analysis.type_of(query_site(c, last))
+        };
+        let (head, arguments) = match slice::send_parts(c, run, pos) {
+            Some((head, arguments)) => (head, arguments),
+            None => return plain_read(c),
+        };
+        // A `NoArguments` send without a trailing access marker is the
+        // bare-name tear-off — the flow-row plain read, not a callee
+        // face. With the marker it is the property-access tile and the
+        // member face below answers (the getter's type).
+        let marker = slice::access_marker(c, run, pos, NodeKind::DotAccess);
+        if arguments.is_none() && marker.is_none() {
+            return plain_read(c);
+        }
+        let selector_row = run[head];
+        let selector = c.head_token(selector_row);
+        if marker.is_some() {
+            let receiver = single_receiver(c, &run[..head], selector)?;
+            let name = analysis.strings().intern(c.lexeme(selector));
+            return analysis.member_type(query_site(c, receiver), name);
+        }
+        analysis.callee_type(query_site(c, selector_row))
+    }
+
+    /// The bare property-access face (`a.b`): the selector rides on the
+    /// whole-access marker's last token; the receiver must be one exact
+    /// name directly before it.
+    fn access_type(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        run: &[u32],
+    ) -> Option<Ty> {
+        let pos = run
+            .iter()
+            .rposition(|&row| c.kind(row) == NodeKind::DotAccess)?;
+        // The whole-access marker's payload word 0 is the dot token; the
+        // member name is the token right after it (the trailing piece rides
+        // `name.`'s close, so `token_range.next_back` lands on the dot, not
+        // the name).
+        let selector = c.payload(run[pos]).first().copied()? + 1;
+        let receiver = single_receiver(c, &run[..pos], selector)?;
+        let name = analysis.strings().intern(c.lexeme(selector));
+        analysis.member_type(query_site(c, receiver), name)
+    }
+
+    /// The exact single-name receiver of a selector: one identifier piece
+    /// whose own token sits directly before the selector's dot (`a.m` —
+    /// a chain's head strands extra tokens in between and answers `None`,
+    /// the documented chain under-report). The selector's own send group
+    /// (`a.b`'s `b` rides a `[Identifier, NoTypeArguments, NoArguments,
+    /// Send]` tail) leads the slice — drop a trailing group whose head is
+    /// the selector token before reading the receiver.
+    pub(crate) fn single_receiver(c: &Check<'_>, run: &[u32], selector: u32) -> Option<u32> {
+        let mut run = slice::access_run(c, run);
+        // The selector's own send tail reduces to its `Identifier` after
+        // the access-piece strip: a property access rides
+        // `[Identifier, NoTypeArguments, NoArguments, Send]`, an
+        // invocation `[Identifier, NoTypeArguments, Arguments, Send]` —
+        // the Arguments row survives the strip and drops here beside the
+        // selector (every row from the selector token onward is the
+        // selector's own tail; earlier calls' rows anchor below it).
+        while let Some(&last) = run.last() {
+            if c.kind(last) == NodeKind::Identifier && c.head_token(last) == selector {
+                run.pop();
+                continue;
+            }
+            if c.unit.ast.token_range(last).start > selector {
+                run.pop();
+                continue;
+            }
+            break;
+        }
+        // The receiver is the one exact name directly before the
+        // selector's dot: the last surviving piece, an `Identifier` whose
+        // token sits at `selector - 2`. Everything before it (a method
+        // header's return-type strays, a chain's stranded call) stays out
+        // of the verdict — the documented chain under-report.
+        let Some(&last) = run.last() else {
+            return None;
+        };
+        if c.kind(last) != NodeKind::Identifier {
+            return None;
+        }
+        let receiver = c.head_token(last);
+        (receiver + 2 == selector).then_some(last)
+    }
+
+    /// The upstream `_reportIfDynamicOrFunction` verdict: the type is
+    /// `dynamic` or the bare `Function` type.
+    pub(crate) fn is_dynamic_or_function(analysis: &dartq_semantic::Analysis<'_>, ty: Ty) -> bool {
+        match ty {
+            Ty::Dynamic => true,
+            Ty::Named { name, .. } => analysis.strings().resolve(name) == "Function",
+            _ => false,
+        }
+    }
+
+    /// Whether `ty` classifies nullable (`Ty::Null` or a `?` projection) —
+    /// `dynamic` stays out (the official `isNullable` callers here exclude
+    /// `DynamicType` explicitly before the nullable read). The `Record`/
+    /// `Function` arms are nominal: the flow `Base` has neither record nor
+    /// function base, so the read-type channel never produces those
+    /// variants today — the disjunct keeps the predicate total for the
+    /// faces that can carry one.
+    pub(crate) fn is_nullable(ty: Ty) -> bool {
+        matches!(
+            ty,
+            Ty::Null
+                | Ty::Named { nullable: true, .. }
+                | Ty::Record { nullable: true, .. }
+                | Ty::Function { nullable: true, .. }
+        )
+    }
+
+    /// The written-target gate the implicit-cast contexts share: the type
+    /// must decide, and it is neither `dynamic`/`void` nor `Object?` (the
+    /// official `_check` exemptions).
+    pub(crate) fn typed_non_dynamic_target(
+        analysis: &dartq_semantic::Analysis<'_>,
+        ty: Ty,
+    ) -> bool {
+        match ty {
+            Ty::Named { name, nullable, .. } => {
+                let name = analysis.strings().resolve(name);
+                name != "dynamic" && name != "void" && !(name == "Object" && nullable)
+            }
+            _ => false,
+        }
+    }
+
+    // —— the typed-receiver family face ————————————————————————————————
+
+    /// The dart:core family bits of a written type name — the same table
+    /// the shared literal face keys (`slice::written_family_bits`):
+    /// `Iterable`/`List`/`Set`/dart:collection's `Queue` carry
+    /// [`slice::ITERABLE`], `String` carries [`slice::STRING`], and the map
+    /// family carries [`slice::MAP`] (never requested by an instance
+    /// receiver gate).
+    fn core_family_bits(name: &str) -> u8 {
+        match name {
+            "Iterable" | "List" | "Set" | "Queue" => slice::ITERABLE,
+            "String" => slice::STRING,
+            "Map" | "LinkedHashMap" | "LinkedHashSet" => slice::MAP,
+            _ => 0,
+        }
+    }
+
+    /// The family verdict of a bridge type against `required`: a
+    /// same-file declaration of the name walks its written supertype
+    /// clauses (the user-subclass faces), an unshadowed name is the core
+    /// type, and everything else (a cross-file class, `dynamic`, an
+    /// unknown) carries no verdict — the caller keeps its bail face.
+    pub(crate) fn ty_family(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        ty: Ty,
+        required: u8,
+    ) -> Option<bool> {
+        let Ty::Named { name, .. } = ty else {
+            return None;
+        };
+        let spelled = analysis.strings().resolve(name);
+        if crate::rules::expressions::same_file::declares_type(c, spelled) {
+            return match crate::rules::expressions::same_file::resolve(
+                c,
+                spelled,
+                &[
+                    "Iterable",
+                    "List",
+                    "Set",
+                    "Queue",
+                    "String",
+                    "Map",
+                    "LinkedHashMap",
+                    "LinkedHashSet",
+                ],
+            ) {
+                crate::rules::expressions::same_file::Verdict::Core(core) => {
+                    Some(core_family_bits(core) & required != 0)
+                }
+                crate::rules::expressions::same_file::Verdict::NotCore => Some(false),
+                crate::rules::expressions::same_file::Verdict::Unknown => None,
+            };
+        }
+        let bits = core_family_bits(spelled);
+        (bits != 0).then(|| bits & required != 0)
+    }
+
+    /// The member-receiver family face (`this.x.m(…)`, `a.b.m(…)`): the
+    /// receiver's static type through the bridge — `this.x` reads the
+    /// same-class field's written type (no read row exists for `this`),
+    /// a single-name access resolves the member's declared type. `None`
+    /// when the receiver shape or the type carries no verdict — the
+    /// caller keeps its documented bail face.
+    pub(crate) fn member_receiver_family(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        receiver_run: &[u32],
+        required: u8,
+    ) -> Option<bool> {
+        // The `this.x` face: the stripped run is the lone `this` and the
+        // trailing whole-access marker names the field.
+        let stripped = slice::access_run(c, receiver_run);
+        if let [single] = stripped.as_slice()
+            && c.kind(*single) == NodeKind::ThisExpression
+        {
+            let marker = receiver_run
+                .iter()
+                .rev()
+                .find(|&&row| c.kind(row) == NodeKind::DotAccess)?;
+            let selector = c.unit.ast.token_range(*marker).next_back()?;
+            let face = crate::rules::type_face_of_field(c, c.lexeme(selector))?;
+            let name = analysis.strings().intern(face.name?);
+            return ty_family(
+                c,
+                analysis,
+                dartq_semantic::model::Ty::named(name),
+                required,
+            );
+        }
+        // A single-name member access: the access face over the run.
+        let ty = access_type(c, analysis, receiver_run)?;
+        ty_family(c, analysis, ty, required)
+    }
+
+    /// The receiver family verdict over the operand pieces before the
+    /// selector piece at `name` — the shared typed-receiver gate
+    /// (`prefer_contains` :143-149, `prefer_is_empty` :229-234,
+    /// `avoid_function_literals_in_foreach_calls` :40-45): literal faces
+    /// decide closed; a bare-identifier receiver — including one revealed
+    /// by expanding transparent `(...)`/`as` wrappers (the official
+    /// `_drillDownTo` walk) — resolves its written type through the
+    /// same-file channel; a member receiver reads the bridge static type
+    /// when mounted. `None` carries no verdict; the caller applies its own
+    /// documented bail/presumption.
+    pub(crate) fn receiver_family(
+        c: &Check<'_>,
+        analysis: Option<&dartq_semantic::Analysis<'_>>,
+        pieces: &[u32],
+        name: usize,
+        required: u8,
+    ) -> Option<bool> {
+        if let Some(faces) = slice::receiver_faces(c, pieces, name) {
+            return Some(faces & required != 0);
+        }
+        if let Some(decides) = slice::resolved_receiver_family(c, pieces, name, required) {
+            return Some(decides);
+        }
+        let run = expand_wrappers(c, &pieces[..name]);
+        // A wrapper-revealed bare name reads its written type.
+        if let [only] = run.as_slice()
+            && c.kind(*only) == NodeKind::Identifier
+        {
+            let receiver_name = c.lexeme(c.head_token(*only));
+            let written =
+                crate::rules::expressions::same_file::written_type(c, *only, receiver_name)?;
+            if crate::rules::expressions::same_file::declares_type(c, written) {
+                return Some(false);
+            }
+            let bits = core_family_bits(written);
+            return (bits != 0).then(|| bits & required != 0);
+        }
+        member_receiver_family(c, analysis?, &run, required)
+    }
+
+    /// Expands the transparent `(...)` / `as` wrapper rows of an operand
+    /// run in place (the official `_drillDownTo(ignoreParens, ignoreAs)`):
+    /// each wrapper's child window replaces the wrapper row.
+    fn expand_wrappers(c: &Check<'_>, pieces: &[u32]) -> Vec<u32> {
+        let mut run: Vec<u32> = pieces.to_vec();
+        loop {
+            let expand = match run.last() {
+                Some(&last) => matches!(
+                    c.kind(last),
+                    NodeKind::ParenthesizedExpression | NodeKind::AsExpression
+                ),
+                None => false,
+            };
+            if !expand {
+                return run;
+            }
+            let &last = run.last().expect("checked above");
+            let inner = c.collect_direct(last);
+            if inner.is_empty() {
+                return run;
+            }
+            run.truncate(run.len() - 1);
+            run.extend(inner);
+        }
+    }
+
+    /// The receiver's static type NAME (the `null_closures` instance face):
+    /// `this.x` reads the same-class field's written type head; any other
+    /// shape reads the bridge expression face — a single-name access
+    /// resolves the member's declared type, a bare send its callee return
+    /// (`getC().map(null)`). The spelled name only — the method tables
+    /// match by written core name.
+    pub(crate) fn receiver_type_name(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        receiver_run: &[u32],
+    ) -> Option<String> {
+        let stripped = slice::access_run(c, receiver_run);
+        // `this.<field>` tiles two ways: the selector rides the access
+        // marker (no row — the stripped run is the lone `this`), or it
+        // carries its own identifier row beside the `this`. Both read the
+        // same-class field's written type (a `this.` target cannot be
+        // shadowed).
+        match stripped.as_slice() {
+            [single] if c.kind(*single) == NodeKind::ThisExpression => {
+                let marker = receiver_run
+                    .iter()
+                    .rev()
+                    .find(|&&row| c.kind(row) == NodeKind::DotAccess)?;
+                let selector = c.unit.ast.token_range(*marker).next_back()?;
+                let face = crate::rules::type_face_of_field(c, c.lexeme(selector))?;
+                return Some(face.name?.to_owned());
+            }
+            [target, name]
+                if c.kind(*target) == NodeKind::ThisExpression
+                    && c.kind(*name) == NodeKind::Identifier =>
+            {
+                let face = crate::rules::type_face_of_field(c, c.lexeme(c.head_token(*name)))?;
+                return Some(face.name?.to_owned());
+            }
+            _ => {}
+        }
+        match expr_type(c, analysis, receiver_run)
+            .or_else(|| access_type(c, analysis, receiver_run))
+        {
+            Some(Ty::Named { name, .. }) => Some(analysis.strings().resolve(name).to_owned()),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) mod avoid_dynamic_calls {
+    use dartq_semantic::model::Ty;
+
+    use super::{
+        Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces,
+        value_run_end,
+    };
+    use crate::rules::utf16_token_span;
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/avoid_dynamic_calls.dart` — a method call
+    /// or property access whose target carries the `dynamic` static type
+    /// reports: compound-assignment reads (:55-67, `??=` exempt), binary
+    /// user-definable operators over a `dynamic` left operand (:70-88,
+    /// `==`/`!=` exempt), invocation functions typed `dynamic` or bare
+    /// `Function` (:91-93, :174-181), member invocations over a `dynamic`
+    /// receiver (:101-132, the `noSuchMethod`/`toString` exemptions and
+    /// the explicit-cast bail), `!` never counts (:136-139), prefix and
+    /// postfix operators over a `dynamic` operand (:134-155, :183-195),
+    /// and property accesses over a `dynamic` target (:144-164, the
+    /// `hashCode`/`noSuchMethod`/`runtimeType`/`toString` exemptions).
+    ///
+    /// dartq faces over the production tiling: the semantic faces decide —
+    /// the read-type face at the operand's head identifier, the
+    /// variable-read face for bare invocations, and the getter/field face
+    /// for a single-name receiver (the receiver token must sit directly
+    /// before the selector's dot; a method's tear-off is a typed function
+    /// type and never answers). Approximations (documented,
+    /// under-report): multi-piece receivers (`getD().m()`, `(d).m()`,
+    /// chain receivers beyond the head) and index expressions stay
+    /// silent, the `.call` receiver special-casing (:119-129) stays
+    /// silent, declared-function and getter bare calls stay silent (no
+    /// read-row face), and a member invocation on an unresolvable
+    /// receiver keeps only the head-read verdict. Message:
+    /// `diagnostic.g.dart` `avoidDynamicCalls`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_dynamic_calls",
+        group: Group::Standalone,
+        problem: "Method invocation or property access on a 'dynamic' target.",
+        correction: "Try giving the target a type.",
+        kinds: &[
+            NodeKind::Assignment,
+            NodeKind::BinaryExpression,
+            NodeKind::Send,
+            NodeKind::DotAccess,
+            NodeKind::UnaryPrefix,
+            NodeKind::UnaryPostfix,
+        ],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        match c.kind(c.node()) {
+            NodeKind::Send => send_face(c, analysis),
+            NodeKind::DotAccess => access_face(c, analysis),
+            NodeKind::Assignment => assignment_face(c, analysis),
+            NodeKind::BinaryExpression => binary_face(c, analysis),
+            NodeKind::UnaryPrefix | NodeKind::UnaryPostfix => unary_face(c, analysis),
+            _ => {}
+        }
+    }
+
+    /// The invocation faces (:91-132): a member receiver's `dynamic` read
+    /// reports at the receiver (:116); otherwise the invocation function's
+    /// tear-off type decides (:130) — a bare invocation reports at the
+    /// selector, a member invocation over the receiver-through-selector
+    /// window.
+    fn send_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((head, arguments)) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        let selector_row = kids[head];
+        let member = slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some();
+        // The every-object exemptions (:103-114) need a receiver.
+        if member {
+            let name = c.lexeme(c.head_token(selector_row));
+            let arg_count =
+                arguments.map_or(0, |args| slice::arguments(c, &c.collect_direct(args)).len());
+            let no_named = arguments.is_some_and(|args| single_positional(c, args, arg_count == 1));
+            if (name == "noSuchMethod" && arg_count == 1 && no_named)
+                || (name == "toString" && arg_count == 0)
+                // The property-read tile's own Send dispatch (no argument
+                // list — a getter read, not an invocation): the
+                // every-object property faces (:144-150).
+                || (arguments.is_none()
+                    && matches!(
+                        name,
+                        "hashCode" | "runtimeType" | "toString" | "noSuchMethod"
+                    ))
+            {
+                return;
+            }
+        }
+        // The receiver face (:116): one exact name read as `dynamic`.
+        let receiver = member
+            .then(|| faces::single_receiver(c, &kids[..head], c.head_token(selector_row)))
+            .flatten();
+        if let Some(receiver) = receiver
+            && analysis.type_of(query_site(c, receiver)) == Some(Ty::Dynamic)
+        {
+            let range = utf16_token_span(c, c.head_token(receiver));
+            c.report(range, &[]);
+            return;
+        }
+        // The tear-off face (:130): `a.m` / `m` typed `dynamic` or bare
+        // `Function`. The tear-off type is the member's own type — a
+        // getter's or field's declared type (a method's tear-off is a
+        // typed function type, never `dynamic`/`Function`) — and the bare
+        // name's flow read row (a variable read; a declared function's
+        // name carries no read row and cannot answer).
+        let tear_off = if member {
+            receiver.and_then(|receiver| {
+                let name = analysis
+                    .strings()
+                    .intern(c.lexeme(c.head_token(selector_row)));
+                let member_face = analysis.member_of(query_site(c, receiver), name)?;
+                match member_face.entry.kind {
+                    dartq_semantic::model::MemberKind::Getter
+                    | dartq_semantic::model::MemberKind::Field => {
+                        analysis.member_type(query_site(c, receiver), name)
+                    }
+                    _ => None,
+                }
+            })
+        } else if arguments.is_some() {
+            // A bare invocation; the plain name reference group (no
+            // arguments) is not a call site (:91-93 dispatches
+            // FunctionExpressionInvocation).
+            analysis.type_of(query_site(c, selector_row))
+        } else {
+            None
+        };
+        if tear_off.is_some_and(|ty| faces::is_dynamic_or_function(analysis, ty)) {
+            let range = if member {
+                let receiver_token = receiver.map_or(c.head_token(selector_row), |receiver| {
+                    c.head_token(receiver)
+                });
+                utf16_token_span(c, receiver_token).start
+                    ..utf16_token_span(c, c.head_token(selector_row)).end
+            } else {
+                utf16_token_span(c, c.head_token(selector_row))
+            };
+            c.report(range, &[]);
+        }
+    }
+
+    /// Whether the argument list is exactly one positional argument (the
+    /// `noSuchMethod` exemption's first-argument shape, :104-109).
+    fn single_positional(c: &Check<'_>, arguments: u32, expected: bool) -> bool {
+        if !expected {
+            return false;
+        }
+        let raw = c.collect_direct(arguments);
+        let ranges = slice::arguments(c, &raw);
+        let [range] = &ranges[..] else {
+            return false;
+        };
+        c.kind(raw[range.end - 1]) != NodeKind::NamedArgument
+    }
+
+    /// The property-access face (:144-164, the `PrefixedIdentifier` and
+    /// `PropertyAccess` dispatch): a `dynamic` target over a non-exempt
+    /// member reports at the target. The invocation's own trailing
+    /// whole-access marker dispatches here too — the piece directly before
+    /// it is the invocation send, whose face already owns the verdict.
+    fn access_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        if pos > 0 && c.kind(kids[pos - 1]) == NodeKind::Send {
+            return;
+        }
+        let Some(selector) = c.unit.ast.token_range(kids[pos]).next_back() else {
+            return;
+        };
+        if matches!(
+            c.lexeme(selector),
+            "hashCode" | "noSuchMethod" | "runtimeType" | "toString"
+        ) {
+            return;
+        }
+        let before = slice::statement_run(c, &kids[..pos]);
+        if faces::is_explicit_cast(c, &before) {
+            return;
+        }
+        let Some(receiver) = faces::single_receiver(c, &before, selector) else {
+            return;
+        };
+        if analysis.type_of(query_site(c, receiver)) == Some(Ty::Dynamic) {
+            let range = utf16_token_span(c, c.head_token(receiver));
+            c.report(range, &[]);
+        }
+    }
+
+    /// The compound-assignment read face (:55-67): a compound operator
+    /// (`=`, `??=` exempt) over a `dynamic` read reports at the
+    /// assignment.
+    fn assignment_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let Some(&op) = c.payload(c.node()).first() else {
+            return;
+        };
+        if matches!(c.lexeme(op), "=" | "??=") {
+            return;
+        }
+        let Some((left, right)) = slice::binary_operands(c) else {
+            return;
+        };
+        let run = slice::access_run(c, &left);
+        let [only] = run[..] else {
+            return;
+        };
+        if c.kind(only) != NodeKind::Identifier {
+            return;
+        }
+        if analysis.type_of(query_site(c, only)) == Some(Ty::Dynamic) {
+            // `reportAtNode(node)` spans the whole assignment; the
+            // container row opens at the operator's tile anchor, so the
+            // extent runs from the left operand run's first token to the
+            // right run's last value row.
+            let Some(start) = slice::operand_utf16_start(c, &left, op) else {
+                return;
+            };
+            c.report(start..value_run_end(c, &right, c.node()), &[]);
+        }
+    }
+
+    /// The binary face (:70-88): a user-definable operator (`==`/`!=`
+    /// exempt) over a `dynamic` left operand reports at the operator
+    /// expression; the right operand is an implicit cast, not a call.
+    fn binary_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let Some(&op) = c.payload(c.node()).first() else {
+            return;
+        };
+        let operator = c.lexeme(op);
+        if matches!(operator, "==" | "!=")
+            || !matches!(
+                operator,
+                "+" | "-"
+                    | "*"
+                    | "/"
+                    | "%"
+                    | "~/"
+                    | "<<"
+                    | ">>"
+                    | ">>>"
+                    | "&"
+                    | "|"
+                    | "^"
+                    | "<"
+                    | "<="
+                    | ">"
+                    | ">="
+            )
+        {
+            return;
+        }
+        let Some((left, right)) = slice::binary_operands(c) else {
+            return;
+        };
+        if faces::is_explicit_cast(c, &left) {
+            return;
+        }
+        if faces::expr_type(c, analysis, &left) == Some(Ty::Dynamic) {
+            // `reportAtNode(node)` spans the whole binary expression; the
+            // container row opens at the operator's tile anchor, so the
+            // extent runs from the left operand run's first token to the
+            // right run's last value row.
+            let Some(start) = slice::operand_utf16_start(c, &left, op) else {
+                return;
+            };
+            c.report(start..value_run_end(c, &right, c.node()), &[]);
+        }
+    }
+
+    /// The prefix and postfix faces (:134-155): a `dynamic` operand
+    /// reports at the operator expression (the postfix `!` never
+    /// dispatches here — it is its own token-leaf kind).
+    fn unary_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let operand = slice::statement_run(c, &kids[..pos]);
+        if faces::is_explicit_cast(c, &operand) {
+            return;
+        }
+        if faces::expr_type(c, analysis, &operand) == Some(Ty::Dynamic) {
+            // `reportAtNode(node)` spans the whole operator expression; a
+            // postfix row anchors at its operator token (`x++` opens at
+            // `++`), so the extent runs from the operand run's first
+            // token — bounded at the operator, since the owner-side run
+            // can carry enclosing strays. A prefix row already opens at
+            // its operator.
+            let start = if c.kind(c.node()) == NodeKind::UnaryPostfix {
+                let floor = c.unit.ast.token_range(c.node()).end - 1;
+                let Some(start) = slice::operand_utf16_start(c, &operand, floor) else {
+                    return;
+                };
+                start
+            } else {
+                c.utf16_span(c.node()).start
+            };
+            c.report(start..c.utf16_span(c.node()).end, &[]);
+        }
+    }
+}
+
+pub(crate) mod no_dynamic_casts {
+    use dartq_semantic::model::Ty;
+
+    use super::{
+        Check, Group, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces as faces,
+    };
+    use crate::rules::{TypeFace, type_before, type_face};
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/no_dynamic_casts.dart` — a `dynamic`-typed
+    /// expression flowing into a typed context reports at the expression
+    /// (`_check` :251-264): the target type must decide and be neither
+    /// `dynamic` nor `Object?`, and an explicit `as` cast on the expression
+    /// bails. The registered contexts (:39-60) are assignments
+    /// (:77-79), arguments (:67-74), returns and arrow bodies (:100-104,
+    /// :189-195), and variable declarations (:216-223), plus the boolean
+    /// faces (conditions, guards, logical operands, `!`).
+    ///
+    /// dartq faces over the production tiling: the decidable context slice
+    /// ports — variable declarations (the written type row), assignments
+    /// (the LHS's innermost same-file written type, the `same_file`
+    /// channel), returns (the nearest enclosing declaration's written
+    /// return type, async-flattened through the first type argument), and
+    /// arguments (the member or creation formal table). The source type is
+    /// the piece-run static-type face; the explicit-cast bail reads.
+    /// Approximations (documented, under-report): bare-call and
+    /// local-callable arguments (no formal-table face at M1), the boolean
+    /// contexts, collection elements, for-each iterables, and yield
+    /// targets stay silent; member-write assignment targets stay silent
+    /// (no same-file written type). Message: `diagnostic.g.dart`
+    /// `noDynamicCasts`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "no_dynamic_casts",
+        group: Group::Standalone,
+        problem: "Implicit cast from 'dynamic'.",
+        correction: "Try adding an explicit cast or changing the target type.",
+        kinds: &[
+            NodeKind::VariablesDeclaration,
+            NodeKind::Assignment,
+            NodeKind::ReturnStatement,
+            NodeKind::Arguments,
+        ],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        match c.kind(c.node()) {
+            NodeKind::VariablesDeclaration => declaration_face(c, analysis),
+            NodeKind::Assignment => assignment_face(c, analysis),
+            NodeKind::ReturnStatement => return_face(c, analysis),
+            NodeKind::Arguments => arguments_face(c, analysis),
+            _ => {}
+        }
+    }
+
+    /// Whether a written target type admits the report: it must decide and
+    /// be neither `dynamic`/`void` nor `Object?` (:257-258).
+    fn target_admits(name: &str, nullable: bool) -> bool {
+        name != "dynamic" && name != "void" && !(name == "Object" && nullable)
+    }
+
+    /// The dynamic-source verdict for a piece run: the static type is
+    /// `dynamic` and the expression is not an explicit cast (:255-262).
+    fn source_is_dynamic(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        run: &[u32],
+    ) -> bool {
+        !faces::is_explicit_cast(c, run) && faces::expr_type(c, analysis, run) == Some(Ty::Dynamic)
+    }
+
+    /// The report span of a piece run: its first token through its last.
+    fn report_run(c: &mut Check<'_>, run: &[u32]) {
+        let Some((first, last)) = run.first().zip(run.last()) else {
+            return;
+        };
+        let range = c.utf16_span(*first).start..c.utf16_span(*last).end;
+        c.report(range, &[]);
+    }
+
+    /// The variable-declaration face (:216-223): a written type that
+    /// admits the report, over a `dynamic` initializer, reports at the
+    /// initializer (an untyped `var` binding carries no target — silent,
+    /// exactly like the official `type?` read).
+    fn declaration_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let node = c.node();
+        let kids = c.collect_direct(node);
+        // A typed declaration's written type tiles beside the declaration
+        // row under the statement wrapper (the header-sibling pattern); an
+        // untyped `var` binding has none and stays silent.
+        let Some(type_row) = c.unit.ast.parent(node).and_then(|top| {
+            c.collect_direct(top)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::Type)
+        }) else {
+            return;
+        };
+        let face = type_face(c, type_row);
+        let Some(name) = face.name else {
+            return;
+        };
+        if !target_admits(name, face.nullable) {
+            return;
+        }
+        for var in kids
+            .iter()
+            .copied()
+            .filter(|&kid| c.kind(kid) == NodeKind::InitializedIdentifier)
+            .collect::<Vec<u32>>()
+        {
+            // The initializer pieces tile inside the `VariableInitializer`
+            // container (the `= d` row wraps its operand group) — the same
+            // direct-child tiling every initializer reader reads.
+            let Some(init) = c
+                .collect_direct(var)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::VariableInitializer)
+            else {
+                continue;
+            };
+            let run = c.collect_direct(init);
+            if run.is_empty() {
+                continue;
+            }
+            if source_is_dynamic(c, analysis, &run) {
+                report_run(c, &run);
+            }
+        }
+    }
+
+    /// The assignment face (:77-79): the target's innermost same-file
+    /// written type decides (the official `writeType` — a member-write
+    /// target has no same-file face and stays silent).
+    fn assignment_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let node = c.node();
+        let Some((left, right)) = slice::binary_operands(c) else {
+            return;
+        };
+        let run = slice::access_run(c, &left);
+        let [lhs] = run[..] else {
+            return;
+        };
+        if c.kind(lhs) != NodeKind::Identifier {
+            return;
+        }
+        let Some((_, Some(type_row))) = same_file::binding(c, node, c.lexeme(c.head_token(lhs)))
+        else {
+            return;
+        };
+        let face = type_face(c, type_row);
+        let Some(name) = face.name else {
+            return;
+        };
+        if !target_admits(name, face.nullable) {
+            return;
+        }
+        if source_is_dynamic(c, analysis, &right) {
+            report_run(c, &right);
+        }
+    }
+
+    /// The return face (:100-104, :189-195): the nearest enclosing
+    /// declaration's written return type decides, async-flattened
+    /// (:349-380 — a `Future`/`FutureOr` wrapper reports through its first
+    /// type argument, any other written type through [`target_admits`]).
+    fn return_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let node = c.node();
+        let run = c.collect_direct(node);
+        if run.is_empty() || !source_is_dynamic(c, analysis, &run) {
+            return;
+        }
+        for &row in c.path.iter().rev().skip(1) {
+            match c.kind(row) {
+                NodeKind::Method
+                | NodeKind::TopLevelMethod
+                | NodeKind::LocalFunctionDeclaration => {
+                    // A local function's name nests under `FunctionName` —
+                    // `member_declaration_name` covers all three kinds.
+                    let written = crate::rules::declarations::member_declaration_name(c, row)
+                        .and_then(|name| type_before(c, row, name))
+                        .map(|(type_row, _)| type_face(c, type_row));
+                    if admits_return(c, row, written) {
+                        report_run(c, &run);
+                    }
+                    return;
+                }
+                // An inferred return type carries no face; a constructor's
+                // return type is the enclosing class (never nullable).
+                NodeKind::FunctionExpression
+                | NodeKind::NamedFunctionExpression
+                | NodeKind::Constructor
+                | NodeKind::Factory
+                | NodeKind::CompilationUnit => return,
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether the written return type admits the report (`_check`
+    /// :251-264): the target must decide and be neither `dynamic`/`void`
+    /// nor `Object?` — nullability never exempts (`int?` admits like
+    /// `int`).
+    fn admits_return(c: &Check<'_>, declaration: u32, written: Option<TypeFace<'_>>) -> bool {
+        let Some(face) = written else {
+            return false;
+        };
+        let Some(name) = face.name else {
+            return false;
+        };
+        let async_marked = c
+            .unit
+            .ast
+            .token_range(declaration)
+            .any(|token| c.lexeme(token) == "async");
+        if async_marked && matches!(name, "Future" | "FutureOr") {
+            // flatten(): the wrapper's first type argument decides.
+            return match face.type_arguments.first() {
+                Some((arg, arg_nullable)) => target_admits(arg, *arg_nullable),
+                None => false,
+            };
+        }
+        target_admits(name, face.nullable)
+    }
+
+    /// The argument face (:67-74): the resolved callee's formal type
+    /// decides — a member invocation's member table or an implicit
+    /// creation's constructor table. A bare top-level call carries no
+    /// formal face at M1 and stays silent.
+    fn arguments_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some(&send) = kids.get(pos + 1) else {
+            return;
+        };
+        if c.kind(send) != NodeKind::Send {
+            return;
+        }
+        let Some((head, _)) = slice::send_parts(c, &kids, pos + 1) else {
+            return;
+        };
+        let selector_row = kids[head];
+        let formals = if slice::access_marker(c, &kids, pos + 1, NodeKind::DotAccess).is_some() {
+            let selector = c.head_token(selector_row);
+            let Some(receiver) = faces::single_receiver(c, &kids[..head], selector) else {
+                return;
+            };
+            let name = analysis.strings().intern(c.lexeme(selector));
+            match analysis.member_of(query_site(c, receiver), name) {
+                Some(member) => member.entry.formals.as_deref(),
+                None => return,
+            }
+        } else {
+            match analysis.resolve_constructor(query_site(c, selector_row), None) {
+                Some(ctor) if ctor.exists => ctor.formals,
+                _ => return,
+            }
+        };
+        let Some(formals) = formals else {
+            return;
+        };
+        let raw = c.collect_direct(c.node());
+        let ranges = slice::arguments(c, &raw);
+        let mut positional = 0usize;
+        for range in ranges {
+            let named = c.kind(raw[range.end - 1]) == NodeKind::NamedArgument;
+            let (value, ty) = if named {
+                let arg_name = c.lexeme(c.head_token(raw[range.start]));
+                (
+                    &raw[range.start + 1..range.end - 1],
+                    formals
+                        .named
+                        .iter()
+                        .find(|formal| analysis.strings().resolve(formal.name) == arg_name)
+                        .map(|formal| formal.ty),
+                )
+            } else {
+                let ty = formals.positional.get(positional).map(|formal| formal.ty);
+                positional += 1;
+                (&raw[range.clone()], ty)
+            };
+            let Some(ty) = ty else { continue };
+            if !faces::typed_non_dynamic_target(analysis, ty) {
+                continue;
+            }
+            if source_is_dynamic(c, analysis, value) {
+                report_run(c, value);
+            }
+        }
+    }
+}
+
+pub(crate) mod avoid_type_to_string {
+    use dartq_semantic::model::Ty;
+
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+    use crate::rules::utf16_token_span;
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/avoid_type_to_string.dart` — a `toString`
+    /// invocation whose receiver's static type is a subtype of `Type`
+    /// reports at the method name (:80-86, :98-114 — the result may be
+    /// minified in production). The dartq face is the member invocation
+    /// over an exact `Type`-typed receiver: the receiver's read row must
+    /// name the written `Type` (non-nullable — a `Type?` receiver is not a
+    /// `Type` subtype and stays silent, matching the official subtype
+    /// read). Approximations (documented, under-report): type-literal
+    /// receivers (`int.toString()`), `runtimeType` member chains, the
+    /// bare-name tear-off faces (:116-131), and the enclosing-class
+    /// `thisType` face stay silent. Message: `diagnostic.g.dart`
+    /// `avoidTypeToString`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_type_to_string",
+        group: Group::Standalone,
+        problem: "Using 'toString' on a 'Type' is not safe in production code.",
+        correction: "Try a normal type check or compare the 'runtimeType' directly.",
+        kinds: &[NodeKind::Send],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((head, _arguments)) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        // The receiver-present face (:80-86): the whole-access marker.
+        if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_none() {
+            return;
+        }
+        let selector_row = kids[head];
+        let selector = c.head_token(selector_row);
+        if c.lexeme(selector) != "toString" {
+            return;
+        }
+        let Some(receiver) = faces::single_receiver(c, &kids[..head], selector) else {
+            return;
+        };
+        // The subtype face (:105): the receiver reads as the written
+        // `Type` — non-nullable (`Type?` is not a `Type` subtype).
+        let Some(Ty::Named {
+            name,
+            nullable: false,
+            ..
+        }) = analysis.type_of(query_site(c, receiver))
+        else {
+            return;
+        };
+        if analysis.strings().resolve(name) != "Type" {
+            return;
+        }
+        let range = utf16_token_span(c, selector);
+        c.report(range, &[]);
+    }
+}
+
+pub(crate) mod cast_nullable_to_non_nullable {
+    use super::{Check, Group, NodeKind, RuleSpec, slice, static_type_faces as faces};
+    use crate::rules::{type_face, utf16_token_span};
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/cast_nullable_to_non_nullable.dart` — an
+    /// `as` cast whose source static type is nullable and whose written
+    /// target is non-nullable reports at the cast expression (:38-49; the
+    /// rewrite is the `!` assertion). `dynamic` sources are excluded
+    /// (:41-42 — the downcast is legal there). The dartq face reads the
+    /// source's flow type at the operand run and the written target row
+    /// inside the cast container (`Type`'s `?` tail). Approximation
+    /// (documented, under-report): an operand without a static-type face
+    /// (a chain, a creation, a literal) stays silent. Message:
+    /// `diagnostic.g.dart` `castNullableToNonNullable`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "cast_nullable_to_non_nullable",
+        group: Group::Standalone,
+        problem: "Don't cast a nullable value to a non-nullable type.",
+        correction: "Try adding a not-null assertion ('!') to make the type non-nullable.",
+        kinds: &[NodeKind::AsExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let node = c.node();
+        // The operand tiles as the owner siblings before the cast
+        // container (the container anchors at the `as` operator).
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let operand = slice::statement_run(c, &kids[..pos]);
+        // The source gate (:41-45): nullable, and never `dynamic`.
+        match faces::expr_type(c, analysis, &operand) {
+            Some(ty) if faces::is_nullable(ty) => {}
+            _ => return,
+        }
+        // The target gate (:45-46): the written type is non-nullable.
+        let Some(type_row) = c
+            .collect_direct(node)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Type)
+        else {
+            return;
+        };
+        let face = type_face(c, type_row);
+        if face.nullable || face.name.is_none() {
+            return;
+        }
+        let Some(first) = operand.first() else {
+            return;
+        };
+        let range = utf16_token_span(c, c.head_token(*first)).start..c.utf16_span(node).end;
+        c.report(range, &[]);
+    }
+}
+
+pub(crate) mod unnecessary_null_checks {
+    use super::{Check, Group, NodeKind, RuleSpec, written_type_sibling};
+    use crate::rules::{TypeFace, type_face, utf16_token_span};
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/unnecessary_null_checks.dart` — a `!`
+    /// whose context expects a nullable type reports at the operator
+    /// (:209-216: the expected type decides — removing the check cannot
+    /// change the program when the context accepts `null`). The expected
+    /// type faces (:26-161) cover returns, arrow bodies, variable
+    /// declarations, assignments, operator right sides, collection
+    /// members, and arguments.
+    ///
+    /// dartq faces over the production tiling: the decidable context slice
+    /// ports — the variable/field-declaration initializer (the written
+    /// type row tiles as the declaration's left sibling,
+    /// [`written_type_sibling`]), the return statement, and the arrow
+    /// body, each through the nearest enclosing declaration's written
+    /// return type with the async flatten (:50-57 — a `Future`/
+    /// `FutureOr` wrapper decides through its first type argument). The
+    /// enclosing-declaration lookup keeps the official
+    /// `thisOrAncestorOfType<FunctionExpression>` shape (:41): class
+    /// methods, constructors and factories never satisfy it, so their
+    /// return and arrow faces stay silent exactly like the oracle. The
+    /// pattern arm (:183-205) belongs to the pattern family and stays
+    /// unported; assignments, operator right sides, collection members,
+    /// await wrappers, and arguments under-report (the promotable-LHS
+    /// guard and the formal-table availability make them undecidable at
+    /// M1). Message: `diagnostic.g.dart` `unnecessaryNullChecks`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_null_checks",
+        group: Group::Standalone,
+        problem: "Unnecessary use of a null check ('!').",
+        correction: "Try removing the null check.",
+        kinds: &[NodeKind::NonNullAssert],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        if c.semantics().is_none() {
+            return;
+        }
+        let node = c.node();
+        // `getExpectedType`'s realNode (:30-33): the `!`'s nearest
+        // ancestor whose own parent is not a transparent `(...)` wrapper.
+        let mut real = node;
+        while let Some(parent) = c.unit.ast.parent(real)
+            && c.kind(parent) == NodeKind::ParenthesizedExpression
+        {
+            real = parent;
+        }
+        let Some(context) = c.unit.ast.parent(real) else {
+            return;
+        };
+        let admits = match c.kind(context) {
+            // `int? y = x!;` — the direct-initializer face (:95-98): the
+            // written type row decides. The production tiling parks the
+            // expression pieces flat in the initializer window, so the
+            // `!` is the whole initializer exactly when it is the
+            // window's tail row (`foo(x!)`'s pieces fill the argument
+            // container and trail the `!`; a nested `x!.foo()` completes
+            // later pieces — both carry no expected type, :132-159).
+            NodeKind::VariableInitializer => {
+                c.children(context).end - 1 == real
+                    && c.path
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|&row| c.kind(row) == NodeKind::VariablesDeclaration)
+                        .is_some_and(|decl| written_nullable(c, declaration_written_type(c, decl)))
+            }
+            // `int? f() { return x!; }` — the return's own expression
+            // window roots the `!` and the enclosing declaration's
+            // written return type decides (:40-57).
+            NodeKind::ReturnStatement => {
+                c.collect_direct(context).last() == Some(&real) && enclosing_return_admits(c)
+            }
+            // `int? f() => x!;` — the childless `ExpressionBody` handle
+            // leaves the arrow expression as the declaration's own tail
+            // rows, so the arrow posture reads at the declaration row
+            // (:40-57's ExpressionFunctionBody arm): the `!` is the tail
+            // row before the body handle.
+            NodeKind::TopLevelMethod
+            | NodeKind::LocalFunctionDeclaration
+            | NodeKind::FunctionExpression
+            | NodeKind::NamedFunctionExpression => {
+                let kids = c.collect_direct(context);
+                kids.len() >= 2
+                    && c.kind(kids[kids.len() - 1]) == NodeKind::ExpressionBody
+                    && kids[kids.len() - 2] == real
+                    && return_admits_at(c, context)
+            }
+            _ => false,
+        };
+        if admits {
+            let range = utf16_token_span(c, c.head_token(node));
+            c.report(range, &[]);
+        }
+    }
+
+    /// The written type row of the declaration an initializer belongs to:
+    /// the local shape tiles the type as the declaration's left sibling
+    /// ([`written_type_sibling`]); the field shape nests the declaration
+    /// in a `Fields` row whose own type child heads the member group.
+    fn declaration_written_type(c: &Check<'_>, decl: u32) -> Option<u32> {
+        written_type_sibling(c, decl, &[NodeKind::Type]).or_else(|| {
+            let fields = c.unit.ast.parent(decl)?;
+            let type_row = c
+                .collect_direct(fields)
+                .into_iter()
+                .find(|&kid| matches!(c.kind(kid), NodeKind::Type | NodeKind::FunctionType));
+            (c.kind(fields) == NodeKind::Fields).then_some(type_row)?
+        })
+    }
+
+    /// The written type row's nullable verdict (the declaration-context
+    /// face — an `async` local variable is not a thing).
+    fn written_nullable(c: &Check<'_>, type_row: Option<u32>) -> bool {
+        let Some(type_row) = type_row else {
+            return false;
+        };
+        let face = type_face(c, type_row);
+        face.nullable || face.name == Some("dynamic")
+    }
+
+    /// The nearest enclosing function-like declaration's written return
+    /// type with the async flatten (:349-380). The official lookup is
+    /// `thisOrAncestorOfType<FunctionExpression>` (:41): class methods,
+    /// constructors and factories never satisfy it, so their return faces
+    /// stay silent exactly like the oracle; inferred lambdas carry no
+    /// written face.
+    fn enclosing_return_admits(c: &Check<'_>) -> bool {
+        for &row in c.path.iter().rev().skip(1) {
+            match c.kind(row) {
+                NodeKind::TopLevelMethod
+                | NodeKind::LocalFunctionDeclaration
+                | NodeKind::FunctionExpression
+                | NodeKind::NamedFunctionExpression => return return_admits_at(c, row),
+                NodeKind::Method
+                | NodeKind::Constructor
+                | NodeKind::Factory
+                | NodeKind::CompilationUnit => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// The declaration's own written return type, read at the row.
+    fn return_admits_at(c: &Check<'_>, declaration: u32) -> bool {
+        let written = super::void_checks::written_return_face(c, declaration);
+        admits_return(c, declaration, written)
+    }
+
+    /// The `isNullable` read on the flattened expected type (:50-57).
+    fn admits_return(c: &Check<'_>, declaration: u32, written: Option<TypeFace<'_>>) -> bool {
+        let Some(face) = written else {
+            return false;
+        };
+        let Some(name) = face.name else {
+            return false;
+        };
+        let async_marked = c
+            .unit
+            .ast
+            .token_range(declaration)
+            .any(|token| c.lexeme(token) == "async");
+        if async_marked && matches!(name, "Future" | "FutureOr") {
+            return match face.type_arguments.first() {
+                Some((arg, arg_nullable)) => *arg_nullable || *arg == "dynamic",
+                None => false,
+            };
+        }
+        face.nullable || name == "dynamic"
+    }
+}
+
+pub(crate) mod unnecessary_unawaited {
+    use dartq_semantic::model::Ty;
+
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+    use crate::rules::utf16_token_span;
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/unnecessary_unawaited.dart` — a bare
+    /// `unawaited(...)` invocation over exactly one argument whose
+    /// expression carries no await requirement reports at the method name
+    /// (:36-57; `hasAwaitNotRequired` — the argument is not `Future`
+    /// typed). A prefixed invocation (`node.target != null`, :38) and any
+    /// other argument count skip (:42).
+    ///
+    /// dartq faces over the production tiling: the argument's static type
+    /// is the piece-run face (an identifier read, an invocation, or a
+    /// single-name member access — the official switch's shapes); a
+    /// written `Future`/`FutureOr` keeps the wrapper necessary and
+    /// everything without a decided name stays silent. The dart:async
+    /// library gate (:62-64) is the resolution face: a name that resolves
+    /// to any declaration (same file or imported) is not the core
+    /// `unawaited` and stays silent. Approximations (documented,
+    /// under-report): `dynamic`-typed arguments, operator expressions,
+    /// and creations stay silent (the official switch's element faces);
+    /// a cross-library `Future` alias reads by its written name
+    /// (over-report, the alias family). Message: `diagnostic.g.dart`
+    /// `unnecessaryUnawaited`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_unawaited",
+        group: Group::Standalone,
+        problem: "Unnecessary use of 'unawaited'.",
+        correction: "Try removing the use of 'unawaited', as the unawaited element is annotated with '@awaitNotRequired'.",
+        kinds: &[NodeKind::Send],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((head, Some(arguments))) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        // The bare-invocation shape (:38) and the dart:async gate
+        // (:61-64): a resolved binding of the name is a user declaration.
+        if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some()
+            || analysis.binding_of(query_site(c, kids[head])).is_some()
+        {
+            return;
+        }
+        if c.lexeme(c.head_token(kids[head])) != "unawaited" {
+            return;
+        }
+        // Exactly one argument (:42).
+        let raw = c.collect_direct(arguments);
+        let ranges = slice::arguments(c, &raw);
+        let [range] = &ranges[..] else {
+            return;
+        };
+        let value: &[u32] = if c.kind(raw[range.end - 1]) == NodeKind::NamedArgument {
+            &raw[range.start + 1..range.end - 1]
+        } else {
+            &raw[range.clone()]
+        };
+        // The not-Future face (:44-54): a decided written name that is
+        // neither `Future` nor `FutureOr` reports.
+        let Some(Ty::Named { name, .. }) = faces::expr_type(c, analysis, value) else {
+            return;
+        };
+        let written = analysis.strings().resolve(name);
+        if written == "Future" || written == "FutureOr" {
+            return;
+        }
+        let range = utf16_token_span(c, c.head_token(kids[head]));
+        c.report(range, &[]);
+    }
+}
+
+/// The GAP-1 static-type-consumer wave's production-bridge pins: each rule
+/// runs with the semantic face mounted (the #1049 face construction), so
+/// the pins decide the tiling reading, not just the registration.
+#[cfg(test)]
+mod gap1_pins {
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces};
+    use dartq_semantic::{ElementIndex, MicroKind, StrictModes, analyze_unit, collect};
+    use dartq_source::{FileTable, StringTable};
+
+    use crate::engine::Lint;
+    use crate::testsupport::{Fixture, one_rule};
+
+    /// Runs `rule` over `source` with the semantic face mounted: the
+    /// source folded as the sole analyzed file of `package:t` — the
+    /// driver's per-file build shape. The context tables leak
+    /// (`'static`); the tests are one-shot processes.
+    fn run_semantic(source: &str, rule: &str) -> Vec<Lint> {
+        run_semantic_version(source, rule, LanguageVersion::new(3, 15))
+    }
+
+    /// [`run_semantic`] at an explicit effective library version — the
+    /// version-gated rules' faces (`future_sync_value`,
+    /// `unnecessary_this_alias`).
+    fn run_semantic_version(source: &str, rule: &str, version: LanguageVersion) -> Vec<Lint> {
+        let mut fixture = Fixture::parse(source);
+        fixture.version = Some(version);
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut files = FileTable::new();
+        let file = files.intern(std::path::Path::new("lint_semantic.dart"));
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(version));
+        let scanned = dartq_scanner::scan(source, crate::testsupport::CONFIG, file);
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let elements = collect(source, &scanned.tokens, features, strings);
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib = builder.intern("package:t/lint_semantic.dart");
+        for (name, declaration) in elements.declarations() {
+            if declaration.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        let graph: &'static LibraryGraph = Box::leak(Box::new(builder.finish()));
+        let namespaces: &'static Namespaces = Box::leak(Box::new(Namespaces::build(graph)));
+        let index: &'static ElementIndex = Box::leak(Box::new(index));
+        let analysis = analyze_unit(
+            source,
+            &scanned.tokens,
+            features,
+            strings,
+            file,
+            lib,
+            graph,
+            namespaces,
+            index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+        );
+        let unit = crate::engine::Unit {
+            source: &fixture.source,
+            tokens: &fixture.tokens,
+            ast: &fixture.ast,
+            lines: &fixture.lines,
+            path: Some(&fixture.path),
+            features: fixture.features,
+            version: fixture.version,
+            workspace: None,
+            reachability: None,
+            async_context_uses: None,
+            library_type_uses: None,
+        };
+        unit.run_with_semantics(
+            &one_rule(rule),
+            &rustc_hash::FxHashSet::default(),
+            Some(&analysis),
+        )
+    }
+
+    /// The wave posture: every static-type-consumer rule is silent under
+    /// the plain run (the face absent) and reports with it mounted.
+    #[test]
+    fn gap1_rules_require_the_semantic_face() {
+        let source = "void f(dynamic d) {\n  d.foo();\n}\n";
+        let plain = Fixture::parse(source);
+        for rule in [
+            "avoid_dynamic_calls",
+            "no_dynamic_casts",
+            "avoid_type_to_string",
+            "cast_nullable_to_non_nullable",
+            "unnecessary_null_checks",
+            "unnecessary_unawaited",
+        ] {
+            assert!(plain.run(&one_rule(rule)).is_empty(), "{rule}");
+        }
+        assert_eq!(run_semantic(source, "avoid_dynamic_calls").len(), 1);
+    }
+
+    /// The member faces report at the receiver: a `dynamic`-typed read
+    /// under a method invocation, a property access (statement and write
+    /// target), and the bare-invocation tear-off face (`dynamic f()`
+    /// called bare). The exemptions and non-`dynamic` reads stay silent.
+    #[test]
+    fn avoid_dynamic_calls_member_and_tear_off_faces() {
+        let lints = run_semantic(
+            "void f(dynamic d) {\n  d.foo();\n}\n",
+            "avoid_dynamic_calls",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Method invocation or property access on a 'dynamic' target."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try giving the target a type.")
+        );
+
+        assert_eq!(
+            run_semantic("void f(dynamic d) {\n  d.foo;\n}\n", "avoid_dynamic_calls").len(),
+            1
+        );
+        assert_eq!(
+            run_semantic(
+                "void f(dynamic d) {\n  d.foo = 1;\n}\n",
+                "avoid_dynamic_calls"
+            )
+            .len(),
+            1
+        );
+        // The bare tear-off face: a `dynamic`-typed local variable read as
+        // a call reports; a declared function's tear-off is a typed
+        // function type and never answers (:174-181).
+        assert_eq!(
+            run_semantic(
+                "void f() {\n  dynamic x = () {};\n  x();\n}\n",
+                "avoid_dynamic_calls"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            run_semantic("void f(dynamic d) {\n  d += 1;\n}\n", "avoid_dynamic_calls").len(),
+            1
+        );
+        assert_eq!(
+            run_semantic("void f(dynamic d) {\n  d + 1;\n}\n", "avoid_dynamic_calls").len(),
+            1
+        );
+        assert_eq!(
+            run_semantic("void f(dynamic d) {\n  -d;\n}\n", "avoid_dynamic_calls").len(),
+            1
+        );
+
+        for source in [
+            // The every-object exemptions (:103-114, :144-150).
+            "void f(dynamic d) {\n  d.toString();\n}\n",
+            "void f(dynamic d) {\n  d.hashCode;\n}\n",
+            "void f(dynamic d) {\n  d.noSuchMethod(f);\n}\n",
+            // `??=` and plain `=` are not dynamic calls (:62-65, the
+            // read-type gate).
+            "void f(dynamic d) {\n  d ??= 1;\n  d = 1;\n}\n",
+            // `==`/`!=` exist on every type (:76-82).
+            "void f(dynamic d) {\n  d == 1;\n}\n",
+            // The explicit-cast bail (:205-207).
+            "void f(dynamic d) {\n  (d as dynamic).foo();\n}\n",
+            // A typed receiver never reports.
+            "void f(int i) {\n  i.foo();\n}\n",
+            // The postfix `!` is not a dynamic call (:136-139).
+            "void f(dynamic d) {\n  d!;\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "avoid_dynamic_calls").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The implicit-cast faces: a `dynamic` source into a typed target —
+    /// a written declaration, an assignment target, a return, and a
+    /// resolved formal — reports at the source; untyped targets, `Object?`,
+    /// explicit casts, and bare-call arguments stay silent.
+    #[test]
+    fn no_dynamic_casts_typed_context_faces() {
+        let lints = run_semantic("void f(dynamic d) {\n  int i = d;\n}\n", "no_dynamic_casts");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Implicit cast from 'dynamic'.");
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try adding an explicit cast or changing the target type.")
+        );
+
+        assert_eq!(
+            run_semantic(
+                "void f(dynamic d) {\n  int i;\n  i = d;\n}\n",
+                "no_dynamic_casts"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            run_semantic(
+                "int g() {\n  dynamic d;\n  return d;\n}\n",
+                "no_dynamic_casts"
+            )
+            .len(),
+            1
+        );
+        // The member-formal face: `c.m(d)` against `void m(int x)`.
+        assert_eq!(
+            run_semantic(
+                "class C {\n  void m(int x) {}\n}\nvoid f(C c, dynamic d) {\n  c.m(d);\n}\n",
+                "no_dynamic_casts"
+            )
+            .len(),
+            1
+        );
+
+        for source in [
+            // An untyped target carries no context type (:219-221).
+            "void f(dynamic d) {\n  var v = d;\n}\n",
+            // `Object?` and `dynamic` targets exempt (:257-258).
+            "void f(dynamic d) {\n  Object? o = d;\n  dynamic e = d;\n}\n",
+            // The explicit-cast bail (:261-263).
+            "void f(dynamic d) {\n  int i = d as int;\n}\n",
+            // A bare `return;` carries no expression.
+            "void g(dynamic d) {\n  return;\n}\n",
+            // A `dynamic`-typed formal target is exempt.
+            "void f(dynamic d, dynamic e) {\n  e = d;\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "no_dynamic_casts").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The `Type` receiver face: a `Type`-typed receiver's `toString`
+    /// reports at the method name; other receivers and nullable `Type?`
+    /// stay silent.
+    #[test]
+    fn avoid_type_to_string_type_receiver_face() {
+        let lints = run_semantic(
+            "void f(Type t) {\n  t.toString();\n}\n",
+            "avoid_type_to_string",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Using 'toString' on a 'Type' is not safe in production code."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try a normal type check or compare the 'runtimeType' directly.")
+        );
+
+        for source in [
+            // A non-`Type` receiver never matches (:98-105).
+            "void f(String s) {\n  s.toString();\n}\n",
+            // A different member is not the shape.
+            "void f(Type t) {\n  t.hashCode;\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "avoid_type_to_string").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The cast face: a nullable source into a non-nullable written target
+    /// reports; nullable targets, `dynamic` sources, and non-nullable
+    /// sources stay silent.
+    #[test]
+    fn cast_nullable_to_non_nullable_faces() {
+        let lints = run_semantic(
+            "void f(int? n) {\n  n as int;\n}\n",
+            "cast_nullable_to_non_nullable",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Don't cast a nullable value to a non-nullable type."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try adding a not-null assertion ('!') to make the type non-nullable.")
+        );
+
+        for source in [
+            // A nullable target needs no assertion (:45-46).
+            "void f(int? n) {\n  n as int?;\n}\n",
+            // `dynamic` sources are excluded (:41-42).
+            "void f(dynamic d) {\n  d as int;\n}\n",
+            // A non-nullable source never reports (:44).
+            "void f(int n) {\n  n as int;\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "cast_nullable_to_non_nullable").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The context faces: a `!` under a nullable written type (declaration
+    /// initializer or return) reports at the operator; a non-nullable
+    /// context keeps the check.
+    #[test]
+    fn unnecessary_null_checks_nullable_context_faces() {
+        let lints = run_semantic(
+            "void f(int? n) {\n  int? y = n!;\n}\n",
+            "unnecessary_null_checks",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Unnecessary use of a null check ('!').");
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try removing the null check.")
+        );
+
+        assert_eq!(
+            run_semantic(
+                "int? g(int? n) {\n  return n!;\n}\n",
+                "unnecessary_null_checks"
+            )
+            .len(),
+            1
+        );
+
+        // The arrow body and the transparent `(...)` wrapper (`n!`'s
+        // nearest non-paren ancestor chain) report the same way.
+        assert_eq!(
+            run_semantic("int? f(int? n) => n!;\n", "unnecessary_null_checks").len(),
+            1
+        );
+        assert_eq!(
+            run_semantic(
+                "void f(int? n) {\n  int? y = (n!);\n}\n",
+                "unnecessary_null_checks"
+            )
+            .len(),
+            1
+        );
+        // A field initializer is the same VariableDeclaration face.
+        assert_eq!(
+            run_semantic(
+                "class C {\n  int? y = first()!;\n}\n",
+                "unnecessary_null_checks"
+            )
+            .len(),
+            1
+        );
+        // The async flatten unwraps the `Future` wrapper through its first
+        // type argument; without the marker the wrapper itself decides.
+        assert_eq!(
+            run_semantic(
+                "Future<int?> f(int? n) async => n!;\n",
+                "unnecessary_null_checks"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            run_semantic("Future<int?> f(int? n) => n!;\n", "unnecessary_null_checks").len(),
+            0
+        );
+
+        // The official lookup is `thisOrAncestorOfType<FunctionExpression>`
+        // (:41): class methods never satisfy it, so their return and arrow
+        // faces stay silent exactly like the oracle.
+        for source in [
+            "class C {\n  int? m(int? n) => n!;\n}\n",
+            "class C {\n  int? m(int? n) {\n    return n!;\n  }\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "unnecessary_null_checks").is_empty(),
+                "{source}"
+            );
+        }
+
+        for source in [
+            // The check is required under a non-nullable context.
+            "void f(int? n) {\n  int y = n!;\n}\n",
+            "int g(int? n) {\n  return n!;\n}\n",
+            // An untyped binding carries no context face.
+            "void f(int? n) {\n  var y = n!;\n}\n",
+            // The `!` is not in a direct context position.
+            "void f(int? n) {\n  int? y = n!.foo();\n}\n",
+            // An argument position carries the callee's parameter type,
+            // not the declaration's (:132-159).
+            "void f(int? n, int g(int? x)) {\n  int? y = g(n!);\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "unnecessary_null_checks").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The `unawaited` face: a bare core-`unawaited` wrapper over a
+    /// non-`Future` expression reports at the name; a `Future`-typed
+    /// argument and a same-file shadow of the name stay silent.
+    #[test]
+    fn unnecessary_unawaited_not_future_faces() {
+        let lints = run_semantic(
+            "int g() => 1;\nvoid f() {\n  unawaited(g());\n}\n",
+            "unnecessary_unawaited",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Unnecessary use of 'unawaited'.");
+
+        for source in [
+            // A `Future`-typed argument keeps the wrapper.
+            "Future<void> g() async {}\nvoid f() {\n  unawaited(g());\n}\n",
+            // A same-file declaration of the name is not dart:async's.
+            "void unawaited(int x) {}\nint g() => 1;\nvoid f() {\n  unawaited(g());\n}\n",
+            // The prefixed shape skips (:38).
+            "int g() => 1;\nvoid f(p p) {\n  p.unawaited(g());\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "unnecessary_unawaited").is_empty(),
+                "{source}"
+            );
+        }
+    }
+}
+
+pub(crate) mod discarded_futures {
+    use super::{Check, Group, NodeKind, RuleSpec, unused_futures};
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/discarded_futures.dart` — a `Future`- or
+    /// `FutureOr`-typed expression dropped as a statement reports through
+    /// the shared `UnusedFuturesVisitor` (`util/unused_futures.dart`). The
+    /// rule is only concerned with code in sync functions (:38-40 — the
+    /// `isInteresting` gate; `async` bodies belong to `unawaited_futures`)
+    /// and registers expression statements, cascades, and interpolation
+    /// expressions (:42-44).
+    ///
+    /// dartq faces over the production tiling: the expression-statement
+    /// face — the statement row trails its expression pieces, whose static
+    /// type is the shared piece-run face (a bare invocation's callee, a
+    /// member invocation, a property access, or a bare read). The escapes
+    /// read structurally: an assignment or `await` root
+    /// (`util/unused_futures.dart:49-50`), a bare core
+    /// `unawaited`/`safeUnawaited` wrapper (the official
+    /// `isAwaitNotRequired` face — a resolved binding is a user
+    /// declaration), and a `Map.putIfAbsent` invocation over a `Map`-typed
+    /// receiver (:83-86) stay silent; a same-file `Future`/`FutureOr`
+    /// declaration is not the core type. Approximations (documented): the
+    /// cascade and interpolation arms stay silent (the M1 face cut), and
+    /// the `Future.delayed(d, computation)` creation exemption (:73-77)
+    /// folds into the same silence — a creation carries no
+    /// declared-return face and never reports. Message:
+    /// `diagnostic.g.dart` `discardedFutures` (the `FutureOr` shape
+    /// reports the paired `discarded_future_or` texts).
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "discarded_futures",
+        group: Group::Standalone,
+        problem: "'Future'-returning calls in a non-'async' function.",
+        correction: "Try either making the enclosing function 'async' and awaiting the expression or wrapping the expression in 'unawaited'.",
+        kinds: &[NodeKind::ExpressionStatement],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        unused_futures::check(c, false);
+    }
+}
+
+pub(crate) mod unawaited_futures {
+    use super::{Check, Group, NodeKind, RuleSpec, unused_futures};
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/unawaited_futures.dart` — the same
+    /// `Future`/`FutureOr` statement face as `discarded_futures` (the
+    /// shared `UnusedFuturesVisitor`), only concerned with code in async
+    /// functions (:38-40 — the `isInteresting` gate).
+    ///
+    /// dartq faces: the expression-statement face with the async context
+    /// gate — the nearest enclosing function body (closures included) is
+    /// read for its `async` modifier word off the body payload; a body
+    /// with no decided word stays silent. The escapes and approximations
+    /// are the shared walk's (see `discarded_futures`). Message:
+    /// `diagnostic.g.dart` `unawaitedFutures` (the `FutureOr` shape
+    /// reports the paired `unawaited_future_or` texts).
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unawaited_futures",
+        group: Group::Standalone,
+        problem: "Missing an 'await' for the 'Future' computed by this expression.",
+        correction: "Try adding an 'await' or wrapping the expression with 'unawaited' (if it is a 'Future').",
+        kinds: &[NodeKind::ExpressionStatement],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        unused_futures::check(c, true);
+    }
+}
+
+/// The shared walk behind `discarded_futures` and `unawaited_futures` (the
+/// upstream `util/unused_futures.dart` visitor): a `Future`/`FutureOr`-typed
+/// expression dropped as a statement reports at its selector. `want_async`
+/// is the context gate — `discarded_futures` wants sync bodies,
+/// `unawaited_futures` async ones.
+mod unused_futures {
+    use dartq_semantic::model::Ty;
+
+    use super::{Check, NodeKind, query_site, slice, static_type_faces as faces};
+    use crate::rules::{NONE_TOKEN, same_file_declaration, utf16_token_span};
+
+    // The official message templates (`diagnostic.g.dart`): the Future
+    // shapes report `discardedFutures`/`unawaitedFutures`, the FutureOr
+    // shapes the paired `*FutureOr` codes under the same rule names.
+    const SYNC_FUTURE_PROBLEM: &str = "'Future'-returning calls in a non-'async' function.";
+    const SYNC_FUTURE_CORRECTION: &str = "Try either making the enclosing function 'async' and awaiting the expression or wrapping the expression in 'unawaited'.";
+    const SYNC_FUTURE_OR_PROBLEM: &str = "'FutureOr'-returning calls in a non-'async' function.";
+    const SYNC_FUTURE_OR_CORRECTION: &str =
+        "Try making the enclosing function 'async' and awaiting the expression.";
+    const ASYNC_FUTURE_PROBLEM: &str =
+        "Missing an 'await' for the 'Future' computed by this expression.";
+    const ASYNC_FUTURE_CORRECTION: &str =
+        "Try adding an 'await' or wrapping the expression with 'unawaited' (if it is a 'Future').";
+    const ASYNC_FUTURE_OR_PROBLEM: &str =
+        "Missing an 'await' for the 'FutureOr' computed by this expression.";
+    const ASYNC_FUTURE_OR_CORRECTION: &str = "Try adding an 'await'.";
+
+    pub(super) fn check(c: &mut Check<'_>, want_async: bool) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        // The context gate (the official `isInteresting` filter): the
+        // nearest enclosing function body decides, closures included; no
+        // body ancestor is the official `?? false` silence.
+        if enclosing_body_is_async(c) != Some(want_async) {
+            return;
+        }
+        let node = c.node();
+        let Some(parent) = c.ancestor(1) else {
+            return;
+        };
+        let kids = c.collect_direct(parent);
+        let Some(pos) = kids.iter().position(|&kid| kid == node) else {
+            return;
+        };
+        // The statement's expression pieces tile before its row.
+        let run = slice::statement_run(c, &kids[..pos]);
+        let Some(&root) = run.last() else {
+            return;
+        };
+        let root = faces::unparenthesized(c, root);
+        // A stored or awaited value is not discarded (:49-50).
+        if matches!(
+            c.kind(root),
+            NodeKind::Assignment | NodeKind::AwaitExpression
+        ) {
+            return;
+        }
+        if is_unawaited_wrapper(c, analysis, &run, root)
+            || is_map_put_if_absent(c, analysis, &run, root)
+        {
+            return;
+        }
+        // The relevance gate (:88-90): the static type is `Future<...>` or
+        // `FutureOr<...>` — the written-name face; a same-file declaration
+        // of either name is not the core type and stays silent.
+        let Some(Ty::Named { name, .. }) = faces::expr_type(c, analysis, &run) else {
+            return;
+        };
+        let written = analysis.strings().resolve(name);
+        if (written != "Future" && written != "FutureOr")
+            || same_file_declaration(c, written).is_some()
+        {
+            return;
+        }
+        let (problem, correction) = texts(want_async, written);
+        c.report_texts(selector_span(c, &run, root), problem, correction, &[]);
+    }
+
+    /// Whether the nearest enclosing function body carries `async` (the
+    /// official `thisOrAncestorOfType<FunctionBody>()` walk): the
+    /// `BlockBody`/`ExpressionBody` payload holds the modifier words
+    /// (block `[async, star]`, expression `[arrow, end, async, star]` —
+    /// the `async_words` layout, the absent word stored as
+    /// [`NONE_TOKEN`]), and `sync*` is a synchronous body.
+    fn enclosing_body_is_async(c: &Check<'_>) -> Option<bool> {
+        let body =
+            c.path.iter().rev().copied().find(|&row| {
+                matches!(c.kind(row), NodeKind::BlockBody | NodeKind::ExpressionBody)
+            })?;
+        let slot = match c.kind(body) {
+            NodeKind::BlockBody => 0,
+            _ => 2,
+        };
+        let kw = c.payload(body).get(slot).copied().unwrap_or(NONE_TOKEN);
+        Some(kw != NONE_TOKEN && c.lexeme(kw) == "async")
+    }
+
+    /// The `unawaited`/`safeUnawaited` wrapper escape (the official
+    /// `isAwaitNotRequired` face, :55): a bare send of either name with no
+    /// resolved binding is the dart:async helper. A resolved binding is a
+    /// user declaration and reads through the ordinary type face.
+    fn is_unawaited_wrapper(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        run: &[u32],
+        root: u32,
+    ) -> bool {
+        if c.kind(root) != NodeKind::Send {
+            return false;
+        }
+        let Some(pos) = run.iter().rposition(|&row| row == root) else {
+            return false;
+        };
+        if slice::access_marker(c, run, pos, NodeKind::DotAccess).is_some() {
+            return false;
+        }
+        let Some((head, _)) = slice::send_parts(c, run, pos) else {
+            return false;
+        };
+        let selector = run[head];
+        matches!(
+            c.lexeme(c.head_token(selector)),
+            "unawaited" | "safeUnawaited"
+        ) && analysis.binding_of(query_site(c, selector)).is_none()
+    }
+
+    /// The `Map.putIfAbsent` exemption (:83-86): a member invocation named
+    /// `putIfAbsent` over a `Map`-typed receiver — the written-name cut of
+    /// the official dart:core class face.
+    fn is_map_put_if_absent(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        run: &[u32],
+        root: u32,
+    ) -> bool {
+        if c.kind(root) != NodeKind::Send {
+            return false;
+        }
+        let Some(pos) = run.iter().rposition(|&row| row == root) else {
+            return false;
+        };
+        if slice::access_marker(c, run, pos, NodeKind::DotAccess).is_none() {
+            return false;
+        }
+        let Some((head, _)) = slice::send_parts(c, run, pos) else {
+            return false;
+        };
+        let selector = c.head_token(run[head]);
+        if c.lexeme(selector) != "putIfAbsent" {
+            return false;
+        }
+        let Some(receiver) = faces::single_receiver(c, &run[..head], selector) else {
+            return false;
+        };
+        matches!(
+            analysis.type_of(query_site(c, receiver)),
+            Some(Ty::Named { name, .. }) if analysis.strings().resolve(name) == "Map"
+        )
+    }
+
+    /// The report face (`_reportOnExpression`, :92-101): the selector — a
+    /// method name, property name, or callee — or the expression itself.
+    fn selector_span(c: &Check<'_>, run: &[u32], root: u32) -> core::ops::Range<u32> {
+        match c.kind(root) {
+            NodeKind::Send => {
+                if let Some(pos) = run.iter().rposition(|&row| row == root)
+                    && let Some((head, _)) = slice::send_parts(c, run, pos)
+                {
+                    return utf16_token_span(c, c.head_token(run[head]));
+                }
+                c.utf16_span(root)
+            }
+            NodeKind::DotAccess => match c.unit.ast.token_range(root).next_back() {
+                Some(selector) => utf16_token_span(c, selector),
+                None => c.utf16_span(root),
+            },
+            _ => c.utf16_span(root),
+        }
+    }
+
+    fn texts(want_async: bool, written: &str) -> (&'static str, &'static str) {
+        match (want_async, written) {
+            (false, "FutureOr") => (SYNC_FUTURE_OR_PROBLEM, SYNC_FUTURE_OR_CORRECTION),
+            (false, _) => (SYNC_FUTURE_PROBLEM, SYNC_FUTURE_CORRECTION),
+            (true, "FutureOr") => (ASYNC_FUTURE_OR_PROBLEM, ASYNC_FUTURE_OR_CORRECTION),
+            (true, _) => (ASYNC_FUTURE_PROBLEM, ASYNC_FUTURE_CORRECTION),
+        }
+    }
+}
+
+pub(crate) mod unnecessary_null_aware_operator_on_extension_on_nullable {
+    use dartq_semantic::model::Ty;
+
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+    use crate::rules::{MemberQuery, body_members, type_face, utf16_token_span};
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/unnecessary_null_aware_operator_on_extension_on_nullable.dart`
+    /// — a null-aware access whose member resolves to an extension whose
+    /// extended type is nullable reports at the `?.` (the registrations
+    /// :39-42 are index expressions, method invocations, and property
+    /// accesses; the verdict :66-91 also demands the target be an
+    /// extension override or carry a nullable static type :98-106).
+    ///
+    /// dartq faces over the production tiling: the null-aware token is the
+    /// access marker's payload dot (`?.`), read on the invocation send's
+    /// trailing marker or on a bare property access; the target face is
+    /// the single-name receiver's static type under the `?`-suffix read
+    /// (`Ty::Null` stays out — the official nullable check is the suffix,
+    /// which `NullType` does not carry); the extension face is the
+    /// same-file structural walk — the extension's `on` clause type row
+    /// carries the trailing `?`, and its body names the selector.
+    /// Approximations (documented, under-report): extension overrides,
+    /// index expressions, write contexts, chained receivers, and
+    /// cross-library extensions stay silent, as does a receiver whose
+    /// static type does not resolve. Message: `diagnostic.g.dart`
+    /// `unnecessaryNullAwareOperatorOnExtensionOnNullable`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_null_aware_operator_on_extension_on_nullable",
+        group: Group::Standalone,
+        problem: "Unnecessary use of a null-aware operator to invoke an extension method on a nullable type.",
+        correction: "Try removing the '?'.",
+        kinds: &[NodeKind::Send, NodeKind::DotAccess],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        match c.kind(c.node()) {
+            NodeKind::Send => send_face(c, analysis),
+            NodeKind::DotAccess => access_face(c, analysis),
+            _ => {}
+        }
+    }
+
+    /// The member-invocation face (`r?.m(...)`): the send's trailing
+    /// access marker carries the `?.` and the selector sits before the
+    /// argument list.
+    fn send_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((head, _arguments)) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        let Some(marker) = slice::access_marker(c, &kids, pos, NodeKind::DotAccess) else {
+            return;
+        };
+        let selector = c.head_token(kids[head]);
+        let Some(receiver) = faces::single_receiver(c, &kids[..head], selector) else {
+            return;
+        };
+        verdict(c, analysis, receiver, selector, null_aware_dot(c, marker));
+    }
+
+    /// The bare property-access face (`r?.p`): the dispatched marker owns
+    /// the access; an invocation's trailing marker dispatches on the send
+    /// face instead.
+    fn access_face(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        if pos > 0 && c.kind(kids[pos - 1]) == NodeKind::Send {
+            return;
+        }
+        let dot = c
+            .payload(c.node())
+            .first()
+            .copied()
+            .filter(|&dot| c.lexeme(dot) == "?.");
+        let Some(selector) = c.unit.ast.token_range(c.node()).next_back() else {
+            return;
+        };
+        let Some(receiver) = faces::single_receiver(c, &kids[..pos], selector) else {
+            return;
+        };
+        verdict(c, analysis, receiver, selector, dot);
+    }
+
+    /// The marker's access token, `None` unless null-aware (`?.`).
+    fn null_aware_dot(c: &Check<'_>, marker: u32) -> Option<u32> {
+        let &dot = c.payload(marker).first()?;
+        (c.lexeme(dot) == "?.").then_some(dot)
+    }
+
+    /// The verdict (:66-91): the target's static type is nullable and the
+    /// selector resolves to a same-file extension member whose `on` type
+    /// is nullable-marked; the report sits on the `?.` token.
+    fn verdict(
+        c: &mut Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        receiver: u32,
+        selector: u32,
+        dot: Option<u32>,
+    ) {
+        let Some(dot) = dot else {
+            return;
+        };
+        let Some(Ty::Named { nullable: true, .. }) = analysis.type_of(query_site(c, receiver))
+        else {
+            return;
+        };
+        if !extension_on_nullable_member(c, c.lexeme(selector)) {
+            return;
+        }
+        c.report(utf16_token_span(c, dot), &[]);
+    }
+
+    /// Whether some same-file extension declares `selector` over a
+    /// nullable-marked `on` type: the header's `Type` row (before the
+    /// body, the `supertypes` walk's window) carries the trailing `?`, and
+    /// the body names the member.
+    fn extension_on_nullable_member(c: &Check<'_>, selector: &str) -> bool {
+        let Some(root) = c.unit.ast.root() else {
+            return false;
+        };
+        for top in c.collect_direct(root) {
+            if c.kind(top) != NodeKind::TopLevelDeclaration {
+                continue;
+            }
+            let Some(ext) = c
+                .collect_direct(top)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::ExtensionDeclaration)
+            else {
+                continue;
+            };
+            let on_nullable = c
+                .collect_direct(ext)
+                .into_iter()
+                .take_while(|&kid| {
+                    !matches!(c.kind(kid), NodeKind::DeclarationBody | NodeKind::EnumBody)
+                })
+                .find(|&kid| c.kind(kid) == NodeKind::Type)
+                .is_some_and(|row| type_face(c, row).nullable);
+            if !on_nullable {
+                continue;
+            }
+            // The member-name face is context-keyed: a method/getter/setter
+            // names through its `MethodDeclaration`-context `Identifier`
+            // (the first direct `Identifier` child can be the return type —
+            // `member_matches` reads the declared-name context).
+            if body_members(c, ext).into_iter().any(|member| {
+                !crate::rules::member_matches(c, member, MemberQuery::Getter, selector).is_empty()
+                    || !crate::rules::member_matches(c, member, MemberQuery::Setter, selector)
+                        .is_empty()
+                    || !crate::rules::member_matches(c, member, MemberQuery::Method, selector)
+                        .is_empty()
+            }) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+pub(crate) mod use_truncating_division {
+    use dartq_semantic::model::Ty;
+
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/use_truncating_division.dart` — a `/`
+    /// division whose operands are both `int` (:40-44, the `/` element
+    /// from dart:core :48-52) with a parenthesized parent (:54-55) whose
+    /// outermost parentheses are wrapped by a `toInt()` invocation with no
+    /// arguments (:57-67) reports: `(a / b).toInt()` should be `a ~/ b`.
+    ///
+    /// dartq faces over the production tiling: the dispatched
+    /// `BinaryExpression` is the division (payload operator `/`); the
+    /// operand faces are the single stripped identifier reads or the
+    /// piece-run types; the wrapper face is the direct
+    /// [`NodeKind::ParenthesizedExpression`] parent, climbed to its
+    /// outermost wrapper, followed by the `[toInt, (), Send]` invocation
+    /// tail. The report sits on the invocation send (the official
+    /// grand-parent node, :66). Approximations (documented,
+    /// under-report): a non-`int`, unresolved, or compound operand, a
+    /// user-declared `/` (the dart:core element face), and a
+    /// non-parenthesized division stay silent.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "use_truncating_division",
+        group: Group::Standalone,
+        problem: "Use truncating division.",
+        correction: "Try using truncating division, '~/', instead of regular division ('/') followed by 'toInt()'.",
+        kinds: &[NodeKind::BinaryExpression],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        // The division operator (:37).
+        let Some(&op) = c.payload(c.node()).first() else {
+            return;
+        };
+        if c.lexeme(op) != "/" {
+            return;
+        }
+        // Both operands are `int` (:40-44).
+        let Some((left, right)) = slice::binary_operands(c) else {
+            return;
+        };
+        if !operand_is_int(c, analysis, &left) || !operand_is_int(c, analysis, &right) {
+            return;
+        }
+        // The parenthesized wrapper (:54-55), climbed to the outermost.
+        let Some(mut outer) = c.ancestor(1) else {
+            return;
+        };
+        if c.kind(outer) != NodeKind::ParenthesizedExpression {
+            return;
+        }
+        while let Some(up) = c.unit.ast.parent(outer) {
+            if c.kind(up) != NodeKind::ParenthesizedExpression {
+                break;
+            }
+            outer = up;
+        }
+        // The `toInt()` invocation tail (:57-67): the outermost wrapper's
+        // owner window carries the selector, the empty argument list, and
+        // the invocation send.
+        let Some(owner) = c.unit.ast.parent(outer) else {
+            return;
+        };
+        let kids = c.collect_direct(owner);
+        let Some(pos) = kids.iter().position(|&kid| kid == outer) else {
+            return;
+        };
+        // The member-send tail tiles [selector, type-argument wrapper,
+        // arguments, send, access marker] — peel the wrapper and the
+        // marker the same way [`slice::send_parts`] reads a callee run.
+        let [selector, tail @ ..] = &kids[pos + 1..] else {
+            return;
+        };
+        if c.kind(*selector) != NodeKind::Identifier || c.lexeme(c.head_token(*selector)) != "toInt"
+        {
+            return;
+        }
+        let tail = match tail {
+            [head @ .., last] if c.kind(*last) == NodeKind::DotAccess => head,
+            _ => tail,
+        };
+        let tail = match tail {
+            [wrapper, rest @ ..]
+                if matches!(
+                    c.kind(*wrapper),
+                    NodeKind::NoTypeArguments | NodeKind::TypeArguments
+                ) =>
+            {
+                rest
+            }
+            _ => tail,
+        };
+        if tail.len() < 2 {
+            return;
+        }
+        let [arguments, send] = std::array::from_fn::<_, 2, _>(|i| tail[i]);
+        let empty = match c.kind(arguments) {
+            NodeKind::Arguments => slice::arguments(c, &c.collect_direct(arguments)).is_empty(),
+            NodeKind::NoArguments => true,
+            _ => false,
+        };
+        if !empty || c.kind(send) != NodeKind::Send {
+            return;
+        }
+        c.report(c.utf16_span(send), &[]);
+    }
+
+    /// The operand's `int` face: a single stripped identifier read, or the
+    /// piece-run type face; anything else under-reports.
+    fn operand_is_int(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32]) -> bool {
+        let is_int = |ty: Option<Ty>| {
+            matches!(ty, Some(Ty::Named { name, nullable: false, .. })
+                if analysis.strings().resolve(name) == "int")
+        };
+        let stripped = slice::access_run(c, run);
+        if let [only] = stripped[..]
+            && c.kind(only) == NodeKind::Identifier
+        {
+            return is_int(analysis.type_of(query_site(c, only)));
+        }
+        is_int(faces::expr_type(c, analysis, run))
+    }
+}
+
+/// The GAP-1 tranche-2 static-type-consumer wave's production-bridge pins:
+/// each rule runs with the semantic face mounted (the #1049 face
+/// construction), so the pins decide the tiling reading, not just the
+/// registration.
+#[cfg(test)]
+mod gap1_pins_t2 {
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces};
+    use dartq_semantic::{ElementIndex, MicroKind, StrictModes, analyze_unit, collect};
+    use dartq_source::{FileTable, StringTable};
+
+    use crate::engine::Lint;
+    use crate::testsupport::{Fixture, one_rule};
+
+    /// Runs `rule` over `source` with the semantic face mounted: the
+    /// source folded as the sole analyzed file of `package:t` — the
+    /// driver's per-file build shape. The context tables leak
+    /// (`'static`); the tests are one-shot processes.
+    fn run_semantic(source: &str, rule: &str) -> Vec<Lint> {
+        run_semantic_version(source, rule, LanguageVersion::new(3, 15))
+    }
+
+    /// [`run_semantic`] at an explicit effective library version — the
+    /// version-gated rules' faces (`future_sync_value`,
+    /// `unnecessary_this_alias`).
+    fn run_semantic_version(source: &str, rule: &str, version: LanguageVersion) -> Vec<Lint> {
+        let mut fixture = Fixture::parse(source);
+        fixture.version = Some(version);
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut files = FileTable::new();
+        let file = files.intern(std::path::Path::new("lint_semantic.dart"));
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(version));
+        let scanned = dartq_scanner::scan(source, crate::testsupport::CONFIG, file);
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let elements = collect(source, &scanned.tokens, features, strings);
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib = builder.intern("package:t/lint_semantic.dart");
+        for (name, declaration) in elements.declarations() {
+            if declaration.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        let graph: &'static LibraryGraph = Box::leak(Box::new(builder.finish()));
+        let namespaces: &'static Namespaces = Box::leak(Box::new(Namespaces::build(graph)));
+        let index: &'static ElementIndex = Box::leak(Box::new(index));
+        let analysis = analyze_unit(
+            source,
+            &scanned.tokens,
+            features,
+            strings,
+            file,
+            lib,
+            graph,
+            namespaces,
+            index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+        );
+        let unit = crate::engine::Unit {
+            source: &fixture.source,
+            tokens: &fixture.tokens,
+            ast: &fixture.ast,
+            lines: &fixture.lines,
+            path: Some(&fixture.path),
+            features: fixture.features,
+            version: fixture.version,
+            workspace: None,
+            reachability: None,
+            async_context_uses: None,
+            library_type_uses: None,
+        };
+        unit.run_with_semantics(
+            &one_rule(rule),
+            &rustc_hash::FxHashSet::default(),
+            Some(&analysis),
+        )
+    }
+
+    /// The wave posture: the four rules are silent under the plain run
+    /// (the face absent) and report with it mounted.
+    #[test]
+    fn gap1_t2_rules_require_the_semantic_face() {
+        let sources = [
+            (
+                "discarded_futures",
+                "Future<void> f() async {}\nvoid g() {\n  f();\n}\n",
+            ),
+            (
+                "unawaited_futures",
+                "Future<void> f() async {}\nvoid g() async {\n  f();\n}\n",
+            ),
+            (
+                "unnecessary_null_aware_operator_on_extension_on_nullable",
+                "extension E on int? {\n  int get foo => 1;\n}\nvoid f(int? i) {\n  i?.foo;\n}\n",
+            ),
+            (
+                "use_truncating_division",
+                "void f(int a, int b) {\n  print((a / b).toInt());\n}\n",
+            ),
+        ];
+        for (rule, source) in sources {
+            let plain = Fixture::parse(source);
+            assert!(plain.run(&one_rule(rule)).is_empty(), "{rule}");
+            assert_eq!(run_semantic(source, rule).len(), 1, "{rule}");
+        }
+    }
+
+    /// The sync-context faces: a `Future`-typed drop reports at the
+    /// selector in a sync body — bare and member invocations — and the
+    /// `FutureOr` shape reports its paired texts; an `async` body, an
+    /// `await`, a `var` binding, a `return`, and the wrapper exemption
+    /// stay silent.
+    #[test]
+    fn discarded_futures_sync_faces() {
+        let lints = run_semantic(
+            "Future<void> f() async {}\nvoid g() {\n  f();\n}\n",
+            "discarded_futures",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "'Future'-returning calls in a non-'async' function."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some(
+                "Try either making the enclosing function 'async' and awaiting the expression or wrapping the expression in 'unawaited'."
+            )
+        );
+
+        // The member-invocation face reports at the method name.
+        assert_eq!(
+            run_semantic(
+                "class C {\n  Future<void> m() async {}\n}\nvoid g(C c) {\n  c.m();\n}\n",
+                "discarded_futures"
+            )
+            .len(),
+            1
+        );
+
+        let lints = run_semantic(
+            "FutureOr<int> h() => 1;\nvoid g() {\n  h();\n}\n",
+            "discarded_futures",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "'FutureOr'-returning calls in a non-'async' function."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try making the enclosing function 'async' and awaiting the expression.")
+        );
+
+        for source in [
+            // The async-body gate (:38-40): `async` bodies belong to
+            // `unawaited_futures`.
+            "Future<void> f() async {}\nvoid g() async {\n  f();\n}\n",
+            // A stored value is not discarded (the assignment escape).
+            "Future<void> f() async {}\nvoid g() {\n  var x = f();\n}\n",
+            // Neither is a returned one (the return-position dispatch).
+            "Future<void> f() async {}\nFuture<void> g() {\n  return f();\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "discarded_futures").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The async-context faces: a `Future`-typed drop reports in an `async`
+    /// body — the `FutureOr` shape with its paired texts — and a sync body,
+    /// an `await`, and the nearest-body gate (a sync closure inside an
+    /// `async` function) stay silent.
+    #[test]
+    fn unawaited_futures_async_faces() {
+        let lints = run_semantic(
+            "Future<void> f() async {}\nvoid g() async {\n  f();\n}\n",
+            "unawaited_futures",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Missing an 'await' for the 'Future' computed by this expression."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some(
+                "Try adding an 'await' or wrapping the expression with 'unawaited' (if it is a 'Future')."
+            )
+        );
+
+        let lints = run_semantic(
+            "FutureOr<int> h() => 1;\nvoid g() async {\n  h();\n}\n",
+            "unawaited_futures",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Missing an 'await' for the 'FutureOr' computed by this expression."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try adding an 'await'.")
+        );
+
+        for source in [
+            // The sync-body gate (:38-40).
+            "Future<void> f() async {}\nvoid g() {\n  f();\n}\n",
+            // The awaited shape is not unawaited (the await escape).
+            "Future<void> f() async {}\nvoid g() async {\n  await f();\n}\n",
+            // The nearest body decides: the statement sits in a sync
+            // closure inside the `async` function.
+            "Future<void> f() async {}\nvoid g() async {\n  [1].forEach((_) {\n    f();\n  });\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "unawaited_futures").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The extension faces: a null-aware access over a nullable receiver
+    /// whose selector resolves to a same-file extension member declared
+    /// `on <T>?` reports at the `?.` — the property and invocation shapes;
+    /// a non-nullable receiver, a non-nullable `on` type, an unresolvable
+    /// receiver, an unlisted member, and ordinary class members stay
+    /// silent.
+    #[test]
+    fn unnecessary_null_aware_extension_on_nullable_faces() {
+        let source =
+            "extension E on int? {\n  int get foo => 1;\n}\nvoid f(int? i) {\n  i?.foo;\n}\n";
+        let lints = run_semantic(
+            source,
+            "unnecessary_null_aware_operator_on_extension_on_nullable",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Unnecessary use of a null-aware operator to invoke an extension method on a nullable type."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try removing the '?'.")
+        );
+
+        // The invocation face reports too.
+        assert_eq!(
+            run_semantic(
+                "extension E on int? {\n  int foo() => 1;\n}\nvoid f(int? i) {\n  i?.foo();\n}\n",
+                "unnecessary_null_aware_operator_on_extension_on_nullable"
+            )
+            .len(),
+            1
+        );
+
+        for source in [
+            // A non-nullable target keeps the null-aware meaningful (the
+            // `isNullable` gate).
+            "extension E on int? {\n  int get foo => 1;\n}\nvoid f(int i) {\n  i?.foo;\n}\n",
+            // The `on` type must be nullable-marked.
+            "extension E on int {\n  int get foo => 1;\n}\nvoid f(int? i) {\n  i?.foo;\n}\n",
+            // An unresolvable receiver stays silent (the under-report
+            // posture).
+            "extension E on int? {\n  int get foo => 1;\n}\nvoid f(dynamic d) {\n  d?.foo;\n}\n",
+            // The member must belong to the extension.
+            "extension E on int? {\n  int get foo => 1;\n}\nvoid f(int? i) {\n  i?.bar;\n}\n",
+            // An ordinary nullable class member access never reports.
+            "class C {\n  int get foo => 1;\n}\nvoid f(C? c) {\n  c?.foo;\n}\n",
+        ] {
+            assert!(
+                run_semantic(
+                    source,
+                    "unnecessary_null_aware_operator_on_extension_on_nullable"
+                )
+                .is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The truncating-division faces: `(a / b).toInt()` over two `int`
+    /// operands reports at the invocation; an unparenthesized division, a
+    /// non-`int` operand, another selector, a bare parenthesized
+    /// division, and `~/` itself stay silent.
+    #[test]
+    fn use_truncating_division_faces() {
+        let lints = run_semantic(
+            "void f(int a, int b) {\n  print((a / b).toInt());\n}\n",
+            "use_truncating_division",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Use truncating division.");
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some(
+                "Try using truncating division, '~/', instead of regular division ('/') followed by 'toInt()'."
+            )
+        );
+
+        for source in [
+            // The parenthesized-parent requirement (:54-55).
+            "void f(int a, int b) {\n  var x = a / b;\n}\n",
+            // A non-`int` operand keeps the division (:40-44).
+            "void f(double a, double b) {\n  print((a / b).toInt());\n}\n",
+            // Another selector is not the shape (:63-65).
+            "void f(int a, int b) {\n  print((a / b).round());\n}\n",
+            // A bare parenthesized division carries no invocation tail.
+            "void f(int a, int b) {\n  print((a / b));\n}\n",
+            // Truncating division itself never matches (:37).
+            "void f(int a, int b) {\n  print((a ~/ b).toInt());\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "use_truncating_division").is_empty(),
+                "{source}"
+            );
+        }
+    }
+}
+
+pub(crate) mod avoid_print {
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice};
+    use crate::rules::utf16_token_span;
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/avoid_print.dart` — an invocation whose
+    /// method name resolves to the dart:core `print` function reports at
+    /// the method name (:39-43), unless the call sits inside an
+    /// `if (kDebugMode)` then branch (`_isDebugOnly`, :52-68 — the
+    /// ancestor walk stops at the enclosing function body) or a comment
+    /// reference; a bare `print` identifier passed as an argument reports
+    /// at the identifier (`_validateArgument`, :70-80 — the debug walk
+    /// does not apply on this face, and the comment reference is the only
+    /// exemption).
+    ///
+    /// dartq faces over the production tiling: the bare-invocation
+    /// callee face — the selector is the bare identifier `print` and
+    /// carries no binding (the static-type wave's core-name posture: a
+    /// resolvable same-file, local, type-parameter, or imported
+    /// declaration shadows the core function and stays silent, the
+    /// under-report direction; the shadow join validates the matched
+    /// reference row's own name, so only a row that IS this `print` use
+    /// answers the shadow). The tear-off argument face rides the
+    /// bare-name argument's own four-piece send group dispatch, gated on
+    /// the group's top-level membership in an `Arguments` row — the
+    /// `SimpleIdentifier`-argument posture; every other bare use
+    /// (`print;`, `var x = print;`) is never visited upstream and stays
+    /// silent. Approximations (documented): member and prefixed callees
+    /// (`a.print()`, `p.print()`) and member tear-off arguments
+    /// (`f(C.print)` — the trailing access marker) resolve through the
+    /// member model this rule does not carry; comment references
+    /// (no faces from comments) stay silent. A flattened binary-operand
+    /// argument (`f(x + print)`) still reports — the adopted rows keep
+    /// the group shape — where upstream's `expression is
+    /// SimpleIdentifier` skips (the documented over-report corner). The
+    /// `kDebugMode` exemption gates on the written name — the upstream
+    /// face resolves package:flutter's foundation getter, which no
+    /// imported model carries — so a shadowing `kDebugMode` value
+    /// under-reports. Message: `diagnostic.g.dart` `avoidPrint`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_print",
+        group: Group::Standalone,
+        problem: "Don't invoke 'print' in production code.",
+        correction: "Try using a logging framework.",
+        kinds: &[NodeKind::Send],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((head, arguments)) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        if arguments.is_none() {
+            // The tear-off argument face (:70-80): this row is the
+            // bare-name group's own marker. It reports only when the
+            // group stands at the top level of an `Arguments` row — the
+            // `SimpleIdentifier`-argument posture (`_validateArgument`
+            // takes the argument expression; other bare uses never
+            // visit). A trailing access marker is a member tear-off
+            // (`f(C.print)` — not a `SimpleIdentifier`, silent). The
+            // debug-only walk does not apply here (:70-80 carries only
+            // the comment-reference exemption, and comments produce no
+            // rows in this substrate).
+            let argument_position = c
+                .ancestor(1)
+                .is_some_and(|parent| c.kind(parent) == NodeKind::Arguments)
+                && slice::is_tear_off_group(c, &kids, head)
+                && slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_none();
+            if !argument_position {
+                return;
+            }
+            let selector_row = kids[head];
+            let selector = c.head_token(selector_row);
+            if c.lexeme(selector) != "print" {
+                return;
+            }
+            if shadowed(c, analysis, selector_row) {
+                return;
+            }
+            c.report(utf16_token_span(c, selector), &[]);
+            return;
+        }
+        // The bare-callee face: a member receiver (`a.print()`) resolves
+        // through the member model this rule does not carry.
+        if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some() {
+            return;
+        }
+        let selector_row = kids[head];
+        let selector = c.head_token(selector_row);
+        if c.lexeme(selector) != "print" {
+            return;
+        }
+        // The dart:core face (:39-40): an unshadowed bare name — the
+        // reference row at the callee site must BE the `print` use itself
+        // (the row's own name validates the join) for a user declaration
+        // to shadow the core function (the `unnecessary_unawaited` gate).
+        if shadowed(c, analysis, selector_row) {
+            return;
+        }
+        // The debug-only exemption (:52-68).
+        if debug_only(c) {
+            return;
+        }
+        c.report(utf16_token_span(c, selector), &[]);
+    }
+
+    /// Whether the reference row joined at `selector_row`'s site is the
+    /// `print` use itself bound to a user declaration — the shadow face.
+    /// The row's own name validates the join: a reference row naming any
+    /// other identifier is not this use's resolution (the offset join is
+    /// positional, so a foreign-name row answers `false` and the core
+    /// function's unshadowed verdict stands), and the dart:core spelling
+    /// carries no user binding at all (`RefTarget::Missing` answers
+    /// `None` upstream of the name read).
+    fn shadowed(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, selector_row: u32) -> bool {
+        analysis
+            .binding_of(query_site(c, selector_row))
+            .is_some_and(|binding| binding.target_name == analysis.strings().intern("print"))
+    }
+
+    /// The `_isDebugOnly` walk (:52-68): the call sits in a then branch
+    /// whose condition is the bare name `kDebugMode` at any depth, and
+    /// the enclosing function body never comes first — the body bail
+    /// keeps a call inside a closure under the branch from exempting.
+    fn debug_only(c: &Check<'_>) -> bool {
+        let path = c.path;
+        for i in (0..path.len().saturating_sub(1)).rev() {
+            let row = path[i];
+            let below = path[i + 1];
+            match c.kind(row) {
+                NodeKind::IfStatement => {
+                    // Production tiling: the then-arm pieces tile flat
+                    // beside the ParenthesizedCondition, so branch
+                    // membership is token geometry — `below` sits in the
+                    // then branch when it starts at/after the condition's
+                    // end and no `else` token lies between.
+                    let kids = c.collect_direct(row);
+                    let Some(cond) = kids
+                        .iter()
+                        .copied()
+                        .find(|&k| c.kind(k) == NodeKind::ParenthesizedCondition)
+                    else {
+                        continue;
+                    };
+                    let cond_end = c.unit.ast.token_range(cond).end;
+                    let below_start = c.unit.ast.token_range(below).start;
+                    let in_then = below_start >= cond_end
+                        && !(cond_end..below_start).any(|t| c.lexeme(t) == "else");
+
+                    if in_then {
+                        // The condition's pieces tile in the IfStatement's
+                        // own window (only the degenerate Send container
+                        // parents to the ParenthesizedCondition) — the
+                        // bare-name face is the cond-range piece run: one
+                        // Identifier, wrappers only beside it.
+                        let cond_range = c.unit.ast.token_range(cond);
+                        let mut name = None;
+                        let bare = c
+                            .collect_direct(row)
+                            .into_iter()
+                            .filter(|&kid| {
+                                kid != cond
+                                    && c.unit.ast.token_range(kid).start >= cond_range.start
+                                    && c.unit.ast.token_range(kid).end <= cond_range.end
+                            })
+                            .all(|kid| match c.kind(kid) {
+                                NodeKind::Identifier if name.is_none() => {
+                                    name = Some(kid);
+                                    true
+                                }
+                                NodeKind::NoTypeArguments | NodeKind::NoArguments => true,
+                                _ => false,
+                            });
+                        if bare && name.is_some_and(|n| c.lexeme(c.head_token(n)) == "kDebugMode") {
+                            return true;
+                        }
+                    }
+                }
+                // The function-body bail (:62-66): `Block`-bodied and
+                // arrow bodies — the only body rows that own expression
+                // pieces.
+                NodeKind::BlockBody | NodeKind::ExpressionBody => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+}
+
+pub(crate) mod no_runtimetype_tostring {
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice};
+    use crate::rules::{type_face, utf16_token_span};
+
+    /// `NodeHeader.flags` modifier-mask bit for the class-family
+    /// `abstract` modifier (bridge `mod_bits`) — the
+    /// extension gate's abstract-class read.
+    const CLASS_ABSTRACT_BIT: u16 = 1 << 2;
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/no_runtimeType_toString.dart` — a
+    /// `toString` invocation whose real target is a `runtimeType` access
+    /// reports at the method name (:67-74), and a string-interpolation
+    /// expression that *is* a `runtimeType` access (the implicit
+    /// `toString`) reports at the expression (:59-65). The access faces
+    /// (:113-120): `this.runtimeType`/`super.runtimeType` syntactically,
+    /// or a bare `runtimeType` identifier resolving to a getter. The
+    /// skip posture (`_canSkip`, :76-112): inside an assert, a throw, a
+    /// catch clause, a mixin, an abstract class, or an extension whose
+    /// `on` type is not a non-abstract class, the verdict suppresses.
+    ///
+    /// dartq faces over the production tiling: the member-invocation
+    /// face over the exact `[this|super, runtimeType]` receiver pair
+    /// (token adjacency, the dot between) or the bare `runtimeType`
+    /// receiver whose binding resolves — the implicit-`this` Object
+    /// member or a same-file container member (the getter read);
+    /// locals, top-level declarations, type parameters, prefixes, and
+    /// unresolved names stay silent (the under-report posture).
+    /// Approximations (documented): the interpolation faces stay silent
+    /// — interpolation segments carry no AST rows (the token-layer
+    /// carry); a same-file top-level getter named `runtimeType`
+    /// under-reports (a `Decl` binding), and the extension `on` gate
+    /// reads the same-file declarations only, so core and cross-file
+    /// `on` types skip. Message: `diagnostic.g.dart`
+    /// `noRuntimetypeTostring`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "no_runtimetype_tostring",
+        group: Group::Standalone,
+        problem: "Using 'toString' on a 'Type' is not safe in production code.",
+        correction: "Try removing the usage of 'toString' or restructuring the code.",
+        kinds: &[NodeKind::Send],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // The wave posture: the rule reads the semantic face; face absent
+        // is the plain-run posture and stays silent (the engine contract).
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((head, _arguments)) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        // A real target is required (:68-69): a bare `toString()` (the
+        // implicit-`this` invocation) carries none.
+        if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_none() {
+            return;
+        }
+        let selector_row = kids[head];
+        let selector = c.head_token(selector_row);
+        // Only `toString` (:67) — `toStringDeep`/`toStringShort` are not
+        // the registered faces.
+        if c.lexeme(selector) != "toString" {
+            return;
+        }
+        if !is_runtime_type_access(c, analysis, &kids[..head], selector) {
+            return;
+        }
+        // The skip posture (:76-112).
+        let access = slice::access_run(c, &kids[..head]);
+        let run_start = access.first().map(|&row| c.head_token(row));
+        if can_skip(c, run_start, selector) {
+            return;
+        }
+        c.report(utf16_token_span(c, selector), &[]);
+    }
+
+    /// The `_isRuntimeTypeAccess` read (:113-120) over the receiver run
+    /// before the `toString` selector: one bare `runtimeType` identifier
+    /// directly before the dot whose binding resolves to a getter face
+    /// (the implicit-`this` Object member, or a same-file container
+    /// member), or the `[this|super, runtimeType]` pair — syntactic
+    /// upstream (:108-112).
+    fn is_runtime_type_access(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        run: &[u32],
+        selector: u32,
+    ) -> bool {
+        match slice::access_run(c, run)[..] {
+            [only]
+                if c.kind(only) == NodeKind::Identifier
+                    && c.lexeme(c.head_token(only)) == "runtimeType"
+                    && c.head_token(only) + 2 == selector =>
+            {
+                matches!(
+                    analysis.binding_of(query_site(c, only)).map(|b| b.kind),
+                    Some(dartq_semantic::BindingKind::Opaque | dartq_semantic::BindingKind::Member)
+                )
+            }
+            [target, name]
+                if c.kind(name) == NodeKind::Identifier
+                    && c.lexeme(c.head_token(name)) == "runtimeType"
+                    && matches!(
+                        c.kind(target),
+                        NodeKind::ThisExpression | NodeKind::SuperExpression
+                    )
+                    && c.head_token(target) + 2 == c.head_token(name) =>
+            {
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The `_canSkip` walk (:76-112): the nearest matching ancestor
+    /// decides — assert, throw, catch clause, mixin, and abstract class
+    /// skip; an extension skips unless its `on` type names a same-file
+    /// non-abstract class; a concrete class keeps the verdict.
+    fn can_skip(c: &Check<'_>, run_start: Option<u32>, selector: u32) -> bool {
+        for &row in c.path.iter().rev().skip(1) {
+            match c.kind(row) {
+                NodeKind::Assert
+                | NodeKind::ThrowExpression
+                | NodeKind::CatchClause
+                | NodeKind::MixinDeclaration => return true,
+                NodeKind::ClassDeclaration => {
+                    if dartq_ast::mod_flags(c.unit.ast, row) & CLASS_ABSTRACT_BIT != 0 {
+                        return true;
+                    }
+                }
+                NodeKind::ExtensionDeclaration if !on_concrete_class(c, row) => {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // The production tiling: throw/assert are childless adopted
+        // containers — the operand tiles beside them in the enclosing
+        // window, and the container row anchors at the keyword. The
+        // context row whose extent reaches the receiver run decides:
+        // it starts at/before the selector and ends at the run's first
+        // token (a later statement's row starts after the run and never
+        // reaches back).
+        if let Some(run_start) = run_start {
+            let node = c.node();
+            if let Some(parent) = c.unit.ast.parent(node) {
+                for row in c.collect_direct(parent) {
+                    if matches!(c.kind(row), NodeKind::Assert | NodeKind::ThrowExpression) {
+                        let range = c.unit.ast.token_range(row);
+                        if range.start <= selector && range.end >= run_start {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether the extension's `on` type names a same-file non-abstract
+    /// class — the official `extendedElement is ClassElement &&
+    /// !isAbstract` read (:93-105) over the same-file declarations.
+    /// Cross-file, core, and mixin/enum/typedef `on` types answer
+    /// `false` (skip).
+    fn on_concrete_class(c: &Check<'_>, extension: u32) -> bool {
+        // The `on` type row sits before the body (the header walk's
+        // window).
+        let Some(on_type) = c
+            .collect_direct(extension)
+            .into_iter()
+            .take_while(|&kid| {
+                !matches!(c.kind(kid), NodeKind::DeclarationBody | NodeKind::EnumBody)
+            })
+            .find(|&kid| c.kind(kid) == NodeKind::Type)
+        else {
+            return false;
+        };
+        let Some(name) = type_face(c, on_type).name else {
+            return false;
+        };
+        let Some(root) = c.unit.ast.root() else {
+            return false;
+        };
+        for top in c.collect_direct(root) {
+            if c.kind(top) != NodeKind::TopLevelDeclaration {
+                continue;
+            }
+            let kids = c.collect_direct(top);
+            let class_row = kids
+                .iter()
+                .copied()
+                .find(|&kid| c.kind(kid) == NodeKind::ClassDeclaration);
+            let class_name = kids
+                .iter()
+                .copied()
+                .find(|&kid| c.kind(kid) == NodeKind::Identifier);
+            if let (Some(class_row), Some(class_name)) = (class_row, class_name)
+                && c.lexeme(c.head_token(class_name)) == name
+            {
+                return dartq_ast::mod_flags(c.unit.ast, class_row) & CLASS_ABSTRACT_BIT == 0;
+            }
+        }
+        false
+    }
+}
+
+pub(crate) mod prefer_const_constructors {
+    use super::{Check, Group, NodeKind, RuleSpec, slice, static_type_faces};
+    use crate::rules::{body_members, in_const_context, member_annotations, same_file_declaration};
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/prefer_const_constructors.dart` — a
+    /// non-const instance creation whose constructor is `const` and whose
+    /// every argument could be const reports at the creation (:57/:99
+    /// `node.canBeConst` → `reportAtNode`). The visitor's skip gates in
+    /// order (:39-60 dot-shorthand, :63-102 instance creation): the
+    /// written `const` (`node.isConst`), a deferred constructor type
+    /// (:65), a non-const constructor (:46/:69), a `@literal` constructor
+    /// (:49/:72 — the analyzer's own warning covers it), the dart:core
+    /// `Object` unnamed constructor (:52-55/:75-78 — `new Object()` makes
+    /// identity sentinels), and the generic-context-type skip (:80-97 —
+    /// a generic class created without written type arguments whose
+    /// context type carries type parameters, dart-lang/linter#4531).
+    ///
+    /// dartq faces over the production tiling: the dispatch rows are the
+    /// three creation shapes — the `new`-keyword row, the generic implicit
+    /// creation, and the invocation send of a bare/member callee. The
+    /// const gates fold into the shared const-ability face
+    /// ([`crate::rules::const_ability::is_const_able`]: the callee
+    /// resolves to a same-file `const` constructor and the arguments are
+    /// const-able — the `canBeConst` core) and
+    /// [`crate::rules::in_const_context`] (the written-`const` and
+    /// constant-context faces — a creation inside `const [...]`, an
+    /// annotation, an enum element, or a constant pattern is already
+    /// const). Approximations (documented): the deferred-import gate is
+    /// subsumed (a prefixed callee never resolves same-file, so the
+    /// const-ability face keeps it silent), the `Object` skip likewise
+    /// (dart:core `Object` never resolves here — a same-file `Object`
+    /// class is the user's and correctly reports), and the generic
+    /// context-type read is unreachable without inference, so the whole
+    /// generic-without-written-type-arguments face bails (the
+    /// conservative direction — suggesting `const` there can change
+    /// inference, #4531; the downward-inference face that does report
+    /// upstream under-reports). The `@literal` gate reads the resolved
+    /// same-file constructor's own metadata. Message: `diagnostic.g.dart`
+    /// `preferConstConstructors`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "prefer_const_constructors",
+        group: Group::Standalone,
+        problem: "Use 'const' with the constructor to improve performance.",
+        correction: "Try adding the 'const' keyword to the constructor invocation.",
+        kinds: &[
+            NodeKind::NewExpression,
+            NodeKind::ImplicitCreation,
+            NodeKind::Send,
+        ],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // `node.isConst` and every constant-context face (:42/:64): a
+        // const wrapper, an annotation, an enum element, a constant
+        // pattern, or a const collection's contents — already const.
+        if in_const_context(c) {
+            return;
+        }
+        // `element.isConst` (:46/:69) + `node.canBeConst` (:57/:99) — the
+        // same-file const-ability face.
+        if !crate::rules::const_ability::is_const_able(c.unit, node) {
+            return;
+        }
+        match c.kind(node) {
+            NodeKind::NewExpression | NodeKind::ImplicitCreation => {
+                // `new` is the row's span head for the keyword shape; the
+                // implicit creation begins at the class name itself.
+                let from = if c.kind(node) == NodeKind::NewExpression {
+                    c.head_token(node) + 1
+                } else {
+                    c.head_token(node)
+                };
+                let Some((class_name, selector, written_type_arguments)) =
+                    creation_header_tokens(c, from)
+                else {
+                    return;
+                };
+                if gate_generic(c, class_name, written_type_arguments)
+                    || ctor_has_literal(c, class_name, selector)
+                {
+                    return;
+                }
+                // The whole creation (`new A(...)` — the row's span is the
+                // `new` keyword alone; the args close it).
+                let end = creation_args_end(c, node);
+                let start = c.utf16_span(node).start;
+                c.report(start..end.unwrap_or(c.utf16_span(node).end), &[]);
+            }
+            _ => send_face(c),
+        }
+    }
+
+    /// The invocation-send face: the callee resolves through the same
+    /// shared face, the member shape reads the single-name receiver, and
+    /// the report spans the whole creation (`A(...)` / `A.named(...)`).
+    fn send_face(c: &mut Check<'_>) {
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((head, arguments)) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        // A tear-off send carries no invocation (:46 `element is!
+        // ConstructorElement` face).
+        let Some(arguments) = arguments else {
+            return;
+        };
+        let selector_row = kids[head];
+        let (start, selector) =
+            if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_some() {
+                // `C.named(...)`: the class is the single-name receiver.
+                let selector = c.head_token(selector_row);
+                let Some(receiver) = static_type_faces::single_receiver(c, &kids[..head], selector)
+                else {
+                    return;
+                };
+                (c.head_token(receiver), Some(c.lexeme(selector)))
+            } else {
+                // `C(...)`: the callee head is the class.
+                let head_token = c.head_token(selector_row);
+                (head_token, None)
+            };
+        let Some((class_name, written_type_arguments)) =
+            creation_header_names(c, start, c.head_token(arguments))
+        else {
+            return;
+        };
+        if gate_generic(c, class_name, written_type_arguments)
+            || ctor_has_literal(c, class_name, selector)
+        {
+            return;
+        }
+        let end = c.utf16_span(arguments).end;
+        c.report(crate::rules::utf16_token_span(c, start).start..end, &[]);
+    }
+
+    /// The creation's header tokens from `from` up to the arguments' `(`:
+    /// the first identifier names the class, an identifier after the last
+    /// `.` is the named-constructor selector, and a `<` proves written
+    /// type arguments (`C<int>.named(` — the whole header is a handful of
+    /// tokens). Returns `(class name, written type arguments)`.
+    fn creation_header_names<'a>(
+        c: &'a Check<'_>,
+        from: u32,
+        args_start: u32,
+    ) -> Option<(&'a str, bool)> {
+        let mut class_name = None;
+        let mut type_arguments = false;
+        let mut token = from;
+        while token < args_start {
+            let lexeme = c.lexeme(token);
+            match lexeme {
+                "<" => type_arguments = true,
+                "." | "?" | "new" => {}
+                _ if is_identifier_lexeme(c, token) && class_name.is_none() => {
+                    class_name = Some(lexeme);
+                }
+                _ => {}
+            }
+            token += 1;
+        }
+        Some((class_name?, type_arguments))
+    }
+
+    /// The same walk for the structured rows: `from` skips the `new`
+    /// keyword; the named-constructor selector rides the same tokens.
+    fn creation_header_tokens<'a>(
+        c: &'a Check<'_>,
+        from: u32,
+    ) -> Option<(&'a str, Option<&'a str>, bool)> {
+        let node = c.node();
+        let args = creation_args_row(c, node)?;
+        let (class_name, type_arguments) = creation_header_names(c, from, c.head_token(args))?;
+        // The selector is the identifier right after the header's last
+        // `.`; `new` never names one (the unnamed face).
+        let mut selector = None;
+        let mut token = from;
+        while token < c.head_token(args) {
+            if c.lexeme(token) == "." {
+                let next = token + 1;
+                if next < c.head_token(args) && is_identifier_lexeme(c, next) {
+                    selector = Some(c.lexeme(next));
+                }
+            }
+            token += 1;
+        }
+        Some((class_name, selector, type_arguments))
+    }
+
+    /// The arguments row of a structured creation: the content rows
+    /// completed inside the row's own window (the begin/end brackets wrap
+    /// them).
+    fn creation_args_row(c: &Check<'_>, node: u32) -> Option<u32> {
+        c.children(node)
+            .rev()
+            .find(|&row| c.kind(row) == NodeKind::Arguments)
+    }
+
+    /// The creation's last UTF-16 offset: the arguments row's end when the
+    /// window carries one.
+    fn creation_args_end(c: &Check<'_>, node: u32) -> Option<u32> {
+        Some(c.utf16_span(creation_args_row(c, node)?).end)
+    }
+
+    /// The generic-context-type skip (:80-97): a same-file class that
+    /// declares type parameters, created without written type arguments —
+    /// the conservative bail (see the spec doc). The header's
+    /// `TypeVariables` tiles beside the `ClassDeclaration` row under the
+    /// top-level wrapper.
+    fn gate_generic(c: &Check<'_>, class_name: &str, written_type_arguments: bool) -> bool {
+        !written_type_arguments
+            && same_file_declaration(c, class_name).is_some_and(|class_row| {
+                c.unit.ast.parent(class_row).is_some_and(|top| {
+                    c.collect_direct(top)
+                        .iter()
+                        .any(|&kid| c.kind(kid) == NodeKind::TypeVariables)
+                })
+            })
+    }
+
+    /// `element.metadata.hasLiteral` (:49/:72): the resolved constructor's
+    /// own metadata names `literal`.
+    fn ctor_has_literal(c: &Check<'_>, class_name: &str, selector: Option<&str>) -> bool {
+        let Some(class_row) = same_file_declaration(c, class_name) else {
+            return false;
+        };
+        let unnamed = selector.is_none() || selector == Some("new");
+        let body = c
+            .collect_direct(class_row)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::DeclarationBody);
+        for member in body_members(c, class_row) {
+            if c.kind(member) != NodeKind::Constructor {
+                continue;
+            }
+            // The row anchors at the class name; a named constructor's
+            // selector rides the `MethodDeclarationContinuation`
+            // identifier (declarations.rs `constructor_name_part` idiom).
+            if c.lexeme(c.head_token(member)) != class_name {
+                continue;
+            }
+            let part = c.collect_direct(member).into_iter().find(|&kid| {
+                c.kind(kid) == NodeKind::Identifier
+                    && c.payload(kid).first()
+                        == Some(
+                            &(dartq_parser::IdentifierContext::MethodDeclarationContinuation
+                                as u32),
+                        )
+            });
+            let matches = match (unnamed, part.map(|p| c.lexeme(c.head_token(p)))) {
+                (true, None | Some("new")) => true,
+                (false, Some(name)) => Some(name) == selector,
+                _ => false,
+            };
+            if !matches {
+                continue;
+            }
+            let Some(body) = body else { return false };
+            return member_annotations(c, body, member)
+                .iter()
+                .any(|&meta| annotation_names_literal(c, meta));
+        }
+        false
+    }
+
+    /// Whether the metadata names `literal` (any segment of a prefix
+    /// chain — the `@literal` spelling).
+    fn annotation_names_literal(c: &Check<'_>, meta: u32) -> bool {
+        c.collect_direct(meta).iter().any(|&piece| {
+            c.kind(piece) == NodeKind::Identifier && c.lexeme(c.head_token(piece)) == "literal"
+        })
+    }
+
+    /// Whether the token is a plain identifier (keywords excluded — `new`
+    /// and `const` never name a class).
+    fn is_identifier_lexeme(c: &Check<'_>, token: u32) -> bool {
+        c.unit
+            .tokens
+            .get(token as usize)
+            .is_some_and(|t| matches!(t.kind, dartq_scanner::TokenKind::Identifier))
+    }
+}
+
+pub(crate) mod use_named_constants {
+    use super::{Check, Group, NodeKind, RuleSpec};
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/use_named_constants.dart` — a const-written
+    /// instance creation whose value equals a `static const` field of its
+    /// class reports at the creation with the constant's name (:48/:41
+    /// `node.isConst` gate, :53-84 the field walk, `reportAtNode` :80).
+    ///
+    /// dartq faces: the dispatch rows are the written-`const` wrappers
+    /// ([`NodeKind::ConstExpression`] / [`NodeKind::ConstLiteral`] — the
+    /// `isConst` gate IS the dispatch shape) and the whole structural face
+    /// is the shared named-constant proxy
+    /// ([`crate::rules::const_ability::matches_named_constant`]: the
+    /// creation compared, token for token, against the same-file class's
+    /// `static const` initializers in declaration order, the own-class
+    /// static-initializer guard included). Approximations (documented,
+    /// under-report): the contextually-const face (`const A a = A(0)` —
+    /// upstream's `isConst` answers through resolution) and the const
+    /// dot-shorthands never carry a written wrapper row here, a
+    /// constant-pattern creation reports only when it carries the written
+    /// `const`, and cross-file classes are outside the proxy's
+    /// same-file resolution. Message: `diagnostic.g.dart`
+    /// `useNamedConstants` (the `{0}` slot carries `Type.field`).
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "use_named_constants",
+        group: Group::Standalone,
+        problem: "Use the constant '{0}' rather than a constructor returning the same object.",
+        correction: "Try using '{0}'.",
+        kinds: &[NodeKind::ConstExpression, NodeKind::ConstLiteral],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        // The written-const gate is the dispatch row itself; the proxy
+        // carries the type/extension-type face, the declaration-order
+        // first match, and the own-static-initializer guard (:56-77).
+        let Some((type_name, field)) =
+            crate::rules::const_ability::matches_named_constant(c.unit, node)
+        else {
+            return;
+        };
+        let constant = format!("{type_name}.{field}");
+        c.report(c.utf16_span(node), &[constant.as_str()]);
+    }
+}
+
+pub(crate) mod avoid_redundant_argument_values {
+    use super::{Check, Group, NodeKind, RuleSpec, narrow_u32, slice, static_type_faces};
+    use crate::rules::{body_members, same_file_declaration};
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/avoid_redundant_argument_values.dart` —
+    /// an argument whose constant value equals its parameter's default
+    /// value reports at the argument expression (:64-81 `checkArgument`,
+    /// `reportAtNode(arg.argumentExpression)` :78). The visitor walks the
+    /// arguments from the last to the first (:52-61) and breaks after an
+    /// optional-positional parameter (:56-59 — a later optional positional
+    /// makes the earlier ones required). The gates (:64-71): the parameter
+    /// must resolve, be optional (named or optional positional), and not
+    /// carry `@required`. The registered faces (:35-41): method
+    /// invocations, function-expression invocations, instance creations,
+    /// annotations, enum constants, and the dot-shorthand invocation
+    /// shapes; factory constructors resolve the defaults against the
+    /// ultimate redirect target's parameters (:134-199).
+    ///
+    /// dartq faces over the production tiling: the dispatch row is the
+    /// argument list, the callee resolved same-file per parent face —
+    /// a following `Send` sibling (bare `g(...)` or member `a.g(...)`
+    /// through the single-name receiver's written type or class, or the
+    /// implicit-`this` method of the enclosing class), a parent
+    /// creation/annotation/enum-constant row (the class's constructor,
+    /// factory redirects walked to the target with a cycle guard), and a
+    /// top-level or local function for the bare face. The parameter's
+    /// default is its written `=`/`:` expression (the bridge init words —
+    /// upstream compares the computed constant values); equality is
+    /// token-for-token, so values spelled differently (`2` vs `1 + 1`)
+    /// under-report. A parameter without a default clause carries the
+    /// implicit `null`: only a written `null` argument reports (the
+    /// `computeConstantValue` null-value face). Constructor rows anchor at
+    /// the class name (the named selector rides the
+    /// `MethodDeclarationContinuation` identifier) and factory rows at the
+    /// `factory` keyword (the name two or four tokens ahead); both faces
+    /// matched accordingly. Approximations (documented, under-report): the
+    /// element-model faces that leave the file — SDK members like
+    /// `toList(growable: true)`, prefixed annotations and creations,
+    /// function-typed parameters' own lists, `A.new` tear-off variables,
+    /// and cross-file declarations — resolve to nothing and stay silent.
+    /// The upstream options face (`ignoredParameters`) does not exist in
+    /// the current rule source. Message: `diagnostic.g.dart`
+    /// `avoidRedundantArgumentValues`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_redundant_argument_values",
+        group: Group::Standalone,
+        problem: "The value of the argument is redundant because it matches the default value.",
+        correction: "Try removing the argument.",
+        kinds: &[NodeKind::Arguments],
+        check,
+    };
+
+    /// The callee's resolved formal rows: positional in declaration order
+    /// (required group first, then the optional-positional group), named
+    /// in declaration order.
+    struct Formals<'a> {
+        params_row: u32,
+        positional: Vec<u32>,
+        named: Vec<(&'a str, u32)>,
+    }
+
+    fn check(c: &mut Check<'_>) {
+        let node = c.node();
+        let pieces = c.collect_direct(node);
+        let ranges = slice::arguments(c, &pieces);
+        if ranges.is_empty() {
+            return;
+        }
+        let Some(formals) = resolve_callee(c, node) else {
+            return;
+        };
+        // The named-argument face: the group's trailing marker
+        // ([`slice::arguments`] tiling).
+        let named: Vec<bool> = ranges
+            .iter()
+            .map(|range| c.kind(pieces[range.end - 1]) == NodeKind::NamedArgument)
+            .collect();
+        // Each positional argument's 0-based index among the positional
+        // arguments before it.
+        let mut positional_seen = 0usize;
+        let indices: Vec<Option<usize>> = named
+            .iter()
+            .map(|&is_named| {
+                if is_named {
+                    None
+                } else {
+                    let index = positional_seen;
+                    positional_seen += 1;
+                    Some(index)
+                }
+            })
+            .collect();
+        // Last to first (:52), breaking after an optional positional
+        // (:56-59).
+        for i in (0..ranges.len()).rev() {
+            let param = if let Some(index) = indices[i] {
+                formals.positional.get(index).copied()
+            } else {
+                let name = c.lexeme(c.head_token(pieces[ranges[i].start]));
+                formals
+                    .named
+                    .iter()
+                    .find(|&&(formal, _)| formal == name)
+                    .map(|&(_, row)| row)
+            };
+            check_argument(c, &formals, &pieces, &ranges[i], param);
+            if param.is_some_and(|p| {
+                formal_kind(c, p) == dartq_parser::FormalParameterKind::OptionalPositional as u32
+            }) {
+                break;
+            }
+        }
+    }
+
+    /// `checkArgument` (:64-81): the optionality gates, the `@required`
+    /// metadata gate, then the default-value comparison.
+    fn check_argument(
+        c: &mut Check<'_>,
+        formals: &Formals<'_>,
+        pieces: &[u32],
+        range: &core::ops::Range<usize>,
+        param: Option<u32>,
+    ) {
+        let Some(param) = param else {
+            return;
+        };
+        // `param.isRequired` (:67-69): only the two optional kinds answer.
+        let kind = formal_kind(c, param);
+        if kind != dartq_parser::FormalParameterKind::OptionalNamed as u32
+            && kind != dartq_parser::FormalParameterKind::OptionalPositional as u32
+        {
+            return;
+        }
+        // `param.metadata.hasRequired` (:68).
+        if param_has_required_annotation(c, formals.params_row, param) {
+            return;
+        }
+        // The value face: the argument expression's own pieces (a named
+        // group's name and marker bracket its value pieces).
+        let (first, last) = if c.kind(pieces[range.end - 1]) == NodeKind::NamedArgument {
+            (range.start + 1, range.end - 2)
+        } else {
+            (range.start, range.end - 1)
+        };
+        if first > last {
+            return;
+        }
+        // The value's token range: the widest piece bounds it (a nested
+        // call's own pieces tile flat inside the argument list).
+        let value_start = c.head_token(pieces[first]);
+        let Some(value_end) = (first..=last)
+            .filter_map(|k| c.unit.ast.token_range(pieces[k]).end.checked_sub(1))
+            .max()
+        else {
+            return;
+        };
+        let redundant = match default_clause(c, param) {
+            Some((start, end)) => tokens_equal(c, value_start..=value_end, start..=end),
+            // No default clause: the implicit `null` — only a written
+            // `null` argument equals it (the `computeConstantValue`
+            // null-value face).
+            None => first == last && c.kind(pieces[first]) == NodeKind::LiteralNull,
+        };
+        if redundant {
+            let start = crate::rules::utf16_token_span(c, value_start).start;
+            let end = crate::rules::utf16_token_span(c, value_end).end;
+            c.report(start..end, &[]);
+        }
+    }
+
+    /// The parameter's default-clause tokens (payload words 2-3 — the
+    /// bridge init words: word 2 opens the expression, word 3 is the peek
+    /// after it — exclusive).
+    fn default_clause(c: &Check<'_>, param: u32) -> Option<(u32, u32)> {
+        let start = c.payload(param).get(2).copied()?;
+        let end = c.payload(param).get(3).copied()?;
+        if start == crate::rules::NONE_TOKEN || end == crate::rules::NONE_TOKEN || end <= start {
+            return None;
+        }
+        Some((start, end - 1))
+    }
+
+    /// Whether two token ranges spell the same lexeme sequence (the
+    /// `computeConstantValue()` equality at the written face).
+    fn tokens_equal(
+        c: &Check<'_>,
+        left: core::ops::RangeInclusive<u32>,
+        right: core::ops::RangeInclusive<u32>,
+    ) -> bool {
+        let (left_len, right_len) = (
+            left.end() - left.start() + 1,
+            right.end() - right.start() + 1,
+        );
+        left_len == right_len
+            && (0..left_len).all(|offset| {
+                let (left_tok, right_tok) = (left.start() + offset, right.start() + offset);
+                left_tok == right_tok || c.lexeme(left_tok) == c.lexeme(right_tok)
+            })
+    }
+
+    /// The formal's kind word (bridge `end_formal_parameter` payload 4).
+    fn formal_kind(c: &Check<'_>, param: u32) -> u32 {
+        c.payload(param)
+            .get(4)
+            .copied()
+            .unwrap_or(dartq_parser::FormalParameterKind::RequiredPositional as u32)
+    }
+
+    /// The formal's declared name (payload word 1).
+    fn formal_name<'a>(c: &Check<'a>, param: u32) -> Option<&'a str> {
+        let name = c.payload(param).get(1).copied()?;
+        (name != crate::rules::NONE_TOKEN).then(|| c.lexeme(name))
+    }
+
+    /// The formal's `@required` metadata (:68): the metadata star is the
+    /// formal's left sibling inside the parameter group that holds it
+    /// (the required list, or the `[...]`/`{...}` optional group).
+    fn param_has_required_annotation(c: &Check<'_>, params_row: u32, param: u32) -> bool {
+        let container = c
+            .collect_direct(params_row)
+            .into_iter()
+            .find(|&kid| {
+                c.kind(kid) == NodeKind::OptionalFormalParameters
+                    && c.collect_direct(kid).contains(&param)
+            })
+            .unwrap_or(params_row);
+        let mut pending = false;
+        for kid in c.collect_direct(container) {
+            match c.kind(kid) {
+                NodeKind::MetadataStar => {
+                    pending = c.collect_direct(kid).into_iter().any(|meta| {
+                        c.kind(meta) == NodeKind::Metadata && annotation_named(c, meta, "required")
+                    });
+                }
+                NodeKind::FormalParameter | NodeKind::FunctionTypedFormalParameter => {
+                    if kid == param {
+                        return pending;
+                    }
+                    pending = false;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn annotation_named(c: &Check<'_>, meta: u32, name: &str) -> bool {
+        c.collect_direct(meta).into_iter().any(|piece| {
+            c.kind(piece) == NodeKind::Identifier && c.lexeme(c.head_token(piece)) == name
+        })
+    }
+
+    /// The callee face per parent shape, resolved to its formal rows.
+    /// `None` = the face cannot resolve same-file (the silent family).
+    fn resolve_callee<'a>(c: &Check<'a>, args: u32) -> Option<Formals<'a>> {
+        let parent = c.unit.ast.parent(args)?;
+        match c.kind(parent) {
+            NodeKind::NewExpression | NodeKind::ImplicitCreation => creation_formals(c, parent),
+            NodeKind::Metadata => annotation_formals(c, parent),
+            NodeKind::EnumElement => enum_constant_formals(c, parent),
+            _ => {
+                // The invocation faces: a `Send` sibling right after the
+                // argument list (the send row completes after it).
+                let siblings = c.collect_direct(parent);
+                let pos = siblings.iter().position(|&kid| kid == args)?;
+                if siblings
+                    .get(pos + 1)
+                    .copied()
+                    .is_none_or(|send| c.kind(send) != NodeKind::Send)
+                {
+                    return None;
+                }
+                invocation_formals(c, &siblings, pos + 1)
+            }
+        }
+    }
+
+    /// The bare / member invocation faces (:117-131): the selector off
+    /// [`slice::send_parts`], the member shape resolving through the
+    /// receiver's written type or class.
+    fn invocation_formals<'a>(c: &Check<'a>, siblings: &[u32], pos: usize) -> Option<Formals<'a>> {
+        let (head, arguments) = slice::send_parts(c, siblings, pos)?;
+        // A tear-off send carries no invocation.
+        arguments?;
+        let selector_row = siblings[head];
+        let name = c.lexeme(c.head_token(selector_row));
+        if slice::access_marker(c, siblings, pos, NodeKind::DotAccess).is_some() {
+            let selector = c.head_token(selector_row);
+            let receiver = static_type_faces::single_receiver(c, &siblings[..head], selector)?;
+            let receiver_name = c.lexeme(c.head_token(receiver));
+            // The written-type face first — the shadow-correct variable
+            // read (`c.m(1)` through the declared class).
+            if let Some(face) = crate::rules::written_type_face(c, receiver, receiver_name)
+                && let Some(type_name) = face.name
+                && let Some(class_row) = same_file_declaration(c, type_name)
+                && let Some(formals) = method_formals(c, class_row, name)
+            {
+                return Some(formals);
+            }
+            // A same-file class name in receiver position: the static
+            // member face (`C.m(1)`).
+            let class_row = same_file_declaration(c, receiver_name)?;
+            return method_formals(c, class_row, name);
+        }
+        // The bare face: a top-level function, a local function on the
+        // path, a same-file class constructor (`A(...)` — the upstream
+        // InstanceCreationExpression rewrite), or the implicit-`this`
+        // method of the enclosing class.
+        if let Some(formals) = top_level_function_formals(c, name) {
+            return Some(formals);
+        }
+        if let Some(formals) = local_function_formals(c, name) {
+            return Some(formals);
+        }
+        if let Some(class_row) = same_file_declaration(c, name) {
+            return constructor_formals(c, class_row, name, None, &mut Vec::new());
+        }
+        let class_row = c.path.iter().rev().copied().find(|&row| {
+            matches!(
+                c.kind(row),
+                NodeKind::ClassDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::ExtensionDeclaration
+                    | NodeKind::ExtensionTypeDeclaration
+            )
+        })?;
+        method_formals(c, class_row, name)
+    }
+
+    /// The method `name` of the class-like row, as formals.
+    fn method_formals<'a>(c: &Check<'a>, class_row: u32, name: &str) -> Option<Formals<'a>> {
+        let member = body_members(c, class_row).into_iter().find(|&member| {
+            c.kind(member) == NodeKind::Method
+                && !crate::rules::member_matches(c, member, crate::rules::MemberQuery::Method, name)
+                    .is_empty()
+        })?;
+        formals_of(c, member)
+    }
+
+    /// The top-level function `name`, as formals.
+    fn top_level_function_formals<'a>(c: &Check<'a>, name: &str) -> Option<Formals<'a>> {
+        let root = c.unit.ast.root()?;
+        let ctx = dartq_parser::IdentifierContext::TopLevelFunctionDeclaration as u32;
+        for top in c.collect_direct(root) {
+            if c.kind(top) != NodeKind::TopLevelDeclaration {
+                continue;
+            }
+            for decl in c.collect_direct(top) {
+                if c.kind(decl) != NodeKind::TopLevelMethod {
+                    continue;
+                }
+                let named = c.collect_direct(decl).into_iter().any(|kid| {
+                    c.kind(kid) == NodeKind::Identifier
+                        && c.payload(kid).first() == Some(&ctx)
+                        && c.lexeme(c.head_token(kid)) == name
+                });
+                if named {
+                    return formals_of(c, decl);
+                }
+            }
+        }
+        None
+    }
+
+    /// The local function `name` declared along the call's path (the
+    /// innermost binder — shadowing wins).
+    fn local_function_formals<'a>(c: &Check<'a>, name: &str) -> Option<Formals<'a>> {
+        let row = c.path.iter().rev().copied().find(|&row| {
+            matches!(
+                c.kind(row),
+                NodeKind::LocalFunctionDeclaration | NodeKind::NamedFunctionExpression
+            ) && crate::rules::declarations::member_declaration_name(c, row)
+                .is_some_and(|n| c.lexeme(c.head_token(n)) == name)
+        })?;
+        formals_of(c, row)
+    }
+
+    /// The creation face (:122-127): the class constructor (the unnamed
+    /// face or the spelled selector), factory redirects walked to the
+    /// ultimate target (:143-158).
+    fn creation_formals<'a>(c: &Check<'a>, creation: u32) -> Option<Formals<'a>> {
+        let args = c
+            .collect_direct(creation)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Arguments)?;
+        // `new` opens the keyword shape's span; the implicit creation
+        // begins at the class name itself.
+        let from = if c.kind(creation) == NodeKind::NewExpression {
+            c.head_token(creation) + 1
+        } else {
+            c.head_token(creation)
+        };
+        let (class_name, selector) = creation_names(c, from, c.head_token(args))?;
+        let class_row = same_file_declaration(c, class_name)?;
+        constructor_formals(c, class_row, class_name, selector, &mut Vec::new())
+    }
+
+    /// The annotation face (:84-92): the annotation names a constructor
+    /// of its class (one identifier is the class, two name a constructor
+    /// selector — prefixed names under-report).
+    fn annotation_formals<'a>(c: &Check<'a>, metadata: u32) -> Option<Formals<'a>> {
+        let mut ids: Vec<&str> = c
+            .collect_direct(metadata)
+            .into_iter()
+            .filter(|&piece| c.kind(piece) == NodeKind::Identifier)
+            .map(|piece| c.lexeme(c.head_token(piece)))
+            .collect();
+        let selector = (ids.len() >= 2).then(|| ids.swap_remove(1));
+        let class_name = ids.pop()?;
+        let class_row = same_file_declaration(c, class_name)?;
+        constructor_formals(c, class_row, class_name, selector, &mut Vec::new())
+    }
+
+    /// The enum-constant face (:107-114): the enum's constructor, named
+    /// or unnamed.
+    fn enum_constant_formals<'a>(c: &Check<'a>, element: u32) -> Option<Formals<'a>> {
+        let body = c.unit.ast.parent(element)?;
+        let enum_row = c.unit.ast.parent(body)?;
+        if c.kind(enum_row) != NodeKind::EnumDeclaration {
+            return None;
+        }
+        let args = c
+            .collect_direct(element)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Arguments)?;
+        let (class_name, selector) = creation_names(c, c.head_token(element), c.head_token(args))?;
+        constructor_formals(c, enum_row, class_name, selector, &mut Vec::new())
+    }
+
+    /// The creation header's names: the first identifier token names the
+    /// class, the identifier after the last `.` is the named-constructor
+    /// selector (`C<int>.named(` — the whole header is a handful of
+    /// tokens).
+    fn creation_names<'a>(
+        c: &'a Check<'_>,
+        from: u32,
+        args_start: u32,
+    ) -> Option<(&'a str, Option<&'a str>)> {
+        let mut class_name = None;
+        let mut selector = None;
+        let mut token = from;
+        while token < args_start {
+            if is_identifier_lexeme(c, token) {
+                if class_name.is_none() {
+                    class_name = Some(c.lexeme(token));
+                } else if token > 0 && c.lexeme(token - 1) == "." {
+                    selector = Some(c.lexeme(token));
+                }
+            }
+            token += 1;
+        }
+        Some((class_name?, selector))
+    }
+
+    /// The constructor row spelling `selector` on the class-like row, its
+    /// formals after the factory-redirect walk (:143-199). `visited`
+    /// carries the redirect cycle guard (:150-153 — a cycle is a
+    /// compile-time error; silent).
+    fn constructor_formals<'a>(
+        c: &Check<'a>,
+        class_row: u32,
+        class_name: &str,
+        selector: Option<&str>,
+        visited: &mut Vec<u32>,
+    ) -> Option<Formals<'a>> {
+        let unnamed = selector.is_none() || selector == Some("new");
+        let wanted: Option<&str> = if unnamed { None } else { selector };
+        let mut row =
+            body_members(c, class_row)
+                .into_iter()
+                .find(|&member| match c.kind(member) {
+                    NodeKind::Constructor => constructor_matches(c, member, class_name, wanted),
+                    NodeKind::Factory => factory_matches(c, member, class_name, wanted),
+                    _ => false,
+                })?;
+        // The factory-redirect walk: `= Target` resolves to the target
+        // constructor whose defaults decide.
+        while c.kind(row) == NodeKind::Factory {
+            if visited.contains(&row) {
+                return None;
+            }
+            visited.push(row);
+            let (target_class, target_selector) = redirect_target(c, row)?;
+            let target_row = same_file_declaration(c, &target_class)?;
+            let wanted = target_selector.as_deref();
+            row = body_members(c, target_row)
+                .into_iter()
+                .find(|&member| match c.kind(member) {
+                    NodeKind::Constructor => constructor_matches(c, member, &target_class, wanted),
+                    NodeKind::Factory => factory_matches(c, member, &target_class, wanted),
+                    _ => false,
+                })?;
+        }
+        formals_of(c, row)
+    }
+
+    /// Whether the constructor row names `class_name` (its anchor) with
+    /// `selector` (the named face rides the `MethodDeclarationContinuation`
+    /// identifier — declarations.rs `constructor_name_part` idiom).
+    fn constructor_matches(
+        c: &Check<'_>,
+        ctor: u32,
+        class_name: &str,
+        selector: Option<&str>,
+    ) -> bool {
+        if c.lexeme(c.head_token(ctor)) != class_name {
+            return false;
+        }
+        let part = c.collect_direct(ctor).into_iter().find(|&kid| {
+            c.kind(kid) == NodeKind::Identifier
+                && c.payload(kid).first()
+                    == Some(
+                        &(dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32),
+                    )
+        });
+        match (selector, part.map(|p| c.lexeme(c.head_token(p)))) {
+            (None, None | Some("new")) => true,
+            (Some(wanted), Some(name)) => name == wanted,
+            _ => false,
+        }
+    }
+
+    /// Whether the factory row names `class_name` with `selector`: the row
+    /// anchors at the `factory` keyword, the name rides one token later
+    /// (three past a named selector — docs.rs `factory_name_token` idiom).
+    fn factory_matches(
+        c: &Check<'_>,
+        factory: u32,
+        class_name: &str,
+        selector: Option<&str>,
+    ) -> bool {
+        let head = c.head_token(factory);
+        let count = narrow_u32(c.unit.tokens.len());
+        let name = head + 1;
+        if name >= count || c.lexeme(name) != class_name {
+            return false;
+        }
+        let written = if head + 2 < count && c.lexeme(head + 2) == "." && head + 3 < count {
+            Some(c.lexeme(head + 3))
+        } else {
+            None
+        };
+        written == selector
+    }
+
+    /// The `= Target.named` of a redirecting factory body (the segments'
+    /// identifier tokens; one segment is the class, two the named
+    /// constructor — prefixed targets under-report).
+    fn redirect_target(c: &Check<'_>, factory: u32) -> Option<(String, Option<String>)> {
+        let body = c
+            .collect_direct(factory)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::RedirectingFactoryBody)?;
+        let tokens = c.unit.ast.token_range(body);
+        let mut cursor = tokens.start;
+        while cursor < tokens.end && c.lexeme(cursor) != "=" {
+            cursor += 1;
+        }
+        cursor += 1;
+        let mut segments: Vec<&str> = Vec::new();
+        while cursor < tokens.end && c.lexeme(cursor) != ";" {
+            if is_identifier_lexeme(c, cursor) {
+                segments.push(c.lexeme(cursor));
+            }
+            cursor += 1;
+        }
+        let selector = (segments.len() >= 2).then(|| segments[1].to_owned());
+        let &class = segments.first()?;
+        Some((class.to_owned(), selector))
+    }
+
+    /// The executable's formal rows (see [`Formals`]).
+    fn formals_of<'a>(c: &Check<'a>, owner: u32) -> Option<Formals<'a>> {
+        let params_row = formal_params_row(c, owner)?;
+        let mut positional = Vec::new();
+        let mut named = Vec::new();
+        for kid in c.collect_direct(params_row) {
+            match c.kind(kid) {
+                NodeKind::FormalParameter | NodeKind::FunctionTypedFormalParameter => {
+                    // The required-positional group tiles directly inside
+                    // the list.
+                    positional.push(kid);
+                }
+                NodeKind::OptionalFormalParameters => {
+                    for row in c.collect_direct(kid) {
+                        if !matches!(
+                            c.kind(row),
+                            NodeKind::FormalParameter | NodeKind::FunctionTypedFormalParameter
+                        ) {
+                            continue;
+                        }
+                        match formal_kind(c, row) {
+                            k if k
+                                == dartq_parser::FormalParameterKind::OptionalPositional as u32 =>
+                            {
+                                positional.push(row);
+                            }
+                            k if k == dartq_parser::FormalParameterKind::OptionalNamed as u32
+                                || k == dartq_parser::FormalParameterKind::RequiredNamed as u32 =>
+                            {
+                                if let Some(name) = formal_name(c, row) {
+                                    named.push((name, row));
+                                }
+                            }
+                            _ => positional.push(row),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(Formals {
+            params_row,
+            positional,
+            named,
+        })
+    }
+
+    /// The owner's parameter list: a direct child, or one nested in the
+    /// function-expression child of a named function expression.
+    fn formal_params_row(c: &Check<'_>, owner: u32) -> Option<u32> {
+        let direct = c
+            .collect_direct(owner)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters);
+        direct.or_else(|| {
+            c.collect_direct(owner)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::FunctionExpression)
+                .and_then(|expression| {
+                    c.collect_direct(expression)
+                        .into_iter()
+                        .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)
+                })
+        })
+    }
+
+    /// Whether the token is a plain identifier (keywords excluded — `new`
+    /// and `const` never name a class or a target segment).
+    fn is_identifier_lexeme(c: &Check<'_>, token: u32) -> bool {
+        c.unit
+            .tokens
+            .get(token as usize)
+            .is_some_and(|t| matches!(t.kind, dartq_scanner::TokenKind::Identifier))
+    }
+}
+
+pub(crate) mod avoid_slow_async_io {
+    use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces};
+    use crate::rules::{same_file_declaration, utf16_token_span};
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/avoid_slow_async_io.dart` — an invocation
+    /// resolving to a `dart:io` method whose synchronous twin exists
+    /// reports at the invocation (`reportAtNode(node)`): the
+    /// `FileSystemEntity` set `{exists, isDirectory, isFile, isLink, stat,
+    /// type}` and `File.lastModified` (the rule source :25-27/:41-58).
+    /// The upstream verdict is the resolved `MethodElement`'s enclosing
+    /// class + library; the tests cover instance receivers
+    /// (`dir.exists()`), the `FileSystemEntity` statics
+    /// (`FileSystemEntity.type(path)`), extension types implementing the
+    /// interface, and the sync twins' silence.
+    ///
+    /// dartq faces over the production tiling, the dart:io member
+    /// identity face without SDK elements: the dispatch row is the
+    /// invocation send with a single bare identifier receiver. The static
+    /// face matches the receiver spelling `FileSystemEntity` unbound
+    /// same-file (a shadowing declaration keeps it silent — the element
+    /// library gate) with the slow static names `{stat, type,
+    /// isDirectory, isFile, isLink}` — `exists` is instance-only, so a
+    /// static spelling never resolves upstream. The instance face reads
+    /// the receiver's type — `File` carries `{lastModified, exists,
+    /// stat}`, `Directory`/`Link`/`FileSystemEntity` carry `{exists,
+    /// stat}` (the type-checking set is static-only upstream) — and stays
+    /// silent when the type names a same-file declaration (the user's own
+    /// `File` is not `dart:io`'s). Approximations (documented,
+    /// under-report): prefixed receivers (`io.FileSystemEntity.type`),
+    /// `this`/`super` receivers, extension-type receivers implementing the
+    /// interface, and cross-file shadowing classes resolve to nothing
+    /// here. Message: `diagnostic.g.dart` `avoidSlowAsyncIo`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "avoid_slow_async_io",
+        group: Group::Standalone,
+        problem: "Use of an async 'dart:io' method.",
+        correction: "Try using the synchronous version of the method.",
+        kinds: &[NodeKind::Send],
+        check,
+    };
+
+    /// The slow `FileSystemEntity` statics: `exists` is instance-only.
+    const STATIC_SLOW: [&str; 5] = ["stat", "type", "isDirectory", "isFile", "isLink"];
+
+    /// The instance-slow names per receiver class: `File.lastModified`
+    /// plus the `FileSystemEntity` instance members its subclasses carry.
+    fn instance_slow(class: &str) -> Option<&'static [&'static str]> {
+        match class {
+            "File" => Some(&["lastModified", "exists", "stat"]),
+            "Directory" | "Link" | "FileSystemEntity" => Some(&["exists", "stat"]),
+            _ => None,
+        }
+    }
+
+    fn check(c: &mut Check<'_>) {
+        let Some(analysis) = c.semantics() else {
+            // The wave posture: no semantic face, no member identity.
+            return;
+        };
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((head, arguments)) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        // A tear-off is not a MethodInvocation upstream.
+        let Some(arguments) = arguments else {
+            return;
+        };
+        if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_none() {
+            return;
+        }
+        let selector_row = kids[head];
+        let selector = c.head_token(selector_row);
+        // The identity face reads single bare identifier receivers.
+        let Some(receiver) = static_type_faces::single_receiver(c, &kids[..head], selector) else {
+            return;
+        };
+        let name = c.lexeme(selector);
+        // The static face: the receiver spells `FileSystemEntity` and
+        // binds to nothing same-file (the element library gate).
+        if c.lexeme(c.head_token(receiver)) == "FileSystemEntity"
+            && crate::rules::expressions::same_file::binding(c, receiver, "FileSystemEntity")
+                .is_none()
+            && STATIC_SLOW.contains(&name)
+        {
+            report_invocation(c, receiver, arguments);
+            return;
+        }
+        // The instance face: the receiver's declared class decides the
+        // slow set; a same-file class of the same name is not `dart:io`'s.
+        let Some(ty) = analysis.type_of(query_site(c, receiver)) else {
+            return;
+        };
+        let dartq_semantic::model::Ty::Named { name: class, .. } = ty else {
+            return;
+        };
+        let class = analysis.strings().resolve(class);
+        if same_file_declaration(c, class).is_some() {
+            return;
+        }
+        if instance_slow(class).is_some_and(|slow| slow.contains(&name)) {
+            report_invocation(c, receiver, arguments);
+        }
+    }
+
+    /// The upstream anchor is the whole invocation (`reportAtNode(node)`).
+    fn report_invocation(c: &mut Check<'_>, receiver: u32, arguments: u32) {
+        let start = utf16_token_span(c, c.head_token(receiver)).start;
+        let end = c.utf16_span(arguments).end;
+        c.report(start..end, &[]);
+    }
+}
+
+pub(crate) mod future_sync_value {
+    use super::{Check, Group, NodeKind, RuleSpec, slice, static_type_faces};
+    use crate::rules::{same_file_declaration, utf16_token_span};
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/future_sync_value.dart` — a `Future.value`
+    /// creation whose first argument is not future-typed reports at the
+    /// `value` constructor-name token (`_report`, `reportAtToken`): the
+    /// instance type must be `Future` (`isDartAsyncFuture`), the class
+    /// must declare `syncValue`, and the first argument's type must be
+    /// neither `Future`/`FutureOr` nor `dynamic` — everything else,
+    /// including an unread type, reports (the visitor :44-105). The rule
+    /// registers below the `syncValue` constructor's introduction
+    /// (`constructorSince = Version(3, 10, 0)`). The faces upstream
+    /// registers: instance creations and dot-shorthand constructor
+    /// invocations (a plain `Future.value(1)` rewrites to the former
+    /// through constructor resolution).
+    ///
+    /// dartq faces over the production tiling: the dispatch rows are the
+    /// three creation shapes — the `new`-keyword row, the generic implicit
+    /// creation (`Future<int>.value(1)`), and the invocation send (a plain
+    /// `Future.value(1)` stays a send here — the tiles are disjoint). The
+    /// `isDartAsyncFuture` + `syncValue`-exists faces fold into the
+    /// dart:io-style identity: the callee head is the spelled `Future`,
+    /// bound to nothing same-file (a user `Future` fails both upstream
+    /// gates), and the version gate carries the constructor's existence
+    /// (the 3.15 oracle's `Future` has it). The argument type reads the
+    /// static-type faces. Approximations (documented): the dot-shorthand
+    /// face (`.value(1)`) is not tiled into the dispatch here and
+    /// under-reports; a generic receiver (`Future<int>.value`) takes the
+    /// implicit-creation face; cross-file callee types the faces cannot
+    /// read report through the null-type posture. Message:
+    /// `diagnostic.g.dart` `futureSyncValue`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "future_sync_value",
+        group: Group::Standalone,
+        problem: "For synchronous values, `Future.syncValue` is more performant.",
+        correction: "Try replacing `Future.value` with `Future.syncValue`.",
+        kinds: &[
+            NodeKind::NewExpression,
+            NodeKind::ImplicitCreation,
+            NodeKind::Send,
+        ],
+        check,
+    };
+
+    fn check(c: &mut Check<'_>) {
+        // `constructorSince = Version(3, 10, 0)`: the effective library
+        // version below it never registers the visitor; the `syncValue`
+        // constructor's existence folds into the same gate.
+        if let Some(version) = c.unit.version
+            && (version.major, version.minor) < (3, 10)
+        {
+            return;
+        }
+        match c.kind(c.node()) {
+            NodeKind::Send => send_face(c),
+            _ => creation_face(c),
+        }
+    }
+
+    /// The invocation-send face (a plain `Future.value(1)`).
+    fn send_face(c: &mut Check<'_>) {
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return;
+        };
+        let Some((head, arguments)) = slice::send_parts(c, &kids, pos) else {
+            return;
+        };
+        // A tear-off (`Future.value` as a reference) is no invocation.
+        let Some(arguments) = arguments else {
+            return;
+        };
+        let selector_row = kids[head];
+        let selector = c.head_token(selector_row);
+        let marker = slice::access_marker(c, &kids, pos, NodeKind::DotAccess);
+        if marker.is_none() {
+            return;
+        }
+        let Some(receiver) = static_type_faces::single_receiver(c, &kids[..head], selector) else {
+            return;
+        };
+        if c.lexeme(c.head_token(receiver)) != "Future"
+            || c.lexeme(selector) != "value"
+            // The `isDartAsyncFuture` identity: a same-file `Future`
+            // binding shadows the SDK class (which lacks `syncValue` —
+            // both upstream gates keep it silent).
+            || crate::rules::expressions::same_file::binding(c, receiver, "Future").is_some()
+        {
+            return;
+        }
+        if first_argument_reports(c, analysis, arguments) {
+            c.report(utf16_token_span(c, selector), &[]);
+        }
+    }
+
+    /// The structured-creation face (`new Future.value(1)` and the
+    /// generic `Future<int>.value(1)`).
+    fn creation_face(c: &mut Check<'_>) {
+        let Some(analysis) = c.semantics() else {
+            return;
+        };
+        let node = c.node();
+        if same_file_declaration(c, "Future").is_some() {
+            return;
+        }
+        let Some(arguments) = c
+            .collect_direct(node)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Arguments)
+        else {
+            return;
+        };
+        // `new` opens the keyword shape's span; the implicit creation
+        // begins at the class name itself.
+        let from = if c.kind(node) == NodeKind::NewExpression {
+            c.head_token(node) + 1
+        } else {
+            c.head_token(node)
+        };
+        let args_start = c.head_token(arguments);
+        let (mut class_name, mut selector) = (None, None);
+        let mut token = from;
+        while token < args_start {
+            if is_identifier_lexeme(c, token) {
+                if class_name.is_none() {
+                    class_name = Some(token);
+                } else if token > 0 && c.lexeme(token - 1) == "." {
+                    selector = Some(token);
+                }
+            }
+            token += 1;
+        }
+        // `constructorName.name?.token` — an unnamed creation carries no
+        // token and never reports.
+        if class_name.is_none_or(|t| c.lexeme(t) != "Future")
+            || selector.is_none_or(|t| c.lexeme(t) != "value")
+        {
+            return;
+        }
+        if first_argument_reports(c, analysis, arguments) {
+            c.report(utf16_token_span(c, selector.expect("checked above")), &[]);
+        }
+    }
+
+    /// The first-argument face (`arguments.firstOrNull`): `Future`/
+    /// `FutureOr`/`dynamic` exempt, everything else — an unread type
+    /// included (the upstream null-staticType posture) — reports.
+    fn first_argument_reports(
+        c: &Check<'_>,
+        analysis: &dartq_semantic::Analysis<'_>,
+        arguments: u32,
+    ) -> bool {
+        let pieces = c.collect_direct(arguments);
+        let ranges = slice::arguments(c, &pieces);
+        let Some(range) = ranges.first() else {
+            return false;
+        };
+        let named = c.kind(pieces[range.end - 1]) == NodeKind::NamedArgument;
+        let first = if named { range.start + 1 } else { range.start };
+        let last = if named { range.end - 2 } else { range.end - 1 };
+        if first > last {
+            return false;
+        }
+        // An untyped parameter's flow row answers `Unknown` — the
+        // substrate's undecided posture, which the oracle reads as
+        // `dynamic` (exempt); a typeless row (`None`) is the unread face
+        // and reports.
+        match static_type_faces::expr_type(c, analysis, &pieces[first..=last]) {
+            Some(dartq_semantic::model::Ty::Named { name, .. }) => {
+                let spelled = analysis.strings().resolve(name);
+                !(spelled == "Future" || spelled == "FutureOr")
+            }
+            Some(dartq_semantic::model::Ty::Dynamic) | Some(dartq_semantic::model::Ty::Unknown) => {
+                false
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether the token is a plain identifier (keywords excluded — `new`
+    /// never names the class here).
+    fn is_identifier_lexeme(c: &Check<'_>, token: u32) -> bool {
+        c.unit
+            .tokens
+            .get(token as usize)
+            .is_some_and(|t| matches!(t.kind, dartq_scanner::TokenKind::Identifier))
+    }
+}
+
+pub(crate) mod unnecessary_this_alias {
+    use super::{Check, Group, NodeKind, RuleSpec, query_site};
+    use crate::rules::{class_declaration_name, initialized_identifier_name, utf16_token_span};
+
+    /// Official: `upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/unnecessary_this_alias.dart` — a local
+    /// variable initialized to `this` that (1) carries no `late`, (2) has
+    /// the variable's type equal to the `this` type, (3) is never
+    /// potentially mutated in the enclosing function body, and (4) has at
+    /// least one promotion usage in that body (`_ReferenceVisitor`
+    /// `_isPromotionUsage`) reports at the variable's name
+    /// (`reportAtToken(node.name)`). The usage faces: `is`/`as` operands,
+    /// `==`/`!=` against `null`, `!`, the null-aware member/index/cascade
+    /// receivers, `?..` cascade targets, `if (self case ...)`,
+    /// `switch (self)` statements and expressions — each read through
+    /// `_skipParenthesesUp`. Registered only with `this_promotion`
+    /// enabled; the 3.13 test stays silent.
+    ///
+    /// dartq faces over the production tiling: the dispatch row is the
+    /// initialized identifier. The late gate reads the declaration
+    /// keyword; the type-equality gate compares a written type's head
+    /// name with the enclosing class-like container's name (a written
+    /// nullable never equals the non-null `this`; extensions read the
+    /// this-nullable `on` type through inference alone, so any written
+    /// type skips — documented under-report); the mutation gate is the
+    /// semantic `is_potentially_mutated_in_scope` over the declared name.
+    /// The usage scan walks the function body's subtree: candidates are
+    /// same-name identifiers bound to a local, paren-climbed up, and read
+    /// per parent face — `IsExpression`/`AsExpression`, the `==`/`!=`
+    /// null binary, `SwitchStatement`/`SwitchExpression` conditions, the
+    /// `if`-case face (`ParenthesizedCondition` parent plus a
+    /// `CaseExpression` child on the statement), a null-aware `?..`
+    /// cascade target — and per run adjacency — the null-aware `?.` dot
+    /// marker, the null-aware `?[` index, the `!` postfix, and the
+    /// `?..` cascade head. Shadowing rebinding is excluded: an innermost
+    /// declaring `Block` or function container between the use and the
+    /// declaration that does not bind this row skips the candidate.
+    /// Approximations (documented, under-report): the
+    /// `AnonymousMethodInvocation` face (the anonymous-methods
+    /// experiment) is not tiled into the scan, and `catch (self)`
+    /// parameters do not rebinder-exclude. Message: `diagnostic.g.dart`
+    /// `unnecessaryThisAlias`.
+    pub(crate) static SPEC: RuleSpec = RuleSpec {
+        name: "unnecessary_this_alias",
+        group: Group::Standalone,
+        problem: "Unnecessary 'this' alias.",
+        correction: "Try removing the variable and using 'this' directly.",
+        kinds: &[NodeKind::InitializedIdentifier],
+        check,
+    };
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one flat face ladder over the alias write's contexts;                   splitting it would scatter the official line citations"
+    )]
+    fn check(c: &mut Check<'_>) {
+        let Some(analysis) = c.semantics() else {
+            // The wave posture: no binding or mutation faces.
+            return;
+        };
+        // The experimental-feature posture folds into the effective
+        // version (the 3.13 test stays silent).
+        if let Some(version) = c.unit.version
+            && (version.major, version.minor) < (3, 14)
+        {
+            return;
+        }
+        let var = c.node();
+        // `initializer?.unParenthesized is ThisExpression` — the
+        // parenthesized spelling rides the wrapper row.
+        let mut initializer = c
+            .collect_direct(var)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::VariableInitializer);
+        let Some(first) = initializer
+            .take()
+            .and_then(|wrapper| c.collect_direct(wrapper).into_iter().next_back())
+        else {
+            return;
+        };
+        let mut expression = first;
+        while c.kind(expression) == NodeKind::ParenthesizedExpression {
+            let Some(inner) = c.collect_direct(expression).into_iter().next_back() else {
+                return;
+            };
+            expression = inner;
+        }
+        if c.kind(expression) != NodeKind::ThisExpression {
+            return;
+        }
+        let Some(name_row) = initialized_identifier_name(c, var) else {
+            return;
+        };
+        // `parentList.isLate` — the declaration keyword reads `late`.
+        let Some(decl_row) = c.unit.ast.parent(var) else {
+            return;
+        };
+        // `late`: real parses store the token in payload word 0 (the
+        // keyword reader answers var/final/const only); the name-anchored
+        // local face recovers it as the token before the answered keyword.
+        let stored = c
+            .payload(decl_row)
+            .first()
+            .copied()
+            .unwrap_or(crate::rules::NONE_TOKEN);
+        let declares_late = (stored != crate::rules::NONE_TOKEN && c.lexeme(stored) == "late")
+            || crate::rules::variables_declaration_keyword(c, decl_row).is_some_and(|keyword| {
+                keyword
+                    .checked_sub(1)
+                    .is_some_and(|prev| c.lexeme(prev) == "late")
+            });
+        if c.kind(decl_row) == NodeKind::VariablesDeclaration && declares_late {
+            return;
+        }
+        // `variableType != thisType` — a written type must spell the
+        // enclosing class-like container's non-nullable name (`var`
+        // infers the `this` type and passes).
+        let Some(container) = c.path.iter().rev().copied().find(|&row| {
+            matches!(
+                c.kind(row),
+                NodeKind::ClassDeclaration
+                    | NodeKind::MixinDeclaration
+                    | NodeKind::ExtensionDeclaration
+                    | NodeKind::ExtensionTypeDeclaration
+                    | NodeKind::EnumDeclaration
+            )
+        }) else {
+            return;
+        };
+        // The written type: the binding face at the alias declaration —
+        // the production tiling leaks the written `Type` row out of the
+        // declaration's own window, so the `type_before` sibling read
+        // cannot see it. `None` is the `var` shape — the inferred type is
+        // the `this` type and the gate passes.
+        // The use anchor is the initializer row: the alias's own
+        // declaration anchors at the same token as the alias (`var`), and
+        // the binding walk's use-position filter would exclude it.
+        if let Some(face) = crate::rules::written_type_face(c, expression, c.lexeme(name_row)) {
+            let matches = match c.kind(container) {
+                // The `this` type of an extension is its (possibly
+                // nullable) `on` type — inference-only here.
+                NodeKind::ExtensionDeclaration => false,
+                _ => face.name == class_declaration_name(c, container) && !face.nullable,
+            };
+            if !matches {
+                return;
+            }
+        }
+        // `functionBody` — the body row owned by the nearest function-like
+        // container.
+        let Some(body) = c
+            .path
+            .iter()
+            .rev()
+            .copied()
+            .find(|&row| {
+                matches!(
+                    c.unit.ast.parent(row).map(|parent| c.kind(parent)),
+                    Some(
+                        NodeKind::Method
+                            | NodeKind::Constructor
+                            | NodeKind::Factory
+                            | NodeKind::TopLevelMethod
+                            | NodeKind::LocalFunctionDeclaration
+                            | NodeKind::NamedFunctionExpression
+                            | NodeKind::FunctionExpression
+                    )
+                )
+            })
+            .filter(|&row| {
+                matches!(
+                    c.kind(row),
+                    NodeKind::Block | NodeKind::BlockBody | NodeKind::ExpressionBody
+                )
+            })
+        else {
+            return;
+        };
+        // `isPotentiallyMutatedInScope(element)`.
+        if analysis.is_potentially_mutated_in_scope(query_site(c, name_row)) {
+            return;
+        }
+        let name = c.lexeme(name_row).to_owned();
+        let decl_range = query_site(c, name_row);
+        for row in c.children(body) {
+            if c.kind(row) != NodeKind::Identifier
+                || c.lexeme(c.head_token(row)) != name
+                || row == name_row
+            {
+                continue;
+            }
+            // The same-element face: a local binding, unshadowed between
+            // the use and this declaration.
+            if !matches!(
+                analysis.binding_of(query_site(c, row)).map(|b| b.kind),
+                Some(dartq_semantic::BindingKind::Local)
+            ) || shadowed(c, row, &name, decl_range)
+            {
+                continue;
+            }
+            if is_promotion_usage(c, row) {
+                c.report(utf16_token_span(c, c.head_token(name_row)), &[]);
+                return;
+            }
+        }
+    }
+
+    /// `_skipParenthesesUp`: the identifier's top row past the
+    /// parenthesized-expression wrappers.
+    fn paren_top(c: &Check<'_>, row: u32) -> u32 {
+        let mut top = row;
+        while let Some(parent) = c.unit.ast.parent(top)
+            && c.kind(parent) == NodeKind::ParenthesizedExpression
+        {
+            top = parent;
+        }
+        top
+    }
+
+    /// Whether a local `name` rebinding sits between the use and the
+    /// declaration: the innermost scope on the path that binds the name —
+    /// a `Block`'s locals or a nested function container's parameters —
+    /// decides (it must be this declaration).
+    fn shadowed(
+        c: &Check<'_>,
+        use_row: u32,
+        name: &str,
+        decl_range: dartq_source::SourceRange,
+    ) -> bool {
+        let mut current = use_row;
+        while let Some(parent) = c.unit.ast.parent(current) {
+            match c.kind(parent) {
+                NodeKind::Block => {
+                    if let Some(bound) = block_binds(c, parent, name) {
+                        return query_site(c, bound) != decl_range;
+                    }
+                }
+                NodeKind::FunctionExpression | NodeKind::LocalFunctionDeclaration
+                    if declares_parameter(c, parent, name) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+            current = parent;
+        }
+        false
+    }
+
+    /// The `InitializedIdentifier` row of the block's direct local named
+    /// `name`, if any.
+    fn block_binds(c: &Check<'_>, block: u32, name: &str) -> Option<u32> {
+        c.collect_direct(block)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::VariablesDeclaration)
+            .flat_map(|decl| c.collect_direct(decl))
+            .find(|&var| {
+                c.kind(var) == NodeKind::InitializedIdentifier
+                    && initialized_identifier_name(c, var)
+                        .is_some_and(|bound| c.lexeme(c.head_token(bound)) == name)
+            })
+            .and_then(|var| initialized_identifier_name(c, var))
+    }
+
+    /// Whether the function-like container binds a parameter `name`.
+    fn declares_parameter(c: &Check<'_>, owner: u32, name: &str) -> bool {
+        c.collect_direct(owner).into_iter().any(|kid| {
+            c.kind(kid) == NodeKind::FormalParameters
+                && c.collect_direct(kid).into_iter().any(|param| {
+                    matches!(
+                        c.kind(param),
+                        NodeKind::FormalParameter | NodeKind::FunctionTypedFormalParameter
+                    ) && c.payload(param).get(1).copied().is_some_and(|name_token| {
+                        name_token != crate::rules::NONE_TOKEN && c.lexeme(name_token) == name
+                    })
+                })
+        })
+    }
+
+    /// `_isPromotionUsage`: the parent faces over the paren-climbed row,
+    /// then the run-adjacency faces at the raw row.
+    fn is_promotion_usage(c: &Check<'_>, row: u32) -> bool {
+        let top = paren_top(c, row);
+        let parent = c.unit.ast.parent(top);
+        if let Some(parent) = parent {
+            match c.kind(parent) {
+                NodeKind::IsExpression | NodeKind::AsExpression => return true,
+                NodeKind::BinaryExpression => {
+                    return binary_null_test(c, parent, top);
+                }
+                NodeKind::Cascade => {
+                    // The cascade target: the row anchors at the `?..`/`..`
+                    // operator itself.
+                    return c.lexeme(c.head_token(parent)) == "?..";
+                }
+                NodeKind::ParenthesizedCondition => {
+                    if let Some(grandparent) = c.unit.ast.parent(parent) {
+                        match c.kind(grandparent) {
+                            // `switch (self)`.
+                            NodeKind::SwitchStatement | NodeKind::SwitchExpression => {
+                                return true;
+                            }
+                            // `if (self case ...)` — the case clause gate.
+                            NodeKind::IfStatement => {
+                                return c
+                                    .collect_direct(grandparent)
+                                    .iter()
+                                    .any(|&kid| c.kind(kid) == NodeKind::CaseExpression);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // The run-adjacency faces: childless containers leak the send
+        // group's pieces into the enclosing run, so the pieces around the
+        // (paren-climbed) receiver decide. The adopted operator container
+        // (`self is C` / `self as C` / `self == null`) tiles beside the
+        // receiver's run — over the operator and the right operand
+        // (completion order seals it after its operands) — leaking past
+        // the send-group markers, one container deep through the
+        // parenthesized condition, and inside the paren-climbed top
+        // itself (`(self as C)`). The first container whose token window
+        // overlaps the receiver binds it; a later statement's rows never
+        // overlap.
+        if let Some(parent) = c.unit.ast.parent(top) {
+            let siblings = c.collect_direct(parent);
+            if let Some(position) = siblings.iter().position(|&kid| kid == top) {
+                let operand = c.unit.ast.token_range(row);
+                let judge = |op: u32| -> Option<bool> {
+                    let window = c.unit.ast.token_range(op);
+                    // One-token slack: the `?.` marker's row anchors past
+                    // the receiver's tail (the question mark rides the
+                    // payload, the row covers `.m()`).
+                    if !(window.start <= operand.end + 1 && operand.start <= window.end) {
+                        return None;
+                    }
+                    match c.kind(op) {
+                        NodeKind::IsExpression | NodeKind::AsExpression => Some(true),
+                        NodeKind::BinaryExpression => Some(binary_null_test(c, op, row)),
+                        // `self!` — the production bridge tiles the `!`
+                        // postfix as its own kind.
+                        NodeKind::NonNullAssert | NodeKind::UnaryPostfix => Some(true),
+                        // `self?[0]` — the payload carries the `?`.
+                        NodeKind::Indexed => Some(
+                            c.payload(op)
+                                .first()
+                                .copied()
+                                .is_some_and(|question| question != crate::rules::NONE_TOKEN),
+                        ),
+                        // `self?.m()` / `self?.x` — the marker's null-aware bit.
+                        NodeKind::DotAccess => Some(c.payload(op).get(1).copied() == Some(1)),
+                        _ => None,
+                    }
+                };
+                // `if (self case C _)` — the usage row is the if-case
+                // scrutinee: hand-built trees tile a CaseExpression row;
+                // the production tiling leaks the pattern rows instead, so
+                // the `case` token directly after the receiver decides.
+                let next_token = ((operand.end as usize) < c.unit.tokens.as_slice().len())
+                    .then(|| c.unit.tokens.lexeme(c.unit.source, operand.end as usize));
+                if siblings
+                    .iter()
+                    .any(|&sib| c.kind(sib) == NodeKind::CaseExpression)
+                    || next_token == Some("case")
+                {
+                    return true;
+                }
+                for &sib in &siblings[position + 1..] {
+                    if let Some(verdict) = judge(sib) {
+                        return verdict;
+                    }
+                    // `if (self is C)` — the operator lives inside the
+                    // condition container the run leaks into.
+                    if c.kind(sib) == NodeKind::ParenthesizedCondition {
+                        for kid in c.collect_direct(sib) {
+                            if let Some(verdict) = judge(kid) {
+                                return verdict;
+                            }
+                        }
+                    }
+                }
+                // `(self as C)` — the paren-climbed top wraps the usage;
+                // the operator container trails inside its own window.
+                if c.kind(top) == NodeKind::ParenthesizedExpression {
+                    for kid in c.collect_direct(top) {
+                        if let Some(verdict) = judge(kid) {
+                            return verdict;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// `self == null` / `null != self` / `(self) == null`: the operator is
+    /// `==`/`!=` and the other operand (unparenthesized) is `null`.
+    fn binary_null_test(c: &Check<'_>, binary: u32, operand: u32) -> bool {
+        if !matches!(
+            c.lexeme(c.payload(binary).first().copied().unwrap_or(0)),
+            "==" | "!="
+        ) {
+            return false;
+        }
+        c.collect_direct(binary).into_iter().any(|kid| {
+            kid != operand
+                && match c.kind(kid) {
+                    NodeKind::LiteralNull => true,
+                    NodeKind::ParenthesizedExpression => c
+                        .collect_direct(kid)
+                        .into_iter()
+                        .any(|inner| c.kind(inner) == NodeKind::LiteralNull),
+                    _ => false,
+                }
+        })
+    }
+}
+
+/// The W2-remainder expression rules' production-bridge pins: each rule
+/// runs with the semantic face mounted (the gap1 face construction), so
+/// the pins decide the tiling reading, not just the registration.
+#[cfg(test)]
+mod w2_expr_pins {
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces};
+    use dartq_semantic::{ElementIndex, MicroKind, StrictModes, analyze_unit, collect};
+    use dartq_source::{FileTable, StringTable};
+
+    use crate::engine::Lint;
+    use crate::testsupport::{Fixture, one_rule};
+
+    /// Runs `rule` over `source` with the semantic face mounted: the
+    /// source folded as the sole analyzed file of `package:t` — the
+    /// driver's per-file build shape. The context tables leak
+    /// (`'static`); the tests are one-shot processes.
+    fn run_semantic(source: &str, rule: &str) -> Vec<Lint> {
+        run_semantic_version(source, rule, LanguageVersion::new(3, 15))
+    }
+
+    /// [`run_semantic`] at an explicit effective library version — the
+    /// version-gated rules' faces (`future_sync_value`,
+    /// `unnecessary_this_alias`).
+    fn run_semantic_version(source: &str, rule: &str, version: LanguageVersion) -> Vec<Lint> {
+        let mut fixture = Fixture::parse(source);
+        fixture.version = Some(version);
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut files = FileTable::new();
+        let file = files.intern(std::path::Path::new("lint_semantic.dart"));
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(version));
+        let scanned = dartq_scanner::scan(source, crate::testsupport::CONFIG, file);
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let elements = collect(source, &scanned.tokens, features, strings);
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib = builder.intern("package:t/lint_semantic.dart");
+        for (name, declaration) in elements.declarations() {
+            if declaration.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        let graph: &'static LibraryGraph = Box::leak(Box::new(builder.finish()));
+        let namespaces: &'static Namespaces = Box::leak(Box::new(Namespaces::build(graph)));
+        let index: &'static ElementIndex = Box::leak(Box::new(index));
+        let analysis = analyze_unit(
+            source,
+            &scanned.tokens,
+            features,
+            strings,
+            file,
+            lib,
+            graph,
+            namespaces,
+            index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+        );
+        let unit = crate::engine::Unit {
+            source: &fixture.source,
+            tokens: &fixture.tokens,
+            ast: &fixture.ast,
+            lines: &fixture.lines,
+            path: Some(&fixture.path),
+            features: fixture.features,
+            version: fixture.version,
+            workspace: None,
+            reachability: None,
+            async_context_uses: None,
+            library_type_uses: None,
+        };
+        unit.run_with_semantics(
+            &one_rule(rule),
+            &rustc_hash::FxHashSet::default(),
+            Some(&analysis),
+        )
+    }
+
+    /// The wave posture: both rules are silent under the plain run (the
+    /// face absent) and report with it mounted.
+    #[test]
+    fn w2_expr_rules_require_the_semantic_face() {
+        let sources = [
+            ("avoid_print", "void f() {\n  print('hi');\n}\n"),
+            (
+                "no_runtimetype_tostring",
+                "class C {\n  void f() {\n    runtimeType.toString();\n  }\n}\n",
+            ),
+        ];
+        for (rule, source) in sources {
+            let plain = Fixture::parse(source);
+            assert!(plain.run(&one_rule(rule)).is_empty(), "{rule}");
+            assert_eq!(run_semantic(source, rule).len(), 1, "{rule}");
+        }
+    }
+
+    /// The bare `print` face: a top-level and a class-method call report
+    /// at the method name; a same-file shadow, a member callee, the
+    /// `kDebugMode` then branch (braced and not), and another condition
+    /// stay silent. The closure bail keeps a call under the branch
+    /// reporting.
+    #[test]
+    fn avoid_print_faces() {
+        let lints = run_semantic("void f() {\n  print('hi');\n}\n", "avoid_print");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Don't invoke 'print' in production code.");
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try using a logging framework.")
+        );
+        // The report anchors at the method name (:43).
+        assert_eq!(lints[0].range, 13..18);
+
+        assert_eq!(
+            run_semantic(
+                "class C {\n  void f() {\n    print('x');\n  }\n}\n",
+                "avoid_print"
+            )
+            .len(),
+            1
+        );
+        // The closure bail (:62-66): a call inside a closure under the
+        // branch is not debug-only.
+        assert_eq!(
+            run_semantic(
+                "void f(bool kDebugMode) {\n  if (kDebugMode) foo(() {\n    print('x');\n  });\n}\n",
+                "avoid_print"
+            )
+            .len(),
+            1
+        );
+
+        for source in [
+            // A same-file `print` shadows the core function (the binding
+            // gate).
+            "void print(Object? o) {}\nvoid f() {\n  print('x');\n}\n",
+            // A member callee is another face (the prefixed core spelling
+            // under-reports).
+            "class C {\n  void print() {}\n  void f() {\n    C.print();\n  }\n}\n",
+            // The `kDebugMode` then branch exempts, braced or not
+            // (:52-68).
+            "void f(bool kDebugMode) {\n  if (kDebugMode) print('x');\n}\n",
+            "void f(bool kDebugMode) {\n  if (kDebugMode) {\n    print('x');\n  }\n}\n",
+        ] {
+            assert!(run_semantic(source, "avoid_print").is_empty(), "{source}");
+        }
+        // Another condition does not exempt — upstream `_isDebugOnly`
+        // requires the condition to be the `kDebugMode` element
+        // (avoid_print.dart :52-68), so a `debug` flag keeps the lint.
+        assert_eq!(
+            run_semantic(
+                "void f(bool debug) {\n  if (debug) print('x');\n}\n",
+                "avoid_print"
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// The multibyte-trivia face: three em-dashes ahead of the call put
+    /// six bytes of UTF-16/byte drift on the `print` selector — the shape
+    /// that used to land the binding probe on the argument identifier's
+    /// reference row (a phantom local binding) and silence the report.
+    /// The shadow join reads the matched row's own name, so a
+    /// non-`print` binding never shadows.
+    #[test]
+    fn avoid_print_multibyte_trivia_drift_reports() {
+        let source = "// ———\nvoid f() {\n  var bad = 1;\n  print(bad);\n}\n";
+        let lints = run_semantic(source, "avoid_print");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Don't invoke 'print' in production code.");
+    }
+
+    /// The tear-off argument face (:70-80): a bare `print` identifier
+    /// passed as an argument reports at the identifier —
+    /// `list.forEach(print)` and `f(print)` — and the gates hold: a
+    /// same-file `print` shadow stays silent (the binding gate), a member
+    /// tear-off `C.print` is not a `SimpleIdentifier` (the access-marker
+    /// gate), other bare uses never visit (`print;`, `var x = print;`),
+    /// and the debug-only walk does not apply on this face (the
+    /// then-branch call still reports). The invocation face stacks with
+    /// it: `print(print)` is two rows.
+    #[test]
+    fn avoid_print_tear_off_argument_faces() {
+        let member_call = "void f(List<int> xs) {\n  xs.forEach(print);\n}\n";
+        let lints = run_semantic(member_call, "avoid_print");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let off = u32::try_from(member_call.find("print").expect("anchor")).expect("u32");
+        assert_eq!(lints[0].range, off..off + 5);
+
+        let plain_argument = "void g(int x) {}\nvoid f() {\n  g(print);\n}\n";
+        let lints = run_semantic(plain_argument, "avoid_print");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let off = u32::try_from(plain_argument.rfind("print").expect("anchor")).expect("u32");
+        assert_eq!(lints[0].range, off..off + 5);
+
+        // The binding gate: a same-file `print` shadows the core function.
+        let shadow = "void print(Object? o) {}\nvoid g(int x) {}\nvoid f() {\n  g(print);\n}\n";
+        assert!(run_semantic(shadow, "avoid_print").is_empty(), "{shadow}");
+
+        // The access-marker gate: a member tear-off is not a
+        // `SimpleIdentifier` (the unresolved receiver keeps the binding
+        // gate out of the verdict).
+        let member_tear_off = "void g(void h()) {}\nvoid f() {\n  g(Unknown.print);\n}\n";
+        assert!(
+            run_semantic(member_tear_off, "avoid_print").is_empty(),
+            "{member_tear_off}"
+        );
+
+        // Other bare uses are never arguments — silent.
+        for source in [
+            "void f() {\n  print;\n}\n",
+            "void f() {\n  var x = print;\n}\n",
+        ] {
+            assert!(run_semantic(source, "avoid_print").is_empty(), "{source}");
+        }
+
+        // The debug-only walk is invocation-face-only (:70-80).
+        let debug_argument =
+            "void g(int x) {}\nvoid f(bool kDebugMode) {\n  if (kDebugMode) g(print);\n}\n";
+        assert_eq!(run_semantic(debug_argument, "avoid_print").len(), 1);
+
+        // The invocation face stacks: `print(print)` reports at both the
+        // method name and the argument.
+        let stacked = "void f() {\n  print(print);\n}\n";
+        let mut offsets: Vec<u32> = run_semantic(stacked, "avoid_print")
+            .into_iter()
+            .map(|lint| lint.range.start)
+            .collect();
+        offsets.sort_unstable();
+        assert_eq!(offsets.len(), 2, "{offsets:?}");
+        let base = u32::try_from(stacked.find("print").expect("anchor")).expect("u32");
+        assert_eq!(offsets, vec![base, base + 6]);
+    }
+
+    /// The `runtimeType`-access faces: the bare implicit-`this` read,
+    /// the explicit `this`/`super` receivers, and an extension on a
+    /// same-file concrete class report at the method name; a plain
+    /// receiver, a bare `toString()`, another selector, an unresolved
+    /// name, and the skip posture (assert, throw, catch, mixin, abstract
+    /// class, and non-concrete-class extensions) stay silent.
+    #[test]
+    fn no_runtimetype_tostring_faces() {
+        let lints = run_semantic(
+            "class C {\n  void f() {\n    runtimeType.toString();\n  }\n}\n",
+            "no_runtimetype_tostring",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Using 'toString' on a 'Type' is not safe in production code."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try removing the usage of 'toString' or restructuring the code.")
+        );
+        // The report anchors at the method name (:67-74).
+        assert_eq!(lints[0].range, 39..47);
+
+        // The explicit receivers are syntactic faces (:108-112).
+        assert_eq!(
+            run_semantic(
+                "class C {\n  void f() {\n    this.runtimeType.toString();\n  }\n}\n",
+                "no_runtimetype_tostring"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            run_semantic(
+                "class C {\n  void f() {\n    super.runtimeType.toString();\n  }\n}\n",
+                "no_runtimetype_tostring"
+            )
+            .len(),
+            1
+        );
+        // An extension on a same-file concrete class keeps the verdict
+        // (the `!(is ClassElement && !isAbstract)` arm, :93-105).
+        assert_eq!(
+            run_semantic(
+                "class D {}\nextension E on D {\n  void f() {\n    runtimeType.toString();\n  }\n}\n",
+                "no_runtimetype_tostring"
+            )
+            .len(),
+            1
+        );
+
+        for source in [
+            // A plain receiver is not a `runtimeType` access (:113-120).
+            "class C {\n  void f(C c) {\n    c.runtimeType.toString();\n  }\n}\n",
+            // A bare `toString()` carries no real target (:68-69).
+            "class C {\n  void f() {\n    toString();\n  }\n}\n",
+            // Only `toString` is the selector (:67).
+            "class C {\n  void f() {\n    runtimeType.toStringDeep();\n  }\n}\n",
+            // An unresolved bare `runtimeType` (top level, static
+            // context) stays silent.
+            "void f() {\n  runtimeType.toString();\n}\n",
+            "class C {\n  static void f() {\n    runtimeType.toString();\n  }\n}\n",
+            // The skip posture (:76-112): assert, throw, catch clause,
+            // mixin, and abstract class.
+            "class C {\n  void f() {\n    assert(runtimeType.toString() != null);\n  }\n}\n",
+            "class C {\n  void f() {\n    throw runtimeType.toString();\n  }\n}\n",
+            "class C {\n  void f() {\n    try {} catch (e) {\n      runtimeType.toString();\n    }\n  }\n}\n",
+            "mixin M {\n  void f() {\n    runtimeType.toString();\n  }\n}\n",
+            "abstract class C {\n  void f() {\n    runtimeType.toString();\n  }\n}\n",
+            // An extension whose `on` type is abstract, or not a
+            // same-file class, skips (:93-105).
+            "abstract class A {}\nextension E on A {\n  void f() {\n    runtimeType.toString();\n  }\n}\n",
+            "extension E on int {\n  void f() {\n    runtimeType.toString();\n  }\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "no_runtimetype_tostring").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    // —— the incoming sextet (#1147/#1148 batch) ————————————————————————
+
+    /// `prefer_const_constructors` production-bridge pins: a const
+    /// constructor's unnamed, named, and written-type-argument creations
+    /// report spanning the whole creation; a non-const constructor, a
+    /// written `const`, a generic creation without written type arguments
+    /// (the conservative bail), and a `@literal` constructor stay silent.
+    #[test]
+    fn prefer_const_constructors_faces() {
+        let lints = Fixture::parse("class C {\n  const C();\n}\nvoid f() {\n  C();\n}\n")
+            .run(&one_rule("prefer_const_constructors"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Use 'const' with the constructor to improve performance."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try adding the 'const' keyword to the constructor invocation.")
+        );
+        // The whole creation (`C()` — 38..41).
+        assert_eq!(lints[0].range, 38..41);
+
+        // The named-selector face (`C.n()` — 40..45).
+        let lints = Fixture::parse("class C {\n  const C.n();\n}\nvoid f() {\n  C.n();\n}\n")
+            .run(&one_rule("prefer_const_constructors"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range, 40..45);
+
+        // Written type arguments pass the generic gate (`G<int>()`).
+        let lints = Fixture::parse("class G<T> {\n  const G();\n}\nvoid f() {\n  G<int>();\n}\n")
+            .run(&one_rule("prefer_const_constructors"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+
+        for source in [
+            // A non-const constructor never reports.
+            "class C {\n  C();\n}\nvoid f() {\n  C();\n}\n",
+            // A written `const` is the dispatch bail.
+            "class C {\n  const C();\n}\nvoid f() {\n  const C();\n}\n",
+            // A generic class created without written type arguments
+            // bails (the conservative direction, linter#4531).
+            "class G<T> {\n  const G();\n}\nvoid f() {\n  G();\n}\n",
+            // A `@literal` constructor is the analyzer's own warning.
+            "class C {\n  @literal\n  const C();\n}\nvoid f() {\n  C();\n}\n",
+        ] {
+            let fixture = Fixture::parse(source);
+            assert!(
+                fixture
+                    .run(&one_rule("prefer_const_constructors"))
+                    .is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// `use_named_constants` production-bridge pins: a written-`const`
+    /// creation equal to the class's `static const` initializer reports
+    /// with `Type.field`; an unmatched creation stays silent.
+    #[test]
+    fn use_named_constants_faces() {
+        let lints = Fixture::parse(
+            "class C {\n  const C();\n  static const zero = C();\n}\nvoid f() {\n  const C();\n}\n",
+        )
+        .run(&one_rule("use_named_constants"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Use the constant 'C.zero' rather than a constructor returning the same object."
+        );
+        assert_eq!(lints[0].correction.as_deref(), Some("Try using 'C.zero'."));
+        // The whole written-const wrapper (`const C()` — 65..74).
+        assert_eq!(lints[0].range, 65..74);
+
+        // No matching static constant — silent.
+        let fixture = Fixture::parse("class C {\n  const C();\n}\nvoid f() {\n  const C();\n}\n");
+        assert!(fixture.run(&one_rule("use_named_constants")).is_empty());
+    }
+
+    /// `avoid_redundant_argument_values` production-bridge pins: named
+    /// and optional-positional defaults equal to the written argument
+    /// report at the argument expression; a different value, a
+    /// `@required` parameter, the implicit-`null` face, and the
+    /// optional-positional break decide the counts. The factory redirect
+    /// resolves the defaults against the target's parameters.
+    #[test]
+    fn avoid_redundant_argument_values_faces() {
+        let source = "void g({int x = 1}) {}\nvoid f() {\n  g(x: 1);\n}\n";
+        let lints = Fixture::parse(source).run(&one_rule("avoid_redundant_argument_values"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The value of the argument is redundant because it matches the default value."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try removing the argument.")
+        );
+        // The argument expression `1` (41..42).
+        assert_eq!(lints[0].range, 41..42);
+
+        // The optional-positional face and the break after it: only the
+        // last argument reports (`g(1, 2)` — `2` at 52..53).
+        let lints =
+            Fixture::parse("void g([int a = 1, int b = 2]) {}\nvoid f() {\n  g(1, 2);\n}\n")
+                .run(&one_rule("avoid_redundant_argument_values"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range, 52..53);
+
+        // The implicit-`null` face: a written `null` against a default-less
+        // optional (`g(null)` — 35..39).
+        let lints = Fixture::parse("void g([int? x]) {}\nvoid f() {\n  g(null);\n}\n")
+            .run(&one_rule("avoid_redundant_argument_values"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range, 35..39);
+
+        // The factory redirect: `A(x: 1)` resolves through `= B` to `B`'s
+        // constructor defaults (`1` at 115..116).
+        let lints = Fixture::parse(
+            "class A {\n  const factory A({int x = 1}) = B;\n}\nclass B implements A {\n  const B({int x = 1});\n}\nvoid f() {\n  A(x: 1);\n}\n",
+        )
+        .run(&one_rule("avoid_redundant_argument_values"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range, 115..116);
+
+        for source in [
+            // A different value never reports.
+            "void g({int x = 1}) {}\nvoid f() {\n  g(x: 2);\n}\n",
+            // A `@required` parameter keeps its argument.
+            "void g({@required int x = 1}) {}\nvoid f() {\n  g(x: 1);\n}\n",
+            // A required positional cannot be written.
+            "void g(int x) {}\nvoid f() {\n  g(1);\n}\n",
+        ] {
+            let fixture = Fixture::parse(source);
+            assert!(
+                fixture
+                    .run(&one_rule("avoid_redundant_argument_values"))
+                    .is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// `avoid_slow_async_io` pins: the wave posture keeps the plain run
+    /// silent (the production-bridge guardrail); the semantic face
+    /// reports the whole invocation for the instance `Directory.exists`
+    /// and the `FileSystemEntity.type` static, and the sync twin stays
+    /// silent.
+    #[test]
+    fn avoid_slow_async_io_faces() {
+        let instance =
+            "import 'dart:io';\nvoid f(Directory dir) async {\n  await dir.exists();\n}\n";
+        let fixture = Fixture::parse(instance);
+        assert!(fixture.run(&one_rule("avoid_slow_async_io")).is_empty());
+        let lints = run_semantic(instance, "avoid_slow_async_io");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Use of an async 'dart:io' method.");
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try using the synchronous version of the method.")
+        );
+        // The whole invocation (`dir.exists()` — 56..68).
+        assert_eq!(lints[0].range, 56..68);
+
+        // The static face (`FileSystemEntity.type(p)` — 39..63).
+        let lints = run_semantic(
+            "import 'dart:io';\nvoid f(String p) {\n  FileSystemEntity.type(p);\n}\n",
+            "avoid_slow_async_io",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range, 39..63);
+
+        // `File.lastModified` reports; the sync twin stays silent.
+        let lints = run_semantic(
+            "import 'dart:io';\nvoid f(File file) {\n  file.lastModified();\n}\n",
+            "avoid_slow_async_io",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert!(
+            run_semantic(
+                "import 'dart:io';\nvoid f(Directory dir) {\n  dir.existsSync();\n}\n",
+                "avoid_slow_async_io",
+            )
+            .is_empty()
+        );
+    }
+
+    /// `future_sync_value` pins: a non-future first argument reports at
+    /// the `value` token; `dynamic`, `Future`, and `FutureOr` arguments
+    /// stay silent; the `new`-keyword face reports; the 3.9 gate keeps
+    /// the rule off and 3.10 turns it on.
+    #[test]
+    fn future_sync_value_faces() {
+        // The wave posture: the plain production-bridge run stays silent
+        // (the argument-type face is absent).
+        let fixture = Fixture::parse("Future<int> f() => Future.value(1);");
+        assert!(fixture.run(&one_rule("future_sync_value")).is_empty());
+        let lints = run_semantic("Future<int> f() => Future.value(1);", "future_sync_value");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "For synchronous values, `Future.syncValue` is more performant."
+        );
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try replacing `Future.value` with `Future.syncValue`.")
+        );
+        // The constructor-name token `value` (26..31).
+        assert_eq!(lints[0].range, 26..31);
+
+        // The `new`-keyword face (`new Future.value(1)` — `value` at 30..35).
+        let lints = run_semantic(
+            "Future<int> f() => new Future.value(1);",
+            "future_sync_value",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range, 30..35);
+
+        for source in [
+            // A dynamic argument is exempt (:69-72).
+            "Future<int> f(p) => Future.value(p);",
+            // Future-typed and FutureOr-typed arguments are exempt.
+            "Future<int> f(Future<int> f) => Future.value(f);",
+            "Future<int> f(FutureOr<int> f) => Future.value(f);",
+            // No argument at all — silent.
+            "Future<int> f() => Future.value();",
+        ] {
+            assert!(
+                run_semantic(source, "future_sync_value").is_empty(),
+                "{source}"
+            );
+        }
+
+        // The 3.9 gate keeps the rule off; 3.10 turns it on.
+        let source = "Future<int> f() => Future.value(1);";
+        assert!(
+            run_semantic_version(source, "future_sync_value", LanguageVersion::new(3, 9))
+                .is_empty()
+        );
+        assert_eq!(
+            run_semantic_version(source, "future_sync_value", LanguageVersion::new(3, 10)).len(),
+            1
+        );
+    }
+
+    /// `unnecessary_this_alias` pins: the wave posture (the
+    /// production-bridge guardrail), the `is`/`as`/`== null`/`!`/if-case
+    /// promotion faces, the type-equality/late/mutation/no-usage
+    /// exemptions, and the 3.13/3.15 gate.
+    #[test]
+    fn unnecessary_this_alias_faces() {
+        let is_face =
+            "class C {\n  void m() {\n    var self = this;\n    if (self is C) {}\n  }\n}\n";
+        let fixture = Fixture::parse(is_face);
+        assert!(fixture.run(&one_rule("unnecessary_this_alias")).is_empty());
+        let lints = run_semantic(is_face, "unnecessary_this_alias");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Unnecessary 'this' alias.");
+        assert_eq!(
+            lints[0].correction.as_deref(),
+            Some("Try removing the variable and using 'this' directly.")
+        );
+        // The variable's name `self` (31..35).
+        assert_eq!(lints[0].range, 31..35);
+
+        for (source, count) in [
+            // The `as` face.
+            (
+                "class C {\n  void m() {\n    var self = this;\n    (self as C).m();\n  }\n}\n",
+                1,
+            ),
+            // The `== null` and `!= null` faces.
+            (
+                "class C {\n  void m() {\n    var self = this;\n    if (self == null) {}\n  }\n}\n",
+                1,
+            ),
+            (
+                "class C {\n  void m() {\n    var self = this;\n    if (null != self) {}\n  }\n}\n",
+                1,
+            ),
+            // The `!` postfix and the null-aware `?.` marker.
+            (
+                "class C {\n  void m() {\n    var self = this;\n    self!.m();\n  }\n}\n",
+                1,
+            ),
+            (
+                "class C {\n  void m() {\n    var self = this;\n    self?.m();\n  }\n}\n",
+                1,
+            ),
+            // The if-case face.
+            (
+                "class C {\n  void m() {\n    var self = this;\n    if (self case C _) {}\n  }\n}\n",
+                1,
+            ),
+            // The parenthesized initializer and parenthesized usage.
+            (
+                "class C {\n  void m() {\n    var self = (this);\n    if ((self) == null) {}\n  }\n}\n",
+                1,
+            ),
+        ] {
+            assert_eq!(
+                run_semantic(source, "unnecessary_this_alias").len(),
+                count,
+                "{source}"
+            );
+        }
+
+        for source in [
+            // A written different type never equals the `this` type.
+            "class C {\n  void m() {\n    Object self = this;\n    if (self is C) {}\n  }\n}\n",
+            // `late` aliases are reassignable by design.
+            "class C {\n  void m() {\n    late var self = this;\n    if (self is C) {}\n  }\n}\n",
+            // A mutated alias promotes unreliably.
+            "class C {\n  void m() {\n    var self = this;\n    if (self is C) {}\n    self = C();\n  }\n}\n",
+            // No promotion usage.
+            "class C {\n  void m() {\n    var self = this;\n    print(self);\n  }\n}\n",
+            // Not a `this` initializer.
+            "class C {\n  void m(C other) {\n    var self = other;\n    if (self is C) {}\n  }\n}\n",
+            // The non-null-aware faces stay silent.
+            "class C {\n  void m() {\n    var self = this;\n    self.m();\n  }\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "unnecessary_this_alias").is_empty(),
+                "{source}"
+            );
+        }
+
+        // The 3.13 gate keeps the rule off; 3.15 turns it on.
+        assert!(
+            run_semantic_version(
+                is_face,
+                "unnecessary_this_alias",
+                LanguageVersion::new(3, 13)
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            run_semantic_version(
+                is_face,
+                "unnecessary_this_alias",
+                LanguageVersion::new(3, 15)
+            )
+            .len(),
+            1
+        );
+    }
+}
+
+/// The #589 W-A B4 wave's production-bridge pins: the four rules turned
+/// resolution-bound (`literal_only_boolean_expressions`,
+/// `noop_primitive_operations`, `unnecessary_statements`,
+/// `prefer_int_literals`) run with the semantic face mounted — the same
+/// single-file shape as `gap1_pins`, plus a two-file face for the
+/// cross-library closures.
+#[cfg(test)]
+mod b4_expr_pins {
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{
+        Combinators, ImportEdge, LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder,
+        Namespaces,
+    };
+    use dartq_semantic::{ElementIndex, MicroKind, StrictModes, analyze_unit, collect};
+    use dartq_source::{FileTable, StringTable};
+
+    use crate::engine::Lint;
+    use crate::testsupport::{Fixture, one_rule, tok, utf16_at};
+
+    /// Runs `rule` over `source` with the semantic face mounted: the
+    /// source folded as the sole analyzed file of `package:t` — the
+    /// driver's per-file build shape. The context tables leak
+    /// (`'static`); the tests are one-shot processes.
+    fn run_semantic(source: &str, rule: &str) -> Vec<Lint> {
+        run_semantic_dep(source, None, rule)
+    }
+
+    /// [`run_semantic`] with a dependency file declared and imported
+    /// unprefixed into the library — the cross-file closure faces.
+    fn run_semantic_dep(source: &str, dependency: Option<&str>, rule: &str) -> Vec<Lint> {
+        let version = LanguageVersion::new(3, 15);
+        let mut fixture = Fixture::parse(source);
+        fixture.version = Some(version);
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut files = FileTable::new();
+        let file = files.intern(std::path::Path::new("lint_b4.dart"));
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(version));
+        let scanned = dartq_scanner::scan(source, crate::testsupport::CONFIG, file);
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let elements = collect(source, &scanned.tokens, features, strings);
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib = builder.intern("package:t/lint_b4.dart");
+        for (name, declaration) in elements.declarations() {
+            if declaration.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        if let Some(dependency) = dependency {
+            let dep_file = files.intern(std::path::Path::new("kit.dart"));
+            let scanned_dep = dartq_scanner::scan(dependency, crate::testsupport::CONFIG, dep_file);
+            assert!(
+                scanned_dep.diagnostics.is_empty(),
+                "scanner diagnostics: {dependency:?}"
+            );
+            let dep_elements = collect(dependency, &scanned_dep.tokens, features, strings);
+            let dep_lib = builder.intern("package:t/kit.dart");
+            for (name, declaration) in dep_elements.declarations() {
+                if declaration.kind == MicroKind::TypeParam {
+                    continue;
+                }
+                builder.declare(dep_lib, name, dep_file);
+            }
+            builder.import(
+                lib,
+                ImportEdge {
+                    target: Some(dep_lib),
+                    prefix: None,
+                    deferred: false,
+                    combinators: Combinators::unfiltered(),
+                },
+            );
+            index.insert(dep_file, dep_elements);
+        }
+        let graph: &'static LibraryGraph = Box::leak(Box::new(builder.finish()));
+        let namespaces: &'static Namespaces = Box::leak(Box::new(Namespaces::build(graph)));
+        let index: &'static ElementIndex = Box::leak(Box::new(index));
+        let analysis = analyze_unit(
+            source,
+            &scanned.tokens,
+            features,
+            strings,
+            file,
+            lib,
+            graph,
+            namespaces,
+            index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+        );
+        let unit = crate::engine::Unit {
+            source: &fixture.source,
+            tokens: &fixture.tokens,
+            ast: &fixture.ast,
+            lines: &fixture.lines,
+            path: Some(&fixture.path),
+            features: fixture.features,
+            version: fixture.version,
+            workspace: None,
+            reachability: None,
+            async_context_uses: None,
+            library_type_uses: None,
+        };
+        unit.run_with_semantics(
+            &one_rule(rule),
+            &rustc_hash::FxHashSet::default(),
+            Some(&analysis),
+        )
+    }
+
+    /// The wave posture: the four rules are silent under the plain run
+    /// (the face absent) and report with it mounted.
+    #[test]
+    fn b4_rules_require_the_semantic_face() {
+        let sources = [
+            (
+                "literal_only_boolean_expressions",
+                "void f() {\n  if (1 == 1) {}\n}\n",
+            ),
+            (
+                "noop_primitive_operations",
+                "void f(String x) {\n  x.toString();\n}\n",
+            ),
+            ("unnecessary_statements", "void f() {\n  1 + 2;\n}\n"),
+            ("prefer_int_literals", "double x = 1.0;\n"),
+        ];
+        for (rule, source) in sources {
+            let plain = Fixture::parse(source);
+            assert!(plain.run(&one_rule(rule)).is_empty(), "{rule}");
+            assert_eq!(run_semantic(source, rule).len(), 1, "{rule}");
+        }
+    }
+
+    /// `literal_only_boolean_expressions`: the constant-condition faces —
+    /// `while (true)` passes, a non-constant condition passes, the `do`,
+    /// `for`, and `when` faces report at their anchors.
+    #[test]
+    fn literal_only_condition_faces() {
+        let source = "void f() {\n  if (1 == 1) {}\n}\n";
+        let lints = run_semantic(source, "literal_only_boolean_expressions");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The Boolean expression has a constant value."
+        );
+        // The report anchors at the whole `if` statement.
+        let f = Fixture::parse(source);
+        let start = tok(source, &f.tokens, "if", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, start));
+
+        assert_eq!(
+            run_semantic(
+                "void f() {\n  do {} while (!true);\n}\n",
+                "literal_only_boolean_expressions"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            run_semantic(
+                "void f() {\n  for (;true;) {}\n}\n",
+                "literal_only_boolean_expressions"
+            )
+            .len(),
+            1
+        );
+        // The `when` guard face.
+        assert_eq!(
+            run_semantic(
+                "void f(int x) {\n  switch (x) {\n    case 1 when true:\n      break;\n  }\n}\n",
+                "literal_only_boolean_expressions"
+            )
+            .len(),
+            1
+        );
+
+        for source in [
+            // `while (true)` passes (dart-lang/linter#453).
+            "void f() {\n  while (true) {}\n}\n",
+            // A non-constant condition passes.
+            "void f() {\n  bool b = true;\n  if (b) {}\n}\n",
+            // The `??` face reads the left operand alone — non-literal.
+            "void f(bool? b) {\n  if (b ?? true) {}\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "literal_only_boolean_expressions").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The string constant-value gate (:23): a plain string counts, an
+    /// interpolated one counts only when every interpolation is itself
+    /// literal-only.
+    #[test]
+    fn literal_only_string_gate_faces() {
+        // A plain string literal is a valued constant (`'' == ''` reports).
+        assert_eq!(
+            run_semantic(
+                "void f() {\n  if ('a' == 'b') {}\n}\n",
+                "literal_only_boolean_expressions"
+            )
+            .len(),
+            1
+        );
+        // A non-constant interpolation is not — the condition stays silent.
+        assert!(
+            run_semantic(
+                "void f(String x) {\n  if ('${x}' == 'b') {}\n}\n",
+                "literal_only_boolean_expressions"
+            )
+            .is_empty()
+        );
+        // A literal-only interpolation keeps the constant-valued string.
+        assert_eq!(
+            run_semantic(
+                "void f() {\n  if ('${1}' == 'b') {}\n}\n",
+                "literal_only_boolean_expressions"
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// The `is` and case-clause faces: a resolved type recurses into the
+    /// operand, a type-parameter type keeps the condition silent, and an
+    /// `if` carrying a case clause never reports.
+    #[test]
+    fn literal_only_is_and_case_clause_faces() {
+        // A resolved core type recurses: the literal operand reports.
+        assert_eq!(
+            run_semantic(
+                "void f() {\n  if (1 is int) {}\n}\n",
+                "literal_only_boolean_expressions"
+            )
+            .len(),
+            1
+        );
+        // A type-parameter type bails (:36).
+        assert!(
+            run_semantic(
+                "void f<T>(int x) {\n  if (x is T) {}\n}\n",
+                "literal_only_boolean_expressions"
+            )
+            .is_empty()
+        );
+        // The case-clause skip (:86) — the condition never walks.
+        assert!(
+            run_semantic(
+                "void f(int x) {\n  if (x case 1) {}\n}\n",
+                "literal_only_boolean_expressions"
+            )
+            .is_empty()
+        );
+    }
+
+    /// `noop_primitive_operations`: the typed receiver families report at
+    /// the member name — the `String` face non-nullable, the `int`
+    /// invariants and `double.toDouble()` over nullable receivers too
+    /// (upstream reads no null gate there) — and the resolved chain
+    /// receiver reports.
+    #[test]
+    fn noop_primitive_typed_receiver_faces() {
+        let source = "void f(String x) {\n  x.toString();\n}\n";
+        let lints = run_semantic(source, "noop_primitive_operations");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "The expression has no effect and can be removed."
+        );
+        let f = Fixture::parse(source);
+        let start = tok(source, &f.tokens, "toString", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, start));
+
+        assert_eq!(
+            run_semantic(
+                "void f(int x) {\n  x.toInt();\n  x.round();\n  x.ceil();\n  x.floor();\n  x.truncate();\n}\n",
+                "noop_primitive_operations"
+            )
+            .len(),
+            5
+        );
+        assert_eq!(
+            run_semantic(
+                "void f(double x) {\n  x.toDouble();\n}\n",
+                "noop_primitive_operations"
+            )
+            .len(),
+            1
+        );
+        // The chain receiver resolves through the member walk.
+        assert_eq!(
+            run_semantic(
+                "class C {\n  String get s => '';\n}\nvoid f(C c) {\n  c.s.toString();\n}\n",
+                "noop_primitive_operations"
+            )
+            .len(),
+            1
+        );
+        // A literal receiver decides closed.
+        assert_eq!(
+            run_semantic(
+                "void f() {\n  'a'.toString();\n}\n",
+                "noop_primitive_operations"
+            )
+            .len(),
+            1
+        );
+
+        for source in [
+            // A nullable receiver is meaningful for `toString`.
+            "void f(String? x) {\n  x.toString();\n}\n",
+            // `num` is not `int`.
+            "void f(num x) {\n  x.toInt();\n}\n",
+            // An unresolved receiver stays silent.
+            "void f(dynamic x) {\n  x.toString();\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "noop_primitive_operations").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The `print` descent and the interpolation face report at the inner
+    /// `toString`; a shadowing declaration, a plain argument, and `super`
+    /// stay silent.
+    #[test]
+    fn noop_primitive_descent_faces() {
+        let source = "void f(Object x) {\n  print(x.toString());\n}\n";
+        let lints = run_semantic(source, "noop_primitive_operations");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let f = Fixture::parse(source);
+        let start = tok(source, &f.tokens, "toString", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, start));
+
+        assert_eq!(
+            run_semantic(
+                "void f() {\n  print(null.toString());\n}\n",
+                "noop_primitive_operations"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            run_semantic(
+                "void f() {\n  var s = '${1.toString()}';\n}\n",
+                "noop_primitive_operations"
+            )
+            .len(),
+            1
+        );
+        // A same-file `print` shadows the core function (the binding gate).
+        assert!(
+            run_semantic(
+                "void print(Object? o) {}\nvoid f(Object x) {\n  print(x.toString());\n}\n",
+                "noop_primitive_operations"
+            )
+            .is_empty()
+        );
+
+        for source in [
+            "void f() {\n  print(7);\n}\n",
+            "class C {\n  String m() => super.toString();\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "noop_primitive_operations").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The middle empty literal of an adjacent-strings group reports at
+    /// itself; the ends pass, and a non-empty middle passes.
+    #[test]
+    fn noop_primitive_adjacent_empty_middle_faces() {
+        let source = "void f(String x) {\n  x = 'a' '' 'b';\n}\n";
+        let lints = run_semantic(source, "noop_primitive_operations");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let f = Fixture::parse(source);
+        let start = tok(source, &f.tokens, "''", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, start));
+
+        for source in [
+            "void f(String x) {\n  x = '' 'a' 'b';\n}\n",
+            "void f(String x) {\n  x = 'a' 'b' '';\n}\n",
+            "void f(String x) {\n  x = 'a' 'nonempty' 'b';\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "noop_primitive_operations").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The ratchet pin: the fixture-style source reports the full
+    /// nine-row shape set in one function — the five `int` invariants,
+    /// the non-nullable `String` `toString`, the `double` `toDouble`, the
+    /// adjacent-strings middle `''`, and the `print` descent (the `Object`
+    /// receiver keeps the typed face silent, so only the descent fires).
+    #[test]
+    fn noop_primitive_fixture_shape_set() {
+        let source = concat!(
+            "void f(int x, String s, double d, Object o) {\n",
+            "  var a = x.toInt();\n",
+            "  var b = x.round();\n",
+            "  var c = x.ceil();\n",
+            "  var e = x.floor();\n",
+            "  var g = x.truncate();\n",
+            "  var h = s.toString();\n",
+            "  var i = d.toDouble();\n",
+            "  var j = 'a' '' 'b';\n",
+            "  print(o.toString());\n",
+            "}\n",
+        );
+        let lints = run_semantic(source, "noop_primitive_operations");
+        assert_eq!(lints.len(), 9, "{lints:?}");
+        for lint in &lints {
+            assert_eq!(
+                lint.message,
+                "The expression has no effect and can be removed."
+            );
+        }
+        // The reported spans are the member names, the middle empty
+        // literal, and the descent's inner `toString` — never a statement
+        // head.
+        let f = Fixture::parse(source);
+        let mut expected: Vec<u32> = [
+            ("toInt", 0),
+            ("round", 0),
+            ("ceil", 0),
+            ("floor", 0),
+            ("truncate", 0),
+            ("toString", 0),
+            ("toDouble", 0),
+            ("''", 0),
+            ("toString", 1),
+        ]
+        .into_iter()
+        .map(|(text, nth)| {
+            let start = tok(source, &f.tokens, text, nth);
+            utf16_at(&f, start)
+        })
+        .collect();
+        let mut starts: Vec<u32> = lints.iter().map(|lint| lint.range.start).collect();
+        expected.sort_unstable();
+        starts.sort_unstable();
+        assert_eq!(starts, expected);
+    }
+
+    /// `unnecessary_statements`: the effect-free faces report at the
+    /// expression; the getter exemptions and invocations stay silent; a
+    /// type-parameter name is not a getter and reports.
+    #[test]
+    fn unnecessary_statements_faces() {
+        let source = "void f() {\n  1 + 2;\n}\n";
+        let lints = run_semantic(source, "unnecessary_statements");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Unnecessary statement.");
+        let f = Fixture::parse(source);
+        let start = tok(source, &f.tokens, "1", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, start));
+
+        // A field read through a typed receiver reports.
+        assert_eq!(
+            run_semantic(
+                "class C {\n  int x = 1;\n}\nvoid f(C c) {\n  c.x;\n}\n",
+                "unnecessary_statements"
+            )
+            .len(),
+            1
+        );
+        // A cross-file class field read reports (the semantic member walk).
+        assert_eq!(
+            run_semantic_dep(
+                "void f(K c) {\n  c.x;\n}\n",
+                Some("class K {\n  int x = 1;\n}\n"),
+                "unnecessary_statements"
+            )
+            .len(),
+            1
+        );
+        // A type-parameter name is not a getter — upstream's `visitNode`
+        // verdict.
+        assert_eq!(
+            run_semantic("void f<T>(T x) {\n  T;\n}\n", "unnecessary_statements").len(),
+            1
+        );
+
+        // A statement-level binary reports the whole expression opening at
+        // the operand head — `a.b + y` opens at `a`, never at the `+` tile
+        // anchor the container row opens on.
+        let source = "class C {\n  int b = 1;\n}\nvoid f(C a, int y) {\n  a.b + y;\n}\n";
+        let lints = run_semantic(source, "unnecessary_statements");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let f = Fixture::parse(source);
+        let a = tok(source, &f.tokens, "a", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, a), "start at `a`");
+
+        for source in [
+            "void f() {\n  print(1);\n}\n",
+            // An origin getter read keeps the getter face.
+            "int get g => 1;\nvoid f() {\n  g;\n}\n",
+            // A cross-file getter stays silent (the conservative family).
+            "void f(K k) {\n  k.g;\n}\n",
+            // An assignment has a clear effect.
+            "void f(int x) {\n  x = 1;\n}\n",
+        ] {
+            let lints = match source {
+                "void f(K k) {\n  k.g;\n}\n" => run_semantic_dep(
+                    source,
+                    Some("class K {\n  int get g => 1;\n}\n"),
+                    "unnecessary_statements",
+                ),
+                _ => run_semantic(source, "unnecessary_statements"),
+            };
+            assert!(lints.is_empty(), "{source}: {lints:?}");
+        }
+    }
+
+    /// The cascade face: a bare method section is a tear-off and reports;
+    /// an invocation section and a getter section stay silent.
+    #[test]
+    fn unnecessary_statements_cascade_faces() {
+        assert_eq!(
+            run_semantic(
+                "class C {\n  void m() {}\n}\nvoid f(C c) {\n  c..m;\n}\n",
+                "unnecessary_statements"
+            )
+            .len(),
+            1
+        );
+        for source in [
+            // An invocation section has a clear effect.
+            "class C {\n  void m() {}\n}\nvoid f(C c) {\n  c..m();\n}\n",
+            // A getter section is a value read.
+            "class C {\n  int get g => 1;\n}\nvoid f(C c) {\n  c..g;\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "unnecessary_statements").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// `prefer_int_literals`: the parameter faces — a positional and a
+    /// named argument against a `double` formal report, a member callee
+    /// through the semantic walk, an `int` formal and a generic callee
+    /// stay silent.
+    #[test]
+    fn prefer_int_literals_argument_faces() {
+        assert_eq!(
+            run_semantic(
+                "void g(double d) {}\nvoid f() {\n  g(1.0);\n}\n",
+                "prefer_int_literals"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            run_semantic(
+                "void g({double d = 0}) {}\nvoid f() {\n  g(d: 1.0);\n}\n",
+                "prefer_int_literals"
+            )
+            .len(),
+            1
+        );
+        assert_eq!(
+            run_semantic(
+                "class C {\n  void m(double d) {}\n}\nvoid f(C c) {\n  c.m(1.0);\n}\n",
+                "prefer_int_literals"
+            )
+            .len(),
+            1
+        );
+        // The cross-file member face.
+        assert_eq!(
+            run_semantic_dep(
+                "void f(K k) {\n  k.m(1.0);\n}\n",
+                Some("class K {\n  void m(double d) {}\n}\n"),
+                "prefer_int_literals"
+            )
+            .len(),
+            1
+        );
+        // The negated form rides the same formal face.
+        assert_eq!(
+            run_semantic(
+                "void g(double d) {}\nvoid f() {\n  g(-1.0);\n}\n",
+                "prefer_int_literals"
+            )
+            .len(),
+            1
+        );
+
+        for source in [
+            // An `int` formal is not a double context.
+            "void g(int d) {}\nvoid f() {\n  g(1.0);\n}\n",
+            // A generic callee's parameter is not written `double`.
+            "void g<T>(T x) {}\nvoid f() {\n  g(1.0);\n}\n",
+            // An unresolved callee stays silent.
+            "void f() {\n  unknown(1.0);\n}\n",
+            // A non-integral value never reports.
+            "void g(double d) {}\nvoid f() {\n  g(1.5);\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "prefer_int_literals").is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The lexical faces kept from the inherited wave: the written
+    /// variable type, the return type, the arrow body, and the typed list.
+    #[test]
+    fn prefer_int_literals_lexical_faces() {
+        assert_eq!(
+            run_semantic("double x = 1.0;\n", "prefer_int_literals").len(),
+            1
+        );
+        assert_eq!(
+            run_semantic("double f() {\n  return 1.0;\n}\n", "prefer_int_literals").len(),
+            1
+        );
+        assert_eq!(
+            run_semantic("double f() => 1.0;\n", "prefer_int_literals").len(),
+            1
+        );
+        assert_eq!(
+            run_semantic(
+                "void f() {\n  var x = <double>[1.0];\n}\n",
+                "prefer_int_literals"
+            )
+            .len(),
+            1
+        );
+        assert!(run_semantic("double x = 1.5;\n", "prefer_int_literals").is_empty());
+        // An anonymous boundary has no written return type.
+        assert!(run_semantic("void f() {\n  () => 1.0;\n}\n", "prefer_int_literals").is_empty());
+    }
+
+    /// `avoid_bool_literals_in_conditional_expressions`: the both-arms
+    /// exact non-nullable `bool` gate (:46-47) over the semantic faces —
+    /// the literals answer by their own face, a bare identifier at its
+    /// flow read (promotions included), a bare call through the cross-file
+    /// callee — and one report at the whole conditional when an arm is a
+    /// `bool` literal (the oracle observable: the upstream per-arm pair
+    /// (:48-49) collapses to one identical diagnostic at one span).
+    /// Dynamic, unpromoted `bool?`, inferred-`var`, and resolved
+    /// non-`bool` arms keep the gate silent, the plain run stays silent
+    /// (the wave posture), and an if-statement is not a target (:34).
+    #[test]
+    fn bool_literal_conditional_faces() {
+        // Both literal arms collapse to ONE lint at the whole conditional;
+        // the plain run (the face absent) stays silent.
+        let source = "void f(bool b) {\n  var x = b ? true : false;\n}\n";
+        let plain = Fixture::parse(source);
+        assert!(
+            plain
+                .run(&one_rule("avoid_bool_literals_in_conditional_expressions"))
+                .is_empty()
+        );
+        let lints = run_semantic(source, "avoid_bool_literals_in_conditional_expressions");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Conditional expressions with a 'bool' literal can be simplified."
+        );
+        let f = Fixture::parse(source);
+        // The report opens at the condition's first token — the operand
+        // head `b` (the parameter reference, nth=1), never the row's `?`
+        // delta-tile anchor.
+        let start = tok(source, &f.tokens, "b", 1);
+        assert_eq!(lints[0].range.start, utf16_at(&f, start));
+
+        // The written `bool` parameter answers at the flow read (the
+        // written-type face's green cases).
+        assert_eq!(
+            run_semantic(
+                "void f(bool c, bool d) {\n  var x = c ? d : true;\n}\n",
+                "avoid_bool_literals_in_conditional_expressions"
+            )
+            .len(),
+            1
+        );
+
+        for source in [
+            // A resolved non-`bool` arm fails the gate.
+            "void f(bool c, int i) {\n  var x = c ? i : true;\n}\n",
+            // `dynamic` is not `boolType` (:39-40).
+            "void f(bool c, dynamic d) {\n  var x = c ? d : true;\n}\n",
+            // An unpromoted `bool?` arm is not `bool`.
+            "void f(bool c, bool? b) {\n  var x = c ? b : true;\n}\n",
+            // An inferred-`var` arm carries no decided face — silent.
+            "void f(bool c) {\n  var t = c;\n  var x = c ? t : true;\n}\n",
+            // An if-statement is not a conditional expression (:30).
+            "void f(bool c) {\n  if (c) {\n    var x = true;\n  }\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "avoid_bool_literals_in_conditional_expressions").is_empty(),
+                "{source}"
+            );
+        }
+
+        // The promotion face: a `bool?` promoted inside `if` reads exact
+        // `bool` at the analyzer's `staticType`, which the arm would report
+        // beside the literal. The substrate's truthy-`if` does not promote
+        // the bare `bool?` operand (dartq-flow promotes `!=`/`is`/pattern
+        // tests, not the bare condition read), so the read stays `bool?`
+        // and the gate stays silent — the documented under-report.
+        assert!(
+            run_semantic(
+                "void f(bool? b) {\n  if (b) {\n    var x = b ? b : false;\n  }\n}\n",
+                "avoid_bool_literals_in_conditional_expressions"
+            )
+            .is_empty()
+        );
+
+        // The cross-file callee face: a dep-declared `bool` function
+        // answers an invocation arm — the gate passes with one literal
+        // arm reporting, and with no literal arms at all it stays silent.
+        assert_eq!(
+            run_semantic_dep(
+                "void f(bool c) {\n  var x = c ? g() : false;\n}\n",
+                Some("bool g() => true;\n"),
+                "avoid_bool_literals_in_conditional_expressions"
+            )
+            .len(),
+            1
+        );
+        assert!(
+            run_semantic_dep(
+                "void f(bool c) {\n  var x = c ? g() : h();\n}\n",
+                Some("bool g() => true;\nbool h() => false;\n"),
+                "avoid_bool_literals_in_conditional_expressions"
+            )
+            .is_empty()
+        );
+    }
+
+    /// `unnecessary_lambdas`, the signature gate's report faces
+    /// (`isAssignableTo(invocationType, nodeType)`, :208/:246, read as
+    /// [`dartq_semantic::FnSig::assignable_from`]'s `Some(true)`): a
+    /// zero-parameter forwarding lambda over a bare top-level callee (the
+    /// message and the whole-lambda anchor pinned), a typed
+    /// parameter-forwarding lambda, an expression-statement block body,
+    /// a cross-file top-level callee (the dependency's declaration
+    /// composes), an implicit-`this` method, a `final` typed receiver's
+    /// method, a named-parameter forward, the zero-argument bare
+    /// creation (`test_constructorCall_noArgs`), and a `new` creation
+    /// whose constructor formals compose (:208-223). The plain run stays
+    /// silent (the wave posture).
+    #[test]
+    fn unnecessary_lambdas_signature_gate_faces() {
+        let source = "void g() {}\nvoid main() {\n  var cb = () => g();\n}\n";
+        assert!(
+            Fixture::parse(source)
+                .run(&one_rule("unnecessary_lambdas"))
+                .is_empty(),
+            "the plain run stays silent"
+        );
+        let lints = run_semantic(source, "unnecessary_lambdas");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "Closure should be a tearoff.");
+        let f = Fixture::parse(source);
+        let start = tok(source, &f.tokens, "(", 2);
+        assert_eq!(lints[0].range.start, utf16_at(&f, start));
+
+        for source in [
+            // A typed parameter forwards to a matching formal.
+            "void g(int a) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) => g(a));\n}\n",
+            // The expression-statement block body (:160-167).
+            "void g(int a) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) {\n    g(a);\n  });\n}\n",
+            // The `return` block body (:168-175).
+            "int g(int a) => a;\nvoid f(List<int> xs) {\n  xs.map((int a) {\n    return g(a);\n  });\n}\n",
+            // An implicit-`this` method composes through the member face.
+            "class C {\n  void m(int e) {}\n  void f(List<int> xs) {\n    xs.forEach((int e) => m(e));\n  }\n}\n",
+            // A `final` typed receiver's method (:283-284).
+            "class K {\n  bool has(int e) => true;\n}\nvoid f(List<int> xs) {\n  final K k = K();\n  xs.where((int e) => k.has(e));\n}\n",
+            // A named parameter forwards by name; the nullable target
+            // formal is Right Top for the non-nullable lambda formal.
+            "void g({required int? a}) {}\nvoid f() {\n  var cb = ({required int a}) => g(a: a);\n}\n",
+            // The zero-argument bare creation is provable by construction.
+            "class C {}\nvoid f() {\n  var mk = () => C();\n}\n",
+            // A `new` creation composes the constructor's formals.
+            "class C {\n  C(int a);\n}\nvoid f() {\n  var mk = (int a) => new C(a);\n}\n",
+            // An undeclared unnamed constructor composes the implicit
+            // default's empty table.
+            "class C {}\nvoid f() {\n  var mk = () => new C();\n}\n",
+        ] {
+            let lints = run_semantic(source, "unnecessary_lambdas");
+            assert_eq!(lints.len(), 1, "{source}\n{lints:?}");
+        }
+
+        // The cross-file callee: the dependency's declaration composes.
+        assert_eq!(
+            run_semantic_dep(
+                "void f(List<int> xs) {\n  xs.forEach((int e) => g(e));\n}\n",
+                Some("void g(int e) {}\n"),
+                "unnecessary_lambdas"
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// `unnecessary_lambdas`, the `parametersMatch` fallback's report
+    /// faces (:108-111, "We must assume is valid here"): a callee the
+    /// model resolves to no function type — a local function, an
+    /// unresolved spelling, the untyped-formal forward onto one —
+    /// reports once the arguments-match, finality, type-argument, and
+    /// null-aware gates hold.
+    #[test]
+    fn unnecessary_lambdas_fallback_faces() {
+        for source in [
+            // A local function composes no model signature.
+            "void f(List<int> xs) {\n  void local(int a) {}\n  xs.forEach((int a) => local(a));\n}\n",
+            // An unresolved callee.
+            "void f(List<int> xs) {\n  xs.forEach((int a) => missing(a));\n}\n",
+            // The gate row itself: an untyped formal forwarding to an
+            // unresolved core spelling.
+            "void f(List<int> xs) {\n  xs.forEach((e) => print(e));\n}\n",
+        ] {
+            let lints = run_semantic(source, "unnecessary_lambdas");
+            assert_eq!(lints.len(), 1, "{source}\n{lints:?}");
+            assert_eq!(lints[0].message, "Closure should be a tearoff.");
+        }
+    }
+
+    /// `unnecessary_lambdas`, the silences. The structural bails (an
+    /// `async` body :156, several statements :160, an argument that is
+    /// not the lambda's own parameter :232-239 — arithmetic, a capturing
+    /// closure, a foreign name — explicit type arguments :285, a
+    /// null-aware chain :282, a non-`final` or parameter receiver
+    /// :283/:70-76); the `Some(false)` faces (a nullable lambda formal
+    /// against a non-nullable target formal, a required target formal
+    /// the lambda lacks, a constructor with a required formal the lambda
+    /// lacks); and the `None` faces (an untyped lambda formal, a generic
+    /// callee, distinct named types, a written `dynamic` formal, a
+    /// parameterized formal, a bare creation with arguments). The local
+    /// function and the unresolved callee moved to the fallback arm's
+    /// report faces (`unnecessary_lambdas_fallback_faces`).
+    #[test]
+    fn unnecessary_lambdas_silent_faces() {
+        for source in [
+            // The async body keyword bails.
+            "void g(int a) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) async => g(a));\n}\n",
+            // Two statements bail.
+            "void g(int a) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) {\n    g(a);\n    g(a);\n  });\n}\n",
+            // Parameter arithmetic is not a forward.
+            "void g(int a) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) => g(a + 1));\n}\n",
+            // A capturing closure argument is not a forward.
+            "bool g(bool Function(int) t) => true;\nvoid f(List<int> xs) {\n  xs.where((int a) => g((int b) => b == a));\n}\n",
+            // A foreign name is not the lambda's own parameter.
+            "void g(int a) {}\nvoid f(List<int> xs, int a) {\n  xs.forEach((int e) => g(a));\n}\n",
+            // Explicit type arguments bail.
+            "void g<T>(T a) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) => g<int>(a));\n}\n",
+            // A null-aware chain bails.
+            "class K {\n  void touch(int e) {}\n}\nvoid f(List<int> xs) {\n  final K? k = null;\n  xs.forEach((int e) => k?.touch(e));\n}\n",
+            // A mutable typed receiver is not final.
+            "class K {\n  bool has(int e) => true;\n}\nvoid f(List<int> xs) {\n  K k = K();\n  xs.where((int e) => k.has(e));\n}\n",
+            // The lambda's own parameter as receiver.
+            "class K {\n  bool has(K e) => true;\n}\nvoid f(List<K> xs) {\n  xs.where((K e) => e.has(e));\n}\n",
+            // `late final` demotes the verdict.
+            "class K {\n  bool has(int e) => true;\n}\nvoid f(List<int> xs) {\n  late final K k;\n  xs.where((int e) => k.has(e));\n}\n",
+            // `Some(false)`: a nullable lambda formal cannot stand at a
+            // non-nullable target formal.
+            "void g(int a) {}\nvoid f(List<int?> xs) {\n  xs.forEach((int? a) => g(a));\n}\n",
+            // `Some(false)`: a required target formal the lambda lacks.
+            "void g(int a, int b) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) => g(a));\n}\n",
+            // `Some(false)`: a constructor formal the lambda lacks.
+            "class C {\n  C(int a);\n}\nvoid f() {\n  var mk = () => new C();\n}\n",
+            // `None`: an untyped lambda formal is inferred upstream.
+            "void g(int a) {}\nvoid f(List<int> xs) {\n  xs.forEach((a) => g(a));\n}\n",
+            // `None`: a generic callee.
+            "void g<T>(T a) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) => g(a));\n}\n",
+            // `None`: distinct named types are undecided at M1.
+            "void g(num a) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) => g(a));\n}\n",
+            // `None`: a written `dynamic` formal.
+            "void g(int a) {}\nvoid f(List<int> xs) {\n  xs.forEach((dynamic a) => g(a));\n}\n",
+            // `None`: a parameterized written formal.
+            "void g(List<int> a) {}\nvoid f(List<List<int>> xs) {\n  xs.forEach((List<int> a) => g(a));\n}\n",
+            // `None`: a bare creation with arguments carries no type-use
+            // row (only the zero-argument shape is provable).
+            "class C {\n  C(int a);\n}\nvoid f() {\n  var mk = (int a) => C(a);\n}\n",
+        ] {
+            assert!(
+                run_semantic(source, "unnecessary_lambdas").is_empty(),
+                "{source}"
+            );
+        }
     }
 }

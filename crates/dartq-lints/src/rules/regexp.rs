@@ -27,7 +27,9 @@
 //!   `{n,m}` with `n > m` throws in both modes (so does the literal-brace
 //!   reading of it, e.g. the non-unicode `\u{2,1}`), quantified lookbehinds
 //!   throw in both modes, quantified anchors/lookaheads throw only in
-//!   unicode mode, duplicate named groups are accepted.
+//!   unicode mode, duplicate named groups are accepted, and a numeric `\N`
+//!   escape is a backreference iff `N` does not exceed the pattern's total
+//!   capturing-group count (forward references parse).
 
 use dartq_ast::NodeKind;
 
@@ -277,7 +279,12 @@ fn hex_value(chars: &[char], from: usize, width: usize) -> u32 {
 
 /// Whether `source` parses as a regex under the `unicode` flag's strictness.
 fn is_valid(source: &str, unicode: bool) -> bool {
-    Scan::new(source, unicode).disjunction(false)
+    let mut scan = Scan::new(source, unicode);
+    // A recorded `\N` is a backreference iff `N` does not exceed the
+    // pattern's total capture count; the verdict waits for the walk because
+    // forward references are legal (regexp-parser.cc
+    // ParseBackReferenceIndex).
+    scan.disjunction(false) && scan.backrefs.iter().all(|&n| n <= scan.groups)
 }
 
 /// One escape's class face: a single character (usable as a class-range
@@ -304,9 +311,13 @@ struct Scan {
     s: Vec<char>,
     pos: usize,
     unicode: bool,
-    /// Capturing groups by open order; `true` once closed (the backreference
-    /// validity test, unicode mode).
-    groups: Vec<bool>,
+    /// Capturing groups opened so far; never popped, so at walk end this is
+    /// the pattern's total capture count — the `\N` validity bound in
+    /// unicode mode.
+    groups: usize,
+    /// Numeric `\N` backreference values in walk order; each is checked
+    /// against the final [`Self::groups`] total after the walk.
+    backrefs: Vec<usize>,
     /// Names of closed named capturing groups.
     named: Vec<String>,
 }
@@ -317,7 +328,8 @@ impl Scan {
             s: source.chars().collect(),
             pos: 0,
             unicode,
-            groups: Vec::new(),
+            groups: 0,
+            backrefs: Vec::new(),
             named: Vec::new(),
         }
     }
@@ -527,9 +539,8 @@ impl Scan {
                     }
                     let name: String = self.s[start..self.pos].iter().collect();
                     self.pos += 1; // `>`
-                    self.groups.push(false);
+                    self.groups += 1;
                     self.group_body()?;
-                    *self.groups.last_mut().expect("just pushed") = true;
                     self.named.push(name);
                     Some(Atom::Term)
                 }
@@ -537,9 +548,8 @@ impl Scan {
                 _ => None,
             };
         }
-        self.groups.push(false);
+        self.groups += 1;
         self.group_body()?;
-        *self.groups.last_mut().expect("just pushed") = true;
         Some(Atom::Term)
     }
 
@@ -731,11 +741,17 @@ impl Scan {
                 }
                 let mut group = u64::from(self.s[self.pos - 1].to_digit(10)?);
                 while let Some(digit) = self.peek().and_then(|ch| ch.to_digit(10)) {
-                    group = group * 10 + u64::from(digit);
+                    group = group.saturating_mul(10).saturating_add(u64::from(digit));
                     self.pos += 1;
                 }
+                // A numeric escape is a backreference iff `N` does not exceed
+                // the pattern's TOTAL capture count (regexp-parser.cc
+                // ParseBackReferenceIndex): forward references and references
+                // into still-open groups are legal, so the verdict waits for
+                // the end of the walk (`is_valid`).
                 let group = usize::try_from(group).ok()?;
-                (group >= 1 && self.groups.get(group - 1) == Some(&true)).then_some(Escape::Char(0))
+                self.backrefs.push(group);
+                Some(Escape::Char(0))
             }
             'd' | 'D' | 's' | 'S' | 'w' | 'W' => Some(Escape::Set),
             'p' | 'P' => {
@@ -852,6 +868,7 @@ impl Scan {
 #[cfg(test)]
 mod tests {
     use super::is_valid;
+    use crate::engine::narrow_u32;
 
     #[test]
     fn valid_and_invalid_shapes() {
@@ -901,11 +918,27 @@ mod tests {
         assert!(is_valid(r"(?<a>x)\k<a>", true));
         assert!(!is_valid(r"\k<a>(?<a>x)", true));
         assert!(is_valid(r"\1(a)", false));
-        assert!(!is_valid(r"\1(a)", true));
+        // `\1` is a backreference iff 1 <= the TOTAL capture count, so the
+        // forward reference parses in unicode mode (regexp-parser.cc
+        // ParseBackReferenceIndex).
+        assert!(is_valid(r"\1(a)", true));
         assert!(is_valid(r"(a)\1", true));
         // Surrogate halves are valid `\uHHHH` in both modes.
         assert!(is_valid(r"\uD800", false));
         assert!(is_valid(r"\uD800", true));
+    }
+
+    #[test]
+    fn unicode_backreferences_bound_by_total_captures() {
+        // The VM parser accepts `\N` iff `N` does not exceed the pattern's
+        // TOTAL capturing-group count (regexp-parser.cc
+        // ParseBackReferenceIndex); only `N` beyond the total hits the
+        // unicode-mode `kInvalidEscape` throw.
+        assert!(is_valid(r"(a\1)", true)); // its own group is still open
+        assert!(is_valid(r"((a))\1", true)); // nested captures, outer referenced
+        assert!(is_valid(r"(?<a>(?<b>c))\1", true)); // nested named captures
+        assert!(!is_valid(r"\2(a)", true)); // `N` exceeds the total
+        assert!(!is_valid(r"(a)\2", true));
     }
 
     #[test]
@@ -927,7 +960,7 @@ mod tests {
     }
 
     // —— the rule against hand-built trees —————————————————————————————————
-    // The rule reads the sibling-leaf call shape (collapse map §3.5: the
+    // The rule reads the sibling-leaf call shape (the
     // `Send` leaf completes after its callee and `Arguments`) and the
     // `NewExpression` child shape. Fixtures mount the creation under an
     // `ExpressionStatement`.
@@ -952,7 +985,7 @@ mod tests {
             b.end(NodeKind::Arguments, 7);
             b.leaf_span(NodeKind::Send, 3, 7);
             b.end(NodeKind::ExpressionStatement, 8);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         })
     }
 
@@ -993,7 +1026,7 @@ mod tests {
             b.end(NodeKind::Arguments, 10);
             b.leaf_span(NodeKind::Send, 3, 10);
             b.end(NodeKind::ExpressionStatement, 11);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         });
         assert!(rule_hits(&f).is_empty());
     }
@@ -1011,7 +1044,7 @@ mod tests {
             b.end(NodeKind::Arguments, 7);
             b.leaf_span(NodeKind::Send, 3, 7);
             b.end(NodeKind::ExpressionStatement, 8);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         });
         assert!(rule_hits(&f).is_empty());
     }
@@ -1032,7 +1065,7 @@ mod tests {
             identifier(b, 3, 4);
             b.leaf_span(NodeKind::Send, 3, 4);
             b.end(NodeKind::ExpressionStatement, 5);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         });
         assert!(rule_hits(&f).is_empty());
     }
@@ -1056,7 +1089,7 @@ mod tests {
             b.end(NodeKind::Arguments, 8);
             b.end(NodeKind::NewExpression, 8);
             b.end(NodeKind::ExpressionStatement, 9);
-            b.end(NodeKind::CompilationUnit, t.len() as u32);
+            b.end(NodeKind::CompilationUnit, narrow_u32(t.len()));
         });
         let lints = rule_hits(&f);
         assert_eq!(lints.len(), 1);

@@ -10,12 +10,14 @@
 //! listed in the crate docs with their blocker.
 
 pub(crate) mod collections;
+pub(crate) mod const_ability;
 pub(crate) mod declarations;
 pub(crate) mod directives;
 pub(crate) mod docs;
 pub(crate) mod empty;
 pub(crate) mod expressions;
 pub(crate) mod flow;
+pub(crate) mod flutter;
 pub(crate) mod names;
 pub(crate) mod pubspec;
 pub(crate) mod regexp;
@@ -105,6 +107,7 @@ pub(crate) fn is_statement_row(c: &Check<'_>, row: u32) -> bool {
             | NodeKind::PatternVarDeclStatement
             | NodeKind::InvalidStatement
             | NodeKind::VariablesDeclaration
+            | NodeKind::LocalFunctionDeclaration
     )
 }
 
@@ -134,7 +137,7 @@ pub(crate) fn body_members(c: &Check<'_>, ancestor: u32) -> Vec<u32> {
 }
 
 /// The written name of a class-like declaration row: the production
-/// wrapper (collapse map §3.2 #1-5) keeps the name `Identifier` as the
+/// wrapper keeps the name `Identifier` as the
 /// row's left sibling; hand-built trees nest it inside the row.
 pub(crate) fn class_declaration_name<'a>(c: &'a Check<'_>, class_row: u32) -> Option<&'a str> {
     let is_class_name = |kid: u32| {
@@ -166,14 +169,54 @@ pub(crate) fn class_declaration_name<'a>(c: &'a Check<'_>, class_row: u32) -> Op
     Some(c.lexeme(c.head_token(name)))
 }
 
-/// The name-bearing direct child (Identifier or `OperatorName`) of a member
-/// declaration node — operators name through [`NodeKind::OperatorName`],
-/// everything else through an `Identifier` (collapse map §3.3/§3.5).
+/// The name-bearing row of a `Method`/`TopLevelMethod` declaration — the
+/// direct `Identifier` child stamped `MethodDeclaration`/
+/// `TopLevelFunctionDeclaration` by the bridge's `handle_identifier`, or the
+/// `OperatorName` of an operator (a direct child on hand-built tables, the
+/// member's immediate left sibling on production parses).
+///
+/// `Method`/`TopLevelMethod`-only semantics: the production tiling places a
+/// written return type's `Identifier` (a `TypeReference` leaf) INSIDE the
+/// member window BEFORE the name row, so an unfiltered first-`Identifier`
+/// read answers the type (`int f()` reads `int`). Local/named functions,
+/// `InitializedIdentifier` rows, and `FunctionName` wrappers are out of
+/// contract — those read through
+/// [`declarations::member_declaration_name`], which adds the
+/// `LocalFunctionDeclaration` stamp and the `FunctionName` sub-row arm.
 pub(crate) fn member_name(c: &Check<'_>, parent: u32) -> Option<u32> {
+    if !matches!(c.kind(parent), NodeKind::Method | NodeKind::TopLevelMethod) {
+        return None;
+    }
     c.direct_children(parent)
         .iter()
         .copied()
-        .find(|&child| matches!(c.kind(child), NodeKind::Identifier | NodeKind::OperatorName))
+        .find(|&child| match c.kind(child) {
+            NodeKind::Identifier => matches!(
+                c.payload(child).first().copied(),
+                Some(ctx)
+                    if ctx == dartq_parser::IdentifierContext::MethodDeclaration as u32
+                        || ctx == dartq_parser::IdentifierContext::TopLevelFunctionDeclaration
+                            as u32
+                        // Hand-built test tables stamp every identifier with
+                        // the generic `Expression` word (`testsupport::
+                        // identifier`); a `TypeReference` leaf is the only
+                        // non-name `Identifier` a production member window
+                        // carries, so the generic word stays a name read.
+                        || ctx == dartq_parser::IdentifierContext::Expression as u32
+            ),
+            NodeKind::OperatorName => true,
+            _ => false,
+        })
+        .or_else(|| {
+            // Production parses tile the `OperatorName` as the member's
+            // immediate left sibling inside the body wrapper, not as a
+            // child (declarations.rs `adjacent_operator_name`).
+            let owner = c.unit.ast.parent(parent)?;
+            let siblings = c.collect_direct(owner);
+            let pos = siblings.iter().position(|&kid| kid == parent)?;
+            let prev = siblings.get(pos.checked_sub(1)?)?;
+            (c.kind(*prev) == NodeKind::OperatorName).then_some(*prev)
+        })
 }
 
 /// The name token of an [`NodeKind::InitializedIdentifier`] row: the
@@ -227,7 +270,7 @@ pub(crate) fn variables_declaration_keyword(c: &Check<'_>, row: u32) -> Option<u
 
 /// The type node directly before the name among the declaration's direct
 /// children (`Type` when a return type/variable type is written, `NoType`
-/// when the grammar allows its absence — collapse map §3.3/§3.8). `name`'s
+/// when the grammar allows its absence). `name`'s
 /// subtree ends at the previous direct sibling, so the sibling is O(1) to
 /// read. `None` when the name is the first child (nothing recovered).
 pub(crate) fn type_before(c: &Check<'_>, parent: u32, name: u32) -> Option<(u32, NodeKind)> {
@@ -452,8 +495,8 @@ pub(crate) fn in_const_context(c: &Check<'_>) -> bool {
 
 /// The explicit `const` keyword of a const-carrying expression node, or
 /// `None`. Const expressions/carry literals keep the keyword as a payload
-/// word (collapse map §3.5 `LiteralListHandle`/`RecordLiteralEnd`/
-/// `LiteralSetOrMapHandle`/`ConstExpressionEnd` rows); the keyword-less forms
+/// word (`LiteralListHandle`/`RecordLiteralEnd`/
+/// `LiteralSetOrMapHandle`/`ConstExpressionEnd` payloads); the keyword-less forms
 /// are transparent.
 pub(crate) fn const_keyword(c: &Check<'_>, node: u32) -> Option<u32> {
     match c.kind(node) {
@@ -469,9 +512,37 @@ pub(crate) fn const_keyword(c: &Check<'_>, node: u32) -> Option<u32> {
 }
 
 /// Whether `node`'s span head lexeme is the `const` keyword (the head-when-
-/// present eliminations of collapse map §1).
+/// present eliminations of derivable words).
 fn head_is_const(c: &Check<'_>, node: u32) -> bool {
-    c.lexeme(c.head_token(node)) == "const"
+    if c.kind(node) != NodeKind::VariablesDeclaration {
+        // A constant pattern anchors at the keyword itself.
+        return c.lexeme(c.head_token(node)) == "const";
+    }
+    // The declaration row anchors at the declared name and the keyword
+    // token rides no row: the modifier run (keywords plus the written
+    // type's identifiers/punctuation) sits before the anchor, bounded by
+    // the previous statement's terminator.
+    let mut token = c.unit.ast.token_range(node).start;
+    loop {
+        let Some(prev) = token.checked_sub(1) else {
+            break;
+        };
+        match c.lexeme(prev) {
+            "const" | "final" | "var" | "late" | "?" | "<" | ">" => token = prev,
+            other if is_identifier_lexeme_mod(other) => token = prev,
+            _ => break,
+        }
+    }
+    c.lexeme(token) == "const"
+}
+
+/// The identifier-shaped lexeme the modifier walk crosses (a written type
+/// part).
+fn is_identifier_lexeme_mod(lexeme: &str) -> bool {
+    lexeme
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_' || *b == b'$')
 }
 
 /// The last token of `id`'s span (the span's `end` is exclusive).
@@ -479,30 +550,31 @@ pub(crate) fn tail_token(c: &Check<'_>, id: u32) -> u32 {
     c.unit.ast.token_range(id).end - 1
 }
 
-/// The byte span of one token.
+/// The byte span of one token. A miss on the shared token helper degrades
+/// to the zero-width span at the table tail — the caller's span arithmetic
+/// stays sound and the report it feeds collapses to a skipped hit.
 pub(crate) fn byte_span_of_token(c: &Check<'_>, token: u32) -> core::ops::Range<usize> {
-    let t = c
-        .unit
-        .tokens
-        .get(token as usize)
-        .expect("token outside the table");
-    t.byte_offset as usize..(t.byte_offset + t.byte_len) as usize
+    match c.token(token) {
+        Some(t) => t.byte_offset as usize..(t.byte_offset + t.byte_len) as usize,
+        None => {
+            let end = c.unit.tokens.last().byte_offset as usize;
+            end..end
+        }
+    }
 }
 
-/// The UTF-16 span of one token — the `reportAtToken` face.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "utf16 lengths fit u32 by the SourceRange convention"
-)]
+/// The UTF-16 span of one token — the `reportAtToken` face. A miss on the
+/// shared token helper degrades to a zero-width span at the unit's UTF-16
+/// tail (the report the range feeds is inert either way: the helper miss
+/// already debug-asserted, and a zero-width anchor past every real token is
+/// not a Dart construct a rule reports).
 pub(crate) fn utf16_token_span(c: &Check<'_>, token: u32) -> core::ops::Range<u32> {
-    let start = c
-        .unit
-        .tokens
-        .get(token as usize)
-        .expect("token outside the table")
-        .utf16_offset;
-    let len = c.lexeme(token).encode_utf16().count() as u32;
-    start..start + len
+    let Some(start) = c.utf16_of_token(token) else {
+        let end = c.unit.tokens.last().utf16_offset;
+        return end..end;
+    };
+    let end = c.utf16_end_of_token(token).unwrap_or(start);
+    start..end
 }
 
 /// Whether the node carries a documentation comment (`node.documentationComment
@@ -519,7 +591,7 @@ pub(crate) fn has_doc_comment(c: &Check<'_>, node: u32) -> bool {
 
 /// The `get`/`set` keyword token of a member declaration, by lexeme.
 /// `Method` payload word 1 and `TopLevelMethod` payload word 0 are the
-/// `get_set` option (collapse map §3.3).
+/// `get_set` option.
 pub(crate) fn get_set_token<'a>(c: &'a Check<'_>, node: u32) -> Option<&'a str> {
     let word = match c.kind(node) {
         NodeKind::Method => 1,
@@ -749,16 +821,6 @@ pub(crate) fn same_file_ancestors(c: &Check<'_>, class_row: u32, concrete: bool)
 /// children name the annotations (declarations.rs `has_annotations` idiom).
 pub(crate) fn has_override_annotation(c: &Check<'_>, body: u32, member: u32) -> bool {
     has_annotation_named(c, body, member, "override")
-}
-
-/// Whether the member row carries any annotation other than `override`
-/// (the `_addsMetadata` guard of `unnecessary_overrides`, :117-131).
-pub(crate) fn has_any_annotation(c: &Check<'_>, body: u32, member: u32) -> bool {
-    member_annotations(c, body, member).iter().any(|&meta| {
-        c.collect_direct(meta).into_iter().any(|piece| {
-            c.kind(piece) == NodeKind::Identifier && c.lexeme(c.head_token(piece)) != "override"
-        })
-    })
 }
 
 /// The `Metadata` rows of one member: the `MetadataStar` left sibling's
