@@ -35,8 +35,8 @@ pub enum DiscoverError {
 /// parse as Dart and emit phantom diagnostics. A directory argument is
 /// walked recursively with the oracle's only built-in exclusion — the
 /// dot-basename rule, checked on every child path, directories and files
-/// alike (context_root.dart:116 + 146-149). `build`/`node_modules` are
-/// analysis_options concerns (excluded globs), not walk-level ones.
+/// alike (`context_root.dart:116` + 146-149). `build`/`node_modules` are
+/// `analysis_options` concerns (excluded globs), not walk-level ones.
 ///
 /// Symlinked directories are never descended into (cycle safety). This is a
 /// deliberate subset of the oracle's walk, which descends symlinked

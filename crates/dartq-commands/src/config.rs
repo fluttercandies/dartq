@@ -1,18 +1,18 @@
-//! The `dartq.yaml` workspace config (PRD §15.9) and the compat face's
+//! The `dartq.yaml` workspace config and the compat face's
 //! axis-root resolution.
 //!
 //! The config is all-optional: an absent file is [`load`]'s `Ok(None)` and
 //! every downstream behavior stays byte-identical to the zero-config
 //! default (the single `$DART_SDK` axis, default policies). The typed
-//! model carries the §15.9 fields — named SDK contexts, the generated-file
-//! policy (§18.2), and the memory/cache defaults (§17) — parsed here for
-//! the faces that consume them; compat (§15.5) consumes the contexts as
+//! model carries the fields — named SDK contexts, the generated-file
+//! policy, and the memory/cache defaults — parsed here for
+//! the faces that consume them; compat consumes the contexts as
 //! matrix axes through [`compat_axis_roots`], the shared resolution edge
 //! (explicit roots + context labels → one deduplicated root list) both
 //! shells call before handing *explicit* roots to the core.
 //!
 //! Context declaration order is file order (a YAML mapping walked in
-//! document order, never sorted), and locator forms (§15.9) are
+//! document order, never sorted), and locator forms are
 //! `fvm:<version>`, `path:<dir>`, and `system`. An unsupported form is a
 //! structured [`ConfigError::Invalid`], never a silent skip; a
 //! resolvable-but-missing root (an uninstalled FVM version, a dangling
@@ -41,22 +41,22 @@ pub enum ConfigError {
     Io(#[from] io::Error),
 }
 
-/// The parsed `dartq.yaml` (PRD §15.9). Every section is optional and
+/// The parsed `dartq.yaml`. Every section is optional and
 /// unknown keys are ignored — a reader that survives forward-compatible
 /// config, matching the pub-tooling convention.
 #[derive(Debug, Clone, Default)]
 pub struct DartqConfig {
     /// The declared SDK contexts, in file order.
     pub contexts: Vec<ContextConfig>,
-    /// The §18.2 generated-file policy.
+    /// The generated-file policy.
     pub generated: Option<GeneratedPolicy>,
-    /// The §17.1 memory defaults.
+    /// The memory defaults.
     pub memory: Option<MemoryDefaults>,
-    /// The §17.2 cache defaults.
+    /// The cache defaults.
     pub cache: Option<CacheDefaults>,
 }
 
-/// One named SDK context (a §15.5 `--context` label).
+/// One named SDK context.
 #[derive(Debug, Clone)]
 pub struct ContextConfig {
     /// The label `--context` selects by.
@@ -70,11 +70,11 @@ pub struct ContextConfig {
     pub define: BTreeMap<String, String>,
 }
 
-/// The context's target platform (§15.9).
+/// The context's target platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContextTarget {
-    /// Native I/O target (the PRD default).
+    /// Native I/O target.
     Io,
     /// The web target.
     Web,
@@ -82,7 +82,7 @@ pub enum ContextTarget {
     Wasm,
 }
 
-/// The §18.2 generated-file policy. Absent keys stay `None` — consumers
+/// The generated-file policy. Absent keys stay `None` — consumers
 /// apply their own defaults; this type invents none.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GeneratedPolicy {
@@ -94,21 +94,21 @@ pub struct GeneratedPolicy {
     pub patterns: Option<Vec<String>>,
 }
 
-/// The §17.1 memory defaults.
+/// The memory defaults.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct MemoryDefaults {
     /// The memory budget in MiB.
     pub limit_mib: u64,
 }
 
-/// The §17.2 cache defaults.
+/// The cache defaults.
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct CacheDefaults {
     /// The on-disk cache size limit in GiB.
     pub size_limit_gib: u64,
 }
 
-/// Loads `dir/dartq.yaml` — the workspace root's config. (§15.9's full
+/// Loads `dir/dartq.yaml` — the workspace root's config. (the full
 /// lookup order — explicit `--config`, per-pub-project roots — lands with
 /// its consumers; the root file is this round's contract.) `Ok(None)` is
 /// the absent file: every consumer keeps its zero-config behavior,
@@ -127,7 +127,7 @@ pub fn load(dir: &Path) -> Result<Option<DartqConfig>, ConfigError> {
     parse(&text).map(Some)
 }
 
-/// The compat face's axis roots for one invocation (§15.5): the explicit
+/// The compat face's axis roots for one invocation: the explicit
 /// `--sdk-root` roots in CLI order, then the selected contexts' resolved
 /// locators in file order, deduplicated by root. `contexts` non-empty
 /// picks those labels (every label must be declared — an unknown one is a
@@ -193,7 +193,7 @@ pub fn compat_axis_roots(
     Ok(axes)
 }
 
-/// Resolves one context's SDK locator (§15.9) to a root directory. A
+/// Resolves one context's SDK locator to a root directory. A
 /// missing FVM version resolves to its canonical cache path so the axis
 /// loader — not this function — reports it as an unavailable SDK.
 ///
@@ -201,7 +201,11 @@ pub fn compat_axis_roots(
 ///
 /// [`ConfigError::Invalid`] for an unsupported locator form, an empty
 /// version/dir, `system` without `$DART_SDK`, or no HOME for `fvm:`.
-fn resolve_locator(label: &str, locator: &str, config_dir: &Path) -> Result<PathBuf, ConfigError> {
+pub fn resolve_locator(
+    label: &str,
+    locator: &str,
+    config_dir: &Path,
+) -> Result<PathBuf, ConfigError> {
     if locator == "system" {
         return match std::env::var_os("DART_SDK") {
             Some(root) if !root.is_empty() => Ok(PathBuf::from(root)),
@@ -399,7 +403,8 @@ mod tests {
         let axes = compat_axis_roots(&root, &[], &[]).expect("axes");
         assert_eq!(axes, vec![root.join("sdks/new"), root.join("sdks/old")]);
 
-        let report = crate::compat::compat(&root, &root.join("lib/a.dart"), &axes).expect("run");
+        let (report, _) =
+            crate::compat::compat(&root, &root.join("lib/a.dart"), &axes).expect("run");
         assert_eq!(report.matrix.len(), 2);
         assert_eq!(report.matrix[0].sdk, "3.13.1");
         assert!(report.matrix[0].compatible);
@@ -422,14 +427,18 @@ mod tests {
 
         let target = root.join("lib/a.dart");
         let roots = vec![root.join("sdks/old"), root.join("sdks/new")];
-        let without = crate::compat::compat(&root, &target, &roots).expect("run");
+        let without = crate::compat::compat(&root, &target, &roots)
+            .expect("run")
+            .0;
         let without = serde_json::to_string(&without).expect("json");
 
         write_config(
             &root,
             "version: 1\ngenerated:\n  include: false\n  patterns: [\"*.g.dart\"]\nmemory:\n  limit_mib: 2048\ncache:\n  size_limit_gib: 10\n",
         );
-        let with = crate::compat::compat(&root, &target, &roots).expect("run");
+        let with = crate::compat::compat(&root, &target, &roots)
+            .expect("run")
+            .0;
         assert_eq!(
             serde_json::to_string(&with).expect("json"),
             without,

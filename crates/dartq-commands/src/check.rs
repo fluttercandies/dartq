@@ -1,4 +1,4 @@
-//! The check face's core: the M0 pipeline (engine-api-spec §2.1) over a
+//! The check face's core: the M0 pipeline over a
 //! discovered file set — bytes → scan → `@dart` override rescan → parse —
 //! plus the URI-layer existence face for relative directive targets:
 //! `uri_does_not_exist` / `uri_has_not_been_generated` where a sibling the
@@ -7,8 +7,8 @@
 //! oracle-exact writers render, it stops there by design: no
 //! pub/package/SDK/engine involvement (scheme-carrying URIs — `dart:`,
 //! `package:` — need the package/SDK universe and stay the engine view's
-//! business; PRD §15.1's CLI/RPC equivalence is pinned by both faces
-//! sharing this implementation).
+//! business). The CLI/RPC equivalence is pinned by both faces sharing
+//! this implementation.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -17,12 +17,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use crate::layout::{path_key, severity_rank};
 use dartq_diagnostics::{
     AnalysisOutput, CodeInfo, CodeRegistry, Diagnostic, FileId, FileLayoutProvider, Severity,
     SourceRange, write_machine,
 };
 use dartq_language::{
-    DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion, triple_shift_enabled,
+    DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion,
+    MIN_LANGUAGE_VERSION_CONSTRAINT, triple_shift_enabled,
 };
 use dartq_parser::{
     ExperimentalFlag, Message, Parser, ParserFeatures, ParserListener, TokenSpan,
@@ -30,12 +32,14 @@ use dartq_parser::{
 };
 use dartq_resolution::{ResolutionCode, parse_directive_uri};
 use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, ScanResult, TokenKind, TokenTable, scan};
-use dartq_source::{FileTable, LineIndex, normalize_lexical, utf16_len_of};
+use dartq_source::{
+    FileTable, LineIndex, MAX_SOURCE_BYTES, OpenError, normalize_lexical, utf16_len_of,
+};
 
 /// One check run's result: the per-file layout state behind the writers and
-/// the canonical-order diagnostic set (file discovery order, then source
-/// position, then code/message — the engine-spec §1.3 canonical-sort
-/// granularity M0 has).
+/// the oracle-order diagnostic set (severity, then path bytes, then source
+/// position, then message — the upstream `DiagnosticWithPath.compareTo`
+/// granularity).
 pub struct CheckRun {
     files: FileSet,
     diagnostics: Vec<Diagnostic>,
@@ -112,10 +116,11 @@ pub fn write_machine_verbosity(
     output: &AnalysisOutput<'_>,
     verbosity: DiagnosticVerbosity,
 ) -> io::Result<()> {
+    use std::fmt::Write as _;
+
     if verbosity == DiagnosticVerbosity::Default {
         return write_machine(out, output);
     }
-    use std::fmt::Write as _;
 
     let mut field = String::new();
     for d in output.diagnostics {
@@ -135,22 +140,19 @@ pub fn write_machine_verbosity(
         );
         // Infallible: `String`'s `fmt::Write` never fails.
         let _ = write!(field, "|{line}|{column}|{}", d.range.length);
-        match verbosity {
-            DiagnosticVerbosity::Concise => {}
-            // `Default` returned above, so this arm is `Verbose`: the
+        if verbosity != DiagnosticVerbosity::Concise {
+            // `Default` returned above, so this branch is `Verbose`: the
             // message rides as the eighth field — the oracle writer's
             // rendering verbatim — and the correctionMessage follows as
             // the ninth, `-` when absent (the query face's
             // absent-container posture), both escaped like every other
             // free-text field.
-            _ => {
-                field.push('|');
-                escape_machine_field(&d.message, &mut field);
-                field.push('|');
-                match d.correction.as_deref() {
-                    Some(correction) => escape_machine_field(correction, &mut field),
-                    None => field.push('-'),
-                }
+            field.push('|');
+            escape_machine_field(&d.message, &mut field);
+            field.push('|');
+            match d.correction.as_deref() {
+                Some(correction) => escape_machine_field(correction, &mut field),
+                None => field.push('-'),
             }
         }
         field.push('\n');
@@ -180,6 +182,19 @@ fn escape_machine_field(text: &str, out: &mut String) {
     out.push_str(&text[copied..]);
 }
 
+/// The canonical file's parent directory — relative directive targets
+/// compose against it. `Path::parent` is `None` only for a root, and a root
+/// is never a file [`read_source`] accepts, so the `None` arm is a
+/// defensive degrade: a structured error, never a panic.
+fn parent_dir(canonical: &Path) -> io::Result<&Path> {
+    canonical.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path has no parent: {}", canonical.display()),
+        )
+    })
+}
+
 /// Runs the M0 pipeline over a discovered file set (see
 /// [`crate::discover::discover`]). A read failure aborts the run — a partial
 /// diagnostic set must never masquerade as a valid result; an undecodable
@@ -195,12 +210,8 @@ fn escape_machine_field(text: &str, out: &mut String) {
 ///
 /// # Errors
 ///
-/// Source read or UTF-8 decode failure.
-///
-/// # Panics
-///
-/// Never in practice: every file arrives canonicalized by [`read_source`],
-/// and a canonical path always has a parent.
+/// Source read or UTF-8 decode failure, or a canonical path without a
+/// parent directory (defensive — see [`parent_dir`]).
 pub fn analyze_files(files: &BTreeSet<PathBuf>) -> Result<CheckRun, io::Error> {
     let mut files_state = FileSet::default();
     let mut diags = Vec::new();
@@ -212,19 +223,28 @@ pub fn analyze_files(files: &BTreeSet<PathBuf>) -> Result<CheckRun, io::Error> {
         let file = files_state.push(&source, &canonical);
         // Relative directive targets compose against the canonical file's
         // directory (canonical paths are absolute, so the parent exists).
-        let dir = canonical.parent().expect("canonical path has a parent");
+        let dir = parent_dir(&canonical)?;
         diags.extend(analyze_file(&source, dir, file));
     }
-    // The canonical order leads on the printed path's bytes (the oracle
-    // sorts path-first), not the intern slot: the intern order follows the
-    // discovery set's raw spellings, so under a symlinked duplicate the
-    // deduped file's slot can precede a lexically smaller real path while
-    // its canonical name sorts after (#558).
+    // The oracle display order (DiagnosticWithPath.compareTo, upstream Dart
+    // SDK source, pkg/dartdev/lib/src/commands/analyze.dart:681-705):
+    // severity first, then the printed path's bytes, then position (the
+    // UTF-16 offset stands in for the monotone line/character pair), then
+    // message — no code tiebreak exists upstream, and `emitMachineFormat`
+    // re-sorts the merged list through the same comparator (:338).
+    // analyze.rs's `oracle_cmp` is the sibling implementation over the
+    // engine layout. The path bytes lead within one severity — the printed
+    // path, not the intern slot: the intern order follows the discovery
+    // set's raw spellings, so under a symlinked duplicate the deduped
+    // file's slot can precede a lexically smaller real path while its
+    // canonical name sorts after (#558).
     diags.sort_by(|a, b| {
-        crate::layout::path_key(files_state.file_path(a.file))
-            .cmp(crate::layout::path_key(files_state.file_path(b.file)))
+        severity_rank(a.severity)
+            .cmp(&severity_rank(b.severity))
+            .then_with(|| {
+                path_key(files_state.file_path(a.file)).cmp(path_key(files_state.file_path(b.file)))
+            })
             .then_with(|| a.range.offset.cmp(&b.range.offset))
-            .then_with(|| a.code.machine.cmp(b.code.machine))
             .then_with(|| a.message.cmp(&b.message))
     });
     Ok(CheckRun {
@@ -256,16 +276,55 @@ pub fn analyze_files(files: &BTreeSet<PathBuf>) -> Result<CheckRun, io::Error> {
 /// analyzer read path strips it before scanning; spans are relative to the
 /// stripped text). A second BOM is content.
 ///
+/// A file over [`MAX_SOURCE_BYTES`] is rejected on the span-capacity gate —
+/// the bypass face of #1543: this read reaches [`LineIndex::new`] directly,
+/// outside the engine's intake gates, so the same bound refuses it here.
+/// The stat rejects before the bytes are read (nothing materializes to be
+/// rejected); the byte length is the authoritative bound, covering a file
+/// swapped between the two checks.
+///
 /// # Errors
 ///
-/// Canonicalization or read failure.
+/// Canonicalization or read failure, including the span-capacity
+/// rejection.
 pub fn read_source(path: &Path) -> io::Result<(PathBuf, String)> {
     let canonical = path.canonicalize()?;
-    let mut source = String::from_utf8(fs::read(&canonical)?).unwrap_or_default();
+    if let Some(error) = stat_capacity_error(&canonical) {
+        return Err(error);
+    }
+    let bytes = fs::read(&canonical)?;
+    let len = bytes.len();
+    if len > MAX_SOURCE_BYTES {
+        return Err(capacity_error(&canonical, len as u64));
+    }
+    let mut source = String::from_utf8(bytes).unwrap_or_default();
     if source.starts_with('\u{FEFF}') {
         source.drain(..'\u{FEFF}'.len_utf8());
     }
     Ok((canonical, source))
+}
+
+/// The span-capacity rejection for the command faces' own file reads —
+/// the #1543 bypass face: [`read_source`] and the fix face's reads build
+/// their [`LineIndex`] directly, outside the engine's intake gates, so the
+/// same [`MAX_SOURCE_BYTES`] bound rejects here. The message carries the
+/// path and the file's size via [`OpenError::TooLarge`]'s canonical text;
+/// each face renders it through its own error channel.
+pub(crate) fn capacity_error(path: &Path, len: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{}: {}", path.display(), OpenError::TooLarge { len }),
+    )
+}
+
+/// The pre-read stat rejection — [`dartq_source::open_mapped`]'s gate
+/// mirrored at the command faces' read entries: a file already oversized
+/// on disk is refused before its bytes are read, so no face materializes
+/// gigabytes only to reject them. `None` — including when the stat itself
+/// fails — falls through to the read, whose error is the truth.
+pub(crate) fn stat_capacity_error(path: &Path) -> Option<io::Error> {
+    let len = fs::metadata(path).ok()?.len();
+    (len > MAX_SOURCE_BYTES as u64).then(|| capacity_error(path, len))
 }
 
 /// Per-file state behind [`FileLayoutProvider`]: canonical paths live in the
@@ -315,20 +374,15 @@ impl FileLayoutProvider for FileSet {
 fn analyze_file(source: &str, dir: &Path, file: FileId) -> Vec<Diagnostic> {
     let (version, scanned, mut diags) = scan_file(source, file);
     let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(version));
-    // The parser owns its listener by value and exposes no accessor; a shared
-    // sink is the minimal way to collect events out. When #18 starts emitting
-    // `handle_recoverable_error`, these diagnostics flow without CLI changes.
+    // A shared sink collects events out of the parse. When #18 starts
+    // emitting `handle_recoverable_error`, these diagnostics flow without
+    // CLI changes.
     let sink = Rc::new(RefCell::new(Vec::new()));
-    Parser::new(
-        source,
-        &scanned.tokens,
-        features,
-        DiagnosticListener {
-            file,
-            sink: Rc::clone(&sink),
-        },
-    )
-    .parse_unit();
+    let mut listener = DiagnosticListener {
+        file,
+        sink: Rc::clone(&sink),
+    };
+    Parser::new(source, &scanned.tokens, features, &mut listener).parse_unit();
     diags.extend(std::mem::take(&mut *sink.borrow_mut()));
     diags.extend(directive_diagnostics(dir, file, &scanned.tokens, source));
     diags.extend(scanned.diagnostics);
@@ -395,7 +449,7 @@ fn missing_relative(uri: &DirectiveUri, dir: &Path, file: FileId) -> Option<Diag
     ))
 }
 
-/// The §4.2 code for a known-path-but-missing target: generated-suffix paths
+/// The code for a known-path-but-missing target: generated-suffix paths
 /// report `uri_has_not_been_generated`, everything else `uri_does_not_exist`
 /// (the engine's `missing_file_code`; suffixes frozen at
 /// `library_analyzer.dart:694-700`).
@@ -644,6 +698,7 @@ pub(crate) fn scan_file_at(
     file: FileId,
 ) -> (LanguageVersion, ScanResult, Vec<Diagnostic>) {
     let mut version = seed;
+    let mut diagnostics = Vec::new();
     loop {
         let features = FeatureSet::for_language_version(version);
         let result = scan(
@@ -654,36 +709,63 @@ pub(crate) fn scan_file_at(
             },
             file,
         );
-        match result.language_version_override {
-            Some(override_version) if override_version.is_above_latest() => {
-                // The warning pins at the version comment — the whole
-                // `// @dart = x.y` lexeme, isomorphic to the official
-                // `LanguageVersionToken` (`analyzer scanner.dart:124`
-                // `.atOffset(versionToken.offset, versionToken.length)`; oracle
-                // `dart analyze --format=machine` on a line-1 comment:
-                // `1|1|15`).
-                let code = CodeRegistry::builtin()
-                    .get("invalid_language_version_override")
-                    .expect("official registry pins invalid_language_version_override");
-                let span = result
-                    .language_version_override_span
-                    .expect("scanner records the comment span with every override");
-                let warning = Diagnostic::new(
-                    Severity::Warning,
-                    code,
-                    format!(
-                        "The language version override can't specify a version greater than \
-                         the latest known language version: {DEFAULT_LANGUAGE_VERSION}."
-                    ),
-                    file,
-                    span,
-                    None,
-                );
-                return (version, result, vec![warning]);
-            }
-            Some(override_version) if override_version != version => version = override_version,
-            _ => return (version, result, Vec::new()),
+        let Some(override_version) = result.language_version_override else {
+            return (version, result, diagnostics);
+        };
+        // Both override rows pin at the version comment — the whole
+        // `// @dart = x.y` lexeme, isomorphic to the official
+        // `LanguageVersionToken` (`analyzer scanner.dart:124`
+        // `.atOffset(versionToken.offset, versionToken.length)`; oracle
+        // `dart analyze --format=machine` on a line-1 comment:
+        // `1|1|15`).
+        let span = result
+            .language_version_override_span
+            .expect("scanner records the comment span with every override");
+        if override_version.is_above_latest() {
+            let code = CodeRegistry::builtin()
+                .get("invalid_language_version_override")
+                .expect("official registry pins invalid_language_version_override");
+            // The warning drops the override (official scanner:
+            // `_overrideVersion = null`) — the seed version stands.
+            diagnostics.push(Diagnostic::new(
+                Severity::Warning,
+                code,
+                format!(
+                    "The language version override can't specify a version greater than \
+                     the latest known language version: {DEFAULT_LANGUAGE_VERSION}."
+                ),
+                file,
+                span,
+                None,
+            ));
+            return (version, result, diagnostics);
         }
+        // The floor is a verifier check, not a scanner drop
+        // (`error_verifier.dart:5787-5809`): the override stays effective
+        // and the ERROR rides beside the settled version. The gate reads
+        // `== version` so the row is pushed exactly once — at settlement
+        // (the loop rescans until the override matches the version in
+        // force).
+        if override_version.is_below_floor() && override_version == version {
+            let code = CodeRegistry::builtin()
+                .get("illegal_language_version_override")
+                .expect("official registry pins illegal_language_version_override");
+            diagnostics.push(Diagnostic::new(
+                Severity::Error,
+                code,
+                format!("The language version must be {MIN_LANGUAGE_VERSION_CONSTRAINT}."),
+                file,
+                span,
+                Some(
+                    "Try removing the language version override and migrating the code.".to_owned(),
+                ),
+            ));
+        }
+        if override_version != version {
+            version = override_version;
+            continue;
+        }
+        return (version, result, diagnostics);
     }
 }
 
@@ -882,13 +964,13 @@ mod tests {
     /// the same `experiment_not_enabled_message` selection the engine's
     /// `DiagCollector` uses. Oracle probes (dart 3.13.1, machine format)
     /// split the declaration kinds on `endPrimaryConstructor`
-    /// (ast_builder.dart:2855): the Class/Enum arm gates at the
+    /// (`ast_builder.dart:2855)`: the Class/Enum arm gates at the
     /// constructor's begin token, so `class C(int x);` at 2.12 is the
-    /// two-row experiment face — EXPERIMENT_NOT_ENABLED on the `(` (`2|8|1`)
+    /// two-row experiment face — `EXPERIMENT_NOT_ENABLED` on the `(` (`2|8|1`)
     /// plus parseClass's `;`-body row (`2|15|1`) — while the
     /// `TopLevel|Mixin|Extension` arm is silent, so `mixin M(int x);` takes
     /// only the parser rows: `UNEXPECTED_TOKEN` at the `(` (`2|8|1`) plus
-    /// EXPERIMENT_NOT_ENABLED at the `;` (`2|15|1`, the parser event's
+    /// `EXPERIMENT_NOT_ENABLED` at the `;` (`2|15|1`, the parser event's
     /// anchor); at the current version `mixin_primary_constructor`
     /// replaces the gate (`1|8|1`). The patterns family never gates
     /// on this face either: the official parser short-circuits the
@@ -898,6 +980,7 @@ mod tests {
     /// row; the same probe's `non_bool_condition` row is semantic, absent
     /// on this scan+parse face by design.
     #[test]
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     fn experiment_gate_renders_on_the_check_face() {
         // The Class/Enum arm: the `(`-anchored gate row plus the `;`-body
         // row, no syntax rows (the paired formals parse clean pre-feature).
@@ -907,7 +990,7 @@ mod tests {
         let diags = analyze_file(pinned_class, Path::new("/c/lib"), file);
         let shape: Vec<(&str, u32, u32)> = diags
             .iter()
-            .map(|d| (d.code.name.as_ref(), d.range.offset, d.range.length))
+            .map(|d| (d.code.name, d.range.offset, d.range.length))
             .collect();
         assert_eq!(
             shape,
@@ -926,7 +1009,7 @@ mod tests {
         let diags = analyze_file(pinned, Path::new("/c/lib"), file);
         let shape: Vec<(&str, u32, u32)> = diags
             .iter()
-            .map(|d| (d.code.name.as_ref(), d.range.offset, d.range.length))
+            .map(|d| (d.code.name, d.range.offset, d.range.length))
             .collect();
         assert_eq!(
             shape,
@@ -952,7 +1035,7 @@ mod tests {
         let diags = analyze_file(current, Path::new("/c/lib"), file);
         let shape: Vec<(&str, u32, u32)> = diags
             .iter()
-            .map(|d| (d.code.name.as_ref(), d.range.offset, d.range.length))
+            .map(|d| (d.code.name, d.range.offset, d.range.length))
             .collect();
         assert_eq!(
             shape,
@@ -1001,7 +1084,7 @@ mod tests {
         assert_eq!(warnings[0].range.offset, 0, "span at the comment");
         assert_eq!(warnings[0].range.length, 14, "whole comment lexeme");
 
-        // Era anchors (oracle dart 3.13.1, facts version-skew §1.3 T2): 3.14
+        // Era anchors: 3.14
         // is above the oracle's latest known version — warned and dropped;
         // 3.13 is the latest and is accepted.
         let (version, _, warnings) = scan_file("// @dart = 3.14\nvar x = 1;\n", file);
@@ -1024,6 +1107,46 @@ mod tests {
 
         let (version, ..) = scan_file("var x = 1;\n", file);
         assert_eq!(version, DEFAULT_LANGUAGE_VERSION);
+    }
+
+    /// The official override floor (`analysis_options.dart:183-185`,
+    /// `>= 2.12.0`; upstream test
+    /// `illegal_language_version_override_test.dart:29-34`): 2.9 reports
+    /// the `illegal_language_version_override` ERROR at column 1, length 14
+    /// ("The language version must be >=2.12.0."), 2.12 (equal) and 2.14
+    /// are clean, and a below-floor override STAYS effective (the settled
+    /// version is the written one — a verifier row, not a scanner drop).
+    #[test]
+    fn override_floor_illegal_below_2_12() {
+        let mut table = FileTable::new();
+        let file = table.intern(Path::new("t.dart"));
+
+        let (version, _, errors) = scan_file("// @dart = 2.9\nint a = 0;\n", file);
+        assert_eq!(
+            version,
+            LanguageVersion::new(2, 9),
+            "below-floor override stays effective"
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code.name, "illegal_language_version_override");
+        assert_eq!(errors[0].severity, Severity::Error);
+        assert_eq!(errors[0].range.offset, 0, "column 1");
+        assert_eq!(errors[0].range.length, 14, "the whole comment lexeme");
+        assert_eq!(errors[0].message, "The language version must be >=2.12.0.");
+        assert_eq!(
+            errors[0].correction.as_deref(),
+            Some("Try removing the language version override and migrating the code.")
+        );
+
+        let (version, _, errors) = scan_file("// @dart = 2.11\nvar x = 1;\n", file);
+        assert_eq!(version, LanguageVersion::new(2, 11));
+        assert_eq!(errors.len(), 1, "2.11 is below the floor too");
+
+        let (_, _, errors) = scan_file("// @dart = 2.12\nvar x = 1;\n", file);
+        assert!(errors.is_empty(), "the floor itself is allowed");
+
+        let (_, _, errors) = scan_file("// @dart = 2.14\nvar x = 1;\n", file);
+        assert!(errors.is_empty());
     }
 
     /// The above-latest warning emits the oracle-matching machine line: the
@@ -1070,6 +1193,40 @@ mod tests {
         );
     }
 
+    /// The oracle display order reaches the machine rows: a file whose
+    /// earliest row is the above-latest `invalid_language_version_override`
+    /// WARNING (offset 0) plus a later parse ERROR emits the ERROR row
+    /// first — severity leads the comparator (DiagnosticWithPath.compareTo,
+    /// upstream Dart SDK source, pkg/dartdev/lib/src/commands/analyze.dart:
+    /// 681-705). The retired check-face order (path-first with a code
+    /// tiebreak) emitted the WARNING first.
+    #[test]
+    fn analyze_files_orders_severity_before_path() {
+        let root = std::env::temp_dir().join(format!("dq_cmd_order_{}", std::process::id()));
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(root.join("a.dart"), "// @dart = 99.9\nvoid f() { x }\n").expect("write");
+
+        let files = BTreeSet::from([root.join("a.dart")]);
+        let run = analyze_files(&files).expect("run");
+        let diags = run.diagnostics();
+        assert_eq!(diags.len(), 2, "the warning plus the parse error");
+        assert_eq!(diags[0].code.name, "expected_token", "the ERROR row leads");
+        assert_eq!(diags[0].severity, Severity::Error);
+        assert_eq!(
+            diags[1].code.name, "invalid_language_version_override",
+            "the WARNING row follows despite its smaller offset"
+        );
+
+        let mut out = Vec::new();
+        write_machine(&mut out, &run.output()).expect("write");
+        let text = String::from_utf8(out).unwrap();
+        let (error_row, warning_row) = text.split_once('\n').expect("two rows");
+        assert!(error_row.starts_with("ERROR|"), "{error_row}");
+        assert!(warning_row.starts_with("WARNING|"), "{warning_row}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// The CLI read face strips exactly one leading BOM, matching the oracle
     /// read layer: single BOM gone, second BOM kept as content, BOM-only
     /// file reads back empty.
@@ -1090,6 +1247,59 @@ mod tests {
         assert!(only.is_empty(), "BOM-only file strips to the empty string");
         let (_, plain) = read_source(&root.join("plain.dart")).expect("read");
         assert_eq!(plain, "var x;");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The span-capacity gate (#1543 bypass face): a file over
+    /// [`MAX_SOURCE_BYTES`] is refused with the path and both sizes in the
+    /// message. The sparse fixture claims the size with `set_len` — no
+    /// blocks are materialized — and the stat rejects before any read. The
+    /// accepted side of the boundary is the constant's own unit test in
+    /// dartq-source; a physical `== MAX` fixture would need a 4 GiB read.
+    #[test]
+    fn read_source_rejects_span_capacity_files() {
+        let root = std::env::temp_dir().join(format!("dq_cmd_capacity_{}", std::process::id()));
+        fs::create_dir_all(&root).expect("mkdir");
+        let path = root.join("huge.dart");
+        fs::File::create(&path)
+            .and_then(|file| file.set_len(MAX_SOURCE_BYTES as u64 + 1))
+            .expect("sparse fixture");
+
+        let error = read_source(&path).expect_err("over-capacity file rejected");
+        let line = error.to_string();
+        let canonical = path.canonicalize().expect("canonical");
+        assert!(
+            line.contains(canonical.to_str().expect("utf-8 temp path")),
+            "{line}"
+        );
+        assert!(line.contains(&MAX_SOURCE_BYTES.to_string()), "{line}");
+        assert!(
+            line.contains(&(MAX_SOURCE_BYTES as u64 + 1).to_string()),
+            "{line}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The check face's posture for an over-capacity file: the rejection
+    /// rides the read-failure channel — the run aborts with the error (a
+    /// partial diagnostic set must never masquerade as a valid result),
+    /// never silently skips the file.
+    #[test]
+    fn analyze_files_aborts_on_span_capacity_rejection() {
+        let root = std::env::temp_dir().join(format!("dq_cmd_capacity_run_{}", std::process::id()));
+        fs::create_dir_all(&root).expect("mkdir");
+        fs::write(root.join("ok.dart"), "var ok = 1;\n").expect("write");
+        fs::File::create(root.join("huge.dart"))
+            .and_then(|file| file.set_len(MAX_SOURCE_BYTES as u64 + 1))
+            .expect("sparse fixture");
+
+        let files = crate::discover::discover(std::slice::from_ref(&root)).expect("discover");
+        assert!(
+            analyze_files(&files).is_err(),
+            "the run aborts on the rejection"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -1130,6 +1340,25 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The fallible parent resolution's happy face: the canonical file's
+    /// directory (the composition root for relative directive targets).
+    #[test]
+    fn parent_dir_yields_the_canonical_parent() {
+        let dir = parent_dir(Path::new("/c/lib/a.dart")).expect("parent");
+        assert_eq!(dir, Path::new("/c/lib"));
+    }
+
+    /// The defensive degrade: a root path has no parent, and the miss is a
+    /// structured error naming the path — never a panic. A root is never a
+    /// file [`read_source`] accepts, so the arm is unreachable through
+    /// [`analyze_files`]; the helper pins the contract directly.
+    #[test]
+    fn parent_dir_rejects_a_root_path_with_a_structured_error() {
+        let error = parent_dir(Path::new("/")).expect_err("root has no parent");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("path has no parent"), "{error}");
+    }
+
     /// End to end over a real temp tree: discovery, canonical paths, machine
     /// output, and the canonical diagnostic order.
     #[test]
@@ -1154,7 +1383,7 @@ mod tests {
     }
 
     /// The disk pipeline's URI face (the row the CLI check face and the
-    /// daemon's disk view both render — PRD §15.1 equivalence): a missing
+    /// daemon's disk view both render — equivalence): a missing
     /// relative import surfaces `uri_does_not_exist` at the URI literal,
     /// `../` composes through the canonical parent, and the generated
     /// suffixes code `uri_has_not_been_generated`. Everything the face
@@ -1299,7 +1528,7 @@ mod tests {
     /// component-wise to the plain one — Path/PathBuf equality and ordering
     /// are component-wise — so `.` spellings never enter the set as
     /// duplicates in the first place.) Before the dedup the second pass
-    /// tripped the FileSet index invariant in debug builds and doubled the
+    /// tripped the `FileSet` index invariant in debug builds and doubled the
     /// rows in release.
     #[test]
     fn analyze_files_dedupes_duplicate_spellings() {

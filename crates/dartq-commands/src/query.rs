@@ -1,25 +1,35 @@
 //! The query face's core: the analyzed workspace's symbol index query
-//! (PRD §20.3). The queried name's declaration rows plus resolved reference
+//!. The queried name's declaration rows plus resolved reference
 //! rows, sorted by file path, then position — the printed contract.
 //!
-//! The PRD §15.2 query kinds over the current index: `references` serves
+//! The query kinds over the current index: `references` serves
 //! the same rows as `symbol` (the index's reference surface is name-keyed
 //! and already kinded — reference/read/invoked/written/read-written, the
-//! frozen v1 enum); `callers` is its invocation-shaped subset;
+//! frozen v1 enum, plus the query-time `override` rows the engine appends
+//! for a queried member's overriding declarations); `callers` is its
+//! invocation-shaped subset;
 //! `implementations` walks the index's resolved supertype edges in reverse
 //! (the subtypes of the queried type, and the same-name member rows of
-//! those subtypes for a queried member — the overrides the edge set can
-//! see: `extends`/mixin-application heads, the clauses the capture
-//! records); `dependencies` serves the declaring library's importers (the
-//! frozen `DependencyRow` shape, the same rows the explain face's
-//! `dependencies` section carries).
+//! those subtypes for a queried member — the overrides the resolved edge
+//! set sees, every clause kind the capture records: `extends`,
+//! `with`, `on`, `implements`); `dependencies` serves the declaring
+//! library's own import edges and the dependency-library symbols its
+//! resolved uses consume (the frozen `DependencyRow` shape — `path`,
+//! plus the optional `name` column the forward direction carries). The
+//! reverse question — who imports the declaring library — is the impact
+//! face's answer (and the explain face's `dependencies` section), not
+//! this kind's.
 //!
 //! The JSON shaper [`to_json`] is the single implementation of the JSON
 //! output face: the CLI's `--format=json` writes it verbatim and the
 //! daemon's `dartq/query` compact verbosity returns it (plus
-//! `schema_version`), so the two faces cannot drift.
+//! `schema_version`), so the two faces cannot drift. [`to_json_at_tier`]
+//! is the tier-aware spelling of the same envelope — `minimal` keeps the
+//! red-line locators and drops the convenience spellings and the reserved
+//! kind arrays, exactly the canonical tables' query rows; compact and full
+//! answer today's shape.
 //!
-//! The §15.8.4 batch face shares every piece of that: one batch answer
+//! The batch face shares every piece of that: one batch answer
 //! expands to the single faces' own runs, one per requested
 //! `(symbol, kind)` pair, all walking one resident graph — the round trip
 //! buys one graph build for N answers. There is no aggregate envelope (the
@@ -29,11 +39,13 @@
 // The dependencies row type (the frozen `DependencyRow` shape), re-exported
 // so the faces name it in their signatures without a dartq-ai dependency.
 pub use dartq_ai::explain::DependencyRow;
-use dartq_ai::rev_import_graph::RevImportGraph;
 use dartq_diagnostics::FileLayoutProvider as _;
-use dartq_engine::{DeclHit, DeclKind, Engine, RefHit, RefKind, SymbolAnswer};
+use dartq_engine::{DeclHit, DeclKind, Engine, RefHit, ReferenceKind, SymbolAnswer};
 use dartq_index::{DeclRow, LibraryIndex, TargetRef};
-use dartq_source::{FileId, StringId};
+use dartq_semantic::model::{
+    ArgPool, Formal, Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
+};
+use dartq_source::{FileId, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use serde_json::json;
@@ -57,8 +69,10 @@ pub struct SymbolRun<'a> {
     /// the queried member's overriding rows, declaration-row typed (the
     /// frozen schema's reserved array), path-then-offset order.
     pub implementations: Vec<DeclHit<'a>>,
-    /// The `dependencies` kind's rows: the declaring library's importers,
-    /// the frozen `DependencyRow` shape (`path`), deduplicated ascending.
+    /// The `dependencies` kind's rows: the declaring library's own
+    /// import edges and consumed dependency symbols, the frozen
+    /// `DependencyRow` shape (`path`, plus the optional `name` column),
+    /// ascending by `(path, name)`.
     pub dependencies: Vec<DependencyRow>,
     /// Position/path resolution over the analyzed engine.
     pub layout: EngineLayout<'a>,
@@ -115,10 +129,13 @@ pub fn symbol_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a
     }
 }
 
-/// The `query callers` face (PRD §15.2): the invocation-shaped subset of the
+/// The `query callers` face: the invocation-shaped subset of the
 /// references answer. A callers row is a reference row whose kind is
-/// [`RefKind::Invoked`] — dartq-index's definition: "a call site,
-/// constructor reference, or tear-off-shaped use".
+/// [`ReferenceKind::Invoked`] — dartq-index's definition: "a call site,
+/// constructor reference, or tear-off-shaped use" (the `override` rows the
+/// references answer appends for a queried member are declarations, not
+/// invocations, and stay out; the engine's `Engine::query_callers` is the
+/// declaration-projected face for symbol-level consumers).
 ///
 /// # Direction
 ///
@@ -149,16 +166,18 @@ pub fn callers<'a>(engine: &'a mut Engine, name: &str) -> Result<SymbolRun<'a>, 
 pub fn callers_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a> {
     let mut run = symbol_after_analysis(engine, name);
     run.refs
-        .retain(|reference| reference.kind == RefKind::Invoked);
+        .retain(|reference| reference.kind == ReferenceKind::Invoked);
     run
 }
 
-/// The `query implementations` face (PRD §15.2): given a type name, its
+/// The `query implementations` face: given a type name, its
 /// subtypes' declaration rows; given a member name, the overriding member
 /// rows of the subtypes that declare it. Both walk the index's resolved
-/// supertype edges in reverse — the clause set the capture records
-/// (`extends` heads and mixin-application heads); `implements`/`with`/`on`
-/// clauses have no edges in the index yet and ride no rows.
+/// supertype edges in reverse — every clause kind the capture records
+/// (`extends`, `with`, `on`, `implements`; the index folds all four and
+/// the walk probes them all, so a class implementing the queried
+/// interface rides the same rows as one extending the queried
+/// superclass).
 ///
 /// # Errors
 ///
@@ -175,6 +194,11 @@ pub fn implementations<'a>(
 /// path (see [`symbol_after_analysis`]). The declaration rows stay for
 /// target identity (the callers face's convention); the references array
 /// is empty — use sites are not this kind's semantics.
+///
+/// # Panics
+///
+/// Panics when a library member lacks its analyzed capture — an internal
+/// invariant breach (every resident member is analyzed).
 #[must_use]
 pub fn implementations_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a> {
     let mut run = symbol_after_analysis(engine, name);
@@ -289,10 +313,17 @@ pub fn implementations_after_analysis<'a>(engine: &'a Engine, name: &str) -> Sym
     run
 }
 
-/// The `query dependencies` face (PRD §15.2): the declaring library's
-/// importers — the reverse import graph the explain face's `dependencies`
-/// section serves, on the frozen `DependencyRow` shape (`path`), the
-/// primary (path-ascending first) declaration's library.
+/// The `query dependencies` face: what the declaring library itself
+/// depends on — the forward direction. One row per workspace import edge
+/// of the primary (path-ascending first) declaration's library, on the
+/// frozen `DependencyRow` shape (`path`), plus one row per resolved use
+/// of a dependency library's declaration (the `name` column) when the
+/// library's own reference surface sees one. Edges whose targets are not
+/// workspace libraries (the SDK's synthetic nodes, unanalyzed packages)
+/// carry no row — the import CSR's node space is the live-library set.
+/// The reverse direction — who imports the declaring library — is the
+/// impact face's answer (and the explain `dependencies` section), not
+/// this kind's.
 ///
 /// # Errors
 ///
@@ -305,6 +336,12 @@ pub fn dependencies<'a>(engine: &'a mut Engine, name: &str) -> Result<SymbolRun<
 /// The dependencies answer over an already-analyzed engine — the daemon
 /// path (see [`symbol_after_analysis`]). Declaration rows stay for target
 /// identity; the references array is empty.
+///
+/// # Panics
+///
+/// Panics when the primary declaration's library or surface is missing —
+/// an internal invariant breach (the primary's file is analyzed and
+/// resident).
 #[must_use]
 pub fn dependencies_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a> {
     let mut run = symbol_after_analysis(engine, name);
@@ -313,26 +350,76 @@ pub fn dependencies_after_analysis<'a>(engine: &'a Engine, name: &str) -> Symbol
         return run;
     };
 
-    // The shared graph substrate (`impact`'s): one CSR projection, one
-    // reverse build per call — the same per-query posture explain keeps.
+    // The shared graph substrate (`impact`'s): one CSR projection per
+    // call — the same per-query posture the import faces keep. The
+    // forward edges are the substrate's own neighbor lists; no reverse
+    // build is needed.
     let libraries = engine.libraries();
     let substrate = impact_substrate(engine, &libraries);
-    let importers = RevImportGraph::build(substrate.node_count(), |library| {
-        substrate.neighbors(library)
-    });
     let library = engine
         .library_of(primary.file)
         .expect("analyzed member")
         .index();
-    let mut rows: Vec<DependencyRow> = importers
-        .importers_of(library as usize)
-        .iter()
-        .map(|&importer| DependencyRow {
-            path: substrate.label(importer).to_owned(),
-        })
+
+    // The declaring library's own reference surface: every resolved use
+    // site, with the target's declaring file and name. A use lands on a
+    // dependency library when its `target_file` is one of the target's
+    // member files (the import edges are library-level, the members the
+    // file-level ones). One pass over the surface attributes every use to
+    // its target's library through the member-file map.
+    let surfaces: FxHashMap<u32, &LibraryIndex> = engine
+        .library_surfaces()
+        .map(|(library, surface)| (library.index(), surface))
         .collect();
-    rows.sort_by(|a, b| a.path.cmp(&b.path));
-    rows.dedup_by(|a, b| a.path == b.path);
+    let surface = surfaces.get(&library).expect("live library surface");
+    let mut file_library: FxHashMap<FileId, u32> = FxHashMap::default();
+    for (library, files) in &libraries {
+        for &file in files {
+            file_library.insert(file, library.index());
+        }
+    }
+    let mut consumed: FxHashMap<u32, Vec<StringId>> = FxHashMap::default();
+    for reference in surface.refs() {
+        if let Some(&target) = file_library.get(&reference.target_file) {
+            consumed
+                .entry(target)
+                .or_default()
+                .push(reference.target_name);
+        }
+    }
+
+    // Distinct dependency targets, ascending by their slot id (the final
+    // rows re-sort by label — the id order only dedups duplicated
+    // directives).
+    let mut targets = substrate.neighbors(library).to_vec();
+    targets.sort_unstable();
+    targets.dedup();
+
+    let strings = engine.strings();
+    let mut rows: Vec<DependencyRow> = Vec::new();
+    for target in targets {
+        let label = substrate.label(target).to_owned();
+        // The consumed symbols, distinct ascending. A bare import edge
+        // (no resolved use) answers the library-level row alone.
+        let mut names: Vec<&str> = consumed
+            .get(&target)
+            .map(|ids| ids.iter().map(|&id| strings.resolve(id)).collect())
+            .unwrap_or_default();
+        names.sort_unstable();
+        names.dedup();
+        if names.is_empty() {
+            rows.push(DependencyRow {
+                path: label,
+                name: None,
+            });
+        } else {
+            rows.extend(names.into_iter().map(|name| DependencyRow {
+                path: label.clone(),
+                name: Some(name.to_owned()),
+            }));
+        }
+    }
+    rows.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.name.cmp(&b.name)));
     run.dependencies = rows;
     run
 }
@@ -347,7 +434,7 @@ fn sort_rows<'a>(layout: &EngineLayout<'a>, rows: &mut [DeclHit<'a>]) {
     });
 }
 
-/// The query face's kind (PRD §15.2): which query answers. The lowercase
+/// The query face's kind: which query answers. The lowercase
 /// wire spelling is one surface — the daemon's `dartq/query` params and
 /// batch items decode it through serde, the CLI's `--kind` values parse it
 /// through [`std::str::FromStr`] — so the two faces cannot disagree on the
@@ -368,8 +455,11 @@ pub enum QueryKind {
     /// The queried type's subtypes / the queried member's overriding rows,
     /// on the declaration-row shape (the frozen schema's reserved array).
     Implementations,
-    /// The declaring library's importers, on the frozen `DependencyRow`
-    /// shape (the reserved array, the explain section's rows).
+    /// The declaring library's own dependencies — its import edges and
+    /// the dependency-library symbols its resolved uses consume — on the
+    /// frozen `DependencyRow` shape (the reserved array). The reverse
+    /// direction (who consumes the declaring library) is the impact
+    /// face's and the explain `dependencies` section's answer.
     Dependencies,
 }
 
@@ -394,8 +484,9 @@ impl std::str::FromStr for QueryKind {
 /// The one kind→rows routing behind every query face: `symbol` and
 /// `references` serve the same rows, `callers` the invocation-shaped
 /// subset, `implementations` the reverse supertype walk, `dependencies`
-/// the declaring library's importers — the same routing the single faces
-/// have always had, now the one copy the batch face reuses.
+/// the declaring library's own import edges and consumed symbols — the
+/// same routing the single faces have always had, now the one copy the
+/// batch face reuses.
 #[must_use]
 pub fn kind_after_analysis<'a>(engine: &'a Engine, name: &str, kind: QueryKind) -> SymbolRun<'a> {
     match kind {
@@ -406,7 +497,7 @@ pub fn kind_after_analysis<'a>(engine: &'a Engine, name: &str, kind: QueryKind) 
     }
 }
 
-/// One §15.8.4 batch query item: the symbol name plus the kinds to answer.
+/// One batch query item: the symbol name plus the kinds to answer.
 /// The wire form is the daemon's `dartq/queryBatch` item
 /// (`{"name": ..., "kinds": [...]}`, kinds defaulting to the symbol face);
 /// the CLI's `dartq query batch` assembles the same items from repeated
@@ -432,7 +523,7 @@ pub struct BatchAnswer<'run, 'name> {
     pub run: SymbolRun<'run>,
 }
 
-/// The §15.8.4 batch answer over a fresh engine: the discover+analyze
+/// The batch answer over a fresh engine: the discover+analyze
 /// prelude once (the read-after-write every answer reflects), then every
 /// `(item, kind)` pair answered over the one analyzed graph.
 ///
@@ -471,14 +562,46 @@ pub fn batch_after_analysis<'run, 'name>(
 
 /// The JSON face: one object — `schema_version`, `name`, and the
 /// `declarations`/`references` arrays carrying the machine rows' fields
-/// (snake_case, the metrics-JSON convention). Zero results produce empty
+/// (`snake_case`, the metrics-JSON convention). Zero results produce empty
 /// arrays. The `implementations`/`dependencies` arrays ride the answer
 /// only when their kind's rows exist (the frozen v1 reserved slots —
 /// additive, optional, dropped by the daemon's minimal tier). The envelope
 /// is the frozen v1 query contract (dartq-schema's `Domain::Query`), which
 /// requires the `schema_version` key.
+///
+/// # Panics
+///
+/// Panics when a row array fails to serialize — an internal invariant
+/// breach (the row shapes are schema-pinned and always serialize).
 #[must_use]
 pub fn to_json(run: &SymbolRun<'_>, name: &str) -> serde_json::Value {
+    to_json_at_tier(run, name, crate::Verbosity::Compact)
+}
+
+/// The tier-aware spelling of [`to_json`] — the one implementation of the
+/// query JSON face's verbosity axis. `minimal` is the canonical tables'
+/// red line: the declaration rows keep `file` (the stable package-form
+/// label)/`kind`/`name`/`line`/`column`/`length`, the reference rows keep
+/// `target_file`/`kind`/`offset`/`length`; the convenience spellings
+/// (`container`, `qualified`, the use-file column, the element-face
+/// `signature`/`annotations` columns) and the reserved kind arrays
+/// (`implementations`, `dependencies`) drop. `compact` and `full` answer
+/// [`to_json`] verbatim (the canonical tables list no full-only extras for
+/// query today).
+#[must_use]
+pub fn to_json_at_tier(
+    run: &SymbolRun<'_>,
+    name: &str,
+    verbosity: crate::Verbosity,
+) -> serde_json::Value {
+    if verbosity == crate::Verbosity::Minimal {
+        return json!({
+            "schema_version": crate::SCHEMA_VERSION,
+            "name": name,
+            "declarations": minimal_declaration_rows(run, &run.decls),
+            "references": minimal_reference_rows(run, &run.refs),
+        });
+    }
     let mut json = json!({
         "schema_version": crate::SCHEMA_VERSION,
         "name": name,
@@ -497,15 +620,359 @@ pub fn to_json(run: &SymbolRun<'_>, name: &str) -> serde_json::Value {
 }
 
 /// The declaration-row shape, shared verbatim by the `declarations` and
-/// `implementations` arrays (the frozen schema's one `DECLARATION_ITEM`).
+/// `implementations` arrays (the frozen schema's one `DECLARATION_ITEM`),
+/// plus the additive signature/annotation columns joined from the file's
+/// resident element facts: a member row carries its rendered signature, a
+/// container row its annotations — shapes the facts do not model (a
+/// generic top-level function's unnamed type parameters, an unnamed
+/// extension member) keep the keys omitted.
 fn declaration_rows(run: &SymbolRun<'_>, decls: &[DeclHit<'_>]) -> Vec<serde_json::Value> {
+    let engine = run.layout.engine();
+    let packages = engine.packages();
+    let label = |file| crate::pkg_label::pkg_label(packages, run.layout.file_path(file));
+    decls
+        .iter()
+        .map(|decl| {
+            let (line, column) = run.layout.line_col(decl.file, decl.range.offset);
+            let mut row = json!({
+                "file": label(decl.file),
+                "kind": decl_kind_name(decl.kind),
+                "name": decl.name,
+                "line": line,
+                "column": column,
+                "length": decl.range.length,
+            });
+            // The convenience column is omit-on-absent: a top-level row has
+            // no container, so the key drops rather than spelling a null.
+            if let Some(container) = decl.container {
+                row["container"] = json!(container);
+            }
+            let (signature, annotations) = declaration_extras(engine, decl);
+            if let Some(signature) = signature {
+                row["signature"] = json!(signature);
+            }
+            if !annotations.is_empty() {
+                row["annotations"] = json!(annotations);
+            }
+            row
+        })
+        .collect()
+}
+
+/// The element-facts join behind the additive row columns: the signature
+/// from the declaration's own face (a member's [`MemberEntry`], a
+/// top-level executable's [`TopDecl`]) and the annotations from the
+/// container face (the only face the model carries metadata on). A
+/// declaration with no matching face — an unnamed extension member, a
+/// type parameter — answers the bare row.
+///
+/// Public as the machine grammar's column source: the CLI's machine
+/// printer spells the same pair as the JSON face's trailing `signature`/
+/// `annotations` columns, so the two grammars cannot drift.
+pub fn declaration_extras(engine: &Engine, decl: &DeclHit<'_>) -> (Option<String>, Vec<String>) {
+    let facts = engine.file_facts(decl.file).expect("resident member facts");
+    let strings = engine.strings();
+    let elements = &facts.elements;
+    let args = elements.type_args();
+    match decl.container {
+        // A named container's member: its own entry face.
+        Some(container) => {
+            let signature = elements
+                .container(strings.intern(container))
+                .and_then(|c| c.members.get(&strings.intern(decl.name)))
+                .map(|entry| member_signature(entry, decl.name, strings, args));
+            (signature, Vec::new())
+        }
+        // A top-level name: the executable face carries the signature; the
+        // container face carries the annotations (container kinds only —
+        // an unnamed extension member has no container face and its
+        // name never aliases a top-level declaration probe).
+        None => {
+            let signature = matches!(decl.kind, DeclKind::TopLevelFn | DeclKind::TopLevelVar)
+                .then(|| strings.intern(decl.name))
+                .and_then(|name| elements.decl(name))
+                .and_then(|top| top_signature(top, decl.name, strings, args));
+            let annotations = matches!(
+                decl.kind,
+                DeclKind::Class
+                    | DeclKind::Enum
+                    | DeclKind::Mixin
+                    | DeclKind::Extension
+                    | DeclKind::ExtensionType
+            )
+            .then(|| strings.intern(decl.name))
+            .and_then(|name| elements.container(name))
+            .map(|c| {
+                c.annotations
+                    .iter()
+                    .map(|annotation| annotation_text(annotation, strings))
+                    .collect()
+            })
+            .unwrap_or_default();
+            (signature, annotations)
+        }
+    }
+}
+
+/// The member's signature text — modifier keywords in written order, then
+/// the type and parameter face (`static final int x`, `T pick<T>(T a)`,
+/// `int get x`, `void set x(int v)`; setters render under their plain
+/// display name, the lookup spelling's trailing `=` stripped).
+fn member_signature(
+    entry: &MemberEntry,
+    name: &str,
+    strings: &StringTable,
+    args: &ArgPool,
+) -> String {
+    let mut text = String::new();
+    if entry.is_external {
+        text.push_str("external ");
+    }
+    if entry.is_static {
+        text.push_str("static ");
+    }
+    if entry.is_abstract {
+        text.push_str("abstract ");
+    }
+    if entry.is_final {
+        text.push_str("final ");
+    }
+    match entry.kind {
+        MemberKind::Method => {
+            text.push_str(&render_ty(entry.return_ty, strings, args));
+            text.push(' ');
+            text.push_str(name);
+            text.push_str(&type_params_text(&entry.type_param_names, strings));
+            text.push_str(&render_formals(entry.formals.as_deref(), strings, args));
+        }
+        MemberKind::Getter => {
+            text.push_str(&render_ty(entry.return_ty, strings, args));
+            text.push_str(" get ");
+            text.push_str(name);
+        }
+        MemberKind::Setter => {
+            text.push_str(&render_ty(entry.return_ty, strings, args));
+            text.push_str(" set ");
+            text.push_str(name.strip_suffix('=').unwrap_or(name));
+            text.push_str(&render_formals(entry.formals.as_deref(), strings, args));
+        }
+        MemberKind::Field => {
+            text.push_str(&render_ty(entry.var_ty, strings, args));
+            text.push(' ');
+            text.push_str(name);
+        }
+    }
+    text
+}
+
+/// The top-level declaration's signature text; `None` where the shape has
+/// none (containers, aliases, type parameters, import prefixes) or the
+/// model cannot render it fully (a generic function's type parameters
+/// carry no names — a lossy signature is never emitted).
+fn top_signature(
+    decl: &TopDecl,
+    name: &str,
+    strings: &StringTable,
+    args: &ArgPool,
+) -> Option<String> {
+    match decl.kind {
+        MicroKind::TopLevelFn if decl.type_params == 0 => {
+            let return_ty = render_ty(decl.return_ty, strings, args);
+            Some(match decl.formals.as_deref() {
+                // Setters are spelled `name=` in the lookup surface.
+                _ if name.ends_with('=') => format!(
+                    "{} set {}{}",
+                    return_ty,
+                    name.strip_suffix('=').unwrap_or(name),
+                    render_formals(decl.formals.as_deref(), strings, args)
+                ),
+                // No captured parameter list is the getter shape.
+                None => format!("{return_ty} get {name}"),
+                Some(formals) => format!(
+                    "{return_ty} {name}{}",
+                    render_formals(Some(formals), strings, args)
+                ),
+            })
+        }
+        MicroKind::TopLevelVar => Some(format!("{} {name}", render_ty(decl.var_ty, strings, args))),
+        _ => None,
+    }
+}
+
+/// One annotation's text: `@` plus the spelled name and, when captured,
+/// the verbatim argument group (`@Deprecated('use Other')`).
+fn annotation_text(
+    annotation: &dartq_semantic::model::Annotation,
+    strings: &StringTable,
+) -> String {
+    let mut text = format!("@{}", strings.resolve(annotation.name));
+    if let Some(args) = annotation.args_text {
+        text.push_str(strings.resolve(args));
+    }
+    text
+}
+
+/// The member's own type-parameter list (`<T, U>`), empty when absent.
+fn type_params_text(names: &[dartq_source::StringId], strings: &StringTable) -> String {
+    if names.is_empty() {
+        return String::new();
+    }
+    let joined: Vec<&str> = names.iter().map(|&id| strings.resolve(id)).collect();
+    format!("<{}>", joined.join(", "))
+}
+
+/// Renders a type in the signature text's display form — the official
+/// display (`List<int>?`) with the model's uncaptured shape spelled
+/// `dynamic` (Dart's element display renders an undeclared type as
+/// `dynamic`, never as an empty slot).
+pub(crate) fn render_ty(ty: Ty, strings: &StringTable, args: &ArgPool) -> String {
+    match ty {
+        Ty::Unknown => "dynamic".to_owned(),
+        Ty::Null => "Null".to_owned(),
+        Ty::Dynamic => "dynamic".to_owned(),
+        Ty::Never => "Never".to_owned(),
+        Ty::Void => "void".to_owned(),
+        // A record type renders in the model's own display form
+        // (`(int, String)?`): the shape is canonical in `args`, and the
+        // official `InvalidType` splice inside a recovered field is not
+        // this face's `dynamic` convention. A function type renders the
+        // same way (`int Function(String)?`).
+        Ty::Record { .. } | Ty::Function { .. } => ty.render(strings, args),
+        Ty::Named {
+            name,
+            nullable,
+            args: list,
+        } => {
+            let mut text = strings.resolve(name).to_owned();
+            let list = args.get(list);
+            if !list.is_empty() {
+                text.push('<');
+                for (index, arg) in list.iter().enumerate() {
+                    if index > 0 {
+                        text.push_str(", ");
+                    }
+                    text.push_str(&render_ty(*arg, strings, args));
+                }
+                text.push('>');
+            }
+            if nullable {
+                text.push('?');
+            }
+            text
+        }
+    }
+}
+
+/// Renders the parameter face: required positional bare, optional
+/// positional in `[...]`, named in `{...}` with the `required` keyword
+/// (`(int a, [int? b], {required String s})`). `None` — no captured
+/// parameter list — renders the empty list.
+pub(crate) fn render_formals(
+    formals: Option<&Formals>,
+    strings: &StringTable,
+    args: &ArgPool,
+) -> String {
+    let Some(formals) = formals else {
+        return "()".to_owned();
+    };
+    let formal_text = |formal: &Formal| {
+        format!(
+            "{} {}",
+            render_ty(formal.ty, strings, args),
+            strings.resolve(formal.name)
+        )
+    };
+    // The positional slice runs required group first; the optional group
+    // begins at the first non-required formal.
+    let split = formals
+        .positional
+        .iter()
+        .position(|formal| !formal.required)
+        .unwrap_or(formals.positional.len());
+    let mut groups: Vec<String> = Vec::with_capacity(3);
+    let required = &formals.positional[..split];
+    if !required.is_empty() {
+        groups.push(
+            required
+                .iter()
+                .map(formal_text)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    let optional = &formals.positional[split..];
+    if !optional.is_empty() {
+        groups.push(format!(
+            "[{}]",
+            optional
+                .iter()
+                .map(formal_text)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !formals.named.is_empty() {
+        groups.push(format!(
+            "{{{}}}",
+            formals
+                .named
+                .iter()
+                .map(|formal| {
+                    if formal.required {
+                        format!("required {}", formal_text(formal))
+                    } else {
+                        formal_text(formal)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    format!("({})", groups.join(", "))
+}
+
+/// The reference-row shape: the frozen v1 contract plus the optional
+/// use-file and qualified-name columns. The `target_file`/`file` labels
+/// are the stable package-form references (the shared
+/// [`crate::pkg_label::pkg_label`] projection), the sort order above stays
+/// keyed on canonical paths.
+fn reference_rows(run: &SymbolRun<'_>, refs: &[RefHit<'_>], name: &str) -> Vec<serde_json::Value> {
+    let packages = run.layout.engine().packages();
+    let label = |file| crate::pkg_label::pkg_label(packages, run.layout.file_path(file));
+    refs.iter()
+        .map(|reference| {
+            let mut row = json!({
+                "target_file": label(reference.target_file),
+                "kind": ref_kind_name(reference.kind),
+                "file": label(reference.file),
+                "offset": reference.range.offset,
+                "length": reference.range.length,
+            });
+            // The convenience column: the qualified-name spelling,
+            // emitted only when an armed import prefix resolved the use
+            // (the schema's optional string — bare rows keep the key
+            // omitted). RefRows exist only for the queried name, so the
+            // queried spelling completes the column.
+            if let Some(prefix) = reference.qualified_name {
+                row["qualified"] = json!(format!("{prefix}.{name}"));
+            }
+            row
+        })
+        .collect()
+}
+
+/// The minimal tier's declaration rows: the red-line locators only — the
+/// stable package-form `file` label, `kind`, `name`, `line`, `column`,
+/// `length` (the daemon's `dartq/query` minimal shaping, mirrored).
+fn minimal_declaration_rows(run: &SymbolRun<'_>, decls: &[DeclHit<'_>]) -> Vec<serde_json::Value> {
+    let packages = run.layout.engine().packages();
+    let label = |file| crate::pkg_label::pkg_label(packages, run.layout.file_path(file));
     decls
         .iter()
         .map(|decl| {
             let (line, column) = run.layout.line_col(decl.file, decl.range.offset);
             json!({
-                "file": run.layout.file_path(decl.file).display().to_string(),
-                "container": decl.container,
+                "file": label(decl.file),
                 "kind": decl_kind_name(decl.kind),
                 "name": decl.name,
                 "line": line,
@@ -516,27 +983,20 @@ fn declaration_rows(run: &SymbolRun<'_>, decls: &[DeclHit<'_>]) -> Vec<serde_jso
         .collect()
 }
 
-/// The reference-row shape: the frozen v1 contract plus the optional
-/// use-file and qualified-name columns.
-fn reference_rows(run: &SymbolRun<'_>, refs: &[RefHit<'_>], name: &str) -> Vec<serde_json::Value> {
+/// The minimal tier's reference rows: `target_file`/`kind`/`offset`/
+/// `length` — the qualified spelling and the use-file column are the
+/// compact tier's contribution (the daemon's minimal shaping, mirrored).
+fn minimal_reference_rows(run: &SymbolRun<'_>, refs: &[RefHit<'_>]) -> Vec<serde_json::Value> {
+    let packages = run.layout.engine().packages();
+    let label = |file| crate::pkg_label::pkg_label(packages, run.layout.file_path(file));
     refs.iter()
         .map(|reference| {
-            let mut row = json!({
-                "target_file": run.layout.file_path(reference.target_file).display().to_string(),
+            json!({
+                "target_file": label(reference.target_file),
                 "kind": ref_kind_name(reference.kind),
-                "file": run.layout.file_path(reference.file).display().to_string(),
                 "offset": reference.range.offset,
                 "length": reference.range.length,
-            });
-            // The §15.8 convenience column: the qualified-name spelling,
-            // emitted only when an armed import prefix resolved the use
-            // (the schema's optional string — bare rows keep the key
-            // omitted). RefRows exist only for the queried name, so the
-            // queried spelling completes the column.
-            if let Some(prefix) = reference.qualified_name {
-                row["qualified"] = json!(format!("{prefix}.{name}"));
-            }
-            row
+            })
         })
         .collect()
 }
@@ -562,15 +1022,20 @@ pub fn decl_kind_name(kind: DeclKind) -> &'static str {
     }
 }
 
-/// Stable machine spelling of a reference relation.
+/// Stable machine spelling of a reference relation: the engine's stored
+/// capture kinds map 1:1 onto the first five spellings, and the query-time
+/// [`ReferenceKind::Override`] widening (the overriding-declaration rows
+/// the references answer appends for a queried member) spells `override` —
+/// the schema's sixth `REF_KINDS` entry.
 #[must_use]
-pub fn ref_kind_name(kind: RefKind) -> &'static str {
+pub fn ref_kind_name(kind: ReferenceKind) -> &'static str {
     match kind {
-        RefKind::Referenced => "reference",
-        RefKind::Read => "read",
-        RefKind::Invoked => "invoked",
-        RefKind::Written => "written",
-        RefKind::ReadWritten => "read-written",
+        ReferenceKind::Referenced => "reference",
+        ReferenceKind::Read => "read",
+        ReferenceKind::Invoked => "invoked",
+        ReferenceKind::Written => "written",
+        ReferenceKind::ReadWritten => "read-written",
+        ReferenceKind::Override => "override",
     }
 }
 
@@ -590,7 +1055,7 @@ mod tests {
     const A: &str = "class Foo {\n  void meth() {}\n}\nvoid top() {}\n";
     const B: &str = "import 'a.dart';\nvoid main() {\n  var f = Foo();\n  top();\n}\n";
     const C: &str = "import 'a.dart';\nvoid other() {\n  var f2 = Foo();\n}\n";
-    /// A prefixed import plus use site: the §15.8 qualified-name column
+    /// A prefixed import plus use site: the qualified-name column
     /// needs an armed import prefix to exercise the row (the shared
     /// fixture's imports are bare).
     const D: &str = "import 'a.dart' as p;\n\nvoid from_d() {\n  p.Foo();\n}\n";
@@ -628,10 +1093,11 @@ mod tests {
         let run = callers(&mut engine, "Foo").expect("query");
         assert_eq!(run.decls.len(), 1, "the declaration rows stay");
         assert_eq!(run.decls[0].name, "Foo");
-        let refs: Vec<(RefKind, u32)> = run.refs.iter().map(|r| (r.kind, r.range.offset)).collect();
+        let refs: Vec<(ReferenceKind, u32)> =
+            run.refs.iter().map(|r| (r.kind, r.range.offset)).collect();
         assert_eq!(
             refs,
-            vec![(RefKind::Invoked, 41), (RefKind::Invoked, 43)],
+            vec![(ReferenceKind::Invoked, 41), (ReferenceKind::Invoked, 43)],
             "both constructor sites, one per use file"
         );
         // RefHit borrows the engine's interned spellings, so the rows' ids
@@ -647,7 +1113,7 @@ mod tests {
 
         let run = callers(&mut engine, "top").expect("query");
         assert_eq!(run.refs.len(), 1);
-        assert_eq!(run.refs[0].kind, RefKind::Invoked);
+        assert_eq!(run.refs[0].kind, ReferenceKind::Invoked);
         assert_eq!(run.refs[0].range.offset, 50);
 
         // A declaration with no uses: empty callers, declaration still listed.
@@ -667,24 +1133,25 @@ mod tests {
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
 
         let run = symbol(&mut engine, "Foo").expect("query");
-        let refs: Vec<(RefKind, u32)> = run.refs.iter().map(|r| (r.kind, r.range.offset)).collect();
+        let refs: Vec<(ReferenceKind, u32)> =
+            run.refs.iter().map(|r| (r.kind, r.range.offset)).collect();
         assert_eq!(
             refs,
-            vec![(RefKind::Invoked, 41), (RefKind::Invoked, 43)],
+            vec![(ReferenceKind::Invoked, 41), (ReferenceKind::Invoked, 43)],
             "the constructor sites, offset order across the two use files"
         );
 
         let run = symbol(&mut engine, "top").expect("query");
         assert_eq!(run.refs.len(), 1);
-        assert_eq!(run.refs[0].kind, RefKind::Invoked);
+        assert_eq!(run.refs[0].kind, ReferenceKind::Invoked);
         assert_eq!(run.refs[0].range.offset, 50);
 
         // The use-file column rides the emitted rows: `file` is the use
-        // site's member path (b.dart, c.dart), distinct from the target's
-        // (a.dart) — the frozen-v1 schema's optional reference-row string.
+        // site's member label (b.dart, c.dart — the stable package-form
+        // reference), distinct from the target's (a.dart) — the frozen-v1
+        // schema's optional reference-row string.
         let run = symbol(&mut engine, "Foo").expect("query");
         let json = to_json(&run, "Foo");
-        let root = root.canonicalize().expect("root");
         let use_files: Vec<Option<&str>> = json["references"]
             .as_array()
             .expect("references array")
@@ -694,8 +1161,8 @@ mod tests {
         assert_eq!(
             use_files,
             vec![
-                root.join("lib/b.dart").to_str(),
-                root.join("lib/c.dart").to_str(),
+                Some("package:fixture/b.dart"),
+                Some("package:fixture/c.dart")
             ],
             "each row names the member file its use site sits in"
         );
@@ -715,7 +1182,7 @@ mod tests {
         let run = symbol(&mut engine, "Foo").expect("query");
         let json = to_json(&run, "Foo");
         assert_eq!(json["schema_version"], dartq_schema::SCHEMA_VERSION_QUERY);
-        // The §15.8 qualified-name column rides armed-prefix rows only:
+        // The qualified-name column rides armed-prefix rows only:
         // the bare sites keep the key omitted, the prefixed site spells
         // `<qualifier>.<name>` (the schema's optional string). Rows sort
         // by offset then use path: b (41), then c and d both 43 with the
@@ -749,7 +1216,7 @@ mod tests {
     /// is a plain `reference`, the constructor site is `invoked`).
     const BATCH_B: &str = "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  top();\n}\n";
 
-    /// The §15.8.4 expansion: 3 symbols × 2 kinds answer all 6 pairs in
+    /// The expansion: 3 symbols × 2 kinds answer all 6 pairs in
     /// request order (item order, then kind order), each pair the single
     /// face's own rows over the one analyzed graph, each answer
     /// schema-valid under the frozen v1 query contract.
@@ -780,7 +1247,7 @@ mod tests {
         // the callers face keeps the invocation only.
         assert_eq!(answers[0].run.refs.len(), 2);
         assert_eq!(answers[1].run.refs.len(), 1);
-        assert_eq!(answers[1].run.refs[0].kind, RefKind::Invoked);
+        assert_eq!(answers[1].run.refs[0].kind, ReferenceKind::Invoked);
         // top: one call site under both kinds; meth: declared, never used.
         assert_eq!(answers[2].run.refs.len(), 1);
         assert_eq!(answers[3].run.refs.len(), 1);
@@ -836,8 +1303,8 @@ mod tests {
 
     /// The inheritance fixture: `Animal` declares the abstract member
     /// `breathe`, `Dog extends Animal` overrides it, `Cat extends Animal`
-    /// does not, and the one import makes b the dependency face's importer
-    /// row.
+    /// does not, and the one import makes a the dependency face's forward
+    /// edge from b.
     const INHERIT_A: &str = "abstract class Animal {\n  void breathe();\n}\n";
     const INHERIT_B: &str = "import 'a.dart';\nclass Dog extends Animal {\n  void breathe() {}\n}\nclass Cat extends Animal {}\n";
 
@@ -888,7 +1355,9 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["name"], "Dog");
         assert_eq!(rows[0]["kind"], "class");
-        assert_eq!(rows[0]["container"], serde_json::Value::Null);
+        // Top-level rows omit the container key (null/empty fields are
+        // omitted, never spelled as null).
+        assert!(!rows[0].as_object().expect("row").contains_key("container"));
         assert!(rows[0]["line"].as_i64().expect("line") >= 1);
         let text = json.to_string();
         dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
@@ -916,9 +1385,14 @@ mod tests {
         let run = implementations(&mut engine, "breathe").expect("query");
         assert_eq!(run.decls.len(), 2, "the declaring and overriding members");
         assert_eq!(run.implementations.len(), 1, "only Dog overrides breathe");
-        let (name, container, file) = {
+        let (name, container, file, container_json) = {
             let row = &run.implementations[0];
-            (row.name, row.container, row.file)
+            (
+                row.name,
+                row.container,
+                row.file,
+                to_json(&run, "breathe")["implementations"][0]["container"].clone(),
+            )
         };
         assert_eq!(name, "breathe");
         assert_eq!(container, Some("Dog"));
@@ -927,55 +1401,108 @@ mod tests {
             Some(b.as_path()),
             "the override declares in Dog, b.dart"
         );
+        // The member row keeps the container key on the JSON face (the
+        // omission rule applies to top-level rows only).
+        assert_eq!(
+            container_json,
+            json!("Dog"),
+            "a member row carries its container"
+        );
 
         fs_remove(&root);
     }
 
-    /// The `query dependencies` face: the declaring library's importers on
-    /// the frozen `DependencyRow` shape — b.dart imports a.dart, so
-    /// querying a.dart's `Animal` names b.dart's path, deduplicated
-    /// ascending; the schema's reserved array carries the row.
+    /// The `query dependencies` face, forward direction: the declaring
+    /// library's own import edges plus the dependency-library symbols its
+    /// resolved uses consume. Querying b.dart's `Dog` names the a.dart
+    /// edge and the `Animal` use (`extends Animal` resolves there);
+    /// querying a.dart's `Animal` — a library with no imports — answers
+    /// the absent array (the additive slot's empty-row omission).
     #[test]
-    fn dependencies_rows_are_the_declaring_library_importers() {
+    fn dependencies_rows_are_the_declaring_library_own_imports() {
         let root = inherit_fixture("deps");
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
-        let b = root.canonicalize().expect("root").join("lib/b.dart");
 
-        let run = dependencies(&mut engine, "Animal").expect("query");
+        let run = dependencies(&mut engine, "Dog").expect("query");
         assert_eq!(run.decls.len(), 1, "the declaration row stays for identity");
         assert_eq!(run.refs.len(), 0);
-        let paths: Vec<&str> = run
+        let rows: Vec<(&str, Option<&str>)> = run
             .dependencies
             .iter()
-            .map(|row| row.path.as_str())
+            .map(|row| (row.path.as_str(), row.name.as_deref()))
             .collect();
         assert_eq!(
-            paths,
-            vec![b.to_str().expect("utf-8 path")],
-            "the one importer, its defining-file path"
+            rows,
+            vec![("package:fixture/a.dart", Some("Animal"))],
+            "b.dart's import edge plus the consumed symbol"
         );
 
-        let json = to_json(&run, "Animal");
-        let rows = json["dependencies"].as_array().expect("array");
-        assert_eq!(rows.len(), 1);
+        let json = to_json(&run, "Dog");
+        let deps = json["dependencies"].as_array().expect("array");
+        assert_eq!(deps.len(), 1);
         assert_eq!(
-            rows[0]["path"],
-            json!(b.to_str().expect("utf-8 path")),
-            "the frozen DependencyRow shape: `path` only"
+            deps[0],
+            json!({"path": "package:fixture/a.dart", "name": "Animal"}),
+            "the DependencyRow shape: the joined library's path plus the consumed name"
         );
-        let text = json.to_string();
-        dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
+        dartq_schema::validate(&json.to_string(), dartq_schema::Domain::Query)
+            .expect("schema-valid");
 
-        // A name whose library nothing imports (`Dog` declares in b.dart,
-        // which nothing imports — unlike `breathe`, whose primary
-        // declaration is a.dart's, and a.dart IS imported): the
+        // A name whose declaring library imports nothing: the
         // dependencies array is absent (the schema's additive slots are
         // empty-row omitted), the envelope stays the frozen one.
-        let run = dependencies(&mut engine, "Dog").expect("query");
+        let run = dependencies(&mut engine, "Animal").expect("query");
         assert!(run.dependencies.is_empty());
-        let json = to_json(&run, "Dog");
+        let json = to_json(&run, "Animal");
         assert!(json.get("dependencies").is_none());
         assert!(dartq_schema::validate(&json.to_string(), dartq_schema::Domain::Query).is_ok());
+
+        fs_remove(&root);
+    }
+
+    /// A bare import edge — one the declaring library's reference surface
+    /// resolves no use through — answers the library-level row alone: the
+    /// `path`, the `name` key omitted.
+    #[test]
+    fn a_dependency_with_no_consumed_symbol_is_the_bare_row() {
+        let root = workspace(
+            "deps_bare",
+            &[
+                ("lib/a.dart", "class Unused {}\n"),
+                ("lib/b.dart", "class Leaf {}\n"),
+                // c.dart imports both a.dart (whose `Unused` it uses) and
+                // b.dart (a bare edge — `Leaf` is never named).
+                (
+                    "lib/c.dart",
+                    "import 'a.dart';\nimport 'b.dart';\nclass C extends Unused {}\n",
+                ),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+
+        let run = dependencies(&mut engine, "C").expect("query");
+        let rows: Vec<(&str, Option<&str>)> = run
+            .dependencies
+            .iter()
+            .map(|row| (row.path.as_str(), row.name.as_deref()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("package:fixture/a.dart", Some("Unused")),
+                ("package:fixture/b.dart", None),
+            ],
+            "the consumed symbol rides its library, the bare edge stands alone"
+        );
+        let json = to_json(&run, "C");
+        let deps = json["dependencies"].as_array().expect("array");
+        assert_eq!(
+            deps[0],
+            json!({"path": "package:fixture/a.dart", "name": "Unused"})
+        );
+        assert_eq!(deps[1], json!({"path": "package:fixture/b.dart"}));
+        dartq_schema::validate(&json.to_string(), dartq_schema::Domain::Query)
+            .expect("schema-valid");
 
         fs_remove(&root);
     }
@@ -1035,11 +1562,200 @@ mod tests {
         let answers = batch(&mut engine, &queries).expect("batch");
         assert_eq!(answers.len(), 2, "one answer per (item, kind) pair");
         assert_eq!(answers[0].run.implementations.len(), 2, "Dog and Cat");
-        assert_eq!(answers[1].run.dependencies.len(), 1, "the b.dart importer");
+        assert!(
+            answers[1].run.dependencies.is_empty(),
+            "a.dart imports nothing — the forward direction's empty set"
+        );
         for answer in &answers {
             let text = to_json(&answer.run, answer.name).to_string();
             dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
         }
+
+        fs_remove(&root);
+    }
+
+    /// The signature-surface fixture: an annotated container (the
+    /// annotation column's source), a member set covering every member
+    /// kind and formal group, a top-level executable, and an unnamed
+    /// extension whose member answers the bare row (no container face to
+    /// join).
+    const SIG_A: &str = concat!(
+        "@Deprecated('use Other')\n",
+        "class Widget {\n",
+        "  static final int limit = 9;\n",
+        "  int size = 0;\n",
+        "  T pick<T>(T a, [int? b]) => a;\n",
+        "  int get twice => 2;\n",
+        "  void set twice(int v) {}\n",
+        "  void named({required String s, int n = 0}) {}\n",
+        "}\n",
+        "int top(int a, {String? b}) => a;\n",
+        "extension on int {\n",
+        "  void ext() {}\n",
+        "}\n",
+    );
+
+    /// The additive element-face columns: a container row carries its
+    /// annotations (never a signature), a member row its rendered
+    /// signature (never annotations), a top-level executable its own
+    /// signature, and a shape without a matching face keeps both keys
+    /// omitted — every shape born schema-valid.
+    #[test]
+    fn declaration_rows_carry_the_element_face_columns() {
+        let root = workspace("query_signature", &[("lib/a.dart", SIG_A)]);
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+
+        let row_for = |engine: &mut Engine, name: &str| {
+            let run = symbol(engine, name).expect("query");
+            let json = to_json(&run, name);
+            let row = json["declarations"]
+                .as_array()
+                .expect("declarations array")
+                .iter()
+                .find(|row| row["name"] == json!(name))
+                .unwrap_or_else(|| panic!("the queried declaration {name}: {json}"))
+                .clone();
+            assert!(
+                dartq_schema::validate(&json.to_string(), dartq_schema::Domain::Query).is_ok(),
+                "schema-valid: {name}"
+            );
+            row
+        };
+
+        // The container row: the annotation face, no signature.
+        let row = row_for(&mut engine, "Widget");
+        assert_eq!(
+            row["annotations"],
+            json!(["@Deprecated('use Other')"]),
+            "the spelled name plus the verbatim argument group"
+        );
+        assert!(row.get("signature").is_none());
+
+        // The members: every kind's rendered face, the modifier keywords
+        // in written order, the formal groups in source shape.
+        for (name, expected) in [
+            ("limit", "static final int limit"),
+            ("size", "int size"),
+            ("pick", "T pick<T>(T a, [int? b])"),
+            ("twice", "int get twice"),
+            ("twice=", "void set twice(int v)"),
+            ("named", "void named({required String s, int n})"),
+        ] {
+            let row = row_for(&mut engine, name);
+            assert_eq!(row["signature"], json!(expected), "signature of {name}");
+            assert!(row.get("annotations").is_none(), "{name} is a member");
+        }
+
+        // The top-level executable's own face; the unnamed extension
+        // member keeps the bare row (no facts face answers it).
+        let row = row_for(&mut engine, "top");
+        assert_eq!(row["signature"], json!("int top(int a, {String? b})"));
+        let row = row_for(&mut engine, "ext");
+        assert_eq!(row["kind"], "method");
+        assert!(row.get("signature").is_none(), "no face, no signature key");
+        assert!(row.get("annotations").is_none());
+
+        fs_remove(&root);
+    }
+
+    /// The minimal tier over the signature fixture: the element-face
+    /// columns (`signature`, `annotations`) and the convenience spellings
+    /// drop — the answer is tier-exact under the frozen contract's minimal
+    /// check — while compact and full answer [`to_json`] verbatim.
+    #[test]
+    fn minimal_tier_keeps_the_red_line_only() {
+        let root = workspace("query_minimal", &[("lib/a.dart", SIG_A)]);
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+
+        // A member row (compact carries its signature) and a container row
+        // (compact carries its annotations) both trim to the locators.
+        for name in ["limit", "Widget"] {
+            let run = symbol(&mut engine, name).expect("query");
+            let minimal = to_json_at_tier(&run, name, crate::Verbosity::Minimal);
+            dartq_schema::validate_at_tier(
+                &minimal.to_string(),
+                dartq_schema::Domain::Query,
+                dartq_schema::Verbosity::Minimal,
+            )
+            .expect("tier-exact at minimal");
+            assert!(
+                minimal["declarations"]
+                    .as_array()
+                    .expect("declarations")
+                    .iter()
+                    .all(|row| row.get("container").is_none()
+                        && row.get("signature").is_none()
+                        && row.get("annotations").is_none()),
+                "locators only: {name}"
+            );
+            assert!(minimal.get("implementations").is_none());
+            assert!(minimal.get("dependencies").is_none());
+
+            // Compact and full answer the frozen shape verbatim.
+            assert_eq!(
+                to_json_at_tier(&run, name, crate::Verbosity::Compact),
+                to_json(&run, name)
+            );
+            assert_eq!(
+                to_json_at_tier(&run, name, crate::Verbosity::Full),
+                to_json(&run, name)
+            );
+        }
+
+        fs_remove(&root);
+    }
+
+    /// The golden fixture's use file (goldens/ai/README.md): the
+    /// constructor site lands at the shared fixtures' pinned offset 41.
+    const GOLDEN_B: &str = "import 'a.dart';\nvoid main() {\n  var w = Widget();\n  top(1);\n}\n";
+    /// The golden fixture's non-lib member: no `package:` URI addresses
+    /// it, so its label is the canonical path — root-dependent, which is
+    /// why the golden carries the `FIXTURE_ROOT` placeholder token.
+    const GOLDEN_NOTE: &str = "import 'package:fixture/a.dart';\nWidget? probe() => null;\n";
+
+    /// The AI-face goldens (`goldens/ai/query_symbol_{compact,minimal}
+    /// .json`): the promoted envelopes over the golden fixture, pinned
+    /// against live producer output. They carry #1560's element-face
+    /// columns, #1556's package-form labels, and the non-lib canonical
+    /// fallback (the `FIXTURE_ROOT` placeholder substituted with the
+    /// canonical fixture root). Values derive from the pinned tests
+    /// (goldens/ai/README.md); a mismatch is a regression, not a golden to
+    /// edit.
+    #[test]
+    fn the_ai_goldens_pin_the_promoted_envelopes() {
+        let root = workspace(
+            "query_golden",
+            &[
+                ("lib/a.dart", SIG_A),
+                ("lib/b.dart", GOLDEN_B),
+                ("tool/note.dart", GOLDEN_NOTE),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let run = symbol(&mut engine, "Widget").expect("query");
+
+        let goldens = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../goldens/ai");
+        let load = |file: &str| {
+            let raw = std::fs::read_to_string(goldens.join(file))
+                .unwrap_or_else(|e| panic!("read goldens/ai/{file}: {e}"));
+            let raw = raw.replace(
+                "FIXTURE_ROOT",
+                root.canonicalize()
+                    .expect("canonical root")
+                    .to_str()
+                    .expect("UTF-8 root"),
+            );
+            serde_json::from_str(&raw).expect("one JSON object")
+        };
+
+        let compact: serde_json::Value = load("query_symbol_compact.json");
+        assert_eq!(to_json(&run, "Widget"), compact, "compact golden drift");
+        let minimal: serde_json::Value = load("query_symbol_minimal.json");
+        assert_eq!(
+            to_json_at_tier(&run, "Widget", crate::Verbosity::Minimal),
+            minimal,
+            "minimal golden drift"
+        );
 
         fs_remove(&root);
     }

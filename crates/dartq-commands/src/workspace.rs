@@ -10,13 +10,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use dartq_diagnostics::{CodeInfo, DARTQ_PACKAGE_CONFIG_MISSING, DARTQ_PACKAGE_CONFIG_OUT_OF_DATE};
+use dartq_diagnostics::{
+    CodeInfo, DARTQ_PACKAGE_CONFIG_INVALID, DARTQ_PACKAGE_CONFIG_MISSING,
+    DARTQ_PACKAGE_CONFIG_OUT_OF_DATE,
+};
 use dartq_engine::semdiag;
 use dartq_engine::{Engine, EngineConfig};
 use dartq_package::PackageTable;
 use dartq_pub::{
-    DependencySpec, EnvSnapshot, Freshness, LanguageVersion, LockFile, PackageConfig, PubError,
-    Pubspec, StaleReason, WorkspaceLayout, build_graph, find_workspace_root, normalize,
+    DependencySpec, EnvSnapshot, Environment, Freshness, LanguageVersion, LockFile, PackageConfig,
+    PackageConfigEntry, PubError, Pubspec, Resolution, ResolutionBaseline, ResolvedPackageGraph,
+    StaleReason, WorkspaceLayout, build_graph, find_workspace_root, normalize,
 };
 use dartq_sdk::SdkSnapshot;
 use thiserror::Error;
@@ -61,13 +65,47 @@ impl StaleConfigAdvisory {
     }
 }
 
+/// The one non-gating advisory of a corrupt resolution: the
+/// `dartq/package_config_invalid` TOOL diagnostic. The config exists but is
+/// unusable — unreadable, malformed JSON, duplicate package names — and the
+/// analyze path degrades to the oracle's `Packages.empty` floor instead of
+/// refusing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidConfigAdvisory {
+    /// The `package_config.json` that failed — the output faces' row anchor
+    /// (canonical, the oracle path convention).
+    pub config_path: PathBuf,
+    /// The concrete failure (the parse/resolve error), verbatim.
+    pub reason: String,
+}
+
+impl InvalidConfigAdvisory {
+    /// The diagnostic code, pinned to the reserved registry row
+    /// (`dartq_diagnostics::code::DARTQ_PACKAGE_CONFIG_INVALID`).
+    pub const CODE: &'static str = "dartq/package_config_invalid";
+
+    /// One-line message for the output faces.
+    #[must_use]
+    pub fn message(&self) -> String {
+        format!(
+            "package_config.json is unusable ({}); analyzing with `package:` \
+             imports unresolved",
+            self.reason
+        )
+    }
+}
+
 /// The one non-gating workspace advisory of an assembly, riding the #732
 /// output channel (one INFO TOOL row per invocation, never part of the
 /// per-file set or the exit tier). The stale variant covers a config that
 /// exists but looks stale; the missing variant covers degraded mode (#759):
 /// no `package_config.json` found, the context opens on the oracle's
-/// BasicWorkspace floor and every `package:` import stays unresolved — the
-/// oracle analyzes, it does not refuse.
+/// `BasicWorkspace` floor and every `package:` import stays unresolved — the
+/// oracle analyzes, it does not refuse. The invalid variant covers a config
+/// that exists but cannot be used: the oracle's parse-failure catch-all
+/// (upstream Dart SDK source, pkg/analyzer/lib/src/context/packages.dart
+/// `parsePackageConfigJsonFile`) turns any read/parse failure into
+/// `Packages.empty` and keeps analyzing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceAdvisory {
     /// The config as written looks stale
@@ -76,6 +114,9 @@ pub enum WorkspaceAdvisory {
     /// No config anywhere (`dartq/package_config_missing`); the payload is
     /// the path `dart pub get` would materialize — the row's anchor.
     MissingConfig(PathBuf),
+    /// The config is unusable (`dartq/package_config_invalid`); the floor
+    /// is `Packages.empty` plus the self package.
+    InvalidConfig(InvalidConfigAdvisory),
 }
 
 impl WorkspaceAdvisory {
@@ -85,16 +126,18 @@ impl WorkspaceAdvisory {
         match self {
             Self::Stale(_) => DARTQ_PACKAGE_CONFIG_OUT_OF_DATE,
             Self::MissingConfig(_) => DARTQ_PACKAGE_CONFIG_MISSING,
+            Self::InvalidConfig(_) => DARTQ_PACKAGE_CONFIG_INVALID,
         }
     }
 
     /// The row's file anchor: the config the advisory names — existing for
-    /// the stale variant, prospective for the missing one.
+    /// the stale and invalid variants, prospective for the missing one.
     #[must_use]
     pub fn config_path(&self) -> &Path {
         match self {
             Self::Stale(advisory) => &advisory.config_path,
             Self::MissingConfig(config_path) => config_path,
+            Self::InvalidConfig(advisory) => &advisory.config_path,
         }
     }
 
@@ -103,27 +146,36 @@ impl WorkspaceAdvisory {
     pub fn message(&self) -> String {
         match self {
             Self::Stale(advisory) => advisory.message(),
+            Self::InvalidConfig(advisory) => advisory.message(),
             // The row's FILE field already carries the path; the message
             // stays position-free.
-            Self::MissingConfig(_) => format!(
-                "package_config.json not found; run `dart pub get` \
+            Self::MissingConfig(_) => "package_config.json not found; run `dart pub get` \
                  (analyzing with `package:` imports unresolved)"
-            ),
+                .to_string(),
         }
     }
 }
 
-/// The usage-tier workspace assembly shared by the engine-backed faces:
-/// SDK root resolution, canonicalized package directory (printed paths are
+/// The usage-tier workspace assembly shared by the engine-backed faces that
+/// print no diagnostics (the query family and `impact`): SDK root
+/// resolution, canonicalized package directory (printed paths are
 /// symlink-resolved, the oracle convention), the three pub faces, package
-/// tables, SDK snapshot, and the engine context.
+/// tables, SDK snapshot, and the engine context. The semantic diagnostic
+/// families are disarmed here (`semdiag: None`, the engine's
+/// under-reporting posture): these faces answer from the index rows,
+/// graphs, and facts the pipeline builds regardless, so the per-library
+/// semantic fold would be dead work on every analyzed file.
 ///
 /// # Errors
 ///
 /// [`WorkspaceError`] when the SDK, the package directory, or the pub
 /// faces are unusable.
 pub fn open_engine(dir: &Path, sdk: Option<&Path>) -> Result<(Engine, PathBuf), WorkspaceError> {
-    open_engine_with_advisory(dir, sdk).map(|(engine, dir, _)| (engine, dir))
+    let (mut config, dir, _) = engine_config_with_advisory(dir, sdk)?;
+    config.semdiag = None;
+    let engine = Engine::new(config)
+        .map_err(|error| WorkspaceError(format!("engine context unusable: {error}")))?;
+    Ok((engine, dir))
 }
 
 /// [`open_engine`] plus the assembly's one workspace advisory (the #732
@@ -261,19 +313,25 @@ pub fn engine_config_with_overrides(
             "no Dart SDK root (pass --sdk PATH or set DART_SDK)".into(),
         ));
     };
+    // The SDK loads before the assembly: the freshness face observes the
+    // snapshot's Dart version against the config's `generatorVersion`. The
+    // message is the oracle's usage text for the unusable-SDK tier,
+    // verbatim (upstream Dart SDK source, pkg/dartdev — analyze.dart:208).
+    let sdk_snapshot = SdkSnapshot::load(&sdk_root, None)
+        .map_err(|_| WorkspaceError(format!("Invalid Dart SDK path: {}", sdk_root.display())))?;
     // The stale-config advisory rides `package_assembly`; the engine-backed
     // faces surface it through their output plumbing.
-    let (packages, config, config_dir, dir, stale_advisory) =
-        package_assembly_with(dir, overrides.packages.as_deref())?;
-    let sdk_snapshot = SdkSnapshot::load(&sdk_root, None).map_err(|error| {
-        WorkspaceError(format!(
-            "Dart SDK at {} unusable: {error}",
-            sdk_root.display()
-        ))
-    })?;
+    let (packages, config, config_dir, dir, stale_advisory) = package_assembly_with(
+        dir,
+        overrides.packages.as_deref(),
+        Some(&sdk_snapshot.dart.version),
+    )?;
     Ok((
         EngineConfig {
-            store: dartq_engine::memory_store(),
+            // The file-backed CAS store: workspace loads ride read-only
+            // memory mappings (zero-copy text, content-deduplicated), the
+            // engine's cold-load default.
+            store: dartq_engine::mmap_store(),
             sdk: sdk_snapshot,
             packages,
             pub_config: config,
@@ -299,7 +357,7 @@ pub fn engine_config_with_overrides(
 /// [`WorkspaceAdvisory::Stale`] when a config exists and
 /// [`Freshness::check`] reports staleness or the graph recorded membership
 /// findings; [`WorkspaceAdvisory::MissingConfig`] when there is no config
-/// at all and the assembly degrades to the oracle's BasicWorkspace floor.
+/// at all and the assembly degrades to the oracle's `BasicWorkspace` floor.
 /// Assembly proceeds either way; the advisory is output, not refusal.
 ///
 /// The degraded floor (#759, the official locator's posture): the root
@@ -316,19 +374,21 @@ pub fn engine_config_with_overrides(
 ///
 /// [`WorkspaceError`] when the package directory or the pub faces are
 /// unusable.
-pub(crate) fn package_assembly(
-    dir: &Path,
-) -> Result<
-    (
-        PackageTable,
-        Arc<PackageConfig>,
-        PathBuf,
-        PathBuf,
-        Option<WorkspaceAdvisory>,
-    ),
-    WorkspaceError,
-> {
-    package_assembly_with(dir, None)
+/// One assembled workspace face: the package table, the resolution config,
+/// the workspace root, the resolved pubspec path, and any non-fatal pub
+/// advisory.
+pub(crate) type WorkspaceAssembly = (
+    PackageTable,
+    Arc<PackageConfig>,
+    PathBuf,
+    PathBuf,
+    Option<WorkspaceAdvisory>,
+);
+
+pub(crate) fn package_assembly(dir: &Path) -> Result<WorkspaceAssembly, WorkspaceError> {
+    // No SDK snapshot on this path: the generatorVersion comparison stays
+    // skipped (an unobservable face never stales).
+    package_assembly_with(dir, None, None)
 }
 
 /// [`package_assembly`] with the analyze face's `--packages` override
@@ -338,19 +398,109 @@ pub(crate) fn package_assembly(
 /// missing file is the usage-tier refusal the dartdev CLI ships
 /// (`The file doesn't exist: {path}`); an override without any pubspec on
 /// the walk is refused (dartq's package table is workspace-assembled).
+/// `dart_version` is the SDK snapshot's observed version, when the caller
+/// has one — the freshness face compares it against the config's
+/// `generatorVersion` (upstream pub source, entrypoint.dart:1231-1233
+/// `isPackageConfigGeneratedBySameDartSdk`); `None` (the SDK-free faces)
+/// skips that comparison, an unobservable face never stales.
 pub(crate) fn package_assembly_with(
     dir: &Path,
     packages_override: Option<&Path>,
-) -> Result<
-    (
-        PackageTable,
-        Arc<PackageConfig>,
-        PathBuf,
-        PathBuf,
-        Option<WorkspaceAdvisory>,
-    ),
-    WorkspaceError,
-> {
+    dart_version: Option<&str>,
+) -> Result<WorkspaceAssembly, WorkspaceError> {
+    match assemble(dir, packages_override, dart_version)? {
+        AssemblyBody::Floor(assembly) => Ok(assembly),
+        AssemblyBody::Resolved {
+            packages,
+            config,
+            config_dir,
+            dir,
+            advisory,
+            ..
+        } => Ok((packages, config, config_dir, dir, advisory)),
+    }
+}
+
+/// The strict assembly's payload: the resolution config, the resolved graph
+/// (the compat face rebuilds its per-axis identity tables from it — the
+/// table is engine-owned, not `Clone`), the config directory, and the one
+/// non-gating advisory (the [`WorkspaceAdvisory::Stale`] variant; the
+/// Missing and Invalid variants are the strict refusals here).
+pub(crate) type StrictAssembly = (
+    Arc<PackageConfig>,
+    ResolvedPackageGraph,
+    PathBuf,
+    Option<WorkspaceAdvisory>,
+);
+
+/// The compat face's assembly: the same machinery as
+/// [`package_assembly_with`] (root resolution, member/non-member pubspec
+/// seeding, nested-root extension, freshness baseline), with the three
+/// degrade floors turned into the config-required refusals the face's
+/// strictness contract pins — a package with no resolvable config anywhere
+/// up the root chain (or a config unusable at all) is the usage tier, where
+/// the analyze path degrades and analyzes. `dart_version` is `None` on this
+/// path by shape: the compat face assembles before any axis SDK is loaded
+/// and the axes may disagree, so no `generatorVersion` comparison runs.
+///
+/// # Errors
+///
+/// [`WorkspaceError`] when the package directory or the pub faces are
+/// unusable (the floors, verbatim messages below), with the missing-config
+/// message byte-identical to [`load_workspace_faces`]'s.
+pub(crate) fn package_assembly_strict(dir: &Path) -> Result<StrictAssembly, WorkspaceError> {
+    match assemble(dir, None, None)? {
+        AssemblyBody::Floor((_, _, _, _, advisory)) => Err(WorkspaceError(match advisory {
+            Some(WorkspaceAdvisory::MissingConfig(config_path)) => format!(
+                "no package config at {} (run `dart pub get`)",
+                config_path.display()
+            ),
+            Some(WorkspaceAdvisory::InvalidConfig(invalid)) => format!(
+                "package_config.json at {} is unusable: {}",
+                invalid.config_path.display(),
+                invalid.reason
+            ),
+            // The floors carry Missing or Invalid by construction; Stale
+            // and None are the success path's shapes.
+            Some(WorkspaceAdvisory::Stale(_)) | None => {
+                unreachable!("a degrade floor's advisory is Missing or Invalid")
+            }
+        })),
+        AssemblyBody::Resolved {
+            config,
+            graph,
+            config_dir,
+            advisory,
+            ..
+        } => Ok((config, graph, config_dir, advisory)),
+    }
+}
+
+/// The shared assembly body's outcome: one of the three degrade floors —
+/// the analyze path assembles over it, the strict face refuses on it — or
+/// the full resolution, which also carries the graph (the table-backed
+/// faces don't consume it; the compat face's per-axis identity-table
+/// rebuilds do).
+#[derive(Debug)]
+enum AssemblyBody {
+    Floor(Assembly),
+    Resolved {
+        packages: PackageTable,
+        config: Arc<PackageConfig>,
+        graph: ResolvedPackageGraph,
+        config_dir: PathBuf,
+        dir: PathBuf,
+        advisory: Option<WorkspaceAdvisory>,
+    },
+}
+
+/// The machinery [`package_assembly_with`] and [`package_assembly_strict`]
+/// share; the callers diverge exactly at the [`AssemblyBody::Floor`] sites.
+fn assemble(
+    dir: &Path,
+    packages_override: Option<&Path>,
+    dart_version: Option<&str>,
+) -> Result<AssemblyBody, WorkspaceError> {
     let override_config = packages_override
         .map(|given| {
             let path = std::path::absolute(given)
@@ -361,10 +511,7 @@ pub(crate) fn package_assembly_with(
                     given.display()
                 )));
             }
-            let parent = path
-                .parent()
-                .expect("an absolute path always has a parent")
-                .to_path_buf();
+            let parent = override_parent(&path)?;
             Ok((path, parent))
         })
         .transpose()?;
@@ -381,25 +528,36 @@ pub(crate) fn package_assembly_with(
     // a refusal; every other discovery finding (a workspace-resolution
     // pubspec with no root above it) stays a usage error. The discriminator
     // is the walk's typed no-root variant (`PubError::NoRoot`), the one
-    // error that means "no pubspec on the chain".
+    // error that means "no pubspec on the chain". An unparseable pubspec on
+    // the chain is the oracle's empty-model floor, not a refusal: the
+    // analyzer reads every pubspec through the catching `Pubspec.parse`
+    // (upstream Dart SDK source, `pkg/analyzer/lib/src/lint/pub.dart`;
+    // the workspace face `pkg/analyzer/lib/src/workspace/pub.dart:487-494`
+    // builds through the same constructor), so the run roots at the
+    // nearest pubspec with empty facts where pub's validation walk refuses
+    // (entrypoint.dart).
     let workspace = match find_workspace_root(&dir) {
         Ok(workspace) => workspace,
-        Err(PubError::NoRoot(_)) if override_config.is_none() => return bare_assembly(&dir),
-        Err(PubError::NoRoot(_)) => {
-            return Err(WorkspaceError(format!(
-                "--packages requires a package directory (no pubspec above {})",
-                dir.display()
-            )));
-        }
+        Err(PubError::NoRoot(_)) => return no_root_posture(&dir, override_config.is_some()),
+        Err(PubError::Pubspec(_)) => match nearest_pubspec_dir(&dir) {
+            // A parse failure implies a pubspec on the chain at discovery
+            // time; a file deleted between the two walks (TOCTOU) is the
+            // same no-pubspec chain, the posture below — not a panic.
+            Some(root) => WorkspaceLayout {
+                root,
+                members: Vec::new(),
+                member_pubspecs: Vec::new(),
+            },
+            None => return no_root_posture(&dir, override_config.is_some()),
+        },
         Err(error) => return Err(WorkspaceError(error.to_string())),
     };
-    let (config_path, config_dir) = override_config
-        .map(|(path, parent)| (path, parent))
-        .unwrap_or_else(|| {
-            let config_dir = workspace.root.join(".dart_tool");
-            let config_path = config_dir.join("package_config.json");
-            (config_path, config_dir)
-        });
+    let packages_overridden = override_config.is_some();
+    let (config_path, config_dir) = override_config.unwrap_or_else(|| {
+        let config_dir = workspace.root.join(".dart_tool");
+        let config_path = config_dir.join("package_config.json");
+        (config_path, config_dir)
+    });
     // Known divergence: the oracle's PackageConfigWorkspaceFindSession walks
     // ancestors, so a config ABOVE the pubspec root wins there; dartq checks
     // only `workspace.root/.dart_tool` and degrades.
@@ -409,35 +567,106 @@ pub(crate) fn package_assembly_with(
         // `_contextRootLocation` walk = the member dir), so for a member with
         // no config anywhere dartq attributes files outside the member to the
         // self package where the oracle attributes nothing — attribution-only.
-        return degraded_assembly(&workspace.root, &config_path, &dir);
+        return degraded_assembly(&workspace.root, &config_path, &dir).map(AssemblyBody::Floor);
     }
-    let (config, lock, pubspec) =
-        load_workspace_faces(&workspace.root, &config_path).map_err(WorkspaceError)?;
+    // A config face failure degrades (the oracle's `Packages.empty`
+    // catch-all, packages.dart `parsePackageConfigJsonFile`); the lock face
+    // still refuses, and a malformed pubspec degrades to the empty model
+    // (the oracle's `Pubspec.parse` catch).
+    let (config, lock, mut pubspec) = match load_workspace_faces(&workspace.root, &config_path) {
+        Ok(faces) => faces,
+        Err(WorkspaceFacesError::PackageConfig(reason)) => {
+            return corrupt_config_assembly(&workspace.root, &config_path, &dir, &reason)
+                .map(AssemblyBody::Floor);
+        }
+        Err(error) => return Err(WorkspaceError(error.to_string())),
+    };
+    // The empty-model floor's root identity borrows the config's self-entry
+    // name (`config_self_name`): the table's name grammar has no null, and
+    // the attribution is root-based either way.
+    if pubspec.name.is_empty()
+        && let Some(name) = config_self_name(&config, &config_dir, &workspace.root)
+    {
+        pubspec.name = name;
+    }
+    // Nested self-resolved packages: a directory under the analyzed tree
+    // carrying its own `pubspec.yaml` AND its own
+    // `.dart_tool/package_config.json` (a Flutter plugin repo's `example/`
+    // after `pub get`) is a separate context root for the oracle
+    // (context_locator.dart `_createContextRoots`: a locally different
+    // packages file splits the root). dartq's single context stands in by
+    // giving the nested package a config identity, so its files attribute
+    // to it at the nested pubspec's sdk lower bound instead of the
+    // enclosing package's (or the default). With `--packages` the locator's
+    // `_defaultPackageConfigFile` short-circuit keeps one root everywhere,
+    // so discovery is skipped exactly there. The freshness face re-reads
+    // the on-disk config, so the in-memory extension never moves the
+    // advisory.
+    let config = if packages_overridden {
+        config
+    } else {
+        extend_config_with_nested_roots(config, &config_dir, &dir)
+    };
     let (extra_pubspecs, member_names) = assemble_extra_pubspecs(&workspace, &pubspec);
     // `workspace_members: None` outside a pub workspace — the standalone
     // package table must stay byte-identical to the pre-workspace shape.
     let workspace_members = (!pubspec.workspace.is_empty()).then_some(member_names.as_slice());
-    let graph = build_graph(
+    // A graph or table failure is a config-content defect (duplicate
+    // entries, a rejected `rootUri`/name/`packageUri`) — the same corrupt
+    // floor as a parse failure, the reason naming the defect.
+    let graph = match build_graph(
         &config,
         &lock,
         &pubspec,
         &extra_pubspecs,
         workspace_members,
         &config_dir,
-    )
-    .map_err(|error| WorkspaceError(error.to_string()))?;
-    let packages = PackageTable::build(&config, &graph, &config_dir)
-        .map_err(|error| WorkspaceError(error.to_string()))?;
+    ) {
+        Ok(graph) => graph,
+        Err(error) => {
+            return corrupt_config_assembly(
+                &workspace.root,
+                &config_path,
+                &dir,
+                &error.to_string(),
+            )
+            .map(AssemblyBody::Floor);
+        }
+    };
+    let packages = match PackageTable::build(&config, &graph, &config_dir) {
+        Ok(packages) => packages,
+        Err(error) => {
+            return corrupt_config_assembly(
+                &workspace.root,
+                &config_path,
+                &dir,
+                &error.to_string(),
+            )
+            .map(AssemblyBody::Floor);
+        }
+    };
     // The one stale-config advisory: freshness reasons plus the graph's
-    // membership findings, never a gate. The environment faces are skipped
-    // (dartq observes no Flutter/pub-cache environment here) and no
-    // `ResolutionBaseline` is retained yet, so mtime failures stand — the
-    // remedy, `pub get`, is always safe. The check stats a fixed file set
-    // (config, lock, per-entry pubspecs); it adds no directory scan. The
-    // lock's absence skips the freshness face entirely (#759): no lock
-    // means no freshness comparison, not an advisory.
+    // membership findings, never a gate. The environment faces other than
+    // the SDK version stay skipped (dartq observes no Flutter/pub-cache
+    // environment here). The content baseline is captured once per accepted
+    // resolution, right here — the config and per-entry pubspec bytes the
+    // graph was just built from — so an mtime-chain failure (a VCS checkout
+    // or `touch`) is excused when the content is unchanged,
+    // pub's own content-check posture; a capture failure (an entry pubspec
+    // vanished mid-run) keeps the conservative mtime verdict. The check
+    // stats a fixed file set (config, lock, per-entry pubspecs); it adds no
+    // directory scan. The lock's absence skips the freshness face entirely
+    // (#759): no lock means no freshness comparison, not an advisory.
+    // Cross-run seam: the baseline reflects the bytes as analyzed, so a
+    // pubspec edited after the real `pub get` but before this run is not
+    // caught; catching it needs a baseline persisted at acceptance time.
     let mut reasons = if workspace.root.join("pubspec.lock").is_file() {
-        Freshness::check(&workspace.root, &EnvSnapshot::default(), None).stale_reasons
+        let baseline = ResolutionBaseline::capture(&workspace.root).ok();
+        let env = EnvSnapshot {
+            dart_version: dart_version.map(str::to_owned),
+            ..EnvSnapshot::default()
+        };
+        Freshness::check(&workspace.root, &env, baseline.as_ref()).stale_reasons
     } else {
         Vec::new()
     };
@@ -448,7 +677,44 @@ pub(crate) fn package_assembly_with(
             config_path: config_path.clone(),
         })
     });
-    Ok((packages, config, config_dir, dir, stale_advisory))
+    Ok(AssemblyBody::Resolved {
+        packages,
+        config,
+        graph,
+        config_dir,
+        dir,
+        advisory: stale_advisory,
+    })
+}
+
+/// The `--packages` override's `rootUri` resolution base: the config
+/// file's parent directory. Fallible for the no-parent spellings (`/`,
+/// the empty path) — the usage-tier error, not a panic; the `is_file`
+/// guard refuses those first through the assembly, so the arm is
+/// hardening only.
+fn override_parent(path: &Path) -> Result<PathBuf, WorkspaceError> {
+    let parent = path.parent().ok_or_else(|| {
+        WorkspaceError(format!(
+            "--packages: path has no parent: {}",
+            path.display()
+        ))
+    })?;
+    Ok(parent.to_path_buf())
+}
+
+/// The no-pubspec-chain posture, shared by the root walk's typed no-root
+/// finding and the unparseable-pubspec arm whose nearest-pubspec walk
+/// comes up empty (the pubspec vanished mid-run): the bare floor without
+/// `--packages`, the usage refusal with it.
+fn no_root_posture(dir: &Path, packages_overridden: bool) -> Result<AssemblyBody, WorkspaceError> {
+    if packages_overridden {
+        Err(WorkspaceError(format!(
+            "--packages requires a package directory (no pubspec above {})",
+            dir.display()
+        )))
+    } else {
+        bare_assembly(dir).map(AssemblyBody::Floor)
+    }
 }
 
 /// The degraded floor's assembly: a single-package context rooted at the
@@ -463,9 +729,9 @@ fn degraded_assembly(
     config_path: &Path,
     dir: &Path,
 ) -> Result<Assembly, WorkspaceError> {
-    let pubspec = load_pubspec(root).map_err(WorkspaceError)?;
+    let pubspec = load_pubspec_or_empty(root).map_err(WorkspaceError)?;
     let language_version = LanguageVersion::from_sdk_constraint(pubspec.environment.sdk.as_ref());
-    let packages = PackageTable::basic(root, Some((&pubspec.name, Some(language_version))))
+    let packages = PackageTable::basic(root, self_package_facts(&pubspec, language_version))
         .map_err(|error| WorkspaceError(error.to_string()))?;
     Ok((
         packages,
@@ -476,8 +742,39 @@ fn degraded_assembly(
     ))
 }
 
+/// The corrupt-config floor: the oracle's `Packages.empty` catch-all — any
+/// read/parse/resolve failure of an existing `package_config.json` becomes
+/// an empty configuration and the run keeps analyzing with every `package:`
+/// import unresolved (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/context/packages.dart `parsePackageConfigJsonFile`
+/// catch; duplicate names reach it because package:package_config's default
+/// `onError` throws). Same single-package `BasicWorkspace` shape as
+/// [`degraded_assembly`] (the pubspec root is retained), with the
+/// invalid-config advisory carrying the failure.
+fn corrupt_config_assembly(
+    root: &Path,
+    config_path: &Path,
+    dir: &Path,
+    reason: &str,
+) -> Result<Assembly, WorkspaceError> {
+    let pubspec = load_pubspec_or_empty(root).map_err(WorkspaceError)?;
+    let language_version = LanguageVersion::from_sdk_constraint(pubspec.environment.sdk.as_ref());
+    let packages = PackageTable::basic(root, self_package_facts(&pubspec, language_version))
+        .map_err(|error| WorkspaceError(error.to_string()))?;
+    Ok((
+        packages,
+        empty_package_config(),
+        root.join(".dart_tool"),
+        dir.to_path_buf(),
+        Some(WorkspaceAdvisory::InvalidConfig(InvalidConfigAdvisory {
+            config_path: config_path.to_path_buf(),
+            reason: reason.to_owned(),
+        })),
+    ))
+}
+
 /// The bare floor: no pubspec anywhere on the walk — the oracle's
-/// path-local BasicWorkspace with `Packages.empty`
+/// path-local `BasicWorkspace` with `Packages.empty`
 /// (`context_locator.dart:517-522`). No self package (the workspace-default
 /// language version applies per file), every `package:` import unresolved.
 fn bare_assembly(dir: &Path) -> Result<Assembly, WorkspaceError> {
@@ -505,6 +802,20 @@ fn empty_package_config() -> Arc<PackageConfig> {
     })
 }
 
+/// The nearest directory at or above `from` carrying a `pubspec.yaml` —
+/// the root of the unparseable-pubspec floor (the oracle's `BasicWorkspace`
+/// roots at the closest pubspec, `context_locator.dart`
+/// `_contextRootLocation`).
+fn nearest_pubspec_dir(from: &Path) -> Option<PathBuf> {
+    let mut dir = from.to_path_buf();
+    loop {
+        if dir.join("pubspec.yaml").is_file() {
+            return Some(dir);
+        }
+        dir = dir.parent()?.to_path_buf();
+    }
+}
+
 /// The [`package_assembly`] tuple, named for the two floor helpers.
 type Assembly = (
     PackageTable,
@@ -514,6 +825,29 @@ type Assembly = (
     Option<WorkspaceAdvisory>,
 );
 
+/// Why [`load_workspace_faces`] failed, split on the face the two callers
+/// treat differently: the config face's failure is the analyze path's
+/// degrade trigger (the oracle's `Packages.empty` catch-all), while the
+/// compat face requires the config and the lock/pubspec faces always
+/// refuse. The message text is the printed failure, byte-identical to the
+/// pre-typing strings.
+#[derive(Debug)]
+pub enum WorkspaceFacesError {
+    /// `package_config.json` is unreadable or unparseable.
+    PackageConfig(String),
+    /// `pubspec.lock` is unreadable or unparseable, or `pubspec.yaml` is
+    /// missing (an unparseable pubspec degrades — [`load_pubspec_or_empty`]).
+    PubFaces(String),
+}
+
+impl std::fmt::Display for WorkspaceFacesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PackageConfig(message) | Self::PubFaces(message) => f.write_str(message),
+        }
+    }
+}
+
 /// The three pub faces the engine's context derives from (the same assembly
 /// the engine integration fixture pins): `package_config.json`,
 /// `pubspec.lock`, `pubspec.yaml` — `dir` already canonicalized and, on the
@@ -521,33 +855,39 @@ type Assembly = (
 ///
 /// The lock is optional (#759): its absence yields an empty
 /// [`LockFile`] — the graph resolves every config entry as a local path
-/// source and the freshness face stays silent. A present but malformed lock
-/// still fails the assembly, and so does a missing or malformed config:
-/// the caller (`dartq compat`) owns the config-required posture.
+/// source and the freshness face stays silent. A present but malformed
+/// lock still fails the assembly, and so does a missing or malformed
+/// config: the caller (`dartq compat`) owns the config-required posture;
+/// the analyze path matches the [`WorkspaceFacesError::PackageConfig`]
+/// variant into its degrade floor. A malformed `pubspec.yaml` degrades
+/// to the empty model ([`load_pubspec_or_empty`], the oracle's
+/// `Pubspec.parse` catch) instead of refusing.
 ///
 /// # Errors
 ///
-/// A human-readable message naming the missing or malformed face.
+/// A [`WorkspaceFacesError`] naming the missing or malformed face.
 pub fn load_workspace_faces(
     dir: &Path,
     config_path: &Path,
-) -> Result<(Arc<PackageConfig>, LockFile, Pubspec), String> {
+) -> Result<(Arc<PackageConfig>, LockFile, Pubspec), WorkspaceFacesError> {
     let config_text = fs::read_to_string(config_path).map_err(|_| {
-        format!(
+        WorkspaceFacesError::PackageConfig(format!(
             "no package config at {} (run `dart pub get`)",
             config_path.display()
-        )
+        ))
     })?;
-    let config = PackageConfig::parse(&config_text).map_err(|error| error.to_string())?;
+    let config = PackageConfig::parse(&config_text)
+        .map_err(|error| WorkspaceFacesError::PackageConfig(error.to_string()))?;
     let lock_path = dir.join("pubspec.lock");
     let lock = if lock_path.is_file() {
-        let lock_text =
-            fs::read_to_string(&lock_path).map_err(|error| format!("pubspec.lock: {error}"))?;
-        LockFile::parse(&lock_text).map_err(|error| error.to_string())?
+        let lock_text = fs::read_to_string(&lock_path)
+            .map_err(|error| WorkspaceFacesError::PubFaces(format!("pubspec.lock: {error}")))?;
+        LockFile::parse(&lock_text)
+            .map_err(|error| WorkspaceFacesError::PubFaces(error.to_string()))?
     } else {
         LockFile::empty()
     };
-    let pubspec = load_pubspec(dir)?;
+    let pubspec = load_pubspec_or_empty(dir).map_err(WorkspaceFacesError::PubFaces)?;
     Ok((Arc::new(config), lock, pubspec))
 }
 
@@ -561,6 +901,79 @@ pub fn load_workspace_faces(
 ///
 /// A human-readable message naming the missing file or the parse error.
 fn load_pubspec(dir: &Path) -> Result<Pubspec, String> {
+    let (text, overrides) = read_pubspec_sources(dir)?;
+    Pubspec::parse_with_overrides(&text, overrides.as_deref()).map_err(|error| error.to_string())
+}
+
+/// The assembly faces' pubspec read: a present but unparseable
+/// `pubspec.yaml` is the oracle's empty model, never a refusal — the
+/// analyzer builds every pubspec through a constructor that catches the
+/// YAML failure and yields an empty document (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/lint/pub.dart`, `Pubspec.parse`'s catch; the
+/// workspace face `pkg/analyzer/lib/src/workspace/pub.dart` reads through
+/// the same constructor, so the run assembles with name/workspace/override
+/// facts at their empty floors instead of refusing). A missing pubspec
+/// stays an error.
+///
+/// # Errors
+///
+/// A human-readable message naming the missing file or the overrides read.
+fn load_pubspec_or_empty(dir: &Path) -> Result<Pubspec, String> {
+    let (text, overrides) = read_pubspec_sources(dir)?;
+    Ok(
+        Pubspec::parse_with_overrides(&text, overrides.as_deref()).unwrap_or_else(|_| Pubspec {
+            name: String::new(),
+            version: None,
+            environment: Environment::default(),
+            workspace: Vec::new(),
+            resolution: Resolution::Unspecified,
+            dependencies: BTreeMap::new(),
+            dev_dependencies: BTreeMap::new(),
+            dependency_overrides: BTreeMap::new(),
+        }),
+    )
+}
+
+/// The empty-model floor's self-package facts for [`PackageTable::basic`]:
+/// a nameless pubspec (the unparseable floor) carries no self package —
+/// the name grammar has no null, and the bare floor is the closest
+/// representable posture.
+fn self_package_facts(
+    pubspec: &Pubspec,
+    language_version: LanguageVersion,
+) -> Option<(&str, Option<LanguageVersion>)> {
+    if pubspec.name.is_empty() {
+        None
+    } else {
+        Some((&pubspec.name, Some(language_version)))
+    }
+}
+
+/// The config entry whose root is `root` — the resolution artifacts' name
+/// for the self package (the config is the fresher face of the package
+/// identity). The empty-model floor's root identity borrows it: the table's
+/// name grammar has no null, and attribution is root-based either way.
+fn config_self_name(config: &PackageConfig, config_dir: &Path, root: &Path) -> Option<String> {
+    let target = normalize(root);
+    config
+        .packages
+        .iter()
+        .find(|entry| {
+            entry
+                .resolve_root(config_dir)
+                .map(|resolved| normalize(&resolved) == target)
+                .unwrap_or(false)
+        })
+        .map(|entry| entry.name.to_string())
+}
+
+/// Reads `<dir>/pubspec.yaml` plus its optional `pubspec_overrides.yaml`
+/// (`allowOverridesFile: true`, entrypoint.dart:95-101).
+///
+/// # Errors
+///
+/// A human-readable message naming the missing file or the overrides read.
+fn read_pubspec_sources(dir: &Path) -> Result<(String, Option<String>), String> {
     let text = fs::read_to_string(dir.join("pubspec.yaml"))
         .map_err(|_| format!("no pubspec.yaml under {}", dir.display()))?;
     let overrides_path = dir.join("pubspec_overrides.yaml");
@@ -572,7 +985,7 @@ fn load_pubspec(dir: &Path) -> Result<Pubspec, String> {
     } else {
         None
     };
-    Pubspec::parse_with_overrides(&text, overrides.as_deref()).map_err(|error| error.to_string())
+    Ok((text, overrides))
 }
 
 /// The graph's `extra_pubspecs` and the workspace member names: every member
@@ -665,6 +1078,137 @@ fn seed_non_member_path_deps(
     }
 }
 
+/// Directories visited before [`extend_config_with_nested_roots`]'s scan
+/// stops: the bounded-walk fuse. A tree beyond the budget keeps today's
+/// attribution for its undiscovered nested packages instead of growing the
+/// startup cost without bound.
+const NESTED_ROOT_WALK_BUDGET: usize = 10_000;
+
+/// Extends the context config with one entry per nested self-resolved
+/// package: a directory under `dir` (the canonicalized analyzed tree)
+/// carrying its own `pubspec.yaml` together with its own
+/// `.dart_tool/package_config.json` — the oracle's separate-context-root
+/// trigger (`context_locator.dart` `_createContextRoots`,
+/// `packageConfigFileToUse != containingRoot.packagesFile`). The entry's
+/// language version is the nested pubspec's sdk lower bound — what pub
+/// materializes into a written config's `languageVersion`, the same
+/// inference the degraded floor applies.
+///
+/// Skips: directories already covered by a config entry root (the root,
+/// workspace members, path deps), names already present or added (one
+/// identity per name is a table invariant), and pubspecs that fail to load
+/// — a stray malformed pubspec degrades to today's attribution instead of
+/// failing the assembly. Hidden directories hold no package source
+/// (`.dart_tool`, `.git`) and are not descended; discovered roots are,
+/// mirroring the locator's recursion; the walk stops at
+/// [`NESTED_ROOT_WALK_BUDGET`] directories.
+///
+/// The common case — no nested roots — returns `config` unchanged.
+fn extend_config_with_nested_roots(
+    config: Arc<PackageConfig>,
+    config_dir: &Path,
+    dir: &Path,
+) -> Arc<PackageConfig> {
+    let taken_names: BTreeSet<&str> = config
+        .packages
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+    let taken_roots: BTreeSet<PathBuf> = config
+        .packages
+        .iter()
+        .filter_map(|entry| entry.resolve_root(config_dir).ok())
+        .map(|root| normalize(&root))
+        .collect();
+
+    let mut entries = Vec::new();
+    let mut added_roots: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut added_names: BTreeSet<String> = BTreeSet::new();
+    let mut visited = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        visited += 1;
+        if visited > NESTED_ROOT_WALK_BUDGET {
+            break;
+        }
+        let mut children: Vec<PathBuf> = fs::read_dir(&current)
+            .map(|listing| {
+                listing
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default();
+        children.sort();
+        for child in children {
+            if child
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.'))
+            {
+                continue;
+            }
+            stack.push(child);
+        }
+        // The nested-root trigger: own pubspec, own resolution artifacts.
+        if !current.join("pubspec.yaml").is_file()
+            || !current.join(".dart_tool/package_config.json").is_file()
+        {
+            continue;
+        }
+        // One spelling universe with the config's resolved roots; the walk
+        // starts canonical, and a symlinked candidate resolves too.
+        let Ok(target) = current.canonicalize() else {
+            continue;
+        };
+        let target = normalize(&target);
+        if taken_roots.contains(&target) || !added_roots.insert(target.clone()) {
+            continue;
+        }
+        let Ok(spec) = load_pubspec(&target) else {
+            continue;
+        };
+        if taken_names.contains(spec.name.as_str()) || !added_names.insert(spec.name.clone()) {
+            continue;
+        }
+        let base = config_dir.parent().unwrap_or(config_dir);
+        let Ok(relative) = target.strip_prefix(base) else {
+            continue;
+        };
+        entries.push(PackageConfigEntry {
+            name: spec.name.clone(),
+            root_uri: relative_root_uri(relative),
+            package_uri: "lib/".to_owned(),
+            language_version: Some(LanguageVersion::from_sdk_constraint(
+                spec.environment.sdk.as_ref(),
+            )),
+            additional_properties: BTreeMap::new(),
+        });
+    }
+    if entries.is_empty() {
+        return config;
+    }
+    let mut extended = (*config).clone();
+    extended.packages.extend(entries);
+    Arc::new(extended)
+}
+
+/// The `rootUri` for a nested root: a relative URI path from the config's
+/// directory (`"../example"`). The raw spelling rides `resolve_root`'s
+/// percent-decode, so a directory name carrying an encoded `%` would
+/// mis-decode — a spelling real package directories never carry.
+fn relative_root_uri(relative: &Path) -> String {
+    let mut uri = String::from("../");
+    for (index, component) in relative.components().enumerate() {
+        if index > 0 {
+            uri.push('/');
+        }
+        uri.push_str(&component.as_os_str().to_string_lossy());
+    }
+    uri
+}
+
 #[cfg(test)]
 pub(crate) mod test_fixture {
     //! The throwaway pub workspace + synthetic dart:core-only SDK the
@@ -695,7 +1239,7 @@ pub(crate) mod test_fixture {
         );
         write(
             ".dart_tool/package_config.json",
-            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
         );
         write("sdk/version", "3.13.1\n");
         write(
@@ -778,21 +1322,20 @@ mod tests {
         root
     }
 
-    /// Stale chain (pubspec no longer strictly older than the lock):
-    /// exactly one advisory, carrying the mtime reason — and the assembly
-    /// still succeeds (advisory, not refusal).
+    /// Stale resolution: exactly one advisory, carrying the reason — and
+    /// the assembly still succeeds (advisory, not refusal). The trigger is
+    /// a config entry whose package directory has no pubspec: the only
+    /// freshness faces the in-run content baseline cannot excuse
+    ///, so an mtime touch no longer stales — see
+    /// [`touched_resolution_stays_fresh_with_baseline`].
     #[test]
     fn stale_workspace_reports_exactly_one_advisory() {
         let root = workspace("ws_stale", &[]);
-        // Deterministic chain: pubspec (oldest) < lock < config.
-        let stamp = FileTime::from_unix_time(5_000, 0);
-        set_file_mtime(root.join("pubspec.yaml"), stamp).expect("set mtime");
-        set_file_mtime(root.join("pubspec.lock"), stamp).expect("set mtime");
-        set_file_mtime(
+        fs::write(
             root.join(".dart_tool/package_config.json"),
-            FileTime::from_unix_time(9_000, 0),
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}, {"name": "ghost", "rootUri": "../ghost", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
         )
-        .expect("set mtime");
+.expect("config");
 
         let root = root.canonicalize().expect("root");
         let (_, _, _, _, advisory) = package_assembly(&root).expect("assembly");
@@ -802,9 +1345,8 @@ mod tests {
         };
         assert_eq!(
             stale.reasons,
-            vec![StaleReason::PubspecNotStrictlyOlder {
-                package: "fixture".into(),
-                file: "pubspec.yaml",
+            vec![StaleReason::PackageDirMissing {
+                package: "ghost".into(),
             }]
         );
         assert!(advisory.message().contains("run `dart pub get`"));
@@ -834,7 +1376,7 @@ mod tests {
 
         let root = root.canonicalize().expect("root");
         let (_, _, _, _, advisory) = package_assembly(&root).expect("assembly");
-        assert!(advisory.is_none(), "unexpected: {:?}", advisory);
+        assert!(advisory.is_none(), "unexpected: {advisory:?}");
 
         fs::remove_dir_all(&root).ok();
     }
@@ -886,16 +1428,11 @@ mod tests {
     #[test]
     fn advisory_names_the_config_path() {
         let root = workspace("ws_adv_path", &[]);
-        set_file_mtime(
-            root.join("pubspec.yaml"),
-            FileTime::from_unix_time(5_000, 0),
+        fs::write(
+            root.join(".dart_tool/package_config.json"),
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}, {"name": "ghost", "rootUri": "../ghost", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
         )
-        .expect("set mtime");
-        set_file_mtime(
-            root.join("pubspec.lock"),
-            FileTime::from_unix_time(4_000, 0),
-        )
-        .expect("set mtime");
+.expect("config");
 
         let root = root.canonicalize().expect("root");
         let (_, _, _, _, advisory) = package_assembly(&root).expect("assembly");
@@ -920,7 +1457,7 @@ mod tests {
 
         // Missing file: the usage error, verbatim.
         let missing = root.join("absent.json");
-        let error = package_assembly_with(&root, Some(&missing)).expect_err("missing");
+        let error = package_assembly_with(&root, Some(&missing), None).expect_err("missing");
         assert!(
             error
                 .to_string()
@@ -937,7 +1474,7 @@ mod tests {
             r#"{"configVersion": 2, "packages": [], "generator": "pub"}"#,
         )
         .expect("config");
-        let error = package_assembly_with(&bare, Some(&config)).expect_err("no pubspec");
+        let error = package_assembly_with(&bare, Some(&config), None).expect_err("no pubspec");
         assert!(error.to_string().contains("no pubspec above"), "{error}");
 
         // A real override: the config comes from the given path (the
@@ -952,7 +1489,7 @@ mod tests {
         )
         .expect("config");
         let (packages, _, config_dir, _, advisory) =
-            package_assembly_with(&root, Some(&config)).expect("override assembly");
+            package_assembly_with(&root, Some(&config), None).expect("override assembly");
         assert_eq!(config_dir, other, "the override's directory");
         assert!(packages.get("fixture").is_some(), "the override's entries");
         assert!(
@@ -961,6 +1498,42 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&bare).ok();
+    }
+
+    /// The `--packages` parent hardening: the no-parent spellings (`/`,
+    /// the empty path) are the usage-tier error, not a panic. The
+    /// assembly's `is_file` guard refuses those first, so the arm is only
+    /// reachable at this seam.
+    #[test]
+    fn packages_override_without_parent_is_the_error_row() {
+        let error = override_parent(Path::new("/")).expect_err("no parent");
+        assert!(error.to_string().contains("path has no parent"), "{error}");
+    }
+
+    /// The TOCTOU degrade: an unparseable-pubspec finding whose
+    /// nearest-pubspec walk comes up empty (the file vanished mid-run)
+    /// takes the no-root posture — the bare floor's advisory without
+    /// `--packages`, the usage refusal with it — never a panic.
+    #[test]
+    fn pubspec_vanished_midrun_takes_the_no_root_posture() {
+        let bare = std::env::temp_dir().join(format!("dq_cmd_ws_noroot_{}", std::process::id()));
+        fs::create_dir_all(&bare).expect("bare dir");
+
+        let floor = no_root_posture(&bare, false).expect("bare floor");
+        let AssemblyBody::Floor((_, _, _, _, advisory)) = floor else {
+            panic!("bare floor, got a Resolved body")
+        };
+        assert!(
+            matches!(advisory, Some(WorkspaceAdvisory::MissingConfig(_))),
+            "{advisory:?}"
+        );
+
+        let Err(error) = no_root_posture(&bare, true) else {
+            panic!("expected the usage refusal")
+        };
+        assert!(error.to_string().contains("no pubspec above"), "{error}");
+
         fs::remove_dir_all(&bare).ok();
     }
 
@@ -1151,7 +1724,7 @@ mod tests {
     }
 
     /// The bare floor: no pubspec anywhere — the oracle's path-local
-    /// BasicWorkspace (`Packages.empty`). A bare context opens with no
+    /// `BasicWorkspace` (`Packages.empty`). A bare context opens with no
     /// packages at all (per-file language version falls to the workspace
     /// default) and the same missing-config advisory.
     #[test]
@@ -1199,8 +1772,117 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// The config-required tier that survives is `load_workspace_faces`'s —
-    /// the `dartq compat` face's posture, which pins its own target dir.
+    /// The nested self-resolved package: `example/` carries its own
+    /// pubspec (lower sdk bound) and its own `package_config.json` — its
+    /// files attribute to the nested package at the nested pubspec's sdk
+    /// lower bound, not the enclosing package's version, and its
+    /// `package:` face joins the context universe (the single-context
+    /// stand-in for the oracle's separate root, context_locator.dart
+    /// `_createContextRoots`).
+    #[test]
+    fn nested_self_resolved_package_gets_its_own_language_version() {
+        let root = workspace("ws_nested", &[("lib/main.dart", "var ok = 1;\n")]);
+        fs::create_dir_all(root.join("example")).expect("example dir");
+        fs::write(
+            root.join("example/pubspec.yaml"),
+            "name: example\nenvironment:\n  sdk: ^3.2.0\n",
+        )
+        .expect("example pubspec");
+        fs::create_dir_all(root.join("example/.dart_tool")).expect("example dart_tool");
+        fs::write(
+            root.join("example/.dart_tool/package_config.json"),
+            r#"{"configVersion": 2, "packages": [{"name": "example", "rootUri": "../", "languageVersion": "3.2"}], "generator": "pub"}"#,
+        )
+.expect("example config");
+        fs::create_dir_all(root.join("example/lib")).expect("example lib dir");
+        fs::write(root.join("example/lib/main.dart"), "var nested = 1;\n").expect("nested file");
+
+        let root = root.canonicalize().expect("root");
+        let (config, _, _) =
+            engine_config_with_advisory(&root, Some(&root.join("sdk"))).expect("assembly");
+
+        let nested = config
+            .packages
+            .containing(&root.join("example/lib/main.dart"))
+            .expect("nested attribution");
+        assert_eq!(nested.name.as_str(), "example");
+        let version = nested.language_version.expect("nested pubspec sdk bound");
+        assert_eq!((version.major(), version.minor()), (3, 2));
+
+        // The root's own files stay attributed to the root package at the
+        // root config's version.
+        let own = config
+            .packages
+            .containing(&root.join("lib/main.dart"))
+            .expect("own attribution");
+        assert_eq!(own.name.as_str(), "fixture");
+        assert_eq!(
+            own.language_version.map(|v| (v.major(), v.minor())),
+            Some((3, 5))
+        );
+
+        // The nested package's own `package:` face resolves in the context
+        // universe.
+        assert!(
+            config
+                .pub_config
+                .packages
+                .iter()
+                .any(|entry| entry.name == "example"),
+            "the nested entry joins the resolution face"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// With `--packages` the locator's `_defaultPackageConfigFile`
+    /// short-circuit keeps one root everywhere, so nested-root discovery
+    /// is skipped: the nested file falls back to the enclosing config
+    /// entry instead of gaining its own identity.
+    #[test]
+    fn packages_override_skips_nested_root_discovery() {
+        let root = workspace("ws_nested_override", &[]);
+        fs::create_dir_all(root.join("example")).expect("example dir");
+        fs::write(
+            root.join("example/pubspec.yaml"),
+            "name: example\nenvironment:\n  sdk: ^3.2.0\n",
+        )
+        .expect("example pubspec");
+        fs::create_dir_all(root.join("example/.dart_tool")).expect("example dart_tool");
+        fs::write(
+            root.join("example/.dart_tool/package_config.json"),
+            r#"{"configVersion": 2, "packages": [{"name": "example", "rootUri": "../", "languageVersion": "3.2"}], "generator": "pub"}"#,
+        )
+.expect("example config");
+        fs::create_dir_all(root.join("example/lib")).expect("example lib dir");
+        fs::write(root.join("example/lib/main.dart"), "var nested = 1;\n").expect("nested file");
+        let other = root.join("other");
+        fs::create_dir_all(&other).expect("other dir");
+        let override_config = other.join("custom.json");
+        fs::write(
+            &override_config,
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+        )
+.expect("override config");
+
+        let root = root.canonicalize().expect("root");
+        let (packages, _, _, _, _) =
+            package_assembly_with(&root, Some(&override_config), None).expect("override assembly");
+        let nested = packages
+            .containing(&root.join("example/lib/main.dart"))
+            .expect("enclosing attribution");
+        assert_eq!(nested.name.as_str(), "fixture", "no nested identity added");
+        assert_eq!(
+            nested.language_version.map(|v| (v.major(), v.minor())),
+            Some((3, 5))
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The config-required tier's message source: `load_workspace_faces`'s
+    /// missing-config line is the text [`package_assembly_strict`] refuses
+    /// with (the `dartq compat` face's posture, through the shared body).
     #[test]
     fn compat_face_still_requires_the_config() {
         let root = workspace("ws_pubget", &[]);
@@ -1211,12 +1893,141 @@ mod tests {
             panic!("compat's config requirement must hold")
         };
         assert_eq!(
-            error,
+            error.to_string(),
             format!(
                 "no package config at {} (run `dart pub get`)",
                 root.join(".dart_tool/package_config.json").display()
             )
         );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A malformed `package_config.json` degrades to the oracle's
+    /// `Packages.empty` floor instead of refusing (packages.dart
+    /// `parsePackageConfigJsonFile` catch): the assembly succeeds with the
+    /// self package only, every `package:` import unresolved, and ONE
+    /// TOOL-severity advisory naming the config and the failure.
+    #[test]
+    fn corrupt_config_degrades_to_empty_floor() {
+        let root = workspace("ws_corrupt", &[]);
+        fs::write(root.join(".dart_tool/package_config.json"), "{not json")
+            .expect("corrupt config");
+
+        let root = root.canonicalize().expect("root");
+        let config_path = root.join(".dart_tool/package_config.json");
+        let (config, _, advisory) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
+            .expect(
+                "a corrupt config degrades, never refuses (the oracle analyzes with \
+                 Packages.empty)",
+            );
+        assert!(
+            config.pub_config.packages.is_empty(),
+            "the Packages.empty floor"
+        );
+        assert_eq!(config.packages.len(), 1, "the self package stays");
+        assert!(config.packages.get("fixture").is_some());
+
+        let advisory = advisory.expect("one advisory");
+        assert_eq!(advisory.code(), DARTQ_PACKAGE_CONFIG_INVALID);
+        assert_eq!(advisory.config_path(), config_path);
+        let WorkspaceAdvisory::InvalidConfig(invalid) = &advisory else {
+            panic!("invalid-config advisory, got {advisory:?}")
+        };
+        assert!(!invalid.reason.is_empty(), "the failure is named");
+        assert!(
+            advisory
+                .message()
+                .contains("package_config.json is unusable (")
+                && advisory
+                    .message()
+                    .contains("analyzing with `package:` imports unresolved"),
+            "{advisory:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Duplicate package names reach the same floor: the reader grammar
+    /// tolerates them in the file (package:package_config reports and
+    /// skips), the graph build rejects them, and the analyze path degrades
+    /// with the advisory naming the defect — the compat face is the one
+    /// that still refuses (its own `load_workspace_faces` call).
+    #[test]
+    fn duplicate_config_names_degrade_to_empty_floor() {
+        let root = workspace("ws_dupes", &[]);
+        fs::write(
+            root.join(".dart_tool/package_config.json"),
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}, {"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
+        )
+.expect("duplicate config");
+
+        let root = root.canonicalize().expect("root");
+        let (config, _, advisory) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
+            .expect("duplicate names degrade, never refuse");
+        assert!(config.pub_config.packages.is_empty(), "the empty floor");
+        assert_eq!(config.packages.len(), 1, "the self package stays");
+
+        let advisory = advisory.expect("one advisory");
+        let WorkspaceAdvisory::InvalidConfig(invalid) = &advisory else {
+            panic!("invalid-config advisory, got {advisory:?}")
+        };
+        assert!(
+            invalid.reason.contains("duplicate"),
+            "the reason names the defect: {}",
+            invalid.reason
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The content baseline at the assembly: a VCS-style
+    /// checkout or `touch` — every mtime equal, bytes unchanged — stays
+    /// fresh. Without the baseline this exact chain stales (the pubspec is
+    /// not strictly older than the lock); with it, byte-identical inputs
+    /// cannot invalidate the resolution the graph was just built from.
+    #[test]
+    fn touched_resolution_stays_fresh_with_baseline() {
+        let root = workspace("ws_touched", &[]);
+        let stamp = FileTime::from_unix_time(7_000, 0);
+        set_file_mtime(root.join("pubspec.yaml"), stamp).expect("set mtime");
+        set_file_mtime(root.join("pubspec.lock"), stamp).expect("set mtime");
+        set_file_mtime(root.join(".dart_tool/package_config.json"), stamp).expect("set mtime");
+
+        let root = root.canonicalize().expect("root");
+        let (_, _, advisory) =
+            engine_config_with_advisory(&root, Some(&root.join("sdk"))).expect("assembly");
+        assert!(
+            advisory.is_none(),
+            "touched-but-unchanged inputs stay fresh: {advisory:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The observed SDK version joins the freshness judgment: a config
+    /// generated by a different Dart major.minor stales (upstream pub
+    /// source, entrypoint.dart `isPackageConfigGeneratedBySameDartSdk`),
+    /// a patch-only bump does not.
+    #[test]
+    fn generator_sdk_mismatch_stales() {
+        let root = workspace("ws_generator", &[]);
+        fs::write(root.join("sdk/version"), "3.14.0\n").expect("sdk version");
+
+        let root = root.canonicalize().expect("root");
+        let (_, _, advisory) =
+            engine_config_with_advisory(&root, Some(&root.join("sdk"))).expect("assembly");
+        let advisory = advisory.expect("generator mismatch stales");
+        let WorkspaceAdvisory::Stale(stale) = &advisory else {
+            panic!("stale advisory, got {advisory:?}")
+        };
+        assert_eq!(
+            stale.reasons,
+            vec![StaleReason::GeneratorSdkMismatch {
+                config: "3.13.1".into(),
+                current: "3.14.0".into(),
+            }]
+        );
+
         fs::remove_dir_all(&root).ok();
     }
 }

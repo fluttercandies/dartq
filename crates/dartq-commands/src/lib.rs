@@ -1,5 +1,5 @@
-//! The per-command cores shared by the CLI and the daemon RPC faces (PRD
-//! §15.1's one-implementation rule): plain parameters in, typed results
+//! The per-command cores shared by the CLI and the daemon RPC faces (the
+//! one-implementation rule): plain parameters in, typed results
 //! out. No argument parsing, no printing, no process exit, no exit codes —
 //! `dartq-cli` adds those on top (clap, output formats, exit tiers), and
 //! `dartq-daemon` shapes the same results into `dartq/*` JSON-RPC
@@ -13,16 +13,26 @@
 //!   face ([`EngineConfig`] plus the canonical package directory).
 //! * [`check`] — the M0 scan+parse pipeline plus the relative-URI
 //!   existence face (`uri_does_not_exist` for missing directive targets).
-//! * [`config`] — the `dartq.yaml` workspace config (PRD §15.9) plus the
+//! * [`config`] — the `dartq.yaml` workspace config plus the
 //!   compat face's axis-root resolution over it.
 //! * [`analyze`] — the full engine pass (discover + analyze + oracle sort).
 //! * [`query`] — the symbol index query over the analyzed state.
-//! * [`explain`] — the §15.3 explain report.
-//! * [`impact`] — the §15.4 impact report.
-//! * [`compat`] — the §15.5 per-SDK compatibility matrix.
-//! * [`fix`] — the §15.6 anchored patch substrate.
-//! * [`lints`] — the lint face's mount (PRD §13): enable-set resolution
+//! * [`rename`] — the symbol rename face: the anchor resolution joined
+//!   with the reference rows, as a machine-readable edit set plus the
+//!   drift-checked patcher.
+//! * [`explain`] — the explain report.
+//! * [`impact`] — the impact report.
+//! * [`compat`] — the per-SDK compatibility matrix.
+//! * [`fix`] — the anchored patch substrate.
+//! * [`lints`] — the lint face's mount: enable-set resolution
 //!   from the merged analysis options and lint rows as engine diagnostics.
+//! * [`plugins`] — the analyze face's plugin cycle (launch, feed, drain,
+//!   findings→diagnostic merge) over `dartq-plugin`, the CLI `dart analyze`
+//!   counterpart of the daemon's plugin weave.
+//! * [`uri`] — the `file:` URI ↔ path mapping (the daemon's overlay keys,
+//!   the analyze faces' document URIs).
+//! * `pkg_label` — the stable package-form file reference the output
+//!   faces print (the one implementation of the reference-label grammar).
 //!
 //! [`EngineConfig`]: dartq_engine::EngineConfig
 
@@ -33,13 +43,18 @@ pub mod config;
 pub mod discover;
 pub mod explain;
 pub mod fix;
+pub mod fix_table;
 pub mod impact;
 pub mod index;
 pub mod layout;
 mod lint_names;
 pub mod lints;
+mod pkg_label;
+pub mod plugins;
 pub mod query;
+pub mod rename;
 mod rule_states;
+pub mod uri;
 pub mod workspace;
 
 use serde::Deserialize;
@@ -52,7 +67,7 @@ use serde::Deserialize;
 /// producer type carries no version field of its own.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// How much detail an output face carries (PRD §15.1, §15.8.1). Default
+/// How much detail an output face carries. Default
 /// [`Verbosity::Compact`].
 ///
 /// The canonical tier semantics are pinned by the schema-freeze contract —
@@ -60,7 +75,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// single source of truth (per-face field tables); do not invent tier
 /// semantics here. Summary:
 ///
-/// * `minimal` — the red-line floor (§15.8): locating fields are never
+/// * `minimal` — the red-line floor: locating fields are never
 ///   omissible (`code`/`file`/`range` or the face's equivalent); prose and
 ///   convenience spellings are dropped, never location;
 /// * `compact` — the shape each producer emits today (the default; the

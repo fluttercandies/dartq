@@ -1,4 +1,4 @@
-//! The impact face's core (PRD §15.4): what a change to one file would
+//! The impact face's core: what a change to one file would
 //! affect, over the analyzed workspace.
 //!
 //! The query assembles the impact substrate from the engine's public graph
@@ -12,37 +12,60 @@
 //! * the **file snapshot** folds the seed library's member files — blake3
 //!   over the member hashes, the blake3-128 fold of the member API
 //!   signatures (dartq-ai's [`dartq_ai::impact::fold_api_signatures`]), the
-//!   library-face declaration names. Per member the persisted-facts hint
-//!   decides the read face: a snapshot hit is `materialize`d through the
-//!   #341 load faces; a genuine miss reads the engine's resident facts
-//!   through the #341 accessor face ([`dartq_engine::Engine::file_facts`])
-//!   — the analysis prelude has already computed them, so no member is
-//!   ever re-scanned (the retired scan+capture seed also carried a
-//!   language-version drift: it re-fixed the default version where the
-//!   engine settles each file's own).
+//!   library-face declaration names with their member-level signature
+//!   digests (#1561: the canonical per-name slices, derived on demand from
+//!   the resident element model — never persisted). Per member the
+//!   persisted-facts hint decides the read face: a snapshot hit is
+//!   `materialize`d through the #341 load faces; a genuine miss reads the
+//!   engine's resident facts through the #341 accessor face
+//!   ([`dartq_engine::Engine::file_facts`]) — the analysis prelude has
+//!   already computed them, so no member is ever re-scanned (the retired
+//!   scan+capture seed also carried a language-version drift: it re-fixed
+//!   the default version where the engine settles each file's own).
 //!
 //! One-shot posture: a CLI run holds no baseline, so the seed enters the
 //! query as a **hypothetical** API-level change ([`LibraryChange::hypothetical`])
 //! — the report answers "what depends on this file's API surface". The
 //! daemon passes real before/after diffs through the same query.
 //!
+//! The **environment matrix** (#1554) rides the compat face's context
+//! substrate: when the workspace's `dartq.yaml` declares SDK contexts, the
+//! one-shot run answers one ✓/✗ row per context — the affected set
+//! re-analyzed under each context's SDK, one axis engine alive at a time
+//! (the bounded-memory doctrine), compatible when zero ERROR-severity
+//! diagnostics land on the affected files (the compat verdict rule). The
+//! resolution is the same [`crate::config`] context model the compat face
+//! uses, so both faces answer contexts from one fact source. A contextless
+//! workspace answers one honest `default` row — the same verdict rule
+//! evaluated over the main pass's diagnostics, so a target (or its
+//! affected set) carrying an ERROR never ships an unevaluated
+//! affirmative.
+//!
 //! [`LibraryChange::hypothetical`]: dartq_ai::impact::LibraryChange::hypothetical
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use dartq_ai::impact::{self as query, FileSnapshot, LibraryChange, content_hash};
-use dartq_diagnostics::CodeRegistry;
+use dartq_diagnostics::{CodeRegistry, Diagnostic, Severity};
 use dartq_engine::state::persist::PersistedFacts;
-use dartq_engine::{CsrGraph, Engine, LibraryId, UnitFacts};
+use dartq_engine::{CsrGraph, Engine, EngineConfig, LibraryId, memory_store, semdiag};
 use dartq_index::TestGraph;
-use dartq_semantic::MicroKind;
+use dartq_package::PackageTable;
+use dartq_pub::{PackageConfig, ResolvedPackageGraph};
+use dartq_sdk::SdkSnapshot;
 use dartq_source::{FileId, FileTable, StringId, StringTable};
+use rustc_hash::FxHashSet;
 use thiserror::Error;
 
 use crate::analyze::AnalyzeError;
+use crate::workspace::package_assembly_strict;
 
 /// Why an impact run aborts: target problems are the CLI's usage tier,
-/// prelude failures the internal tier.
+/// prelude failures the internal tier, and the environments axis carries
+/// the same split as the compat face — a malformed config, an unresolvable
+/// context locator, or an unusable axis workspace refuses as usage; a
+/// failed axis engine is internal.
 #[derive(Debug, Error)]
 pub enum ImpactError {
     /// The target path does not exist (the message names the path as given).
@@ -55,19 +78,268 @@ pub enum ImpactError {
     /// The discover+analyze prelude failed.
     #[error(transparent)]
     Step(#[from] AnalyzeError),
+    /// The environments axis hit an unusable input — a malformed
+    /// `dartq.yaml`, an unresolvable context locator, or an unusable axis
+    /// workspace/engine. The message body is the usage-tier text (the
+    /// compat face's phrasing).
+    #[error("{0}")]
+    Usage(String),
+    /// An environment axis's discovery or analysis failed.
+    #[error("{0}")]
+    Internal(String),
+}
+
+/// The JSON face: one object — the report's serialized shape (the report
+/// carries its own `schema_version`). The payload is routed through
+/// `dartq_schema::validate(.., Domain::Impact)` right here — the
+/// producer-side gate the index face holds, shared verbatim by the CLI and
+/// the daemon (both call this shaper).
+///
+/// Tier-invariant (the canonical verbosity tables): every field is a
+/// locator or a verdict — `changed[].signature_changed` and
+/// `affected[].impact` are verdicts the published v2 schema requires at
+/// every tier — so the CLI's `--verbosity` parses for grammar parity and
+/// shapes nothing here (the index run summary's accept-and-document
+/// posture).
+///
+/// # Panics
+///
+/// Panics when the born payload violates the published schema — a
+/// producer bug, surfaced never clamped (the CLI's crash tier turns it
+/// into exit 4 with stdout kept empty; the daemon's read task contains
+/// it at its panic boundary).
+#[must_use]
+pub fn to_json(report: &query::ImpactReport) -> serde_json::Value {
+    let value = serde_json::to_value(report).expect("ImpactReport serializes");
+    let text = value.to_string();
+    dartq_schema::validate(&text, dartq_schema::Domain::Impact)
+        .expect("the impact report is schema-valid at birth");
+    value
 }
 
 /// Runs the impact face over an assembled engine: the discover+analyze
-/// prelude, then the report for `target`'s owning library as a hypothetical
-/// API-level change.
+/// prelude (the pass's diagnostics are the environment verdicts' input),
+/// the report for `target`'s owning library as a hypothetical API-level
+/// change, then the environment section — the `dartq.yaml` contexts' ✓/✗
+/// rows over the affected set, or the one honest `default` row when the
+/// workspace declares none ([`environments_section`]).
 ///
 /// # Errors
 ///
-/// [`ImpactError`] on a missing or unanalyzed target, discovery failure, or
-/// cancellation.
+/// [`ImpactError`] on a missing or unanalyzed target, discovery failure,
+/// cancellation, or an unusable context configuration.
 pub fn impact(engine: &mut Engine, target: &Path) -> Result<query::ImpactReport, ImpactError> {
-    crate::analyze::prelude(engine).map_err(ImpactError::from)?;
-    impact_after_analysis(engine, target)
+    // The run's diagnostics move out here: the borrowed `AnalyzeRun` drops
+    // with the statement, so the engine re-borrows for the report.
+    let diagnostics = crate::analyze::run_overlaid(engine, &[], &[])
+        .map_err(ImpactError::from)?
+        .diagnostics;
+    let mut report = impact_after_analysis(engine, target)?;
+    report.affected_environments = environments_section(engine, target, &report, &diagnostics)?;
+    Ok(report)
+}
+
+/// The environment section: one honest row per declared `dartq.yaml`
+/// context, each judged by the compat face's verdict rule over the
+/// affected set ([`compatible_over_affected`]); a workspace with no
+/// `dartq.yaml` — or one without contexts — answers the single `default`
+/// row, the same rule evaluated over `diagnostics` (the main analysis
+/// pass's rows), so the contextless answer is derived, never an
+/// unevaluated affirmative.
+///
+/// The context resolution rides the same substrate the compat face uses
+/// ([`crate::config`]'s context model and locator resolution, the strict
+/// package assembly, the per-axis engine, one semantic graph alive at a
+/// time), so both faces answer contexts from one fact source; an SDK root
+/// that fails to load isolates as an incompatible row (the compat
+/// doctrine), never fatal.
+///
+/// The v1 row shape is the ✓/✗ pair alone: the failure detail a row
+/// cannot carry is one `dartq compat` run away.
+///
+/// # Errors
+///
+/// [`ImpactError::Usage`] on a malformed config, an unresolvable locator,
+/// or an unusable axis workspace/engine; [`ImpactError::Internal`] on a
+/// failed axis discovery or analysis.
+fn environments_section(
+    engine: &Engine,
+    target: &Path,
+    report: &query::ImpactReport,
+    diagnostics: &[Diagnostic],
+) -> Result<Vec<query::EnvironmentImpact>, ImpactError> {
+    let canonical = target
+        .canonicalize()
+        .map_err(|_| ImpactError::Missing(target.to_path_buf()))?;
+    let Some(seed_file) = engine.file_table().try_file_id(&canonical) else {
+        return Err(ImpactError::NotAnalyzed(canonical));
+    };
+    let Some(seed) = engine.library_of(seed_file) else {
+        return Err(ImpactError::NotAnalyzed(canonical));
+    };
+    let affected = affected_label_set(engine, seed.index(), report);
+
+    // The declared contexts: the nearest `dartq.yaml` up the target's root
+    // chain (the workspace root's file, the config face's contract). No
+    // file, no axes — the zero-config fast path answers the default row
+    // from the already-run analysis.
+    let Some(config_root) = canonical
+        .parent()
+        .and_then(|dir| dir.ancestors().find(|dir| dir.join("dartq.yaml").is_file()))
+    else {
+        return Ok(vec![default_environment_row(
+            engine,
+            &affected,
+            diagnostics,
+        )]);
+    };
+    let contexts = crate::config::load(config_root)
+        .map_err(|error| ImpactError::Usage(error.to_string()))?
+        .map(|config| config.contexts)
+        .unwrap_or_default();
+    if contexts.is_empty() {
+        return Ok(vec![default_environment_row(
+            engine,
+            &affected,
+            diagnostics,
+        )]);
+    }
+
+    // The pub faces are axis-independent: built once, every axis's engine
+    // reassembles from them. The assembly's one stale-config advisory has
+    // no channel on this machine face; it never gates the matrix.
+    let (config, graph, config_dir, _) = package_assembly_strict(config_root)
+        .map_err(|error| ImpactError::Usage(error.to_string()))?;
+    let mut rows = Vec::with_capacity(contexts.len());
+    for context in &contexts {
+        let root = crate::config::resolve_locator(&context.label, &context.sdk, config_root)
+            .map_err(|error| ImpactError::Usage(error.to_string()))?;
+        let compatible = analyze_environment(&root, &config, &graph, &config_dir, &affected)?;
+        rows.push(query::EnvironmentImpact {
+            label: context.label.clone(),
+            compatible,
+        });
+    }
+    Ok(rows)
+}
+
+/// The contextless answer: the one `default` row, its verdict the compat
+/// rule over `diagnostics`.
+fn default_environment_row(
+    engine: &Engine,
+    affected: &FxHashSet<String>,
+    diagnostics: &[Diagnostic],
+) -> query::EnvironmentImpact {
+    query::EnvironmentImpact {
+        label: "default".to_owned(),
+        compatible: compatible_over_affected(engine, affected, diagnostics),
+    }
+}
+
+/// The affected set as stable labels: the seed library's member files plus
+/// every affected library's member files — the reference labels the
+/// report's Affected section already names (the same
+/// [`crate::pkg_label::pkg_label`] projection on both sides, so the string
+/// set matches whatever the package context spells). Label strings, not
+/// file ids: the environment axes run their own engines, whose id spaces
+/// are their own.
+fn affected_label_set(
+    engine: &Engine,
+    seed: u32,
+    report: &query::ImpactReport,
+) -> FxHashSet<String> {
+    let affected_labels: FxHashSet<&str> = report
+        .affected
+        .iter()
+        .map(|row| row.path.as_str())
+        .collect();
+    let mut affected_files: FxHashSet<String> = FxHashSet::default();
+    let label = |path| crate::pkg_label::pkg_label(engine.packages(), path);
+    for (library, files) in engine.libraries() {
+        let affected_library = library.index() == seed
+            || files
+                .first()
+                .and_then(|&file| engine.file_table().path(file))
+                .is_some_and(|path| affected_labels.contains(label(path).as_str()));
+        if !affected_library {
+            continue;
+        }
+        affected_files.extend(
+            files
+                .iter()
+                .filter_map(|&file| engine.file_table().path(file))
+                .map(label),
+        );
+    }
+    affected_files
+}
+
+/// The compat verdict rule, stated once for both impact faces' rows (the
+/// contextless default and the per-context axes): the judged set is
+/// compatible when zero ERROR-severity diagnostics land on it — warnings
+/// and lints never flip, and diagnostics outside the set are nobody
+/// else's verdict (the whole-workspace matrix is the compat face's job).
+/// `diagnostics` are one engine's merged analysis rows.
+fn compatible_over_affected(
+    engine: &Engine,
+    affected: &FxHashSet<String>,
+    diagnostics: &[Diagnostic],
+) -> bool {
+    diagnostics.iter().all(|diag| {
+        diag.severity != Severity::Error
+            || !engine.file_table().path(diag.file).is_some_and(|path| {
+                // The engine's table builds from the same resolution as
+                // the label set's own projection, so the spellings match.
+                affected.contains(&crate::pkg_label::pkg_label(engine.packages(), path))
+            })
+    })
+}
+
+/// One environment axis, the compat face's recipe: assemble the engine
+/// under `root`'s snapshot over the shared package resolution, run the
+/// discover+analyze passes, and answer whether the affected set produced
+/// zero ERROR-severity diagnostics (the compat verdict rule — warnings and
+/// lints never flip an environment). An SDK root that fails to load
+/// isolates as `false` (the compat doctrine; the v1 row has no detail
+/// column — `dartq compat` names the cause). The engine drops at return —
+/// one semantic graph alive at a time.
+fn analyze_environment(
+    root: &Path,
+    config: &Arc<PackageConfig>,
+    graph: &ResolvedPackageGraph,
+    config_dir: &Path,
+    affected: &FxHashSet<String>,
+) -> Result<bool, ImpactError> {
+    let Ok(snapshot) = SdkSnapshot::load(root, None) else {
+        return Ok(false);
+    };
+    let packages = PackageTable::build(config, graph, config_dir)
+        .map_err(|error| ImpactError::Usage(error.to_string()))?;
+    let mut engine = Engine::new(EngineConfig {
+        store: memory_store(),
+        sdk: snapshot,
+        packages,
+        pub_config: Arc::clone(config),
+        config_dir: config_dir.to_path_buf(),
+        // The semantic families are part of the verdict (the compat face's
+        // rationale): the SDK-difference signal rides the default diagnoser.
+        semdiag: Some(semdiag::diagnoser()),
+        target: dartq_engine::DEFAULT_TARGET.to_owned(),
+        declared_variables: rustc_hash::FxHashMap::default(),
+        experiments: Vec::new(),
+    })
+    .map_err(|error| ImpactError::Usage(format!("engine context unusable: {error}")))?;
+    engine
+        .discover_workspace()
+        .map_err(|error| ImpactError::Internal(format!("discovery failed: {error}")))?;
+    let diags = engine
+        .analyze(
+            &[],
+            &mut |_: dartq_engine::EngineEvent| {},
+            &dartq_engine::CancellationToken::default(),
+        )
+        .map_err(|_: dartq_engine::Cancelled| ImpactError::Internal("analysis cancelled".into()))?;
+    Ok(compatible_over_affected(&engine, affected, &diags))
 }
 
 /// The report over an already-analyzed engine — the daemon path, whose read
@@ -102,11 +374,21 @@ fn unpersisted(_: &str) -> Option<PersistedFacts> {
 /// [`impact_after_analysis`] over a persisted-facts hint: members the
 /// snapshot carries surface through [`PersistedFacts::materialize`], the
 /// rest seed exactly as before — the outputs are byte-identical either way
-/// for the same content (the impact equivalence test).
+/// for the same content (the impact equivalence test). The environment
+/// section answers the single `default` row, its verdict the compat rule
+/// over the diagnostics this entry carries — none (the caller's analysis
+/// pass kept them), so the rule evaluates over an empty set; the CLI path
+/// re-answers the section with the pass's rows.
 ///
 /// # Errors
 ///
 /// [`ImpactError::Missing`] / [`ImpactError::NotAnalyzed`] on a bad target.
+///
+/// # Panics
+///
+/// Panics when the seed library's member list is missing from the live
+/// library set — an internal invariant breach (the seed resolves through
+/// the same set).
 pub fn impact_after_analysis_with_persisted_facts(
     engine: &Engine,
     target: &Path,
@@ -146,27 +428,32 @@ pub fn impact_after_analysis_with_persisted_facts(
     // The substrate over the engine's faces, then the query.
     let substrate = impact_substrate(engine, &libraries);
     let change = LibraryChange::hypothetical(seed_library.index(), current);
-    Ok(query::impact(
+    let mut report = query::impact(
         substrate.node_count(),
         |library| substrate.neighbors(library),
         |library| substrate.label(library),
         &substrate.tests,
         strings,
         &[change],
-    ))
+    );
+    let affected = affected_label_set(engine, seed_library.index(), &report);
+    report.affected_environments = vec![default_environment_row(engine, &affected, &[])];
+    Ok(report)
 }
 
 /// The graph substrate both graph faces read, built once per call (#558):
 /// the engine's import CSR projection, the arena-spaced identity labels,
 /// and the test graph joined over them.
-pub(crate) struct Substrate<'a> {
+pub(crate) struct Substrate {
     csr: CsrGraph,
-    /// The defining-file label of every arena slot, `None` on a dead slot —
-    /// sized by [`CsrGraph::nodes`] (the arena's slot count), never by the
-    /// live-library count: the consumers iterate the CSR's node space,
-    /// which includes retired slots, so a live-count-sized table indexes
-    /// out of bounds on the first retirement (#558 P1).
-    idents: Vec<Option<&'a str>>,
+    /// The stable reference label of every arena slot's defining file —
+    /// projected once per build through [`crate::pkg_label::pkg_label`] —
+    /// `None` on a dead slot. Sized by [`CsrGraph::nodes`] (the arena's
+    /// slot count), never by the live-library count: the consumers iterate
+    /// the CSR's node space, which includes retired slots, so a
+    /// live-count-sized table indexes out of bounds on the first
+    /// retirement (#558 P1).
+    idents: Vec<Option<String>>,
     tests: TestGraph,
 }
 
@@ -174,22 +461,23 @@ pub(crate) struct Substrate<'a> {
 /// `libraries` (the faces pass the same fetch they need for their own
 /// member lookups — no second `Engine::libraries` build).
 ///
-/// The labels borrow the engine's file table (`&str`, no per-library
-/// allocation); a path that is not UTF-8 labels empty — it cannot ride the
-/// JSON faces' string columns anyway, and the retired lossy spelling's
-/// replacement characters surfaced no better.
-pub(crate) fn impact_substrate<'a>(
-    engine: &'a Engine,
+/// The labels are the report assembly boundary's projected spellings,
+/// constructed once per live library here (the attribution walk amortizes
+/// over the package table's per-directory memo); a path that is not UTF-8
+/// labels lossily — it cannot ride the JSON faces' string columns
+/// byte-exact anyway.
+pub(crate) fn impact_substrate(
+    engine: &Engine,
     libraries: &[(LibraryId, Vec<FileId>)],
-) -> Substrate<'a> {
+) -> Substrate {
     let csr = engine.library_import_graph();
     let count = csr.nodes();
-    let mut idents: Vec<Option<&'a str>> = vec![None; count];
+    let mut idents: Vec<Option<String>> = vec![None; count];
     for (library, files) in libraries {
         if let Some(label) = files
             .first()
             .and_then(|&file| engine.file_table().path(file))
-            .and_then(std::path::Path::to_str)
+            .map(|path| crate::pkg_label::pkg_label(engine.packages(), path))
         {
             idents[library.index() as usize] = Some(label);
         }
@@ -201,11 +489,13 @@ pub(crate) fn impact_substrate<'a>(
     };
     // Dead slots carry no identity and gain no test edges — the convention
     // fallback reads the identity path, and `None` skips the slot.
-    let tests = TestGraph::build(count, neighbors, |library| idents[library as usize]);
+    let tests = TestGraph::build(count, neighbors, |library| {
+        idents[library as usize].as_deref()
+    });
     Substrate { csr, idents, tests }
 }
 
-impl<'a> Substrate<'a> {
+impl Substrate {
     /// The node count: the engine library arena's slot count, dead slots
     /// included (the CSR's node space).
     #[must_use]
@@ -221,7 +511,7 @@ impl<'a> Substrate<'a> {
         &self.csr.edges()[start..end]
     }
 
-    /// The defining-file label of `library`.
+    /// The defining-file reference label of `library`.
     ///
     /// Dead slots never reach here — the label consumers are flood-joined:
     /// a retired slot projects no edges, so it appears in no importer row
@@ -231,8 +521,10 @@ impl<'a> Substrate<'a> {
     /// libraries). A label demand on a dead slot is a caller bug and
     /// surfaces as one.
     #[must_use]
-    pub(crate) fn label(&self, library: u32) -> &'a str {
-        self.idents[library as usize].expect("live library")
+    pub(crate) fn label(&self, library: u32) -> &str {
+        self.idents[library as usize]
+            .as_deref()
+            .expect("live library")
     }
 
     /// The joined test graph (the `AffectedTests` join's read side).
@@ -244,22 +536,22 @@ impl<'a> Substrate<'a> {
 
 /// The folded surface of one library over its member files: blake3 over the
 /// member content hashes, the blake3-128 fold of the member API signatures,
-/// the library-face declaration names. Per member the persisted hint decides
-/// the read face: a hit `materialize`s the payload through the #341 load
-/// faces; a miss reads the engine's resident facts through the #341
-/// accessor face — analysis has already computed them, so nothing is
-/// re-derived (parse-surface diagnostics play no role: this face produces
-/// no diagnostics of its own).
+/// the library-face declaration names with their member-level signature
+/// digests (#1561). Per member the persisted hint decides the read face: a
+/// hit `materialize`s the payload through the #341 load faces; a miss reads
+/// the engine's resident facts through the #341 accessor face — analysis
+/// has already computed them, so nothing is re-derived (parse-surface
+/// diagnostics play no role: this face produces no diagnostics of its own).
 ///
 /// The equivalence the fold stands on: both arms answer for the same
 /// resident bytes — the content identity is the same blake3 over the same
 /// bytes, the face sets coincide (the materialized element model and the
-/// engine's residency are equal for equal content), and the signature
-/// columns are the same baked digest — so a generation whose entries match
-/// the workspace folds into the seed's exact snapshot. The `restored` table
-/// takes the payload's file references (directive targets, diagnostic
-/// files); the surface face reads none of them, but `materialize` mints ids
-/// through it by contract.
+/// engine's residency are equal for equal content), the signature columns
+/// are the same baked digest, and the member digests render from equal
+/// element models — so a generation whose entries match the workspace folds
+/// into the seed's exact snapshot. The `restored` table takes the payload's
+/// file references (directive targets, diagnostic files); the surface face
+/// reads none of them, but `materialize` mints ids through it by contract.
 fn library_surface(
     engine: &Engine,
     members: &[FileId],
@@ -267,23 +559,7 @@ fn library_surface(
     persisted: PersistedFactsHint<'_>,
     restored: &mut FileTable,
 ) -> FileSnapshot {
-    /// The library-face names of one unit's element model: every named
-    /// container plus every non-type-parameter top-level declaration,
-    /// setters under their `name=` spelling — the capture filter's
-    /// mirror, applying the same `MicroKind::TypeParam` exclusion the
-    /// engine's library graph does.
-    fn face_names(facts: &UnitFacts, names: &mut Vec<StringId>) {
-        names.extend(facts.elements.containers().map(|(name, _)| name));
-        names.extend(
-            facts
-                .elements
-                .declarations()
-                .filter(|(_, decl)| decl.kind != MicroKind::TypeParam)
-                .map(|(name, _)| name),
-        );
-    }
-
-    let mut names: Vec<StringId> = Vec::new();
+    let mut member_faces: Vec<(StringId, [u8; 16])> = Vec::new();
     let mut folded = Vec::with_capacity(members.len() * 32);
     let mut signatures = Vec::with_capacity(members.len());
     // The builtin diagnostic-code registry, built once per load (the #428
@@ -298,14 +574,24 @@ fn library_surface(
         // the payload's 16-byte column is the entry key's domain, not the
         // fold's.
         folded.extend_from_slice(&content_hash(bytes));
+        // The materialize identity is the house 16-byte content id — the
+        // same digest residency carries.
+        let content = dartq_source::content_hash(bytes);
         let text = std::str::from_utf8(bytes).expect("engine content is UTF-8");
         let signature = if let Some(payload) = persisted(text) {
             // The signature column off the payload bytes before the
             // materializing move (`materialize` consumes the payload).
             let signature = payload.api_signature;
-            let facts =
-                payload.materialize(text, strings, &codes, &mut |path| restored.intern(path));
-            face_names(&facts, &mut names);
+            let facts = payload.materialize(text, content, strings, &codes, &mut |path| {
+                restored.intern(path)
+            });
+            member_faces.extend(
+                facts
+                    .elements
+                    .member_digests(strings)
+                    .into_iter()
+                    .map(|(name, digest)| (name, *digest.as_bytes())),
+            );
             signature
         } else {
             // The engine's residency is the authority here: the
@@ -315,17 +601,29 @@ fn library_surface(
             // engine's own), and no language-version drift (the file's
             // settled feature set rode the analysis).
             let facts = engine.file_facts(file).expect("resident member facts");
-            face_names(facts, &mut names);
+            member_faces.extend(
+                facts
+                    .elements
+                    .member_digests(strings)
+                    .into_iter()
+                    .map(|(name, digest)| (name, *digest.as_bytes())),
+            );
             *facts.api_signature().as_bytes()
         };
         signatures.push(signature);
     }
-    names.sort_unstable();
-    names.dedup();
+    // Ascending by name (the query's merge-walk and binary-search
+    // contract); a name declared twice in one library — the
+    // duplicate-definition defect the capture logs — keeps its first
+    // (name, digest) pair: deterministic, and the defect is that log's
+    // problem, not this face's.
+    member_faces.sort_unstable();
+    member_faces.dedup_by(|a, b| a.0 == b.0);
     FileSnapshot {
         content_hash: content_hash(&folded),
         api_signature: query::fold_api_signatures(&signatures),
-        top_level_names: names.into_boxed_slice(),
+        member_names: member_faces.iter().map(|(name, _)| *name).collect(),
+        member_digests: member_faces.into_iter().map(|(_, digest)| digest).collect(),
     }
 }
 
@@ -430,9 +728,13 @@ mod tests {
     /// analysis uses: every library-face row becomes an element column
     /// entry (containers vs top-level declarations, names on the per-entry
     /// string slice, kinds in the persisted spellings) — the shape the load
-    /// arm's derivation consumes. The signature column is a fixture
-    /// simplification (all-zero): it rides the payload but never reaches
-    /// the report, whose verdicts key on the name sets.
+    /// arm's derivation consumes. The fixture simplifies the face contents
+    /// (all-zero signature column, bare `Unknown` types, empty member
+    /// lists): the member digests differ between this projection and
+    /// residency, harmlessly — the one-shot posture's rows key on the
+    /// face-name sets alone (every name is an addition), and the report
+    /// bytes never see a digest.
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     fn persisted_facts(text: &str, file: FileId, strings: &StringTable) -> PersistedFacts {
         let scanned = scan(text, SCAN_CONFIG, file);
         let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
@@ -476,13 +778,12 @@ mod tests {
                 continue;
             }
             let name = strings.resolve(row.name).to_owned();
-            let at = match slots.get(&name) {
-                Some(&at) => at,
-                None => {
-                    slots.insert(name.clone(), slice.len() as u32);
-                    slice.push(name);
-                    (slice.len() - 1) as u32
-                }
+            let at = if let Some(&at) = slots.get(&name) {
+                at
+            } else {
+                slots.insert(name.clone(), slice.len() as u32);
+                slice.push(name);
+                (slice.len() - 1) as u32
             };
             match row.kind {
                 DeclKind::Class => {
@@ -718,5 +1019,308 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The context fixture (the config tests' twin, plus an importer): a
+    /// real package directory with two stub SDKs — `new` carries
+    /// `dart:async`, `old` does not, so `a.dart`'s `dart:async` import is
+    /// the ERROR-severity discriminator between the axes — and `b.dart`
+    /// importing `a.dart`, so the affected set spans two libraries.
+    fn context_fixture(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("dq_cmd_impact_ctx_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |relative: &str, content: &str| {
+            std::fs::create_dir_all(root.join(relative).parent().expect("parent")).expect("dir");
+            std::fs::write(root.join(relative), content).expect("file");
+        };
+        write(
+            "pubspec.yaml",
+            "name: fixture\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            "pubspec.lock",
+            "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+        );
+        write(
+            ".dart_tool/package_config.json",
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+        );
+        write("sdks/new/version", "3.13.1\n");
+        write(
+            "sdks/new/lib/libraries.json",
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}, "async": {"uri": "async/async.dart"}}}}"#,
+        );
+        write("sdks/new/lib/async/async.dart", "library dart.async;\n");
+        write("sdks/old/version", "3.5.0\n");
+        write(
+            "sdks/old/lib/libraries.json",
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+        );
+        for sdk in ["new", "old"] {
+            write(
+                &format!("sdks/{sdk}/lib/_internal/allowed_experiments.json"),
+                r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+            );
+        }
+        write("lib/a.dart", "import 'dart:async';\nclass Foo {}\n");
+        write("lib/b.dart", "import 'a.dart';\nclass B {}\n");
+        root
+    }
+
+    fn write_config(root: &Path, yaml: &str) {
+        fs::write(root.join("dartq.yaml"), yaml).expect("config");
+    }
+
+    /// The declared contexts are the matrix, in file order, each judged by
+    /// the compat verdict rule over the affected set: `a.dart`'s
+    /// `dart:async` import is clean under `new` and an ERROR under `old`,
+    /// so the seed-and-importer set flips exactly the `old` row. The
+    /// primary sections ride unchanged.
+    #[test]
+    fn declared_contexts_drive_the_environment_matrix() {
+        let root = context_fixture("matrix");
+        write_config(
+            &root,
+            "version: 1\ncontexts:\n  new:\n    sdk: path:sdks/new\n  old:\n    sdk: path:sdks/old\n",
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdks/new"))).expect("engine");
+        let target = root.join("lib/a.dart");
+        let report = impact(&mut engine, &target).expect("impact");
+        assert_eq!(
+            report.affected_environments,
+            vec![
+                query::EnvironmentImpact {
+                    label: "new".to_owned(),
+                    compatible: true,
+                },
+                query::EnvironmentImpact {
+                    label: "old".to_owned(),
+                    compatible: false,
+                },
+            ],
+            "one honest row per context, in file order"
+        );
+        assert!(
+            report
+                .affected
+                .iter()
+                .any(|row| row.path.ends_with("b.dart")),
+            "the primary sections ride unchanged: {:?}",
+            report.affected
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The contextless degradation: no `dartq.yaml` anywhere up the chain —
+    /// the single `default` row, its verdict the compat rule over the main
+    /// pass. The clean analysis stays compatible.
+    #[test]
+    fn contextless_workspaces_keep_the_default_row() {
+        let root = context_fixture("default");
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdks/new"))).expect("engine");
+        let report = impact(&mut engine, &root.join("lib/a.dart")).expect("impact");
+        assert_eq!(
+            report.affected_environments,
+            vec![query::EnvironmentImpact {
+                label: "default".to_owned(),
+                compatible: true,
+            }],
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The contextless verdict is derived, never an unevaluated
+    /// affirmative: with the main engine on the `old` SDK, `a.dart`'s
+    /// `dart:async` import is an ERROR on the affected set (the seed is in
+    /// it), and the default row answers `compatible: false` — the same
+    /// verdict the compat face's axis answers for the same SDK.
+    #[test]
+    fn a_contextless_target_with_an_error_answers_incompatible() {
+        let root = context_fixture("default_error");
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdks/old"))).expect("engine");
+        let target = root.join("lib/a.dart");
+        let report = impact(&mut engine, &target).expect("impact");
+        assert_eq!(
+            report.affected_environments,
+            vec![query::EnvironmentImpact {
+                label: "default".to_owned(),
+                compatible: false,
+            }],
+            "the seed's ERROR flips the contextless row",
+        );
+
+        // The compat face's answer for the same axis agrees: the rule is
+        // one, the faces scope it differently (affected set vs workspace).
+        let (compat_report, _) =
+            crate::compat::compat(&root, &target, &[root.join("sdks/old")]).expect("compat run");
+        assert_eq!(
+            compat_report.matrix[0].compatible, false,
+            "the compat axis verdict matches the default row"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An SDK root that fails to load isolates as an incompatible row (the
+    /// compat doctrine): the matrix still answers, the healthy context's
+    /// honest verdict rides, and the report ships.
+    #[test]
+    fn an_unloadable_context_sdk_is_an_incompatible_row() {
+        let root = context_fixture("ghost");
+        write_config(
+            &root,
+            "contexts:\n  ghost:\n    sdk: path:sdks/missing\n  new:\n    sdk: path:sdks/new\n",
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdks/new"))).expect("engine");
+        let report = impact(&mut engine, &root.join("lib/a.dart")).expect("impact");
+        assert_eq!(
+            report.affected_environments,
+            vec![
+                query::EnvironmentImpact {
+                    label: "ghost".to_owned(),
+                    compatible: false,
+                },
+                query::EnvironmentImpact {
+                    label: "new".to_owned(),
+                    compatible: true,
+                },
+            ],
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The matrix judges the affected set, not the workspace: seeded at the
+    /// importer `b.dart`, the closure is `{b}` alone, so `a.dart`'s
+    /// `old`-SDK ERROR lands outside the set and both contexts stay
+    /// compatible — the whole-workspace verdict is the compat face's job.
+    #[test]
+    fn the_matrix_judges_the_affected_set_not_the_workspace() {
+        let root = context_fixture("scope");
+        write_config(
+            &root,
+            "contexts:\n  new:\n    sdk: path:sdks/new\n  old:\n    sdk: path:sdks/old\n",
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdks/new"))).expect("engine");
+        let report = impact(&mut engine, &root.join("lib/b.dart")).expect("impact");
+        assert!(
+            report.affected.is_empty(),
+            "no importer of b: {:?}",
+            report.affected
+        );
+        assert_eq!(
+            report.affected_environments,
+            vec![
+                query::EnvironmentImpact {
+                    label: "new".to_owned(),
+                    compatible: true,
+                },
+                query::EnvironmentImpact {
+                    label: "old".to_owned(),
+                    compatible: true,
+                },
+            ],
+            "a.dart's error is outside the affected set"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An unresolvable locator refuses the run (the compat face's usage
+    /// tier), with the structured message naming the context and defect.
+    #[test]
+    fn an_unresolvable_locator_refuses() {
+        let root = context_fixture("refuse");
+        write_config(&root, "contexts:\n  bad:\n    sdk: registry:foo\n");
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdks/new"))).expect("engine");
+        let error = impact(&mut engine, &root.join("lib/a.dart")).expect_err("refusal");
+        assert!(
+            matches!(error, ImpactError::Usage(_)),
+            "usage tier: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("unsupported sdk locator"),
+            "structured: {error}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The canonical fixture report (the shaper tests' input): every row
+    /// shape in one document — both signature verdicts, both impact
+    /// levels, the test section, and the two-row environment matrix.
+    fn golden_report() -> query::ImpactReport {
+        query::ImpactReport {
+            schema_version: query::IMPACT_SCHEMA_VERSION,
+            changed: vec![
+                query::ChangedSymbol {
+                    symbol: "lib/a.dart|Foo".to_owned(),
+                    signature_changed: true,
+                },
+                query::ChangedSymbol {
+                    symbol: "lib/a.dart|foo".to_owned(),
+                    signature_changed: false,
+                },
+            ],
+            affected: vec![
+                query::AffectedTarget {
+                    path: "lib/b.dart".to_owned(),
+                    impact: query::ImpactLevel::Semantic,
+                },
+                query::AffectedTarget {
+                    path: "tool/note.dart".to_owned(),
+                    impact: query::ImpactLevel::ContentOnly,
+                },
+            ],
+            affected_tests: vec![query::AffectedTest {
+                path: "test/a_test.dart".to_owned(),
+            }],
+            affected_environments: vec![
+                query::EnvironmentImpact {
+                    label: "default".to_owned(),
+                    compatible: true,
+                },
+                query::EnvironmentImpact {
+                    label: "old".to_owned(),
+                    compatible: false,
+                },
+            ],
+        }
+    }
+
+    /// The AI-face golden (`goldens/ai/impact_report.json`): the promoted
+    /// report envelope, pinned against the live shaper. The comparison
+    /// rides the schema validate-at-birth gate inside [`to_json`]; a
+    /// mismatch is a regression, not a golden to edit.
+    #[test]
+    fn the_ai_golden_pins_the_report_shaper() {
+        let golden = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../goldens/ai/impact_report.json");
+        let expected: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&golden).expect("the impact golden rides the repo"),
+        )
+        .expect("one JSON object");
+        assert_eq!(to_json(&golden_report()), expected, "impact golden drift");
+    }
+
+    /// The tier exactness boundary at the producer gate: the report is
+    /// tier-invariant (every field a locator or a verdict the published
+    /// schema requires at every tier), so the same payload is exact at
+    /// minimal, compact, and full — the contract the CLI's grammar-parity
+    /// `--verbosity` stands on.
+    #[test]
+    fn the_report_is_schema_valid_at_every_tier() {
+        let text = to_json(&golden_report()).to_string();
+        for tier in [
+            dartq_schema::Verbosity::Minimal,
+            dartq_schema::Verbosity::Compact,
+            dartq_schema::Verbosity::Full,
+        ] {
+            dartq_schema::validate_at_tier(&text, dartq_schema::Domain::Impact, tier)
+                .expect("tier-invariant: exact at every tier");
+        }
     }
 }

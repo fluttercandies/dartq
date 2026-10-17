@@ -20,13 +20,19 @@ use dartq_source::LineIndex;
 /// the same pair per file.
 pub struct EngineLayout<'a> {
     engine: &'a Engine,
-    /// Exactly the FileIds the caller will query, each with its resident
+    /// Exactly the `FileIds` the caller will query, each with its resident
     /// text and line index.
     cache: BTreeMap<FileId, (&'a str, &'a LineIndex)>,
 }
 
 impl<'a> EngineLayout<'a> {
     /// Snapshots (text, index) once per distinct file in `files`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a file is not analyzed (no resident content or line
+    /// index) or its content is not UTF-8 — both internal invariant
+    /// breaches (content is validated at `set_content` time).
     #[must_use]
     pub fn over(engine: &'a Engine, files: impl IntoIterator<Item = FileId>) -> Self {
         let mut cache = BTreeMap::new();
@@ -40,6 +46,15 @@ impl<'a> EngineLayout<'a> {
             });
         }
         Self { engine, cache }
+    }
+
+    /// The snapshotted engine view: the read faces the output faces' own
+    /// conversions run over (the analyze Json face's LSP conversion reads
+    /// the resident line indexes straight from it, through the run's
+    /// borrow).
+    #[must_use]
+    pub fn engine(&self) -> &'a Engine {
+        self.engine
     }
 }
 
