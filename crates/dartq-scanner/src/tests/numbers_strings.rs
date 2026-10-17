@@ -1,6 +1,6 @@
 //! Number form matrix and the full string form matrix (raw/triple-quoted/nested interpolation/escapes/unterminated).
 
-use super::{assert_codes, assert_kinds, codes, scan_src};
+use super::{assert_codes, assert_kinds, scan_src};
 use crate::{Keyword, TokenKind as K};
 use dartq_source::byte_offset_to_utf16;
 
@@ -135,7 +135,10 @@ fn escape_sequences() {
 #[test]
 fn unterminated_single_line() {
     let r = scan_src("'abc");
-    // Synthetic empty STRING segment + unterminated_string_literal (pinned to the last character `c`).
+    // Synthetic STRING segment spanning the remaining content from the string
+    // start (official SyntheticStringToken: [0, 4), closing quote in the
+    // lexeme but not the length) + unterminated_string_literal (pinned to
+    // the last character `c`).
     assert_eq!(
         r.tokens
             .as_slice()
@@ -145,6 +148,7 @@ fn unterminated_single_line() {
         1
     );
     assert!(r.tokens.first().is_synthetic());
+    assert_eq!(r.tokens.first().byte_range(), 0..4);
     assert_codes(&r, &["unterminated_string_literal"]);
     assert_eq!(r.diagnostics[0].range.offset, 3);
     assert_eq!(r.diagnostics[0].range.length, 1);
@@ -156,6 +160,10 @@ fn unterminated_single_line() {
         &["unterminated_string_literal", "unterminated_string_literal"],
     );
     assert_kinds(&r, &[K::String, K::Identifier, K::String]);
+    // The first segment carries the real content up to the break (`'ab`);
+    // the second is empty (EOF cascade: upstream `start = scanOffset`).
+    assert_eq!(r.tokens.get(0).unwrap().byte_range(), 0..3);
+    assert_eq!(r.tokens.get(2).unwrap().byte_range(), 5..6);
 }
 
 #[test]
@@ -211,6 +219,45 @@ fn unterminated_raw() {
 fn unterminated_multiline() {
     let r = scan_src("'''abc\ndef");
     assert_codes(&r, &["unterminated_string_literal"]);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+}
+
+#[test]
+fn unterminated_multiline_at_eof_segment_shape() {
+    // Corpus string3.dart (regression f59c79c8): `"""\næbler` truncated at
+    // EOF — the synthetic STRING segment spans from the opening quote through
+    // the last real content unit (official SyntheticStringToken: offset =
+    // tokenStart, length = content length without the synthetic suffix), and
+    // the diagnostic pins to the last UTF-16 unit (analyzer
+    // `endOffset - 1, length 1`, translate_error_token.dart; the corpus
+    // oracle's unterminated_string_literal row lands on the `r`).
+    let src = "  return \"\"\"\næbler";
+    let r = scan_src(src);
+    assert_codes(&r, &["unterminated_string_literal"]);
+    let t = &r.tokens;
+    assert_eq!(t.get(1).unwrap().kind, K::String);
+    assert!(t.get(1).unwrap().is_synthetic());
+    assert_eq!(t.get(1).unwrap().byte_range(), 9..19); // `"""` through `æbler` (æ is 2 bytes)
+    assert_eq!(t.get(1).unwrap().utf16_offset, 9);
+    assert_eq!(r.diagnostics[0].range.offset, 17); // last unit of `æbler`
+    assert_eq!(r.diagnostics[0].range.length, 1);
+}
+
+#[test]
+fn unterminated_multiline_raw_at_eof_segment_shape() {
+    // Corpus string4.dart (regression e0f42062): `r"""` truncated at EOF —
+    // the synthetic segment's tokenStart includes the `r` prefix (official
+    // `unterminatedString` passes the literal's `start`, which is the raw
+    // marker for a raw string).
+    let src = "  return r\"\"\"\næbler";
+    let r = scan_src(src);
+    assert_codes(&r, &["unterminated_string_literal"]);
+    let t = &r.tokens;
+    assert_eq!(t.get(1).unwrap().kind, K::String);
+    assert!(t.get(1).unwrap().is_synthetic());
+    assert_eq!(t.get(1).unwrap().byte_range(), 9..20); // `r"""` through `æbler`
+    assert_eq!(t.get(1).unwrap().utf16_offset, 9);
+    assert_eq!(r.diagnostics[0].range.offset, 18); // last unit of `æbler`
     assert_eq!(r.diagnostics[0].range.length, 1);
 }
 
@@ -378,15 +425,17 @@ fn empty_interp_close_paren_faces() {
     // Quote-less tail inside the call: `)` and `;` stay string content; the
     // pin lands on the `;` (oracle `f('${});` row 1|8|1). The `(` never sees
     // a real `)` — this one is string content — so the unmatched begin gets
-    // its eof-synthetic closer: expected_token ')' at the eof position, the
-    // same unmatched-begin-at-eof law as `f({` (two expected_token rows) and
-    // `'a${b` (unterminated first, then the eof expected_token).
+    // its eof-synthetic closer: the pair is recorded on the table and the
+    // parser reports the row post-parse (same unmatched-begin-at-eof law as
+    // `f({` and `'a${b`; the `${` itself matched the real `}`, no pair).
     let r = scan_src("f('${});");
-    assert_codes(&r, &["unterminated_string_literal", "expected_token"]);
+    assert_codes(&r, &["unterminated_string_literal"]);
     assert_eq!(r.diagnostics[0].range.offset, 7);
     assert_eq!(r.diagnostics[0].range.length, 1);
-    assert_eq!(r.diagnostics[1].range.offset, 8);
-    assert_eq!(r.diagnostics[1].range.length, 0);
+    let t = &r.tokens;
+    let n = t.as_slice().len();
+    assert!(t.get(n - 2).unwrap().is_synthetic());
+    assert_eq!(t.unmatched_groups(), &[(1, (n - 2) as u32)]);
 
     // No enclosing call: same rule, pin on the `)` (oracle `var s = '${})`
     // row 1|13|1).
@@ -396,40 +445,45 @@ fn empty_interp_close_paren_faces() {
     assert_eq!(r.diagnostics[0].range.length, 1);
 
     // `)` inside the empty interpolation deep-matches the enclosing `(`: the
-    // `${` is reported unmatched at the `)` (insert posture), then the body
-    // resumes and hits the break with an empty tail. The endOffset - 1 pin
-    // falls on the `)` — the last string-facing character; a length-1 range
-    // at offset 6 would sit past the 6-byte source (eof-adjacent diagnostics
-    // are zero-width at eof, never length-1 past the end).
+    // `${` is recorded unmatched at the `)` (insert posture; the parser
+    // reports the row post-parse), then the body resumes and hits the break
+    // with an empty tail. The endOffset - 1 pin falls on the `)` — the last
+    // string-facing character; a length-1 range at offset 6 would sit past
+    // the 6-byte source (eof-adjacent diagnostics are zero-width at eof,
+    // never length-1 past the end).
     let r = scan_src("f('${)");
-    assert_codes(&r, &["expected_token", "unterminated_string_literal"]);
+    assert_codes(&r, &["unterminated_string_literal"]);
     assert_eq!(r.diagnostics[0].range.offset, 5);
     assert_eq!(r.diagnostics[0].range.length, 1);
-    assert_eq!(r.diagnostics[1].range.offset, 5);
-    assert_eq!(r.diagnostics[1].range.length, 1);
+    // 0 f, 1 (, 2 ', 3 ${, 4 synthetic }, 5 ). The `${` pairs with the
+    // synthetic; the `(` matched the real `)`.
+    let t = &r.tokens;
+    assert!(t.get(4).unwrap().is_synthetic());
+    assert_eq!(t.unmatched_groups(), &[(3, 4)]);
 
     // EOF inside the interpolation: unterminated pinned at the break, then
-    // the eof-synthetic closers — the open `${` AND the enclosing `(` (same
-    // unmatched-begin-at-eof law as `f({`, which oracle pins as two rows).
-    // The string consumed nothing after `${`, so endOffset - 1 drops the
-    // unterminated pin onto the `{` (a pin at offset 5 would be a length-1
-    // range past the 5-byte source); both expected_token rows are zero-width
-    // at the eof position.
+    // the eof-cascade empty segment and the eof-synthetic closers — the open
+    // `${` AND the enclosing `(` (same unmatched-begin-at-eof law as `f({`):
+    // both pairs recorded, both rows reported by the parser post-parse. The
+    // string consumed nothing after `${`, so the tail segment is the empty
+    // [5,5) (upstream appendSyntheticSubstringToken with start = scanOffset =
+    // eof) and endOffset - 1 drops the unterminated pin onto the `{` (a pin
+    // at offset 5 would be a length-1 range past the 5-byte source).
     let r = scan_src("g('${");
-    assert_codes(
-        &r,
-        &[
-            "unterminated_string_literal",
-            "expected_token",
-            "expected_token",
-        ],
-    );
+    assert_codes(&r, &["unterminated_string_literal"]);
     assert_eq!(r.diagnostics[0].range.offset, 4);
     assert_eq!(r.diagnostics[0].range.length, 1);
-    assert_eq!(r.diagnostics[1].range.offset, 5);
-    assert_eq!(r.diagnostics[1].range.length, 0);
-    assert_eq!(r.diagnostics[2].range.offset, 5);
-    assert_eq!(r.diagnostics[2].range.length, 0);
+    // 0 g, 1 (, 2 String(`'`), 3 `${`, 4 empty eof-cascade segment, 5
+    // synthetic `}`, 6 synthetic `)`, 7 eof — the tail segment precedes the
+    // closers (upstream token order: unterminatedString's substring token,
+    // then appendEofToken's unmatchedBeginGroup closers); `${` pops first
+    // (stack top), then the `(`.
+    let t = &r.tokens;
+    assert!(t.get(4).unwrap().is_synthetic());
+    assert_eq!(t.get(4).unwrap().byte_range(), 5..5);
+    assert!(t.get(5).unwrap().is_synthetic());
+    assert!(t.get(6).unwrap().is_synthetic());
+    assert_eq!(t.unmatched_groups(), &[(3, 5), (1, 6)]);
 }
 
 #[test]
@@ -498,7 +552,7 @@ fn interpolation_official_corpus_ranges() {
 
 #[test]
 fn synthetic_tokens_dual_coordinate_identity() {
-    // PRD §10.4 identity must hold for synthetic tokens too: utf16_offset is
+    // identity must hold for synthetic tokens too: utf16_offset is
     // derived from byte_offset (F3: the synthetic `0` of `0x`/`1e` starts at
     // the number start while the cursor sits past the missing digits — a
     // lexeme-based derivation drifted by the skipped suffix, growing with the
@@ -577,40 +631,23 @@ fn adjacent_strings_inside_interpolation() {
 
 #[test]
 fn nested_unterminated_diagnostic_order() {
-    // Two-level unterminated nesting locks the recovery ORDER (the recursive
-    // shape emitted it as its Eof propagated out): the inner `"` string's
-    // unterminated recovery first, then the outer `'` string's, then the
-    // synthetic `}` closers inner-first (all four pin to EOF, and same-start
-    // diagnostics keep emission order — diag::finish).
+    // Two-level unterminated nesting: the inner `"` string's recovery and the
+    // outer `'` string's EOF-cascade recovery both pin one unit before EOF
+    // with the identical (code, offset, length, message) identity, and the
+    // oracle's row set is a Set over that identity — the pair surfaces once
+    // (the same collapse the `f('${f('${')` capture shows: two rows over
+    // three error tokens). Identical rows are unobservable in any order by
+    // construction — the dedup structural invariant (tests/dedup.rs) keeps
+    // them adjacent so the finish pass removes all of them.
     let src = "'a${\"b${c";
     let r = scan_src(src);
-    assert_codes(
-        &r,
-        &[
-            "unterminated_string_literal", // inner `"b${c`
-            "unterminated_string_literal", // outer `'a${…`
-            "expected_token",              // inner ${ → synthetic }
-            "expected_token",              // outer ${ → synthetic }
-        ],
-    );
-    // Both string pins sit one unit before EOF (the last character `c`).
-    for d in &r.diagnostics[..2] {
-        assert_eq!(d.range.offset, 8);
-        assert_eq!(d.range.length, 1);
-    }
-    // The registry-true message carries no opener placeholder, so both levels
-    // emit the identical text (the oracle does the same); emission order
-    // (inner first) stays pinned by the codes above and `diag::finish`'s
-    // stable sort.
-    for d in &r.diagnostics[..2] {
-        assert_eq!(d.message, "Unterminated string literal.");
-    }
-    // Both expected_token pins sit AT the eof position (zero-width).
-    for d in &r.diagnostics[2..] {
-        assert_eq!(d.range.offset, 9);
-        assert_eq!(d.range.length, 0);
-        assert!(d.message.contains("'}'"), "{}", d.message);
-    }
+    assert_codes(&r, &["unterminated_string_literal"]);
+    // The collapse keeps the shared pin: one unit before EOF (the last
+    // character `c`), registry-true message.
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 8);
+    assert_eq!(d.range.length, 1);
+    assert_eq!(d.message, "Unterminated string literal.");
     // Token tail: the two unterminated synthetics, then the closers LIFO
     // (inner SII → the first `}`), then Eof.
     let slice = r.tokens.as_slice();
@@ -622,23 +659,106 @@ fn nested_unterminated_diagnostic_order() {
     assert_eq!(slice[n - 1].kind, K::Eof);
     assert_eq!(r.tokens.matching_end(3), Some(n - 3)); // inner ${ → inner }
     assert_eq!(r.tokens.matching_end(1), Some(n - 2)); // outer ${ → outer }
+    // Both eof-parked closers, inner first: the parser reports the two
+    // expected_token rows in this order, zero-width at the eof position.
+    assert_eq!(
+        r.tokens.unmatched_groups(),
+        &[(3, (n - 3) as u32), (1, (n - 2) as u32)]
+    );
+}
+
+#[test]
+fn sii_probe_dollar_eof_unterminated_pins() {
+    // The sii-probe `$`-EOF family (oracle `dart analyze --format=machine`
+    // rows), pinned at scanner level: the driver's EOF unwind emits one
+    // unterminated recovery per suspended body with the `endOffset - 1` pin,
+    // and the `$` identifier form's missing_identifier rides alongside.
+    //
+    // bare_dollar (`'$\n`): the `$` takes the identifier form with the break
+    // as the "identifier" — missing_identifier pins past the `$` (col 3),
+    // then the body's line termination reports the unterminated string one
+    // unit back (col 2). Emission order is the finish pass's stable sort:
+    // both records start at the break.
+    let r = scan_src("'$\n");
+    assert_codes(&r, &["missing_identifier", "unterminated_string_literal"]);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.range.offset, 2);
+    assert_eq!(d.range.length, 1);
+    assert_eq!(d.message, "Expected an identifier.");
+    let d = &r.diagnostics[1];
+    assert_eq!(d.range.offset, 1);
+    assert_eq!(d.range.length, 1);
+    assert_eq!(d.message, "Unterminated string literal.");
+
+    // double_dollar (`f('$${')\n`): the first `$` takes the identifier form
+    // (`$` itself is not an identifier start → missing_identifier @col 5);
+    // the second `$` opens a `${` whose string rides to the break and EOF —
+    // two unterminated rows, oracle 1|8|1 and 1|9|1. The `(` and the open
+    // `${` close with eof-synthetic closers recorded as unmatched pairs (the
+    // parser reports their rows post-parse).
+    let r = scan_src("f('$${')\n");
+    assert_codes(
+        &r,
+        &[
+            "missing_identifier",
+            "unterminated_string_literal",
+            "unterminated_string_literal",
+        ],
+    );
+    assert_eq!(r.diagnostics[0].range.offset, 4);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+    assert_eq!(r.diagnostics[0].message, "Expected an identifier.");
+    for d in &r.diagnostics[1..] {
+        assert_eq!(d.message, "Unterminated string literal.");
+        assert_eq!(d.range.length, 1);
+    }
+    assert_eq!(r.diagnostics[1].range.offset, 7); // the break (col 8)
+    assert_eq!(r.diagnostics[2].range.offset, 8); // eof - 1 (col 9)
+    let pairs = r.tokens.unmatched_groups();
+    assert_eq!(pairs.len(), 2, "the paren and SIE groups: {pairs:?}");
+    for &(_, close) in pairs {
+        assert!(r.tokens.get(close as usize).unwrap().is_synthetic());
+    }
+
+    // bare_interp (`'${\n`): EOF right after the `${` — the unterminated pin
+    // falls on the break (col 4, oracle 1:4), and the eof-synthetic `}`
+    // closer rides the pair list (the `'a${b` law; zero-width at eof when
+    // the parser reports it).
+    let r = scan_src("'${\n");
+    assert_codes(&r, &["unterminated_string_literal"]);
+    assert_eq!(r.diagnostics[0].range.offset, 3);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+    assert_eq!(r.tokens.unmatched_groups().len(), 1);
+
+    // two_unclosed_curly (`f('${{\n`): the `{` after `${` stays an ordinary
+    // code-mode begin group; only the string reports unterminated (oracle
+    // 1:7 = eof - 1), and all three open groups (`(`, `${`, `{`) close with
+    // eof-synthetic closers recorded as pairs behind it.
+    let r = scan_src("f('${{\n");
+    assert_codes(&r, &["unterminated_string_literal"]);
+    assert_eq!(r.diagnostics[0].range.offset, 6);
+    assert_eq!(r.diagnostics[0].range.length, 1);
+    let pairs = r.tokens.unmatched_groups();
+    assert_eq!(pairs.len(), 3, "paren, SIE and curly groups: {pairs:?}");
+    for &(_, close) in pairs {
+        assert!(r.tokens.get(close as usize).unwrap().is_synthetic());
+    }
 }
 
 #[test]
 fn deep_nested_unterminated_interpolation() {
     // 50_000 levels of `"a${` hitting EOF: the interpolation frames live on
     // the heap, so the scan completes where a native-stack-recursive scanner
-    // would overflow (SIGSEGV). Diagnostic recording is capped.
+    // would overflow (SIGSEGV). Every unwound recovery pins the identical
+    // (code, eof - 1, 1, message) row, so the oracle Set semantics collapse
+    // them all into one (the finish-pass dedup; the row cap never engages).
     let src = "\"a${".repeat(50_000);
     let r = scan_src(&src);
-    assert_eq!(r.diagnostics.len(), 10_000);
-    // The cap fills with the unwound string recoveries; the synthetic group
-    // closers come after and overflow it.
-    assert!(
-        codes(&r)
-            .iter()
-            .all(|c| *c == "unterminated_string_literal")
-    );
+    assert_eq!(r.diagnostics.len(), 1);
+    let d = &r.diagnostics[0];
+    assert_eq!(d.code.name, "unterminated_string_literal");
+    assert_eq!(d.range.offset, u32::try_from(src.len() - 1).unwrap());
+    assert_eq!(d.range.length, 1);
     let eof = r.tokens.get(r.tokens.len() - 1).unwrap();
     assert_eq!(eof.kind, K::Eof);
 }

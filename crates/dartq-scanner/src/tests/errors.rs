@@ -1,6 +1,6 @@
 //! Recovery strategies, diagnostic pinning, the @dart window, CRLF, BOM-as-content, dual-offset consistency.
 
-use super::{assert_codes, assert_kinds, codes, scan_src, u32_of};
+use super::{assert_codes, assert_kinds, codes, scan_src};
 use crate::{Keyword, TokenKind as K};
 use dartq_source::byte_offset_to_utf16;
 
@@ -167,6 +167,39 @@ fn illegal_astral_char_double_emission() {
 }
 
 #[test]
+fn illegal_character_registry_message() {
+    // One registry template for every token class: `Illegal character '{0}'.`
+    // with `{0}` the decimal UTF-16 code unit (analyzer messages.yaml
+    // `illegalCharacter`, parameter `int codePoint`). Exact pins against the
+    // captured oracle rows of the known-diffs GAP-SPIN trio:
+    // `a = Щ;` → `Illegal character '1065'.` @1:5 (dbf4285a),
+    // `a = ShcheгlovЩx;` → `'1075'.` @1:10 + `'1065'.` @1:14 (4caf0953),
+    // the astral emoji → `'55357'.` + `'56832'.` one unit each (8f05c31e,
+    // line 5 there; the relative pins here are line-1 equivalents).
+    let r = scan_src("a = Щ;");
+    assert_eq!(r.diagnostics[0].message, "Illegal character '1065'.");
+    assert_eq!(r.diagnostics[0].range.offset, 4);
+    let r = scan_src("a = ShcheгlovЩx;");
+    assert_eq!(r.diagnostics[0].message, "Illegal character '1075'.");
+    assert_eq!(r.diagnostics[0].range.offset, 9);
+    assert_eq!(r.diagnostics[1].message, "Illegal character '1065'.");
+    assert_eq!(r.diagnostics[1].range.offset, 13);
+    let r = scan_src("f(😀);");
+    assert_eq!(r.diagnostics[0].message, "Illegal character '55357'.");
+    assert_eq!(r.diagnostics[0].range.offset, 2);
+    assert_eq!(r.diagnostics[1].message, "Illegal character '56832'.");
+    assert_eq!(r.diagnostics[1].range.offset, 3);
+    // The remaining token classes share the template (registry-derived; the
+    // live-oracle captures above cover the identifier and surrogate faces).
+    let r = scan_src("a \u{1} b"); // ASCII control
+    assert_eq!(r.diagnostics[0].message, "Illegal character '1'.");
+    let r = scan_src("ab\u{7F}cd"); // DEL (default arm → merge path)
+    assert_eq!(r.diagnostics[0].message, "Illegal character '127'.");
+    let r = scan_src("\u{FEFF}var x;"); // non-ASCII whitespace class
+    assert_eq!(r.diagnostics[0].message, "Illegal character '65279'.");
+}
+
+#[test]
 fn illegal_pure_junk_is_an_identifier() {
     // A junk run with no adjacent ASCII identifier still becomes a real
     // Identifier token (official `unexpected`, abstract_scanner.dart:2470:
@@ -291,8 +324,10 @@ fn diag_ranges_utf16_with_non_ascii() {
 fn unclosed_groups_at_eof() {
     // `f({` → two synthetic close tokens: the stack top (inner `{`) pops first →
     // `}` before `)` (official unmatchedBeginGroup linear order: syn_inner … syn_outer).
+    // The pairs are recorded on the table; the parser reports the rows
+    // post-parse (official UnmatchedToken translation is post-parse).
     let r = scan_src("f({");
-    assert_codes(&r, &["expected_token", "expected_token"]);
+    assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
     let slice = r.tokens.as_slice();
     let n = slice.len();
     assert_eq!(slice[n - 3].kind, K::CloseCurly);
@@ -302,30 +337,37 @@ fn unclosed_groups_at_eof() {
     // begin → synthetic close token pairing (official endGroup semantics).
     assert_eq!(r.tokens.matching_end(2), Some(n - 3)); // `{` → `}`
     assert_eq!(r.tokens.matching_end(1), Some(n - 2)); // `(` → `)`
-    // Pinned AT the eof position (oracle `dart analyze --format=json` on
-    // `f({`: both expected_token @3 len1 = the eof offset itself, one past
-    // the last char — the analyzer's synthetic closer + `charOffset--` land
-    // on the eof position, not eof-1). A byte range cannot address the
-    // unit after the source, so the encoded range is zero-width at eof.
-    assert_eq!(r.diagnostics[0].range.offset, 3);
-    assert_eq!(r.diagnostics[0].range.length, 0);
-    assert_eq!(r.diagnostics[1].range.offset, 3);
-    assert_eq!(r.diagnostics[1].range.length, 0);
+    // The unmatched pairs, in scan-close order (inner `{` first).
+    assert_eq!(
+        r.tokens.unmatched_groups(),
+        &[(2, (n - 3) as u32), (1, (n - 2) as u32)]
+    );
 }
 
 #[test]
 fn unclosed_interpolation_at_eof() {
-    // `'a${b` → unclosed `${`: expected_token + unterminated_string_literal.
+    // `'a${b` → unclosed `${`: the pair rides the table (the parser reports
+    // the `expected_token` row post-parse); the scanner's own diagnostic is
+    // just the unterminated string.
     let r = scan_src("'a${b");
-    assert_codes(&r, &["unterminated_string_literal", "expected_token"]);
+    assert_codes(&r, &["unterminated_string_literal"]);
     // The unterminated-string pin keeps the `endOffset - 1` law (last
-    // character `b` → [4,5)); the expected_token pins AT the eof position
-    // (oracle json: unterminated_string_literal @12 len1, expected_token
-    // '}' @13 len1 = the eof offset — two different laws).
+    // character `b` → [4,5)); the `}` row reports post-parse at
+    // `begin.endGroup` (the eof-parked synthetic).
     assert_eq!(r.diagnostics[0].range.offset, 4);
     assert_eq!(r.diagnostics[0].range.length, 1);
-    assert_eq!(r.diagnostics[1].range.offset, 5);
-    assert_eq!(r.diagnostics[1].range.length, 0);
+    // 0 String(`'a`), 1 `${`, 2 b, 3 empty eof-cascade segment, 4 synthetic
+    // `}`, 5 eof — upstream tokenizeStringInterpolation scans the literal as
+    // STRING segments around the expression, and appendEofToken's
+    // unmatchedBeginGroup parks the synthetic `}` at eof after the
+    // unterminated tail segment (upstream Dart SDK source,
+    // `pkg/_fe_analyzer_shared/lib/src/scanner/abstract_scanner.dart`).
+    let t = &r.tokens;
+    assert_eq!(t.matching_end(1), Some(4)); // `${` → the eof-parked synthetic
+    assert!(t.get(3).unwrap().is_synthetic());
+    assert_eq!(t.get(3).unwrap().byte_range(), 5..5);
+    assert!(t.get(4).unwrap().is_synthetic());
+    assert_eq!(t.unmatched_groups(), &[(1, 4)]);
 }
 
 #[test]
@@ -341,61 +383,57 @@ fn stray_close_brace_no_scanner_diag() {
 #[test]
 fn deeper_match_reports_intermediate_at_closer() {
     // `{[}`: `}` matches `{` deep in the stack; the `[` above it is closed by
-    // a synthetic `]` and reported **at the mismatching closer** (official
-    // insertSyntheticClosers + `begin.endToken.charOffset` translation).
-    // Oracle `dart analyze --format=json` on `{[}\n`: expected_token
-    // "Expected to find ']'." @2 len1 — the `}` position, not eof-1.
+    // a synthetic `]` at the mismatching closer and recorded unmatched
+    // (official insertSyntheticClosers; the parser reports the row post-parse
+    // at `begin.endGroup` — oracle `dart analyze --format=json` on `{[}\n`:
+    // expected_token "Expected to find ']'." @2 len1 — the `}` position,
+    // not eof-1).
     let r = scan_src("{[}");
-    assert_codes(&r, &["expected_token"]);
-    let d = &r.diagnostics[0];
-    assert_eq!(d.range.offset, 2); // the `}`
-    assert_eq!(d.range.length, 1);
-    assert!(d.message.contains("']'"), "{}", d.message);
+    assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
     let t = &r.tokens;
     // 0 {, 1 [, 2 synthetic ], 3 }: `[` → synthetic, `{` → the real `}`.
     assert_eq!(t.matching_end(0), Some(3));
     assert_eq!(t.matching_end(1), Some(2));
     assert!(t.get(2).unwrap().is_synthetic());
+    assert_eq!(t.unmatched_groups(), &[(1, 2)]);
 }
 
 #[test]
 fn unmatched_paren_reported_at_mismatching_close() {
-    // `main() { f(} }`: the `(` above the deep `{` is reported at the first
-    // `}` (oracle json: expected_token ')' @11 len1 = the first `}`); the
-    // `{` itself closes with that `}`; the stray second `}` is silent.
-    let src = "main() { f(} }";
+    // `main { f(} }`: the `(` above the deep `{` is closed by a synthetic
+    // `)` at the mismatching closer and recorded unmatched (official
+    // insertSyntheticClosers; the parser reports the row post-parse at
+    // `begin.endGroup`'s offset — translate_error_token.dart UnmatchedToken —
+    // the synthetic parks at the first `}`); the `{` itself closes with that
+    // `}`; the stray second `}` is silent.
+    let src = "main { f(} }";
     let r = scan_src(src);
-    assert_codes(&r, &["expected_token"]);
-    let d = &r.diagnostics[0];
-    assert_eq!(d.range.offset, 11);
-    assert_eq!(d.range.length, 1);
-    assert!(d.message.contains("')'"), "{}", d.message);
+    assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
     let t = &r.tokens;
-    // 0 main, 1 (, 2 ), 3 {, 4 f, 5 (, 6 synthetic ), 7 }, 8 }
-    assert_eq!(t.matching_end(3), Some(7)); // `{` closed by the first `}`
-    assert_eq!(t.matching_end(5), Some(6)); // `(` → synthetic
-    assert!(t.get(6).unwrap().is_synthetic());
+    // 0 main, 1 `{`@5, 2 f, 3 `(`@8, 4 synthetic `)`@9, 5 `}`@9, 6 `}`@11, 7 eof.
+    assert_eq!(t.matching_end(1), Some(5)); // `{` closed by the first `}`
+    assert_eq!(t.matching_end(3), Some(4)); // `(` → synthetic at the closer
+    assert!(t.get(4).unwrap().is_synthetic());
+    assert_eq!(t.unmatched_groups(), &[(3, 4)]);
 }
 
 #[test]
 fn curly_without_match_closes_head_at_closer() {
     // `f(}`: a `}` with no `{` anywhere still closes off the stack head at
-    // the closer: oracle json on `f(}\n` and `f(}\nhello\n` both show
-    // expected_token ')' @2 len1 (the `}`) and **nothing** at eof.
+    // the closer: the `(` is recorded unmatched at the `}` (oracle json on
+    // `f(}\n` and `f(}\nhello\n` both show expected_token ')' @2 len1 — the
+    // `}`, reported by the parser post-parse — and **nothing** at eof).
     let r = scan_src("f(}");
-    assert_codes(&r, &["expected_token"]);
-    let d = &r.diagnostics[0];
-    assert_eq!(d.range.offset, 2); // the `}`, not eof-1
-    assert_eq!(d.range.length, 1);
-    assert!(d.message.contains("')'"), "{}", d.message);
+    assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
     let t = &r.tokens;
     // 0 f, 1 (, 2 synthetic ), 3 }
     assert_eq!(t.matching_end(1), Some(2));
     assert!(t.get(2).unwrap().is_synthetic());
-    // Content after the mismatch does not move or duplicate the report.
+    assert_eq!(t.unmatched_groups(), &[(1, 2)]);
+    // Content after the mismatch does not move or duplicate the pair.
     let r = scan_src("f(}\nhello\n");
-    assert_codes(&r, &["expected_token"]);
-    assert_eq!(r.diagnostics[0].range.offset, 2);
+    assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
+    assert_eq!(r.tokens.unmatched_groups(), &[(1, 2)]);
 }
 
 #[test]
@@ -425,7 +463,11 @@ fn deep_match_drop_official_example() {
     assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
     let t = &r.tokens;
     // 0 [, 1 (, 2 ], 3 ), 4 ] — every closer a real token.
-    assert!(!t.as_slice().iter().any(|tok| tok.is_synthetic()));
+    assert!(
+        !t.as_slice()
+            .iter()
+            .any(super::super::token::Token::is_synthetic)
+    );
     assert_eq!(t.matching_end(0), Some(4)); // `[` closed by the final `]`
     assert_eq!(t.matching_end(1), Some(3)); // `(` closed by the first `)`
 }
@@ -442,7 +484,11 @@ fn deep_match_drop_corpus_bracket_mismatch_00() {
     assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
     let t = &r.tokens;
     // 0 void, 1 bad, 2 (, 3 ), 4 {, 5 [, 6 (, 7 ], 8 ), 9 ], 10 ;, 11 }.
-    assert!(!t.as_slice().iter().any(|tok| tok.is_synthetic()));
+    assert!(
+        !t.as_slice()
+            .iter()
+            .any(super::super::token::Token::is_synthetic)
+    );
     assert_eq!(t.matching_end(4), Some(11)); // `{` — the final `}`
     assert_eq!(t.matching_end(5), Some(9)); // `[` — the `]` of `];`
     assert_eq!(t.matching_end(6), Some(8)); // `(` — the `)` right after the junk `]`
@@ -463,7 +509,11 @@ fn deep_match_drop_corpus_bracket_mismatch_04() {
     let t = &r.tokens;
     // 0 void, 1 foo, 2 (, 3 ), 4 {, 5 foo, 6 (, 7 (, 8 ), 9 {, 10 bar,
     // 11 (, 12 ), 13 ), 14 ;, 15 }, 16 ), 17 ;, 18 }.
-    assert!(!t.as_slice().iter().any(|tok| tok.is_synthetic()));
+    assert!(
+        !t.as_slice()
+            .iter()
+            .any(super::super::token::Token::is_synthetic)
+    );
     assert_eq!(t.matching_end(4), Some(18)); // `void foo() {` body
     assert_eq!(t.matching_end(6), Some(16)); // `foo(` — the `)` after the block `}`
     assert_eq!(t.matching_end(9), Some(15)); // `{` — the block's own `}`
@@ -476,37 +526,27 @@ fn deep_match_insert_stays_when_not_strictly_cheaper() {
     //
     // `{[1};`: insert = 1 synthetic + 0 EOF stack = 1; drop = 0 + 2 unclosed
     // + 1 = 3 → insert. The `[` is closed by a synthetic `]` at the `}` and
-    // reported there (existing `{[}` pin: errors::deeper_match…; `main() {
-    // f(} }` tie→insert pin: errors::unmatched_paren…).
+    // recorded unmatched (the parser reports the row there post-parse —
+    // existing `{[}` pin: errors::deeper_match…; `main { f(} }`
+    // tie→insert pin: errors::unmatched_paren…).
     let src = "{[1};";
     let r = scan_src(src);
-    assert_codes(&r, &["expected_token"]);
-    let d = &r.diagnostics[0];
-    assert_eq!(d.range.offset, 3); // the `}`
-    assert_eq!(d.range.length, 1);
-    assert!(d.message.contains("']'"), "{}", d.message);
+    assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
     let t = &r.tokens;
     // 0 {, 1 [, 2 1, 3 synthetic ], 4 }.
     assert_eq!(t.matching_end(0), Some(4));
     assert_eq!(t.matching_end(1), Some(3));
     assert!(t.get(3).unwrap().is_synthetic());
+    assert_eq!(t.unmatched_groups(), &[(1, 3)]);
 
     // EOF-truncated `void f() { [ (])`: insert = 1 synthetic + no-match `)`
     // + 1 unclosed `{` at eof = 3; drop = 0 + 2 unclosed + 1 = 3 — a tie
     // inserts (official default). The synthetic `)` lands at the `]`; the
     // `[` is the insert match and closes at the REAL `]`, so only the `{`
-    // remains for eof (appendEofToken: one row per still-unclosed begin).
+    // remains for eof (appendEofToken: one pair per still-unclosed begin).
     let src = "void f() { [ (])";
     let r = scan_src(src);
-    assert_codes(&r, &["expected_token", "expected_token"]);
-    assert_eq!(r.diagnostics[0].range.offset, 14); // the `]`
-    assert_eq!(r.diagnostics[0].range.length, 1);
-    assert!(
-        r.diagnostics[0].message.contains("')'"),
-        "{}",
-        r.diagnostics[0].message
-    );
-    assert_eq!(r.diagnostics[1].range.offset, u32_of(src.len())); // eof `{` row
+    assert!(r.diagnostics.is_empty(), "{:?}", codes(&r));
     let t = &r.tokens;
     // 0 void, 1 f, 2 (, 3 ), 4 {, 5 [, 6 (, 7 synthetic ), 8 ], 9 ), 10 eof }.
     assert_eq!(t.matching_end(6), Some(7));
@@ -514,6 +554,8 @@ fn deep_match_insert_stays_when_not_strictly_cheaper() {
     assert_eq!(t.matching_end(5), Some(8)); // `[` — the real `]` (insert match)
     let eof_n = t.len();
     assert_eq!(t.matching_end(4), Some(eof_n - 2)); // `{` — the eof synthetic
+    // Pairs: the `(` at the `]`-parked synthetic, the `{` at eof.
+    assert_eq!(t.unmatched_groups(), &[(6, 7), (4, (eof_n - 2) as u32)]);
 }
 
 #[test]
@@ -683,8 +725,8 @@ fn dart_version_comment_span() {
 #[test]
 fn del_merges_into_identifier() {
     // DEL (0x7F) takes the official default arm (error_token.dart:17-47 →
-    // NonAsciiIdentifierToken): merges with the adjacent identifier, message
-    // worded as a non-ASCII character (the pre-fix ASCII-skip arm contradicted it).
+    // NonAsciiIdentifierToken): merges with the adjacent identifier, carrying
+    // the registry illegal_character template like every other class.
     let src = "ab\u{7F}cd";
     let r = scan_src(src);
     assert_kinds(&r, &[K::Identifier]);
@@ -702,7 +744,7 @@ fn replacement_char_is_skipped_silently() {
     // path, but the pinned oracle emits nothing for either reachable U+FFFD
     // class — a raw undecodable byte (read-layer tolerance) and a literal
     // U+FFFD in valid UTF-8 — so the measured-cull doctrine governs
-    // (the corpus expansion plan §7). The character is consumed,
+    //. The character is consumed,
     // never merged into an identifier.
     let r = scan_src("a\u{FFFD}b");
     assert_kinds(&r, &[K::Identifier, K::Identifier]);
@@ -778,18 +820,29 @@ fn unterminated_comment_astral_last_char() {
 
 #[test]
 fn eof_expected_token_astral_last_char() {
-    // The synthetic-close `expected_token` at EOF pins the eof POSITION
-    // itself (oracle json on `f(😀`: expected_token ')' @4 len1 = the utf16
-    // eof offset — one unit past the emoji's low surrogate), regardless of
-    // the final character's width.
+    // An unclosed `(` behind a trailing astral character: the scanner's own
+    // rows are the two surrogate illegal_character pins (high then low, one
+    // unit each); the `expected_token` row rides the parser's post-parse
+    // report (official unmatchedBeginGroup records the pair, the analyzer
+    // translates it post-parse) — pinned at the eof position regardless of
+    // the final character's width (oracle json on `f(😀`: expected_token
+    // ')' at the utf16 eof offset — one unit past the emoji's low
+    // surrogate).
     let r = scan_src("f(😀"); // utf16: f 0, ( 1, emoji 2-3, eof 4
-    assert_codes(
-        &r,
-        &["illegal_character", "illegal_character", "expected_token"],
-    );
-    let d = &r.diagnostics[2];
-    assert_eq!(d.range.offset, 4);
-    assert_eq!(d.range.length, 0);
+    assert_codes(&r, &["illegal_character", "illegal_character"]);
+    let d0 = &r.diagnostics[0];
+    assert_eq!(d0.range.offset, 2); // high surrogate
+    assert_eq!(d0.range.length, 1);
+    let d1 = &r.diagnostics[1];
+    assert_eq!(d1.range.offset, 3); // low surrogate
+    assert_eq!(d1.range.length, 1);
+    // The `(` closes with the eof-synthetic closer (second to last, just
+    // before Eof) and the pair feeds the parser's expected_token row.
+    let t = &r.tokens;
+    let n = t.as_slice().len();
+    assert_eq!(t.matching_end(1), Some(n - 2));
+    assert!(t.get(n - 2).unwrap().is_synthetic());
+    assert_eq!(t.unmatched_groups(), &[(1, (n - 2) as u32)]);
 }
 
 #[test]

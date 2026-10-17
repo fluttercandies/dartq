@@ -87,6 +87,10 @@
 //!   Adjudicated KEEP — Jaccard-neutral (the oracle axis scores `(code, file)`
 //!   entries, not invalid-input token spans) and the shapes are pinned by
 //!   tests; `[start, stop)` partial-lexeme alignment remains a future option.
+//!   Overturned for the unterminated string segment (2026-10-16, sii leg):
+//!   its span is row-shape-bearing (the parser anchors `expected_token`
+//!   recovery rows on the segment boundary), so it now carries the official
+//!   `[start, stop)` shape — see [`crate::ScanResult`] recovery table.
 //!
 //! # Identifiers
 //!
@@ -101,11 +105,11 @@
 //!
 //! | Input | Behavior |
 //! |---|---|
-//! | Unclosed `{`/`(`/`[`/`${` (EOF) | Pop the stack one by one, inserting synthetic close tokens + `expected_token` diagnostics (official `unmatchedBeginGroup`) |
+//! | Unclosed `{`/`(`/`[`/`${` (EOF) | Pop the stack one by one, inserting synthetic close tokens and recording the `(begin, synthetic close)` pairs on the token table ([`TokenTable::unmatched_groups`]); the parser reports the `expected_token` rows post-parse (official `unmatchedBeginGroup` + the analyzer's post-parse `UnmatchedToken` translation) |
 //! | Exactly one unclosed `{` at EOF + a misaligned `{`/`${` in the stream | Two-pass recovery (official `scan`/`scanString` re-scan): the blamed brace's offset feeds a second full scan in which a `}` closing it is replaced by a synthetic closer + `expected_token` (`tokenizeCloseBrace`), and a blamed `${` is discarded with a synthetic `}` at the `$` while the string body resumes after the `{` (`tokenizeInterpolatedExpression`) — the "user is typing" shape recovers to the oracle's outline |
 //! | Extra/mismatched `}`/`)`/`]` | No scanner diagnostic, emitted as normal tokens (when official `discardBeginGroupUntil` finds no match it emits as-is; the parser reports the error) |
-//! | Close token matching deep in the stack | Dual-option recovery (official `discardBeginGroupUntil` :787-826): both postures run the remaining input to EOF on cloned state (100-step cap, nested deep matches insert unconditionally) — insert a synthetic closer + `expected_token` per popped begin, or drop the closer as a plain token with the stack untouched. Drop wins only when strictly cheaper (`recoveryCount` + final unclosed-stack size, +1 for the dropped closer); ties insert: `{[}` → `{[]}`, but the oracle's `bracket_mismatch` corpus drops (`[(])]` → `[(])]` all real) |
-//! | Unterminated string | Synthetic closing-quote STRING segment + `unterminated_string_literal` (range pinned to the last character, aligned with the analyzer's translation of `ErrorToken`) |
+//! | Close token matching deep in the stack | Dual-option recovery (official `discardBeginGroupUntil` :787-826): both postures run the remaining input to EOF on cloned state (100-step cap, nested deep matches insert unconditionally) — insert a synthetic closer (recorded as an unmatched pair, reported by the parser) per popped begin, or drop the closer as a plain token with the stack untouched. Drop wins only when strictly cheaper (`recoveryCount` + final unclosed-stack size, +1 for the dropped closer); ties insert: `{[}` → `{[]}`, but the oracle's `bracket_mismatch` corpus drops (`[(])]` → `[(])]` all real) |
+//! | Unterminated string | Synthetic STRING segment spanning the remaining content from the current segment start (official `SyntheticStringToken` shape; empty after an EOF cascade) + `unterminated_string_literal` (range pinned to the last character, aligned with the analyzer's translation of `ErrorToken`) |
 //! | Unterminated block comment | `unterminated_multi_line_comment` (pinned to the last character) |
 //! | `0x` with no digits | Synthetic `0` HEX token + `missing_hex_digit` |
 //! | `1e` with no exponent digits | Synthetic `0` DOUBLE token + `missing_digit` |

@@ -1,11 +1,13 @@
 //! Shared test helpers.
 
 mod curly_recovery;
+mod dedup;
 mod errors;
 mod escapes;
 mod inserted;
 mod kinds;
 mod numbers_strings;
+mod sii_probes;
 mod smoke;
 
 use std::path::Path;

@@ -19,7 +19,7 @@ use crate::diag::{ScanDiag, msg};
 use crate::keyword::{Keyword, keyword_from_str};
 use crate::token::{Token, TokenKind, TokenTable};
 use crate::{ScanConfig, ScanResult};
-use dartq_diagnostics::{CodeInfo, EXPECTED_TOKEN};
+use dartq_diagnostics::CodeInfo;
 use dartq_language::LanguageVersion;
 use dartq_source::{FileId, LineIndex, SourceRange};
 use memchr::memchr2;
@@ -107,6 +107,12 @@ pub(crate) struct Lexer<'s> {
     /// inserted synthetic closer): the yardstick the dual-option comparison
     /// sums over each option run. Unobservable on the real pass.
     recovery_count: u32,
+    /// The unmatched `(begin index, synthetic close index)` pairs, in
+    /// scan-close order — the parser-side report's input (official
+    /// `unmatchedBeginGroup` records an `UnmatchedToken` without emitting a
+    /// diagnostic; the translation happens post-parse). Option runs start
+    /// empty and are discarded with the run.
+    unmatched: Vec<(u32, u32)>,
 }
 
 impl<'s> Lexer<'s> {
@@ -133,6 +139,7 @@ impl<'s> Lexer<'s> {
             suspended: Vec::new(),
             in_simulation: false,
             recovery_count: 0,
+            unmatched: Vec::new(),
         };
         lex.next = lex.peek_char(0);
         lex
@@ -144,10 +151,14 @@ impl<'s> Lexer<'s> {
         // first pass errored while ending with exactly one unclosed `{`, a
         // misaligned `{`/`${` is located in the token stream and the source
         // is re-scanned once with that offset (the "user is typing" shape).
-        // Both gates are error-path-only: a clean file pays nothing beyond
-        // the O(1) empty-diagnostics check.
+        // The error face is `hasErrors`: any recorded diagnostic or any
+        // unmatched group (whose row the parser emits post-parse — the
+        // scanner itself stays silent for them). Both gates are error-path
+        // only: a clean file pays nothing beyond the O(1) empty checks.
         let recovery = curly_begin
-            .filter(|_| !result.diagnostics.is_empty())
+            .filter(|_| {
+                !result.diagnostics.is_empty() || !result.tokens.unmatched_groups().is_empty()
+            })
             .and_then(|begin| {
                 curly_recovery::recovery_offset(&result.line_index, &result.tokens, begin)
             });
@@ -173,8 +184,9 @@ impl<'s> Lexer<'s> {
         let tokens = std::mem::take(&mut self.tokens);
         let end_of = std::mem::take(&mut self.end_of);
         let diags = std::mem::take(&mut self.diags);
+        let unmatched = std::mem::take(&mut self.unmatched);
         let result = ScanResult {
-            tokens: TokenTable::new(tokens, end_of),
+            tokens: TokenTable::new(tokens, end_of, unmatched),
             diagnostics: crate::diag::finish(diags, self.src, self.file),
             language_version_override: self.version_override,
             language_version_override_span: self.version_override_span,
@@ -245,9 +257,19 @@ impl<'s> Lexer<'s> {
                 p += 1;
                 self.utf16_value += 1;
             } else {
-                let ch = self.src[p..].chars().next().unwrap();
-                p += ch.len_utf8();
-                self.utf16_value += ch.len_utf16() as u32;
+                // `get` reads without slicing, so a cursor that ever left a
+                // char boundary cannot panic here; the byte is then taken as
+                // a single unit and the loop still structurally advances.
+                match self.src.get(p..).and_then(|tail| tail.chars().next()) {
+                    Some(ch) => {
+                        p += ch.len_utf8();
+                        self.utf16_value += ch.len_utf16() as u32;
+                    }
+                    None => {
+                        p += 1;
+                        self.utf16_value += 1;
+                    }
+                }
             }
         }
         if p != self.pos {
@@ -761,7 +783,7 @@ impl<'s> Lexer<'s> {
             // ZERO diagnostics for both reachable U+FFFD classes: a raw
             // undecodable byte (the read layer tolerates it) and a literal
             // U+FFFD in valid UTF-8 — measured against
-            // `dart analyze --format=machine` (the corpus expansion plan §7). Measured-cull doctrine governs:
+            // `dart analyze --format=machine`. Measured-cull doctrine governs:
             // dartq emits nothing here. The character is still consumed
             // (never merged into an identifier), preserving termination.
             self.bump();
@@ -771,7 +793,7 @@ impl<'s> Lexer<'s> {
             // Non-ASCII whitespace: skip (official advanceAfterError).
             self.diag(
                 crate::diag::ILLEGAL_CHARACTER,
-                || msg::illegal_character(c),
+                || msg::illegal_character(c as u32),
                 start,
                 start + c.len_utf8(),
             );
@@ -786,7 +808,7 @@ impl<'s> Lexer<'s> {
             // the merge path below.
             self.diag(
                 crate::diag::ILLEGAL_CHARACTER,
-                || msg::illegal_character(c),
+                || msg::illegal_character(c as u32),
                 start,
                 start + c.len_utf8(),
             );
@@ -806,18 +828,18 @@ impl<'s> Lexer<'s> {
             let low = 0xDC00 + ((cp - 0x10000) & 0x3FF);
             self.diag_pin_last_unit(
                 crate::diag::ILLEGAL_CHARACTER,
-                || msg::illegal_character_cp(high),
+                || msg::illegal_character(high),
                 start + 1,
             );
             self.diag_pin_last_unit(
                 crate::diag::ILLEGAL_CHARACTER,
-                || msg::illegal_character_cp(low),
+                || msg::illegal_character(low),
                 start + c.len_utf8(),
             );
         } else {
             self.diag(
                 crate::diag::ILLEGAL_CHARACTER,
-                || msg::illegal_character(c),
+                || msg::illegal_character(c as u32),
                 start,
                 start + c.len_utf8(),
             );
@@ -912,6 +934,15 @@ impl<'s> Lexer<'s> {
         // `<` never matches an end token (official discardBeginGroupUntil).
         self.discard_open_lt();
         let opens = close.matching_opens();
+        // Fast path: the head opener matches (the dominant posture — official
+        // `appendEndGroupInternal` foundMatchingBrace = true). Checking it
+        // first keeps balanced files off the backward scan, which degenerates
+        // to O(n²) probes on deeply nested unclosed begins.
+        if let Some(&(_, head_kind)) = self.groups.last()
+            && opens.contains(&head_kind)
+        {
+            return self.close_matched(close, start);
+        }
         let Some(depth) = self
             .groups
             .iter()
@@ -955,6 +986,7 @@ impl<'s> Lexer<'s> {
     /// true). Closing a `${` returns [`Flow::CloseInterp`] — the string body
     /// resumes.
     fn close_matched(&mut self, close: TokenKind, start: usize) -> Flow {
+        // Invariant: each caller proved a matching opener sits on the stack; the pop cannot miss.
         let (begin_idx, begin_kind) = self.groups.pop().expect("head match guarantees a begin");
         let idx = self.emit(close, start, self.pos - start);
         self.record_end(begin_idx, idx);
@@ -971,6 +1003,7 @@ impl<'s> Lexer<'s> {
     /// @ the `}`), then the real closer closes the match.
     fn execute_insert(&mut self, close: TokenKind, start: usize, depth: usize) -> Flow {
         while self.groups.len() > depth + 1 {
+            // Invariant: the loop condition keeps the stack above `depth`, so the pop yields.
             let (begin_idx, begin_kind) = self.groups.pop().expect("depth bounds the stack walk");
             self.report_unmatched_begin(begin_idx, begin_kind, start);
         }
@@ -1030,6 +1063,7 @@ impl<'s> Lexer<'s> {
             suspended: self.suspended.clone(),
             in_simulation: true,
             recovery_count: self.recovery_count,
+            unmatched: Vec::new(),
         }
     }
 
@@ -1052,11 +1086,13 @@ impl<'s> Lexer<'s> {
 
     /// Official `unmatchedBeginGroup`: the begin is closed by a synthetic
     /// closer at the mismatching closer's offset (inserted before the closer
-    /// token, keeping `begin → endGroup` jumps well-formed) and reported as
-    /// `expected_token` pinned at that closer, length 1 (analyzer
-    /// translation `charOffset = begin.endToken.charOffset`; oracle
-    /// `dart analyze --format=json` on `{[1};` → `expected_token` ']' @ the
-    /// `}` offset, len 1).
+    /// token, keeping `begin → endGroup` jumps well-formed) and the
+    /// `(begin, synthetic close)` pair is recorded for the parser's
+    /// post-parse report — `expected_token` pinned at `begin.endGroup`'s
+    /// offset as it stands after the parse (analyzer translation
+    /// `charOffset = begin.endToken.charOffset`, translate_error_token.dart;
+    /// oracle `dart analyze --format=json` on `{[1};` → `expected_token` ']'
+    /// @ the `}` offset, len 1). No diagnostic is emitted here.
     fn report_unmatched_begin(
         &mut self,
         begin_idx: u32,
@@ -1068,20 +1104,17 @@ impl<'s> Lexer<'s> {
         };
         self.recovery_count += 1;
         self.emit_synthetic(close_kind, close_start, 0);
-        self.record_end(begin_idx, self.last_index());
-        let lexeme = close_kind.fixed_lexeme().unwrap_or("}");
-        self.diag(
-            EXPECTED_TOKEN,
-            || msg::expected_token(lexeme),
-            close_start,
-            close_start + 1,
-        );
+        let close_idx = self.last_index();
+        self.record_end(begin_idx, close_idx);
+        self.unmatched.push((begin_idx, close_idx));
     }
 
-    /// Closes every still-open group at EOF. Returns the token index of the
-    /// single unclosed `{` when the stack was exactly one `{` (official
-    /// `appendEofToken`'s `openBraceWithMissingEndForPossibleRecovery`
-    /// condition, :532-537) — the two-pass recovery candidate.
+    /// Closes every still-open group at EOF, recording each
+    /// `(begin, synthetic close)` pair for the parser's post-parse report.
+    /// Returns the token index of the single unclosed `{` when the stack was
+    /// exactly one `{` (official `appendEofToken`'s
+    /// `openBraceWithMissingEndForPossibleRecovery` condition, :532-537) —
+    /// the two-pass recovery candidate.
     fn close_unclosed_groups(&mut self) -> Option<u32> {
         self.discard_open_lt();
         let curly_begin = match self.groups.as_slice() {
@@ -1100,14 +1133,16 @@ impl<'s> Lexer<'s> {
                 .push(Token::new(close_kind, eof as u32, 0, utf16).synthetic());
             self.end_of.push(crate::token::NO_END);
             self.record_end(begin_idx, close_idx);
-            // analyzer translation: UnmatchedToken → expected_token, pinned AT
-            // the eof position (oracle `dart analyze --format=json` on
-            // `var x = {;` → expected_token '}' @11 = the eof offset; on
-            // `f(😀` → @4 = the utf16 eof offset). A byte range cannot address
-            // the unit past the source, so the encoded range is zero-width
-            // at eof.
-            let lexeme = close_kind.fixed_lexeme().unwrap_or("}");
-            self.diag(EXPECTED_TOKEN, || msg::expected_token(lexeme), eof, eof);
+            // No diagnostic here: the parser reports the pair post-parse at
+            // `begin.endGroup`'s offset as it stands after the parse (analyzer
+            // translation of `UnmatchedToken`, translate_error_token.dart;
+            // oracle `dart analyze --format=json` on `var x = {;` →
+            // expected_token '}' @ the eof offset, on `f(😀` → @ the utf16 eof
+            // offset). The parser records the EOF-parked rows with length 1
+            // at the eof offset (the official translation's fixed
+            // `atOffset(offset, length: 1)` shape — no zero-width row
+            // exists); identical `(lexeme, offset)` rows dedupe to one.
+            self.unmatched.push((begin_idx, close_idx));
         }
         curly_begin
     }

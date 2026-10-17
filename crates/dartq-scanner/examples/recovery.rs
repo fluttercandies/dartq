@@ -63,14 +63,15 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let target_mb = match (args.next(), args.next()) {
         (None, _) => 1u64,
-        (Some(arg), None) => match arg.parse::<u64>() {
-            Ok(mb @ 1..) => mb,
-            _ => {
+        (Some(arg), None) => {
+            if let Ok(mb @ 1..) = arg.parse::<u64>() {
+                mb
+            } else {
                 eprintln!("error: expected a positive integer (total target MB)");
                 usage();
                 exit(2);
             }
-        },
+        }
         (Some(_), Some(_)) => {
             eprintln!("error: expected at most one positional argument (total target MB)");
             usage();

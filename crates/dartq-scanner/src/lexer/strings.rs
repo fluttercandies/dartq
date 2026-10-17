@@ -13,7 +13,8 @@
 //! snapshot, and it also keeps interpolation nesting off the call stack.
 //!
 //! Escape sequences are validated against the official unescape rules
-//! (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/parser/quote.dart`,
+//! (upstream Dart SDK source,
+//! `pkg/_fe_analyzer_shared/lib/src/parser/quote.dart`,
 //! `unescapeCodeUnits`): `\x` wants exactly two hex digits, `\u` a
 //! `{1-6 hex}` bracket or four bare hex digits, values above 0x10FFFF are
 //! invalid, and a part cannot end with a lone backslash. Unescaping happens
@@ -23,8 +24,9 @@
 //! official exception that keeps validating.
 //!
 //! For the token sequence contract see "Interpolated string token sequence
-//! shape" in the crate docs. An unterminated string produces a synthetic empty
-//! STRING segment (pinned where scanning stopped) +
+//! shape" in the crate docs. An unterminated string produces a synthetic
+//! STRING segment spanning the remaining real content (from the current
+//! segment start to the break; empty after an EOF cascade) +
 //! `unterminated_string_literal`; the diagnostic range pins to the last
 //! UTF-16 unit (the analyzer's translation rule for `ErrorToken`,
 //! `endOffset - 1, length 1` — the low surrogate when the final character
@@ -106,10 +108,15 @@ impl Lexer<'_> {
             Flow::Eof => {
                 // Unwind innermost-first: every open level is a frame on the
                 // stack (pushed at its `${`, not yet resumed), and each emits
-                // its own unterminated recovery. `run` then closes the
-                // still-open SII groups (synthetic `}` innermost first).
+                // its own unterminated recovery. Upstream resumes each
+                // suspended body with `start = scanOffset` after the
+                // interpolation cascade returns — the EOF position — so the
+                // synthetic segment is empty here (the content before the
+                // `${` was already emitted as the prefix segment).
+                // `run` then closes the still-open SII groups (synthetic `}`
+                // innermost first).
                 while self.suspended.pop().is_some() {
-                    self.unterminated();
+                    self.unterminated(self.pos);
                 }
                 return Flow::Eof;
             }
@@ -121,13 +128,18 @@ impl Lexer<'_> {
     /// current (`Flow::CloseInterp` handling; the stack mirrors the open SII
     /// begin groups 1:1, LIFO).
     pub(super) fn resume_interpolation(&mut self) {
-        let mut frame = self
-            .suspended
-            .pop()
-            .expect("SII close without a suspended body");
-        frame.segment_start = self.pos;
-        frame.escape_err = false;
-        self.string_frame = Some(frame);
+        // The stack mirrors the open SII begin groups 1:1 (one frame per
+        // `${`; `CloseInterp` fires only when a `}` head-matches such a
+        // group), so the pop always succeeds in reachable states. A `None`
+        // is a broken pairing: stay in code mode instead of panicking.
+        match self.suspended.pop() {
+            Some(mut frame) => {
+                frame.segment_start = self.pos;
+                frame.escape_err = false;
+                self.string_frame = Some(frame);
+            }
+            None => debug_assert!(false, "SII close without a suspended body"),
+        }
     }
 
     /// Consumes the opening quote(s); `quote_start` is the string start
@@ -175,7 +187,7 @@ impl Lexer<'_> {
     fn scan_single_line(&mut self, f: &mut StringFrame) -> StringBody {
         loop {
             let Some(c) = self.peek() else {
-                self.unterminated();
+                self.unterminated(f.segment_start);
                 return StringBody::Done;
             };
             match c {
@@ -199,7 +211,7 @@ impl Lexer<'_> {
                         if !f.escape_err {
                             self.escape_started(f, backslash);
                         }
-                        self.unterminated();
+                        self.unterminated(f.segment_start);
                         return StringBody::Done;
                     }
                     self.escape(f, backslash);
@@ -210,7 +222,7 @@ impl Lexer<'_> {
                     }
                 }
                 '\n' | '\r' => {
-                    self.unterminated();
+                    self.unterminated(f.segment_start);
                     return StringBody::Done;
                 }
                 _ => {
@@ -226,7 +238,7 @@ impl Lexer<'_> {
         loop {
             match self.peek() {
                 None | Some('\n' | '\r') => {
-                    self.unterminated();
+                    self.unterminated(f.segment_start);
                     return StringBody::Done;
                 }
                 Some(c) if c == f.quote => {
@@ -246,7 +258,7 @@ impl Lexer<'_> {
     fn scan_multiline(&mut self, f: &mut StringFrame) -> StringBody {
         loop {
             let Some(c) = self.peek() else {
-                self.unterminated();
+                self.unterminated(f.segment_start);
                 return StringBody::Done;
             };
             if !f.raw && c == '$' {
@@ -278,7 +290,7 @@ impl Lexer<'_> {
                     if !f.escape_err {
                         self.escape_started(f, backslash);
                     }
-                    self.unterminated();
+                    self.unterminated(f.segment_start);
                     return StringBody::Done;
                 }
                 self.escape(f, backslash);
@@ -311,13 +323,15 @@ impl Lexer<'_> {
             // Two-pass recovery (official tokenizeInterpolatedExpression
             // :2260-2266): in the re-scan, the blamed `${` is discarded right
             // after being opened — unmatchedBeginGroup pins a synthetic `}` at
-            // the `$` and reports it, and the string body resumes immediately
-            // after the `{` (official `return advance()`). The whole
+            // the `$` and records the unmatched pair (the parser reports it
+            // post-parse), and the string body resumes immediately after the
+            // `{` (official `return advance()`). The whole
             // expression text stays string content: the next `"` in it closes
             // the literal, which is what turns a typing-in-progress `${` into
             // a plain unterminated/terminated string instead of cascading
             // code-mode errors.
             if self.curly_recovery == Some(dollar_start as u32) {
+                // Invariant: `begin_group` pushed the SII head in this same call; the pop cannot miss.
                 let (begin_idx, begin_kind) = self.groups.pop().expect("SII was just pushed");
                 self.report_unmatched_begin(begin_idx, begin_kind, dollar_start);
                 f.segment_start = self.pos;
@@ -363,14 +377,16 @@ impl Lexer<'_> {
             let dollar_start = self.pos - 1;
             self.emit_fixed(TokenKind::StringInterpolationIdentifier, dollar_start);
             // The pin sits at the character after `$` (official
-            // synthetic-identifier scanOffset, tokenizeInterpolatedIdentifier);
-            // at EOF it backs off one unit (translateErrorToken's
-            // `_isAtEnd` decrement) onto the 1-byte `$`. The byte cap is
-            // applied BEFORE the boundary snap: a `.min` after `pin_back`
-            // could cut a boundary-safe offset into a multi-byte
-            // character, and `TokenTable::lexeme` panics on
-            // non-boundary offsets.
-            let at = self.pin_back(self.pos.min(self.src.len().saturating_sub(1)));
+            // synthetic-identifier offset, tokenizeInterpolatedIdentifier:
+            // the error token's charOffset = stringOffset right after the
+            // `$`). The analyzer translation never backs this pin off
+            // (translate_error_token.dart `_isAtEnd` walks `token.next` and
+            // the synthetic identifier follows the error in-stream, so the
+            // EOF-equals-offset decrement never fires) — a `$` at EOF reports
+            // at the EOF position like anywhere else. `self.pos` is always a
+            // char boundary and the diag walk maps `at..at+1` to one UTF-16
+            // unit (the official `length: 1` pin).
+            let at = self.pos;
             self.emit_synthetic(TokenKind::Identifier, at, 0);
             self.diag(
                 dartq_diagnostics::MISSING_IDENTIFIER,
@@ -424,6 +440,7 @@ impl Lexer<'_> {
         }
         // Both digit units are present; each must be a hex digit. A multi-unit
         // (astral) character contributes a non-hex high unit at its position.
+        // Invariant: `digit_units` walked past this unit, so `self.pos` reads.
         let d1 = self
             .peek()
             .expect("presence walk guarantees a digit character");
@@ -438,6 +455,7 @@ impl Lexer<'_> {
             return;
         }
         let at2 = self.pos + d1.len_utf8();
+        // Invariant: the same presence walk covered `at2`, so the unit reads.
         let d2 = self
             .peek_char(at2)
             .expect("presence walk guarantees a second digit unit");
@@ -492,6 +510,7 @@ impl Lexer<'_> {
                 );
                 return;
             }
+            // Invariant: `part_end` false rules out EOF, so the lookahead reads.
             let c = self.peek().expect("part_end guarantees a character");
             let at = self.pos;
             if j != 0 && c == '}' {
@@ -562,6 +581,7 @@ impl Lexer<'_> {
         };
         let mut at = self.pos;
         while at < end {
+            // Invariant: `digit_units` Ok walked to `end`, so every offset below it reads.
             let c = self
                 .peek_char(at)
                 .expect("presence walk guarantees the digit units");
@@ -657,13 +677,23 @@ impl Lexer<'_> {
         Ok(at)
     }
 
-    /// Unterminated string: a synthetic empty STRING segment (pinned where
-    /// scanning stopped) + diagnostic (pinned to the last UTF-16 unit:
-    /// official `UnterminatedString` + analyzer-side `endOffset-1`, `length 1`).
+    /// Unterminated string recovery (official `unterminatedString`,
+    /// abstract_scanner.dart:2507-2524): the remaining body content becomes a
+    /// synthetic STRING segment starting at `content_start` — the current
+    /// segment start (the opening quote, or just past the last `}`/`$id`)
+    /// for a body-local break, the EOF position for the EOF cascade — with
+    /// its length covering the real content (upstream `SyntheticStringToken(
+    /// type, value, offset, scanOffset - start)` at string_scanner.dart:181:
+    /// the synthetic closing quote joins the lexeme but not the length). The
+    /// parser's recovery anchors on these segment boundaries, so the span is
+    /// row-shape-bearing (sii leg: `expected_token` pins on the trailing
+    /// content). The diagnostic pins to the last UTF-16 unit ending at the
+    /// break (analyzer translation `endOffset - 1, length 1`,
+    /// translate_error_token.dart:37-46).
     /// The registry-true message carries no opener/close placeholder.
-    fn unterminated(&mut self) {
+    fn unterminated(&mut self, content_start: usize) {
         let stop = self.pos;
-        self.emit_synthetic(TokenKind::String, stop, 0);
+        self.emit_synthetic(TokenKind::String, content_start, stop - content_start);
         self.diag_pin_last_unit(
             UNTERMINATED_STRING_LITERAL,
             || msg::UNTERMINATED_STRING.to_owned(),

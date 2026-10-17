@@ -1,4 +1,4 @@
-//! Token model: dual offsets (byte internally / UTF-16 externally, PRD §10.4),
+//! Token model: dual offsets,
 //! compact arena elements, and a linear token table.
 //!
 //! `Token` targets ≤16B: `byte_offset`(4) + `byte_len`(4) + `utf16_offset`(4) +
@@ -233,7 +233,7 @@ impl TokenKind {
 
 /// Arena element: a 16B compact token (see the module docs).
 ///
-/// `utf16_offset` and `byte_offset` both point at the token start (dual-track, PRD §10.4).
+/// `utf16_offset` and `byte_offset` both point at the token start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Token {
     pub kind: TokenKind,
@@ -309,11 +309,31 @@ pub struct TokenTable {
     /// after recovery an unclosed begin points at its synthetic close token,
     /// consistent with the official endGroup).
     end_of: Vec<u32>,
+    /// The unmatched begin groups: `(begin index, synthetic close index)`, in
+    /// the order the scanner closed them. The parser reports these rows
+    /// post-parse (the official `UnmatchedToken` head-run translation reads
+    /// `begin.endGroup.charOffset` after the parse, so an adopted closer
+    /// reports at its relocation point); the scanner itself emits nothing for
+    /// them.
+    unmatched: Vec<(u32, u32)>,
 }
 
 impl TokenTable {
-    pub(crate) fn new(tokens: Vec<Token>, end_of: Vec<u32>) -> Self {
-        Self { tokens, end_of }
+    pub(crate) fn new(tokens: Vec<Token>, end_of: Vec<u32>, unmatched: Vec<(u32, u32)>) -> Self {
+        Self {
+            tokens,
+            end_of,
+            unmatched,
+        }
+    }
+
+    /// The scanner's unmatched `(begin, synthetic close)` index pairs, in
+    /// scan-close order. Empty for a well-formed file (no allocation on the
+    /// clean path). [`Self::append_inserted`] never disturbs them (scan-time
+    /// indices only).
+    #[must_use]
+    pub fn unmatched_groups(&self) -> &[(u32, u32)] {
+        &self.unmatched
     }
 
     /// Total token count (EOF included).
@@ -393,18 +413,26 @@ impl TokenTable {
     /// an inserted id resolves only in the parser's side table, and no span
     /// may be derived through the table for one.
     ///
-    /// # Panics
+    /// # Degradation
     ///
-    /// Panics if the table is empty, i.e. there is no scanned Eof sentinel to
-    /// re-seat (the contract requires a fully scanned table).
+    /// A scanned table always ends at Eof, so the pop always succeeds; a
+    /// missing sentinel (never-scanned table) debug-asserts and appends the
+    /// inserted tokens without a re-seat instead of panicking.
     pub fn append_inserted(&mut self, inserted: impl IntoIterator<Item = Token>) {
-        let eof = self
-            .tokens
-            .pop()
-            .expect("append_inserted expects a scanned table ending at Eof");
-        debug_assert_eq!(eof.kind, TokenKind::Eof, "Eof must be the last token");
-        self.tokens.extend(inserted);
-        self.tokens.push(eof);
+        match self.tokens.pop() {
+            Some(eof) => {
+                debug_assert_eq!(eof.kind, TokenKind::Eof, "Eof must be the last token");
+                self.tokens.extend(inserted);
+                self.tokens.push(eof);
+            }
+            None => {
+                debug_assert!(
+                    false,
+                    "append_inserted expects a scanned table ending at Eof"
+                );
+                self.tokens.extend(inserted);
+            }
+        }
     }
 }
 

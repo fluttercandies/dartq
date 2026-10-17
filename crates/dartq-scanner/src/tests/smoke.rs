@@ -1,5 +1,5 @@
 //! Legality golden smoke: scans the official scanner's own source (~2900 lines
-//! of real Dart) and a ~1MB synthetic source (release <5ms, PRD §19.3
+//! of real Dart) and a ~1MB synthetic source (release <5ms
 //! performance axis). Automatically skipped unless `DARTQ_SDK_CHECKOUT` is
 //! set to a dart-lang/sdk checkout.
 
@@ -60,7 +60,7 @@ fn perf_one_megabyte() {
         src.push_str(&base);
     }
     // Two warm-up passes, then take the minimum of 7 passes (removes scheduling
-    // noise; PRD §19.3 metrics are steady-state figures).
+    // noise; metrics are steady-state figures).
     for _ in 0..2 {
         let warm = scan(&src, config(), file_id());
         assert!(warm.tokens.len() > 100_000);
