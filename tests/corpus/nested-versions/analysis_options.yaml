@@ -1,0 +1,12 @@
+# Root analysis options for the nested-versions corpus. Every package in
+# the tree inherits this file by directory walk except apps/shell, which
+# carries its own override file — together they form the ancestor-chain
+# discovery and per-subtree override face.
+#
+# `always_declare_return_types` is an options-driven standalone SDK rule
+# (not carried by any include set), so its on/off state is decided solely
+# by the options maps: on at the root and everywhere that inherits this
+# file, silenced under apps/shell's override.
+linter:
+  rules:
+    always_declare_return_types: true

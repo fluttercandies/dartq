@@ -1,0 +1,8 @@
+name: sibling
+description: >-
+  The sibling_a face of the shadowed name: this directory is what
+  `package:sibling` means inside the ROOT context's config. Exposes
+  siblingAOnly() and `shared` — members the sibling_b face lacks or
+  defines differently — so wrong-context resolution is observable.
+environment:
+  sdk: ^3.5.0

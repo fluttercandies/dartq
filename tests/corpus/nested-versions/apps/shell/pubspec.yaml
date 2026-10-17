@@ -1,0 +1,23 @@
+# 3.7 workspace member at depth 2. `resolution: workspace` opts it into
+# the root's resolution — the key requires language version >= 3.5
+# (upstream pub source, lib/src/pubspec.dart:110 and
+# lib/src/language_version.dart:114), satisfied at 3.7. Sibling members
+# are declared with plain version constraints; the vendored
+# out-of-workspace packages are ordinary path dependencies.
+name: shell
+description: Frontend member of the nested mixed-language-version corpus.
+version: 1.0.0
+publish_to: none
+
+environment:
+  sdk: ^3.7.0
+
+resolution: workspace
+
+dependencies:
+  core: ^1.0.0
+  deep_ui: ^1.0.0
+  ext_lib:
+    path: ../../third_party/ext_lib
+  legacy_lib:
+    path: ../../third_party/legacy/legacy_lib

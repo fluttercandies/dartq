@@ -1,0 +1,11 @@
+{
+  "configVersion": 2,
+  "packages": [
+    {
+      "name": "example",
+      "rootUri": "../",
+      "packageUri": "lib/",
+      "languageVersion": "3.2"
+    }
+  ]
+}

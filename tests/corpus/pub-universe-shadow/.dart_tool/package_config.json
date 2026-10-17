@@ -1,0 +1,17 @@
+{
+  "configVersion": 2,
+  "packages": [
+    {
+      "name": "universe_shadow",
+      "rootUri": "../",
+      "packageUri": "lib/",
+      "languageVersion": "3.13"
+    },
+    {
+      "name": "sibling",
+      "rootUri": "../pkgs/sibling_a/",
+      "packageUri": "lib/",
+      "languageVersion": "3.13"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "configVersion": 2,
+  "packages": [
+    {
+      "name": "pub_nested_example",
+      "rootUri": "../",
+      "packageUri": "lib/",
+      "languageVersion": "3.5"
+    }
+  ]
+}

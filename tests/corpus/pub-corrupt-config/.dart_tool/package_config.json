@@ -1,0 +1,7 @@
+{
+  "configVersion": 2,
+  "packages": [
+    {
+      "name": "pub_corrupt_config",
+      "rootUri": "../",
+      "packageUri": "lib/",

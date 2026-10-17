@@ -1,0 +1,17 @@
+{
+  "configVersion": 2,
+  "packages": [
+    {
+      "name": "tool",
+      "rootUri": "../",
+      "packageUri": "lib/",
+      "languageVersion": "3.13"
+    },
+    {
+      "name": "sibling",
+      "rootUri": "../../sibling_b/",
+      "packageUri": "lib/",
+      "languageVersion": "3.13"
+    }
+  ]
+}

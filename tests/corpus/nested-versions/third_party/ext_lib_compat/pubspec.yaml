@@ -1,0 +1,14 @@
+# Vendored ext_lib_compat 1.x — the "ext_lib major 1" half of the
+# same-dependency-two-versions face, NOT a workspace member (language
+# version 2.19 is below the >= 3.5 gate on `resolution: workspace`).
+# Distinct name and API surface from ext_lib 2.x on purpose: a pub
+# package_config keys entries by name, so one shared resolution holds
+# one major per name, and the contamination assertion is pinned through
+# per-name path mapping (see README).
+name: ext_lib_compat
+description: Legacy major of the vendored ext_lib dependency family.
+version: 1.4.0
+publish_to: none
+
+environment:
+  sdk: ^2.19.0

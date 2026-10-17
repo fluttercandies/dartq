@@ -1,0 +1,12 @@
+name: universe_shadow
+description: >-
+  Per-context package universe face (#1370 audit, fixture for the #1344
+  machinery): the same package NAME (`sibling`) resolves to different
+  directories in different contexts — pkgs/sibling_a in this root's
+  config, pkgs/sibling_b in pkgs/tool's config — and the crossing
+  imports (package:tool from this root, package:universe_shadow from
+  tool) name packages outside each context's universe and must fail
+  resolution. The hand-written configs pin languageVersion 3.13 so the
+  run-face preflight admits the root on the m0-merged replay leg.
+environment:
+  sdk: ^3.5.0

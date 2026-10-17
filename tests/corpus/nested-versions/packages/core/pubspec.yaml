@@ -1,0 +1,16 @@
+# 3.6 workspace member at depth 2. Depends on the vendored
+# ext_lib_compat (2.19) — the "ext_lib major 1" side of the
+# same-dependency-two-versions split; apps/shell holds the other side.
+name: core
+description: Core member of the nested mixed-language-version corpus.
+version: 1.0.0
+publish_to: none
+
+environment:
+  sdk: ^3.6.0
+
+resolution: workspace
+
+dependencies:
+  ext_lib_compat:
+    path: ../../third_party/ext_lib_compat

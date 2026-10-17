@@ -1,0 +1,14 @@
+name: pub_null_sections
+description: >-
+  Null-section pubspec face (#1347): the environment and dependencies keys
+  are present with fully commented-out bodies. Both parsers must treat a
+  null YAML body as an absent section — no sdk constraint to settle a
+  language version from, no dependencies to resolve — end-to-end over the
+  trivial lib file.
+# The would-be environment body: writing a real sdk constraint would
+# settle a language version and turn this into an ordinary package.
+environment:
+  # sdk: ^3.13.0
+# The would-be dependency set: likewise absent.
+dependencies:
+  # meta: ^1.0.0

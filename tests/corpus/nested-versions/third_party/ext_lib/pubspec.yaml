@@ -1,0 +1,15 @@
+# Vendored ext_lib 2.x — NOT a workspace member: its settled language
+# version 3.0 is below the >= 3.5 gate on `resolution: workspace`
+# (upstream pub source, lib/src/pubspec.dart:110 and
+# lib/src/language_version.dart:114), so membership would be a pubspec
+# error. It rides in the root package_config as an ordinary path
+# dependency. The "2.x" half of the same-dependency-two-versions face
+# (ext_lib_compat 1.x sits next door; apps/shell depends here,
+# packages/core there).
+name: ext_lib
+description: Modern major of the vendored ext_lib dependency family.
+version: 2.0.0
+publish_to: none
+
+environment:
+  sdk: ^3.0.0

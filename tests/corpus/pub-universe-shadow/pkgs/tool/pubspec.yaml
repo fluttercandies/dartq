@@ -1,0 +1,8 @@
+name: tool
+description: >-
+  The second context of the per-context universe face: its config maps
+  `sibling` to pkgs/sibling_b (NOT sibling_a) and does not list
+  universe_shadow, so the root library is outside this universe — the
+  mirror image of the root context.
+environment:
+  sdk: ^3.5.0
