@@ -1,0 +1,727 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [2.8.0](https://github.com/ittae/clean_architecture_linter/compare/v2.7.5...v2.8.0) (2026-10-12)
+
+
+### Features
+
+* 확장 @Dependencies가 notifier 런타임 스코프를 벗어나면 보고한다 ([#188](https://github.com/ittae/clean_architecture_linter/issues/188)) ([0073892](https://github.com/ittae/clean_architecture_linter/commit/0073892bf04e1f94d26b75bdaa1c92733853d810))
+
+
+### Bug Fixes
+
+* presentation_no_throw가 ConsumerStatefulWidget, StatefulHookConsumerWidget, HookWidget 슈퍼클래스를 위젯으로 본다 ([#190](https://github.com/ittae/clean_architecture_linter/issues/190)) ([9d875a3](https://github.com/ittae/clean_architecture_linter/commit/9d875a3295004bc9c5749ba0c9adc02e645b18ca))
+
+
+### Documentation
+
+* Riverpod 3.4.3 / flutter_riverpod 3.4.3 / hooks_riverpod 3.4.3 호환을 확인했다 ([#186](https://github.com/ittae/clean_architecture_linter/issues/186)) ([542a349](https://github.com/ittae/clean_architecture_linter/commit/542a349963e15bd22ffc1f00bdd4bae275b6441c)), ([#190](https://github.com/ittae/clean_architecture_linter/issues/190)) ([9d875a3](https://github.com/ittae/clean_architecture_linter/commit/9d875a3295004bc9c5749ba0c9adc02e645b18ca))
+
+## [2.7.5](https://github.com/ittae/clean_architecture_linter/compare/v2.7.4...v2.7.5) (2026-10-07)
+
+
+### Bug Fixes
+
+* DI 파일명 예외가 remain.dart를 건너뛰지 않게 한다 ([#183](https://github.com/ittae/clean_architecture_linter/issues/183)) ([545dbb5](https://github.com/ittae/clean_architecture_linter/commit/545dbb558458f1f4650efe581dab953614149052))
+
+## [2.7.4](https://github.com/ittae/clean_architecture_linter/compare/v2.7.3...v2.7.4) (2026-09-26)
+
+
+### Bug Fixes
+
+* no_presentation_models가 presentation 파일에서만 ChangeNotifier를 보고한다 ([#175](https://github.com/ittae/clean_architecture_linter/issues/175)) ([6cb1414](https://github.com/ittae/clean_architecture_linter/commit/6cb14146d5c07f7b207c964e7242ffaa85890982))
+* riverpod_state_after_async_gap이 private 메서드의 await 뒤 state 접근을 보고한다 ([#177](https://github.com/ittae/clean_architecture_linter/issues/177)) ([bf65af4](https://github.com/ittae/clean_architecture_linter/commit/bf65af44bc627caa8d54abff31b9e65bfa1e9eca))
+
+## [2.7.3](https://github.com/ittae/clean_architecture_linter/compare/v2.7.2...v2.7.3) (2026-09-25)
+
+
+### Bug Fixes
+
+* public inline reviewer_engine allowlist에 cursor를 추가한다 ([#172](https://github.com/ittae/clean_architecture_linter/issues/172)) ([5f9f605](https://github.com/ittae/clean_architecture_linter/commit/5f9f605ade78c75ea06d6f5373baf377d548461b))
+
+## [2.7.2](https://github.com/ittae/clean_architecture_linter/compare/v2.7.1...v2.7.2) (2026-09-11)
+
+
+### Bug Fixes
+
+* riverpod_ref_after_async_gap이 캐스케이드·괄호 ref 접근을 보고한다 ([#169](https://github.com/ittae/clean_architecture_linter/issues/169)) ([33e1c6f](https://github.com/ittae/clean_architecture_linter/commit/33e1c6f95a40abeeb80b77d8d35ebb5fe66894cc))
+
+## [2.7.1](https://github.com/ittae/clean_architecture_linter/compare/v2.7.0...v2.7.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* riverpod_ref_after_async_gap이 Stream.listen·Timer 콜백의 ref 접근을 보고한다 ([#167](https://github.com/ittae/clean_architecture_linter/issues/167)) ([811dbdb](https://github.com/ittae/clean_architecture_linter/commit/811dbdb07a0b624ec190356aabfe913387a0d573))
+
+## [2.7.0](https://github.com/ittae/clean_architecture_linter/compare/v2.6.0...v2.7.0) (2026-09-08)
+
+
+### Features
+
+* sentinel 게이트에 SENTINEL_REQUIRE_ALL·SENTINEL_FILE 옵트인 스위치를 추가한다 ([#164](https://github.com/ittae/clean_architecture_linter/issues/164)) ([22f01e3](https://github.com/ittae/clean_architecture_linter/commit/22f01e3a2404301c8c4aebe20c80349a42298bca))
+
+
+### Bug Fixes
+
+* riverpod_state_after_async_gap이 루프 재진입 시점의 state 읽기 gap을 보고한다 ([#166](https://github.com/ittae/clean_architecture_linter/issues/166)) ([89f5ca1](https://github.com/ittae/clean_architecture_linter/commit/89f5ca13c283a29ef0f20e2bf00f970ca0719d00))
+
+## [2.6.0](https://github.com/ittae/clean_architecture_linter/compare/v2.5.0...v2.6.0) (2026-09-06)
+
+
+### Features
+
+* riverpod_state_after_async_gap이 await 이후 state 읽기와 super.state 쓰기를 보고한다 ([#162](https://github.com/ittae/clean_architecture_linter/issues/162)) ([764eb4c](https://github.com/ittae/clean_architecture_linter/commit/764eb4c0182259cdbc9b12ce2c054ff351ee6036)), closes [#161](https://github.com/ittae/clean_architecture_linter/issues/161)
+
+## [2.5.0](https://github.com/ittae/clean_architecture_linter/compare/v2.4.0...v2.5.0) (2026-09-04)
+
+
+### Features
+
+* analyzer 14.3 / analysis_server_plugin 0.3.22 라인으로 올린다 ([#154](https://github.com/ittae/clean_architecture_linter/issues/154)) ([e66767a](https://github.com/ittae/clean_architecture_linter/commit/e66767a3f25039c029c0f29053fabbde1e6cd94b))
+* await 이후 state 대입 검출을 opt-in 규칙 riverpod_state_after_async_gap으로 분리한다 ([#156](https://github.com/ittae/clean_architecture_linter/issues/156)) ([8228c76](https://github.com/ittae/clean_architecture_linter/commit/8228c76b5a68c019919916abc400154fc4ee4e6c))
+* riverpod_keep_alive가 앱 수명 provider 이름(startup, bootstrap, listener, manager, storage, timezone)을 허용한다 ([#152](https://github.com/ittae/clean_architecture_linter/issues/152)) ([67dea73](https://github.com/ittae/clean_architecture_linter/commit/67dea73bcb6c79c8bc806c5cbfab7d6d91593a00))
+
+
+### Bug Fixes
+
+* AI 리뷰 finding 카운트 추출이 PR review 코멘트를 놓치는 문제 수정 ([#121](https://github.com/ittae/clean_architecture_linter/issues/121)) ([cc8391d](https://github.com/ittae/clean_architecture_linter/commit/cc8391da9dd08ea1fec89583bb413e707a79c1d7))
+* AI 리뷰 host engine order resolve helper를 추가한다 ([#141](https://github.com/ittae/clean_architecture_linter/issues/141)) ([59ff494](https://github.com/ittae/clean_architecture_linter/commit/59ff4948f76ce5fc5afdd7bfe0e6804bfeb01e55))
+* AI 리뷰 host SoT 파서·model resolve와 검증 unit을 추가한다 ([#139](https://github.com/ittae/clean_architecture_linter/issues/139)) ([0934da6](https://github.com/ittae/clean_architecture_linter/commit/0934da6b7ce825cfb0596ee22e28f605d14370a4))
+* AI 리뷰 meta에 reviewer_engine inject helper를 추가한다 ([#140](https://github.com/ittae/clean_architecture_linter/issues/140)) ([96d6ea7](https://github.com/ittae/clean_architecture_linter/commit/96d6ea782da3dc2bec286f6f4a075559bf6f001d))
+* body lint가 주석 문법 인용 본문을 오탐 reject하지 않게 한다 ([#126](https://github.com/ittae/clean_architecture_linter/issues/126)) ([1fbc090](https://github.com/ittae/clean_architecture_linter/commit/1fbc090b57dbac7d6de7c52761a01a403043203e))
+* extension 멤버 미스캔으로 진단이 누락되던 FN을 고친다 ([#135](https://github.com/ittae/clean_architecture_linter/issues/135)) ([5a81c78](https://github.com/ittae/clean_architecture_linter/commit/5a81c7825c1393d1d71c7df986d072375c26e4ad))
+* ITT-2464 product relay sparse-checkout을 full checkout으로 맞춘다 ([c680729](https://github.com/ittae/clean_architecture_linter/commit/c680729d49f18fc64d99f351a0f40a1367b5d32d))
+* ITT-2464 relay sparse-checkout 제거 (full clean checkout) ([d874300](https://github.com/ittae/clean_architecture_linter/commit/d874300544024dff016a73ad75ecfd389ff41e3f))
+* presentation_use_async_value uiEffect 부분 실패 오탐을 없앤다 ([#136](https://github.com/ittae/clean_architecture_linter/issues/136)) ([98e7ab5](https://github.com/ittae/clean_architecture_linter/commit/98e7ab527e3e3e5c0ddfac6ba5cb0edbc120ec7b))
+* presentation_use_async_value 필드명 부분일치 오탐을 없앤다 ([#137](https://github.com/ittae/clean_architecture_linter/issues/137)) ([79979c1](https://github.com/ittae/clean_architecture_linter/commit/79979c163a1bfda1417e0f011e6d9857334f17c4))
+* Riverpod 3.3 presentation 규칙 갭을 정리하고 DI read 오탐을 줄인다 ([#142](https://github.com/ittae/clean_architecture_linter/issues/142)) ([d439bf7](https://github.com/ittae/clean_architecture_linter/commit/d439bf78d51b93f8f38ee5171f3ea59a249b3189))
+* riverpod_ref_after_async_gap이 await 이후 state 대입을 추적한다 ([#143](https://github.com/ittae/clean_architecture_linter/issues/143)) ([7a4e169](https://github.com/ittae/clean_architecture_linter/commit/7a4e1698406c1b5562593f7f8bcdbfa50976372f))
+* this.ref UseCase provider 직접 호출을 감지한다 ([#134](https://github.com/ittae/clean_architecture_linter/issues/134)) ([06b70ea](https://github.com/ittae/clean_architecture_linter/commit/06b70ea7a98950853e6a5fdb5b03df24163611b2))
+* widget_ref_read_then_when이 Freezed Result snapshot .when을 허용한다 ([#144](https://github.com/ittae/clean_architecture_linter/issues/144)) ([c977e7a](https://github.com/ittae/clean_architecture_linter/commit/c977e7aa9b3c32b4c51159a94e77fcae9abd1bfb))
+
+## [2.4.0](https://github.com/ittae/clean_architecture_linter/compare/v2.3.1...v2.4.0) (2026-07-30)
+
+### Changed
+
+- Re-aligned the package dependency constraints to analyzer `>=13.0.0 <14.0.0`
+  and `analysis_server_plugin >=0.3.15 <0.3.16` so
+  `clean_architecture_linter` can coexist with `riverpod_lint 3.1.x` in the
+  analyzer plugin synthetic package while retaining the 2.3 rule set.
+- Kept the plugin host on `analysis_server_plugin 0.3.15` after consumer smoke
+  found `0.3.18` still hangs during plugin analysis under analyzer 13.
+- **Migration:** analyzer 14 plugin hosts should stay on `2.3.x` until the
+  upstream hang is resolved; `2.4.x` intentionally targets the analyzer 13 line.
+
+### Bug Fixes
+
+* AI 리뷰 게이트를 finding count 기준으로 정렬 ([#117](https://github.com/ittae/clean_architecture_linter/issues/117)) ([4ebf4f6](https://github.com/ittae/clean_architecture_linter/commit/4ebf4f698780739e0c8b4c5e019ecd5abdf6d995))
+* analyzer 13 plugin host 정렬 ([#116](https://github.com/ittae/clean_architecture_linter/issues/116)) ([cfa8f18](https://github.com/ittae/clean_architecture_linter/commit/cfa8f182f86021c2b49fc8dcafc901700a83a63c))
+
+## [2.3.1](https://github.com/ittae/clean_architecture_linter/compare/v2.3.0...v2.3.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* ITT-1978 PR body lint이 release-please PR을 봇으로 오인해 실패하는 문제 수정 ([#115](https://github.com/ittae/clean_architecture_linter/issues/115)) ([441cbf4](https://github.com/ittae/clean_architecture_linter/commit/441cbf494c14e88d54c4e6f0bf42bfe453baeeca))
+* pub.dev score 개선 - poc_v2 패키지명 중복 제거 및 isAbstract deprecation 해소 ([#113](https://github.com/ittae/clean_architecture_linter/issues/113)) ([6661bcd](https://github.com/ittae/clean_architecture_linter/commit/6661bcd2cd86b005c3013ea37e88795310ce3685))
+
+## [2.3.0](https://github.com/ittae/clean_architecture_linter/compare/v2.2.0...v2.3.0) (2026-07-27)
+
+
+### Features
+
+* ITT-1838 Riverpod 3 non-codegen provider 인식 공통화 ([#110](https://github.com/ittae/clean_architecture_linter/issues/110)) ([b9c8c27](https://github.com/ittae/clean_architecture_linter/commit/b9c8c27d100481e317589998079260eb90387bd3))
+* ITT-1911 riverpod_uncancelled_disposable 룰 main 이식 ([#112](https://github.com/ittae/clean_architecture_linter/issues/112)) ([37e43d8](https://github.com/ittae/clean_architecture_linter/commit/37e43d84cde19b6ef5c0b8054b278e827406d8d0))
+
+
+### Bug Fixes
+
+* AI review engine chain grok→codex→claude (public inline sync) ([#111](https://github.com/ittae/clean_architecture_linter/issues/111)) ([3b1d410](https://github.com/ittae/clean_architecture_linter/commit/3b1d4107b07fb97f490fcecf1a73cfaf0c33e546))
+* **ci:** pub.dev 자동 publish는 tag push + RELEASE_PLEASE_TOKEN ([#108](https://github.com/ittae/clean_architecture_linter/issues/108)) ([315dab9](https://github.com/ittae/clean_architecture_linter/commit/315dab9f91d18ecb2bc649edca1be39c322c2a8d))
+* **ci:** Release Please에서 pub.dev publish를 workflow_call로 연결 ([#106](https://github.com/ittae/clean_architecture_linter/issues/106)) ([8eec99b](https://github.com/ittae/clean_architecture_linter/commit/8eec99be3b4be87a9e249b8ded15f546bd3b95f6))
+
+## [2.2.0](https://github.com/ittae/clean_architecture_linter/compare/v2.1.1...v2.2.0) (2026-07-24)
+
+
+### Features
+
+* add release-please pilot for versioned releases ([#89](https://github.com/ittae/clean_architecture_linter/issues/89)) ([968d3f3](https://github.com/ittae/clean_architecture_linter/commit/968d3f34a5ac3fd2ba2a73827a2e44d57d212360))
+
+
+### Bug Fixes
+
+* AI 리뷰 always-on + owner(get6) authored only ([#104](https://github.com/ittae/clean_architecture_linter/issues/104)) ([8e48d49](https://github.com/ittae/clean_architecture_linter/commit/8e48d49132e59f7e5bbdb9bdb0430f1f738a9daa))
+* align release-please tags with vX.Y.Z (avoid false major) ([#91](https://github.com/ittae/clean_architecture_linter/issues/91)) ([f6978ee](https://github.com/ittae/clean_architecture_linter/commit/f6978ee2555bb64da6710eff7d79bcfdabcbcd36))
+* **ci:** harden public package AI review and mention guards ([#93](https://github.com/ittae/clean_architecture_linter/issues/93)) ([dfe8908](https://github.com/ittae/clean_architecture_linter/commit/dfe89083d7d6334d895872589250bda4cdc887cb))
+* dependabot이 내부 reusable workflow를 추적하지 않도록 ignore ([#100](https://github.com/ittae/clean_architecture_linter/issues/100)) ([8cf0943](https://github.com/ittae/clean_architecture_linter/commit/8cf0943ca5a0d0ba37e8828bcf85a0d832999131))
+* ITT-1266 Future continuation callback ref 접근 진단 ([#79](https://github.com/ittae/clean_architecture_linter/issues/79)) ([96de2c6](https://github.com/ittae/clean_architecture_linter/commit/96de2c6f7244ace2ca2c27ce8d93f773ac5daa0b))
+* ITT-1673 ref.mounted 룰 레이어 인식 전환 (Notifier 오탐 제거) ([#97](https://github.com/ittae/clean_architecture_linter/issues/97)) ([d5d200c](https://github.com/ittae/clean_architecture_linter/commit/d5d200ca7729cf419d3995c6d893c84f3d743ee6))
+* light 리뷰 caller issues:write 승격 (reusable harden [#30](https://github.com/ittae/clean_architecture_linter/issues/30) 이후 startup_failure 복구) ([#82](https://github.com/ittae/clean_architecture_linter/issues/82)) ([649c984](https://github.com/ittae/clean_architecture_linter/commit/649c98409d6a8b875878b267d0a560e64e72043d))
+* 동작 불가능한 claude 멘션 워크플로 제거 (ITT-1703) ([#101](https://github.com/ittae/clean_architecture_linter/issues/101)) ([a5aaf05](https://github.com/ittae/clean_architecture_linter/commit/a5aaf05021e91cf9fc65a8905ab0c8b78b268891))
+* 리뷰 caller paths에 .github/** 추가 (ITT-1703 follow / rebased) ([#102](https://github.com/ittae/clean_architecture_linter/issues/102)) ([0bb5b86](https://github.com/ittae/clean_architecture_linter/commit/0bb5b865532a142a2c43a5ca18ba87812e3c9fc4))
+
+## [Unreleased]
+
+## [2.1.1] - 2026-06-25
+
+### Fixed
+
+- `riverpod_ref_after_async_gap`: removed control-flow false positives. The previous implementation collected every `await` in a function body into a flat offset list and flagged any tracked `ref` call positioned after it, which incorrectly reported `ref` usage in mutually exclusive sibling branches (an `else` branch flagged because of an `await` in the `if` branch, or a `switch` case flagged because of an `await` in another case). Detection now walks the ref call's ancestor blocks and only counts `await`s that sequentially precede it on its own execution path; `await`s in a `try` body are still counted for `ref` usage in the matching `catch`/`finally`, and nested function bodies are treated as separate scopes.
+
+## [2.1.0] - 2026-06-24
+
+### Added
+
+- `riverpod_ref_after_async_gap`: advisory INFO lint for `ref.read`, `ref.watch`, `ref.listen`, `ref.invalidate`, and `ref.refresh` after `await` in public Riverpod provider/notifier methods and async callbacks. The first version is intentionally narrow to reduce false positives: it only scans `lib/**/presentation/**/providers/**`, skips generated/test files and private helpers, and does not report `state = ...` after `await`.
+- Package-named public library entrypoint `lib/clean_architecture_linter.dart` exporting `CleanArchitectureUtils`, so the package keeps a conventional importable library alongside the analyzer plugin `lib/main.dart` entrypoint.
+
+## [2.0.1] - 2026-06-06
+
+### Fixed
+
+- **Consumer CI hang (`flutter analyze` never returns).** Capped `analysis_server_plugin` to `>=0.3.4 <0.3.15` and `analyzer` to `>=9.0.0 <13.0.0`. Root-caused via a controlled experiment: a consumer resolving the plugin against **asp 0.3.16 / analyzer 13.1** intermittently **hangs during plugin-isolate load/analysis** (shard never completes, 20 min+), while the same code on **asp 0.3.14 / analyzer 12.1** completes in ~5 min. The hang is in the upstream asp/analyzer-13.x plugin host, not in this package's rules (all rule visitors are loop-safe; a larger consumer on 12.1 passes). Consumers that also use `riverpod_lint` were already unaffected (it caps them at asp 0.3.14/analyzer 12.1). Consumers on `^2.0.0` pick this up automatically. The analyzer-13 range will be restored once the upstream host issue is resolved.
+
+## [2.0.0] - 2026-06-05
+
+> **Stable v2.0 release.** First stable release on the official [`analysis_server_plugin`](https://pub.dev/packages/analysis_server_plugin), validated against consumer projects (`ittae`, `flutter_boilerplate`) which fully migrated off `custom_lint`. See [2.0.0-dev.1] below for the full breaking-change list.
+
+### Added
+
+- **analyzer 9–13 compatibility.** Widened the analyzer constraint to `>=9.0.0 <14.0.0` and introduced a runtime AST compatibility layer (`analyzer_ast_compat`) bridging renamed analyzer APIs (formal parameter / named argument / class & extension members). This lets the plugin load across analyzer 9–13 and **coexist with other analysis_server_plugin plugins such as `riverpod_lint`** in a single consumer (ITT-338).
+
+### Fixed (since `2.0.0-dev.1`)
+
+- `repository_pass_through`: false report on non-`Future` `Result` returns and over-flagging of nested try-catch blocks (ITT-301).
+- `circular_dependency`: false positive reporting cycles that do not contain the analyzed file (ITT-290).
+- `repository_interface`: now detects data-layer models exposed inside nested generics (e.g. `Future<Result<UserModel>>`, `Future<List<UserModel>>`) via recursive type-argument inspection (ITT-291).
+- `model_field_duplication`: replaced `startsWith`-based primitive detection with exact base-type matching (fixes false negatives for `Settings`/`Interval`/`MapLocation`/`Boolean`), added missing SDK types (`num`/`Object`/`dynamic`/`Iterable`), and stopped flagging record / function / structural-typed fields (ITT-295, ITT-380).
+- `datasource_abstraction`: correct `lib/`→`test/` resolution for relative paths so a present test file is no longer missed (ITT-296).
+- presentation rules: detect `try { } on X catch` data-exception handling (`CatchClause`), narrow over-broad `state = AsyncValue` matching, de-duplicate `!ref.mounted` reports, and fix the `extension_location` correction message (ITT-304).
+
+## [2.0.0-dev.1] - 2026-05-31
+
+> **v2.0 first dev release (analysis_server_plugin migration).** Pre-release; the stable `2.0.0` follows once the v2 contract is validated against consumer projects.
+
+### 💥 Breaking Changes
+
+- **Migrated from `custom_lint` to the official [`analysis_server_plugin`](https://pub.dev/packages/analysis_server_plugin)**, following the archival of upstream [invertase/dart_custom_lint](https://github.com/invertase/dart_custom_lint) and the original author's migration recommendation.
+- **`analysis_options.yaml` format change**: lint activation moves from `analyzer: plugins: - custom_lint` to the top-level `plugins: clean_architecture_linter: <version>` map. The `analyzer: exclude:` block is unchanged.
+- **`custom_lint` dependency removed**: consumers no longer add `custom_lint` as a dev_dependency, and the analyzer 9 / Riverpod 3+ `pubspec_overrides.yaml` workaround is no longer required.
+- **CLI change**: lint runs via `dart analyze` / `flutter analyze` instead of `dart run custom_lint`.
+- **Minimum Dart SDK raised to `^3.10.0`** (`analysis_server_plugin` requires Dart 3.10+).
+- **Dependencies pinned to `analysis_server_plugin: ^0.3.15` + `analyzer: ^13.0.0`** so the plugin loads in-process under the analyzer shipped with current Dart/Flutter SDKs (Dart 3.12 / analyzer 13).
+
+### 🔧 Changed
+
+- All **33 rules** are registered in the v2 `analysis_server_plugin` plugin entrypoint (`lib/main.dart`) as default-enabled rules; per-rule severity is preserved from v1 (most WARNING, 7 INFO). Rule names and diagnostic messages remain equivalent to v1.
+- Migrated all rule + helper AST traversal to the **analyzer 13 AST API** (`ClassDeclaration.namePart.typeName` / `ClassBody.members`, `RegularFormalParameter`, `NamedArgument`). Detection logic, messages, and severities are unchanged — only the AST accessors were updated.
+
+### 🗑️ Removed
+
+- Removed the v1 `custom_lint` entrypoint (`lib/clean_architecture_linter.dart`), all 34 `*_custom_lint_rule.dart` implementations, the `CleanArchitectureLintRule extends DartLintRule` base class, and the corresponding v1 tests. `CleanArchitectureUtils`, the shared mixins, the v2 rules, and the v2 test harness are retained.
+
+### 📖 Docs
+
+- Added [MIGRATION.md](MIGRATION.md) — v1 → v2.0 consumer migration guide (change table, step-by-step procedure, known differences).
+- Flipped `README.md` / `README_KO.md` install guides to the v2 `plugins:` + `dart analyze` workflow and removed the v1 analyzer-9 compatibility workaround section.
+
+## [1.3.2] - 2026-05-29
+
+### 🔧 Changed
+
+- Widened the direct `analyzer` constraint to `>=8.4.0 <10.0.0` so consumers on the analyzer 9 line (freezed 3.x, riverpod_generator 4.x, riverpod_lint 3.1.x) no longer need to override `clean_architecture_linter` itself in `pubspec_overrides.yaml`.
+- Hardened the `DiagnosticReporter` compatibility layer with a typed `LintCode` bridge, severity-name mapping, and cached analyzer lint codes.
+
+### 📖 Docs
+
+- Added **Compatibility — analyzer 9 / Riverpod 3+** sections to `README.md` and `README_KO.md` covering: the archived `invertase/dart_custom_lint` upstream, a verified `pubspec_overrides.yaml` workaround for `custom_lint*`, a CI gitignore caveat for Flutter projects, and cleanup checkpoints leading up to v2.0 (analysis_server_plugin migration).
+
+### 🧪 Tests
+
+- Added unit coverage for analyzer lint code bridging, including metadata preservation, default severity handling, and cache reuse.
+
+## [1.3.1] - 2026-05-05
+
+### 🛠 Maintenance
+
+- D 방향 reusable 워크플로우 적용 (Claude Code Review + mention responder)
+- `karpathy-guidelines` 스킬 준수 줄을 CLAUDE.md에 추가
+- `dart format` 미적용 파일 정리 (CI 통과 위함)
+
+코드 로직 변경 없음 — 의존성/콘텐츠 안정. 1.3.0과 동등하게 사용 가능.
+
+## [1.3.0] - 2026-02-15
+
+### ✨ Added
+
+- **P0 error-handling policy tightening** for pass-through + AsyncValue architecture
+  - `repository_pass_through`: detects unnecessary `try-catch` rewrapping in Repository public methods
+  - `usecase_no_result_return`: stronger Result/Either detection including typedef alias cases
+  - `presentation_use_async_value` / `presentation_no_throw`: stronger detection for swallowed exceptions and direct business exception branching in presentation
+- **Lint profiles**
+  - `docs/config/lint_profile_balanced.yaml`
+  - `docs/config/lint_profile_strict.yaml`
+
+### 🔧 Changed
+
+- Analyzer compatibility updates (DiagnosticReporter/DiagnosticSeverity/name/diagnosticCode)
+- Documentation/messages aligned to **pass-through + AsyncValue** policy (removed stale Result-centric guidance)
+
+### 🧪 Tests
+
+- Added real AST-based tests for typedef alias Result detection in `return_type_validation_mixin_test.dart`
+- `flutter analyze` and `dart test` pass
+
+## [1.2.0] - 2026-01-19
+
+### ✨ Added (2 new rules)
+
+- **ref_mounted_usage** - Detects `ref.mounted` usage in Riverpod providers
+  - Using `ref.mounted` to guard async operations masks design problems
+  - Encourages proper patterns: AsyncValue, ref.listen, or completing async work before navigation
+  - Only checks in `/presentation/` and `/providers/` directories
+  - Severity: WARNING
+
+- **riverpod_keep_alive** - Warns against unnecessary `@Riverpod(keepAlive: true)`
+  - `keepAlive: true` should only be used for truly global state (auth, settings, cache)
+  - Warns when used on feature-specific providers (e.g., TodoListNotifier)
+  - Skips infrastructure providers (DataSource, Repository, UseCase, Service, Client, API)
+  - Valid patterns: auth, user, session, settings, preferences, config, theme, locale, cache, analytics, notification, connectivity, permission
+  - Severity: WARNING
+
+### 📊 Statistics
+
+- **Total rules: 33** (was 31 in v1.1.0)
+  - Presentation layer rules: 13 (was 11)
+
+## [1.1.0] - 2026-01-09
+
+### 🚀 Breaking Changes
+
+- **Pass-through Repository Pattern** - Result 패턴 제거, pass-through 패턴으로 전환
+  - Repository는 이제 `Future<Entity>`를 직접 반환 (권장)
+  - `Future<Result<Entity, Failure>>` 사용 시 경고 표시
+  - 에러는 DataSource에서 발생하여 Presentation까지 pass-through
+  - `AsyncValue.guard()`로 에러 자동 캐치
+
+### ✨ Added
+
+- **AppException 타입 인식** - `exception_validation_mixin`에 AppException 타입 세트 추가
+  - 표준 AppException 타입: `AppException`, `NetworkException`, `TimeoutException`, `ServerException`, `UnauthorizedException`, `ForbiddenException`, `NotFoundException`, `InvalidInputException`, `ConflictException`, `CacheException`, `UnknownException`
+  - `isAppExceptionType()` 메서드 추가
+  - `isAllowedWithoutPrefix()`가 AppException 타입 인식
+
+- **Loading 필드 감지** - `presentation_use_async_value` 규칙 강화
+  - `isLoading`, `loading`, `isSubmitting`, `submitting`, `isFetching`, `fetching`, `isProcessing`, `processing` 필드 감지
+  - Freezed State에서 수동 로딩 상태 관리 금지 (AsyncValue가 자동 관리)
+
+### 🔄 Changed
+
+- **repository_must_return_result** - Result 패턴 사용 시 경고
+  - 이전: `Future<Entity>` 또는 `Future<Result<Entity, Failure>>` 모두 허용
+  - 이후: `Future<Entity>` 권장, Result 사용 시 WARNING
+
+- **repository_must_return_result** → **repository_pass_through** (이름 변경)
+  - 규칙 이름이 pass-through 패턴을 더 명확하게 반영
+
+- **repository_no_throw** - 문서 업데이트
+  - Pass-through 패턴 중심으로 문서 재작성
+  - AppException 타입 throw 허용
+  - 비표준 예외 throw 시 INFO 레벨 경고
+
+- **datasource_exception_types** - AppException 타입 체크 추가
+  - `isAppExceptionType()` 체크 추가
+  - DataSource에서 AppException 타입만 throw 허용
+
+### ⚠️ Deprecated
+
+- **usecase_must_convert_failure** - Pass-through 패턴으로 인해 더 이상 필요 없음
+  - UseCase에서 Failure→Exception 변환 불필요
+  - 에러가 DataSource에서 Presentation까지 직접 전달됨
+  - 규칙은 유지되지만 no-op (아무 동작 안함)
+
+- **failure_naming_convention** - Failure 클래스 사용 자체를 경고
+  - Result 패턴 제거로 Failure 클래스 불필요
+  - 규칙이 Failure 클래스 정의 시 경고 표시
+  - AppException 사용 권장
+
+### 📝 Documentation
+
+- **CLAUDE.md** - Pass-through 패턴 중심으로 업데이트
+  - Result 패턴 예제 제거
+  - STATE_MANAGEMENT_GUIDE.md 참조 추가
+
+- **doc/UNIFIED_ERROR_GUIDE.md** - 통합 에러 핸들링 가이드 추가
+- **doc/STATE_MANAGEMENT_GUIDE.md** - 상태 관리 가이드 추가
+
+### 🧪 Tests
+
+- 모든 테스트 업데이트 (568개 테스트 통과)
+  - `exception_validation_mixin_test.dart` - AppException 타입 테스트 추가
+  - `repository_no_throw_rule_test.dart` - Pass-through 패턴 테스트로 변경
+  - `exception_handling_integration_test.dart` - 전체 리팩토링
+
+## [1.0.11] - 2025-12-31
+
+### 🔧 Fixed
+
+- **layer_dependency_rule** - DI Provider 파일에서 Data Models import 금지 추가
+  - DI/Provider 파일(`*_providers.dart`, `providers.dart`)에서 DataSource/Repository 구현체 import는 허용
+  - 하지만 **Data Models(`/data/models/`)** import는 DI 파일에서도 **금지**
+  - Data Models는 Data 레이어 내부용이며, Presentation 레이어(DI 포함)에서 사용하면 안됨
+  - 새로운 `_isDataModelImport()` 헬퍼 메서드 추가
+
+## [1.0.10] - 2025-12-10
+
+### ✨ Added
+
+- **allowed_instance_variables_rule** - Extended infrastructure SDK type support
+  - Google Mobile Ads SDK: `BannerAd`, `InterstitialAd`, `RewardedAd`, `NativeAd`, `AppOpenAd`, `AdWidget`
+  - In-App Purchase SDK: `InAppPurchase`, `ProductDetails`, `PurchaseDetails`
+  - `Subscription` type (StreamSubscription, etc.)
+  - These SDK types require mutable state for lifecycle management
+
+### 🎨 Improved
+
+- **Correction messages** - Made all rule correction messages more concise for better VS Code PROBLEMS panel display
+  - Removed verbose examples from correction messages
+  - Focused on brief, actionable fix instructions
+  - Affected rules: `failure_naming_convention`, `model_naming_convention`, `exception_message_localization`, `presentation_no_data_exceptions`, `presentation_use_async_value`, `riverpod_provider_naming`, `riverpod_ref_usage`, `widget_no_usecase_call`, `widget_ref_read_then_when`
+
+## [1.0.9] - 2025-11-12
+
+### ✨ Added (1 new rule)
+
+- **allowed_instance_variables_rule** - Enforce stateless architecture in UseCase, Repository, and DataSource classes
+  - **UseCase**: Only `final`/`const` Repository and Service dependencies allowed
+  - **Repository**: Only `final`/`const` DataSource and infrastructure dependencies (primitives, Stream, HTTP, Firebase, Database) allowed
+  - **DataSource**: Only `final`/`const` primitives and infrastructure dependencies allowed
+  - Mock/Fake classes can have mutable state for testing purposes
+  - Prevents hidden state bugs and enables testability
+  - Comprehensive validation with clear error messages
+  - Total rules: **34** (was 33)
+  - Cross-layer rules: 3 (was 2)
+
+### 🔧 Fixed
+
+- **Domain Layer dart:io Support** - Fixed false positive for `dart:io` imports in domain layer
+  - `domain_purity_rule`: Now allows `dart:io` imports for type references (File, Directory) in domain layer method signatures
+  - Actual I/O operations should still be implemented in data layer
+  - Addresses legitimate use cases where domain repositories need File type parameters
+
+- **Database Library Support** - Added proper exceptions for database libraries (ObjectBox, Realm, Isar, Drift)
+  - `layer_dependency_rule`: Data layer can now import `package:objectbox/`, `package:realm/`, `package:isar/`, `package:drift/`
+  - `datasource_abstraction_rule`:
+    - Private methods/getters (starting with `_`) are now skipped from validation
+    - Database entity types (Box<*Entity>, *ObjectBoxEntity, *RealmEntity, etc.) are allowed in return types
+  - `model_structure_rule`: Models with database annotations (@Entity, @RealmModel, @collection, etc.) are exempt from @freezed requirement
+  - These libraries require mutable classes with their own code generation, incompatible with Freezed
+
+### 📝 Documentation
+
+- **CLAUDE.md**
+  - Added "Instance Variables & Stateless Architecture" section with comprehensive examples
+  - Added "Domain Layer with dart:io Types" example showing allowed usage of File type in repository signatures
+  - Updated Layer Dependencies section to clarify dart:io is allowed for type references
+  - Documented allowed infrastructure types for each layer
+  - Explained Mock/Fake exception for testing
+  - Added "Database Library Exceptions" section with comprehensive examples
+  - Explained why database Models don't use @freezed (mutability requirement)
+  - Listed all allowed database imports and annotations
+
+- **README.md**
+  - Updated rule count from 33 to 34
+  - Added allowed_instance_variables_rule to Core Clean Architecture Principles section
+  - Added ObjectBox example in "Good Examples" section
+  - Documented database library exceptions with clear note
+
+- **README_KO.md**
+  - Updated rule count from 29 to 34
+  - Synchronized with English README structure
+
+### 🎨 Improved
+
+- **exception_naming_convention_rule** - More concise error messages for better VS Code PROBLEMS panel display
+
+## [1.0.8] - 2025-10-30
+
+### 🔧 Changed
+
+- **Minimum Dart SDK updated to 3.7.0**
+  - Updated from ^3.6.0 to ^3.7.0 for better compatibility
+  - Downgraded lints from ^6.0.0 to ^5.1.1 for Dart 3.7.0 compatibility
+  - All existing features and tests remain compatible
+  - No breaking changes to API or functionality
+
+## [1.0.6] - 2025-10-28
+
+### 🔧 Fixed
+
+- **Fixed package dependencies structure**
+  - Moved `analyzer`, `custom_lint_builder`, and `path` back to `dependencies`
+  - These packages are used in `lib/` code and must be runtime dependencies
+  - `custom_lint`, `lints`, and `test` remain in `dev_dependencies`
+  - Note: End users still add this package to `dev_dependencies` in their projects
+
+### 📦 Dependencies
+
+- Runtime dependencies (used in lib/): `analyzer`, `custom_lint_builder`, `path`
+- Dev dependencies (development only): `custom_lint`, `lints`, `test`
+
+## [1.0.5] - 2025-10-28
+
+### 🔧 Changed
+
+- **Upgraded custom_lint_builder** from `0.7.6` to `0.8.0`
+  - Ensures compatibility with riverpod_generator 3.0.0
+  - Upgraded custom_lint dev dependency to `0.8.0`
+  - All 527 tests pass successfully
+  - No breaking API changes required
+  - Maintains backward compatibility
+
+### 📦 Dependencies
+
+- `custom_lint_builder`: ^0.7.6 → ^0.8.0
+- `custom_lint`: ^0.7.6 → ^0.8.0 (dev dependency)
+
+## [1.0.4] - 2025-10-22
+
+### ✨ Added (2 new rules)
+
+- **widget_no_usecase_call rule** - Enforce proper Riverpod architecture: Widget → Provider → UseCase
+  - Prevents widgets from directly importing or calling UseCases
+  - Enforces proper separation: Widgets should only interact with Providers
+  - Detects UseCase imports in widget/page files
+  - Detects direct UseCase provider calls via `ref.read()` or `ref.watch()`
+  - Provides comprehensive correction messages with proper Riverpod patterns
+  - Severity: WARNING
+
+- **widget_ref_read_then_when rule** - Prevent anti-pattern of using `.when()` after `ref.read()`
+  - Detects `ref.read()` followed by `.when()` in the same function
+  - Enforces proper patterns: `ref.watch()` + `.when()` for UI, `ref.listen()` for side effects
+  - Prevents misuse of AsyncValue state management
+  - Explains why this pattern is incorrect (state is already settled after operation)
+  - Provides three correct alternatives based on use case
+  - Severity: WARNING
+
+### 🔄 Changed
+
+- **presentation_no_throw rule** - Enhanced detection capabilities
+  - Now checks `/providers/` directory in addition to `/states/` and `/state/`
+  - Improved State/Notifier class detection with three methods:
+    1. Detects `@riverpod` annotation (Riverpod Generator pattern)
+    2. Detects `extends AsyncNotifier/Notifier/StateNotifier/ChangeNotifier`
+    3. Detects generated classes with `_$` prefix
+  - More robust validation of Riverpod-based state management classes
+  - Better coverage of modern Riverpod code generation patterns
+
+- **Total rules: 31** (was 29 in v1.0.3)
+  - Added: 2 new presentation layer rules
+  - Modified: 1 rule (presentation_no_throw)
+
+### 📝 Documentation
+
+- Enhanced CLAUDE.md with comprehensive Riverpod state management patterns
+  - Added 3-tier provider architecture documentation
+  - Documented Entity Providers (AsyncNotifier), UI State Providers (Notifier), and Computed Logic Providers
+  - Added detailed examples of AsyncValue.when() pattern usage
+  - Included common violations and their solutions
+  - Comprehensive Widget usage examples with proper error handling
+
+### 📊 Statistics
+
+- **Files changed**: 5 files
+  - 2 new rule implementations
+  - 1 rule enhancement
+  - 1 test file
+  - 1 main registration file
+- **Lines added**: ~600+ lines
+  - widget_no_usecase_call_rule.dart: 265 lines
+  - widget_ref_read_then_when_rule.dart: 301 lines
+  - Enhanced presentation_no_throw_rule.dart
+- **Test coverage**: Comprehensive unit tests for widget_no_usecase_call rule
+
+## [1.0.3] - 2025-10-17
+
+### ✨ Added (3 new rules)
+
+- **model_entity_direct_access rule** - Enforce `.toEntity()` method usage instead of direct `.entity` property access in Data layer
+  - Prevents direct `.entity` access in Repository and DataSource implementations
+  - Allows direct access inside extension methods (where conversion logic is implemented)
+  - Allows direct access in test files
+  - Provides clear architectural boundaries for Model → Entity conversion
+
+- **model_naming_convention rule** - Enforce naming conventions for Models in Data layer
+  - Models must end with `Model` suffix
+  - Validates proper naming in `data/models/` directories
+  - Helps maintain consistent codebase structure
+
+- **presentation_no_throw rule** - Enforce no exception throwing in Presentation layer
+  - Presentation layer should use AsyncValue for error handling
+  - No direct exception throws in widgets, states, or notifiers
+  - Aligns with Riverpod best practices
+
+### 🔄 Changed
+
+- **model_conversion_methods rule** - Updated to align with Dart/Freezed best practices
+  - Now only requires `toEntity()` method in extensions (mandatory)
+  - `fromEntity()` implementation is optional and should use factory constructors in the Model class
+  - Removed extension static method pattern (not idiomatic in Dart)
+  - Updated error messages to guide users toward factory constructor pattern
+
+- **Total rules: 29** (was 26 in v1.0.2)
+  - Added: 3 new rules
+  - Modified: 1 rule (model_conversion_methods)
+
+### 🐛 Bug Fixes
+
+- Fixed `exception_naming_convention` rule to skip `core/` directory (framework-level exceptions)
+- Fixed `failure_naming_convention` rule to skip `core/` directory
+- Fixed data file detection to correctly exclude `domain/repositories/` from data layer
+- Fixed `model_conversion_methods` rule incorrectly requiring extension static methods
+- Improved error severity levels across multiple rules
+
+### 📝 Documentation
+
+- Updated CLAUDE.md with comprehensive `.entity` access control guidelines
+- Updated Data Layer rules README with all 3 new rules documentation
+- Enhanced Model conversion pattern examples with factory constructor approach
+- Added 48 new lines of documentation in CLAUDE.md
+- Added 55 new lines in Data Layer README
+- Updated README.md with accurate rule count
+
+### 📊 Statistics
+
+- **Files changed**: 23 files
+- **Lines added**: ~1,237 lines
+- **New test coverage**: 398+ lines of new tests for new rules
+- **Documentation improvements**: 100+ lines across multiple files
+
+## [1.0.2] - 2025-10-09
+
+### 🗑️ Removed
+
+- **entity_business_logic rule** - Removed overly strict rule requiring all entities to have business logic methods
+  - Not all entities need business logic (e.g., events, DTOs, value objects)
+  - Users reported this as too restrictive for practical use cases
+  - Total rules: 27 → 26
+
+### 📝 Documentation
+
+- Fixed incomplete code snippet in README.md examples section
+- Synchronized README_KO.md structure with README.md (removed inconsistent sections)
+- Updated rule count from 27 to 26 in both English and Korean READMEs
+
+## [1.0.1] - 2025-10-09
+
+### 📝 Documentation
+
+- Updated README.md with accurate rule count (27 rules instead of 16+)
+- Updated README_KO.md with accurate rule count and simplified structure
+- Simplified configuration section, removed non-existent Core/Strict modes
+- Reorganized rules documentation with clear categorization
+- Removed unnecessary documentation files (VALIDATION_REPORT.md, ERROR_HANDLING_RULES_TODO.md)
+
+### 🔧 CI/CD
+
+- Improved publish workflow to use official OIDC-based authentication
+- Added quality checks (tests, analyzer, format) before publishing
+- Aligned publish workflow with CI workflow for consistency
+
+## [1.0.0] - 2025-10-09
+
+### 🎉 Initial Release
+
+A comprehensive custom lint package that automatically enforces Clean Architecture principles in Flutter/Dart projects.
+
+### ✨ Added
+
+#### New Utility Infrastructure
+- **CleanArchitectureUtils** - Centralized utility class for common Clean Architecture validations
+  - File path detection (isDomainFile, isDataFile, isPresentationFile)
+  - Component detection (isUseCaseFile, isDataSourceFile, isRepositoryFile)
+  - Class name validation (isUseCaseClass, isDataSourceClass, isRepositoryClass)
+  - Type checking (isVoidType, isResultType)
+  - Exception pattern recognition (isDataException, isDomainException)
+  - AST utilities (findParentClass, isPrivateMethod, isRethrow)
+  - Feature extraction (extractFeatureName)
+
+#### New Mixin System
+- **ExceptionValidationMixin** - Exception naming and validation logic
+- **ReturnTypeValidationMixin** - Return type validation for methods
+- **RepositoryRuleVisitor** - Repository-specific validation
+
+### 🔄 Changed
+
+#### Code Organization
+- **170 lines removed** (13.6% code reduction) through deduplication
+- Consolidated 13 rules to use shared mixins and utilities
+- Improved consistency across all validation logic
+- Enhanced test coverage with **76 comprehensive tests**
+
+#### Refactored All 24 Rules
+All lint rules were refactored to leverage the new utility and mixin infrastructure:
+
+**Cross-Layer Rules (4)**
+- LayerDependencyRule
+- CircularDependencyRule
+- BoundaryCrossingRule
+- TestCoverageRule
+
+**Domain Layer Rules (4)**
+- DomainPurityRule
+- DependencyInversionRule
+- RepositoryInterfaceRule
+- UseCaseNoResultReturnRule
+- UseCaseMustConvertFailureRule
+- ExceptionNamingConventionRule
+- ExceptionMessageLocalizationRule
+
+**Data Layer Rules (7)**
+- ModelStructureRule
+- DataSourceAbstractionRule
+- DataSourceNoResultReturnRule
+- RepositoryMustReturnResultRule
+- RepositoryNoThrowRule
+- DataSourceExceptionTypesRule
+- FailureNamingConventionRule
+
+**Presentation Layer Rules (6)**
+- NoPresentationModelsRule
+- ExtensionLocationRule
+- FreezedUsageRule
+- RiverpodGeneratorRule
+- PresentationNoDataExceptionsRule
+- PresentationUseAsyncValueRule
+
+### 📈 Improved
+
+#### Documentation
+- Added comprehensive ARCHITECTURE.md with system overview
+- Created CONTRIBUTING.md with development guidelines
+- Added RULE_DEVELOPMENT_GUIDE.md for contributors
+- Enhanced inline documentation across all files
+
+#### Testing
+- **76 comprehensive tests** covering all utilities and mixins
+- 100% coverage of utility methods
+- Extensive mixin behavior validation
+
+#### Code Quality
+- Eliminated 170 lines of duplicate code
+- Consistent validation patterns across all rules
+- Improved error messages with better context
+- Enhanced maintainability through shared components
+
+### 🔧 Technical Details
+
+#### Dependencies
+- Dart SDK: ^3.6.0
+- analyzer: ^7.6.0
+- custom_lint_builder: ^0.7.6
+- path: ^1.9.1

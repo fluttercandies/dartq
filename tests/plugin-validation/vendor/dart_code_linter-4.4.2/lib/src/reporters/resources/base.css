@@ -1,0 +1,28 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  padding: var(--dart-code-linter-body-padding);
+  font-family: var(--dart-code-linter-font-family);
+  font-size: var(--dart-code-linter-body-font-size);
+}
+
+table {
+  width: 100%;
+  margin: 0;
+  border-spacing: 0;
+  font-size: inherit;
+  table-layout: fixed;
+}
+
+table td {
+  vertical-align: top;
+}
+
+pre,
+code {
+  margin: 0;
+}

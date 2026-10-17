@@ -1,0 +1,105 @@
+part of 'prefer_extracting_callbacks_rule.dart';
+
+class _Visitor extends SimpleAstVisitor<void> {
+  final _expressions = <AstNode>[];
+
+  final LineInfo _lineInfo;
+  final Iterable<String> _ignoredArguments;
+  final int? _allowedLineCount;
+
+  Iterable<AstNode> get expressions => _expressions;
+
+  _Visitor(this._lineInfo, this._ignoredArguments, this._allowedLineCount);
+
+  @override
+  void visitClassDeclaration(ClassDeclaration node) {
+    final classType = node.extendsClause?.superclass.type;
+    if (!isWidgetOrSubclass(classType) && !isWidgetStateOrSubclass(classType)) {
+      return;
+    }
+
+    final visitor = _InstanceCreationVisitor(
+      _lineInfo,
+      _ignoredArguments,
+      _allowedLineCount,
+    );
+    node.visitChildren(visitor);
+
+    _expressions.addAll(visitor.expressions);
+  }
+}
+
+class _InstanceCreationVisitor extends RecursiveAstVisitor<void> {
+  final _expressions = <AstNode>[];
+
+  final LineInfo _lineInfo;
+  final Iterable<String> _ignoredArguments;
+  final int? _allowedLineCount;
+
+  Iterable<AstNode> get expressions => _expressions;
+
+  _InstanceCreationVisitor(
+    this._lineInfo,
+    this._ignoredArguments,
+    this._allowedLineCount,
+  );
+
+  @override
+  void visitInstanceCreationExpression(InstanceCreationExpression node) {
+    super.visitInstanceCreationExpression(node);
+
+    for (final argument in node.argumentList.arguments) {
+      final expression = unwrapArgumentExpression(argument);
+
+      if (_isNotIgnored(argument) &&
+          expression is FunctionExpression &&
+          _hasNotEmptyBlockBody(expression) &&
+          !_isFlutterBuilder(expression) &&
+          _isLongEnough(expression)) {
+        _expressions.add(argument);
+      }
+    }
+  }
+
+  bool _hasNotEmptyBlockBody(FunctionExpression expression) {
+    final body = expression.body;
+    if (body is! BlockFunctionBody) {
+      return false;
+    }
+
+    return body.block.statements.isNotEmpty;
+  }
+
+  bool _isFlutterBuilder(FunctionExpression expression) {
+    if (!isWidgetOrSubclass(
+      expression.declaredFragment?.element.returnType,
+    )) {
+      return false;
+    }
+
+    final formalParameters = expression.parameters?.parameters;
+
+    return formalParameters == null ||
+        formalParameters.isNotEmpty &&
+            isBuildContext(
+              formalParameters.first.declaredFragment?.element.type,
+            );
+  }
+
+  bool _isNotIgnored(AstNode argument) {
+    final named = asNamedArgument(argument);
+    return named == null || !_ignoredArguments.contains(named.name);
+  }
+
+  bool _isLongEnough(Expression expression) {
+    final allowedLineCount = _allowedLineCount;
+    if (allowedLineCount == null) {
+      return true;
+    }
+
+    final visitor = SourceCodeVisitor(_lineInfo);
+    expression.visitChildren(visitor);
+
+    return visitor.linesWithCode.length > allowedLineCount;
+  }
+}

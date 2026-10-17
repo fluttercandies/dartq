@@ -1,0 +1,208 @@
+import 'package:analyzer/analysis_rule/analysis_rule.dart';
+import 'package:analyzer/analysis_rule/rule_context.dart';
+import 'package:analyzer/analysis_rule/rule_visitor_registry.dart';
+import 'package:analyzer/dart/ast/ast.dart';
+import 'package:analyzer/dart/ast/visitor.dart';
+import 'package:analyzer/dart/element/element.dart';
+import 'package:analyzer/dart/element/type.dart';
+import 'package:analyzer/error/error.dart';
+
+import '../../clean_architecture_linter_base.dart';
+import '../../compat/analyzer_ast_compat.dart';
+import '../../utils/riverpod_provider_detector.dart';
+
+/// Detects usage of `ref.mounted` in the UI layer.
+///
+/// The rule is layer-aware rather than path-based:
+///
+/// * **State layer (Notifier / provider classes)** — `if (!ref.mounted) return;`
+///   after an async gap is the documented Riverpod 3 way to avoid
+///   `UnmountedRefException`, so it is NOT reported.
+/// * **UI layer (widgets / pages)** — gating state logic on `ref.mounted`
+///   masks a design problem and IS reported.
+class RefMountedUsageRule extends AnalysisRule {
+  static const LintCode code = LintCode(
+    'ref_mounted_usage',
+    'Avoid using "ref.mounted" to guard async operations in the UI layer. This masks design problems.',
+    correctionMessage:
+        'Instead: (1) Complete async work before navigation, or (2) Call UseCase directly then navigate - new screen\'s provider will load state. Inside a Notifier, "if (!ref.mounted) return;" is the recommended disposal guard and is not reported.',
+    severity: DiagnosticSeverity.INFO,
+    uniqueName: 'LintCode.ref_mounted_usage',
+  );
+
+  RefMountedUsageRule()
+    : super(
+        name: 'ref_mounted_usage',
+        description:
+            'Disallows ref.mounted lifecycle masking in the UI layer, while allowing it as a disposal guard inside Notifier classes.',
+      );
+
+  @override
+  bool get canUseParsedResult => true;
+
+  @override
+  DiagnosticCode get diagnosticCode => code;
+
+  @override
+  void registerNodeProcessors(
+    RuleVisitorRegistry registry,
+    RuleContext context,
+  ) {
+    final visitor = _RefMountedUsageVisitor(this, context);
+    registry.addPrefixedIdentifier(this, visitor);
+    registry.addPrefixExpression(this, visitor);
+  }
+}
+
+class _RefMountedUsageVisitor extends SimpleAstVisitor<void> {
+  _RefMountedUsageVisitor(this.rule, this.context);
+
+  final AnalysisRule rule;
+  final RuleContext context;
+
+  String get _filePath =>
+      context.currentUnit?.file.path ?? context.definingUnit.file.path;
+
+  @override
+  void visitPrefixedIdentifier(PrefixedIdentifier node) {
+    if (!_shouldCheckFile) return;
+
+    final parent = node.parent;
+    if (parent is PrefixExpression &&
+        parent.operator.lexeme == '!' &&
+        parent.operand == node &&
+        node.prefix.name == 'ref' &&
+        node.identifier.name == 'mounted') {
+      return;
+    }
+
+    if (node.prefix.name == 'ref' && node.identifier.name == 'mounted') {
+      if (_isExemptContext(node)) return;
+      rule.reportAtNode(node);
+    }
+  }
+
+  @override
+  void visitPrefixExpression(PrefixExpression node) {
+    if (!_shouldCheckFile) return;
+
+    if (node.operator.lexeme == '!' && node.operand is PrefixedIdentifier) {
+      final operand = node.operand as PrefixedIdentifier;
+      if (operand.prefix.name == 'ref' &&
+          operand.identifier.name == 'mounted') {
+        if (_isExemptContext(node)) return;
+        rule.reportAtNode(node);
+      }
+    }
+  }
+
+  bool get _shouldCheckFile {
+    if (CleanArchitectureUtils.shouldExcludeFile(_filePath)) return false;
+
+    final normalized = _filePath.replaceAll('\\', '/').toLowerCase();
+    return normalized.contains('/presentation/') ||
+        normalized.contains('/providers/');
+  }
+
+  /// Whether [node] sits in a state-layer declaration, where `ref.mounted` is
+  /// the recommended disposal guard rather than a design smell.
+  ///
+  /// Judged from the enclosing declaration in the AST, not from the file path:
+  /// a Notifier and the widget that consumes it routinely live under the same
+  /// `presentation/providers/` directory.
+  bool _isExemptContext(AstNode node) {
+    final enclosingClass = node.thisOrAncestorOfType<ClassDeclaration>();
+    if (enclosingClass != null) {
+      return isRiverpodNotifierClass(enclosingClass);
+    }
+
+    // Notifier methods are routinely split into an `extension X on FooNotifier`
+    // in a part file. Those members are still state layer.
+    final enclosingExtension = node
+        .thisOrAncestorOfType<ExtensionDeclaration>();
+    if (enclosingExtension != null) {
+      return _isRiverpodNotifierExtension(enclosingExtension);
+    }
+
+    // Functional `@riverpod` providers are state layer too — codegen turns them
+    // into providers with the same disposal semantics as a Notifier.
+    final enclosingFunction = node.thisOrAncestorOfType<FunctionDeclaration>();
+    if (enclosingFunction == null) return false;
+
+    return hasRiverpodAnnotation(enclosingFunction.metadata);
+  }
+}
+
+/// Whether [node] extends a Riverpod state-layer class.
+///
+/// Prefers the resolved element, which sees through prefixed types, typedefs,
+/// and declarations in another unit of the same library — the common case,
+/// since the Notifier lives in the library body and the extension in a part.
+/// Falls back to the class name heuristics only when the type is unresolved
+/// (this rule also runs on parsed-only results).
+bool _isRiverpodNotifierExtension(ExtensionDeclaration node) {
+  final extendedType = node.onClause?.extendedType;
+  if (extendedType is! NamedType) return false;
+
+  final resolved = extendedType.type;
+  if (resolved is InterfaceType) {
+    return _isRiverpodNotifierElement(resolved.element);
+  }
+
+  final targetName = extendedType.name.lexeme;
+  if (riverpodWidgetSuperclasses.contains(targetName)) return false;
+  if (nonRiverpodNotifierSuperclasses.contains(targetName)) return false;
+
+  // Unresolved. Still prefer a real declaration over the name when the target
+  // happens to be declared in this same unit — that covers the single-file
+  // case without any type information.
+  final unit = node.thisOrAncestorOfType<CompilationUnit>();
+  if (unit != null) {
+    for (final declaration in unit.declarations) {
+      if (declaration is ClassDeclaration &&
+          classDeclarationName(declaration) == targetName) {
+        return isRiverpodNotifierClass(declaration);
+      }
+    }
+  }
+
+  // Last resort: the name alone. This leans false-negative by design — the
+  // point of the rule is to stop punishing the recommended disposal guard.
+  return targetName.endsWith('Notifier');
+}
+
+/// Layer classification for a resolved extension target, mirroring
+/// [isRiverpodNotifierClass] but reading the element model instead of AST.
+bool _isRiverpodNotifierElement(InterfaceElement element) {
+  for (final annotation in element.metadata.annotations) {
+    final name = annotation.element?.displayName;
+    if (name == 'riverpod' || name == 'Riverpod') return true;
+  }
+
+  // allSupertypes covers the whole chain, so a project-local base notifier or
+  // a generated `_$Name` several levels up is still recognised.
+  for (final supertype in element.allSupertypes) {
+    final name = supertype.element.name;
+    if (name == null) continue;
+    if (name.startsWith('_\$')) return true;
+    if (riverpodWidgetSuperclasses.contains(name)) return false;
+    if (nonRiverpodNotifierSuperclasses.contains(name)) return false;
+  }
+
+  for (final supertype in element.allSupertypes) {
+    final name = supertype.element.name;
+    if (name != null && name.endsWith('Notifier')) return true;
+  }
+
+  final elementName = element.name;
+  if (elementName == null) return false;
+  if (hasWidgetNameSuffix(elementName)) return false;
+
+  return elementName.endsWith('Notifier');
+}
+
+// Class-based recognition (`isRiverpodNotifierClass`), the widget/notifier
+// superclass sets, and the annotation/name helpers live in the shared
+// `utils/riverpod_provider_detector.dart` so every Riverpod rule recognises the
+// same set of state-layer classes. Only the resolved-element and extension
+// paths below are specific to this rule.

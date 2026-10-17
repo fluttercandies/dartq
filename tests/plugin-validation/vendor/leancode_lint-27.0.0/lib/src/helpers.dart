@@ -1,0 +1,404 @@
+import 'package:analysis_server_plugin/edit/dart/correction_producer.dart';
+import 'package:analysis_server_plugin/edit/dart/dart_fix_kind_priority.dart';
+import 'package:analyzer/analysis_rule/analysis_rule.dart';
+import 'package:analyzer/analysis_rule/pubspec.dart';
+import 'package:analyzer/analysis_rule/rule_visitor_registry.dart';
+import 'package:analyzer/dart/ast/ast.dart';
+import 'package:analyzer/dart/ast/token.dart';
+import 'package:analyzer/dart/ast/visitor.dart';
+// `PubPackage`, the only way to reach the parsed pubspec of the package owning
+// a file, has no public equivalent. The SDK's own
+// `depend_on_referenced_packages` reaches for it the same way.
+// ignore: implementation_imports
+import 'package:analyzer/src/workspace/pub.dart';
+import 'package:analyzer/workspace/workspace.dart';
+import 'package:analyzer_plugin/utilities/change_builder/change_builder_core.dart';
+import 'package:analyzer_plugin/utilities/fixes/fixes.dart';
+import 'package:analyzer_plugin/utilities/range_factory.dart';
+import 'package:leancode_lint/src/type_checker.dart';
+import 'package:leancode_lint/src/utils.dart';
+import 'package:meta/meta.dart';
+
+String typeParametersString(
+  Iterable<TypeParameter> typeParameters, {
+  bool withBounds = false,
+}) {
+  final parameters = typeParameters
+      .map((e) => withBounds ? e.toSource() : e.name)
+      .join(', ');
+
+  if (parameters.isNotEmpty) {
+    return '<$parameters>';
+  } else {
+    return '';
+  }
+}
+
+Expression? maybeGetSingleReturnExpression(FunctionBody body) {
+  return switch (body) {
+    ExpressionFunctionBody(:final expression) ||
+    BlockFunctionBody(
+      block: Block(statements: [ReturnStatement(:final expression?)]),
+    ) => expression,
+    _ => null,
+  };
+}
+
+class _HookExpressionsGatherer() extends GeneralizingAstVisitor<void> {
+  final List<InvocationExpression> _hookExpressions = [];
+
+  static List<InvocationExpression> gather(AstNode node) {
+    final visitor = _HookExpressionsGatherer();
+    node.accept(visitor);
+    return visitor._hookExpressions;
+  }
+
+  // use + upper case letter to avoid cases like "user"
+  static final _isHookRegex = RegExp('^_?use[0-9A-Z]');
+
+  @override
+  void visitInstanceCreationExpression(InstanceCreationExpression node) {
+    switch (maybeHookBuilderBody(node)) {
+      case null:
+        // It is not a hook builder, let's continue searching
+        return super.visitInstanceCreationExpression(node);
+      case final _:
+        // this is a hook builder, so it has a new hook context for used hooks: stop recursing
+        return;
+    }
+  }
+
+  @override
+  void visitInvocationExpression(InvocationExpression node) {
+    if (_isHookRegex.hasMatch(node.beginToken.lexeme)) {
+      _hookExpressions.add(node);
+    }
+
+    super.visitInvocationExpression(node);
+  }
+}
+
+List<InvocationExpression> getAllInnerHookExpressions(AstNode node) {
+  return _HookExpressionsGatherer.gather(node);
+}
+
+/// Given an instance creation, returns the builder function body if the node is a HookBuilder.
+FunctionBody? maybeHookBuilderBody(InstanceCreationExpression node) {
+  final classElement = node.constructorName.type.element;
+  if (classElement == null) {
+    return null;
+  }
+
+  final isHookBuilder = const TypeChecker.any([
+    .fromName('HookBuilder', packageName: 'flutter_hooks'),
+    .fromName('HookConsumer', packageName: 'hooks_riverpod'),
+  ]).isExactly(classElement);
+  if (!isHookBuilder) {
+    return null;
+  }
+
+  final builderArg = node.argumentList.arguments
+      .whereType<NamedArgument>()
+      .firstWhereOrNull((e) => e.name.lexeme == 'builder');
+  if (builderArg?.argumentExpression case FunctionExpression(:final body)) {
+    return body;
+  }
+
+  return null;
+}
+
+class _ReturnExpressionGatherer() extends GeneralizingAstVisitor<void> {
+  final List<Expression?> _returnExpressions = [];
+
+  static List<Expression?> gather(AstNode node) {
+    final visitor = _ReturnExpressionGatherer();
+    node.visitChildren(visitor);
+    return visitor._returnExpressions;
+  }
+
+  @override
+  void visitFunctionBody(FunctionBody node) {
+    // stop recursing on a new function body, return statements will be from a different scope
+  }
+
+  @override
+  void visitReturnStatement(ReturnStatement node) {
+    _returnExpressions.add(node.expression);
+  }
+}
+
+/// Returns all return expressions of a function body.
+List<Expression?> getAllReturnExpressions(FunctionBody body) {
+  return switch (body) {
+    BlockFunctionBody(:final block) => _ReturnExpressionGatherer.gather(block),
+    ExpressionFunctionBody(:final expression) => [expression],
+    EmptyFunctionBody() || NativeFunctionBody() => const [],
+  };
+}
+
+bool isWidgetClass(ClassDeclaration node) =>
+    switch (node.declaredFragment?.element) {
+      final element? => const TypeChecker.any([
+        .fromName('StatelessWidget', packageName: 'flutter'),
+        .fromName('State', packageName: 'flutter'),
+        .fromName('HookWidget', packageName: 'flutter_hooks'),
+      ]).isSuperOf(element),
+      _ => false,
+    };
+
+MethodDeclaration? getBuildMethod(ClassDeclaration node) => switch (node.body) {
+  BlockClassBody(:final members) =>
+    members.whereType<MethodDeclaration>().firstWhereOrNull(
+      (member) => member.name.lexeme == 'build',
+    ),
+  _ => null,
+};
+
+extension NodeLintRegistryExtensions on RuleVisitorRegistry {
+  void addRegularComment(
+    AnalysisRule rule,
+    void Function(Token comment) listener,
+  ) {
+    addCompilationUnit(rule, _RegularCommentVisitor(listener));
+  }
+
+  void addHookWidgetBody(
+    AnalysisRule rule,
+    void Function(FunctionBody node, AstNode diagnosticNode) listener, {
+    bool isExactly = false,
+  }) {
+    final visitor = _HookWidgetBodyVisitor(listener, isExactly);
+    addInstanceCreationExpression(rule, visitor);
+    addClassDeclaration(rule, visitor);
+  }
+}
+
+class _RegularCommentVisitor(final void Function(Token comment) listener)
+    extends SimpleAstVisitor<void> {
+  @override
+  void visitCompilationUnit(CompilationUnit node) {
+    bool isRegularComment(Token commentToken) {
+      final token = commentToken.toString();
+
+      return !token.startsWith('///') && token.startsWith('//');
+    }
+
+    Token? token = node.root.beginToken;
+    while (token != null) {
+      Token? commentToken = token.precedingComments;
+      while (commentToken != null) {
+        if (isRegularComment(commentToken)) {
+          listener(commentToken);
+        }
+        commentToken = commentToken.next;
+      }
+
+      if (token == token.next) {
+        break;
+      }
+
+      token = token.next;
+    }
+  }
+}
+
+class _HookWidgetBodyVisitor(
+  final void Function(FunctionBody node, AstNode diagnosticNode) listener,
+  final bool isExactly,
+) extends SimpleAstVisitor<void> {
+  @override
+  void visitInstanceCreationExpression(InstanceCreationExpression node) {
+    if (maybeHookBuilderBody(node) case final body?) {
+      listener(body, node.constructorName);
+    }
+  }
+
+  @override
+  void visitClassDeclaration(ClassDeclaration node) {
+    final element = node.declaredFragment?.element;
+    if (element == null) {
+      return;
+    }
+
+    const checker = TypeChecker.any([
+      .fromName('HookWidget', packageName: 'flutter_hooks'),
+      .fromName('HookConsumerWidget', packageName: 'hooks_riverpod'),
+    ]);
+
+    final AstNode diagnosticNode;
+    if (isExactly) {
+      final superclass = node.extendsClause?.superclass;
+      final superclassElement = superclass?.element;
+      if (superclass == null || superclassElement == null) {
+        return;
+      }
+
+      final isDirectHookWidget = checker.isExactly(superclassElement);
+      if (!isDirectHookWidget) {
+        return;
+      }
+      diagnosticNode = superclass;
+    } else {
+      final isHookWidget = checker.isSuperOf(element);
+      if (!isHookWidget) {
+        return;
+      }
+      diagnosticNode = node;
+    }
+
+    final buildMethod = getBuildMethod(node);
+    if (buildMethod == null) {
+      return;
+    }
+
+    listener(buildMethod.body, diagnosticNode);
+  }
+}
+
+extension PackageDependencies on ResolvedCorrectionProducer {
+  bool dependsOnPackage(String packageName) => packageDependsOn(
+    packageName,
+    package: sessionHelper.session.analysisContext.contextRoot.workspace
+        .findPackageFor(file),
+    filePath: file,
+  );
+}
+
+/// Whether [package] declares a direct dependency on [packageName], as seen
+/// from the file at [filePath].
+///
+/// A transitive dependency does not count: an import of it resolves today, but
+/// breaks as soon as the intermediate package stops depending on
+/// [packageName]. The package config cannot tell the two apart, hence the
+/// pubspec. Dev dependencies count only outside the package's public
+/// directories, since code that ships to consumers cannot rely on them.
+///
+/// This mirrors how the SDK's `depend_on_referenced_packages` answers the very
+/// same question.
+@visibleForTesting
+bool packageDependsOn(
+  String packageName, {
+  required WorkspacePackage? package,
+  required String filePath,
+}) {
+  if (package is! PubPackage) {
+    return false;
+  }
+  final pubspec = package.pubspec;
+  if (pubspec == null) {
+    return false;
+  }
+
+  bool declares(Iterable<PubspecDependency>? dependencies) =>
+      dependencies?.any((dep) => dep.name?.text == packageName) ?? false;
+
+  return declares(pubspec.dependencies) ||
+      (!_isInPublicDir(filePath, package) && declares(pubspec.devDependencies));
+}
+
+/// Mirrors `isInPublicDir` from the SDK's linter.
+bool _isInPublicDir(String filePath, WorkspacePackage package) {
+  final pathContext = package.root.provider.pathContext;
+  String inRoot(List<String> parts) =>
+      pathContext.joinAll([package.root.path, ...parts]);
+
+  return pathContext.isWithin(inRoot(['lib']), filePath) ||
+      pathContext.isWithin(inRoot(['bin']), filePath) ||
+      filePath == inRoot(['hook', 'build.dart']) ||
+      filePath == inRoot(['hook', 'link.dart']);
+}
+
+bool isExpressionExactlyType(
+  Expression expression,
+  String typeName,
+  String packageName,
+) {
+  if (expression.staticType case final type?) {
+    return TypeChecker.fromName(
+      typeName,
+      packageName: packageName,
+    ).isExactlyType(type);
+  }
+  return false;
+}
+
+/// Checks whether an instance creation uses only the specified named parameter.
+///
+/// Returns true when the [node] has:
+/// - Only one relevant named argument whose name equals [parameter]
+/// - The argument value is not a null literal and the argument type is not
+///   nullable (i.e. not `T?`)
+/// - No other arguments are present, except those explicitly listed in
+///   [ignoredParameters]
+///
+/// Otherwise returns false.
+bool isInstanceCreationExpressionOnlyUsingParameter(
+  InstanceCreationExpression node, {
+  required String parameter,
+  Set<String> ignoredParameters = const {},
+}) {
+  var hasParameter = false;
+
+  for (final argument in node.argumentList.arguments) {
+    if (argument case NamedArgument(
+      name: Token(lexeme: final argumentName),
+      :final argumentExpression,
+    )) {
+      if (ignoredParameters.contains(argumentName)) {
+        continue;
+      } else if (argumentName == parameter &&
+          argumentExpression is! NullLiteral &&
+          argumentExpression.staticType?.nullabilitySuffix != .question) {
+        hasParameter = true;
+      } else {
+        // Other named arguments are not allowed
+        return false;
+      }
+    } else {
+      // Other arguments are not allowed
+      return false;
+    }
+  }
+  return hasParameter;
+}
+
+/// A fix that replaces the widget constructor name with a new one specified as [widgetName].
+///
+/// Assumption: the corresponding lint diagnostic reports an error whose
+/// source range matches the constructor's name (identifier). The fix applies
+/// the replacement to that exact range.
+///
+/// Example:
+/// ```dart
+/// Container(alignment: null, child: const SizedBox());
+/// ```
+///
+/// will be replaced with:
+/// ```dart
+/// Align(alignment: null, child: const SizedBox());
+/// ```
+abstract class ChangeWidgetNameFix({
+  required final String widgetName,
+  required super.context,
+}) extends ResolvedCorrectionProducer {
+  @override
+  FixKind get fixKind => .new(
+    'leancode_lint.fix.replaceWith$widgetName',
+    DartFixKindPriority.standard,
+    'Replace with $widgetName',
+  );
+
+  @override
+  CorrectionApplicability get applicability => .automatically;
+
+  @override
+  Future<void> compute(ChangeBuilder builder) async {
+    await builder.addDartFileEdit(
+      file,
+      (builder) => builder.addSimpleReplacement(
+        range.diagnostic(diagnostic!),
+        widgetName,
+      ),
+    );
+  }
+}

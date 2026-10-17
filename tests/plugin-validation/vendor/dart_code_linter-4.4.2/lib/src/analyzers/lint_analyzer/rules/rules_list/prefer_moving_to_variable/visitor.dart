@@ -1,0 +1,253 @@
+part of 'prefer_moving_to_variable_rule.dart';
+
+class _Visitor extends RecursiveAstVisitor<void> {
+  final _nodes = <AstNode>[];
+
+  final int? _duplicatesThreshold;
+  final Iterable<String> _ignoredInvocations;
+  final Iterable<String> _ignoredTargets;
+
+  Iterable<AstNode> get nodes => _nodes;
+
+  _Visitor(this._duplicatesThreshold, this._ignoredInvocations,
+      this._ignoredTargets);
+
+  @override
+  void visitBlockFunctionBody(BlockFunctionBody node) {
+    final visitor = _BlockVisitor(
+      _duplicatesThreshold,
+      _ignoredInvocations,
+      _ignoredTargets,
+    );
+    node.visitChildren(visitor);
+
+    _nodes.addAll(visitor.duplicates);
+  }
+
+  @override
+  void visitExpressionFunctionBody(ExpressionFunctionBody node) {
+    final visitor = _BlockVisitor(
+      _duplicatesThreshold,
+      _ignoredInvocations,
+      _ignoredTargets,
+    );
+    node.visitChildren(visitor);
+
+    _nodes.addAll(visitor.duplicates);
+  }
+}
+
+class _BlockVisitor extends RecursiveAstVisitor<void> {
+  final Map<String, AstNode> _visitedInvocations = {};
+  final Set<AstNode> _visitedNodes = {};
+  final Map<String, Set<AstNode>> _duplicates = {};
+
+  final int? _duplicatesThreshold;
+  final Iterable<String> _ignoredInvocations;
+  final Iterable<String> _ignoredTargets;
+
+  Set<AstNode> get duplicates =>
+      _duplicates.entries.fold(<AstNode>{}, (previousValue, element) {
+        final duplicatesThreshold = _duplicatesThreshold;
+        if (duplicatesThreshold == null ||
+            element.value.length >= duplicatesThreshold) {
+          previousValue.addAll(element.value);
+        }
+
+        return previousValue;
+      });
+
+  _BlockVisitor(this._duplicatesThreshold, this._ignoredInvocations,
+      this._ignoredTargets);
+
+  @override
+  void visitPropertyAccess(PropertyAccess node) {
+    if (_ignoredInvocations.contains(node.propertyName.name)) {
+      return;
+    }
+    if (_isIgnoredTarget(node.realTarget)) {
+      return;
+    }
+
+    final target = node.target;
+    if (target == null) {
+      return;
+    }
+
+    if (target is PrefixedIdentifier) {
+      final element = target.identifier.element;
+      if (element is EnumElement || element is ClassElement) {
+        return;
+      }
+    }
+
+    final hasDuplicates = _checkForDuplicates(node, node.target);
+    if (!hasDuplicates) {
+      super.visitPropertyAccess(node);
+    }
+  }
+
+  @override
+  void visitMethodInvocation(MethodInvocation node) {
+    if (node.parent is CascadeExpression ||
+        node.parent is VariableDeclaration ||
+        (node.staticType is VoidType)) {
+      return;
+    }
+
+    if (_ignoredInvocations.contains(node.methodName.name)) {
+      return;
+    }
+    if (_isIgnoredTarget(node.realTarget)) {
+      return;
+    }
+
+    final hasDuplicates = _checkForDuplicates(node, node.target);
+    if (!hasDuplicates) {
+      super.visitMethodInvocation(node);
+    }
+  }
+
+  bool _isIgnoredTarget(Expression? target) {
+    if (target == null || _ignoredTargets.isEmpty) {
+      return false;
+    }
+    final type = target.staticType;
+    if (type == null) {
+      return false;
+    }
+    final typeName = type.getDisplayString().replaceAll(RegExp('<.*>'), '');
+
+    return _ignoredTargets.contains(typeName);
+  }
+
+  bool _checkForDuplicates(AstNode node, Expression? target) {
+    final access = _extractAccess(node);
+    final visitedInvocation = _visitedInvocations[access];
+    final isDuplicate =
+        visitedInvocation != null && _isDuplicate(visitedInvocation, node);
+    if (isDuplicate) {
+      _duplicates.update(
+        access,
+        (value) => value..addAll([visitedInvocation, node]),
+        ifAbsent: () => {visitedInvocation, node},
+      );
+    }
+
+    if (_visitedNodes.contains(node)) {
+      return isDuplicate;
+    }
+
+    _visitedInvocations[access] = node;
+    _visitAllTargets(target);
+
+    return false;
+  }
+
+  String _extractAccess(AstNode node) {
+    final parent = node.parent;
+    if (parent is FunctionExpressionInvocation) {
+      final typeArguments = parent.typeArguments;
+      if (typeArguments != null && typeArguments.arguments.isNotEmpty) {
+        return parent.toString();
+      }
+    }
+
+    return node.toString();
+  }
+
+  bool _isDuplicate(AstNode visitedInvocation, AstNode node) {
+    if (_haveDifferentParameterTypes(visitedInvocation, node) ||
+        _isSetter(node) ||
+        _isSetter(visitedInvocation) ||
+        _hasMutableArguments(visitedInvocation, node) ||
+        _bothInsideWhile(visitedInvocation, node)) {
+      return false;
+    }
+
+    final visitedSwitch =
+        visitedInvocation.thisOrAncestorOfType<SwitchStatement>();
+
+    final visitedBlock = visitedInvocation.thisOrAncestorOfType<Block>();
+    final parentBlock = node.thisOrAncestorOfType<Block>();
+
+    final grandParentBlock = parentBlock?.thisOrAncestorMatching(
+      (block) => block is Block && block != parentBlock,
+    );
+
+    final visitedFunctionExpression = visitedInvocation.thisOrAncestorMatching(
+      (astNode) =>
+          astNode is FunctionExpression || astNode is FunctionDeclaration,
+    );
+    final parentFunctionExpression = node.thisOrAncestorMatching((astNode) =>
+        astNode is FunctionExpression || astNode is FunctionDeclaration);
+
+    return visitedInvocation != node &&
+        visitedSwitch == null &&
+        (visitedBlock == parentBlock || visitedBlock == grandParentBlock) &&
+        (visitedFunctionExpression == null &&
+                parentFunctionExpression == null ||
+            visitedFunctionExpression == parentFunctionExpression);
+  }
+
+  void _visitAllTargets(Expression? target) {
+    var realTarget = target;
+
+    while (realTarget != null) {
+      _visitedNodes.add(realTarget);
+
+      final access = realTarget.toString();
+      if (!_visitedInvocations.containsKey(access)) {
+        _visitedInvocations[access] = realTarget;
+      }
+
+      if (realTarget is MethodInvocation) {
+        realTarget = realTarget.realTarget;
+      } else if (realTarget is PropertyAccess) {
+        realTarget = realTarget.realTarget;
+      } else {
+        realTarget = null;
+      }
+    }
+  }
+
+  bool _hasMutableArguments(AstNode visitedInvocation, AstNode node) =>
+      visitedInvocation is MethodInvocation &&
+      node is MethodInvocation &&
+      visitedInvocation.argumentList.arguments.any((argument) {
+        final expression = unwrapArgumentExpression(argument);
+
+        if (expression is SimpleIdentifier) {
+          final element = expression.element;
+
+          return element is VariableElement &&
+              !element.isConst &&
+              !element.isFinal;
+        }
+
+        return false;
+      });
+
+  bool _isSetter(AstNode node) {
+    if (node is! PropertyAccess) {
+      return false;
+    }
+
+    final parent = node.parent;
+
+    return parent is AssignmentExpression && parent.leftHandSide == node;
+  }
+
+  bool _bothInsideWhile(AstNode visitedInvocation, AstNode node) {
+    final visitedWhile =
+        visitedInvocation.thisOrAncestorOfType<WhileStatement>();
+    final parentWhile = node.thisOrAncestorOfType<WhileStatement>();
+
+    return visitedWhile != null && visitedWhile == parentWhile;
+  }
+
+  bool _haveDifferentParameterTypes(AstNode visitedInvocation, AstNode node) =>
+      visitedInvocation is Expression &&
+      node is Expression &&
+      !haveSameParameterType(visitedInvocation, node);
+}

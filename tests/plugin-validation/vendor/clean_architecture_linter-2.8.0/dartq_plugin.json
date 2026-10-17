@@ -1,0 +1,12 @@
+{
+  "name": "clean_architecture_linter",
+  "version": "2.8.0",
+  "entrypoint": "bin/dartq_serve.dart",
+  "capabilities": ["lint"],
+  "timeouts": {
+    "callback_ms": 30000,
+    "request_ms": 60000,
+    "request_retries": 3
+  },
+  "memory_budget_mb": 1024
+}

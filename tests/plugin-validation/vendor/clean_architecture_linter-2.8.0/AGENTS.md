@@ -1,0 +1,57 @@
+## 이 레포 고유 지침
+- 이 저장소는 Flutter 앱이 아니라 외부 사용자에게 배포되는 **public Dart package (`analysis_server_plugin` 기반 Clean Architecture linter)**.
+- 패키지 구현 경로는 `lib/src/rules/`, `lib/src/mixins/`, plugin entrypoint는 `lib/clean_architecture_linter.dart`다. 예제/fixture의 `lib/features/...`는 소비자 앱 lint semantics를 검증하기 위한 입력이며, agent 구현 레이아웃으로 해석하지 않는다.
+- lint semantics와 agent 운영 규칙을 분리한다. 이 패키지는 Riverpod 기반 Clean Architecture 위반을 `dart analyze`에서 검출하는 제품이며, agent 지침은 maintainer 작업 절차일 뿐 package behavior나 public docs API가 아니다.
+- public GitHub metadata(브랜치명, PR 제목/본문, release note)에 private Multica `ITT-*` key를 노출하지 않는다. traceability는 Multica 내부에만 둔다.
+- PR은 human merge only다. agent는 명시 승인 없이 merge/close/label/review approval/force push를 하지 않는다.
+- 실제 검증 명령은 manifest/현행 문서 기준으로만 기록하고 실행한다: root `dart analyze`, root `dart test`, consumer smoke `cd example && dart analyze`, analysis_server_plugin/Riverpod coexistence smoke `cd poc_v2/consumer_riverpod_lint && dart analyze`.
+- Vision / rule 등록 / Riverpod 3-tier 상세: `CLAUDE.md` 참조.
+
+
+## 검색·컨텍스트 규율 (토큰 효율)
+<!-- BEGIN agent-search-discipline (managed) -->
+- 코드/텍스트 검색은 `rg`, **파일명·최근변경 찾기는 `fd`** (`find` 금지), 구조(AST) 매칭은 `ast-grep`/`sg` (`grep -r`/`find`/정규식 대신).
+- `ast-grep`의 Dart는 내장이지만 맨 패턴(`print($A)`)은 ERROR 노드로 0건이다. 완전한 문맥 + `--selector`로 쓴다: `ast-grep run -l dart -p 'void f(){ print($A); }' --selector call_expression lib` (위젯은 `-p 'Widget f() => Padding(padding: $P, child: $C);'`). `customLanguages`로 `dart`를 재등록하지 않는다(내장과 충돌해 파일 모드 0건). exit 1은 매치 없음이지 오류가 아니다.
+- 파일을 통째로 읽지 않는다. `rg`/`ast-grep`로 위치를 특정한 뒤 필요한 심볼/라인 범위만 읽는다.
+- 툴 결과 JSON/YAML을 raw로 컨텍스트에 넣지 않는다. `jq`/`yq`로 필요한 필드만 필터한다.
+- GitHub는 `gh`, HTTP 스모크는 `xh`(없으면 `curl`). Multica 플랫폼은 `multica` CLI만.
+- 광범위 매칭을 통째로 프롬프트에 넣지 않는다. 범위를 좁히거나 count만 확인한다.
+- 목적: 토큰 낭비·환각(길 잃음) 방지. Multica 할당 에이전트도 workspace context/agent instructions의 Mac mini CLI routing과 동일 적용.
+- **위 필터 규율은 조회(read)에만 적용한다.** 상태를 바꾸는 명령(`git push`, `gh pr create/edit/merge`, `--apply`, 배포·설정 생성)은 출력을 `| tail`/`| head`로 자르지 않는다. 에러는 잘린 부분에 숨고, 남은 마지막 줄은 성공처럼 보인다. 실측 사례: `gh pr edit ... -q .`가 `unknown shorthand flag: 'q'`로 실패했는데 `| tail -1`이 usage 끝줄만 남겨 성공으로 오독했다.
+- **쓰기 명령은 실행 후 목적지를 조회해 확인한다.** `push` 성공은 브랜치에 올라갔다는 뜻일 뿐 PR에 반영됐다는 뜻이 아니다 — `gh pr view <n> --json state,commits`로 확인한다. 이 확인을 생략해 수정 커밋이 머지 1분 뒤에 도착했고, 게이트가 깨진 채 하루 동안 배포돼 있었다.
+<!-- END agent-search-discipline -->
+
+## 검증 규율 (analyze 먼저, test 나중)
+<!-- BEGIN agent-verify-discipline (managed) -->
+- 코드 작성/수정 직후 정적 분석을 **테스트보다 먼저** 돌린다. 통과 후에만 필요한 테스트를 타겟 실행.
+  - **Dart/Flutter (`analysis_options.yaml`에 `plugins:` 있는 repo):** 게이트는 VS Code/Cursor **Problems**와 동일 소스인 `dart analyze`다 (`riverpod_lint`, `clean_architecture_linter` 등). **`flutter analyze`만으로 통과 선언·PR 금지** — 플러그인 진단을 놓쳐 Problems가 남은 채로 CI green이 된다. Multica/Codex/Cursor 에이전트도 동일. SoT는 repo 종류로 갈린다. **sentinel 없는 repo:** `dart analyze --fatal-infos`(또는 그것을 호출하는 `./scripts/verify.sh` / `--quick`). **lint sentinel(`lib/zz_lint_sentinel/`)이 있는 repo:** 통과 증거는 `bash scripts/analyze.sh`의 exit 0뿐이고, `verify.sh`는 그 래퍼를 호출할 때만 인정한다. `scripts/analyze.sh`는 clean_architecture_linter `tools/lint_sentinel/check.sh`의 사본이며, 래퍼가 아직 없으면 그 파일을 `scripts/analyze.sh`로 복사한 뒤 호출한다. 단독 `dart analyze`는 통과 증거가 아니다: 플러그인이 전달되면 sentinel 2행(`riverpod_keep_alive`·`presentation_no_throw`, 경로 `lib/zz_lint_sentinel/`)만 허용 진단이고 그 외는 0건이어야 하며, 0행·exit 0은 깨끗함이 아니라 플러그인 미수신(실패, 재시도는 래퍼가 수행)이다.
+  - **Dart/Flutter (`plugins:` 없는 repo):** 플러그인 진단이 없으므로 게이트는 `dart analyze --fatal-infos`(또는 그것을 호출하는 `./scripts/verify.sh`) exit 0. `flutter analyze`도 같은 analyzer지만 INFO를 통과시키므로 `--fatal-infos` 없는 결과를 통과 증거로 쓰지 않는다.
+  - TS/Node: `tsc --noEmit` + eslint · Python: `ruff`+`mypy`
+- analyze 이슈(Problems)는 test 전에 **0건**(sentinel repo는 위 2행 제외). "flutter analyze OK"만 증거로 쓰지 않는다.
+- 실행 검증도 전체가 아니라 바뀐 부분만 타겟한다.
+<!-- END agent-verify-discipline -->
+
+## PR 작성 규율 (org 템플릿 준수)
+<!-- BEGIN agent-pr-discipline (managed) -->
+- `clean_architecture_linter`는 public package다. branch, commit, PR title/body/comment, release note 등 public GitHub metadata에 private Multica `ITT-*` key를 넣지 않는다.
+- PR 본문은 org template를 사용하고 workspace `pr-fetch-template-ittae.sh` → validate → `pr-create-ittae.sh --body-file` 경로로 생성한다. 렌더되는 본문 섹션은 요약, 목표 / 이유, 실제 동작 증거, 범위 밖이다. 그 외 섹션은 해당하지 않으면 지우고, "미확인" 또는 "해당 없음"으로 빈칸을 채우지 않는다.
+- 실제 검증 명령, 관측한 결과, 검증하지 않은 영역은 실제 동작 증거에 기록한다. 위험을 적어야 하면 범위 밖 또는 실제 동작 증거에 한 줄이면 된다.
+- PR은 ready까지 전환하되 agent가 merge, approve, force-push, protection 변경을 하지 않는다. 이 package는 human merge only다.
+<!-- END agent-pr-discipline -->
+
+## sandbox 안전 규율
+<!-- BEGIN agent-safety-discipline (managed) -->
+- `.env` secret을 출력·검사·커밋하지 않는다. 필요한 경우 `.env.example`의 key 이름만 확인한다.
+- 삭제가 필요하면 대상을 정확히 특정해 `rm`, `rmdir`, `git rm`을 사용할 수 있다. `rm -rf`와 대량 삭제는 명확한 scope·dry-run·rollback을 먼저 확인한다.
+- 홈 루트, repo `.git/`, secret/credential, shared runner/worktree root처럼 고위험 대상을 삭제·정리할 때는 명시 승인을 받는다.
+- 승인 없이 `curl | sh`, 출처 불명 installer, `chmod`, `sudo`, network shell을 실행하지 않는다.
+- conductor/Multica가 관리하는 workspace는 담당 issue/worktree의 scope 안에서만 수정한다.
+<!-- END agent-safety-discipline -->
+
+## 개발 판단 규율 (위험·경계 비례)
+<!-- BEGIN agent-lean-discipline (managed) -->
+- 새 구현 전에 기존 코드, stdlib, 플랫폼 기능, 현재 dependency로 해결 가능한지 확인한다.
+- architecture와 테스트 범위는 실제 dependency/trust boundary, 변경 위험, 실패 비용에 비례시킨다. 미래 확장만을 위한 layer/interface/factory/wrapper는 만들지 않는다.
+- LOC·파일 수는 목표가 아니다. correctness, security, privacy, data integrity, accessibility, i18n, 명시적 error handling과 필요한 경계를 단순화와 교환하지 않는다.
+- repo의 architecture convention과 required gate가 optional skill/plugin/persona 지침보다 우선한다.
+<!-- END agent-lean-discipline -->

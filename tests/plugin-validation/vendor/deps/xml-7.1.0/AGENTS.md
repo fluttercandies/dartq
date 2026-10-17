@@ -1,0 +1,70 @@
+# Development Charter
+
+## General Instructions
+
+- When generating new Dart code, strictly follow the style conventions defined in [Effective Dart](https://dart.dev/effective-dart).
+- Systematically prefer using `const` constructors and literals whenever possible to optimize runtime performance.
+- Prefer using the Dart MCP tool instead of running commands manually.
+
+## Comments, Documentation and Examples
+  
+- Use triple-slash (`///`) doc comments for all public members.
+- Use square brackets (`[Name]`) to link to other members within doc comments. Use markdown sparingly.
+- Start with a concise, single-sentence summary. If more detail is required, follow with a blank line and a deeper explanation (e.g., edge cases, parameters, error handling, ...).
+- Include code examples for non-trivial public APIs. Ensure examples are well-formatted, accurate, and relevant. Verify that examples compile and produce the advertised output.
+
+## Coding Style and Conventions
+
+### Naming
+
+- File names must use snake-case (e.g., `recipe_card.dart`).
+- Class names, enums, and extensions must use upper camel-case (e.g., `RecipeCard`).
+- Private class members, variables, and functions (visible only within the file) must be prefixed with an underscore `_`.
+- Use descriptive, intention-revealing names that communicate purpose. Avoid single-letter variables except for standard loop counters (e.g., `i`).
+
+### Imports
+
+- Adhere to the `directives_ordering` linter rule: `dart:` imports first, then `package:` imports, then relative imports.
+- Within `lib/`, prefer relative imports (e.g., `import 'src/utils.dart';`) over package imports.
+- All imports must be in a single block, not split into multiple import blocks.
+
+### Code Quality
+
+- The code must be auto-formatted (run `dart format .`).
+- The code must be free of linter warnings (run `dart analyze` and `dart fix --apply`).
+- Embrace strict null safety. Avoid using the non-null assertion operator (`!`) or `dynamic` types, if possible.
+
+## Logic and Patterns
+
+### Asynchrony
+
+- Prefer `async` / `await` syntax over chaining `Future.then`, `Future.catchError`, ...
+- Always return `Future<void>` instead of `void` for asynchronous functions.
+
+### Error Handling
+
+- **Throw Specific Exceptions**: Never throw generic Exception or String objects. Always throw specialized exceptions (e.g., `ArgumentError`, `StateError`, `FormatException`) to provide clear context.
+- **Catch Narrowly**: Avoid catching generic `Error` or `Exception` types, and never use blank catch blocks `catch (_)` or try-catch blocks without rethrowing, as they swallow critical failures.
+- **Prevent, Don't Catch**: Do not use exception handling for predictable control flow. If a framework or class provides a non-throwing alternative (e.g., `int.tryParse()` vs `int.parse()`), always prefer the safe method.
+
+## Architecture
+
+- Keep the root `lib/` directory clean. It should primarily contain the public API exports.
+- Place implementation details in `lib/src/`. Users of the package should not import files from `lib/src/` directly.
+- Exports are only allowed in `lib/*.dart`, and never in any files in `lib/src/...`.
+- Avoid introducing new external dependencies in `pubspec.yaml` unless absolutely necessary and no alternative exists in the SDK. Justify any addition to the user.
+
+### XPath and XDM Function Conventions
+
+- Standard XPath functions and operators are defined as `XPathFunctionItem` instances.
+- Always use specialized typed constructors: `XPathFunctionItem.fn0`, `.fn1`, `.fn2`, `.fn3`, `.fnN`, `.variadic`, or `.overloaded`.
+- For overloaded arities, use `XPathFunctionItem.overloaded` mapping each arity to its specialized `XPathFunctionItem` implementation.
+- For variadic functions (e.g. `fn:concat`), use `XPathFunctionItem.variadic(name, minArity, fn)` and ensure `XPathConfiguration.getFunction` handles variadic lookup.
+- Functions must work over `XPathSequence` arguments and return `XPathSequence` values. When atomizing inputs, handle coercion gracefully (e.g., untyped atomic values to string or numeric types) rather than assuming concrete subtypes directly.
+
+## Testing
+
+- All new code must be accompanied by unit tests in the `test/` folder.
+- Structure the tests following the same folder structure as the code under test (e.g., `lib/src/foo/bar.dart` -> `test/foo/bar_test.dart`).
+- Use `expect` with literal values or matchers to assert the expected behavior (e.g., `expect(result, 'expected')`, `expect(list, isEmpty)`).
+- Group tests by functionality using `group('description', () { ... })`. Avoid declaring a single top-level group in a file.

@@ -1,0 +1,16 @@
+name: custom_example_app
+description: Example app using leancode_lint with custom configuration.
+publish_to: none
+
+environment:
+  sdk: '>=3.13.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  my_lints:
+    path: ../my_lints

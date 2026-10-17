@@ -1,0 +1,16 @@
+name: dartq_parity_clean_architecture_linter
+description: >-
+  Plugin-parity corpus package for clean_architecture_linter. The official
+  face reads only analysis_options.yaml (its synthetic plugin package lives
+  under the run's ANALYZER_STATE_LOCATION_OVERRIDE); this pubspec exists for
+  the dartq face, whose plugin discovery resolves the declared plugin name
+  through the package_config the override below produces (the preset
+  technique, tests/plugin-validation/README.md).
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+
+dependency_overrides:
+  clean_architecture_linter:
+    path: ../../vendor/clean_architecture_linter-2.8.0

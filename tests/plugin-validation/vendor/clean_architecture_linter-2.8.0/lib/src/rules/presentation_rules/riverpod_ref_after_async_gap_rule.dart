@@ -1,0 +1,1533 @@
+import 'package:analyzer/analysis_rule/analysis_rule.dart';
+import 'package:analyzer/analysis_rule/rule_context.dart';
+import 'package:analyzer/analysis_rule/rule_visitor_registry.dart';
+import 'package:analyzer/dart/ast/ast.dart';
+import 'package:analyzer/dart/ast/visitor.dart';
+import 'package:analyzer/error/error.dart';
+
+import '../../clean_architecture_linter_base.dart';
+import '../../compat/analyzer_ast_compat.dart';
+import '../../utils/riverpod_provider_detector.dart';
+
+const _trackedRefMethods = {'read', 'watch', 'listen', 'invalidate', 'refresh'};
+const _futureContinuationMethods = {'then', 'catchError', 'whenComplete'};
+const _timerTypeName = 'Timer';
+const _timerNamedConstructors = {'periodic', 'run'};
+
+/// `ref`, `(ref)`, `this.ref`, `(this).ref`, `super.ref` on parsed AST (no types).
+/// Cascade `ref..read` is recognized via [MethodInvocation.realTarget].
+bool _isRefReceiver(Expression? target) {
+  final current = _unwrapParens(target);
+  if (current is SimpleIdentifier) return current.name == 'ref';
+  return current is PropertyAccess &&
+      _isThisOrSuperReceiver(current.target) &&
+      current.propertyName.name == 'ref';
+}
+
+bool _isThisOrSuperReceiver(Expression? target) {
+  final current = _unwrapParens(target);
+  return current is ThisExpression || current is SuperExpression;
+}
+
+/// Selects which post-async-gap sites a [RiverpodRefAfterAsyncGapVisitor]
+/// reports.
+///
+/// [RiverpodRefAfterAsyncGapRule] tracks `ref.*` calls only. Unguarded
+/// `state = …` writes and `state` reads after a gap are tracked by the opt-in
+/// `riverpod_state_after_async_gap` rule, which reuses the same visitor with
+/// [stateAssignments] and [stateReads] enabled instead.
+class RefGapTracking {
+  const RefGapTracking({
+    required this.refCalls,
+    required this.stateAssignments,
+    required this.stateReads,
+  });
+
+  /// Report `ref.read/watch/listen/invalidate/refresh` after an async gap.
+  final bool refCalls;
+
+  /// Report simple `state = …` / `this.state = …` after an async gap.
+  final bool stateAssignments;
+
+  /// Report `state` / `this.state` reads (the getter also throws once the
+  /// provider is disposed) after an async gap.
+  final bool stateReads;
+}
+
+/// Reports Riverpod `ref` usage after an async gap in provider classes.
+///
+/// Unguarded `state` writes after a gap are intentionally *not* reported here;
+/// see the opt-in `riverpod_state_after_async_gap` rule.
+class RiverpodRefAfterAsyncGapRule extends AnalysisRule {
+  static const LintCode code = LintCode(
+    'riverpod_ref_after_async_gap',
+    '{0}',
+    correctionMessage: '{1}',
+    severity: DiagnosticSeverity.INFO,
+    uniqueName: 'LintCode.riverpod_ref_after_async_gap',
+  );
+
+  RiverpodRefAfterAsyncGapRule()
+    : super(
+        name: 'riverpod_ref_after_async_gap',
+        description:
+            'Advises against using Riverpod ref after an async gap (await, Future continuations, Stream.listen, Timer, or addListener callbacks) in provider classes.',
+      );
+
+  @override
+  bool get canUseParsedResult => true;
+
+  @override
+  DiagnosticCode get diagnosticCode => code;
+
+  @override
+  void registerNodeProcessors(
+    RuleVisitorRegistry registry,
+    RuleContext context,
+  ) {
+    final visitor = RiverpodRefAfterAsyncGapVisitor(
+      this,
+      context,
+      tracking: const RefGapTracking(
+        refCalls: true,
+        stateAssignments: false,
+        stateReads: false,
+      ),
+    );
+    registry.addClassDeclaration(this, visitor);
+    // Notifier helpers are routinely `extension on FooNotifier` (often in a
+    // part file). Class-only registration skipped those members entirely.
+    registry.addExtensionDeclaration(this, visitor);
+  }
+}
+
+/// Scans Riverpod notifier classes/extensions under
+/// `lib/**/presentation/**/providers/**` for post-async-gap sites selected by
+/// [tracking]. Shared by `riverpod_ref_after_async_gap` and
+/// `riverpod_state_after_async_gap`.
+class RiverpodRefAfterAsyncGapVisitor extends SimpleAstVisitor<void> {
+  RiverpodRefAfterAsyncGapVisitor(
+    this.rule,
+    this.context, {
+    required this.tracking,
+  });
+
+  final AnalysisRule rule;
+  final RuleContext context;
+  final RefGapTracking tracking;
+
+  String get _filePath =>
+      context.currentUnit?.file.path ?? context.definingUnit.file.path;
+
+  @override
+  void visitClassDeclaration(ClassDeclaration node) {
+    if (!_shouldCheckFile(_filePath)) return;
+    if (!isRiverpodNotifierClass(node)) return;
+
+    _scanMembers(classMembers(node));
+  }
+
+  @override
+  void visitExtensionDeclaration(ExtensionDeclaration node) {
+    if (!_shouldCheckFile(_filePath)) return;
+    if (!isRiverpodNotifierExtension(node)) return;
+
+    _scanMembers(extensionMembers(node));
+  }
+
+  void _scanMembers(Iterable<AstNode> members) {
+    final methods = [
+      for (final member in members)
+        if (member is MethodDeclaration) member,
+    ];
+    // Opt-in state tracking follows private methods. The default-on ref rule
+    // still skips them.
+    final syncPrivateStateTouches = _tracksState
+        ? _syncPrivateStateTouches(methods)
+        : const <String, _SyncPrivateStateTouch>{};
+
+    for (final member in methods) {
+      if (!_tracksState && _isPrivate(member.name.lexeme)) continue;
+
+      final reportedRefCallOffsets = <int>{};
+      if (member.body.isAsynchronous) {
+        _AsyncRefAfterGapScanner(
+          rule,
+          tracking: tracking,
+          reportedRefCallOffsets: reportedRefCallOffsets,
+          syncPrivateStateTouches: syncPrivateStateTouches,
+        ).scan(member.body);
+      }
+
+      member.body.accept(
+        _AsyncCallbackScanner(
+          rule,
+          tracking: tracking,
+          reportedRefCallOffsets: reportedRefCallOffsets,
+          syncPrivateStateTouches: syncPrivateStateTouches,
+        ),
+      );
+    }
+  }
+
+  bool get _tracksState => tracking.stateAssignments || tracking.stateReads;
+
+  /// Sync private methods whose own body reads or writes notifier `state`
+  /// outside a `ref.mounted` guard. Nested functions are ignored: a `Timer`
+  /// callback is reported when the private method itself is scanned, not
+  /// again at every call. A helper that guards every direct access is absent,
+  /// same as a public method whose body scan sees only guarded touches.
+  Map<String, _SyncPrivateStateTouch> _syncPrivateStateTouches(
+    List<MethodDeclaration> methods,
+  ) {
+    final probe = _AsyncRefAfterGapScanner(rule, tracking: tracking);
+    final touches = <String, _SyncPrivateStateTouch>{};
+    for (final method in methods) {
+      if (!_isPrivate(method.name.lexeme)) continue;
+      if (method.isGetter || method.isSetter || method.isOperator) continue;
+      if (method.body.isAsynchronous) continue;
+
+      probe._scannedBody = method.body;
+      final finder = _DirectStateTouchFinder(probe);
+      method.body.accept(finder);
+      if (!finder.unguardedReads && !finder.unguardedWrites) continue;
+      touches[method.name.lexeme] = _SyncPrivateStateTouch(
+        writes: finder.unguardedWrites,
+      );
+    }
+    return touches;
+  }
+
+  bool _shouldCheckFile(String filePath) {
+    if (CleanArchitectureUtils.shouldExcludeFile(filePath)) return false;
+
+    final normalized = filePath.replaceAll('\\', '/').toLowerCase();
+    return normalized.contains('/lib/') &&
+        normalized.contains('/presentation/') &&
+        normalized.contains('/providers/');
+  }
+
+  bool _isPrivate(String name) => name.startsWith('_');
+}
+
+class _AsyncCallbackScanner extends RecursiveAstVisitor<void> {
+  _AsyncCallbackScanner(
+    this.rule, {
+    required RefGapTracking tracking,
+    Set<int>? reportedRefCallOffsets,
+    this.syncPrivateStateTouches = const {},
+  }) : _tracking = tracking,
+       _reportedRefCallOffsets = reportedRefCallOffsets ?? {};
+
+  final AnalysisRule rule;
+  final RefGapTracking _tracking;
+  final Set<int> _reportedRefCallOffsets;
+  final Map<String, _SyncPrivateStateTouch> syncPrivateStateTouches;
+  final Map<String, FunctionDeclaration> _localFunctions = {};
+
+  @override
+  void visitFunctionDeclaration(FunctionDeclaration node) {
+    if (!node.functionExpression.body.isAsynchronous) {
+      _localFunctions[node.name.lexeme] = node;
+    }
+
+    super.visitFunctionDeclaration(node);
+  }
+
+  @override
+  void visitFunctionExpression(FunctionExpression node) {
+    // Deferred callbacks (`then`/`listen`/`Timer`/…) are scanned with
+    // `hasInheritedAsyncGap` from visitMethodInvocation / instance creation.
+    // Scanning them again here would duplicate opt-in state findings:
+    // assignment offsets live in the first scanner, so a second pass can
+    // still report the `state` read inside `state = state.copyWith(…)`.
+    if (node.body.isAsynchronous && !_isArgumentOfDeferredCallback(node)) {
+      _AsyncRefAfterGapScanner(
+        rule,
+        tracking: _tracking,
+        reportedRefCallOffsets: _reportedRefCallOffsets,
+        syncPrivateStateTouches: syncPrivateStateTouches,
+      ).scan(node.body);
+    }
+
+    super.visitFunctionExpression(node);
+  }
+
+  @override
+  void visitMethodInvocation(MethodInvocation node) {
+    if (_isDeferredCallbackInvocation(node)) {
+      _scanInheritedGapArguments(node.argumentList.arguments);
+    }
+
+    super.visitMethodInvocation(node);
+  }
+
+  @override
+  void visitInstanceCreationExpression(InstanceCreationExpression node) {
+    if (_isTimerInstanceCreation(node)) {
+      _scanInheritedGapArguments(node.argumentList.arguments);
+    }
+
+    super.visitInstanceCreationExpression(node);
+  }
+
+  /// `then`/`catchError`/`whenComplete`, `Stream.listen` (not `ref.listen`),
+  /// `addListener`, and `Timer` constructors all resume later — the callback
+  /// itself is the async gap, even in a sync enclosing method.
+  bool _isDeferredCallbackInvocation(MethodInvocation node) {
+    final name = node.methodName.name;
+    if (_futureContinuationMethods.contains(name)) return true;
+    if (name == 'addListener') return true;
+    if (name == 'listen') {
+      if (_isRefListen(node)) return false;
+      // Receiverless `listen(...)` is a local/inherited helper, not
+      // `Stream.listen`. Cascade `stream..listen` still has `realTarget`.
+      return (node.realTarget ?? node.target) != null;
+    }
+    return _isTimerConstructorInvocation(node);
+  }
+
+  /// Whether [node] is an inline argument of a deferred callback invocation
+  /// already scanned by [_scanInheritedGapArguments].
+  bool _isArgumentOfDeferredCallback(FunctionExpression node) {
+    AstNode? current = node.parent;
+    while (current is ParenthesizedExpression) {
+      current = current.parent;
+    }
+    if (current != null && namedArgumentName(current) != null) {
+      current = current.parent;
+    }
+    if (current is! ArgumentList) return false;
+    final parent = current.parent;
+    if (parent is MethodInvocation) {
+      return _isDeferredCallbackInvocation(parent);
+    }
+    if (parent is InstanceCreationExpression) {
+      return _isTimerInstanceCreation(parent);
+    }
+    return false;
+  }
+
+  void _scanInheritedGapArguments(Iterable<AstNode> arguments) {
+    for (final argument in arguments) {
+      final body = _resolveCallbackBody(argument);
+      if (body == null) continue;
+
+      _AsyncRefAfterGapScanner(
+        rule,
+        tracking: _tracking,
+        hasInheritedAsyncGap: true,
+        reportedRefCallOffsets: _reportedRefCallOffsets,
+        syncPrivateStateTouches: syncPrivateStateTouches,
+      ).scan(body);
+    }
+  }
+
+  /// Resolves a deferred-callback argument to the [FunctionBody] it will
+  /// run, covering both inline closures and tear-offs of a local function
+  /// declared earlier in the same method (e.g. `fetchTodo().then(onDone)`).
+  FunctionBody? _resolveCallbackBody(AstNode argument) {
+    final expression = _unwrapParens(callbackArgumentExpression(argument));
+    if (expression is FunctionExpression) return expression.body;
+    if (expression is SimpleIdentifier) {
+      return _localFunctions[expression.name]?.functionExpression.body;
+    }
+
+    return null;
+  }
+}
+
+bool _isRefListen(MethodInvocation node) {
+  // Cascade `ref..listen(...)` has a null `target`; `realTarget` is `ref`.
+  return _isRefReceiver(_unwrapParens(node.realTarget ?? node.target));
+}
+
+Expression? _unwrapParens(Expression? expression) {
+  var current = expression;
+  while (current is ParenthesizedExpression) {
+    current = current.expression;
+  }
+  return current;
+}
+
+bool _isTimerConstructorInvocation(MethodInvocation node) {
+  if (node.methodName.name == _timerTypeName && node.target == null) {
+    return true;
+  }
+  return _timerTypeNameFrom(node.target) == _timerTypeName &&
+      _timerNamedConstructors.contains(node.methodName.name);
+}
+
+bool _isTimerInstanceCreation(InstanceCreationExpression node) {
+  final type = node.constructorName.type;
+  if (type.name.lexeme == _timerTypeName) return true;
+  // `new Timer.periodic(...)` parses NamedType as prefix=Timer, name=periodic.
+  return type.importPrefix?.name.lexeme == _timerTypeName &&
+      _timerNamedConstructors.contains(type.name.lexeme);
+}
+
+String? _timerTypeNameFrom(Expression? target) {
+  final current = _unwrapParens(target);
+  if (current is SimpleIdentifier) return current.name;
+  if (current is PrefixedIdentifier) return current.identifier.name;
+  if (current is PropertyAccess) return current.propertyName.name;
+  return null;
+}
+
+class _SyncPrivateStateTouch {
+  const _SyncPrivateStateTouch({required this.writes});
+
+  /// True when the method's own body assigns notifier `state`. A read-only
+  /// body keeps this false so the call is reported as a read.
+  final bool writes;
+}
+
+class _AsyncRefAfterGapScanner extends RecursiveAstVisitor<void> {
+  _AsyncRefAfterGapScanner(
+    this.rule, {
+    required RefGapTracking tracking,
+    bool hasInheritedAsyncGap = false,
+    Map<String, FunctionDeclaration>? localFunctions,
+    Set<String>? activeLocalFunctionNames,
+    Set<int>? reportedRefCallOffsets,
+    this.syncPrivateStateTouches = const {},
+  }) : _tracking = tracking,
+       _hasInheritedAsyncGap = hasInheritedAsyncGap,
+       _localFunctions = localFunctions ?? {},
+       _activeLocalFunctionNames = activeLocalFunctionNames ?? {},
+       _reportedRefCallOffsets = reportedRefCallOffsets ?? {};
+
+  final AnalysisRule rule;
+  final RefGapTracking _tracking;
+  final bool _hasInheritedAsyncGap;
+  final Map<String, FunctionDeclaration> _localFunctions;
+  final Set<String> _activeLocalFunctionNames;
+  final Set<int> _reportedRefCallOffsets;
+  final Map<String, _SyncPrivateStateTouch> syncPrivateStateTouches;
+  final List<MethodInvocation> _refCalls = [];
+  final List<AssignmentExpression> _stateAssignments = [];
+  final List<SimpleIdentifier> _stateReads = [];
+  final List<MethodInvocation> _syncPrivateCalls = [];
+  final List<AssignmentExpression> _reportedAssignments = [];
+  final Set<int> _reportedReadStatementOffsets = {};
+  FunctionBody? _scannedBody;
+
+  void scan(FunctionBody body) {
+    _scannedBody = body;
+    body.accept(this);
+
+    if (_tracking.refCalls) {
+      for (final refCall in _refCalls) {
+        if (_shouldReport(refCall)) {
+          _reportRefCall(refCall);
+        }
+      }
+    }
+
+    if (_tracking.stateAssignments) {
+      for (final assignment in _stateAssignments) {
+        if (_shouldReport(assignment)) {
+          _reportedAssignments.add(assignment);
+          _reportStateAssignment(assignment);
+        }
+      }
+    }
+
+    if (_tracking.stateReads) {
+      for (final read in _stateReads) {
+        // `state = state.copyWith(…)` is one finding, not two.
+        if (_isInsideReportedAssignment(read)) continue;
+        if (!_shouldReport(read)) continue;
+        // One finding per statement; `state.a + state.b` is a single site.
+        final statement = read.thisOrAncestorOfType<Statement>();
+        if (!_reportedReadStatementOffsets.add(
+          statement?.offset ?? read.offset,
+        )) {
+          continue;
+        }
+        _reportStateRead(read);
+      }
+    }
+
+    if (syncPrivateStateTouches.isNotEmpty) {
+      for (final call in _syncPrivateCalls) {
+        // `state = _apply()` is the assignment finding. The helper call inside
+        // that RHS is the same site.
+        if (_isInsideReportedAssignment(call)) continue;
+        if (!_shouldReport(call)) continue;
+        final touch = syncPrivateStateTouches[call.methodName.name];
+        if (touch == null) continue;
+        if (touch.writes) {
+          _reportStateAssignment(call);
+        } else {
+          _reportStateRead(call);
+        }
+      }
+    }
+  }
+
+  bool _isInsideReportedAssignment(AstNode node) => _reportedAssignments.any(
+    (assignment) =>
+        node.offset >= assignment.offset && node.end <= assignment.end,
+  );
+
+  @override
+  void visitFunctionDeclaration(FunctionDeclaration node) {
+    if (node.functionExpression.body.isAsynchronous) {
+      // Async local functions are scanned separately by _AsyncCallbackScanner.
+      return;
+    }
+
+    _localFunctions[node.name.lexeme] = node;
+  }
+
+  @override
+  void visitFunctionExpression(FunctionExpression node) {
+    if (node.body.isAsynchronous) {
+      // Async callbacks are scanned separately by _AsyncCallbackScanner.
+      return;
+    }
+
+    super.visitFunctionExpression(node);
+  }
+
+  @override
+  void visitMethodInvocation(MethodInvocation node) {
+    // Cascade `ref..read(...)` has a null `target`; `realTarget` is `ref`.
+    final target = node.realTarget ?? node.target;
+    final methodName = node.methodName.name;
+
+    if (_isRefTarget(target) && _trackedRefMethods.contains(methodName)) {
+      _refCalls.add(node);
+    }
+
+    _scanLocalFunctionInvocation(node);
+    _considerSyncPrivateStateCall(node);
+
+    super.visitMethodInvocation(node);
+  }
+
+  /// `_apply()` / `this._apply()` after a gap, when that method is a sync
+  /// private method that touches notifier `state` in its own body outside a
+  /// `ref.mounted` guard. Async helpers, and sync helpers whose every direct
+  /// touch is guarded, are absent from [syncPrivateStateTouches]; async
+  /// bodies are scanned instead.
+  void _considerSyncPrivateStateCall(MethodInvocation node) {
+    if (syncPrivateStateTouches.isEmpty) return;
+    if (!_isImplicitThisCall(node)) return;
+    final name = node.methodName.name;
+    if (_localFunctions.containsKey(name)) return;
+    if (!syncPrivateStateTouches.containsKey(name)) return;
+    _syncPrivateCalls.add(node);
+  }
+
+  bool _isImplicitThisCall(MethodInvocation node) {
+    final target = _unwrapParens(node.target);
+    if (target == null) {
+      final real = _unwrapParens(node.realTarget);
+      return real == null || real is ThisExpression;
+    }
+    return target is ThisExpression;
+  }
+
+  @override
+  void visitAssignmentExpression(AssignmentExpression node) {
+    // Simple `state = …` / `this.state = …` only.
+    // Out of scope: compound ops (`??=`, `+=`, …). A bare `state` target that
+    // is shadowed by a local/parameter/loop variable named `state` is not the
+    // notifier setter (same parsed-AST shadowing as reads).
+    final target = node.leftHandSide;
+    if (_tracking.stateAssignments &&
+        node.operator.lexeme == '=' &&
+        _isStateTarget(target) &&
+        !(target is SimpleIdentifier && _isShadowedState(target))) {
+      _stateAssignments.add(node);
+    }
+
+    super.visitAssignmentExpression(node);
+  }
+
+  @override
+  void visitSimpleIdentifier(SimpleIdentifier node) {
+    if (_tracking.stateReads && _isStateRead(node)) {
+      _stateReads.add(node);
+    }
+
+    super.visitSimpleIdentifier(node);
+  }
+
+  /// `state` / `this.state` used as a value. Excludes assignment targets
+  /// (tracked separately), declarations, named-argument labels, method names,
+  /// and `other.state` properties of some other object.
+  ///
+  /// Name-based match would otherwise FP on a local or parameter named `state`
+  /// (same caveat as [visitAssignmentExpression]). Locals, lambda/method
+  /// parameters, and catch variables named `state` are skipped. `this.state`
+  /// is always the notifier getter.
+  bool _isStateRead(SimpleIdentifier node) {
+    if (node.name != 'state' || node.inDeclarationContext()) return false;
+
+    final parent = node.parent;
+    if (parent is Label) return false;
+    if (parent is MethodInvocation && parent.methodName == node) return false;
+    if (parent is AssignmentExpression && parent.leftHandSide == node) {
+      return false;
+    }
+    if (parent is PrefixedIdentifier && parent.identifier == node) {
+      return false;
+    }
+    if (parent is PropertyAccess && parent.propertyName == node) {
+      if (!_isSelfTarget(parent.target)) return false;
+      final grandParent = parent.parent;
+      if (grandParent is AssignmentExpression &&
+          grandParent.leftHandSide == parent) {
+        return false;
+      }
+    }
+
+    if (!_isThisStateAccess(node) && _isShadowedState(node)) return false;
+
+    return true;
+  }
+
+  /// `this.state`, `super.state`, `(this).state` — all the notifier getter.
+  bool _isThisStateAccess(SimpleIdentifier node) {
+    final parent = node.parent;
+    return parent is PropertyAccess &&
+        parent.propertyName == node &&
+        _isSelfTarget(parent.target);
+  }
+
+  bool _isSelfTarget(Expression? target) => _isThisOrSuperReceiver(target);
+
+  /// Parsed-AST shadowing: a local, parameter, or catch variable named
+  /// `state` is not the notifier getter. Resolution is unavailable because
+  /// this rule uses parsed results.
+  bool _isShadowedState(SimpleIdentifier node) {
+    AstNode child = node;
+    AstNode? current = node.parent;
+    while (current != null &&
+        current is! ClassDeclaration &&
+        current is! ExtensionDeclaration) {
+      if (current is FunctionExpression &&
+          _parametersDeclareState(current.parameters)) {
+        return true;
+      }
+      if (current is MethodDeclaration &&
+          _parametersDeclareState(current.parameters)) {
+        return true;
+      }
+      if (current is FunctionDeclaration &&
+          _parametersDeclareState(current.functionExpression.parameters)) {
+        return true;
+      }
+      if (current is CatchClause) {
+        if (current.exceptionParameter?.name.lexeme == 'state') return true;
+        if (current.stackTraceParameter?.name.lexeme == 'state') return true;
+      }
+      if (current is SwitchMember) {
+        if (_statementsDeclareStateBefore(current.statements, node)) {
+          return true;
+        }
+        if (current is SwitchPatternCase &&
+            _patternDeclaresState(current.guardedPattern.pattern)) {
+          return true;
+        }
+      }
+      if (current is SwitchExpressionCase &&
+          _patternDeclaresState(current.guardedPattern.pattern)) {
+        return true;
+      }
+      // An if-case pattern variable is only in scope in the `when` guard and
+      // the then branch; an `else` branch still sees the notifier getter.
+      if (current is IfStatement) {
+        final caseClause = current.caseClause;
+        if (caseClause != null &&
+            (identical(child, caseClause) ||
+                identical(child, current.thenStatement)) &&
+            _patternDeclaresState(caseClause.guardedPattern.pattern)) {
+          return true;
+        }
+      }
+      if (current is IfElement) {
+        final caseClause = current.caseClause;
+        if (caseClause != null &&
+            (identical(child, caseClause) ||
+                identical(child, current.thenElement)) &&
+            _patternDeclaresState(caseClause.guardedPattern.pattern)) {
+          return true;
+        }
+      }
+      if (current is Block &&
+          _statementsDeclareStateBefore(current.statements, node)) {
+        return true;
+      }
+      if (current is ForStatement || current is ForElement) {
+        final parts = current is ForStatement
+            ? current.forLoopParts
+            : (current as ForElement).forLoopParts;
+        // A loop variable is in scope in the body (and, for C-style loops,
+        // in the condition/updaters), not in its own initializer or the
+        // iterable: `for (final state in state.items)` and
+        // `for (var state = state.session; …)` read the getter first.
+        if (parts is ForEachPartsWithDeclaration &&
+            parts.loopVariable.name.lexeme == 'state' &&
+            node.offset >= parts.end) {
+          return true;
+        }
+        if (parts is ForEachPartsWithPattern &&
+            node.offset >= parts.end &&
+            _patternDeclaresState(parts.pattern)) {
+          return true;
+        }
+        if (parts is ForPartsWithDeclarations) {
+          for (final variable in parts.variables.variables) {
+            if (variable.name.lexeme == 'state' &&
+                node.offset >= variable.end) {
+              return true;
+            }
+          }
+        }
+        if (parts is ForPartsWithPattern &&
+            node.offset >= parts.variables.end &&
+            _patternDeclaresState(parts.variables.pattern)) {
+          return true;
+        }
+      }
+      child = current;
+      current = current.parent;
+    }
+    return false;
+  }
+
+  /// Unbraced `case` bodies keep their statements on the [SwitchMember],
+  /// not in a [Block].
+  bool _statementsDeclareStateBefore(
+    NodeList<Statement> statements,
+    AstNode node,
+  ) {
+    for (final statement in statements) {
+      if (statement.offset >= node.offset) break;
+      if (statement is VariableDeclarationStatement) {
+        for (final variable in statement.variables.variables) {
+          if (variable.name.lexeme == 'state') return true;
+        }
+      }
+      if (statement is PatternVariableDeclarationStatement &&
+          _patternDeclaresState(statement.declaration.pattern)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Whether [pattern] binds a variable named `state` (Dart 3 patterns:
+  /// `case Foo(:final state)`, `if (x case final state)`,
+  /// `var (a, state) = …`, `for (final (state, _) in …)`).
+  bool _patternDeclaresState(DartPattern pattern) {
+    final finder = _DeclaredStateFinder();
+    pattern.accept(finder);
+    return finder.found;
+  }
+
+  bool _parametersDeclareState(FormalParameterList? parameters) {
+    if (parameters == null) return false;
+    for (final parameter in parameters.parameters) {
+      if (formalParameterName(parameter) == 'state') return true;
+    }
+    return false;
+  }
+
+  bool _isRefTarget(Expression? target) => _isRefReceiver(target);
+
+  /// `state = …`, `this.state = …`, `super.state = …`, `(this).state = …` —
+  /// the same self targets [_isThisStateAccess] accepts for reads.
+  bool _isStateTarget(Expression target) {
+    if (target is SimpleIdentifier) return target.name == 'state';
+
+    return target is PropertyAccess &&
+        _isSelfTarget(target.target) &&
+        target.propertyName.name == 'state';
+  }
+
+  /// Whether an `await` actually precedes [node] on its own execution path.
+  ///
+  /// Walks the ancestor chain from [node] up to the scanned function body and
+  /// only counts `await`s that sequentially execute before the suspect node:
+  /// earlier statements within an enclosing block, or — when the node sits
+  /// inside a `catch`/`finally` — the `try` body. Awaits in mutually exclusive
+  /// sibling branches (`if`/`else`, separate `switch` cases) are NOT counted,
+  /// which removes the false positives the flat-offset scan produced.
+  ///
+  /// Same-statement awaits (`await foo() ?? state`) are handled separately by
+  /// [_hasExpressionPriorAwait] so the default-on ref rule stays unchanged.
+  bool _hasPriorAsyncGap(AstNode node) {
+    AstNode child = node;
+    AstNode? parent = child.parent;
+    while (parent != null) {
+      if (identical(child, _scannedBody)) break;
+
+      if (parent is Block || (parent is SwitchMember && _tracking.stateReads)) {
+        // Unbraced `case` bodies keep their statements on the SwitchMember.
+        // Opt-in rule only for SwitchMember, so the default-on ref rule's
+        // output is unchanged.
+        final statements = parent is Block
+            ? parent.statements
+            : (parent as SwitchMember).statements;
+        for (final statement in statements) {
+          if (identical(statement, child)) break;
+          if (_subtreeHasAwait(statement)) return true;
+        }
+      } else if (parent is TryStatement && !identical(child, parent.body)) {
+        // The node lives in a catch clause or finally block, both of which
+        // execute after the try body (including after an await that threw).
+        if (_subtreeHasAwait(parent.body)) return true;
+      } else if (_tracking.stateReads &&
+          _bodyFollowsControlAwait(parent, child)) {
+        // `if (await check()) { use(state); }`, `while (await more()) {…}`,
+        // `for (final x in await list()) {…}` — the body runs after the
+        // control expression's await. A `ref.mounted` guard inside the body
+        // still applies (checked by _isDisposalGuarded). Opt-in rule only, so
+        // the default-on ref rule's output is unchanged.
+        return true;
+      }
+
+      child = parent;
+      parent = child.parent;
+    }
+    return false;
+  }
+
+  /// Whether an `await` evaluates before [node] in the same expression.
+  ///
+  /// Dart evaluates left-to-right. `await foo() ?? state` and
+  /// `use(await foo(), state)` read `state` after the gap; `state.foo(await x)`
+  /// and `await foo(state)` evaluate `state` first and must not report.
+  /// An await inside the argument list of the call being reported
+  /// (`_apply(await fetch())`) is a descendant of that call, not a prior
+  /// sibling; [_shouldReport] treats it like an assignment RHS. A later
+  /// sibling (`use(_apply(), await fetch())`) stays quiet.
+  /// Nested function bodies are ignored by [_subtreeHasAwait].
+  ///
+  /// One exception crosses an iteration boundary rather than staying within a
+  /// single evaluation pass: a `for` loop condition is also treated as
+  /// running after the *previous* iteration's updaters (see the `ForParts`
+  /// case in [_evalPredecessors]), since from the second iteration on the
+  /// condition genuinely does run after them.
+  bool _hasExpressionPriorAwait(AstNode node) {
+    AstNode child = node;
+    AstNode? parent = child.parent;
+    while (parent != null) {
+      if (identical(child, _scannedBody)) break;
+      // Statement boundary: `if (await …) { … }` is a prior-gap question
+      // for _hasPriorAsyncGap (which respects a `ref.mounted` guard), not a
+      // same-expression one.
+      if (parent is FunctionBody || parent is Statement) break;
+      if (_priorEvalSiblingsHaveAwait(parent, child)) return true;
+      child = parent;
+      parent = child.parent;
+    }
+    return false;
+  }
+
+  bool _priorEvalSiblingsHaveAwait(AstNode parent, AstNode child) {
+    for (final predecessor in _evalPredecessors(parent, child)) {
+      if (_subtreeHasAwait(predecessor)) return true;
+    }
+    return false;
+  }
+
+  List<AstNode> _evalPredecessors(AstNode parent, AstNode child) {
+    if (parent is BinaryExpression) {
+      if (identical(child, parent.rightOperand)) return [parent.leftOperand];
+      return const [];
+    }
+    if (parent is AssignmentExpression) {
+      // Dart evaluates the assignment target (receiver/index) before the
+      // right-hand side: `items[state.i] = await f()` reads `state` first,
+      // while `(await g()).value = state` reads it after the gap.
+      if (identical(child, parent.rightHandSide)) {
+        return [parent.leftHandSide];
+      }
+      return const [];
+    }
+    if (parent is ConditionalExpression) {
+      if (identical(child, parent.thenExpression) ||
+          identical(child, parent.elseExpression)) {
+        return [parent.condition];
+      }
+      return const [];
+    }
+    if (parent is ArgumentList) {
+      return _priorNodes(parent.arguments, child);
+    }
+    if (parent is MethodInvocation) {
+      final target = parent.target;
+      if (target != null && !identical(child, target)) return [target];
+      return const [];
+    }
+    if (parent is FunctionExpressionInvocation) {
+      if (!identical(child, parent.function)) return [parent.function];
+      return const [];
+    }
+    if (parent is PropertyAccess) {
+      final target = parent.target;
+      if (target != null && identical(child, parent.propertyName)) {
+        return [target];
+      }
+      return const [];
+    }
+    if (parent is PrefixedIdentifier) {
+      if (identical(child, parent.identifier)) return [parent.prefix];
+      return const [];
+    }
+    if (parent is IndexExpression) {
+      final target = parent.target;
+      if (target != null && identical(child, parent.index)) return [target];
+      return const [];
+    }
+    if (parent is CascadeExpression) {
+      if (identical(child, parent.target)) return const [];
+      return [parent.target, ..._priorNodes(parent.cascadeSections, child)];
+    }
+    if (parent is ListLiteral) {
+      return _priorNodes(parent.elements, child);
+    }
+    if (parent is SetOrMapLiteral) {
+      return _priorNodes(parent.elements, child);
+    }
+    if (parent is MapLiteralEntry) {
+      // `{await k: state}` evaluates the key before the value.
+      if (identical(child, parent.value)) return [parent.key];
+      return const [];
+    }
+    if (parent is StringInterpolation) {
+      return _priorNodes(parent.elements, child);
+    }
+    if (parent is RecordLiteral) {
+      return _priorNodes(parent.fields, child);
+    }
+    if (parent is SwitchExpression) {
+      if (identical(child, parent.expression)) return const [];
+      // Cases are tried in order: an earlier case's `when` guard may have
+      // awaited before this case is reached.
+      return [
+        parent.expression,
+        for (final earlier in _priorNodes(parent.cases, child))
+          if (earlier is SwitchExpressionCase)
+            ?_whenExpression(earlier.guardedPattern),
+      ];
+    }
+    if (parent is ForParts) {
+      // Header order: declarations/initializer → condition → updaters. From
+      // the second iteration on, the condition runs after the previous
+      // iteration's updaters, so treat them as predecessors too — a
+      // conservative over-approximation, since on the very first evaluation
+      // of the condition no updater has actually run yet (the same kind of
+      // first-iteration slack _forPartsAwaitSources accepts below for the
+      // loop body).
+      if (identical(child, parent.condition)) {
+        return [
+          if (parent is ForPartsWithDeclarations) parent.variables,
+          if (parent is ForPartsWithPattern) parent.variables,
+          if (parent is ForPartsWithExpression) ?parent.initialization,
+          ...parent.updaters,
+        ];
+      }
+      if (parent.updaters.any((u) => identical(u, child))) {
+        return [
+          if (parent is ForPartsWithDeclarations) parent.variables,
+          if (parent is ForPartsWithPattern) parent.variables,
+          if (parent is ForPartsWithExpression) ?parent.initialization,
+          ?parent.condition,
+          ..._priorNodes(parent.updaters, child),
+        ];
+      }
+      return const [];
+    }
+    if (parent is VariableDeclarationList) {
+      return _priorNodes(parent.variables, child);
+    }
+    if (parent is SwitchExpressionCase) {
+      // `case final x when await pred(x) => state.foo` — the guard awaits
+      // before the case body evaluates.
+      final when = _whenExpression(parent.guardedPattern);
+      if (when != null && identical(child, parent.expression)) return [when];
+      return const [];
+    }
+    if (parent is IfElement) {
+      if (identical(child, parent.thenElement) ||
+          identical(child, parent.elseElement)) {
+        return [
+          parent.expression,
+          ?_whenExpression(parent.caseClause?.guardedPattern),
+        ];
+      }
+      // The scrutinee is evaluated before the case clause's `when` guard.
+      if (identical(child, parent.caseClause)) return [parent.expression];
+      return const [];
+    }
+    if (parent is ForElement && identical(child, parent.body)) {
+      return _forPartsAwaitSources(parent.forLoopParts);
+    }
+    return const [];
+  }
+
+  /// The parts of a `for` header that run before the body on the first
+  /// iteration (iterable, initializer/declarations, condition) plus the
+  /// updaters, which run before every later iteration.
+  List<AstNode> _forPartsAwaitSources(ForLoopParts parts) {
+    if (parts is ForEachParts) return [parts.iterable];
+    if (parts is ForParts) {
+      return [
+        if (parts is ForPartsWithDeclarations) parts.variables,
+        if (parts is ForPartsWithPattern) parts.variables,
+        if (parts is ForPartsWithExpression) ?parts.initialization,
+        ?parts.condition,
+        ...parts.updaters,
+      ];
+    }
+    return const [];
+  }
+
+  List<AstNode> _priorNodes(NodeList<AstNode> nodes, AstNode child) {
+    final prior = <AstNode>[];
+    for (final node in nodes) {
+      if (identical(node, child)) break;
+      prior.add(node);
+    }
+    return prior;
+  }
+
+  /// Whether [child] is a branch/loop body whose control expression(s) in
+  /// [parent] contain an `await` that runs before the body.
+  bool _bodyFollowsControlAwait(AstNode parent, AstNode child) {
+    if (parent is SwitchStatement) {
+      if (identical(child, parent.expression)) return false;
+      if (_subtreeHasAwait(parent.expression)) return true;
+      // Cases are tried in order, so a `when` guard on this or an earlier
+      // pattern case may have awaited before this case's body runs.
+      for (final member in parent.members) {
+        if (member is SwitchPatternCase) {
+          final when = _whenExpression(member.guardedPattern);
+          if (when != null && _subtreeHasAwait(when)) return true;
+        }
+        if (identical(member, child)) break;
+      }
+      return false;
+    }
+    if (parent is IfStatement) {
+      if (identical(child, parent.expression)) return false;
+      // The scrutinee is evaluated before the case clause's `when` guard,
+      // and before either branch.
+      if (_subtreeHasAwait(parent.expression)) return true;
+      if (identical(child, parent.caseClause)) return false;
+      // `if (v case final x when await pred(x)) {…}` — the guard awaits
+      // before either branch runs.
+      final when = _whenExpression(parent.caseClause?.guardedPattern);
+      return when != null && _subtreeHasAwait(when);
+    }
+    if (parent is ForElement) {
+      return identical(child, parent.body) && parent.awaitKeyword != null;
+    }
+    if (parent is WhileStatement) {
+      return identical(child, parent.body) &&
+          _subtreeHasAwait(parent.condition);
+    }
+    if (parent is DoStatement) {
+      // The body re-runs after the condition from the second iteration on.
+      if (identical(child, parent.body)) {
+        return _subtreeHasAwait(parent.condition);
+      }
+      // The `while (…)` condition always runs after the body, on every
+      // iteration including the first, so an await in the body makes the
+      // condition a post-gap read (still subject to a `ref.mounted` guard
+      // inside the body via _isDisposalGuarded).
+      if (identical(child, parent.condition)) {
+        return _subtreeHasAwait(parent.body);
+      }
+      return false;
+    }
+    if (parent is ForStatement) {
+      // `await for` suspends before every body run even though the keyword
+      // is not an AwaitExpression.
+      return identical(child, parent.body) &&
+          (parent.awaitKeyword != null ||
+              _forPartsAwaitSources(parent.forLoopParts).any(_subtreeHasAwait));
+    }
+    return false;
+  }
+
+  /// Whether [node]'s subtree contains an `await`, without descending into
+  /// nested function bodies (their awaits do not sequentially precede code in
+  /// the enclosing scope).
+  bool _subtreeHasAwait(AstNode node) {
+    final finder = _AwaitFinder(includeAwaitFor: _tracking.stateReads);
+    node.accept(finder);
+    return finder.found;
+  }
+
+  /// The `when` guard expression of a pattern case, if any.
+  Expression? _whenExpression(GuardedPattern? guarded) =>
+      guarded?.whenClause?.expression;
+
+  bool _shouldReport(AstNode node) {
+    // `state = await expr` — the store runs after the await. A preceding
+    // `ref.mounted` guard cannot protect the write mid-expression, so RHS
+    // await is always an unguardable gap for state assignments.
+    final hasRhsAwait =
+        node is AssignmentExpression && _subtreeHasAwait(node.rightHandSide);
+    // Arguments evaluate before the callee body. `_apply(await fetch())`
+    // touches state after that gap; `use(_apply(), await fetch())` does not,
+    // because the await is a later sibling rather than this call's arguments.
+    // A preceding `ref.mounted` guard cannot cover an await inside the
+    // argument list. Gated on state tracking so the default-on ref rule's
+    // diagnostics stay unchanged.
+    final hasArgumentAwait =
+        _tracking.stateReads &&
+        node is MethodInvocation &&
+        _subtreeHasAwait(node.argumentList);
+    // Same-statement reads: `await foo() ?? state` is a gap; the default-on
+    // ref rule does not use this path, so its diagnostics stay unchanged.
+    final hasExpressionPriorAwait =
+        _tracking.stateReads &&
+        (node is SimpleIdentifier || node is MethodInvocation) &&
+        _hasExpressionPriorAwait(node);
+    if (!_hasInheritedAsyncGap &&
+        !hasRhsAwait &&
+        !hasArgumentAwait &&
+        !hasExpressionPriorAwait &&
+        !_hasPriorAsyncGap(node)) {
+      return false;
+    }
+    // A preceding `ref.mounted` guard cannot protect a getter that runs
+    // after an await in the same expression (`await foo() ?? state`), nor a
+    // private call whose arguments await before the body runs.
+    if (!hasRhsAwait &&
+        !hasArgumentAwait &&
+        !hasExpressionPriorAwait &&
+        _isDisposalGuarded(node)) {
+      return false;
+    }
+
+    return _reportedRefCallOffsets.add(node.offset);
+  }
+
+  /// Whether [node] is dominated by a `ref.mounted` disposal guard that no
+  /// later `await` has invalidated.
+  ///
+  /// Recognises both the early-return form and the positive wrapper:
+  ///
+  /// ```dart
+  /// await save();
+  /// if (!ref.mounted) return;   // early return
+  /// ref.invalidate(p);          // guarded
+  /// state = next;               // also guarded
+  ///
+  /// await save();
+  /// if (ref.mounted) {          // positive wrapper
+  ///   ref.invalidate(p);        // guarded
+  ///   state = next;             // guarded
+  /// }
+  /// ```
+  ///
+  /// A guard only protects the code that runs before the next async gap, so an
+  /// `await` between the guard and [node] makes the guard stale:
+  ///
+  /// ```dart
+  /// if (!ref.mounted) return;
+  /// await save();
+  /// ref.invalidate(p);          // still reported
+  /// state = next;               // still reported
+  /// ```
+  bool _isDisposalGuarded(AstNode node) {
+    AstNode child = node;
+    AstNode? parent = child.parent;
+    while (parent != null) {
+      if (identical(child, _scannedBody)) break;
+
+      if (parent is Block) {
+        final verdict = _siblingGuardVerdict(parent.statements, child);
+        if (verdict != null) return verdict;
+      } else if (parent is SwitchMember) {
+        // Unbraced `case` bodies keep their statements on the SwitchMember,
+        // so `case 1: await f(); if (!ref.mounted) return; use(state);` is
+        // guarded exactly like the braced form.
+        final verdict = _siblingGuardVerdict(parent.statements, child);
+        if (verdict != null) return verdict;
+      } else if (parent is IfStatement) {
+        // `if (ref.mounted) { <node> }`
+        if (identical(child, parent.thenStatement) &&
+            _isRefMountedCheck(parent.expression, negated: false)) {
+          return true;
+        }
+        // `if (!ref.mounted) return; else { <node> }` — the else branch is
+        // only reachable while mounted.
+        if (identical(child, parent.elseStatement) &&
+            _isRefMountedEarlyReturnGuard(parent)) {
+          return true;
+        }
+      } else if (parent is TryStatement && !identical(child, parent.body)) {
+        // The node is in a catch clause or finally block, which run after
+        // the try body — including after an await in it that threw. Any guard
+        // outside the try is therefore stale.
+        if (_subtreeHasAwait(parent.body)) return false;
+      } else if (parent is DoStatement && identical(child, parent.condition)) {
+        // `do { await f(); if (!ref.mounted) return; } while (state…);` — a
+        // guard as the body's last relevant statement still protects the
+        // condition check that runs right after it, exactly like a guard
+        // protecting the statement that follows it in a Block.
+        final verdict = _doWhileBodyGuardVerdict(parent);
+        if (verdict != null) return verdict;
+      } else if (_awaitingLoopBody(parent, child)) {
+        // On the second and later iterations the loop body's own await has
+        // already run, so a guard outside the loop no longer holds.
+        return false;
+      }
+
+      child = parent;
+      parent = child.parent;
+    }
+
+    return false;
+  }
+
+  /// Scans the [statements] that precede [child] in one statement list.
+  ///
+  /// When [child] is not itself a member of [statements] (as when a
+  /// do-while's `parent.condition` is passed in), the `break` never fires and
+  /// the entire list is scanned — the intended behavior there, since the
+  /// condition runs after every statement in the body.
+  ///
+  /// Returns `true` when a `ref.mounted` early-return guard is the last
+  /// relevant sibling, `false` when an `await` runs after any such guard (so
+  /// no outer guard can still protect the node), and `null` when the list is
+  /// inconclusive and the walk should continue outward.
+  bool? _siblingGuardVerdict(List<Statement> statements, AstNode child) {
+    var guarded = false;
+    var awaitAfterGuard = false;
+    for (final statement in statements) {
+      if (identical(statement, child)) break;
+      if (_isRefMountedEarlyReturnGuard(statement)) {
+        guarded = true;
+        awaitAfterGuard = false;
+      } else if (_subtreeHasAwait(statement)) {
+        guarded = false;
+        awaitAfterGuard = true;
+      }
+    }
+    if (guarded) return true;
+    if (awaitAfterGuard) return false;
+    return null;
+  }
+
+  /// Whether a `ref.mounted` guard as [stmt]'s body's last relevant statement
+  /// still protects [stmt]'s own `while (…)` condition.
+  ///
+  /// Used only for that condition, not for whatever statement follows [stmt]
+  /// as a sibling: a nested do-while is deliberately *not* recognized as a
+  /// guard by [_siblingGuardVerdict] for a following sibling or an outer
+  /// do-while's condition — see the README's `riverpod_state_after_async_gap`
+  /// section for that documented, conservative (false-positive-direction)
+  /// limitation.
+  ///
+  /// A `break`/`continue` anywhere in the body can reach the condition (via
+  /// `continue`, which in a do-while jumps straight to the condition check)
+  /// or skip past the loop entirely (via `break`) without ever running
+  /// through a guard placed after it in the same statement list — so any
+  /// jump statement in the body makes the tail guard untrustworthy: `false`
+  /// when the body still has its own `await` (a jump-free path runs it with
+  /// nothing of its own protecting the condition, and any guard preceding
+  /// this do-while entirely is stale against it too), `null` only when the
+  /// body has no `await` at all to be stale against. This is deliberately
+  /// coarse (it does not distinguish a jump that targets this loop from one
+  /// that targets an inner loop nested in the body, or check whether the
+  /// jump is actually positioned before the guard), matching this file's
+  /// "when unsure, don't suppress" philosophy elsewhere (e.g. the try/catch
+  /// and loop-body-await branches in [_isDisposalGuarded]).
+  ///
+  /// Same tri-state contract as [_siblingGuardVerdict]: `true` when guarded,
+  /// `false` when an await follows the last guard, `null` when inconclusive.
+  bool? _doWhileBodyGuardVerdict(DoStatement stmt) {
+    final body = stmt.body;
+    if (_containsJumpStatement(body)) {
+      // Returning `null` here would let _isDisposalGuarded's walk continue
+      // outward and potentially trust a guard that precedes this do-while
+      // entirely — stale, since a body `await` on the jump-free path still
+      // runs after it with nothing of its own protecting the condition. Only
+      // truly answer "inconclusive" when the body has no await at all to be
+      // stale against.
+      return _subtreeHasAwait(body) ? false : null;
+    }
+    final statements = body is Block ? body.statements : [body];
+    return _siblingGuardVerdict(statements, stmt.condition);
+  }
+
+  /// Whether [node]'s subtree contains a `break` or `continue`, without
+  /// descending into nested function bodies.
+  bool _containsJumpStatement(AstNode node) {
+    final finder = _JumpStatementFinder();
+    node.accept(finder);
+    return finder.found;
+  }
+
+  /// Whether [child] is the body of a loop whose body contains an `await`.
+  ///
+  /// A guard placed outside such a loop only covers the first iteration: every
+  /// later iteration re-enters the body after the previous iteration's await.
+  bool _awaitingLoopBody(AstNode parent, AstNode child) {
+    final Statement? body = switch (parent) {
+      WhileStatement() => parent.body,
+      DoStatement() => parent.body,
+      ForStatement() => parent.body,
+      _ => null,
+    };
+    if (body == null || !identical(child, body)) return false;
+
+    return _subtreeHasAwait(body);
+  }
+
+  /// Whether [statement] is `if (!ref.mounted) <exit>;` — a guard whose then
+  /// branch always leaves the current execution path.
+  bool _isRefMountedEarlyReturnGuard(Statement statement) {
+    if (statement is! IfStatement) return false;
+    if (!_isRefMountedCheck(statement.expression, negated: true)) return false;
+
+    return _alwaysExits(statement.thenStatement);
+  }
+
+  bool _alwaysExits(Statement statement) {
+    if (statement is ReturnStatement) return true;
+    if (statement is ExpressionStatement) {
+      return statement.expression is ThrowExpression;
+    }
+    if (statement is Block) {
+      final statements = statement.statements;
+      if (statements.isEmpty) return false;
+      return _alwaysExits(statements.last);
+    }
+
+    return false;
+  }
+
+  /// Whether [expression] is `ref.mounted` (when [negated] is false) or
+  /// `!ref.mounted` (when [negated] is true).
+  bool _isRefMountedCheck(Expression expression, {required bool negated}) {
+    if (negated) {
+      return expression is PrefixExpression &&
+          expression.operator.lexeme == '!' &&
+          _isRefMountedAccess(expression.operand);
+    }
+
+    return _isRefMountedAccess(expression);
+  }
+
+  bool _isRefMountedAccess(Expression expression) {
+    if (expression is PrefixedIdentifier) {
+      return expression.prefix.name == 'ref' &&
+          expression.identifier.name == 'mounted';
+    }
+    if (expression is PropertyAccess) {
+      return expression.propertyName.name == 'mounted' &&
+          _isRefTarget(expression.target);
+    }
+
+    return false;
+  }
+
+  void _scanLocalFunctionInvocation(MethodInvocation invocation) {
+    if (invocation.target != null) return;
+    if (!_hasInheritedAsyncGap && !_hasPriorAsyncGap(invocation)) return;
+
+    final functionName = invocation.methodName.name;
+    final declaration = _localFunctions[functionName];
+    if (declaration == null) return;
+
+    final body = declaration.functionExpression.body;
+    if (body.isAsynchronous) return;
+    if (!_activeLocalFunctionNames.add(functionName)) return;
+
+    try {
+      _AsyncRefAfterGapScanner(
+        rule,
+        tracking: _tracking,
+        hasInheritedAsyncGap: true,
+        localFunctions: _localFunctions,
+        activeLocalFunctionNames: _activeLocalFunctionNames,
+        reportedRefCallOffsets: _reportedRefCallOffsets,
+        syncPrivateStateTouches: syncPrivateStateTouches,
+      ).scan(body);
+    } finally {
+      _activeLocalFunctionNames.remove(functionName);
+    }
+  }
+
+  void _reportRefCall(MethodInvocation refCall) {
+    final methodName = refCall.methodName.name;
+    rule.reportAtNode(
+      refCall,
+      arguments: [
+        'Avoid ref.$methodName() after an async gap in Riverpod providers.',
+        'Capture provider/usecase dependencies before the async gap, or guard the post-gap access with "if (!ref.mounted) return;".',
+      ],
+    );
+  }
+
+  void _reportStateAssignment(AstNode assignment) {
+    rule.reportAtNode(
+      assignment,
+      arguments: [
+        'Avoid assigning to state after an async gap in Riverpod providers (Riverpod 3 throws UnmountedRefException once the provider is disposed).',
+        'Guard right after the await ("await …; if (!ref.mounted) return;"), or await into a local first: "final next = await …; if (!ref.mounted) return; state = next;".',
+      ],
+    );
+  }
+
+  void _reportStateRead(AstNode read) {
+    rule.reportAtNode(
+      read,
+      arguments: [
+        'Avoid reading state after an async gap in Riverpod providers (the state getter throws UnmountedRefException once the provider is disposed).',
+        'Guard right after the await ("await …; if (!ref.mounted) return;"), or capture the needed state values before the await.',
+      ],
+    );
+  }
+}
+
+/// Notifier `state` reads and writes in a method body, skipping nested
+/// functions. Used to decide whether a sync private call is itself a finding.
+/// A touch dominated by `ref.mounted` does not index the call.
+class _DirectStateTouchFinder extends RecursiveAstVisitor<void> {
+  _DirectStateTouchFinder(this._scanner);
+
+  final _AsyncRefAfterGapScanner _scanner;
+  bool unguardedReads = false;
+  bool unguardedWrites = false;
+
+  @override
+  void visitFunctionExpression(FunctionExpression node) {}
+
+  @override
+  void visitFunctionDeclaration(FunctionDeclaration node) {}
+
+  @override
+  void visitAssignmentExpression(AssignmentExpression node) {
+    final target = node.leftHandSide;
+    if (node.operator.lexeme == '=' &&
+        _scanner._isStateTarget(target) &&
+        !(target is SimpleIdentifier && _scanner._isShadowedState(target))) {
+      if (!_scanner._isDisposalGuarded(node)) unguardedWrites = true;
+    }
+    super.visitAssignmentExpression(node);
+  }
+
+  @override
+  void visitSimpleIdentifier(SimpleIdentifier node) {
+    if (_scanner._isStateRead(node) && !_scanner._isDisposalGuarded(node)) {
+      unguardedReads = true;
+    }
+    super.visitSimpleIdentifier(node);
+  }
+}
+
+/// Finds a `DeclaredVariablePattern` named `state` inside a pattern.
+class _DeclaredStateFinder extends RecursiveAstVisitor<void> {
+  bool found = false;
+
+  @override
+  void visitDeclaredVariablePattern(DeclaredVariablePattern node) {
+    if (node.name.lexeme == 'state') found = true;
+    super.visitDeclaredVariablePattern(node);
+  }
+}
+
+/// Detects an `await` within a subtree, stopping at nested function boundaries.
+class _AwaitFinder extends RecursiveAstVisitor<void> {
+  _AwaitFinder({required this.includeAwaitFor});
+
+  /// Whether `await for (…)` counts as a gap. Opt-in (state reads) only, so
+  /// the default-on ref rule's diagnostics stay unchanged.
+  final bool includeAwaitFor;
+
+  bool found = false;
+
+  @override
+  void visitAwaitExpression(AwaitExpression node) {
+    found = true;
+  }
+
+  @override
+  void visitForStatement(ForStatement node) {
+    if (includeAwaitFor && node.awaitKeyword != null) found = true;
+    super.visitForStatement(node);
+  }
+
+  @override
+  void visitForElement(ForElement node) {
+    if (includeAwaitFor && node.awaitKeyword != null) found = true;
+    super.visitForElement(node);
+  }
+
+  @override
+  void visitFunctionExpression(FunctionExpression node) {
+    // Nested closures are a separate execution scope; their awaits do not
+    // sequentially precede code in the enclosing scope.
+  }
+
+  @override
+  void visitFunctionDeclarationStatement(FunctionDeclarationStatement node) {
+    // Local function declarations are likewise a separate scope.
+  }
+}
+
+/// Detects a `continue`, or a `break` that isn't scoped to a nested
+/// `switch`, within a subtree, stopping at nested function boundaries. Used
+/// by [_AsyncRefAfterGapScanner._doWhileBodyGuardVerdict] to conservatively
+/// refuse to trust a do-while's tail guard when a jump statement anywhere in
+/// the body could reach the condition (or skip past the loop) without
+/// running through it. An unlabeled `break` inside a nested `switch` only
+/// terminates that switch, not a loop, so it is not counted. A labeled
+/// `break` is counted conservatively even though a label can name an
+/// enclosing `switch` rather than a loop (`break` targeting a labeled
+/// `switch` also only exits that switch) — this only ever costs a spurious
+/// non-suppression, never a missed report, so it's left unresolved. Any
+/// `continue` is always loop-scoped (an unlabeled `continue` requires an
+/// enclosing loop, and a labeled one can only target a loop) and is counted
+/// regardless of an intervening `switch`.
+class _JumpStatementFinder extends RecursiveAstVisitor<void> {
+  bool found = false;
+
+  /// Nesting depth of `switch` statements between the root and the node
+  /// currently being visited. An *unlabeled* `break` inside a `switch`
+  /// terminates the switch, not an enclosing loop, so it can't reach the
+  /// do-while's condition or skip past the loop — unlike `continue`, which
+  /// is always loop-scoped regardless of an intervening `switch`.
+  var _switchDepth = 0;
+
+  @override
+  void visitSwitchStatement(SwitchStatement node) {
+    _switchDepth++;
+    super.visitSwitchStatement(node);
+    _switchDepth--;
+  }
+
+  @override
+  void visitBreakStatement(BreakStatement node) {
+    if (node.label != null || _switchDepth == 0) found = true;
+  }
+
+  @override
+  void visitContinueStatement(ContinueStatement node) {
+    found = true;
+  }
+
+  @override
+  void visitFunctionExpression(FunctionExpression node) {
+    // Nested closures are a separate execution scope.
+  }
+
+  @override
+  void visitFunctionDeclarationStatement(FunctionDeclarationStatement node) {
+    // Local function declarations are likewise a separate scope.
+  }
+}

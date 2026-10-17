@@ -1,0 +1,209 @@
+// MIT License
+//
+// Copyright (c) 2020-2021 Dart Code Checker team
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+import 'package:analyzer/dart/ast/ast.dart';
+import 'package:analyzer/dart/ast/visitor.dart';
+import 'package:analyzer/dart/element/element.dart';
+import 'package:collection/collection.dart';
+import 'package:solid_lints/src/lints/avoid_unused_parameters/avoid_unused_parameters_rule.dart';
+import 'package:solid_lints/src/lints/avoid_unused_parameters/models/avoid_unused_parameters_parameters.dart';
+import 'package:solid_lints/src/utils/node_utils.dart';
+import 'package:solid_lints/src/utils/parameter_utils.dart';
+
+/// A visitor that reports unused formal parameters.
+class AvoidUnusedParametersVisitor extends RecursiveAstVisitor<void> {
+  final AvoidUnusedParametersRule _rule;
+  final AvoidUnusedParametersParameters _parameters;
+
+  /// Creates a new instance of [AvoidUnusedParametersVisitor].
+  AvoidUnusedParametersVisitor(this._rule, this._parameters);
+
+  @override
+  void visitConstructorDeclaration(ConstructorDeclaration node) {
+    super.visitConstructorDeclaration(node);
+
+    final parent = node.parent;
+    final parameters = node.parameters;
+
+    if ((parent is ClassDeclaration && parent.abstractKeyword != null) ||
+        node.externalKeyword != null ||
+        node.redirectedConstructor != null ||
+        _hasExcludedAnnotationClass(node) ||
+        parameters.parameters.isEmpty) {
+      return;
+    }
+
+    if (_isExcluded(node)) return;
+
+    final unused = _getUnusedParameters(
+      node.body,
+      parameters.parameters,
+      initializers: node.initializers,
+    ).whereNot(nameConsistsOfUnderscoresOnly);
+
+    for (final parameter in unused) {
+      _rule.reportAtNode(parameter);
+    }
+  }
+
+  @override
+  void visitMethodDeclaration(MethodDeclaration node) {
+    super.visitMethodDeclaration(node);
+
+    final parent = node.parent;
+    final parameters = node.parameters;
+
+    if ((parent is ClassDeclaration && parent.abstractKeyword != null) ||
+        !node.isComplete ||
+        node.externalKeyword != null ||
+        (parameters == null || parameters.parameters.isEmpty)) {
+      return;
+    }
+
+    if (_isExcluded(node) || isOverride(node.metadata) || _isATearOff(node)) {
+      return;
+    }
+
+    for (final parameter in _filterOutUnderscoresAndNamed(
+      node.body,
+      parameters.parameters,
+    )) {
+      _rule.reportAtNode(parameter);
+    }
+  }
+
+  @override
+  void visitFunctionExpression(FunctionExpression node) {
+    super.visitFunctionExpression(node);
+
+    final declaration =
+        node.thisOrAncestorOfType<FunctionDeclaration>() ??
+        node.thisOrAncestorOfType<MethodDeclaration>() ??
+        node.thisOrAncestorOfType<ConstructorDeclaration>();
+    if (declaration != null && _isExcluded(declaration)) return;
+
+    final params = node.parameters;
+    if (params == null) return;
+
+    for (final parameter in _filterOutUnderscoresAndNamed(
+      node.body,
+      params.parameters,
+    )) {
+      _rule.reportAtNode(parameter);
+    }
+  }
+
+  bool _isExcluded(Declaration node) => _parameters.exclude.shouldIgnore(node);
+
+  bool _hasExcludedAnnotationClass(ConstructorDeclaration node) =>
+      _parameters.excludeAnnotation.shouldIgnore(node);
+
+  Iterable<FormalParameter> _filterOutUnderscoresAndNamed(
+    AstNode body,
+    Iterable<FormalParameter> parameters,
+  ) {
+    final unused = _getUnusedParameters(
+      body,
+      parameters,
+    );
+
+    return unused
+        .whereNot(nameConsistsOfUnderscoresOnly)
+        .where((param) => !param.isNamed);
+  }
+
+  Set<FormalParameter> _getUnusedParameters(
+    AstNode body,
+    Iterable<FormalParameter> parameters, {
+    NodeList<AstNode>? initializers,
+  }) {
+    final result = <FormalParameter>{};
+    final visitor = _IdentifiersVisitor();
+    body.visitChildren(visitor);
+    initializers?.accept(visitor);
+
+    final allIdentifierElements = visitor.elements;
+
+    for (final parameter in parameters) {
+      final name = parameter.name;
+      final isPresentInAll = allIdentifierElements.contains(
+        parameter.declaredFragment?.element.baseElement.nonSynthetic,
+      );
+
+      final isInitializingFormal =
+          parameter is FieldFormalParameter ||
+          parameter is SuperFormalParameter;
+
+      if (name != null && !isPresentInAll && !isInitializingFormal) {
+        result.add(parameter);
+      }
+    }
+
+    return result;
+  }
+
+  bool _isATearOff(MethodDeclaration node) {
+    final name = node.name.lexeme;
+    if (!Identifier.isPrivateName(name)) {
+      return false;
+    }
+
+    final visitor = _InvocationsVisitor(name);
+    node.root.visitChildren(visitor);
+
+    return visitor.hasTearOffInvocations;
+  }
+}
+
+class _IdentifiersVisitor extends RecursiveAstVisitor<void> {
+  final elements = <Element>{};
+
+  @override
+  void visitSimpleIdentifier(SimpleIdentifier node) {
+    super.visitSimpleIdentifier(node);
+
+    final element = node.element;
+    if (element != null) {
+      elements.add(element);
+    }
+  }
+}
+
+class _InvocationsVisitor extends RecursiveAstVisitor<void> {
+  final String methodName;
+
+  bool hasTearOffInvocations = false;
+
+  _InvocationsVisitor(this.methodName);
+
+  @override
+  void visitSimpleIdentifier(SimpleIdentifier node) {
+    if (node.name == methodName &&
+        node.element is MethodElement &&
+        node.parent is ArgumentList) {
+      hasTearOffInvocations = true;
+    }
+
+    super.visitSimpleIdentifier(node);
+  }
+}

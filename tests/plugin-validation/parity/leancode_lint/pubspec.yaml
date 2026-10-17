@@ -1,0 +1,16 @@
+name: dartq_parity_leancode_lint
+description: >-
+  Plugin-parity corpus package for leancode_lint. The official face reads
+  only analysis_options.yaml (its synthetic plugin package lives under the
+  run's ANALYZER_STATE_LOCATION_OVERRIDE); this pubspec exists for the dartq
+  face, whose plugin discovery resolves the declared plugin name through the
+  package_config the override below produces (the preset technique,
+  tests/plugin-validation/README.md).
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+
+dependency_overrides:
+  leancode_lint:
+    path: ../../vendor/leancode_lint-27.0.0

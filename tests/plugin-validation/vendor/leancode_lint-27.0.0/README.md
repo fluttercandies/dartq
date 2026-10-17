@@ -1,0 +1,1228 @@
+<div align="center">
+
+[![Banner][banner-img]][leancode-landing]
+
+</div>
+
+# leancode_lint
+
+[![leancode_lint pub.dev badge][pub-badge]][pub-badge-link]
+
+An opinionated set of high-quality, robust, and up-to-date lint rules used at LeanCode.
+
+## Usage
+
+There are two supported ways to use this package:
+
+1. **As-is (default configuration)** – enable the built-in `leancode_lint`
+   analyzer plugin. This uses `const LeanCodeLintConfig()` defaults.
+2. **With custom configuration** – create your own analyzer plugin package that
+   instantiates `LeanCodeLintPlugin` with your `LeanCodeLintConfig`, then enable
+   your plugin instead (see [“Configuration (custom plugin package)”](#configuration-custom-plugin-package) below).
+
+If you only want to toggle individual rules on/off, you can do that in
+`analysis_options.yaml` (see [“Custom lint rules”](#custom-lint-rules)).
+
+## Installation
+
+1. Add `leancode_lint` as a dev dependency in your project's `pubspec.yaml`.
+
+   ```sh
+   dart pub add leancode_lint --dev
+   ```
+
+2. In your `analysis_options.yaml` add `include: package:leancode_lint/analysis_options.yaml`.
+   You might want to exclude some files (e.g generated json serializable) from analysis.
+
+3. Enable the analyzer plugin in `analysis_options.yaml`.
+
+   - For default behavior, enable `leancode_lint`.
+   - For custom configuration, enable your own plugin package instead
+     (see [“Configuration (custom plugin package)”](#configuration-custom-plugin-package) below).
+
+4. Run `flutter pub get` in your project main directory and restart the analysis server in your IDE.
+   You're ready to go!
+
+Example `analysis_options.yaml`:
+
+```yaml
+include: package:leancode_lint/analysis_options.yaml
+
+plugins:
+  leancode_lint: ^20.0.0
+
+analyzer:
+  exclude:
+    - '**/*.g.dart'
+```
+
+> [!TIP]
+> See the [example/](./example) directory for complete, runnable examples
+> with both default and custom configuration.
+
+## Configuration (custom plugin package)
+
+This section is optional. You only need it if you want to customize the
+behavior of configurable rules beyond the built-in defaults.
+
+To configure `leancode_lint` rules programmatically, create your own analyzer
+plugin package (e.g. `my_lints`) that depends on `leancode_lint` and exposes a
+top-level `plugin` variable.
+
+`my_lints/lib/main.dart`:
+
+```dart
+import 'package:leancode_lint/plugin.dart';
+
+final plugin = LeanCodeLintPlugin(
+  name: 'my_lints',
+  config: LeanCodeLintConfig(
+    applicationPrefix: 'Lncd',
+    catchParameterNames: CatchParameterNamesConfig(
+      exception: 'error',
+      stackTrace: 'stackTrace',
+    ),
+    designSystemItemReplacements: {
+      'AppText': [
+        DesignSystemForbiddenItem(name: 'Text', packageName: 'flutter'),
+        DesignSystemForbiddenItem(name: 'RichText', packageName: 'flutter'),
+      ],
+      'AppScaffold': [
+        DesignSystemForbiddenItem(name: 'Scaffold', packageName: 'flutter'),
+      ],
+    },
+  ),
+);
+```
+
+Then enable your plugin in the consuming project’s `analysis_options.yaml`:
+
+```yaml
+include: package:leancode_lint/analysis_options.yaml
+
+plugins:
+  my_lints:
+    path: ./path/to/my_lints
+```
+
+## Usage in libraries
+
+If your package is a library rather than a binary application, you will expose some public API for users of your library. Therefore, you should use lint rules optimized for this case by just changing your `include` entry in `analysis_options.yaml`:
+
+```yaml
+include: package:leancode_lint/analysis_options_package.yaml
+```
+
+## Custom lint rules
+
+<details>
+<summary><code>add_cubit_suffix_for_your_cubits</code></summary>
+
+### `add_cubit_suffix_for_your_cubits`
+
+**DO** add a 'Cubit' suffix to your cubit names.
+
+**BAD:**
+
+```dart
+class MyClass extends Cubit<int> {}
+```
+
+**GOOD:**
+
+```dart
+class MyClassCubit extends Cubit<int> {}
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>avoid_build_context_in_blocs</code></summary>
+
+### `avoid_build_context_in_blocs`
+
+**AVOID** letting a `BuildContext` cross into a Bloc/Cubit.
+
+A `BuildContext` couples business logic to the widget tree, which risks stale
+contexts and wrong `InheritedWidget` reads and makes the logic hard to test. The
+rule flags both passing a `BuildContext` into a Bloc/Cubit (via a method such as
+`add`, or a constructor) and declaring one inside a Bloc/Cubit (as a parameter or
+field). A value merely derived from a context (e.g. `MediaQuery.sizeOf(context)`)
+is allowed.
+
+**BAD:**
+
+```dart
+bloc.add(CounterEvent(context));
+
+final event = CounterEvent(context);
+bloc.add(event);
+
+class CounterCubit extends Cubit<int> {
+  CounterCubit() : super(0);
+
+  final BuildContext context;
+
+  void another(BuildContext context) {}
+}
+```
+
+**GOOD:**
+
+```dart
+bloc.add(CounterEvent());
+bloc.add(CounterEvent(MediaQuery.sizeOf(context)));
+
+class CounterCubit extends Cubit<int> {
+  CounterCubit() : super(0);
+
+  void another() {}
+}
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>avoid_catch_error</code></summary>
+
+### `avoid_catch_error`
+
+**AVOID** using `Future.catchError`.
+
+Prefer `async`/`await` with `try`/`catch`, which keeps error handling in normal
+control flow and preserves stack traces more predictably.
+
+**BAD:**
+
+```dart
+Future<void> load() {
+  return repository.load().catchError((err, st) {
+    logger.error(err, st);
+  });
+}
+```
+
+**GOOD:**
+
+```dart
+Future<void> load() async {
+  try {
+    await repository.load();
+  } catch (err, st) {
+    logger.error(err, st);
+  }
+}
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>avoid_conditional_hooks</code></summary>
+
+### `avoid_conditional_hooks`
+
+**AVOID** using hooks conditionally
+
+**BAD:**
+
+```dart
+Widget build(BuildContext context) {
+  if (condition) {
+    useEffect(() {
+      // ...
+    }, []);
+  }
+}
+```
+
+**BAD:**
+
+```dart
+Widget build(BuildContext context) {
+  final controller = this.controller ?? useTextEditingController();
+}
+```
+
+**BAD:**
+
+```dart
+Widget build(BuildContext context) {
+  if (condition) {
+    return Text('Early return');
+  }
+
+  final state = useState(0);
+}
+```
+
+**GOOD:**
+
+```dart
+Widget build(BuildContext context) {
+  useEffect(() {
+    if (condition) {
+        // ...
+    }
+  }, []);
+}
+```
+
+**GOOD:**
+
+```dart
+Widget build(BuildContext context) {
+  final backingController = useTextEditingController();
+  final controller = this.controller ?? backingController;
+}
+```
+
+**GOOD:**
+
+```dart
+Widget build(BuildContext context) {
+  final state = useState(0);
+
+  if (condition) {
+    return Text('Early return');
+  }
+}
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>avoid_context_read_in_build</code></summary>
+
+### `avoid_context_read_in_build`
+
+**AVOID** using `context.read` inside a `build` method.
+
+`read` grabs a value once and never re-subscribes, so using its result to render
+leaves the UI stale when the value changes — `watch` (or a `BlocBuilder` /
+`BlocSelector`) is what you want. `select` (or `BlocSelector`) works too, and is
+preferable when only part of the state is needed.
+
+Every `read` that executes during `build` is flagged, whatever it is used for:
+reading a value, calling a method, or grabbing a bloc/service reference. All
+three run on every rebuild, so none of them belong in `build`. Either consume
+the value with `watch` / `select` / `BlocBuilder` / `BlocSelector`, or move the
+read into a callback. Reads inside deferred interaction callbacks (`onTap`,
+`onPressed`) are exempt — that's where `read` is meant to be used; reads inside
+builder closures that run during `build` are checked. A `BuildContext`-taking
+closure that doesn't return a `Widget` (e.g. a provider's `create`) is exempt
+too, since it runs once rather than on every rebuild.
+
+**BAD:**
+
+```dart
+Widget build(BuildContext context) {
+  final count = context.read<CounterCubit>().state;
+  return Text('$count');
+}
+```
+
+```dart
+Widget build(BuildContext context) {
+  // Fires on every rebuild.
+  context.read<CounterCubit>().increment();
+  return const SizedBox();
+}
+```
+
+**GOOD:**
+
+```dart
+Widget build(BuildContext context) {
+  final count = context.watch<CounterCubit>().state;
+  return Text('$count');
+}
+```
+
+```dart
+Widget build(BuildContext context) {
+  return ElevatedButton(
+    onPressed: () => context.read<CounterCubit>().increment(),
+    child: const Text('+'),
+  );
+}
+```
+
+```dart
+Widget build(BuildContext context) {
+  return BlocProvider(
+    create: (context) => CounterCubit(repository: context.read()),
+    child: const CounterPage(),
+  );
+}
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>avoid_direct_collection_equality_checks</code></summary>
+
+### `avoid_direct_collection_equality_checks`
+
+**AVOID** comparing collections directly with `==` or `!=`.
+
+For `List`, `Set`, and `Map`, `==` compares identity (reference equality), not
+contents, so `[1, 2] == [1, 2]` is `false`. Use a content-equality helper
+instead.
+
+The rule offers three quick fixes: one rewriting the comparison to Flutter's
+`listEquals`/`setEquals`/`mapEquals` (from `package:flutter/foundation.dart`),
+one to `package:collection`'s `ListEquality`/`SetEquality`/`MapEquality`, and one
+to `identical` for the cases where an identity comparison is actually intended.
+The content-equality fixes add the required import, so each is only offered when
+the package owning the analyzed file declares a direct dependency on the package
+it imports (`flutter` and `collection` respectively). All fixes negate the result for
+`!=`.
+
+**BAD:**
+
+```dart
+bool sameItems(List<int> a, List<int> b) {
+  return a == b;
+}
+```
+
+**GOOD:**
+
+```dart
+import 'package:flutter/foundation.dart';
+
+bool sameItems(List<int> a, List<int> b) {
+  return listEquals(a, b);
+}
+```
+
+**GOOD:**
+
+```dart
+import 'package:collection/collection.dart';
+
+bool sameItems(List<int> a, List<int> b) {
+  return const ListEquality<int>().equals(a, b);
+}
+```
+
+**GOOD:**
+
+```dart
+bool isSameList(List<int> a, List<int> b) {
+  return identical(a, b);
+}
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>bloc_related_class_naming</code></summary>
+
+### `bloc_related_class_naming`
+
+**DO** follow the naming convention for Bloc/Cubit related classes.
+
+For `ExampleBloc`:
+- Event class: `ExampleEvent`
+- State class: `ExampleState`
+- Presentation Event class: `ExamplePresentationEvent`
+
+For `ExampleCubit`:
+- State class: `ExampleState`
+- Presentation Event class: `ExamplePresentationEvent`
+
+> [!NOTE]
+> This lint only checks classes defined in the same library (including parts) as the Bloc/Cubit.
+> Presentation events are only checked if the `bloc_presentation` package is used.
+
+**BAD:**
+
+```dart
+class MyBloc extends Bloc<WrongEvent, WrongState> {}
+```
+
+**GOOD:**
+
+```dart
+class MyBloc extends Bloc<MyEvent, MyState> {}
+```
+
+#### Configuration
+
+Configured via `LeanCodeLintConfig.blocRelatedClassNaming`:
+
+```dart
+import 'package:leancode_lint/plugin.dart';
+
+final plugin = LeanCodeLintPlugin(
+  name: 'my_lints',
+  config: LeanCodeLintConfig(
+    blocRelatedClassNaming: BlocRelatedClassNamingConfig(
+      stateSuffix: 'State',
+      eventSuffix: 'Event',
+      presentationEventSuffix: 'PresentationEvent',
+    ),
+  ),
+);
+```
+
+</details>
+
+<details>
+<summary><code>bloc_subclasses_naming</code></summary>
+
+### `bloc_subclasses_naming`
+
+**DO** prefix subclasses of bloc state, event, and presentation event classes with the name of the base class.
+
+**BAD:**
+
+```dart
+class MyState {}
+class Initial extends MyState {}
+class Loaded extends MyState {}
+
+class MyEvent {}
+class Load extends MyEvent {}
+
+class MyCubit extends Cubit<MyState> {}
+```
+
+**GOOD:**
+
+```dart
+class MyState {}
+class MyStateInitial extends MyState {}
+class MyStateLoaded extends MyState {}
+
+class MyEvent {}
+class MyEventLoad extends MyEvent {}
+
+class MyCubit extends Cubit<MyState> {}
+```
+
+> [!NOTE]
+> This lint only triggers when a corresponding Bloc/Cubit exists in the same library.
+> The required prefix is always the exact name of the base class, regardless of how it is named.
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>catch_parameter_names</code></summary>
+
+### `catch_parameter_names`
+
+**DO** name catch clause parameters consistently
+
+- if it's a catch-all, the exception should be named `err` and the stacktrace `st`
+- if it's a typed catch, the stacktrace has to be named `st`
+
+**BAD:**
+
+```dart
+void f() {
+  try {} catch (e, s) {}
+  try {} on SocketException catch (e, s) {}
+}
+```
+
+**GOOD:**
+
+```dart
+void f() {
+  try {} catch (err, st) {}
+  try {} on SocketException catch (e, st) {}
+}
+```
+
+**GOOD:**
+
+With custom config: exception: error, stack_trace: stackTrace
+
+```dart
+void f() {
+  try {} catch (error, stackTrace) {}
+  try {} on SocketException catch (error, stackTrace) {}
+}
+```
+
+#### Configuration
+
+Configured via `LeanCodeLintConfig.catchParameterNames`:
+
+```dart
+import 'package:leancode_lint/plugin.dart';
+
+final plugin = LeanCodeLintPlugin(
+  name: 'my_lints',
+  config: LeanCodeLintConfig(
+    catchParameterNames: CatchParameterNamesConfig(
+      exception: 'error',
+      stackTrace: 'stackTrace',
+    ),
+  ),
+);
+```
+
+</details>
+
+<details>
+<summary><code>hook_widget_does_not_use_hooks</code></summary>
+
+### `hook_widget_does_not_use_hooks`
+
+**AVOID** extending `HookWidget` if no hooks are used.
+
+**BAD:**
+
+```dart
+class MyWidget extends HookWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Placeholder();
+  }
+}
+```
+
+**BAD:**
+
+```dart
+class MyWidget extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return HookBuilder(
+      builder: (context) {
+        return Placeholder();
+      },
+    );
+  }
+}
+```
+
+**GOOD:**
+
+```dart
+class MyWidget extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Placeholder();
+  }
+}
+```
+
+**GOOD:**
+
+```dart
+Widget build(BuildContext context) {
+  return Builder(
+    builder: (context) {
+      return Placeholder();
+    },
+  );
+}
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>never_discard_build_context</code></summary>
+
+### `never_discard_build_context`
+
+**AVOID** discarding `BuildContext` parameters by naming them `_`.
+
+Discarding a `BuildContext` causes the body to use an ancestor context instead,
+risking incorrect theme lookups, navigation, or inherited widget reads.
+
+**BAD:**
+
+```dart
+Widget myBuilder(BuildContext _) {
+  return const SizedBox();
+}
+```
+
+**BAD:**
+
+```dart
+Widget build(BuildContext context) {
+  return Builder(
+    builder: (_) => const SizedBox(),
+  );
+}
+```
+
+**GOOD:**
+
+```dart
+Widget myBuilder(BuildContext context) {
+  return const SizedBox();
+}
+```
+
+**GOOD:**
+
+```dart
+Widget build(BuildContext context) {
+  return Builder(
+    builder: (context) => const SizedBox(),
+  );
+}
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>prefix_widgets_returning_slivers</code></summary>
+
+### `prefix_widgets_returning_slivers`
+
+**DO** prefix widget names with 'Sliver' if the widget returns slivers.
+
+**BAD:**
+
+```dart
+class MyWidget extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return SliverToBoxAdapter();
+  }
+}
+```
+
+**GOOD:**
+
+```dart
+class SliverMyWidget extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return SliverToBoxAdapter();
+  }
+}
+```
+
+#### Configuration
+
+- `application_prefix`: A string. Specifies the application prefix to accept sliver prefixes.
+  For example if set to "Lncd" then "LncdSliverMyWidget" is a valid sliver name.
+
+Configured via `LeanCodeLintConfig.applicationPrefix`:
+
+```dart
+import 'package:leancode_lint/plugin.dart';
+
+final plugin = LeanCodeLintPlugin(
+  name: 'my_lints',
+  config: LeanCodeLintConfig(applicationPrefix: 'Lncd'),
+);
+```
+
+</details>
+
+<details>
+<summary><code>start_comments_with_space</code></summary>
+
+### `start_comments_with_space`
+
+**DO** start comments/docs with an empty space.
+
+**BAD:**
+
+```dart
+//some comment
+///some doc
+```
+
+**GOOD:**
+
+```dart
+// some comment
+/// some doc
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>use_design_system_item</code></summary>
+
+### `use_design_system_item`
+
+**AVOID** using items disallowed by the design system.
+
+This rule has to be configured to do anything. The rule will highlight forbidden usages and suggest alternatives preferred by the design system.
+
+#### Configuration
+
+Configured via `LeanCodeLintConfig.designSystemItemReplacements`:
+
+```dart
+import 'package:leancode_lint/plugin.dart';
+
+final plugin = LeanCodeLintPlugin(
+  name: 'my_lints',
+  config: LeanCodeLintConfig(
+    designSystemItemReplacements: {
+      'LncdText': [
+        DesignSystemForbiddenItem(name: 'Text', packageName: 'flutter'),
+        DesignSystemForbiddenItem(name: 'RichText', packageName: 'flutter'),
+      ],
+      'LncdScaffold': [
+        DesignSystemForbiddenItem(name: 'Scaffold', packageName: 'flutter'),
+      ],
+    },
+  ),
+);
+
+```
+
+</details>
+
+<details>
+<summary><code>avoid_single_child_in_multi_child_widgets</code></summary>
+
+### `avoid_single_child_in_multi_child_widgets`
+
+**AVOID** using `Column`, `Row`, `Flex`, `Wrap`, `SliverList`, `MultiSliver`, `SliverChildListDelegate`, `SliverMainAxisGroup`, and `SliverCrossAxisGroup` with a single child.
+
+**BAD:**
+
+```dart
+Widget build(BuildContext context) {
+  return Column(
+    children: [
+      Container(),
+    ],
+  );
+}
+```
+
+**GOOD:**
+
+```dart
+Widget build(BuildContext context) {
+  return Container();
+}
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>use_dedicated_media_query_methods</code></summary>
+
+### `use_dedicated_media_query_methods`
+
+**AVOID** using `MediaQuery.of` or `MediaQuery.maybeOf` to access only one property. Instead, prefer dedicated methods, for example `MediaQuery.paddingOf(context)`.
+
+Dedicated methods offer better performance by minimizing unnecessary widget rebuilds.
+
+**BAD:**
+
+```dart
+Widget build(BuildContext context) {
+  final size = MediaQuery.of(context).size;
+  return const SizedBox();
+}
+```
+
+**GOOD:**
+
+```dart
+Widget build(BuildContext context) {
+  final size = MediaQuery.sizeOf(context);
+  return const SizedBox();
+}
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>use_align</code></summary>
+
+### `use_align`
+
+**DO** Use the Align widget instead of the Container widget with only the alignment parameter.
+
+**BAD:**
+
+```dart
+class MyWidget extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      alignment: Alignment.bottomCenter,
+      child: const SizedBox(),
+    );
+  }
+}
+```
+
+**GOOD:**
+
+```dart
+class MyWidget extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return const Align(
+      alignment: Alignment.bottomCenter,
+      child: SizedBox(),
+    );
+  }
+}
+```
+
+#### Configuration
+
+None
+
+</details>
+
+<details>
+<summary><code>use_padding</code></summary>
+
+### `use_padding`
+
+**DO** Use Padding widget instead of the Container widget with only the margin parameter
+
+**BAD:**
+
+```dart
+class MyWidget extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: EdgeInsets.all(10),
+      child: const SizedBox(),
+    );
+  }
+}
+```
+
+**GOOD:**
+
+```dart
+class MyWidget extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return const Padding(
+      padding: EdgeInsets.all(10),
+      child: SizedBox(),
+    );
+  }
+}
+```
+
+#### Configuration
+
+None
+
+</details>
+
+<details>
+<summary><code>prefer_center_over_align</code></summary>
+
+### `prefer_center_over_align`
+
+**DO** Use the Center widget instead of the Align widget with the alignment parameter set to Alignment.center
+
+**BAD:**
+
+```dart
+class MyWidget extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return const Align(
+      child: SizedBox(),
+    );
+  }
+}
+```
+
+**GOOD:**
+
+```dart
+class MyWidget extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return const Center(
+      child: SizedBox(),
+    );
+  }
+}
+```
+
+#### Configuration
+
+None
+
+</details>
+
+<details>
+<summary><code>prefer_equatable_mixin</code></summary>
+
+### `prefer_equatable_mixin`
+
+**DO** mix in `Equatable` instead of extending it.
+
+Since `equatable` 2.1.0, `Equatable` can be used as a mixin and `EquatableMixin`
+is deprecated. This lint suggests mixing in `Equatable` directly when the package
+depends on `equatable` 2.1.0 or higher, and falls back to suggesting `EquatableMixin`
+for older versions.
+
+**BAD:**
+
+```dart
+import 'package:equatable/equatable.dart';
+
+class Foobar extends Equatable {
+  const Foobar(this.value);
+
+  final int value;
+
+  @override
+  List<Object?> get props => [value];
+}
+```
+
+**GOOD:**
+
+```dart
+import 'package:equatable/equatable.dart';
+
+// `equatable` >= 2.1.0
+class Foobar with Equatable {
+  const Foobar(this.value);
+
+  final int value;
+
+  @override
+  List<Object?> get props => [value];
+}
+
+// `equatable` < 2.1.0
+class Foobar with EquatableMixin {
+  const Foobar(this.value);
+
+  final int value;
+
+  @override
+  List<Object?> get props => [value];
+}
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>missing_equatable_props</code></summary>
+
+### `missing_equatable_props`
+
+**DO** include every non-static field of an `Equatable`/`EquatableMixin` class in its `props` getter. When the class extends another Equatable-shaped class whose `props` getter is concrete, `super.props` must also be referenced so inherited fields participate in equality. `super.props` is not required when the superclass chain declares no fields, since it can only be empty.
+
+The lint only fires when `props` is defined as a list literal (e.g. `=> [a, b]` or `{ return [a, b]; }`) so it can safely reason about the contents. If the list contains expressions the rule cannot enumerate (other spreads, `if`/`for` elements, method calls, …) it silently skips the class to avoid false positives.
+
+The `Add all missing entries to props` quick fix inserts the missing entries — `super.props` at the start of the list, missing fields at the end, preserving declaration order.
+
+**BAD:**
+
+```dart
+import 'package:equatable/equatable.dart';
+
+class Foobar with EquatableMixin {
+  const Foobar(this.a, this.b);
+
+  final int a;
+  final int b;
+
+  @override
+  List<Object?> get props => [a];
+}
+
+class FoobarChild extends Foobar {
+  const FoobarChild(super.a, super.b, this.c);
+
+  final int c;
+
+  @override
+  List<Object?> get props => [c];
+}
+```
+
+**GOOD:**
+
+```dart
+import 'package:equatable/equatable.dart';
+
+class Foobar with EquatableMixin {
+  const Foobar(this.a, this.b);
+
+  final int a;
+  final int b;
+
+  @override
+  List<Object?> get props => [a, b];
+}
+
+class FoobarChild extends Foobar {
+  const FoobarChild(super.a, super.b, this.c);
+
+  final int c;
+
+  @override
+  List<Object?> get props => [super.props, c];
+}
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+<details>
+<summary><code>prefer_abstract_final_class</code></summary>
+
+### `prefer_abstract_final_class`
+
+**PREFER** declaring a static-members-only holder as an `abstract final class` instead of using a private constructor to prevent instantiation.
+
+The lint fires only on a plain `class` with at least one static member whose sole constructor is a private, empty `_()` guarding against instantiation. To stay conservative it skips classes with any other constructor or factory, any instance member, a non-trivial `_()` (parameters, initializers, redirection or body), an existing class modifier, or an `extends`/`with`/`implements` clause.
+
+The `Convert to an abstract final class` quick fix marks the class `abstract final` and removes the redundant private constructor.
+
+**BAD:**
+
+```dart
+class MyConstants {
+  MyConstants._();
+
+  static const foo = 1;
+}
+```
+
+**GOOD:**
+
+```dart
+abstract final class MyConstants {
+  static const foo = 1;
+}
+```
+
+#### Configuration
+
+None.
+
+</details>
+
+## Disabling custom lint rules
+
+To disable a particular custom lint rule, set the rule to false in `analysis_options.yaml`. For example, to disable `prefix_widgets_returning_slivers`:
+
+```yaml
+plugins:
+  leancode_lint:
+    version: ^20.0.0
+    diagnostics:
+      prefix_widgets_returning_slivers: false
+```
+
+## Assists
+
+Assists are IDE refactorings not related to a particular issue. They can be triggered by placing your cursor over a relevant piece of code and opening the code actions dialog. For instance, in VSCode this is done with <kbd>ctrl</kbd>+<kbd>.</kbd> or <kbd>⌘</kbd>+<kbd>.</kbd>.
+
+See linked source code containing explanation in dart doc.
+
+- [Convert positional to named formal](./lib/src/assists/convert_positional_to_named_formal.dart)
+- [Convert record into nominal type](./lib/src/assists/convert_record_into_nominal_type.dart)
+- [Convert iterable map to collection-for](./lib/src/assists/convert_iterable_map_to_collection_for.dart)
+
+---
+
+## 🛠️ Maintained by LeanCode
+
+<div align="center">
+
+  [<img src="https://leancodepublic.blob.core.windows.net/public/wide.png" alt="LeanCode Logo" height="100" />][leancode-landing]
+
+</div>
+
+This package is built with 💙 by **[LeanCode][leancode-landing]**.
+We are **top-tier experts** focused on Flutter Enterprise solutions.
+
+### Why LeanCode?
+
+- **Creators of [Patrol][patrol-landing]** – the next-gen testing framework for Flutter.
+
+- **Production-Ready** – We use this package in apps with millions of users.
+- **Full-Cycle Product Development** – We take your product from scratch to long-term maintenance.
+
+<div align="center">
+  <br />
+
+  **Need help with your Flutter project?**
+
+  [**👉 Hire our team**][leancode-estimate]
+  &nbsp;&nbsp;•&nbsp;&nbsp;
+  [Check our other packages][leancode-packages]
+
+</div>
+
+[pub-badge]: https://img.shields.io/pub/v/leancode_lint
+[pub-badge-link]: https://pub.dev/packages/leancode_lint
+[banner-img]: https://raw.githubusercontent.com/leancodepl/flutter_corelibrary/refs/heads/master/packages/leancode_lint/doc/imgs/banner.png
+[leancode-landing]: https://leancode.co/?utm_source=github.com&utm_medium=referral&utm_campaign=leancode-lint
+[leancode-estimate]: https://leancode.co/get-estimate?utm_source=github.com&utm_medium=referral&utm_campaign=leancode-lint
+[leancode-packages]: https://pub.dev/packages?q=publisher%3Aleancode.co&sort=downloads
+[patrol-landing]: https://patrol.leancode.co/?utm_source=github.com&utm_medium=referral&utm_campaign=leancode-lint

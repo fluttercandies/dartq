@@ -1,0 +1,6 @@
+# Plugin-absent preset (arm A). Byte-identical to presets/present/ except
+# that this file declares no `plugins:` section (and no plugins/ directory
+# exists in this tree): discovery takes the absence path — one options
+# locator walk, one empty-section short-circuit, no plugin launches.
+linter:
+  rules: []

@@ -1,0 +1,12 @@
+{
+  "name": "riverpod_lint",
+  "version": "3.1.9",
+  "entrypoint": "bin/dartq_serve.dart",
+  "capabilities": ["lint", "fix", "assist"],
+  "timeouts": {
+    "callback_ms": 30000,
+    "request_ms": 60000,
+    "request_retries": 3
+  },
+  "memory_budget_mb": 1024
+}

@@ -1,0 +1,34 @@
+# Plugin-parity corpus for solid_lints (scripts/plugin-parity.sh): the
+# official face and the dartq face analyze this same tree with this same
+# options file. Exactly one vendored plugin is declared, through the native
+# `path:` source form the official server resolves into its synthetic plugin
+# package; the diagnostics entries pin the corpus rules on (`true` = enable
+# at the declared severity) identically on both faces. The
+# `dependency_overrides` sibling pins the synthetic package's framework deps
+# to the vendored copies so its pub solve is local. Every `path:` value here
+# is relative to THIS file's directory: upstream options parsing absolutizes
+# relative paths before they reach the generated plugin_entrypoint pubspec
+# (upstream Dart SDK source,
+# pkg/analyzer/lib/src/analysis_options/analysis_options_parse_model.dart
+# `_parsePluginSource`), so the synthetic package's own location under
+# .plugin_manager/ never enters resolution.
+# lib/ carries one trigger
+# file per pinned rule (byte-identical to ../../corpora/solid_lints).
+linter:
+  rules: []
+
+plugins:
+  solid_lints:
+    path: ../../vendor/solid_lints-2.0.0
+    diagnostics:
+      avoid_non_null_assertion: true
+      avoid_late_keyword: true
+      prefer_early_return: true
+      avoid_global_state: true
+  dependency_overrides:
+    analysis_server_plugin:
+      path: ../../vendor/deps/analysis_server_plugin-0.3.25-dev
+    analyzer:
+      path: ../../vendor/deps/analyzer-14.5.0
+    analyzer_plugin:
+      path: ../../vendor/deps/analyzer_plugin-0.14.18

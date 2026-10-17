@@ -1,0 +1,42 @@
+part of 'avoid_expanded_as_spacer_rule.dart';
+
+const _expandedClassName = 'Expanded';
+const _containerClassName = 'Container';
+const _sizeBoxClassName = 'SizeBox';
+
+class _Visitor extends RecursiveAstVisitor<void> {
+  final _expressions = <InstanceCreationExpression>[];
+
+  Iterable<InstanceCreationExpression> get expressions => _expressions;
+
+  @override
+  void visitInstanceCreationExpression(InstanceCreationExpression expression) {
+    super.visitInstanceCreationExpression(expression);
+
+    final arguments = expression.argumentList.arguments;
+    final isExpanded =
+        expression.staticType?.getDisplayString() == _expandedClassName;
+
+    final hasOneArgument = arguments.length == 1;
+
+    if (isExpanded && hasOneArgument) {
+      final expandedChild = asNamedArgument(arguments.first);
+      if (expandedChild == null) {
+        return;
+      }
+
+      final child = expandedChild.expression;
+      final childName = child.staticType?.getDisplayString();
+
+      if (child is InstanceCreationExpression) {
+        final hasNoArgument = child.argumentList.arguments.isEmpty;
+
+        if (hasNoArgument &&
+            (childName == _containerClassName ||
+                childName == _sizeBoxClassName)) {
+          _expressions.add(expression);
+        }
+      }
+    }
+  }
+}

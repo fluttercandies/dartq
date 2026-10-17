@@ -1,0 +1,149 @@
+import 'package:analysis_server_plugin/edit/dart/correction_producer.dart';
+import 'package:analysis_server_plugin/edit/dart/dart_fix_kind_priority.dart';
+import 'package:analyzer/analysis_rule/analysis_rule.dart';
+import 'package:analyzer/analysis_rule/rule_context.dart';
+import 'package:analyzer/analysis_rule/rule_visitor_registry.dart';
+import 'package:analyzer/dart/ast/ast.dart';
+import 'package:analyzer/dart/ast/visitor.dart';
+import 'package:analyzer/error/error.dart';
+import 'package:analyzer_plugin/utilities/change_builder/change_builder_core.dart';
+import 'package:analyzer_plugin/utilities/fixes/fixes.dart';
+import 'package:analyzer_plugin/utilities/range_factory.dart';
+import 'package:leancode_lint/src/helpers.dart';
+import 'package:leancode_lint/src/type_checker.dart';
+
+/// Warns when `context.read` is called during `build`.
+///
+/// `read` grabs a value once and never re-subscribes, so using its result to
+/// render leaves the UI stale when the value changes — `watch` (or a
+/// `BlocBuilder`/`BlocSelector`) is what's actually wanted. `select` (or
+/// `BlocSelector`) works too, and is preferable when only part of the state
+/// is needed.
+///
+/// Every `read` that executes during build is reported, whatever it is used
+/// for: reading a value, calling a method, or grabbing a bloc/service
+/// reference. Reads inside deferred interaction callbacks (`onTap`,
+/// `onPressed`) are exempt, and so are `BuildContext`-taking closures that
+/// don't return a `Widget` (e.g. a provider's `create`), since neither runs
+/// on every rebuild.
+class AvoidContextReadInBuild() extends AnalysisRule {
+  this : super(name: code.lowerCaseName, description: code.problemMessage);
+
+  static const code = LintCode(
+    'avoid_context_read_in_build',
+    "Avoid using 'context.read' inside 'build' method.",
+    correctionMessage: "Use 'context.watch' or 'context.select' (or BlocBuilder/BlocSelector) to consume the value, or move the read into a callback.",
+    severity: .WARNING,
+  );
+
+  @override
+  LintCode get diagnosticCode => code;
+
+  @override
+  void registerNodeProcessors(
+    RuleVisitorRegistry registry,
+    RuleContext context,
+  ) {
+    registry.addMethodInvocation(this, _Visitor(this));
+  }
+}
+
+class _Visitor(final AnalysisRule rule) extends SimpleAstVisitor<void> {
+  static const _buildContextChecker = TypeChecker.fromName(
+    'BuildContext',
+    packageName: 'flutter',
+  );
+
+  static const _widgetChecker = TypeChecker.fromName(
+    'Widget',
+    packageName: 'flutter',
+  );
+
+  @override
+  void visitMethodInvocation(MethodInvocation node) {
+    if (node.methodName.name != 'read') {
+      return;
+    }
+    final targetType = node.realTarget?.staticType;
+    if (targetType == null ||
+        !_buildContextChecker.isAssignableFromType(targetType)) {
+      return;
+    }
+
+    if (!_runsDuringBuild(node)) {
+      return;
+    }
+
+    rule.reportAtNode(node.methodName);
+  }
+
+  /// Whether [node] is inside a widget's `build` method, with every closure
+  /// in between taking `BuildContext` and returning a `Widget`.
+  bool _runsDuringBuild(AstNode node) {
+    for (
+      AstNode? current = node.parent;
+      current != null;
+      current = current.parent
+    ) {
+      if (current is FunctionExpression &&
+          (!_declaresBuildContextParameter(current) ||
+              !_returnsWidget(current))) {
+        return false;
+      }
+      if (current is MethodDeclaration) {
+        if (current.name.lexeme != 'build') {
+          return false;
+        }
+        final classDeclaration = current
+            .thisOrAncestorOfType<ClassDeclaration>();
+        return classDeclaration != null && isWidgetClass(classDeclaration);
+      }
+    }
+    return false;
+  }
+
+  bool _declaresBuildContextParameter(FunctionExpression function) {
+    final parameters = function.parameters?.parameters;
+    if (parameters == null) {
+      return false;
+    }
+    for (final parameter in parameters) {
+      final type = parameter.declaredFragment?.element.type;
+      if (type != null && _buildContextChecker.isAssignableFromType(type)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Whether [function] returns a `Widget`. Only such closures re-run on
+  /// every rebuild; anything else is a one-off factory (e.g. a provider's
+  /// `create`).
+  bool _returnsWidget(FunctionExpression function) =>
+      switch (function.declaredFragment?.element.returnType) {
+        final returnType? => _widgetChecker.isAssignableFromType(returnType),
+        null => false,
+      };
+}
+
+class ReplaceContextReadWithWatchFix({required super.context})
+    extends ResolvedCorrectionProducer {
+  @override
+  FixKind get fixKind => const .new(
+    'leancode_lint.fix.replaceContextReadWithWatch',
+    DartFixKindPriority.standard,
+    "Replace with 'context.watch'",
+  );
+
+  @override
+  CorrectionApplicability get applicability => .singleLocation;
+
+  @override
+  Future<void> compute(ChangeBuilder builder) async {
+    await builder.addDartFileEdit(
+      file,
+      (builder) =>
+          builder.addSimpleReplacement(range.diagnostic(diagnostic!), 'watch'),
+    );
+  }
+}

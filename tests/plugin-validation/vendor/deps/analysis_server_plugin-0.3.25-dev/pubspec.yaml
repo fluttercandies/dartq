@@ -1,0 +1,28 @@
+# Vendored copy of the analysis_server_plugin framework (upstream Dart SDK
+# source tree, pkg/analysis_server_plugin, version 0.3.25-dev; lib/ + docs,
+# the SDK-tree workspace scaffolding stripped) for the plugin-parity oracle:
+# the official server's synthetic plugin package resolves
+# analysis_server_plugin through the `plugins.dependency_overrides` pin in
+# tests/plugin-validation/parity/*/analysis_options.yaml.
+#
+# Two adjustments from the upstream pubspec, which is a workspace member of
+# the SDK tree and cannot resolve standalone:
+# - `resolution: workspace` is dropped;
+# - the analyzer/analyzer_plugin constraints are loosened to the vendored
+#   lines (the synthetic package's dependency_overrides pin the exact
+#   versions; the vendored copies sit alongside this directory).
+name: analysis_server_plugin
+description: A framework and support code for building plugins for the analysis server.
+version: 0.3.25-dev
+repository: https://github.com/dart-lang/sdk/tree/main/pkg/analysis_server_plugin
+
+environment:
+  sdk: ^3.9.0
+
+dependencies:
+  analyzer: ^14.5.0
+  analyzer_plugin: ^0.14.18
+  collection: ^1.19.0
+  meta: ^1.16.0
+  yaml: ^3.1.0
+  yaml_edit: ^2.2.0

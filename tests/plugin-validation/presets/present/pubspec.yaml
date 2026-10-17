@@ -1,0 +1,24 @@
+name: plugin_fixture_present
+description: >-
+  Plugin-present preset (arm B) of the third-party plugin validation
+  fixture: the analysis_options.yaml declares all five vendored plugins
+  through the native pub `plugins:` face; the overrides below point each
+  declared name at its vendored plugin root so the pub-native discovery
+  resolves for real. The lib/ tree is materialized from ../../corpora by
+  scripts/plugin-ab.sh (byte-identical across both arms).
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+
+dependency_overrides:
+  leancode_lint:
+    path: ../../vendor/leancode_lint-27.0.0
+  clean_architecture_linter:
+    path: ../../vendor/clean_architecture_linter-2.8.0
+  riverpod_lint:
+    path: ../../vendor/riverpod_lint-3.1.9
+  dart_code_linter:
+    path: ../../vendor/dart_code_linter-4.4.2
+  solid_lints:
+    path: ../../vendor/solid_lints-2.0.0

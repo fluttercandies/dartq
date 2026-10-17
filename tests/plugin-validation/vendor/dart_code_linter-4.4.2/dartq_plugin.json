@@ -1,0 +1,12 @@
+{
+  "name": "dart_code_linter",
+  "version": "4.4.2",
+  "entrypoint": "bin/dartq_serve.dart",
+  "capabilities": ["lint", "fix"],
+  "timeouts": {
+    "callback_ms": 30000,
+    "request_ms": 60000,
+    "request_retries": 3
+  },
+  "memory_budget_mb": 1536
+}

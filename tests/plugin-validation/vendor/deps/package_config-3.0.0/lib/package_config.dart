@@ -1,0 +1,366 @@
+// Copyright (c) 2019, the Dart project authors. Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+/// A package configuration is a way to assign file paths to package URIs,
+/// and vice-versa.
+///
+/// This package provides functionality to find, read and write package
+/// configurations in the [specified format](https://github.com/dart-lang/language/blob/main/accepted/2.8/language-versioning/package-config-file-v2.md).
+library;
+
+import 'dart:io' show Directory, File;
+import 'dart:typed_data' show Uint8List;
+
+import 'src/discovery.dart' as discover;
+import 'src/errors.dart' show throwError;
+import 'src/package_config.dart';
+import 'src/package_config_io.dart';
+
+export 'package_config_types.dart';
+
+/// Reads a specific package configuration file.
+///
+/// The file must exist, be readable and be a valid `package_config.json` file.
+///
+/// If [onError] is provided, the configuration file parsing will report errors
+/// by calling that function, and then try to recover.
+/// The returned package configuration is a *best effort* attempt to create
+/// a valid configuration from the invalid configuration file.
+/// If no [onError] is provided, errors are thrown immediately.
+Future<PackageConfig> loadPackageConfig(
+  File file, {
+  void Function(Object error)? onError,
+}) => readConfigFile(file, onError ?? throwError);
+
+/// @nodoc
+@Deprecated('use loadPackageConfig instead')
+Future<PackageConfig> loadAnyPackageConfig(
+  File file, {
+  bool preferNewest = true,
+  void Function(Object error)? onError,
+}) => loadPackageConfig(file, onError: onError);
+
+/// Reads a specific package configuration URI.
+///
+/// The file of the URI must exist, be readable,
+/// and be a valid `package_config.json` file.
+///
+/// If [loader] is provided, URIs are loaded using that function.
+/// The future returned by the loader must complete with a [Uint8List]
+/// containing the entire file content encoded as UTF-8,
+/// or with `null` if the file does not exist.
+/// The loader may throw at its own discretion, for situations where
+/// it determines that an error might be need user attention,
+/// but it is always allowed to return `null`.
+/// This function makes no attempt to catch such errors.
+/// As such, it may throw any error that [loader] throws.
+///
+/// If no [loader] is supplied, a default loader is used which
+/// only accepts `file:`, `http:` and `https:` URIs,
+/// and which uses the platform file system and HTTP requests to
+/// fetch file content. The default loader never throws because
+/// of an I/O issue, as long as the location URIs are valid.
+/// As such, it does not distinguish between a file not existing,
+/// and it being temporarily locked or unreachable.
+///
+/// If [onError] is provided, the configuration file parsing will report errors
+/// by calling that function, and then try to recover.
+/// The returned package configuration is a *best effort* attempt to create
+/// a valid configuration from the invalid configuration file.
+/// If no [onError] is provided, errors are thrown immediately.
+Future<PackageConfig> loadPackageConfigUri(
+  Uri file, {
+  Future<Uint8List?> Function(Uri uri)? loader,
+  void Function(Object error)? onError,
+}) => readConfigFileUri(file, loader, onError ?? throwError);
+
+/// @nodoc
+@Deprecated('use loadPackageConfigUri instead')
+Future<PackageConfig> loadAnyPackageConfigUri(
+  Uri uri, {
+  bool preferNewest = true,
+  void Function(Object error)? onError,
+}) => loadPackageConfigUri(uri, onError: onError);
+
+/// Finds a package configuration relative to [directory].
+///
+/// Returns both the configuration and the [File] it was in,
+/// or `null` if no valid configuration file was found.
+///
+/// If [directory] contains a `.dart_tool/package_config.json` file,
+/// then that file is loaded.
+///
+/// If no file is found in the current directory,
+/// then the parent directories are checked recursively,
+/// all the way to the root directory, to check if those contains
+/// a package configuration.
+/// If [recurse] is set to `false`, this parent directory check is not
+/// performed.
+///
+/// If [onError] is provided, the configuration file parsing will report errors
+/// by calling that function, and then try to recover.
+/// It's called with an error and the [File] being parsed.
+/// The returned package configuration is a *best effort* attempt to create
+/// a valid configuration from the invalid configuration file.
+/// If no [onError] is provided, errors are thrown immediately.
+///
+/// If [minVersion] is set to something greater than its default,
+/// any lower-version configuration files are ignored in the search
+/// when [skipInvalid] is `true`.
+/// If [skipInvalid] is `false` (the default),
+/// a configuration with an unaccepted version is reported to [onError].
+///
+/// See also:
+/// - [findPackageConfigAndUri] which works the same, except it uses
+///   [Uri]s for locations instead of [File] and [Directory],
+///   and can work with other schemes than `file:` if provided with a
+///   compatible `loader` function.
+Future<({PackageConfig config, File file})?> findPackageConfigAndFile(
+  Directory directory, {
+  bool recurse = true,
+  bool skipInvalid = false,
+  void Function(Object error, File file)? onError,
+  int minVersion = PackageConfig.minVersion,
+}) {
+  if (minVersion > PackageConfig.maxVersion) {
+    throw ArgumentError.value(
+      minVersion,
+      'minVersion',
+      'Maximum known version is ${PackageConfig.maxVersion}',
+    );
+  }
+  return discover.findPackageConfig(
+    directory,
+    minVersion,
+    recurse,
+    skipInvalid,
+    onError ?? throwError,
+  );
+}
+
+/// Finds a package configuration relative to [directory].
+///
+/// If [directory] contains a `.dart_tool/package_config.json` file,
+/// then that file is loaded.
+///
+/// If no file is found in the current directory,
+/// then the parent directories are checked recursively,
+/// all the way to the root directory, to check if those contains
+/// a package configuration.
+/// If [recurse] is set to `false`, this parent directory check is not
+/// performed.
+///
+/// If [onError] is provided, the configuration file parsing will report errors
+/// by calling that function, and then try to recover.
+/// The returned package configuration is a *best effort* attempt to create
+/// a valid configuration from the invalid configuration file.
+/// If no [onError] is provided, errors are thrown immediately.
+///
+/// If [minVersion] is set to something greater than its default,
+/// any lower-version configuration files are ignored in the search
+/// when [skipInvalid] is `true` (the default).
+/// If [skipInvalid] is `false`, an error is reported to [onError]
+/// for a configuration with an unaccepted version.
+///
+/// Returns `null` if no configuration file is found.
+///
+/// See also:
+/// - [findPackageConfigAndFile] which provides the actual configuration
+///   file being parsed in the result and to `onError`.
+/// - [findPackageConfigAndUri] which works the same, except it uses
+///   [Uri]s for locations instead of [File] and [Directory],
+///   and can work with other schemes than `file:` if provided with a
+///   compatible `loader` function.
+Future<PackageConfig?> findPackageConfig(
+  Directory directory, {
+  int minVersion = PackageConfig.minVersion,
+  bool recurse = true,
+  bool skipInvalid = true,
+  void Function(Object error)? onError,
+}) {
+  if (minVersion > PackageConfig.maxVersion) {
+    throw ArgumentError.value(
+      minVersion,
+      'minVersion',
+      'Maximum known version is ${PackageConfig.maxVersion}',
+    );
+  }
+  return discover
+      .findPackageConfig(
+        directory,
+        minVersion,
+        recurse,
+        skipInvalid,
+        onError == null ? throwError : (Object error, _) => onError(error),
+      )
+      .then(discover.configOnly);
+}
+
+/// Finds a package configuration relative to [location] and its URI location.
+///
+/// Returns both the configuration and the URI it was loaded from,
+/// or `null` if no configuration is found.
+///
+/// If [location] contains a `.dart_tool/package_config.json`
+/// package configuration file, then that file is loaded.
+/// The [location] URI *must not* be a `package:` URI.
+/// It should be a hierarchical URI which is supported
+/// by [loader].
+///
+/// If no file is found in the current directory,
+/// then the parent directories are checked recursively,
+/// all the way to the root directory, to check if those contains
+/// a package configuration.
+/// If [recurse] is set to `false`, this parent directory check is not
+/// performed.
+///
+/// If [loader] is provided, URIs are loaded using that function.
+/// The future returned by the loader must complete with a [Uint8List]
+/// containing the entire file content,
+/// or with `null` if the file does not exist.
+/// The loader may throw at its own discretion, for situations where
+/// it determines that an error might be need user attention,
+/// but it is always allowed to return `null`.
+/// This function makes no attempt to catch such errors.
+///
+/// If no [loader] is supplied, a default loader is used which
+/// only accepts `file:`, `http:` and `https:` URIs,
+/// and which uses the platform file system and HTTP requests to
+/// fetch file content. The default loader never throws because
+/// of an I/O issue, as long as the location URIs are valid.
+/// As such, it does not distinguish between a file not existing,
+/// and it being temporarily locked or unreachable.
+///
+/// If [onError] is provided, the configuration file parsing will report errors
+/// by calling that function, and then try to recover.
+/// The returned package configuration is a *best effort* attempt to create
+/// a valid configuration from the invalid configuration file.
+/// If no [onError] is provided, errors are thrown immediately.
+///
+/// If [minVersion] is set to something greater than its default,
+/// any lower-version configuration files are ignored in the search
+/// when [skipInvalid] is `true`.
+/// If [skipInvalid] is `false` (the default),
+/// a configuration with an unaccepted version is reported to [onError].
+///
+/// See also:
+/// - [findPackageConfigAndFile] which behaves the same, but uses
+///   [File] and [Directory] for locations instead of [Uri]s,
+///   and only uses the local filesystem.
+Future<({PackageConfig config, Uri file})?> findPackageConfigAndUri(
+  Uri location, {
+  bool recurse = true,
+  bool skipInvalid = false,
+  int minVersion = PackageConfig.minVersion,
+  Future<Uint8List?> Function(Uri uri)? loader,
+  void Function(Object error, Uri uri)? onError,
+}) {
+  if (minVersion > PackageConfig.maxVersion) {
+    throw ArgumentError.value(
+      minVersion,
+      'minVersion',
+      'Maximum known version is ${PackageConfig.maxVersion}',
+    );
+  }
+  return discover.findPackageConfigUri(
+    location,
+    minVersion,
+    loader,
+    recurse,
+    skipInvalid,
+    onError ?? throwError,
+  );
+}
+
+/// Finds a package configuration relative to [location].
+///
+/// If [location] contains a `.dart_tool/package_config.json`
+/// package configuration file or, then that file is loaded.
+/// The [location] URI *must not* be a `package:` URI.
+/// It should be a hierarchical URI which is supported
+/// by [loader].
+///
+/// If no file is found in the current directory,
+/// then the parent directories are checked recursively,
+/// all the way to the root directory, to check if those contains
+/// a package configuration.
+/// If [recurse] is set to `false`, this parent directory check is not
+/// performed.
+///
+/// If [loader] is provided, URIs are loaded using that function.
+/// The future returned by the loader must complete with a [Uint8List]
+/// containing the entire file content,
+/// or with `null` if the file does not exist.
+/// The loader may throw at its own discretion, for situations where
+/// it determines that an error might be need user attention,
+/// but it is always allowed to return `null`.
+/// This function makes no attempt to catch such errors.
+///
+/// If no [loader] is supplied, a default loader is used which
+/// only accepts `file:`, `http:` and `https:` URIs,
+/// and which uses the platform file system and HTTP requests to
+/// fetch file content. The default loader never throws because
+/// of an I/O issue, as long as the location URIs are valid.
+/// As such, it does not distinguish between a file not existing,
+/// and it being temporarily locked or unreachable.
+///
+/// If [onError] is provided, the configuration file parsing will report errors
+/// by calling that function, and then try to recover.
+/// The returned package configuration is a *best effort* attempt to create
+/// a valid configuration from the invalid configuration file.
+/// If no [onError] is provided, errors are thrown immediately.
+///
+/// If [minVersion] is set to something greater than its default,
+/// any lower-version configuration files are ignored in the search
+/// when [skipInvalid] is `true` (the default).
+/// If [skipInvalid] is `false`, an error is reported to [onError]
+/// for a configuration with an unaccepted version.
+///
+/// Returns `null` if no configuration file is found.
+///
+/// See also:
+/// - [findPackageConfigAndUri] which provides the actual configuration
+///   file being parsed in the result and to `onError`.
+/// - [findPackageConfigAndFile] which works the same, except it uses
+///   [File] and [Directory] for locations instead of [Uri]s,
+///   and only uses the local filesystem.
+Future<PackageConfig?> findPackageConfigUri(
+  Uri location, {
+  bool recurse = true,
+  bool skipInvalid = true,
+  int minVersion = PackageConfig.minVersion,
+  Future<Uint8List?> Function(Uri uri)? loader,
+  void Function(Object error)? onError,
+}) {
+  if (minVersion > PackageConfig.maxVersion) {
+    throw ArgumentError.value(
+      minVersion,
+      'minVersion',
+      'Maximum known version is ${PackageConfig.maxVersion}',
+    );
+  }
+  return discover
+      .findPackageConfigUri(
+        location,
+        minVersion,
+        loader,
+        recurse,
+        skipInvalid,
+        onError == null ? throwError : (Object error, _) => onError(error),
+      )
+      .then(discover.configOnly);
+}
+
+/// Writes a package configuration to the provided directory.
+///
+/// Writes `.dart_tool/package_config.json` relative to [directory].
+/// If the `.dart_tool/` directory does not exist, it is created.
+/// If it cannot be created, this operation fails.
+///
+/// A comment is generated if `[PackageConfig.extraData]` contains a
+/// `"generator"` entry.
+Future<void> savePackageConfig(
+  PackageConfig configuration,
+  Directory directory,
+) => writePackageConfigJsonFile(configuration, directory);

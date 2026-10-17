@@ -1,0 +1,12 @@
+{
+  "name": "solid_lints",
+  "version": "2.0.0",
+  "entrypoint": "bin/dartq_serve.dart",
+  "capabilities": ["lint", "fix"],
+  "timeouts": {
+    "callback_ms": 30000,
+    "request_ms": 60000,
+    "request_retries": 3
+  },
+  "memory_budget_mb": 1024
+}

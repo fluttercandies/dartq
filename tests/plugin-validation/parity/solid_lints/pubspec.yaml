@@ -1,0 +1,16 @@
+name: dartq_parity_solid_lints
+description: >-
+  Plugin-parity corpus package for solid_lints. The official face reads
+  only analysis_options.yaml (its synthetic plugin package lives under the
+  run's ANALYZER_STATE_LOCATION_OVERRIDE); this pubspec exists for the dartq
+  face, whose plugin discovery resolves the declared plugin name through the
+  package_config the override below produces (the preset technique,
+  tests/plugin-validation/README.md).
+publish_to: none
+
+environment:
+  sdk: ^3.13.0
+
+dependency_overrides:
+  solid_lints:
+    path: ../../vendor/solid_lints-2.0.0

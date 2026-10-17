@@ -1,0 +1,377 @@
+import '../../xml/utils/name.dart';
+import '../evaluation/context.dart';
+import '../evaluation/functions.dart';
+import '../exceptions/error_code.dart';
+import '../exceptions/evaluation_exception.dart';
+import 'atomic.dart';
+import 'item.dart';
+import 'sequence.dart';
+import 'types.dart';
+
+typedef XPathFunction0 = XPathSequence Function(XPathContext context);
+typedef XPathFunction1 = XPathSequence Function(
+  XPathContext context,
+  XPathSequence a1,
+);
+typedef XPathFunction2 = XPathSequence Function(
+  XPathContext context,
+  XPathSequence a1,
+  XPathSequence a2,
+);
+typedef XPathFunction3 = XPathSequence Function(
+  XPathContext context,
+  XPathSequence a1,
+  XPathSequence a2,
+  XPathSequence a3,
+);
+typedef XPathFunctionN = XPathSequence Function(
+  XPathContext context,
+  List<XPathSequence> args,
+);
+
+/// Base class for all function items (functions, maps, arrays) in XDM 3.1.
+abstract class XPathFunctionItem implements XPathItem {
+  /// Creates a function item.
+  const new();
+
+  /// Creates a general function item taking a list of arguments.
+  const factory function({
+    required XmlName name,
+    required int arity,
+    required XPathFunctionN function,
+    List<XPathType>? parameterTypes,
+    XPathType? returnType,
+  }) = _XPathFunctionN.named;
+
+  /// Creates a function item with 0 arguments.
+  const factory fn0(
+    XmlName name,
+    XPathFunction0 function, {
+    XPathType? returnType,
+  }) = _XPathFunction0;
+
+  /// Creates a function item with 1 argument.
+  const factory fn1(
+    XmlName name,
+    XPathFunction1 function, {
+    List<XPathType>? parameterTypes,
+    XPathType? returnType,
+  }) = _XPathFunction1;
+
+  /// Creates a function item with 2 arguments.
+  const factory fn2(
+    XmlName name,
+    XPathFunction2 function, {
+    List<XPathType>? parameterTypes,
+    XPathType? returnType,
+  }) = _XPathFunction2;
+
+  /// Creates a function item with 3 arguments.
+  const factory fn3(
+    XmlName name,
+    XPathFunction3 function, {
+    List<XPathType>? parameterTypes,
+    XPathType? returnType,
+  }) = _XPathFunction3;
+
+  /// Creates a function item with [arity] arguments taking a list.
+  const factory fnN(
+    XmlName name,
+    int arity,
+    XPathFunctionN function, {
+    List<XPathType>? parameterTypes,
+    XPathType? returnType,
+  }) = _XPathFunctionN;
+
+  /// Creates a variadic function item with minimum arity [minArity].
+  const factory variadic(
+    XmlName name,
+    int minArity,
+    XPathFunctionN function, {
+    List<XPathType>? parameterTypes,
+    XPathType? returnType,
+  }) = _XPathVariadicFunction;
+
+  /// Creates an overloaded function item that dispatches across arities.
+  const factory overloaded(XmlName name, Map<int, XPathFunctionItem> byArity) =
+      XPathOverloadedFunction;
+
+  /// The name of the function, if named.
+  XmlName get name => anonymousFunctionName;
+
+  /// The arity (number of required arguments) of the function item.
+  int get arity;
+
+  /// Whether this function accepts variable arguments (at least [arity]).
+  bool get isVariadic => false;
+
+  /// The parameter types of the function, if statically known.
+  List<XPathType>? get parameterTypes => null;
+
+  /// The return type of the function, if statically known.
+  XPathType? get returnType => null;
+
+  @override
+  XPathType get type => parameterTypes != null || returnType != null
+      ? XPathFunctionType(
+          parameterTypes: parameterTypes,
+          returnType: returnType,
+        )
+      : xsFunction;
+
+  @override
+  XPathAtomic atomize() => throw XPathEvaluationException(
+    XPathErrorCode.FOTY0013,
+    'Cannot atomize a map or function item',
+  );
+
+  @override
+  String get stringValue => throw XPathEvaluationException(
+    XPathErrorCode.FOTY0013,
+    'String value not defined for function item: $this',
+  );
+
+  @override
+  bool get effectiveBooleanValue => throw XPathEvaluationException(
+    XPathErrorCode.FORG0006,
+    'Cannot compute EBV for a function item: $this',
+  );
+
+  @override
+  Object toValue() => this;
+
+  /// Invokes the function item with the given arguments.
+  XPathSequence call(XPathContext context, List<XPathSequence> arguments);
+
+  @override
+  String toString() => '${name.qualified}#$arity';
+}
+
+class _XPathFunction0 extends XPathFunctionItem {
+  const new(this.name, this._function, {this.returnType});
+
+  @override
+  final XmlName name;
+
+  final XPathFunction0 _function;
+
+  @override
+  int get arity => 0;
+
+  @override
+  final XPathType? returnType;
+
+  @override
+  XPathSequence call(XPathContext context, List<XPathSequence> arguments) {
+    if (arguments.isNotEmpty) {
+      throw XPathEvaluationException(
+        XPathErrorCode.FOAP0001,
+        'Function ${name.qualified} expects 0 arguments, but got ${arguments.length}.',
+      );
+    }
+    return _function(context);
+  }
+}
+
+class _XPathFunction1 extends XPathFunctionItem {
+  const new(this.name, this._function, {this.parameterTypes, this.returnType});
+
+  @override
+  final XmlName name;
+
+  final XPathFunction1 _function;
+
+  @override
+  int get arity => 1;
+
+  @override
+  final List<XPathType>? parameterTypes;
+
+  @override
+  final XPathType? returnType;
+
+  @override
+  XPathSequence call(XPathContext context, List<XPathSequence> arguments) {
+    if (arguments.length != 1) {
+      throw XPathEvaluationException(
+        XPathErrorCode.FOAP0001,
+        'Function ${name.qualified} expects 1 argument, but got ${arguments.length}.',
+      );
+    }
+    return _function(context, arguments[0]);
+  }
+}
+
+class _XPathFunction2 extends XPathFunctionItem {
+  const new(this.name, this._function, {this.parameterTypes, this.returnType});
+
+  @override
+  final XmlName name;
+
+  final XPathFunction2 _function;
+
+  @override
+  int get arity => 2;
+
+  @override
+  final List<XPathType>? parameterTypes;
+
+  @override
+  final XPathType? returnType;
+
+  @override
+  XPathSequence call(XPathContext context, List<XPathSequence> arguments) {
+    if (arguments.length != 2) {
+      throw XPathEvaluationException(
+        XPathErrorCode.FOAP0001,
+        'Function ${name.qualified} expects 2 arguments, but got ${arguments.length}.',
+      );
+    }
+    return _function(context, arguments[0], arguments[1]);
+  }
+}
+
+class _XPathFunction3 extends XPathFunctionItem {
+  const new(this.name, this._function, {this.parameterTypes, this.returnType});
+
+  @override
+  final XmlName name;
+
+  final XPathFunction3 _function;
+
+  @override
+  int get arity => 3;
+
+  @override
+  final List<XPathType>? parameterTypes;
+
+  @override
+  final XPathType? returnType;
+
+  @override
+  XPathSequence call(XPathContext context, List<XPathSequence> arguments) {
+    if (arguments.length != 3) {
+      throw XPathEvaluationException(
+        XPathErrorCode.FOAP0001,
+        'Function ${name.qualified} expects 3 arguments, but got ${arguments.length}.',
+      );
+    }
+    return _function(context, arguments[0], arguments[1], arguments[2]);
+  }
+}
+
+class _XPathFunctionN extends XPathFunctionItem {
+  const new(
+    this.name,
+    this.arity,
+    this._function, {
+    this.parameterTypes,
+    this.returnType,
+  });
+
+  const new named({
+    required this.name,
+    required this.arity,
+    required this._function,
+    this.parameterTypes,
+    this.returnType,
+  });
+
+  @override
+  final XmlName name;
+
+  @override
+  final int arity;
+
+  final XPathFunctionN _function;
+
+  @override
+  final List<XPathType>? parameterTypes;
+
+  @override
+  final XPathType? returnType;
+
+  @override
+  XPathSequence call(XPathContext context, List<XPathSequence> arguments) {
+    if (arguments.length != arity) {
+      throw XPathEvaluationException(
+        XPathErrorCode.FOAP0001,
+        'Function ${name.qualified} expects $arity arguments, but got ${arguments.length}.',
+      );
+    }
+    return _function(context, arguments);
+  }
+}
+
+/// An [XPathFunctionItem] that represents an overloaded function group keyed by arity.
+class XPathOverloadedFunction extends XPathFunctionItem {
+  const new(this.name, this.byArity);
+
+  @override
+  final XmlName name;
+
+  final Map<int, XPathFunctionItem> byArity;
+
+  @override
+  int get arity => byArity.keys.reduce((a, b) => a < b ? a : b);
+
+  XPathFunctionItem? getForArity(int arity) => byArity[arity];
+
+  @override
+  List<XPathType>? get parameterTypes => byArity[arity]?.parameterTypes;
+
+  @override
+  XPathType? get returnType => byArity[arity]?.returnType;
+
+  @override
+  XPathSequence call(XPathContext context, List<XPathSequence> arguments) {
+    final func = byArity[arguments.length];
+    if (func != null) {
+      return func.call(context, arguments);
+    }
+    throw XPathEvaluationException(
+      XPathErrorCode.FOAP0001,
+      'Function ${name.qualified} does not support arity ${arguments.length}. Available arities: ${byArity.keys.toList()..sort()}.',
+    );
+  }
+}
+
+class _XPathVariadicFunction extends XPathFunctionItem {
+  const new(
+    this.name,
+    this.minArity,
+    this._function, {
+    this.parameterTypes,
+    this.returnType,
+  });
+
+  @override
+  final XmlName name;
+
+  final int minArity;
+
+  @override
+  int get arity => minArity;
+
+  @override
+  bool get isVariadic => true;
+
+  final XPathFunctionN _function;
+
+  @override
+  final List<XPathType>? parameterTypes;
+
+  @override
+  final XPathType? returnType;
+
+  @override
+  XPathSequence call(XPathContext context, List<XPathSequence> arguments) {
+    if (arguments.length < minArity) {
+      throw XPathEvaluationException(
+        XPathErrorCode.FOAP0001,
+        'Function ${name.qualified} expects at least $minArity arguments, but got ${arguments.length}.',
+      );
+    }
+    return _function(context, arguments);
+  }
+}

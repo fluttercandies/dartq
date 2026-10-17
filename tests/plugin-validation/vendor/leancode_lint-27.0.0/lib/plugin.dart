@@ -1,0 +1,128 @@
+import 'package:analysis_server_plugin/plugin.dart';
+import 'package:analysis_server_plugin/registry.dart';
+import 'package:leancode_lint/config.dart';
+import 'package:leancode_lint/src/assists/convert_iterable_map_to_collection_for.dart';
+import 'package:leancode_lint/src/assists/convert_positional_to_named_formal.dart';
+import 'package:leancode_lint/src/assists/convert_record_into_nominal_type.dart';
+import 'package:leancode_lint/src/lints/add_cubit_suffix_for_cubits.dart';
+import 'package:leancode_lint/src/lints/avoid_build_context_in_blocs.dart';
+import 'package:leancode_lint/src/lints/avoid_catch_error.dart';
+import 'package:leancode_lint/src/lints/avoid_conditional_hooks.dart';
+import 'package:leancode_lint/src/lints/avoid_context_read_in_build.dart';
+import 'package:leancode_lint/src/lints/avoid_direct_collection_equality_checks.dart';
+import 'package:leancode_lint/src/lints/avoid_single_child_in_multi_child_widget.dart';
+import 'package:leancode_lint/src/lints/bloc_related_class_naming.dart';
+import 'package:leancode_lint/src/lints/bloc_subclasses_naming.dart';
+import 'package:leancode_lint/src/lints/catch_parameter_names.dart';
+import 'package:leancode_lint/src/lints/constructor_parameters_and_fields_should_have_the_same_order.dart';
+import 'package:leancode_lint/src/lints/hook_widget_does_not_use_hooks.dart';
+import 'package:leancode_lint/src/lints/missing_equatable_props.dart';
+import 'package:leancode_lint/src/lints/never_discard_build_context.dart';
+import 'package:leancode_lint/src/lints/prefer_abstract_final_class.dart';
+import 'package:leancode_lint/src/lints/prefer_equatable_mixin.dart';
+import 'package:leancode_lint/src/lints/prefix_widgets_returning_slivers.dart';
+import 'package:leancode_lint/src/lints/start_comments_with_space.dart';
+import 'package:leancode_lint/src/lints/use_align.dart';
+import 'package:leancode_lint/src/lints/use_dedicated_media_query_methods.dart';
+import 'package:leancode_lint/src/lints/use_design_system_item.dart';
+import 'package:leancode_lint/src/lints/use_padding.dart';
+
+export 'package:leancode_lint/config.dart';
+
+/// Analyzer plugin implementation for `leancode_lint`.
+///
+/// Consumers that want to configure the lints programmatically should import
+/// `package:leancode_lint/plugin.dart` and instantiate [LeanCodeLintPlugin]
+/// from their own plugin package.
+final class LeanCodeLintPlugin({
+  @override final String name = 'leancode_lint',
+  final LeanCodeLintConfig config = const .new(),
+}) extends Plugin {
+  @override
+  void register(PluginRegistry registry) {
+    UseDesignSystemItem.fromConfig(config)
+        .forEach(registry.registerWarningRule);
+    registry
+      ..registerWarningRule(StartCommentsWithSpace())
+      ..registerWarningRule(
+        PrefixWidgetsReturningSlivers(
+          applicationPrefix: config.applicationPrefix,
+        ),
+      )
+      ..registerFixForRule(
+        StartCommentsWithSpace.code,
+        AddStartingSpaceToComment.new,
+      )
+      ..registerWarningRule(AddCubitSuffixForYourCubits())
+      ..registerWarningRule(
+        BlocRelatedClassNaming(config: config.blocRelatedClassNaming),
+      )
+      ..registerWarningRule(BlocSubclassesNaming())
+      ..registerWarningRule(
+        CatchParameterNames(config: config.catchParameterNames),
+      )
+      ..registerWarningRule(AvoidCatchError())
+      ..registerWarningRule(AvoidBuildContextInBlocs())
+      ..registerWarningRule(AvoidConditionalHooks())
+      ..registerWarningRule(AvoidDirectCollectionEqualityChecks())
+      ..registerFixForRule(
+        AvoidDirectCollectionEqualityChecks.code,
+        ReplaceWithFlutterFoundationEqualsFix.new,
+      )
+      ..registerFixForRule(
+        AvoidDirectCollectionEqualityChecks.code,
+        ReplaceWithCollectionPackageEqualityFix.new,
+      )
+      ..registerFixForRule(
+        AvoidDirectCollectionEqualityChecks.code,
+        ReplaceWithIdenticalFix.new,
+      )
+      ..registerWarningRule(HookWidgetDoesNotUseHooks())
+      ..registerFixForRule(
+        HookWidgetDoesNotUseHooks.code,
+        ConvertHookWidgetToStatelessWidget.new,
+      )
+      ..registerWarningRule(NeverDiscardBuildContext())
+      ..registerFixForRule(
+        NeverDiscardBuildContext.code,
+        RenameDiscardedBuildContextFix.new,
+      )
+      ..registerWarningRule(AvoidContextReadInBuild())
+      ..registerFixForRule(
+        AvoidContextReadInBuild.code,
+        ReplaceContextReadWithWatchFix.new,
+      )
+      // TODO: disabled by default until stabilized. Add documentation.
+      ..registerLintRule(ConstructorParametersAndFieldsShouldHaveTheSameOrder())
+      ..registerWarningRule(AvoidSingleChildInMultiChildWidgets())
+      ..registerWarningRule(UseAlign())
+      ..registerFixForRule(UseAlign.code, UseAlignFix.new)
+      ..registerWarningRule(UsePadding())
+      ..registerFixForRule(UsePadding.code, UsePaddingFix.new)
+      ..registerWarningRule(UseDedicatedMediaQueryMethods())
+      ..registerFixForRule(
+        UseDedicatedMediaQueryMethods.code,
+        ReplaceMediaQueryOfWithDedicatedMethodFix.new,
+      )
+      ..registerWarningRule(PreferEquatableMixin())
+      ..registerFixForRule(
+        PreferEquatableMixin.code,
+        ConvertToEquatableMixin.new,
+      )
+      ..registerWarningRule(PreferAbstractFinalClass())
+      ..registerFixForRule(
+        PreferAbstractFinalClass.code,
+        ConvertToAbstractFinalClass.new,
+      )
+      ..registerWarningRule(MissingEquatableProps())
+      ..registerFixForRule(
+        MissingEquatableProps.code,
+        AddToEquatablePropsFix.new,
+      )
+      // TODO: uncomment when `prefer_center_over_align` is migrated
+      // ..registerWarningRule(PreferCenterOverAlign())
+      ..registerAssist(ConvertRecordIntoNominalType.new)
+      ..registerAssist(ConvertPositionalToNamedFormal.new)
+      ..registerAssist(ConvertIterableMapToCollectionFor.new);
+  }
+}

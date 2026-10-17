@@ -1,0 +1,42 @@
+# Plugin-present preset (arm B). The `plugins:` section is the only
+# difference from presets/absent/analysis_options.yaml: five entries, one
+# per vendored plugin, declared through the native pub plugins face and
+# resolved via this preset's package_config.json (the dependency_overrides
+# in pubspec.yaml put the vendored roots on it).
+#
+# Enablement face (dartq v1 reads plugins.<name>.diagnostics scalars only):
+# `true` enables a lint-kind rule (lint rules are opt-in), severity names
+# re-level. Warning-kind rules are enabled by default; the explicit `true`
+# entries pin the corpus rules on regardless of their registration kind.
+# After scripts/plugin-census.sh produces expectations/<pkg>.census.txt,
+# extend these maps from the census (kind column) to reach "all rules on"
+# for a maximal-overhead arm B.
+plugins:
+  leancode_lint:
+    diagnostics:
+      avoid_build_context_in_blocs: true
+      prefer_abstract_final_class: true
+      catch_parameter_names: true
+  clean_architecture_linter:
+    diagnostics:
+      repository_interface: true
+      usecase_no_result_return: true
+      repository_pass_through: true
+      model_field_duplication: true
+  riverpod_lint:
+    diagnostics:
+      notifier_build: true
+      avoid_build_context_in_providers: true
+      missing_provider_scope: true
+      avoid_public_notifier_properties: true
+  dart_code_linter:
+    diagnostics:
+      avoid-dynamic: true
+      prefer-trailing-comma: true
+      no-empty-block: true
+  solid_lints:
+    diagnostics:
+      avoid_non_null_assertion: true
+      avoid_late_keyword: true
+      prefer_early_return: true
+      avoid_global_state: true

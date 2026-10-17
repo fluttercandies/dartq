@@ -1,0 +1,114 @@
+import 'dart:io';
+
+import 'package:dart_code_linter/src/cli/cli_runner.dart';
+import 'package:path/path.dart' as p;
+import 'package:test/test.dart';
+
+const _usage = 'Check unused *.dart files.\n'
+    '\n'
+    'Usage: metrics check-unused-files [arguments] <directories>\n'
+    '-h, --help                                       Print this usage information.\n'
+    '\n'
+    '\n'
+    '-r, --reporter=<console>                         The format of the output of the analysis.\n'
+    '                                                 [console (default), json]\n'
+    '\n'
+    '\n'
+    '-c, --print-config                               Print resolved config.\n'
+    '\n'
+    '\n'
+    '    --root-folder=<./>                           Root folder.\n'
+    '                                                 (defaults to current directory)\n'
+    '    --sdk-path=<directory-path>                  Dart SDK directory path. Should be provided only when you run the application as compiled executable(https://dart.dev/tools/dart-compile#exe) and automatic Dart SDK path detection fails.\n'
+    '    --exclude=<{/**.g.dart,/**.freezed.dart}>    File paths in Glob syntax to be exclude.\n'
+    '                                                 (defaults to "{/**.g.dart,/**.freezed.dart}")\n'
+    '\n'
+    '\n'
+    "    --no-congratulate                            Don't show output even when there are no issues.\n"
+    '\n'
+    '\n'
+    '    --[no-]verbose                               Show verbose logs.\n'
+    '\n'
+    '\n'
+    '    --[no-]monorepo                              Treat all exported files as unused by default.\n'
+    '\n'
+    '\n'
+    '    --[no-]fatal-unused                          Treat find unused file as fatal.\n'
+    '                                                 (defaults to on)\n'
+    '\n'
+    '\n'
+    '-d, --[no-]delete-files                          Delete all unused files.\n'
+    '\n'
+    'Run "metrics help" to see global options.';
+
+void main() {
+  group('CheckUnusedFilesCommand', () {
+    final runner = CliRunner();
+    final command = runner.commands['check-unused-files'];
+
+    test('should have correct name', () {
+      expect(command?.name, equals('check-unused-files'));
+    });
+
+    test('should have correct description', () {
+      expect(command?.description, equals('Check unused *.dart files.'));
+    });
+
+    test('should have correct invocation', () {
+      expect(
+        command?.invocation,
+        equals('metrics check-unused-files [arguments] <directories>'),
+      );
+    });
+
+    test('should have correct usage', () {
+      expect(
+        command?.usage.replaceAll('"${p.current}"', 'current directory'),
+        equals(_usage),
+      );
+    });
+
+    test(
+      'should not delete files matched by the default --exclude',
+      () async {
+        final root = Directory(
+          Directory.systemTemp
+              .createTempSync('dcl_delete_files_')
+              .resolveSymbolicLinksSync(),
+        );
+        addTearDown(() => root.deleteSync(recursive: true));
+
+        File(p.join(root.path, 'analysis_options.yaml')).writeAsStringSync('');
+        final files = {
+          'main.dart': 'void main() {}',
+          'x.g.dart': 'int x = 1;',
+          'x.freezed.dart': 'int x = 1;',
+          'y.dart': 'int y = 1;',
+        }.map((name, content) {
+          final file = File(p.join(root.path, 'lib', name))
+            ..createSync(recursive: true)
+            ..writeAsStringSync(content);
+
+          return MapEntry(name, file);
+        });
+
+        // CliRunner.run exits the process, so run the command directly.
+        await runner.runCommand(runner.parse([
+          'check-unused-files',
+          'lib',
+          '--root-folder=${root.path}',
+          '--delete-files',
+          '--no-fatal-unused',
+          '--no-congratulate',
+        ]));
+
+        expect(files['main.dart']!.existsSync(), isTrue);
+        expect(files['x.g.dart']!.existsSync(), isTrue);
+        expect(files['x.freezed.dart']!.existsSync(), isTrue);
+        expect(files['y.dart']!.existsSync(), isFalse);
+      },
+      testOn: 'posix',
+      timeout: const Timeout.factor(4),
+    );
+  });
+}
