@@ -42,6 +42,14 @@ use scan::{FlatEntry, parse_flat_table, scan_unit};
 const FLAT_OUT: &str = "crates/dartq-sdk/src/flat_libraries.rs";
 const FACES_OUT: &str = "crates/dartq-engine/src/sdk_faces_gen.rs";
 
+/// Names the analyzer's front end injects into a library's namespace without
+/// a source-level declaration. `Never` has no declaration anywhere in the
+/// SDK's `lib/` sources (the front end synthesizes the type in its type
+/// universe and exposes it through dart:core's namespace), so a pure source
+/// scan drops it — yet `dart analyze` resolves bare `Never` through the
+/// implicit core import, and so must the engine's face table.
+const SYNTHETIC_NAMES: &[(&str, &[&str])] = &[("core", &["Never"])];
+
 /// Public top-level names that must be present in a library's face for the
 /// run to succeed — the pinned acceptance symbols of the facade census
 /// (`Completer`, `base64`, `JS`, `staticInterop`, …) plus the re-export
@@ -57,6 +65,7 @@ const ANCHORS: &[(&str, &[&str])] = &[
             "double",
             "num",
             "bool",
+            "Never",
             "print",
             "identical",
             "pragma",
@@ -447,6 +456,12 @@ fn face(
         }
     }
     stack.pop();
+    // Front-end synthetics (see [`SYNTHETIC_NAMES`]) join after the export
+    // fold — they are part of the oracle's namespace shape for the library
+    // despite having no source declaration to scan.
+    if let Some((_, names_injected)) = SYNTHETIC_NAMES.iter().find(|(lib, _)| *lib == name) {
+        names.extend(names_injected.iter().map(|n| n.to_string()));
+    }
     memo.insert(name.to_owned(), names.clone());
     Ok(names)
 }

@@ -1,7 +1,7 @@
 // GENERATED FILE — do not edit.
 // Regenerate: cargo run -p sdk-faces-gen -- <dart-sdk-root> (from the workspace root)
 // Source SDK: 3.13.1 — per-library public top-level export faces, 25 libraries /
-// 1551 names total.
+// 1552 names total.
 //
 // Each set is the library's FULL top-level public surface: own declarations
 // (library file plus parts) plus every transitively re-exported name
@@ -210,6 +210,7 @@ pub static SDK_LIBRARY_FACES: &[(&str, &[&str])] = &[
             "Map",
             "MapEntry",
             "Match",
+            "Never",
             "NoSuchMethodError",
             "Null",
             "NullableIterableExtensions",
