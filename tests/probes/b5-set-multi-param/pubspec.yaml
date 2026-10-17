@@ -1,0 +1,12 @@
+name: probe_b5_set_multi_param
+description: >-
+  Setter-arity probe package (decision ticket B5). Measures the oracle's
+  machine-format face for setters whose parameter shape violates the
+  exactly-one-required-positional rule, plus nearby control shapes. One
+  face per lib file; no analysis_options (analyzer defaults, zero lints);
+  no dependencies. Fixture sources are hand-verified valid Dart except for
+  the constructs under probe.
+publish_to: none
+
+environment:
+  sdk: ^3.13.0

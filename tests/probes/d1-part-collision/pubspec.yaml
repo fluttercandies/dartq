@@ -1,0 +1,13 @@
+name: probe_d1_part_collision
+description: >-
+  Cross-part duplicate-definition probe package (decision ticket D1).
+  Measures which FILES the oracle reports rows on, and how many rows, when
+  the same top-level name is declared twice within one library spread over
+  a defining file and two part files. One face per file; no
+  analysis_options (analyzer defaults, zero lints); no dependencies.
+  Fixture sources are hand-verified valid Dart except for the constructs
+  under probe.
+publish_to: none
+
+environment:
+  sdk: ^3.13.0

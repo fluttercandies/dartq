@@ -15,7 +15,7 @@
 #   script concurrently with another analysis process on either side (noisy numbers).
 # - The script never runs `pub get`; the target directory must already have a
 #   package context (or none — dart analyze also works without one, see
-#   the oracle machine-format contract §3).
+#   the oracle machine-format contract).
 #
 # Usage: oracle_baseline.sh <target-dir> [rounds] [--label <name>] [--cmd "<command>"]
 #
@@ -40,12 +40,12 @@ while [ $# -gt 0 ]; do
   --label)
     [ $# -ge 2 ] || { echo "error: --label needs a value" >&2; exit 2; }
     LABEL="$2"
-    shift
+    shift 2
     ;;
   --cmd)
     [ $# -ge 2 ] || { echo "error: --cmd needs a value" >&2; exit 2; }
     CMD="$2"
-    shift
+    shift 2
     ;;
   -h | --help)
     sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
@@ -64,7 +64,8 @@ while [ $# -gt 0 ]; do
     ;;
   esac
 done
-DIR="${DIR:?usage: oracle_baseline.sh <target-dir> [rounds] [--label <name>] [--cmd \"<command>\"]}"
+[ -n "$DIR" ] ||
+  { echo "error: usage: oracle_baseline.sh <target-dir> [rounds] [--label <name>] [--cmd \"<command>\"]" >&2; exit 2; }
 ROUNDS="${ROUNDS:-5}"
 LABEL="${LABEL:-$(basename "$DIR")}"
 
@@ -81,6 +82,9 @@ else
   [ "${#RUN_WORDS[@]}" -ge 1 ] || { echo "error: --cmd is empty" >&2; exit 2; }
   command -v "${RUN_WORDS[0]}" >/dev/null 2>&1 ||
     { echo "error: --cmd binary not found or not executable: ${RUN_WORDS[0]}" >&2; exit 2; }
+  # The --cmd words get the target dir appended (the documented contract):
+  # callers pass the tool prefix only; the corpus is always "$DIR".
+  RUN_WORDS+=("$DIR")
 fi
 
 # --- corpus scale -----------------------------------------------------------
@@ -126,7 +130,6 @@ for i in $(seq 1 "$ROUNDS"); do
   /usr/bin/time -l -o "$WORK/time.$i" "${RUN_WORDS[@]}" \
     >"$WORK/out.$i" 2>"$WORK/err.$i" </dev/null
   CODE=$?
-  set -e
   REAL=$(awk '/ real / {printf "%.0f", $1 * 1000}' "$WORK/time.$i")
   MAXRSS=$(awk '/maximum resident set size/ {print $1}' "$WORK/time.$i")
   DIAGS=$(wc -l <"$WORK/out.$i" | tr -d ' ')
