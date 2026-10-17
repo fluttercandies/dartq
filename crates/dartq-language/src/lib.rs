@@ -53,8 +53,57 @@
 //!   default. When that fallback lands on the default version (== latest)
 //!   the drop is observationally a clamp, but the mechanism is drop +
 //!   re-resolve. [`LanguageVersion::is_above_latest`] is the detection hook
-//!   for that warning/drop emission site (measured in
-//!   the version-skew ledger §1.3 T2).
+//!   for that warning/drop emission site.
+//!
+//! # Fallback posture above the vendored horizon
+//!
+//! The snapshot is era-pinned (dart 3.13.1), while packages can declare
+//! newer language versions — a `sdk: ^3.15.0` constraint materialized into a
+//! package config by a newer pub, or any hand-resolved nested project. The
+//! posture for a version past the data horizon
+//! ([`NEWEST_KNOWN_VERSION`] = `max(current-version, max enabledIn)`,
+//! recomputed by `build.rs` on every re-vendor) is the official one: a tool
+//! never knows features past its own feature table, and a newer declaration
+//! never disables what the table knows.
+//!
+//! * Version-derived enablement ([`FeatureSet::for_language_version`],
+//!   [`triple_shift_enabled`]) clamps the version to the horizon: features
+//!   shipped at or below it stay on; nothing past it can switch on. This is
+//!   `ExperimentStatus.restrictToVersion` deciding at the running tool's
+//!   known table — the same answer the official comparisons produce, made
+//!   explicit instead of an accident of "no `enabledIn` exceeds
+//!   current-version".
+//! * Explicit flag decode ([`FeatureSet::with_experiment_for_version`])
+//!   keeps raw comparisons — it mirrors
+//!   `restrictEnableFlagsToVersion`, which compares the library version
+//!   against `sdkLanguageVersion` unclamped; the exact-equality gate for
+//!   flags without a release version already yields the official "off"
+//!   above the horizon.
+//! * Hand-written version gates above the snapshot (the lints registry's
+//!   `wildcard_variables` 3.7 class) compare the raw settled version, which
+//!   the clamp never touches, so a 3.15-declared package still gets its
+//!   3.7-era lints. Those gates are the interim mechanism for features that
+//!   shipped in a newer era than the snapshot knows — not a license to
+//!   hand-edit entries.
+//! * Unparseable version shapes never reach this crate as a version:
+//!   dartq-pub rejects a malformed package-config `languageVersion` with a
+//!   hard parse error, the scanner gives a malformed `// @dart` comment no
+//!   override, and the engine resolves a missing package version to
+//!   [`DEFAULT_LANGUAGE_VERSION`] — equal to the horizon today, so the
+//!   default lands inside the clamp by identity.
+//! * [`LanguageVersion::is_above_latest`] stays keyed to
+//!   [`DEFAULT_LANGUAGE_VERSION`], not the horizon: the official scanner's
+//!   "latest known language version" is the tool's current version, not the
+//!   max `enabledIn` (they only coincide when no entry ships above
+//!   current-version, as in this snapshot).
+//!
+//! ## Refresh procedure
+//!
+//! Re-vendor `data/experimental_features.yaml` from the new oracle-era SDK
+//! tag (never hand-edit): `build.rs` regenerates the registry,
+//! [`DEFAULT_LANGUAGE_VERSION`], and [`NEWEST_KNOWN_VERSION`], and the
+//! golden-fingerprint and horizon pins in `tests/language.rs` fail loudly so
+//! the drift is decided, not swallowed.
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/feature_registry.rs"));
@@ -63,7 +112,9 @@ mod generated {
 use core::fmt;
 use core::str::FromStr;
 
-pub use generated::{DEFAULT_LANGUAGE_VERSION, FEATURE_COUNT, FEATURES, Feature, FeatureMeta};
+pub use generated::{
+    DEFAULT_LANGUAGE_VERSION, FEATURE_COUNT, FEATURES, Feature, FeatureMeta, NEWEST_KNOWN_VERSION,
+};
 
 impl Feature {
     /// Whether this flag is expired (retired or rejected in the SDK).
@@ -93,14 +144,29 @@ impl Feature {
 ///
 /// Reads the one registry bit directly (the exact
 /// [`FeatureSet::for_language_version`] predicate) instead of materializing
-/// the full set.
+/// the full set, and clamps to [`NEWEST_KNOWN_VERSION`] like every
+/// version-derived face. The clamp is behavior-identical here by
+/// construction (the horizon is the max `enabledIn`, so it admits every
+/// entry); it keeps the above-horizon posture uniform.
 #[must_use]
 pub fn triple_shift_enabled(version: LanguageVersion) -> bool {
+    let version = version.min(NEWEST_KNOWN_VERSION);
     Feature::TripleShift
         .meta()
         .enabled_in
         .is_some_and(|enabled_in| version >= enabled_in)
 }
+
+/// The official floor for a `// @dart` language-version override
+/// (`analysis_options.dart:183-185`): `sourceLanguageConstraint =
+/// VersionConstraint.parse('>= 2.12.0')` — null safety is the oldest
+/// version the analyzer accepts.
+pub const MIN_LANGUAGE_VERSION: LanguageVersion = LanguageVersion::new(2, 12);
+
+/// The constraint rendering the official floor message interpolates
+/// (`error_verifier.dart:5805`, `'$sourceLanguageConstraint'`): "The
+/// language version must be {0}." with `{0}` = `>=2.12.0`.
+pub const MIN_LANGUAGE_VERSION_CONSTRAINT: &str = ">=2.12.0";
 
 /// A Dart language version (`major.minor`), e.g. `3.13`.
 ///
@@ -127,8 +193,8 @@ impl LanguageVersion {
     /// `STATIC_WARNING` and drops the override (`scanner.dart`:
     /// `_overrideVersion = null`), so the library version re-resolves through
     /// the normal chain — package config, else the default — before any
-    /// feature computation (measured in the version-skew ledger §1.3
-    /// T2; against the 3.13 oracle, `@dart = 3.14` warned while
+    /// feature computation (measured against the 3.13 oracle: `@dart = 3.14`
+    /// warned while
     /// `@dart = 3.13` did not — the drop only looks like a clamp when the
     /// fallback resolves to the default, which equals latest).
     /// [`FeatureSet::for_language_version`] does not drop anything — it
@@ -138,6 +204,22 @@ impl LanguageVersion {
     #[must_use]
     pub fn is_above_latest(self) -> bool {
         self > DEFAULT_LANGUAGE_VERSION
+    }
+
+    /// Whether this version violates the official `// @dart` override floor
+    /// ([`MIN_LANGUAGE_VERSION`]).
+    ///
+    /// Official behavior for an override below the floor: the override STAYS
+    /// effective (the library still resolves at the written version) and the
+    /// verifier reports `illegal_language_version_override`
+    /// (`error_verifier.dart:5787-5809` — the check runs only when the file
+    /// carries a `languageVersionToken`, so a package merely configured at a
+    /// pre-floor version stays silent). Official test pin
+    /// (`illegal_language_version_override_test.dart:29-34`): 2.9 errors,
+    /// 2.12 and 2.14 are clean.
+    #[must_use]
+    pub fn is_below_floor(self) -> bool {
+        self < MIN_LANGUAGE_VERSION
     }
 }
 
@@ -219,8 +301,15 @@ impl FeatureSet {
     /// `version >= enabledIn`; a feature without `enabledIn` is disabled here
     /// and requires [`FeatureSet::with_experiment_for_version`]. Expiry never
     /// affects this computation — see the crate docs.
+    ///
+    /// `version` is clamped to [`NEWEST_KNOWN_VERSION`] first: a declared
+    /// version past the vendored horizon (a newer-SDK package) decides
+    /// enablement at the horizon itself — already-shipped features stay on,
+    /// nothing the snapshot predates can switch on. See "Fallback posture
+    /// above the vendored horizon" in the crate docs.
     #[must_use]
     pub fn for_language_version(version: LanguageVersion) -> Self {
+        let version = version.min(NEWEST_KNOWN_VERSION);
         let mut bits = 0u128;
         for (index, meta) in FEATURES.iter().enumerate() {
             if meta

@@ -6,7 +6,8 @@ use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use dartq_language::{
     DEFAULT_LANGUAGE_VERSION, FEATURE_COUNT, FEATURES, Feature, FeatureSet, LanguageVersion,
-    UnknownFeature, triple_shift_enabled,
+    MIN_LANGUAGE_VERSION, MIN_LANGUAGE_VERSION_CONSTRAINT, NEWEST_KNOWN_VERSION, UnknownFeature,
+    triple_shift_enabled,
 };
 
 fn lv(major: u32, minor: u32) -> LanguageVersion {
@@ -17,8 +18,8 @@ fn lv(major: u32, minor: u32) -> LanguageVersion {
 fn default_language_version_matches_sdk() {
     // Era pin: the vendored yaml is the dart 3.13.1 measurement-oracle
     // snapshot (`current-version: '3.13.0'`; provenance in the yaml header).
-    // The oracle rejects `// @dart` overrides above 3.13 (facts version-skew
-    // §1.3 T2).
+    // The oracle rejects `// @dart` overrides above 3.13 (the pinned
+    // version-skew behavior).
     assert_eq!(DEFAULT_LANGUAGE_VERSION, lv(3, 13));
 }
 
@@ -241,11 +242,94 @@ fn latest_matches_default_version() {
     assert!(!FeatureSet::latest().is_enabled(Feature::Variance));
 }
 
+/// The horizon pin (fallback posture): the vendored 3.13.1 snapshot tops at
+/// 3.13 both in `current-version` and in `enabledIn`, so the horizon equals
+/// the default version. A re-vendor that moves either edge fails here, next
+/// to `default_language_version_matches_sdk`, so the fallback contract is
+/// re-decided against the new snapshot instead of drifting silently.
+#[test]
+fn newest_known_matches_snapshot_horizon() {
+    assert_eq!(NEWEST_KNOWN_VERSION, lv(3, 13));
+    assert_eq!(NEWEST_KNOWN_VERSION, DEFAULT_LANGUAGE_VERSION);
+}
+
+/// A package declaring above the horizon (a newer-SDK `sdk:` constraint
+/// materialized by a newer pub) decides enablement at the horizon:
+/// shipped features stay on, unshipped stay off, and the set is exactly the
+/// latest-known set — the official posture (a tool never knows features
+/// past its own table; a newer declaration never disables what it knows).
+#[test]
+fn above_horizon_version_clamps_to_horizon() {
+    for declared in [lv(3, 14), lv(3, 15), lv(4, 0)] {
+        let set = FeatureSet::for_language_version(declared);
+        assert_eq!(set, FeatureSet::latest(), "at {declared}");
+        assert!(set.is_enabled(Feature::Records)); // shipped 3.0
+        assert!(set.is_enabled(Feature::DotShorthands)); // shipped 3.10
+        assert!(set.is_enabled(Feature::PrimaryConstructors)); // shipped 3.13
+        assert!(!set.is_enabled(Feature::Variance)); // unshipped
+        assert!(!set.is_enabled(Feature::Augmentations)); // unshipped
+        assert!(triple_shift_enabled(declared)); // shipped 2.14
+    }
+}
+
+/// The clamp only engages above the horizon: between two known versions
+/// enablement stays exact (regression pin for the mid-era boundary), and
+/// at/below-horizon versions are their own clamp.
+#[test]
+fn between_known_versions_enablement_is_exact() {
+    let mid = FeatureSet::for_language_version(lv(3, 11));
+    assert!(mid.is_enabled(Feature::DotShorthands)); // 3.10
+    assert!(!mid.is_enabled(Feature::PrivateNamedParameters)); // 3.12
+    assert!(!mid.is_enabled(Feature::PrimaryConstructors)); // 3.13
+    assert_eq!(
+        mid,
+        FeatureSet::for_language_version(lv(3, 11).min(NEWEST_KNOWN_VERSION))
+    );
+}
+
+/// The lints-registry hand-gate pattern (`wildcard_variables` 3.7,
+/// `registry.rs::version_gated`): gates compare the raw settled version,
+/// which the feature clamp never touches, so a package declaring above the
+/// horizon still admits its shipped-era gates — and even the clamped
+/// horizon itself admits them. Below the gate version both faces reject:
+/// the clamp never widens enablement.
+#[test]
+fn hand_written_gates_compose_with_the_clamp() {
+    let wildcard = lv(3, 7);
+    for declared in [lv(3, 15), lv(4, 0)] {
+        // The raw comparison the hand gates perform.
+        assert!(declared >= wildcard, "raw gate at {declared}");
+        // The clamped version the feature faces decide at still admits.
+        assert!(
+            declared.min(NEWEST_KNOWN_VERSION) >= wildcard,
+            "clamped gate at {declared}"
+        );
+    }
+    assert!(lv(3, 6) < wildcard);
+    assert!(lv(3, 6).min(NEWEST_KNOWN_VERSION) < wildcard);
+}
+
+/// Flag decode above the horizon stays raw — the official
+/// `restrictEnableFlagsToVersion` compares the library version against
+/// `sdkLanguageVersion` unclamped: a release-versioned flag opts in
+/// (release 3.6 ≤ any above-horizon version), the exact-equality gate for a
+/// flag without a release version does not (3.15 ≠ 3.13).
+#[test]
+fn flag_decode_above_horizon_stays_raw() {
+    let above = lv(3, 15);
+    let released = FeatureSet::for_language_version(above)
+        .with_experiment_for_version(above, Feature::Augmentations);
+    assert!(released.is_enabled(Feature::Augmentations));
+    let unreleased = FeatureSet::for_language_version(above)
+        .with_experiment_for_version(above, Feature::InferenceUpdate4);
+    assert!(!unreleased.is_enabled(Feature::InferenceUpdate4));
+}
+
 /// Audit A2: `is_above_latest` is the crate-level hook for the
 /// `INVALID_LANGUAGE_VERSION_OVERRIDE` warning + override drop (the official
 /// scanner emits the warning and nulls the override; the version then
 /// re-resolves via the package-config/default chain). Measured oracle shape
-/// (facts version-skew §1.3 T2, oracle dart 3.13.1): `@dart = 3.14` is
+///: `@dart = 3.14` is
 /// above-latest (WARNING, override dropped), `@dart = 3.13` is not.
 #[test]
 fn is_above_latest_pins_the_override_rejection_boundary() {
@@ -256,6 +340,21 @@ fn is_above_latest_pins_the_override_rejection_boundary() {
     assert!(lv(4, 0).is_above_latest());
     assert!(!lv(3, 13).is_above_latest());
     assert!(!lv(3, 12).is_above_latest());
+}
+
+/// The official override floor (`analysis_options.dart:183-185`,
+/// `>= 2.12.0`; upstream test `illegal_language_version_override_test.dart:
+/// 29-34` — 2.9 errors, 2.12/2.14 clean).
+#[test]
+fn is_below_floor_pins_the_override_floor() {
+    assert_eq!(MIN_LANGUAGE_VERSION, lv(2, 12));
+    assert_eq!(MIN_LANGUAGE_VERSION_CONSTRAINT, ">=2.12.0");
+    assert!(lv(2, 9).is_below_floor());
+    assert!(lv(2, 11).is_below_floor());
+    assert!(lv(1, 0).is_below_floor());
+    assert!(!lv(2, 12).is_below_floor());
+    assert!(!lv(2, 14).is_below_floor());
+    assert!(!lv(3, 13).is_below_floor());
 }
 
 /// Exercises the gate-bypassing constructor; flag decoding must use

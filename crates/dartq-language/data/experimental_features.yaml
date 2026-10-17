@@ -5,13 +5,13 @@
 # a live SDK main. Source: dart-lang/sdk tag `3.13.1`,
 # `tools/experimental_features.yaml` (`current-version: '3.13.0'`), fetched
 # 2026-10-09 and cross-checked against the locked pub artifacts
-# analyzer-8.4.1 + _fe_analyzer_shared-91.0.0 (the version-skew ledger §2;
+# analyzer-8.4.1 + _fe_analyzer_shared-91.0.0 (version-skew note:
 # both are older 3.11-dev generated snapshots that lag the 3.13.1 tag — they
 # still carry `declaring-constructors` (shipped by the 3.13.1 tag as
 # `primary-constructors`) and lack `this-promotion` / `anonymous-methods`,
 # which the 3.13.1 tag already lists as experiments). Measured anchor: the
 # oracle rejects `// @dart` overrides above 3.13 with
-# "latest known language version: 3.13" (version-skew.md §1.3 T2). To update, re-vendor from the oracle-era SDK
+# "latest known language version: 3.13". To update, re-vendor from the oracle-era SDK
 # tag and bump the oracle lock first; do not hand-edit entries.
 #
 # Rows changed relative to the previous 3.15-main snapshot
