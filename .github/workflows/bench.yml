@@ -1,4 +1,4 @@
-# Nightly four-axis benchmark vs the oracle (the §19.3 metric face).
+# Nightly four-axis benchmark vs the oracle.
 #
 # Base oracle: the newest stable Dart (resolved live from the dart-archive
 # VERSION pointer). Runs the harness's four comparison axes over the m0

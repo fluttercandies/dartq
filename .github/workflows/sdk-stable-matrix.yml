@@ -1,4 +1,4 @@
-# Full stable-band multi-SDK differential matrix (the §19.1 matrix face).
+# Full stable-band multi-SDK differential matrix.
 #
 # One job per released Dart 3.x minor line (numerically newest patch per
 # minor, resolved live from the dart-archive bucket by

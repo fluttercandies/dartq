@@ -3,7 +3,7 @@
 # scripts/ci.sh (per-crate serial fmt + clippy) is fully subsumed by the
 # workspace-wide steps of the `rust` job, so it is not re-run here. The
 # `gates` job runs the Dart differential gates (m0 / m1 / lints), the M4
-# schema-freeze sweep + plugin-host Dart suite (#945), and the §19.5
+# schema-freeze sweep + plugin-host Dart suite (#945), and the reproducibility
 # reproducibility gate, which scripts/ci.sh deliberately excludes, reproducing
 # their local oracle assumptions on the runner:
 #   - The gates resolve the oracle at $FVM_HOME/default/bin/cache/dart-sdk
@@ -108,7 +108,7 @@ jobs:
         run: |
           dart pub get
           dart test -j 2
-      # §19.5 reproducibility gate. RUNBOOK: the first LIVE run of this gate
+      # reproducibility gate. RUNBOOK: the first LIVE run of this gate
       # is the main-agent's serial-phase action — a clean-tree local
       # `scripts/repro-gate.sh` run validates it first, and the commit
       # landing on main is what triggers this job. Do not dispatch or re-run
@@ -122,7 +122,7 @@ jobs:
       # gate's clean-tracked-tree guard holds here because gate reports
       # (target/evidence is gitignored) and persisted regression cases are untracked.
       - id: repro
-        name: Reproducibility gate (§19.5)
+        name: Reproducibility gate
         run: bash scripts/repro-gate.sh --label ci
       - name: Upload the repro report on failure
         if: failure() && steps.repro.outcome == 'failure'
