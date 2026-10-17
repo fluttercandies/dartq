@@ -1,7 +1,7 @@
 //! The [`ParserListener`] event contract.
 //!
 //! One trait with all-default methods, mirroring the official single
-//! `Listener` class (`listener.dart:45`, 379 methods — core-spec §2 chose
+//! `Listener` class (`listener.dart:45`, 379 methods — the core spec chose
 //! the same shape for the same reasons: builders span domains, and the
 //! official `ForwardingListener`/`NullListener` prove the "one big
 //! interface + empty defaults" form). Events are emitted in the official
@@ -15,7 +15,7 @@
 //!
 //! Naming: official lowerCamelCase mechanically transliterated to
 //! `snake_case` (`beginClassDeclaration` → `begin_class_declaration`); no
-//! invented names (core-spec §2). Token positions carry [`TokenSpan`].
+//! invented names. Token positions carry [`TokenSpan`].
 
 use crate::message::Message;
 use crate::token_id::TokenSpan;
@@ -341,7 +341,7 @@ pub enum ExperimentalFlag {
 /// `begin*`/`end*` pairs bracket a structure; `handle*` events stand alone
 /// (official contract, listener.dart:46-57). End events carry `count`s where
 /// the official ones do — the AST builder uses them to pop stacks
-/// (ast-design-spec §2.1).
+///.
 #[allow(unused_variables)]
 pub trait ParserListener {
     // —— compilation unit ————————————————————————————————————————————
@@ -457,7 +457,7 @@ pub trait ParserListener {
     }
     /// The official events are tokenless (`listener.dart:1639/:1647`);
     /// the entry's token bounds ride along so span-building listeners need
-    /// no private token stack (the official AstBuilder keeps one).
+    /// no private token stack (the official `AstBuilder` keeps one).
     fn begin_record_type_entry(&mut self, first: Token) {}
     fn end_record_type_entry(&mut self, last: Token) {}
     fn handle_no_name(&mut self, token: Token) {}
@@ -543,6 +543,22 @@ pub trait ParserListener {
     fn handle_send(&mut self, begin: Token, end: Token) {}
     fn handle_send_without_arguments(&mut self, begin: Token, end: Token, next: Token) {}
     fn handle_dot_access(&mut self, token: Token, end: Token, is_null_aware: bool) {}
+    /// Flow-face extension fired the moment the `?[` of a null-aware index
+    /// selector is consumed — before the index operand parses. The official
+    /// analyzer's null-shorting begins at the `?` (`nullAwareAccess_rightBegin`,
+    /// flow_analysis.dart:9199): the operand runs on the not-null path, so a
+    /// `throw`/Never inside it must not kill the skip path the listener is
+    /// asked to capture here. No official counterpart (the official parser
+    /// reports the whole index at `handleIndexedExpression`); existing
+    /// listeners ignore it.
+    fn handle_null_aware_index_operand_begin(&mut self, question: Token) {}
+    /// Flow-face extension fired the moment the `?.` of a null-aware member
+    /// selector is consumed — before the member name (and any invocation
+    /// arguments on it) parses. Same official anchor as the index face
+    /// (`nullAwareAccess_rightBegin`, flow_analysis.dart:9199): a
+    /// `throw`/Never inside `x?.m(throw _)`'s argument list must not kill
+    /// the skip path. No official counterpart; existing listeners ignore it.
+    fn handle_null_aware_member_begin(&mut self, question: Token) {}
     fn handle_indexed_expression(&mut self, question: Option<Token>, open: Token, close: Token) {}
     fn begin_constructor_reference(&mut self, start: Token) {}
     fn handle_no_constructor_reference_continuation_after_type_arguments(&mut self, token: Token) {}
@@ -578,7 +594,7 @@ pub trait ParserListener {
     /// [`ParserListener::handle_conditional_expression_colon`]: the then
     /// arm's first token and the colon-adjacent end. The official
     /// dead-arm rows span the arm's own range
-    /// (`flowEnd(thenExpression)`, type_analyzer.dart:2588), which the
+    /// (`flowEnd(thenExpression)`, `type_analyzer.dart:2588`), which the
     /// argless colon call cannot carry. No official counterpart; existing
     /// listeners ignore it.
     fn end_conditional_expression_then_arm(
@@ -711,6 +727,7 @@ pub trait ParserListener {
     fn end_formal_parameter(
         &mut self,
         var_or_final: Option<Token>,
+        covariant_kw: Option<Token>,
         this_keyword: Option<Token>,
         super_keyword: Option<Token>,
         period_after_this_or_super: Option<Token>,
@@ -1185,7 +1202,7 @@ pub trait ParserListener {
     /// `endIfStatement(ifToken, elseToken, end)`. `end` is the
     /// statement's own last consumed token — its `node.end` token, never
     /// the follower (the `parseStatement` result,
-    /// parser_impl.dart:10148).
+    /// `parser_impl.dart:10148`).
     fn end_if_statement(&mut self, token: Token, else_kw: Option<Token>, end: Token) {}
     /// `beginForStatement(token)`.
     fn begin_for_statement(&mut self, token: Token) {}

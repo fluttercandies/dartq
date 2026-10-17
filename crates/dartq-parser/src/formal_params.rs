@@ -21,7 +21,7 @@ use crate::token_id::TokenSpan;
 use crate::type_args::TypeParamOrArg;
 use crate::types::TypeInfo;
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// Official `parseFormalParametersRequiredOpt`: a required `(...)` group;
     /// missing `(` is recovered with a synthetic empty list.
     pub(crate) fn parse_formal_parameters_required_opt(&mut self, kind: MemberKind) -> TokenSpan {
@@ -33,6 +33,17 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             let close = self.synthetic(TokenKind::CloseParen, at.range.offset);
             self.listener.begin_formal_parameters(open, kind);
             self.listener.end_formal_parameters(0, open, close, kind);
+            // Official `insertParens` splices the pair into the stream and
+            // `parseFormalParametersRest` returns the inserted `)` — the
+            // parser resumes AFTER the synthesized group, so the caller's
+            // body-section reads see the real follower. Drain the queued
+            // synthetics here (`parseGetterOrFormalParameters` recovery
+            // drains the same way); leaving them queued feeds the synthetic
+            // `(` to the body grammar and mints spurious rows (oracle
+            // getter_in_function: `int get g => 1;` in a function body keeps
+            // the `=>` for the expression-body parse).
+            self.cursor.advance();
+            self.cursor.advance();
             return close;
         }
         self.parse_formal_parameters_rest(kind)
@@ -49,7 +60,6 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             return self.peek_span();
         }
         let begin = self.peek_span();
-        let begin_group_close = self.current_matching_end();
         self.listener.begin_formal_parameters(begin, kind);
         self.cursor.advance();
         let mut parameter_count = 0usize;
@@ -175,10 +185,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     break;
                 }
                 _ => {
-                    // Recovery: scanner-synthetic closers are adopted
-                    // silently; id-id suggests a missing comma (reported,
-                    // tokens kept); otherwise jump to the group closer.
-                    end = self.recover_parameter_group_end(begin, begin_group_close);
+                    // Recovery: id-id suggests a missing comma (reported,
+                    // tokens kept); everything else routes through
+                    // `ensure_close_paren` — the official tail's single
+                    // recovery exit (:1975-1985), whose `moveSynthetic`
+                    // adoption reports the unmatched-group row at the
+                    // relocation point and latches the pair for the parse-end
+                    // pass.
+                    end = self.recover_parameter_group_end(begin);
                     break;
                 }
             }
@@ -190,28 +204,18 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         end
     }
 
-    /// The `parseFormalParametersRest` tail recovery: a scanner-synthetic
-    /// `)` is relocated in front of the current token (official
-    /// `moveSynthetic`, :1977-1981 — the scanner already reported the
-    /// unmatched `(`; the enclosing parse, e.g. the enum body of
-    /// `enum E( {}`, resumes at the current token), `id id` reports a
-    /// missing comma and continues, everything else jumps to the group's
-    /// closer.
-    fn recover_parameter_group_end(
-        &mut self,
-        begin: TokenSpan,
-        begin_group_close: Option<crate::token_id::TokenId>,
-    ) -> TokenSpan {
-        if let Some(close) = begin_group_close
-            && self.cursor.resolve(close).1
-        {
-            let at = self.peek_span();
-            let id = self
-                .cursor
-                .insert_synthetic(TokenKind::CloseParen, at.range.offset);
-            self.cursor.advance(); // the relocated closer
-            return self.span_of(id);
-        }
+    /// The `parseFormalParametersRest` tail recovery: `id id` reports a
+    /// missing comma and continues, everything else funnels into
+    /// [`Self::ensure_close_paren`] — the official tail has no separate
+    /// silent-adoption arm (`parser_impl.dart:1975-1985`); a scanner-synthetic
+    /// closer adopts through `ensureCloseParen`'s `moveSynthetic`, which
+    /// reports the unmatched-group row at the relocation point (the analyzer
+    /// translation reads `begin.endGroup.charOffset` post-parse; the scanner
+    /// itself emits no row — the pair list on the token table is the only
+    /// scan-time record) and latches the begin so the parse-end pass skips
+    /// it. A pre-#1485 silent relocation here relied on the scanner's own
+    /// row, which no longer exists.
+    fn recover_parameter_group_end(&mut self, begin: TokenSpan) -> TokenSpan {
         let next = self.cursor.peek();
         let next_next = self.cursor.look_kind(1);
         if is_identifier(next.kind) && is_identifier(next_next) {
@@ -409,9 +413,32 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     }
                     self.cursor.advance();
                 }
-                TokenKind::Keyword(Keyword::Const)
-                    if !in_function_type && var_final_or_const.is_none() =>
-                {
+                TokenKind::Keyword(Keyword::Var | Keyword::Final) if in_function_type => {
+                    // Function-type formals take the official recovery route
+                    // (`parseFormalParameterModifiers`): the modifier is
+                    // consumed and recorded — it flows back into
+                    // `parseFormalParameter` as `varFinalOrConst` — and the
+                    // `GeneralizedFunctionType` gate below reports
+                    // `function_typed_parameter_var` in place of the return
+                    // type (modifier_context.dart:278-286). The var/final
+                    // walk-end gate adds `extraneous_modifier` (probed
+                    // 3.13.1: `typedef F = void Function(final int inner);`
+                    // → the pair on the `final`, tree intact).
+                    if var_final_or_const.is_some() {
+                        let t = self.peek_span();
+                        self.report(msg::duplicated_modifier(self.cursor.lexeme(t.id)), t);
+                    } else {
+                        var_final_or_const = Some(self.peek_span());
+                    }
+                    self.cursor.advance();
+                }
+                TokenKind::Keyword(Keyword::Const) if var_final_or_const.is_none() => {
+                    // `const` routes to the recovery walk's `constToken`
+                    // branch in both flavors: `extraneous_modifier` only —
+                    // the `function_typed_parameter_var` arm is the `else
+                    // if` of the const test (modifier_context.dart:270-286),
+                    // and the recorded token is never a `const`, so the
+                    // walk-end VAR/FINAL split stays silent for it.
                     let t = self.peek_span();
                     self.cursor.advance();
                     self.report(msg::extraneous_modifier("const"), t);
@@ -467,9 +494,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if member_kind == MemberKind::PrimaryConstructor
             && let Some(t) = covariant
             && self.features.primary_constructors_enabled
-            && !var_final_or_const
-                .map(|v| self.cursor.lexeme(v.id) == "var")
-                .unwrap_or(false)
+            && var_final_or_const.is_none_or(|v| self.cursor.lexeme(v.id) != "var")
         {
             self.report(msg::invalid_covariant_modifier_in_primary_constructor(), t);
         }
@@ -485,12 +510,32 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         // flavor lets `TYPE <reserved word>` read as type + keyword name
         // (official acceptKeywordForSimpleType, parser_impl.dart:2158).
         let type_info = self.compute_type_formal(in_function_type);
+
+        // Official :2160 — the type region is consumed before the
+        // this/super walk. `looksLikeName` accepts `this`/`super` in the
+        // name position, so a written type commits even for `String this.x`
+        // and the receiver walk must classify the token AFTER the type (the
+        // pre-type walk never fired behind a written type and left `this`
+        // for the name parse: `expected_identifier_but_got_keyword` +
+        // `expected_token` where the oracle parses clean). The raw skip is
+        // rewind-clean: the event-emitting type parse below re-walks from
+        // `before_type`.
+        let before_type = self.cursor.mark();
+        type_info.skip_type_raw(self);
+
         let mut this_keyword: Option<TokenSpan> = None;
         let mut super_keyword: Option<TokenSpan> = None;
         let mut period_after_this_or_super: Option<TokenSpan> = None;
         let mut name_context = IdentifierContext::FormalParameterDeclaration;
 
+        // The this/super walk (official :2177-2211), now reading the token
+        // after the consumed type. The event-emitting type parse below
+        // re-walks from `before_type`, so when the walk consumed a head the
+        // parse arms step over the consumed `this`/`super` + period again
+        // (the missing-`.` arm's synthetic period re-mints silently — its
+        // report fired exactly once in the walk).
         let before_this = self.cursor.mark();
+        let mut period_synthetic = false;
         if !in_function_type
             && matches!(
                 self.peek_kind(),
@@ -535,6 +580,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     .insert_synthetic(TokenKind::Period, at.range.offset);
                 self.cursor.advance();
                 period_after_this_or_super = Some(self.span_of(id));
+                period_synthetic = true;
                 name_context = IdentifierContext::FieldInitializer;
                 if is_this {
                     this_keyword = Some(keyword);
@@ -544,6 +590,27 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 } else {
                     super_keyword = Some(keyword);
                 }
+            }
+        }
+
+        // Declaring-parameter faces (official :2212-2226, run right after the
+        // walk): a primary-constructor formal that carries `var`/`final` AND
+        // a `this.`/`super.` receiver reports at the receiver keyword —
+        // `initializingDeclaringParameter` for `this`, else
+        // `superInitializingDeclaringParameter` for `super`. The official
+        // gate is `varFinalOrConst != null && !isA(CONST)`: a `const` formal
+        // never carries a declaring code and keeps the modifier walk's
+        // `extraneous_modifier` as its only parser row. Here `const` is
+        // reported in the walk without being recorded, so `is_some()` is
+        // exactly the var/final test (probed 3.13.1, corpus default
+        // ^3.13.0: `class C(var this.str);` → the declaring row at `this`;
+        // `class C(const super.str);` → `extraneous_modifier` at `const`
+        // only).
+        if member_kind == MemberKind::PrimaryConstructor && var_final_or_const.is_some() {
+            if let Some(kw) = this_keyword {
+                self.report(msg::initializing_declaring_parameter(), kw);
+            } else if let Some(kw) = super_keyword {
+                self.report(msg::super_initializing_declaring_parameter(), kw);
             }
         }
 
@@ -562,13 +629,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         // the token after the type is the tentative name; its `<...>(` or
         // direct `(` follower makes this an inline function-typed parameter
         // (a committed type never reaches the bare-`(` arm, so record-type
-        // parameters like `((Enum, Enum) r)` parse as type + name).
+        // parameters like `((Enum, Enum) r)` parse as type + name). The type
+        // region was already consumed above, so the probe reads the
+        // post-type token directly (a `this` receiver formal never probes —
+        // the walk owns it; a `super` receiver probes its name exactly as
+        // the post-walk probe did).
         let mut before_inline_function_type: Option<TokenSpan> = None;
         let mut inline_name: Option<TokenSpan> = None;
         let mut type_param = TypeParamOrArg::None;
+        let before_probe = self.cursor.mark();
         if this_keyword.is_none() {
-            let before_name = self.cursor.mark();
-            type_info.skip_type_raw(self);
             let tentative_name = is_identifier(self.peek_kind());
             let mut shape_matched = false;
             if tentative_name {
@@ -593,12 +663,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     if let Some(t) = var_final_or_const
                         && member_kind != MemberKind::PrimaryConstructor
                     {
-                        // Probed 3.13.1: `void g(var g()) {}` reports BOTH
-                        // `extraneous_modifier` and
-                        // `function_typed_parameter_var` on the `var`/`final`
-                        // token.
-                        let lexeme = self.cursor.lexeme(t.id).to_owned();
-                        self.report(msg::extraneous_modifier(&lexeme), t);
+                        // Official :2239-2247 — the shape-matched probe
+                        // reports `function_typed_parameter_var` on the
+                        // modifier; the `extraneous_modifier` half of the
+                        // probed pair (`void g(var g()) {}` → both rows on
+                        // the keyword) comes from the var/final walk-end
+                        // gate below.
                         self.report(msg::function_typed_parameter_var(), t);
                     }
                     inline_name = Some(name);
@@ -610,30 +680,51 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 if let Some(t) = var_final_or_const
                     && member_kind != MemberKind::PrimaryConstructor
                 {
-                    // Same probed pair as the type-led shape above.
-                    let lexeme = self.cursor.lexeme(t.id).to_owned();
-                    self.report(msg::extraneous_modifier(&lexeme), t);
+                    // Same probed pair as the type-led shape above; the
+                    // walk-end gate owns the `extraneous_modifier` half.
                     self.report(msg::function_typed_parameter_var(), t);
                 }
                 before_inline_function_type = Some(self.peek_span());
             }
             // The unified parse below re-walks from the type start (official
-            // `parseType(beforeType)`).
-            self.cursor.reset(before_name);
+            // `parseType(beforeType)`). An untyped walked formal re-walks
+            // nothing — its post-walk position (the name) stands, exactly
+            // like the pre-reorder probe's reset target.
+            if !matches!(type_info, TypeInfo::NoType) {
+                self.cursor.reset(before_type);
+            } else {
+                self.cursor.reset(before_probe);
+            }
         }
 
         let mut var_or_final = None;
         if let Some(t) = var_final_or_const {
-            // `var`/`final` stay silent here (official :2271-2277 gates the
-            // extraneousModifier report on the primary-constructors feature,
-            // which the gate oracle does not enable); `const` was already
-            // reported in the modifier walk.
+            // Official walk-end gate (parser_impl.dart:2271-2285 var arm,
+            // :2299-2307 final arm): `extraneous_modifier` when the
+            // primary-constructors feature is on and this is not a
+            // primary-constructor formal — the settled 3.13+ posture that
+            // rejects `final`/`var` on ordinary formals (`void f(final int
+            // x)` → the row on the keyword, probed 3.13.1). `const` is
+            // never recorded (reported in the walk), so the var/final test
+            // is exactly the official VAR/FINAL arm split.
             let is_var = self.cursor.lexeme(t.id) == "var";
             let is_final = self.cursor.lexeme(t.id) == "final";
             if is_var || is_final {
                 var_or_final = Some(t);
+                // Catch formals never surface the row (probed 3.13.1:
+                // `catch (final e)` and `catch (e, final t)` → the
+                // `catch_syntax` family only, no `extraneous_modifier` —
+                // the official catch-shape scan consumes the keyword as the
+                // invalid name before the group re-parse reaches the gate).
+                if self.features.primary_constructors_enabled
+                    && member_kind != MemberKind::PrimaryConstructor
+                    && member_kind != MemberKind::Catch
+                {
+                    let lexeme = self.cursor.lexeme(t.id).to_owned();
+                    self.report(msg::extraneous_modifier(&lexeme), t);
+                }
                 // `varAndType` for `var` + a type in ordinary formal
-                // positions (parser_impl.dart:2283-2298). Primary-constructor
+                // positions (parser_impl.dart:2286-2298). Primary-constructor
                 // declaring parameters legitimately carry `var` + a type and
                 // stay silent: the official gate keys on
                 // `memberKind != MemberKind.PrimaryConstructor`, and the
@@ -679,7 +770,35 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         } else if in_function_type {
             type_info.ensure_type_or_void(self);
         } else {
+            // A consumed receiver head sits between the type and the name.
+            // With a written type the re-walk stopped on the already-consumed
+            // `this`/`super`, so step over the head again after the type
+            // parse (official order — skipType (:2160), the walk
+            // (:2177-2211), then the event-emitting `parseType(beforeType)`
+            // (:2332)). The missing-`.` arm's synthetic period re-mints
+            // silently — its report fired exactly once in the walk, and the
+            // payload span is re-captured from the fresh synthetic. An
+            // untyped walked formal re-walks nothing and is already on the
+            // name.
+            let stepped_receiver =
+                period_after_this_or_super.is_some() && !matches!(type_info, TypeInfo::NoType);
+            if stepped_receiver {
+                self.cursor.reset(before_type);
+            }
             type_info.parse_type(self);
+            if stepped_receiver {
+                self.cursor.advance(); // `this`/`super`
+                if period_synthetic {
+                    let at = self.peek_span();
+                    let id = self
+                        .cursor
+                        .insert_synthetic(TokenKind::Period, at.range.offset);
+                    self.cursor.advance();
+                    period_after_this_or_super = Some(self.span_of(id));
+                } else {
+                    self.cursor.advance(); // the real `.`
+                }
+            }
         }
 
         // Name. A TRUE-JUNK name slot behind a real type takes the official
@@ -785,6 +904,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
         self.listener.end_formal_parameter(
             var_or_final,
+            covariant,
             this_keyword,
             super_keyword,
             period_after_this_or_super,

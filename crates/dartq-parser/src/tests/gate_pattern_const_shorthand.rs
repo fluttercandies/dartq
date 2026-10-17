@@ -20,12 +20,12 @@
 //!   const branch runs and `endConstDotShorthand` fires. dartq reaches
 //!   these through `parse_pattern_primary`'s `Const` arm →
 //!   `parse_const_expression`'s const-dot branch, whose const-keyword
-//!   anchor (expr_const.rs, `report_dot_shorthands_gate(const_keyword)`)
+//!   anchor (`expr_const.rs`, `report_dot_shorthands_gate(const_keyword)`)
 //!   is load-bearing for exactly these faces — removing it to chase the
 //!   pattern faces would diverge here.
 //!
 //! Oracle ground truth: dart 3.13.1, package pinned `sdk: ^3.9.0`,
-//! `dart analyze --format=machine` EXPERIMENT_NOT_ENABLED rows per face.
+//! `dart analyze --format=machine` `EXPERIMENT_NOT_ENABLED` rows per face.
 
 use super::collector::{Collector, scan_ok};
 use crate::ParserFeatures;
@@ -39,12 +39,14 @@ fn rows_at(source: &str, major: u32, minor: u32) -> Vec<(String, u32, u32)> {
     let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
         LanguageVersion::new(major, minor),
     ));
-    let mut parser = crate::Parser::new(text, table, features, Collector::default());
+    let mut collector = Collector::default();
+    let mut parser = crate::Parser::new(text, table, features, &mut collector);
     parser.parse_unit();
     parser.listener.errors.clone()
 }
 
 /// The offset of the `.a`/`.new` shorthand head's dot.
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn dot_of(source: &str) -> u32 {
     let at = source
         .rfind(".a")
@@ -60,58 +62,78 @@ fn gate(code: &str, at: u32, len: u32) -> (String, u32, u32) {
 /// Every plain pattern face reports the dot and nothing else at 3.9 — the
 /// const-keyword anchor never fires when the pattern dispatcher consumed
 /// `const` before the expression engine (oracle: one row per face, probed
-/// shapes at the cited lines).
+/// shapes at the cited lines). The selector chain's last link is the one
+/// exception: `.b` parses as a plain const-context send whose `:` follower
+/// cannot complete a const constructor invocation, so the official
+/// explicit-const gate (`parseSend` :9413-9423) adds its
+/// `invalidConstantPatternConstPrefix` row on the link's last consumed
+/// token — exactly one gate row, then the context is reset (parseSend-local).
 #[test]
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn pattern_const_shorthand_reports_the_dot_only_below_3_10() {
-    let cases: [(&str, &str); 8] = [
+    let cases: [(&str, &str, Option<&str>); 8] = [
         (
             "switch case",
             "enum E { a }\nvoid f() {\n  switch (0) {\n    case const .a:\n      break;\n  }\n}\n",
+            None,
         ),
         (
             "if-case",
             "enum E { a }\nvoid f(Object o) {\n  if (o case const .a) {}\n}\n",
+            None,
         ),
         (
             "list element",
             "enum E { a }\nvoid f(Object o) {\n  switch (0) {\n    case [const .a]:\n      break;\n  }\n}\n",
+            None,
         ),
         (
             "map value pattern",
             "enum E { a }\nvoid f(Object o) {\n  switch (0) {\n    case {0: const .a}:\n      break;\n  }\n}\n",
+            None,
         ),
         (
             "new head",
             "enum E { a }\nvoid f() {\n  switch (0) {\n    case const .new:\n      break;\n  }\n}\n",
+            None,
         ),
         (
             "invocation",
             "enum E { a }\nvoid f() {\n  switch (0) {\n    case const .a():\n      break;\n  }\n}\n",
+            None,
         ),
         (
             "selector chain",
             "enum E { a }\nvoid f() {\n  switch (0) {\n    case const .a.b:\n      break;\n  }\n}\n",
+            Some(".b"),
         ),
         (
             "null assert suffix",
             "enum E { a }\nvoid f() {\n  switch (0) {\n    case const .a!:\n      break;\n  }\n}\n",
+            None,
         ),
     ];
-    for (label, source) in cases {
+    for (label, source, chain_link) in cases {
         let dot = dot_of(source);
+        let mut expected = vec![gate("experiment_not_enabled", dot, 1)];
+        if let Some(link) = chain_link {
+            let at = source.rfind(link).expect("chain link") as u32 + 1;
+            expected.push(gate("invalid_constant_const_prefix", at, 1));
+        }
         assert_eq!(
             rows_at(source, 3, 9),
-            vec![gate("experiment_not_enabled", dot, 1)],
-            "{label}: exactly one gate row at the dot, no const-keyword row"
+            expected,
+            "{label}: the 3.9 face rows diverged"
         );
     }
 }
 
 /// Expression faces report both anchors at 3.9: the deduped head+context
 /// row at the dot plus the `endConstDotShorthand` row at the `const`
-/// keyword (oracle rows cited in gate_m0_wave10's const pin; re-probed for
+/// keyword (oracle rows cited in `gate_m0_wave10`'s const pin; re-probed for
 /// each face here).
 #[test]
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn expression_const_shorthand_reports_dot_and_const_below_3_10() {
     let cases: [(&str, &str); 5] = [
         ("declaration", "enum E { a }\nfinal x = const .a;\n"),
@@ -154,6 +176,7 @@ fn expression_const_shorthand_reports_dot_and_const_below_3_10() {
 /// These faces are why the const-keyword anchor in
 /// `parse_const_expression` must stay.
 #[test]
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn pattern_operand_expression_faces_report_both_anchors_below_3_10() {
     // `const const .a`: duplicate-const report on the second keyword, then
     // the dot and second-keyword gate anchors.

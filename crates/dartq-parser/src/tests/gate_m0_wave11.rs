@@ -47,12 +47,8 @@ fn assert_codes(source: &'static str, expected: &[&str], label: &str) {
 fn legacy_switch_case_head_parses_as_expression() {
     let source = "f(int a) {\n  switch (a = 0) {\n    case 1:\n      break;\n    default:\n      break;\n  }\n}\n";
     let (table, text) = scan_ok(source);
-    let mut parser = crate::Parser::new(
-        text,
-        table,
-        legacy_features(),
-        super::collector::Collector::default(),
-    );
+    let mut collector = super::collector::Collector::default();
+    let mut parser = crate::Parser::new(text, table, legacy_features(), &mut collector);
     parser.parse_unit();
     assert!(
         parser.listener.errors.is_empty(),
@@ -95,7 +91,7 @@ fn var_semicolon_reports_missing_identifier() {
 }
 
 /// `int ;` — a consumed type with a junk name: silent name insert, and the
-/// NoType re-derive surfaces `missingConstFinalVarOrType` on the type
+/// `NoType` re-derive surfaces `missingConstFinalVarOrType` on the type
 /// (probed 3.13.1: one row anchored on `int`).
 #[test]
 fn type_semicolon_reports_only_missing_type() {
@@ -131,14 +127,14 @@ fn covariant_primary_constructor_formal_reports() {
 
 /// `class C({var int a})` at EOF — the params parse succeeds, but the
 /// missing-body recovery restarts from `headerStart`
-/// (parser_impl.dart:3098): the `(` ahead of the body `{` reports as
+/// (`parser_impl.dart:3098)`: the `(` ahead of the body `{` reports as
 /// skipped junk (`unexpected_token`), `{var int a}` re-forms the class
 /// body (the member re-reports `var_and_type` and walks the `;` back to
 /// `a`), and the leftover `)` lands as top-level junk
 /// (`expected_executable`). The probed oracle face (3.13.1, feature on,
 /// re-probed 2026-10-12) is exactly these four codes — `var_and_type`
 /// ONCE, from the junk member: the declaring-parameter parse itself stays
-/// silent under the PrimaryConstructor exemption (parser_impl.dart:2283-
+/// silent under the `PrimaryConstructor` exemption (`parser_impl.dart:2283`-
 /// 2298; the earlier twice-face probe predates the feature-on oracle).
 #[test]
 fn missing_class_body_reexpands_primary_params_as_junk() {

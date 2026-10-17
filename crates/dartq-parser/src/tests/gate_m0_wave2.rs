@@ -35,8 +35,8 @@ fn sorted_codes(source: &'static str) -> Vec<String> {
 }
 
 /// Sorted diagnostic-code multiset (scanner + parser) of one whole-unit
-/// parse, for inputs the scanner itself flags (an unclosed `(` in a broken
-/// for header pins a synthetic closer and reports `expectedToken`).
+/// parse, for inputs with unmatched groups (an unclosed `(` in a broken for
+/// header parks a synthetic closer; the parser reports the pair post-parse).
 fn sorted_codes_with_scanner(source: &'static str) -> Vec<String> {
     let config = dartq_scanner::ScanConfig {
         enable_triple_shift: true,
@@ -52,7 +52,8 @@ fn sorted_codes_with_scanner(source: &'static str) -> Vec<String> {
         .iter()
         .map(|d| d.code.name.to_owned())
         .collect();
-    let mut p = crate::Parser::new(text, table, latest_features(), Collector::default());
+    let mut collector = Collector::default();
+    let mut p = crate::Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
     codes.extend(p.listener.error_codes());
     codes.sort();
@@ -109,12 +110,15 @@ fn representation_field_covariant_reports() {
     );
 }
 
-/// `var` + type in ordinary member formals is `varAndType`.
+/// `var` + type in ordinary member formals reports the oracle pair
+/// (probed 3.13.1 on `extension type ET(int i) { ET(var a b) {} }`:
+/// `extraneous_modifier` + `var_and_type`, both on the `var` — the
+/// constructor member's formals are non-primary).
 #[test]
 fn var_and_type_in_member_formals() {
     assert_codes(
         "extension type ET(int i) { ET(var a b) {} }\n",
-        &["var_and_type"],
+        &["extraneous_modifier", "var_and_type"],
         "var and type member formal",
     );
 }
@@ -151,16 +155,22 @@ fn pattern_reserved_element_positions() {
         &["missing_identifier"],
         "list pattern element",
     );
-    assert_codes(
-        "void f(Object? x) {\n  switch (x) {\n    case {0: if}:\n  }\n}\n",
-        &[
-            "expected_token",
-            "expected_token",
-            "missing_identifier",
-            "missing_identifier",
-            "missing_identifier",
+    // The map loop's recovery re-parses the blocker as the next key; the
+    // first separator row (`,`) anchors on the blocker, the `:` row on the
+    // token the entry recovery lands behind — the map's `}` (the #2024
+    // separator-anchor rule; frozen 0c9fda4b anchors the separator
+    // recovery row on the token following the recovery point).
+    let map_src = "void f(Object? x) {\n  switch (x) {\n    case {0: if}:\n  }\n}\n";
+    let mut p = setup(map_src);
+    p.parse_unit();
+    assert_eq!(
+        p.listener.errors,
+        vec![
+            ("missing_identifier".to_string(), 48, 50),
+            ("expected_token".to_string(), 48, 50),
+            ("expected_token".to_string(), 50, 51),
         ],
-        "map pattern value",
+        "{map_src}"
     );
     assert_codes(
         "void f(Object? x) {\n  switch (x) {\n    case (if):\n  }\n}\n",
@@ -354,7 +364,9 @@ fn setter_constructor_shapes_no_arity_cascade() {
 /// An unclosed `(` in a for header can never complete: the enclosing
 /// block's `}` is reported as the stall point
 /// (`parseForLoopPartsRest` :10369) and the header parses on to the
-/// scanner-pinned closer.
+/// scanner-pinned closer. The recovery re-visits the same tokens, so the
+/// repeated rows share anchors — the oracle's downstream dedupe surfaces
+/// one row per (code, anchor) pair.
 #[test]
 fn for_header_stall_on_block_close() {
     assert_codes_with_scanner(
@@ -362,9 +374,6 @@ fn for_header_stall_on_block_close() {
         &[
             "expected_token",
             "expected_token",
-            "expected_token",
-            "expected_token",
-            "missing_identifier",
             "missing_identifier",
             "missing_identifier",
             "unexpected_token",

@@ -151,7 +151,7 @@ pub(crate) fn is_variance(kind: TokenKind) -> bool {
 // Parser position/shape helpers shared by the grammar modules
 // ---------------------------------------------------------------------------
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// Real-stream kind at an absolute table offset (EOF-pinned).
     #[inline]
     pub(crate) fn kind_at(&self, offset: usize) -> TokenKind {
@@ -226,7 +226,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 // computeType (type_info.dart:158)
 // ---------------------------------------------------------------------------
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// Official `computeType` at the cursor. Precondition: clean cursor
     /// (nothing queued).
     pub(crate) fn compute_type(&mut self, required: bool, in_declaration: bool) -> TypeInfo {

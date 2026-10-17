@@ -9,7 +9,7 @@
 //! Codes come from the `dartq-diagnostics` registry (single source of
 //! truth; every code used here is a registry constant). Message texts follow
 //! the official templates (`_fe_analyzer_shared/messages.yaml`), matching the
-//! (code, file) oracle differential of PRD §19.
+//! (code, file) oracle differential of
 
 use crate::listener::ExperimentalFlag;
 use dartq_diagnostics::CodeInfo;
@@ -94,8 +94,8 @@ pub(crate) mod msg {
         MISSING_TYPEDEF_PARAMETERS, MIXIN_DECLARES_CONSTRUCTOR, MODIFIER_OUT_OF_ORDER,
         MULTIPLE_CLAUSES, MULTIPLE_EXTENDS_CLAUSES, NAMED_PARAMETER_OUTSIDE_GROUP,
         NATIVE_CLAUSE_IN_NON_SDK_CODE, NATIVE_FUNCTION_BODY_IN_NON_SDK_CODE, OUT_OF_ORDER_CLAUSES,
-        REDIRECTING_CONSTRUCTOR_WITH_BODY, REDIRECTION_IN_NON_FACTORY_CONSTRUCTOR,
-        SEALED_ENUM, SEALED_MIXIN, SEALED_MIXIN_CLASS, SETTER_CONSTRUCTOR, STATIC_CONSTRUCTOR, STATIC_OPERATOR,
+        REDIRECTING_CONSTRUCTOR_WITH_BODY, REDIRECTION_IN_NON_FACTORY_CONSTRUCTOR, SEALED_ENUM,
+        SEALED_MIXIN, SEALED_MIXIN_CLASS, SETTER_CONSTRUCTOR, STATIC_CONSTRUCTOR, STATIC_OPERATOR,
         TOP_LEVEL_OPERATOR, TYPE_BEFORE_FACTORY, TYPEDEF_IN_CLASS, UNEXPECTED_TOKEN,
         UNEXPECTED_TOKENS, VAR_RETURN_TYPE, WITH_BEFORE_EXTENDS,
     };
@@ -143,7 +143,8 @@ pub(crate) mod msg {
         EXPECTED_STRING_LITERAL, EXPORT_DIRECTIVE_AFTER_PART_DIRECTIVE,
         IMPORT_DIRECTIVE_AFTER_PART_DIRECTIVE, LIBRARY_DIRECTIVE_NOT_FIRST,
         MISSING_PREFIX_IN_DEFERRED_IMPORT, MULTIPLE_LIBRARY_DIRECTIVES,
-        MULTIPLE_PART_OF_DIRECTIVES, NON_PART_OF_DIRECTIVE_IN_PART, PREFIX_AFTER_COMBINATOR,
+        MULTIPLE_PART_OF_DIRECTIVES, NON_PART_OF_DIRECTIVE_IN_PART, PART_OF_NAME,
+        PREFIX_AFTER_COMBINATOR,
     };
     use dartq_diagnostics::{
         EXTENSION_AUGMENTATION_HAS_ON_CLAUSE, EXTRANEOUS_MODIFIER, MISSING_KEYWORD_OPERATOR,
@@ -157,17 +158,20 @@ pub(crate) mod msg {
         Message::new(EXPECTED_TOKEN, format!("Expected to find '{lexeme}'."))
     }
 
-    /// `expectedButGot` text; still reports the analyzer `expected_token` code.
+    /// `expectedButGot`; the analyzer converter re-renders every
+    /// `PseudoSharedCode.expectedToken` message with the registry template
+    /// (error_converter.dart:89-96), so the shared "Expected '<x>' before
+    /// this." text is never dart-analyze-observable — the rendered text is
+    /// the same `Expected to find '<x>'.` face (oracle
+    /// typing_string_interpolation_2.dart comma rows).
     pub(crate) fn expected_but_got(expected: &str) -> Message {
-        Message::new(
-            EXPECTED_TOKEN,
-            format!("Expected '{expected}' before this."),
-        )
+        Message::new(EXPECTED_TOKEN, format!("Expected to find '{expected}'."))
     }
 
-    /// `expectedAfterButGot` text; analyzer code `expected_token`.
+    /// `expectedAfterButGot`; same pseudoSharedCode re-rendering as
+    /// [`expected_but_got`].
     pub(crate) fn expected_after_but_got(expected: &str) -> Message {
-        Message::new(EXPECTED_TOKEN, format!("Expected '{expected}' after this."))
+        Message::new(EXPECTED_TOKEN, format!("Expected to find '{expected}'."))
     }
 
     /// `invalidVoid` (analyzer code `expected_type_name`, per pseudoSharedCode).
@@ -181,6 +185,12 @@ pub(crate) mod msg {
         Message::new(EXPECTED_TYPE_NAME, "Expected a type name.")
     }
 
+    /// Registry `missing_identifier`. The fasta `expectedIdentifier`
+    /// template carries `PseudoSharedCode.missingIdentifier`
+    /// (`diagnostic.g.dart:820-831`) and formats the offending lexeme, but
+    /// the analyzer converter re-renders every pseudo-shared code as the
+    /// registry text — `missing_identifier` takes no parameters, so only
+    /// `Expected an identifier.` is observable (oracle 76dd104c 11:12).
     pub(crate) fn missing_identifier() -> Message {
         Message::new(MISSING_IDENTIFIER, "Expected an identifier.")
     }
@@ -192,15 +202,6 @@ pub(crate) mod msg {
         Message::new(
             EXPECTED_IDENTIFIER_BUT_GOT_KEYWORD,
             format!("'{lexeme}' can't be used as an identifier because it's a keyword."),
-        )
-    }
-
-    /// `expectedIdentifier` (pseudo-shared `missingIdentifier`; the template
-    /// text carries the offending lexeme).
-    pub(crate) fn expected_identifier(lexeme: &str) -> Message {
-        Message::new(
-            MISSING_IDENTIFIER,
-            format!("Expected an identifier, but got '{lexeme}'."),
         )
     }
 
@@ -339,7 +340,7 @@ pub(crate) mod msg {
 
     /// `reportVarianceModifierNotEnabled` (listener.dart:1722) bridged to the
     /// analyzer's `handleExperimentNotEnabled` in `endTypeVariable`
-    /// (ast_builder.dart:3604) — one report per kept variance modifier when
+    /// (`ast_builder.dart:3604`) — one report per kept variance modifier when
     /// the opt-in `variance` experiment is off (default toolchain state).
     pub(crate) fn experiment_not_enabled_off_by_default(feature: &str) -> Message {
         Message::new(
@@ -468,6 +469,17 @@ pub(crate) mod msg {
         Message::new(
             MULTIPLE_PART_OF_DIRECTIVES,
             "Only one part-of directive may be declared in a file.",
+        )
+    }
+
+    /// `partOfName` (AstBuilder `endPartOf`, ast_builder.dart:2823-2826):
+    /// the name-form `part of` face, reported only when the enhanced-parts
+    /// feature is enabled.
+    pub(crate) fn part_of_name() -> Message {
+        Message::with_correction(
+            PART_OF_NAME,
+            "The 'part of' directive can't use a name with the enhanced-parts feature.",
+            "Try using 'part of' with a URI instead.",
         )
     }
 
@@ -1399,6 +1411,34 @@ pub(crate) mod msg {
         )
     }
 
+    // Declaring-parameter faces of a primary constructor (upstream Dart SDK
+    // source, pkg/front_end messages.yaml `InitializingDeclaringParameter` /
+    // `SuperInitializingDeclaringParameter`; emitted by parser_impl.dart
+    // :2212-2226 at the `this`/`super` keyword of a `var`/`final` formal).
+    // Texts verbatim from the upstream templates.
+
+    pub(crate) fn initializing_declaring_parameter() -> Message {
+        Message::with_correction(
+            local_code(
+                "initializing_declaring_parameter",
+                "INITIALIZING_DECLARING_PARAMETER",
+            ),
+            "Declaring parameters can't be initializing.",
+            "Try removing the `this.` prefix or making the parameter non-declaring.",
+        )
+    }
+
+    pub(crate) fn super_initializing_declaring_parameter() -> Message {
+        Message::with_correction(
+            local_code(
+                "super_initializing_declaring_parameter",
+                "SUPER_INITIALIZING_DECLARING_PARAMETER",
+            ),
+            "Declaring parameters can't be super parameters.",
+            "Try removing the `super.` prefix or making the parameter non-declaring.",
+        )
+    }
+
     // The two native codes are resolver-side in the official pipeline
     // (`error_verifier.dart` `visitNativeClause`/:1324 and
     // `_checkForNativeFunctionBodyInNonSdkCode`/:4516, both gated on
@@ -1441,6 +1481,28 @@ pub(crate) mod msg {
         CodeInfo::new(name, machine, DiagnosticType::CompileTimeError, false)
     }
 
+    // Official analyzer registry codes the parser emits through the
+    // pseudoSharedCode routing: the shared parser's message is
+    // re-faced with the analyzer code at emit time. Both live outside the
+    // syntax-codes.tsv capture (compile-time family); the constants sit here
+    // until the registry crate grows the hand-written M1 set for them.
+    // Published-docs and CompileTimeError class per diagnostic.g.dart
+    // (`constNotInitialized` :3148, `finalNotInitialized` :6855, dart 3.15).
+
+    const CONST_NOT_INITIALIZED: CodeInfo = CodeInfo::new(
+        "const_not_initialized",
+        "CONST_NOT_INITIALIZED",
+        DiagnosticType::CompileTimeError,
+        true,
+    );
+
+    const FINAL_NOT_INITIALIZED: CodeInfo = CodeInfo::new(
+        "final_not_initialized",
+        "FINAL_NOT_INITIALIZED",
+        DiagnosticType::CompileTimeError,
+        true,
+    );
+
     pub(crate) fn built_in_identifier_in_declaration(lexeme: &str) -> Message {
         Message::new(
             local_code(
@@ -1448,6 +1510,23 @@ pub(crate) mod msg {
                 "BUILT_IN_IDENTIFIER_IN_DECLARATION",
             ),
             format!("Can't use '{lexeme}' as a name here."),
+        )
+    }
+
+    /// The typedef-name variant of the same analyzer code family: every
+    /// `built_in_identifier_*_name` registry entry shares the
+    /// `built_in_identifier_in_declaration` name
+    /// (`builtInIdentifierAsTypedefName`, diagnostic.g.dart:1717-1726), with
+    /// the per-context template text the oracle carries on
+    /// `keyword_named_typedefs.dart` ("The built-in identifier 'abstract'
+    /// can't be used as a typedef name.").
+    pub(crate) fn built_in_identifier_as_typedef_name(lexeme: &str) -> Message {
+        Message::new(
+            local_code(
+                "built_in_identifier_in_declaration",
+                "BUILT_IN_IDENTIFIER_IN_DECLARATION",
+            ),
+            format!("The built-in identifier '{lexeme}' can't be used as a typedef name."),
         )
     }
 
@@ -1587,22 +1666,26 @@ pub(crate) mod msg {
         )
     }
 
-    pub(crate) fn const_field_without_initializer(name: &str) -> Message {
+    /// `ConstFieldWithoutInitializer` (pseudoSharedCode `constNotInitialized`)
+    /// surfaces under the analyzer's registry code with the analyzer template
+    /// text — the oracle's machine row on `augmentation/member_errors.dart`
+    /// 35|26 is `const_not_initialized` "The constant 'field' must be
+    /// initialized." (analyzer diagnostic.g.dart `constNotInitialized`, not
+    /// the shared parser's "The const variable" wording).
+    pub(crate) fn const_not_initialized(name: &str) -> Message {
         Message::new(
-            local_code(
-                "const_field_without_initializer",
-                "CONST_FIELD_WITHOUT_INITIALIZER",
-            ),
-            format!("The const variable '{name}' must be initialized."),
+            CONST_NOT_INITIALIZED,
+            format!("The constant '{name}' must be initialized."),
         )
     }
 
-    pub(crate) fn final_field_without_initializer(name: &str) -> Message {
+    /// `FinalFieldWithoutInitializer` (pseudoSharedCode
+    /// `finalNotInitialized`): same registry routing — the code face is the
+    /// analyzer's `final_not_initialized`; the two suites share the template
+    /// text verbatim (diagnostic.g.dart:1442/:6857).
+    pub(crate) fn final_not_initialized(name: &str) -> Message {
         Message::new(
-            local_code(
-                "final_field_without_initializer",
-                "FINAL_FIELD_WITHOUT_INITIALIZER",
-            ),
+            FINAL_NOT_INITIALIZED,
             format!("The final variable '{name}' must be initialized."),
         )
     }

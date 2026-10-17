@@ -44,7 +44,7 @@ struct MemberModifiers {
     required: Option<TokenSpan>,
 }
 
-impl<'s, L: ParserListener> Parser<'s, '_, L> {
+impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     // ------------------------------------------------------------------
     // top-level member
     // ------------------------------------------------------------------
@@ -1123,6 +1123,35 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 enclosing_declaration_name,
             );
         } else {
+            // Member-name event gate: a begin-method name is a declared-name
+            // token — the identifier event's token (identifier, or the
+            // reserved word `ensureIdentifierPotentiallyRecovered` accepted).
+            // The `recoverFromInvalidMember` dispatch hands non-lexical heads
+            // (`{`, `(`, `=>` — e.g. a constructor body orphaned by the
+            // `this.new` initializer cascade re-entering the member loop,
+            // parser_impl.dart:11334) through here with the raw token, but
+            // the official builder never names from it: the name comes from
+            // `ensureIdentifierPotentiallyRecovered`, which reports
+            // `missing_identifier` and names the member with the inserted
+            // synthetic. Operators are named by `handleOperatorName` and keep
+            // their operator token. Minting the synthetic face queues it
+            // ahead of the junk head and drains it immediately — no stream
+            // movement, no report; the return-type re-parse's
+            // `reset(before_type)` then truncates the queued entry, and the
+            // name resolution below re-issues the same id for its own
+            // recovery synthetic (ids mint as `table_len + inserted_len`,
+            // rewound by the reset), so the face resolves to exactly the
+            // zero-width synthetic the official declared name carries.
+            let name = if is_operator || is_keyword_or_identifier(self.peek_kind()) {
+                name
+            } else {
+                let at = self.peek_span();
+                let id = self
+                    .cursor
+                    .insert_synthetic(TokenKind::Identifier, at.range.offset);
+                self.cursor.advance(); // drain the minted synthetic; the junk head stays current
+                self.span_of(id)
+            };
             self.listener.begin_method(
                 kind,
                 mods.augment,
@@ -1196,6 +1225,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 let at = self.peek_span();
                 self.listener
                     .handle_no_identifier(at, IdentifierContext::MethodDeclaration);
+                // Official parseMethod keeps `name = newToken`: with no
+                // identifier after the `new` head, the keyword itself is the
+                // unnamed-constructor name, so the mmp recovery anchor
+                // (parseGetterOrFormalParameters) points at the rejected
+                // `new` token, never at its follower (`new = null;` in a
+                // class body: oracle `missing_method_parameters` on `new`).
+                name = new_kw.expect("new_kw arm guarantees the head");
             }
         } else {
             name = if name_is_recovered {
@@ -1663,7 +1699,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 // parseFields reports on the member's head — probed 3.13.1:
                 // `late;` → the `late` keyword, `late int;`/`int;`/`x;` → the
                 // type-position identifier). A junk token at the type position
-                // (`late;`'s `;`) falls back to the `late` keyword.
+                // (`late;`'s `;`) falls back to the `late` keyword; a name-
+                // position identifier (`late x;`) IS the type-position token,
+                // which is also the official `name` anchor — the face fires
+                // unconditionally for `noType` + no `var`/`final`/`const`,
+                // including `late x;` fields at top-level and member depth
+                // (official parseFields has no late carve-out;
+                // parser_impl.dart:4476-4479, intertwined trace reports on
+                // x/y/z at every depth in late_without_var_etc).
+                // In the late-free shapes (`int;`/`x;` → the type-position
+                // identifier) the anchor stays on that identifier.
                 let at_type = self.span_at_mark(before_type);
                 let type_kind =
                     crate::cursor::TokenCursor::mark_pos(before_type).min(self.table.len() - 1);
@@ -1757,7 +1802,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         // Official `VariableDeclarationList` head (`_endClassFields`,
         // ast_builder.dart): `late` when present, else the var/final/const
         // keyword, else the type start — `late` must be the span head
-        // (collapse map §3.3 head-is-late).
+        //.
         let decl_head = mods
             .late_kw
             .or(mods.var_final_or_const)
@@ -1777,7 +1822,19 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             self.parse_field_initializer_opt(name, name_text, kind, &mods);
             field_count += 1;
         }
+        let had_semicolon = self.peek_kind() == TokenKind::Semicolon;
         let end = self.ensure_semicolon();
+        // The missing-`;` field-group recovery re-enters the member loop at
+        // the follower, and the group's written name re-enters the next
+        // member as its annotation (the `augment int field;` recovery — the
+        // member splits at the name `int`, and the reparsed `int` type
+        // reference is the lookup the member-shadow rule resolves; 3.13.1
+        // oracle, member_declarations.dart line 14). Fire the NamedType
+        // event for the written name so the reparsed reference reaches
+        // resolution.
+        if !had_semicolon && self.peek_kind() == TokenKind::Identifier && synthetic_name.is_none() {
+            self.listener.handle_type(first_name, None);
+        }
         self.listener
             .end_variables_declaration(field_count, Some(end));
 
@@ -1850,14 +1907,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             if let Some(vfc) = mods.var_final_or_const {
                 let lexeme = self.cursor.lexeme(vfc.id);
                 if lexeme == "const" {
-                    self.report(msg::const_field_without_initializer(name_text), name);
+                    self.report(msg::const_not_initialized(name_text), name);
                 } else if lexeme == "final"
                     && kind == DeclarationKind::TopLevel
                     && mods.late_kw.is_none()
                     && mods.abstract_kw.is_none()
                     && mods.external.is_none()
                 {
-                    self.report(msg::final_field_without_initializer(name_text), name);
+                    self.report(msg::final_not_initialized(name_text), name);
                 }
             }
             let next = self.peek_span();
@@ -2050,12 +2107,25 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     // remaining `= expr` then re-enters the member loop as
                     // the official cascade does).
                     let at = self.look_span_at(2);
+                    // The slot template is `expectedIdentifier`
+                    // (fieldInitializer recoveryTemplate,
+                    // identifier_context.dart:305), whose pseudo-shared-code
+                    // conversion re-renders the parameterless registry text
+                    // (frozen oracle ccf7f50c/d1b3378f `this.new` slots).
                     self.report(msg::missing_identifier(), at);
                     self.report(msg::missing_assignment_in_initializer(), head);
                     self.cursor.advance(); // `this`
                     self.cursor.advance(); // `.`
-                    self.synthetic(TokenKind::Identifier, at.range.offset);
-                    let name = self.ensure_identifier(IdentifierContext::ExpressionContinuation);
+                    // The synthetic name carries exactly ONE identifier
+                    // event — the official re-read's
+                    // `ensureIdentifier(., expressionContinuation)`
+                    // (`handleIdentifier(, expressionContinuation)`,
+                    // new_as_identifier trace). No `new` rewrite here: the
+                    // rewrite face is gated on the `(` follower
+                    // (:4830-4834), so the reserved word never reaches an
+                    // identifier gate — it is left for the member loop.
+                    let name = self.synthetic(TokenKind::Identifier, at.range.offset);
+                    self.cursor.advance(); // the synthetic name
                     self.listener
                         .handle_identifier(name, IdentifierContext::ExpressionContinuation);
                     self.listener.end_initializer(name);
@@ -2244,10 +2314,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     }
                     let mut end_id = type_param.skip(self.peek_id());
                     let after = self.offset_of(end_id) + 1;
-                    if self.kind_at(after) == TokenKind::OpenParen {
-                        if let Some(close) = self.cursor.table_matching_end(self.real_id(after)) {
-                            end_id = close;
-                        }
+                    if self.kind_at(after) == TokenKind::OpenParen
+                        && let Some(close) = self.cursor.table_matching_end(self.real_id(after))
+                    {
+                        end_id = close;
                     }
                     let end_span = self.span_of(end_id);
                     self.report(
@@ -2298,7 +2368,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
     /// Official `parseAsyncModifierOpt`; updates the [`AsyncModifier`] state
     /// and returns the `async`/`sync` keyword token — the official
     /// `asyncToken` anchor the caller-side setter/factory not-sync reports
-    /// pin (parser_impl.dart:4644/:6060/:6230; measured b02/c01: the row
+    /// pin (`parser_impl.dart:4644/:6060/:6230`; measured b02/c01: the row
     /// spans the keyword, never the star).
     pub(crate) fn parse_async_modifier_opt(&mut self) -> TokenSpan {
         let mut async_kw: Option<TokenSpan> = None;
@@ -2551,7 +2621,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 }
 
 /// `isUnaryMinus`: `unary` immediately followed by `-`.
-fn is_unary_minus_ahead<L: ParserListener>(parser: &Parser<'_, '_, L>) -> bool {
+fn is_unary_minus_ahead<L: ParserListener>(parser: &Parser<'_, '_, '_, L>) -> bool {
     // Official `isUnaryMinus` (parser_impl.dart:5208): the legacy
     // `operator unary-(` spelling — identifier `unary` followed by `-`.
     is_identifier(parser.peek_kind())

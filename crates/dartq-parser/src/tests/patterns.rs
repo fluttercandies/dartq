@@ -1,6 +1,6 @@
 //! Pattern grammar tests.
 
-use super::collector::setup;
+use super::collector::{Collector, setup};
 use crate::listener::PatternContext;
 
 #[test]
@@ -92,6 +92,29 @@ fn relational_pattern() {
         .assert_sequence(&[("handle", "relational_pattern")]);
 }
 
+/// Whole-unit parse returning the collector (statement-level fixtures;
+/// `parse_pattern_entry` covers single patterns only).
+fn unit_parse(source: &'static str) -> Collector {
+    let mut p = setup(source);
+    p.parse_unit();
+    std::mem::take(p.listener)
+}
+
+#[test]
+fn relational_pattern_in_switch_case() {
+    // The #1723 fixture family: equality/relational patterns as switch
+    // cases. The operand parses before `handle_relational_pattern` fires
+    // (official parser :11810-11815); the builder seals the node from that
+    // event order, patching the operator as payload word 0.
+    let c = unit_parse("void f(o) { switch (o) { case == 'x': break; } }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[("handle", "relational_pattern")]);
+
+    let c = unit_parse("void f(o) { switch (o) { case >= y: break; } }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+    c.assert_sequence(&[("handle", "relational_pattern")]);
+}
+
 #[test]
 fn object_pattern_fields() {
     let mut p = setup("Rect(width: 2, height: x)");
@@ -123,12 +146,8 @@ fn patterns_disabled_reports_experiment() {
         enhanced_parts_enabled: false,
         dot_shorthands_enabled: false,
     };
-    let mut p = crate::Parser::new(
-        text,
-        table,
-        features,
-        super::collector::Collector::default(),
-    );
+    let mut collector = super::collector::Collector::default();
+    let mut p = crate::Parser::new(text, table, features, &mut collector);
     let end = p.parse_pattern_entry(PatternContext::Matching);
     let _ = end;
     assert_eq!(
@@ -205,19 +224,21 @@ fn keyword_blocker_inside_map_pattern_spawns_entry_recovery() {
     // The map loop's stale-`next` skip leaves the FIRST entry's blocker for
     // the `,` recovery: the blocker is re-parsed as the next key (`:` then
     // fails), skipped as the second value, and `}` closes. Official
-    // syntheticIdentifier_insideMapPattern: 3 x missing_identifier +
-    // `expected ','` + `expected ':'`.
+    // syntheticIdentifier_insideMapPattern traces 3 x missing_identifier +
+    // `expected ','` + `expected ':'` (same-text reports dedupe downstream);
+    // the `,` row anchors on the blocker, the `:` row on the token the
+    // entry recovery lands behind — the map's `}` (the #2024
+    // separator-anchor rule; frozen 0c9fda4b anchors the separator
+    // recovery row on the token following the recovery point).
     let mut p = setup("{0: if}");
     let _ = p.parse_pattern_entry(PatternContext::Matching);
     p.listener.assert_sequence(&[("handle", "map_pattern")]);
     assert_eq!(
-        sorted_pattern_codes("{0: if}"),
-        [
-            "expected_token",
-            "expected_token",
-            "missing_identifier",
-            "missing_identifier",
-            "missing_identifier"
+        p.listener.errors,
+        vec![
+            ("missing_identifier".to_string(), 4, 6),
+            ("expected_token".to_string(), 4, 6),
+            ("expected_token".to_string(), 6, 7),
         ],
         "map blocker"
     );

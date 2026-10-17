@@ -9,7 +9,7 @@ use super::collector::{Collector, setup};
 fn parse(source: &'static str) -> Collector {
     let mut p = setup(source);
     p.parse_unit();
-    p.listener
+    std::mem::take(p.listener)
 }
 
 // —— valid statement forms ————————————————————————————————————————————————
@@ -64,6 +64,70 @@ fn local_function_block_body() {
     assert!(c.errors.is_empty(), "{:?}", c.errors);
     c.assert_sequence(&[
         ("begin", "local_function_declaration"),
+        ("end", "local_function_declaration"),
+    ]);
+}
+
+#[test]
+fn dangling_member_access_consumes_next_line_identifier_not_declaration() {
+    // issue_49477_prime shape (oracle error_recovery/issue_49477_prime.dart,
+    // rows 7:3): the dangling dot's operand is `int` — lexically a plain
+    // identifier — so the continuation consumes it SILENTLY as the member
+    // name (`parseSendOrFunctionLiteral`'s continuation guard,
+    // parser_impl.dart:8844-8847 — no function-literal reading after a
+    // dot), the statement's missing `;` anchors on the last consumed token
+    // (`int`, ensureSemicolon's findPreviousNonZeroLengthToken anchor,
+    // parser_impl.dart:5106), and `getNumber() { return 42; }` still parses
+    // as a local function declaration — `return 42` stays out of the
+    // enclosing body's flow. The resolution rows (undefined_getter 'int',
+    // unused_element) ride these events. Event variant: dartq's bare sends
+    // complete through `handle_send` (the send-leaf tiling contract, #585);
+    // upstream's `handleSendWithoutArguments` distinction is not observable
+    // in diagnostics.
+    let c = parse("void f() {\n  p.stdout.\n\n  int getNumber() { return 42; }\n}\n");
+    assert_eq!(c.error_codes(), ["expected_token"], "{:?}", c.errors);
+    assert_eq!(c.errors, [("expected_token".to_owned(), 26, 29)]);
+    c.assert_sequence(&[
+        ("handle", "send"),
+        ("handle", "send"),
+        ("handle", "send"),
+        ("handle", "expression_statement"),
+        ("begin", "local_function_declaration"),
+        ("end", "local_function_declaration"),
+    ]);
+}
+
+#[test]
+fn local_function_missing_params_keep_expression_body() {
+    // `int get g => 1;` in a function body (oracle `getter_in_function`,
+    // pinned against 3.13.1): `int get` is a local variable whose `;` is
+    // missing (expected_token anchored on the consumed `get`), then
+    // `g => 1;` rides the local-function missing-formals recovery — the
+    // synthesized `()` group is spliced and the parser resumes AFTER it
+    // (`parseFormalParametersRequiredOpt` -> `insertParens`), so the `=> 1;`
+    // parses as `g`'s expression body. Exactly the oracle's two rows: a
+    // `missing_function_body` or a second `missing_identifier` row here
+    // means the synthetic-paren drain regressed and the queued synthetic
+    // `(` reached the body grammar.
+    let c = parse("void f() { int get g => 1; }");
+    assert_eq!(
+        c.errors,
+        vec![
+            ("expected_token".to_string(), 15, 18),
+            ("missing_function_parameters".to_string(), 21, 23),
+        ],
+        "oracle row set: missing `;` at `get`, missing formals at `=>`"
+    );
+    assert_eq!(
+        c.texts,
+        vec![
+            "Expected to find ';'.".to_string(),
+            "Functions must have an explicit list of parameters.".to_string(),
+        ]
+    );
+    c.assert_sequence(&[
+        ("begin", "local_function_declaration"),
+        ("handle", "expression_function_body"),
         ("end", "local_function_declaration"),
     ]);
 }
@@ -334,10 +398,7 @@ fn rethrow_outside_catch_is_not_a_parser_error() {
     // nothing here either.
     let c = parse("void f() { rethrow; }");
     assert!(c.errors.is_empty(), "{:?}", c.errors);
-    c.assert_sequence(&[
-        ("begin", "rethrow_statement"),
-        ("end", "rethrow_statement"),
-    ]);
+    c.assert_sequence(&[("begin", "rethrow_statement"), ("end", "rethrow_statement")]);
 }
 
 #[test]
@@ -468,13 +529,19 @@ fn await_for_outside_async_is_event_only() {
 #[test]
 fn expression_statement_recovery_is_bounded() {
     // Official `{ + }` face: parseUnaryExpression rewrites the prefix `+`
-    // away (rewriteAndRecover, parser_impl.dart:7904-7912), reporting
-    // unsupportedPrefixPlus — pseudo-shared with missing_identifier
-    // (diagnostic.g.dart:3008-3013) — and the statement's missing `;`
-    // reports expected_but_got at the `}`. Exactly two diagnostics; the
-    // recovery stays bounded.
+    // away via rewriteAndRecover (parser_impl.dart:7904-7912) — reporting
+    // unsupportedPrefixPlus (pseudo-shared with missing_identifier,
+    // diagnostic.g.dart:3008-3013) and INSERTING the synthetic identifier
+    // before it, so the `+` itself stays in the stream (:5112-5114) and
+    // reaches the binary loop. Its RHS at `}` then reports its own
+    // missing_identifier (expression-identifier template), and the
+    // statement's missing `;` reports expected_but_got at the `}`. Three
+    // rows; the recovery stays bounded.
     let c = parse("void f() { + }");
-    assert_eq!(c.error_codes(), ["missing_identifier", "expected_token"]);
+    assert_eq!(
+        c.error_codes(),
+        ["missing_identifier", "missing_identifier", "expected_token"]
+    );
     c.assert_sequence(&[
         ("begin", "block_function_body"),
         ("end", "block_function_body"),
@@ -528,17 +595,24 @@ fn catch_extra_parameters_report() {
 }
 
 #[test]
-fn catch_reserved_statement_start_double_catch_syntax() {
-    // `catch (assert)`: the reserved token is a statement start, so the
-    // official catchParameter template keeps it behind a synthetic name
-    // (identifier_context_impl.dart:36-38) — the scan then hits it again at
-    // the trace-name position: exactly 2x `catchSyntax`, and the
-    // extra-parameters report stays silent (the trace name is synthetic).
+fn catch_reserved_statement_start_parks_a_synthetic_name() {
+    // `catch (assert)`: the reserved statement start parks behind a synthetic
+    // name in the catch scan (CatchParameterIdentifierContext.ensureIdentifier,
+    // identifier_context_impl.dart:36-38 — one `catchSyntax` report, no second
+    // row there). The formal re-parse's name slot then reads the stray token:
+    // `assert` is a statement start whose follower `)` is an ok-next value in
+    // a formal parameter, so the template's synthetic arm does not apply and
+    // the keyword-consume arm reports `expectedIdentifierButGotKeyword` while
+    // taking the word as the name (FormalParameterDeclarationIdentifierContext
+    // .ensureIdentifier, identifier_context_impl.dart:604-621). Both rows
+    // anchor on `assert`; the closer stays clean and the extra-parameters
+    // report stays silent (the trace name is synthetic).
     let c = parse("void f() { try {} catch (assert) {} }");
     let codes = c.error_codes();
-    assert!(
-        codes.starts_with(&["catch_syntax".to_owned(), "catch_syntax".to_owned()]),
-        "2x catch_syntax expected: {:?}",
+    assert_eq!(
+        codes,
+        ["catch_syntax", "expected_identifier_but_got_keyword"],
+        "catchSyntax at `assert` + the re-parse keyword-name face: {:?}",
         c.errors
     );
     assert!(
@@ -632,7 +706,7 @@ fn missing_type_before_type_arguments_in_local_decl() {
     );
 }
 
-// —— Group A do-not-emit compliance (corpus-expansion-plan §7) ——————————————
+// —— Group A do-not-emit compliance ——————————————
 
 /// Each Group A statement situation emits only the pinned oracle's generic
 /// codes — never the oracle-dead dedicated code.
@@ -711,11 +785,14 @@ fn statement_flood_respects_diagnostics_cap() {
     let (table, text) = super::collector::scan_ok(source);
     let mut listener = super::collector::Collector::default();
     {
-        let mut parser =
-            crate::Parser::new(text, table, super::collector::latest_features(), listener);
+        let mut parser = crate::Parser::new(
+            text,
+            table,
+            super::collector::latest_features(),
+            &mut listener,
+        );
         parser.parse_unit();
         assert!(parser.is_bailed(), "the cap must latch");
-        listener = parser.listener;
     }
     assert_eq!(
         listener.errors.len(),

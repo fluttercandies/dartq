@@ -5,7 +5,7 @@ use dartq_source::SourceRange;
 
 /// Handle to one token: an index into the [`TokenTable`](dartq_scanner::TokenTable)
 /// for scanned tokens, or `table_len + i` into the parser's inserted-token
-/// side table for closer splits and recovery synthetics (core-spec §5.3).
+/// side table for closer splits and recovery synthetics.
 ///
 /// `u32` is ample: 100k LOC is on the order of 3M tokens.
 pub type TokenId = u32;

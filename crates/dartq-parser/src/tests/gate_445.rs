@@ -46,7 +46,8 @@ fn sorted_codes_with_scanner(source: &'static str) -> Vec<String> {
         .iter()
         .map(|d| d.code.name.to_owned())
         .collect();
-    let mut p = crate::Parser::new(text, table, latest_features(), Collector::default());
+    let mut collector = Collector::default();
+    let mut p = crate::Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
     codes.extend(p.listener.error_codes());
     codes.sort();

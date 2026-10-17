@@ -43,11 +43,6 @@ fn assert_code_fires(source: &'static str, code: &str) {
     );
 }
 
-/// Shared snippet: `implements <literal>` misparse — the oracle reports a
-/// body-shaped row and a member-shaped row on one stream, so one snippet
-/// pins two dark codes.
-const IMPLEMENTS_LITERAL: &str = "class X implements 3 {}\n";
-
 /// Shared snippet: top-level send-assignment statement — a member head with
 /// no type and no modifier, pinning two dark codes.
 const TOP_LEVEL_SEND_ASSIGN: &str = "x.y = 42;\n";
@@ -71,10 +66,13 @@ fn dark_syntax_never_nailed_base_enum() {
 }
 
 /// Written-out binary operator (`and`) at a binary position recovers with
-/// the written-out-operator report (gate_m0's `issue_26810` family face).
+/// the written-out-operator report (`gate_m0`'s `issue_26810` family face).
 #[test]
 fn dark_syntax_never_nailed_binary_operator_written_out() {
-    assert_code_fires("void f() { var x = a and b; }\n", "binary_operator_written_out");
+    assert_code_fires(
+        "void f() { var x = a and b; }\n",
+        "binary_operator_written_out",
+    );
 }
 
 /// `class` keyword in a class body: `recoverFromInvalidMember` reports and
@@ -101,7 +99,10 @@ fn dark_syntax_never_nailed_const_constructor_with_body() {
 /// makes the member a constructor, and the type prefix reports.
 #[test]
 fn dark_syntax_never_nailed_constructor_with_return_type() {
-    assert_code_fires("class C { int C() => 1; }\n", "constructor_with_return_type");
+    assert_code_fires(
+        "class C { int C() => 1; }\n",
+        "constructor_with_return_type",
+    );
 }
 
 /// `default` arm in a switch EXPRESSION (official :11819-11825: report and
@@ -133,7 +134,10 @@ fn dark_syntax_never_nailed_expected_instead() {
 /// `extends` on an extension type: the clause is always invalid.
 #[test]
 fn dark_syntax_never_nailed_extension_type_extends() {
-    assert_code_fires("extension type E(int x) extends A {}\n", "extension_type_extends");
+    assert_code_fires(
+        "extension type E(int x) extends A {}\n",
+        "extension_type_extends",
+    );
 }
 
 /// `with` on an extension type: the clause is always invalid.
@@ -142,11 +146,14 @@ fn dark_syntax_never_nailed_extension_type_with() {
     assert_code_fires("extension type E(int x) with A {}\n", "extension_type_with");
 }
 
-/// `this` formal outside a constructor parameter list (error_verifier
+/// `this` formal outside a constructor parameter list (`error_verifier`
 /// `field_initializer_outside_constructor` at the `this` keyword).
 #[test]
 fn dark_syntax_never_nailed_field_initializer_outside_constructor() {
-    assert_code_fires("void f(this.x) {}\n", "field_initializer_outside_constructor");
+    assert_code_fires(
+        "void f(this.x) {}\n",
+        "field_initializer_outside_constructor",
+    );
 }
 
 /// `covariant final` field pair (official `_endClassFields` validation).
@@ -174,11 +181,16 @@ fn dark_syntax_never_nailed_final_enum() {
     assert_code_fires("final enum E { a }\n", "final_enum");
 }
 
-/// Getter in constructor-name position (`get C()` where `C` names the
-/// enclosing class): the constructor head reports the accessor.
+/// QUALIFIED accessor named like the enclosing class (`get C.x()`): the
+/// name's `.` makes `_isConstructor` return true before the accessor
+/// bail-out (`parser_impl.dart:5753-5755`), so the constructor tail reports
+/// the accessor keyword (`getterConstructor`/`setterConstructor`,
+/// :6093-6098). The simple-name shapes (`get C()`) take the
+/// `getOrSet != null → false` bail (:5786-5788) and surface the
+/// name/parameter checks instead.
 #[test]
 fn dark_syntax_never_nailed_getter_constructor() {
-    assert_code_fires("class C { get C() => 1; }\n", "getter_constructor");
+    assert_code_fires("class C { get C.x() => 1; }\n", "getter_constructor");
 }
 
 /// Getter with a formal parameter list (official `parseGetterOrFormalParameters`).
@@ -201,7 +213,10 @@ fn dark_syntax_never_nailed_illegal_pattern_assignment_variable_name() {
 /// declaration-context variable-name check fires.
 #[test]
 fn dark_syntax_never_nailed_illegal_pattern_variable_name() {
-    assert_code_fires("void f() { var (when) = y; }\n", "illegal_pattern_variable_name");
+    assert_code_fires(
+        "void f() { var (when) = y; }\n",
+        "illegal_pattern_variable_name",
+    );
 }
 
 /// `interface enum` — enums take no class modifiers.
@@ -210,13 +225,17 @@ fn dark_syntax_never_nailed_interface_enum() {
     assert_code_fires("interface enum E { a }\n", "interface_enum");
 }
 
-/// Unary suffix (`?`) applied to a logical-or pattern whose last primary is
-/// a refutable identifier (constant pattern): the unary-context guard
-/// reports (official `isLastPatternAllowedInsideUnaryPattern`).
+/// Unary suffix (`?`) after a RELATIONAL pattern (`case == 3?:`): the
+/// relational primary leaves
+/// `isLastPatternAllowedInsideUnaryPattern` false (:11750), so the `?`
+/// arm's guard reports (`invalidInsideUnaryPattern`, :11629-11633). After
+/// any other primary (constants included, :11889) the flag is true, and a
+/// `?` binds inside the binary RHS recursion where the flag was re-set —
+/// so `a || b?` is the wrong shape.
 #[test]
 fn dark_syntax_never_nailed_invalid_inside_unary_pattern() {
     assert_code_fires(
-        "void f(x) { switch (x) { case a || b?: break; } }\n",
+        "void f(x) { switch (x) { case == 3?: break; } }\n",
         "invalid_inside_unary_pattern",
     );
 }
@@ -266,11 +285,16 @@ fn dark_syntax_never_nailed_member_with_class_name() {
     assert_code_fires("class C { get C => 1; }\n", "member_with_class_name");
 }
 
-/// `enum E;` — no body: the block-body verifier maps the enum flavor to
-/// `missing_enum_body` (pseudoSharedCode `expectedEnumBody`).
+/// An enum header with no body token at all (`enum E` at EOF): the body
+/// check's else arm runs `ensureBlock(token, BlockKind.enumDeclaration)`
+/// (official :2676-2680), whose `expectedEnumBody` flavor maps to
+/// `missing_enum_body`. `enum E;` is the WRONG shape: the `;` body is the
+/// official body-less primary-constructor form (`handleNoEnumBody`,
+/// :2650-2652 — silent with the feature on, `experiment_not_enabled`
+/// without it, never `missing_enum_body`).
 #[test]
 fn dark_syntax_never_nailed_missing_enum_body() {
-    assert_code_fires("enum E;\n", "missing_enum_body");
+    assert_code_fires("enum E\n", "missing_enum_body");
 }
 
 /// `with` clause on a mixin: always invalid (mixins take `on` clauses).
@@ -283,7 +307,10 @@ fn dark_syntax_never_nailed_mixin_with_clause() {
 /// keyword against the earlier one (official modifier-order table).
 #[test]
 fn dark_syntax_never_nailed_modifier_out_of_order() {
-    assert_code_fires("class C { final late int x = 0; }\n", "modifier_out_of_order");
+    assert_code_fires(
+        "class C { final late int x = 0; }\n",
+        "modifier_out_of_order",
+    );
 }
 
 /// Two `extends` types in one class header (official
@@ -319,11 +346,14 @@ fn dark_syntax_never_nailed_sealed_enum() {
     assert_code_fires("sealed enum E { a }\n", "sealed_enum");
 }
 
-/// Setter in constructor-name position (`set C(v)` where `C` names the
-/// enclosing class): the constructor head reports the accessor.
+/// QUALIFIED setter named like the enclosing class (`set C.x(v)`): the
+/// name's `.` makes `_isConstructor` return true before the accessor
+/// bail-out (`parser_impl.dart:5753-5755`), so the constructor tail reports
+/// `setterConstructor` (:6093-6098); the simple-name `set C(v)` takes the
+/// `getOrSet != null → false` bail and surfaces `member_with_class_name`.
 #[test]
 fn dark_syntax_never_nailed_setter_constructor() {
-    assert_code_fires("class C { set C(v) {} }\n", "setter_constructor");
+    assert_code_fires("class C { set C.x(v) {} }\n", "setter_constructor");
 }
 
 /// `var` keyword on a declaration-context variable pattern (`var (var a)`):
@@ -418,7 +448,10 @@ fn dark_syntax_exposure_only_duplicated_modifier() {
 /// `record_and_commas`).
 #[test]
 fn dark_syntax_exposure_only_empty_record_literal_with_comma() {
-    assert_code_fires("void f() { var x = (,); }\n", "empty_record_literal_with_comma");
+    assert_code_fires(
+        "void f() { var x = (,); }\n",
+        "empty_record_literal_with_comma",
+    );
 }
 
 /// Record type `(,)` — empty with a trailing comma (official
@@ -438,18 +471,25 @@ fn dark_syntax_exposure_only_equality_cannot_be_equality_operand() {
     );
 }
 
-/// `implements <literal>`: the body-shaped row of the misparse
-/// (regression-nail shape, `blindspot_type_literals`).
+/// A class header whose body `{` never arrives: the official body check
+/// falls to `ensureBlock(token, BlockKind.classDeclaration)`
+/// (`parser_impl.dart:2676-2677` class flavor), whose shared template
+/// surfaces as `expected_body` (regression-nail shape family; the earlier
+/// `implements 3` minimization parses the `{}` as the body and stays
+/// silent — every class WITH a body leaves this code dark).
 #[test]
 fn dark_syntax_exposure_only_expected_body() {
-    assert_code_fires(IMPLEMENTS_LITERAL, "expected_body");
+    assert_code_fires("class C\n", "expected_body");
 }
 
-/// `implements <literal>`: the member-shaped row of the same misparse
-/// (regression-nail shape, `blindspot_type_literals`).
+/// A class-body member head that is junk and consumes nothing: the
+/// member-recovery tail reports `expected_class_member` and skips it
+/// (official `parseMember` recovery tail; the earlier `implements 3`
+/// minimization routes through the type-literal recovery instead and never
+/// reaches the member lane).
 #[test]
 fn dark_syntax_exposure_only_expected_class_member() {
-    assert_code_fires(IMPLEMENTS_LITERAL, "expected_class_member");
+    assert_code_fires("class C { 3 }\n", "expected_class_member");
 }
 
 /// Top-level junk token: the invalid-declaration face (official
@@ -586,20 +626,19 @@ fn dark_syntax_exposure_only_invalid_constructor_name() {
 /// (official initializer-entry verifier; nail shape `issue_48411_prime_1`).
 #[test]
 fn dark_syntax_exposure_only_invalid_initializer() {
-    assert_code_fires(
-        "class C {\n  C() : super = 0;\n}\n",
-        "invalid_initializer",
-    );
+    assert_code_fires("class C {\n  C() : super = 0;\n}\n", "invalid_initializer");
 }
 
-/// `operator =` — the assignment operator is not user-definable (official
-/// `parseOperatorName`; nail row on the `=` of an initializer recovery).
+/// `operator !` — `!` is an operator token but not user-definable, so the
+/// member dispatch routes to the invalid-operator recovery
+/// (`parseMember` :5521-5535: `isOperator && !EQ && !LT`), whose spliced
+/// method reports `invalidOperator` via `parseOperatorName` (:6309). The
+/// `=` head is NOT this face: the dispatch explicitly falls through to the
+/// field lane there (`int operator = 2`, :5513), so an `operator =` member
+/// parses as a type-less field (mcfvot + the statement's expected-`;` row).
 #[test]
 fn dark_syntax_exposure_only_invalid_operator() {
-    assert_code_fires(
-        "class C {\n  operator =(x) {}\n}\n",
-        "invalid_operator",
-    );
+    assert_code_fires("class C {\n  operator !(x) {}\n}\n", "invalid_operator");
 }
 
 /// Scanner-channel pin: a string part's content ending in a lone `\`
@@ -632,10 +671,7 @@ fn dark_syntax_exposure_only_invalid_unicode_escape_started() {
 /// `issue_45251_list`).
 #[test]
 fn dark_syntax_exposure_only_literal_with_class() {
-    assert_code_fires(
-        "final x = List<List<int>>[];\n",
-        "literal_with_class",
-    );
+    assert_code_fires("final x = List<List<int>>[];\n", "literal_with_class");
 }
 
 /// Constructor initializer entry without an assignment (`this = 0` shape
@@ -676,10 +712,7 @@ fn dark_syntax_exposure_only_missing_function_parameters() {
 /// :4905-4915; nail shape `issue_48411_prime_1`).
 #[test]
 fn dark_syntax_exposure_only_missing_initializer() {
-    assert_code_fires(
-        "class C {\n  C() : null = 0;\n}\n",
-        "missing_initializer",
-    );
+    assert_code_fires("class C {\n  C() : null = 0;\n}\n", "missing_initializer");
 }
 
 /// Operator-token head in an initializer context recovers as an operator
@@ -697,10 +730,7 @@ fn dark_syntax_exposure_only_missing_keyword_operator() {
 /// `missing_parameters` method flavor; nail shape `blindspot_accessors`).
 #[test]
 fn dark_syntax_exposure_only_missing_method_parameters() {
-    assert_code_fires(
-        "class C {\n  int x => 1;\n}\n",
-        "missing_method_parameters",
-    );
+    assert_code_fires("class C {\n  int x => 1;\n}\n", "missing_method_parameters");
 }
 
 /// `typedef void = ...` — no alias name: the `=` falls to the typedef
@@ -714,14 +744,16 @@ fn dark_syntax_exposure_only_missing_typedef_parameters() {
     );
 }
 
-/// Extension type without a representation declaration: the primary-
-/// constructor parameter parse reports the missing list (official
-/// extension-type header face; nail shape
-/// `extension_type_primary_constructor_error`).
+/// A NAMED primary constructor without a parameter list
+/// (`class C.named {}`): the primary-constructor parse sees the `.name`
+/// entry, then no `(` — `missingPrimaryConstructorParameters` at the name
+/// (official :3855-3865; the extension-type flavor reports the
+/// representation pair instead, so `extension type E {}` is the wrong
+/// shape for this code).
 #[test]
 fn dark_syntax_exposure_only_missing_primary_constructor_parameters() {
     assert_code_fires(
-        "extension type E {}\n",
+        "class C.named {}\n",
         "missing_primary_constructor_parameters",
     );
 }
@@ -825,18 +857,16 @@ fn dark_syntax_exposure_only_unexpected_token() {
 /// (official `recoverySmallLookAheadSkipTokens`; nail shape `issue_48371`).
 #[test]
 fn dark_syntax_exposure_only_unexpected_tokens() {
-    assert_code_fires(
-        "enum E w Foo {\n  v\n}\n",
-        "unexpected_tokens",
-    );
+    assert_code_fires("enum E w Foo {\n  v\n}\n", "unexpected_tokens");
 }
 
-/// `var` + type on a primary-constructor formal (official formal-parameter
-/// var face; nail shape `class_primary_constructor_error`).
+/// `var` + type in an ORDINARY formal position (`void f(var int a)`):
+/// `typeAfterVar` fires for non-primary-constructor formals (official
+/// :2287-2298; a primary-constructor declaring parameter legitimately
+/// carries `var` + a type and stays silent, so `class C({var int a})` is
+/// the wrong shape — the member-field face is pinned separately by
+/// `var_and_type_in_member_formals`).
 #[test]
 fn dark_syntax_exposure_only_var_and_type() {
-    assert_code_fires(
-        "class C({var int a}) {}\n",
-        "var_and_type",
-    );
+    assert_code_fires("void foo(var int a) {}\n", "var_and_type");
 }

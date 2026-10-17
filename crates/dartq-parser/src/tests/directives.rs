@@ -12,7 +12,7 @@ use crate::token_id::TokenSpan;
 fn parse(source: &'static str) -> Collector {
     let mut p = setup(source);
     p.parse_unit();
-    p.listener
+    std::mem::take(p.listener)
 }
 
 fn error_codes(source: &'static str) -> Vec<String> {
@@ -83,17 +83,13 @@ impl ConditionalPayloads {
     /// Parses `source` and drains the capture.
     fn of(source: &'static str) -> Self {
         let (table, text) = scan_ok(source);
-        let mut parser = Parser::new(
+        let mut listener = Self {
             text,
-            table,
-            latest_features(),
-            Self {
-                text,
-                ..Default::default()
-            },
-        );
+            ..Default::default()
+        };
+        let mut parser = Parser::new(text, table, latest_features(), &mut listener);
         parser.parse_unit();
-        parser.listener
+        listener
     }
 }
 
@@ -350,7 +346,8 @@ fn directive_after_part_of_with_enhanced_parts() {
         ))
         .with_experiment(dartq_language::Feature::EnhancedParts),
     );
-    let mut p = Parser::new(text, table, features, Collector::default());
+    let mut collector = Collector::default();
+    let mut p = Parser::new(text, table, features, &mut collector);
     p.parse_unit();
     assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
 }

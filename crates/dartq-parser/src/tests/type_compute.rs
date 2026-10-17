@@ -17,7 +17,7 @@ use super::collector::{Collector, Logged, setup};
 fn parse(source: &'static str) -> Collector {
     let mut p = setup(source);
     p.parse_unit();
-    p.listener
+    std::mem::take(p.listener)
 }
 
 /// The events inside the outermost `(begin, pattern)` .. `(end, pattern)`

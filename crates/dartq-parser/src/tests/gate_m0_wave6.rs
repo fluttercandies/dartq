@@ -33,9 +33,10 @@ use super::collector::{Collector, latest_features};
 use crate::Parser;
 use dartq_scanner::{ScanConfig, scan};
 
-/// Scans `source` keeping scanner diagnostics visible (the bracket-mismatch
-/// class carries the scanner's unmatched-begin row) and parses the table.
-/// Returns the collector and the scanner diagnostics.
+/// Scans `source` keeping scanner diagnostics visible and parses the table.
+/// Unmatched groups ride the table as (begin, synthetic closer) pairs — the
+/// scanner emits no rows for them; the parser reports the pairs post-parse
+/// into the collector. Returns the collector and the scanner diagnostics.
 fn parse_with_scan_diags(source: &'static str) -> (Collector, Vec<dartq_diagnostics::Diagnostic>) {
     let config = ScanConfig {
         enable_triple_shift: true,
@@ -48,9 +49,8 @@ fn parse_with_scan_diags(source: &'static str) -> (Collector, Vec<dartq_diagnost
     let diags = result.diagnostics;
     let mut listener = Collector::default();
     {
-        let mut p = Parser::new(source, table, latest_features(), listener);
+        let mut p = Parser::new(source, table, latest_features(), &mut listener);
         p.parse_unit();
-        listener = p.listener;
     }
     (listener, diags)
 }
@@ -97,10 +97,7 @@ fn bracket_mismatch_drop_official_pair() {
     );
     assert_eq!(
         listener.texts,
-        [
-            "Expected an identifier, but got ']'.",
-            "Expected to find ')'.",
-        ],
+        ["Expected an identifier.", "Expected to find ')'.",],
         "message templates diverged"
     );
     assert!(
@@ -143,8 +140,15 @@ fn constructor_form_spill_mints_no_unexpected_rows() {
 // —— boundary: the spill run ends at EOF ———————————————————————————————————
 
 /// Truncating the fixture after the stranded closers drains to EOF: the
-/// `)` is consumed by the drain, the scanner's unclosed-`}` row stands, and
-/// the parse terminates at EOF with the single semicolon row.
+/// `)` is consumed by the drain, and the two unmatched pairs (`(` against
+/// its synthetic parked at the `]`, the function `{` against its eof
+/// synthetic) surface post-parse. The in-parse semicolon row anchors past
+/// the relocation point — on the token the parse resumed at (the `)` at
+/// 26..27, the #2024 recovery-anchor rule; the official `ensureSemicolon`
+/// walk-back starts from the construct's last token, which after a
+/// relocation is the resume token) — so the pair row keeps the `]` anchor
+/// to itself. One `]` pair plus the length-1 eof row for `{`
+/// (translateErrorToken's unconditional `length: 1`).
 #[test]
 fn spill_run_drains_to_eof() {
     let source = "void f() {\n  [\n    (\n    ])";
@@ -152,11 +156,25 @@ fn spill_run_drains_to_eof() {
     let got: Vec<(String, u32, u32)> = listener.errors.clone();
     assert_eq!(
         got,
-        vec![("expected_token".to_string(), 25, 26)],
+        vec![
+            ("expected_token".to_string(), 26, 27),
+            ("expected_token".to_string(), 25, 26),
+            ("expected_token".to_string(), 27, 28),
+        ],
         "spill run at EOF: parser stream diverged"
     );
-    assert_eq!(listener.texts, ["Expected to find ';'."]);
-    assert_eq!(scan_diags.len(), 2, "unmatched `(` and `{{` rows");
+    assert_eq!(
+        listener.texts,
+        [
+            "Expected to find ';'.",
+            "Expected to find ')'.",
+            "Expected to find '}'.",
+        ]
+    );
+    assert!(
+        scan_diags.is_empty(),
+        "the scanner records the pairs without rows: {scan_diags:?}"
+    );
 }
 
 // —— boundary: a construct opener re-enters parsing ———————————————————————
@@ -168,9 +186,14 @@ fn spill_run_drains_to_eof() {
 /// statement and the assignment), and the drain stops at the `x`.
 #[test]
 fn spill_run_stops_at_construct_opener() {
+    // The unclosed `(` never meets its synthetic in the parse (the drain
+    // consumes the stranded closers), so its pair surfaces at parse end at
+    // the parked position; the in-parse semicolon row anchors past the
+    // relocation point — on the token the parse resumed at (the `)` at
+    // 26..27, the #2024 recovery-anchor rule).
     let listener = assert_stream(
         "void f() {\n  [\n    (\n    ])\n  x = 1;\n}\n",
-        &[("expected_token", 25, 26)],
+        &[("expected_token", 26, 27), ("expected_token", 25, 26)],
         "spill run stops at the opener",
     );
     let statements = listener
@@ -202,7 +225,7 @@ fn lone_junk_outside_spill_keeps_stall_row() {
     assert_eq!(
         listener.texts,
         [
-            "Expected an identifier, but got ','.",
+            "Expected an identifier.",
             "Expected to find ';'.",
             "Unexpected text ','.",
         ],

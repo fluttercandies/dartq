@@ -62,7 +62,7 @@ const SECTION_UNITS: [fn(u64, &mut String); 5] = [
 /// One benchmark source, prescanned once so timed rounds do no scanning.
 struct Source {
     name: &'static str,
-    source: String,
+    text: String,
     tokens: TokenTable,
     bytes: u64,
     /// Shortest parse time seen across all rounds.
@@ -78,14 +78,15 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let target_mb = match (args.next(), args.next()) {
         (None, _) => 1u64,
-        (Some(arg), None) => match arg.parse::<u64>() {
-            Ok(mb @ 1..) => mb,
-            _ => {
+        (Some(arg), None) => {
+            if let Ok(mb @ 1..) = arg.parse::<u64>() {
+                mb
+            } else {
                 eprintln!("error: expected a positive integer (target MB)");
                 usage();
                 exit(2);
             }
-        },
+        }
         (Some(_), Some(_)) => {
             eprintln!("error: expected at most one positional argument (target MB)");
             usage();
@@ -122,7 +123,7 @@ fn main() {
         "aggregate",
         sections
             .iter()
-            .map(|s| s.source.as_str())
+            .map(|s| s.text.as_str())
             .collect::<Vec<_>>()
             .join("\n"),
         config,
@@ -140,8 +141,8 @@ fn main() {
     for _ in 0..ROUNDS {
         for s in sections.iter_mut().chain(once(&mut combined)) {
             let start = Instant::now();
-            let (listener, inserted) =
-                parse_unit_with(&s.source, &s.tokens, features, Counting::default());
+            let mut listener = Counting::default();
+            let inserted = parse_unit_with(&s.text, &s.tokens, features, &mut listener);
             let elapsed = start.elapsed();
             s.errors += listener.errors;
             s.inserted += inserted.len();
@@ -183,14 +184,9 @@ fn main() {
 /// which doubles as a sanity check on the input and keeps the parse result
 /// observable. All other listener events keep their defaults, so the parser
 /// still runs on the zero-cost listener path.
+#[derive(Default)]
 struct Counting {
     errors: usize,
-}
-
-impl Default for Counting {
-    fn default() -> Self {
-        Self { errors: 0 }
-    }
 }
 
 impl ParserListener for Counting {
@@ -229,7 +225,7 @@ fn build_source(
     Source {
         name,
         bytes: source.len() as u64,
-        source,
+        text: source,
         tokens,
         min_time: Duration::MAX,
         errors: 0,
@@ -247,13 +243,13 @@ fn synth_directives(target: u64, out: &mut String) {
     let import_target = target - target / 10;
     let mut i = 0usize;
     while (out.len() as u64) < import_target {
-        let _ = write!(
+        let _ = writeln!(
             out,
-            "import 'src/lib{i}.dart' show Alpha{i}, Beta{i} hide Gamma{i};\n"
+            "import 'src/lib{i}.dart' show Alpha{i}, Beta{i} hide Gamma{i};"
         );
-        let _ = write!(out, "import 'src/ext{i}.dart' deferred as ext{i};\n");
-        let _ = write!(out, "@Deprecated('superseded by lib{i}')\n");
-        let _ = write!(out, "export 'src/api{i}.dart' show Delta{i};\n");
+        let _ = writeln!(out, "import 'src/ext{i}.dart' deferred as ext{i};");
+        let _ = writeln!(out, "@Deprecated('superseded by lib{i}')");
+        let _ = writeln!(out, "export 'src/api{i}.dart' show Delta{i};");
         i += 1;
     }
     let mut j = 0usize;

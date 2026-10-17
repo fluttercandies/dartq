@@ -65,7 +65,7 @@ pub(crate) enum ExprStmtOrDecl {
     PatternHead { pattern_keyword: TokenSpan },
 }
 
-impl<'s, L: ParserListener> Parser<'s, '_, L> {
+impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     // ------------------------------------------------------------------
     // statement dispatch
     // ------------------------------------------------------------------
@@ -289,6 +289,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             }
             let start = self.cursor.peek_id();
             self.parse_statement();
+            // Form boundary: the fuse latch survives the form's own recovery
+            // and clears only when the statement genuinely completed
+            // (consumed at least one token) — a stalled parse keeps the
+            // latch, so the same deep form cannot re-trip mid-recovery
+            // (`Parser::clear_depth_fuse`); an independent later form trips
+            // again.
+            if self.cursor.peek_id() != start {
+                self.clear_depth_fuse();
+            }
             count += 1;
             if self.cursor.peek_id() == start && !self.is_bailed() {
                 if self.in_spill_region() {
@@ -593,7 +602,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         if no_modifiers && !for_parts && matches!(type_info, TypeInfo::SimpleNullable) {
             if !self.peek_is_identifier() {
                 let next = self.peek_span();
-                self.report(msg::expected_identifier(self.cursor.lexeme(next.id)), next);
+                self.report(msg::missing_identifier(), next);
                 let id = self
                     .cursor
                     .insert_synthetic(TokenKind::Identifier, next.range.offset);
@@ -612,7 +621,8 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 // `:` makes this a conditional expression, so `int? y = null;`
                 // keeps the declaration.
                 let lands_on_colon = {
-                    let mut spec = self.fork_for_speculation();
+                    let mut spec_listener = crate::listener::SpeculationListener { errors: 0 };
+                    let mut spec = self.fork_for_speculation(&mut spec_listener);
                     spec.cursor.advance(); // `=`
                     let _ = spec.parse_expression_without_cascade();
                     spec.peek_kind() == TokenKind::Colon
@@ -629,10 +639,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
 
         // No annotation, modifier, or type: an expression statement (official
-        // gate `varFinalOrConst == null && beforeType == start` — a consumed
-        // `var`/`final`/`const` always heads a declaration, never an
-        // expression).
-        if var_final_or_const.is_none()
+        // gate `token == start` — the comparison runs against the STATEMENT's
+        // first token, so a consumed `late`/`var`/`final`/`const` modifier or
+        // type always lands in the declaration lane, never here; a built-in
+        // modifier left standing (`late;` before `;`) stays `no_modifiers` and
+        // reads as the expression it is).
+        if no_modifiers
+            && var_final_or_const.is_none()
             && self.cursor.progress() == TokenCursor::progress_at(before_type)
         {
             if for_parts {
@@ -698,7 +711,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
             // fixed shape is consumed directly: the synthetic name, then the
             // `<...>` group — mirroring `parseComplexPlainType`'s events.
             let at = self.peek_span();
-            self.report(msg::expected_identifier(self.cursor.lexeme(at.id)), at);
+            self.report(msg::missing_identifier(), at);
             let id = self
                 .cursor
                 .insert_synthetic(TokenKind::Identifier, at.range.offset);
@@ -1301,7 +1314,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         if let Some((identifier, identifier_pos)) = identifier {
             if !is_identifier(self.cursor.resolve(identifier.id).0) {
                 let at = identifier;
-                self.report(msg::expected_identifier(self.cursor.lexeme(at.id)), at);
+                self.report(msg::missing_identifier(), at);
             } else if self.cursor.real_pos() > identifier_pos + 1 {
                 // The head consumed more than the lone identifier.
                 let follower = self.kind_at(identifier_pos + 1);

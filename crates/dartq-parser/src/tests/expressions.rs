@@ -21,6 +21,15 @@ struct ExprLog {
     /// Send-leaf tiled spans `(begin.offset, end.offset + end.length)` in
     /// UTF-16 — the tests/collector.rs recording convention (#585).
     sends: Vec<(u32, u32)>,
+    /// Error rows with their anchor spans `(code, offset, length)` — the
+    /// family-pin surface (#1317).
+    error_rows: Vec<(String, u32, u32)>,
+    /// Dot accesses `(is_null_aware, dot-token offset)`.
+    dots: Vec<(bool, u32)>,
+    /// Index accesses `(null-aware question present, `[`-token offset)`.
+    indexes: Vec<(bool, u32)>,
+    /// Postfix `!` null-assert token offsets.
+    null_asserts: Vec<u32>,
 }
 
 impl ExprLog {
@@ -47,11 +56,24 @@ impl ExprLog {
             .filter(|(p, n)| *p == phase && *n == name)
             .count()
     }
+
+    /// The error rows as `(code, offset, length)` for span pins.
+    fn error_rows(&self) -> Vec<(&str, u32, u32)> {
+        self.error_rows
+            .iter()
+            .map(|(code, offset, length)| (code.as_str(), *offset, *length))
+            .collect()
+    }
 }
 
 impl ParserListener for ExprLog {
-    fn handle_recoverable_error(&mut self, message: Message, _: TokenSpan, _: TokenSpan) {
+    fn handle_recoverable_error(&mut self, message: Message, start: TokenSpan, _: TokenSpan) {
         self.errors.push(message.code.name.to_owned());
+        self.error_rows.push((
+            message.code.name.to_owned(),
+            start.range.offset,
+            start.range.length,
+        ));
     }
 
     fn handle_experiment_not_enabled(&mut self, _: ExperimentalFlag, _: TokenSpan, _: TokenSpan) {
@@ -205,6 +227,22 @@ impl ParserListener for ExprLog {
         self.sends
             .push((begin.range.offset, end.range.offset + end.range.length));
     }
+    fn handle_dot_access(&mut self, dot: TokenSpan, _: TokenSpan, is_null_aware: bool) {
+        self.log.push(("handle", "dot_access"));
+        self.dots.push((is_null_aware, dot.range.offset));
+    }
+    fn handle_indexed_expression(
+        &mut self,
+        question: Option<TokenSpan>,
+        open: TokenSpan,
+        _: TokenSpan,
+    ) {
+        self.log.push(("handle", "indexed_expression"));
+        self.indexes.push((question.is_some(), open.range.offset));
+    }
+    fn handle_non_null_assert_expression(&mut self, token: TokenSpan) {
+        self.null_asserts.push(token.range.offset);
+    }
 
     // Pattern events the switch-expression cases and pattern assignments
     // ride on (constant/wildcard/list shapes).
@@ -250,7 +288,7 @@ impl ParserListener for ExprLog {
     }
 }
 
-fn setup(source: &'static str) -> Parser<'static, 'static, ExprLog> {
+fn setup(source: &'static str) -> Parser<'static, 'static, 'static, ExprLog> {
     let config = dartq_scanner::ScanConfig {
         enable_triple_shift: true,
         enable_augmentations: true,
@@ -269,13 +307,20 @@ fn setup(source: &'static str) -> Parser<'static, 'static, ExprLog> {
         crate::ParserFeatures::from_feature_set(dartq_language::FeatureSet::for_language_version(
             dartq_language::LanguageVersion::new(3, 13),
         ));
-    Parser::new(text, table, features, ExprLog::default())
+    // The `'static` fixture shape (matching the leaked table/text) leaks
+    // the log: tests read events through the parser and never reclaim it.
+    Parser::new(
+        text,
+        table,
+        features,
+        Box::leak(Box::new(ExprLog::default())),
+    )
 }
 
 fn parse(source: &'static str) -> ExprLog {
     let mut p = setup(source);
     p.parse_unit();
-    p.listener
+    std::mem::take(p.listener)
 }
 
 /// Parses just the expression at the cursor (unit-level entry checks).
@@ -440,18 +485,19 @@ fn await_expression_events_split_by_async_state() {
 /// `handle_send` end, so `x;`'s leaf covers the `;` and the `x = 1` LHS
 /// leaf covers the `=`. Consumers must not assume leaf span == own token.
 #[test]
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn bare_send_leaf_span_includes_follower_token() {
     let src = "void f() { x; }";
     let c = parse(src);
     assert!(c.errors.is_empty(), "{:?}", c.errors);
-    let x = src.find("x").unwrap() as u32;
+    let x = src.find('x').unwrap() as u32;
     let semi = src.find(';').unwrap() as u32;
     assert_eq!(c.sends, [(x, semi + 1)]);
 
     let src = "void f() { x = 1; }";
     let c = parse(src);
     assert!(c.errors.is_empty(), "{:?}", c.errors);
-    let x = src.find("x").unwrap() as u32;
+    let x = src.find('x').unwrap() as u32;
     let eq = src.find('=').unwrap() as u32;
     assert_eq!(c.sends, [(x, eq + 1)]);
 }
@@ -461,14 +507,15 @@ fn bare_send_leaf_span_includes_follower_token() {
 /// Assignment's extent is the RHS Send leaf's tiled span — which includes
 /// the statement `;` (`x = y;` RHS leaf ends past the `;`).
 #[test]
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn assignment_rhs_send_leaf_span_includes_semicolon() {
     let src = "void f() { x = y; }";
     let c = parse(src);
     assert!(c.errors.is_empty(), "{:?}", c.errors);
     assert_eq!(c.count("handle", "assignment_expression"), 1);
-    let x = src.find("x").unwrap() as u32;
+    let x = src.find('x').unwrap() as u32;
     let eq = src.find('=').unwrap() as u32;
-    let y = src.find("y").unwrap() as u32;
+    let y = src.find('y').unwrap() as u32;
     let semi = src.find(';').unwrap() as u32;
     // LHS leaf ends on the `=`; the RHS leaf — the subtree the Assignment
     // anchor adopts — ends past the `;`.
@@ -603,12 +650,13 @@ fn collection_control_flow_nesting_closes_in_order() {
 fn deep_collection_control_flow_latches_stack_overflow() {
     // 600-deep `if` elements inside one list literal: the pending machine
     // frames obey the shared 500 nesting cap — the linearized counterpart of
-    // the official `expressionDepth` guard (parser_impl.dart:6939-6944),
+    // the official `expressionDepth` guard (parser_impl.dart:6939-6963),
     // whose trip reports a single `stackOverflow`, skips to the group end,
     // and splices a synthetic identifier (an event, not a diagnostic). The
-    // latch suppresses every later report, so the legal-descent face is
-    // exactly one code. (The leading `[` matters: an `if` at the initializer
-    // position is not an expression and would legitimately prepend
+    // official guard is LOCAL — no terminal bailout; the parse resumes past
+    // the group and completes, so the legal-descent face is exactly one
+    // code. (The leading `[` matters: an `if` at the initializer position is
+    // not an expression and would legitimately prepend
     // missing_identifier/expected_token prologue codes in both parsers.)
     let source: &'static str = Box::leak(
         format!(
@@ -620,10 +668,6 @@ fn deep_collection_control_flow_latches_stack_overflow() {
     );
     let mut p = setup(source);
     p.parse_unit();
-    assert!(
-        p.is_bailed(),
-        "the collection control-flow cap must latch the bailout"
-    );
     assert_eq!(
         p.listener.codes(),
         ["stack_overflow"],
@@ -804,7 +848,10 @@ fn written_out_operator_recovery_reports_once() {
 
 #[test]
 fn deep_nesting_latches_the_bailout() {
-    // 600 nested list literals inside a variable initializer.
+    // 600 nested list literals inside a variable initializer: the official
+    // expressionDepth guard (parser_impl.dart:6939-6963) is LOCAL — one
+    // stackOverflow report, skip to the group end, synthetic-identifier
+    // splice, and the parse completes without a terminal bailout.
     let source: &'static str = Box::leak(
         format!(
             "void f() {{ var x = {}1{}; }}",
@@ -815,10 +862,6 @@ fn deep_nesting_latches_the_bailout() {
     );
     let mut p = setup(source);
     p.parse_unit();
-    assert!(
-        p.is_bailed(),
-        "the structural nesting cap must latch the bailout"
-    );
     let codes = p.listener.codes();
     assert!(
         codes.contains(&"stack_overflow".to_owned()),
@@ -908,7 +951,8 @@ fn sorted_unit_codes_with_scanner(source: &'static str) -> Vec<String> {
         crate::ParserFeatures::from_feature_set(dartq_language::FeatureSet::for_language_version(
             dartq_language::LanguageVersion::new(3, 13),
         ));
-    let mut p = Parser::new(text, table, features, ExprLog::default());
+    let mut expr_log = ExprLog::default();
+    let mut p = Parser::new(text, table, features, &mut expr_log);
     p.parse_unit();
     codes.extend(p.listener.codes().iter().cloned());
     codes.sort();
@@ -983,17 +1027,21 @@ fn const_dot_shorthand_incomplete_member_recovers() {
 fn keyword_blocker_inside_switch_expression_case() {
     // `switch (x) {if}` (oracle patterns/syntheticIdentifier_insideSwitchExpression):
     // the case pattern, the `=>` and the case body each meet the reserved
-    // `if` without consuming it — missing_identifier x2, then the arrow and
-    // the case separator report expected_token ('=>' and '}').
+    // `if` without consuming it — missing_identifier for the pattern and the
+    // body (deduped), expected_token for the arrow. The arrow row anchors on
+    // the blocker; the case-separator recovery row anchors past it — on the
+    // switch expression's closing `}` the skip lands on (the #2024
+    // separator-anchor rule; frozen 0c9fda4b anchors the separator recovery
+    // row on the token following the recovery point).
+    let src = "void f(Object? x) => switch (x) {if};\n";
     assert_eq!(
-        sorted_unit_codes("void f(Object? x) => switch (x) {if};\n"),
-        [
-            "expected_token",
-            "expected_token",
-            "missing_identifier",
-            "missing_identifier"
+        parse(src).error_rows,
+        vec![
+            ("missing_identifier".to_string(), 33, 2),
+            ("expected_token".to_string(), 33, 2),
+            ("expected_token".to_string(), 35, 1),
         ],
-        "switch-expression case blocker"
+        "switch-expression case blocker: {src}"
     );
 }
 
@@ -1039,6 +1087,66 @@ fn typing_inside_interpolation_multiline_content_recovers() {
     }
 }
 
+#[test]
+fn unclosed_interpolation_eof_recovery_terminates() {
+    // The malformed-EOF shape (`var s = '${x y` — the string AND its open
+    // `${` group run to EOF) exercising the interpolation-close recovery
+    // (`parseSingleLiteralString`'s missing-`}` jump, upstream Dart SDK
+    // source, pkg/_fe_analyzer_shared parser_impl.dart :8745-8750): the
+    // expression parse stops on the `y`, the recovery reports once and jumps
+    // to the scanner-paired closer via `skip_to_token` — EOF-pinned by
+    // contract (the loop exits at eof and `advance` is idempotent there), so
+    // a stale target cannot spin. Channel faces: the scanner parks the
+    // suspended body's unterminated_string_literal (last-unit pin); the
+    // parser's recovery row and the declaration tail's `;` row share the
+    // same `y` anchor with different texts ('}' vs ';') — the official
+    // `ensureSemicolon` walk-back (`findPreviousNonZeroLengthToken`,
+    // util.dart:39) skips the zero-width adopted `}` and lands on `y`, so
+    // the cross-text pair stands at one anchor (frozen 76dd104c 12:23:
+    // cross-text rows at one anchor both surface), and the adopted
+    // `${`-pair row is the third expected_token (the `${` and the string's
+    // closer dedupe into it). The pin's completion is the termination
+    // proof — the whole-unit parse reaches EOF with this bounded four-row
+    // face, no bailout.
+    let source = "var s = '${x y";
+    let config = dartq_scanner::ScanConfig {
+        enable_triple_shift: true,
+        enable_augmentations: true,
+    };
+    let mut files = dartq_source::FileTable::new();
+    let file = files.intern(std::path::Path::new("test.dart"));
+    let result = dartq_scanner::scan(source, config, file);
+    let table: &'static dartq_scanner::TokenTable = Box::leak(Box::new(result.tokens));
+    let scanner_codes: Vec<&str> = result
+        .diagnostics
+        .iter()
+        .map(|d| d.code.name)
+        .collect();
+    let text: &'static str = Box::leak(source.to_string().into_boxed_str());
+    let features =
+        crate::ParserFeatures::from_feature_set(dartq_language::FeatureSet::for_language_version(
+            dartq_language::LanguageVersion::new(3, 13),
+        ));
+    let mut expr_log = ExprLog::default();
+    let mut p = Parser::new(text, table, features, &mut expr_log);
+    p.parse_unit();
+    assert_eq!(
+        expr_log.error_rows,
+        vec![
+            ("expected_token".to_string(), 13, 1),
+            ("expected_token".to_string(), 13, 1),
+            ("expected_token".to_string(), 14, 1),
+        ],
+        "unclosed `${{` at eof — bounded recovery face: {:?}",
+        expr_log.error_rows
+    );
+    assert_eq!(
+        scanner_codes,
+        ["unterminated_string_literal"],
+        "the scanner parks the suspended body"
+    );
+}
+
 // —— audit #180: `>`-family residue ordering ———————————————————————————————
 
 #[test]
@@ -1054,4 +1162,276 @@ fn gt_family_operators_in_statement_position() {
         ("handle", "expression_statement"),
         ("handle", "expression_statement"),
     ]);
+}
+
+// —— still-red family pins (#1317): FAM12 null-aware chains / FAM9 `new` ————
+//
+// Parser-level faces from the m0-syntax differential families: the
+// null-aware chain and `new`-as-identifier decision points, pinned at the
+// anchors the oracle rows use. The families' warning/resolution rows
+// (invalid_null_aware_operator, unnecessary_non_null_assertion,
+// undefined_getter/setter, dead_code, undefined_identifier, ...) are
+// semantic-layer faces riding these events; the parse surface itself is the
+// rows below (upstream Dart SDK source, pkg/_fe_analyzer_shared
+// parser_impl.dart and identifier_context_impl.dart).
+
+#[test]
+fn null_aware_dot_index_missing_identifier_anchors_on_bracket() {
+    // `c1?.[0];` (oracle null_shorting_index line 12, row 12:7 len=1): the
+    // `?.` opens a null-aware DOT access whose operand is the `[0]` list
+    // literal — parsePrimary's OPEN_SQUARE arm runs in continuation position
+    // too (parser_impl.dart:8224-8227) — and the dropped operand is ONE
+    // missing_identifier anchored on the `[` token itself
+    // (ast_builder.doDotExpression recovery, ast_builder.dart:918; the
+    // pinned oracle keeps the `[` lexeme as the property name, which is
+    // where the resolution face `The getter '[' isn't defined` comes from).
+    let c = parse("void f() {\n  c1?.[0];\n}\n");
+    assert_eq!(c.codes(), ["missing_identifier"], "{:?}", c.error_rows());
+    assert_eq!(c.error_rows(), [("missing_identifier", 17, 1)]);
+    assert_eq!(c.dots, [(true, 15)]);
+    assert!(c.indexes.is_empty());
+}
+
+#[test]
+fn bang_then_null_aware_dot_chain_parses_clean() {
+    // `a!?.toString();` (oracle issue_39723 line 7 — resolution warnings
+    // only, zero parse rows): the `!` before `?.` is selector-level
+    // (`_computePrecedence`'s BANG arm, parser_impl.dart:7740-7751), fires
+    // one null-assert event, and `?.toString()` continues the chain as a
+    // null-aware dot access.
+    let c = parse("void f() {\n  a!?.toString();\n}\n");
+    assert!(c.codes().is_empty(), "{:?}", c.codes());
+    assert_eq!(c.null_asserts, [14]);
+    assert_eq!(c.dots, [(true, 15)]);
+}
+
+#[test]
+fn bang_then_question_bracket_is_null_aware_index_not_conditional() {
+    // `a!?[42];` and the spaced `a! ? [42];` (oracle issue_39723 lines 9-10
+    // — resolution warnings only): `?` followed by `[` keeps conditional
+    // precedence only when `canParseAsConditional` succeeds
+    // (parser_impl.dart:7777-7789); `[42] ;` has no `:`, so both readings
+    // are null-aware index chains with no diagnostics.
+    let c = parse("void f() {\n  a!?[42];\n  a! ? [42];\n}\n");
+    assert!(c.codes().is_empty(), "{:?}", c.codes());
+    assert_eq!(c.null_asserts, [14, 25]);
+    assert_eq!(c.indexes, [(true, 16), (true, 29)]);
+    assert_eq!(c.count("begin", "conditional_expression"), 0);
+}
+
+#[test]
+fn null_aware_index_assignment_targets_parse_clean() {
+    // `c1?[0] = 1;` and the spaced form (oracle null_shorting_index lines
+    // 16/19 — no parse rows): the null-aware index chain is an assignable
+    // target (the LHS ends in the index `]`), so the assignment arm adds no
+    // selector reports on top of the chain. The logged anchors are the
+    // chain-internal event offsets: the unspaced form anchors on the `[`,
+    // the spaced form (which rides the conditional-candidate probe before
+    // reverting to the index chain) anchors one token later — the diagnostics
+    // face is empty on both shapes either way.
+    let c = parse("void f() {\n  c1?[0] = 1;\n  c1 ? [0] = 1;\n}\n");
+    assert!(c.codes().is_empty(), "{:?}", c.codes());
+    assert_eq!(c.indexes, [(true, 16), (true, 32)]);
+}
+
+#[test]
+fn null_aware_dot_index_assignment_keeps_bracket_row() {
+    // `c1?.[0] = 1;` (oracle null_shorting_index line 13, rows 13:7
+    // missing_identifier + undefined_setter): the missing-name row anchors
+    // on the `[` and the assignment shape is unchanged by the dropped
+    // operand.
+    let c = parse("void f() {\n  c1?.[0] = 1;\n}\n");
+    assert_eq!(c.codes(), ["missing_identifier"], "{:?}", c.error_rows());
+    assert_eq!(c.error_rows(), [("missing_identifier", 17, 1)]);
+    assert_eq!(c.dots, [(true, 15)]);
+}
+
+#[test]
+fn null_aware_dot_index_chain_reports_per_link() {
+    // `c1?.[0]?.[1];`: every `?.[` link of the chain takes the
+    // dropped-operand face once, anchored on its own `[`.
+    let c = parse("void f() {\n  c1?.[0]?.[1];\n}\n");
+    assert_eq!(
+        c.codes(),
+        ["missing_identifier", "missing_identifier"],
+        "{:?}",
+        c.error_rows()
+    );
+    assert_eq!(
+        c.error_rows(),
+        [("missing_identifier", 17, 1), ("missing_identifier", 22, 1)]
+    );
+    assert_eq!(c.dots, [(true, 15), (true, 20)]);
+}
+
+#[test]
+fn dot_paren_operand_reports_missing_identifier_at_paren() {
+    // `a.(0);` / `a?.(0);` (oracle error_recovery/period_missing_name lines
+    // 3/5, rows 3:5 and 5:6 len=1): the parenthesized group is not a name —
+    // parsePrimary only takes the parenthesized/record reading OUTSIDE
+    // continuation positions (parser_impl.dart:8219-8223), so the operand
+    // face is one missing_identifier anchored on the `(`.
+    let c = parse("void f() {\n  a.(0);\n  a?.(0);\n}\n");
+    assert_eq!(
+        c.codes(),
+        ["missing_identifier", "missing_identifier"],
+        "{:?}",
+        c.error_rows()
+    );
+    assert_eq!(
+        c.error_rows(),
+        [("missing_identifier", 15, 1), ("missing_identifier", 25, 1)]
+    );
+    assert_eq!(c.dots, [(false, 14), (true, 23)]);
+}
+
+#[test]
+fn new_reads_as_identifier_in_dot_continuations() {
+    // `C.new()`, the `C.new` tear-off and the `.new.toString()` chain
+    // (oracle new_as_identifier lines 37/41/44 — zero rows): after `.`,
+    // `new` is rewritten to an identifier naming the unnamed constructor
+    // (parsePrimary's `_tryRewriteNewToIdentifier`,
+    // parser_impl.dart:8108 + :4101-4111), so the chain is dot accesses
+    // with no diagnostics; the constructor reading is the resolution
+    // layer's call.
+    let c =
+        parse("void f() {\n  var a = C.new();\n  var t = C.new;\n  var u = C.new.toString();\n}\n");
+    assert!(c.codes().is_empty(), "{:?}", c.codes());
+    assert_eq!(c.dots, [(false, 22), (false, 41), (false, 58), (false, 62)]);
+    assert_eq!(c.count("begin", "constructor_reference"), 0);
+}
+
+// —— trend-w5B residual faces #1448: F-J `?.[` / F-K keyword-call `+ 1` ————
+//
+// Parse-surface pins for the m0-syntax differential anchors
+// (nnbd/issue_39723*.dart, nnbd/null_shorting_index.dart,
+// error_recovery/keyword_named_*_methods_2.dart). The rows these fixtures
+// additionally report (undefined_getter/setter `'['`,
+// invalid_null_aware_operator, return_of_invalid_type, undefined_operator,
+// not_a_type, dead_code) are resolution/flow faces riding these events.
+
+#[test]
+fn bang_null_aware_dot_bracket_missing_name_anchors_on_bracket() {
+    // `a!?.[42];` (oracle issue_39723 line 8, rows 8:7): the postfix `!`
+    // fires one null-assert event, then the `?.` opens a null-aware DOT
+    // access whose operand is the `[42]` list literal folded in by
+    // parsePrimary's OPEN_SQUARE arm in continuation position
+    // (parser_impl.dart:8224-8227) — one missing_identifier anchored on the
+    // `[`, no index event (the bracket group is the dropped operand, not a
+    // selector).
+    let c = parse("void f() {\n  a!?.[42];\n}\n");
+    assert_eq!(c.codes(), ["missing_identifier"], "{:?}", c.error_rows());
+    assert_eq!(c.error_rows(), [("missing_identifier", 17, 1)]);
+    assert_eq!(c.null_asserts, [14]);
+    assert_eq!(c.dots, [(true, 15)]);
+    assert!(c.indexes.is_empty());
+}
+
+#[test]
+fn paren_bang_null_aware_dot_bracket_missing_name_anchors_on_bracket() {
+    // `(a!)?.[42];` (oracle issue_39723_prime line 8, row 8:9): the
+    // parenthesized receiver parses as a group (the `!` inside fires its
+    // own null-assert event) and the `?.[` link folds the `[42]` operand
+    // with the missing-name row anchored on the `[`.
+    let c = parse("void f() {\n  (a!)?.[42];\n}\n");
+    assert_eq!(c.codes(), ["missing_identifier"], "{:?}", c.error_rows());
+    assert_eq!(c.error_rows(), [("missing_identifier", 19, 1)]);
+    assert_eq!(c.null_asserts, [15]);
+    assert_eq!(c.dots, [(true, 17)]);
+    assert!(c.indexes.is_empty());
+}
+
+#[test]
+fn keyword_is_call_recovers_as_is_expression_with_record_type_operand() {
+    // `return is(x-1) + 1;` (oracle keyword_named_class_methods_2 line 184
+    // parse rows): `is` in expression position reports missing_identifier
+    // and is SYNTHESIZED AROUND — the reserved word stays in the stream and
+    // serves as the is-operator (`ensureIdentifier`'s expression recovery,
+    // identifier_context_impl.dart:407-449; the intertwined expect shows
+    // handleSendWithoutArguments ending at `is`, then parseIsOperatorRest),
+    // so `(x-1` parses as the record TYPE operand: the `-` reports
+    // expected_token ')', the group closes at the real `)` with the
+    // one-positional-field report, the return's `;` reports at that `)`,
+    // and `+ 1;` continues as its own statement — prefix `+` rewrites to a
+    // synthetic identifier while the `+` itself stays for the binary loop
+    // (parseUnaryExpression :7904-7912), so the statement consumes `1 ;`
+    // cleanly with its one missing_identifier and NO trailing
+    // expected_token.
+    let c = parse("void f(int x) {\n  return is(x-1) + 1;\n}\n");
+    assert_eq!(
+        c.error_rows(),
+        [
+            ("missing_identifier", 25, 2),
+            ("expected_token", 29, 1),
+            ("record_type_one_positional_no_trailing_comma", 31, 1),
+            ("expected_token", 31, 1),
+            ("missing_identifier", 33, 1),
+        ],
+        "is-call recovery rows: {:?}",
+        c.codes()
+    );
+    c.assert_sequence(&[
+        ("handle", "is_operator"),
+        ("handle", "expression_statement"),
+    ]);
+}
+
+#[test]
+fn keyword_const_call_parses_const_record_and_joins_binary_plus() {
+    // `return const(x-1) + 1;` (oracle keyword_named_class_methods_2 line
+    // 49 parse rows): `const(x-1)` is a const record literal — one
+    // positional field without a trailing comma reports once at the `)` —
+    // and the binary `+ 1` joins the return expression (no expected_token
+    // rows; `non_constant_record_field` and `undefined_operator '+'` are
+    // resolution faces).
+    let c = parse("void f(int x) {\n  return const(x-1) + 1;\n}\n");
+    assert_eq!(
+        c.error_rows(),
+        [("record_literal_one_positional_no_trailing_comma", 34, 1)],
+        "const-call recovery rows: {:?}",
+        c.codes()
+    );
+}
+
+#[test]
+fn prefixed_and_generic_tearoffs_parse_clean() {
+    // `p.C.new` and `C<int>.new` tear-offs (oracle new_as_identifier lines
+    // 45/46 — only resolution rows): the qualified prefix chain and the
+    // method-type-argument application both keep `.new` readable. The third
+    // dot's anchor sits past the `<int>` group (C@40, `<`@41, `int` 42..45,
+    // `.`@46).
+    let c = parse("void f() {\n  var t = p.C.new;\n  var g = C<int>.new;\n}\n");
+    assert!(c.codes().is_empty(), "{:?}", c.codes());
+    assert_eq!(c.dots, [(false, 22), (false, 24), (false, 46)]);
+}
+
+#[test]
+fn new_constructor_references_parse_clean() {
+    // `const C.new()`, `new C<int>.new()` (oracle new_as_identifier lines
+    // 29/33-34 — only resolution rows): parseNewExpression and
+    // parseConstExpression route through the constructor reference, whose
+    // `.new` continuation reads as the unnamed constructor
+    // (parseConstructorReference :6414 with the continuation rewrite).
+    let c = parse("void f() {\n  var a = const C.new();\n  var b = new C<int>.new();\n}\n");
+    assert!(c.codes().is_empty(), "{:?}", c.codes());
+    assert_eq!(c.count("begin", "constructor_reference"), 2);
+    assert!(c.dots.is_empty());
+}
+
+#[test]
+fn cascade_sections_accept_new_as_name() {
+    // `a..new()`, `a?..new` and the section chain `a..b.new` (parseSend at
+    // expressionContinuation: ensureIdentifier's `new` rewrite,
+    // parser_impl.dart:4101-4111 with identifier_context_impl.dart:391 —
+    // `allowsNewAsIdentifier => isContinuation`): the section name is the
+    // unnamed constructor, consumed silently — a reserved-word report here
+    // would be a dartq-only row on any corpus using `..new`.
+    let c = parse("void f() {\n  a..new();\n  a?..new;\n  a..b.new;\n}\n");
+    assert!(c.codes().is_empty(), "{:?}", c.codes());
+    assert_eq!(
+        c.dots,
+        [(false, 40)],
+        "only the section loop's `.new` is a dot access; the heads are cascade_access"
+    );
+    assert_eq!(c.count("handle", "cascade_access"), 3);
 }

@@ -45,7 +45,7 @@ fn assert_stream(
         .map(|(c, s, e)| (ToString::to_string(c), *s, *e))
         .collect();
     assert_eq!(got, want, "{label}: diagnostic stream diverged");
-    p.listener
+    std::mem::take(p.listener)
 }
 
 /// Asserts the exact diagnostic-code multiset of one whole-unit parse.
@@ -128,7 +128,7 @@ fn group_error_at_list_end_stays_in_list() {
 fn function_typed_parameter_inside_broken_group() {
     let listener = assert_stream(
         "void f({int b, void cb(int x)]}) {}",
-        &[("expected_token", 29, 30)], // Expected '}' before this. at the `]`
+        &[("expected_token", 29, 30)], // Expected to find '}' — at the `]`
         "function-typed formal inside a broken group",
     );
     listener.assert_sequence(&[

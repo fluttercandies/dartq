@@ -111,7 +111,7 @@ fn written_out_candidates(lexeme: &str) -> Option<&'static [TokenKind]> {
     })
 }
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// `_computePrecedence(next, forPattern: false)` (`parser_impl.dart:7773`)
     /// at the cursor: the level of an infix/postfix operator, `None` when the
     /// token cannot continue an expression. The `?[` null-aware bracket and
@@ -167,7 +167,8 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// forked parser (events dropped, stream untouched), so the caller can
     /// re-parse the winning reading for real.
     pub(crate) fn can_parse_as_conditional(&mut self) -> bool {
-        let mut spec = self.fork_for_speculation();
+        let mut spec_listener = crate::listener::SpeculationListener { errors: 0 };
+        let mut spec = self.fork_for_speculation(&mut spec_listener);
         spec.cursor.advance(); // the `?` itself
         let _ = spec.parse_expression_without_cascade();
         if spec.listener.errors == 0 && spec.peek_kind() == TokenKind::Colon {
@@ -225,7 +226,16 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             // after the group skip, and let the enclosing frames unwind
             // through their closers by kind. The oracle's post-fuse rows
             // ride that normal unwind, never the fuse itself (see
-            // [`Self::recover_stack_overflow_expression`]).
+            // [`Self::recover_stack_overflow_expression`]). While the fuse
+            // is latched the trip is not re-reported — the official
+            // counter decrements on every exit, so its unwind never
+            // re-enters above the cap; the latch reproduces that
+            // report-once-per-form face for the collection-control-flow
+            // frames that hold their slots until their closers pop.
+            if self.depth_fuse_latched {
+                return self.peek_span();
+            }
+            self.depth_fuse_latched = true;
             return self.recover_stack_overflow_expression();
         }
         if !self.enter_depth() {
@@ -430,16 +440,52 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     TokenKind::Period | TokenKind::QuestionPeriod => {
                         let dot = self.peek_span();
                         self.cursor.advance();
+                        // The null-aware split rides the `?`: the member
+                        // (and any invocation arguments on it) runs on the
+                        // receiver's not-null path — same `rightBegin`
+                        // timing as the `?[` face.
+                        if kind == TokenKind::QuestionPeriod {
+                            self.listener.handle_null_aware_member_begin(dot);
+                        }
                         // AstBuilder `doDotExpression` (ast_builder.dart:918):
                         // the operand after `.` must be a name — a literal or
                         // bracket operand (`a?.[0]`) is reported as a missing
-                        // identifier and replaced by a synthetic name.
+                        // identifier and replaced by a synthetic name. The
+                        // report anchors here only when the operand parsed as
+                        // a complete expression (literal, bracket group, or
+                        // keyword head): junk that fell through to the
+                        // identifier recovery (`x.;`, `a.class`) already took
+                        // its single `expectedIdentifier` row there, and a
+                        // second anchor here would double the oracle's one
+                        // row (`x.;` surfaces exactly one missing_identifier).
                         let operand = self.peek_span();
                         let operand_kind = self.peek_kind();
                         left = self.parse_primary(IdentifierContext::ExpressionContinuation);
-                        if !is_identifier(operand_kind)
-                            && operand_kind != TokenKind::Keyword(Keyword::New)
-                        {
+                        if matches!(
+                            operand_kind,
+                            TokenKind::Int
+                                | TokenKind::Hexadecimal
+                                | TokenKind::Double
+                                | TokenKind::String
+                                | TokenKind::Hash
+                                | TokenKind::OpenParen
+                                | TokenKind::OpenSquare
+                                | TokenKind::Index
+                                | TokenKind::OpenCurly
+                                | TokenKind::Lt
+                        ) || matches!(
+                            operand_kind,
+                            TokenKind::Keyword(
+                                Keyword::True
+                                    | Keyword::False
+                                    | Keyword::Null
+                                    | Keyword::This
+                                    | Keyword::Super
+                                    | Keyword::Const
+                                    | Keyword::Void
+                                    | Keyword::Assert
+                            )
+                        ) {
                             self.report(msg::missing_identifier(), operand);
                         }
                         if is_dot_shorthand {
@@ -583,7 +629,8 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             // progress without errors and stopped at a clean follower
             // (:6943-6966).
             let accepted = {
-                let mut spec = self.fork_for_speculation();
+                let mut spec_listener = crate::listener::SpeculationListener { errors: 0 };
+                let mut spec = self.fork_for_speculation(&mut spec_listener);
                 spec.currently_recovering = true;
                 spec.cursor.advance();
                 let _ = spec.parse_precedence(replacement_level + 1, allow_cascades);
@@ -733,7 +780,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     }
 }
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     // ------------------------------------------------------------------
     // unary (official parseUnaryExpression :7172)
     // ------------------------------------------------------------------
@@ -756,15 +803,19 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             TokenKind::Plus => {
                 // `unsupportedPrefixPlus` (:7904-7912): `rewriteAndRecover`
-                // REPLACES the `+` with a synthetic identifier — the `+`
-                // never re-reaches the binary loop — and `parsePrimary` then
-                // parses that synthetic (its one `handleIdentifier` comes
-                // from parseSend). The CFE code is pseudo-shared with the
-                // analyzer's missing_identifier (diagnostic.g.dart:3008-3013),
-                // the pinned oracle surface, so report that directly.
+                // inserts the synthetic identifier AT the `+` and KEEPS the
+                // `+` in the stream — parsePrimary parses the synthetic as a
+                // bare send ending at the `+`, and the binary loop then takes
+                // the `+` as its operator with the literal RHS
+                // (`beginBinaryExpression(+)` in the official
+                // keyword_named_class_methods_2.intertwined.expect trace of
+                // `return is(x-1) + 1;`). Consuming the `+` here would strand
+                // the RHS and mint a spurious `expected_token ';'` at it.
+                // The CFE code is pseudo-shared with the analyzer's
+                // missing_identifier (diagnostic.g.dart:3008-3013), the
+                // pinned oracle surface, so report that directly.
                 let plus = self.peek_span();
                 self.report(msg::missing_identifier(), plus);
-                self.cursor.advance();
                 self.synthetic(TokenKind::Identifier, plus.range.offset);
                 self.parse_primary(IdentifierContext::Expression)
             }
@@ -915,6 +966,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 // (`parser_impl.dart:8028`), so consume `[` before the
                 // operand — otherwise `[i]` re-parses as a list literal.
                 self.cursor.advance();
+                // The null-aware split rides the `?`: the operand runs on
+                // the receiver's not-null path (official
+                // `nullAwareAccess_rightBegin`), so listeners need the
+                // marker before the operand's own events stream.
+                if let Some(question) = question {
+                    self.listener
+                        .handle_null_aware_index_operand_begin(question);
+                }
                 let mut empty_operand: Option<crate::token_id::TokenId> = None;
                 if self.peek_kind() == TokenKind::CloseSquare {
                     // Empty index operand (`a[]`, `a[ ]`): the adjacent
@@ -930,6 +989,15 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     let id = self
                         .cursor
                         .insert_synthetic(TokenKind::Identifier, close.range.offset);
+                    // The synthetic splices in at the peek: with no queued
+                    // split closer (a real `]` follows) it lands BEFORE the
+                    // `]`, behind one (the `[]`-token face) AFTER it. Consume
+                    // it in the first case so the closer below is the real
+                    // `]` either way — the official splice order is
+                    // `[` operand `]` (`rewriteSquareBrackets` :4743).
+                    if self.cursor.peek_id() == id {
+                        self.cursor.advance();
+                    }
                     empty_operand = Some(id);
                 } else {
                     let saved = self.may_parse_function_expressions;
@@ -956,11 +1024,14 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 }
                 let close = self.peek_span();
                 self.cursor.advance();
-                // The synthetic operand rides the queue behind the split
-                // closer; drain it once the `]` is consumed so it cannot
-                // resurface as a phantom operand downstream.
-                if let Some(id) = empty_operand {
-                    while self.cursor.advance() != id {}
+                // The `[]`-token face leaves the synthetic operand current
+                // once the split `]` is consumed; step over it so it cannot
+                // resurface as a phantom operand downstream. One bounded
+                // step, never an id scan: `advance` is idempotent at EOF, so
+                // a search drain here could not terminate (and the official
+                // parser never scans for an id — its loop bails at EOF).
+                if empty_operand.is_some_and(|id| self.cursor.peek_id() == id) {
+                    self.cursor.advance();
                 }
                 self.listener
                     .handle_indexed_expression(question, open, close);
@@ -1069,6 +1140,27 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     // cascades (official parseCascadeExpression :7091)
     // ------------------------------------------------------------------
 
+    /// `parseSend` at an expression-continuation position with the official
+    /// `ensureIdentifier` `new`-rewrite folded in: `expressionContinuation`
+    /// allows `new` as an identifier (identifier_context_impl.dart:391,
+    /// `allowsNewAsIdentifier => isContinuation`), so `..new()` names the
+    /// unnamed constructor and is consumed silently
+    /// (`_tryRewriteNewToIdentifier`, parser_impl.dart:4101-4111 — no
+    /// report). The generic `ensure_identifier` rewrite set covers the
+    /// constructor-reference and method-declaration continuations; cascade
+    /// sections parse their names through `parse_send` directly, so this is
+    /// their expression-side counterpart.
+    fn parse_send_continuation(&mut self) -> TokenSpan {
+        if self.peek_kind() == TokenKind::Keyword(Keyword::New) {
+            let new_kw = self.peek_span();
+            self.cursor.advance();
+            self.listener
+                .handle_identifier(new_kw, IdentifierContext::ExpressionContinuation);
+            return self.parse_send_from_identifier(new_kw);
+        }
+        self.parse_send(IdentifierContext::ExpressionContinuation)
+    }
+
     /// Official `parseCascadeExpression`; the cursor sits on the `..`/`?..`
     /// operator, `left` the cascade target expression span.
     fn parse_cascade_expression(&mut self, left: TokenSpan) -> TokenSpan {
@@ -1080,7 +1172,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             self.parse_argument_or_index_star(left, TypeParamOrArg::None, false)
                 .0
         } else {
-            let sent = self.parse_send(IdentifierContext::ExpressionContinuation);
+            let sent = self.parse_send_continuation();
             self.listener
                 .handle_cascade_access(cascade_operator, sent, is_null_aware_cascade);
             sent
@@ -1094,7 +1186,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 let period = self.peek_span();
                 let is_null_aware = self.peek_kind() == TokenKind::QuestionPeriod;
                 self.cursor.advance();
-                end = self.parse_send(IdentifierContext::ExpressionContinuation);
+                if is_null_aware {
+                    self.listener.handle_null_aware_member_begin(period);
+                }
+                end = self.parse_send_continuation();
                 self.listener.handle_dot_access(period, end, is_null_aware);
             } else if self.peek_kind() == TokenKind::Bang {
                 let bang = self.peek_span();
@@ -1129,7 +1224,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     }
 }
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     // ------------------------------------------------------------------
     // primary (official parsePrimary :7440)
     // ------------------------------------------------------------------
@@ -1377,17 +1472,33 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// Official `parseConstructorInvocationArguments` :8884: arguments (or
     /// the invalid-type-arguments recovery). [token] is the last-consumed
     /// span — the official `token` parameter — so the missing-`(` report
-    /// lands on the type-argument closer/identifier, not the follower. The
-    /// pinned oracle never surfaces `constructor_with_type_arguments`
-    /// (#96 cull), so the type-argument arm emits only
-    /// `handle_invalid_type_arguments` and the generic `(`-missing recovery.
+    /// anchors there (parser_impl.dart:8878-8884 reports on `token`): the
+    /// consumed identifier (`const Foo;`) or the type-argument closer, never
+    /// the bare follower. The pinned oracle never surfaces
+    /// `constructor_with_type_arguments` (#96 cull), so the type-argument arm
+    /// emits only `handle_invalid_type_arguments` and the generic
+    /// `(`-missing recovery.
     pub(crate) fn parse_constructor_invocation_arguments(&mut self, token: TokenSpan) -> TokenSpan {
         if self.peek_kind() == TokenKind::OpenParen {
             return self.parse_arguments_rest();
         }
         let type_arg = self.compute_type_param_or_arg(false);
         if matches!(type_arg, TypeParamOrArg::None) {
-            self.report(msg::expected_after_but_got("("), token);
+            // Official `reportRecoverableError(token, ...)` with its
+            // `findNonZeroLengthToken` anchor adjustment (parser_impl.dart:
+            // 8878-8884 + parser/util.dart:56): a real anchor reports there
+            // (the consumed identifier, e.g. `const Foo;`), while a
+            // zero-width synthetic anchor — the enum-element empty name —
+            // surfaces on the stream-next token, the current peek (corpus
+            // 5ad4a307: `expected_token` at the `;`, length 1).
+            let (anchor_kind, anchor_synthetic) = self.cursor.resolve(token.id);
+            let at = if anchor_synthetic && anchor_kind != TokenKind::Eof && token.range.length == 0
+            {
+                self.peek_span()
+            } else {
+                token
+            };
+            self.report(msg::expected_token("("), at);
         } else {
             let parsed = type_arg.parse_arguments(self);
             self.listener.handle_invalid_type_arguments(parsed);
@@ -1566,7 +1677,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     }
 }
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     // ------------------------------------------------------------------
     // sends (official parseSend :8828)
     // ------------------------------------------------------------------
@@ -1734,7 +1845,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     }
 }
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     // ------------------------------------------------------------------
     // pattern assignment (official parsePatternAssignment :11776)
     // ------------------------------------------------------------------
@@ -2050,10 +2161,19 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                             self.skip_to_token(self.real_id(sep_pos));
                             self.cursor.advance();
                         } else {
-                            let at = self.peek_span();
-                            self.report(msg::expected_but_got("}"), at);
-                            if let Some(close) = self.cursor.table_matching_end(begin_switch.id) {
-                                self.skip_to_token(close);
+                            // #2024: the recovery row anchors on the token
+                            // the skip lands on — the switch expression's
+                            // closing `}` — not the blocker (the frozen
+                            // oracle anchors the separator recovery row on
+                            // the token following the recovery point).
+                            let close = self.cursor.table_matching_end(begin_switch.id);
+                            let anchor = match close {
+                                Some(c) => self.span_of(c),
+                                None => self.peek_span(),
+                            };
+                            self.report(msg::expected_but_got("}"), anchor);
+                            if let Some(c) = close {
+                                self.skip_to_token(c);
                             }
                             break;
                         }
@@ -2095,7 +2215,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     }
 }
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     // ------------------------------------------------------------------
     // `<...>` literal/function dispatch (official
     // parseLiteralListSetMapOrFunction :8310)

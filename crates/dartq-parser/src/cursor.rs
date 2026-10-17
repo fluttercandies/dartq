@@ -1,7 +1,7 @@
 //! Token cursor over an immutable [`TokenTable`].
 #![allow(clippy::cast_possible_truncation)] // ids/offsets are u32 by design
 //!
-//! Replaces the official token-stream rewriter (core-spec §5.3): the scanned
+//! Replaces the official token-stream rewriter: the scanned
 //! table is never modified. Two mechanisms stand in for rewrites:
 //!
 //! * **Closer splitting** — the scanner emits `>>`/`>=`/`>>>`-family tokens
@@ -13,7 +13,7 @@
 //! * **Synthetic insertion** — recovery inserts a zero-width synthetic token
 //!   at the current position ([`TokenCursor::insert_synthetic`]); events
 //!   reference it by id and the AST builder materializes it as a zero-length
-//!   span (ast-design-spec §5.1).
+//!   span.
 //!
 //! Inserted tokens live in an append-only side table addressed by ids past
 //! `TokenTable::len()`. Speculation saves/restores the cursor and truncates
@@ -211,11 +211,30 @@ impl<'s, 't> TokenCursor<'s, 't> {
     pub(crate) fn resolve(&self, id: TokenId) -> (TokenKind, bool) {
         let index = id as usize;
         if index < self.table.len() {
-            let t = self.table.get(index).expect("id below table len");
-            (t.kind, t.is_synthetic())
+            // The scanned table is immutable, so any id below its length must
+            // resolve; a miss is a logic bug. Degrade to the EOF-pinned shape
+            // (kind reads as Eof, so parser loops bail) instead of panicking
+            // on the hot path.
+            match self.table.get(index) {
+                Some(t) => (t.kind, t.is_synthetic()),
+                None => {
+                    debug_assert!(false, "id below table len must resolve");
+                    (TokenKind::Eof, true)
+                }
+            }
         } else {
-            let t = &self.inserted[index - self.table.len()];
-            (t.kind, t.synthetic)
+            // An id past the table addresses the side table; a miss there is
+            // a stale id from a rolled-back speculation or detach (the
+            // caller side of the [`Self::reset`] contract). Degrade to the
+            // same EOF-pinned shape (kind reads as Eof, so parser loops
+            // bail) instead of panicking on the hot path.
+            match self.inserted.get(index - self.table.len()) {
+                Some(t) => (t.kind, t.synthetic),
+                None => {
+                    debug_assert!(false, "stale token id after reset/detach");
+                    (TokenKind::Eof, true)
+                }
+            }
         }
     }
 
@@ -224,13 +243,35 @@ impl<'s, 't> TokenCursor<'s, 't> {
     pub(crate) fn span(&self, id: TokenId) -> SourceRange {
         let index = id as usize;
         if index < self.table.len() {
-            let t = self.table.get(index).expect("id below table len");
-            SourceRange {
-                offset: t.utf16_offset,
-                length: utf16_len_of_token(self.source, t),
+            // Same invariant as `resolve`: degrade to a zero-width EOF-pinned
+            // span instead of panicking.
+            match self.table.get(index) {
+                Some(t) => SourceRange {
+                    offset: t.utf16_offset,
+                    length: utf16_len_of_token(self.source, t),
+                },
+                None => {
+                    debug_assert!(false, "id below table len must resolve");
+                    SourceRange {
+                        offset: self.table.last().utf16_offset,
+                        length: 0,
+                    }
+                }
             }
         } else {
-            self.inserted[index - self.table.len()].range()
+            // Same invariant as the table arm: a side-table miss is a stale
+            // id — degrade to a zero-width EOF-pinned span instead of
+            // panicking.
+            match self.inserted.get(index - self.table.len()) {
+                Some(t) => t.range(),
+                None => {
+                    debug_assert!(false, "stale token id after reset/detach");
+                    SourceRange {
+                        offset: self.table.last().utf16_offset,
+                        length: 0,
+                    }
+                }
+            }
         }
     }
 
@@ -243,8 +284,14 @@ impl<'s, 't> TokenCursor<'s, 't> {
         if index < self.table.len() {
             self.table.lexeme(self.source, index)
         } else {
-            let t = &self.inserted[index - self.table.len()];
-            t.kind.fixed_lexeme().unwrap_or("")
+            // Same invariant as `resolve`: a stale id lexes as empty.
+            match self.inserted.get(index - self.table.len()) {
+                Some(t) => t.kind.fixed_lexeme().unwrap_or(""),
+                None => {
+                    debug_assert!(false, "stale token id after reset/detach");
+                    ""
+                }
+            }
         }
     }
 
@@ -257,24 +304,58 @@ impl<'s, 't> TokenCursor<'s, 't> {
         let id = self.peek_id();
         let index = id as usize;
         if index < self.table.len() {
-            let t = self.table.get(index).expect("id below table len");
-            TokenView {
-                kind: t.kind,
-                span: TokenSpan::new(
-                    id,
-                    SourceRange {
-                        offset: t.utf16_offset,
-                        length: utf16_len_of_token(self.source, t),
-                    },
-                ),
-                is_synthetic: t.is_synthetic(),
+            // Same invariant as `resolve`: an Eof-shaped view makes every loop
+            // head bail, so the degradation stays terminating.
+            match self.table.get(index) {
+                Some(t) => TokenView {
+                    kind: t.kind,
+                    span: TokenSpan::new(
+                        id,
+                        SourceRange {
+                            offset: t.utf16_offset,
+                            length: utf16_len_of_token(self.source, t),
+                        },
+                    ),
+                    is_synthetic: t.is_synthetic(),
+                },
+                None => {
+                    debug_assert!(false, "id below table len must resolve");
+                    TokenView {
+                        kind: TokenKind::Eof,
+                        span: TokenSpan::new(
+                            id,
+                            SourceRange {
+                                offset: self.table.last().utf16_offset,
+                                length: 0,
+                            },
+                        ),
+                        is_synthetic: true,
+                    }
+                }
             }
         } else {
-            let t = &self.inserted[index - self.table.len()];
-            TokenView {
-                kind: t.kind,
-                span: TokenSpan::new(id, t.range()),
-                is_synthetic: t.synthetic,
+            // Same invariant as the table arm: an Eof-shaped view makes
+            // every loop head bail, so the degradation stays terminating.
+            match self.inserted.get(index - self.table.len()) {
+                Some(t) => TokenView {
+                    kind: t.kind,
+                    span: TokenSpan::new(id, t.range()),
+                    is_synthetic: t.synthetic,
+                },
+                None => {
+                    debug_assert!(false, "stale token id after reset/detach");
+                    TokenView {
+                        kind: TokenKind::Eof,
+                        span: TokenSpan::new(
+                            id,
+                            SourceRange {
+                                offset: self.table.last().utf16_offset,
+                                length: 0,
+                            },
+                        ),
+                        is_synthetic: true,
+                    }
+                }
             }
         }
     }
@@ -423,6 +504,21 @@ impl<'s, 't> TokenCursor<'s, 't> {
     #[inline]
     pub(crate) fn at_eof(&self) -> bool {
         self.peek_kind() == TokenKind::Eof
+    }
+
+    /// Drains queued and current tokens until `id` is consumed — the
+    /// insert-then-drain contract of the recovery synthetics (`ensureSemicolon`,
+    /// `ensureIdentifier`'s spliced names, the synthetic type reference, the
+    /// synthetic block pair). The target is by construction the insert this
+    /// call drains to, so the loop always terminates there; the `at_eof`
+    /// backstop only covers a hypothetical queue-reordering regression, where
+    /// an unreachable target would otherwise spin forever on the EOF-pinned
+    /// [`Self::advance`] with zero diagnostic burn (the diagnostic caps never
+    /// see a drain loop). On every correct-path execution the backstop is
+    /// unreachable and the loop is the plain `while advance() != id {}`.
+    #[inline]
+    pub(crate) fn drain_to(&mut self, id: TokenId) {
+        while !self.at_eof() && self.advance() != id {}
     }
 
     // --- optional consumption -----------------------------------------------------
@@ -762,5 +858,52 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(cursor.progress(), before);
         assert!(cursor.at_eof());
+    }
+
+    /// A stale id from a rolled-back speculation (the caller side of the
+    /// `reset` contract) reads as the EOF-pinned shape in release builds —
+    /// under-report, never a panic. Debug builds trip the invariant instead
+    /// (the twin test below).
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_stale_inserted_id_degrades_to_the_eof_pinned_shape() {
+        let (mut cursor, _src) = cursor("a b");
+        let mark = cursor.mark();
+        let stale = cursor.insert_synthetic(TokenKind::Semicolon, 0);
+        cursor.reset(mark); // the side table truncates; the id is garbage now
+        let eof_offset = cursor.table.last().utf16_offset;
+        assert_eq!(cursor.resolve(stale), (TokenKind::Eof, true));
+        assert_eq!(
+            cursor.span(stale),
+            SourceRange {
+                offset: eof_offset,
+                length: 0
+            }
+        );
+        assert_eq!(cursor.lexeme(stale), "");
+        // `peek` derives its own id; a forged head past the truncated side
+        // table drives the same degrade through the queue arm.
+        cursor.head = cursor.inserted.len();
+        let view = cursor.peek();
+        assert_eq!(view.kind, TokenKind::Eof);
+        assert_eq!(
+            view.span.range,
+            SourceRange {
+                offset: eof_offset,
+                length: 0
+            }
+        );
+        assert!(view.is_synthetic);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "stale token id")]
+    fn a_stale_inserted_id_trips_the_debug_invariant() {
+        let (mut cursor, _src) = cursor("a b");
+        let mark = cursor.mark();
+        let stale = cursor.insert_synthetic(TokenKind::Semicolon, 0);
+        cursor.reset(mark);
+        let _ = cursor.resolve(stale);
     }
 }

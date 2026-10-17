@@ -9,17 +9,17 @@
 //!   stay silent (re-probed live at 3.13.1: `== 'a' '$x'` emits no row).
 //! * `non_sync_abstract_method` — dartq-only rows retired: the oracle
 //!   converter suppresses the code (error_converter.dart:338-340,
-//!   "Not reported but followed by a MISSING_FUNCTION_BODY error").
+//!   "Not reported but followed by a `MISSING_FUNCTION_BODY` error").
 //! * `required_parameter_with_default` — pseudo-shared to
 //!   `named_parameter_outside_group` (fe91 codes_generated.dart:2742-2746);
 //!   both separators on a required positional report the same code.
 //! * `empty_*_parameter_list` — pseudo-shared to `missing_identifier`
 //!   (fe91 codes :577-590).
 //! * `wrong_number_of_parameters_for_setter` — the top-level setter arm
-//!   (ast_builder.dart:6257/:6289) mirrors the class-member check; the row
+//!   (`ast_builder.dart:6257/:6289`) mirrors the class-member check; the row
 //!   anchors on the setter name.
 //! * not-sync anchors — setter/factory rows span the `async`/`sync` keyword
-//!   (`asyncToken`, parser_impl.dart:4644/:6060/:6230), never the star.
+//!   (`asyncToken`, `parser_impl.dart:4644/:6060/:6230`), never the star.
 
 use super::collector::{latest_features, scan_ok, setup};
 use crate::Parser;
@@ -56,12 +56,8 @@ fn assert_code_absent(source: &'static str, code: &str, label: &str) {
 /// (UTF-16 units; ASCII sources make them byte-exact with the probes).
 fn first_span(source: &'static str) -> (String, u32, u32) {
     let (table, text) = scan_ok(source);
-    let mut p = Parser::new(
-        text,
-        table,
-        latest_features(),
-        super::collector::Collector::default(),
-    );
+    let mut collector = super::collector::Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
     let (code, start, end) = &p.listener.errors[0];
     (code.clone(), *start, *end)
@@ -87,7 +83,7 @@ fn conditional_uri_reports_only_first_interpolation() {
     assert_eq!((start, end), (40, 42));
 }
 
-/// Probed b03: a plain value literal reports nothing (the URI_DOES_NOT_EXIST
+/// Probed b03: a plain value literal reports nothing (the `URI_DOES_NOT_EXIST`
 /// family is resolution-tier).
 #[test]
 fn conditional_uri_plain_value_stays_silent() {

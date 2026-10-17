@@ -9,7 +9,7 @@ use dartq_language::{FeatureSet, LanguageVersion};
 fn parse(source: &'static str) -> super::collector::Collector {
     let mut p = setup(source);
     p.parse_unit();
-    p.listener
+    std::mem::take(p.listener)
 }
 
 // —— valid declaration forms ————————————————————————————————————————————
@@ -789,7 +789,7 @@ fn field_initializer_parses_full_expression() {
 }
 
 /// The lint-end proof for #502: a `late` field group's `VariablesDeclaration`
-/// span head is the `late` token (collapse map §3.3 head-is-late; official
+/// span head is the `late` token (head-is-late; official
 /// `VariableDeclarationList` begins at `lateKeyword`), and the initializer
 /// rides `InitializedIdentifier > VariableInitializer` — the shape the
 /// lints bridge collapse map dispatches `unnecessary_late` on.
@@ -811,9 +811,10 @@ fn late_field_variables_declaration_head_is_the_late_token() {
             }
         }
         let (table, text) = scan_ok(source);
-        let mut parser = Parser::new(text, table, latest_features(), Heads { heads: Vec::new() });
+        let mut heads = Heads { heads: Vec::new() };
+        let mut parser = Parser::new(text, table, latest_features(), &mut heads);
         parser.parse_unit();
-        parser.listener.heads
+        std::mem::take(&mut parser.listener.heads)
     }
 
     let static_field = "class C { static late int x = 0; }\n";
@@ -852,7 +853,7 @@ fn late_field_variables_declaration_head_is_the_late_token() {
 fn initializers(source: &'static str) -> super::collector::Collector {
     let mut p = setup(source);
     p.parse_initializers_opt();
-    p.listener
+    std::mem::take(p.listener)
 }
 
 #[test]
@@ -971,14 +972,10 @@ fn parse_off_with_scanner(source: &'static str) -> (super::collector::Collector,
     let features = crate::ParserFeatures::from_feature_set(FeatureSet::for_language_version(
         LanguageVersion::new(3, 9),
     ));
-    let mut p = Parser::new(
-        text,
-        table,
-        features,
-        super::collector::Collector::default(),
-    );
+    let mut collector = super::collector::Collector::default();
+    let mut p = Parser::new(text, table, features, &mut collector);
     p.parse_unit();
-    (p.listener, scanner_codes)
+    (std::mem::take(p.listener), scanner_codes)
 }
 
 #[test]
@@ -1143,7 +1140,7 @@ fn mixin_formal_off_two_row_parser_face() {
 }
 
 /// `extension E(int x) {}` at 2.12: per the oracle's silent
-/// `TopLevel|Mixin|Extension` `endPrimaryConstructor` arm (ast_builder.dart),
+/// `TopLevel|Mixin|Extension` `endPrimaryConstructor` arm (`ast_builder.dart`),
 /// extension formals carry no `(`-anchored experiment row — only the
 /// parser-side `unexpected_token` from the `parsePrimaryConstructorOpt`
 /// extension arm, and no experiment row anywhere else (a `{}` body has no
@@ -1175,12 +1172,8 @@ fn extension_formal_off_no_paren_experiment_row() {
 /// (code, start, end) rows in emission order for `source`.
 fn rows(source: &'static str) -> Vec<(String, u32, u32)> {
     let (table, text) = scan_ok(source);
-    let mut p = Parser::new(
-        text,
-        table,
-        latest_features(),
-        super::collector::Collector::default(),
-    );
+    let mut collector = super::collector::Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
     p.listener.errors.clone()
 }
@@ -1191,7 +1184,7 @@ fn rows(source: &'static str) -> Vec<(String, u32, u32)> {
 /// follows) or carries a `var`/`final`/`const` keyword, a junk token at the
 /// name slot reports `missing_identifier` and a zero-width synthetic name
 /// splices in before the junk (official `insertSyntheticIdentifier`,
-/// parser_impl.dart:4056/:4367). The member parse then cascades against the
+/// `parser_impl.dart:4056/:4367`). The member parse then cascades against the
 /// junk follower: `ensureSemicolon` anchors `expected_token ';'` on the
 /// previous non-zero-width token (findPreviousNonZeroLengthToken over the
 /// zero-width synthetic), the unit loop restarts on the leftover junk
@@ -1215,7 +1208,7 @@ fn rows(source: &'static str) -> Vec<(String, u32, u32)> {
 ///   (`missing_identifier` 9|11 and `expected_executable` 9|11).
 /// * `void<int> x, ?y;` — comma-list junk name: the context recovery
 ///   consumes the `?` in doubt and splices the synthetic after it
-///   (TopLevelDeclarationIdentifierContext, identifier_context_impl.dart:
+///   (`TopLevelDeclarationIdentifierContext`, `identifier_context_impl.dart`:
 ///   1338-1345), so `missing_identifier` (13|14) and the walked-back
 ///   `expected_token` (13|14) both anchor on the `?` and no restart fires.
 /// * `void<int>?;` — `unexpected_token` (10|11) on the `;` restart.

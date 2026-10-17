@@ -24,7 +24,8 @@ fn snapshot(tokens: &[dartq_scanner::Token]) -> Vec<(TokenKind, u32, u32, u32, b
 
 fn parse(source: &'static str) -> (Collector, Vec<dartq_scanner::Token>) {
     let (table, text) = scan_ok(source);
-    let (listener, tokens) = parse_unit_with(text, table, latest_features(), Collector::default());
+    let mut listener = Collector::default();
+    let tokens = parse_unit_with(text, table, latest_features(), &mut listener);
     (listener, tokens)
 }
 

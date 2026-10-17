@@ -18,7 +18,7 @@ use super::collector::{Collector, setup};
 fn parse(source: &'static str) -> Collector {
     let mut p = setup(source);
     p.parse_unit();
-    p.listener
+    std::mem::take(p.listener)
 }
 
 // —— family 1: committed-return formal gate (official parser_impl.dart

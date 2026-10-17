@@ -37,7 +37,7 @@ fn assert_codes(source: &'static str, expected: &[&str], label: &str) {
 /// `const Foo;` — the missing-`(` recovery reports
 /// `expectedAfterButGot('(')` (analyzer shared code `expected_token`) on
 /// the LAST-CONSUMED token (`Foo`, official `parseConstructorInvocationArguments`
-/// `token` parameter, parser_impl.dart:8884), splices an empty synthetic
+/// `token` parameter, `parser_impl.dart:8884`), splices an empty synthetic
 /// argument group, and rides `parseArgumentsRest` over it — the `;`
 /// follower survives as the declaration terminator.
 #[test]
@@ -89,8 +89,9 @@ fn new_expression_missing_args_recover_with_synthetic_args() {
 
 // —— incomplete const dot shorthand (#609 dot-shorthand) ————————————————
 
-/// `Color c = const .;` (corpus dot_shorthands/
-/// const_no_identifier_recovery.dart): the pinned 3.13.1 oracle faces
+/// `Color c = const .;` (corpus case
+/// `dot_shorthands/const_no_identifier_recovery.dart`): the pinned 3.13.1
+/// oracle faces
 /// (trend-w4 gate raw output + live probe) are `missing_identifier` on the
 /// follower `;` (kept unconsumed, real-token anchor) and
 /// `expected_token(';')` at the dot (the terminator's walked-back anchor
@@ -111,8 +112,10 @@ fn incomplete_const_dot_shorthand_missing_identifier() {
 // —— stack_overflow difference surface (#333 accepted difference) ———————
 
 /// The exact `targeted/stack_overflow.dart` shape (~700 nested parens):
-/// dartq latches the bounded bailout at the nesting cap and terminates —
-/// it must NEVER reproduce the oracle's unbounded-crash recovery rows
+/// dartq mirrors the official LOCAL expressionDepth guard
+/// (parser_impl.dart:6939-6963) — one `stackOverflow` report, skip to the
+/// group end, synthetic-identifier splice, parse completes — and must NEVER
+/// reproduce the oracle's unbounded-crash recovery rows
 /// (`expected_executable` + `expected_token` + `unexpected_token`, the
 /// accepted differential difference disclosed in #333).
 #[test]
@@ -121,7 +124,6 @@ fn deep_paren_bomb_latches_bounded_bailout() {
         Box::leak(format!("var x = {}1{};\n", "(".repeat(700), ")".repeat(700)).into_boxed_str());
     let mut parser = setup(source);
     parser.parse_unit();
-    assert!(parser.is_bailed(), "the nesting cap must latch the bailout");
     let codes = parser.listener.error_codes();
     assert!(
         codes.contains(&"stack_overflow".to_owned()),
@@ -129,7 +131,7 @@ fn deep_paren_bomb_latches_bounded_bailout() {
     );
     assert!(
         codes.len() <= 4,
-        "the bailout bounds total diagnostics on the bomb: {codes:?}"
+        "the fuse bounds total diagnostics on the bomb: {codes:?}"
     );
 }
 
@@ -272,6 +274,165 @@ fn function_typed_parameter_var_also_reports_extraneous_modifier() {
     );
 }
 
+// —— #1999 W-A: the avoid_final_parameters.dart corpus faces ————————————
+
+/// Ordinary formals reject `final` with the oracle's `extraneous_modifier`
+/// row on the keyword (probed 3.13.1: rows 1:8 / 2:9 / 3:9, each len 5);
+/// `var` pairs with `var_and_type`, untyped `var` and `const` stand alone.
+#[test]
+fn ordinary_formals_reject_var_final_const_modifiers() {
+    let mut parser = setup("void f(final int x) {}\n");
+    parser.parse_unit();
+    assert_eq!(
+        parser.listener.errors,
+        [("extraneous_modifier".to_owned(), 7, 12)],
+        "positional final formal"
+    );
+    let mut parser = setup("void g({final int y = 1}) {}\n");
+    parser.parse_unit();
+    assert_eq!(
+        parser.listener.errors,
+        [("extraneous_modifier".to_owned(), 8, 13)],
+        "named final formal"
+    );
+    let mut parser = setup("void h([final int z = 2]) {}\n");
+    parser.parse_unit();
+    assert_eq!(
+        parser.listener.errors,
+        [("extraneous_modifier".to_owned(), 8, 13)],
+        "optional positional final formal"
+    );
+    let mut parser = setup("void p(var int q) {}\n");
+    parser.parse_unit();
+    assert_eq!(
+        parser.listener.errors,
+        [
+            ("extraneous_modifier".to_owned(), 7, 10),
+            ("var_and_type".to_owned(), 7, 10),
+        ],
+        "var + type reports the probed pair in emission order"
+    );
+    let mut parser = setup("void u(var x) {}\n");
+    parser.parse_unit();
+    assert_eq!(
+        parser.listener.errors,
+        [("extraneous_modifier".to_owned(), 7, 10)],
+        "untyped var formal"
+    );
+    let mut parser = setup("void c(const int d) {}\n");
+    parser.parse_unit();
+    assert_eq!(
+        parser.listener.errors,
+        [("extraneous_modifier".to_owned(), 7, 12)],
+        "const formal"
+    );
+}
+
+/// The generalized-function-type formal (`typedef F = void Function(final
+/// int inner);`, probed 3.13.1 rows 4:27 len 5 twice): the modifier is
+/// consumed where the return type sits,
+/// `function_typed_parameter_var` + `extraneous_modifier` report, and the
+/// declaration tree stays intact — exactly two rows, none of the seven
+/// keyword-rejection cascade rows the pre-W-A parser minted
+/// (`expected_identifier_but_got_keyword`, `expected_type_name`,
+/// `expected_token` ×3, `expected_executable`, `unexpected_token`).
+#[test]
+fn function_type_formal_final_pair_keeps_the_tree_intact() {
+    let mut parser = setup("typedef F = void Function(final int inner);\n");
+    parser.parse_unit();
+    let mut got = parser.listener.errors.clone();
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            ("extraneous_modifier".to_owned(), 26, 31),
+            ("function_typed_parameter_var".to_owned(), 26, 31),
+        ],
+        "the oracle pair, nothing else — no cascade"
+    );
+}
+
+/// The whole corpus file parses to exactly the oracle ERROR face: four
+/// `extraneous_modifier` + one `function_typed_parameter_var`, and the
+/// clean lines (`void i`, `void j`, the local `final int local`) mint zero
+/// rows — the zero-extra half of the acceptance.
+#[test]
+fn avoid_final_parameters_corpus_parses_to_the_oracle_face() {
+    let mut parser = setup(concat!(
+        "// avoid_final_parameters — official rule faces\n",
+        "void f(final int x) {}\n",
+        "\n",
+        "void g({final int y = 1}) {}\n",
+        "\n",
+        "void h([final int z = 2]) {}\n",
+        "\n",
+        "void i(int x) {}\n",
+        "\n",
+        "void j(void Function(int) cb) {}\n",
+        "\n",
+        "typedef F = void Function(final int inner);\n",
+        "\n",
+        "void k() {\n",
+        "  final int local = 1;\n",
+        "  print(local);\n",
+        "}\n",
+    ));
+    parser.parse_unit();
+    let mut codes = parser.listener.error_codes();
+    codes.sort();
+    assert_eq!(
+        codes,
+        [
+            "extraneous_modifier".to_owned(),
+            "extraneous_modifier".to_owned(),
+            "extraneous_modifier".to_owned(),
+            "extraneous_modifier".to_owned(),
+            "function_typed_parameter_var".to_owned(),
+        ],
+        "the oracle ERROR face and nothing else"
+    );
+}
+
+/// The rejection is the shipped-feature posture: with
+/// `primary_constructors` off (pre-3.13) the modifiers are accepted
+/// silently again — the grammar the `unnecessary_final` /
+/// `avoid_final_parameters` lint faces key on.
+#[test]
+fn modifier_rejection_is_feature_gated() {
+    let (table, text) = super::collector::scan_ok("void f(final int x) {}\n");
+    let mut collector = Collector::default();
+    let mut parser = crate::Parser::new(
+        text,
+        table,
+        super::collector::version_features(3, 10),
+        &mut collector,
+    );
+    parser.parse_unit();
+    assert!(
+        collector.errors.is_empty(),
+        "pre-feature formals stay silent: {:?}",
+        collector.errors
+    );
+    // The extraneous face is the only feature-gated half: `var` + a type
+    // keeps `var_and_type` at every version (official typeAfterVar has no
+    // feature gate), and `final` stays fully silent pre-feature.
+    let (table, text) =
+        super::collector::scan_ok("void f(final int x) {}\nvoid p(var int q) {}\n");
+    let mut collector = Collector::default();
+    let mut parser = crate::Parser::new(
+        text,
+        table,
+        super::collector::version_features(3, 10),
+        &mut collector,
+    );
+    parser.parse_unit();
+    assert_eq!(
+        collector.errors,
+        [("var_and_type".to_owned(), 30, 33)],
+        "only the non-gated var_and_type survives at 3.10"
+    );
+}
+
 /// #891: top-level `factory Foo.bar();` — the `factory` arm reports
 /// `factory_top_level_declaration` and hands the stream back at `Foo`
 /// (`force_advance` = the official consume-on-invalidation posture), and the
@@ -327,7 +488,8 @@ fn rows_at(source: &'static str, major: u32, minor: u32) -> Vec<(String, u32, u3
         crate::ParserFeatures::from_feature_set(dartq_language::FeatureSet::for_language_version(
             dartq_language::LanguageVersion::new(major, minor),
         ));
-    let mut parser = crate::Parser::new(text, table, features, Collector::default());
+    let mut collector = Collector::default();
+    let mut parser = crate::Parser::new(text, table, features, &mut collector);
     parser.parse_unit();
     parser
         .listener
@@ -354,6 +516,7 @@ fn dot_shorthand_gate_is_silent_at_latest_version() {
 /// dot token (the deduped head+context anchor, oracle probe 3.13.1:
 /// `ERROR|SYNTACTIC_ERROR|EXPERIMENT_NOT_ENABLED|…|4|14|1`).
 #[test]
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn dot_shorthand_gate_reports_once_at_the_dot_below_3_10() {
     let source = "enum E { a }\nvoid f() {\n  if (E.a == .a) {}\n}\n";
     let dot = source.rfind(".a").expect("shorthand dot") as u32;
@@ -369,6 +532,7 @@ fn dot_shorthand_gate_reports_once_at_the_dot_below_3_10() {
 /// `…|3|11|5|This requires the 'dot-shorthands' language feature to be
 /// enabled.` + `…|3|17|1|` same text).
 #[test]
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn const_dot_shorthand_gate_reports_dot_and_const_below_3_10() {
     let source = "enum E { a }\nfinal x = const .a;\n";
     let const_kw = source.find("const").expect("const keyword") as u32;

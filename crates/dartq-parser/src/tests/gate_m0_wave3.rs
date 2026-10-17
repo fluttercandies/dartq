@@ -43,8 +43,8 @@ fn sorted_codes(source: &'static str) -> Vec<String> {
 }
 
 /// Sorted diagnostic-code multiset (scanner + parser) of one whole-unit
-/// parse, for inputs the scanner itself flags (an unclosed `(` pins a
-/// synthetic closer and reports `expectedToken`).
+/// parse, for inputs with unmatched groups (an unclosed `(` parks a
+/// synthetic closer; the parser reports the pair post-parse).
 fn sorted_codes_with_scanner(source: &'static str) -> Vec<String> {
     let config = dartq_scanner::ScanConfig {
         enable_triple_shift: true,
@@ -60,7 +60,8 @@ fn sorted_codes_with_scanner(source: &'static str) -> Vec<String> {
         .iter()
         .map(|d| d.code.name.to_owned())
         .collect();
-    let mut p = crate::Parser::new(text, table, latest_features(), Collector::default());
+    let mut collector = Collector::default();
+    let mut p = crate::Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
     codes.extend(p.listener.error_codes());
     codes.sort();
@@ -417,7 +418,8 @@ fn assert_codes_engine(source: &'static str, expected: &[&str], label: &str) {
         .iter()
         .map(|d| d.code.name.to_owned())
         .collect();
-    let mut p = crate::Parser::new(text, table, latest_features(), Collector::default());
+    let mut collector = Collector::default();
+    let mut p = crate::Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
     codes.extend(p.listener.error_codes());
     codes.sort();
@@ -493,8 +495,7 @@ fn new_constructor_this_initializer_cascade() {
     ] {
         assert!(
             codes.iter().any(|c| c == required),
-            "this.new cascade must surface {required}: {:?}",
-            codes
+            "this.new cascade must surface {required}: {codes:?}"
         );
     }
 }
@@ -554,19 +555,37 @@ fn augment_headed_declaration_name_recovery() {
     );
 }
 
+/// The gated-off member spellings from the differential fixtures
+/// (`augmentation/member_declarations.dart` lines 2/4): inside a class
+/// body the identifier `augment` rides the ordinary member paths — a
+/// plain return type (`augment method()`) and a getter return type
+/// (`augment get getter`) — with zero parser diagnostics. The downstream
+/// undefined-family face (`UNDEFINED_CLASS` 'augment', the suppressed
+/// `return_of_invalid_type` cascade) is the semantic layer's named-type
+/// resolution over the member scope chain; it is pinned in the
+/// `dartq-semantic` diagnose suite (`augment_gate_off_*`).
+#[test]
+fn augment_member_spelling_identifier_fall_back() {
+    assert_codes_engine(
+        "class C {\n  augment method() {}\n  augment get getter => null;\n}\n",
+        &[],
+        "member-level augment rides the type-or-name paths silently",
+    );
+}
+
 /// `augment extension E on int {}` with the feature off (engine gate +
 /// 3.13 oracle): `augment` rides the identifier path as a type, the
-/// field-name gate rejects `extension` as the name (missing_identifier,
+/// field-name gate rejects `extension` as the name (`missing_identifier`,
 /// synthetic splice, keyword left for the declaration loop), the `;` check
-/// reports expected_token anchored on the consumed `augment`, and
+/// reports `expected_token` anchored on the consumed `augment`, and
 /// `extension E on int {}` reparses clean as a plain extension. That is
 /// exactly the 3.13.1 oracle's parser-level face for this shape
-/// (EXPECTED_TOKEN at 1|1|7, MISSING_IDENTIFIER at 1|9); the oracle's third
-/// entry, UNDEFINED_CLASS 'augment', is a compile-time code from the
+/// (`EXPECTED_TOKEN` at 1|1|7, `MISSING_IDENTIFIER` at 1|9); the oracle's third
+/// entry, `UNDEFINED_CLASS` 'augment', is a compile-time code from the
 /// semantic layer, and `extension_augmentation_has_on_clause` is unreachable
 /// here (it needs the augmentation parse path, which the lexical gate
 /// precludes at plain 3.13). m0-differential target: the full oracle
-/// multiset (the semantic UNDEFINED_CLASS rides on the diagnose wave).
+/// multiset (the semantic `UNDEFINED_CLASS` rides on the diagnose wave).
 #[test]
 fn augment_extension_on_int_identifier_path() {
     assert_codes_engine(
@@ -611,7 +630,8 @@ fn stack_overflow_fuse_triple() {
     let nested: &'static str =
         Box::leak(format!("void f() {{ {} ; }}\n", "if (1) ".repeat(600)).into_boxed_str());
     let (table, text) = scan_ok(nested);
-    let mut p = crate::Parser::new(text, table, latest_features(), Collector::default());
+    let mut collector = Collector::default();
+    let mut p = crate::Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
     assert!(
         p.is_bailed(),

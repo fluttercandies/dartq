@@ -9,12 +9,13 @@
 //!
 //! 1. `parse_unit` (full declaration dispatch since #18) consumes the whole
 //!    stream and reaches EOF, with every parser diagnostic inside the
-//!    source's UTF-16 bounds;
+//!    source's UTF-16 bounds except the upstream EOF face (start == len,
+//!    end == len + 1 — the oracle's EOF-anchored length-1 row);
 //! 2. at every token position, speculative type, pattern, and top-level
 //!    declaration parses either advance the cursor or leave it unchanged
 //!    (no hangs), never panic;
 //! 3. event/`TokenSpan` invariants hold for every emitted diagnostic: UTF-16
-//!    offsets within `[0, utf16_len]`.
+//!    offsets within `[0, utf16_len]`, plus the EOF face.
 //!
 //! When #19/#20 fill in statements and the full expression engine, these
 //! same drivers graduate into differential coverage over the corpus.
@@ -103,13 +104,19 @@ fn all_golden_cases_consume_cleanly() {
         //    parser diagnostic stays inside the source.
         let mut listener = Collector::default();
         {
-            let mut parser = Parser::new(&source, &result.tokens, latest_features(), listener);
+            let mut parser = Parser::new(&source, &result.tokens, latest_features(), &mut listener);
             parser.parse_unit();
-            listener = parser.listener;
         }
         for (code, start, end) in &listener.errors {
+            // Upstream reports EOF-anchored diagnostics AT the EOF token:
+            // findNonZeroLengthToken stops its walk at EOF
+            // (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/parser/util.dart:56),
+            // and the oracle machine rows pin the length-1 EOF face
+            // (`'}' @2:1|1`, offset == len) — admit exactly start == len,
+            // end == len + 1, reject anything else out of bounds.
+            let eof_anchored = *start == utf16_len && *end == utf16_len + 1;
             assert!(
-                *start <= utf16_len && *end <= utf16_len,
+                eof_anchored || (*start <= utf16_len && *end <= utf16_len),
                 "case {}: parser diagnostic {code} out of bounds ({start}..{end}, utf16 len {utf16_len})",
                 case.source_file
             );
@@ -119,8 +126,8 @@ fn all_golden_cases_consume_cleanly() {
         //    no panics, no hangs, cursor stays in bounds.
         for start in 0..result.tokens.len() {
             for kind in 0..3 {
-                let mut parser =
-                    Parser::new(&source, &result.tokens, latest_features(), NullListener);
+                let mut null = NullListener;
+                let mut parser = Parser::new(&source, &result.tokens, latest_features(), &mut null);
                 for _ in 0..start {
                     parser.cursor.advance();
                 }

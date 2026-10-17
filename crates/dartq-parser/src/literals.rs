@@ -30,7 +30,7 @@ enum Unwind {
     Else,
 }
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// One collection element: a plain entry, or an if/for/spread/null-aware
     /// control-flow shape and its body chain
     /// (`literal_entry_info_impl.dart`, `computeLiteralEntry` :61 +
@@ -281,6 +281,22 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     break;
                 }
                 _ => {
+                    // Latched depth fuse: the descent is spent and no entry
+                    // parsing may re-enter (a fresh descent would trip the
+                    // recovery cycle again). The official unwind consumes the
+                    // remaining group through its closers silently, so jump
+                    // to this literal's closer and close the level.
+                    if self.depth_fuse_latched {
+                        if let Some(close) = self.current_matching_end_for_open(left) {
+                            self.skip_to_token(close);
+                            end = self.peek_span();
+                            self.cursor.advance();
+                        } else {
+                            let at = self.peek_span();
+                            end = self.synthetic(TokenKind::CloseSquare, at.range.offset);
+                        }
+                        break;
+                    }
                     // Recovery (:8569-8595): an entry-looking token means a
                     // missing comma (`expected_else_or_comma` after an `if`
                     // condition); otherwise jump to the group's closer,
@@ -388,6 +404,20 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     break;
                 }
                 _ => {
+                    // Latched depth fuse: no entry parsing may re-enter —
+                    // jump to where the scanner guaranteed the `}` silently
+                    // (see the list-literal arm).
+                    if self.depth_fuse_latched {
+                        if let Some(close) = self.current_matching_end_for_open(left) {
+                            self.skip_to_token(close);
+                            end = self.peek_span();
+                            self.cursor.advance();
+                        } else {
+                            let at = self.peek_span();
+                            end = self.synthetic(TokenKind::CloseCurly, at.range.offset);
+                        }
+                        break;
+                    }
                     // Recovery (:8041-8066): an entry-looking token means a
                     // missing comma; otherwise report and jump to where the
                     // scanner guaranteed the `}`.
@@ -560,6 +590,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// expression's `(begin, end)` spans.
     fn parse_single_literal_string(&mut self) -> (TokenSpan, Option<(TokenSpan, TokenSpan)>) {
         let begin = self.peek_span();
+        // Upstream `parseSingleLiteralString` seals
+        // `endLiteralString(interpolationCount, token)` with the LAST
+        // consumed String token (parser_impl.dart:9305 — the closing-quote
+        // segment `parseStringPart` returned; the plain path passes the
+        // opening token itself, :9595). Interpolation-free literals never
+        // update it, so `end == begin` there.
+        let mut end = begin;
         self.listener.begin_literal_string(begin);
         self.cursor.advance();
         let mut interpolation_count = 0usize;
@@ -607,12 +644,13 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 _ => break,
             }
             if self.peek_kind() == TokenKind::String {
+                end = self.peek_span();
                 self.cursor.advance();
             } else {
                 break;
             }
         }
-        self.listener.end_literal_string(interpolation_count, begin);
+        self.listener.end_literal_string(interpolation_count, end);
         (begin, first_interpolation)
     }
 
@@ -674,6 +712,11 @@ mod tests {
         end_if: usize,
         end_if_else: usize,
         for_control_flow: usize,
+        /// The `(begin, end)` spans of each completed string literal, in
+        /// completion order — the interpolation anchor pins.
+        strings: Vec<(TokenSpan, TokenSpan)>,
+        /// The begin token of the string literal currently open.
+        pending_string_begin: Option<TokenSpan>,
     }
 
     impl crate::listener::ParserListener for LiteralLog {
@@ -741,9 +784,20 @@ mod tests {
         fn end_for_control_flow(&mut self, _: TokenSpan) {
             self.for_control_flow += 1;
         }
+
+        fn begin_literal_string(&mut self, begin: TokenSpan) {
+            self.pending_string_begin = Some(begin);
+        }
+
+        fn end_literal_string(&mut self, _: usize, end: TokenSpan) {
+            let begin = self.pending_string_begin.take().expect("string begin seen");
+            self.strings.push((begin, end));
+        }
     }
 
-    fn literal_parser(source: &'static str) -> crate::Parser<'static, 'static, LiteralLog> {
+    fn literal_parser(
+        source: &'static str,
+    ) -> crate::Parser<'static, 'static, 'static, LiteralLog> {
         crate::expr_const::test_support::parser(source, LiteralLog::default())
     }
 
@@ -963,11 +1017,11 @@ mod tests {
         }
     }
 
-    fn symbol_parser(source: &'static str) -> crate::Parser<'static, 'static, SymbolLog> {
+    fn symbol_parser(source: &'static str) -> crate::Parser<'static, 'static, 'static, SymbolLog> {
         crate::expr_const::test_support::parser(source, SymbolLog::default())
     }
 
-    fn parse_symbol(source: &'static str) -> crate::Parser<'static, 'static, SymbolLog> {
+    fn parse_symbol(source: &'static str) -> crate::Parser<'static, 'static, 'static, SymbolLog> {
         let mut p = symbol_parser(source);
         let hash = p.peek_span();
         p.cursor.advance();
@@ -1048,5 +1102,185 @@ mod tests {
                 IdentifierContext::LiteralSymbolContinuation,
             ]
         );
+    }
+
+    /// The triple-shift lexing gate decides the `#>>>` recovery shape
+    /// (triple_shift_symbol corpus): the official `tokenizeGreaterThan`
+    /// (upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/scanner/
+    /// abstract_scanner.dart :1493) merges `>>>`/`>>>=` only under the
+    /// triple-shift switch, so at a pre-2.14 settled version the scanner
+    /// hands the parser `>>` + `>` and `parseLiteralSymbol` (:9249) takes
+    /// the whole `>>` as the symbol operator — the bare `>` then parses as
+    /// the relational binary with a missing operand, reporting
+    /// `missing_identifier` at the `)`. With the gate on (>= 2.14, the
+    /// default face) the whole `>>>` is the symbol operator and the unit
+    /// parse stays clean.
+    #[test]
+    fn triple_shift_gate_decides_the_hash_triple_gt_recovery_shape() {
+        fn scan(
+            source: &'static str,
+            triple_shift: bool,
+        ) -> (&'static dartq_scanner::TokenTable, &'static str) {
+            let config = dartq_scanner::ScanConfig {
+                enable_triple_shift: triple_shift,
+                enable_augmentations: true,
+            };
+            let mut files = dartq_source::FileTable::new();
+            let file = files.intern(std::path::Path::new("test.dart"));
+            let result = dartq_scanner::scan(source, config, file);
+            assert!(
+                result.diagnostics.is_empty(),
+                "scanner diagnostics in {source:?}: {:?}",
+                result.diagnostics
+            );
+            let table: &'static dartq_scanner::TokenTable = Box::leak(Box::new(result.tokens));
+            let text: &'static str = Box::leak(source.to_string().into_boxed_str());
+            (table, text)
+        }
+        let source = "main() {\n  print(#>>>);\n}\n";
+
+        let (table, text) = scan(source, false);
+        let mut log = SymbolLog::default();
+        let mut p = crate::Parser::new(
+            text,
+            table,
+            crate::expr_const::test_support::features(),
+            &mut log,
+        );
+        p.parse_unit();
+        // The harness listener hears the contract's handleIdentifier events
+        // ahead of the symbol (`main` as the declaration name, `print` as
+        // the send target — listener.dart's identifier events); the symbol
+        // face itself is unchanged: `>>` is the symbol operator, and the
+        // bare `>` is the relational binary whose operand is missing at the
+        // `)`.
+        assert_eq!(
+            p.listener.events,
+            vec!["identifier", "identifier", "begin", "operator", "end:1"]
+        );
+        assert_eq!(p.listener.errors, vec!["missing_identifier".to_string()]);
+
+        let (table, text) = scan(source, true);
+        let mut log = SymbolLog::default();
+        let mut p = crate::Parser::new(
+            text,
+            table,
+            crate::expr_const::test_support::features(),
+            &mut log,
+        );
+        p.parse_unit();
+        // Gate on: the whole `>>>` is the symbol operator, the unit parse
+        // stays clean, and the two contract identifier events still lead.
+        assert_eq!(
+            p.listener.events,
+            vec!["identifier", "identifier", "begin", "operator", "end:1"]
+        );
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
+
+    #[test]
+    fn interpolated_literal_seals_at_the_closing_string_token() {
+        // #1916: upstream `parseSingleLiteralString` seals
+        // `endLiteralString(count, token)` with the LAST consumed String
+        // token (parser_impl.dart:9305) — the closing quote — so the
+        // literal's listener extent covers the whole interpolation run,
+        // matching the oracle's `StringInterpolation` node. The returned
+        // head stays the begin token (the adjacent-strings caller anchors
+        // on it). Spans are UTF-16 units.
+
+        // Single-line `$id` form: begin `"æbler` (6 units), closer `"` at
+        // 10..11.
+        let src = "\"æbler$bar\"";
+        let mut p = literal_parser(src);
+        let (head, first) = p.parse_literal_string_and_first_interpolation();
+        let (begin, end) = p.listener.strings[0];
+        assert_eq!(begin.range.offset, 0);
+        assert_eq!(begin.range.length, 6);
+        assert_eq!(end.range.offset, 10);
+        assert_eq!(end.range.length, 1);
+        assert_eq!(end.range.end(), 11);
+        assert_eq!(head.range, begin.range);
+        assert!(first.is_some());
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+
+        // Multiline `"""` form: begin `"""æbler` (8 units — the row the
+        // pre-fix anchor produced), closer `"""` ends at 15, the oracle's
+        // whole-literal extent.
+        let src = "\"\"\"æbler$bar\"\"\"";
+        let mut p = literal_parser(src);
+        let _ = p.parse_literal_string_and_first_interpolation();
+        let (begin, end) = p.listener.strings[0];
+        assert_eq!(begin.range.offset, 0);
+        assert_eq!(begin.range.length, 8);
+        assert_eq!(end.range.offset, 12);
+        assert_eq!(end.range.length, 3);
+        assert_eq!(end.range.end(), 15);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+
+        // The `${expr}` form: the scanner parks `${` as its own
+        // StringInterpolationExpression token, and the trailing String
+        // segment after the group (`c"`) is the seal.
+        let src = "\"a${b}c\"";
+        let mut p = literal_parser(src);
+        let _ = p.parse_literal_string_and_first_interpolation();
+        let (begin, end) = p.listener.strings[0];
+        assert_eq!(begin.range.length, 2); // `"a`
+        assert_eq!(end.range.offset, 6);
+        assert_eq!(end.range.length, 2); // `c"`
+        assert_eq!(end.range.end(), 8);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+
+        // Interpolation-free: the begin token IS the last consumed String
+        // token, so the anchor pair collapses onto it.
+        let mut p = literal_parser("'abc'");
+        let _ = p.parse_literal_string_and_first_interpolation();
+        let (begin, end) = p.listener.strings[0];
+        assert_eq!(begin.range, end.range);
+        assert_eq!(end.range.end(), 5);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+
+        // EOF-truncated (`"abc$de` runs out before the closer): the
+        // scanner's EOF cascade appends an EMPTY synthetic String segment
+        // at the break (strings.rs "Interpolated string token sequence
+        // shape") — a real token the parser consumes, so it IS the last
+        // consumed String token and the anchor follows it. The scanner's
+        // own `unterminated_string_literal` on this source is the
+        // expressions.rs code pin's face, not the parser's — driven on the
+        // raw scan here (the `literal_parser` harness refuses scanner
+        // diagnostics).
+        let source = "\"abc$de";
+        let config = dartq_scanner::ScanConfig {
+            enable_triple_shift: false,
+            enable_augmentations: true,
+        };
+        let mut files = dartq_source::FileTable::new();
+        let file = files.intern(std::path::Path::new("test.dart"));
+        let result = dartq_scanner::scan(source, config, file);
+        let table: &'static dartq_scanner::TokenTable = Box::leak(Box::new(result.tokens));
+        let text: &'static str = Box::leak(source.to_string().into_boxed_str());
+        let mut log = LiteralLog::default();
+        let mut p = crate::Parser::new(
+            text,
+            table,
+            crate::expr_const::test_support::features(),
+            &mut log,
+        );
+        let _ = p.parse_literal_string_and_first_interpolation();
+        let (begin, end) = p.listener.strings[0];
+        assert_eq!(
+            begin.range,
+            dartq_source::SourceRange {
+                offset: 0,
+                length: 4
+            }
+        );
+        assert_eq!(
+            end.range,
+            dartq_source::SourceRange {
+                offset: 7,
+                length: 0
+            }
+        );
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
     }
 }

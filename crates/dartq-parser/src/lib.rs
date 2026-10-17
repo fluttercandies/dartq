@@ -16,7 +16,7 @@
 //! # Architecture
 //!
 //! * **Cursor, not rewriter** — [`TokenTable`] is immutable; the parser never
-//!   rewrites the stream (core-spec §5.3). `>>`/`>=`/`>>>`-family closers are
+//!   rewrites the stream. `>>`/`>=`/`>>>`-family closers are
 //!   split at consume time into parser-inserted tokens, and recovery inserts
 //!   synthetic tokens into a parser-local side table (`TokenId`s past
 //!   `TokenTable::len()`). Speculation (rolling the cursor back) is therefore
@@ -27,7 +27,7 @@
 //!   be un-returned, but an un-emitted event is trivially absent). Event
 //!   names are the official listener names mechanically transliterated to
 //!   `snake_case`; token positions carry [`TokenSpan`] (token id + UTF-16
-//!   [`SourceRange`]).
+//!   [`SourceRange`](dartq_source::SourceRange)).
 //! * **Termination on any input** — three structural guarantees keep the
 //!   parser finite (and memory input-bounded) for arbitrary bytes: every
 //!   recovery loop consumes at least one real token per iteration or bails
@@ -40,7 +40,7 @@
 //!   ParserListener`; [`NullListener`] (or any all-default impl) monomorphizes
 //!   to dead code. The parser itself allocates nothing per event.
 //! * **Feature folding at construction** — grammar variants are decided once
-//!   in [`Parser::new`] from a [`FeatureSet`] ([`ParserFeatures`]), matching
+//!   in [`Parser::new`] from a [`FeatureSet`](dartq_language::FeatureSet) ([`ParserFeatures`]), matching
 //!   `parser_impl.dart:316-373`.
 //!
 //! # Implemented grammar surface (this milestone)
@@ -70,11 +70,14 @@
 //! # Scanner interplay
 //!
 //! The scanner never splits `>>` (official `abstract_scanner.dart:1479`);
-//! splitting is a parser duty implemented in [`TokenCursor::consume_closer`].
-//! Scanner recovery already inserts synthetic closers for unclosed groups
-//! (`TokenTable::matching_end` resolves to them, flagged
-//! `Token::is_synthetic`); `ensure_close_paren` adopts those without
-//! re-reporting (official `moveSynthetic`). Interpolated strings are a linear
+//! splitting is a parser duty implemented in `TokenCursor::consume_closer`.
+//! Scanner recovery inserts synthetic closers for unclosed groups and
+//! records the unmatched pairs on the table (`TokenTable::matching_end`
+//! resolves to them, flagged `Token::is_synthetic`; the pairs are
+//! `TokenTable::unmatched_groups`) — `ensure_close_paren` adopts those with
+//! the row at its relocation point and the parse-end pass reports the rest
+//! (official `moveSynthetic` + the post-parse `UnmatchedToken` translation).
+//! Interpolated strings are a linear
 //! token flow (`String` segments plus `${`/`}` begin-group pairs), so string
 //! literals need no special parser state.
 
@@ -92,6 +95,7 @@ mod literals;
 mod members;
 mod message;
 mod metadata;
+mod mux;
 mod parser;
 mod patterns;
 mod recovery;
@@ -112,6 +116,7 @@ pub use listener::{
     IdentifierContext, MemberKind, NullListener, ParserListener, PatternContext,
 };
 pub use message::{Message, experiment_not_enabled_message};
+pub use mux::MultiplexListener;
 pub use parser::Parser;
 pub use token_id::{TokenId, TokenSpan};
 pub use types::{TypeInfo, TypeParamOrArg};
@@ -123,12 +128,16 @@ pub use types::{TypeInfo, TypeParamOrArg};
 /// #18; until then nothing inside the unit is analyzed, so by design the
 /// parser produces no diagnostics here.
 pub fn parse_unit(source: &str, tokens: &TokenTable, features: ParserFeatures) {
-    parse_unit_with(source, tokens, features, NullListener);
+    let mut null = NullListener;
+    parse_unit_with(source, tokens, features, &mut null);
 }
 
-/// Parses one compilation unit and returns the listener together with the
+/// Parses one compilation unit through `listener` and returns the
 /// parser-inserted tokens as scanner [`Token`]s, in insertion-id order (the
 /// id order of the parser's side table, `table.len() + i`).
+///
+/// The listener is borrowed: the caller keeps ownership and reads the
+/// collected events back after this call returns.
 ///
 /// Closer splits (`>>` → two `>`) and recovery synthetics live only in the
 /// parser's private side table: until they are folded in, their ids resolve
@@ -139,11 +148,10 @@ pub fn parse_unit_with<L: ParserListener>(
     source: &str,
     tokens: &TokenTable,
     features: ParserFeatures,
-    listener: L,
-) -> (L, Vec<Token>) {
+    listener: &mut L,
+) -> Vec<Token> {
     let mut parser = Parser::new(source, tokens, features, listener);
     parser.parse_unit();
     let inserted = parser.cursor.take_inserted();
-    let listener = parser.listener;
-    (listener, cursor::materialize_inserted(source, &inserted))
+    cursor::materialize_inserted(source, &inserted)
 }

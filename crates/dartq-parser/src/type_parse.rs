@@ -23,7 +23,7 @@ impl TypeInfo {
     /// Last token of the type (`skipType`, `type_info.dart:74`). Cursor
     /// convention: the cursor sits ON the type's first token, so all offsets
     /// are relative to it.
-    pub(crate) fn skip_type(&self, parser: &Parser<'_, '_, impl ParserListener>) -> TokenId {
+    pub(crate) fn skip_type(&self, parser: &Parser<'_, '_, '_, impl ParserListener>) -> TokenId {
         let start = parser.peek_id();
         match self {
             TypeInfo::NoType => start.saturating_sub(1),
@@ -67,7 +67,7 @@ impl TypeInfo {
 
     /// Raw skip: advances the cursor past the type without emitting events
     /// (the stand-in for the official suppressed-parse recovery swaps).
-    pub(crate) fn skip_type_raw(&self, parser: &mut Parser<'_, '_, impl ParserListener>) {
+    pub(crate) fn skip_type_raw(&self, parser: &mut Parser<'_, '_, '_, impl ParserListener>) {
         let end = self.skip_type(parser);
         let mut guard = 0usize;
         while parser.cursor.peek_id() < end && !parser.cursor.at_eof() && guard < parser.table.len()
@@ -84,7 +84,10 @@ impl TypeInfo {
     }
 
     /// Official `parseType`: optional type or void; emits events.
-    pub(crate) fn parse_type(&self, parser: &mut Parser<'_, '_, impl ParserListener>) -> TokenSpan {
+    pub(crate) fn parse_type(
+        &self,
+        parser: &mut Parser<'_, '_, '_, impl ParserListener>,
+    ) -> TokenSpan {
         match self {
             TypeInfo::NoType => {
                 let span = parser.peek_span();
@@ -103,7 +106,7 @@ impl TypeInfo {
     /// Official `parseTypeNotVoid`.
     pub(crate) fn parse_type_not_void(
         &self,
-        parser: &mut Parser<'_, '_, impl ParserListener>,
+        parser: &mut Parser<'_, '_, '_, impl ParserListener>,
     ) -> TokenSpan {
         match self {
             TypeInfo::Void => {
@@ -126,7 +129,7 @@ impl TypeInfo {
     /// Official `ensureTypeNotVoid`.
     pub(crate) fn ensure_type_not_void(
         &self,
-        parser: &mut Parser<'_, '_, impl ParserListener>,
+        parser: &mut Parser<'_, '_, '_, impl ParserListener>,
     ) -> TokenSpan {
         match self {
             TypeInfo::NoType => synthetic_type_reference(parser),
@@ -138,7 +141,7 @@ impl TypeInfo {
     /// Official `ensureTypeOrVoid`.
     pub(crate) fn ensure_type_or_void(
         &self,
-        parser: &mut Parser<'_, '_, impl ParserListener>,
+        parser: &mut Parser<'_, '_, '_, impl ParserListener>,
     ) -> TokenSpan {
         match self {
             TypeInfo::NoType => synthetic_type_reference(parser),
@@ -155,7 +158,7 @@ impl TypeInfo {
 /// the same shape (oracle `class C implements 3 {}`: the header junk-skip
 /// then sees the `{` follower and takes the unexpected-token face instead
 /// of cascading through a class-member reparse).
-fn synthetic_type_reference(parser: &mut Parser<'_, '_, impl ParserListener>) -> TokenSpan {
+fn synthetic_type_reference(parser: &mut Parser<'_, '_, '_, impl ParserListener>) -> TokenSpan {
     let at = parser.peek_span();
     parser.report(msg::expected_type_name(), at);
     let synthetic = parser.synthetic(TokenKind::Identifier, at.range.offset);
@@ -163,12 +166,12 @@ fn synthetic_type_reference(parser: &mut Parser<'_, '_, impl ParserListener>) ->
         .listener
         .handle_identifier(synthetic, IdentifierContext::TypeReference);
     parser.listener.handle_type(synthetic, None);
-    while parser.cursor.advance() != synthetic.id {}
+    parser.cursor.drain_to(synthetic.id);
     synthetic
 }
 
 /// `VoidType.parseType` (`type_info_impl.dart:446`).
-fn parse_void(parser: &mut Parser<'_, '_, impl ParserListener>) -> TokenSpan {
+fn parse_void(parser: &mut Parser<'_, '_, '_, impl ParserListener>) -> TokenSpan {
     let void_span = {
         let id = parser.cursor.advance();
         parser.span_of(id)
@@ -192,7 +195,7 @@ fn parse_void(parser: &mut Parser<'_, '_, impl ParserListener>) -> TokenSpan {
 }
 
 /// `SimpleType.parseType` / `SimpleNullableType.parseType`.
-fn parse_simple(parser: &mut Parser<'_, '_, impl ParserListener>, nullable: bool) -> TokenSpan {
+fn parse_simple(parser: &mut Parser<'_, '_, '_, impl ParserListener>, nullable: bool) -> TokenSpan {
     let name = parser.peek_span();
     parser.cursor.advance();
     parser
@@ -212,7 +215,7 @@ fn parse_simple(parser: &mut Parser<'_, '_, impl ParserListener>, nullable: bool
 }
 
 /// `PrefixedType.parseType` (`type_info_impl.dart:181`).
-fn parse_prefixed(parser: &mut Parser<'_, '_, impl ParserListener>) -> TokenSpan {
+fn parse_prefixed(parser: &mut Parser<'_, '_, '_, impl ParserListener>) -> TokenSpan {
     let start = parser.peek_span();
     parser.cursor.advance();
     parser
@@ -236,7 +239,7 @@ fn parse_prefixed(parser: &mut Parser<'_, '_, impl ParserListener>) -> TokenSpan
 /// `SimpleTypeWith1Argument.parseType` / `SimpleNullableTypeWith1Argument`
 /// (`type_info_impl.dart:288/231)`: `id < id closer [?]`.
 fn parse_simple_with_1_arg(
-    parser: &mut Parser<'_, '_, impl ParserListener>,
+    parser: &mut Parser<'_, '_, '_, impl ParserListener>,
     nullable: bool,
 ) -> TokenSpan {
     let start = parser.peek_span();
@@ -274,7 +277,10 @@ fn parse_simple_with_1_arg(
 
 impl ComplexType {
     /// Official `ComplexTypeInfo.parseType` (`type_info_impl.dart:616`).
-    pub(crate) fn parse_type(&self, parser: &mut Parser<'_, '_, impl ParserListener>) -> TokenSpan {
+    pub(crate) fn parse_type(
+        &self,
+        parser: &mut Parser<'_, '_, '_, impl ParserListener>,
+    ) -> TokenSpan {
         let start = parser.span_of(self.start);
         let starter_count = self.type_variable_starters.len();
 
@@ -339,7 +345,7 @@ impl ComplexType {
     /// suffixes starting the scan at `from`'s successor. Read-only.
     pub(crate) fn compute_rest(
         &mut self,
-        parser: &Parser<'_, '_, impl ParserListener>,
+        parser: &Parser<'_, '_, '_, impl ParserListener>,
         from: TokenId,
         required: bool,
     ) {
@@ -408,7 +414,7 @@ impl ComplexType {
     /// `computeSimpleWithTypeArguments` (`type_info_impl.dart:1048`).
     pub(crate) fn compute_simple_with_type_args(
         &mut self,
-        parser: &Parser<'_, '_, impl ParserListener>,
+        parser: &Parser<'_, '_, '_, impl ParserListener>,
         required: bool,
     ) {
         self.end = self.type_args.skip(self.start);
@@ -419,7 +425,7 @@ impl ComplexType {
     /// `computePrefixedType` (`type_info_impl.dart:1068`).
     pub(crate) fn compute_prefixed_type(
         &mut self,
-        parser: &Parser<'_, '_, impl ParserListener>,
+        parser: &Parser<'_, '_, '_, impl ParserListener>,
         required: bool,
     ) {
         let mut offset = parser.offset_of(self.start);
@@ -441,7 +447,7 @@ impl ComplexType {
     /// parenthesized shape and record `end`/`?`. Cursor is before the `(`.
     pub(crate) fn compute_record_type(
         &mut self,
-        parser: &Parser<'_, '_, impl ParserListener>,
+        parser: &Parser<'_, '_, '_, impl ParserListener>,
         required: bool,
     ) {
         let open = parser.peek_id();
@@ -468,7 +474,7 @@ impl ComplexType {
 /// (type_info_impl.dart:656-692).
 fn parse_complex_plain_type(
     complex: &ComplexType,
-    parser: &mut Parser<'_, '_, impl ParserListener>,
+    parser: &mut Parser<'_, '_, '_, impl ParserListener>,
 ) -> TokenSpan {
     let name;
     if parser.peek_kind() == TokenKind::Keyword(Keyword::Void) {
@@ -511,7 +517,7 @@ fn parse_complex_plain_type(
 // record types (parser_impl.dart:1747-1907)
 // ---------------------------------------------------------------------------
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// Official `parseRecordType`. The cursor sits before the `(`.
     /// `recordType ::= '(' recordTypeFields ','? recordTypeNamedFields? ')'`.
     ///

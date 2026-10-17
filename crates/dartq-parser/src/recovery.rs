@@ -1,4 +1,4 @@
-//! Recovery primitives (core-spec §3.2 and §6).
+//! Recovery primitives.
 //!
 //! Official policy: every syntax error is recoverable — report through the
 //! listener, insert a synthetic to keep the event stream well-formed, and
@@ -9,8 +9,12 @@
 //! * no `insertSyntheticIdentifier` into the stream — synthetics are queued
 //!   in the cursor and referenced by id;
 //! * `move_synthetic_close` — when the scanner already synthesized a closing
-//!   token for an unclosed group (and already reported it), we adopt it by
-//!   skipping to it instead of re-reporting;
+//!   token for an unclosed group (recording the unmatched pair on the token
+//!   table instead of reporting), adopting it REPORTS the row at the
+//!   relocation point (the official translation reads
+//!   `begin.endGroup.charOffset` post-parse) and the parse-end
+//!   [`Self::report_unmatched_groups`] pass reports the never-adopted pairs
+//!   at their parked positions;
 //! * skip-to-sync — group-aware jump to a boundary set, with a no-progress
 //!   guard at every loop level (official strategy C, `parser_impl.dart:445`).
 
@@ -29,19 +33,62 @@ use crate::token_id::TokenSpan;
 /// heads beyond it keep the official lone-junk stall shape.
 const SPILL_SCAN_LIMIT: usize = 64;
 
-impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
+impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
     /// Reports a recoverable error pinned to `at` (official
-    /// `reportRecoverableError`, `parser_impl.dart:11399`; the official
-    /// `findNonZeroLengthToken` adjustment is unnecessary here because the
-    /// scanner keeps zero-width synthetics out of the way of normal
-    /// reporting — our spans stay within bounds regardless).
+    /// `reportRecoverableError`, `parser_impl.dart:11399`).
     ///
-    /// Counted against the per-file diagnostics cap: suppressed once the
-    /// bailout latched.
+    /// Identical `(offset, length, code)` rows collapse to one
+    /// ([`Self::admit_row`]). Counted against the per-file diagnostics cap:
+    /// suppressed once the bailout latched; a deduped duplicate burns no
+    /// capacity. The official zero-width-synthetic anchor walk
+    /// (`findNonZeroLengthToken`, parser/util.dart:56) is applied at the call
+    /// sites that can anchor on a parser-inserted synthetic (see
+    /// `parse_constructor_invocation_arguments`); every other site anchors on
+    /// a real token by construction.
     pub(crate) fn report(&mut self, message: crate::message::Message, at: TokenSpan) {
-        if self.admit_diagnostic() {
+        if self.admit_row(at.range.offset, at.range.length, &message) && self.admit_diagnostic() {
             self.listener.handle_recoverable_error(message, at, at);
         }
+    }
+
+    /// Whether this row is the first of its `(offset, length, code, text)`
+    /// quadruple. The analyzer dedupes same-offset same-code errors with the
+    /// same rendered text, so a recovery cascade re-reporting a row at an
+    /// already-reported anchor surfaces once (oracle `const_patterns` 46:24
+    /// `expected_token ';'` and `const_patterns_binary` 85:12: two recovery
+    /// points, one row; the differently-coded `missing_identifier` at 85:12
+    /// survives). The text is part of the key: at the fasta layer the deduped
+    /// reports are distinct diagnostics (`expectedButGot` vs `expectedToken`)
+    /// sharing one registry code, and the oracle keeps both when their texts
+    /// differ (76dd104c 12:23 surfaces `Expected to find ','.` AND
+    /// `Expected to find ';'.` over one span).
+    fn admit_row(&mut self, offset: u32, length: u32, message: &crate::message::Message) -> bool {
+        // Post-bail rows are suppressed by `admit_diagnostic` anyway (which
+        // is also why the `&&` operand order in [`Self::report`] must not be
+        // swapped: an early `admit_diagnostic` would burn cap capacity — and
+        // could trip the fuse — on rows the dedup would have dropped).
+        // Skipping the dedup work here is behavior-identical: `bailed`
+        // short-circuits `admit_diagnostic` with no side effects.
+        if self.is_bailed() {
+            return false;
+        }
+        // Hash pre-filter keyed on `(offset, length, code)`: a triple never
+        // seen is definitionally a new row (`insert` reports fresh keys as
+        // `true`), so the common case is one O(1) hash insert and the exact
+        // four-field scan (O(k) expected per report versus the previous
+        // O(k²) per-cascade linear scan) only runs on triple collisions —
+        // distinct-text rows over one span are rare (76dd104c 12:23 is the
+        // pinned face).
+        if !self.row_keys.insert((offset, length, message.code.name))
+            && self.reported_rows.iter().any(|(o, l, c, t)| {
+                *o == offset && *l == length && *c == message.code.name && *t == message.text
+            })
+        {
+            return false;
+        }
+        self.reported_rows
+            .push((offset, length, message.code.name, message.text.clone()));
+        true
     }
 
     /// Reports with an explicit span end (official
@@ -72,14 +119,31 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         self.span_of(id)
     }
 
-    /// `expectedButGot` flavor used where the official code chooses that
-    /// message (`Expected '<x>' before this.`).
+    /// `expectedButGot` flavor; the analyzer converter re-renders every
+    /// `PseudoSharedCode.expectedToken` message with the registry template,
+    /// so the rendered text matches [`Self::expect_kind`]'s row (see
+    /// `msg::expected_but_got`).
     pub(crate) fn expect_lexeme_but_got(&mut self, expected: &str) -> TokenSpan {
+        let at = self.peek_span();
+        self.expect_lexeme_but_got_anchored(expected, at)
+    }
+
+    /// [`Self::expect_lexeme_but_got`] with an explicit report anchor: the
+    /// synthetic still splices at the current token, but the row anchors on
+    /// `anchor` — the #2024 separator recovery anchor (the token the
+    /// recovery lands behind, upstream Dart SDK source,
+    /// pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart
+    /// `rewriteAndRecover` reports at the resumed token).
+    pub(crate) fn expect_lexeme_but_got_anchored(
+        &mut self,
+        expected: &str,
+        anchor: TokenSpan,
+    ) -> TokenSpan {
         if let Some(id) = self.cursor.opt_lexeme(expected) {
             return self.span_of(id);
         }
         let at = self.peek_span();
-        self.report(msg::expected_but_got(expected), at);
+        self.report(msg::expected_but_got(expected), anchor);
         let kind = lexeme_kind(expected);
         let id = self.cursor.insert_synthetic(kind, at.range.offset);
         self.cursor.advance();
@@ -102,12 +166,18 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         // continuation contexts `new` after `.` is rewritten to an
         // identifier (the unnamed constructor) with no report
         // (`allowsNewAsIdentifier => isContinuation`,
-        // identifier_context_impl.dart:200/391).
+        // identifier_context_impl.dart:200/391) — the gate is the
+        // continuation property itself, so every continuation context
+        // takes it. Cascade sections consume their `..new` in
+        // `parse_send_continuation` before any identifier entry, so the
+        // set here covers the dot-continuation paths that do reach this
+        // gate (selector chains, dot shorthands, pattern selectors).
         if peek.kind == TokenKind::Keyword(Keyword::New)
             && matches!(
                 context,
                 crate::listener::IdentifierContext::ConstructorReferenceContinuation
                     | crate::listener::IdentifierContext::ConstructorReferenceContinuationAfterTypeArguments
+                    | crate::listener::IdentifierContext::ExpressionContinuation
                     | crate::listener::IdentifierContext::MethodDeclarationContinuation
             )
         {
@@ -153,7 +223,13 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                 .cursor
                 .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
             self.cursor.advance();
-            return self.span_of(id);
+            // Official `ensureIdentifier` fires `handleIdentifier` on the
+            // recovery template's returned identifier (parser_impl.dart:
+            // 4083) — the spliced nameless declaration's event, so the
+            // declaration joins the elements under the empty name.
+            let span = self.span_of(id);
+            self.listener.handle_identifier(span, context);
+            return span;
         }
         if matches!(peek.kind, TokenKind::Keyword(_))
             && let Some(message) = keyword_as_name_message(context, &peek, &self.cursor)
@@ -327,7 +403,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             // parse: `void f(int,, int b)` then re-enters the parameter
             // loop's tail recovery and stacks an `expected_token` on the
             // oracle's single missing_identifier.
-            while self.cursor.advance() != id {}
+            self.cursor.drain_to(id);
         } else if matches!(
             context,
             crate::listener::IdentifierContext::FormalParameterDeclaration
@@ -337,14 +413,67 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             // the junk (insertToken, :84), so the junk lands behind the
             // parse pointer. Drain to the synthetic, then consume the junk
             // for the same stream shape.
-            while self.cursor.advance() != id {}
+            self.cursor.drain_to(id);
             self.cursor.advance();
         } else {
             // Leave posture (the pre-#564 branch-3 shape): the junk stays
             // current; the caller's grammar cascades against it.
             self.cursor.advance();
         }
-        self.span_of(id)
+        let span = self.span_of(id);
+        // Official `ensureIdentifier` fires `handleIdentifier` on the
+        // recovery template's returned synthetic (parser_impl.dart:4083) —
+        // the enum-constant constructor selector's empty-name event rides
+        // it (official trace, issue_48380_1: `handleIdentifier(,
+        // constructorReferenceContinuationAfterTypeArguments)`). Fired for
+        // the constructor-reference continuations only — their downstream
+        // consumers are name-gated, so every other recovery face stays
+        // byte-stable.
+        if matches!(
+            context,
+            crate::listener::IdentifierContext::ConstructorReferenceContinuation
+                | crate::listener::IdentifierContext::ConstructorReferenceContinuationAfterTypeArguments
+        ) {
+            self.listener.handle_identifier(span, context);
+        }
+        span
+    }
+
+    /// Official missing-identifier report span (upstream Dart SDK source,
+    /// pkg/_fe_analyzer_shared/lib/src/parser/util.dart
+    /// `findNonZeroLengthToken` + the analyzer's `handleRecoverableError`
+    /// offset/end formula): a real got token anchors on its own span; a
+    /// zero-width got (the scanner's synthetic interpolation closer parked
+    /// at the discarded `${`) keeps the got offset and borrows the first
+    /// non-zero-length token's length (frozen oracle 76dd104c 11:12: row
+    /// (182, length 4) — got at 182, walked-to segment `foo.` length 4).
+    /// The message is always the registry text `Expected an identifier.` —
+    /// the template carries no lexeme parameter.
+    fn report_missing_identifier(&mut self, got: crate::token_id::TokenSpan) {
+        if got.range.length > 0 {
+            self.report(msg::missing_identifier(), got);
+            return;
+        }
+        let mut n = 0usize;
+        let mut length = 0u32;
+        while self.cursor.look_kind(n) != TokenKind::Eof {
+            let span = self.look_span_at(n);
+            if span.range.length > 0 {
+                length = span.range.length;
+                break;
+            }
+            n += 1;
+        }
+        self.report(
+            msg::missing_identifier(),
+            crate::token_id::TokenSpan::new(
+                got.id,
+                dartq_source::SourceRange {
+                    offset: got.range.offset,
+                    length,
+                },
+            ),
+        );
     }
 
     /// `ExpressionIdentifierContext.ensureIdentifier`
@@ -394,12 +523,27 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                         | TokenKind::Colon
                         | TokenKind::Semicolon
                         | TokenKind::Eof
+                        // The remaining operator-token flags of the official
+                        // `TokenType.isOperator` set (upstream Dart SDK
+                        // source, pkg/_fe_analyzer_shared scanner token.dart):
+                        // these stay in the stream behind the spliced name so
+                        // the precedence loop consumes them — swallowing one
+                        // splits the statement and re-anchors the enclosing
+                        // semicolon recovery on the operator (#2024, frozen
+                        // oracle 0c9fda4b L85: `?? 2` parses as ONE statement
+                        // with the `;` row on the `2`).
+                        | TokenKind::AmpersandAmpersand
+                        | TokenKind::BarBar
+                        | TokenKind::MinusMinus
+                        | TokenKind::PeriodPeriod
+                        | TokenKind::PlusPlus
+                        | TokenKind::QuestionQuestion
+                        | TokenKind::QuestionQuestionEq
                 )
             {
                 // When in doubt, consume the token to ensure progress; the
                 // report anchors on it and the synthetic lands after.
-                let lexeme = self.cursor.lexeme(peek.span.id);
-                self.report(msg::expected_identifier(lexeme), peek.span);
+                self.report_missing_identifier(peek.span);
                 self.cursor.advance();
                 let id = self
                     .cursor
@@ -408,8 +552,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                 return self.span_of(id);
             }
         }
-        let lexeme = self.cursor.lexeme(peek.span.id);
-        self.report(msg::expected_identifier(lexeme), peek.span);
+        self.report_missing_identifier(peek.span);
         let id = self
             .cursor
             .insert_synthetic(TokenKind::Identifier, peek.span.range.offset);
@@ -444,7 +587,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     }
 
     /// `looksLikeStartOfNextTopLevelDeclaration`
-    /// (identifier_context_impl.dart:1650): the `isTopLevelKeyword` heads
+    /// (`identifier_context_impl.dart:1650)`: the `isTopLevelKeyword` heads
     /// (token.dart: class/enum/export/extension/import/library/mixin/part/
     /// typedef) plus const/get/final/set/var/void.
     fn looks_like_start_of_next_top_level_declaration_at(&self, n: usize) -> bool {
@@ -476,16 +619,19 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     /// top-level declaration context's `followingValues` (`=` `,` `;` —
     /// oracle `int class = 42;` names the field, `var class VarClass {}`
     /// reparses the class).
-    fn name_continuation_follower(
-        &self,
-        context: crate::listener::IdentifierContext,
-    ) -> bool {
+    fn name_continuation_follower(&self, context: crate::listener::IdentifierContext) -> bool {
         let follower = self.cursor.look_kind(1);
         match context {
             crate::listener::IdentifierContext::LibraryName => {
-                matches!(follower, TokenKind::Period | TokenKind::Semicolon | TokenKind::Eof)
+                matches!(
+                    follower,
+                    TokenKind::Period | TokenKind::Semicolon | TokenKind::Eof
+                )
             }
-            _ => matches!(follower, TokenKind::Eq | TokenKind::Comma | TokenKind::Semicolon),
+            _ => matches!(
+                follower,
+                TokenKind::Eq | TokenKind::Comma | TokenKind::Semicolon
+            ),
         }
     }
 
@@ -562,10 +708,16 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     /// for `;`.
     ///
     /// Missing `)` with a scanner-synthesized closer for the group: adopt it
-    /// (`moveSynthetic`) without re-reporting — the scanner already reported
-    /// the unclosed group. A well-formed but distant `)` is reported once and
-    /// jumped to. Adopting the scanner's synthetic marks the spill run of the
-    /// primary bracket error (see [`Self::drain_spill_run`]).
+    /// (`moveSynthetic`) and report the unmatched-group row at the
+    /// relocation point — the official `moveSynthetic` re-offsets the closer
+    /// to the insertion point (`_setOffset(endGroup, next.offset)`), and the
+    /// analyzer translation reads `begin.endGroup.charOffset` post-parse, so
+    /// the row lands exactly here (oracle `new C(;` → `expected_token` ')'
+    /// @ the `;`; `f('${{` → ')' @ the `${`). The begin id latches
+    /// [`Self::unmatched_reported`] so the parse-end pass skips the pair.
+    /// A well-formed but distant `)` is reported once and jumped to.
+    /// Adopting the scanner's synthetic marks the spill run of the primary
+    /// bracket error (see [`Self::drain_spill_run`]).
     pub(crate) fn ensure_close_paren(&mut self, open: TokenSpan) -> TokenSpan {
         if let Some(id) = self.cursor.opt_kind(TokenKind::CloseParen) {
             self.mark_spill_run(id);
@@ -577,11 +729,13 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             if synthetic {
                 // Scanner-synthesized closer parked at the wrong spot (EOF
                 // for an unclosed `(`): relocate it in front of the current
-                // token (official `moveSynthetic`, :5035-5037) — the scan
-                // already reported the unclosed group, and the enclosing
-                // parse resumes at the current token.
+                // token (official `moveSynthetic`, :5035-5037), reporting the
+                // row the official translation would emit for the pair — the
+                // enclosing parse resumes at the current token.
                 self.spill_after = Some(self.span_of(close_id).range.offset);
                 let at = self.peek_span();
+                self.report_unmatched_row(")", at);
+                self.unmatched_reported.push(open.id);
                 let id = self
                     .cursor
                     .insert_synthetic(TokenKind::CloseParen, at.range.offset);
@@ -605,6 +759,85 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
         self.span_of(id)
     }
 
+    /// One unmatched-group row (official `translateErrorToken`'s
+    /// `unmatchedToken` arm: `expected_token '<closer>'` at
+    /// `begin.endToken.charOffset`, length always 1 —
+    /// translate_error_token.dart:89-104 reports
+    /// `atOffset(offset: charOffset, length: 1)` (:28), no zero-width shape
+    /// exists). At the source end the closer parks at the eof offset
+    /// (`appendEofToken` → `unmatchedBeginGroup`, abstract_scanner.dart:529-543,
+    /// :901-951) and the eof decrement in `makeError` (:21-27) never fires:
+    /// scanner error tokens chain in one run at the stream front
+    /// (`prependErrorToken`, abstract_scanner.dart:677-689, seeded by the -1
+    /// EOF sentinel), so `_isAtEnd`'s BAD_INPUT-skipping walk (:114-126) hits
+    /// the begin token, not EOF — the row is length-1 AT the eof offset
+    /// (oracle machine rows: `f('${` → '}' @2:1|1, `void main() {` → '}' at
+    /// offset = source length). Identical rows collapse: the oracle dedupes
+    /// them downstream (two_unclosed_curly's two `}`-groups parked at EOF
+    /// surface as a single row). `at` carries the closer's handle + its
+    /// as-scanned span; the encoded range is the translation's law above, not
+    /// `at` verbatim.
+    fn report_unmatched_row(&mut self, lexeme: &'static str, at: TokenSpan) {
+        let eof = self.table.last().utf16_offset;
+        let offset = if at.range.offset >= eof {
+            eof
+        } else {
+            at.range.offset
+        };
+        let key = (lexeme, offset);
+        if self.unmatched_seen.iter().any(|&k| k == key) {
+            return;
+        }
+        self.unmatched_seen.push(key);
+        self.report(
+            msg::expected_token(lexeme),
+            TokenSpan::new(at.id, dartq_source::SourceRange { offset, length: 1 }),
+        );
+    }
+
+    /// The parse-end pass (official `reportAllErrorTokens`,
+    /// `parser_impl.dart:11433-11439`): reports every scanner-unmatched
+    /// group whose closer was never adopted at a relocation point — the row
+    /// sits at the parked closer's position (`begin.endGroup.charOffset`
+    /// post-parse; a never-adopted closer keeps its scan-time position: EOF
+    /// for `appendEofToken` closers, the mismatching closer for
+    /// `insertSyntheticClosers`). Bounded by the pair list; capped through
+    /// the shared diagnostic fuse.
+    pub(crate) fn report_unmatched_groups(&mut self) {
+        let pairs = self.table.unmatched_groups();
+        if pairs.is_empty() {
+            return;
+        }
+        for &(begin, close) in pairs {
+            if self.unmatched_reported.contains(&begin) {
+                continue;
+            }
+            // Scanner pair indices are stable (original tokens keep their
+            // indices through `append_inserted`), so the lookup always
+            // succeeds; a miss degrades by skipping the row (under-report
+            // only — the parity face is untouched) instead of panicking.
+            let closer = match self.table.get(close as usize) {
+                Some(t) => t,
+                None => {
+                    debug_assert!(false, "pair indexes the table");
+                    continue;
+                }
+            };
+            let lexeme = closer.kind.fixed_lexeme().unwrap_or("}");
+            // The span length is a placeholder — report_unmatched_row encodes
+            // the translation's law (length 1; the offset clamps to the eof
+            // anchor).
+            let at = TokenSpan::new(
+                close,
+                dartq_source::SourceRange {
+                    offset: closer.utf16_offset,
+                    length: 0,
+                },
+            );
+            self.report_unmatched_row(lexeme, at);
+        }
+    }
+
     /// Skips forward until `id` is the current token (group boundaries in the
     /// table are respected implicitly: ids are absolute). EOF pins the
     /// cursor, so a stale target cannot loop forever.
@@ -615,13 +848,13 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     }
 
     /// Marks [`Self::drain_spill_run`]'s region when `id` is the scanner's
-    /// synthetic closer of an unmatched begin: the scan reported that primary
-    /// bracket error at the mismatching token (scanner `report_unmatchedBegin`),
-    /// so everything stranded behind it is the spill run the official
-    /// enclosing jumps consume silently (`moveSynthetic` rationale,
-    /// `parser_impl.dart:5034-5037`). Parser-inserted synthetics (ids past
-    /// the table) mark nothing.
-    fn mark_spill_run(&mut self, id: crate::token_id::TokenId) {
+    /// synthetic closer of an unmatched begin: the parse reports that primary
+    /// bracket error for the pair (at this closer's parked position or its
+    /// relocation point), so everything stranded behind it is the spill run
+    /// the official enclosing jumps consume silently (`moveSynthetic`
+    /// rationale, `parser_impl.dart:5034-5037`). Parser-inserted synthetics
+    /// (ids past the table) mark nothing.
+    pub(crate) fn mark_spill_run(&mut self, id: crate::token_id::TokenId) {
         if (id as usize) >= self.table.len() {
             return;
         }
@@ -645,7 +878,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             return false;
         }
         let head = self.peek_span().range.offset;
-        if !self.spill_after.is_some_and(|at| head > at) {
+        if self.spill_after.is_none_or(|at| head <= at) {
             self.locate_spill_mark(head);
         }
         self.spill_after.is_some_and(|at| head > at)
@@ -660,6 +893,7 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     /// real `{` ends the walk (the block boundary). A find latches
     /// `spill_after`, so later checks are O(1); misses are bounded by
     /// [`SPILL_SCAN_LIMIT`] tokens, keeping repeated stalls linear.
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     fn locate_spill_mark(&mut self, head: u32) {
         #[allow(clippy::cast_possible_truncation)] // ids are u32 by design
         let mut id = self.cursor.real_pos();
@@ -692,8 +926,8 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
     /// stranded closers and commas behind the mismatch. Official consumes
     /// this region through the enclosing group drains — `ensureCloseParen`'s
     /// endGroup jump (:5043-5049), the list drain (:8569-8575), the argument
-    /// drain (:9588-9600) — reporting at most the scanner's own row, never
-    /// one row per token. The run stops at any token an enclosing parse can
+    /// drain (:9588-9600) — reporting at most the unmatched group's own row,
+    /// never one row per token. The run stops at any token an enclosing parse can
     /// still consume (`;`, `}`) or that re-enters parsing (the official
     /// `looksLikeExpressionStart`/`looksLikeLiteralEntry` comma forks,
     /// :9588-9600 / :8563). Structurally advancing: every iteration consumes
@@ -761,21 +995,50 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
             return self.span_of(id);
         }
         let at = self.peek_span();
-        let anchor = self.last_consumed_anchor();
+        let mut anchor = self.last_consumed_anchor();
+        // #2024 recovery anchor: a relocation (an adopted scanner closer or
+        // the spill mark of a primary bracket error) moves the parse past
+        // the walked-back token, and the recovery row anchors on the token
+        // the parse resumed at — the official walk-back starts from the
+        // construct's last token, which after a relocation is the resume
+        // token (upstream Dart SDK source,
+        // pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart,
+        // `ensureSemicolon`/`rewriteAndRecover` anchor behavior; frozen
+        // oracle 0c9fda4b L85 anchors the `;` row on the token following
+        // the recovery point).
+        if self.spill_after.is_some_and(|mark| anchor.range.offset <= mark) {
+            // `findNonZeroLengthToken` over the resume token (upstream Dart
+            // SDK source, pkg/_fe_analyzer_shared/lib/src/parser/util.dart):
+            // a zero-width synthetic at the resume point must not capture
+            // the anchor — the official walk-back never returns a
+            // zero-width token.
+            let mut n = 0usize;
+            let mut forward = at;
+            while forward.range.length == 0 && self.cursor.look_kind(n) != TokenKind::Eof {
+                n += 1;
+                forward = self.look_span_at(n);
+            }
+            anchor = forward;
+        }
         self.report(msg::expected_token(";"), anchor);
         let id = self
             .cursor
             .insert_synthetic(TokenKind::Semicolon, at.range.offset);
-        while self.cursor.advance() != id {}
+        self.cursor.drain_to(id);
         self.span_of(id)
     }
 
     /// Official report anchor for `reportRecoverableError(token, ...)`: the
     /// last consumed token walked back over zero-width synthetics
-    /// (`findPreviousNonZeroLengthToken`, `parser_impl.dart:11400` — an
-    /// inserted identifier in front of the insertion point must not capture
-    /// the anchor). Falls back to the current token when nothing
-    /// non-zero-length was consumed yet.
+    /// (`findPreviousNonZeroLengthToken`, `util.dart:39` — the walk skips only
+    /// `isSynthetic && length == 0`, so an inserted identifier in front of the
+    /// insertion point must not capture the anchor while a synthetic carrying
+    /// real text does: the unterminated string is the official
+    /// `SyntheticStringToken` shape (synthetic, non-zero length) and anchors
+    /// the ensureSemicolon row on itself — corpus f59c79c8:
+    /// `expected_token ';'` at the `"""` string, not the `return`). Falls
+    /// back to the current token when nothing non-zero-length was consumed
+    /// yet.
     #[allow(clippy::cast_possible_truncation)] // ids are u32 by design
     pub(crate) fn last_consumed_anchor(&self) -> TokenSpan {
         let table_len = self.table.len() as crate::token_id::TokenId;
@@ -802,7 +1065,10 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, L> {
                 }
                 continue;
             }
-            if !synthetic && kind != TokenKind::Eof && self.span_of(id).range.length > 0 {
+            // Zero-width synthetics are stepped over; anything carrying real
+            // text anchors — synthetic or not (the official walk skips only
+            // `isSynthetic && length == 0`). EOF never anchors the walk-back.
+            if kind != TokenKind::Eof && self.span_of(id).range.length > 0 {
                 break;
             }
             if id == 0 {
@@ -1050,6 +1316,19 @@ fn keyword_as_name_message(
         // the name.
         dartq_scanner::KeywordStyle::BuiltIn
             if context == crate::listener::IdentifierContext::TypeVariableDeclaration =>
+        {
+            Some(msg::expected_identifier_but_got_keyword(lexeme))
+        }
+        // Typedef names ride the official recovered-identifier template
+        // (parseTypedef passes `isIdentifierRecovered = true` for any
+        // non-identifier head heading a `(`/`=` group, parser_impl.dart:1494/
+        // :1585, so the base recovered variant fires
+        // `expectedIdentifierButGotKeyword` for every keyword name — built-in
+        // and reserved alike; oracle keyword_named_typedefs.dart 1|14). The
+        // second face at the same token (the typedef-name built-in text) is
+        // the caller's (`parse_typedef`).
+        dartq_scanner::KeywordStyle::BuiltIn
+            if context == crate::listener::IdentifierContext::TypedefDeclaration =>
         {
             Some(msg::expected_identifier_but_got_keyword(lexeme))
         }

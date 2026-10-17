@@ -15,6 +15,7 @@ dartq-diagnostics = { workspace = true }
 dartq-language = { workspace = true }
 dartq-scanner = { workspace = true }
 dartq-source = { workspace = true }
+rustc-hash = { workspace = true }
 
 [lints]
 workspace = true

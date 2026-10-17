@@ -44,7 +44,7 @@ pub(crate) enum DirectiveState {
     Declarations,
 }
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// `parseTopLevelKeywordModifiers` (`modifier_context.dart:183`, the
     /// import/export/part walk) and `parseLibraryDirectiveModifiers`
     /// (:279): the shared declaration-modifier walk, with `final` always
@@ -584,10 +584,19 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         self.cursor.advance(); // `of`
         let has_name = self.peek_is_identifier();
         if has_name {
+            let head = self.peek_span();
             self.parse_qualified(
                 IdentifierContext::PartName,
                 IdentifierContext::PartNameContinuation,
             );
+            // AstBuilder `endPartOf` (ast_builder.dart:2819-2826): the name
+            // form reports `partOfName` over the whole dotted name
+            // (`diag.partOfName.at(name)`, reported with the end hook) — but
+            // only when the enhanced-parts feature is enabled; the OFF world
+            // stays silent.
+            if self.features.enhanced_parts_enabled {
+                self.report_with_end(msg::part_of_name(), head, self.last_consumed_span());
+            }
         } else {
             self.ensure_literal_string();
         }

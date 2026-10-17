@@ -12,7 +12,11 @@
 //! and `ensure_semicolon` inserts without eating the real `}` — so a
 //! sibling class after a broken member stays TOP-LEVEL (oracle
 //! `error_recovery/with_outline/typing_0{1,3,4,5}.dart`: exactly one
-//! scanner `expected_token`, zero parser diagnostics, no `class_in_class`).
+//! `expected_token`, no `class_in_class`). That row is the unmatched-group
+//! translation: the scanner records the (begin, synthetic closer) pair
+//! without rows, and the parser reports it post-parse (official
+//! `reportAllErrorTokens`) at the parked closer — the same offset the
+//! scanner's eager row used to carry.
 //!
 //! The r5 differential rows that motivated this lane (gate-caliber-r5,
 //! 2026-10-10 15:33) were produced by the PRE-#495 scanner stream (missing
@@ -46,13 +50,15 @@ fn parse_with_scanner(source: &'static str) -> (Collector, Vec<(String, u32, u32
         crate::ParserFeatures::from_feature_set(dartq_language::FeatureSet::for_language_version(
             dartq_language::LanguageVersion::new(3, 13),
         ));
-    let mut parser = Parser::new(text, table, features, Collector::default());
+    let mut collector = Collector::default();
+    let mut parser = Parser::new(text, table, features, &mut collector);
     parser.parse_unit();
-    (parser.listener, scanner)
+    (std::mem::take(parser.listener), scanner)
 }
 
 /// Offset of the recovery closer: the first real `}` after the
 /// `// missing }` comment marker (the comment's own `}` is not a token).
+#[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
 fn recovery_closer(src: &'static str) -> u32 {
     let comment_end = src.find("// missing }").unwrap() + "// missing }".len();
     (src[comment_end..].find('}').unwrap() + comment_end) as u32
@@ -76,7 +82,7 @@ fn assert_sibling_class_top_level(c: &Collector) {
     ]);
 }
 
-/// typing_01 shape: the `if {` the user just typed stays open, so pass 1
+/// `typing_01` shape: the `if {` the user just typed stays open, so pass 1
 /// closes it with the method's `}` and leaves the class brace dangling at
 /// EOF. The re-scan pins the synthetic `}` at the misaligned closer, the
 /// real `}` closes the method, and the next real `}` closes the class —
@@ -87,20 +93,21 @@ fn assert_sibling_class_top_level(c: &Collector) {
 fn two_pass_recovered_closer_realigns_member_loop() {
     let src = "class Foo {\n  void foo_method1() {\n    if (a) { // missing }\n  }\n\n  void foo_method2() {}\n}\n\nclass Bar {}\n";
     let (c, scanner) = parse_with_scanner(src);
-    assert_eq!(
-        scanner,
-        [("expected_token".to_owned(), recovery_closer(src), 1)],
-        "scanner face: one expected_token at the misaligned closer"
-    );
     assert!(
-        c.errors.is_empty(),
-        "the recovered topology must parse clean: {:?}",
+        scanner.is_empty(),
+        "the scanner records the pair without rows: {scanner:?}"
+    );
+    let closer = recovery_closer(src);
+    assert_eq!(
+        c.errors,
+        vec![("expected_token".to_owned(), closer, closer + 1)],
+        "parse-end unmatched row at the parked closer: {:?}",
         c.errors
     );
     assert_sibling_class_top_level(&c);
 }
 
-/// typing_03 shape: the typed-open brace sits three ifs deep; the re-scan
+/// `typing_03` shape: the typed-open brace sits three ifs deep; the re-scan
 /// still blames it (its closer is shallower-indented), the closers realign
 /// one level each, and the member loop resumes at `foo_method2` with Bar
 /// top-level.
@@ -108,20 +115,21 @@ fn two_pass_recovered_closer_realigns_member_loop() {
 fn two_pass_deep_nested_typed_open_realigns_member_loop() {
     let src = "class Foo {\n  void foo_method1() {\n    if (a) {\n      if (a) {\n        if (b) { // missing }\n      }\n    }\n  }\n\n  void foo_method2() {}\n}\n\nclass Bar {}\n";
     let (c, scanner) = parse_with_scanner(src);
-    assert_eq!(
-        scanner,
-        [("expected_token".to_owned(), recovery_closer(src), 1)],
-        "scanner face: one expected_token at the misaligned closer"
-    );
     assert!(
-        c.errors.is_empty(),
-        "the recovered topology must parse clean: {:?}",
+        scanner.is_empty(),
+        "the scanner records the pair without rows: {scanner:?}"
+    );
+    let closer = recovery_closer(src);
+    assert_eq!(
+        c.errors,
+        vec![("expected_token".to_owned(), closer, closer + 1)],
+        "parse-end unmatched row at the parked closer: {:?}",
         c.errors
     );
     assert_sibling_class_top_level(&c);
 }
 
-/// typing_04/05 shape: the unclosed brace is a map literal (`= {` branch of
+/// `typing_04/05` shape: the unclosed brace is a map literal (`= {` branch of
 /// the indent heuristic). The synthetic closer ends the literal, and the
 /// statement's missing `;` reports ONCE (`ensureSemicolon`; the oracle
 /// carries the same row) without eating the real `}` that now closes the
@@ -130,15 +138,15 @@ fn two_pass_deep_nested_typed_open_realigns_member_loop() {
 fn two_pass_unclosed_map_literal_keeps_sibling_class_top_level() {
     let src = "class Foo {\n  void m() {\n    if (a) {\n      var x = {1: 2 // missing }\n    }\n  }\n}\n\nclass Bar {}\n";
     let (c, scanner) = parse_with_scanner(src);
-    assert_eq!(
-        scanner,
-        [("expected_token".to_owned(), recovery_closer(src), 1)],
-        "scanner face: one expected_token at the map's recovery closer"
+    assert!(
+        scanner.is_empty(),
+        "the scanner records the pair without rows: {scanner:?}"
     );
     assert_eq!(
         c.error_codes(),
-        ["expected_token"],
-        "parser face: exactly the missing-`;` row, no member-lane cascade: {:?}",
+        ["expected_token", "expected_token"],
+        "the missing-`;` row plus the parse-end unmatched row at the map's \
+         recovery closer, no member-lane cascade: {:?}",
         c.errors
     );
     c.assert_sequence(&[
@@ -152,7 +160,7 @@ fn two_pass_unclosed_map_literal_keeps_sibling_class_top_level() {
     ]);
 }
 
-/// prime2 positive control (error_recovery/method_called_with_prime2.dart,
+/// prime2 positive control (`error_recovery/method_called_with_prime2.dart`,
 /// official intertwined expect :113): a `class` keyword that GENUINELY sits
 /// at member position keeps `reportAndSkipClassInClass` — report,
 /// `handleInvalidMember`, silent skip of the nested shape (no class events
@@ -189,7 +197,8 @@ fn sorted_codes_at(source: &'static str, major: u32, minor: u32) -> Vec<String> 
         crate::ParserFeatures::from_feature_set(dartq_language::FeatureSet::for_language_version(
             dartq_language::LanguageVersion::new(major, minor),
         ));
-    let mut parser = Parser::new(text, table, features, Collector::default());
+    let mut collector = Collector::default();
+    let mut parser = Parser::new(text, table, features, &mut collector);
     parser.parse_unit();
     let mut codes = parser.listener.error_codes();
     codes.sort();
@@ -209,7 +218,7 @@ fn sorted_codes_at(source: &'static str, major: u32, minor: u32) -> Vec<String> 
 ///   member keyword chain into the method lane, where a `const` modifier
 ///   reports `const_method` (91.0.0 parseMethod tail :5569-5572) and an
 ///   `=` body reports `redirection_in_non_factory_constructor` — the
-///   pre-feature residual face (const_method x4 + redirection x2).
+///   pre-feature residual face (`const_method` x4 + redirection x2).
 /// * at 3.13 the clean-modifier `factory (` heads take
 ///   `parseFactoryMethod(hasName: false)`: only const BODIES report
 ///   `const_factory` (the body arm's `handleConstFactory`); redirections

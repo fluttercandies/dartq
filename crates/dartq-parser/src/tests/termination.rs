@@ -25,10 +25,9 @@ fn diagnostics_cap_latches_and_stops_parsing() {
     let (table, text) = scan_ok(source);
     let mut listener = Collector::default();
     {
-        let mut parser = Parser::new(text, table, latest_features(), listener);
+        let mut parser = Parser::new(text, table, latest_features(), &mut listener);
         parser.parse_unit();
         assert!(parser.is_bailed(), "bailout must latch past the cap");
-        listener = parser.listener;
     }
     assert_eq!(
         listener.errors.len(),
@@ -69,10 +68,9 @@ fn nesting_cap_latches_on_deep_record_types() {
     let (table, text) = scan_ok(source);
     let mut listener = Collector::default();
     {
-        let mut parser = Parser::new(text, table, latest_features(), listener);
+        let mut parser = Parser::new(text, table, latest_features(), &mut listener);
         parser.parse_unit();
         assert!(parser.is_bailed(), "nesting cap must latch the bailout");
-        listener = parser.listener;
     }
     let codes = listener.error_codes();
     assert!(
@@ -102,9 +100,8 @@ fn written_out_operator_chain_terminates() {
     let (table, text) = scan_ok(source);
     let mut listener = Collector::default();
     {
-        let mut parser = Parser::new(text, table, latest_features(), listener);
+        let mut parser = Parser::new(text, table, latest_features(), &mut listener);
         parser.parse_unit();
-        listener = parser.listener;
     }
     assert!(
         listener.errors.len() <= MAX_DIAGNOSTICS,
@@ -174,6 +171,33 @@ fn simple_type_variables_consume_the_real_name() {
         .assert_sequence(&[("begin", "class_declaration"), ("end", "class_declaration")]);
 }
 
+/// The insert-then-drain backstop (#1855): recovery's synthetic-drain loops
+/// share [`crate::cursor::TokenCursor::drain_to`], which must terminate when
+/// the target id is unreachable — a queue-reordering regression would
+/// otherwise spin forever on the EOF-pinned `advance` with zero diagnostic
+/// burn (the diagnostic caps never see a drain loop). The pre-backstop shape
+/// (`while advance() != id {}`) hangs on exactly this queue state: queued
+/// entries drain, then the walk pins at EOF with the target still ahead.
+#[test]
+fn synthetic_drain_terminates_at_eof_on_unreachable_target() {
+    let (table, text) = scan_ok("var x = 1;");
+    let mut cursor = crate::cursor::TokenCursor::new(text, table);
+    // Two queued synthetics: draining to the first consumes exactly it and
+    // leaves the second current (the correct-path posture is unchanged).
+    let first = cursor.insert_synthetic(dartq_scanner::TokenKind::Identifier, 0);
+    let second = cursor.insert_synthetic(dartq_scanner::TokenKind::Identifier, 0);
+    cursor.drain_to(first);
+    assert_eq!(
+        cursor.peek_id(),
+        second,
+        "the drain consumed the target only"
+    );
+    // An unreachable target: the drain pops the remaining queue entry, walks
+    // the real stream to EOF, and returns there instead of spinning.
+    cursor.drain_to(table.len() as crate::token_id::TokenId + 5);
+    assert!(cursor.at_eof(), "the drain exits pinned at EOF");
+}
+
 /// Adversarial junk must always terminate with in-bounds diagnostics (the
 /// same contract the golden smoke enforces over the corpus, here over
 /// recovery-path shapes near the type-argument machinery).
@@ -196,9 +220,8 @@ fn adversarial_inputs_terminate_with_bounded_diagnostics() {
             .expect("utf16 length fits u32");
         let mut listener = Collector::default();
         {
-            let mut parser = Parser::new(text, table, latest_features(), listener);
+            let mut parser = Parser::new(text, table, latest_features(), &mut listener);
             parser.parse_unit();
-            listener = parser.listener;
         }
         for (code, start, end) in &listener.errors {
             assert!(

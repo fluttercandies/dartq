@@ -4,7 +4,7 @@
 //!
 //! * `varAndType` on primary-constructor declaring parameters: the official
 //!   gate reports `typeAfterVar` only when
-//!   `memberKind != MemberKind.PrimaryConstructor` (parser_impl.dart:2283-
+//!   `memberKind != MemberKind.PrimaryConstructor` (`parser_impl.dart:2283`-
 //!   2298; probed 3.13.1: `class C(var int a) {}` is clean — at every
 //!   language version, the analyzer never version-gates the syntax — while
 //!   `void f(var int x) {}` reports).
@@ -25,7 +25,8 @@ use crate::Parser;
 /// Sorted diagnostic-code multiset of one whole-unit parse.
 fn sorted_codes(source: &'static str) -> Vec<String> {
     let (table, text) = scan_ok(source);
-    let mut p = Parser::new(text, table, latest_features(), Collector::default());
+    let mut collector = Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
     let mut codes = p.listener.error_codes();
     codes.sort();
@@ -55,7 +56,7 @@ fn primary_constructor_var_and_type_clean() {
 }
 
 /// Both declaring parameters of the acceptance-corpus shape stay clean
-/// (primary_constructors.dart:14 carried two var_and_type gate rows).
+/// (`primary_constructors.dart:14` carried two `var_and_type` gate rows).
 #[test]
 fn primary_constructor_multi_var_params_clean() {
     assert_clean(
@@ -64,14 +65,14 @@ fn primary_constructor_multi_var_params_clean() {
     );
 }
 
-/// A normal formal position keeps reporting `varAndType` (probed 3.13.1;
-/// the oracle adds `extraneousModifier`, the documented :2271-2277
-/// reduction this parser pins).
+/// A normal formal position reports the oracle pair (probed 3.13.1:
+/// `extraneous_modifier` from the walk-end gate (:2271-2285) plus
+/// `varAndType` (:2286-2298), both on the keyword).
 #[test]
 fn normal_formal_var_and_type_reports() {
     assert_codes(
         "void f(var int x) {}\n",
-        &["var_and_type"],
+        &["extraneous_modifier", "var_and_type"],
         "normal formal var+type",
     );
 }
@@ -81,7 +82,7 @@ fn normal_formal_var_and_type_reports() {
 fn member_formal_var_and_type_reports() {
     assert_codes(
         "class C {\n  void m(var int x) {}\n}\n",
-        &["var_and_type"],
+        &["extraneous_modifier", "var_and_type"],
         "member formal var+type",
     );
 }
@@ -212,7 +213,7 @@ fn parenthesized_type_as_single_type_arg_reports() {
 /// non-const (probed 3.13.1: zero rows). The acceptance-gate row on
 /// constants.dart:54 was read off a release binary predating the #914
 /// probe rewrite; the parse entry (`parseLiteralListSetMapOrFunction`,
-/// parser_impl.dart:8772 — `computeTypeParamOrArg` with
+/// `parser_impl.dart:8772` — `computeTypeParamOrArg` with
 /// `inDeclaration = true`) was already wired through the same probe.
 #[test]
 fn record_type_arg_collection_literals_clean() {
@@ -242,7 +243,7 @@ fn record_type_arg_collection_literals_clean() {
 
 /// Record-returning generalized function types as literal type arguments
 /// (`computeRecordTypeGFT`/`computeRecordTypeQuestionGFT`,
-/// type_info_impl.dart:982/:1019: computeRest from the `)` walks the
+/// `type_info_impl.dart:982/:1019`: computeRest from the `)` walks the
 /// `Function` suffix chain; probed 3.13.1: zero rows). The scan-side
 /// skip length covers the chain so the `<` group closes on its own `>`
 /// and the follower decision never mistakes the `Function` formals for a
@@ -261,7 +262,7 @@ fn record_type_arg_gft_suffix_clean() {
 
 /// The tail verdict in the literal type-argument position: `<(int)>` is no
 /// type-argument group, so `<` derails as a relational operator exactly as
-/// the oracle (probed 3.13.1: EXPECTED_TOKEN `Expected to find '['` at the
+/// the oracle (probed 3.13.1: `EXPECTED_TOKEN` `Expected to find '['` at the
 /// `<` plus the comparison-chain row; the oracle's undefined-operator row
 /// is resolver-tier, not a parser-face code).
 #[test]
@@ -280,7 +281,8 @@ fn parenthesized_type_as_literal_type_arg_reports() {
 /// parse, in emission order.
 fn parse_rows(source: &'static str) -> Vec<(String, u32, u32)> {
     let (table, text) = scan_ok(source);
-    let mut p = Parser::new(text, table, latest_features(), Collector::default());
+    let mut collector = Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
     p.listener.errors.clone()
 }
@@ -289,16 +291,17 @@ fn parse_rows(source: &'static str) -> Vec<(String, u32, u32)> {
 /// arguments: `computeMethodTypeArguments` keeps the group only under
 /// `mayFollowTypeArgs && !typeArg.recovered` (type_info.dart:485-491).
 /// 3.13.1 oracle probe of `f<int>(a < b);` inside `g`: ZERO syntax rows —
-/// the sole oracle row is the resolver-tier ARGUMENT_TYPE_NOT_ASSIGNABLE —
+/// the sole oracle row is the resolver-tier `ARGUMENT_TYPE_NOT_ASSIGNABLE` —
 /// and exactly one `f<int>` application event pair (the old face stacked
-/// expected_token/expected_type_name rows on spurious type-argument
+/// `expected_token/expected_type_name` rows on spurious type-argument
 /// parses).
 #[test]
 fn method_type_args_recovered_scan_is_relational_arg() {
     let source = "void f<T>(T t) {}\nvoid g(int a, int b) {\n  f<int>(a < b);\n}\n";
     assert_eq!(parse_rows(source), vec![], "zero syntax rows");
     let (table, text) = scan_ok(source);
-    let mut p = Parser::new(text, table, latest_features(), Collector::default());
+    let mut collector = Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
     let applied = p
         .listener
@@ -409,12 +412,8 @@ fn record_gft_missing_comma_anchors_on_the_junk() {
 /// Guard-rejection controls. n4 `(int) Function()?`: the single positional
 /// field without a comma fails the record content probe (the recovered flag
 /// of the official `_checkIfRecordTypeParenthesisAreRecovered` tail), so the
-/// group is rejected and `<` derails into the shared cascade. F6
-/// `List<(int) Function()>?`: the inner `<(` is rejected the same way, the
-/// outer group's lone argument is bare `List`, and parseUnexpectedEnd walks
-/// to the scanner-paired real outer `>` (start.endGroup is non-null) — one
-/// expectedAfterButGot('>') row anchored on the last consumed argument, then
-/// a clean `[]` literal; F6c shows the tail row when the derailed remainder
+/// group is rejected and `<` derails into the shared cascade. F6b keeps the
+/// valid inner record; F6c shows the tail row when the derailed remainder
 /// reaches the statement end. V4/V5/V6 stay clean: real record shapes with
 /// `,`/`>`/`?` followers pass the veto.
 #[test]
@@ -431,11 +430,6 @@ fn record_type_args_guard_rejection_controls() {
             ("unexpected_token".to_string(), 29, 30),
         ],
         "n4: single-field record derails the literal"
-    );
-    assert_eq!(
-        parse_rows("var x = <List<(int) Function()>?>[];\n"),
-        vec![("expected_token".to_string(), 9, 13)],
-        "F6: inner rejection leaves one walk-to-endGroup row"
     );
     assert_eq!(
         parse_rows("var x = <List<(int, int)>[]>;\n"),
@@ -462,10 +456,31 @@ fn record_type_args_guard_rejection_controls() {
     assert_eq!(parse_rows("var x = <(int, int)?>[];\n"), vec![], "V6");
 }
 
+/// F6's tail face, pinned to the measured 3.13.1 oracle walk
+/// (`var x = <List<(int) Function()>?>[];` — one row, clean tail):
+/// `List`'s own `<(` group is rejected by the record-content probe
+/// (`_checkIfRecordTypeParenthesisAreRecovered` recovered flag,
+/// type_info_impl.dart:937-941, fed through computeRecordType's
+/// `!required` follower veto :849-852), so the argument type is the bare
+/// `List` and the group's `<` follower derails into `parseUnexpectedEnd`.
+/// The single row anchors on the last consumed type token — `List`
+/// (:1655-1657) — and the walk-to-endGroup tail (type_info_impl.dart:
+/// 1711-1719) absorbs `<…>?` up to the scanner-paired real closer
+/// (abstract_scanner.dart:624-631 pairs `<`/`>` on the scanner stack), so
+/// the literal face sees the real `[` and the tail stays clean.
+#[test]
+fn record_type_args_guard_rejection_controls_f6_tail() {
+    assert_eq!(
+        parse_rows("var x = <List<(int) Function()>?>[];\n"),
+        vec![("expected_token".to_string(), 9, 13)],
+        "F6: inner rejection leaves one walk-to-endGroup row"
+    );
+}
+
 /// The `void` arm rides the same computeRest chain through its
 /// `skip_type_len` delegation to the Function arm. 3.13.1 oracle probes:
 /// s3a/s3c zero rows; s3b's only row is the compile-time-tier
-/// EXPECTED_ONE_LIST_TYPE_ARGUMENTS (resolver face, outside this parser's
+/// `EXPECTED_ONE_LIST_TYPE_ARGUMENTS` (resolver face, outside this parser's
 /// syntax rows).
 #[test]
 fn gft_chain_void_arm_group_scan_clean() {
@@ -487,17 +502,17 @@ fn gft_chain_void_arm_group_scan_clean() {
 }
 
 /// VoidType.parseType reports `voidWithTypeArguments` on `token.next` — the
-/// `<` after `void` (type_info_impl.dart:446) — and the group-derail
+/// `<` after `void` (`type_info_impl.dart:446`) — and the group-derail
 /// recovery anchors `expectedAfterButGot('>')` on the last consumed type
 /// argument's end (parseUnexpectedEnd, type_info_impl.dart:1607-1730).
 /// 3.13.1 oracle rows, machine format:
 ///
-/// * `void<int>? y;` — MISSING_IDENTIFIER (1|10|1) at the `?` from the
-///   member-name slot, VOID_WITH_TYPE_ARGUMENTS (1|5|1) at the `<`, the
-///   adjacent EXPECTED_TOKEN ';' (1|9|1), EXPECTED_EXECUTABLE (1|10|1) and
-///   MISSING_CONST_FINAL_VAR_OR_TYPE (1|12|1) row anchors match too.
-/// * `var x = <void<int>?, int>[];` — VOID_WITH_TYPE_ARGUMENTS (1|14|1) at
-///   the inner `<` plus EXPECTED_TOKEN (1|18|1) on the inner `>`.
+/// * `void<int>? y;` — `MISSING_IDENTIFIER` (1|10|1) at the `?` from the
+///   member-name slot, `VOID_WITH_TYPE_ARGUMENTS` (1|5|1) at the `<`, the
+///   adjacent `EXPECTED_TOKEN` ';' (1|9|1), `EXPECTED_EXECUTABLE` (1|10|1) and
+///   `MISSING_CONST_FINAL_VAR_OR_TYPE` (1|12|1) row anchors match too.
+/// * `var x = <void<int>?, int>[];` — `VOID_WITH_TYPE_ARGUMENTS` (1|14|1) at
+///   the inner `<` plus `EXPECTED_TOKEN` (1|18|1) on the inner `>`.
 #[test]
 fn void_with_type_arguments_rows_anchor_after_void() {
     assert_eq!(
@@ -511,6 +526,20 @@ fn void_with_type_arguments_rows_anchor_after_void() {
         ],
         "void<int>? y; face"
     );
+}
+
+/// The type-argument flavor, pinned to the measured 3.13.1 oracle walk
+/// (`var x = <void<int>?, int>[];` — exactly two rows, clean tail).
+/// `void` in the argument slot takes `VoidType.parseType`, which reports
+/// `voidWithTypeArguments` on the inner `<` (type_info_impl.dart:455) and
+/// parses the `<int>` group as its own; the follower `?` then derails into
+/// `parseUnexpectedEnd`, whose single row anchors on the last consumed
+/// type end — the inner `>` (:1655-1657; machine citation (1|18|1) =
+/// column 18 = UTF-16 offset 17). The walk-to-endGroup tail
+/// (:1711-1719) absorbs `?, int` up to the scanner-paired real closer
+/// (abstract_scanner.dart:624-631), so the literal face sees the real `[`.
+#[test]
+fn void_with_type_arguments_rows_anchor_after_void_type_arg() {
     assert_eq!(
         parse_rows("var x = <void<int>?, int>[];\n"),
         vec![

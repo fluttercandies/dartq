@@ -23,7 +23,7 @@ use dartq_language::FeatureSet;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParserFeatures {
     /// `isPatternsFeatureEnabled` (`parser_impl.dart:325)`: the whole pattern
-    /// production family. When off, [`Parser::parse_pattern`](crate::Parser::parse_pattern)
+    /// production family. When off, `Parser::parse_pattern`
     /// reports `experiment_not_enabled` at the pattern start and consumes
     /// nothing.
     pub patterns_enabled: bool,

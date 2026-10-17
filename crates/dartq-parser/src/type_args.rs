@@ -100,7 +100,7 @@ impl TypeParamOrArg {
     /// guarantees exactly one nameish token before the `>`-family closer.
     pub(crate) fn parse_arguments(
         &self,
-        parser: &mut Parser<'_, '_, impl ParserListener>,
+        parser: &mut Parser<'_, '_, '_, impl ParserListener>,
     ) -> TokenSpan {
         match self {
             TypeParamOrArg::None => {
@@ -148,7 +148,7 @@ impl TypeParamOrArg {
     /// Official `parseVariables`: consumes type parameters.
     pub(crate) fn parse_variables(
         &self,
-        parser: &mut Parser<'_, '_, impl ParserListener>,
+        parser: &mut Parser<'_, '_, '_, impl ParserListener>,
         allows_variance: bool,
     ) -> TokenSpan {
         match self {
@@ -192,7 +192,7 @@ impl TypeParamOrArg {
     }
 }
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// Official `computeTypeParamOrArg` (`type_info.dart:420`): the cursor
     /// sits on the name/type token, so the `<` is one ahead.
     pub(crate) fn compute_type_param_or_arg(&mut self, in_declaration: bool) -> TypeParamOrArg {
@@ -267,7 +267,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 /// The fast-shape guard of `_computeTypeParamOrArgImpl` (`type_info.dart:446)`:
 /// `<` followed by a single name-ish token and a `>`-family closer.
 pub(crate) fn simple1_closer(
-    parser: &Parser<'_, '_, impl ParserListener>,
+    parser: &Parser<'_, '_, '_, impl ParserListener>,
     lt_offset: usize,
 ) -> Option<SimpleCloser> {
     let first = parser.kind_at(lt_offset + 1);
@@ -318,7 +318,7 @@ impl RecordProbe {
     /// record) while `(int,)` and `()` pass.
     pub(crate) fn looks_like_record_type(
         &self,
-        parser: &Parser<'_, '_, impl ParserListener>,
+        parser: &Parser<'_, '_, '_, impl ParserListener>,
         end_offset: usize,
     ) -> bool {
         // Walk head: the last consumed separator (`(`, `,`, `{`).
@@ -385,7 +385,7 @@ impl RecordProbe {
     }
 }
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// Official `parseUnexpectedEnd` (`type_info_impl.dart:1607-1758`) for a
     /// recovered type-ARGUMENT group: runs when neither a `,` nor the group
     /// closer follows the argument type. Arms in official order; the report
@@ -393,9 +393,20 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     /// (the official `reportRecoverableError` `findNonZeroLengthToken`), and
     /// `error_reported` mirrors the official `token.isSynthetic` gate (the
     /// ensure path's `expected_type_name` row already covers the group), so
-    /// at most one `expected_after_but_got('>')` fires per group. Returns
-    /// the group-end span: the consumed `>`-family closer, or a synthesized
-    /// `>` when no real closer absorbs the junk.
+    /// at most one `expected_after_but_got('>')` fires per group. `begin` is
+    /// the group's own `<`. Returns the group-end span: the consumed
+    /// `>`-family closer, or a synthesized `>` when no real closer absorbs
+    /// the junk.
+    ///
+    /// Junk-tail postures, in official order (:1708-1722): a real closer
+    /// directly after the junk absorbs it (`parseCloser(next)`); otherwise
+    /// the walk-to-endGroup branch — the group's `<` carries the
+    /// scanner-paired real closer (`start.endGroup`, the scanner's
+    /// `>`-matching stack, abstract_scanner.dart:624-631), and a closer at
+    /// or beyond the junk absorbs the whole junk run silently and closes
+    /// the group there; only a cursor already past that closer (the
+    /// `charOffset <= endGroup.charOffset` guard) keeps the synthetic-`>`
+    /// posture with the junk left current for the enclosing recovery layer.
     ///
     /// The `< } >`-shaped junk face (the pinned `issue_39060` flow): the
     /// junk's follower is a real `>`, so the fallback's `parseCloser(next)`
@@ -406,6 +417,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         &mut self,
         in_declaration: bool,
         mut error_reported: bool,
+        begin: TokenSpan,
     ) -> TokenSpan {
         // `extends` type continuation (official :1614-1629).
         if self.peek_kind() == TokenKind::Keyword(Keyword::Extends) {
@@ -480,16 +492,35 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 return self.span_of(id);
             }
         }
-        // Fallback (official :1708-1758): one group-level row; a real closer
-        // directly after the junk absorbs it (`parseCloser(next)`), otherwise
-        // the group closes on a synthesized `>` and the junk stays current
-        // for the enclosing recovery layer.
+        // Fallback (official :1708-1722): one group-level row; then a real
+        // closer directly after the junk absorbs it (`parseCloser(next)`),
+        // else the scanner-paired endGroup walk absorbs the junk run and
+        // closes the group on the real closer, else the group closes on a
+        // synthesized `>` and the junk stays current for the enclosing
+        // recovery layer.
         if !error_reported {
             let at = self.last_consumed_anchor();
             self.report(msg::expected_after_but_got(">"), at);
         }
         if is_closer(self.cursor.look_kind(1)) {
             self.cursor.advance();
+            let id = self.cursor.consume_closer();
+            return self.span_of(id);
+        }
+        if let Some(end_group) = self.cursor.table_matching_end(begin.id) {
+            // Official guard: `token.charOffset <= endGroup.charOffset`
+            // (type_info_impl.dart:1713-1717) — both sides are UTF-16 char
+            // offsets, so the closer contributes its span offset, never its
+            // token-table index.
+            let end_offset = self.cursor.span(end_group).offset;
+            while !self.cursor.at_eof()
+                && self.cursor.peek_id() != end_group
+                && self.peek_span().range.offset <= end_offset
+            {
+                self.cursor.advance();
+            }
+        }
+        if self.cursor.peek_is_closer() {
             let id = self.cursor.consume_closer();
             return self.span_of(id);
         }
@@ -919,7 +950,7 @@ impl ComplexTypeParamOrArg {
     /// onto `start` before reading the group.
     pub(crate) fn parse_arguments(
         self,
-        parser: &mut Parser<'_, '_, impl ParserListener>,
+        parser: &mut Parser<'_, '_, '_, impl ParserListener>,
     ) -> TokenSpan {
         if parser.cursor.peek_id() != self.start {
             parser.cursor.rewind_to(self.start);
@@ -1012,7 +1043,11 @@ impl ComplexTypeParamOrArg {
                 // covers the group — so at most one
                 // `expected_after_but_got('>')` fires.
                 let error_reported = matches!(type_info, TypeInfo::NoType);
-                end = parser.parse_type_args_unexpected_end(self.in_declaration, error_reported);
+                end = parser.parse_type_args_unexpected_end(
+                    self.in_declaration,
+                    error_reported,
+                    begin,
+                );
                 parser.listener.end_type_arguments(count, begin, end);
                 parser.leave_depth();
                 return end;
@@ -1025,7 +1060,7 @@ impl ComplexTypeParamOrArg {
     /// (`type_info_impl.dart:1476`). Cursor sits before the `<`.
     pub(crate) fn parse_variables(
         self,
-        parser: &mut Parser<'_, '_, impl ParserListener>,
+        parser: &mut Parser<'_, '_, '_, impl ParserListener>,
         allows_variance: bool,
     ) -> TokenSpan {
         let begin = parser.peek_span(); // `<`
@@ -1189,7 +1224,7 @@ impl ComplexTypeParamOrArg {
         end
     }
 }
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     fn peek_is_variance(&self) -> bool {
         is_variance(self.peek_kind())
     }
@@ -1230,7 +1265,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
 
 /// `looksLikeTypeParamOrArg` (`type_info_impl.dart:512`), cursor flavor: the
 /// current token continues a type parameter list after a missing comma.
-fn looks_like_type_param_member(parser: &Parser<'_, '_, impl ParserListener>) -> bool {
+fn looks_like_type_param_member(parser: &Parser<'_, '_, '_, impl ParserListener>) -> bool {
     // Official `looksLikeTypeParamOrArg(inDeclaration, next)`
     // (type_info_impl.dart:1417-1421): a `<`-headed group after a variable
     // reads as a missing comma — "Looks like missing comma. Continue

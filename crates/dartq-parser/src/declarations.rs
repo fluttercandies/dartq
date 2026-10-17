@@ -50,7 +50,7 @@ struct HeaderClauses {
     implements: bool,
 }
 
-impl<'s, L: ParserListener> Parser<'s, '_, L> {
+impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// One top-level declaration (official `parseTopLevelDeclarationImpl`).
     pub(crate) fn parse_top_level_declaration(&mut self) {
         self.parse_metadata_star();
@@ -650,11 +650,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
         let end;
         if new_style {
+            // The keyword-as-typedef-name built-in face (see
+            // `builtin_typedef_name_row`): captured ahead of the name
+            // recovery, emitted after it — the parser's keyword-name row
+            // precedes the verifier-derived built-in row in the oracle
+            // output.
+            let builtin_row = self.builtin_typedef_name_row();
             let name = if self.peek_is_identifier() {
                 self.ensure_identifier(IdentifierContext::TypedefDeclaration)
             } else {
                 self.ensure_identifier_recovered(IdentifierContext::TypedefDeclaration)
             };
+            if let Some((at, kind)) = builtin_row {
+                self.report_builtin_typedef_name_at(at, kind);
+            }
             let _ = name;
             // The missing-name recovery may have consumed the variable
             // group's own `<` as the name (the official consume-in-doubt
@@ -802,6 +811,19 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     .end_typedef(augment, typedef_keyword, None, head_end);
                 return;
             }
+            // The keyword-as-typedef-name built-in face: any keyword head
+            // (the verifier's isKeyword-and-not-pseudo gate — a reserved
+            // word carries the row exactly like a built-in one, oracle
+            // keyword_named_typedefs.dart 5|14 `typedef void assert();`).
+            // It must not sit behind the identifier-shape guard a reserved
+            // head fails (`isIdentifier` rejects reserved words). Captured
+            // ahead of the name recovery, emitted after it — the parser's
+            // keyword-name row precedes the built-in row in the oracle
+            // output. After the `=` early-return: `typedef void = ...;`
+            // (the missing-name shape) never reaches here, matching the
+            // oracle's silent synthetic-name face on
+            // keyword_named_typedefs.dart 132.
+            let builtin_row = self.builtin_typedef_name_row();
             if self.peek_is_identifier() || self.peek_kind_ahead_is_paren_after_type() {
                 let _ = self.ensure_identifier(IdentifierContext::TypedefDeclaration);
             } else {
@@ -814,6 +836,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 }
                 let _ = self.ensure_identifier_recovered(IdentifierContext::TypedefDeclaration);
             }
+            if let Some((at, kind)) = builtin_row {
+                self.report_builtin_typedef_name_at(at, kind);
+            }
             type_param.parse_variables(self, false);
             self.parse_formal_parameters_required_opt(
                 crate::listener::MemberKind::FunctionTypeAlias,
@@ -822,6 +847,46 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
         self.listener
             .end_typedef(augment, typedef_keyword, equals, end);
+    }
+
+    /// Pre-capture of the keyword-as-typedef-name built-in face (oracle
+    /// `keyword_named_typedefs.dart`: one `built_in_identifier_in_declaration`
+    /// row per KEYWORD taking the name position, both typedef styles; the
+    /// oracle face is the verifier's `_checkForBuiltInIdentifierAsName`
+    /// (error_verifier.dart:3760-3766: `token.type.isKeyword &&
+    /// token.keyword?.isPseudo != true`), so RESERVED words carry it exactly
+    /// like built-in ones (`typedef void assert();` rows at 5|14 and 6|9)
+    /// and pseudo keywords never do. The analyzer converter drops the shared
+    /// parser's `builtInIdentifierInDeclaration` message in favor of that
+    /// verifier face (error_converter.dart:291-295), whose per-context
+    /// template names the declaration kind — the parser fires that face where
+    /// the peek token is about to become the name. The follower test reads
+    /// the stream before the name parse consumes the head, so the capture
+    /// must happen there; [`Self::report_builtin_typedef_name_at`] emits
+    /// after the name parse, keeping the parser row (keyword-name face)
+    /// ahead of the built-in row.
+    fn builtin_typedef_name_row(&self) -> Option<(TokenSpan, TokenKind)> {
+        if let TokenKind::Keyword(kw) = self.peek_kind()
+            && kw.style() != dartq_scanner::KeywordStyle::Pseudo
+            && matches!(
+                self.cursor.look_kind(1),
+                TokenKind::OpenParen
+                    | TokenKind::Lt
+                    | TokenKind::Eq
+                    | TokenKind::Semicolon
+                    | TokenKind::Eof
+            )
+        {
+            return Some((self.peek_span(), self.peek_kind()));
+        }
+        None
+    }
+
+    fn report_builtin_typedef_name_at(&mut self, at: TokenSpan, kind: TokenKind) {
+        if let TokenKind::Keyword(_) = kind {
+            let lexeme = self.cursor.lexeme(at.id);
+            self.report(msg::built_in_identifier_as_typedef_name(lexeme), at);
+        }
     }
 
     fn peek_kind_ahead_is_paren_after_type(&self) -> bool {
@@ -1187,11 +1252,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 self.report(msg::abstract_sealed_class(), sealed_tok);
             } else if let Some(final_tok) = final_kw {
                 if let Some(base_tok) = base {
-                    self.report_with_end(
-                        msg::abstract_final_base_class(),
-                        final_tok,
-                        base_tok,
-                    );
+                    self.report_with_end(msg::abstract_final_base_class(), final_tok, base_tok);
                 } else if let Some(interface_tok) = interface {
                     self.report_with_end(
                         msg::abstract_final_interface_class(),
@@ -1391,7 +1452,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 open,
                 close,
             );
-            while self.cursor.advance() != close.id {}
+            self.cursor.drain_to(close.id);
         }
         let end = self.peek_span();
         self.listener.end_class_declaration(begin, end);
@@ -2018,37 +2079,32 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
         }
         if self.peek_kind() == TokenKind::OpenParen || self.peek_kind() == TokenKind::Period {
             let begin = self.peek_span();
+            // Official :3798-3823 — the per-kind face anchors on the `const`
+            // keyword when present, else on the `(`/`.`; with the feature off
+            // the plain unexpected-token report names the SAME token (oracle
+            // invalid_primary_constructors_pre_feature 13|7 `mixin const
+            // M() {}` → "Unexpected text 'const'.", 5|8 `mixin M() {}` →
+            // "Unexpected text '('.").
+            let anchor = const_keyword.unwrap_or(begin);
             match kind {
                 DeclarationKind::Mixin => {
                     if self.features.primary_constructors_enabled {
-                        self.report(
-                            msg::mixin_primary_constructor(),
-                            const_keyword.unwrap_or(begin),
-                        );
+                        self.report(msg::mixin_primary_constructor(), anchor);
                     } else {
-                        self.report(
-                            msg::unexpected_token(self.cursor.lexeme(begin.id)),
-                            const_keyword.unwrap_or(begin),
-                        );
+                        self.report(msg::unexpected_token(self.cursor.lexeme(anchor.id)), anchor);
                     }
                 }
                 DeclarationKind::Extension => {
                     if self.features.primary_constructors_enabled {
-                        self.report(
-                            msg::extension_primary_constructor(),
-                            const_keyword.unwrap_or(begin),
-                        );
+                        self.report(msg::extension_primary_constructor(), anchor);
                     } else {
-                        self.report(
-                            msg::unexpected_token(self.cursor.lexeme(begin.id)),
-                            const_keyword.unwrap_or(begin),
-                        );
+                        self.report(msg::unexpected_token(self.cursor.lexeme(anchor.id)), anchor);
                     }
                 }
                 DeclarationKind::ExtensionType if !allow_representation => {
                     self.report(
                         msg::extension_type_augmentation_specifies_representation_field(),
-                        const_keyword.unwrap_or(begin),
+                        anchor,
                     );
                 }
                 _ => {}
@@ -2056,10 +2112,12 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
 
             self.listener.begin_primary_constructor(begin);
             let has_constructor_name = self.peek_kind() == TokenKind::Period;
-            if has_constructor_name {
+            let constructor_name = if has_constructor_name {
                 self.cursor.advance();
-                self.ensure_identifier(IdentifierContext::PrimaryConstructorDeclaration);
-            }
+                Some(self.ensure_identifier(IdentifierContext::PrimaryConstructorDeclaration))
+            } else {
+                None
+            };
             if self.peek_kind() == TokenKind::OpenParen {
                 if kind == DeclarationKind::ExtensionType && allow_representation {
                     self.rep_field_check = Some(crate::parser::RepFieldCheck::default());
@@ -2073,7 +2131,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     // (error_verifier.dart:5356-5460; primary constructors
                     // feature disabled arm).
                     if state.count == 0 {
-                        self.report(msg::expected_representation_field(), self.peek_span());
+                        // `expectedRepresentationField` anchors on
+                        // `formalParameterList.leftParenthesis.next`
+                        // (error_verifier.dart:5371) — the `)` closing the
+                        // empty list, never the body `{`.
+                        self.report(
+                            msg::expected_representation_field(),
+                            self.last_consumed_anchor(),
+                        );
                     } else if state.count > 1 {
                         if let Some(comma) = state.comma_after_first {
                             self.report(msg::multiple_representation_fields(), comma);
@@ -2087,7 +2152,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                             state.modifier.unwrap_or(begin),
                         );
                     } else if let Some(delim) = state.delimiter {
-                        self.report(msg::expected_representation_field(), delim);
+                        // The verifier reads the left delimiter only in the
+                        // primary-constructors-disabled arm
+                        // (error_verifier.dart:5427-5434); with the feature
+                        // on a delimited form (e.g. `[int x]`) survives
+                        // clean.
+                        if !self.features.primary_constructors_enabled {
+                            self.report(msg::expected_representation_field(), delim);
+                        }
                     } else if state.fn_typed {
                         // The verifier's `expectedRepresentationField` for a
                         // function-typed representation field only runs with
@@ -2108,9 +2180,15 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                     matches!(kind, DeclarationKind::Class | DeclarationKind::Enum)
                         || (kind == DeclarationKind::ExtensionType && allow_representation);
                 if report_missing_parameters {
+                    // Official anchor is `token` — the constructor-name
+                    // identifier when present (:3857-3862), so
+                    // `class C<T>.named {}` anchors on `named`, never on the
+                    // `{` follower; a junk name anchors on its synthetic
+                    // (zero-width at the follower) exactly as
+                    // `ensureIdentifier` returned it.
                     self.report(
                         msg::missing_primary_constructor_parameters(),
-                        self.peek_span(),
+                        constructor_name.expect("period entry guarantees the name"),
                     );
                 }
                 if kind == DeclarationKind::ExtensionType {
@@ -2164,12 +2242,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, L> {
                 );
                 self.report(msg::expected_representation_field(), self.peek_span());
             } else if let Some(c) = const_keyword {
-                match kind {
-                    DeclarationKind::Mixin => self.report(msg::mixin_primary_constructor(), c),
-                    DeclarationKind::Extension => {
-                        self.report(msg::extension_primary_constructor(), c);
+                if self.features.primary_constructors_enabled {
+                    match kind {
+                        DeclarationKind::Mixin => self.report(msg::mixin_primary_constructor(), c),
+                        DeclarationKind::Extension => {
+                            self.report(msg::extension_primary_constructor(), c);
+                        }
+                        _ => self.report(msg::const_without_primary_constructor(), c),
                     }
-                    _ => self.report(msg::const_without_primary_constructor(), c),
+                } else {
+                    // Official :3884-3905: with the feature disabled the
+                    // per-kind faces collapse into the plain unexpected-token
+                    // report on the `const` keyword, for every declaration
+                    // kind (oracle invalid_primary_constructors_pre_feature
+                    // 2|7, 3|6: `class const C {}` / `enum const E {}`).
+                    self.report(msg::unexpected_token(self.cursor.lexeme(c.id)), c);
                 }
             }
             let at = self.peek_span();

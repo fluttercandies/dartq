@@ -33,8 +33,14 @@ pub(crate) fn scan_ok(source: &'static str) -> (&'static TokenTable, &'static st
 
 /// Latest-version feature set.
 pub(crate) fn latest_features() -> crate::ParserFeatures {
+    version_features(3, 15)
+}
+
+/// Feature set for an explicit language version (the pre-feature pins,
+/// e.g. primary constructors off below 3.13).
+pub(crate) fn version_features(major: u32, minor: u32) -> crate::ParserFeatures {
     crate::ParserFeatures::from_feature_set(FeatureSet::for_language_version(LanguageVersion::new(
-        3, 15,
+        major, minor,
     )))
 }
 
@@ -591,12 +597,7 @@ impl ParserListener for Collector {
     fn end_catch_clause(&mut self, _: Token) {
         self.log.push(("end", "catch_clause"));
     }
-    fn handle_catch_block(
-        &mut self,
-        _: Option<Token>,
-        _: Option<Token>,
-        _: Option<Token>,
-    ) {
+    fn handle_catch_block(&mut self, _: Option<Token>, _: Option<Token>, _: Option<Token>) {
         self.log.push(("handle", "catch_block"));
     }
     fn handle_finally_block(&mut self, _: Token) {
@@ -752,17 +753,31 @@ impl ParserListener for Collector {
 }
 
 /// Builds a parser over `source` with a fresh [`Collector`].
-pub(crate) fn setup(source: &'static str) -> Parser<'static, 'static, Collector> {
+///
+/// The parser borrows its listener, and this fixture hands back the
+/// `'static` shape matching the leaked table/text, so the log is leaked
+/// too: tests read events through the parser and never reclaim it.
+pub(crate) fn setup(source: &'static str) -> Parser<'static, 'static, 'static, Collector> {
     let (table, text) = scan_ok(source);
-    Parser::new(text, table, latest_features(), Collector::default())
+    Parser::new(
+        text,
+        table,
+        latest_features(),
+        Box::leak(Box::new(Collector::default())),
+    )
 }
 
 /// Builds a parser over an ALREADY-SCANNED table with a fresh [`Collector`]
 /// — for fixtures the plain [`scan_ok`] assert cannot take (unmatched begins
-/// legitimately carry scanner-channel rows).
+/// park synthetic closers, whose rows surface parser-side post-parse).
 pub(crate) fn setup_from_parts(
     text: &'static str,
     table: &'static TokenTable,
-) -> Parser<'static, 'static, Collector> {
-    Parser::new(text, table, latest_features(), Collector::default())
+) -> Parser<'static, 'static, 'static, Collector> {
+    Parser::new(
+        text,
+        table,
+        latest_features(),
+        Box::leak(Box::new(Collector::default())),
+    )
 }

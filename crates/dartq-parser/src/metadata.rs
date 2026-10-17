@@ -13,7 +13,7 @@ use crate::message::msg;
 use crate::parser::Parser;
 use crate::token_id::TokenSpan;
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// Official `parseMetadataStar`: `@`-prefixed annotations until the next
     /// non-`@` token. Returns the last consumed span.
     pub(crate) fn parse_metadata_star(&mut self) -> TokenSpan {
@@ -68,10 +68,8 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         // list must hug the annotation name; a gap only recovers as arguments
         // when the parse requires them (type arguments) or the follower is a
         // reserved `class`/`enum` head.
-        #[allow(clippy::cast_possible_truncation)]
-        let prev = self.cursor.real_pos().saturating_sub(1) as crate::token_id::TokenId;
-        let prev_span = self.cursor.span(prev);
-        let name_end = prev_span.offset + prev_span.length;
+        let prev_span = self.last_consumed_span();
+        let name_end = prev_span.range.offset + prev_span.range.length;
         let adjacent =
             self.peek_kind() == TokenKind::OpenParen && self.peek_span().range.offset == name_end;
         let end = self.parse_arguments_opt_metadata(has_type_arguments, adjacent);
@@ -95,7 +93,10 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         if self.peek_kind() != TokenKind::OpenParen {
             let next = self.peek_span();
             self.listener.handle_no_arguments(next);
-            return next;
+            // Official returns the last consumed token (:9463), not the peeked
+            // follower — `parse_arguments_opt`'s peeked-return contract (#585)
+            // does not apply to the metadata variant.
+            return self.last_consumed_span();
         }
         if !adjacent {
             if has_type_arguments {
@@ -119,7 +120,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             }
             let next = self.peek_span();
             self.listener.handle_no_arguments(next);
-            return next;
+            return self.last_consumed_span();
         }
         self.parse_arguments_rest()
     }

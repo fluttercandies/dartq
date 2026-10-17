@@ -10,7 +10,7 @@
 //!   output (probed silent on both formats) and is retired.
 //! * `native_function_body_in_non_sdk_code` — body span runs from the
 //!   keyword through the semicolon (`native "corpus";` len 16); without
-//!   the semicolon no NativeFunctionBody node is built and the oracle's
+//!   the semicolon no `NativeFunctionBody` node is built and the oracle's
 //!   only row is `missing_function_body`.
 //! * `representation_field_trailing_comma` — dead at 3.13: no analyzer
 //!   emitter, probed silent; dartq must not manufacture a row.
@@ -51,7 +51,8 @@ fn assert_code_absent(source: &'static str, code: &str, label: &str) {
 /// (UTF-16 units; ASCII fixtures make them byte-exact with the probes).
 fn first_span(source: &'static str) -> (String, u32, u32) {
     let (table, text) = scan_ok(source);
-    let mut p = Parser::new(text, table, latest_features(), Collector::default());
+    let mut collector = Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
     p.parse_unit();
     let (code, start, end) = &p.listener.errors[0];
     (code.clone(), *start, *end)
@@ -106,7 +107,7 @@ fn native_function_body_span_matches_oracle_row() {
     assert_eq!((start, end), (9, 25));
 }
 
-/// Probed: without the semicolon the oracle builds no NativeFunctionBody
+/// Probed: without the semicolon the oracle builds no `NativeFunctionBody`
 /// node — its only row is `missing_function_body`; neither native code may
 /// fire and the retired `native_clause_should_be_annotation` must stay gone.
 #[test]

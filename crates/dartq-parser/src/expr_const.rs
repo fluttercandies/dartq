@@ -15,7 +15,7 @@
 use dartq_scanner::{Keyword, TokenKind};
 
 pub(crate) use crate::listener::ConstantPatternContext;
-use crate::listener::{ConstructorReferenceContext, IdentifierContext, ParserListener};
+use crate::listener::{AssertKind, ConstructorReferenceContext, IdentifierContext, ParserListener};
 use crate::message::msg;
 use crate::parser::Parser;
 use crate::token_id::TokenSpan;
@@ -40,12 +40,13 @@ pub(crate) fn binary_level(kind: TokenKind) -> Option<u8> {
         TokenKind::QuestionQuestion => IF_NULL_PRECEDENCE,
         TokenKind::BarBar => LOGICAL_OR_PRECEDENCE,
         TokenKind::AmpersandAmpersand => LOGICAL_AND_PRECEDENCE,
-        TokenKind::EqEq | TokenKind::BangEq => EQUALITY_PRECEDENCE,
         // `===`/`!==` carry EQUALITY_PRECEDENCE in the official token table
         // (token.dart:1767-1773): the scanner's `unsupported_operator`
         // ErrorToken is the only diagnostic and the expression still parses
         // (`var b = 1 !== 2;` — the oracle mints no parser rows).
-        TokenKind::EqEqEq | TokenKind::BangEqEq => EQUALITY_PRECEDENCE,
+        TokenKind::EqEq | TokenKind::BangEq | TokenKind::EqEqEq | TokenKind::BangEqEq => {
+            EQUALITY_PRECEDENCE
+        }
         TokenKind::Lt
         | TokenKind::Gt
         | TokenKind::LtEq
@@ -132,7 +133,7 @@ fn invalid_constant_pattern_duplicate_const() -> crate::message::Message {
     )
 }
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// Parses a constant-pattern/default-value/annotation operand at the
     /// cursor (the reduced `parsePrecedenceExpression` at
     /// `EQUALITY_PRECEDENCE`).
@@ -350,7 +351,12 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 let begin = self.peek_span();
                 self.cursor.advance();
                 self.listener.begin_await_expression(begin);
-                let end = self.parse_pattern_unary(context);
+                // Official parseAwaitExpression recurses with
+                // ConstantPatternContext.none (:7934): the await-expression
+                // operand carries no const-pattern checks (oracle
+                // const_patterns 70 `case const await 0:` — one dead-code +
+                // non-constant row, no const-prefix face on the `0`).
+                let end = self.parse_pattern_unary(ConstantPatternContext::None);
                 self.listener.end_await_expression(begin, end);
                 end
             }
@@ -466,8 +472,23 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     // `const const [...]` (official parsePrimary, duplicate
                     // `const` in a constant pattern).
                     self.report(invalid_constant_pattern_duplicate_const(), const_keyword);
+                    // The duplicate-`const` face replaces the operand's own
+                    // const-pattern faces (oracle const_patterns 99
+                    // `case const const ():` — only the duplicate row, no
+                    // empty-record face on the `()`); the record-literal
+                    // parse reads the threaded field, so it resets here.
+                    self.constant_pattern_ctx = ConstantPatternContext::None;
                 }
                 let end = self.parse_const_expression();
+                self.parse_selector_chain(end, context)
+            }
+            TokenKind::Keyword(Keyword::Assert) => {
+                // Official parsePrimary 'assert' arm (:8176): `assert(...)`
+                // parses as an assert expression in constant-pattern
+                // position with no parser row (oracle const_patterns 47/68 —
+                // `case assert(false):` and `case const assert(false):` are
+                // parser-silent; only the semantic layer rejects them).
+                let end = self.parse_assert(AssertKind::Expression);
                 self.parse_selector_chain(end, context)
             }
             TokenKind::Keyword(Keyword::New) => {
@@ -588,11 +609,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         }
     }
 
-    /// Postfix selector loop (`.`/`?.`/`(`/`[`/`!`) — the reduced
-    /// `parseArgumentOrIndexStar` (:8004). `context` is the live
-    /// constant-pattern context: a `.`-access with method type arguments not
-    /// followed by `(` reports `invalidConstantPatternGeneric`
-    /// (`parser_impl.dart:6776-6791`).
+    /// Postfix selector loop (`.`/`?.`/`(`/`[`/`!`/`++`/`--`) — the reduced
+    /// `parseArgumentOrIndexStar` (:8004) plus the precedence loop's POSTFIX
+    /// arm (:7312-7318). `context` is the live constant-pattern context: a
+    /// `.`-access with method type arguments not followed by `(` reports
+    /// `invalidConstantPatternGeneric` (`parser_impl.dart:6776-6791`).
     fn parse_selector_chain(
         &mut self,
         head: TokenSpan,
@@ -619,9 +640,19 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     };
                     self.listener.handle_dot_access(name, name, is_null_aware);
                     end = name;
+                    // Official parsePrimary's identifier arm (:8112-8115): a
+                    // member under a numeric-literal-only negation reports
+                    // `invalidConstantPatternNegation` — and the official
+                    // "reset" there is a no-op `==` comparison, so a dotted
+                    // chain reports per member (oracle const_patterns 42
+                    // `case -prefix.value:` — rows at `prefix` AND `value`).
+                    if context == ConstantPatternContext::NumericLiteralOnly {
+                        self.report(invalid_constant_pattern_negation(), name);
+                    }
                     // Method type arguments after the name, optionally behind
                     // a `!` (`e.f!<T>(c)`); a lone `!` stays for the postfix
                     // arm below.
+                    let mut member_type_args = false;
                     if self.peek_kind() == TokenKind::Bang
                         && self.cursor.look_kind(1) == TokenKind::Lt
                     {
@@ -634,6 +665,7 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                         let type_param = self.compute_type_param_or_arg_on_lt(false);
                         if !matches!(type_param, crate::types::TypeParamOrArg::None) {
                             type_param.parse_arguments(self);
+                            member_type_args = true;
                             if self.peek_kind() != TokenKind::OpenParen {
                                 if context != ConstantPatternContext::None {
                                     self.report(invalid_constant_pattern_generic(), lt);
@@ -647,6 +679,29 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                             }
                         }
                     }
+                    // Official parseSend's explicit-const gate (:9413-9423):
+                    // with the context still explicit, only `.`/`(`/`<` can
+                    // complete a const constructor invocation — any other
+                    // follower reports once at the member head (oracle
+                    // const_patterns 63 `case const prefix.value:` → row at
+                    // `value`; 65 `case const prefix.Class.named:` → row at
+                    // `named`). The gate reads `token.next` BEFORE any type
+                    // arguments: a parsed `<...>` group keeps it silent (the
+                    // generic tear-off report above is that face — oracle
+                    // const_patterns 65prime `prefix.Class<int>` stays one
+                    // row).
+                    if context == ConstantPatternContext::Explicit
+                        && !member_type_args
+                        && !matches!(
+                            self.peek_kind(),
+                            TokenKind::Period | TokenKind::OpenParen | TokenKind::Lt
+                        )
+                    {
+                        // The official reset is parseSend-local (a by-value
+                        // parameter), so the postfix loop's context — this
+                        // `context` — stays explicit for later members.
+                        self.report(msg::invalid_constant_const_prefix(), name);
+                    }
                 }
                 TokenKind::OpenParen => {
                     end = self.parse_arguments();
@@ -658,6 +713,17 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                     let close = self.expect_kind(TokenKind::CloseSquare);
                     self.listener.handle_indexed_expression(None, open, close);
                     end = close;
+                }
+                TokenKind::PlusPlus | TokenKind::MinusMinus => {
+                    // Official precedence-loop POSTFIX arm (:7312-7318):
+                    // postfix `++`/`--` consume silently in any
+                    // constant-pattern context (oracle const_patterns_binary
+                    // 86/87 — `case o++:`/`case o--:` are parser-silent).
+                    let operator = self.peek_span();
+                    self.cursor.advance();
+                    self.listener
+                        .handle_unary_postfix_assignment_expression(operator);
+                    end = operator;
                 }
                 // Postfix `!` is an expression operator only outside constant
                 // patterns; in pattern context it stays for the pattern loop
@@ -842,13 +908,8 @@ impl<L: ParserListener> Parser<'_, '_, L> {
         self.ensure_identifier(IdentifierContext::ConstructorReference);
         self.parse_qualified_rest_opt(IdentifierContext::ConstructorReferenceContinuation);
         if self.peek_kind() == TokenKind::Lt {
-            let open = self.peek_span();
             let type_param = self.compute_type_param_or_arg_on_lt(false);
             type_param.parse_arguments(self);
-            if self.peek_kind() != TokenKind::OpenParen {
-                self.listener
-                    .handle_no_constructor_reference_continuation_after_type_arguments(open);
-            }
         }
         let mut period_before_name = None;
         if self.peek_kind() == TokenKind::Period {
@@ -859,6 +920,15 @@ impl<L: ParserListener> Parser<'_, '_, L> {
             );
             let _ = second;
             period_before_name = Some(period);
+        } else {
+            // Official :6430-6436 — the else of the period check fires the
+            // no-continuation event for EVERY period-less reference, type
+            // arguments or not: `C<int>(...)` (no `.name`) and `C.new(...)`
+            // (whose `.new` rode the qualified rest) both fire it; `C.new`
+            // leaves `period` null because `parseQualifiedRestOpt` consumed
+            // the dot before this check.
+            self.listener
+                .handle_no_constructor_reference_continuation_after_type_arguments(start);
         }
         let end = self.peek_span();
         self.listener
@@ -1104,10 +1174,25 @@ pub(crate) mod test_support {
     }
 
     /// Builds a parser over `source` with a fresh `L`.
+    ///
+    /// The parser borrows its listener, and this fixture hands back the
+    /// `'static` shape matching the leaked table/text, so the log is leaked
+    /// too: tests read events through the parser and never reclaim it.
     pub(crate) fn parser<L: ParserListener>(
         source: &'static str,
         listener: L,
-    ) -> crate::Parser<'static, 'static, L> {
+    ) -> crate::Parser<'static, 'static, 'static, L> {
+        let (table, text) = scanned(source);
+        crate::Parser::new(text, table, features(), Box::leak(Box::new(listener)))
+    }
+
+    /// Builds a parser over `source` borrowing a caller-owned listener —
+    /// for fan-out fixtures whose [`crate::MultiplexListener`] borrows
+    /// stack locals and so cannot take the leaked `'static` shape.
+    pub(crate) fn parser_ref<'l, L: ParserListener>(
+        source: &'static str,
+        listener: &'l mut L,
+    ) -> crate::Parser<'static, 'static, 'l, L> {
         let (table, text) = scanned(source);
         crate::Parser::new(text, table, features(), listener)
     }
@@ -1292,6 +1377,85 @@ mod tests {
             let _ = p.parse_const_expression();
             assert!(p.listener.errors_empty(), "{source}");
         }
+    }
+
+    /// Local listener capturing the constructor-reference continuation
+    /// face: whether the no-continuation event fired and whether
+    /// `end_constructor_reference` carried a `.name` period (the #1328
+    /// inverted-gate regression).
+    #[derive(Default)]
+    struct CtorRefLog {
+        errors: Vec<String>,
+        no_continuation: usize,
+        ends_with_period: usize,
+        ends_without_period: usize,
+    }
+
+    impl crate::listener::ParserListener for CtorRefLog {
+        fn handle_recoverable_error(&mut self, message: Message, _: TokenSpan, _: TokenSpan) {
+            self.errors.push(message.code.name.to_owned());
+        }
+
+        fn handle_no_constructor_reference_continuation_after_type_arguments(&mut self, _: Token) {
+            self.no_continuation += 1;
+        }
+
+        fn end_constructor_reference(
+            &mut self,
+            _: Token,
+            period_before_name: Option<Token>,
+            _: Token,
+            _: crate::listener::ConstructorReferenceContext,
+        ) {
+            if period_before_name.is_some() {
+                self.ends_with_period += 1;
+            } else {
+                self.ends_without_period += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn generic_ctor_ref_named_continuation_takes_name_branch_only() {
+        // #1328 (official :6427-6440): the no-continuation event fires only
+        // when NO period follows the type arguments. `C<int>.new(...)` takes
+        // the name branch — the old `!= (` gate fired the event AND the
+        // name, a contradictory pair.
+        let mut p = parser("const C<int>.new(1)", CtorRefLog::default());
+        let _ = p.parse_const_expression();
+        assert_eq!(p.listener.no_continuation, 0);
+        assert_eq!(p.listener.ends_with_period, 1);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
+
+    #[test]
+    fn generic_ctor_ref_invocation_fires_no_continuation() {
+        // #1328: `C<int>(...)` has no period after the type arguments, so
+        // the event fires (the old gate skipped it because `(` followed).
+        let mut p = parser("const C<int>(1)", CtorRefLog::default());
+        let _ = p.parse_const_expression();
+        assert_eq!(p.listener.no_continuation, 1);
+        assert_eq!(p.listener.ends_without_period, 1);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
+
+    #[test]
+    fn non_generic_ctor_ref_faces_unchanged() {
+        // Official :6414-6446: the qualified rest consumes `.new` BEFORE the
+        // period check, so plain `C.new(...)` carries a null period AND fires
+        // the no-continuation event (the else branch is unconditional on type
+        // arguments); plain `C(...)` fires it too.
+        let mut p = parser("const C.new(1)", CtorRefLog::default());
+        let _ = p.parse_const_expression();
+        assert_eq!(p.listener.no_continuation, 1);
+        assert_eq!(p.listener.ends_without_period, 1);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+
+        let mut p = parser("const C(1)", CtorRefLog::default());
+        let _ = p.parse_const_expression();
+        assert_eq!(p.listener.no_continuation, 1);
+        assert_eq!(p.listener.ends_without_period, 1);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
     }
 
     /// Local listener capturing the dot-shorthand face: head dot offsets,

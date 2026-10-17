@@ -168,7 +168,7 @@ fn compute_complex(
     required: bool,
 ) -> (
     ComplexType,
-    Parser<'static, 'static, super::collector::Collector>,
+    Parser<'static, 'static, 'static, super::collector::Collector>,
 ) {
     let mut p = setup(source);
     let info = p.compute_type(required, false);

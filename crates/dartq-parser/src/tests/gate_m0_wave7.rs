@@ -51,7 +51,7 @@ fn assert_stream(
         .map(|(c, s, e)| (ToString::to_string(c), *s, *e))
         .collect();
     assert_eq!(got, want, "{label}: diagnostic stream diverged");
-    p.listener
+    std::mem::take(p.listener)
 }
 
 // —— family: `mixin class` modifier-M combination heads —————————————————————
@@ -189,7 +189,7 @@ fn bare_class_missing_body_anchors_at_eof() {
 /// identifier_context_impl.dart:288-338), the header recovery's probe
 /// bails on the `class` head without reporting (official
 /// `recoverySmallLookAheadSkipTokens` bails on next-declaration heads,
-/// parser_impl.dart:2870/2882 — success is a `lookFor` boundary alone),
+/// `parser_impl.dart:2870/2882` — success is a `lookFor` boundary alone),
 /// and `ensureBlock` reports the `expectedEnumBody` template through
 /// `findNonZeroLengthToken`, which walks forward over the zero-width
 /// synthetic name onto `class` (oracle `issue_48371_prime3`: line 3

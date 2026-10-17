@@ -45,10 +45,13 @@ pub(crate) enum AsyncModifier {
 // (lookahead latch, bail-out, constructor-formals context, …); folding them
 // into a flags word would obscure that one-to-one mapping.
 #[allow(clippy::struct_excessive_bools)]
-pub struct Parser<'s, 't, L: ParserListener> {
+pub struct Parser<'s, 't, 'l, L: ParserListener> {
     pub(crate) table: &'t TokenTable,
     pub(crate) cursor: TokenCursor<'s, 't>,
-    pub(crate) listener: L,
+    /// Borrowed for the parse: the caller keeps ownership and reads the
+    /// listener back after the [`Parser`] drops (rust-analyzer's
+    /// borrow-the-builder shape — no move-out dance at the call sites).
+    pub(crate) listener: &'l mut L,
     pub(crate) features: ParserFeatures,
     /// Official `isLastPatternAllowedInsideUnaryPattern`
     /// (`parser_impl.dart:342`).
@@ -89,6 +92,49 @@ pub struct Parser<'s, 't, L: ParserListener> {
     /// `external_constructor_with_field_initializers` (`AstBuilder`
     /// `endClassConstructor`, `ast_builder.dart:6160`).
     pub(crate) external_ctor_field_formals: bool,
+    /// Begin token ids whose unmatched-group row was already reported through
+    /// [`crate::recovery`]'s `ensure_close_paren` adoption (the official
+    /// `moveSynthetic` relocation): [`crate::recovery`]'s parse-end pass
+    /// skips these pairs when it reports the rest at their parked positions.
+    /// Speculation forks start empty — a speculation's relocation is undone
+    /// with its rewriter (official `UndoableTokenStreamRewriter`), so the
+    /// real parse re-reports the pair from the parked position.
+    pub(crate) unmatched_reported: Vec<u32>,
+    /// Identical `(lexeme, offset)` unmatched-group rows collapse to one
+    /// (the official translation's rows dedupe downstream — oracle
+    /// two_unclosed_curly: two `}`-groups parked at EOF surface as a single
+    /// row; every row carries length 1, so the offset finishes the key).
+    /// Keyed `&'static str` — closer lexemes are fixed.
+    pub(crate) unmatched_seen: Vec<(&'static str, u32)>,
+    /// Triple pre-filter over [`Self::reported_rows`]
+    /// ([`Self::admit_row`]): a never-seen `(offset, length, code)` is
+    /// definitionally new, so the exact four-field scan only runs on triple
+    /// collisions. Grows with admitted rows only (fuse-capped).
+    pub(crate) row_keys: rustc_hash::FxHashSet<(u32, u32, &'static str)>,
+    /// Identical `(offset, length, code, text)` recoverable-error rows
+    /// collapse to one: the analyzer dedupes same-anchor errors with the same
+    /// rendered text, so a recovery cascade that re-reports a row at an
+    /// already-reported anchor surfaces once (oracle `const_patterns` 46:24
+    /// `expected_token ';'` and `const_patterns_binary` 85:12 `expected_token
+    /// ':'` each appear once while two recovery points report them;
+    /// 85:12's `expected_token` also suppresses the statement lane's
+    /// `expected_token ';'` at the same anchor while the differently-coded
+    /// `missing_identifier` there survives). The text joins the key because
+    /// the deduped reports are distinct fasta diagnostics sharing one
+    /// registry code: 76dd104c 12:23 surfaces `Expected to find ','.` AND
+    /// `Expected to find ';'.` over one span.
+    pub(crate) reported_rows: Vec<(u32, u32, &'static str, String)>,
+    /// The expression-depth fuse has tripped for the current top-level form:
+    /// while it is set, later cap entries unwind silently (the official
+    /// `expressionDepth` guard reports once per deep descent and its
+    /// decrement-on-every-exit counter never re-enters above the limit
+    /// during one form's unwind — `parser_impl.dart:6947-6973`). This
+    /// parser's collection-control-flow recovery frames can re-enter after
+    /// transient below-cap dips, so the latch survives the whole form's
+    /// recovery and is cleared only at a form boundary that made real
+    /// progress ([`Self::clear_depth_fuse`]) — an independent later form
+    /// trips again.
+    pub(crate) depth_fuse_latched: bool,
     /// Set while a constructor's formal parameters parse: `this.x` field
     /// formals there are legal; anywhere else the verifier reports
     /// `field_initializer_outside_constructor` (`error_verifier.dart:5595`).
@@ -137,14 +183,16 @@ pub(crate) struct RepFieldCheck {
     pub(crate) has_type: bool,
 }
 
-impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
+impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
     /// Folds `features` at construction (the official initializer-list fold,
     /// parser_impl.dart:316-373) and starts the cursor at the first token.
+    /// The listener is borrowed, not owned: the caller reads it back after
+    /// the parser drops.
     pub fn new(
         source: &'s str,
         table: &'t TokenTable,
         features: ParserFeatures,
-        listener: L,
+        listener: &'l mut L,
     ) -> Self {
         Self {
             table,
@@ -164,6 +212,11 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             currently_recovering: false,
             directive_state: crate::directives::DirectiveState::Unknown,
             external_ctor_field_formals: false,
+            unmatched_reported: Vec::new(),
+            unmatched_seen: Vec::new(),
+            row_keys: rustc_hash::FxHashSet::default(),
+            reported_rows: Vec::new(),
+            depth_fuse_latched: false,
             in_constructor_formals: false,
             last_parameter_count: 0,
             synthetic_formals: false,
@@ -191,7 +244,7 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
     /// true end token. The official end hooks deliver exactly this (the
     /// `token` a `parseStatement`/block parse returned), never the
     /// follower: `endIfStatement(ifToken, elseToken, token)`
-    /// (parser_impl.dart:10148), `endWhileStatement(whileToken, token)`
+    /// (`parser_impl.dart:10148`), `endWhileStatement(whileToken, token)`
     /// (:10485-10486), `endForStatement(token)`/:10339-10340,
     /// `endForIn(token)`/:10415-10416. The peek fallback covers an empty
     /// stream.
@@ -199,8 +252,7 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
     pub(crate) fn last_consumed_span(&self) -> TokenSpan {
         self.cursor
             .last_consumed_id()
-            .map(|id| self.span_of(id))
-            .unwrap_or_else(|| self.peek_span())
+            .map_or_else(|| self.peek_span(), |id| self.span_of(id))
     }
 
     /// Queue-aware span of the token `n` positions ahead — queued inserted
@@ -233,7 +285,7 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
     }
 
     /// Inserts a synthetic token at the cursor and returns its span
-    /// (zero-width, ast-design-spec §5.1).
+    ///.
     pub(crate) fn synthetic(&mut self, kind: TokenKind, utf16_offset: u32) -> TokenSpan {
         let id = self.cursor.insert_synthetic(kind, utf16_offset);
         self.span_of(id)
@@ -256,7 +308,14 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             return false;
         }
         if self.depth >= MAX_DEPTH {
-            self.bail(crate::message::msg::stack_overflow(MAX_DEPTH));
+            // One report per deep form: once the fuse latched (the official
+            // local guard, `parser_impl.dart:6947`), further cap entries
+            // unwind silently; the latch clears only at a form boundary that
+            // made real progress (`Parser::clear_depth_fuse`).
+            if !self.depth_fuse_latched {
+                self.depth_fuse_latched = true;
+                self.bail(crate::message::msg::stack_overflow(MAX_DEPTH));
+            }
             return false;
         }
         self.depth += 1;
@@ -265,6 +324,16 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
 
     pub(crate) fn leave_depth(&mut self) {
         self.depth -= 1;
+    }
+
+    /// Clears the expression-fuse latch at a form boundary that made real
+    /// progress (a completed statement in a block loop, a completed
+    /// declaration in the unit loop): the latch must survive the whole
+    /// form's recovery — a stalled parse keeps it so the same deep form
+    /// cannot re-trip mid-recovery — while an independent later form trips
+    /// again.
+    pub(crate) fn clear_depth_fuse(&mut self) {
+        self.depth_fuse_latched = false;
     }
 
     /// Whether the structural nesting is at the cap: the expression-fuse
@@ -326,6 +395,11 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
         while !self.cursor.at_eof() && !self.bailed {
             let start_pos = self.cursor.peek_id();
             self.parse_top_level_declaration();
+            // Form boundary: clear only on real progress (see
+            // `parse_statements_until_close`).
+            if self.cursor.peek_id() != start_pos {
+                self.clear_depth_fuse();
+            }
             self.listener.end_top_level_declaration(self.peek_span());
             count += 1;
             if self.cursor.peek_id() == start_pos {
@@ -341,6 +415,12 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             }
         }
         let eof = self.peek_span();
+        // Official `reportAllErrorTokens` (parser_impl.dart:11433-11439, run
+        // after the declaration loop): the scanner's unmatched groups report
+        // here, at `begin.endGroup`'s post-parse offset — adopted closers
+        // reported at their `moveSynthetic` relocation point already, the
+        // rest at their parked positions.
+        self.report_unmatched_groups();
         self.listener.end_compilation_unit(count, eof);
     }
 
@@ -404,15 +484,17 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
     /// Builds an independent speculative parser over a snapshot of this
     /// parser's token stream (official `canParseAsConditional`'s listener +
     /// rewriter swap): events and diagnostics of the speculation are dropped
-    /// into a [`crate::listener::SpeculationListener`], and insertions stay
-    /// in the fork's own cursor side table. The real parser is untouched.
-    pub(crate) fn fork_for_speculation(
+    /// into the caller-owned [`crate::listener::SpeculationListener`], and
+    /// insertions stay in the fork's own cursor side table. The real parser
+    /// is untouched.
+    pub(crate) fn fork_for_speculation<'f>(
         &self,
-    ) -> Parser<'s, 't, crate::listener::SpeculationListener> {
+        listener: &'f mut crate::listener::SpeculationListener,
+    ) -> Parser<'s, 't, 'f, crate::listener::SpeculationListener> {
         Parser {
             table: self.table,
             cursor: self.cursor.fork(),
-            listener: crate::listener::SpeculationListener { errors: 0 },
+            listener,
             features: self.features,
             is_last_pattern_allowed_inside_unary_pattern: self
                 .is_last_pattern_allowed_inside_unary_pattern,
@@ -428,6 +510,11 @@ impl<'s, 't, L: ParserListener> Parser<'s, 't, L> {
             currently_recovering: self.currently_recovering,
             directive_state: self.directive_state,
             external_ctor_field_formals: self.external_ctor_field_formals,
+            unmatched_reported: Vec::new(),
+            unmatched_seen: Vec::new(),
+            row_keys: rustc_hash::FxHashSet::default(),
+            reported_rows: Vec::new(),
+            depth_fuse_latched: false,
             in_constructor_formals: self.in_constructor_formals,
             last_parameter_count: self.last_parameter_count,
             synthetic_formals: self.synthetic_formals,

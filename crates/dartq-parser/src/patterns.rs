@@ -34,7 +34,7 @@ fn pattern_level(kind: TokenKind) -> Option<u8> {
 
 /// `looksLikePatternStart` (`identifier_context.dart:372`).
 pub(crate) fn looks_like_pattern_start(
-    parser: &Parser<'_, '_, impl ParserListener>,
+    parser: &Parser<'_, '_, '_, impl ParserListener>,
     offset: usize,
 ) -> bool {
     let kind = parser.kind_at(offset);
@@ -71,7 +71,7 @@ pub(crate) fn looks_like_pattern_start(
 /// `looksLikeLiteralEntry` (`literal_entry_info.dart:79`) reduced to the
 /// shapes the list/map pattern recovery loops need.
 pub(crate) fn looks_like_literal_entry(
-    parser: &Parser<'_, '_, impl ParserListener>,
+    parser: &Parser<'_, '_, '_, impl ParserListener>,
     offset: usize,
 ) -> bool {
     looks_like_expression_start(parser, offset)
@@ -90,7 +90,7 @@ pub(crate) fn looks_like_literal_entry(
 /// `looksLikeExpressionStart` (`identifier_context.dart:340`) reduced to the
 /// token-kind part (statement-start keywords are #19's surface).
 pub(crate) fn looks_like_expression_start(
-    parser: &Parser<'_, '_, impl ParserListener>,
+    parser: &Parser<'_, '_, '_, impl ParserListener>,
     offset: usize,
 ) -> bool {
     let kind = parser.kind_at(offset);
@@ -132,7 +132,7 @@ pub(crate) fn looks_like_expression_start(
     }
 }
 
-impl<L: ParserListener> Parser<'_, '_, L> {
+impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// Official `parsePattern` (`parser_impl.dart:11582`). The cursor sits on
     /// the pattern's first token. Feature gate: with `patterns` disabled the
     /// construct takes the error path (official `reportExperimentNotEnabled`
@@ -625,8 +625,20 @@ impl<L: ParserListener> Parser<'_, '_, L> {
                 self.listener.handle_rest_pattern(dots, has_sub_pattern);
             } else {
                 // entry: expression `:` pattern
+                let key_before = self.cursor.progress();
                 self.parse_constant_expression(ConstantPatternContext::None);
-                let colon = self.expect_lexeme_but_got(":");
+                // #2024 separator anchor: when the key IS the unrelocated
+                // blocker (the `,` recovery re-parses it as the next key),
+                // the `:` row anchors on the token the recovery lands
+                // behind — the blocker's follower — not on the blocker
+                // (frozen oracle 0c9fda4b: the separator recovery row rides
+                // the token following the recovery point).
+                let colon_anchor = if self.no_progress(key_before) {
+                    self.look_span_at(1)
+                } else {
+                    self.peek_span()
+                };
+                let colon = self.expect_lexeme_but_got_anchored(":", colon_anchor);
                 let value_head = self.peek_id();
                 let before = self.cursor.progress();
                 self.parse_pattern(context);
@@ -821,10 +833,11 @@ impl<L: ParserListener> Parser<'_, '_, L> {
     }
 
     /// Jump to the scanner-paired group end for recovery, or stay. The jump
-    /// is silent when the closer is scanner-synthesized — the scanner already
-    /// reported the unclosed group (official `moveSynthetic` path,
-    /// `parser_impl.dart:12051-12064`); a real but distant closer reports
-    /// `expectedButGot`.
+    /// consumes the closer where it sits — a scanner-synthesized closer keeps
+    /// its parked position, so the parse-end unmatched pass reports its row
+    /// there (official `moveSynthetic` moves only `ensureCloseParen`-style
+    /// adoptions, `parser_impl.dart:12051-12064`); a real but distant closer
+    /// reports `expectedButGot` here.
     fn group_end_or_here(&mut self, begin: TokenSpan, expected: &str) -> TokenSpan {
         if let Some(end) = self.cursor.table_matching_end(begin.id) {
             let (_, synthetic) = self.cursor.resolve(end);
