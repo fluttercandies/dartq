@@ -1,13 +1,13 @@
-//! The M3 seven-agent overlay acceptance (PRD §20.3, M3 row: "7 Agent
+//! The M3 seven-agent overlay acceptance (the M3 row: "7 Agent
 //! concurrency use case"): seven concurrent agent sessions over one
-//! workspace, each holding a whole-file overlay view of the same file
-//! (§16.3), isolated across the declared default + `t` contexts (§16.1),
+//! workspace, each holding a whole-file overlay view of the same file,
+//! isolated across the declared default + `t` contexts,
 //! under interleaved edits, an agent teardown landing mid-batch, and
 //! per-agent eviction — over the real RPC wire, no network, no dart SDK.
 //!
 //! Concurrency shape: the daemon's synchronous core (std threads +
-//! crossbeam channel, zero async) serves every client through the §16.5
-//! batch drain — writer priority, reads coalesced per context — so the
+//! crossbeam channel, zero async) serves every client through the batch
+//! drain — writer priority, reads coalesced per context — so the
 //! tests drive the agents as batched concurrent traffic, the wire shape
 //! production clients produce. This artifact pins correctness under the
 //! seven-agent shape; the performance numbers are #486's benchmark gate.
@@ -61,11 +61,6 @@ fn overlay_set(id: i64, name: &str, content: &str) -> Value {
         "dartq/overlay.set",
         json!({"agentId": name, "files": {"lib/main.dart": content}}),
     )
-}
-
-fn handshake(h: &mut Harness, publishes: usize) {
-    h.step(&request(1, "initialize", json!({})), 1);
-    h.step(&notification("initialized", json!({})), publishes);
 }
 
 /// The `result` of the answer frame for `id`.
@@ -162,35 +157,32 @@ fn assert_base_view(h: &Harness, id: i64) {
 /// plus a base edit in one batch) keep every view consistent; teardown
 /// evicts one agent without touching the rest; agent views never publish.
 #[test]
+#[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 fn seven_agents_hold_isolated_views_over_one_workspace() {
     let _guard = workspace_lock();
     let workspace = Workspace::new(BROKEN_MAIN);
-    let main_uri = format!("file://{}", workspace.path("lib/main.dart").display());
+    let main_dart = workspace.path("lib/main.dart");
     let mut h = spawn_with_heavy_context(&workspace, &store_root("seven-agents-isolation"));
+    // The startup drain already pushed the sweep's base view (the harness
+    // settled it): the seeded `missing.dart` row is the baseline every
+    // agent view isolates from.
 
-    handshake(&mut h, 1);
-    // The client's open document pins the base view (open-document
-    // precedence over the disk bytes).
-    h.step(
-        &notification(
-            "textDocument/didOpen",
-            json!({"textDocument": {"uri": main_uri, "languageId": "dart", "version": 1,
-                   "text": BROKEN_MAIN}}),
-        ),
-        0,
-    );
-
-    // Seven agents stage conflicting whole-file views of the SAME file
-    // (§16.3's `foo.dart → cid_A` / `foo.dart → cid_C` shape).
-    let tags: Vec<String> = (1..=7).map(|i| agent(i)).collect();
+    // Seven agents stage conflicting whole-file views of the SAME file.
+    let tags: Vec<String> = (1..=7).map(agent).collect();
     let sets: Vec<Value> = (1..=7)
-        .map(|i| overlay_set(100 + i as i64, &agent(i), &overlay_buffer(&agent(i))))
+        .map(|i| {
+            overlay_set(
+                100 + i64::try_from(i).unwrap_or(i64::MAX),
+                &agent(i),
+                &overlay_buffer(&agent(i)),
+            )
+        })
         .collect();
     h.burst(&sets, 7);
 
     // The isolation matrix, ONE concurrent batch: each agent's view plus
     // the base on both declared contexts — agents 6 and 7 ride the `t`
-    // fork (§16.1's Workspace₁ → Context₁, Context₂ with overlays atop).
+    // fork.
     let mut matrix: Vec<Value> = (1..=7)
         .map(|i| {
             let params = if i >= 6 {
@@ -198,21 +190,32 @@ fn seven_agents_hold_isolated_views_over_one_workspace() {
             } else {
                 json!({"agentId": agent(i)})
             };
-            request(200 + i as i64, "dartq/analyze", params)
+            request(
+                200 + i64::try_from(i).unwrap_or(i64::MAX),
+                "dartq/analyze",
+                params,
+            )
         })
         .collect();
     matrix.push(request(210, "dartq/analyze", json!({})));
     matrix.push(request(211, "dartq/analyze", json!({"context": "t"})));
+    // Nine answers; nothing publishes — the overlays are agent state, the
+    // base never moved.
     h.burst(&matrix, 9);
     for i in 1..=7 {
-        assert_isolated_view(&h, 200 + i as i64, &agent(i), &tags);
+        assert_isolated_view(
+            &h,
+            200 + i64::try_from(i).unwrap_or(i64::MAX),
+            &agent(i),
+            &tags,
+        );
     }
     assert_base_view(&h, 210);
     assert_base_view(&h, 211);
 
     // After every wear has drained: both contexts' base views still read
     // the disk text — the per-turn wear/restore left nothing behind in the
-    // shared content pool (§16.4: the base is the agents' only shared
+    // shared content pool (the base is the agents' only shared
     // mutable surface, and it never moved).
     h.burst(
         &[
@@ -225,19 +228,15 @@ fn seven_agents_hold_isolated_views_over_one_workspace() {
     assert_base_view(&h, 213);
 
     // Interleaved writes in one batch: two agents restage while the client
-    // pushes a base edit through didChange — intake acks first, then the
-    // drain (writes before reads, §16.5) whose publish diff carries the
-    // base's clear.
+    // reports a base edit through `dartq/sync` — intake acks first, then the
+    // drain whose publish diff carries the base's clear.
+    fs::write(&main_dart, CLEAN_MAIN).expect("rewrite");
     let revised = ["agent3b", "agent7b"];
     h.burst(
         &[
             overlay_set(220, &agent(3), &overlay_buffer(revised[0])),
             overlay_set(221, &agent(7), &overlay_buffer(revised[1])),
-            notification(
-                "textDocument/didChange",
-                json!({"textDocument": {"uri": main_uri, "version": 2},
-                       "contentChanges": [{"text": CLEAN_MAIN}]}),
-            ),
+            notification("dartq/sync", json!({"paths": ["lib/main.dart"]})),
         ],
         3,
     );
@@ -248,19 +247,25 @@ fn seven_agents_hold_isolated_views_over_one_workspace() {
     let mut after: Vec<Value> = (1..=7)
         .map(|i| {
             request(
-                230 + i as i64,
+                230 + i64::try_from(i).unwrap_or(i64::MAX),
                 "dartq/analyze",
                 json!({"agentId": agent(i)}),
             )
         })
         .collect();
     after.push(request(238, "dartq/analyze", json!({})));
+    // Eight answers; the unchanged base view stays suppressed.
     h.burst(&after, 8);
     let mut current = tags.clone();
     current[2] = revised[0].to_owned();
     current[6] = revised[1].to_owned();
     for i in 1..=7 {
-        assert_isolated_view(&h, 230 + i as i64, &current[i - 1], &current);
+        assert_isolated_view(
+            &h,
+            230 + i64::try_from(i).unwrap_or(i64::MAX),
+            &current[i - 1],
+            &current,
+        );
     }
     let base = answer_result(&h, 238);
     assert!(
@@ -302,11 +307,11 @@ fn seven_agents_hold_isolated_views_over_one_workspace() {
     );
     assert_isolated_view(&h, 244, &agent(5), &current);
 
-    h.step(&request(250, "shutdown", json!(null)), 1);
-    let (code, transcript) = h.exit();
+    let (code, transcript) = h.join_ended();
     assert_eq!(code, 0);
-    // Across the whole session: exactly two publishes — the sweep's base
-    // rows and the didChange clear — and neither ever carries an agent view.
+    // Across the whole session: two publishes, both the base view — the
+    // sweep's rows and the sync's clear — and neither ever carries an agent
+    // view.
     let pushed = publishes(&transcript);
     assert_eq!(pushed.len(), 2, "agent views never publish: {pushed:?}");
     for tag in &current {
@@ -332,11 +337,16 @@ fn agent_close_during_in_flight_work_keeps_shared_state_consistent() {
     let _guard = workspace_lock();
     let workspace = Workspace::new(BROKEN_MAIN);
     let mut h = spawn_with_heavy_context(&workspace, &store_root("seven-agents-close"));
-    handshake(&mut h, 1);
 
-    let tags: Vec<String> = (1..=7).map(|i| agent(i)).collect();
+    let tags: Vec<String> = (1..=7).map(agent).collect();
     let sets: Vec<Value> = (1..=7)
-        .map(|i| overlay_set(10 + i as i64, &agent(i), &overlay_buffer(&agent(i))))
+        .map(|i| {
+            overlay_set(
+                10 + i64::try_from(i).unwrap_or(i64::MAX),
+                &agent(i),
+                &overlay_buffer(&agent(i)),
+            )
+        })
         .collect();
     h.burst(&sets, 7);
 
@@ -344,7 +354,13 @@ fn agent_close_during_in_flight_work_keeps_shared_state_consistent() {
     // landing mid-batch, and one more agent-4 request staged after it. The
     // teardown acks at intake; the drain answers everything staged before.
     let mut batch: Vec<Value> = (1..=7)
-        .map(|i| request(20 + i as i64, "dartq/analyze", json!({"agentId": agent(i)})))
+        .map(|i| {
+            request(
+                20 + i64::try_from(i).unwrap_or(i64::MAX),
+                "dartq/analyze",
+                json!({"agentId": agent(i)}),
+            )
+        })
         .collect();
     batch.push(request(
         30,
@@ -376,7 +392,12 @@ fn agent_close_during_in_flight_work_keeps_shared_state_consistent() {
 
     // Every other concurrent view came back intact.
     for i in [1, 2, 3, 5, 6, 7] {
-        assert_isolated_view(&h, 20 + i as i64, &agent(i), &tags);
+        assert_isolated_view(
+            &h,
+            20 + i64::try_from(i).unwrap_or(i64::MAX),
+            &agent(i),
+            &tags,
+        );
     }
 
     // Recovery: agent 4 rejoins with a fresh view; the survivors and the
@@ -394,14 +415,13 @@ fn agent_close_during_in_flight_work_keeps_shared_state_consistent() {
     assert_isolated_view(&h, 42, &agent(1), &tags);
     assert_base_view(&h, 43);
 
-    h.step(&request(50, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, 0);
 
     fs::remove_dir_all(&workspace.root).ok();
 }
 
-/// The >7 policy: §16.3's agent set is open-ended (`Agent A/B/C …`) —
+/// The >7 policy: the agent set is open-ended (`Agent A/B/C …`) —
 /// seven is the M3 acceptance pin, not a capacity — and the daemon's
 /// documented bound (256 live agent overlays, the session contract) is
 /// loud at its boundary and recovers by eviction.
@@ -410,12 +430,17 @@ fn agent_population_exceeds_seven_up_to_the_documented_bound() {
     let _guard = workspace_lock();
     let workspace = Workspace::new(BROKEN_MAIN);
     let mut h = spawn_with_heavy_context(&workspace, &store_root("seven-agents-bound"));
-    handshake(&mut h, 1);
 
     // Eight agents stage and isolate over the one workspace.
-    let eight: Vec<String> = (1..=8).map(|i| agent(i)).collect();
+    let eight: Vec<String> = (1..=8).map(agent).collect();
     let sets: Vec<Value> = (1..=8)
-        .map(|i| overlay_set(10 + i as i64, &agent(i), &overlay_buffer(&agent(i))))
+        .map(|i| {
+            overlay_set(
+                10 + i64::try_from(i).unwrap_or(i64::MAX),
+                &agent(i),
+                &overlay_buffer(&agent(i)),
+            )
+        })
         .collect();
     h.burst(&sets, 8);
     h.burst(
@@ -433,7 +458,7 @@ fn agent_population_exceeds_seven_up_to_the_documented_bound() {
     let bulk: Vec<Value> = (9..=256)
         .map(|i| {
             let name = format!("agent{i}");
-            overlay_set(100 + i as i64, &name, &overlay_buffer(&name))
+            overlay_set(100 + i64::from(i), &name, &overlay_buffer(&name))
         })
         .collect();
     h.burst(&bulk, bulk.len());
@@ -466,7 +491,7 @@ fn agent_population_exceeds_seven_up_to_the_documented_bound() {
         ],
         3,
     );
-    let mut neighbors: Vec<String> = (1..=9).map(|i| agent(i)).collect();
+    let mut neighbors: Vec<String> = (1..=9).map(agent).collect();
     neighbors.push("overflow".to_owned());
     assert_isolated_view(&h, 403, "overflow", &neighbors);
 
@@ -477,8 +502,7 @@ fn agent_population_exceeds_seven_up_to_the_documented_bound() {
     );
     assert_isolated_view(&h, 410, &agent(1), &neighbors);
 
-    h.step(&request(420, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, 0);
 
     fs::remove_dir_all(&workspace.root).ok();

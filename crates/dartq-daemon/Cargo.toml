@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "The dartq daemon: an LSP shell over the multi-context analysis runtime, speaking JSON-RPC on stdio."
+description = "The dartq daemon: a resident RPC server over the multi-context analysis runtime — millisecond diagnostics and headless batch queries for AI agents, over JSON-RPC on stdio."
 repository.workspace = true
 readme = "README.md"
-keywords = ["dart", "lsp", "language-server", "daemon"]
+keywords = ["dart", "rpc", "jsonrpc", "daemon"]
 categories = ["development-tools"]
 
 [dependencies]
@@ -20,8 +20,21 @@ dartq-engine = { workspace = true }
 # signatures.
 dartq-index = { workspace = true }
 dartq-plugin = { workspace = true }
+# Pub-native plugin discovery resolves declared plugin packages against the
+# parsed package_config.json (lib face: the session's engine config and both
+# launcher paths).
+dartq-pub = { workspace = true }
+# The rename faces' new-name gate rejects the scanner's reserved words: the
+# keyword table is the scanner's own classification, not a daemon fork.
+dartq-scanner = { workspace = true }
 dartq-snapshot = { workspace = true }
 dartq-source = { workspace = true }
+# The watch face's OS-event substrate (FSEvents on macOS, inotify on
+# Linux) behind the WatchSource seam — the poll substrate stays as the
+# fallback. Admitted from the local registry cache: MSRV 1.60; the macOS
+# face is fsevent-sys (no bindgen build, sole dep libc) + bitflags + log +
+# walkdir; crossbeam-channel is a default feature and already a dep here.
+notify = "6.1.1"
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -32,7 +45,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 dartq-package = { workspace = true }
-dartq-pub = { workspace = true }
 dartq-sdk = { workspace = true }
 # The session-economics answers (query symbols/since) validate against the
 # published schema in the overlay-scenario test.

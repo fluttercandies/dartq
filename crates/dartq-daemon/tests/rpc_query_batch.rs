@@ -1,4 +1,4 @@
-//! `dartq/queryBatch` end to end (PRD §15.8.4): one round trip answers N
+//! `dartq/queryBatch` end to end: one round trip answers N
 //! symbols × M kinds — one frozen v1 query envelope per `(item, kind)`
 //! pair, request order, no aggregate envelope (dartq-schema's frozen batch
 //! convention). The empty batch answers an empty array; an unknown symbol
@@ -11,7 +11,7 @@ mod common;
 use std::fs;
 use std::sync::Mutex;
 
-use common::{CLEAN_MAIN, Workspace, notification, request, spawn, store_root};
+use common::{CLEAN_MAIN, Workspace, request, spawn, store_root};
 use serde_json::{Value, json};
 
 /// `Workspace::new` pins one pid-derived temp root; the tests in this
@@ -27,13 +27,6 @@ fn workspace_lock() -> std::sync::MutexGuard<'static, ()> {
     WORKSPACE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// `initialize` + `initialized`: the fixture is clean, so the sweep
-/// publishes nothing.
-fn handshake(h: &mut common::Harness) {
-    h.step(&request(1, "initialize", json!({})), 1);
-    h.step(&notification("initialized", json!({})), 0);
 }
 
 /// The `result` of the answer frame for `id`.
@@ -82,7 +75,6 @@ fn batch_answers_every_pair_in_request_order() {
     let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
     let mut h = spawn(&workspace, &store_root("rpc-query-batch-order"));
-    handshake(&mut h);
 
     h.step(
         &request(
@@ -136,8 +128,7 @@ fn batch_answers_every_pair_in_request_order() {
         dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
     }
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -147,13 +138,11 @@ fn empty_batch_answers_an_empty_array() {
     let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
     let mut h = spawn(&workspace, &store_root("rpc-query-batch-empty"));
-    handshake(&mut h);
 
     h.step(&request(2, "dartq/queryBatch", json!({ "queries": [] })), 1);
     assert_eq!(answer_result(&h, 2), json!([]));
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -165,7 +154,6 @@ fn unknown_symbol_answers_the_single_faces_not_found_shape() {
     let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
     let mut h = spawn(&workspace, &store_root("rpc-query-batch-unknown"));
-    handshake(&mut h);
 
     h.step(&request(2, "dartq/query", json!({ "name": "Nope" })), 1);
     h.step(
@@ -179,8 +167,7 @@ fn unknown_symbol_answers_the_single_faces_not_found_shape() {
     let single = answer_result(&h, 2);
     assert_eq!(answer_result(&h, 3), json!([single]));
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -193,7 +180,6 @@ fn single_symbol_request_still_parses_and_answers() {
     let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
     let mut h = spawn(&workspace, &store_root("rpc-query-batch-legacy"));
-    handshake(&mut h);
 
     h.step(&request(2, "dartq/query", json!({ "name": "Foo" })), 1);
     h.step(
@@ -213,8 +199,7 @@ fn single_symbol_request_still_parses_and_answers() {
         "one default-kind batch item is the single face's own answer"
     );
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -226,7 +211,6 @@ fn unknown_item_kind_answers_invalid_params() {
     let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
     let mut h = spawn(&workspace, &store_root("rpc-query-batch-kind"));
-    handshake(&mut h);
 
     h.step(
         &request(
@@ -246,7 +230,6 @@ fn unknown_item_kind_answers_invalid_params() {
         );
     }
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }

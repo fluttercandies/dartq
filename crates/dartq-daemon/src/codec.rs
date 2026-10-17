@@ -1,10 +1,10 @@
-//! LSP wire framing: `Content-Length: N\r\n\r\n` headers + one JSON body
-//! (LSP 3.17 §baseProtocol). Hand-written because the shell carries no Dart
+//! Wire framing: `Content-Length: N\r\n\r\n` headers + one JSON body.
+//! Hand-written because the shell carries no Dart
 //! semantics; the format is ~40 lines and pinned by the tests below.
 
 use std::io::{self, BufRead, Read, Write};
 
-/// Upper bound for one header line (#947 F1): LSP headers are tiny, and
+/// Upper bound for one header line (#947 F1): frame headers are tiny, and
 /// without a ceiling a peer streaming newline-free bytes would grow the
 /// line buffer without limit and take the process down before any framing
 /// check fires. 16 KiB is the industry-standard ceiling; it bounds the
@@ -107,7 +107,7 @@ pub fn read_frame(input: &mut impl BufRead) -> Result<Option<Vec<u8>>, FrameErro
         };
         let (name, value) = (&line[..colon], &line[colon + 1..]);
         if name.eq_ignore_ascii_case(b"content-length") {
-            // One Content-Length per message (LSP §baseProtocol header
+            // One Content-Length per message (the framing's header
             // semantics, #947 F11): a repeat is a framing violation — the
             // two declarations cannot both describe the one body, and
             // last-wins would silently pick the peer's second word over

@@ -1,26 +1,24 @@
-//! The JSON-RPC 2.0 message model as LSP uses it (LSP 3.17 §messages):
-//! requests, notifications, and responses over [`serde_json::Value`]. Only
-//! this milestone's surface is modeled; parsing is hand-rolled because the
-//! `id`-vs-`method` discrimination and the `result`-XOR-`error` response
-//! shape are the whole logic.
+//! The JSON-RPC 2.0 message model: requests, notifications, and responses
+//! over [`serde_json::Value`]. Only the daemon's surface is modeled;
+//! parsing is hand-rolled because the `id`-vs-`method` discrimination and
+//! the `result`-XOR-`error` response shape are the whole logic.
 
 use serde_json::{Value, json};
 
-/// JSON-RPC error codes (JSON-RPC 2.0 §5.1, LSP §statusCodes).
+/// JSON-RPC error codes.
 pub mod codes {
     pub const PARSE_ERROR: i64 = -32700;
     pub const INVALID_REQUEST: i64 = -32600;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;
     pub const INTERNAL_ERROR: i64 = -32603;
-    pub const SERVER_NOT_INITIALIZED: i64 = -32002;
-    /// LSP's `RequestCancelled`: the server dropped the request before
-    /// producing a result (its enqueue epoch was superseded).
+    /// The server dropped the request before producing a result (its
+    /// enqueue epoch was superseded).
     pub const REQUEST_CANCELLED: i64 = -32800;
 }
 
 /// A request id: integer or string (JSON-RPC 2.0); fractional numbers are
-/// forbidden by LSP.
+/// forbidden by the wire contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestId {
     Num(i64),
@@ -28,7 +26,7 @@ pub enum RequestId {
 }
 
 impl RequestId {
-    /// Decodes an `id` field value (`$/cancelRequest` params carry one).
+    /// Decodes an `id` field value (`dartq/cancel` params carry one).
     #[must_use]
     pub fn from_value(value: &Value) -> Option<Self> {
         match value {
@@ -62,7 +60,7 @@ pub struct Notification {
 }
 
 /// A server→client response. `result: None` with `error: None` serializes as
-/// `result: null` (the `shutdown` answer).
+/// `result: null` (a request whose answer is the empty document).
 #[derive(Debug)]
 pub struct Response {
     pub id: Option<RequestId>,
@@ -159,7 +157,7 @@ impl Message {
                     Some((code, message)) => {
                         value["error"] = json!({ "code": code, "message": message });
                     }
-                    // `shutdown` answers `result: null` — the field must be present.
+                    // `result: null` answers exist — the field must be present.
                     None => value["result"] = response.result.clone().unwrap_or(Value::Null),
                 }
                 value
@@ -260,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_shutdown_null_result() {
+    fn writes_null_result() {
         let response = Message::Response(Response::ok(RequestId::Num(3), Value::Null));
         assert_eq!(
             response.to_value(),

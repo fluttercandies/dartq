@@ -1,4 +1,4 @@
-//! The `dartq/*` request faces (PRD §15.1): parameter decoding, execution
+//! The `dartq/*` request faces: parameter decoding, execution
 //! over the session's engine, and response shaping.
 //!
 //! Every face mirrors one CLI command and shares its implementation
@@ -10,11 +10,11 @@
 //!   tier semantics are the canonical tables in dartq-schema's crate docs —
 //!   this module implements exactly those tables and nothing else;
 //! * every engine-view request rides the session's read task, so
-//!   `$/cancelRequest` cancels it through the epoch machinery like any
+//!   `dartq/cancel` cancels it through the epoch machinery like any
 //!   other read. The three `dartq/overlay.*` faces answer at intake instead
 //!   (they mutate session bookkeeping or the worktree, never analyze).
 //!
-//! # Context routing (PRD §16.2, multi-root)
+//! # Context routing
 //!
 //! The engine-view faces accept an optional `context` tag naming a declared
 //! context (a `dartq.yaml` row assembled at the shell edge); the request
@@ -22,12 +22,12 @@
 //! context. The disk-view faces take neither `context` nor `agentId` —
 //! they never touch a session engine view.
 //!
-//! # Analyzed view per face (PRD §16.3 multi-agent overlays)
+//! # Analyzed view per face
 //!
 //! A request with `agentId` analyzes the agent's overlay view (its staged
 //! `path → content` deltas over the base view); a request without one
-//! analyzes the base view (on-disk content plus the LSP `didOpen`/
-//! `didChange` overlay). The per-face visibility is contract:
+//! analyzes the base view (on-disk content as `dartq/sync` and the watch
+//! syncs staged it). The per-face visibility is contract:
 //!
 //! | face            | view                                            |
 //! |-----------------|--------------------------------------------------|
@@ -46,7 +46,15 @@
 //! |                 | agent mode is the overlay-aware one              |
 //! | `dartq/query`   | requested view                                   |
 //! | `dartq/queryBatch` | requested view (one graph walk per batch —     |
-//! |                 | §15.8.4's amortization across the round trip)    |
+//! |                 | the amortization across the round trip)    |
+//! | `dartq/resolveAt` | requested view (a point answer over the        |
+//! |                 | resident index — no rows for a delta cursor     |
+//! |                 | to filter)                                |
+//! | `dartq/completion` | requested view (the visible-name set over   |
+//! |                 | the resident index — the file's own library   |
+//! |                 | faces, its proven import targets, its import |
+//! |                 | prefixes; no rows for a delta cursor to      |
+//! |                 | filter)                                   |
 //! | `dartq/impact`  | requested view                                   |
 //! | `dartq/fix`     | disk, always (`agentId`/`since` rejected)        |
 //! | `dartq/compat`  | disk, always — it rebuilds one engine per axis   |
@@ -63,7 +71,7 @@
 //! |                 | use/import/test rows by the session's            |
 //! |                 | written-file cursors, it does not select a view  |
 //!
-//! # Session economics (PRD §15.8)
+//! # Session economics
 //!
 //! * **Delta mode** — a `since: <cursor>` param restricts the answer to
 //!   rows whose file changed since that cursor and echoes the session's
@@ -73,7 +81,7 @@
 //!   files *explicitly written* — cascade-invalidated dependents are not
 //!   marked. For an agent view, an overlaid path's change cursor is the
 //!   `overlay.set` that staged it (the overlay masks base changes).
-//! * **Batch queries** — `dartq/queryBatch` (§15.8.4) answers every item's
+//! * **Batch queries** — `dartq/queryBatch` answers every item's
 //!   kinds in one round trip over the session's already-built graph: one
 //!   frozen v1 query envelope per `(item, kind)` pair, request order, no
 //!   aggregate envelope (the schema crate's frozen batch convention). The
@@ -90,7 +98,7 @@
 //!   different value domain than the file paths these rows repeat — so
 //!   emission there waits for the schema/index lanes' symbol-path rows; the
 //!   field stays absent-tolerant until then. Full-tier `dartq/explain`
-//!   substitutes its path-valued report rows the same way: the §15.3 schema
+//!   substitutes its path-valued report rows the same way: the schema
 //!   declares `symbols` as the id → path table, absent-tolerant, so the
 //!   economics apply verbatim (compact explains stay byte-identical to the
 //!   CLI's report).
@@ -98,14 +106,18 @@
 //! # Path labels
 //!
 //! The CLI-mirror faces (`check`, `query`, `impact`, `explain`, `fix`,
-//! `compat`) keep the CLI's canonical path labels; the LSP-native
-//! `dartq/analyze` keeps document URIs. Relative request paths resolve
+//! `compat`) shape through the CLI faces' own implementations — the query
+//! rows' file references are the shared shaper's stable package-form
+//! labels (`dartq_commands::pkg_label`, tier-agnostic), the `analyze`
+//! face keeps document URIs. Relative request paths resolve
 //! against the session's workspace root (the CLI resolves them against the
 //! process cwd). The CLI's `$DART_SDK` fallback has no daemon equivalent:
 //! `dartq/compat` requires explicit `sdk_roots`, and `dartq/explain` takes
 //! an optional `sdk` root per query — absent resolves to the session's own
 //! SDK root (the SDK the analyzed view was assembled against); the
-//! `$DART_SDK` fallback stays the CLI path's business.
+//! `$DART_SDK` fallback stays the CLI path's business (the formatting
+//! subprocess bridges honor the same variable as their own override — the
+//! `formatting` module's contract).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -124,27 +136,33 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::lsp;
 use crate::session::SessionError;
+use crate::wire;
 
 /// The response contract version: the frozen v1, mirrored from
 /// [`dartq_commands::SCHEMA_VERSION`] (dartq-schema's constants are
 /// authoritative).
 pub(crate) const SCHEMA_VERSION: u32 = dartq_commands::SCHEMA_VERSION;
 
-/// The `dartq/*` method names, announced under `capabilities.experimental`
-/// in `initialize`'s answer. The `dartq/overlay.*` faces answer at intake
+/// The `dartq/*` method names — the daemon's whole request face.
+/// The `dartq/overlay.*` faces answer at intake
 /// (the server intercepts them before the scheduler queue — pure staging);
 /// the rest, including the two plugin-dispatch faces (`dartq/fix`,
 /// `dartq/assists`), stage onto the session's scheduler — the fix faces
 /// execute off the main loop at their drain (the session module's
 /// fix-dispatch notes).
-pub(crate) const METHODS: [&str; 13] = [
+///
+/// `pub` so the drift gate (tests/rpc_schema.rs) can pin the served request
+/// set itself, not a parallel copy: the schema test asserts this table IS
+/// the dispatchable request family, in both directions.
+pub const METHODS: [&str; 15] = [
     "dartq/index",
     "dartq/analyze",
     "dartq/check",
     "dartq/query",
     "dartq/queryBatch",
+    "dartq/resolveAt",
+    "dartq/completion",
     "dartq/impact",
     "dartq/fix",
     "dartq/assists",
@@ -156,10 +174,10 @@ pub(crate) const METHODS: [&str; 13] = [
 ];
 
 /// A staged `dartq/*` request: decoded parameters. The request id — the
-/// identity `$/cancelRequest` keys on — stays on the session side.
+/// identity `dartq/cancel` keys on — stays on the session side.
 #[derive(Debug, Clone)]
 pub(crate) enum Request {
-    /// The analyzed view's resident index tallied (the §15.1 `index`
+    /// The analyzed view's resident index tallied (the `index`
     /// face). An engine-view face (the tally reads the view's engine), so
     /// `agentId`/`context` select the view; `since` is rejected — the
     /// aggregate has no rows for a delta cursor to filter.
@@ -180,7 +198,7 @@ pub(crate) enum Request {
         context: Option<String>,
         since: Option<u64>,
     },
-    /// The §15.2 symbol-index face; `kind` picks the answered rows (symbol
+    /// The symbol-index face; `kind` picks the answered rows (symbol
     /// by default, references, the callers subset, the implementations
     /// walk, or the declaring library's dependencies).
     Query {
@@ -191,7 +209,7 @@ pub(crate) enum Request {
         context: Option<String>,
         since: Option<u64>,
     },
-    /// The §15.8.4 batch face: every item's kinds answered over the one
+    /// The batch face: every item's kinds answered over the one
     /// session graph in a single round trip. The answer is one frozen v1
     /// query envelope per `(item, kind)` pair — request order, no aggregate
     /// envelope (the schema crate's frozen batch convention).
@@ -202,6 +220,30 @@ pub(crate) enum Request {
         context: Option<String>,
         since: Option<u64>,
     },
+    /// The position-resolution face: what the analyzed view's maintained
+    /// index rows hold under one file offset. An engine-view face
+    /// (`agentId`/`context` select the view); a point answer, so `since`
+    /// is rejected — it has no rows for a cursor to filter (the
+    /// `dartq/index` rule).
+    ResolveAt {
+        file: PathBuf,
+        offset: u32,
+        verbosity: Verbosity,
+        agent: Option<String>,
+        context: Option<String>,
+    },
+    /// The built-in completion face: the visible-name set at one cursor
+    /// over the analyzed view's maintained index — no plugin escape (the
+    /// charter has no `completions` extension point). An engine-view face
+    /// like [`Request::ResolveAt`]; a point answer, so `since` is
+    /// rejected (the `dartq/index` rule).
+    Completion {
+        file: PathBuf,
+        offset: u32,
+        verbosity: Verbosity,
+        agent: Option<String>,
+        context: Option<String>,
+    },
     Impact {
         target: PathBuf,
         verbosity: Verbosity,
@@ -209,7 +251,7 @@ pub(crate) enum Request {
         context: Option<String>,
         since: Option<u64>,
     },
-    /// The §15.3 report over a per-query disk engine (the visibility
+    /// The report over a per-query disk engine (the visibility
     /// table's `dartq/explain` row): no `agent`/`context` field by
     /// construction, and `sdk` — an explicit value is authoritative; absent
     /// defaults to the session's resolved SDK root.
@@ -241,6 +283,8 @@ impl Request {
             | Self::Check { agent, .. }
             | Self::Query { agent, .. }
             | Self::QueryBatch { agent, .. }
+            | Self::ResolveAt { agent, .. }
+            | Self::Completion { agent, .. }
             | Self::Impact { agent, .. } => agent.as_deref(),
             Self::Explain { .. } | Self::Fix { .. } | Self::Compat { .. } => None,
         }
@@ -255,6 +299,8 @@ impl Request {
             | Self::Check { context, .. }
             | Self::Query { context, .. }
             | Self::QueryBatch { context, .. }
+            | Self::ResolveAt { context, .. }
+            | Self::Completion { context, .. }
             | Self::Impact { context, .. } => context.as_deref(),
             Self::Explain { .. } | Self::Fix { .. } | Self::Compat { .. } => None,
         }
@@ -270,6 +316,8 @@ impl Request {
             | Self::Check { verbosity, .. }
             | Self::Query { verbosity, .. }
             | Self::QueryBatch { verbosity, .. }
+            | Self::ResolveAt { verbosity, .. }
+            | Self::Completion { verbosity, .. }
             | Self::Impact { verbosity, .. }
             | Self::Explain { verbosity, .. }
             | Self::Fix { verbosity, .. }
@@ -328,6 +376,26 @@ struct BatchItemParams {
 }
 
 #[derive(Deserialize)]
+struct ResolveAtParams {
+    file: PathBuf,
+    /// UTF-16 code units from the file's start — the engine's external
+    /// convention, the same units the query rows' `offset` fields carry.
+    offset: u32,
+    #[serde(default)]
+    verbosity: Verbosity,
+}
+
+#[derive(Deserialize)]
+struct CompletionParams {
+    file: PathBuf,
+    /// UTF-16 code units from the file's start — the engine's external
+    /// convention, the same units the query rows' `offset` fields carry.
+    offset: u32,
+    #[serde(default)]
+    verbosity: Verbosity,
+}
+
+#[derive(Deserialize)]
 struct TargetParams {
     path: PathBuf,
     #[serde(default)]
@@ -353,7 +421,7 @@ struct CompatParams {
 }
 
 /// One agent's staged overlay: its name plus a whole-file replacement
-/// buffer per path (PRD §16.3).
+/// buffer per path.
 pub(crate) type StagedOverlay = (String, Vec<(PathBuf, Vec<u8>)>);
 
 /// Decodes one `dartq/*` request's parameters. Relative paths resolve
@@ -413,6 +481,51 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
             })
         }
         "dartq/queryBatch" => parse_query_batch(params),
+        "dartq/resolveAt" => {
+            // A point answer: the view selectors apply, a delta cursor has
+            // no rows to filter (the dartq/index rule).
+            let (agent, since) = session_fields(params)?;
+            if since.is_some() {
+                return Err(
+                    "dartq/resolveAt answers one position; since applies to the row-shaped \
+                     faces (check/query/impact/explain)"
+                        .into(),
+                );
+            }
+            let context = context_field(params)?;
+            let decoded =
+                serde_json::from_value::<ResolveAtParams>(params.clone()).map_err(invalid)?;
+            Ok(Request::ResolveAt {
+                file: resolve(root, decoded.file),
+                offset: decoded.offset,
+                verbosity: decoded.verbosity,
+                agent,
+                context,
+            })
+        }
+        "dartq/completion" => {
+            // A point answer over the visible-name set: the view selectors
+            // apply, a delta cursor has no rows to filter (the
+            // dartq/index rule).
+            let (agent, since) = session_fields(params)?;
+            if since.is_some() {
+                return Err(
+                    "dartq/completion answers the visible-name set at one position; since \
+                     applies to the row-shaped faces (check/query/impact/explain)"
+                        .into(),
+                );
+            }
+            let context = context_field(params)?;
+            let decoded =
+                serde_json::from_value::<CompletionParams>(params.clone()).map_err(invalid)?;
+            Ok(Request::Completion {
+                file: resolve(root, decoded.file),
+                offset: decoded.offset,
+                verbosity: decoded.verbosity,
+                agent,
+                context,
+            })
+        }
         "dartq/impact" => {
             let (agent, since) = session_fields(params)?;
             let context = context_field(params)?;
@@ -551,7 +664,7 @@ fn default_query_kinds() -> Vec<QueryKind> {
 }
 
 /// The params' session-economics fields: the optional `agentId` view selector
-/// and the optional `since` delta cursor (PRD §15.8). Absent and `null` are
+/// and the optional `since` delta cursor. Absent and `null` are
 /// equivalent.
 fn session_fields(params: &Value) -> Result<(Option<String>, Option<u64>), String> {
     let agent = match params.get("agentId") {
@@ -573,8 +686,8 @@ fn session_fields(params: &Value) -> Result<(Option<String>, Option<u64>), Strin
     Ok((agent, since))
 }
 
-/// The params' optional `context` tag (the multi-root routing selector,
-/// PRD §16.2). Absent and `null` are equivalent.
+/// The params' optional `context` tag (the multi-root routing selector).
+/// Absent and `null` are equivalent.
 fn context_field(params: &Value) -> Result<Option<String>, String> {
     match params.get("context") {
         None | Some(Value::Null) => Ok(None),
@@ -600,7 +713,7 @@ pub(crate) fn reject_disk_view_only(params: &Value, method: &str) -> Result<(), 
 
 /// Decodes `dartq/overlay.set` params: `{agentId, files: {path → content}}`.
 /// Relative paths resolve against `root`; contents are whole-file
-/// replacement text (PRD §16.3, M1 semantics).
+/// replacement text.
 ///
 /// # Errors
 ///
@@ -629,7 +742,7 @@ pub(crate) fn parse_overlay_set(params: &Value, root: &Path) -> Result<StagedOve
 }
 
 /// The `{agentId}`-shaped overlay faces' agent field: `overlay.clear`
-/// (idempotent teardown) and `overlay.commit` (the §16.3 merge) take
+/// (idempotent teardown) and `overlay.commit` take
 /// exactly that.
 ///
 /// # Errors
@@ -650,7 +763,7 @@ pub(crate) fn parse_overlay_clear(params: &Value) -> Result<String, String> {
 }
 
 /// Decodes `dartq/overlay.commit` params: `{agentId}` — the merge writes
-/// the agent's staged whole-file buffers back to the worktree (PRD §16.3);
+/// the agent's staged whole-file buffers back to the worktree;
 /// there is no path subset (the overlay declares the end state, the merge
 /// commits it whole).
 pub(crate) fn parse_overlay_commit(params: &Value) -> Result<String, String> {
@@ -718,7 +831,7 @@ impl<'a> Changes<'a> {
     }
 }
 
-/// The session's stable path → short-id table (PRD §15.8.2): ids (`s1`,
+/// The session's stable path → short-id table: ids (`s1`,
 /// `s2`, …) are assigned on first payable use and stay stable for the
 /// session; `announced` remembers which ids the client has already seen a
 /// `symbols` preamble for, so later answers back-reference without
@@ -890,9 +1003,9 @@ pub(crate) struct Drain<'a> {
     pub sdk_root: &'a Path,
     /// The analyzed view's raw diagnostic set (engine-canonical order).
     pub diagnostics: &'a [dartq_diagnostics::Diagnostic],
-    /// The shared analyze entries (uri + converted LSP diagnostic per
+    /// The shared analyze entries (uri + converted wire diagnostic per
     /// diagnostic of this view), consumed by `dartq/analyze` answers.
-    pub entries: &'a [lsp::AnalyzeEntry],
+    pub entries: &'a [wire::AnalyzeEntry],
     /// The analyzed view's changed-file table for `since` filtering.
     pub changes: &'a Changes<'a>,
     /// The session's current delta cursor, echoed by delta answers.
@@ -935,6 +1048,8 @@ pub(crate) fn answer(drain: &Drain<'_>, request: &Request) -> Result<Value, Sess
             since,
             ..
         } => Ok(query_batch_answer(drain, queries, *verbosity, *since)),
+        Request::ResolveAt { file, offset, .. } => resolve_at_answer(drain, file, *offset),
+        Request::Completion { file, offset, .. } => completion_answer(drain, file, *offset),
         Request::Impact {
             target,
             verbosity,
@@ -948,8 +1063,16 @@ pub(crate) fn answer(drain: &Drain<'_>, request: &Request) -> Result<Value, Sess
             sdk,
         } => explain_answer(drain, symbol, *verbosity, *since, sdk.as_deref()),
         Request::Fix { paths, verbosity } => {
-            // The scheduler arm has no host set (the intake dispatch owns
-            // the live one); the built-in rows alone answer here.
+            // Dead on the live wire: the server intercepts `dartq/fix` at
+            // intake (the fix-worker dispatch owns the live plugin hosts,
+            // so the real answer carries them) before the `is_command` arm
+            // could stage it here. The arm stays for match exhaustiveness
+            // and answers with the built-in rows alone; a debug hit means
+            // the intake interception regressed.
+            debug_assert!(
+                false,
+                "Request::Fix reached the scheduler: `dartq/fix` must be intercepted at intake"
+            );
             let mut hosts = fix::PluginHosts::empty();
             fix_answer(paths, *verbosity, &mut hosts, drain.sdk_root)
         }
@@ -995,7 +1118,7 @@ fn delta_row(
 }
 
 // ---------------------------------------------------------------------------
-// dartq/index — the §15.1 index-build face (resident tallies, CLI path labels)
+// dartq/index — the index-build face (resident tallies, CLI path labels)
 // ---------------------------------------------------------------------------
 
 /// The analyzed view's resident index tallied through the engine's read
@@ -1007,20 +1130,22 @@ fn delta_row(
 /// count, nothing to trim (the impact posture).
 ///
 /// A live library member without a capture is an engine-contract violation:
-/// the tally panics on it like the CLI face does, contained by the read
-/// task's panic boundary.
+/// the tally skips the member — the counts under-report for this read, never
+/// a panic (the read task's panic boundary stays for real faults).
 fn index_answer(drain: &Drain<'_>, _verbosity: Verbosity) -> Value {
     let mut files = 0;
     let mut symbols = 0;
     for (_, members) in drain.engine.libraries() {
         files += members.len();
         for &file in &members {
-            symbols += drain
-                .engine
-                .file_capture(file)
-                .expect("analyzed member")
-                .index
-                .len();
+            // The analyzed member's capture is the engine contract; a miss
+            // is a pairing violation — the member contributes no tally this
+            // read, never a panic.
+            debug_assert!(drain.engine.file_capture(file).is_some(), "analyzed member");
+            let Some(capture) = drain.engine.file_capture(file) else {
+                continue;
+            };
+            symbols += capture.index.len();
         }
     }
     let mut libraries = 0;
@@ -1039,16 +1164,18 @@ fn index_answer(drain: &Drain<'_>, _verbosity: Verbosity) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// dartq/analyze — the LSP-native pull face
+// dartq/analyze — the diagnostics pull face
 // ---------------------------------------------------------------------------
 
 /// The merged diagnostic set of the analyzed view. Compact keeps the
-/// entry shape (uri + LSP diagnostic); minimal keeps the red line (code +
+/// entry shape (uri + wire diagnostic); minimal keeps the red line (code +
 /// location, here `uri` + `range`); full equals compact plus the short-id
-/// economics over entry URIs. Rows keep the CLI analyze face's
-/// severity-first printed order (the entries are sorted where the read
-/// task builds them); the other faces mirror the engine's canonical
-/// (file, offset) order.
+/// economics over entry URIs. The compact/full rows and the envelope come
+/// from the wire-shape module (`crate::wire`) — the frozen pull-face
+/// shapes — plus the session economics here.
+/// Rows keep the CLI analyze face's severity-first printed order (the
+/// entries are sorted where the read task builds them); the other faces
+/// mirror the engine's canonical (file, offset) order.
 pub(crate) fn analyze_answer(drain: &Drain<'_>, verbosity: Verbosity) -> Value {
     let diagnostics: Vec<Value> = drain
         .entries
@@ -1059,13 +1186,11 @@ pub(crate) fn analyze_answer(drain: &Drain<'_>, verbosity: Verbosity) -> Value {
                 "code": entry.diagnostic.code,
                 "range": entry.diagnostic.range,
             }),
-            Verbosity::Compact | Verbosity::Full => {
-                serde_json::to_value(entry).expect("analyze entry serializes")
-            }
+            Verbosity::Compact | Verbosity::Full => crate::wire::row(entry),
         })
         .collect();
     session_answer(
-        json!({ "schema_version": SCHEMA_VERSION, "diagnostics": diagnostics }),
+        crate::wire::envelope(&diagnostics),
         verbosity,
         None,
         drain,
@@ -1105,7 +1230,7 @@ fn check_row(
             "line": line,
             "column": column,
             "length": diagnostic.range.length,
-            "message": diagnostic.message,
+            "message": diagnostic.message.as_str(),
         }),
     }
 }
@@ -1197,7 +1322,7 @@ fn query_answer(
     query_answer_shaped(drain, name, run, verbosity, since)
 }
 
-/// The `dartq/queryBatch` answer (PRD §15.8.4): one frozen v1 query
+/// The `dartq/queryBatch` answer: one frozen v1 query
 /// envelope per `(item, kind)` pair — request order, item order then kind
 /// order — every pair walking the session's already-built graph, which is
 /// the round trip's whole point (one graph build amortized across N
@@ -1220,13 +1345,14 @@ fn query_batch_answer(
 
 /// The since filter and tier shaping over an already-built query run: a
 /// delta answer keeps only the rows whose file changed since the cursor and
-/// echoes it; the minimal tier drops the convenience spellings (the
-/// declarations' `container`, the references' `qualified`); compact is the
-/// CLI JSON face verbatim (the shared shaper, which stamps
-/// `schema_version`); full adds nothing else (the canonical table lists no
-/// full-only query fields besides the session ones, and the rows' paths
-/// stay spelled out — the module docs' symbol-table note: the published
-/// `symbols` field pins `label|name` values).
+/// echoes it. Every tier — minimal included — shapes through the shared
+/// `to_json_at_tier` (the CLI JSON face's one implementation, #1556: the
+/// package-form label projection is tier-agnostic, so the daemon's answers
+/// cannot drift from the CLI's per tier); full adds nothing else (the
+/// canonical table lists no full-only query fields besides the session
+/// ones, and the rows' paths stay spelled out — the module docs'
+/// symbol-table note: the published `symbols` field pins `label|name`
+/// values).
 fn query_answer_shaped(
     drain: &Drain<'_>,
     name: &str,
@@ -1256,58 +1382,192 @@ fn query_answer_shaped(
         run.dependencies
             .retain(|row| drain.changes.changed_since(Path::new(&row.path), since));
     }
-    match verbosity {
-        // Canonical query table: minimal drops the convenience fields
-        // (declarations[].container, references[].qualified) and the
-        // reserved kind arrays (non-locating detail sections — the frozen
-        // tier table); the row locators stay.
-        Verbosity::Minimal => {
-            let declarations: Vec<Value> = run
-                .decls
-                .iter()
-                .map(|decl| {
-                    let (line, column) = run.layout.line_col(decl.file, decl.range.offset);
-                    json!({
-                        "file": run.layout.file_path(decl.file).display().to_string(),
-                        "kind": decl_kind_name(decl.kind),
-                        "name": decl.name,
-                        "line": line,
-                        "column": column,
-                        "length": decl.range.length,
-                    })
-                })
-                .collect();
-            let references: Vec<Value> = run
-                .refs
-                .iter()
-                .map(|reference| {
-                    json!({
-                        "target_file": run.layout.file_path(reference.target_file).display().to_string(),
-                        "kind": ref_kind_name(reference.kind),
-                        "offset": reference.range.offset,
-                        "length": reference.range.length,
-                    })
-                })
-                .collect();
-            let mut answer = json!({
-                "schema_version": SCHEMA_VERSION,
-                "name": name,
-                "declarations": declarations,
-                "references": references,
-            });
-            if since.is_some() {
-                answer["since"] = json!(drain.cursor);
-            }
-            answer
-        }
-        Verbosity::Compact | Verbosity::Full => {
-            session_answer(query::to_json(&run, name), verbosity, since, drain, &[])
-        }
+    let mut answer = query::to_json_at_tier(&run, name, verbosity);
+    if since.is_some() {
+        answer["since"] = json!(drain.cursor);
     }
+    answer
 }
 
 // ---------------------------------------------------------------------------
-// dartq/impact — the §15.4 report (tier-invariant per the canonical tables)
+// dartq/resolveAt — the position-resolution face (daemon-native; the
+// offset-keyed substrate the cursor-interactive faces share)
+// ---------------------------------------------------------------------------
+
+/// The `dartq/resolveAt` answer: what the analyzed view's maintained index
+/// rows hold under `offset` (UTF-16 code units — the engine's external
+/// convention, the same units the query rows' `offset` fields carry) in
+/// `file`. The engine face carries the full contract (freshness, answer
+/// domain, cost shape — `Engine::resolve_at`); this layer adds the wire
+/// shape: `hit` is `null` for every uncovered position (a non-identifier,
+/// an unresolved use, an out-of-range offset — none is a params error), and
+/// a hit carries the identifier's own span plus the target declaration's
+/// identity and name span — goto-def's target, hover's subject, rename's
+/// anchor. Tier-invariant: every field is a locator or a verdict (the
+/// impact posture).
+///
+/// # Errors
+///
+/// A `file` the analyzed view never interned (the fail-loud rule for a
+/// typo'd path; a resident-but-unanalyzed file answers `hit: null` like
+/// every other uncovered position).
+fn resolve_at_answer(drain: &Drain<'_>, file: &Path, offset: u32) -> Result<Value, SessionError> {
+    let Some(file_id) = drain.engine.file_table().try_file_id(file) else {
+        return Err(SessionError::InvalidParams(format!(
+            "not a resident file: {}",
+            file.display()
+        )));
+    };
+    // Engine answers carry ids the file table issued; a `forget` between
+    // the analyze and this read severs the id's spelling (the immortal-id
+    // contract). The locator degrades to the daemon's `<unknown>` spelling
+    // (the server's client-label convention), never a panic.
+    let path_of = |id| match drain.engine.file_table().path(id) {
+        Some(path) => path.display().to_string(),
+        None => "<unknown>".to_owned(),
+    };
+    let hit = match drain.engine.resolve_at(file_id, offset) {
+        // The verdict slot: an uncovered position stays an explicit null (not omit-on-absent).
+        None => Value::Null,
+        Some(dartq_engine::PositionAnswer::Declaration(decl)) => {
+            let mut hit = json!({
+                "kind": "declaration",
+                "name": decl.name,
+                "decl_kind": decl_kind_name(decl.kind),
+                "file": path_of(decl.file),
+                "range": { "offset": decl.range.offset, "length": decl.range.length },
+            });
+            // The convenience column is omit-on-absent: a top-level
+            // declaration has no container, so the key drops rather than
+            // spelling a null.
+            if let Some(container) = decl.container {
+                hit["container"] = json!(container);
+            }
+            hit
+        }
+        Some(dartq_engine::PositionAnswer::Use(use_hit)) => {
+            let mut hit = json!({
+                "kind": "reference",
+                "name": use_hit.name,
+                "decl_kind": decl_kind_name(use_hit.decl_kind),
+                "file": path_of(use_hit.target_file),
+                "range": { "offset": use_hit.range.offset, "length": use_hit.range.length },
+                "target_range": {
+                    "offset": use_hit.target_range.offset,
+                    "length": use_hit.target_range.length,
+                },
+                "ref_kind": ref_kind_name(use_hit.kind.into()),
+                "qualified": use_hit.qualified,
+            });
+            if let Some(container) = use_hit.container {
+                hit["container"] = json!(container);
+            }
+            if let Some(prefix) = use_hit.prefix {
+                hit["prefix"] = json!(prefix);
+            }
+            hit
+        }
+    };
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "file": file.display().to_string(),
+        "offset": offset,
+        "hit": hit,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// dartq/completion — the built-in completion face (the visible-name set the
+// maintained index proves at one cursor; the charter has no plugin escape)
+// ---------------------------------------------------------------------------
+
+/// The stable machine spelling of a completion origin.
+#[must_use]
+fn completion_origin_name(origin: dartq_engine::CompletionOrigin) -> &'static str {
+    match origin {
+        dartq_engine::CompletionOrigin::Declaration => "declaration",
+        dartq_engine::CompletionOrigin::Reference => "reference",
+        dartq_engine::CompletionOrigin::Prefix => "prefix",
+    }
+}
+
+/// The `dartq/completion` answer: the candidates the analyzed view's
+/// maintained index proves visible at `offset` (UTF-16 code units — the
+/// engine's external convention) in `file`, prefix-filtered by the
+/// identifier fragment the engine extracts from the analyzed text at the
+/// cursor. The engine face carries the full contract (freshness, candidate
+/// domain, the M1 member/local boundary, cost shape —
+/// `Engine::complete_at`); this layer adds the wire shape. Tier-invariant:
+/// every field is a locator or a verdict (the impact posture).
+///
+/// # Errors
+///
+/// A `file` the analyzed view never interned (the fail-loud rule for a
+/// typo'd path, the `dartq/resolveAt` rule). An uncovered position — a
+/// past-end offset, a file cold in the view, a member-access cursor —
+/// answers the empty set, never an error.
+fn completion_answer(drain: &Drain<'_>, file: &Path, offset: u32) -> Result<Value, SessionError> {
+    let Some(file_id) = drain.engine.file_table().try_file_id(file) else {
+        return Err(SessionError::InvalidParams(format!(
+            "not a resident file: {}",
+            file.display()
+        )));
+    };
+    // Engine answers carry ids the file table issued; a `forget` between
+    // the analyze and this read severs the id's spelling (the immortal-id
+    // contract). The locator degrades to the daemon's `<unknown>` spelling
+    // (the server's client-label convention), never a panic.
+    let path_of = |id| match drain.engine.file_table().path(id) {
+        Some(path) => path.display().to_string(),
+        None => "<unknown>".to_owned(),
+    };
+    let answer = drain.engine.complete_at(file_id, offset);
+    let (prefix, items) = match &answer {
+        Some(answer) => (
+            answer.prefix,
+            answer
+                .items
+                .iter()
+                .map(|item| {
+                    let mut row = json!({
+                        "name": item.name,
+                        "origin": completion_origin_name(item.origin),
+                    });
+                    // Omit-on-absent identity columns: a prefix item is a
+                    // wire word, not a declaration — no decl_kind,
+                    // container, file, or range — so those keys drop
+                    // rather than spelling nulls.
+                    if let Some(kind) = item.decl_kind {
+                        row["decl_kind"] = json!(decl_kind_name(kind));
+                    }
+                    if let Some(container) = item.container {
+                        row["container"] = json!(container);
+                    }
+                    if let Some(file) = item.file {
+                        row["file"] = json!(path_of(file));
+                    }
+                    if let Some(range) = item.range {
+                        row["range"] = json!({ "offset": range.offset, "length": range.length });
+                    }
+                    row
+                })
+                .collect(),
+        ),
+        // The uncovered set (a cold file, a past-end offset): the empty
+        // answer, never an error.
+        None => ("", Vec::new()),
+    };
+    Ok(json!({
+        "schema_version": SCHEMA_VERSION,
+        "file": file.display().to_string(),
+        "offset": offset,
+        "prefix": prefix,
+        "items": items,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// dartq/impact — the report (tier-invariant per the canonical tables)
 // ---------------------------------------------------------------------------
 
 fn impact_answer(
@@ -1327,6 +1587,11 @@ fn impact_answer(
                 path.display()
             )),
             impact_core::ImpactError::Step(step) => step.into(),
+            // The environments axis's tiers (the enum's contract): an
+            // unusable context input is the caller's params, a failed axis
+            // run is internal.
+            impact_core::ImpactError::Usage(message) => SessionError::InvalidParams(message),
+            impact_core::ImpactError::Internal(message) => SessionError::Internal(message),
         })?;
     if let Some(since) = since {
         // Delta mode: affected rows and test rows carry their file path
@@ -1345,9 +1610,12 @@ fn impact_answer(
     }
     // Tier-invariant: every report field is a locator or a verdict — the
     // canonical table trims nothing (the report carries its own
-    // `schema_version`). Its library labels stay unsubstituted: each row
-    // names a distinct library, so short ids save nothing.
-    let mut value = serde_json::to_value(&report).expect("ImpactReport serializes");
+    // `schema_version`). The serialization rides the shared producer
+    // shaper (`impact_core::to_json`, #1605): one implementation for the
+    // CLI and the daemon, schema-validated at birth. Its library labels
+    // stay unsubstituted: each row names a distinct library, so short ids
+    // save nothing.
+    let mut value = impact_core::to_json(&report);
     if since.is_some() {
         value["since"] = json!(drain.cursor);
     }
@@ -1355,7 +1623,7 @@ fn impact_answer(
 }
 
 // ---------------------------------------------------------------------------
-// dartq/explain — the §15.3 AI report (disk view, the compat posture)
+// dartq/explain — the AI report (disk view, the compat posture)
 // ---------------------------------------------------------------------------
 
 /// The explain report's path-valued array fields (the short-id economics'
@@ -1363,6 +1631,7 @@ fn impact_answer(
 /// a single occurrence never pays its preamble, so it stays spelled out.
 const EXPLAIN_SPOTS: &[(&str, &str)] = &[
     ("inheritance", "file"),
+    ("interfaces", "file"),
     ("references", "file"),
     ("dependencies", "path"),
     ("affected_tests", "path"),
@@ -1429,10 +1698,10 @@ fn explain_answer(
 }
 
 // ---------------------------------------------------------------------------
-// dartq/fix — the §15.6 patch document (CLI path labels)
+// dartq/fix — the patch document (CLI path labels)
 // ---------------------------------------------------------------------------
 
-/// The fix answer over `hosts`: the §15.6 documents for the discovered
+/// The fix answer over `hosts`: the documents for the discovered
 /// files (built-in lint rows, the engine check pass's semantic rows, and
 /// the plugin rows the hosts returned, every row provenance-tagged) and,
 /// when a host failed, the `errors` list. `sdk` backs the semantic pass's
@@ -1456,7 +1725,7 @@ pub(crate) fn fix_answer(
         .iter()
         // Plugin-only rows are still a patch document (provenance-tagged).
         .filter(|fixes| !fixes.fixes.is_empty() || !fixes.plugin.is_empty())
-        // The §15.6 document, all tiers canonical (the writer owns the
+        // The document, all tiers canonical (the writer owns the
         // anchor and provenance rows per tier).
         .map(|fixes| fix::patch_json(fixes, verbosity))
         .collect();
@@ -1475,7 +1744,7 @@ pub(crate) fn fix_answer(
 }
 
 // ---------------------------------------------------------------------------
-// dartq/compat — the §15.5 matrix (CLI path labels)
+// dartq/compat — the matrix (CLI path labels)
 // ---------------------------------------------------------------------------
 
 fn compat_answer(
@@ -1484,25 +1753,25 @@ fn compat_answer(
     sdk_roots: &[PathBuf],
     verbosity: Verbosity,
 ) -> Result<Value, SessionError> {
-    let report = compat_core::compat(root, target, sdk_roots).map_err(|error| match error {
-        CompatError::Usage(message) => SessionError::InvalidParams(message),
-        CompatError::Internal(message) => SessionError::Internal(message),
-    })?;
-    let mut value = serde_json::to_value(&report).expect("CompatReport serializes");
-    if verbosity == Verbosity::Minimal {
-        // Canonical compat table: minimal keeps the verdict + axis identity;
-        // the evidence rows (first_failure / error) drop.
-        for axis in value["matrix"]
-            .as_array_mut()
-            .expect("CompatReport carries a matrix")
-        {
-            if let Some(axis) = axis.as_object_mut() {
-                axis.remove("first_failure");
-                axis.remove("error");
-            }
-        }
+    let (report, notices) =
+        compat_core::compat(root, target, sdk_roots).map_err(|error| match error {
+            CompatError::Usage(message) => SessionError::InvalidParams(message),
+            CompatError::Internal(message) => SessionError::Internal(message),
+        })?;
+    // The axes' version-skew degrade notices (#1311) log on the daemon's
+    // stderr telemetry channel — the RPC answer stays the contract
+    // (no new notification face), and the log line keeps the channel's
+    // `dartq-daemon:` framing around the shared core's notice verbatim.
+    for line in &notices {
+        eprintln!("dartq-daemon: {line}");
     }
-    Ok(value)
+    // The tier cut and the serialization both ride the shared producer
+    // faces (`compat_core::at_verbosity` + `to_json`, #1605) — the same
+    // cut the CLI serves and the same schema-validated birth, no hand-cut
+    // tier second implementation.
+    Ok(compat_core::to_json(&compat_core::at_verbosity(
+        report, verbosity,
+    )))
 }
 
 impl From<AnalyzeError> for SessionError {

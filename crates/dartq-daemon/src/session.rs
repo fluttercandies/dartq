@@ -1,21 +1,21 @@
 //! The session: one [`Runtime`] (the tagless default analysis context plus
-//! every declared configuration fork, PRD §16.2) plus the open-document
-//! overlay, the per-agent overlays (PRD §16.3), the publish-diff baseline,
-//! the delta cursor, and the debounced snapshot sink. All engine and
-//! scheduler calls happen here, synchronously, on the main-loop thread
-//! (CPU-bound work, no lock contention by construction).
+//! every declared configuration fork) plus the per-agent overlays, the
+//! publish-diff baseline, the delta cursor, and the debounced snapshot
+//! sink. All engine and scheduler calls happen here, synchronously, on
+//! the main-loop thread (CPU-bound work, no lock contention by
+//! construction).
 //!
-//! # Task flow (PRD §16.5, §16.6)
+//! # Task flow
 //!
-//! Intake (a notification or request arrives) only *stages* work: overlay
-//! edits enqueue one write task plus the diagnostics read the publish push
-//! rides on, a `dartq/*` request attaches to (or enqueues) one read task,
-//! stamped with the context's epoch at enqueue. Execution
+//! Intake (a notification or request arrives) only *stages* work: a sync
+//! enqueues one write task plus the diagnostics read the publish push rides
+//! on, a `dartq/*` request attaches to (or enqueues) one read task, stamped
+//! with the context's epoch at enqueue. Execution
 //! happens at the single [`Session::service`] drain point, in the
 //! scheduler's writer-priority order — every staged write applies before any
 //! read analyzes, so N batched edits collapse into one apply + one analysis,
 //! and a read enqueued before a write still answers with the post-write
-//! view. `$/cancelRequest` cancels per id (rust-analyzer's posture): the
+//! view. `dartq/cancel` cancels per id (rust-analyzer's posture): the
 //! coalesced read is partitioned — the cancelled id answers
 //! `RequestCancelled`, its co-riders re-attach to a read re-stamped at the
 //! fresh epoch (mirroring the write re-stamp), and when a write survives
@@ -23,7 +23,7 @@
 //! re-stamped with it so the publish diff still drains — an edit+cancel
 //! batch can never leave the client's diagnostics stale.
 //!
-//! # Fix dispatch off the main loop (PRD §14, §15.6)
+//! # Fix dispatch off the main loop
 //!
 //! `dartq/fix` and `dartq/assists` stage like reads — one task per request
 //! on the default context's epoch, `Interactive` (a client waits) — so a
@@ -35,7 +35,7 @@
 //! surface); the main loop keeps serving edits, reads, publishes, and
 //! cancels, wakes on the worker's completion through a session-owned
 //! channel, and posts the answer then. A wall-clock budget
-//! ([`FIX_TIME_BUDGET`]) answers the request even when the worker is still
+//! (`FIX_TIME_BUDGET`) answers the request even when the worker is still
 //! running — the slow-plugin worst case degrades to one abandoned dispatch,
 //! never a wedged session; the late result is discarded when it lands. A
 //! `dartq/fixProgress` notification rides the turn's notification pipeline
@@ -44,9 +44,9 @@
 //! The off-loop invariants: a fix job never blocks the select loop (the
 //! dispatch returns at the spawn — staging, the progress notice, and the
 //! completion drain are the loop's whole duty), and the completion drain
-//! ([`Session::complete_fix`] → `absorb_fix`) is the one mutation point
-//! for fix state: the worker only mails its [`FixMail`]; a cancel or the
-//! [`FIX_TIME_BUDGET`] expiry only flags the in-flight run, and a flagged
+//! (`Session::complete_fix` → `absorb_fix`) is the one mutation point
+//! for fix state: the worker only mails its `FixMail`; a cancel or the
+//! `FIX_TIME_BUDGET` expiry only flags the in-flight run, and a flagged
 //! run's late mail drops without answering. The worker body is itself a
 //! panic boundary (#947 F5): a panicking job answers `INTERNAL_ERROR`,
 //! logs, and still mails — the slot frees and the host set comes home.
@@ -57,19 +57,24 @@
 //! reflects the disk state the worker observed, not the overlays a
 //! concurrent analysis sees.
 //!
-//! # Context routing (PRD §16.2)
+//! # Context routing
 //!
 //! The runtime holds one context per declared `dartq.yaml` row (assembled
 //! at the shell edge — SDK and packages per context, every store wired to
 //! one shared [`dartq_engine::ContentPool`] through
-//! [`dartq_engine::pooled_memory_store`], the #483 construction contract)
+//! [`dartq_engine::pooled_memory_store`], the #483 construction contract;
+//! [`SessionRuntime::pooled_mapped_store`] is the default-on posture
+//! rebinding every context's store to one shared
+//! [`dartq_engine::MappedContentPool`]
+//! at assembly, same identity contract over page-cache-backed slots;
+//! `false` opts out and keeps the caller-built stores)
 //! plus the tagless default. A `dartq/*` request's `context` tag routes it
-//! to that context's engine; a base write (an LSP edit, a watch sync, an
-//! overlay commit) fans out to every context — content is not a fork
+//! to that context's engine; a base write (a `dartq/sync`, a watch batch,
+//! an overlay commit) fans out to every context — content is not a fork
 //! dimension — and only the default context's base analysis drains the
-//! publish diff (the editor's view).
+//! publish diff (the resident diagnostics view).
 //!
-//! # Agent views (PRD §16.3)
+//! # Agent views
 //!
 //! `overlay.set`/`overlay.clear` stage per-agent `path → content` deltas on
 //! the session (bounded: cleared on teardown, capped count). A request
@@ -98,7 +103,7 @@
 //! per-agent deltas, at the cost of re-analyzing the overlapped libraries
 //! per view switch — bounded by the overlay size, never the workspace.
 //!
-//! # Delta cursor (PRD §15.8)
+//! # Delta cursor
 //!
 //! A per-session monotonic counter bumps once per applied content change
 //! (a base overlay apply, an `overlay.set`); the changed map records each
@@ -129,7 +134,7 @@
 //! panic there skips the cycle's findings but keeps the group's engine
 //! rows flowing, and it is attributable, so it penalizes immediately.
 //! Repeat offenders, and any panic that keeps recurring on the
-//! plugin-bearing group ([`PLUGIN_PANIC_LIMIT`] strikes, never reset),
+//! plugin-bearing group (`PLUGIN_PANIC_LIMIT` strikes, never reset),
 //! disable the whole plugin set for the session through the same
 //! one-shot-crash-row degrade the transport's restart-budget exhaustion
 //! uses. Nothing is masked: the shell's panic hook reports every panic
@@ -137,14 +142,30 @@
 //! recovery on stderr, so no payload is printed twice; the affected
 //! requests see the internal-error tier.
 //!
-//! # Tier mapping (PRD §16.5 — the one place it is defined)
+//! # The contained-panic publish fallback (#1310)
+//!
+//! A panic on the publish-carrying base group defers the publish diff; the
+//! baseline contract retries it on the next intake. When the client has
+//! nothing further to send — the cold-start shape where the whole opening
+//! batch is consumed by the very turn that panicked — that deferral would
+//! sit publishless forever. So the containment schedules ONE self-driven retry
+//! turn (`PUBLISH_RETRY_DELAY` after the panic, fired through the main
+//! loop's deadline-bounded receive — no timer thread): the default
+//! context's publish-carrying read re-enqueues and drains with no client
+//! input. The retry is one-shot per event: if its own analysis is
+//! contained too, self-driven retries stop for that content until the next
+//! applied write lifts the stop (a deterministically panicking corpus must
+//! not churn re-analyses), and the session degrades back to the
+//! next-intake behavior with one stderr line per cycle.
+//!
+//! # Tier mapping
 //!
 //! A task's [`Tier`] is fixed where it enters the scheduler, at enqueue: a
 //! read task is `Interactive` only when a `dartq/*` request created it (a
 //! client waits on the answer); everything else is `Normal` — overlay
-//! writes (client edits and watch syncs alike), the publish-carrying reads
-//! edits and watch changes enqueue, and the `initialized` sweep's first
-//! analysis. `Background` is the engine's slot for indexing/prewarm
+//! writes (`dartq/sync` and watch batches alike), the publish-carrying
+//! reads they enqueue, and the startup sweep's first analysis.
+//! `Background` is the engine's slot for indexing/prewarm
 //! producers the daemon does not run yet. Tier never changes after enqueue:
 //! a request attaching to an already-queued read keeps that read's tier
 //! (drain order is unaffected while one read serves the whole turn anyway;
@@ -163,21 +184,24 @@ use std::collections::hash_map::Entry;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use dartq_commands::Verbosity;
 use dartq_commands::discover::DiscoverError;
 use dartq_commands::fix::{self, PluginHosts};
 use dartq_commands::layout::{path_key, severity_rank};
-use dartq_commands::workspace::WorkspaceAdvisory;
-use dartq_diagnostics::{Diagnostic, FileId, Severity};
+use dartq_commands::workspace::{WorkspaceAdvisory, engine_config_with_advisory};
+use dartq_diagnostics::{DARTQ_SOURCE_REJECTED, Diagnostic, FileId};
 use dartq_engine::{
     CancellationToken, Cancelled, ContextConfig, ContextId, Engine, EngineConfig, EngineError,
-    OverlayChange, PersistedFacts, Runtime, Tier,
+    EngineEvent, OverlayChange, PersistedFacts, Runtime, Tier,
 };
-use rustc_hash::FxHashMap;
+use dartq_pub::PackageConfig;
+use dartq_source::{MAX_SOURCE_BYTES, SourceText};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::json;
 use thiserror::Error;
 
@@ -185,9 +209,9 @@ use dartq_snapshot::{SnapshotConfig, SnapshotStore};
 
 use crate::commands::{self, Request};
 use crate::jsonrpc::{Notification, RequestId};
-use crate::lsp;
 use crate::plugins::{self, PluginSet};
 use crate::uri;
+use crate::wire;
 
 /// The debounce window between the last overlay apply and the snapshot
 /// generation save (#306): 500 ms. While a save is pending the main loop's
@@ -195,11 +219,54 @@ use crate::uri;
 /// wakes to save — no timer thread.
 pub(crate) const SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(500);
 
-/// The per-runtime memory budget every session context runs under (PRD
-/// §17.1's `memory.limit_mib` default, 2048 in the config sample): over
+/// The per-runtime memory budget every session context runs under (the
+/// `memory.limit_mib` default, 2048 in the config sample): over
 /// budget, each context's engine degrades tier-by-tier and reports each
 /// step as `dartq/memory_degraded` instead of growing without bound.
 const DEFAULT_MEMORY_LIMIT_MIB: u64 = 2048;
+
+/// The runtime a session runs under: the CLI shell's runtime flags
+/// (`--memory-limit`/`--cache-size-limit`/`--trace-events`, #1088),
+/// applied to the context engines at assembly. The default is the
+/// standing posture — the 2048 MiB budget, no trace sink, no L3
+/// content-store cap, the shared mapped store armed (#1842).
+pub struct SessionRuntime {
+    /// Per-context memory budget in MiB: every context arms
+    /// the sampled-RSS ladder at assembly; over budget the engine degrades
+    /// tier-by-tier and reports each step as `dartq/memory_degraded`.
+    pub memory_limit_mib: u64,
+    /// The JSONL trace sink: one sink is one writer, so it arms the
+    /// default (tagless) context's engine only — declared extra contexts
+    /// run untraced. `None` constructs nothing and touches no event path.
+    pub trace: Option<dartq_engine::event::TraceSink>,
+    /// The L3 content-store cap in bytes, armed on every context
+    /// when set. `None` keeps the store unarmed — the daemon's standing
+    /// posture (the analyze face arms it unconditionally at the 10 GiB
+    /// default).
+    pub content_store_limit: Option<u64>,
+    /// The shared mapped-store posture, default on (#1842): assembly
+    /// rebinds every context's content store to
+    /// [`dartq_engine::pooled_mmap_store`] over ONE shared
+    /// [`dartq_engine::MappedContentPool`] — each distinct content is held
+    /// once across all contexts through one refcounted slot, and canonical
+    /// file text stays on evictable page-cache mappings instead of the
+    /// anonymous heap. The configs' own `store` fields are replaced (the
+    /// flag owns store construction). `false` opts out and keeps the
+    /// caller-built stores as-is — the A/B posture for the store
+    /// decomposition comparison.
+    pub pooled_mapped_store: bool,
+}
+
+impl Default for SessionRuntime {
+    fn default() -> Self {
+        Self {
+            memory_limit_mib: DEFAULT_MEMORY_LIMIT_MIB,
+            trace: None,
+            content_store_limit: None,
+            pooled_mapped_store: true,
+        }
+    }
+}
 
 /// The read-parallel contract (#487): a view group's coalesced requests
 /// answer across the shared engine view on the answer workers, so the
@@ -259,7 +326,7 @@ const MAX_OVERLAY_BYTES: usize = 64 << 20;
 /// The session-wide staged-overlay byte ceiling (#962 P3-2): the sum of
 /// every live agent's staged `file.bytes` past it is rejected
 /// `INVALID_PARAMS`. The per-agent cap alone leaves a 16 GiB theoretical
-/// residency ([`MAX_AGENTS`] × [`MAX_OVERLAY_BYTES`]); 256 MiB — the order
+/// residency (`MAX_AGENTS` × `MAX_OVERLAY_BYTES`); 256 MiB — the order
 /// of the store's GC watermark — bounds the whole staged table to a few
 /// hundred MiB worst case, while real agent traffic (KiB-scale documents)
 /// never approaches it.
@@ -274,14 +341,20 @@ const MAX_OVERLAY_TOTAL_BYTES: usize = 256 << 20;
 /// bookkeeping at ~150 B/entry, orders above any real editing session.
 const MAX_DELTA_PATHS: usize = 65_536;
 
-/// The open-document table's cap (#947 F8): `opened` grows one entry per
-/// distinct `didOpen`, and only `didClose` removed it before. Real clients
-/// hold tens of open editors; `4_096` is orders above that (≈ 0.5 MiB of
-/// bookkeeping), so the least-recently-touched eighth evicts only under a
-/// broken-client open storm. An evicted document degrades to on-disk
-/// truth: its publishes lose the version, and a watch sync may resync its
-/// disk bytes — the documented cost of the bound.
-const MAX_OPEN_DOCUMENTS: usize = 4_096;
+/// The session live-path ceiling (#1887 D1): the set-content intake
+/// refuses any batch that would push the engine's interned-path count past
+/// it, answering `INVALID_PARAMS`. `FileTable` ids are immortal — every
+/// distinct admitted path interns one forever and raises the slot arenas'
+/// floor — and the memory-budget ladder sheds only recomputable caches, so
+/// this admission gate is the structural bound the ladder cannot be. The
+/// count is a session-lifetime count of distinct admitted paths (read off
+/// the engine's own intern count, no parallel counter), not a per-delta cap
+/// ([`MAX_DELTA_PATHS`] is that). 262,144 paths — 2.6× the 100k-file
+/// release corpus: a legit workspace plus normal edits never trips it;
+/// only adversarial distinct-path churn does. The overlay faces need no
+/// gate: `MAX_AGENTS × MAX_OVERLAY_FILES` (16,384) is already a fixed
+/// structural bound an order below this ceiling.
+const SESSION_MAX_LIVE_PATHS: usize = 262_144;
 
 /// The repeat-offender ladder (#690): unattributable panics on the
 /// plugin-bearing group (the default context's base view) tolerate this
@@ -290,7 +363,17 @@ const MAX_OPEN_DOCUMENTS: usize = 4_096;
 /// never resets, mirroring the transport's never-resetting restart budget.
 const PLUGIN_PANIC_LIMIT: u32 = 3;
 
-/// The wall-clock ceiling for one fix/assists dispatch (PRD §14.3's
+/// The contained-panic publish fallback's one-shot retry delay (#1310): how
+/// long the session waits after a base-analysis panic before the deferred
+/// publish turn re-runs without client input. Short on purpose — the panic
+/// already cost a full analysis, and when no further intake is coming this
+/// retry is the client's only path to diagnostics — and bounded by
+/// construction: one pending retry at a time, one shot per panic event (a
+/// retry that is contained again stops the ladder until the next applied
+/// write).
+const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// The wall-clock ceiling for one fix/assists dispatch (
 /// isolation posture at session granularity). The manifests' own budgets
 /// (`request_ms × (retries + 1)`, defaults 10 s × 4) bound each plugin
 /// round trip; their sum over N plugins × M hits is unbounded, so the
@@ -302,7 +385,19 @@ const PLUGIN_PANIC_LIMIT: u32 = 3;
 /// hangs on one.
 const FIX_TIME_BUDGET: Duration = Duration::from_mins(2);
 
-/// One agent's staged view (PRD §16.3): the files whose content the agent's
+/// The fix workers' completion-mailbox capacity. One dispatch runs at a
+/// time (the host set is one exclusive surface) and its slot frees only
+/// when the main loop consumes the completion mail, so one in-flight mail
+/// is the structural ceiling; the bound turns that invariant into an
+/// enforced one — a producer beyond it meets the worker's blocking send
+/// (backpressure into the main loop's per-turn drain), never unbounded
+/// mailbox growth. The drain is guaranteed while the session lives (every
+/// loop turn runs the completion drain), and a session gone drops the
+/// receiver, so a late send fails harmlessly and the mail's host set tears
+/// down kill-only in its `Drop`.
+const MAX_QUEUED_FIX_MAILS: usize = 1;
+
+/// One agent's staged view: the files whose content the agent's
 /// requests see instead of the base view. Base bytes are never stored here —
 /// they are captured from the engine at wear time and restored through the
 /// turn's `worn` scratch, so a base edit between staging and analysis can
@@ -317,14 +412,6 @@ struct OverlayFile {
     /// The session cursor at which this content was staged (the delta
     /// answer's changed-file cursor for this agent's view of the path).
     set_at: u64,
-}
-
-/// One client-opened document's bookkeeping: the version publishes echo,
-/// plus the LRU stamp the cap eviction scans (#947 F8).
-struct OpenDocument {
-    version: i64,
-    /// Session-monotonic edit stamp — the most recent `queue_edit` touch.
-    touched: u64,
 }
 
 /// The base content a worn path must be restored to.
@@ -362,19 +449,84 @@ impl From<Cancelled> for SessionError {
     }
 }
 
-/// One pending `textDocument/publishDiagnostics` push.
+/// One pending `dartq/diagnostics` push: the file's whole current
+/// diagnostic set (a push replaces the client's set for that URI).
 #[derive(Debug)]
 pub struct Publish {
     pub uri: String,
-    pub version: Option<i64>,
-    pub diagnostics: Vec<lsp::Diagnostic>,
+    pub diagnostics: Vec<wire::Diagnostic>,
+}
+
+/// The advisory's single wire row (the publish push and the `dartq/analyze`
+/// pull share it): an INFO row anchored at the config path — the CLI
+/// analyze face's anchor — carrying the assembly's message. The empty range
+/// is the row's whole extent: the advisory names a file, not a span.
+fn advisory_row(advisory: &WorkspaceAdvisory) -> wire::Diagnostic {
+    wire::Diagnostic {
+        range: wire::Range {
+            start: wire::Position {
+                line: 0,
+                character: 0,
+            },
+            end: wire::Position {
+                line: 0,
+                character: 0,
+            },
+        },
+        severity: 3,
+        code: advisory.code().name.to_owned(),
+        source: "dartq".into(),
+        message: advisory.message(),
+    }
+}
+
+/// The span-capacity rejection's single wire row (#1549): an INFO row
+/// anchored at the rejected file — the empty range names a file, not a
+/// span, the advisory row's same posture. The message carries the CLI
+/// analyze face's rejection clause (`rejection_notice`, #1543) minus the
+/// path: the row's URI field already carries it.
+fn rejection_row() -> wire::Diagnostic {
+    wire::Diagnostic {
+        range: wire::Range {
+            start: wire::Position {
+                line: 0,
+                character: 0,
+            },
+            end: wire::Position {
+                line: 0,
+                character: 0,
+            },
+        },
+        severity: 3,
+        code: DARTQ_SOURCE_REJECTED.name.to_owned(),
+        source: "dartq".into(),
+        message: format!(
+            "source exceeds the {MAX_SOURCE_BYTES}-byte analysis capacity; \
+             the file is excluded from analysis"
+        ),
+    }
+}
+
+/// The apply-path event collector (#1549): `SourceRejected` is the one
+/// event the session observes — every other kind keeps its drop-here
+/// posture — collected as `(path, rejected byte size)` pairs for
+/// [`Session::note_rejections`]. Shared by every apply site (the write
+/// task's overlay apply, the read's analysis, the wear and base-restore
+/// barriers), so the rejection policy lives in exactly one match arm.
+fn rejection_collector(out: &mut Vec<(PathBuf, u64)>) -> impl FnMut(EngineEvent) + '_ {
+    move |event| {
+        if let EngineEvent::SourceRejected { path, len } = event {
+            out.push((path, len));
+        }
+    }
 }
 
 /// What one [`Session::service`] turn produced, in drain-execution order.
 #[derive(Default)]
 pub struct Turn {
-    /// Publishes from the turn's read task (a no-op diff when nothing
-    /// changed).
+    /// Publishes from the turn's base analysis: the per-file diagnostic
+    /// diff against the published baseline — plus the span-capacity
+    /// rejection advisories the turn's apply paths staged (#1549).
     pub publishes: Vec<Publish>,
     /// Server→client notifications the turn staged (the fix dispatch's
     /// progress notice; the same pipeline the publishes ride).
@@ -406,7 +558,7 @@ struct PendingRead {
 /// the wire parameters, paths already resolved against the workspace root.
 #[derive(Debug)]
 pub(crate) enum FixJob {
-    /// The §15.6 patch documents over the requested paths (the built-in
+    /// The patch documents over the requested paths (the built-in
     /// lint rows, the semantic pass's rows, and the hosts' proposals).
     Fix {
         paths: Vec<PathBuf>,
@@ -460,7 +612,7 @@ struct FixRun {
     /// Set once the budget expiry answered; the late completion is then
     /// discarded (no second answer for one request id).
     expired: bool,
-    /// Set by a `$/cancelRequest` while the dispatch ran: the worker cannot
+    /// Set by a `dartq/cancel` while the dispatch ran: the worker cannot
     /// be stopped (it owns the host set), so the late completion drops and
     /// the id answers `Cancelled` at the next drain.
     cancelled: bool,
@@ -472,10 +624,49 @@ pub(crate) struct FixMail {
     outcome: Result<serde_json::Value, SessionError>,
 }
 
+/// Test-only one-shot trigger for the answer-worker join degrade pin: a
+/// spawned worker's panic must escape the per-answer guard to exercise the
+/// `join` degrade, which no RPC input can conjure deterministically. Arms
+/// record the session thread's id; only a different thread (a spawned
+/// answer worker) consumes the trigger — the session thread's own drain
+/// loop must never fire it, or the panic would propagate at the group
+/// boundary instead of exercising the join. Compiled out outside `cfg(test)`.
+#[cfg(test)]
+mod answer_worker_panic_probe {
+    use std::sync::Mutex;
+    use std::thread::ThreadId;
+
+    /// `Some` while armed, holding the arming (session) thread's id.
+    static ARMED: Mutex<Option<ThreadId>> = Mutex::new(None);
+
+    /// Arms one spawned answer worker to panic on its next received job.
+    pub(super) fn arm() {
+        *ARMED.lock().expect("live probe mutex") = Some(std::thread::current().id());
+    }
+
+    /// Disarms without firing: a turn that starved the armed worker must
+    /// not leak the trigger into a later turn's answer fan-out.
+    pub(super) fn disarm() {
+        *ARMED.lock().expect("live probe mutex") = None;
+    }
+
+    /// Fires (and consumes) on a thread other than the arming thread only.
+    pub(super) fn take() -> bool {
+        let mut armed = ARMED.lock().expect("live probe mutex");
+        match *armed {
+            Some(owner) if owner != std::thread::current().id() => {
+                *armed = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// The worker-side execution of one fix job — the same faces the intake
 /// dispatch ran inline before the staging moved them off the main loop.
-/// `sdk` is the session's resolved SDK root, backing the fix face's
-/// semantic engine pass.
+/// `sdk` is the session's resolved SDK root, backing the fix and assists
+/// faces' semantic engine pass.
 fn run_fix_job(
     job: FixJob,
     hosts: &mut PluginHosts,
@@ -490,7 +681,7 @@ fn run_fix_job(
             offset,
             length,
             verbosity,
-        } => fix::assists(&path, offset, length, hosts)
+        } => fix::assists(&path, offset, length, hosts, Some(sdk))
             .map(|answer| fix::assists_json(&answer, verbosity))
             .map_err(|error| match error {
                 DiscoverError::Missing(path) => {
@@ -508,8 +699,14 @@ fn run_fix_job(
 /// every case, so the slot frees and the hosts come home (ownership of
 /// `hosts` stays outside the guarded closure — only its `&mut` borrows in —
 /// so even a panic cannot lose the set; a panicking set is torn down
-/// kill-only by its `Drop` on the mail's eventual consumption). `sdk` is
-/// the session's resolved SDK root (the semantic pass's engine assembly).
+/// kill-only by its `Drop` on the mail's eventual consumption). The mailbox
+/// is bounded (`MAX_QUEUED_FIX_MAILS`) and the send waits for capacity
+/// rather than dropping the mail — a dropped mail would strand the dispatch
+/// slot and the host set forever — and the wait is backed by the main
+/// loop's guaranteed per-turn drain; only a disconnected receiver (the
+/// session is gone) discards the mail. `sdk` is the session's resolved SDK
+/// root (the semantic pass's engine assembly).
+#[expect(clippy::needless_pass_by_value)] // the spawned worker owns its config; the body only reads it
 fn fix_worker_body(job: FixJob, mut hosts: PluginHosts, done: &Sender<FixMail>, sdk: PathBuf) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_fix_job(job, &mut hosts, &sdk)
@@ -580,12 +777,12 @@ impl SnapshotSink {
 /// staged-but-undrained task set, and the snapshot sink.
 pub struct Session {
     runtime: Runtime,
-    /// Context routing (PRD §16.2): tag → context id. The tagless default
+    /// Context routing: tag → context id. The tagless default
     /// context is [`Session::default_context`]; a tag naming an equal
-    /// configuration shares its context (§16.1 dedup).
+    /// configuration shares its context.
     contexts: FxHashMap<String, ContextId>,
-    /// The tagless default context: the LSP-edit view and the publish-diff
-    /// source. Every session has exactly one.
+    /// The tagless default context: the client-edit view and the
+    /// publish-diff source. Every session has exactly one.
     default_context: ContextId,
     /// The distinct open context ids (default first) — the base-write
     /// fan-out and the per-context snapshot walks. Contexts never close in
@@ -600,31 +797,54 @@ pub struct Session {
     /// same one).
     sdk_root: PathBuf,
     next_cookie: u64,
-    /// The open documents' LRU stamp source ([`Self::next_touch`], #947 F8).
-    next_touch: u64,
-    /// Open overlay documents: last-known client version per path plus an
-    /// LRU touch stamp (bumped on every edit — the eviction scan keeps the
-    /// recently-touched documents, #947 F8). A closed or never-opened file
-    /// is absent — publishes then carry no version.
-    opened: FxHashMap<PathBuf, OpenDocument>,
     /// Baseline for publish diffing: a push only goes out when a file's
     /// diagnostic set differs from what was last published for it.
-    published: FxHashMap<dartq_diagnostics::FileId, Vec<lsp::Diagnostic>>,
-    /// The workspace assembly's stale-config advisory (#741), pre-built for
-    /// the publish channel and taken by the first drain: exactly one push
-    /// per session start, never part of the per-file diff baseline (the
-    /// config file is not an engine file, so no later cycle can reconcile
-    /// it away or republish it).
-    workspace_advisory: Option<Publish>,
-    /// Per-agent overlay views (PRD §16.3), keyed by `agentId`. Bounded:
-    /// cleared on `overlay.clear`/session end, capped at [`MAX_AGENTS`].
+    published: FxHashMap<dartq_diagnostics::FileId, Vec<wire::Diagnostic>>,
+    /// The workspace assembly's stale-config advisory (#741), tracked for
+    /// the session's lifetime. Evaluated once at the shell edge's assembly,
+    /// then re-evaluated only by the config-input watch sweep
+    /// ([`Self::refresh_workspace_advisory`]): the watched inputs are
+    /// exactly the files the verdict reads, so a mid-session `dart pub get`
+    /// heals (or re-arms) it, while source edits cannot move it — the
+    /// config is not an engine file (no cycle reconciles it away) and its
+    /// inputs are not source bytes. Every `dartq/analyze` pull leads with
+    /// the current verdict — the full-recompute faces report the on-disk
+    /// state on every run, and the pull face must agree — while the publish
+    /// channel pushes at session start exactly once (`advisory_pushed`)
+    /// plus one replacement push per healed verdict change
+    /// (`advisory_republish`), never part of the per-file diff baseline.
+    workspace_advisory: Option<WorkspaceAdvisory>,
+    /// The session-start advisory push's exactly-once guard (#741): set
+    /// when the first drain has led its publishes with the advisory.
+    advisory_pushed: bool,
+    /// A healed verdict's one deferred push: the replacement row, or the
+    /// empty set that retracts a cleared advisory at its previous anchor.
+    /// Staged only by [`Self::refresh_workspace_advisory`] after the
+    /// session-start push has fired; drained by the next [`Self::service`].
+    advisory_republish: Option<Publish>,
+    /// Live span-capacity rejections (#1549): path → the rejected content's
+    /// byte size — the dedupe state behind the rejection advisories, the
+    /// publish-channel sibling of the workspace advisory above. The engine
+    /// re-fires `SourceRejected` on every oversized sync of the same bytes,
+    /// so the map is the throttle: a repeat at the same size stages nothing,
+    /// a size change re-announces, and a healed write retracts with the
+    /// empty set ([`Self::clear_rejection`] — diagnostics replace per URI,
+    /// so the empty set is the clear). Bounded: an entry lives only while
+    /// the file stays rejected.
+    rejected: FxHashMap<PathBuf, u64>,
+    /// Rejection advisory pushes staged by the drain's apply paths, drained
+    /// into the same turn's publishes: the events fire only inside
+    /// [`Self::service`], so the stage never outlives it.
+    rejected_pushes: Vec<Publish>,
+    /// Per-agent overlay views, keyed by `agentId`. Bounded:
+    /// cleared on `overlay.clear`/session end, capped at `MAX_AGENTS`.
     agents: FxHashMap<String, AgentOverlay>,
     /// Paths currently deviating from ONE context's base view, with that
     /// context and the base content to restore. Within-turn scratch only:
     /// every drain ends by restoring the base view, so between turns this
     /// is empty and wear-time captures read a base-resident engine.
     worn: Option<(ContextId, Vec<(PathBuf, WornBase)>)>,
-    /// The delta cursor (PRD §15.8): monotonic per session, bumped once per
+    /// The delta cursor: monotonic per session, bumped once per
     /// applied content change.
     cursor: u64,
     /// Each explicitly-written path's last-change cursor (base view).
@@ -637,7 +857,7 @@ pub struct Session {
     /// context-tagged or agent requests ride the read, so the diff still
     /// goes out.
     publishes_due: bool,
-    /// The session symbol table (short-id economics, PRD §15.8).
+    /// The session symbol table.
     symbols: commands::SymbolTable,
     /// The per-file lint-row memo (#772): rows keyed by content, features,
     /// enable set, package facts, and path, so a quiet turn's lint stage
@@ -657,10 +877,20 @@ pub struct Session {
     /// The byte watermark the sweep fires at ([`GC_BYTES_SINCE_SWEEP`]; the
     /// GC test shrinks it).
     gc_byte_limit: u64,
-    /// The two table caps ([`MAX_DELTA_PATHS`] / [`MAX_OPEN_DOCUMENTS`];
-    /// the F8 tests shrink them).
+    /// The delta cursor table's cap ([`MAX_DELTA_PATHS`]; the F8 tests
+    /// shrink it).
     delta_path_cap: usize,
-    open_document_cap: usize,
+    /// The live-path ceiling's effective bound
+    /// ([`SESSION_MAX_LIVE_PATHS`]; the ceiling tests shrink it) — the
+    /// `delta_path_cap` seam's twin.
+    live_path_cap: usize,
+    /// The live-path ceiling's one-time degrade row: the first tripped
+    /// admission records the `ResidencyDegradeLog` row naming the ceiling;
+    /// later refusals answer the wire error without re-recording. The
+    /// session flag is the once-only guard — the engine log's (file, face)
+    /// dedup could not hold across batches, each anchoring at a different
+    /// refused path.
+    ceiling_reported: bool,
     /// Staged overlay mutations riding the queued write task (empty ⇔ no
     /// write task queued — the two change together).
     staged: Vec<OverlayChange>,
@@ -671,7 +901,7 @@ pub struct Session {
     reads: Vec<PendingRead>,
     /// Requests cancelled while queued, answered cancelled at the drain.
     cancelled: Vec<RequestId>,
-    /// The plugin set (PRD §14, #471 phase B): discovered under the
+    /// The plugin set: discovered under the
     /// workspace's `plugins/` convention at assembly and spawned eagerly
     /// (the handshake completes before the first turn). Empty when the
     /// workspace declares none — the per-cycle weave skips its drain
@@ -679,16 +909,43 @@ pub struct Session {
     plugins: PluginSet,
     /// The repeat-offender ladder (#690): panics on the plugin-bearing
     /// group — the default context's base view, the only analysis a
-    /// plugin's rows ride — counted toward [`PLUGIN_PANIC_LIMIT`]. The
+    /// plugin's rows ride — counted toward `PLUGIN_PANIC_LIMIT`. The
     /// group-level containment bounds each panic to its own group; this
     /// ladder is the session-level answer to one that keeps coming back.
     plugin_path_panics: u32,
+    /// The contained-panic publish fallback (#1310): the one-shot deadline
+    /// of the deferred retry turn scheduled after a base-analysis panic
+    /// left the publish diff undrained. Only ever pending while
+    /// `publishes_due` holds — every path that clears the diff clears this
+    /// with it. `None` when nothing is deferred, so the quiet loop's
+    /// receive is only bounded while a retry is actually scheduled.
+    publish_retry: Option<Instant>,
+    /// The fallback's stop: a fired retry whose analysis was contained
+    /// again sets it, and self-driven retries stay off until the next
+    /// applied write (a content change) lifts it — a deterministically
+    /// panicking corpus must not churn unbounded re-analyses.
+    publish_retry_blocked: bool,
+    /// Paths whose content an applied write changed and that the publish
+    /// plan must still reconsider: a never-published file whose fresh rows
+    /// are empty falls outside both planner inputs (diagnosed rows, a
+    /// non-empty vanishing baseline), so without this set its one push —
+    /// the applied write's client-visible anchor — never goes out and the
+    /// client is left with a permanently unpublished file. Drained by the
+    /// plan; a contained turn keeps it pending, and the retry ladder (or
+    /// the next drain) drains it with the deferred diff.
+    publish_force: Vec<PathBuf>,
     /// The `dartq/fix`/`dartq/assists` host set: `None` until the first fix
     /// worker launches it inside its thread (a session that never fixes
     /// never pays the spawn handshakes, and the main loop never pays them
     /// at all). The set travels into the worker at dispatch and returns
     /// through the completion mail, so it stays one exclusive surface.
     fix_hosts: Option<PluginHosts>,
+    /// The parsed pub resolution and its directory, captured at assembly:
+    /// the plugin faces' pub-native discovery source, shared with the fix
+    /// worker thread (one `Arc`, never re-read from disk — the fix face must
+    /// resolve against the same resolution the analysis runs on).
+    pub_config: Arc<PackageConfig>,
+    config_dir: PathBuf,
     /// Staged fix jobs waiting for their drain (one task per request, on
     /// the default context's epoch).
     fixes: Vec<PendingFix>,
@@ -698,11 +955,30 @@ pub struct Session {
     /// The fix workers' completion channel. The session owns both ends:
     /// workers get sender clones, the drain collects mails, and the main
     /// loop selects on the receiver so a completion wakes it like intake
-    /// (a quiet client still gets its fix answer).
+    /// (a quiet client still gets its fix answer). Bounded at
+    /// `MAX_QUEUED_FIX_MAILS`: one in-flight mail is the structural
+    /// ceiling (one dispatch slot, freed by the mail's consumption).
     fix_done: (Sender<FixMail>, Receiver<FixMail>),
     /// The dispatch budget (`FIX_TIME_BUDGET`; test seam overrides it).
     fix_budget: Duration,
+    /// The shared mapped-content pool — `Some` only under
+    /// [`SessionRuntime::pooled_mapped_store`]: every context's content
+    /// store was rebound to it at assembly. Kept as the session's handle
+    /// for the residency probes ([`Self::shared_store_mapped_bytes`]).
+    mapped_pool: Option<dartq_engine::MappedContentPool>,
     snapshot: SnapshotSink,
+}
+
+/// The default snapshot store, opened with the accelerator posture: a
+/// missing cache root only means no persistence, never a failed session.
+fn default_store() -> Option<SnapshotStore> {
+    match SnapshotStore::open(SnapshotConfig::default()) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            eprintln!("dartq-daemon: snapshot store unavailable: {error}");
+            None
+        }
+    }
 }
 
 impl Session {
@@ -712,7 +988,10 @@ impl Session {
     /// means no persistence (accelerator semantics), never a failed session.
     /// `workspace_advisory` is the assembly's one stale-config advisory (#741);
     /// when present, the session's first drain leads its publishes with the
-    /// advisory push.
+    /// advisory push, and every `dartq/analyze` pull leads with the advisory
+    /// row. The verdict is stable across source edits; the config-input
+    /// watch sweep is the only mid-session re-evaluation
+    /// ([`Self::refresh_workspace_advisory`]).
     ///
     /// # Errors
     ///
@@ -722,14 +1001,13 @@ impl Session {
         config: EngineConfig,
         workspace_advisory: Option<WorkspaceAdvisory>,
     ) -> Result<Self, EngineError> {
-        let store = match SnapshotStore::open(SnapshotConfig::default()) {
-            Ok(store) => Some(store),
-            Err(error) => {
-                eprintln!("dartq-daemon: snapshot store unavailable: {error}");
-                None
-            }
-        };
-        Self::assemble(config, Vec::new(), store, workspace_advisory)
+        Self::assemble(
+            config,
+            Vec::new(),
+            default_store(),
+            workspace_advisory,
+            SessionRuntime::default(),
+        )
     }
 
     /// [`Session::new`] with an explicit snapshot store (tests pin a
@@ -744,36 +1022,51 @@ impl Session {
         store: SnapshotStore,
         workspace_advisory: Option<WorkspaceAdvisory>,
     ) -> Result<Self, EngineError> {
-        Self::assemble(config, Vec::new(), Some(store), workspace_advisory)
+        Self::assemble(
+            config,
+            Vec::new(),
+            Some(store),
+            workspace_advisory,
+            SessionRuntime::default(),
+        )
     }
 
     /// [`Session::new`] plus declared contexts: `extra` names one context
     /// each — a `dartq.yaml` `contexts` row assembled at the shell edge,
     /// its per-context fork dimensions (SDK, target, declared variables)
-    /// already in the config, its store built from
-    /// [`dartq_engine::pooled_memory_store`] over the ONE shared
-    /// [`dartq_engine::ContentPool`] (the #483 multi-context construction
-    /// contract; standalone stores would multiply content per context).
+    /// already in the config. Under the default
+    /// [`SessionRuntime::pooled_mapped_store`] posture, assembly rebinds
+    /// every context's store — base and declared alike — to
+    /// [`dartq_engine::pooled_mmap_store`] over one session-internal
+    /// [`dartq_engine::MappedContentPool`]: each distinct content lands
+    /// once across the session's contexts (standalone stores would
+    /// multiply content per context), and caller-built stores are not
+    /// consumed — the pool's residency is the introspection face
+    /// ([`Session::shared_store_bytes`],
+    /// [`Session::shared_store_mapped_bytes`],
+    /// [`Session::shared_store_contents`]).
     /// A request routes to a context by its `context` tag; the tagless
     /// default stays the base context. Equal configurations dedup to one
-    /// runtime context (§16.1) — two tags may share one id, and a repeated
+    /// runtime context — two tags may share one id, and a repeated
     /// tag re-points at its later config. Results differ from the default
     /// exactly along the fork dimensions: an SDK, target, or declared
     /// variable that changes resolution changes that context's diagnostics
     /// (content itself is shared — a base write fans out to every
     /// context).
     ///
-    /// # Advisory ruling
-    ///
-    /// This constructor takes no [`WorkspaceAdvisory`], deliberately: the
-    /// advisory is produced by the shell's single-config workspace
-    /// resolution and forwarded by [`Session::new`] — the only production
-    /// face that builds sessions today (the CLI daemon shell has no
-    /// multi-context flag, so no caller reaches here holding an advisory).
-    /// When a multi-context shell face appears, it resolves its advisory
-    /// at the shell edge and passes it here — the session-start push (the
-    /// exactly-once take in [`Session::service`]) is the default view's
-    /// row and stays one per session.
+    /// `store` and `workspace_advisory` are the shell edge's own
+    /// resolutions, forwarded as-is: the multi-context shell face (the CLI
+    /// daemon shell's dartq.yaml assembly, #1086) resolves both at its
+    /// edge — `store: None` opens the default store with
+    /// [`Session::new`]'s accelerator posture (a missing cache root only
+    /// means no persistence, never a failed session; `Some` pins a
+    /// throwaway root — the tests' shape), and the advisory is the shell's
+    /// single-config workspace resolution (#741). The session-start push
+    /// (the exactly-once guard in [`Session::service`]) is the default
+    /// view's row and stays one per session; every `dartq/analyze` pull
+    /// leads with the advisory row's current verdict, which only the
+    /// config-input watch sweep re-evaluates
+    /// ([`Session::refresh_workspace_advisory`]).
     ///
     /// # Errors
     ///
@@ -782,24 +1075,76 @@ impl Session {
     pub fn with_contexts<I>(
         config: EngineConfig,
         extra: I,
-        store: SnapshotStore,
+        store: Option<SnapshotStore>,
+        workspace_advisory: Option<WorkspaceAdvisory>,
     ) -> Result<Self, EngineError>
     where
         I: IntoIterator<Item = (String, EngineConfig)>,
     {
-        // Advisory ruling: none — see the doc above. The one production
-        // construction face (`new`) carries the advisory; this face gains
-        // the parameter when a multi-context shell appears.
-        Self::assemble(config, extra.into_iter().collect(), Some(store), None)
+        Self::with_runtime(
+            config,
+            extra,
+            store,
+            workspace_advisory,
+            SessionRuntime::default(),
+        )
     }
 
-    fn assemble(
+    /// [`Session::with_contexts`] with the shell edge's runtime arming
+    /// (#1088): `session_runtime` replaces the standing posture — the
+    /// memory budget every context arms, the trace sink for the
+    /// default context, and the L3 content-store cap every context
+    /// arms.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::PackageConfig`] when any config cannot back the
+    /// URI-resolution table.
+    pub fn with_runtime<I>(
         config: EngineConfig,
-        extra: Vec<(String, EngineConfig)>,
+        extra: I,
         store: Option<SnapshotStore>,
         workspace_advisory: Option<WorkspaceAdvisory>,
+        session_runtime: SessionRuntime,
+    ) -> Result<Self, EngineError>
+    where
+        I: IntoIterator<Item = (String, EngineConfig)>,
+    {
+        Self::assemble(
+            config,
+            extra.into_iter().collect(),
+            store.or_else(default_store),
+            workspace_advisory,
+            session_runtime,
+        )
+    }
+
+    #[expect(clippy::too_many_lines)] // one-pass assembly wires every context, the store, and the runtime knobs
+    fn assemble(
+        mut config: EngineConfig,
+        mut extra: Vec<(String, EngineConfig)>,
+        store: Option<SnapshotStore>,
+        workspace_advisory: Option<WorkspaceAdvisory>,
+        session_runtime: SessionRuntime,
     ) -> Result<Self, EngineError> {
         let mut runtime = Runtime::new();
+        // The default shared mapped-store posture (#1842): every context's
+        // content store is rebound to `pooled_mmap_store` over ONE pool, so
+        // each distinct content lands once across the session's contexts
+        // and canonical file text stays on evictable page-cache mappings
+        // (the Arc content-identity contract of the pooled store, backed by
+        // mappings instead of the anonymous heap). Opting out
+        // (`pooled_mapped_store: false`) keeps the caller-built stores
+        // untouched — the A/B posture for the store decomposition
+        // comparison.
+        let mapped_pool = session_runtime.pooled_mapped_store.then(|| {
+            let pool = dartq_engine::MappedContentPool::new();
+            config.store = dartq_engine::pooled_mmap_store(&pool);
+            for (_, engine) in &mut extra {
+                engine.store = dartq_engine::pooled_mmap_store(&pool);
+            }
+            pool
+        });
         // The contexts' workspace root (`config_dir` = root/.dart_tool) and
         // the default context's resolved SDK root; both captured before the
         // config moves into the context.
@@ -808,6 +1153,11 @@ impl Session {
             .parent()
             .map_or_else(Default::default, Path::to_path_buf);
         let sdk_root = config.sdk.dart_sdk_root().to_path_buf();
+        // The parsed pub resolution the plugin face's pub-native discovery
+        // resolves the analysis_options `plugins:` declarations against —
+        // captured before the config moves into the context.
+        let pub_config = config.pub_config.clone();
+        let config_dir = config.config_dir.clone();
         // Opens one context and warm-starts it before its first apply: the
         // context's own header (`snapshot_header` reads the context's own
         // target / declared variables / options — the salt's dimensions, so
@@ -818,14 +1168,29 @@ impl Session {
         let open =
             |runtime: &mut Runtime, engine: EngineConfig| -> Result<ContextId, EngineError> {
                 let id = runtime.open_context(ContextConfig { engine, flags: 0 })?;
+                // Invariant: the id came from `open_context` above, so the lookup cannot miss.
                 let engine = runtime
                     .context_state_mut(id)
                     .expect("the context opened above");
-                // The per-runtime budget default (PRD §17.1): every context
-                // arms the ladder at assembly; a limit that never bites is
-                // indistinguishable from an unlimited run beyond one
-                // `Option` test per boundary.
-                engine.set_memory_limit(Some(DEFAULT_MEMORY_LIMIT_MIB));
+                // The per-runtime budget: every context arms
+                // the ladder at the shell's limit; a limit that never
+                // bites is indistinguishable from an unlimited run beyond
+                // one `Option` test per boundary.
+                engine.set_memory_limit(Some(session_runtime.memory_limit_mib));
+                // The L3 store arms only when the shell passes a cap
+                // (the daemon's standing posture keeps it unarmed; the
+                // analyze face arms unconditionally at the default cap).
+                // An unwritable store warns and leaves the engine unarmed
+                // — the cache is an accelerator, never a dependency; no
+                // home directory stays silently unarmed.
+                if let Some(size_limit) = session_runtime.content_store_limit
+                    && let Some(root) = dartq_engine::store::default_root()
+                {
+                    let store_config = dartq_engine::store::StoreConfig { root, size_limit };
+                    if let Err(error) = engine.open_content_store(&store_config) {
+                        eprintln!("dartq-daemon: content store disabled: {error}");
+                    }
+                }
                 if let Some(store) = &store {
                     let header = engine.snapshot_header();
                     if let Some(snapshot) = store.load::<PersistedFacts>(&header) {
@@ -835,6 +1200,17 @@ impl Session {
                 Ok(id)
             };
         let default_context = open(&mut runtime, config)?;
+        // The trace sink arms the default (tagless) context's engine
+        // only: one sink is one writer, and the shell creates it before
+        // assembly (the analyze face's `TraceSink::create` posture).
+        // Declared extra contexts run untraced.
+        if let Some(sink) = session_runtime.trace {
+            // Invariant: the default context opened above and lives for the session.
+            runtime
+                .context_state_mut(default_context)
+                .expect("the default context opened above")
+                .set_trace_sink(Some(sink));
+        }
         let mut contexts = FxHashMap::default();
         let mut context_ids = vec![default_context];
         for (tag, engine) in extra {
@@ -845,34 +1221,16 @@ impl Session {
             contexts.insert(tag, id);
         }
         // The assembly's workspace advisory (#741: the stale-config row, or
-        // its #759 missing-config sibling), shaped for the publish channel:
-        // an INFO row anchored at the config path — the CLI analyze face's
-        // anchor — carrying the assembly's message. The empty range is the
-        // row's whole extent: the advisory names a file, not a span.
-        let workspace_advisory = workspace_advisory.map(|advisory| Publish {
-            uri: uri::from_path(advisory.config_path()),
-            version: None,
-            diagnostics: vec![lsp::Diagnostic {
-                range: lsp::Range {
-                    start: lsp::Position {
-                        line: 0,
-                        character: 0,
-                    },
-                    end: lsp::Position {
-                        line: 0,
-                        character: 0,
-                    },
-                },
-                severity: 3,
-                code: advisory.code().name.to_owned(),
-                source: "dartq".into(),
-                message: advisory.message(),
-            }],
-        });
-        // The plugin set spawns eagerly at assembly (PRD §14, #471 phase B):
+        // its #759 missing-config sibling) moves in as-is: the publish
+        // channel renders it once at session start (the push site in
+        // [`Self::service`]) and the `dartq/analyze` pull leads with its row
+        // on every answer. The verdict is stable across source edits; the
+        // config-input watch sweep is the only mid-session re-evaluation
+        // ([`Self::refresh_workspace_advisory`]).
+        // The plugin set spawns eagerly at assembly:
         // the handshake completes before the first turn. An empty discovery
-        // costs one directory walk and spawns nothing.
-        let plugins = PluginSet::launch(&workspace_root);
+        // costs one options-file lookup and spawns nothing.
+        let plugins = PluginSet::launch(&workspace_root, &pub_config, &config_dir);
         Ok(Self {
             runtime,
             contexts,
@@ -881,10 +1239,12 @@ impl Session {
             workspace_root,
             sdk_root,
             next_cookie: 0,
-            next_touch: 0,
-            opened: FxHashMap::default(),
             published: FxHashMap::default(),
             workspace_advisory,
+            advisory_pushed: false,
+            advisory_republish: None,
+            rejected: FxHashMap::default(),
+            rejected_pushes: Vec::new(),
             agents: FxHashMap::default(),
             worn: None,
             cursor: 0,
@@ -896,18 +1256,25 @@ impl Session {
             gc_bytes_since_sweep: 0,
             gc_byte_limit: GC_BYTES_SINCE_SWEEP,
             delta_path_cap: MAX_DELTA_PATHS,
-            open_document_cap: MAX_OPEN_DOCUMENTS,
+            live_path_cap: SESSION_MAX_LIVE_PATHS,
+            ceiling_reported: false,
             staged: Vec::new(),
             write: None,
             reads: Vec::new(),
             cancelled: Vec::new(),
             plugins,
             plugin_path_panics: 0,
+            publish_retry: None,
+            publish_retry_blocked: false,
+            publish_force: Vec::new(),
             fix_hosts: None,
+            pub_config,
+            config_dir,
             fixes: Vec::new(),
             fix_running: None,
-            fix_done: unbounded(),
+            fix_done: bounded(MAX_QUEUED_FIX_MAILS),
             fix_budget: FIX_TIME_BUDGET,
+            mapped_pool,
             snapshot: SnapshotSink {
                 store,
                 dirty: false,
@@ -916,155 +1283,156 @@ impl Session {
         })
     }
 
-    /// The `initialized`-time workspace sweep: discover every surface file
+    /// The session-start workspace sweep: discover every surface file
     /// into every context (content is shared, each engine interns its own
     /// residency) and enqueue the initial default-context analysis read
     /// (its publishes flow from the turn's drain).
-    ///
-    /// # Open-document precedence
-    ///
-    /// Discovery re-stages disk bytes for every resident path, which would
-    /// clobber a client-opened document the same way an unguarded watch
-    /// sync would ([`Self::queue_disk_changes`] skips opened paths for
-    /// exactly this reason). Each open path's content is therefore
-    /// re-staged after the walk: the pending map is last-wins per path, so
-    /// the client's text (staged bytes when an edit is still queued,
-    /// resident bytes otherwise) displaces the disk bytes discovery just
-    /// enqueued, and the queued read's apply keeps the overlay intact.
     ///
     /// # Errors
     ///
     /// Discovery I/O.
     pub fn sweep(&mut self) -> Result<(), SessionError> {
-        let mut opened: Vec<(PathBuf, Vec<u8>)> = Vec::with_capacity(self.opened.len());
-        for path in self.opened.keys() {
-            // A queued edit has not applied yet — its staged bytes are the
-            // client's latest word (at most one entry per path; see
-            // [`Self::stage`]). Otherwise the open text is the resident one.
-            let staged = self.staged.iter().find_map(|change| match change {
-                OverlayChange::Set {
-                    path: staged,
-                    bytes,
-                } if staged == path => Some(bytes),
-                _ => None,
-            });
-            if let Some(bytes) = staged {
-                opened.push((path.clone(), bytes.clone()));
-                continue;
-            }
-            if let Some(bytes) = self
-                .engine(self.default_context)
-                .file_table()
-                .try_file_id(path)
-                .and_then(|file| self.engine(self.default_context).content(file))
-            {
-                opened.push((path.clone(), bytes.to_vec()));
-            }
-        }
         for index in 0..self.context_ids.len() {
             self.engine_mut(self.context_ids[index])
                 .discover_workspace()?;
-            for (path, bytes) in &opened {
-                self.engine_mut(self.context_ids[index])
-                    .set_content(path, bytes);
-            }
         }
+        // The initial analysis carries publish duty: a `dartq/cancel` can
+        // legally void the sweep read's only request (the cancel lands
+        // before the first drain), and the surviving zero-request read
+        // must still run the base analysis, or a client that goes quiet
+        // never receives any workspace publish.
+        self.publishes_due = true;
         self.ensure_read(self.default_context, Tier::Normal);
         Ok(())
     }
 
-    /// `textDocument/didOpen` / `textDocument/didChange` (whole-file
-    /// replacement, M1 overlay semantics, PRD §16.3): stages the overlay
-    /// text on the queued write task and co-queues the diagnostics read the
-    /// publish push rides on (reads coalesce, so N batched edits still
-    /// reanalyze once). False for non-`file:` URIs, which have no analysis
-    /// path and are skipped.
-    pub fn queue_edit(&mut self, uri: &str, text: &str, version: i64) -> bool {
-        let Some(path) = uri::to_path(uri) else {
-            return false;
+    /// The config-input watch sweep's advisory heal: re-runs the assembly's
+    /// advisory face over the workspace root with the default context's
+    /// resolved SDK — the same evaluation the shell edge ran once at
+    /// assembly — and replaces the stored verdict wholesale: cleared when
+    /// the fresh resolution carries none, updated when it does. Only the
+    /// watched config inputs route here, so the source-edit stability the
+    /// pull face documents stands. The heal moves the reported verdict only;
+    /// the contexts' assembled resolution stays until a real session
+    /// restart.
+    ///
+    /// The publish face keeps the once-per-session economics: before the
+    /// session-start push has fired, the stored replacement is enough (the
+    /// start push carries the fresh verdict); after it, a changed verdict
+    /// republishes the config URI exactly once — the fresh row when an
+    /// advisory stands, the empty set that retracts a cleared one (the
+    /// `dartq/diagnostics` push replaces per URI, so the empty set is the
+    /// clear). An
+    /// unchanged verdict stages nothing. A failed re-evaluation (an unusable
+    /// SDK or assembly) is an observation, never a refusal: the stored
+    /// verdict stands for the session.
+    pub(crate) fn refresh_workspace_advisory(&mut self) {
+        let fresh = match engine_config_with_advisory(&self.workspace_root, Some(&self.sdk_root)) {
+            Ok((_, _, advisory)) => advisory,
+            Err(error) => {
+                eprintln!("dartq-daemon: workspace advisory re-evaluation skipped: {error}");
+                return;
+            }
         };
-        let touched = self.next_touch();
-        self.opened
-            .insert(path.clone(), OpenDocument { version, touched });
-        self.evict_open_documents();
-        self.stage(OverlayChange::Set {
-            path,
-            bytes: text.as_bytes().to_vec(),
-        });
-        self.ensure_write();
-        self.ensure_read(self.default_context, Tier::Normal);
-        true
+        if fresh == self.workspace_advisory {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.workspace_advisory, fresh);
+        if !self.advisory_pushed {
+            return;
+        }
+        let publish = match (&self.workspace_advisory, previous) {
+            (Some(advisory), _) => Publish {
+                uri: uri::from_path(advisory.config_path()),
+                diagnostics: vec![advisory_row(advisory)],
+            },
+            (None, Some(previous)) => Publish {
+                uri: uri::from_path(previous.config_path()),
+                diagnostics: Vec::new(),
+            },
+            // Both verdicts clear: a stale watch event with nothing to
+            // republish (the equality gate above makes this unreachable
+            // today). Degrade as the function's established posture — log
+            // and keep the stored state, never a panic on a watch-event
+            // interleaving.
+            (None, None) => {
+                eprintln!("dartq-daemon: stale workspace advisory event; republish skipped");
+                return;
+            }
+        };
+        self.advisory_republish = Some(publish);
     }
 
-    /// `textDocument/didClose`: stages the overlay drop. The runtime overlay
-    /// has no per-file "restore" change, so the equivalent whole-file
-    /// operation stages the on-disk bytes; an overlay-only file (opened,
-    /// never saved) stages a removal. Closing a document that was never
-    /// opened is a no-op per LSP.
+    /// Records apply-path rejections (#1549): a rejection not already on
+    /// the books at the same size updates the map and stages its advisory
+    /// push plus one stderr line (the daemon's human face, aligned with the
+    /// CLI analyze face's notice); a repeat stages nothing — the engine
+    /// re-fires the event on every oversized sync of unchanged bytes, and
+    /// the map is the throttle.
+    fn note_rejections(&mut self, rejections: Vec<(PathBuf, u64)>) {
+        for (path, len) in rejections {
+            if self.rejected.get(&path) == Some(&len) {
+                continue;
+            }
+            self.rejected.insert(path.clone(), len);
+            eprintln!(
+                "dartq-daemon: skipped {}: source exceeds the \
+                 {MAX_SOURCE_BYTES}-byte analysis capacity",
+                path.display()
+            );
+            self.rejected_pushes.push(Publish {
+                uri: uri::from_path(&path),
+                diagnostics: vec![rejection_row()],
+            });
+        }
+    }
+
+    /// Retracts a healed rejection: the file landed under the capacity (a
+    /// write applied without a rejection event) or left the view (a
+    /// removal), so the empty-set push clears the advisory row at the
+    /// client — the advisory heal's retract arm, mirrored (#741).
+    fn clear_rejection(&mut self, path: &Path) {
+        if self.rejected.remove(path).is_some() {
+            self.rejected_pushes.push(Publish {
+                uri: uri::from_path(path),
+                diagnostics: Vec::new(),
+            });
+        }
+    }
+
+    /// `dartq/sync` and watch-mode intake: syncs each reported
+    /// path's on-disk bytes into the base view — the whole-file
+    /// overlay-equivalent the change-detection discipline names — and
+    /// co-queues the Normal-tier read the publish push rides on. The
+    /// reported paths are the on-disk truth, so a path that is new or
+    /// changed queues the same set the sweep's discovery takes (new files
+    /// enter the analysis) and a vanished path queues a removal (the file
+    /// drops out of the view).
     ///
-    /// The on-disk read happens before any state mutation: on a read error
-    /// that is not `NotFound` the document stays open and any staged edits
-    /// stay queued — the overlay bookkeeping and the staged writes only ever
-    /// diverge from what a successful close would have done.
+    /// Per-path independence: an unreadable file is logged and skipped —
+    /// change reports are hints, and the analysis's content check stays the
+    /// truth.
+    ///
+    /// The batch is admitted atomically past the session live-path ceiling
+    /// ([`SESSION_MAX_LIVE_PATHS`], #1887) before anything is read or
+    /// staged: a batch that would push the engine's interned-path count
+    /// past it stages nothing and answers [`SessionError::InvalidParams`]
+    /// (the wire faces map it to `INVALID_PARAMS`; the notification faces
+    /// report it through the unanswerable-failure idiom), plus the one-time
+    /// `ResidencyDegradeLog` row naming the ceiling.
     ///
     /// # Errors
     ///
-    /// Disk read failure.
-    pub fn queue_close(&mut self, uri: &str) -> io::Result<bool> {
-        let Some(path) = uri::to_path(uri) else {
-            return Ok(false);
-        };
-        if !self.opened.contains_key(&path) {
-            return Ok(false);
+    /// [`SessionError::InvalidParams`] when the batch would push the
+    /// session's distinct interned-path count past
+    /// [`SESSION_MAX_LIVE_PATHS`].
+    pub fn queue_disk_changes(&mut self, paths: &[PathBuf]) -> Result<(), SessionError> {
+        if paths.is_empty() {
+            return Ok(());
         }
-        match fs::read(&path) {
-            Ok(bytes) => {
-                self.opened.remove(&path);
-                self.stage(OverlayChange::Set { path, bytes });
-            }
-            // Overlay-only buffer: dropping the overlay removes the file.
-            // `UnknownPath` cannot happen — `open` interned the path.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.opened.remove(&path);
-                self.stage(OverlayChange::Remove { path });
-            }
-            Err(error) => return Err(error),
-        }
-        self.ensure_write();
-        self.ensure_read(self.default_context, Tier::Normal);
-        Ok(true)
-    }
-
-    /// Watch-mode intake (`--watch`, PRD §16.7 mode 3): syncs each reported
-    /// path's on-disk bytes into the base view — the didChange-equivalent
-    /// the change-detection discipline names — and co-queues the Normal-tier
-    /// read the publish push rides on. The watcher's walk is the on-disk
-    /// truth, so a path that is new or changed queues the same set the
-    /// sweep's discovery takes (new files enter the analysis) and a vanished
-    /// path queues a removal (the file drops out of the view).
-    ///
-    /// # Overlay precedence
-    ///
-    /// A client-opened document ([`Self::queue_edit`], tracked in `opened`)
-    /// owns its content until `didClose`: a watch sync never clobbers it.
-    /// Concretely, a touched-on-disk path with client content is skipped
-    /// entirely, and a deleted one stays as overlay-only content — the open
-    /// buffer survives until `didClose`, which re-syncs the disk state
-    /// (staging the removal when the file never came back). Agent overlays
-    /// need no guard here: their views materialize at wear time over
-    /// whatever the base holds, so agent content wins its own view while
-    /// the base keeps tracking the disk.
-    ///
-    /// Watch files are not LSP-opened, so their publishes carry no version.
-    /// Per-path independence: an unreadable file is logged and skipped —
-    /// watch events are hints, and the analysis's content check stays the
-    /// truth (§16.7).
-    pub fn queue_disk_changes(&mut self, paths: &[PathBuf]) {
+        self.admit_live_paths(paths)?;
         let mut synced = false;
         for path in paths {
-            if self.opened.contains_key(path) {
-                continue;
-            }
             match fs::read(path) {
                 Ok(bytes) => {
                     self.stage(OverlayChange::Set {
@@ -1089,6 +1457,67 @@ impl Session {
             self.ensure_write();
             self.ensure_read(self.default_context, Tier::Normal);
         }
+        Ok(())
+    }
+
+    /// The session live-path ceiling's admission gate (#1887 D1): the batch
+    /// is refused whole when its distinct not-yet-interned paths would push
+    /// the engine's interned-path count past [`Self::live_path_cap`]. The
+    /// count reads the default context's own `FileTable` intern count — the
+    /// session-lifetime distinct-path figure itself (ids are immortal and
+    /// slots never shrink), no parallel counter. Cost: one memoized
+    /// normalization probe per batch path, nothing on the apply path.
+    ///
+    /// On trip: one `ResidencyDegradeLog` row naming the ceiling (once per
+    /// session, anchored at the batch's first already-interned path — a
+    /// whole-new batch anchors at its first path, interned for the row
+    /// only: an id, never content or residency), one stderr line (the
+    /// daemon's human face, the rejection-notice posture), and the
+    /// structured `INVALID_PARAMS` error. Never a panic, never a silent
+    /// drop.
+    fn admit_live_paths(&mut self, paths: &[PathBuf]) -> Result<(), SessionError> {
+        let engine = self.engine(self.default_context);
+        let files = engine.file_table();
+        let live = files.len();
+        let mut fresh = FxHashSet::default();
+        for path in paths {
+            if files.try_file_id(path).is_none() {
+                fresh.insert(path.as_path());
+            }
+        }
+        if live.saturating_add(fresh.len()) <= self.live_path_cap {
+            return Ok(());
+        }
+        let message = format!(
+            "session live-path ceiling exceeded: refusing the batch of {} paths \
+             ({} interned, {} new) past the {}-path session ceiling; \
+             start a new session or shrink the workspace",
+            paths.len(),
+            live,
+            fresh.len(),
+            self.live_path_cap,
+        );
+        // The one-time degrade row's anchor resolves while the table
+        // borrow is live (the batch's first already-interned path, else
+        // the batch's first path — interned by the note face for the row
+        // only); the flag write and the record follow once it ends.
+        let anchor = if self.ceiling_reported {
+            None
+        } else {
+            Some(
+                paths
+                    .iter()
+                    .find(|path| files.try_file_id(path).is_some())
+                    .unwrap_or(&paths[0]),
+            )
+        };
+        if let Some(anchor) = anchor {
+            self.ceiling_reported = true;
+            self.engine_mut(self.default_context)
+                .note_live_path_ceiling(anchor);
+        }
+        eprintln!("dartq-daemon: rejecting sync batch: {message}");
+        Err(SessionError::InvalidParams(message))
     }
 
     /// A `dartq/*` request: resolves its `context` tag to the engine
@@ -1119,6 +1548,8 @@ impl Session {
     /// decoded and their paths resolved at intake.
     pub(crate) fn queue_fix(&mut self, id: RequestId, job: FixJob) {
         let cookie = self.next_cookie();
+        // Invariant: the default context is opened at assembly and never closed, so the
+        // enqueue cannot reject it.
         self.runtime
             .enqueue(self.default_context, false, Tier::Interactive, cookie)
             .expect("the default context lives for the session");
@@ -1130,10 +1561,10 @@ impl Session {
     /// agent materializes the view. Bumps the delta cursor once.
     ///
     /// Every path is confined to the workspace root before anything lands
-    /// ([`confine_to_workspace`] — the write-face trust boundary, #947 F4),
+    /// (`confine_to_workspace` — the write-face trust boundary, #947 F4),
     /// and the agent's post-merge staged set is bounded
-    /// ([`MAX_OVERLAY_FILES`] / [`MAX_OVERLAY_BYTES`], #947 F3) and every
-    /// agent's combined staging is bounded ([`MAX_OVERLAY_TOTAL_BYTES`],
+    /// (`MAX_OVERLAY_FILES` / `MAX_OVERLAY_BYTES`, #947 F3) and every
+    /// agent's combined staging is bounded (`MAX_OVERLAY_TOTAL_BYTES`,
     /// #962 P3-2). A rejection
     /// is atomic: nothing stages, and a new agent's table entry is not
     /// created.
@@ -1141,10 +1572,10 @@ impl Session {
     /// # Errors
     ///
     /// [`SessionError::InvalidParams`] when the agent would exceed
-    /// [`MAX_AGENTS`] (clear one first), a path escapes the workspace root,
+    /// `MAX_AGENTS` (clear one first), a path escapes the workspace root,
     /// the merged staged set would exceed the per-agent file/byte caps, or
     /// the session-wide staged total would exceed
-    /// [`MAX_OVERLAY_TOTAL_BYTES`].
+    /// `MAX_OVERLAY_TOTAL_BYTES`.
     pub fn set_overlay(
         &mut self,
         agent: &str,
@@ -1250,6 +1681,7 @@ impl Session {
     /// it at intake ([`Session::has_context`]).
     fn route(&self, tag: Option<&str>) -> ContextId {
         match tag {
+            // Invariant: the server validated the tag against `has_context` at intake.
             Some(tag) => self
                 .contexts
                 .get(tag)
@@ -1259,7 +1691,7 @@ impl Session {
         }
     }
 
-    /// `dartq/overlay.commit` (PRD §16.3's merge): writes the agent's
+    /// `dartq/overlay.commit`: writes the agent's
     /// staged whole-file buffers back to the worktree, merges them into the
     /// base view — the same whole-file overlay change a watch sync takes —
     /// and frees the agent's staged entries (the base owns the committed
@@ -1321,6 +1753,8 @@ impl Session {
         for (path, bytes) in committed {
             self.stage(OverlayChange::Set { path, bytes });
         }
+        // Invariant: the lookup repeats the `agents.get(agent)` proven above; nothing
+        // removes the entry in between.
         self.agents
             .get_mut(agent)
             .expect("the agent was checked above")
@@ -1336,23 +1770,25 @@ impl Session {
         &self.workspace_root
     }
 
-    /// `$/cancelRequest`: cancels one queued request by id, precisely
+    /// `dartq/cancel`: cancels one queued request by id, precisely
     /// (rust-analyzer cancels per id, not per batch). The coalesced read
     /// task is partitioned: the cancelled id answers `RequestCancelled` at
     /// the drain, while co-riding requests re-attach to a read task
     /// re-stamped at the fresh epoch. When the cancelled request rode the
     /// default context, every task the bump voided re-stamps through
-    /// [`Session::restamp_default_tasks`] — the surviving read, the staged
+    /// `Session::restamp_default_tasks` — the surviving read, the staged
     /// write, and the staged fix jobs (a write survives too: a zero-request
     /// read joins it, so the publish diff the cancelled read was carrying
-    /// still runs). Cancels on other contexts' reads re-stamp that context's
+    /// still runs — and with no write queued, a due publish diff, the
+    /// sweep's first analysis, keeps the read alive on its own). Cancels on
+    /// other contexts' reads re-stamp that context's
     /// surviving read alone — its write and fix jobs ride the default
     /// context's epoch, which the bump never touched.
     ///
-    /// Cancelling an unknown or already-answered id is ignored (LSP
-    /// §cancelRequest) — a duplicate cancel of a running dispatch whose
-    /// answer is still queued counts as already-answered. The staged overlay
-    /// edits are *not* cancellable (LSP notifications carry no ids).
+    /// Cancelling an unknown or already-answered id is ignored — a
+    /// duplicate cancel of a running dispatch whose answer is still queued
+    /// counts as already-answered. The staged overlay edits are *not*
+    /// cancellable (notifications carry no ids).
     ///
     /// # Panics
     ///
@@ -1392,6 +1828,7 @@ impl Session {
             return;
         };
         let mut pending = self.reads.remove(read);
+        // Invariant: the scan above located this id in `requests`, so the position reads.
         let position = pending
             .requests
             .iter()
@@ -1406,7 +1843,16 @@ impl Session {
         // publish diff the cancelled read owned.
         let context = pending.context;
         let has_survivors = !pending.requests.is_empty();
-        if has_survivors || (context == self.default_context && self.write.is_some()) {
+        // A default-context read survives while work it could carry remains:
+        // a staged write (the zero-request read joins it, so the write's
+        // publish diff still drains) or a due publish diff (the sweep's
+        // initial analysis — dropping the read there would leave a client
+        // that cancels its first request and goes quiet with no publish at
+        // all). Other contexts have no publish duty; their read survives
+        // only with survivors.
+        if has_survivors
+            || (context == self.default_context && (self.write.is_some() || self.publishes_due))
+        {
             self.reads.push(pending);
         }
         if context == self.default_context {
@@ -1423,6 +1869,7 @@ impl Session {
             let index = self.reads.len() - 1;
             let tier = self.reads[index].tier;
             let cookie = self.next_cookie();
+            // Invariant: `context` is a session-lived context, so the enqueue cannot reject it.
             self.runtime
                 .enqueue(context, false, tier, cookie)
                 .expect("the read's context lives for the session; read re-stamp cannot fail");
@@ -1442,6 +1889,7 @@ impl Session {
     fn restamp_default_tasks(&mut self) {
         for mut pending in std::mem::take(&mut self.fixes) {
             pending.cookie = self.next_cookie();
+            // Invariant: the default context lives for the session, so the enqueue cannot reject it.
             self.runtime
                 .enqueue(
                     self.default_context,
@@ -1457,6 +1905,7 @@ impl Session {
                 continue;
             }
             let cookie = self.next_cookie();
+            // Invariant: the default context lives for the session, so the enqueue cannot reject it.
             self.runtime
                 .enqueue(self.default_context, false, self.reads[index].tier, cookie)
                 .expect("the default context lives for the session; read re-stamp cannot fail");
@@ -1464,6 +1913,7 @@ impl Session {
         }
         if self.write.is_some() {
             let cookie = self.next_cookie();
+            // Invariant: the default context lives for the session, so the enqueue cannot reject it.
             self.runtime
                 .enqueue(self.default_context, true, Tier::Normal, cookie)
                 .expect("the default context lives for the session; write re-stamp cannot fail");
@@ -1490,6 +1940,18 @@ impl Session {
     /// returned [`Turn`] carries the drain's publishes and answers.
     #[must_use]
     pub fn service(&mut self) -> Turn {
+        // Intake invariant: staged residue implies a write task. The apply
+        // containment re-stages WITHOUT re-enqueueing (a deterministic panic
+        // must not become a self-driven loop), deferring the re-queue to the
+        // next intake; this restores the invariant at the drain boundary so
+        // every turn producer — a command, a fix job, the deferred publish
+        // retry — applies the residue before its reads run (writer priority
+        // orders the healed write first regardless of enqueue order). On
+        // every other state the check is a no-op: content-bearing intakes
+        // arm the write themselves.
+        if !self.staged.is_empty() {
+            self.ensure_write();
+        }
         let report = self.runtime.drain();
         let mut turn = Turn::default();
         // Paths this turn's write removed (empty on every write-free turn):
@@ -1497,11 +1959,27 @@ impl Session {
         let mut removed: Vec<PathBuf> = Vec::new();
         // The session-start advisory (#741): leads the first drain's
         // publishes — the CLI faces render the advisory ahead of the rows —
-        // and `take` keeps it exactly-once. Every turn-producing path runs
-        // through here, so the push rides whichever intake wakes the loop
-        // first.
-        if let Some(advisory) = self.workspace_advisory.take() {
-            turn.publishes.push(advisory);
+        // exactly once per session (`advisory_pushed`; every turn-producing
+        // path runs through here, so the push rides whichever intake wakes
+        // the loop first). The pull face keeps leading with the row across
+        // source edits — the verdict is stable there; only the config-input
+        // watch sweep can change it.
+        if !self.advisory_pushed {
+            self.advisory_pushed = true;
+            if let Some(advisory) = &self.workspace_advisory {
+                turn.publishes.push(Publish {
+                    uri: uri::from_path(advisory.config_path()),
+                    diagnostics: vec![advisory_row(advisory)],
+                });
+            }
+        }
+        // A healed verdict's one replacement push (staged by
+        // [`Self::refresh_workspace_advisory`]): the fresh row, or the empty
+        // set that retracts a cleared advisory at its previous anchor.
+        // Cannot coincide with the session-start push — a heal stages a push
+        // only after that has fired.
+        if let Some(publish) = self.advisory_republish.take() {
+            turn.publishes.push(publish);
         }
         // Cancelled requests were enqueued before every surviving task, so
         // their answers come first.
@@ -1515,62 +1993,93 @@ impl Session {
                 let changes = std::mem::take(&mut self.staged);
                 self.write = None;
                 let context_ids = self.context_ids.clone();
+                // The span-capacity rejections of this batch (#1549): the
+                // overlay gate fires per context (the fan-out rejects the
+                // same file everywhere), so one shared collector feeds the
+                // dedupe map and the batch's own rejected set answers the
+                // heal scan below.
+                let mut rejections: Vec<(PathBuf, u64)> = Vec::new();
                 let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     #[cfg(test)]
-                    if crate::probe::take_write_panic() {
-                        panic!("test-armed write panic");
-                    }
+                    assert!(!crate::probe::take_write_panic(), "test-armed write panic");
                     // The base write fans out to every context: content is
-                    // not a fork dimension (§16.2), so each context's view
+                    // not a fork dimension, so each context's view
                     // of the workspace moves with the edit.
                     for context in context_ids {
+                        // Invariant: `context_ids` holds the session's live contexts, so the apply
+                        // cannot miss.
                         self.runtime
-                            .apply_overlay(context, &changes, &mut |_| {})
+                            .apply_overlay(
+                                context,
+                                &changes,
+                                &mut rejection_collector(&mut rejections),
+                            )
                             .expect("a drain-live write references an open session context");
                     }
                 }));
-                match applied {
-                    Ok(()) => {
-                        self.snapshot.note_apply();
-                        self.cursor += 1;
-                        for change in &changes {
-                            match change {
-                                OverlayChange::Set { path, bytes } => {
-                                    // The store's inflow tally (#947 F7):
-                                    // identical content dedupes on put, so
-                                    // this is an upper bound on real growth.
-                                    self.gc_bytes_since_sweep += bytes.len() as u64;
-                                    self.changed.insert(path.clone(), self.cursor);
-                                }
-                                OverlayChange::Remove { path } => {
-                                    // The file left the view: its delta cursor
-                                    // goes with it (a later re-creation
-                                    // re-inserts through the Set arm), and the
-                                    // path joins the turn's removals for the
-                                    // publish-baseline drop below.
-                                    self.changed.remove(path);
-                                    removed.push(path.clone());
+                if let Ok(()) = applied {
+                    self.snapshot.note_apply();
+                    self.cursor += 1;
+                    for change in &changes {
+                        match change {
+                            OverlayChange::Set { path, bytes } => {
+                                // The store's inflow tally (#947 F7):
+                                // identical content dedupes on put, so
+                                // this is an upper bound on real growth.
+                                self.gc_bytes_since_sweep += bytes.len() as u64;
+                                self.changed.insert(path.clone(), self.cursor);
+                                // The touched path owes the client one
+                                // publish of its fresh state, whatever the
+                                // rows turn out to be.
+                                self.publish_force.push(path.clone());
+                                // A landed Set heals a previously-rejected
+                                // path (#1549): no rejection event for it
+                                // in this batch means the bytes are under
+                                // the capacity and resident again.
+                                if !rejections.iter().any(|(rejected, _)| rejected == path) {
+                                    self.clear_rejection(path);
                                 }
                             }
+                            OverlayChange::Remove { path } => {
+                                // The file left the view: its delta cursor
+                                // goes with it (a later re-creation
+                                // re-inserts through the Set arm), and the
+                                // path joins the turn's removals for the
+                                // publish-baseline drop below.
+                                self.changed.remove(path);
+                                removed.push(path.clone());
+                                // A removed path cannot stay rejected (#1549).
+                                self.clear_rejection(path);
+                            }
                         }
-                        self.evict_delta_paths();
-                        self.publishes_due = true;
                     }
-                    Err(_) => {
-                        eprintln!(
-                            "dartq-daemon: overlay apply panicked; the write did not land; \
-                             the edits are restaged for the next write task"
-                        );
-                        // Re-stage the taken changes (last-wins merge with
-                        // anything a new edit stages) WITHOUT re-enqueueing
-                        // the write task: the next real intake re-queues via
-                        // ensure_write and applies the merged latest bytes.
-                        // Re-enqueueing here would retry the same panicked
-                        // apply every drain — a deterministic panic must not
-                        // become a self-driven loop.
-                        for change in changes {
-                            self.stage(change);
-                        }
+                    self.note_rejections(rejections);
+                    self.evict_delta_paths();
+                    self.publishes_due = true;
+                    // Content changed: the publish-retry ladder's stop
+                    // lifts — the #1310 fallback engages afresh for the
+                    // new state.
+                    self.publish_retry_blocked = false;
+                } else {
+                    eprintln!(
+                        "dartq-daemon: overlay apply panicked; the write did not land; \
+                         the edits are restaged for the next write task"
+                    );
+                    // Re-stage the taken changes (last-wins merge with
+                    // anything a new edit stages) WITHOUT re-enqueueing
+                    // the write task: the next real intake re-queues via
+                    // ensure_write and applies the merged latest bytes.
+                    // Re-enqueueing here would retry the same panicked
+                    // apply every drain — a deterministic panic must not
+                    // become a self-driven loop. This is the deliberate
+                    // asymmetry with the read path's bounded #1310
+                    // self-driven retry (`schedule_publish_retry`): a
+                    // retried analysis only re-runs a diff, while a
+                    // self-retried write would re-apply the exact bytes
+                    // that panicked, so the write path has no autonomous
+                    // retry — the next real intake is the retry.
+                    for change in changes {
+                        self.stage(change);
                     }
                 }
             } else if let Some(position) = self
@@ -1589,12 +2098,16 @@ impl Session {
                     self.dispatch_fix(pending, &mut turn);
                 } else {
                     let cookie = self.next_cookie();
+                    // Invariant: the default context lives for the session, so the enqueue cannot
+                    // reject it.
                     self.runtime
                         .enqueue(self.default_context, false, Tier::Interactive, cookie)
                         .expect("the default context lives for the session");
                     self.fixes[position].cookie = cookie;
                 }
             } else {
+                // Invariant: the popped task is a live read — the write and fix arms did not
+                // claim its cookie.
                 let position = self
                     .reads
                     .iter()
@@ -1624,6 +2137,10 @@ impl Session {
         // drain's wear-time captures never see a stale view.
         self.restore_base_view();
         self.gc_if_due();
+        // The drain's rejection advisories (#1549), delivered this turn:
+        // the push is the client's only window on a file the analysis
+        // excludes.
+        turn.publishes.append(&mut self.rejected_pushes);
         turn
     }
 
@@ -1669,12 +2186,14 @@ impl Session {
         let method = pending.job.method();
         let job = pending.job;
         let hosts = self.fix_hosts.take();
+        let pub_config = Arc::clone(&self.pub_config);
+        let config_dir = self.config_dir.clone();
         let spawned = thread::Builder::new()
             .name("dartq-fix".into())
             .spawn(move || {
                 fix_worker_body(
                     job,
-                    hosts.unwrap_or_else(|| PluginHosts::launch(&root)),
+                    hosts.unwrap_or_else(|| PluginHosts::launch(&root, &pub_config, &config_dir)),
                     &done,
                     sdk,
                 );
@@ -1798,11 +2317,16 @@ impl Session {
         self.gc_bytes_since_sweep
     }
 
-    /// The two table caps' seam (the F8 tests shrink them).
+    /// The delta-path table cap's seam (the F8 tests shrink it).
     #[cfg(test)]
-    fn set_table_caps(&mut self, delta_paths: usize, open_documents: usize) {
+    fn set_delta_path_cap(&mut self, delta_paths: usize) {
         self.delta_path_cap = delta_paths;
-        self.open_document_cap = open_documents;
+    }
+
+    /// The live-path ceiling's seam (the ceiling tests shrink it).
+    #[cfg(test)]
+    fn set_live_path_cap(&mut self, live_paths: usize) {
+        self.live_path_cap = live_paths;
     }
 
     /// Replaces the session's plugin set (test seam): lets a gate inject a
@@ -1829,6 +2353,8 @@ impl Session {
             return;
         };
         for &context in &self.context_ids {
+            // Invariant: session contexts are opened at assembly and never closed, so the
+            // state lookup cannot miss.
             let engine = self
                 .runtime
                 .context_state(context)
@@ -1843,6 +2369,40 @@ impl Session {
     #[cfg(test)]
     pub(crate) fn overlay_store_contents(&self) -> usize {
         self.runtime.stored_contents()
+    }
+
+    /// Distinct contents the shared mapped pool holds — the deduplicated
+    /// entry count across every context (`SessionRuntime::pooled_mapped_store`'s
+    /// residency face, the #483 once-per-content semantic's observability).
+    /// `None` when the posture is off — the probe's honest "not armed"
+    /// answer, not a zero.
+    #[must_use]
+    pub fn shared_store_contents(&self) -> Option<usize> {
+        self.mapped_pool
+            .as_ref()
+            .map(dartq_engine::MappedContentPool::len)
+    }
+
+    /// Bytes the shared mapped pool holds in file-mapping slots — the
+    /// evictable page-cache share of the pooled content heap, deduplicated
+    /// across every context (`SessionRuntime::pooled_mapped_store`'s
+    /// residency face). `None` when the posture is off — the probe's
+    /// honest "not armed" answer, not a zero.
+    #[must_use]
+    pub fn shared_store_mapped_bytes(&self) -> Option<u64> {
+        self.mapped_pool
+            .as_ref()
+            .map(dartq_engine::MappedContentPool::mapped_bytes)
+    }
+
+    /// Bytes the shared mapped pool holds in total (distinct contents once)
+    /// — the pooled heap's deduplicated footprint under the pooled
+    /// posture. `None` when [`SessionRuntime::pooled_mapped_store`] is off.
+    #[must_use]
+    pub fn shared_store_bytes(&self) -> Option<u64> {
+        self.mapped_pool
+            .as_ref()
+            .map(dartq_engine::MappedContentPool::len_bytes)
     }
 
     /// Turn-start debounce check; true when a save was attempted.
@@ -1892,23 +2452,40 @@ impl Session {
         // no publish duty.
         let has_base = groups.iter().any(|(agent, _)| agent.is_none());
         let publishes_here = pending.context == self.default_context;
+        // Set when a containment below left this context's due publish diff
+        // undrained — the #1310 fallback's scheduling condition.
+        let mut publish_panicked = false;
         if publishes_here && (groups.is_empty() || (self.publishes_due && !has_base)) {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.run_group(self.default_context, None, Vec::new(), turn);
             }));
-            match outcome {
-                // The drain happened (run_group clears `publishes_due` at
-                // the publish plan), or the task cancelled — the next write
-                // re-arms the diff anyway.
-                Ok(()) => self.publishes_due = false,
-                Err(_) => {
-                    eprintln!(
-                        "dartq-daemon: base analysis panicked; the publish diff retries on \
-                         the next intake"
-                    );
-                    self.note_plugin_path_panic(pending.context, None);
-                    self.restore_base_view_contained();
-                }
+            if let Ok(()) = outcome {
+                // `Ok` covers two cases. A completed drain cleared
+                // `publishes_due` at the publish plan, so a scheduled
+                // fallback retry is superseded. But a cancelled analysis
+                // (`analyze_with_lints` → `Err(Cancelled)`) also returns
+                // `Ok` — WITHOUT running the plan — so a due diff is
+                // dropped here and nothing self-driven recovers it until
+                // the next intake, which can be indefinitely far for a
+                // quiet open file. Unreachable today: the session's
+                // analyze passes a default token nothing cancels. M4
+                // precondition: once a real cancellation token is threaded
+                // through, clear `publishes_due`/`publish_retry` only when
+                // the plan actually ran (have `run_group` report
+                // plan-executed, or check that `publishes_due` was
+                // consumed).
+                self.publishes_due = false;
+                self.publish_retry = None;
+            } else {
+                eprintln!(
+                    "dartq-daemon: base analysis panicked; the publish diff retries on \
+                     the next intake"
+                );
+                self.note_plugin_path_panic(pending.context, None);
+                self.restore_base_view_contained();
+                // Still due ⇔ the plan never ran: the diff is genuinely
+                // deferred (a panic after it would not be).
+                publish_panicked = self.publishes_due;
             }
         }
 
@@ -1928,7 +2505,21 @@ impl Session {
                 Self::answer_panicked(turn, ids);
                 self.note_plugin_path_panic(pending.context, agent.as_deref());
                 self.restore_base_view_contained();
+                // The base group feeds the publish diff: a panic before its
+                // plan leaves the due diff deferred — the same fallback
+                // shape as the zero-request arm above.
+                if pending.context == self.default_context && agent.is_none() && self.publishes_due
+                {
+                    publish_panicked = true;
+                }
             }
+        }
+
+        // The contained-panic fallback (#1310): a containment that deferred
+        // the due publish diff schedules the one self-driven retry turn, so
+        // the diff drains even when no further client input ever comes.
+        if publish_panicked {
+            self.schedule_publish_retry();
         }
     }
 
@@ -1945,6 +2536,71 @@ impl Session {
         }
     }
 
+    /// The contained-panic fallback's scheduler (#1310): one deferred retry
+    /// turn after a containment left the default context's due publish
+    /// diff undrained. At most one retry is ever pending, and a retry that
+    /// was itself contained (`publish_retry_blocked`) schedules nothing
+    /// until the next applied write lifts the stop — a deterministically
+    /// panicking corpus must not churn self-driven re-analyses.
+    fn schedule_publish_retry(&mut self) {
+        if self.publish_retry.is_some() || self.publish_retry_blocked {
+            return;
+        }
+        self.publish_retry = Some(Instant::now() + PUBLISH_RETRY_DELAY);
+    }
+
+    /// Fires the deferred publish retry once it is due (`now` past the
+    /// scheduled instant): the default context's publish-carrying read
+    /// re-enqueues and drains, so a session that staged everything in the
+    /// turn whose analysis panicked still publishes with NO further client
+    /// input. Staged residue left by a contained write apply re-arms with
+    /// it ([`Self::service`]'s intake invariant), so the retry's read
+    /// analyzes the post-edit state it publishes. The main loop calls this
+    /// every iteration next to
+    /// [`Self::complete_fix`] and bounds its idle receive by
+    /// [`Self::publish_retry_deadline`], so a quiet session wakes for the
+    /// retry — no timer thread. `None` (a no-op) while nothing is scheduled
+    /// or the deadline has not passed.
+    ///
+    /// The retry is one-shot per event: its own containment must not
+    /// reschedule, so the ladder's stop engages across the drain and stays
+    /// engaged when the diff is still due afterwards — one stderr line
+    /// marks the degrade back to the next-intake behavior (bounded: one
+    /// line per cycle, never per file). A drain that succeeded — here or
+    /// through earlier intake — supersedes the retry instead.
+    #[must_use]
+    pub(crate) fn retry_deferred_publish(&mut self, now: Instant) -> Option<Turn> {
+        let deadline = self.publish_retry?;
+        if now < deadline {
+            return None;
+        }
+        self.publish_retry = None;
+        // A containment inside this drain must not schedule a fresh retry:
+        // the stop engages across the drain and lifts only on success.
+        self.publish_retry_blocked = true;
+        self.ensure_read(self.default_context, Tier::Normal);
+        let turn = self.service();
+        if self.publishes_due {
+            eprintln!(
+                "dartq-daemon: the deferred publish retry was contained again; \
+                 further self-driven retries wait for the next content change"
+            );
+        } else {
+            self.publish_retry_blocked = false;
+        }
+        Some(turn)
+    }
+
+    /// The deferred publish retry's deadline (the contained-panic fallback):
+    /// the main loop folds it into its idle-receive bound next to the fix
+    /// budget and the snapshot debounce, so a session left quiet after a
+    /// containment still wakes to retry. `None` while nothing is scheduled —
+    /// the receive blocks freely.
+    #[must_use]
+    pub(crate) fn publish_retry_deadline(&self) -> Option<Instant> {
+        self.publish_retry
+    }
+
     /// One view group's analysis and answers: `agent = None` is the base
     /// view (on the default context its analysis also drains the publish
     /// diff); `Some(agent)` wears that agent's overlay onto `context`'s
@@ -1957,9 +2613,7 @@ impl Session {
         turn: &mut Turn,
     ) {
         #[cfg(test)]
-        if crate::probe::take_read_panic() {
-            panic!("test-armed read panic");
-        }
+        assert!(!crate::probe::take_read_panic(), "test-armed read panic");
         let mut overlay_paths: Vec<PathBuf> = Vec::new();
         if let Some(agent) = agent {
             if !self.has_agent(agent) {
@@ -1984,25 +2638,36 @@ impl Session {
             self.restore_base_view();
         }
 
-        let Ok(mut diagnostics) = self.analyze_with_lints(context) else {
+        let Ok(diagnostics) = self.analyze_with_lints(context) else {
             for (id, _) in requests {
                 turn.answers.push((id, Err(SessionError::Cancelled)));
             }
             return;
         };
-        let mut plugin_findings = Vec::new();
-        if self.carries_plugins(context, agent) {
-            plugin_findings = self.weave_plugins(context, &mut diagnostics);
-        }
-        // The one conversion pass per group (the engine→LSP shape change is
+        // The crash anchor at cycle entry: the published state the plugins
+        // answer against, resolved before any publish touches the baseline —
+        // the withhold-until-anchored posture sees exactly that state. The
+        // scan runs only when a plugin set exists; the empty set's cycle
+        // pays one emptiness check.
+        let anchor = if self.plugins.is_empty() {
+            None
+        } else {
+            self.published.keys().copied().min()
+        };
+        // The one conversion pass per group (the engine→wire shape change is
         // the expensive half — #347's convert-once discipline, per view):
-        // the publish plan and the analyze entries share it.
-        let converted: Vec<Option<lsp::Diagnostic>> = diagnostics
+        // the publish plan and the analyze entries share it. Engine rows
+        // only — plugin rows convert in the merge step below.
+        let converted: Vec<Option<wire::Diagnostic>> = diagnostics
             .iter()
             .map(|diagnostic| self.convert(context, diagnostic))
             .collect();
-        if context == self.default_context && agent.is_none() {
-            self.publish_plan(&diagnostics, &converted, plugin_findings, turn);
+        let is_base = context == self.default_context && agent.is_none();
+        // Core publish first: the engine rows stage with zero plugin
+        // interaction — no lock, no pipe, no wait shared with plugin IO.
+        // The plugin merge step can only add to what this staged.
+        if is_base {
+            self.publish_plan(&diagnostics, &converted, turn);
         }
         // dartq/analyze answers keep the CLI analyze face's printed order
         // (severity-first before writing; the shared key lives in
@@ -2010,7 +2675,7 @@ impl Session {
         // message — not the engine's canonical (file, offset) order the
         // other faces mirror. The entries pair with their engine
         // diagnostics for the sort key, then strip.
-        let mut paired: Vec<(&Diagnostic, &Path, lsp::AnalyzeEntry)> = diagnostics
+        let mut paired: Vec<(&Diagnostic, &Path, wire::AnalyzeEntry)> = diagnostics
             .iter()
             .zip(converted)
             .filter_map(|(diagnostic, converted)| {
@@ -2019,7 +2684,7 @@ impl Session {
                 Some((
                     diagnostic,
                     path,
-                    lsp::AnalyzeEntry {
+                    wire::AnalyzeEntry {
                         uri: uri::from_path(path),
                         diagnostic: converted,
                     },
@@ -2033,8 +2698,24 @@ impl Session {
                 .then_with(|| a.range.offset.cmp(&b.range.offset))
                 .then_with(|| a.message.cmp(&b.message))
         });
-        let entries: Vec<lsp::AnalyzeEntry> =
+        let mut entries: Vec<wire::AnalyzeEntry> =
             paired.into_iter().map(|(_, _, entry)| entry).collect();
+        // The workspace advisory leads the pull answer (#741): the CLI
+        // analyze face renders the advisory ahead of the rows. The verdict
+        // is stable across source edits and tracks the watched config
+        // inputs ([`Self::refresh_workspace_advisory`]), so every pull
+        // carries the on-disk state's verdict — keeping the incremental
+        // face byte-equal with the full-recompute faces (the
+        // incremental-consistency gate compares the two).
+        if let Some(advisory) = &self.workspace_advisory {
+            entries.insert(
+                0,
+                wire::AnalyzeEntry {
+                    uri: uri::from_path(advisory.config_path()),
+                    diagnostic: advisory_row(advisory),
+                },
+            );
+        }
         let agent_changed: Option<Vec<(PathBuf, u64)>> = agent.map(|agent| {
             self.agents[agent]
                 .files
@@ -2046,6 +2727,7 @@ impl Session {
         // Disjoint field borrows: runtime (read), workspace_root/changed
         // (read), symbols (read — the table is mutex-guarded; the full-tier
         // writers answer on this thread inside the fan-out).
+        // Invariant: the read task's context is session-lived, so the state lookup cannot miss.
         let engine = self
             .runtime
             .context_state(context)
@@ -2062,6 +2744,16 @@ impl Session {
             symbols: &self.symbols,
         };
         Self::answer_requests(&drain, requests, &mut turn.answers);
+        // The plugin merge step, strictly last: the plugin set is consulted
+        // only after the core publish is staged and the group's answers are
+        // built, so the bounded per-plugin drain (the timeout isolation) can
+        // never delay either. A plugin-bearing group is always the base
+        // group ([`Self::carries_plugins`]), so its rows ride this turn's
+        // publishes, appended after the engine rows.
+        if self.carries_plugins(context, agent) {
+            let (findings, crashes) = self.weave_plugins(context, anchor, &diagnostics);
+            self.publish_plugin_rows(context, findings, crashes, turn);
+        }
     }
 
     /// The group's analysis: the engine turn plus the resident files' lint
@@ -2073,6 +2765,8 @@ impl Session {
     fn analyze_with_lints(&mut self, context: ContextId) -> Result<Vec<Diagnostic>, Cancelled> {
         let mut diagnostics = self.analyze(context)?;
         let lint_roots = [self.workspace_root().to_path_buf()];
+        // Invariant: session contexts are opened at assembly and never closed, so the
+        // state lookup cannot miss.
         let engine = self
             .runtime
             .context_state(context)
@@ -2087,25 +2781,28 @@ impl Session {
 
     /// The plugin weave (#471 phase B) for the publish-bearing group: the
     /// plugins feed once per base analysis — the editor's view — never per
-    /// agent view or forked context. The cycle runs before the
-    /// convert-once pass so a crash row converts with the engine rows, and
-    /// findings resolve against the same analyzed view; the caller merges
-    /// them into the publish plan (engine rows first, plugin groups by
-    /// discovery order, dedup on the four-key). A crash whose anchor does
-    /// not exist yet — the session has published nothing — is withheld by
-    /// the cycle, not dropped: it publishes on the first cycle that has
-    /// one. Contained a level finer than the group (#690): this is the
-    /// group's only plugin-row exposure, so a panic here is attributable
-    /// and penalizes immediately — while the group's engine rows still
-    /// convert, publish, and answer. The skipped cycle's rows re-feed on
-    /// the next cycle; a crash recorded by the penalty surfaces there
-    /// through the normal one-shot path.
+    /// agent view or forked context. Runs strictly after the core publish
+    /// plan and the group's answers are built (the caller's ordering): the
+    /// cycle's bounded per-plugin drain is the merge step's wait, never the
+    /// core path's. Returns the cycle's findings resolved onto resident
+    /// files and the cycle's crash rows as engine-shaped [`Diagnostic`]s —
+    /// both are plain data here; the caller layers them onto the baseline
+    /// ([`Self::publish_plugin_rows`]). The engine rows the plugins fed are
+    /// [`engine_rows`]; a crash whose [anchor] does not exist yet — the
+    /// session has published nothing — is withheld by the cycle, not
+    /// dropped: it publishes on the first cycle that has one. Contained a
+    /// level finer than the group (#690): this is the group's only
+    /// plugin-row exposure, so a panic here is attributable and penalizes
+    /// immediately — the group's engine rows have already converted,
+    /// published, and answered. The skipped cycle's rows re-feed on the
+    /// next cycle; a crash recorded by the penalty surfaces there through
+    /// the normal one-shot path.
     fn weave_plugins(
         &mut self,
         context: ContextId,
-        diagnostics: &mut Vec<Diagnostic>,
-    ) -> Vec<plugins::PluginFinding> {
-        let anchor: Option<FileId> = self.published.keys().copied().min();
+        anchor: Option<FileId>,
+        engine_rows: &[Diagnostic],
+    ) -> (Vec<plugins::PluginFinding>, Vec<Diagnostic>) {
         // The governing root options file, resolved before the closure: the
         // resolver reads the workspace root through a whole-`self` method,
         // which would defeat the closure's disjoint field capture (the
@@ -2115,96 +2812,137 @@ impl Session {
             dartq_engine::analysis_options::AnalysisOptions::find_for_dir(self.workspace_root());
         // Direct field access (not `self.engine`): the plugins' mutable
         // borrow and the engine's read must stay disjoint field borrows.
+        // Invariant: the read task's context is session-lived, so the lookup cannot miss.
         let engine = self
             .runtime
             .context_state(context)
             .expect("the read task's context lives for the session");
-        let mut plugin_findings = Vec::new();
+        // The cycle context: the analyzed set (the context's resident
+        // libraries — the files the plugin's rules run over), the staged
+        // documents' unsaved text (the upstream `_overlayState` face —
+        // plugin_manager.dart — pushed so rules parse the edited view,
+        // never stale disk bytes), and the governing root options file
+        // (the `plugins:` rule configs). The enumeration runs only when a
+        // plugin set exists; the vec build is the per-cycle cost of
+        // hosting rules.
+        let analyzed: Vec<String> = engine
+            .libraries()
+            .into_iter()
+            .flat_map(|(_, files)| files)
+            .filter_map(|file| {
+                engine
+                    .file_table()
+                    .path(file)
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .collect();
+        let overlays = self.plugin_overlays();
+        // The weave-feed probe: tests read back exactly the overlay set the
+        // cycle was handed (the `CycleContext.overlays` face's evidence).
+        #[cfg(test)]
+        crate::probe::record_weave_overlays(&overlays);
+        let options = options_file.as_deref();
+        // The T4 reverse-query server: the plugins' `request/query` pulls
+        // answer against this context's engine view — the same analyzed
+        // state the cycle's findings resolve against.
+        let query_server = |query: &dartq_plugin::PendingQuery| plugins::serve_query(engine, query);
+        let cycle_context = plugins::CycleContext {
+            analyzed: &analyzed,
+            overlays: &overlays,
+            options_file: options,
+            query_server: Some(&query_server),
+        };
         let woven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(test)]
-            if crate::probe::take_weave_panic() {
-                panic!("test-armed plugin weave panic");
-            }
-            // The cycle context: the analyzed set (the context's resident
-            // libraries — the files the plugin's rules run over), the
-            // client's unsaved text for the opened documents among them
-            // (the overlays; unopened files read from disk), and the
-            // governing root options file (the `plugins:` rule configs).
-            // The enumeration runs only when a plugin set exists; the vec
-            // build is the per-cycle cost of hosting rules.
-            let analyzed: Vec<String> = engine
-                .libraries()
-                .into_iter()
-                .flat_map(|(_, files)| files)
-                .filter_map(|file| {
-                    engine
-                        .file_table()
-                        .path(file)
-                        .map(|path| path.to_string_lossy().into_owned())
-                })
-                .collect();
-            let overlays: Vec<(String, String)> = self
-                .opened
-                .keys()
-                .filter_map(|path| {
-                    let path_string = path.to_string_lossy().into_owned();
-                    let file = engine.file_table().try_file_id(path)?;
-                    let text = engine.content(file)?;
-                    Some((
-                        path_string,
-                        std::str::from_utf8(text)
-                            .expect("engine content is valid UTF-8")
-                            .to_owned(),
-                    ))
-                })
-                .collect();
-            let options = options_file.as_deref();
-            // The T4 reverse-query server: the plugins' `request/query`
-            // pulls answer against this context's engine view — the same
-            // analyzed state the cycle's findings resolve against.
-            let query_server =
-                |query: &dartq_plugin::PendingQuery| plugins::serve_query(engine, query);
-            let cycle_context = plugins::CycleContext {
-                analyzed: &analyzed,
-                overlays: &overlays,
-                options_file: options,
-                query_server: Some(&query_server),
-            };
+            assert!(
+                !crate::probe::take_weave_panic(),
+                "test-armed plugin weave panic"
+            );
             let cycle =
                 self.plugins
-                    .cycle(diagnostics, engine.file_table(), anchor, &cycle_context);
-            diagnostics.extend(cycle.crashes);
-            plugin_findings =
+                    .cycle(engine_rows, engine.file_table(), anchor, &cycle_context);
+            let findings =
                 plugins::resolve_findings(&cycle.findings, engine.file_table(), |file| {
                     let index = engine.line_index(file)?;
                     let text = engine.content(file)?;
+                    // Invariant: the read layer decodes content lossily, so the bytes are
+                    // valid UTF-8 (engine read-layer contract).
                     Some((
                         index,
                         std::str::from_utf8(text).expect("engine content is valid UTF-8"),
                     ))
                 });
+            (findings, cycle.crashes)
         }));
-        if woven.is_err() {
+        if let Ok((findings, crashes)) = woven {
+            (findings, crashes)
+        } else {
             eprintln!("dartq-daemon: the plugin cycle panicked; this cycle's findings are skipped");
             self.penalize_plugins("a panic in the plugin cycle");
+            (Vec::new(), Vec::new())
         }
-        plugin_findings
     }
 
-    /// The base group's publish plan: engine rows merged with the plugin
-    /// findings into the turn's publishes. The crash row is one-shot: it
-    /// rides this push but never the published-state baseline, or every
-    /// later clean cycle would republish the file to reconcile it away. The
-    /// marker is code+source — plugin codes are free-form, so a plugin
-    /// emitting the crash code under its own source keeps its rows and its
-    /// baseline. The diff drains here: future writes re-arm it. Kept after
-    /// the plan so a panic mid-plan leaves the diff due — the next intake
-    /// retries it (the containment posture, #690).
+    /// The cycle's plugin-overlay set (#1819): every agent-staged document's
+    /// unsaved text — the staged table is the session's open/dirty-documents
+    /// face, the same bytes `wear` pushes into the engine for an agent view.
+    /// Upstream sends the same thing: the server's whole `_overlayState`
+    /// (`AnalysisUpdateContentParams`, plugin_manager.dart) so plugin rules
+    /// parse the client's edited view, never stale disk bytes — the base
+    /// view's engine still analyzes disk, which is exactly why the plugin
+    /// push needs the staged text.
+    ///
+    /// One entry per staged path. Two agents can stage the same path: the
+    /// later `set_at` cursor wins — the same last-wins resolution the write
+    /// stage applies to a same-path re-stage (`Self::stage`). Staged bytes
+    /// canonicalize through [`SourceText::canonical`] — one BOM strip, lossy
+    /// decode — so the pushed text is byte-identical to what `wear` pushes
+    /// into the engine (and to the residency text once the same content
+    /// commits). Sorted by path: the runtime's config dedup compares the
+    /// wire params verbatim, so a hash-order build would re-push on every
+    /// cycle. Bounded by the intake caps (`MAX_OVERLAY_TOTAL_BYTES`); the
+    /// per-file span gate (`MAX_SOURCE_BYTES`) cannot trip — staged files
+    /// cap at 64 MiB. `cycle_config` restricts the set to the analyzed
+    /// files downstream. Empty when nothing is staged.
+    fn plugin_overlays(&self) -> Vec<(String, String)> {
+        if self.agents.is_empty() {
+            return Vec::new();
+        }
+        let mut staged: FxHashMap<&Path, &OverlayFile> = FxHashMap::default();
+        for overlay in self.agents.values() {
+            for (path, file) in &overlay.files {
+                staged
+                    .entry(path.as_path())
+                    .and_modify(|held| {
+                        if file.set_at > held.set_at {
+                            *held = file;
+                        }
+                    })
+                    .or_insert(file);
+            }
+        }
+        let mut overlays: Vec<(String, String)> = staged
+            .into_iter()
+            .map(|(path, file)| {
+                (
+                    path.to_string_lossy().into_owned(),
+                    SourceText::canonical(&file.bytes).as_str().to_owned(),
+                )
+            })
+            .collect();
+        overlays.sort_by(|a, b| a.0.cmp(&b.0));
+        overlays
+    }
+
+    /// The core publish plan: the engine rows stage into the turn with zero
+    /// plugin interaction — the core-first publish invariant's first half.
+    /// The diff drains here: future writes re-arm it. Plugin rows are never
+    /// this plan's input; the merge step ([`Self::publish_plugin_rows`])
+    /// adds them after.
     fn publish_plan(
         &mut self,
         diagnostics: &[Diagnostic],
-        converted: &[Option<lsp::Diagnostic>],
-        plugin_findings: Vec<plugins::PluginFinding>,
+        converted: &[Option<wire::Diagnostic>],
         turn: &mut Turn,
     ) {
         let engine_rows =
@@ -2214,14 +2952,115 @@ impl Session {
                 .filter_map(|(diagnostic, converted)| {
                     converted.clone().map(|row| (diagnostic.file, row))
                 });
-        let merged = plugins::merge(engine_rows, plugin_findings);
-        let retained: Vec<_> = merged
-            .iter()
-            .filter(|(_, row)| !Self::is_engine_crash_row(row))
-            .cloned()
-            .collect();
-        turn.publishes.extend(self.plan_publishes(merged, retained));
+        turn.publishes
+            .extend(self.plan_publishes(engine_rows.collect()));
         self.publishes_due = false;
+        // The diff drained: a scheduled fallback retry is superseded.
+        self.publish_retry = None;
+    }
+
+    /// The plugin merge step of the core-first publish: layers the cycle's
+    /// plugin-originated rows onto the baseline the core plan just recorded.
+    /// Runs strictly after [`Self::publish_plan`] and after the group's
+    /// answers are built — the plugin cycle's waits live entirely inside
+    /// [`Self::weave_plugins`], which the caller has already run, so nothing
+    /// here can delay the core output.
+    ///
+    /// Per file, the additions append after the engine rows: the crash rows
+    /// first (the position the engine vec gave them before the merge step
+    /// existed), then the findings in merge order — plugin discovery order,
+    /// offset-sorted within a plugin — each deduplicated on the T5 four-key
+    /// against the file's published rows (the engine set the core plan
+    /// staged and baselined), the crash rows, and each other. Findings enter
+    /// the baseline; crash rows ride once ([`Self::is_engine_crash_row`] —
+    /// they publish but never baseline, or every later clean cycle would
+    /// republish the file to reconcile them away). A file the core plan
+    /// already pushed this turn has its staged push extended (one push per
+    /// file per turn); a file it did not push gets a fresh push carrying the
+    /// file's full row set (the diagnostics push replaces the client's set).
+    fn publish_plugin_rows(
+        &mut self,
+        context: ContextId,
+        findings: Vec<plugins::PluginFinding>,
+        crashes: Vec<Diagnostic>,
+        turn: &mut Turn,
+    ) {
+        if findings.is_empty() && crashes.is_empty() {
+            return;
+        }
+        // The crash rows ride the engine conversion (source `dartq`), the
+        // same pass the engine rows took.
+        let crash_rows: Vec<(FileId, wire::Diagnostic)> = crashes
+            .into_iter()
+            .filter_map(|crash| self.convert(context, &crash).map(|row| (crash.file, row)))
+            .collect();
+        // The merge's engine side: every touched file's published rows (the
+        // engine set the core plan staged and baselined) plus the crash
+        // rows — merge seeds its dedup set from exactly these and appends
+        // the findings in its own merge order, so everything after a file's
+        // published prefix is this step's addition.
+        let mut touched: Vec<FileId> = findings
+            .iter()
+            .map(|finding| finding.file)
+            .chain(crash_rows.iter().map(|(file, _)| *file))
+            .collect();
+        touched.sort_by_key(|file| file.index());
+        touched.dedup();
+        let engine_side = touched.iter().flat_map(|file| {
+            self.published
+                .get(file)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|row| (*file, row))
+        });
+        let merged = plugins::merge(engine_side.chain(crash_rows), findings);
+        let mut per_file: FxHashMap<FileId, Vec<wire::Diagnostic>> = FxHashMap::default();
+        for (file, row) in merged {
+            per_file.entry(file).or_default().push(row);
+        }
+        // Staging runs in file-intern order; the core plan's own pushes stay
+        // URI-sorted ahead of the fresh ones.
+        let mut fresh: Vec<Publish> = Vec::new();
+        for file in touched {
+            let mut now = per_file.remove(&file).unwrap_or_default();
+            let before_len = self.published.get(&file).map_or(0, Vec::len);
+            let additions = now.split_off(before_len);
+            if additions.is_empty() {
+                continue;
+            }
+            let Some(path) = self.engine(self.default_context).file_table().path(file) else {
+                continue;
+            };
+            let path = path.to_path_buf();
+            let uri = uri::from_path(&path);
+            // Findings persist in the baseline; crash rows ride once.
+            let baseline_gains: Vec<wire::Diagnostic> = additions
+                .iter()
+                .filter(|row| !Self::is_engine_crash_row(row))
+                .cloned()
+                .collect();
+            match turn.publishes.iter_mut().find(|staged| staged.uri == uri) {
+                Some(staged) => staged.diagnostics.extend(additions),
+                None => fresh.push(Publish {
+                    uri,
+                    diagnostics: self
+                        .published
+                        .get(&file)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .chain(additions)
+                        .collect(),
+                }),
+            }
+            self.published
+                .entry(file)
+                .or_default()
+                .extend(baseline_gains);
+        }
+        fresh.sort_by(|a, b| a.uri.cmp(&b.uri));
+        turn.publishes.extend(fresh);
     }
 
     /// One view group's request answering: the fan-out that makes reads
@@ -2243,14 +3082,19 @@ impl Session {
         requests: Vec<(RequestId, Request)>,
         answers: &mut Vec<(RequestId, Result<serde_json::Value, SessionError>)>,
     ) {
-        let mut slots: Vec<Option<(RequestId, Result<serde_json::Value, SessionError>)>> =
-            (0..requests.len()).map(|_| None).collect();
-        let mut parallel: Vec<(usize, RequestId, Request)> = Vec::with_capacity(slots.len());
-        for (index, (id, request)) in requests.into_iter().enumerate() {
+        // Each slot owns its request id up front: a slot fills with its
+        // answer below, and a slot a panicked worker emptied answers the
+        // per-request internal error at the end (the id survives in the
+        // slot either way).
+        let mut slots: Vec<(RequestId, Option<Result<serde_json::Value, SessionError>>)> =
+            Vec::with_capacity(requests.len());
+        let mut parallel: Vec<(usize, Request)> = Vec::with_capacity(requests.len());
+        for (id, request) in requests {
             if request.verbosity() == Verbosity::Full {
-                slots[index] = Some((id, commands::answer(drain, &request)));
+                slots.push((id, Some(commands::answer(drain, &request))));
             } else {
-                parallel.push((index, id, request));
+                parallel.push((slots.len(), request));
+                slots.push((id, None));
             }
         }
         // Dynamic work distribution: every worker drains the same queue
@@ -2259,14 +3103,15 @@ impl Session {
         // `workers - 1` threads spawn per group.
         if parallel.len() >= 2 {
             let workers = parallel.len().min(MAX_ANSWER_WORKERS);
-            let (sender, receiver) = unbounded::<(usize, RequestId, Request)>();
+            let (sender, receiver) = unbounded::<(usize, Request)>();
+            // Invariant: the receiver lives to the end of the scope, so these sends cannot fail.
             for job in parallel {
                 sender
                     .send(job)
                     .expect("the job receiver outlives the sends below");
             }
             drop(sender);
-            let results = thread::scope(|scope| {
+            let (results, worker_panicked) = thread::scope(|scope| {
                 let handles: Vec<_> = (1..workers)
                     .map(|_| {
                         let receiver = receiver.clone();
@@ -2274,24 +3119,47 @@ impl Session {
                     })
                     .collect();
                 let mut results = Self::drain_jobs(&receiver, drain);
+                // A panic escapes the per-answer guard only outside it (the
+                // receive loop itself). The join degrades instead of
+                // propagating: the dead worker's claimed jobs stay unfilled
+                // and answer internal errors below — one lost request per
+                // claimed job, never a dead session.
+                let mut worker_panicked = false;
                 for handle in handles {
-                    results.extend(
-                        handle
-                            .join()
-                            .expect("an answer worker never panics outward"),
-                    );
+                    match handle.join() {
+                        Ok(rows) => results.extend(rows),
+                        Err(_) => worker_panicked = true,
+                    }
                 }
-                results
+                (results, worker_panicked)
             });
-            for (index, id, answer) in results {
-                slots[index] = Some((id, answer));
+            if worker_panicked {
+                eprintln!(
+                    "dartq-daemon: answer worker panicked; its claimed requests answer \
+                     internal error"
+                );
+            }
+            for (index, answer) in results {
+                slots[index].1 = Some(answer);
             }
         } else {
-            for (index, id, request) in parallel {
-                slots[index] = Some((id, commands::answer(drain, &request)));
+            for (index, request) in parallel {
+                slots[index].1 = Some(commands::answer(drain, &request));
             }
         }
-        answers.extend(slots.into_iter().flatten());
+        // Unfilled slots are exactly the jobs a panicked worker had claimed
+        // (its results died with the thread): each answers its own
+        // internal-error row, so every request keeps exactly one answer.
+        answers.extend(slots.into_iter().map(|(id, answer)| {
+            (
+                id,
+                answer.unwrap_or_else(|| {
+                    Err(SessionError::Internal(
+                        "internal error: the answer worker panicked".into(),
+                    ))
+                }),
+            )
+        }));
     }
 
     /// One answer worker: pulls jobs until the phase's queue empties, each
@@ -2299,11 +3167,16 @@ impl Session {
     /// the worker moves on — the shared view cannot have been corrupted by
     /// a `&`-read).
     fn drain_jobs(
-        receiver: &Receiver<(usize, RequestId, Request)>,
+        receiver: &Receiver<(usize, Request)>,
         drain: &commands::Drain<'_>,
-    ) -> Vec<(usize, RequestId, Result<serde_json::Value, SessionError>)> {
+    ) -> Vec<(usize, Result<serde_json::Value, SessionError>)> {
         let mut results = Vec::new();
-        for (index, id, request) in receiver {
+        for (index, request) in receiver {
+            #[cfg(test)]
+            assert!(
+                !answer_worker_panic_probe::take(),
+                "test-armed answer worker panic"
+            );
             let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 commands::answer(drain, &request)
             }))
@@ -2315,7 +3188,7 @@ impl Session {
                     "internal error: analysis panicked".into(),
                 ))
             });
-            results.push((index, id, answer));
+            results.push((index, answer));
         }
         results
     }
@@ -2328,8 +3201,8 @@ impl Session {
     }
 
     /// One panic on the plugin-bearing group (#690's repeat-offender
-    /// ladder): counted toward [`PLUGIN_PANIC_LIMIT`], never reset — the
-    /// transport's restart budget never resets either (PRD §14.3), and a
+    /// ladder): counted toward `PLUGIN_PANIC_LIMIT`, never reset — the
+    /// transport's restart budget never resets either, and a
     /// panic that recurs is deterministic enough to re-fire every cycle.
     /// At the limit the whole plugin set is disabled for the session: the
     /// group-level containment bounds each panic to its own group, this is
@@ -2393,7 +3266,9 @@ impl Session {
                 }
             }
         }
-        engine.apply_pending(&mut |_| {});
+        let mut rejections = Vec::new();
+        engine.apply_pending(&mut rejection_collector(&mut rejections));
+        self.note_rejections(rejections);
     }
 
     /// Wears one agent's overlay onto `context`'s engine: restores whatever
@@ -2408,7 +3283,10 @@ impl Session {
             return;
         };
         let mut worn: Vec<(PathBuf, WornBase)> = Vec::with_capacity(overlay.files.len());
+        let mut rejections = Vec::new();
         // Disjoint field borrows: agents (read) and runtime (mutate).
+        // Invariant: session contexts are opened at assembly and never closed, so the
+        // state lookup cannot miss.
         let engine = self
             .runtime
             .context_state_mut(context)
@@ -2420,7 +3298,7 @@ impl Session {
         // correct on its own (an empty queue is a cheap no-op), and a base
         // edit that legitimately landed underneath can never be flushed
         // out by the restore.
-        engine.apply_pending(&mut |_| {});
+        engine.apply_pending(&mut rejection_collector(&mut rejections));
         for (path, file) in &overlay.files {
             // Capture before this path's own set_content; earlier paths'
             // ops only pend, so the resident content is still the base.
@@ -2436,6 +3314,9 @@ impl Session {
             engine.set_content(path, &file.bytes);
         }
         self.worn = Some((context, worn));
+        // After the engine borrow ends: the barrier's rejections (#1549)
+        // join the same advisory stage as the other apply sites.
+        self.note_rejections(rejections);
     }
 
     /// Sweeps the runtime's shared overlay store once the garbage since the
@@ -2477,27 +3358,6 @@ impl Session {
         }
     }
 
-    /// The open-document table's cap eviction (#947 F8): past the cap, keep
-    /// the 7/8 most-recently-touched documents and drop the rest. Only a
-    /// broken client's open storm reaches here (real clients hold tens of
-    /// editors); an evicted document degrades to on-disk truth — publishes
-    /// lose the version and a watch sync may resync its disk bytes.
-    fn evict_open_documents(&mut self) {
-        let keep = self.open_document_cap * 7 / 8;
-        if self.opened.len() <= self.open_document_cap {
-            return;
-        }
-        let mut by_touch: Vec<(u64, PathBuf)> = self
-            .opened
-            .iter()
-            .map(|(path, document)| (document.touched, path.clone()))
-            .collect();
-        by_touch.sort_unstable();
-        for (_, path) in &by_touch[..by_touch.len() - keep] {
-            self.opened.remove(path);
-        }
-    }
-
     /// Stages one overlay mutation on the queued write task, last-wins per
     /// path: a batch's earlier ops for the same path are unobservable (ops
     /// on distinct paths commute, and the overlay declares the end state),
@@ -2521,6 +3381,7 @@ impl Session {
     fn ensure_write(&mut self) {
         if self.write.is_none() {
             let cookie = self.next_cookie();
+            // Invariant: the default context lives for the session, so the enqueue cannot reject it.
             self.runtime
                 .enqueue(self.default_context, true, Tier::Normal, cookie)
                 .expect("the default context lives for the session");
@@ -2536,6 +3397,7 @@ impl Session {
             return;
         }
         let cookie = self.next_cookie();
+        // Invariant: `context` is a session-lived context, so the enqueue cannot reject it.
         self.runtime
             .enqueue(context, false, tier, cookie)
             .expect("session contexts live for the session");
@@ -2552,21 +3414,16 @@ impl Session {
         self.next_cookie
     }
 
-    /// The open documents' LRU clock (#947 F8): one stamp per edit, so the
-    /// cap eviction's scan always has a recency order to keep.
-    fn next_touch(&mut self) -> u64 {
-        self.next_touch = self.next_touch.wrapping_add(1);
-        self.next_touch
-    }
-
     /// A session context's engine: analyze, queries, content reads.
     fn engine(&self, context: ContextId) -> &Engine {
+        // Invariant: session contexts are opened at assembly and never closed.
         self.runtime
             .context_state(context)
             .expect("session contexts live for the session")
     }
 
     fn engine_mut(&mut self, context: ContextId) -> &mut Engine {
+        // Invariant: session contexts are opened at assembly and never closed.
         self.runtime
             .context_state_mut(context)
             .expect("session contexts live for the session")
@@ -2574,10 +3431,18 @@ impl Session {
 
     /// Runs the engine barrier + recompute on one context: `analyze(&[])`
     /// applies the overlay and returns the merged diagnostic set of every
-    /// live library, canonically sorted.
+    /// live library, canonically sorted. The apply's `SourceRejected`
+    /// events (the sweep's discovery sets, anything else still pending)
+    /// feed the rejection advisories (#1549).
     fn analyze(&mut self, context: ContextId) -> Result<Vec<Diagnostic>, Cancelled> {
-        self.engine_mut(context)
-            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+        let mut rejections = Vec::new();
+        let analyzed = self.engine_mut(context).analyze(
+            &[],
+            &mut rejection_collector(&mut rejections),
+            &CancellationToken::default(),
+        );
+        self.note_rejections(rejections);
+        analyzed
     }
 
     /// The one-shot plugin crash row's exact marker: the crash CODE under the
@@ -2585,42 +3450,27 @@ impl Session {
     /// `dartq`). Code alone is not exact — plugin codes are free-form, so a
     /// plugin emitting the crash code under its own source must keep its rows
     /// in the retained baseline.
-    fn is_engine_crash_row(row: &lsp::Diagnostic) -> bool {
+    fn is_engine_crash_row(row: &wire::Diagnostic) -> bool {
         row.code == dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name && row.source == "dartq"
     }
 
     /// Diffs the fresh row set against the published baseline and returns
-    /// one [`Publish`] per changed file (empty set included — the client
-    /// clears its squiggles through it). `merged` is the view's full row
-    /// set — engine rows plus the cycle's plugin findings, already merged
-    /// and deduplicated ([`plugins::merge`]). Order is by URI, so the push
-    /// sequence is deterministic.
-    /// Plans the publish pushes for one base analysis: diffs the merged
-    /// rows against the published-state baseline and emits one push per
-    /// changed file (plus baseline files whose rows vanished entirely).
-    ///
-    /// `retained` is the state future cycles reproduce — recorded as the
-    /// new baseline. It differs from `merged` exactly on one-shot rows
-    /// (the plugin crash row): those ride the push but never the baseline,
-    /// so the next clean cycle diffs quiet against the retained state
-    /// instead of reconciling the one-shot row away (which would
-    /// republish the file forever after).
-    fn plan_publishes(
-        &mut self,
-        merged: Vec<(FileId, lsp::Diagnostic)>,
-        retained: Vec<(FileId, lsp::Diagnostic)>,
-    ) -> Vec<Publish> {
-        let mut current: FxHashMap<dartq_diagnostics::FileId, Vec<lsp::Diagnostic>> =
+    /// one [`Publish`] per pushed file: a push goes out when a file's
+    /// diagnostic set differs from what was last published for it — the
+    /// changed set plus every baseline file whose diagnostics vanished
+    /// entirely (the clearing push; a push replaces the client's set, so
+    /// the empty array retracts it). The pushed set and the recorded
+    /// baseline are the same rows (the one-shot plugin crash rows are a
+    /// concern of the plugin merge step, which baselines its findings but
+    /// not its crash rows). Order is by URI, so the push sequence is
+    /// deterministic.
+    fn plan_publishes(&mut self, rows: Vec<(FileId, wire::Diagnostic)>) -> Vec<Publish> {
+        let mut current: FxHashMap<dartq_diagnostics::FileId, Vec<wire::Diagnostic>> =
             FxHashMap::default();
-        for (file, diagnostic) in merged {
+        for (file, diagnostic) in rows {
             current.entry(file).or_default().push(diagnostic);
         }
-        let mut record: FxHashMap<dartq_diagnostics::FileId, Vec<lsp::Diagnostic>> =
-            FxHashMap::default();
-        for (file, diagnostic) in retained {
-            record.entry(file).or_default().push(diagnostic);
-        }
-        // Reconsider every diagnosed file plus every baseline file whose
+        // Reconsider every diagnosed file and every baseline file whose
         // diagnostics vanished entirely.
         let mut files: Vec<dartq_diagnostics::FileId> = current.keys().copied().collect();
         files.extend(
@@ -2629,11 +3479,24 @@ impl Session {
                 .filter(|(file, previous)| !previous.is_empty() && !current.contains_key(*file))
                 .map(|(file, _)| *file),
         );
+        // Plus every path an applied write touched: a never-published file
+        // whose fresh rows are empty falls outside both inputs above, and
+        // its one push — the applied write's client-visible anchor — must
+        // still go out (the empty set then becomes its baseline). Resolved
+        // against the live table; a path the engine never interned has no
+        // rows to publish. The set drains here: a contained turn kept it
+        // pending for exactly this plan.
+        let forced = std::mem::take(&mut self.publish_force);
+        files.extend(forced.into_iter().filter_map(|path| {
+            self.engine(self.default_context)
+                .file_table()
+                .try_file_id(&path)
+        }));
+        files.sort_unstable();
+        files.dedup();
 
         let mut publishes: Vec<Publish> = Vec::new();
         for file in files {
-            // Duplicated ids only when the same file appears in both sets —
-            // the second pass then sees an empty `current` and no-ops.
             let now = match current.entry(file) {
                 Entry::Occupied(occupied) => occupied.remove(),
                 Entry::Vacant(_) => Vec::new(),
@@ -2645,18 +3508,17 @@ impl Session {
             {
                 continue;
             }
-            let Some(path) = self.engine(self.default_context).file_table().path(file) else {
+            let Some(path) = self
+                .engine(self.default_context)
+                .file_table()
+                .path(file)
+                .map(|path| path.to_path_buf())
+            else {
                 continue;
             };
-            let path = path.to_path_buf();
-            let baseline = match record.entry(file) {
-                Entry::Occupied(occupied) => occupied.remove(),
-                Entry::Vacant(_) => Vec::new(),
-            };
-            self.published.insert(file, baseline);
+            self.published.insert(file, now.clone());
             publishes.push(Publish {
                 uri: uri::from_path(&path),
-                version: self.opened.get(&path).map(|document| document.version),
                 diagnostics: now,
             });
         }
@@ -2664,47 +3526,15 @@ impl Session {
         publishes
     }
 
-    /// Converts one engine diagnostic to the LSP shape, reading the
-    /// analyzed context's line index and resident text. Both are borrowed,
-    /// never cloned — a per-diagnostic whole-file copy would make a read
-    /// task O(D × file bytes). Returns `None` only for a non-resident file,
-    /// which the engine's "live libraries only" contract excludes.
-    fn convert(&self, context: ContextId, diagnostic: &Diagnostic) -> Option<lsp::Diagnostic> {
+    /// Converts one engine diagnostic to the wire shape — the wire-shape
+    /// module's conversion (`crate::wire::convert`), borrowed from the
+    /// analyzed context's resident state. Returns `None` only for a
+    /// non-resident file, which the engine's "live libraries only"
+    /// contract excludes.
+    fn convert(&self, context: ContextId, diagnostic: &Diagnostic) -> Option<wire::Diagnostic> {
         #[cfg(test)]
         crate::probe::count_conversion();
-        let index = self.engine(context).line_index(diagnostic.file)?;
-        let bytes = self.engine(context).content(diagnostic.file)?;
-        let text = std::str::from_utf8(bytes).expect("engine content is valid UTF-8");
-        // `line_col_utf16` answers the oracle's 1-based (line, column); LSP
-        // positions are zero-based.
-        let end_offset = diagnostic
-            .range
-            .offset
-            .checked_add(diagnostic.range.length)
-            .expect("diagnostic range overflows u32");
-        let (start_line, start_column) = index.line_col_utf16(text, diagnostic.range.offset);
-        let (end_line, end_column) = index.line_col_utf16(text, end_offset);
-        let severity = match diagnostic.severity {
-            Severity::Error => 1,
-            Severity::Warning => 2,
-            Severity::Info => 3,
-        };
-        Some(lsp::Diagnostic {
-            range: lsp::Range {
-                start: lsp::Position {
-                    line: start_line - 1,
-                    character: start_column - 1,
-                },
-                end: lsp::Position {
-                    line: end_line - 1,
-                    character: end_column - 1,
-                },
-            },
-            severity,
-            code: diagnostic.code.name.to_owned(),
-            source: "dartq".into(),
-            message: diagnostic.message.clone().into_owned(),
-        })
+        crate::wire::convert(self.engine(context), diagnostic)
     }
 }
 
@@ -2964,10 +3794,24 @@ mod tests {
         (workspace, session)
     }
 
+    /// The in-memory half of [`Session::queue_disk_changes`]: stages one
+    /// whole-file set and queues the write + publish read the intake would.
+    /// Tests use it for synthetic payloads that should not touch the disk
+    /// (oversized or mid-batch bytes); disk-truth tests go through
+    /// `fs::write` + `queue_disk_changes` instead.
+    fn sync_text(session: &mut Session, path: &Path, text: &str) {
+        session.stage(OverlayChange::Set {
+            path: path.to_path_buf(),
+            bytes: text.as_bytes().to_vec(),
+        });
+        session.ensure_write();
+        session.ensure_read(session.default_context, Tier::Normal);
+    }
+
     /// The stale-config advisory (#741): a session assembled with the
     /// advisory leads its first drain with exactly one publish anchored at
     /// the config path — INFO severity, the dartq/* code, the assembly's
-    /// message, no version (the config file is never client-opened) — and
+    /// message — and
     /// no later drain repeats it; an assembly without the advisory never
     /// publishes the config URI.
     #[test]
@@ -3000,7 +3844,6 @@ mod tests {
             "the advisory leads the turn's publishes"
         );
         let push = pushes[0];
-        assert_eq!(push.version, None, "the config file is not client-opened");
         assert_eq!(push.diagnostics.len(), 1, "one advisory row");
         let row = &push.diagnostics[0];
         assert_eq!(row.severity, 3, "INFO — the registry row's severity");
@@ -3046,14 +3889,436 @@ mod tests {
         );
     }
 
-    /// Writer priority (PRD §16.5), deterministically: two `dartq/analyze`
+    /// The span-capacity rejection advisories (#1549): an oversized staged
+    /// write pushes exactly one INFO row at the file's URI — the pinned
+    /// `dartq/*` code and the CLI analyze face's rejection clause — the
+    /// same bytes re-synced re-fire the engine event but stage no second
+    /// push (the rejection map is the throttle), and a healed write
+    /// retracts with the empty set (diagnostics replace per URI).
+    ///
+    /// The oversized content is staged directly ([`Session::stage`]) rather
+    /// than through `queue_disk_changes`: the sync's `fs::read` would fault
+    /// every page of a real oversized file into RSS, while the staged
+    /// `vec![0; …]` stays untouched (lazily mapped zero pages) — the
+    /// overlay gate reads only the length, so the pin exercises the same
+    /// event path without the memory.
+    #[test]
+    fn source_rejection_pushes_once_dedupes_and_retracts() {
+        let (workspace, mut session) = fixture_with("source-rejection-advisory", CLEAN_MAIN);
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        let big = workspace.path("lib/big.dart");
+        let uri = uri::from_path(&big);
+        session.stage(OverlayChange::Set {
+            path: big.clone(),
+            bytes: vec![0u8; MAX_SOURCE_BYTES + 1],
+        });
+        let turn = session.service();
+        let push = turn
+            .publishes
+            .iter()
+            .find(|push| push.uri == uri)
+            .expect("the rejection advisory pushes this turn");
+        assert_eq!(push.diagnostics.len(), 1, "one advisory row");
+        let row = &push.diagnostics[0];
+        assert_eq!(row.severity, 3, "INFO — the advisory row's severity");
+        assert_eq!(row.code, DARTQ_SOURCE_REJECTED.name);
+        assert_eq!(row.source, "dartq");
+        assert_eq!(row.range.start.line, 0, "the row names a file, not a span");
+        assert_eq!(
+            row.message,
+            format!(
+                "source exceeds the {MAX_SOURCE_BYTES}-byte analysis capacity; \
+                 the file is excluded from analysis"
+            )
+        );
+
+        // The re-synced oversized bytes re-fire the event in every
+        // context's gate; the dedupe map stages no second push.
+        session.stage(OverlayChange::Set {
+            path: big.clone(),
+            bytes: vec![0u8; MAX_SOURCE_BYTES + 1],
+        });
+        let turn = session.service();
+        assert!(
+            turn.publishes.iter().all(|push| push.uri != uri),
+            "the same rejection never republishes: {:?}",
+            turn.publishes
+        );
+
+        // A healed write lands under the capacity: the empty set clears
+        // the advisory row at the client.
+        session.stage(OverlayChange::Set {
+            path: big,
+            bytes: b"void main() {}\n".to_vec(),
+        });
+        let turn = session.service();
+        let push = turn
+            .publishes
+            .iter()
+            .find(|push| push.uri == uri)
+            .expect("the heal retracts the advisory");
+        assert!(
+            push.diagnostics.is_empty(),
+            "the empty set is the clear: {:?}",
+            push.diagnostics
+        );
+    }
+
+    /// The pull face carries the stale-config advisory: every `dartq/analyze`
+    /// answer leads with the advisory row — the same anchor, severity, code,
+    /// and message the session-start push serves — and it stays present
+    /// across later turns (a source-only edit cannot change the freshness
+    /// verdict), which is what keeps an incremental replay byte-equal with
+    /// the full-recompute faces (the incremental-consistency gate compares
+    /// the two). The push stays exactly-once across those same turns; a
+    /// fresh assembly's pull carries no config row.
+    #[test]
+    fn analyze_pull_leads_with_the_stale_config_advisory() {
+        let workspace = Workspace::new(BROKEN_MAIN);
+        let config_path = workspace.path(".dart_tool/package_config.json");
+        let config_uri = uri::from_path(&config_path);
+        let advisory = WorkspaceAdvisory::Stale(StaleConfigAdvisory {
+            reasons: vec![StaleReason::MissingLockFile],
+            config_path: config_path.clone(),
+        });
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("stale-advisory-pull")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session =
+            Session::with_store(workspace.engine_config(), store, Some(advisory)).expect("session");
+
+        session.sweep().expect("sweep");
+        let start = session.service();
+        let push_row = &start.publishes[0].diagnostics[0];
+
+        // First pull: the advisory row leads the answer, byte-equal to the
+        // push row (severity, range, code, source, message) at the config URI.
+        session.queue_command(
+            RequestId::Num(1),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diagnostics"]
+            .as_array()
+            .expect("diagnostics rows");
+        assert!(!rows.is_empty(), "the pull is not empty");
+        let lead = &rows[0];
+        assert_eq!(lead["uri"], config_uri.as_str(), "the advisory leads");
+        assert_eq!(lead["severity"], push_row.severity, "same severity");
+        assert_eq!(lead["code"], push_row.code, "same code");
+        assert_eq!(lead["source"], push_row.source, "same source");
+        assert_eq!(lead["message"], push_row.message, "same message");
+        assert_eq!(
+            lead["range"],
+            serde_json::to_value(push_row.range).expect("the row's range serializes"),
+            "the row names a file, not a span"
+        );
+        assert!(
+            !turn.publishes.iter().any(|push| push.uri == config_uri),
+            "the push stays exactly-once across pulls"
+        );
+
+        // A source-only edit turn (the gate's comment splice shape): the
+        // verdict cannot change, so the advisory still leads and the push
+        // never repeats.
+        let main = workspace.path("lib/main.dart");
+        std::fs::write(&main, CLEAN_MAIN).expect("rewrite on disk");
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("sync admits");
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        let rows = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("the post-edit pull answers")["diagnostics"]
+            .as_array()
+            .expect("diagnostics rows");
+        assert_eq!(
+            rows[0]["uri"],
+            config_uri.as_str(),
+            "the advisory still leads after a source-only edit"
+        );
+        assert_eq!(rows[0]["code"], "dartq/package_config_out_of_date");
+        assert!(
+            !turn.publishes.iter().any(|push| push.uri == config_uri),
+            "the push never republishes after an edit"
+        );
+
+        // The fresh face: without the advisory, no pull ever carries the
+        // config row.
+        let fresh = Workspace::new(BROKEN_MAIN);
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("stale-advisory-pull-fresh")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session = Session::with_store(fresh.engine_config(), store, None).expect("session");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        let fresh_uri = uri::from_path(&fresh.path(".dart_tool/package_config.json"));
+        let rows = turn.answers[0].1.as_ref().expect("the fresh pull answers")["diagnostics"]
+            .as_array()
+            .expect("diagnostics rows");
+        assert!(
+            rows.iter().all(|row| row["uri"] != fresh_uri.as_str()),
+            "a fresh assembly's pull never carries the advisory"
+        );
+    }
+
+    /// The config-input watch sweep's advisory heal: a re-evaluation over a
+    /// resolution that went stale behind the session re-arms the verdict
+    /// (the fresh row republishes exactly once and leads the next pull), a
+    /// re-evaluation over a healed resolution clears it (the retraction is
+    /// one empty set at the previous anchor), and a re-evaluation over an
+    /// unchanged resolution stages nothing — the once-per-session push
+    /// economics hold. Source edits never reach the re-evaluation (only the
+    /// watched config inputs route to it), so the pull face's source-edit
+    /// stability is unchanged.
+    #[test]
+    fn config_input_sweep_heals_the_workspace_advisory() {
+        let workspace = Workspace::new(BROKEN_MAIN);
+        let config_path = workspace.path(".dart_tool/package_config.json");
+        let config_uri = uri::from_path(&config_path);
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("advisory-heal")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session =
+            Session::with_store(workspace.engine_config(), store, None).expect("session");
+        session.sweep().expect("sweep");
+        // The session-start push fired with no advisory: the fixture's
+        // resolution is fresh.
+        let turn = session.service();
+        assert!(
+            turn.publishes.iter().all(|push| push.uri != config_uri),
+            "the fresh assembly starts advisory-free"
+        );
+
+        // The resolution goes stale behind the session (the on-disk config
+        // no longer matches the running SDK).
+        std::fs::write(
+            &config_path,
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.9.0"}"#,
+        )
+        .expect("stale config");
+        session.refresh_workspace_advisory();
+        session.queue_command(
+            RequestId::Num(1),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        let pushes: Vec<_> = turn
+            .publishes
+            .iter()
+            .filter(|push| push.uri == config_uri)
+            .collect();
+        assert_eq!(pushes.len(), 1, "the re-armed advisory publishes once");
+        assert_eq!(pushes[0].diagnostics.len(), 1, "one advisory row");
+        assert_eq!(
+            pushes[0].diagnostics[0].code,
+            "dartq/package_config_out_of_date"
+        );
+        let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diagnostics"]
+            .as_array()
+            .expect("diagnostics rows");
+        assert_eq!(
+            rows[0]["uri"],
+            config_uri.as_str(),
+            "the healed verdict leads the pull"
+        );
+        assert!(
+            rows[0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("generated by Dart 3.9.0")),
+            "the row names the fresh verdict: {}",
+            rows[0]["message"]
+        );
+
+        // The heal: the resolution catches up (`dart pub get` rewrote the
+        // config). The cleared verdict retracts once as an empty set at the
+        // previous anchor, and the pull stops carrying the row.
+        std::fs::write(
+            &config_path,
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
+        )
+        .expect("healed config");
+        session.refresh_workspace_advisory();
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        let pushes: Vec<_> = turn
+            .publishes
+            .iter()
+            .filter(|push| push.uri == config_uri)
+            .collect();
+        assert_eq!(pushes.len(), 1, "the cleared advisory retracts once");
+        assert!(
+            pushes[0].diagnostics.is_empty(),
+            "the retraction is an empty set"
+        );
+        let rows = turn.answers[0].1.as_ref().expect("the healed pull answers")["diagnostics"]
+            .as_array()
+            .expect("diagnostics rows");
+        assert!(
+            rows.iter().all(|row| row["uri"] != config_uri.as_str()),
+            "the cleared verdict no longer leads the pull"
+        );
+
+        // A re-evaluation over an unchanged resolution stages nothing.
+        session.refresh_workspace_advisory();
+        let turn = session.service();
+        assert!(
+            turn.publishes.iter().all(|push| push.uri != config_uri),
+            "an unchanged verdict never republishes"
+        );
+    }
+
+    /// The advisory state machine degrades instead of panicking under
+    /// watch-event interleavings (#1834): duplicate
+    /// `refresh_workspace_advisory` calls in the pushed state — an unchanged
+    /// standing verdict, and the both-verdicts-clear neighborhood the
+    /// degrade arm covers — never panic and never stage a republish; the
+    /// pull keeps leading with the standing verdict and the retract stays
+    /// exactly-once.
+    #[test]
+    fn stale_advisory_refresh_degrades_without_unreachable() {
+        let workspace = Workspace::new(BROKEN_MAIN);
+        let config_path = workspace.path(".dart_tool/package_config.json");
+        let config_uri = uri::from_path(&config_path);
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("advisory-degrade")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session =
+            Session::with_store(workspace.engine_config(), store, None).expect("session");
+        session.sweep().expect("sweep");
+        // The session-start push fired with no advisory: the fixture's
+        // resolution is fresh, and `advisory_pushed` stands.
+        let turn = session.service();
+        assert!(
+            turn.publishes.iter().all(|push| push.uri != config_uri),
+            "the fresh assembly starts advisory-free"
+        );
+
+        // The resolution goes stale behind the session; the re-armed
+        // verdict publishes once (the standing push face).
+        std::fs::write(
+            &config_path,
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.9.0"}"#,
+        )
+        .expect("stale config");
+        session.refresh_workspace_advisory();
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes
+                .iter()
+                .filter(|push| push.uri == config_uri)
+                .count(),
+            1,
+            "the re-armed advisory publishes once"
+        );
+
+        // Watch-event interleaving shape: repeated refreshes over the
+        // unchanged standing verdict in the pushed state stage nothing, and
+        // the pull still leads with the row.
+        session.refresh_workspace_advisory();
+        session.refresh_workspace_advisory();
+        session.queue_command(
+            RequestId::Num(1),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.publishes.iter().all(|push| push.uri != config_uri),
+            "an unchanged verdict never republishes, however often the event re-fires"
+        );
+        let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diagnostics"]
+            .as_array()
+            .expect("diagnostics rows");
+        assert_eq!(
+            rows[0]["uri"],
+            config_uri.as_str(),
+            "the standing verdict still leads the pull"
+        );
+
+        // The heal retracts exactly once; further refreshes over the
+        // both-verdicts-clear state — the degrade arm's neighborhood —
+        // neither panic nor republish.
+        std::fs::write(
+            &config_path,
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
+        )
+        .expect("healed config");
+        session.refresh_workspace_advisory();
+        let turn = session.service();
+        let pushes: Vec<_> = turn
+            .publishes
+            .iter()
+            .filter(|push| push.uri == config_uri)
+            .collect();
+        assert_eq!(pushes.len(), 1, "the cleared advisory retracts once");
+        assert!(
+            pushes[0].diagnostics.is_empty(),
+            "the retraction is an empty set"
+        );
+        session.refresh_workspace_advisory();
+        session.refresh_workspace_advisory();
+        let turn = session.service();
+        assert!(
+            turn.publishes.iter().all(|push| push.uri != config_uri),
+            "the clear-on-clear state stages nothing"
+        );
+    }
+
+    /// Writer priority, deterministically: two `dartq/analyze`
     /// requests bracketing an overlay edit drain in one turn, and the
     /// request enqueued BEFORE the edit still answers with the post-write
     /// view — every write executes before any read.
     #[test]
     fn writer_priority_drains_writes_before_reads() {
         let (workspace, mut session) = fixture("writer-priority-unit");
-        let uri = uri::from_path(&workspace.path("lib/main.dart"));
+        let main = workspace.path("lib/main.dart");
 
         session.sweep().expect("sweep");
         let turn = session.service();
@@ -3072,7 +4337,10 @@ mod tests {
                 context: None,
             },
         );
-        assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
+        fs::write(&main, CLEAN_MAIN).expect("rewrite on disk");
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("sync admits");
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
@@ -3084,7 +4352,6 @@ mod tests {
         let turn = session.service();
 
         assert_eq!(turn.publishes.len(), 1, "the write's clear push");
-        assert_eq!(turn.publishes[0].version, Some(2));
         assert!(turn.publishes[0].diagnostics.is_empty());
         assert_eq!(
             turn.answers.iter().map(|(id, _)| id).collect::<Vec<_>>(),
@@ -3174,8 +4441,8 @@ mod tests {
         );
     }
 
-    /// Epoch cancellation (PRD §16.6), deterministically: a request
-    /// superseded by `$/cancelRequest` drops at the drain and answers
+    /// Epoch cancellation, deterministically: a request
+    /// superseded by `dartq/cancel` drops at the drain and answers
     /// cancelled with no result, while the overlay edit sharing the batch
     /// still lands (writes carry no ids) — and the publish the cancelled
     /// read was carrying is re-stamped onto a zero-request read, so the
@@ -3184,7 +4451,7 @@ mod tests {
     #[test]
     fn cancel_drops_queued_reads_but_writes_and_publishes_survive() {
         let (workspace, mut session) = fixture("cancel-unit");
-        let uri = uri::from_path(&workspace.path("lib/main.dart"));
+        let main = workspace.path("lib/main.dart");
 
         session.sweep().expect("sweep");
         let _ = session.service();
@@ -3198,7 +4465,10 @@ mod tests {
                 context: None,
             },
         );
-        assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
+        fs::write(&main, CLEAN_MAIN).expect("rewrite on disk");
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("sync admits");
         session.cancel_request(&RequestId::Num(2));
         let turn = session.service();
 
@@ -3216,11 +4486,10 @@ mod tests {
             "the write's clear push survives the cancel: {:?}",
             turn.publishes
         );
-        assert_eq!(turn.publishes[0].version, Some(2));
         assert!(turn.publishes[0].diagnostics.is_empty());
 
-        // The publish baseline caught up in that turn: a follow-up analysis
-        // (had the client not stayed silent) pushes nothing new.
+        // A follow-up analysis over the unchanged set publishes nothing —
+        // the push face is pure diff — but still answers the clean view.
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
@@ -3232,13 +4501,185 @@ mod tests {
         let turn = session.service();
         assert!(
             turn.publishes.is_empty(),
-            "no duplicate push: {:?}",
+            "the unchanged set stays diff-suppressed: {:?}",
             turn.publishes
         );
         let entries = turn.answers[0].1.as_ref().expect("post-write answer")["diagnostics"]
             .as_array()
             .expect("diagnostics array");
         assert!(entries.is_empty(), "post-write view: {entries:?}");
+    }
+
+    /// The open-file half of the publish contract (the analysis-completion
+    /// The publish face is a pure diff: a clean file's sweep publishes
+    /// nothing, an edit that lands clean pushes exactly one empty set (the
+    /// set replaces the client's rows), and the same unchanged set never
+    /// republishes.
+    #[test]
+    fn a_clean_files_push_is_one_empty_set_then_suppressed() {
+        let (workspace, mut session) = fixture_with("open-clean-publish-unit", CLEAN_MAIN);
+        let uri = uri::from_path(&workspace.path("lib/main.dart"));
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "the clean sweep publishes nothing: {:?}",
+            turn.publishes
+        );
+
+        // Re-break on disk: the error's rows push once, then the unchanged
+        // set suppresses on every later drain.
+        fs::write(&main, BROKEN_MAIN).expect("break on disk");
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("sync admits");
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the re-broken file pushes its rows: {:?}",
+            turn.publishes
+        );
+        assert_eq!(turn.publishes[0].uri, uri);
+        assert_eq!(turn.publishes[0].diagnostics.len(), 1);
+
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "an unchanged set never republishes: {:?}",
+            turn.publishes
+        );
+    }
+
+    /// The first batch's cancel race (#1364): the startup sweep queues the
+    /// initial read, one request attaches to it, and its `dartq/cancel`
+    /// lands before the first drain — a legal order. With no survivors
+    /// and no staged write the read still survives (the sweep stamped
+    /// publish duty): its zero-request base analysis runs, and a client
+    /// that then goes quiet still receives the workspace's first publish.
+    #[test]
+    fn the_first_batch_cancel_still_delivers_the_sweeps_initial_publish() {
+        let (workspace, mut session) = fixture("first-batch-cancel-unit");
+        let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+
+        // The whole first batch before any drain: sweep, request, cancel.
+        session.sweep().expect("sweep");
+        session.queue_command(
+            RequestId::Num(1),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        session.cancel_request(&RequestId::Num(1));
+        let turn = session.service();
+
+        let [(id, answer)] = turn.answers.as_slice() else {
+            panic!("one request, one answer: {:?}", turn.answers);
+        };
+        assert_eq!(*id, RequestId::Num(1));
+        assert!(
+            matches!(answer, Err(SessionError::Cancelled)),
+            "the stale request answers cancelled: {answer:?}"
+        );
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the sweep's initial publish survives the cancel: {:?}",
+            turn.publishes
+        );
+        assert_eq!(turn.publishes[0].uri, uri);
+        assert!(
+            !turn.publishes[0].diagnostics.is_empty(),
+            "the seeded error's rows: {:?}",
+            turn.publishes[0]
+        );
+    }
+
+    /// The publish predicate is a pure diff against the baseline: an
+    /// unchanged diagnostic set never republishes, whatever the file's
+    /// write history — only a real row change pushes.
+    #[test]
+    fn publishes_are_pure_diffs_against_the_baseline() {
+        let (workspace, mut session) = fixture("open-publish-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the sweep publishes the seeded error"
+        );
+
+        // Unchanged: the diff suppression holds.
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "an unchanged set stays suppressed: {:?}",
+            turn.publishes
+        );
+
+        // A synced rewrite of the SAME broken bytes is a content-identical
+        // write: still nothing to push.
+        fs::write(&main, BROKEN_MAIN).expect("same bytes on disk");
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("sync admits");
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "a same-content write pushes nothing: {:?}",
+            turn.publishes
+        );
+
+        // A real change: the clean set replaces the error's rows once,
+        // then suppression resumes.
+        fs::write(&main, CLEAN_MAIN).expect("rewrite on disk");
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("sync admits");
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the clear push: {:?}",
+            turn.publishes
+        );
+        assert!(turn.publishes[0].diagnostics.is_empty());
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "suppression resumes after the diff drained: {:?}",
+            turn.publishes
+        );
     }
 
     /// The fix dispatch leaves the main loop (the #682 P2 residual): the
@@ -3463,8 +4904,8 @@ mod tests {
         assert!(session.fixes.is_empty(), "the job left with the dispatch");
     }
 
-    /// A duplicate cancel of a running dispatch is ignored (LSP
-    /// §cancelRequest's already-answered rule): the first cancel queued the
+    /// A duplicate cancel of a running dispatch is ignored (the
+    /// already-answered rule): the first cancel queued the
     /// answer, the second must not queue another — two `Cancelled` answers
     /// for one id would violate JSON-RPC.
     #[test]
@@ -3662,6 +5103,7 @@ mod tests {
     /// a `dart` on PATH (the live fixture needs one, like the plugin crate's
     /// `callback_timeout` suite).
     #[test]
+    #[expect(clippy::too_many_lines)] // the live slow-plugin scenario drives the full fix-budget lifecycle
     fn fix_budget_answers_a_slow_plugin_and_the_session_survives() {
         let dart = std::process::Command::new("dart")
             .arg("--version")
@@ -3774,7 +5216,7 @@ mod tests {
         // The abandoned worker finishes (its manifest's request budget
         // kills the stall), the late mail drops, the hosts come home, and
         // the next fix dispatches normally.
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         while session.fix_running.is_some() {
             assert!(
                 Instant::now() < deadline,
@@ -3864,7 +5306,7 @@ mod tests {
     }
 
     /// Cancelling an unknown id, or one that already answered, is silently
-    /// ignored (LSP §cancelRequest): no cancelled answer, no state change.
+    /// ignored: no cancelled answer, no state change.
     #[test]
     fn cancel_of_unknown_or_answered_id_is_ignored() {
         let (_workspace, mut session) = fixture("cancel-ignore-unit");
@@ -3914,24 +5356,37 @@ mod tests {
         assert!(turn.answers[0].1.is_ok());
     }
 
-    /// Staged edits merge last-wins per path (#347): three batched
-    /// `didChange` frames for one file stage ONE whole-text op, not three —
+    /// Staged edits merge last-wins per path (#347): three batched syncs of
+    /// one file stage ONE whole-text op, not three —
     /// and the batch publishes exactly what a single edit would (the
     /// terminal state is order-independent for distinct paths, so the
     /// earlier same-path ops are unobservable).
     #[test]
     fn staged_edits_of_one_file_merge_last_wins() {
         let (workspace, mut session) = fixture("staged-merge-unit");
-        let uri = uri::from_path(&workspace.path("lib/main.dart"));
+        let main = workspace.path("lib/main.dart");
 
         session.sweep().expect("sweep");
         let _ = session.service();
 
-        // Three didChange frames land inside one batch window: three
-        // queue_edit calls before the drain.
-        assert!(session.queue_edit(&uri, "}\n", 2));
-        assert!(session.queue_edit(&uri, ")\n", 3));
-        assert!(session.queue_edit(&uri, CLEAN_MAIN, 4));
+        // Three sync payloads land inside one batch window: three staged
+        // sets before the drain (the sync intake's `stage` half — the disk
+        // bytes stay the seeded BROKEN_MAIN while the staged texts are the
+        // payloads).
+        session.stage(OverlayChange::Set {
+            path: main.clone(),
+            bytes: b"}\n".to_vec(),
+        });
+        session.stage(OverlayChange::Set {
+            path: main.clone(),
+            bytes: b")\n".to_vec(),
+        });
+        session.stage(OverlayChange::Set {
+            path: main.clone(),
+            bytes: CLEAN_MAIN.as_bytes().to_vec(),
+        });
+        session.ensure_write();
+        session.ensure_read(session.default_context, Tier::Normal);
         assert_eq!(
             session.staged.len(),
             1,
@@ -3945,7 +5400,6 @@ mod tests {
             "one batch, one push — as if a single clean edit arrived: {:?}",
             turn.publishes
         );
-        assert_eq!(turn.publishes[0].version, Some(4));
         assert!(turn.publishes[0].diagnostics.is_empty());
 
         // The survivor is the LAST text: an earlier broken one winning
@@ -3968,13 +5422,12 @@ mod tests {
         );
     }
 
-    /// Watch intake (`--watch`) is the didChange-equivalent: an on-disk
+    /// Watch intake (`--watch`): an on-disk
     /// rewrite synced through [`Session::queue_disk_changes`] re-analyzes
-    /// and publishes the clean set — with **no version** (a watch file is
-    /// not an LSP-opened document) — and a vanished file stages a removal,
+    /// and publishes the clean set, and a vanished file stages a removal,
     /// so the file drops out of the view and its diagnostics vanish
-    /// (absence semantics, as with a closed overlay-only buffer; the
-    /// analysis's content check stays the §16.7 truth). Nothing staged
+    /// (absence semantics; the
+    /// analysis's content check stays the truth). Nothing staged
     /// (every path unreadable) enqueues nothing.
     #[test]
     fn watch_disk_changes_sync_analyze_and_remove() {
@@ -3985,23 +5438,22 @@ mod tests {
         let turn = session.service();
         assert_eq!(turn.publishes.len(), 1, "the seeded error publishes");
 
-        // A disk rewrite the client never pushed: analyzed Normal-tier, no
-        // version on the push.
+        // A disk rewrite synced in: analyzed Normal-tier, one clear push.
         fs::write(&main, CLEAN_MAIN).expect("rewrite on disk");
-        session.queue_disk_changes(&[main.clone()]);
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("sync admits");
         let turn = session.service();
         assert_eq!(turn.publishes.len(), 1, "the clear push");
-        assert_eq!(
-            turn.publishes[0].version, None,
-            "watch files are not LSP-opened"
-        );
         assert!(turn.publishes[0].diagnostics.is_empty());
 
         // A file deleted since the event: the overlay drops it, the file's
         // diagnostics vanish, and — the baseline already being empty — no
         // push goes out.
         fs::remove_file(&main).expect("delete on disk");
-        session.queue_disk_changes(&[main.clone()]);
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("sync admits");
         let turn = session.service();
         assert!(
             turn.publishes.is_empty(),
@@ -4031,7 +5483,9 @@ mod tests {
 
         // An unreadable path stages nothing: no write, no read, no turn
         // work (the next analysis still answers).
-        session.queue_disk_changes(&[workspace.path("lib/nope-beyond-workspace.rs")]);
+        session
+            .queue_disk_changes(&[workspace.path("lib/nope-beyond-workspace.rs")])
+            .expect("sync admits");
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
@@ -4081,7 +5535,9 @@ mod tests {
         // A watch-written file enters the delta cursor (the sweep alone
         // never touches it — only explicit writes do).
         fs::write(&extra, CLEAN_MAIN).expect("create on disk");
-        session.queue_disk_changes(&[extra.clone()]);
+        session
+            .queue_disk_changes(std::slice::from_ref(&extra))
+            .expect("sync admits");
         let _ = session.service();
         assert!(
             session.changed.contains_key(&extra),
@@ -4092,7 +5548,9 @@ mod tests {
         // rides the diff, then both removed entries leave their tables.
         fs::remove_file(&main).expect("delete on disk");
         fs::remove_file(&extra).expect("delete on disk");
-        session.queue_disk_changes(&[main.clone(), extra.clone()]);
+        session
+            .queue_disk_changes(&[main.clone(), extra.clone()])
+            .expect("sync admits");
         let turn = session.service();
         assert_eq!(
             turn.publishes.len(),
@@ -4116,7 +5574,7 @@ mod tests {
         );
     }
 
-    /// Re-discovery, additions: a file created after `initialized` and
+    /// Re-discovery, additions: a file created after the startup sweep and
     /// synced through [`Session::queue_disk_changes`] enters the analysis —
     /// the sync stages the same set the sweep's discovery takes, so the new
     /// file's own diagnostics surface (publish and analyze entries). The
@@ -4130,7 +5588,9 @@ mod tests {
 
         let extra = workspace.path("lib/extra.dart");
         fs::write(&extra, "import 'also_missing.dart';\nvoid main() {}\n").expect("create");
-        session.queue_disk_changes(&[extra.clone()]);
+        session
+            .queue_disk_changes(std::slice::from_ref(&extra))
+            .expect("sync admits");
         let turn = session.service();
         assert_eq!(
             turn.publishes.len(),
@@ -4189,7 +5649,9 @@ mod tests {
         // debounce delivers both paths in one batch).
         fs::write(&main, BROKEN_MAIN).expect("main takes the broken content");
         fs::write(&other, CLEAN_MAIN).expect("other takes the clean content");
-        session.queue_disk_changes(&[main.clone(), other.clone()]);
+        session
+            .queue_disk_changes(&[main.clone(), other.clone()])
+            .expect("sync admits");
         let turn = session.service();
 
         assert_eq!(
@@ -4213,27 +5675,23 @@ mod tests {
         assert!(by_uri(&other).diagnostics.is_empty(), "other is clean now");
     }
 
-    /// Overlay precedence (the rule [`Session::queue_disk_changes`]
-    /// documents): a client-opened document owns its content until
-    /// `didClose` — a disk rewrite under it never reaches the analysis —
-    /// and an agent overlay masks the base regardless of disk traffic (the
-    /// base keeps tracking the disk; the agent's view stays its own).
+    /// Sync intake has no precedence question left: the base view IS the
+    /// disk view, so a synced rewrite lands as the base content — while an
+    /// agent overlay masks the base regardless of disk traffic (the base
+    /// keeps tracking the disk; the agent's view stays its own).
     #[test]
-    fn watch_sync_never_clobbers_overlay_content() {
+    fn watch_sync_updates_the_base_but_never_an_agent_view() {
         let (workspace, mut session) = fixture("watch-overlay-precedence-unit");
         let main = workspace.path("lib/main.dart");
-        let uri = crate::uri::from_path(&main);
 
         session.sweep().expect("sweep");
         let _ = session.service();
 
-        // A client-opened document: the disk rewrite under the open buffer
-        // is skipped entirely — no clobber push, and the base still holds
-        // the client's text.
-        assert!(session.queue_edit(&uri, CLEAN_MAIN, 1));
-        let _ = session.service();
-        fs::write(&main, BROKEN_MAIN).expect("disk rewrite under the open buffer");
-        session.queue_disk_changes(&[main.clone()]);
+        // A disk rewrite synced in: the base view takes the new bytes.
+        fs::write(&main, CLEAN_MAIN).expect("disk rewrite");
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("sync admits");
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
@@ -4243,43 +5701,33 @@ mod tests {
             },
         );
         let turn = session.service();
-        assert!(
-            turn.publishes.is_empty(),
-            "the disk rewrite did not clobber the open document: {:?}",
-            turn.publishes
-        );
-        assert!(
-            answer_codes(&turn.answers[0].1).is_empty(),
-            "the base view still holds the client's text: {:?}",
-            turn.answers[0]
-        );
-
-        // didClose re-syncs the disk state: the rewrite shows up now (a
-        // write-only turn — the answers list is empty, the push is the
-        // evidence).
-        session.queue_close(&uri).expect("close");
-        let turn = session.service();
-        assert!(turn.answers.is_empty(), "no requests rode the close");
         assert_eq!(
             turn.publishes.len(),
             1,
-            "the close surfaces the disk state: {:?}",
+            "the sync publishes the clean set: {:?}",
             turn.publishes
         );
-        assert_eq!(
-            turn.publishes[0].diagnostics[0].code, "uri_does_not_exist",
-            "close staged the on-disk bytes: {:?}",
+        assert!(
+            turn.publishes[0].diagnostics.is_empty(),
+            "the synced bytes are the base: {:?}",
             turn.publishes[0]
         );
+        assert!(
+            answer_codes(&turn.answers[0].1).is_empty(),
+            "the base view holds the synced text: {:?}",
+            turn.answers[0]
+        );
 
-        // An agent overlay: the base tracks the disk through the sync (the
-        // path is not client-opened), while the agent's view keeps its own
+        // An agent overlay: the base tracks the disk through the sync,
+        // while the agent's view keeps its own
         // content — disk traffic never leaks into it.
         session
             .set_overlay("A", vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())])
             .expect("stage A");
         fs::write(&main, SYNTAX_BROKEN).expect("another disk rewrite");
-        session.queue_disk_changes(&[main.clone()]);
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("sync admits");
         let (id_a, a) = check_request(3, &[workspace.path("lib")], Some("A"), None);
         session.queue_command(id_a, a);
         session.queue_command(
@@ -4313,44 +5761,20 @@ mod tests {
         );
     }
 
-    /// The refresh sweep's open-document precedence (the guard
-    /// [`Session::sweep`] shares with the sync path): discovery re-stages
-    /// disk bytes for every resident path, and a config-triggered sweep
-    /// must not write that text over a live open buffer — both the applied
-    /// overlay and an edit still queued on the write task survive it.
+    /// A refresh sweep under a still-queued write: the staged bytes survive
+    /// it — `staged` is intake-side state the discovery pass never touches,
+    /// and the write applies at the next drain.
     #[test]
-    fn config_refresh_sweep_never_clobbers_an_open_document() {
+    fn config_refresh_sweep_keeps_a_queued_write() {
         let (workspace, mut session) = fixture("sweep-open-guard-unit");
         let main = workspace.path("lib/main.dart");
-        let uri = crate::uri::from_path(&main);
 
         session.sweep().expect("sweep");
         let _ = session.service();
 
-        // An applied open buffer: the refresh re-stages disk bytes under
-        // it, and the buffer's text must displace them (last-wins per
-        // pending path) instead of the other way around.
-        assert!(session.queue_edit(&uri, CLEAN_MAIN, 1));
-        let _ = session.service();
-        session.sweep().expect("refresh sweep");
-        session.queue_command(
-            RequestId::Num(2),
-            Request::Analyze {
-                verbosity: Verbosity::Compact,
-                agent: None,
-                context: None,
-            },
-        );
-        let turn = session.service();
-        assert!(
-            answer_codes(&turn.answers[0].1).is_empty(),
-            "the open buffer survived the refresh sweep: {:?}",
-            turn.answers[0]
-        );
-
-        // An edit still queued (no drain since queue_edit): the sweep's
-        // re-stage must keep the STAGED bytes, not the stale resident ones.
-        assert!(session.queue_edit(&uri, "void main() {} // v2\n", 2));
+        // An edit still queued (no drain since the stage): the sweep's
+        // re-discovery must keep the STAGED bytes, not the resident ones.
+        sync_text(&mut session, &main, "void main() {} // v2\n");
         session.sweep().expect("refresh sweep under a queued edit");
         session.queue_command(
             RequestId::Num(3),
@@ -4431,8 +5855,7 @@ mod tests {
 
     /// A `dartq/check` request rides the same read task and epoch machinery
     /// as `dartq/analyze`: a stale epoch aborts at the drain, before the
-    /// command executes — the request answers cancelled with no result
-    /// (PRD §15.1: every `dartq/*` face is cancellable).
+    /// command executes — the request answers cancelled with no result.
     #[test]
     fn cancel_drops_a_queued_dartq_check_request() {
         let (workspace, mut session) = fixture("cancel-command-unit");
@@ -4518,7 +5941,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Agent views (PRD §16.3) + session economics (PRD §15.8)
+    // Agent views + session economics
     // -----------------------------------------------------------------------
 
     /// Agent B's overlay signature — a syntax error the base fixture never
@@ -4626,6 +6049,88 @@ mod tests {
         );
     }
 
+    /// The plugin feed (#1819): `plugin_overlays` pushes every agent's staged
+    /// unsaved text — the same bytes `wear` sets on the engine — canonicalized
+    /// (one BOM strip, lossy decode) and sorted for the runtime's config
+    /// dedup. A same-path collision across agents resolves last-wins by the
+    /// staging cursor, the same rule the write stage applies.
+    #[test]
+    fn plugin_overlays_feed_the_staged_documents() {
+        let (workspace, mut session) = fixture("plugin-overlays-unit");
+        let main = workspace.path("lib/main.dart");
+        let other = workspace.path("lib/other.dart");
+
+        // Nothing staged: the feed is empty (the plugin-free shape's cost is
+        // the agents-table emptiness check).
+        assert!(session.plugin_overlays().is_empty());
+
+        // Agent A stages `main` with a BOM — the pushed text is the canonical
+        // decode, byte-identical to what `wear` hands the engine — and
+        // `other` plain. Agent B then re-stages `main`: the later cursor
+        // wins the path.
+        let bombed = {
+            let mut bytes = vec![0xEF, 0xBB, 0xBF];
+            bytes.extend_from_slice(b"var a = 1;");
+            bytes
+        };
+        session
+            .set_overlay(
+                "A",
+                vec![
+                    (main.clone(), bombed),
+                    (other.clone(), b"var o = 2;".to_vec()),
+                ],
+            )
+            .expect("stage A");
+        session
+            .set_overlay("B", vec![(main.clone(), b"var b = 3;".to_vec())])
+            .expect("stage B");
+
+        let overlays = session.plugin_overlays();
+        assert_eq!(
+            overlays,
+            vec![
+                // Sorted by path: `lib/main.dart` < `lib/other.dart`.
+                (main.to_string_lossy().into_owned(), "var b = 3;".to_owned(),),
+                (
+                    other.to_string_lossy().into_owned(),
+                    "var o = 2;".to_owned(),
+                ),
+            ],
+            "one entry per staged path, BOM-stripped, last-wins, sorted"
+        );
+
+        // Clearing both agents returns the feed to empty — the staged table
+        // is the source, not a snapshot.
+        session.clear_overlay("A");
+        session.clear_overlay("B");
+        assert!(session.plugin_overlays().is_empty());
+    }
+
+    /// The weave carries the staged text to the plugin cycle (#1819's wire
+    /// half): a dead plugin still runs the cycle (non-empty set), so the
+    /// `CycleContext.overlays` it is handed is readable through the probe —
+    /// the staged bytes, canonicalized, not the disk file's.
+    #[test]
+    fn the_plugin_weave_feeds_the_staged_overlay_content() {
+        let (workspace, mut session) = fixture("plugin-weave-overlays-unit");
+        let main = workspace.path("lib/main.dart");
+        session.inject_plugins(PluginSet::with_dead_plugin("dead", "spawn failed"));
+        session
+            .set_overlay("A", vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())])
+            .expect("stage");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        let fed = crate::probe::take_weave_overlays();
+        assert_eq!(
+            fed,
+            vec![(main.to_string_lossy().into_owned(), CLEAN_MAIN.to_owned(),)],
+            "the cycle's overlay set is the agent's staged text, never last-saved disk bytes"
+        );
+    }
+
     /// Clearing evicts the agent (fail loud on a late request) and the
     /// wear/restore cycle leaves the base view exactly as it was.
     #[test]
@@ -4662,7 +6167,7 @@ mod tests {
         let turn = session.service();
         assert!(
             matches!(&turn.answers[0].1, Err(SessionError::InvalidParams(message))
-                if message.contains("A")),
+                if message.contains('A')),
             "a cleared agent answers INVALID_PARAMS: {:?}",
             turn.answers[0]
         );
@@ -4690,23 +6195,22 @@ mod tests {
     /// base bytes at drain time (never at stage time), the overlay masks
     /// the base edit for its agent, and clearing the overlay reveals the
     /// edited base. The final leg answers through the engine face
-    /// (`dartq/analyze`): the disk-check face reads the worktree, which an
-    /// overlay base edit never touches, so only the engine view can prove
-    /// the wear/restore cycle left the edited base in place.
+    /// (`dartq/analyze`): the disk-check face reads the worktree — the
+    /// same worktree the base sync writes to — so only the staging
+    /// distinction (base write vs agent overlay) is under test here.
     #[test]
     fn base_change_under_a_live_overlay_stays_fresh() {
         let (workspace, mut session) = fixture("agent-freshness-unit");
         let main = workspace.path("lib/main.dart");
-        let uri = crate::uri::from_path(&main);
 
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main, SYNTAX_BROKEN.as_bytes().to_vec())])
+            .set_overlay("A", vec![(main.clone(), SYNTAX_BROKEN.as_bytes().to_vec())])
             .expect("stage");
         // The base moves AFTER staging: the agent's capture must happen at
         // wear time, so A keeps seeing its own text and the base moves on.
-        assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
+        sync_text(&mut session, &main, CLEAN_MAIN);
         session.queue_command(
             RequestId::Num(2),
             Request::Check {
@@ -4743,7 +6247,7 @@ mod tests {
         );
     }
 
-    /// Delta mode (PRD §15.8): the cursor is per-session monotonic, a delta
+    /// Delta mode: the cursor is per-session monotonic, a delta
     /// answer keeps only rows whose file changed since the cursor, and the
     /// answer echoes the session's current cursor for chaining.
     #[test]
@@ -4758,7 +6262,9 @@ mod tests {
         // reads disk, so the rewrite must be on disk for the rows to
         // exist; the sync marks the path changed in the same turn).
         std::fs::write(workspace.path("lib/main.dart"), SYNTAX_BROKEN).expect("rewrite");
-        session.queue_disk_changes(&[workspace.path("lib/main.dart")]);
+        session
+            .queue_disk_changes(&[workspace.path("lib/main.dart")])
+            .expect("sync admits");
 
         let (id_all, all) = check_request(2, &[workspace.path("lib")], None, Some(0));
         session.queue_command(id_all, all);
@@ -4806,7 +6312,6 @@ mod tests {
     fn base_publish_drains_when_only_agent_requests_ride_the_read() {
         let (workspace, mut session) = fixture("agent-publish-unit");
         let main = workspace.path("lib/main.dart");
-        let uri = crate::uri::from_path(&main);
 
         session.sweep().expect("sweep");
         let _ = session.service();
@@ -4814,11 +6319,11 @@ mod tests {
         // the file. If the publish leaked A's view, the push would carry
         // `expected_token` instead of the base clear.
         session
-            .set_overlay("A", vec![(main, AGENT_B_MAIN.as_bytes().to_vec())])
+            .set_overlay("A", vec![(main.clone(), AGENT_B_MAIN.as_bytes().to_vec())])
             .expect("stage");
         let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
         session.queue_command(id_a, a);
-        assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
+        sync_text(&mut session, &main, CLEAN_MAIN);
         let turn = session.service();
 
         assert_eq!(
@@ -4847,7 +6352,7 @@ mod tests {
     #[test]
     fn a_panicking_read_answers_internal_error_and_the_session_survives() {
         let (workspace, mut session) = fixture("panic-boundary-unit");
-        let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+        let main = workspace.path("lib/main.dart");
 
         session.sweep().expect("sweep");
         let _ = session.service();
@@ -4855,7 +6360,7 @@ mod tests {
         // The panicked turn carries a real pending diff: the write applies
         // (the diff becomes due), then the read group panics before it can
         // plan the publishes.
-        assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
+        sync_text(&mut session, &main, CLEAN_MAIN);
         crate::probe::arm_read_panic();
         session.queue_command(
             RequestId::Num(2),
@@ -4901,9 +6406,401 @@ mod tests {
             turn.publishes[0]
         );
         assert!(
-            matches!(&turn.answers[0].1, Ok(_)),
+            turn.answers[0].1.is_ok(),
             "the session survives the panic: {:?}",
             turn.answers[0]
+        );
+    }
+
+    /// A panicking answer worker (the `join` degrade, #1834): the panic
+    /// escapes the per-answer guard, so the dead worker's claimed job
+    /// answers its own internal-error row while every other request still
+    /// answers `Ok` — the old `join().expect` propagated the panic and the
+    /// group boundary errored the whole group instead — and the session
+    /// serves the next request.
+    #[test]
+    fn a_panicking_answer_worker_yields_error_rows_and_the_session_serves_the_next_request() {
+        let (workspace, mut session) = fixture("answer-worker-join-unit");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // Eight compact requests share one read group, so the group's
+        // fan-out engages the worker threads (one job per request). The
+        // armed trigger fires in a spawned worker between the job receive
+        // and its contained answer: that job's request is the error row.
+        let ids: Vec<i64> = (2..10).collect();
+        answer_worker_panic_probe::arm();
+        for &id in &ids {
+            session.queue_command(
+                RequestId::Num(id),
+                Request::Analyze {
+                    verbosity: Verbosity::Compact,
+                    agent: None,
+                    context: None,
+                },
+            );
+        }
+        let turn = session.service();
+        answer_worker_panic_probe::disarm();
+        assert_eq!(
+            turn.answers.len(),
+            ids.len(),
+            "every request answers exactly once: {:?}",
+            turn.answers
+        );
+        let answered_ids: Vec<&RequestId> = turn.answers.iter().map(|(id, _)| id).collect();
+        for id in &ids {
+            assert!(
+                answered_ids.contains(&&RequestId::Num(*id)),
+                "request id {id} is lost: {:?}",
+                answered_ids
+            );
+        }
+        let mut ok_answers = 0usize;
+        let mut error_answers = 0usize;
+        for (id, answer) in &turn.answers {
+            match answer {
+                Ok(_) => ok_answers += 1,
+                Err(SessionError::Internal(message)) if message.contains("panicked") => {
+                    error_answers += 1;
+                }
+                Err(other) => panic!("request {id:?} answers an unexpected error: {other:?}"),
+            }
+        }
+        assert!(
+            ok_answers >= 1,
+            "the unclaimed jobs still answer Ok (the old code errored the whole group)"
+        );
+        assert!(
+            error_answers >= 1,
+            "the dead worker's claimed job yields an error row"
+        );
+
+        // The session is alive: the next request answers normally.
+        session.queue_command(
+            RequestId::Num(20),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.answers[0].1.is_ok(),
+            "the session serves the next request: {:?}",
+            turn.answers[0]
+        );
+    }
+
+    /// The contained-panic publish fallback (#1310): a base analysis that
+    /// panics on the write's turn schedules ONE self-driven retry, and the
+    /// deferred diff drains on it
+    /// with no further client input — a contained panic degrades into a
+    /// bounded recovery, never a silent publishless hang. The retry drain
+    /// is a normal drain: the publish diff is pure, so the file's
+    /// post-write set goes out on the first healthy analysis.
+    #[test]
+    fn a_contained_base_panic_publishes_through_the_scheduled_retry() {
+        let (workspace, mut session) = fixture("panic-retry-publish-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // The cold-start shape: one batch stages the edit and the
+        // publish-carrying read, the base analysis panics at the
+        // containment boundary, and the client sends nothing further.
+        sync_text(&mut session, &main, CLEAN_MAIN);
+        crate::probe::arm_read_panic();
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "the panicked turn planned no publishes: {:?}",
+            turn.publishes
+        );
+        assert!(
+            session.publish_retry_deadline().is_some(),
+            "the containment scheduled the one-shot fallback retry"
+        );
+
+        // Not due yet: the loop-top call is a no-op before the instant.
+        assert!(
+            session.retry_deferred_publish(Instant::now()).is_none(),
+            "the fallback never fires before its deadline"
+        );
+
+        // No intake at all: past the scheduled instant the fallback turn
+        // fires (the main loop's deadline-bounded receive wakes for it) and
+        // the deferred diff drains.
+        let later = Instant::now() + PUBLISH_RETRY_DELAY + Duration::from_millis(50);
+        let turn = session
+            .retry_deferred_publish(later)
+            .expect("the deferred retry fires past its deadline");
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the deferred diff drained without client input: {:?}",
+            turn.publishes
+        );
+        assert!(
+            turn.publishes[0].diagnostics.is_empty(),
+            "the push is the post-write base view: {:?}",
+            turn.publishes[0]
+        );
+        assert!(
+            session.publish_retry_deadline().is_none(),
+            "one-shot: nothing stays scheduled after the retry drained"
+        );
+    }
+
+    /// The fallback is bounded (#1310): a retry whose analysis is contained
+    /// again schedules nothing further and stops the ladder until the next
+    /// applied write changes the content — one degrade line per cycle, no
+    /// self-driven re-analysis churn on a persistently panicking corpus.
+    #[test]
+    fn a_second_contained_panic_stops_the_retry_ladder_until_content_changes() {
+        let (workspace, mut session) = fixture("panic-retry-bounded-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // First containment: the one-shot retry is scheduled.
+        sync_text(&mut session, &main, CLEAN_MAIN);
+        crate::probe::arm_read_panic();
+        let _ = session.service();
+        assert!(session.publish_retry_deadline().is_some());
+
+        // The retry's own analysis is contained too: the degrade engages
+        // (one stderr line marks it) and no second self-driven retry is
+        // scheduled — the diff stays deferred to the next intake.
+        crate::probe::arm_read_panic();
+        let later = Instant::now() + PUBLISH_RETRY_DELAY + Duration::from_millis(50);
+        let turn = session
+            .retry_deferred_publish(later)
+            .expect("the retry fires");
+        assert!(
+            turn.publishes.is_empty(),
+            "the retry was contained as well: {:?}",
+            turn.publishes
+        );
+        assert!(
+            session.publish_retry_deadline().is_none(),
+            "bounded: a contained retry schedules nothing further"
+        );
+
+        // Further intake on the SAME content is contained too — the stopped
+        // ladder stays stopped: no retry is scheduled while blocked.
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        crate::probe::arm_read_panic();
+        let turn = session.service();
+        assert!(
+            matches!(&turn.answers[0].1, Err(SessionError::Internal(message))
+                if message.contains("panicked")),
+            "the containment still answers internal error: {:?}",
+            turn.answers[0]
+        );
+        assert!(
+            session.publish_retry_deadline().is_none(),
+            "the stopped ladder stays stopped while the content is unchanged"
+        );
+
+        // The next applied write changes the content and lifts the stop:
+        // the clean drain publishes the deferred diff, and a fresh
+        // containment on the new content schedules a fresh one-shot retry.
+        sync_text(&mut session, &main, "var lifted = 3;\n");
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the deferred diff drains on the content-changing intake: {:?}",
+            turn.publishes
+        );
+        sync_text(&mut session, &main, "var rearm = 4;\n");
+        crate::probe::arm_read_panic();
+        let _ = session.service();
+        assert!(
+            session.publish_retry_deadline().is_some(),
+            "the lifted ladder engages afresh for the new content"
+        );
+    }
+
+    /// A synced file that never publishes (every drain contained, the
+    /// retry ladder stopped blocked) still pushes once when a later write
+    /// changes the content: the applied write lifts the ladder's stop and
+    /// the next drain's diff carries the file's fresh rows — the client
+    /// is never left with a permanently unpublished file.
+    #[test]
+    fn a_never_published_file_publishes_on_the_next_applied_write() {
+        let (workspace, mut session) = fixture_with("close-force-publish-unit", CLEAN_MAIN);
+        let main = workspace.path("lib/main.dart");
+        let uri = crate::uri::from_path(&main);
+
+        session.sweep().expect("sweep");
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "a clean workspace publishes nothing: {:?}",
+            turn.publishes
+        );
+
+        // Broken content syncs in; the base group panics at the
+        // containment boundary before any publish plan, and the scheduled
+        // retry is contained too — the ladder stops blocked with the file
+        // still unpublished.
+        sync_text(&mut session, &main, BROKEN_MAIN);
+        crate::probe::arm_read_panic();
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "the panicked turn planned no publishes: {:?}",
+            turn.publishes
+        );
+        assert!(
+            session.publish_retry_deadline().is_some(),
+            "the containment scheduled the one-shot fallback retry"
+        );
+        crate::probe::arm_read_panic();
+        let later = Instant::now() + PUBLISH_RETRY_DELAY + Duration::from_millis(50);
+        let turn = session
+            .retry_deferred_publish(later)
+            .expect("the retry fires");
+        assert!(
+            turn.publishes.is_empty(),
+            "the retry was contained as well: {:?}",
+            turn.publishes
+        );
+        assert!(
+            session.publish_retry_deadline().is_none(),
+            "the ladder stops blocked"
+        );
+
+        // A fresh applied write lifts the stop: the clean drain publishes
+        // the deferred diff — the file's rows arrive on that turn.
+        sync_text(&mut session, &main, CLEAN_MAIN);
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the content-changing intake drains the deferred diff: {:?}",
+            turn.publishes
+        );
+        assert_eq!(turn.publishes[0].uri, uri);
+        assert!(
+            turn.publishes[0].diagnostics.is_empty(),
+            "the push is the clean base state: {:?}",
+            turn.publishes[0]
+        );
+    }
+
+    /// A staged file that never existed on disk: the removal half of sync
+    /// intake drops it again. The set's own publish went out once, the
+    /// removal's clearing push once, and the baseline drops with the
+    /// removal so later drains stay quiet.
+    #[test]
+    fn a_synced_then_removed_file_publishes_and_clears_once() {
+        let (workspace, mut session) = fixture_with("overlay-only-close-unit", CLEAN_MAIN);
+        let only = workspace.path("lib/only.dart");
+
+        session.sweep().expect("sweep");
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "a clean workspace publishes nothing: {:?}",
+            turn.publishes
+        );
+
+        // The staged set interns the never-on-disk file and the drain
+        // publishes its row.
+        sync_text(&mut session, &only, BROKEN_MAIN);
+        let turn = session.service();
+        assert_eq!(turn.publishes.len(), 1, "{:?}", turn.publishes);
+        assert_eq!(turn.publishes[0].diagnostics.len(), 1);
+
+        // The removal: the closing drain clears it exactly once.
+        session.stage(OverlayChange::Remove { path: only });
+        session.ensure_write();
+        session.ensure_read(session.default_context, Tier::Normal);
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "one clearing push for the removed file: {:?}",
+            turn.publishes
+        );
+        assert!(turn.publishes[0].diagnostics.is_empty());
+        assert!(session.staged.is_empty());
+
+        // The baseline dropped with the removal: later drains stay quiet.
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "the removed file never republishes: {:?}",
+            turn.publishes
+        );
+    }
+
+    /// One batch — two staged sets then a removal for the same path, no
+    /// intervening drain: staging merges last-wins per path, so the
+    /// removal displaces both texts and the applied state equals absent
+    /// (the earlier payloads never surface). The clearing push still rides
+    /// the diff (the baseline held the seeded error).
+    #[test]
+    fn a_single_batch_set_set_remove_merges_last_wins() {
+        let (workspace, mut session) = fixture("batch-open-edit-close-unit");
+        let main_path = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let turn = session.service();
+        assert_eq!(turn.publishes.len(), 1, "the seeded error published");
+
+        session.stage(OverlayChange::Set {
+            path: main_path.clone(),
+            bytes: b"var a = 1;\n".to_vec(),
+        });
+        session.stage(OverlayChange::Set {
+            path: main_path.clone(),
+            bytes: b"var b = 2;\n".to_vec(),
+        });
+        session.stage(OverlayChange::Remove {
+            path: main_path.clone(),
+        });
+        session.ensure_write();
+        session.ensure_read(session.default_context, Tier::Normal);
+        let turn = session.service();
+
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the removal's clearing push: {:?}",
+            turn.publishes
+        );
+        assert!(turn.publishes[0].diagnostics.is_empty());
+        assert!(session.staged.is_empty(), "the merged set applied");
+        let engine = session.engine(session.default_context);
+        let main_file = engine
+            .file_table()
+            .try_file_id(main_path.as_path())
+            .expect("the swept file is resident");
+        assert!(
+            engine.content(main_file).is_none(),
+            "the removal won the last-wins merge — the file left the view"
         );
     }
 
@@ -4950,7 +6847,7 @@ mod tests {
             by_id(3)
         );
         assert!(
-            matches!(by_id(2), Ok(_)),
+            by_id(2).is_ok(),
             "the agent group still answered in the same turn: {:?}",
             by_id(2)
         );
@@ -4966,7 +6863,7 @@ mod tests {
         );
         let turn = session.service();
         assert!(
-            matches!(&turn.answers[0].1, Ok(_)),
+            turn.answers[0].1.is_ok(),
             "the session survives: {:?}",
             turn.answers[0]
         );
@@ -4979,16 +6876,15 @@ mod tests {
     fn an_agent_group_panic_keeps_the_turns_publish_diff() {
         let (workspace, mut session) = fixture("panic-publish-unit");
         let main = workspace.path("lib/main.dart");
-        let uri = crate::uri::from_path(&main);
 
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main, AGENT_B_MAIN.as_bytes().to_vec())])
+            .set_overlay("A", vec![(main.clone(), AGENT_B_MAIN.as_bytes().to_vec())])
             .expect("stage A");
         let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
         session.queue_command(id_a, a);
-        assert!(session.queue_edit(&uri, CLEAN_MAIN, 2));
+        sync_text(&mut session, &main, CLEAN_MAIN);
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
@@ -5022,7 +6918,7 @@ mod tests {
                 .1
         };
         assert!(
-            matches!(by_id(3), Ok(_)),
+            by_id(3).is_ok(),
             "the base group answered before the panic: {:?}",
             by_id(3)
         );
@@ -5041,14 +6937,14 @@ mod tests {
     #[test]
     fn a_panicking_write_restages_the_edits_for_the_next_apply() {
         let (workspace, mut session) = fixture("write-panic-unit");
-        let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+        let main_path = workspace.path("lib/main.dart");
 
         session.sweep().expect("sweep");
         let _ = session.service();
 
         // The apply panics; the engine keeps its old view and the edits come
         // back staged.
-        assert!(session.queue_edit(&uri, "var client = 1;\n", 2));
+        sync_text(&mut session, &main_path, "var client = 1;\n");
         crate::probe::arm_write_panic();
         let turn = session.service();
         assert!(
@@ -5060,7 +6956,6 @@ mod tests {
             !session.staged.is_empty(),
             "the edits are restaged, not dropped"
         );
-        let main_path = workspace.path("lib/main.dart");
         let main_file = session
             .engine(session.default_context)
             .file_table()
@@ -5077,8 +6972,8 @@ mod tests {
 
         // The next real intake applies the restaged edit alongside the new
         // one — the client's first word is not lost.
-        let second = crate::uri::from_path(&workspace.path("lib/second.dart"));
-        assert!(session.queue_edit(&second, "var second = 2;\n", 1));
+        let second = workspace.path("lib/second.dart");
+        sync_text(&mut session, &second, "var second = 2;\n");
         let turn = session.service();
         assert!(
             !turn.publishes.is_empty(),
@@ -5098,10 +6993,81 @@ mod tests {
         let second_file = engine
             .file_table()
             .try_file_id(workspace.path("lib/second.dart").as_path())
-            .expect("the overlay-only file is interned by its apply");
+            .expect("the synced file is interned by its apply");
         assert_eq!(
-            engine.content(second_file).expect("overlay content"),
+            engine.content(second_file).expect("synced content"),
             "var second = 2;\n".as_bytes()
+        );
+    }
+
+    /// The retry heals the write-panic residue too (#1364's pair): the
+    /// apply containment re-stages the edits without a write task, and a
+    /// second contained turn strands them with the old retry deadline —
+    /// the retry alone must re-arm the write, apply the residue, and
+    /// publish the post-edit view, with no further client
+    /// input. (The test above recovers through a NEW edit; this one
+    /// recovers through the retry, the quiet-client shape.)
+    #[test]
+    fn the_publish_retry_reapplies_the_staged_residue_after_a_panicking_write() {
+        let (workspace, mut session) = fixture("write-panic-retry-unit");
+        let main_path = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // Turn one: the edit applies, the publish-carrying read panics —
+        // the one-shot retry is scheduled.
+        sync_text(&mut session, &main_path, CLEAN_MAIN);
+        crate::probe::arm_read_panic();
+        let _ = session.service();
+        assert!(session.publish_retry_deadline().is_some());
+
+        // Turn two: a second edit stages, its apply panics (the edits
+        // re-stage with no write task), and the read panics again — the
+        // old deadline is kept and the residue is stranded.
+        sync_text(&mut session, &main_path, "var recovered = 7;\n");
+        crate::probe::arm_write_panic();
+        crate::probe::arm_read_panic();
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "both tasks contained: {:?}",
+            turn.publishes
+        );
+        assert!(!session.staged.is_empty(), "the residue is stranded");
+        assert!(session.write.is_none(), "no write task survives the panic");
+
+        // Quiet client: past the deadline the retry alone re-arms the
+        // write, drains the residue, and publishes the post-edit state.
+        let later = Instant::now() + PUBLISH_RETRY_DELAY + Duration::from_millis(50);
+        let turn = session
+            .retry_deferred_publish(later)
+            .expect("the retry fires");
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the retry drains the deferred diff: {:?}",
+            turn.publishes
+        );
+        assert!(
+            turn.publishes[0].diagnostics.is_empty(),
+            "the push carries the post-edit content: {:?}",
+            turn.publishes[0]
+        );
+        assert!(session.staged.is_empty(), "the residue drained");
+        let engine = session.engine(session.default_context);
+        let main_file = engine
+            .file_table()
+            .try_file_id(main_path.as_path())
+            .expect("the swept file is resident");
+        assert_eq!(
+            engine.content(main_file).expect("resident content"),
+            "var recovered = 7;\n".as_bytes(),
+            "the retry applied the stranded edit"
+        );
+        assert!(
+            session.publish_retry_deadline().is_none(),
+            "the retry drained; nothing stays scheduled"
         );
     }
 
@@ -5110,13 +7076,13 @@ mod tests {
     /// (its baseline must stabilize); only the engine's own row is one-shot.
     #[test]
     fn crash_row_marker_matches_code_and_source() {
-        let engine_row = lsp::Diagnostic {
-            range: lsp::Range {
-                start: lsp::Position {
+        let engine_row = wire::Diagnostic {
+            range: wire::Range {
+                start: wire::Position {
                     line: 0,
                     character: 0,
                 },
-                end: lsp::Position {
+                end: wire::Position {
                     line: 0,
                     character: 0,
                 },
@@ -5128,7 +7094,7 @@ mod tests {
         };
         assert!(Session::is_engine_crash_row(&engine_row));
 
-        let colliding = lsp::Diagnostic {
+        let colliding = wire::Diagnostic {
             source: "echo".into(),
             ..engine_row.clone()
         };
@@ -5137,7 +7103,7 @@ mod tests {
             "a plugin's own code collision is not a one-shot row"
         );
 
-        let ordinary = lsp::Diagnostic {
+        let ordinary = wire::Diagnostic {
             code: "uri_does_not_exist".into(),
             ..engine_row
         };
@@ -5150,16 +7116,16 @@ mod tests {
     #[test]
     fn overlay_store_sweep_bounds_the_shared_store() {
         let (workspace, mut session) = fixture("overlay-gc-unit");
-        let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+        let main = workspace.path("lib/main.dart");
 
         session.sweep().expect("sweep");
         let _ = session.service();
         for version in 0..(GC_CONTENTS_THRESHOLD * 2) {
-            assert!(session.queue_edit(
-                &uri,
+            sync_text(
+                &mut session,
+                &main,
                 &format!("void main() {{}} // v{version}\n"),
-                i64::try_from(version).expect("version") + 2,
-            ));
+            );
             let _ = session.service();
         }
         let contents = session.overlay_store_contents();
@@ -5179,7 +7145,7 @@ mod tests {
             },
         );
         let turn = session.service();
-        assert!(matches!(&turn.answers[0].1, Ok(_)));
+        assert!(turn.answers[0].1.is_ok());
     }
 
     /// The same bound under agent-overlay churn (the store-hygiene ticket's
@@ -5243,7 +7209,7 @@ mod tests {
         );
         let turn = session.service();
         assert!(
-            matches!(&turn.answers[0].1, Ok(_)),
+            turn.answers[0].1.is_ok(),
             "the still-active agent answers after the sweeps: {:?}",
             turn.answers[0]
         );
@@ -5261,10 +7227,10 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
 
-        let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+        let main = workspace.path("lib/main.dart");
         for version in 0..6u64 {
             let text = format!("void main() {{}} // v{version} {}", "x".repeat(280));
-            assert!(session.queue_edit(&uri, &text, i64::try_from(version).expect("version") + 2,));
+            sync_text(&mut session, &main, &text);
             let _ = session.service();
         }
         assert_eq!(
@@ -5287,7 +7253,7 @@ mod tests {
             },
         );
         let turn = session.service();
-        assert!(matches!(&turn.answers[0].1, Ok(_)));
+        assert!(turn.answers[0].1.is_ok());
     }
 
     /// The delta table's cap eviction (#947 F8): past the cap the lowest
@@ -5297,7 +7263,7 @@ mod tests {
     #[test]
     fn delta_table_evicts_oldest_cursors_past_the_cap() {
         let (_workspace, mut session) = fixture("delta-cap-unit");
-        session.set_table_caps(8, 8);
+        session.set_delta_path_cap(8);
 
         for index in 0..12u64 {
             let path = PathBuf::from(format!("/w/lib/file_{index}.dart"));
@@ -5326,53 +7292,141 @@ mod tests {
         }
     }
 
-    /// The open-document table's cap eviction (#947 F8), through the real
-    /// intake: past the cap the least-recently-touched documents drop, and
-    /// an edit refreshes recency — the active document survives an open
-    /// storm that evicts its older, idle neighbors.
+    /// The session live-path ceiling (#1887), admission arm: a legit small
+    /// batch admits whole, the intake answers `Ok`, the engine's
+    /// interned-path count grows by exactly the batch's new paths at the
+    /// drain, and no ceiling trip ever records.
+    ///
+    /// The baseline is the first drain's settled count: a fresh fixture's
+    /// first analysis interns its own derived paths (the missing import's
+    /// resolved target, the mounted `pubspec.yaml`, the synthetic
+    /// `<dart:…>` faces), so measuring from the sweep alone would fold
+    /// that growth into the batch's delta.
     #[test]
-    fn open_documents_evict_least_recently_touched_past_the_cap() {
-        let (workspace, mut session) = fixture("open-cap-unit");
-        session.set_table_caps(8, 8);
-        let uri = |name: &str| crate::uri::from_path(&workspace.path(name));
+    fn live_path_ceiling_admits_a_legit_small_batch() {
+        let (workspace, mut session) = fixture("live-path-admits");
+        assert_eq!(
+            session.live_path_cap, SESSION_MAX_LIVE_PATHS,
+            "the adjudicated constant is the standing bound"
+        );
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        let live_before = session.engine(session.default_context).file_table().len();
 
-        for index in 0..8u64 {
-            assert!(session.queue_edit(
-                &uri(&format!("lib/doc_{index}.dart")),
-                &format!("void d{index}() {{}}\n"),
-                i64::try_from(index).expect("version") + 1,
+        let extra = workspace.path("lib/extra.dart");
+        std::fs::write(&extra, CLEAN_MAIN).expect("write extra");
+        session
+            .queue_disk_changes(std::slice::from_ref(&extra))
+            .expect("a legit batch admits under the ceiling");
+        let turn = session.service();
+        assert!(
+            turn.answers.iter().all(|(_, answer)| answer.is_ok()),
+            "nothing degrades under the ceiling"
+        );
+
+        let live_after = session.engine(session.default_context).file_table().len();
+        assert_eq!(live_after, live_before + 1, "one new path interned");
+        assert!(!session.ceiling_reported, "no trip, no degrade row");
+    }
+
+    /// The session live-path ceiling (#1887), refusal arm: a batch that
+    /// would push the interned count past the cap answers the structured
+    /// `INVALID_PARAMS` error naming the ceiling and stages nothing; the
+    /// one `ResidencyDegradeLog` row records exactly once per session and
+    /// surfaces as a `ResidencyDegrade` trace row at the next non-empty
+    /// apply.
+    #[test]
+    fn live_path_ceiling_rejects_an_over_ceiling_batch_once() {
+        let (workspace, mut session) = fixture("live-path-refuses");
+        let trace_path = workspace.path("trace.jsonl");
+        session
+            .engine_mut(session.default_context)
+            .set_trace_sink(Some(
+                dartq_engine::event::TraceSink::create(&trace_path).expect("sink opens"),
             ));
-        }
-        assert_eq!(session.opened.len(), 8, "at the cap: nothing evicts");
 
-        // Touch doc_0 (refresh its recency), then open one more — the cap
-        // fires, and the coldest two (doc_1, doc_2) evict, not doc_0.
-        assert!(session.queue_edit(&uri("lib/doc_0.dart"), "void d0() {}\n", 9));
-        assert!(session.queue_edit(&uri("lib/doc_8.dart"), "void d8() {}\n", 1));
+        // A legit first sync lands (the drain interns it), so the ceiling
+        // arithmetic runs over a real interned count.
+        let main = workspace.path("lib/main.dart");
+        std::fs::write(&main, CLEAN_MAIN).expect("write main");
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("the first sync admits");
+        let _ = session.service();
+        let live = session.engine(session.default_context).file_table().len();
+        assert!(live > 0, "the drained sync interned its path");
 
-        assert_eq!(session.opened.len(), 7, "the cap's newest 7/8 stay");
+        // A batch of two new paths past a cap of `live + 1` trips: the
+        // whole batch is refused, nothing stages.
+        session.set_live_path_cap(live + 1);
+        let batch: Vec<PathBuf> = (0..2)
+            .map(|index| {
+                let path = workspace.path(&format!("lib/churn_{index}.dart"));
+                std::fs::write(&path, CLEAN_MAIN).expect("write churn file");
+                path
+            })
+            .collect();
+        let error = session
+            .queue_disk_changes(&batch)
+            .expect_err("the over-ceiling batch is refused");
+        let SessionError::InvalidParams(message) = &error else {
+            panic!("the structured error is InvalidParams: {error:?}");
+        };
         assert!(
-            session
-                .opened
-                .contains_key(&workspace.path("lib/doc_0.dart")),
-            "the refreshed document survives"
+            message.contains("session live-path ceiling exceeded")
+                && message.contains(&format!("past the {}-path session ceiling", live + 1)),
+            "the error names the ceiling: {message}"
+        );
+        assert!(session.staged.is_empty(), "a refusal stages nothing");
+        let anchored = session.engine(session.default_context).file_table().len();
+        assert_eq!(
+            anchored,
+            live + 1,
+            "the degrade row's anchor is an id only — the batch stays refused"
+        );
+
+        // The row drains once, at the next non-empty apply, as a
+        // ResidencyDegrade trace row naming the ceiling.
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("a legit re-sync admits");
+        let _ = session.service();
+        let traced = std::fs::read_to_string(&trace_path).expect("the sink wrote its tail");
+        assert_eq!(
+            traced
+                .lines()
+                .filter(|line| line.contains("\"event\":\"ResidencyDegrade\""))
+                .count(),
+            1,
+            "exactly one ceiling row: {traced}"
         );
         assert!(
-            !session
-                .opened
-                .contains_key(&workspace.path("lib/doc_1.dart")),
-            "the coldest document evicted"
+            traced.contains("\"face\":\"session live-path ceiling\""),
+            "the row names the ceiling: {traced}"
         );
-        assert!(
-            !session
-                .opened
-                .contains_key(&workspace.path("lib/doc_2.dart")),
-            "the second-coldest document evicted"
+
+        // A second trip answers the error again but records no second row.
+        let error = session
+            .queue_disk_changes(&batch)
+            .expect_err("the over-ceiling batch is refused again");
+        assert!(matches!(error, SessionError::InvalidParams(_)));
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("a legit re-sync admits");
+        let _ = session.service();
+        let traced = std::fs::read_to_string(&trace_path).expect("the sink wrote its tail");
+        assert_eq!(
+            traced
+                .lines()
+                .filter(|line| line.contains("\"event\":\"ResidencyDegrade\""))
+                .count(),
+            1,
+            "the ceiling row stays one per session: {traced}"
         );
     }
 
     /// The live-agent cap: one more overlay than the cap answers
-    /// INVALID_PARAMS until one is cleared.
+    /// `INVALID_PARAMS` until one is cleared.
     #[test]
     fn agent_overlay_count_is_capped() {
         let (workspace, mut session) = fixture("agent-cap-unit");
@@ -5402,7 +7456,7 @@ mod tests {
     }
 
     /// The per-agent file ceiling (#947 F3): merging past
-    /// [`MAX_OVERLAY_FILES`] files is rejected atomically — nothing stages,
+    /// `MAX_OVERLAY_FILES` files is rejected atomically — nothing stages,
     /// and an overwrite that keeps the count at the cap still fits.
     #[test]
     fn agent_overlay_file_count_is_capped() {
@@ -5447,7 +7501,7 @@ mod tests {
     }
 
     /// The per-agent byte ceiling (#947 F3): staged bytes past
-    /// [`MAX_OVERLAY_BYTES`] are rejected `INVALID_PARAMS`; exactly the cap
+    /// `MAX_OVERLAY_BYTES` are rejected `INVALID_PARAMS`; exactly the cap
     /// fits.
     #[test]
     fn agent_overlay_bytes_are_capped() {
@@ -5470,7 +7524,7 @@ mod tests {
 
     /// The session-wide staged-total ceiling (#962 P3-2): every agent may
     /// hold its own per-agent cap, but the sum across agents is capped —
-    /// one byte past [`MAX_OVERLAY_TOTAL_BYTES`] rejects atomically for the
+    /// one byte past `MAX_OVERLAY_TOTAL_BYTES` rejects atomically for the
     /// staging agent, and clearing an agent frees budget again.
     #[test]
     fn session_overlay_total_is_capped() {
@@ -5609,7 +7663,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Multi-root contexts (PRD §16.2), overlay commit (§16.3's merge),
+    // Multi-root contexts, overlay commit,
     // warm start (#482's daemon wiring)
     // -----------------------------------------------------------------------
 
@@ -5659,9 +7713,11 @@ mod tests {
     }
 
     /// A two-context session over the conditional fixture — the tagless
-    /// default plus `t` — with every store wired to one content pool
-    /// (#483's multi-context construction contract). Returns the pool (to
-    /// pin the sharing) and the store root (to count generations).
+    /// default plus `t` — with every caller-built store wired to one heap
+    /// content pool (#483's multi-context construction contract; assembly's
+    /// default posture rebinds them to the shared mapped pool). Returns the
+    /// pool (the caller-built #483 shape) and the store root (to count
+    /// generations).
     fn fixture_two_contexts(
         name: &str,
     ) -> (Workspace, Session, dartq_engine::ContentPool, PathBuf) {
@@ -5673,7 +7729,8 @@ mod tests {
         let session = Session::with_contexts(
             base,
             [fork_config(&workspace, &pool)],
-            store_at(root.clone()),
+            Some(store_at(root.clone())),
+            None,
         )
         .expect("session");
         (workspace, session, pool, root)
@@ -5685,15 +7742,21 @@ mod tests {
     /// shared content pool.
     #[test]
     fn requests_route_to_their_declared_context() {
-        let (_workspace, mut session, pool, _root) = fixture_two_contexts("route-unit");
+        let (_workspace, mut session, _pool, _root) = fixture_two_contexts("route-unit");
 
         session.sweep().expect("sweep");
         let _ = session.service();
 
-        // The pool holds the workspace's three distinct contents exactly
-        // once — not once per context (the #483 sharing contract, observed
-        // through the daemon face).
-        assert_eq!(pool.len(), 3, "three files shared across both engines");
+        // The session's shared mapped pool holds the workspace's three
+        // distinct contents exactly once — not once per context (the #483
+        // sharing contract, observed through the daemon face; assembly
+        // rebinds the fixture's caller-built heap pool to the mapped one).
+        let corpus_bytes = (COND_MAIN.len() + HEAVY_DART.len() + LIGHT_DART.len()) as u64;
+        assert_eq!(
+            session.shared_store_bytes(),
+            Some(corpus_bytes),
+            "three files shared across both engines"
+        );
 
         // The forked tag exists; a typo would fail loud at the wire.
         assert!(session.has_context("t"));
@@ -5731,7 +7794,70 @@ mod tests {
         );
     }
 
-    /// Equal configurations dedup to one context (§16.1): tags over the
+    /// A forked context's read carries no publish duty (#1364 gap): with
+    /// the publish diff due (the write applied, the default read contained)
+    /// a forked-only turn answers from its own engine, publishes nothing,
+    /// and leaves the diff due for the retry's default-context drain. A
+    /// context-blind gate would clear the diff without planning its
+    /// publishes, silently dropping it.
+    #[test]
+    fn a_forked_read_leaves_the_due_publish_diff_to_the_default_context() {
+        let (workspace, mut session, _pool, _root) = fixture_two_contexts("fork-publish-duty-unit");
+        let main = workspace.path("lib/main.dart");
+        let uri = crate::uri::from_path(&main);
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // The edit applies; the default read's base group panics — the
+        // diff is due and the one-shot retry owns it. The content carries
+        // exactly one row (`uri_does_not_exist`): the retry's push asserts
+        // the row count below.
+        sync_text(
+            &mut session,
+            &main,
+            "import 'missing.dart';\nvoid main() {}\n",
+        );
+        crate::probe::arm_read_panic();
+        let _ = session.service();
+        assert!(session.publish_retry_deadline().is_some());
+
+        // A forked request drains before the retry: it answers, publishes
+        // nothing, and consumes nothing.
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: Some("t".into()),
+            },
+        );
+        let turn = session.service();
+        assert_eq!(turn.answers.len(), 1, "{:?}", turn.answers);
+        assert!(turn.answers[0].1.is_ok(), "the forked view answers");
+        assert!(
+            turn.publishes.is_empty(),
+            "the forked turn publishes nothing: {:?}",
+            turn.publishes
+        );
+        assert!(session.publishes_due, "the forked read left the diff due");
+
+        // The retry drains it on the default context.
+        let later = Instant::now() + PUBLISH_RETRY_DELAY + Duration::from_millis(50);
+        let turn = session
+            .retry_deferred_publish(later)
+            .expect("the retry fires");
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the deferred diff drained: {:?}",
+            turn.publishes
+        );
+        assert_eq!(turn.publishes[0].uri, uri);
+        assert_eq!(turn.publishes[0].diagnostics.len(), 1);
+    }
+
+    /// Equal configurations dedup to one context: tags over the
     /// default's config shape share its engine, and the flush writes ONE
     /// generation (equal salt) — the forked pair's two generations are the
     /// contrast pinned by the warm-start test below.
@@ -5749,7 +7875,8 @@ mod tests {
         let mut session = Session::with_contexts(
             base,
             [("a".to_owned(), a), ("b".to_owned(), b)],
-            store_at(root.clone()),
+            Some(store_at(root.clone())),
+            None,
         )
         .expect("session");
 
@@ -5773,8 +7900,7 @@ mod tests {
         );
 
         // The sink dirties on an overlay apply only.
-        let uri = uri::from_path(&workspace.path("lib/main.dart"));
-        assert!(session.queue_edit(&uri, COND_MAIN, 2));
+        sync_text(&mut session, &workspace.path("lib/main.dart"), COND_MAIN);
         let _ = session.service();
         session.flush_snapshot();
         let generations = fs::read_dir(root.join("snapshots"))
@@ -5798,8 +7924,7 @@ mod tests {
         let _ = session.service();
         // The sink dirties on an overlay apply only: a base write marks the
         // flush due (the sweep's discovery alone never saves).
-        let uri = uri::from_path(&workspace.path("lib/main.dart"));
-        assert!(session.queue_edit(&uri, COND_MAIN, 2));
+        sync_text(&mut session, &workspace.path("lib/main.dart"), COND_MAIN);
         let _ = session.service();
         session.flush_snapshot();
         let generations = fs::read_dir(root.join("snapshots"))
@@ -5815,9 +7940,13 @@ mod tests {
         let pool = dartq_engine::ContentPool::new();
         let mut base = workspace.engine_config();
         base.store = dartq_engine::pooled_memory_store(&pool);
-        let mut warm =
-            Session::with_contexts(base, [fork_config(&workspace, &pool)], store_at(root))
-                .expect("warm session");
+        let mut warm = Session::with_contexts(
+            base,
+            [fork_config(&workspace, &pool)],
+            Some(store_at(root)),
+            None,
+        )
+        .expect("warm session");
         warm.sweep().expect("sweep");
         let _ = warm.service();
         warm.queue_command(
@@ -5845,6 +7974,263 @@ mod tests {
         );
         // The fresh session's contexts stayed distinct through the load.
         assert_ne!(warm.route(Some("t")), warm.default_context);
+    }
+
+    /// The default [`SessionRuntime`] is the standing posture (#1088's
+    /// flag floor): the 2048 MiB budget, no trace sink, no L3 content
+    /// store, the shared mapped store on (#1842).
+    #[test]
+    fn session_runtime_default_keeps_the_standing_posture() {
+        let runtime = SessionRuntime::default();
+        assert_eq!(runtime.memory_limit_mib, DEFAULT_MEMORY_LIMIT_MIB);
+        assert!(runtime.trace.is_none(), "untraced by default");
+        assert!(
+            runtime.content_store_limit.is_none(),
+            "the L3 cap stays unarmed by default"
+        );
+        assert!(runtime.pooled_mapped_store, "the shared pool is default-on");
+    }
+
+    /// The content-store cap arms the L3 store on the default
+    /// context and every declared extra (`content_store` is the engine's
+    /// observability face); the standing posture leaves it unarmed.
+    #[test]
+    fn runtime_content_store_cap_arms_every_context() {
+        let workspace = cond_workspace();
+        let pool = dartq_engine::ContentPool::new();
+        let mut base = workspace.engine_config();
+        base.store = dartq_engine::pooled_memory_store(&pool);
+        let session = Session::with_runtime(
+            base,
+            [fork_config(&workspace, &pool)],
+            Some(store_at(store_root("runtime-store-cap"))),
+            None,
+            SessionRuntime {
+                content_store_limit: Some(64 * 1024 * 1024),
+                ..SessionRuntime::default()
+            },
+        )
+        .expect("session");
+        assert!(
+            session
+                .engine(session.default_context)
+                .content_store()
+                .is_some(),
+            "the cap arms the default context's store"
+        );
+        let extra = session.route(Some("t"));
+        assert!(
+            session.engine(extra).content_store().is_some(),
+            "the cap arms every declared context's store"
+        );
+
+        let (_, plain) = fixture("runtime-store-unarmed");
+        assert!(
+            plain
+                .engine(plain.default_context)
+                .content_store()
+                .is_none(),
+            "the standing posture keeps the store unarmed"
+        );
+    }
+
+    /// The pooled-mapped posture: `SessionRuntime
+    /// ::pooled_mapped_store` rebinds every context's content store to one
+    /// shared [`dartq_engine::MappedContentPool`] at assembly — the Arc
+    /// content-identity contract holds (both contexts' engines resolve the
+    /// same three contents through the pool, so the pool holds each once),
+    /// canonical file text stays mapped (`mapped_bytes` counts the
+    /// workspace's on-disk corpus), and both contexts still route and
+    /// answer. The opted-out session reports `None` from the probes.
+    #[test]
+    fn pooled_mapped_store_posture_shares_mapped_content_across_contexts() {
+        let workspace = cond_workspace();
+        let mut fork = workspace.engine_config();
+        fork.declared_variables
+            .insert("dart.library.heavy".to_owned(), "true".to_owned());
+        let session = Session::with_runtime(
+            workspace.engine_config(),
+            [("t".to_owned(), fork)],
+            Some(store_at(store_root("pooled-mapped"))),
+            None,
+            SessionRuntime {
+                pooled_mapped_store: true,
+                ..SessionRuntime::default()
+            },
+        )
+        .expect("session");
+
+        // Probes armed: the pool exists and starts empty.
+        assert_eq!(session.shared_store_bytes(), Some(0));
+        assert_eq!(session.shared_store_mapped_bytes(), Some(0));
+
+        let mut session = session;
+        session.sweep().expect("sweep");
+        let _ = session.service();
+
+        // Cross-context dedup: the workspace's three distinct contents land
+        // once in the pool — the same identity contract `pool.len() == 3`
+        // pins on the memory pool — observed through the deduplicated
+        // byte face (both contexts loaded the same files).
+        let corpus_bytes = [COND_MAIN, HEAVY_DART, LIGHT_DART]
+            .iter()
+            .map(|text| text.len() as u64)
+            .sum::<u64>();
+        assert_eq!(
+            session.shared_store_bytes(),
+            Some(corpus_bytes),
+            "each distinct content is pooled once across both contexts"
+        );
+        assert_eq!(
+            session.shared_store_mapped_bytes(),
+            Some(corpus_bytes),
+            "discovery loads stay mapped — the whole corpus is page-cache"
+        );
+        // Routing is unaffected by the posture: the forked tag answers.
+        // The fork's own apply runs here — its pending discovery drains on
+        // its first analysis (contexts apply lazily per view).
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: Some("t".into()),
+            },
+        );
+        let turn = session.service();
+        assert!(turn.answers[0].1.is_ok(), "the forked view answers");
+        assert!(session.has_context("t"));
+
+        // Both contexts now hold the same mapped corpus through the shared
+        // pool — the identity is the shared slot, not a per-context copy,
+        // and the pool still counts each content once.
+        let extra = session.route(Some("t"));
+        assert_eq!(
+            session.engine(extra).stored_mapped_bytes(),
+            session
+                .engine(session.default_context)
+                .stored_mapped_bytes(),
+            "both contexts hold the same mapped corpus by refcount"
+        );
+        assert_eq!(
+            session.shared_store_bytes(),
+            Some(corpus_bytes),
+            "the second context's load deduped against the pool — no growth"
+        );
+
+        // Overlay writes land as owned slots — bytes, not mappings — while
+        // the mapped corpus stays put (the amortized store GC retires the
+        // stale mapping far past this test's edit).
+        sync_text(&mut session, &workspace.path("lib/main.dart"), CLEAN_MAIN);
+        let _ = session.service();
+        assert_eq!(
+            session.shared_store_mapped_bytes(),
+            Some(corpus_bytes),
+            "the mapped corpus is untouched by the overlay write"
+        );
+        assert_eq!(
+            session.shared_store_bytes(),
+            Some(corpus_bytes + CLEAN_MAIN.len() as u64),
+            "the new content pools once — owned bytes beside the mapped slots"
+        );
+    }
+
+    /// The default posture is the shared mapped pool (#1842): the default
+    /// [`SessionRuntime`] flips the flag on, a default-constructed session
+    /// assembles the pool at the seam (the probes report the armed face,
+    /// not `None`), and a minimal real-path run loads the workspace's file
+    /// text as pooled mappings — the store actually engaged. The explicit
+    /// opt-out (`pooled_mapped_store: false`) keeps the caller-built
+    /// stores untouched: no pool, probes `None` — the A/B posture for the
+    /// store decomposition comparison.
+    #[test]
+    fn pooled_mapped_store_defaults_on_engages_the_shared_pool() {
+        assert!(SessionRuntime::default().pooled_mapped_store);
+
+        // The default runtime: the pool exists from assembly (armed, empty)
+        // and the workspace's file text lands as pooled mappings on the
+        // first drain.
+        let workspace = cond_workspace();
+        let mut session = Session::with_runtime(
+            workspace.engine_config(),
+            Vec::new(),
+            Some(store_at(store_root("pooled-mapped-default"))),
+            None,
+            SessionRuntime::default(),
+        )
+        .expect("session");
+        assert_eq!(
+            session.shared_store_bytes(),
+            Some(0),
+            "the pool is assembled with the default runtime"
+        );
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        let corpus_bytes = (COND_MAIN.len() + HEAVY_DART.len() + LIGHT_DART.len()) as u64;
+        assert_eq!(
+            session.shared_store_bytes(),
+            Some(corpus_bytes),
+            "the minimal run engages the pool — the workspace text pooled once"
+        );
+        assert_eq!(
+            session.shared_store_mapped_bytes(),
+            Some(corpus_bytes),
+            "the engaged store holds file text as mappings"
+        );
+
+        // The explicit opt-out restores the caller-built stores: no pool,
+        // the probes' honest not-armed answer.
+        let workspace = cond_workspace();
+        let session = Session::with_runtime(
+            workspace.engine_config(),
+            Vec::new(),
+            Some(store_at(store_root("pooled-mapped-optout"))),
+            None,
+            SessionRuntime {
+                pooled_mapped_store: false,
+                ..SessionRuntime::default()
+            },
+        )
+        .expect("session");
+        assert_eq!(session.shared_store_bytes(), None);
+        assert_eq!(session.shared_store_mapped_bytes(), None);
+    }
+
+    /// The memory budget rides [`SessionRuntime`] into the default
+    /// context's engine and the sink receives its events: a 0-MiB
+    /// budget deterministically degrades at the first boundary poll (any
+    /// real RSS exceeds it) and the sink's JSONL carries the
+    /// `MemoryDegrade` line with the armed limit — the limit's and the
+    /// sink's propagation pinned in one observable stroke.
+    #[test]
+    fn runtime_memory_limit_and_trace_sink_reach_the_engine() {
+        let workspace = Workspace::new(CLEAN_MAIN);
+        let trace_path = workspace.path("trace.jsonl");
+        let mut session = Session::with_runtime(
+            workspace.engine_config(),
+            Vec::new(),
+            Some(store_at(store_root("runtime-trace"))),
+            None,
+            SessionRuntime {
+                memory_limit_mib: 0,
+                trace: Some(
+                    dartq_engine::event::TraceSink::create(&trace_path).expect("sink opens"),
+                ),
+                ..SessionRuntime::default()
+            },
+        )
+        .expect("session");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        let traced = fs::read_to_string(&trace_path).expect("the sink wrote its tail");
+        assert!(
+            traced.contains("\"event\":\"MemoryDegrade\""),
+            "the armed budget degrades at the first boundary poll: {traced}"
+        );
+        assert!(
+            traced.contains("\"limit_mib\":0"),
+            "the trace line carries the SessionRuntime limit: {traced}"
+        );
     }
 
     /// The plugin weave (#471 phase B): a dead plugin is recorded at
@@ -5930,6 +8316,89 @@ mod tests {
         );
     }
 
+    /// The core-first publish order, observed end to end: the turn after
+    /// the crash is withheld carries BOTH an engine delta (a disk rewrite
+    /// synced through the watch intake) and the crash row. The core plan
+    /// stages the engine rows first; the plugin merge step extends the SAME
+    /// staged push instead of emitting a second one for the file — one
+    /// publish, engine rows leading, the crash row appended — and the next
+    /// cycle is clean (the crash never baselined, the engine rows did).
+    /// The turn-1 withhold above also pins the anchor's resolution point:
+    /// it is read before any publish touches the baseline, not after.
+    #[test]
+    fn the_plugin_merge_extends_the_core_push_instead_of_duplicating_it() {
+        let (workspace, mut session) = fixture("core-first-unit");
+        session.inject_plugins(PluginSet::with_dead_plugin(
+            "dead",
+            "restart budget of 3 exhausted",
+        ));
+
+        session.sweep().expect("sweep");
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "the seeded error publishes: {:?}",
+            turn.publishes
+        );
+
+        // The engine view changes AND the withheld crash publishes, in one
+        // turn: the core push grows by the crash row, never duplicates.
+        std::fs::write(workspace.path("lib/main.dart"), SYNTAX_BROKEN).expect("rewrite");
+        session
+            .queue_disk_changes(&[workspace.path("lib/main.dart")])
+            .expect("sync admits");
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert_eq!(
+            turn.publishes.len(),
+            1,
+            "one push for the file — the merge extended the core plan's: {:?}",
+            turn.publishes
+        );
+        let rows = &turn.publishes[0].diagnostics;
+        // `void f() { x }` carries two oracle rows (the differential corpus
+        // pins both: `expected_token` then `undefined_identifier`) plus the
+        // one-shot crash row.
+        assert_eq!(rows.len(), 3, "the rewritten file's rows plus the crash");
+        assert_eq!(
+            rows[0].code, "expected_token",
+            "the new engine rows lead: {rows:?}"
+        );
+        assert_eq!(
+            rows[1].code, "undefined_identifier",
+            "the rewritten file's second engine row: {rows:?}"
+        );
+        assert_eq!(
+            rows[2].code,
+            dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name,
+            "the crash row appends: {rows:?}"
+        );
+
+        // The next cycle is clean: engine rows baselined, crash not.
+        session.queue_command(
+            RequestId::Num(3),
+            Request::Analyze {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            turn.publishes.is_empty(),
+            "no reconciliation churn after the merge: {:?}",
+            turn.publishes
+        );
+    }
+
     /// The weave is contained a level finer than the group (#690): a panic
     /// in the plugin cycle skips that cycle's findings but the group's
     /// engine rows still answer and publish — and the penalty's crash row
@@ -5968,7 +8437,7 @@ mod tests {
         );
         let turn = session.service();
         assert!(
-            matches!(&turn.answers[0].1, Ok(_)),
+            turn.answers[0].1.is_ok(),
             "the group survived the weave panic: {:?}",
             turn.answers[0]
         );
@@ -6081,7 +8550,7 @@ mod tests {
         assert_eq!(session.plugin_path_panics, PLUGIN_PANIC_LIMIT + 1);
     }
 
-    /// `overlay.commit` (PRD §16.3's merge): the agent's staged buffer
+    /// `overlay.commit`: the agent's staged buffer
     /// writes back to the worktree, merges into the base view (the publish
     /// diff drains the clean set), and the staged entries free — the
     /// agent's view falls through to the committed base, whose change

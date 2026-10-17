@@ -29,7 +29,7 @@ const SETTLE: Duration = Duration::from_secs(10);
 /// Seeded disk content: one resolvable URI-layer error (`uri_does_not_exist`),
 /// deterministic under the synthetic SDK.
 pub const BROKEN_MAIN: &str = "import 'missing.dart';\nvoid main() {}\n";
-/// Clean replacement pushed through didChange.
+/// Clean replacement synced through `dartq/sync`.
 pub const CLEAN_MAIN: &str = "void main() {}\n";
 
 /// A throwaway single-package workspace with `lib/main.dart` on disk.
@@ -68,7 +68,7 @@ impl Workspace {
         );
         write(
             ".dart_tool/package_config.json",
-            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub"}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
         );
         write("sdk/version", "3.13.1\n");
         write(
@@ -214,8 +214,7 @@ impl Write for SharedOutput {
 /// A running session: the server loop on its own thread, the test thread as
 /// the paced client. Steps settle through transcript-frame counts; a step
 /// that produces no frames settles through a probe `dartq/analyze` (its
-/// answer proves the server turned past every earlier message, and it never
-/// pushes).
+/// answer proves the server turned past every earlier message).
 pub struct Harness {
     client: mpsc::Sender<Vec<u8>>,
     output: SharedOutput,
@@ -253,7 +252,17 @@ pub fn spawn_with_heavy_context(workspace: &Workspace, store_root: &Path) -> Har
         capacity_bytes: DEFAULT_CAPACITY_BYTES,
     })
     .expect("store opens on a temp root");
-    start(Session::with_contexts(base, [("t".to_owned(), fork)], store).expect("session"))
+    start(
+        Session::with_contexts(base, [("t".to_owned(), fork)], Some(store), None).expect("session"),
+    )
+}
+
+/// Spawns an already-assembled session over the wire (the dartq.yaml
+/// context tests assemble their own multi-context session at the shell
+/// edge, the CLI daemon face's shape).
+#[must_use]
+pub fn spawn_session(session: Session) -> Harness {
+    start(session)
 }
 
 /// Runs the server loop over `session` on its own thread (the shared
@@ -272,12 +281,17 @@ fn start(session: Session) -> Harness {
             .spawn(move || run(std::io::BufReader::new(reader), output, session, None))
             .expect("server thread spawns")
     };
-    Harness {
+    let mut harness = Harness {
         client,
         output,
         server,
         probe: 1000,
-    }
+    };
+    // The server is ready from `run()`'s start — no handshake: the startup
+    // drain writes the sweep's pushes ahead of any client frame. Settle it
+    // through a probe so every test steps on a drained baseline.
+    harness.probe_step();
+    harness
 }
 
 impl Harness {
@@ -319,30 +333,31 @@ impl Harness {
         frames(&self.output.0.lock().expect("output lock"))
     }
 
-    /// Sends `exit`, waits for the server loop to end, and returns the exit
-    /// code with the full transcript.
-    pub fn exit(self) -> (u8, Vec<Value>) {
-        self.client
-            .send(framed(&notification("exit", json!(null))))
-            .expect("exit send");
-        self.join_ended()
-    }
-
-    /// Waits for an already-ending server (desync or EOF) and returns the
-    /// exit code with the full transcript.
+    /// Hangs up the client (end of input) and waits for the server to end,
+    /// returning the exit code with the full transcript. EOF is the
+    /// session's only end signal — a session whose peer stops delivering
+    /// mid-frame ends through this same path (the truncated-frame contract,
+    /// #947 F10). Pending frames deliver before the EOF (FIFO channel), so
+    /// nothing in flight is lost to the hangup.
     pub fn join_ended(self) -> (u8, Vec<Value>) {
+        let Harness {
+            client,
+            output,
+            server,
+            probe: _,
+        } = self;
+        drop(client);
         let deadline = Instant::now() + SETTLE;
-        while Instant::now() < deadline && !self.server.is_finished() {
+        while Instant::now() < deadline && !server.is_finished() {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(
-            self.server.is_finished(),
+            server.is_finished(),
             "server did not end; transcript: {:?}",
-            self.transcript()
+            frames(&output.0.lock().expect("output lock"))
         );
-        let transcript = self.transcript();
-        let code = self
-            .server
+        let transcript = frames(&output.0.lock().expect("output lock"));
+        let code = server
             .join()
             .expect("server thread does not panic")
             .expect("transport does not fail on memory pipes");
@@ -449,12 +464,12 @@ pub fn answered(transcript: &[Value]) -> Vec<&Value> {
         .collect()
 }
 
-/// The transcript's `textDocument/publishDiagnostics` pushes.
+/// The transcript's `dartq/diagnostics` pushes.
 #[must_use]
 pub fn publishes(transcript: &[Value]) -> Vec<&Value> {
     transcript
         .iter()
-        .filter(|frame| frame["method"] == "textDocument/publishDiagnostics")
+        .filter(|frame| frame["method"] == "dartq/diagnostics")
         .collect()
 }
 

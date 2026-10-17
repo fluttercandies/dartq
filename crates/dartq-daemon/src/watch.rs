@@ -1,12 +1,17 @@
-//! File-watch for `dartq daemon --watch` (PRD §16.7, mode 3 — the optional
+//! File-watch for `dartq daemon --watch` (mode 3 — the optional
 //! convenience layer; explicit push and `ContentId` verification stay the
 //! truth).
 //!
-//! # Shape (the runtime model's hand-wired notifier)
+//! # Shape (a substrate seam + the hand-wired debouncer)
 //!
-//! No OS-event substrate exists in the dependency tree, so the watcher is a
-//! **bounded-interval directory poll**, documented as such: one thread
-//! re-walks the workspace every [`POLL_INTERVAL`] (reusing
+//! The watch face is a [`WatchSource`] seam carrying two substrates into
+//! the same drain-debounce-hand-off cycle: the **bounded-interval
+//! directory poll** (the default, the watch face's proven shape) and the
+//! OS-event substrate — `notify`'s recommended watcher, FSEvents on macOS
+//! and inotify on Linux — opt-in via `DARTQ_WATCH_SUBSTRATE=os` while its
+//! watcher-thread integration is being proven (the substrate itself is
+//! pinned by a smoke test: delivery, kinds, path forms). The poll source
+//! re-walks the workspace per drain (reusing
 //! `dartq_commands::discover` for exact walk-rule parity with the CLI's
 //! discovery), fingerprints each `.dart` file by `(mtime, len)` — plus the
 //! three non-`.dart` context inputs ([`CONFIG_INPUTS`], the files a context
@@ -16,44 +21,54 @@
 //! that vanished (re-discovery: what the session's `queue_disk_changes`
 //! turns into the same set the sweep's discovery takes, or a removal; a
 //! context input instead refreshes the contexts at intake — their bytes
-//! never stage as analysis content).
+//! never stage as analysis content, and the batch re-evaluates the
+//! session's workspace advisory).
+//!
 //! A burst coalesces through the [`Debounce`]
 //! state machine until a changeless tick (the quiet period is one poll
 //! interval) or the max-hold deadline, then one batch of touched paths goes
 //! to the main loop over the reader channel — which enqueues the
-//! didChange-equivalent overlay syncs at `Tier::Normal`. Overlay precedence
-//! is decided at that intake, not here: client-opened documents keep their
-//! content over the disk (see `Session::queue_disk_changes`).
+//! `dartq/sync`-equivalent overlay syncs at `Tier::Normal` (see
+//! `Session::queue_disk_changes`). Per drain with changes, the release
+//! watch-latency probe ([`WatchMetrics`]) records the stalest event's wait
+//! — change time to the drain that observed it (the poll source stamps the
+//! file's mtime; the OS substrate stamps delivery, the best known time it
+//! has) — and logs it the way the daemon logs everything operational.
 //!
-//! Bounded by construction: the thread's state is one fingerprint map plus
-//! the pending set, both replaced/drained per tick — one walk plus one diff
-//! per interval, no per-event accumulation, no timer thread, no unbounded
-//! queue (the channel item is one batch). Watch events are hints, not
-//! facts: a deleted file whose base copy the engine holds resurfaces on
-//! overlay removal, and a failed read is logged and skipped — the next
-//! analysis's content check is authoritative (§16.7).
+//! Bounded by construction: the thread's state is the substrate (the poll
+//! source's one fingerprint map, replaced per tick; the OS substrate's
+//! event queue, drained non-blocking every tick) plus the pending set —
+//! no per-event accumulation in our own state, no timer thread, and a
+//! bounded intake queue (the channel item is one batch; a full queue hands
+//! the batch back to the accumulator instead of stalling the drain). Watch
+//! events are hints, not facts: a deleted file whose base copy the engine
+//! holds resurfaces on overlay removal, and a failed read is logged and
+//! skipped — the next analysis's content check is authoritative — and a
+//! substrate rescan notice (lost or coalesced history) says so and lets
+//! the next batch's re-discovery self-heal.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Sender, TrySendError};
 use rustc_hash::FxHashMap;
 
 use dartq_commands::discover::{DiscoverError, discover};
 
 use crate::server::Incoming;
 
-/// The poll cadence: one workspace walk per interval. Polling is the
-/// documented cost of the convenience layer (§16.7 watch is optional).
+/// The watch cadence: one substrate drain + debounce cycle per interval —
+/// and the poll substrate's walk cadence, polling being that substrate's
+/// documented cost.
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// The non-`.dart` context inputs tracked beside the `.dart` walk: the
 /// files a context assembly consumes (the package manifest, the resolved
-/// package graph, the analysis options — PRD §16.7's reload surface). They
+/// package graph, the analysis options — the reload surface). They
 /// are fingerprinted like `.dart` files so a change (or appearance, or
 /// deletion) surfaces in the tick diff, but they never stage as analysis
 /// content — [`is_config_input`] routes them to the context refresh at
@@ -76,11 +91,290 @@ pub(crate) fn is_config_input(path: &Path, root: &Path) -> bool {
 
 /// A change burst may hold the batch at most this long before it flushes
 /// mid-burst — a writer that never quiets (a build tool, a formatter loop)
-/// must not starve re-analysis (the §16.5 starvation-protection posture).
+/// must not starve re-analysis.
 const MAX_HOLD: Duration = Duration::from_secs(2);
 
+/// How an observed change surfaced. The poll substrate derives it from the
+/// fingerprint diff; the OS substrate reports it directly. Metadata for the
+/// latency probe and the tests — the intake batch stays a path batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventKind {
+    Create,
+    Modify,
+    Delete,
+    Rename,
+}
+
+/// One observed change. `at` is the best known time the change happened —
+/// the file's mtime for the poll substrate, the delivery time for the OS
+/// substrate (FSEvents/inotify expose no per-event timestamp) — the
+/// denominator of the release watch-latency probe.
+#[derive(Debug)]
+struct SourceEvent {
+    path: PathBuf,
+    /// The change's shape: today's intake batch is path-only (the session
+    /// re-discovers per batch), so the tests are the field's reader until a
+    /// substrate-aware intake consumes it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    kind: EventKind,
+    at: SystemTime,
+}
+
+/// The release watch-latency probe: per drain with changes, the stalest
+/// event's wait — change time to the drain that observed it — and the count
+/// of such drains. Surfaced the way the daemon surfaces everything
+/// operational, one log line per observed drain; the atomics are the
+/// recorded values the tests read.
+#[derive(Default)]
+#[cfg_attr(not(test), allow(dead_code))] // the atomics are the tests' read face
+struct WatchMetrics {
+    observed_drains: AtomicU64,
+    last_max_latency_micros: AtomicU64,
+}
+
+impl WatchMetrics {
+    /// Records one drain. The stalest event's wait is the drain's latency
+    /// — the freshest event would under-report a burst's true delay — and
+    /// a future-stamped event (a backwards clock) contributes no wait
+    /// rather than a negative one.
+    fn observe(&self, events: &[SourceEvent], now: SystemTime) {
+        if events.is_empty() {
+            return;
+        }
+        let stalest = events
+            .iter()
+            .filter_map(|event| now.duration_since(event.at).ok())
+            .max()
+            .unwrap_or(Duration::ZERO);
+        self.observed_drains.fetch_add(1, Ordering::Relaxed);
+        self.last_max_latency_micros.store(
+            u64::try_from(stalest.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        eprintln!(
+            "dartq-daemon: watch: {} changed paths observed, max latency {}ms",
+            events.len(),
+            stalest.as_millis(),
+        );
+    }
+}
+
+/// The watch face's substrate: whatever turns on-disk changes into
+/// [`SourceEvent`]s. Two implementations — the OS-event substrate and the
+/// bounded-interval poll — behind one seam: the loop and the debounce are
+/// substrate-agnostic, and a substrate swap never touches a call site.
+trait WatchSource: Send {
+    /// Drains the changes observed since the last call. Non-blocking: the
+    /// loop's cadence stays the poll interval on every substrate.
+    fn drain(&mut self) -> Vec<SourceEvent>;
+}
+
+/// The poll substrate: the watch face's original behavior verbatim, one
+/// walk plus one fingerprint diff per drain.
+struct PollSource {
+    root: PathBuf,
+    previous: FxHashMap<PathBuf, Fingerprint>,
+}
+
+impl PollSource {
+    /// The baseline walk. `None` when it fails — the walk already logged
+    /// the reason, and the watch thread exits as it always has.
+    fn new(root: &Path) -> Option<Self> {
+        let previous = scan(root)?;
+        Some(Self {
+            root: root.to_path_buf(),
+            previous,
+        })
+    }
+}
+
+impl WatchSource for PollSource {
+    fn drain(&mut self) -> Vec<SourceEvent> {
+        let Some(current) = scan(&self.root) else {
+            return Vec::new();
+        };
+        let events = diff(&self.previous, &current)
+            .into_iter()
+            .map(|path| match current.get(&path) {
+                // The mtime is the write time the latency probe measures
+                // from; a vanished file leaves no mtime, so its stamp is
+                // the drain itself.
+                Some(&(modified, _)) => SourceEvent {
+                    kind: if self.previous.contains_key(&path) {
+                        EventKind::Modify
+                    } else {
+                        EventKind::Create
+                    },
+                    path,
+                    at: modified,
+                },
+                None => SourceEvent {
+                    kind: EventKind::Delete,
+                    path,
+                    at: SystemTime::now(),
+                },
+            })
+            .collect();
+        self.previous = current;
+        events
+    }
+}
+
+/// The OS-event substrate: `notify`'s recommended watcher — FSEvents on
+/// macOS, inotify on Linux. Gated to the two platforms the daemon ships
+/// for; the Linux face is the same platform-agnostic wrapper (notify
+/// selects the backend) and is compile-checked there, not on this host.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct NotifySource {
+    /// The workspace root as given: event paths arrive under the
+    /// canonicalized watch root (FSEvents reports resolved paths), and the
+    /// intake batch must carry the walk's path forms.
+    root: PathBuf,
+    /// The canonical watch root, stripped off incoming event paths.
+    canonical: PathBuf,
+    /// Keep-alive: dropping the watcher stops the OS stream and its
+    /// delivery thread.
+    _watcher: notify::RecommendedWatcher,
+    receiver: crossbeam_channel::Receiver<Result<notify::Event, notify::Error>>,
+    /// Set once the substrate's sender is gone: the drain goes silent
+    /// instead of reporting the disconnect every tick.
+    dead: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl NotifySource {
+    /// Arms the OS stream over `root`, recursively. `Err` carries the
+    /// substrate's own reason — the caller logs it and falls back to poll.
+    fn new(root: &Path) -> Result<Self, String> {
+        let canonical = root.canonicalize().map_err(|error| error.to_string())?;
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        // The trait method's namesake trait, imported anonymously: our own
+        // `Watcher` handle owns the module's name.
+        use notify::Watcher as _;
+        let mut watcher = notify::recommended_watcher(sender).map_err(|error| error.to_string())?;
+        watcher
+            .watch(&canonical, notify::RecursiveMode::Recursive)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            canonical,
+            _watcher: watcher,
+            receiver,
+            dead: false,
+        })
+    }
+
+    /// Event paths arrive under the canonical root; the batch must carry
+    /// the walk's forms (`/var/...`, not `/private/var/...`). Paths outside
+    /// the root (mount noise) and the root itself (no specific file — a
+    /// root path in a batch would sync the directory as a file) drop.
+    fn normalize(&self, path: PathBuf) -> Option<PathBuf> {
+        let normalized = match path.strip_prefix(&self.canonical) {
+            Ok(relative) => self.root.join(relative),
+            Err(_) if path.starts_with(&self.root) => path,
+            Err(_) => return None,
+        };
+        (normalized != self.root).then_some(normalized)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl WatchSource for NotifySource {
+    fn drain(&mut self) -> Vec<SourceEvent> {
+        if self.dead {
+            return Vec::new();
+        }
+        // The substrate stamps no per-event time: delivery (this drain) is
+        // the best known time, sampled once before the queue drains so a
+        // queued event never stamps after the drain that observed it.
+        let at = SystemTime::now();
+        let mut events = Vec::new();
+        loop {
+            match self.receiver.try_recv() {
+                Ok(Ok(event)) => {
+                    // The substrate lost track (dropped or coalesced
+                    // history): say so — the next batch's re-discovery
+                    // self-heals — and carry no phantom paths.
+                    if event.need_rescan() {
+                        eprintln!(
+                            "dartq-daemon: watch substrate lost events; \
+                             changes re-discover on the next batch"
+                        );
+                        continue;
+                    }
+                    let Some(kind) = classify(&event.kind) else {
+                        continue;
+                    };
+                    events.extend(event.paths.into_iter().filter_map(|path| {
+                        let path = self.normalize(path)?;
+                        Some(SourceEvent { path, kind, at })
+                    }));
+                }
+                Ok(Err(error)) => eprintln!("dartq-daemon: watch substrate error: {error}"),
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    self.dead = true;
+                    eprintln!("dartq-daemon: watch substrate ended; no further events");
+                    break;
+                }
+            }
+        }
+        events
+    }
+}
+
+/// The substrate's event kinds to the watch face's. Access events are
+/// noise (inotify reports them; nothing re-analyzes on a read), the
+/// substrate's `Other` carries no actionable change, and an `Any` — the
+/// non-precise backends' catch-all — is a change: `Modify`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn classify(kind: &notify::EventKind) -> Option<EventKind> {
+    use notify::EventKind as Backend;
+    match kind {
+        Backend::Create(_) => Some(EventKind::Create),
+        Backend::Modify(notify::event::ModifyKind::Name(_)) => Some(EventKind::Rename),
+        Backend::Modify(_) => Some(EventKind::Modify),
+        Backend::Remove(_) => Some(EventKind::Delete),
+        Backend::Any => Some(EventKind::Modify),
+        Backend::Access(_) | Backend::Other => None,
+    }
+}
+
+/// The substrate for this build. The poll substrate is the default — the
+/// watch face's proven shape. The OS-event substrate is the target shape
+/// and works where it is proven (delivery, kinds, and path forms are
+/// pinned by the smoke test), but its stream delivered nothing when the
+/// watcher ran on the daemon's own watch thread under test, so it is
+/// opt-in — `DARTQ_WATCH_SUBSTRATE=os` — until that thread-context
+/// integration is root-caused and proven on every face. `None` means the
+/// watch face cannot come up at all — the baseline walk failed, already
+/// logged — and the watch thread exits as it always has.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn init_source(root: &Path) -> Option<Box<dyn WatchSource>> {
+    if std::env::var_os("DARTQ_WATCH_SUBSTRATE").is_none_or(|value| value != "os") {
+        return PollSource::new(root).map(|source| Box::new(source) as Box<dyn WatchSource>);
+    }
+    match NotifySource::new(root) {
+        Ok(source) => {
+            eprintln!("dartq-daemon: watch: OS-event substrate active");
+            Some(Box::new(source))
+        }
+        Err(error) => {
+            eprintln!("dartq-daemon: watch: OS-event substrate unavailable ({error}); polling");
+            PollSource::new(root).map(|source| Box::new(source) as Box<dyn WatchSource>)
+        }
+    }
+}
+
+/// Off the shipped platforms there is no OS-event backend: poll is the
+/// substrate.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn init_source(root: &Path) -> Option<Box<dyn WatchSource>> {
+    PollSource::new(root).map(|source| Box::new(source) as Box<dyn WatchSource>)
+}
+
 /// Where the watcher polls and how fast. `poll_interval` is injectable for
-/// tests; production uses [`POLL_INTERVAL`] via [`Self::new`].
+/// tests; production uses `POLL_INTERVAL` via [`Self::new`].
 pub struct WatchOptions {
     /// The package directory to walk (the daemon's workspace root).
     pub(crate) root: PathBuf,
@@ -129,10 +423,20 @@ impl Debounce {
         self.first_change = None;
         Some(batch)
     }
+
+    /// Returns an unsent batch to the accumulator: a full intake queue is
+    /// backpressure, not a loss. The paths merge with any later touches
+    /// (the sort+dedup flush coalesces same-file repeats into one entry)
+    /// and retry on the next quiet tick or max-hold deadline — one send
+    /// attempt per poll interval, never a spin and never a blocked walk.
+    fn requeue(&mut self, batch: Vec<PathBuf>, now: Instant) {
+        self.pending.extend(batch);
+        self.first_change.get_or_insert(now);
+    }
 }
 
 /// A per-file poll fingerprint: cheap hints, not content identities (the
-/// engine's `ContentId` discipline stays the truth, §16.7).
+/// engine's `ContentId` discipline stays the truth).
 type Fingerprint = (SystemTime, u64);
 
 /// One workspace walk: every `.dart` file by the discovery walk rules, with
@@ -170,12 +474,16 @@ fn scan(root: &std::path::Path) -> Option<FxHashMap<PathBuf, Fingerprint>> {
     )
 }
 
-/// The paths whose fingerprint changed, plus the paths that vanished.
+/// The paths whose fingerprint changed, plus the paths that vanished —
+/// sorted, so the `Incoming` batch order is deterministic at the source
+/// instead of inheriting the fingerprint map's hash-iteration order (the
+/// engine's intake re-sort stays the truth; this makes the watch face
+/// order-stable on its own).
 fn diff(
     previous: &FxHashMap<PathBuf, Fingerprint>,
     current: &FxHashMap<PathBuf, Fingerprint>,
 ) -> Vec<PathBuf> {
-    current
+    let mut touched: Vec<PathBuf> = current
         .iter()
         .filter(|(path, fingerprint)| previous.get(*path) != Some(*fingerprint))
         .map(|(path, _)| path.clone())
@@ -185,7 +493,9 @@ fn diff(
                 .filter(|path| !current.contains_key(*path))
                 .cloned(),
         )
-        .collect()
+        .collect();
+    touched.sort_unstable();
+    touched
 }
 
 /// A handle to the one watch thread: dropping it stops the poll and joins
@@ -197,16 +507,18 @@ pub(crate) struct Watcher {
 }
 
 impl Watcher {
-    /// Spawns the poll thread (one thread per watcher, by construction).
-    /// A failed spawn only loses the convenience layer — the daemon logs and
-    /// serves without watch.
+    /// Spawns the watch thread (one thread per watcher, by construction;
+    /// the substrate is inited on the thread, so a slow OS stream arm never
+    /// blocks the caller). A failed spawn only loses the convenience layer —
+    /// the daemon logs and serves without watch.
     pub(crate) fn spawn(options: WatchOptions, sender: Sender<Vec<Incoming>>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let join = thread::Builder::new()
             .name("dartq-daemon-watch".into())
             .spawn({
                 let stop = Arc::clone(&stop);
-                move || watch_loop(&options, &sender, &stop)
+                let metrics = Arc::new(WatchMetrics::default());
+                move || watch_loop(&options, &sender, &stop, &metrics)
             })
             .inspect_err(|error| eprintln!("dartq-daemon: watch thread unavailable: {error}"))
             .ok();
@@ -214,6 +526,15 @@ impl Watcher {
     }
 }
 
+/// The shutdown site: set the stop flag, then join. The join's latency is
+/// bounded by construction — the flag is checked at the top of every poll
+/// iteration, the tick's only channel operation is a non-blocking
+/// [`Sender::try_send`], and every path out of a tick (a failed walk
+/// `continue`s, a disconnected receiver `return`s) leads back to that
+/// check — so the join waits at most one in-flight poll interval (the
+/// sleep is not interruptible) plus one tick's work (one walk, one diff,
+/// one batch hand-off), or the pre-loop baseline walk in the spawn race.
+/// Session end is never held unbounded by the watcher's shutdown.
 impl Drop for Watcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -223,26 +544,40 @@ impl Drop for Watcher {
     }
 }
 
-/// The poll loop: baseline scan, then one sleep-walk-diff-debounce cycle per
-/// interval. Batches ride the reader channel as main-loop intake; a dead
-/// receiver ends the thread, and a full bounded queue blocks the send until
-/// the main loop drains (the same backpressure the reader takes — #947 F2).
-fn watch_loop(options: &WatchOptions, sender: &Sender<Vec<Incoming>>, stop: &AtomicBool) {
-    let Some(mut previous) = scan(&options.root) else {
+/// The watch loop: substrate init, then one drain-debounce-hand-off cycle
+/// per interval. Batches ride the bounded reader channel as main-loop
+/// intake; a dead receiver ends the thread, and a full queue is
+/// backpressure without a blocked drain — the batch returns to the
+/// accumulator and retries on a later tick. A blocking send would stall
+/// the poll on a slow drain and could hold [`Watcher::drop`]'s join at
+/// shutdown past the receiver's own drop, so the send never waits.
+fn watch_loop(
+    options: &WatchOptions,
+    sender: &Sender<Vec<Incoming>>,
+    stop: &AtomicBool,
+    metrics: &WatchMetrics,
+) {
+    let Some(mut source) = init_source(&options.root) else {
         return;
     };
     let mut debounce = Debounce::default();
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(options.poll_interval);
-        let Some(current) = scan(&options.root) else {
-            continue;
-        };
-        let touched = diff(&previous, &current);
-        previous = current;
+        let events = source.drain();
+        metrics.observe(&events, SystemTime::now());
+        let touched: Vec<PathBuf> = events.into_iter().map(|event| event.path).collect();
         if let Some(batch) = debounce.tick(touched, Instant::now()) {
-            let item = vec![Incoming::Watch { touched: batch }];
-            if sender.send(item).is_err() {
-                return;
+            match sender.try_send(vec![Incoming::Watch { touched: batch }]) {
+                Ok(()) => {}
+                Err(TrySendError::Disconnected(_)) => return,
+                Err(TrySendError::Full(item)) => {
+                    // The recovered intake is the one built above; the
+                    // impossible non-Watch shape falls out as a dropped
+                    // stale hint, which is a sanctioned watch semantic.
+                    if let Some(Incoming::Watch { touched }) = item.into_iter().next() {
+                        debounce.requeue(touched, Instant::now());
+                    }
+                }
             }
         }
     }
@@ -310,6 +645,7 @@ mod tests {
     /// A burst that never quiets flushes at the max-hold deadline instead of
     /// starving re-analysis.
     #[test]
+    #[expect(clippy::cast_possible_truncation)] // the tick indices are single-digit constants feeding Duration math
     fn tick_flushes_at_max_hold_inside_a_never_quiet_burst() {
         let t0 = Instant::now();
         let mut debounce = Debounce::default();
@@ -368,13 +704,41 @@ mod tests {
         assert!(scan(&root).is_none(), "no map, no phantom deletion");
     }
 
+    /// The diff's touched batch is sorted at the source (determinism audit
+    /// R1): paths touched in one tick surface in byte order, never in the
+    /// fingerprint map's hash-iteration order — the batch order is a
+    /// contract, not an accident the engine's intake re-sort papers over.
+    #[test]
+    fn diff_reports_touched_paths_sorted() {
+        let untouched = (SystemTime::UNIX_EPOCH, 0);
+        let touched_now = (SystemTime::UNIX_EPOCH, 1);
+        let names = [
+            "a.dart", "b.dart", "c.dart", "d.dart", "e.dart", "f.dart", "g.dart", "h.dart",
+        ];
+        let previous: FxHashMap<PathBuf, Fingerprint> = names
+            .into_iter()
+            .map(|name| (PathBuf::from(name), untouched))
+            .collect();
+        let current: FxHashMap<PathBuf, Fingerprint> = names
+            .into_iter()
+            .map(|name| (PathBuf::from(name), touched_now))
+            .collect();
+        let expected: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+        assert_eq!(
+            diff(&previous, &current),
+            expected,
+            "eight simultaneous touches: byte-sorted batch"
+        );
+    }
+
     /// The spawned thread delivers one debounced batch for a real write and
     /// shuts down cleanly on drop (stop + join; the channel then reports
     /// disconnect). One watcher, one thread — the lifecycle never leaks.
     #[test]
     fn watch_thread_delivers_batch_and_stops_on_drop() {
         let (root, main) = workspace("thread");
-        let (sender, receiver) = crossbeam_channel::unbounded::<Vec<Incoming>>();
+        // The bounded intake shape the server's main loop takes.
+        let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(2);
         let watcher = Watcher::spawn(
             WatchOptions {
                 root: root.clone(),
@@ -406,6 +770,48 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// A full intake queue is backpressure, never a stall or a loss: the
+    /// batch merges back into the accumulator and retries tick by tick, so
+    /// the change surfaces once the queue drains — and the poll loop never
+    /// blocks on the send.
+    #[test]
+    fn watch_thread_full_channel_requeues_and_retries() {
+        let (root, main) = workspace("full-channel");
+        let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(1);
+        // Occupy the one slot before the thread exists: the debounced
+        // batch below must meet a full queue.
+        sender.send(Vec::new()).expect("occupy the slot");
+        let watcher = Watcher::spawn(
+            WatchOptions {
+                root: root.clone(),
+                poll_interval: Duration::from_millis(25),
+            },
+            sender,
+        );
+
+        // Let the baseline scan settle, then make exactly one change.
+        thread::sleep(Duration::from_millis(120));
+        fs::write(&main, "var edited = 9;\n").expect("write");
+
+        // The occupied slot drains first; the requeued batch retries tick
+        // by tick and surfaces once the slot is free — the thread kept
+        // walking the whole time (no blocked send, no hang).
+        let occupied = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the pre-occupying item");
+        assert!(occupied.is_empty(), "the slot's filler, not a watch batch");
+        let batch = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the requeued change surfaces after the drain");
+        let Incoming::Watch { touched } = batch.into_iter().next().expect("one intake item") else {
+            panic!("watch intake is a Watch item");
+        };
+        assert_eq!(touched, vec![main], "the requeued batch retried");
+
+        drop(watcher);
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// Re-discovery rides the real thread: a file created after the
     /// baseline scan surfaces as a touched path (the batch that makes the
     /// session stage the set discovery takes), and its later deletion
@@ -415,7 +821,8 @@ mod tests {
     #[test]
     fn watch_thread_reports_creations_and_deletions() {
         let (root, _main) = workspace("thread-rediscover");
-        let (sender, receiver) = crossbeam_channel::unbounded::<Vec<Incoming>>();
+        // The bounded intake shape the server's main loop takes.
+        let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(2);
         let watcher = Watcher::spawn(
             WatchOptions {
                 root: root.clone(),
@@ -433,7 +840,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the creation surfaced within the window");
         assert_eq!(
-            watch_paths(created),
+            watch_paths(&created),
             vec![extra.clone()],
             "the new file is the batch"
         );
@@ -443,7 +850,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("the deletion surfaced within the window");
         assert_eq!(
-            watch_paths(deleted),
+            watch_paths(&deleted),
             vec![extra],
             "the removal is the batch"
         );
@@ -454,7 +861,7 @@ mod tests {
 
     /// The non-`.dart` context inputs ride the same fingerprint map as the
     /// `.dart` walk: each of the three triggers the diff on creation,
-    /// rewrite, and deletion — the watch trigger set PRD §16.7's reload
+    /// rewrite, and deletion — the watch trigger set the reload
     /// surface needs.
     #[test]
     fn scan_and_diff_track_each_config_input() {
@@ -542,9 +949,146 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The poll substrate — the seam's fallback and the watch face's
+    /// original behavior — reports the same touches the scan/diff pair
+    /// always did, now stamped with kind and time: a rewrite is a Modify
+    /// carrying the file's mtime, an addition a Create, a removal a
+    /// Delete. The latency probe round-trips through the source: the
+    /// measured write-to-drain latency is recorded, positive, and bounded.
+    #[test]
+    fn poll_source_reports_kinds_and_latency() {
+        let (root, main) = workspace("poll-source");
+        let mut source = PollSource::new(&root).expect("baseline");
+
+        // A rewrite: one Modify, stamped with the write's mtime — and the
+        // write-to-drain latency is positive (the drain ran after the
+        // write) and far inside the probe's sane bound.
+        fs::write(&main, "var edited = 7;\n").expect("rewrite");
+        thread::sleep(Duration::from_millis(5));
+        let observed = SystemTime::now();
+        let events = source.drain();
+        assert_eq!(events.len(), 1, "the rewrite is the only touch");
+        assert_eq!(events[0].path, main);
+        assert_eq!(events[0].kind, EventKind::Modify);
+        let latency = observed
+            .duration_since(events[0].at)
+            .expect("the mtime precedes the drain");
+        assert!(!latency.is_zero(), "latency recorded and > 0");
+        assert!(
+            latency < Duration::from_secs(2),
+            "latency bounded: {latency:?}"
+        );
+
+        // An addition and a removal in one drain, each with its kind.
+        let extra = root.join("lib/extra.dart");
+        fs::write(&extra, "var b = 2;\n").expect("add");
+        fs::remove_file(&main).expect("remove");
+        let events = source.drain();
+        assert_eq!(events.len(), 2, "the addition and the removal: {events:?}");
+        let create = events
+            .iter()
+            .find(|event| event.kind == EventKind::Create)
+            .expect("the addition");
+        assert_eq!(create.path, extra);
+        let delete = events
+            .iter()
+            .find(|event| event.kind == EventKind::Delete)
+            .expect("the removal");
+        assert_eq!(delete.path, main);
+
+        // A failed walk (vanished root) is a silent tick, not a phantom
+        // mass deletion.
+        fs::remove_dir_all(&root).expect("rm -rf");
+        assert!(source.drain().is_empty());
+    }
+
+    /// The latency probe's recording face: a drain's latency is the stalest
+    /// event's wait, recorded and surfaced; a changeless drain records
+    /// nothing.
+    #[test]
+    fn latency_probe_records_the_stalest_wait() {
+        let metrics = WatchMetrics::default();
+        let stale = SystemTime::now() - Duration::from_millis(150);
+        let fresh = SystemTime::now();
+        let events = [
+            SourceEvent {
+                path: PathBuf::from("a.dart"),
+                kind: EventKind::Modify,
+                at: stale,
+            },
+            SourceEvent {
+                path: PathBuf::from("b.dart"),
+                kind: EventKind::Create,
+                at: fresh,
+            },
+        ];
+        metrics.observe(&events, SystemTime::now());
+
+        assert_eq!(metrics.observed_drains.load(Ordering::Relaxed), 1);
+        let latency =
+            Duration::from_micros(metrics.last_max_latency_micros.load(Ordering::Relaxed));
+        assert!(
+            latency >= Duration::from_millis(150),
+            "the stalest event's wait, recorded and > 0: {latency:?}"
+        );
+        assert!(latency < Duration::from_secs(2), "bounded: {latency:?}");
+
+        // A changeless drain records nothing more.
+        metrics.observe(&[], SystemTime::now());
+        assert_eq!(metrics.observed_drains.load(Ordering::Relaxed), 1);
+    }
+
+    /// The OS-event substrate end to end (FSEvents on this host): a
+    /// create, a rewrite, and a removal each surface — with their kind and
+    /// in the workspace's own path form — inside a bounded window. The
+    /// substrate must start for the test to mean anything: a fallback to
+    /// poll would fail loudly at the `expect`, not pass vacuously.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn os_event_source_reports_kinds() {
+        let (root, _main) = workspace("os-events");
+        let mut source = NotifySource::new(&root).expect("the OS substrate starts");
+
+        let extra = root.join("lib/extra.dart");
+        fs::write(&extra, "var b = 2;\n").expect("create");
+        let created = wait_for_event(&mut source, EventKind::Create, &extra);
+        assert_eq!(created, extra, "the create, in the walk's path form");
+
+        fs::write(&extra, "var bcd = 234;\n").expect("rewrite");
+        let modified = wait_for_event(&mut source, EventKind::Modify, &extra);
+        assert_eq!(modified, extra);
+
+        fs::remove_file(&extra).expect("remove");
+        let removed = wait_for_event(&mut source, EventKind::Delete, &extra);
+        assert_eq!(removed, extra);
+
+        drop(source);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Drains until an event of `kind` for `path` arrives, or the window
+    /// closes and the test fails — bounded, never a hang.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn wait_for_event(source: &mut NotifySource, kind: EventKind, path: &Path) -> PathBuf {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            for event in source.drain() {
+                if event.kind == kind && event.path == path {
+                    return event.path;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no {kind:?} event for {} within the window",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Unwraps a channel item into its touched-path batch.
-    fn watch_paths(item: Vec<Incoming>) -> Vec<PathBuf> {
-        match item.as_slice() {
+    fn watch_paths(item: &[Incoming]) -> Vec<PathBuf> {
+        match item {
             [Incoming::Watch { touched }] => touched.clone(),
             _ => panic!("watch intake is one Watch item"),
         }

@@ -2,7 +2,7 @@
 //! every face is driven over the fixture workspace through the wire harness
 //! and its answer is run through `dartq_schema::validate` for its domain and
 //! `validate_at_tier` at the tier the request asked for — the daemon-boundary
-//! capture PRD §15.7's CI consumption names. Also pinned: the single-stamp
+//! capture the CI consumption names. Also pinned: the single-stamp
 //! rule (exactly one `schema_version` per response level — the producer's
 //! own; the daemon assembly adds none and re-adds no dropped field) and the
 //! validator bite (a corrupted live answer is named at its field path).
@@ -20,15 +20,9 @@ mod common;
 
 use std::fs;
 
-use common::{BROKEN_MAIN, CLEAN_MAIN, Workspace, notification, request, spawn, store_root};
+use common::{BROKEN_MAIN, CLEAN_MAIN, Workspace, request, spawn, store_root};
 use dartq_schema::{Domain, Verbosity, validate, validate_at_tier};
 use serde_json::{Value, json};
-
-/// `initialize` + `initialized`: the sweep publishes `publishes` frames.
-fn handshake(h: &mut common::Harness, publishes: usize) {
-    h.step(&request(1, "initialize", json!({})), 1);
-    h.step(&notification("initialized", json!({})), publishes);
-}
 
 /// The `result` of the answer frame for `id`.
 fn answer_result(h: &common::Harness, id: i64) -> Value {
@@ -115,7 +109,6 @@ fn seeded_explain_workspace() -> Workspace {
 fn dartq_query_answers_validate_at_every_tier() {
     let workspace = seeded_query_workspace();
     let mut h = spawn(&workspace, &store_root("schema-query"));
-    handshake(&mut h, 0);
 
     for (id, tier) in [
         (2, Verbosity::Minimal),
@@ -161,8 +154,7 @@ fn dartq_query_answers_validate_at_every_tier() {
     assert_eq!(delta["since"], 0, "the cursor echoes");
     assert_valid_at_tier(&delta, Domain::Query, Verbosity::Compact);
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
     fs::remove_dir_all(&workspace.root).ok();
 }
@@ -176,7 +168,7 @@ fn dartq_query_answers_validate_at_every_tier() {
 fn dartq_impact_validates_and_is_tier_invariant() {
     let workspace = seeded_query_workspace();
     // The test imports the lib through its package URI only: a clean
-    // workspace keeps the sweep publish-free (a deterministic handshake).
+    // workspace keeps the sweep publish-free.
     fs::write(
         workspace.path("test/a_test.dart"),
         "import 'package:fixture/a.dart';\nvoid main() {\n  foo();\n}\n",
@@ -184,7 +176,6 @@ fn dartq_impact_validates_and_is_tier_invariant() {
     .expect("write the test");
     let a = workspace.path("lib/a.dart");
     let mut h = spawn(&workspace, &store_root("schema-impact"));
-    handshake(&mut h, 0);
 
     let mut baseline: Option<Value> = None;
     for (id, tier) in [
@@ -213,8 +204,7 @@ fn dartq_impact_validates_and_is_tier_invariant() {
         "the report carries its own single stamp"
     );
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
     fs::remove_dir_all(&workspace.root).ok();
 }
@@ -259,8 +249,8 @@ fn dartq_compat_answers_validate_at_every_tier() {
     let a = workspace.path("lib/a.dart");
     let mut h = spawn(&workspace, &store_root("schema-compat"));
     // `lib/a.dart` imports `dart:async`, unresolvable under the session's
-    // core-only SDK: the sweep publishes one push for it.
-    handshake(&mut h, 1);
+    // core-only SDK: the sweep's startup drain pushes it before the first
+    // request — already in the transcript when these steps run.
 
     for (id, tier) in [
         (2, Verbosity::Minimal),
@@ -302,8 +292,7 @@ fn dartq_compat_answers_validate_at_every_tier() {
         "the compact tier carries the evidence"
     );
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
     fs::remove_dir_all(&workspace.root).ok();
 }
@@ -320,7 +309,6 @@ fn dartq_compat_answers_validate_at_every_tier() {
 fn dartq_explain_answers_validate_at_every_tier() {
     let workspace = seeded_explain_workspace();
     let mut h = spawn(&workspace, &store_root("schema-explain"));
-    handshake(&mut h, 0);
 
     for (id, tier) in [
         (2, Verbosity::Minimal),
@@ -387,8 +375,7 @@ fn dartq_explain_answers_validate_at_every_tier() {
     );
     assert_valid_at_tier(&delta, Domain::Explain, Verbosity::Compact);
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
     fs::remove_dir_all(&workspace.root).ok();
 }
@@ -408,7 +395,6 @@ fn dartq_fix_documents_validate_with_their_provenance() {
     let fixable = workspace.root.join("fixable.dart");
     fs::write(&fixable, "void f() { var a = new B(); }\n").expect("write fixable");
     let mut h = spawn(&workspace, &store_root("schema-fix"));
-    handshake(&mut h, 0);
 
     for (id, tier) in [
         (2, Verbosity::Minimal),
@@ -453,8 +439,7 @@ fn dartq_fix_documents_validate_with_their_provenance() {
         }
     }
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
     fs::remove_dir_all(&workspace.root).ok();
 }
@@ -473,7 +458,6 @@ fn dartq_fix_documents_validate_with_their_provenance() {
 fn every_stamped_face_validates_against_its_published_domain() {
     let workspace = Workspace::new(BROKEN_MAIN);
     let mut h = spawn(&workspace, &store_root("schema-stamped-faces"));
-    handshake(&mut h, 1);
 
     for (id, tier) in [
         (2, Verbosity::Minimal),
@@ -564,8 +548,7 @@ fn every_stamped_face_validates_against_its_published_domain() {
         );
     }
 
-    h.step(&request(12, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
     fs::remove_dir_all(&workspace.root).ok();
 }
@@ -578,7 +561,6 @@ fn every_stamped_face_validates_against_its_published_domain() {
 fn corrupted_live_answers_are_named_at_their_path() {
     let workspace = seeded_query_workspace();
     let mut h = spawn(&workspace, &store_root("schema-corrupt"));
-    handshake(&mut h, 0);
 
     h.step(&request(2, "dartq/query", json!({ "name": "Foo" })), 1);
     let compact = answer_result(&h, 2);
@@ -620,8 +602,179 @@ fn corrupted_live_answers_are_named_at_their_path() {
     assert_eq!(violation.path, "declarations[0].container");
     assert_eq!(violation.expected, "omitted at the minimal tier");
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
     fs::remove_dir_all(&workspace.root).ok();
+}
+
+/// The frozen `dartq/*` method family: the daemon's 15-method request
+/// table, pinned here as the independent copy the live face must serve.
+/// dartq-schema validates answer shapes per domain and has no method-name
+/// registry, so the frozen wire shape is the pin — an added, renamed, or
+/// removed method drifts the table and fails the gate below.
+const FROZEN_METHODS: [&str; 15] = [
+    "dartq/index",
+    "dartq/analyze",
+    "dartq/check",
+    "dartq/query",
+    "dartq/queryBatch",
+    "dartq/resolveAt",
+    "dartq/completion",
+    "dartq/impact",
+    "dartq/fix",
+    "dartq/assists",
+    "dartq/compat",
+    "dartq/explain",
+    "dartq/overlay.set",
+    "dartq/overlay.commit",
+    "dartq/overlay.clear",
+];
+
+/// The method-table drift gate: every frozen `dartq/*` name is a live face
+/// — the server answers each one (a real result or its own INVALID_PARAMS
+/// intake verdict), never `METHOD_NOT_FOUND`. A renamed or dropped method
+/// fails on its own line; a stray `dartq/`-spelled unknown still answers
+/// `METHOD_NOT_FOUND`, so the face surface is exactly the frozen family.
+#[test]
+fn every_frozen_method_is_a_live_face() {
+    let workspace = seeded_query_workspace();
+    let a = workspace.path("lib/a.dart");
+    let mut h = spawn(&workspace, &store_root("schema-methods"));
+
+    // Params chosen to reach each face's own intake (a valid selector where
+    // the face validates one) — the pin is "answered, never METHOD_NOT_FOUND".
+    let paths = json!({ "paths": [a.display().to_string()] });
+    let cases: [(i64, &str, Value); 15] = [
+        (1, "dartq/index", json!({})),
+        (2, "dartq/analyze", json!({})),
+        (3, "dartq/check", paths.clone()),
+        (4, "dartq/query", json!({ "name": "Foo" })),
+        (5, "dartq/queryBatch", json!({ "queries": [] })),
+        (
+            6,
+            "dartq/resolveAt",
+            json!({ "file": a.display().to_string(), "offset": 0 }),
+        ),
+        (
+            7,
+            "dartq/completion",
+            json!({ "file": a.display().to_string(), "offset": 0 }),
+        ),
+        (
+            8,
+            "dartq/impact",
+            json!({ "path": a.display().to_string() }),
+        ),
+        (9, "dartq/fix", paths.clone()),
+        (
+            10,
+            "dartq/assists",
+            json!({ "path": a.display().to_string(), "offset": 0, "length": 0 }),
+        ),
+        (
+            11,
+            "dartq/compat",
+            json!({ "path": a.display().to_string(), "sdk_roots": [workspace.path("sdk")] }),
+        ),
+        (
+            12,
+            "dartq/explain",
+            json!({ "symbol": "Foo", "sdk": workspace.path("sdk") }),
+        ),
+        (
+            13,
+            "dartq/overlay.set",
+            json!({ "agentId": "A", "files": {} }),
+        ),
+        (14, "dartq/overlay.commit", json!({ "agentId": "A" })),
+        (15, "dartq/overlay.clear", json!({ "agentId": "A" })),
+    ];
+    for (id, method, params) in cases {
+        h.step(&request(id, method, params), 1);
+        let frame = h.wait_answer(id);
+        let code = frame["error"]["code"].as_i64();
+        assert_ne!(
+            code,
+            Some(-32601),
+            "{method} must be a live face, not METHOD_NOT_FOUND: {frame}"
+        );
+        assert!(
+            frame.get("error").is_none() || code == Some(-32602),
+            "{method} answers a result or its own intake verdict: {frame}"
+        );
+    }
+
+    // The family is closed: a `dartq/`-spelled unknown answers
+    // METHOD_NOT_FOUND, so nothing outside the frozen table answers.
+    h.step(&request(16, "dartq/nope", json!({})), 1);
+    let frame = h.wait_answer(16);
+    assert_eq!(frame["error"]["code"], -32601, "the face set is closed");
+
+    let (code, _) = h.join_ended();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+    fs::remove_dir_all(&workspace.root).ok();
+}
+
+/// The gate's symmetric direction: the SERVER's dispatchable set equals the
+/// frozen family exactly — the live-face test above proves every frozen
+/// name answers (METHODS ⊆ served), this one proves nothing outside the
+/// frozen table serves (served ⊆ METHODS ⊆ frozen).
+///
+/// The server's request path has exactly two ways to serve a name:
+/// `handle_request`'s intake-literal arms (the overlay triple and the
+/// plugin-dispatch pair) and the `commands::is_command` arm — and the
+/// latter is `METHODS.contains`, METHODS-driven, so it can only serve a
+/// listed name. That leaves the literal arms as the only place a
+/// handler could answer an unlisted name. Those arms match on the
+/// `server.rs` constants that `INTAKE_REQUESTS` is built from, so the
+/// served intake set IS the published set — asserting it ⊆ `METHODS`
+/// closes the hole: a new literal arm serving a fresh name requires adding
+/// the constant, and the constant's table entry fails this assertion
+/// unless `METHODS` (and therefore the frozen copy) grows with it.
+///
+/// Notifications are deliberately separate: `dartq/sync`/`dartq/cancel`
+/// are notification faces (no `id`, nothing to answer) and are NOT in
+/// `METHODS` by design — that table is the request family only. The gate
+/// pins them as the closed notification set and asserts the two families
+/// stay disjoint.
+#[test]
+fn the_served_set_is_exactly_the_frozen_family() {
+    // Direction 1: every intake-intercepted request name is in the
+    // exhaustive request table — no handler serves a name `METHODS`
+    // doesn't list.
+    for method in dartq_daemon::INTAKE_REQUESTS {
+        assert!(
+            dartq_daemon::METHODS.contains(&method),
+            "{method} is served at intake but missing from METHODS — \
+             an unlisted live face the frozen gate cannot see"
+        );
+    }
+
+    // Direction 2 (the symmetric half the existing live-face test already
+    // covers behaviorally): METHODS — the dispatchable request set the
+    // `is_command` arm routes — is exactly the frozen family, no extras.
+    assert_eq!(
+        dartq_daemon::METHODS.len(),
+        FROZEN_METHODS.len(),
+        "the request family grew or shrank: {METHODS:?}",
+        METHODS = dartq_daemon::METHODS
+    );
+    for method in dartq_daemon::METHODS {
+        assert!(
+            FROZEN_METHODS.contains(&method),
+            "{method} is a live face but not in the frozen table"
+        );
+    }
+
+    // The notification faces are a parallel closed set: the served
+    // notification names are exactly the frozen pair, and none is a request
+    // method.
+    let served = dartq_daemon::SERVED_NOTIFICATIONS;
+    assert_eq!(served, ["dartq/sync", "dartq/cancel"]);
+    for notification in served {
+        assert!(
+            !dartq_daemon::METHODS.contains(&notification),
+            "{notification} is both a request and a notification"
+        );
+    }
 }

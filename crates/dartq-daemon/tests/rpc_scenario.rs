@@ -1,20 +1,19 @@
-//! The scripted end-to-end scenario a Cockpit-style client drives over the
-//! daemon RPC (the m4-recon Q1/Q2 contract: the daemon RPC faces themselves
-//! over LSP Content-Length framing — no bespoke protocol). One fixture
-//! workspace, one session, the full face sequence as a data-driven steps
-//! table; the table doubles as the replayable conformance script (each entry
-//! is the wire message verbatim plus the transcript growth it settles on and
-//! the response contract it asserts — schema-domain field names where the
-//! frozen schemas pin them):
+//! The scripted end-to-end scenario an agent client drives over the
+//! daemon RPC (the wire shape: Content-Length framed JSON-RPC, the
+//! `dartq/*` request family — no handshake, no bespoke protocol). One
+//! fixture workspace, one session, the full face sequence as a data-driven
+//! steps table; the table doubles as the replayable conformance script
+//! (each entry is the wire message verbatim plus the transcript growth it
+//! settles on and the response contract it asserts — schema-domain field
+//! names where the frozen schemas pin them):
 //!
-//! initialize → didOpen (the analysis face) → query symbol → `overlay.set`
-//! (agent A edits a file) → analyze (the agent view) → query references
-//! under the overlay → `overlay.commit` → delta query (cursor echo) →
-//! didChange (full sync) → the publish diff arrives → full query vs the
-//! second `since:` query returning only the delta rows → `dartq/impact` on
-//! the changed symbol → `dartq/explain` with the session short-ids (the
-//! repeat path back-references `s1`, mapped by the `symbols` table) →
-//! shutdown/exit. No network, no dart SDK.
+//! query symbol → `overlay.set` (agent A edits a file) → analyze (the
+//! agent view) → query references under the overlay → `overlay.commit` →
+//! delta query (cursor echo) → `dartq/sync` (a base edit) → the publish
+//! diff arrives → full query vs the second `since:` query returning only
+//! the delta rows → `dartq/impact` on the changed symbol → `dartq/explain`
+//! with the session short-ids (the repeat path back-references `s1`,
+//! mapped by the `symbols` table) → EOF. No network, no dart SDK.
 
 mod common;
 
@@ -42,8 +41,8 @@ fn workspace_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// The scenario fixture: `Foo`/`foo` declared in lib/a.dart, used from
-/// lib/b.dart and test/a_test.dart — clean under the synthetic SDK, so the
-/// sweep publishes nothing and every later frame is scenario-caused.
+/// lib/b.dart and `test/a_test.dart` — clean under the synthetic SDK, so
+/// the sweep publishes nothing and every later frame is scenario-caused.
 fn scenario_workspace() -> Workspace {
     let workspace = Workspace::new(CLEAN_MAIN);
     fs::write(workspace.path("lib/a.dart"), A_SOURCE).expect("write a.dart");
@@ -54,7 +53,7 @@ fn scenario_workspace() -> Workspace {
 
 const A_SOURCE: &str = "class Foo {\n  void meth() {}\n}\nvoid foo() {}\n";
 /// Every local is read (`f?.meth()`), so no `unused_local_variable` row ever
-/// fires and the clean-open baseline holds. The `Foo` rows stay at
+/// fires and the clean baseline holds. The `Foo` rows stay at
 /// `reference@33` / `invoked@42` — the fix appends after line 3.
 const B_SOURCE: &str =
     "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f?.meth();\n  foo();\n}\n";
@@ -103,12 +102,12 @@ fn answer_result(h: &Harness, id: i64) -> Value {
         .clone()
 }
 
-/// The session's `textDocument/publishDiagnostics` pushes so far (owned
-/// copies — the assertions run after the transcript borrow would die).
+/// The session's `dartq/diagnostics` pushes so far (owned copies — the
+/// assertions run after the transcript borrow would die).
 fn publishes(h: &Harness) -> Vec<Value> {
     h.transcript()
         .into_iter()
-        .filter(|frame| frame["method"] == "textDocument/publishDiagnostics")
+        .filter(|frame| frame["method"] == "dartq/diagnostics")
         .collect()
 }
 
@@ -128,10 +127,10 @@ fn assert_schema_valid(result: &Value, domain: dartq_schema::Domain) {
 }
 
 /// The scenario, end to end. The cursor arithmetic every delta below chains
-/// from: the didOpen drain = 1, the overlay.set = 2, the commit merge = 3,
-/// the didChange drain = 4.
+/// from: the startup sweep = 1, the overlay.set = 2, the commit merge = 3,
+/// the sync's drain = 4.
 #[test]
-fn cockpit_script_over_the_daemon_rpc_surface() {
+fn agent_script_over_the_daemon_rpc_surface() {
     let _guard = workspace_lock();
     let workspace = scenario_workspace();
     let a = workspace.path("lib/a.dart");
@@ -142,65 +141,9 @@ fn cockpit_script_over_the_daemon_rpc_surface() {
     let mut h = spawn(&workspace, &store_root("rpc-scenario"));
 
     let script = vec![
-        // -- lifecycle: the negotiated capability set pins the LSP surface
-        // plus the experimental dartq/* family, each entry carrying the
-        // response contract version --
-        step(request(1, "initialize", json!({})), 1, |h| {
-            let result = answer_result(h, 1);
-            assert_eq!(result["capabilities"]["textDocumentSync"], 1);
-            assert_eq!(result["capabilities"]["positionEncoding"], "utf-16");
-            assert_eq!(result["serverInfo"]["name"], "dartq");
-            let experimental = result["capabilities"]["experimental"]
-                .as_object()
-                .expect("experimental capability map");
-            assert_eq!(
-                experimental.len(),
-                13,
-                "the full dartq/* family: {experimental:?}"
-            );
-            for method in [
-                "dartq/index",
-                "dartq/analyze",
-                "dartq/check",
-                "dartq/query",
-                "dartq/queryBatch",
-                "dartq/impact",
-                "dartq/fix",
-                "dartq/assists",
-                "dartq/compat",
-                "dartq/explain",
-                "dartq/overlay.set",
-                "dartq/overlay.commit",
-                "dartq/overlay.clear",
-            ] {
-                assert_eq!(
-                    experimental[method]["schemaVersion"], 1,
-                    "{method} announced with the contract version"
-                );
-            }
-        }),
-        // -- the sweep finds the fixture clean: no publish --
-        step(notification("initialized", json!({})), 0, |_| {}),
-        // -- the analysis face: the client opens main.dart with its on-disk
-        // text; a clean view diffs quiet, so nothing publishes --
-        step(
-            notification(
-                "textDocument/didOpen",
-                json!({"textDocument": {"uri": main_uri, "languageId": "dart", "version": 1,
-                       "text": CLEAN_MAIN}}),
-            ),
-            0,
-            |h| {
-                assert!(
-                    publishes(h).is_empty(),
-                    "a clean open publishes nothing: {:?}",
-                    publishes(h)
-                );
-            },
-        ),
         // -- the base symbol query: the declaration plus each file's
         // annotation-plus-invocation pair (both b.dart and the test file
-        // use Foo) --
+        // use Foo); the clean fixture publishes nothing --
         step(
             request(2, "dartq/query", json!({ "name": "Foo" })),
             1,
@@ -324,11 +267,11 @@ fn cockpit_script_over_the_daemon_rpc_surface() {
                 expected.sort();
                 assert_eq!(uses, expected, "the overlay pair lands at 64/73");
                 assert_schema_valid(&result, dartq_schema::Domain::Query);
-                assert_schema_valid(&result, dartq_schema::Domain::Query);
             },
         ),
         // -- the merge: the staged buffer reaches the worktree and the base
-        // view; both sides stay clean, so the publish diff pushes nothing --
+        // view; b.dart's rows are unchanged (clean before, clean after), so
+        // the publish diff stays silent --
         step(
             request(6, "dartq/overlay.commit", json!({"agentId": "A"})),
             1,
@@ -341,16 +284,11 @@ fn cockpit_script_over_the_daemon_rpc_surface() {
                     AGENT_B_SOURCE.as_bytes(),
                     "the staged buffer reached the worktree"
                 );
-                assert!(
-                    publishes(h).is_empty(),
-                    "a no-diff merge pushes nothing: {:?}",
-                    publishes(h)
-                );
             },
         ),
         // -- delta mode: only the session-written files' rows survive
-        // (b.dart at cursor 3, main.dart opened at 1; the test file was
-        // never written through this session) --
+        // (b.dart at cursor 3; the test file was never written through this
+        // session) --
         step(
             request(7, "dartq/query", json!({"name": "main", "since": 0})),
             1,
@@ -358,30 +296,37 @@ fn cockpit_script_over_the_daemon_rpc_surface() {
                 let result = answer_result(h, 7);
                 assert_eq!(
                     result["since"], 3,
-                    "the cursor echoes (didOpen 1 + overlay.set 2 + commit merge 3)"
+                    "the cursor echoes (sweep 1 + overlay.set 2 + commit merge 3)"
                 );
                 assert_eq!(
                     declaration_files(&result),
-                    [b.display().to_string(), main.display().to_string()],
+                    [b.display().to_string()],
                     "only files written through this session"
                 );
             },
         ),
-        // -- the client's full-sync edit: clean → the URI error, and the
-        // publish diff arrives for the open document --
+    ];
+    run_script(&mut h, &script);
+
+    // The base edit: main.dart breaks on disk. `dartq/sync` reports paths,
+    // never contents — the write lands first, the notification only names
+    // what to re-read.
+    fs::write(&main, BROKEN_MAIN).expect("the edit lands before its report");
+
+    let script = vec![
+        // -- the client reports the touched path; the publish diff arrives --
         step(
-            notification(
-                "textDocument/didChange",
-                json!({"textDocument": {"uri": main_uri, "version": 2},
-                       "contentChanges": [{"text": BROKEN_MAIN}]}),
-            ),
+            notification("dartq/sync", json!({"paths": ["lib/main.dart"]})),
             1,
             |h| {
                 let pushed = publishes(h);
-                assert_eq!(pushed.len(), 1, "the diff arrives: {pushed:?}");
+                assert_eq!(pushed.len(), 1, "the sync's diff: {pushed:?}");
                 let params = &pushed[0]["params"];
                 assert_eq!(params["uri"], main_uri);
-                assert_eq!(params["version"], 2, "the open document's version rides");
+                assert!(
+                    params.get("version").is_none(),
+                    "the RPC push carries no document version: {params}"
+                );
                 let diagnostics = params["diagnostics"].as_array().expect("diagnostics");
                 assert_eq!(diagnostics.len(), 1);
                 assert_eq!(diagnostics[0]["code"], "uri_does_not_exist");
@@ -410,7 +355,7 @@ fn cockpit_script_over_the_daemon_rpc_surface() {
             },
         ),
         // -- the second query, since the commit cursor: only the file that
-        // changed after it (the didChange drain) keeps its rows --
+        // changed after it (the sync's drain) keeps its rows --
         step(
             request(9, "dartq/query", json!({"name": "main", "since": 3})),
             1,
@@ -428,10 +373,7 @@ fn cockpit_script_over_the_daemon_rpc_surface() {
                         .is_empty(),
                     "no references to main anywhere"
                 );
-                assert_eq!(
-                    result["since"], 4,
-                    "the cursor echoes (the didChange drain)"
-                );
+                assert_eq!(result["since"], 4, "the cursor echoes (the sync's drain)");
                 assert_schema_valid(&result, dartq_schema::Domain::Query);
             },
         ),
@@ -555,26 +497,34 @@ fn cockpit_script_over_the_daemon_rpc_surface() {
                 assert_schema_valid(&result, dartq_schema::Domain::Explain);
             },
         ),
-        // -- shutdown answers, then exit is the clean end --
-        step(request(13, "shutdown", json!(null)), 1, |h| {
-            assert!(
-                answer_result(h, 13).is_null(),
-                "shutdown answers a null result"
-            );
-        }),
     ];
+    // The base edit's on-disk truth must land before its `dartq/sync`
+    // report runs inside the script — write it here, ahead of the runner.
+    fs::write(&main, BROKEN_MAIN).expect("the edit lands before its report");
     run_script(&mut h, &script);
 
-    let (code, transcript) = h.exit();
+    let (code, transcript) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
     let pushed: Vec<&Value> = transcript
         .iter()
-        .filter(|frame| frame["method"] == "textDocument/publishDiagnostics")
+        .filter(|frame| frame["method"] == "dartq/diagnostics")
         .collect();
+    // One push: the sync's diff. Nothing else publishes — b.dart's merge
+    // left its (empty) set unchanged, and reads never re-push an unchanged
+    // baseline.
     assert_eq!(
         pushed.len(),
         1,
-        "exactly the didChange diff ever published: {pushed:?}"
+        "the publish face is a pure diff: {pushed:?}"
+    );
+    assert_eq!(pushed[0]["params"]["uri"], main_uri);
+    assert_eq!(
+        pushed[0]["params"]["diagnostics"]
+            .as_array()
+            .expect("d")
+            .len(),
+        1,
+        "the sync diff's error set: {pushed:?}"
     );
 
     fs::remove_dir_all(&workspace.root).ok();

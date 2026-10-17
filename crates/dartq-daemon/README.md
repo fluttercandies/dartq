@@ -1,8 +1,8 @@
 # dartq-daemon
 
-The dartq daemon: an LSP shell over the multi-context analysis runtime.
-One client on stdin/stdout, a reader thread feeding a message channel, and
-the request handlers that drive analysis contexts, snapshots, and plugin
+The dartq daemon: a resident RPC server over the multi-context analysis
+runtime. One client on stdin/stdout, a reader thread feeding a message channel,
+and the request handlers that drive analysis contexts, snapshots, and plugin
 sessions.
 
 ## Role in the workspace

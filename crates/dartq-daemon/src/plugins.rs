@@ -1,27 +1,36 @@
-//! Plugin lifecycle orchestration for the daemon (PRD §14): discovery,
-//! eager spawn, the per-cycle engine-diagnostics feed, the crash→diagnostic
-//! bridge, and the deterministic merge of plugin findings into the LSP
-//! output. The thin daemon-side layer `dartq-plugin` deliberately leaves to
-//! its output consumer.
+//! Plugin lifecycle orchestration for the daemon: discovery,
+//! lazy spawn at first use, the per-cycle engine-diagnostics feed, the
+//! crash→diagnostic bridge, and the deterministic merge of plugin findings
+//! into the diagnostics output. The thin daemon-side layer `dartq-plugin`
+//! deliberately leaves to its output consumer.
 //!
 //! # Representation contract (the merge's type-level boundary)
 //!
-//! Plugin *findings* convert directly to [`lsp::Diagnostic`] with the
-//! plugin's manifest name as the LSP `source` tag. They never pass through
+//! Plugin *findings* convert directly to [`wire::Diagnostic`] with the
+//! plugin's manifest name as the `source` tag. They never pass through
 //! the engine [`Diagnostic`] — its `CodeInfo` requires `&'static` code
-//! names, and plugin codes are free-form strings. Only
+//! names, and plugin codes are free-form. Only
 //! [`crash_diagnostic`] output (already a legal engine `Diagnostic`) rides
-//! the engine diagnostics vec; the session's convert-once pass then carries
-//! it into publishes and answers.
+//! the engine shape: the cycle hands it back beside the findings and the
+//! session's merge step converts it through the engine face into the
+//! turn's publishes — never into the analyze answers.
 //!
 //! # Blocking posture (synchronous-core policy)
 //!
 //! Every face here blocks the calling thread — the main loop's thread — by
-//! design: [`PluginSet::launch`] spends up to the manifest's
-//! `request_ms × (retries + 1)` per plugin on the spawn handshake (the
-//! manifest defaults 10 s × 4, PRD §14.3); [`PluginSet::cycle`] spends at
-//! most one [`DRAIN_BUDGET`] per plugin per cycle waiting for findings.
+//! design: [`PluginSet::launch`] spends only the discovery walks (no
+//! sidecar starts there); the first spawn handshake (up to the manifest's
+//! `request_ms × (retries + 1)` per plugin, defaults 10 s × 4)
+//! lands inside [`PluginSet::cycle`]'s launch pass on the first cycle that
+//! has something to feed, and each cycle after that spends at most one
+//! [`DRAIN_BUDGET`] per plugin waiting for findings.
 //! Findings that arrive after a cycle's budget publish on the next cycle.
+//! The cycle is the *merge step* of the core-first publish: the session
+//! stages its engine diagnostics publish before consulting the plugin set
+//! at all, so the waits here can delay only the plugin rows' own addition —
+//! never the core publish ([`DRAIN_BUDGET`] is the per-plugin timeout
+//! isolation; a plugin that will not quiesce within it is degraded, its
+//! rows deferred, and the move is counted in the stats' `degraded_cycles`).
 //!
 //! # Known-accepted postures
 //!
@@ -30,14 +39,22 @@
 //!   none). A cycle with analyzed files but an empty diagnostic set still
 //!   feeds — the enabled rules must run over the files even when the engine
 //!   has nothing to report.
-//! - The restart budget never resets (PRD semantics): the runtime relaunches
+//! - A plugin whose capability is never exercised never spawns: the launch
+//!   pass runs only on cycles that would feed, so a plugin-free workload
+//!   keeps the sidecar plane at zero resident processes. A sidecar idle
+//!   past its manifest's `idle_evict_ms` is evicted by the runtime's
+//!   monitor and returns budget-free at the next fed cycle — an eviction
+//!   is a host memory action, never a crash row; its cost is one cold
+//!   respawn + re-analysis on the first post-idle interaction.
+//! - The restart budget never resets: the runtime relaunches
 //!   a dead child lazily within the manifest's `request_retries`, and a
-//!   spent budget is terminal for the session.
+//!   spent budget is terminal for the session (eviction respawns are
+//!   budget-free and never consume it).
 //! - A crash row recorded while the session has no anchor file is withheld,
 //!   not dropped: it publishes on the first cycle that has one.
 //! - A plugin row whose offsets fall outside the resident file (the classic
 //!   stale row surviving a shrink edit) clamps to the file's UTF-16 end in
-//!   [`to_lsp`]: the row publishes degraded, it never panics the mapping.
+//!   [`to_wire`]: the row publishes degraded, it never panics the mapping.
 //! - The `plugins:` options section is read root-file-only (T5): includes
 //!   and nested options directories are not consulted, matching the plan's
 //!   pinned simplification of the official include-chain merge.
@@ -52,20 +69,23 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use dartq_commands::SCHEMA_VERSION;
+use dartq_commands::fix::{DeclaredPlugin, declared_plugin_sources, plugin_package_config};
 use dartq_commands::query as commands_query;
 use dartq_diagnostics::{Diagnostic, FileId};
 use dartq_engine::Engine;
 use dartq_index::{DeclRow, FileCapture};
 use dartq_plugin::{
-    CycleConfig, CyclePush, PendingQuery, PluginDiagnostic, PluginRuntime, QueryKind, RuleCensus,
-    RuleKind, RuntimeError, Severity as PluginSeverity, SpawnSpec, crash_diagnostic, discover,
+    CycleConfig, CyclePush, PendingQuery, PluginDiagnostic, PluginRuntime, PubNative, QueryKind,
+    RuleCensus, RuleKind, RuntimeError, Severity as PluginSeverity, SpawnSpec, crash_diagnostic,
+    discover,
 };
+use dartq_pub::PackageConfig;
 use dartq_source::{FileTable, LineIndex, SourceRange, utf16_len_of};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{Value, json};
 use serde_yaml::Value as Yaml;
 
-use crate::lsp;
+use crate::wire;
 
 /// Per-cycle wait for plugin findings (the bounded drain): long enough for a
 /// warm plugin's push, short enough to keep the main loop responsive. Rows
@@ -108,7 +128,6 @@ impl ConfiguredSeverity {
     /// names degrade to enable).
     fn parse(value: &Yaml) -> Self {
         match value {
-            Yaml::Bool(true) => Self::Enable,
             Yaml::Bool(false) => Self::Disable,
             Yaml::String(name) => match name.to_ascii_lowercase().as_str() {
                 "disable" | "false" => Self::Disable,
@@ -232,9 +251,16 @@ pub struct CycleContext<'a> {
     /// one declines queued queries with the wire's error channel, so a
     /// querying producer fails fast instead of stalling into its callback
     /// budget. `serve_query` is the canonical implementation.
-    pub query_server:
-        Option<&'a dyn Fn(&PendingQuery) -> Result<serde_json::Map<String, Value>, String>>,
+    pub query_server: Option<QueryServer<'a>>,
 }
+
+/// A reverse-query answer: the reply params (`Err` answers the wire's
+/// error channel).
+type QueryAnswer = Result<serde_json::Map<String, Value>, String>;
+
+/// A reverse-query server (T4): answers one pending query with its reply
+/// params (`Err` answers the wire's error channel).
+type QueryServer<'a> = &'a dyn Fn(&PendingQuery) -> QueryAnswer;
 
 /// One rule of a census, resolved for the cycle: enablement plus the
 /// severity overrides for its codes.
@@ -330,6 +356,17 @@ fn cycle_config(
 #[derive(Default)]
 pub struct PluginSet {
     plugins: Vec<PluginSlot>,
+    /// The code → owning-plugin attribution (upstream `pluginCodeMapping`,
+    /// upstream Dart SDK source,
+    /// `pkg/analysis_server_plugin/lib/src/plugin_server.dart`): the first
+    /// plugin in discovery order whose enabled census declares a code owns
+    /// it — `putIfAbsent` semantics — for `plugin/name`-scoped suppression.
+    /// **Attribution only, never a row filter**: upstream
+    /// `mergeAnalysisErrors` (`pkg/analysis_server/lib/src/plugin/result_merger.dart`)
+    /// concatenates every plugin's diagnostics verbatim, duplicates
+    /// included, so a code collision drops nothing. Rebuilt per cycle in
+    /// [`PluginSet::cycle`]; the map holds discovery-order indexes.
+    code_owners: FxHashMap<String, usize>,
 }
 
 /// One plugin's session state. `runtime: None` marks the plugin dead for
@@ -338,7 +375,7 @@ pub struct PluginSet {
 /// the manifest's request budget on every cycle for a plugin that cannot
 /// come back.
 struct PluginSlot {
-    /// The manifest name — the LSP `source` tag and the crash-message
+    /// The manifest name — the wire `source` tag and the crash-message
     /// subject.
     name: String,
     runtime: Option<PluginRuntime>,
@@ -350,17 +387,72 @@ struct PluginSlot {
 }
 
 impl PluginSet {
-    /// Discovers plugins under `<workspace_root>/plugins/` (the session's
-    /// `config_dir.parent()` convention; no overrides this milestone) and
-    /// spawns each hit eagerly, completing the handshake before returning.
+    /// Discovers plugins from the workspace's explicit sources — the
+    /// `plugins/` convention and the governing `analysis_options`' pub-native
+    /// `plugins:` section resolved through `pub_config` (the parsed
+    /// `package_config.json` in `config_dir`, augmented by each
+    /// `path:`-declared name's synthetic entry — a pub-resolved entry wins
+    /// over a `path:` shadow, matching upstream's precedence) —
+    /// and registers each hit. **No sidecar process starts here**: every
+    /// runtime is built lazy, and the first generation spawns at the first
+    /// cycle that has something to feed ([`PluginSet::cycle`]'s launch
+    /// pass), so a plugin whose capability is never needed never costs its
+    /// resident set.
     ///
-    /// Spawn failures never fail the session: they are logged here and
-    /// surface as their `dartq/plugin_crashed` row on the first cycle with
-    /// an anchor file. Skipped manifests (malformed, missing entrypoint,
-    /// duplicate name) are logged and ignored.
+    /// This is the plugin subsystem's whole boot cost, once per session:
+    /// the options locator walk and read (`declared_plugin_sources`) and the
+    /// `plugins/` convention scan. A workspace that declares
+    /// no plugins and ships no `plugins/` directory pays the two absence
+    /// probes — one `read_dir` miss, one locator walk — and allocates
+    /// nothing (the `declared` source contributes an empty borrowed slice);
+    /// the per-cycle path then reduces to [`PluginSet::is_empty`].
+    ///
+    /// Skipped plugins (malformed, missing entrypoint,
+    /// duplicate name, declared but unresolved) are logged and ignored. A
+    /// plugin whose later spawn fails surfaces through the ordinary crash
+    /// path on the cycle that first needs it — one `dartq/plugin_crashed`
+    /// row, the session alive.
     #[must_use]
-    pub fn launch(workspace_root: &Path) -> Self {
-        let report = discover(workspace_root, &[]);
+    pub fn launch(workspace_root: &Path, pub_config: &PackageConfig, config_dir: &Path) -> Self {
+        // The declaration seam is the commands side's single fact source
+        // (`declared_plugin_sources` + `plugin_package_config` in
+        // `dartq-commands`' fix face): the daemon depends on `dartq-commands`,
+        // so both faces consume one implementation — the same upstream
+        // `_parsePluginSource` arm order and the same `path:`-augmented
+        // package config — instead of a re-encoded daemon copy.
+        let declared = declared_plugin_sources(workspace_root);
+        // The absent shape: a 'static empty path borrow and an empty vec —
+        // the pub-native source contributes nothing and allocates nothing.
+        let (options_file, names, decls): (&Path, Vec<String>, &[DeclaredPlugin]) =
+            match declared.as_ref() {
+                Some((file, decls)) => (
+                    file.as_path(),
+                    decls.iter().map(|decl| decl.name.clone()).collect(),
+                    decls.as_slice(),
+                ),
+                None => (Path::new(""), Vec::new(), &[]),
+            };
+        // `path:`-declared names absent from pub's resolution get a synthetic
+        // config entry so the unchanged discovery arm resolves them like any
+        // pub-native hit; the clone costs only when a `path:` declaration
+        // exists (the plugin-free workspace never reaches it).
+        let augmented;
+        let config = if decls.iter().any(|decl| decl.path.is_some()) {
+            augmented = plugin_package_config(pub_config, decls);
+            &augmented
+        } else {
+            pub_config
+        };
+        let report = discover(
+            workspace_root,
+            &[],
+            &PubNative {
+                declared: &names,
+                config,
+                config_dir,
+                options_file,
+            },
+        );
         for issue in &report.skipped {
             eprintln!(
                 "dartq-daemon: skipping plugin manifest `{}`: {}",
@@ -379,38 +471,33 @@ impl PluginSet {
                     serve_queries: true,
                     ..SpawnSpec::dart(&plugin.dir, plugin.manifest)
                 };
-                match PluginRuntime::spawn(spec) {
-                    Ok(runtime) => PluginSlot {
-                        name,
-                        runtime: Some(runtime),
-                        pending_crash: None,
-                        crash_emitted: false,
-                    },
-                    Err(error) => {
-                        eprintln!("dartq-daemon: plugin `{name}` failed to launch: {error}");
-                        PluginSlot {
-                            name,
-                            runtime: None,
-                            pending_crash: Some(Box::new(error)),
-                            crash_emitted: false,
-                        }
-                    }
+                PluginSlot {
+                    name,
+                    runtime: Some(PluginRuntime::lazy(spec)),
+                    pending_crash: None,
+                    crash_emitted: false,
                 }
             })
             .collect();
-        Self { plugins }
+        Self {
+            plugins,
+            code_owners: FxHashMap::default(),
+        }
     }
 
     /// True when no plugin was discovered — the per-cycle hook skips its
     /// work entirely (and the session skips the drain latency with it).
+    /// This is the whole absent-path cost of a plugin-free workspace's
+    /// analysis cycle: one emptiness check.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.plugins.is_empty()
     }
 
     /// A set carrying one already-dead plugin: `runtime: None` with a
-    /// recorded failure awaiting an anchor, exactly what `launch` produces
-    /// when a spawn fails. Test seam for the session-side weave — reaching
+    /// recorded failure awaiting an anchor, exactly what the cycle's launch
+    /// pass records when a first-use spawn fails. Test seam for the
+    /// session-side weave — reaching
     /// the same state through the launch path needs a real child process
     /// (and a manifest whose entrypoint exists; missing-entrypoint
     /// manifests are *skipped*, never spawned-failed, so a session gate
@@ -429,7 +516,31 @@ impl PluginSet {
                 })),
                 crash_emitted: false,
             }],
+            code_owners: FxHashMap::default(),
         }
+    }
+
+    /// The owning plugin's discovery-order index for `code` (`plugin/name`
+    /// suppression attribution): the first configured plugin that declared
+    /// it — `putIfAbsent`, never overwritten by a later claimant. The
+    /// row-level upshot of the collision ruling (#1819) is exercised
+    /// through the cycle: both emitters' rows publish, this map names the
+    /// one owner.
+    #[cfg(test)]
+    pub(crate) fn code_owner(&self, code: &str) -> Option<usize> {
+        self.code_owners.get(&code.to_ascii_lowercase()).copied()
+    }
+
+    /// The named plugin's live stats snapshot — the serial phase's evidence
+    /// face (the cycle counters land in the runtime's own
+    /// [`PluginStatsSnapshot`]; a dead slot has none).
+    #[cfg(test)]
+    pub(crate) fn runtime_stats(&self, name: &str) -> Option<dartq_plugin::PluginStatsSnapshot> {
+        self.plugins
+            .iter()
+            .find(|slot| slot.name == name)
+            .and_then(|slot| slot.runtime.as_ref())
+            .map(PluginRuntime::stats)
     }
 
     /// One analyze cycle against the plugins: pushes the engine's merged
@@ -437,27 +548,40 @@ impl PluginSet {
     /// analyzed file set, and the resolved per-plugin execution config; waits
     /// [`DRAIN_BUDGET`] per live plugin for findings; and returns both.
     ///
-    /// `anchor` is the crash anchor, resolved by the caller as the session
-    /// file table's first entry — `None` when the table is empty, in which
-    /// case crash rows are withheld until a cycle that has one. Crash rows
-    /// are engine `Diagnostic`s the caller extends into its engine vec
-    /// before the convert-once pass; at most one is emitted per plugin per
-    /// session.
+    /// `anchor` is the crash anchor, resolved by the caller at cycle entry
+    /// (the file table's first published entry) — `None` when nothing has
+    /// published yet, in which case crash rows are withheld until a cycle
+    /// that has one. Crash rows come back beside the findings as engine
+    /// `Diagnostic`s; the caller's merge step converts and publishes them
+    /// (they never join the engine vec). At most one is emitted per plugin
+    /// per session.
     ///
     /// Rule enablement resolves per plugin against the governing options'
     /// `plugins:` section (official `_computeDiagnosticsFromPlugin`
     /// semantics: `registry.enabled(configuration.diagnosticConfigs)`) and
     /// the plugin's registration census; the resolved config is pushed only
-    /// when it changed (the runtime dedups). Codes follow the official
-    /// `putIfAbsent` claim face: the first configured plugin (discovery
-    /// order) claims each enabled census code, and a later plugin's rows for
-    /// a claimed code are attributed away — dropped here. Hand-emitted codes
+    /// when it changed (the runtime dedups). Code collisions follow the
+    /// official face: the `(code → plugin)` attribution map is
+    /// `putIfAbsent` first-claim (`plugin_server.dart:576`, upstream Dart
+    /// SDK source, `pkg/analysis_server_plugin/lib/src/plugin_server.dart`)
+    /// for `plugin/name` suppression, while the rows themselves never
+    /// drop — upstream `mergeAnalysisErrors` concatenates every plugin's
+    /// diagnostics verbatim, duplicates included. Hand-emitted codes
     /// outside any census never collide and always flow.
     ///
     /// Findings are grouped per plugin in discovery order with their wire
     /// rows intact; the caller resolves them onto resident files and merges
     /// ([`resolve_findings`] + [`merge`]).
+    ///
+    /// The cycle opens with the lazy launch pass: every slot's runtime is
+    /// made alive before the rule census resolves below, so the first fed
+    /// cycle resolves enablement against the real registration census (a
+    /// never-launched runtime reports an empty census) and a failed first
+    /// spawn takes the ordinary crash path. Slots stay unlaunched on cycles
+    /// with nothing to feed — a plugin-free workload never spawns a
+    /// sidecar.
     #[must_use]
+    #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
     pub fn cycle(
         &mut self,
         engine: &[Diagnostic],
@@ -469,6 +593,16 @@ impl PluginSet {
             findings: Vec::new(),
             crashes: Vec::new(),
         };
+        if !engine.is_empty() || !context.analyzed.is_empty() {
+            for slot in &mut self.plugins {
+                let Some(runtime) = slot.runtime.as_mut() else {
+                    continue;
+                };
+                if let Err(error) = runtime.ensure_alive() {
+                    fail_slot(slot, error, anchor, &mut cycle);
+                }
+            }
+        }
         // The rule-claim map and the per-plugin configs, resolved once per
         // cycle. The options file is read only when some live plugin
         // actually registered rules; a read or parse failure degrades to
@@ -486,7 +620,14 @@ impl PluginSet {
         } else {
             PluginOptionsConfigs::default()
         };
-        let mut claims: FxHashMap<String, usize> = FxHashMap::default();
+        // The code-ownership map, rebuilt per cycle: upstream
+        // `pluginCodeMapping` is `putIfAbsent` — the first configured
+        // plugin (discovery order) owns a code for `plugin/name`
+        // suppression attribution. It never filters rows (#1819): a later
+        // plugin's diagnostics for a claimed code still publish, matching
+        // upstream's verbatim merge.
+        self.code_owners.clear();
+        let code_owners = &mut self.code_owners;
         let resolved_per_plugin: Vec<(String, CycleConfig)> = self
             .plugins
             .iter()
@@ -498,16 +639,7 @@ impl PluginSet {
                     .map(PluginRuntime::rule_census)
                     .unwrap_or_default();
                 let resolved = resolve_census(&census, configs.for_plugin(&slot.name));
-                for (census_rule, resolved_rule) in census.iter().zip(resolved.iter()) {
-                    if !resolved_rule.enabled {
-                        continue;
-                    }
-                    for code in &census_rule.codes {
-                        claims
-                            .entry(code.name.to_ascii_lowercase())
-                            .or_insert(index);
-                    }
-                }
+                claim_codes(code_owners, index, &census, &resolved);
                 let config = cycle_config(&resolved, context.overlays, context.analyzed);
                 (slot.name.clone(), config)
             })
@@ -534,48 +666,38 @@ impl PluginSet {
             let mut serve = context
                 .query_server
                 .map(|query_server| move |query: &PendingQuery| query_server(query));
-            let server: Option<
-                &mut dyn FnMut(&PendingQuery) -> Result<serde_json::Map<String, Value>, String>,
-            > = match serve.as_mut() {
+            let server: Option<&mut dyn FnMut(&PendingQuery) -> QueryAnswer> = match serve.as_mut()
+            {
                 Some(serve) => Some(serve),
                 None => None,
             };
+            let started = Instant::now();
             let outcome = runtime
                 .feed(engine, files, &push)
                 .and_then(|()| pump_plugin(runtime, server, DRAIN_BUDGET));
             match outcome {
-                Ok(rows) if !rows.is_empty() => {
-                    // A code an earlier plugin claimed is attributed away.
-                    let rows = rows
-                        .into_iter()
-                        .filter(|row| {
-                            claims
-                                .get(&row.code.to_ascii_lowercase())
-                                .is_none_or(|&owner| owner == index)
-                        })
-                        .collect();
-                    cycle.findings.push(PluginBatch {
-                        name: slot.name.clone(),
-                        rows,
-                    });
+                Ok((rows, degraded)) => {
+                    // The cycle's per-plugin cost lands in the stats face:
+                    // the busy wall time, and the budget-expired drains
+                    // (degraded — the plugin's remaining rows publish on a
+                    // later cycle). Errors take the crash path below and
+                    // count through the crash machinery instead.
+                    if degraded {
+                        eprintln!(
+                            "dartq-daemon: plugin `{}` exceeded its {} ms drain budget; \
+                             remaining rows publish on a later cycle",
+                            slot.name,
+                            DRAIN_BUDGET.as_millis(),
+                        );
+                    }
+                    runtime.observe_cycle(started.elapsed(), degraded);
+                    accept_rows(&mut cycle, &slot.name, rows);
                 }
-                Ok(_) => {}
                 Err(error) => {
                     // First surfaced error ends the plugin's session (the
                     // isolation contract: the runtime has already spent its
                     // budget; the engine turn stays alive).
-                    slot.runtime = None;
-                    if slot.crash_emitted {
-                        continue;
-                    }
-                    if let Some(anchor) = anchor {
-                        cycle
-                            .crashes
-                            .push(crash_diagnostic(&slot.name, &error, anchor));
-                        slot.crash_emitted = true;
-                    } else {
-                        slot.pending_crash = Some(Box::new(error));
-                    }
+                    fail_slot(slot, error, anchor, &mut cycle);
                 }
             }
         }
@@ -607,7 +729,7 @@ impl PluginSet {
     /// The graceful session-end teardown: `shutdown` per live runtime (the
     /// graceful handshake; `Drop` alone is kill-only). Errors are logged,
     /// never propagated — teardown quality does not affect the session's
-    /// outcome. Each live plugin emits one structured §14.3 stats line (the
+    /// outcome. Each live plugin emits one structured stats line (the
     /// evidence round's per-plugin numbers); the snapshot is read before the
     /// handshake consumes the runtime, and a dead slot's counters died with
     /// its dropped runtime — its crash row already recorded the death.
@@ -621,11 +743,91 @@ impl PluginSet {
                 }
                 eprintln!(
                     "dartq-daemon: plugin stats `{name}`: peak_rss_bytes={} restarts={} \
-                     frames_in={} frames_out={}",
-                    stats.peak_rss_bytes, stats.restarts, stats.frames_in, stats.frames_out,
+                     evictions={} frames_in={} frames_out={} cycles={} degraded_cycles={} \
+                     busy_ms={}",
+                    stats.peak_rss_bytes,
+                    stats.restarts,
+                    stats.evictions,
+                    stats.frames_in,
+                    stats.frames_out,
+                    stats.cycles,
+                    stats.degraded_cycles,
+                    stats.busy_nanos / 1_000_000,
                 );
             }
         }
+    }
+}
+
+/// One plugin's enabled census codes claim ownership in `code_owners`
+/// (first-claim `putIfAbsent` — upstream `pluginCodeMapping`): the
+/// discovery-order-first plugin that declares a code owns it for
+/// `plugin/name` suppression attribution. Only *enabled* rules claim —
+/// the same gate upstream applies (`pluginCodeMapping` fills inside
+/// `_computeDiagnosticsFromPlugin` after `registry.enabled`). Pure
+/// attribution: the claim never decides whether a drained row publishes
+/// ([`accept_rows`] takes them verbatim).
+fn claim_codes(
+    code_owners: &mut FxHashMap<String, usize>,
+    index: usize,
+    census: &[RuleCensus],
+    resolved: &[ResolvedRule],
+) {
+    for (census_rule, resolved_rule) in census.iter().zip(resolved.iter()) {
+        if !resolved_rule.enabled {
+            continue;
+        }
+        for code in &census_rule.codes {
+            code_owners
+                .entry(code.name.to_ascii_lowercase())
+                .or_insert(index);
+        }
+    }
+}
+
+/// One plugin's drained rows join the cycle's findings — verbatim, in wire
+/// arrival order, one batch per emitting plugin (#1819). A code an earlier
+/// plugin claimed still publishes: the `code_owners` claim is `plugin/name`
+/// suppression attribution only, and upstream `mergeAnalysisErrors`
+/// (upstream Dart SDK source,
+/// `pkg/analysis_server/lib/src/plugin/result_merger.dart`) concatenates
+/// every plugin's diagnostics — duplicates included — so dropping a
+/// claimed row here would under-report versus the oracle. Engine-level
+/// dedup of an exact-equal row is the merge step's job
+/// (`merge`'s `(file, offset, code, message)` key), not this one's.
+fn accept_rows(cycle: &mut Cycle, name: &str, rows: Vec<PluginDiagnostic>) {
+    if rows.is_empty() {
+        return;
+    }
+    cycle.findings.push(PluginBatch {
+        name: name.to_owned(),
+        rows,
+    });
+}
+
+/// Ends a slot's session at its first surfaced runtime error: the runtime is
+/// dropped (the isolation contract — the runtime has already spent its
+/// budget reaching the error), and the failure records as the plugin's
+/// one-shot `dartq/plugin_crashed` row, published against `anchor` in this
+/// cycle or withheld (pending) until a cycle that has one. Shared by the
+/// cycle's launch pass and its feed/drain error arm.
+fn fail_slot(
+    slot: &mut PluginSlot,
+    error: RuntimeError,
+    anchor: Option<FileId>,
+    cycle: &mut Cycle,
+) {
+    slot.runtime = None;
+    if slot.crash_emitted {
+        return;
+    }
+    if let Some(anchor) = anchor {
+        cycle
+            .crashes
+            .push(crash_diagnostic(&slot.name, &error, anchor));
+        slot.crash_emitted = true;
+    } else {
+        slot.pending_crash = Some(Box::new(error));
     }
 }
 
@@ -634,14 +836,15 @@ pub struct Cycle {
     /// Findings per emitting plugin, in discovery order; empty batches are
     /// omitted.
     pub findings: Vec<PluginBatch>,
-    /// Crash rows for the caller's engine vec (at most one per plugin per
-    /// session).
+    /// Crash rows beside the findings — engine `Diagnostic`s the caller's
+    /// merge step converts and publishes (never the engine vec itself; at
+    /// most one per plugin per session).
     pub crashes: Vec<Diagnostic>,
 }
 
 /// One plugin's drained findings, in wire arrival order.
 pub struct PluginBatch {
-    /// The manifest name (the LSP `source` tag for these rows).
+    /// The manifest name (the wire `source` tag for these rows).
     pub name: String,
     pub rows: Vec<PluginDiagnostic>,
 }
@@ -653,11 +856,11 @@ pub struct PluginFinding {
     pub plugin: usize,
     /// The wire row's UTF-16 start offset (the within-plugin sort key).
     pub offset: u64,
-    pub diagnostic: lsp::Diagnostic,
+    pub diagnostic: wire::Diagnostic,
 }
 
 /// Resolves drained plugin rows onto the files they name and converts them
-/// to the LSP shape. `resident` answers a `FileId` with its line index and
+/// to the wire shape. `resident` answers a `FileId` with its line index and
 /// text (the session's engine faces); rows on files the engine does not
 /// know are skipped — the same posture the transport's own feed takes for
 /// unknown `FileId`s.
@@ -684,24 +887,29 @@ pub fn resolve_findings<'a>(
                 file,
                 plugin,
                 offset: row.offset,
-                diagnostic: to_lsp(&batch.name, row, index, text),
+                diagnostic: to_wire(&batch.name, row, index, text),
             });
         }
     }
     findings
 }
 
-/// Converts one wire row to the LSP shape: severity mapped to the LSP
+/// Converts one plugin row to the wire shape: severity mapped to the
 /// 1/2/3 scale, UTF-16 offsets mapped through the line index to zero-based
 /// positions, the plugin's manifest name as the `source` tag.
 ///
-/// Plugin offsets are untrusted (the §14.3 isolation posture): a stale row
+/// Plugin offsets are untrusted: a stale row
 /// can predate an edit that shrank the file. Both bounds clamp to the
 /// text's UTF-16 length before mapping — the file-end degradation
 /// [`wire_offset`] starts — so a malformed row degrades to zero-width at
 /// the end instead of tripping [`LineIndex::line_col_utf16`]'s
 /// engine-internal assert. The monotone clamp keeps `start <= end`.
-fn to_lsp(plugin: &str, row: &PluginDiagnostic, index: &LineIndex, text: &str) -> lsp::Diagnostic {
+fn to_wire(
+    plugin: &str,
+    row: &PluginDiagnostic,
+    index: &LineIndex,
+    text: &str,
+) -> wire::Diagnostic {
     let total = utf16_len_of(text);
     let start = wire_offset(row.offset).min(total);
     let end = wire_offset(row.offset.saturating_add(row.length)).min(total);
@@ -712,13 +920,13 @@ fn to_lsp(plugin: &str, row: &PluginDiagnostic, index: &LineIndex, text: &str) -
         PluginSeverity::Warning => 2,
         PluginSeverity::Info => 3,
     };
-    lsp::Diagnostic {
-        range: lsp::Range {
-            start: lsp::Position {
+    wire::Diagnostic {
+        range: wire::Range {
+            start: wire::Position {
                 line: start_line - 1,
                 character: start_column - 1,
             },
-            end: lsp::Position {
+            end: wire::Position {
                 line: end_line - 1,
                 character: end_column - 1,
             },
@@ -731,20 +939,20 @@ fn to_lsp(plugin: &str, row: &PluginDiagnostic, index: &LineIndex, text: &str) -
 }
 
 /// Clamps a wire offset into the engine's u32 UTF-16 range; the resident
-/// text's UTF-16-length bound is applied on top in [`to_lsp`].
+/// text's UTF-16-length bound is applied on top in [`to_wire`].
 fn wire_offset(offset: u64) -> u32 {
     u32::try_from(offset).unwrap_or(u32::MAX)
 }
 
 /// The dedup key of the merge: file, range start, code, and message — the
 /// T5 ruling's `(file, offset, code, message)` exact-equality in the merged
-/// rows' LSP coordinates. `message` (not source) is the key's discriminator:
+/// rows' wire coordinates. `message` (not source) is the key's discriminator:
 /// a plugin row exactly equal to a built-in row is the same finding twice,
 /// and the built-in row wins by seeding `seen` first; rows that differ in
 /// wording keep both faces.
 type DedupKey = (u32, u32, u32, String, String);
 
-fn dedup_key(file: FileId, diagnostic: &lsp::Diagnostic) -> DedupKey {
+fn dedup_key(file: FileId, diagnostic: &wire::Diagnostic) -> DedupKey {
     (
         file.index(),
         diagnostic.range.start.line,
@@ -765,10 +973,10 @@ fn dedup_key(file: FileId, diagnostic: &lsp::Diagnostic) -> DedupKey {
 /// publishes.
 #[must_use]
 pub fn merge(
-    engine_rows: impl IntoIterator<Item = (FileId, lsp::Diagnostic)>,
+    engine_rows: impl IntoIterator<Item = (FileId, wire::Diagnostic)>,
     findings: Vec<PluginFinding>,
-) -> Vec<(FileId, lsp::Diagnostic)> {
-    let mut merged: Vec<(FileId, lsp::Diagnostic)> = engine_rows.into_iter().collect();
+) -> Vec<(FileId, wire::Diagnostic)> {
+    let mut merged: Vec<(FileId, wire::Diagnostic)> = engine_rows.into_iter().collect();
     let mut seen: FxHashSet<DedupKey> = merged
         .iter()
         .map(|(file, diagnostic)| dedup_key(*file, diagnostic))
@@ -784,28 +992,28 @@ pub fn merge(
 }
 
 /// One plugin's bounded drain (the cycle's wait half): parks for at most
-/// [budget] total, hands back every diagnostic that arrived, and pumps the
-/// plugin's reverse `request/query` frames through [server] as they land —
-/// a producer that queries while its findings are computed stalls itself,
-/// so the answers go out within the same drain instead of past the plugin's
-/// own callback budget. A cycle without a server declines the queries (the
-/// immediate error reply — the producer fails fast, the session stays up).
-/// Findings that answer a query arrive after this budget publish on the
-/// next cycle, like every late row.
+/// [budget] total, hands back every diagnostic that arrived plus whether
+/// the drain was *degraded* — the budget expired before the plugin
+/// quiesced, so its remaining rows publish on a later cycle (the timeout
+/// isolation: the caller never waits past [budget] for a plugin) — and
+/// pumps the plugin's reverse `request/query` frames through [server] as
+/// they land — a producer that queries while its findings are computed
+/// stalls itself, so the answers go out within the same drain instead of
+/// past the plugin's own callback budget. A cycle without a server declines
+/// the queries (the immediate error reply — the producer fails fast, the
+/// session stays up).
 fn pump_plugin(
     runtime: &mut PluginRuntime,
-    mut server: Option<
-        &mut dyn FnMut(&PendingQuery) -> Result<serde_json::Map<String, Value>, String>,
-    >,
+    mut server: Option<&mut dyn FnMut(&PendingQuery) -> QueryAnswer>,
     budget: Duration,
-) -> Result<Vec<PluginDiagnostic>, RuntimeError> {
+) -> Result<(Vec<PluginDiagnostic>, bool), RuntimeError> {
     let deadline = Instant::now() + budget;
     let mut rows = Vec::new();
     loop {
         let drain = runtime.wait_output(deadline.saturating_duration_since(Instant::now()))?;
         rows.extend(drain.diagnostics);
         if drain.pending_queries == 0 {
-            return Ok(rows);
+            return Ok((rows, false));
         }
         match server.as_deref_mut() {
             Some(serve) => {
@@ -816,7 +1024,7 @@ fn pump_plugin(
             }
         }
         if Instant::now() >= deadline {
-            return Ok(rows);
+            return Ok((rows, true));
         }
     }
 }
@@ -946,9 +1154,9 @@ fn declaration_row(engine: &Engine, capture: &FileCapture, row: &DeclRow) -> Val
 }
 
 /// The 1-based (line, UTF-16 column) of an offset, the query face's
-/// convention. A plugin's offset is untrusted (the §14.3 posture): the
+/// convention. A plugin's offset is untrusted: the
 /// clamp keeps `line_col_utf16`'s in-range assert out of a stale query's
-/// reach, exactly like the findings path clamps in [`to_lsp`].
+/// reach, exactly like the findings path clamps in [`to_wire`].
 fn line_col(engine: &Engine, file: FileId, offset: u32) -> (u32, u32) {
     let index = engine
         .line_index(file)
@@ -1039,18 +1247,19 @@ mod query_server_tests {
         assert_eq!(references.len(), 1);
         assert_eq!(references[0]["kind"], "invoked");
 
-        // `dependencies` names the declaring library's importer.
+        // `dependencies` is the forward face: the declaring library's own
+        // imports. `fa` lives in a.dart, which imports nothing, so the
+        // additive array is omitted (the schema's empty-row omission) —
+        // the importer answer (main.dart) is the impact face's, not this
+        // kind's.
         let dependencies = serve_query(
             &engine,
             &query(QueryKind::Dependencies, Some("fa"), None, None),
         )
         .expect("dependencies");
-        let rows = dependencies["dependencies"].as_array().expect("rows");
         assert!(
-            rows.iter().any(|row| row["path"]
-                .as_str()
-                .is_some_and(|path| path.ends_with("main.dart"))),
-            "main.dart imports the declaring library: {rows:?}"
+            dependencies.get("dependencies").is_none(),
+            "a.dart imports nothing — the additive array is omitted: {dependencies:?}"
         );
     }
 
@@ -1175,11 +1384,11 @@ mod tests {
         }
     }
 
-    fn lsp_row(code: &str, source: &str, line: u32, character: u32) -> lsp::Diagnostic {
-        lsp::Diagnostic {
-            range: lsp::Range {
-                start: lsp::Position { line, character },
-                end: lsp::Position { line, character },
+    fn wire_row(code: &str, source: &str, line: u32, character: u32) -> wire::Diagnostic {
+        wire::Diagnostic {
+            range: wire::Range {
+                start: wire::Position { line, character },
+                end: wire::Position { line, character },
             },
             severity: 2,
             code: code.to_owned(),
@@ -1188,6 +1397,7 @@ mod tests {
         }
     }
 
+    #[expect(clippy::cast_possible_truncation)] // fixture offsets are tiny; the cast only fills the wire character column
     fn finding(
         file: FileId,
         plugin: usize,
@@ -1201,11 +1411,11 @@ mod tests {
             offset,
             // The start mirrors the offset so distinct offsets carry
             // distinct dedup keys, as real converted rows would.
-            diagnostic: lsp_row(code, source, 0, offset as u32),
+            diagnostic: wire_row(code, source, 0, offset as u32),
         }
     }
 
-    fn wire_row(file: &str, code: &str, offset: u64, length: u64) -> PluginDiagnostic {
+    fn plugin_row(file: &str, code: &str, offset: u64, length: u64) -> PluginDiagnostic {
         PluginDiagnostic {
             file: file.to_owned(),
             severity: PluginSeverity::Warning,
@@ -1237,8 +1447,8 @@ mod tests {
         let b = files.intern(Path::new("b.dart"));
 
         let engine_rows = [
-            (a, lsp_row("e/one", "dartq", 0, 0)),
-            (a, lsp_row("e/two", "dartq", 1, 0)),
+            (a, wire_row("e/one", "dartq", 0, 0)),
+            (a, wire_row("e/two", "dartq", 1, 0)),
         ];
         let findings = vec![
             finding(b, 1, 1, "p1/a", "p1"),
@@ -1260,15 +1470,15 @@ mod tests {
         let mut files = FileTable::new();
         let a = files.intern(Path::new("a.dart"));
 
-        let mut builtin = lsp_row("shared/code", "dartq", 0, 0);
+        let mut builtin = wire_row("shared/code", "dartq", 0, 0);
         builtin.message = "the built-in wording".to_owned();
         let engine_rows = [(a, builtin)];
 
-        let mut same = lsp_row("shared/code", "echo", 0, 0);
+        let mut same = wire_row("shared/code", "echo", 0, 0);
         same.message = "the built-in wording".to_owned();
-        let mut other = lsp_row("shared/code", "echo", 0, 0);
+        let mut other = wire_row("shared/code", "echo", 0, 0);
         other.message = "the plugin's own wording".to_owned();
-        let mut twin = lsp_row("shared/code", "echo", 0, 0);
+        let mut twin = wire_row("shared/code", "echo", 0, 0);
         twin.message = "the plugin's own wording".to_owned();
         let findings = vec![
             // Exact duplicate of the built-in row (same code, start, and
@@ -1472,7 +1682,7 @@ plugins:
             Some(&PluginSeverity::Error)
         );
         assert!(
-            config.severity_overrides.get("dropped_code").is_none(),
+            !config.severity_overrides.contains_key("dropped_code"),
             "a disabled rule contributes no overrides"
         );
         assert_eq!(
@@ -1484,6 +1694,83 @@ plugins:
         assert!(config.overlays[0].content.is_some());
         // The empty resolution is the empty config (the dedup's no-push shape).
         assert!(cycle_config(&[], &[], &[]).is_empty());
+    }
+
+    /// The code-claim collision ruling (#1819): upstream
+    /// `pluginCodeMapping` is `putIfAbsent` — the first configured plugin
+    /// owns a shared code for `plugin/name` suppression attribution — while
+    /// upstream `mergeAnalysisErrors` concatenates every plugin's
+    /// diagnostics verbatim. dartq mirrors both halves: two plugins
+    /// emitting the same code both reach the findings, and the attribution
+    /// keeps the first claimant.
+    #[test]
+    fn a_code_collision_keeps_every_plugins_rows_and_the_first_claim() {
+        // Both plugins declare `shared/code` on an enabled warning rule
+        // (warning rules are enabled by default — `resolve_census` with no
+        // options section).
+        let census_a = [census_rule(
+            "rule_a",
+            RuleKind::Warning,
+            &[("Shared/Code", PluginSeverity::Warning)],
+        )];
+        let census_b = [census_rule(
+            "rule_b",
+            RuleKind::Warning,
+            &[("shared/code", PluginSeverity::Warning)],
+        )];
+        let mut set = PluginSet::default();
+        claim_codes(
+            &mut set.code_owners,
+            0,
+            &census_a,
+            &resolve_census(&census_a, None),
+        );
+        claim_codes(
+            &mut set.code_owners,
+            1,
+            &census_b,
+            &resolve_census(&census_b, None),
+        );
+        // First-claim wins (case-insensitive key), and the second plugin's
+        // declaration neither overwrites nor strips the row below.
+        assert_eq!(
+            set.code_owner("shared/code"),
+            Some(0),
+            "the discovery-order-first plugin owns the code"
+        );
+
+        // The drain side: both plugins' rows for the claimed code land —
+        // nothing filters the later plugin's batch.
+        let mut cycle = Cycle {
+            findings: Vec::new(),
+            crashes: Vec::new(),
+        };
+        accept_rows(
+            &mut cycle,
+            "plugin_a",
+            vec![plugin_row("a.dart", "shared/code", 0, 2)],
+        );
+        accept_rows(
+            &mut cycle,
+            "plugin_b",
+            vec![
+                plugin_row("a.dart", "shared/code", 0, 2),
+                plugin_row("a.dart", "plugin_b/solo", 4, 1),
+            ],
+        );
+        assert_eq!(cycle.findings.len(), 2, "both plugins' batches survive");
+        assert_eq!(cycle.findings[0].name, "plugin_a");
+        assert_eq!(cycle.findings[1].name, "plugin_b");
+        let codes: Vec<&str> = cycle
+            .findings
+            .iter()
+            .flat_map(|batch| batch.rows.iter().map(|row| row.code.as_str()))
+            .collect();
+        assert_eq!(
+            codes,
+            ["shared/code", "shared/code", "plugin_b/solo"],
+            "the claimed code's rows are not attributed away"
+        );
     }
 
     #[test]
@@ -1499,9 +1786,9 @@ plugins:
         let batches = [PluginBatch {
             name: "echo".to_owned(),
             rows: vec![
-                wire_row("a.dart", "echo/roundtrip", 3, 2),
-                wire_row("ghost.dart", "echo/ghost", 0, 0),
-                wire_row("b.dart", "echo/not_resident", 0, 0),
+                plugin_row("a.dart", "echo/roundtrip", 3, 2),
+                plugin_row("ghost.dart", "echo/ghost", 0, 0),
+                plugin_row("b.dart", "echo/not_resident", 0, 0),
             ],
         }];
 
@@ -1513,17 +1800,17 @@ plugins:
         assert_eq!(row.offset, 3);
         // "ab\ncd\ne": offset 3 starts line 2 col 1; the row's end offset 5
         // (the newline terminating line 2) answers line 2 col 3 — one-based
-        // line_col answers, LSP zero-based positions out.
+        // line_col answers, wire zero-based positions out.
         assert_eq!(
             row.diagnostic.range.start,
-            lsp::Position {
+            wire::Position {
                 line: 1,
                 character: 0
             }
         );
         assert_eq!(
             row.diagnostic.range.end,
-            lsp::Position {
+            wire::Position {
                 line: 1,
                 character: 2
             }
@@ -1548,14 +1835,14 @@ plugins:
         // file far below them. The mapping must degrade, not panic.
         let batches = [PluginBatch {
             name: "echo".to_owned(),
-            rows: vec![wire_row("a.dart", "echo/stale", 10_000_000, 4)],
+            rows: vec![plugin_row("a.dart", "echo/stale", 10_000_000, 4)],
         }];
 
         let findings = resolve_findings(&batches, &files, resident);
         assert_eq!(findings.len(), 1, "the row publishes degraded");
         // Both bounds clamp to the file's UTF-16 end (7 units): zero-width
-        // at EOF ("e" is line 3, so the 1-based (3, 2) answers LSP (2, 1)).
-        let eof = lsp::Position {
+        // at EOF ("e" is line 3, so the 1-based (3, 2) answers wire (2, 1)).
+        let eof = wire::Position {
             line: 2,
             character: 1,
         };
@@ -1578,14 +1865,14 @@ plugins:
         let batches = [PluginBatch {
             name: "echo".to_owned(),
             rows: vec![
-                wire_row("a.dart", "echo/long_tail", 5, 1_000_000),
-                wire_row("a.dart", "echo/past_end", 100, 200),
+                plugin_row("a.dart", "echo/long_tail", 5, 1_000_000),
+                plugin_row("a.dart", "echo/past_end", 100, 200),
             ],
         }];
 
         let findings = resolve_findings(&batches, &files, resident);
         assert_eq!(findings.len(), 2);
-        let eof = lsp::Position {
+        let eof = wire::Position {
             line: 2,
             character: 1,
         };
@@ -1597,11 +1884,11 @@ plugins:
                 .diagnostic
                 .range
         };
-        // Offset 5 survives intact (the newline ending line 2 → LSP (1, 2));
+        // Offset 5 survives intact (the newline ending line 2 → wire (1, 2));
         // the out-of-range end clamps to EOF.
         assert_eq!(
             range_of("echo/long_tail").start,
-            lsp::Position {
+            wire::Position {
                 line: 1,
                 character: 2
             }
@@ -1622,7 +1909,52 @@ plugins:
                 })),
                 crash_emitted: false,
             }],
+            code_owners: FxHashMap::default(),
         }
+    }
+
+    /// Launches over a workspace against the empty pub resolution — the
+    /// test shape of [`PluginSet::launch`]'s three inputs (these fixtures
+    /// ship no `analysis_options`, so the pub-native source is absent and
+    /// only the convention scan runs).
+    fn launch(workspace: &Path) -> PluginSet {
+        let config =
+            PackageConfig::parse(r#"{"configVersion": 2, "packages": []}"#).expect("valid config");
+        PluginSet::launch(workspace, &config, &workspace.join(".dart_tool"))
+    }
+
+    /// The absent path of the core-first invariant, end to end: a
+    /// nonexistent workspace root makes every absence probe — the options
+    /// locator walk, the options read, the convention `read_dir` — miss,
+    /// and the result is the empty set with no panic, no spawn, and no
+    /// issue row. This is the most a plugin-free workspace can cost at
+    /// launch; the per-cycle cost is [`PluginSet::is_empty`] alone.
+    #[test]
+    fn absent_plugin_configuration_costs_nothing_at_launch() {
+        let nowhere = std::env::temp_dir().join(format!("dartq-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&nowhere);
+        assert!(
+            declared_plugin_sources(&nowhere).is_none(),
+            "no options file declares nothing"
+        );
+        assert!(
+            launch(&nowhere).is_empty(),
+            "the empty discovery is the empty set"
+        );
+    }
+
+    /// An options file without a `plugins:` section (the common
+    /// configuration) is the same absent shape: `None` — no declaration,
+    /// no allocation, no issue.
+    #[test]
+    fn options_without_a_plugins_section_declare_nothing() {
+        let workspace = TempWorkspace::new("no_section");
+        std::fs::write(
+            workspace.path().join("analysis_options.yaml"),
+            "linter:\n  rules:\n    avoid_print: true\n",
+        )
+        .expect("write options");
+        assert!(declared_plugin_sources(workspace.path()).is_none());
     }
 
     #[test]
@@ -1708,7 +2040,7 @@ plugins:
         );
         workspace.write_plugin("echo", &[("dartq_plugin.json", &manifest)]);
 
-        let mut set = PluginSet::launch(workspace.path());
+        let mut set = launch(workspace.path());
         assert!(!set.is_empty(), "the echo fixture discovered and launched");
 
         let mut files = FileTable::new();
@@ -1745,12 +2077,60 @@ plugins:
         std::fs::create_dir_all(workspace.path().join("plugins").join("notes"))
             .expect("create notes dir");
 
-        let set = PluginSet::launch(workspace.path());
+        let set = launch(workspace.path());
         assert!(set.is_empty(), "every manifest was skipped");
 
         let empty = TempWorkspace::new("empty");
         std::fs::remove_dir(empty.path().join("plugins")).expect("drop plugins dir");
-        assert!(PluginSet::launch(empty.path()).is_empty());
+        assert!(launch(empty.path()).is_empty());
+    }
+
+    /// The launch seam over the real discovery face, driven from a
+    /// `path:`-declared `plugins:` section — the daemon mirror of the CLI
+    /// analyze face's identical pin: the manifest resolves through the same
+    /// `path:`-augmented package config (the commands side's
+    /// `declared_plugin_sources` + `plugin_package_config`, both faces'
+    /// single fact source) and registers a lazy runtime — the set is
+    /// non-empty with zero sidecar processes started (the spawn lands on
+    /// the first cycle that has something to feed), and the plugin-free
+    /// workspace next door discovers nothing. The empty package config
+    /// forces the synthetic-entry path: without the augmentation the
+    /// `path:`-declared name could not resolve at all.
+    #[test]
+    fn launch_discovers_path_declared_plugins_and_the_plugin_free_workspace_stays_empty() {
+        let declared = TempWorkspace::new("path_declared");
+        std::fs::write(
+            declared.path().join("analysis_options.yaml"),
+            "plugins:\n  demo:\n    path: plugins/demo\n",
+        )
+        .expect("options");
+        let dir = declared.path().join("plugins/demo");
+        std::fs::create_dir_all(dir.join("lib")).expect("plugin tree");
+        std::fs::write(
+            dir.join("dartq_plugin.json"),
+            r#"{"name": "demo", "version": "1.0.0", "entrypoint": "lib/main.dart"}"#,
+        )
+        .expect("manifest");
+        std::fs::write(dir.join("lib/main.dart"), "void main() {}\n").expect("entrypoint");
+
+        let set = launch(declared.path());
+        assert!(!set.is_empty(), "the declared plugin registers lazily");
+        assert_eq!(
+            set.plugins
+                .iter()
+                .map(|slot| slot.name.as_str())
+                .collect::<Vec<_>>(),
+            ["demo"],
+            "the path:-declared manifest registers under its declared name"
+        );
+        set.shutdown();
+
+        let plain = TempWorkspace::new("path_plain");
+        let set = launch(plain.path());
+        assert!(
+            set.is_empty(),
+            "no declaration, no convention manifest, no set"
+        );
     }
 
     /// Serial phase: spawns a real `dart` plugin process (the host package's
@@ -1776,7 +2156,7 @@ plugins:
         );
         workspace.write_plugin("echo", &[("dartq_plugin.json", &manifest)]);
 
-        let mut set = PluginSet::launch(workspace.path());
+        let mut set = launch(workspace.path());
         assert!(!set.is_empty(), "the echo fixture discovered and launched");
 
         let mut files = FileTable::new();
@@ -1802,6 +2182,144 @@ plugins:
         assert_eq!(
             row.file,
             files.path(a).unwrap_or(Path::new("")).to_string_lossy()
+        );
+
+        // The cycle face recorded every hosted cycle: at least one counted,
+        // with busy wall time on it (the per-plugin attribution the
+        // benchmark reads; a cold `dart` boot also degrades some early
+        // drains, which the degraded counter catches whenever it happens).
+        let stats = set
+            .runtime_stats("echo")
+            .expect("the live runtime carries stats");
+        assert!(stats.cycles >= 1, "cycles counted: {stats:?}");
+        assert!(stats.busy_nanos > 0, "busy time recorded: {stats:?}");
+
+        set.shutdown();
+    }
+
+    /// Serializes the env-mutating live test against any other test touching
+    /// the process-wide environment (the dartq-snapshot `env_lock` shape):
+    /// the runtime resolves its idle-eviction deadline from
+    /// `DARTQ_PLUGIN_IDLE_EVICT_MS` at construction, and env writes are
+    /// process-global.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("env lock")
+    }
+
+    /// Removes `DARTQ_PLUGIN_IDLE_EVICT_MS` when dropped: the override is
+    /// process-global, so a failing assert mid-test must still unarm it
+    /// before the next serial test constructs a runtime.
+    struct EvictMsOverride;
+
+    impl Drop for EvictMsOverride {
+        fn drop(&mut self) {
+            // SAFETY: runs while `env_lock` is still held (the guard is
+            // declared before this value, so it drops last).
+            unsafe { std::env::remove_var("DARTQ_PLUGIN_IDLE_EVICT_MS") };
+        }
+    }
+
+    /// Serial phase: pins the idle-eviction economics end to end (the
+    /// module-note contract): a sidecar idle past its `idle_evict_ms` is
+    /// evicted — counted in the stats' `evictions`, never surfaced as a
+    /// crash row — and the next fed cycle respawns it budget-free (the
+    /// restart counter does not move, and the plugin still answers).
+    ///
+    /// The env override arms a short deadline for measurement; it must be
+    /// set before `launch` (the runtime constructor reads it) and the
+    /// deadline clamps up to `request_ms + callback_ms`, so the manifest
+    /// carries short budgets while the retry budget still prices a cold
+    /// `dart` boot generously.
+    #[test]
+    #[ignore = "serial phase: spawns a real dart plugin process"]
+    fn live_idle_eviction_counts_without_a_crash_and_respawns_budget_free() {
+        const EVICT_MS: u64 = 10_500;
+        let dart_ok = std::process::Command::new("dart")
+            .arg("--version")
+            .output()
+            .is_ok();
+        assert!(dart_ok, "dart is not on PATH");
+
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../dartq-plugin-host/bin/echo_plugin.dart");
+        let workspace = TempWorkspace::new("evict");
+        let manifest = format!(
+            r#"{{"name": "echo", "version": "0.1.0", "entrypoint": "{}",
+                "capabilities": ["lint"],
+                "timeouts": {{"callback_ms": 500, "request_ms": 10000, "request_retries": 3}}}}"#,
+            script.display(),
+        );
+        workspace.write_plugin("echo", &[("dartq_plugin.json", &manifest)]);
+
+        let _guard = env_lock();
+        // SAFETY: single-threaded set through env_lock; the drop guard
+        // below removes the override even when an assert fails mid-test.
+        unsafe { std::env::set_var("DARTQ_PLUGIN_IDLE_EVICT_MS", EVICT_MS.to_string()) };
+        let _override = EvictMsOverride;
+        let mut set = launch(workspace.path());
+        assert!(!set.is_empty(), "the echo fixture discovered and launched");
+
+        // The first generation: a cold `dart` boot rides the first cycle's
+        // feed (the handshake); the echo reply lands within a later cycle's
+        // bounded drain.
+        let mut files = FileTable::new();
+        let a = files.intern(&workspace.path().join("lib").join("a.dart"));
+        let engine_rows = [engine_row(a, "hello")];
+        let mut batch = None;
+        for _ in 0..200 {
+            let cycle = set.cycle(&engine_rows, &files, Some(a), &cycle_context());
+            assert!(cycle.crashes.is_empty(), "the echo fixture must not crash");
+            if let Some(found) = cycle.findings.into_iter().next() {
+                batch = Some(found);
+                break;
+            }
+        }
+        assert_eq!(
+            batch.expect("echo replied within the cycle budget").name,
+            "echo"
+        );
+        let before = set
+            .runtime_stats("echo")
+            .expect("the live runtime carries stats");
+
+        // Idle past the deadline: the monitor's eviction arm kills the
+        // child within a poll tick of the deadline. No interaction touches
+        // the clock during the wait.
+        std::thread::sleep(Duration::from_millis(EVICT_MS + 1_500));
+        let after_eviction = set
+            .runtime_stats("echo")
+            .expect("the evicted runtime stays in its slot");
+        assert!(
+            after_eviction.evictions >= 1,
+            "the idle eviction is counted: {after_eviction:?}"
+        );
+
+        // The next fed cycle respawns budget-free: the plugin answers
+        // again, no crash row surfaced, and the restart counter did not
+        // move (an eviction is a host memory action, not a crash).
+        let mut respawned = false;
+        for _ in 0..200 {
+            let cycle = set.cycle(&engine_rows, &files, Some(a), &cycle_context());
+            assert!(
+                cycle.crashes.is_empty(),
+                "an eviction never surfaces a crash row: {:?}",
+                cycle.crashes
+            );
+            if cycle.findings.into_iter().next().is_some() {
+                respawned = true;
+                break;
+            }
+        }
+        assert!(respawned, "the plugin answers again after the eviction");
+        let after = set
+            .runtime_stats("echo")
+            .expect("the live runtime carries stats");
+        assert_eq!(
+            after.restarts, before.restarts,
+            "the eviction respawn is budget-free: {after:?}"
         );
 
         set.shutdown();

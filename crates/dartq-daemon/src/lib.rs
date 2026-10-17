@@ -1,7 +1,7 @@
-//! The dartq daemon: an LSP shell over the multi-context runtime (PRD §16).
+//! The dartq daemon: the resident RPC shell over the multi-context runtime.
 //! One client on stdin/stdout, one reader thread feeding a message channel,
 //! and the main loop (this thread) doing all dispatch, engine calls, and
-//! writing — the rust-analyzer/lsp-server posture with the thread count the
+//! writing — the rust-analyzer main-loop posture with the thread count the
 //! single-client milestone actually needs.
 //!
 //! # Runtime posture
@@ -15,41 +15,40 @@
 //! task's analyzed view is `&`-shared; writes and analyses stay
 //! single-owner); the main loop remains the only writer.
 //!
-//! # Protocol face (the milestone's minimal typed surface)
+//! # Protocol face
 //!
-//! * Lifecycle: `initialize` (capabilities: full text sync) → `initialized`
-//!   → requests → `shutdown` (answers `null`) → `exit` (process exit 0;
-//!   exit without shutdown exits 1, per LSP). Requests before `initialize`
-//!   answer `ServerNotInitialized`.
-//! * Overlay (PRD §16.3, M1 whole-file replacement): `textDocument/didOpen`
-//!   and `textDocument/didChange` stage a write task that fans out to the
-//!   session's contexts; `textDocument/didClose` stages the on-disk bytes
-//!   back (or a removal for an overlay-only buffer). None of this touches
-//!   the workspace files on disk.
-//! * Scheduling (PRD §16.5, §16.6): each turn batches every already-queued
+//! * No handshake gate: the session is ready from `run()`'s start — the
+//!   workspace sweep and its first `dartq/diagnostics` pushes land ahead
+//!   of the first client frame. A client close (end of stream) ends the
+//!   session with [`EXIT_CLEAN`].
+//! * Change intake: `dartq/sync` notifications name the paths the caller
+//!   wrote (the explicit change-report face; `--watch` is the convenience
+//!   equivalent polling the same files). Each sync stages a write task
+//!   that fans out to the session's contexts.
+//! * Scheduling: each turn batches every already-queued
 //!   frame and drains once — writes apply before any read analyzes, N edits
-//!   collapse into one apply + one analysis, and `textDocument/
-//!   publishDiagnostics` pushes go out for every file whose diagnostic set
-//!   changed (diff against the last publish). A `dartq/*` request queues a
-//!   read stamped with the context's enqueue epoch; `$/cancelRequest` bumps
+//!   collapse into one apply + one analysis, and `dartq/diagnostics`
+//!   pushes go out for every file whose diagnostic set changed (a diff
+//!   against the last publish; a push replaces the client's set for that
+//!   URI, so the empty array clears it). A `dartq/*` request queues a
+//!   read stamped with the context's enqueue epoch; `dartq/cancel` bumps
 //!   the epoch, the stale task drops at the drain, and its requests answer
 //!   `RequestCancelled` (-32800) with no result.
-//! * The `dartq/*` command family (PRD §15.1 — the RPC faces 1:1 with the
-//!   CLI commands): `dartq/analyze` (the merged diagnostic set, LSP URIs),
+//! * The `dartq/*` command family (the RPC faces 1:1 with the
+//!   CLI commands): `dartq/analyze` (the merged diagnostic set, `file:` URIs),
 //!   `dartq/check`, `dartq/query`, `dartq/impact`, `dartq/explain`,
 //!   `dartq/fix`, and `dartq/compat` (CLI-mirror faces with canonical path
 //!   labels), plus the per-agent overlay faces `dartq/overlay.set`,
-//!   `dartq/overlay.commit` (the PRD §16.3 merge: the agent's staged
+//!   `dartq/overlay.commit` (the merge: the agent's staged
 //!   buffers write back to the worktree and merge into the base view), and
-//!   `dartq/overlay.clear`. All are announced under
-//!   `capabilities.experimental`; all answers carry `schema_version` and
+//!   `dartq/overlay.clear`. All answers carry `schema_version` and
 //!   honor an optional `verbosity` (the canonical tiers in dartq-schema's
 //!   crate docs); the engine-view faces additionally accept `context` (the
-//!   multi-root routing tag, PRD §16.2), `agentId` (the analyzed overlay
+//!   multi-root routing tag), `agentId` (the analyzed overlay
 //!   view), and `since` (delta mode), with the per-face visibility contract
 //!   documented in the `commands` module.
 //! * Everything else: unknown requests answer `MethodNotFound`; unknown
-//!   notifications are ignored (both per LSP).
+//!   notifications are ignored.
 //!
 //! # Snapshot persistence (#306, #309)
 //!
@@ -64,19 +63,19 @@
 //! deadline to save instead of blocking forever — still no timer thread.
 //! Saves are accelerator semantics: failures log and continue.
 //!
-//! # File watch (`--watch`, PRD §16.7 mode 3)
+//! # File watch
 //!
 //! The optional convenience layer: --watch polls the workspace on one
 //! bounded-interval thread (no OS-event substrate in the dependency tree —
 //! documented as such), debounces bursts, and feeds the debounced batches
-//! through the reader channel as didChange-equivalent overlay syncs at
+//! through the reader channel as `dartq/sync`-equivalent overlay syncs at
 //! `Tier::Normal`. Watch events are hints; the analysis's content check
 //! stays the truth.
 //!
 //! # Transport
 //!
 //! Hand-written `Content-Length` framing ([`codec`]) — the shell layer has
-//! no Dart semantics to inherit, so no LSP library is pulled in. The reader
+//! no Dart semantics to inherit, so no RPC library is pulled in. The reader
 //! thread decodes frames and sends [`jsonrpc::Message`] values; only the
 //! main loop writes, so the output side needs no lock. A framing violation
 //! (malformed or duplicate headers, a truncated frame body) ends the
@@ -87,11 +86,15 @@
 pub mod codec;
 pub(crate) mod commands;
 pub mod jsonrpc;
-pub mod lsp;
 pub(crate) mod plugins;
 pub mod session;
-pub mod uri;
 mod watch;
+pub mod wire;
+
+// The `file:` URI mapping lives with the shared per-command cores (the
+// analyze faces' document-URI rows use it too); re-exported so `crate::uri`
+// keeps resolving for the overlay-key call sites.
+pub use dartq_commands::uri;
 
 // Lets the shared integration fixture (tests/common) compile inside the
 // lib's own unit-test build too, where the crate is not an --extern.
@@ -103,8 +106,9 @@ mod test_fixtures;
 
 mod server;
 
-pub use server::{EXIT_CLEAN, EXIT_PROTOCOL, EXIT_WITHOUT_SHUTDOWN, run};
-pub use session::{Publish, Session, SessionError, Turn};
+pub use commands::METHODS;
+pub use server::{EXIT_CLEAN, EXIT_PROTOCOL, INTAKE_REQUESTS, SERVED_NOTIFICATIONS, run};
+pub use session::{Publish, Session, SessionError, SessionRuntime, Turn};
 pub use watch::WatchOptions;
 
 /// Test-only observability for the daemon's hot-path allocation discipline
@@ -136,6 +140,12 @@ pub(crate) mod probe {
         /// real plugin-path panic cannot be conjured deterministically from
         /// RPC input). Thread-local, same discipline as READ_PANIC.
         static WEAVE_PANIC: Cell<bool> = const { Cell::new(false) };
+        /// The overlay set the last plugin weave built (#1819's push pin:
+        /// the staged documents' path/text pairs handed to the cycle
+        /// context). Thread-local like the rest: tests drive their session
+        /// on the harness thread.
+        static WEAVE_OVERLAYS: std::cell::RefCell<Vec<(String, String)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
         /// How many read groups the armed READ_PANIC lets pass before it
         /// fires: the #690 containment tests need a later group surviving an
         /// earlier group's panic, so the trigger must target a group.
@@ -256,6 +266,17 @@ pub(crate) mod probe {
 
     pub(crate) fn take_weave_panic() -> bool {
         WEAVE_PANIC.with(|armed| armed.replace(false))
+    }
+
+    /// Records the overlay set a plugin weave built (the `CycleContext`'s
+    /// `overlays` argument).
+    pub(crate) fn record_weave_overlays(overlays: &[(String, String)]) {
+        WEAVE_OVERLAYS.with(|seen| *seen.borrow_mut() = overlays.to_vec());
+    }
+
+    /// Drains the recorded weave overlays (each test reads its own turn's).
+    pub(crate) fn take_weave_overlays() -> Vec<(String, String)> {
+        WEAVE_OVERLAYS.with(|seen| std::mem::take(&mut *seen.borrow_mut()))
     }
 
     /// Arms the next write task's apply to panic once (the write path's

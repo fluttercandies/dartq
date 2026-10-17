@@ -1,4 +1,4 @@
-//! `dartq/query`'s `kind` parameter end to end (PRD §15.2): the default
+//! `dartq/query`'s `kind` parameter end to end: the default
 //! (absent-kind) answer is byte-identical to the explicit `symbol` request,
 //! `references` serves the symbol rows (the CLI face's seam), `callers`
 //! keeps the invocation-shaped subset, and an unknown kind answers
@@ -12,7 +12,7 @@ mod common;
 use std::fs;
 use std::sync::Mutex;
 
-use common::{CLEAN_MAIN, Workspace, notification, request, spawn, store_root};
+use common::{CLEAN_MAIN, Workspace, request, spawn, store_root};
 use serde_json::{Value, json};
 
 /// `Workspace::new` pins one pid-derived temp root; the tests in this
@@ -28,13 +28,6 @@ fn workspace_lock() -> std::sync::MutexGuard<'static, ()> {
     WORKSPACE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// `initialize` + `initialized`: the fixture is clean, so the sweep
-/// publishes nothing.
-fn handshake(h: &mut common::Harness) {
-    h.step(&request(1, "initialize", json!({})), 1);
-    h.step(&notification("initialized", json!({})), 0);
 }
 
 /// The `result` of the answer frame for `id`.
@@ -102,9 +95,7 @@ fn assert_reference_row_shape(row: &Value) {
 fn default_missing_kind_is_the_symbol_answer() {
     let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
-    let a = workspace.path("lib/a.dart");
     let mut h = spawn(&workspace, &store_root("rpc-query-kind-default"));
-    handshake(&mut h);
 
     h.step(&request(2, "dartq/query", json!({ "name": "Foo" })), 1);
     h.step(
@@ -118,12 +109,13 @@ fn default_missing_kind_is_the_symbol_answer() {
         "absent kind answers the symbol face byte-identically"
     );
 
-    // The symbol face's compact shape (the CLI JSON face verbatim).
+    // The symbol face's compact shape (the CLI JSON face verbatim, the
+    // shared shaper's stable package-form labels included).
     assert_eq!(absent["schema_version"], 1);
     assert_eq!(absent["name"], "Foo");
     let declarations = absent["declarations"].as_array().expect("declarations");
     assert_eq!(declarations.len(), 1);
-    assert_eq!(declarations[0]["file"], a.display().to_string());
+    assert_eq!(declarations[0]["file"], "package:fixture/a.dart");
     assert_eq!(declarations[0]["kind"], "class");
     assert_eq!(declarations[0]["name"], "Foo");
     assert_eq!(declarations[0]["line"], 1);
@@ -141,8 +133,42 @@ fn default_missing_kind_is_the_symbol_answer() {
     assert_eq!(references[1]["offset"], 42);
     references.iter().for_each(assert_reference_row_shape);
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+}
+
+/// The minimal tier shapes through the shared shaper's own tier cut (#1556):
+/// the red-line rows keep the stable package-form labels — the projection
+/// is tier-agnostic, so the daemon's minimal answer cannot drift from the
+/// CLI's.
+#[test]
+fn minimal_tier_keeps_the_package_form_labels() {
+    let _guard = workspace_lock();
+    let workspace = seeded_query_workspace();
+    let mut h = spawn(&workspace, &store_root("rpc-query-minimal-labels"));
+
+    h.step(
+        &request(
+            2,
+            "dartq/query",
+            json!({ "name": "Foo", "verbosity": "minimal" }),
+        ),
+        1,
+    );
+    let result = answer_result(&h, 2);
+    let declarations = result["declarations"].as_array().expect("declarations");
+    assert_eq!(declarations.len(), 1);
+    assert_eq!(declarations[0]["file"], "package:fixture/a.dart");
+    let references = result["references"].as_array().expect("references");
+    assert_eq!(references.len(), 2);
+    assert_eq!(references[0]["target_file"], "package:fixture/a.dart");
+    assert!(
+        references[0].get("file").is_none(),
+        "the minimal red line keeps the target locator only: {row}",
+        row = &references[0]
+    );
+
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -154,7 +180,6 @@ fn references_kind_serves_the_symbol_rows() {
     let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
     let mut h = spawn(&workspace, &store_root("rpc-query-kind-references"));
-    handshake(&mut h);
 
     h.step(&request(2, "dartq/query", json!({ "name": "Foo" })), 1);
     h.step(
@@ -174,7 +199,8 @@ fn references_kind_serves_the_symbol_rows() {
     assert_eq!(references["schema_version"], 1);
 
     // The declaration rows' schema-domain shape (compact carries the
-    // convenience `container`, null for top-level rows).
+    // convenience `container` when a row has one — the omission rule drops
+    // it on top-level rows rather than spelling a null).
     let declarations = references["declarations"].as_array().expect("declarations");
     assert_eq!(declarations.len(), 1);
     for field in ["file", "kind", "name", "line", "column", "length"] {
@@ -183,13 +209,14 @@ fn references_kind_serves_the_symbol_rows() {
             "declaration row carries {field}"
         );
     }
-    assert!(declarations[0].get("container").is_some());
+    // `Foo` is a top-level class, so `container` is omitted per the
+    // null/empty omission — not spelled as a null.
+    assert!(declarations[0].get("container").is_none());
 
     let text = serde_json::to_string(&references).expect("serialize");
     dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -201,7 +228,6 @@ fn callers_kind_keeps_the_invocation_rows() {
     let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
     let mut h = spawn(&workspace, &store_root("rpc-query-kind-callers"));
-    handshake(&mut h);
 
     // `Foo`: the annotation use drops, the constructor site stays.
     h.step(
@@ -247,8 +273,7 @@ fn callers_kind_keeps_the_invocation_rows() {
     let text = serde_json::to_string(&result).expect("serialize");
     dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -259,7 +284,6 @@ fn unknown_kind_answers_invalid_params() {
     let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
     let mut h = spawn(&workspace, &store_root("rpc-query-kind-unknown"));
-    handshake(&mut h);
 
     h.step(
         &request(
@@ -299,8 +323,7 @@ fn unknown_kind_answers_invalid_params() {
     let result = answer_result(&h, 3);
     assert_eq!(result["name"], "Foo");
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -323,17 +346,16 @@ fn seeded_inheritance_workspace() -> Workspace {
 }
 
 /// The `implementations` and `dependencies` kinds end to end: the single
-/// face serves the subtype/override rows and the importer row on the
-/// frozen reserved arrays, the batch face answers both spellings through
-/// the same expansion, and every answer validates against the published
-/// query contract.
+/// face serves the subtype/override rows on the frozen reserved arrays,
+/// and the `dependencies` forward answer for a library with no imports is
+/// the omitted additive array; the batch face answers both spellings
+/// through the same expansion, and every answer validates against the
+/// published query contract.
 #[test]
 fn implementation_and_dependency_kinds_end_to_end() {
     let _guard = workspace_lock();
     let workspace = seeded_inheritance_workspace();
-    let b = workspace.path("lib/b.dart");
     let mut h = spawn(&workspace, &store_root("rpc-query-kind-impl-deps"));
-    handshake(&mut h);
 
     // `implementations` over the type: both extends subtypes, no reference
     // rows, the declaration row kept for identity.
@@ -377,9 +399,15 @@ fn implementation_and_dependency_kinds_end_to_end() {
     assert_eq!(implementations.len(), 1, "only Dog overrides breathe");
     assert_eq!(implementations[0]["name"], "breathe");
     assert_eq!(implementations[0]["container"], "Dog");
-    assert_eq!(implementations[0]["file"], b.display().to_string());
+    assert_eq!(
+        implementations[0]["file"], "package:fixture/b.dart",
+        "the stable package-form label (the shared shaper's projection)"
+    );
 
-    // `dependencies`: the declaring library's importer row, `path`-shaped.
+    // `dependencies` is the forward face: the declaring library's own
+    // imports. `Animal` lives in a.dart, which imports nothing, so the
+    // additive array is omitted (the schema's empty-row omission) — the
+    // importer answer (b.dart) is the impact face's, not this kind's.
     h.step(
         &request(
             4,
@@ -389,9 +417,10 @@ fn implementation_and_dependency_kinds_end_to_end() {
         1,
     );
     let result = answer_result(&h, 4);
-    let dependencies = result["dependencies"].as_array().expect("array");
-    assert_eq!(dependencies.len(), 1, "b.dart imports a.dart");
-    assert_eq!(dependencies[0]["path"], b.display().to_string());
+    assert!(
+        result.get("dependencies").is_none(),
+        "a.dart imports nothing — the additive array is omitted: {result:?}"
+    );
     let text = serde_json::to_string(&result).expect("serialize");
     dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
 
@@ -417,13 +446,14 @@ fn implementation_and_dependency_kinds_end_to_end() {
             .len(),
         2
     );
-    assert_eq!(
-        answers[1]["dependencies"].as_array().expect("array").len(),
-        1
+    // The forward `dependencies` answer for `Animal` (a.dart imports
+    // nothing) is empty, so the additive array is omitted here too.
+    assert!(
+        answers[1].get("dependencies").is_none(),
+        "a.dart imports nothing — the additive array is omitted: {answers:?}"
     );
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -437,7 +467,6 @@ fn kinded_queries_share_one_turn_of_the_request_lifecycle() {
     let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
     let mut h = spawn(&workspace, &store_root("rpc-query-kind-lifecycle"));
-    handshake(&mut h);
 
     h.burst(
         &[
@@ -467,7 +496,6 @@ fn kinded_queries_share_one_turn_of_the_request_lifecycle() {
         "callers drops exactly the non-invocation use"
     );
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }

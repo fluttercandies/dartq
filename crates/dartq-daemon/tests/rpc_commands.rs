@@ -1,6 +1,6 @@
 //! End-to-end `dartq/*` RPC tests over the in-memory-pipe harness: each
 //! face answers on a fixture workspace and its result is pinned against the
-//! CLI face it mirrors (PRD §15.1's equivalence rule — the two share one
+//! CLI face it mirrors (equivalence rule — the two share one
 //! implementation in `dartq-commands`, so the comparison runs the command
 //! core directly and renders it through the CLI's oracle-exact writers).
 //! Also covers cancellation through the epoch machinery, the verbosity red
@@ -33,13 +33,6 @@ fn workspace_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// `initialize` + `initialized`: the sweep publishes `publishes` frames
-/// (one on a fixture with diagnostics, zero on a clean one).
-fn handshake(h: &mut common::Harness, publishes: usize) {
-    h.step(&request(1, "initialize", json!({})), 1);
-    h.step(&notification("initialized", json!({})), publishes);
-}
-
 /// The `result` of the answer frame for `id`. Waiting, not one-shot: the
 /// plugin-dispatch faces (`dartq/fix`, `dartq/assists`) stage at intake,
 /// emit their progress notice at the drain, and answer one worker hop
@@ -55,7 +48,7 @@ fn answer_error(h: &common::Harness, id: i64) -> Value {
 
 /// Renders `diagnostics` through the CLI's machine writer and parses the
 /// lines back into the RPC check row shape (code lowercased to dartq's
-/// stable snake_case name; severity/type stay the machine spellings).
+/// stable `snake_case` name; severity/type stay the machine spellings).
 fn machine_face_rows(
     diagnostics: &[dartq_diagnostics::Diagnostic],
     files: &dyn dartq_diagnostics::FileLayoutProvider,
@@ -112,7 +105,6 @@ fn dartq_check_matches_the_cli_machine_face() {
     let _guard = workspace_lock();
     let workspace = Workspace::new(BROKEN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-check"));
-    handshake(&mut h, 1);
 
     h.step(
         &request(
@@ -140,10 +132,7 @@ fn dartq_check_matches_the_cli_machine_face() {
         "the RPC rows equal the CLI machine rows"
     );
 
-    // Shutdown answers, then exit is the clean end (a bare `exit` is
-    // EXIT_WITHOUT_SHUTDOWN).
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -154,7 +143,6 @@ fn dartq_analyze_matches_the_cli_machine_face() {
     let _guard = workspace_lock();
     let workspace = Workspace::new(BROKEN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-analyze"));
-    handshake(&mut h, 1);
 
     h.step(&request(2, "dartq/analyze", json!({})), 1);
     let result = answer_result(&h, 2);
@@ -178,7 +166,7 @@ fn dartq_analyze_matches_the_cli_machine_face() {
         assert_eq!(
             entry["range"]["start"]["line"],
             row["line"].as_u64().expect("line") - 1,
-            "LSP positions are zero-based"
+            "wire positions are zero-based"
         );
         assert_eq!(
             entry["range"]["start"]["character"],
@@ -187,10 +175,7 @@ fn dartq_analyze_matches_the_cli_machine_face() {
         assert_eq!(entry["severity"], 1, "the fixture row is an error");
     }
 
-    // Shutdown answers, then exit is the clean end (a bare `exit` is
-    // EXIT_WITHOUT_SHUTDOWN).
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -201,9 +186,7 @@ fn dartq_analyze_matches_the_cli_machine_face() {
 fn dartq_query_equals_the_cli_json_face() {
     let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
-    let a = workspace.path("lib/a.dart");
     let mut h = spawn(&workspace, &store_root("rpc-query"));
-    handshake(&mut h, 0);
 
     h.step(&request(2, "dartq/query", json!({ "name": "Foo" })), 1);
     let result = answer_result(&h, 2);
@@ -212,17 +195,24 @@ fn dartq_query_equals_the_cli_json_face() {
 
     let declarations = result["declarations"].as_array().expect("declarations");
     assert_eq!(declarations.len(), 1);
-    assert_eq!(declarations[0]["file"], a.display().to_string());
+    assert_eq!(
+        declarations[0]["file"], "package:fixture/a.dart",
+        "the stable package-form label (the shared shaper's projection)"
+    );
     assert_eq!(declarations[0]["kind"], "class");
     assert_eq!(declarations[0]["name"], "Foo");
-    assert!(declarations[0]["container"].is_null());
+    assert!(
+        declarations[0].get("container").is_none(),
+        "a top-level row omits the container key (the omission rule): {row}",
+        row = &declarations[0]
+    );
     assert_eq!(declarations[0]["line"], 1);
     assert_eq!(declarations[0]["column"], 7);
     assert_eq!(declarations[0]["length"], 3);
 
     let references = result["references"].as_array().expect("references");
     assert_eq!(references.len(), 2, "the type use plus the invocation");
-    assert_eq!(references[0]["target_file"], a.display().to_string());
+    assert_eq!(references[0]["target_file"], "package:fixture/a.dart");
     assert_eq!(references[0]["kind"], "reference");
     // The frozen contract types `qualified` as the qualified-name string and
     // the row model carries only the bit, so the shared writer omits the
@@ -236,10 +226,292 @@ fn dartq_query_equals_the_cli_json_face() {
     assert_eq!(references[1]["kind"], "invoked");
     assert_eq!(references[1]["offset"], 42);
 
-    // Shutdown answers, then exit is the clean end (a bare `exit` is
-    // EXIT_WITHOUT_SHUTDOWN).
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+}
+
+/// dartq/resolveAt over the seeded workspace: the declaration arm, the
+/// reference arm (target identity plus the target's own name span), the
+/// null hit on an uncovered position, the `since` rejection (a point
+/// answer has no rows for a cursor), and the fail-loud unknown file — the
+/// wire contract over the engine substrate (`Engine::resolve_at` carries
+/// the semantics; offsets are the engine's UTF-16 convention, the same
+/// units the query rows' `offset` fields pin: 6 = `Foo`'s declaration, 33
+/// its type use in b.dart).
+#[test]
+fn dartq_resolve_at_answers_the_position_shapes() {
+    let _guard = workspace_lock();
+    let workspace = seeded_query_workspace();
+    let a = workspace.path("lib/a.dart");
+    let b = workspace.path("lib/b.dart");
+    let mut h = spawn(&workspace, &store_root("rpc-resolve-at"));
+
+    // A declaration name token: the declaration itself is the answer.
+    h.step(
+        &request(2, "dartq/resolveAt", json!({ "file": a, "offset": 6 })),
+        1,
+    );
+    let result = answer_result(&h, 2);
+    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["file"], a.display().to_string());
+    assert_eq!(result["offset"], 6);
+    let hit = &result["hit"];
+    assert_eq!(hit["kind"], "declaration");
+    assert_eq!(hit["name"], "Foo");
+    assert_eq!(hit["decl_kind"], "class");
+    assert!(
+        hit.get("container").is_none(),
+        "a top-level declaration omits the container key: {hit}",
+        hit = hit,
+    );
+    assert_eq!(hit["file"], a.display().to_string());
+    assert_eq!(hit["range"]["offset"], 6);
+    assert_eq!(hit["range"]["length"], 3);
+
+    // A resolved use: the target identity plus its name span.
+    h.step(
+        &request(3, "dartq/resolveAt", json!({ "file": b, "offset": 33 })),
+        1,
+    );
+    let hit = &answer_result(&h, 3)["hit"];
+    assert_eq!(hit["kind"], "reference");
+    assert_eq!(hit["name"], "Foo");
+    assert_eq!(hit["decl_kind"], "class");
+    assert_eq!(hit["file"], a.display().to_string(), "the target's file");
+    assert_eq!(hit["range"]["offset"], 33);
+    assert_eq!(hit["target_range"]["offset"], 6);
+    assert_eq!(hit["target_range"]["length"], 3);
+    assert_eq!(hit["ref_kind"], "reference");
+    assert_eq!(hit["qualified"], false);
+    assert!(
+        hit.get("prefix").is_none(),
+        "a bare use omits the prefix key: {hit}",
+        hit = hit,
+    );
+
+    // An uncovered position (the newline after `class Foo {`): a null hit,
+    // not an error.
+    h.step(
+        &request(4, "dartq/resolveAt", json!({ "file": a, "offset": 11 })),
+        1,
+    );
+    let result = answer_result(&h, 4);
+    assert_eq!(
+        result.get("hit"),
+        Some(&Value::Null),
+        "the verdict slot stays an explicit null, never an omitted key: {result}"
+    );
+
+    // A point answer rejects the delta cursor...
+    h.step(
+        &request(
+            5,
+            "dartq/resolveAt",
+            json!({ "file": a, "offset": 6, "since": 0 }),
+        ),
+        1,
+    );
+    let error = answer_error(&h, 5);
+    assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("since"),
+        "the rejection names the rule: {error}"
+    );
+
+    // ...and a file the analyzed view never interned fails loud (the
+    // typo'd-path rule); the session is unharmed either way.
+    h.step(
+        &request(
+            6,
+            "dartq/resolveAt",
+            json!({ "file": workspace.path("lib/absent.dart"), "offset": 0 }),
+        ),
+        1,
+    );
+    let error = answer_error(&h, 6);
+    assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
+    h.step(&request(7, "dartq/analyze", json!({})), 1);
+    assert_eq!(answer_result(&h, 7)["schema_version"], 1);
+
+    let (code, _) = h.join_ended();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+}
+
+/// dartq/completion over the seeded workspace: the visible-name set at a
+/// cursor — the fragment filter over the text left of the offset (the
+/// engine extracts it from the analyzed snapshot), the import-proven
+/// reference rows carrying their target identity and span, the whole set
+/// at a fresh-name cursor, the empty set for a fragment nothing matches
+/// and for a past-end offset, the `since` rejection (a point answer has no
+/// rows for a cursor), and the fail-loud unknown file — the wire contract
+/// over the engine substrate (`Engine::complete_at` carries the
+/// semantics; offsets are the engine's UTF-16 convention: in b.dart 53 is
+/// after the `fo` of `foo`, 17 a fresh-name line start, 19 inside the
+/// `void` keyword).
+#[test]
+fn dartq_completion_answers_the_visible_names() {
+    let _guard = workspace_lock();
+    let workspace = seeded_query_workspace();
+    // A prefixed import (`a.Foo` / `a.foo`): the qualifier arms a
+    // continuation candidate — the one origin that carries no declaration
+    // identity.
+    fs::write(
+        workspace.path("lib/p.dart"),
+        "import 'a.dart' as a;\nvoid main() {\n  a.Foo? f = a.foo();\n}\n",
+    )
+    .expect("write p.dart");
+    let a = workspace.path("lib/a.dart");
+    let b = workspace.path("lib/b.dart");
+    let p = workspace.path("lib/p.dart");
+    let mut h = spawn(&workspace, &store_root("rpc-completion"));
+
+    // The fragment filter: `fo|` answers the import-proven `foo` only —
+    // case-sensitive, so `Foo` stays out — with the target's declaring
+    // file and name span (the completed pick can jump to it).
+    h.step(
+        &request(2, "dartq/completion", json!({ "file": b, "offset": 53 })),
+        1,
+    );
+    let result = answer_result(&h, 2);
+    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["file"], b.display().to_string());
+    assert_eq!(result["offset"], 53);
+    assert_eq!(result["prefix"], "fo");
+    let items = result["items"].as_array().expect("items");
+    assert_eq!(items.len(), 1, "only `foo` extends `fo`: {items:?}");
+    assert_eq!(items[0]["name"], "foo");
+    assert_eq!(items[0]["origin"], "reference");
+    assert_eq!(items[0]["decl_kind"], "function");
+    assert!(
+        items[0].get("container").is_none(),
+        "a top-level target omits the container key (the omission rule): {item}",
+        item = &items[0]
+    );
+    assert_eq!(
+        items[0]["file"],
+        a.display().to_string(),
+        "the target's file"
+    );
+    assert_eq!(items[0]["range"]["offset"], 36);
+    assert_eq!(items[0]["range"]["length"], 3);
+
+    // A fresh-name cursor (no fragment): the whole visible set — the
+    // import-proven `Foo` and `foo`, the file-local `main` — ascending by
+    // name, each origin and identity honest.
+    h.step(
+        &request(3, "dartq/completion", json!({ "file": b, "offset": 17 })),
+        1,
+    );
+    let result = answer_result(&h, 3);
+    let items = result["items"].as_array().expect("items");
+    let names: Vec<&str> = items
+        .iter()
+        .map(|item| item["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, vec!["Foo", "foo", "main"], "{items:?}");
+    let origins: Vec<&str> = items
+        .iter()
+        .map(|item| item["origin"].as_str().expect("origin"))
+        .collect();
+    assert_eq!(origins, vec!["reference", "reference", "declaration"]);
+    assert_eq!(items[0]["decl_kind"], "class");
+    assert_eq!(items[0]["file"], a.display().to_string());
+    assert_eq!(items[0]["range"]["offset"], 6, "Foo's own name span");
+    assert_eq!(items[2]["file"], b.display().to_string());
+    assert_eq!(items[2]["range"]["offset"], 22, "main's own name span");
+
+    // The armed qualifier in p.dart: `a` answers as a Prefix-origin item —
+    // a wire word, not a declaration — beside the import-proven names.
+    h.step(
+        &request(4, "dartq/completion", json!({ "file": p, "offset": 22 })),
+        1,
+    );
+    let result = answer_result(&h, 4);
+    assert_eq!(result["prefix"], "", "a fresh-name cursor: the whole set");
+    let items = result["items"].as_array().expect("items");
+    let named: Vec<(&str, &str)> = items
+        .iter()
+        .map(|item| {
+            (
+                item["name"].as_str().expect("name"),
+                item["origin"].as_str().expect("origin"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            ("Foo", "reference"),
+            ("a", "prefix"),
+            ("foo", "reference"),
+            ("main", "declaration"),
+        ],
+        "ascending by name, the qualifier arms a continuation: {items:?}"
+    );
+    let prefix_item = &items[1];
+    assert!(
+        prefix_item.get("decl_kind").is_none()
+            && prefix_item.get("container").is_none()
+            && prefix_item.get("file").is_none()
+            && prefix_item.get("range").is_none(),
+        "a prefix item carries no identity — every column omits, never a null: {item}",
+        item = prefix_item
+    );
+
+    // A fragment nothing visible extends (`vo|` inside the keyword), and a
+    // past-end offset: the empty set, never an error.
+    h.step(
+        &request(5, "dartq/completion", json!({ "file": b, "offset": 19 })),
+        1,
+    );
+    let result = answer_result(&h, 5);
+    assert_eq!(result["prefix"], "vo");
+    assert!(result["items"].as_array().expect("items").is_empty());
+    h.step(
+        &request(6, "dartq/completion", json!({ "file": b, "offset": 9_999 })),
+        1,
+    );
+    let result = answer_result(&h, 6);
+    assert!(result["items"].as_array().expect("items").is_empty());
+
+    // A point answer rejects the delta cursor...
+    h.step(
+        &request(
+            7,
+            "dartq/completion",
+            json!({ "file": b, "offset": 53, "since": 0 }),
+        ),
+        1,
+    );
+    let error = answer_error(&h, 7);
+    assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .expect("message")
+            .contains("since"),
+        "the rejection names the rule: {error}"
+    );
+
+    // ...and a file the analyzed view never interned fails loud (the
+    // typo'd-path rule); the session is unharmed either way.
+    h.step(
+        &request(
+            8,
+            "dartq/completion",
+            json!({ "file": workspace.path("lib/absent.dart"), "offset": 0 }),
+        ),
+        1,
+    );
+    let error = answer_error(&h, 8);
+    assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
+    h.step(&request(9, "dartq/analyze", json!({})), 1);
+    assert_eq!(answer_result(&h, 9)["schema_version"], 1);
+
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -259,7 +531,6 @@ fn dartq_impact_matches_the_cli_report() {
     .expect("write the test");
     let a = workspace.path("lib/a.dart");
     let mut h = spawn(&workspace, &store_root("rpc-impact"));
-    handshake(&mut h, 0);
 
     h.step(
         &request(
@@ -270,7 +541,7 @@ fn dartq_impact_matches_the_cli_report() {
         1,
     );
     let result = answer_result(&h, 2);
-    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["schema_version"], 2);
 
     let symbols: Vec<String> = result["changed"]
         .as_array()
@@ -281,14 +552,16 @@ fn dartq_impact_matches_the_cli_report() {
     assert_eq!(
         symbols,
         vec![
-            format!("{}|Foo", a.display()),
-            format!("{}|foo", a.display())
+            "package:fixture/a.dart|Foo".to_string(),
+            "package:fixture/a.dart|foo".to_string()
         ],
-        "every face name, ASCII-sorted"
+        "every face name, ASCII-sorted (the shared pkg_label projection)"
     );
 
-    let b = workspace.path("lib/b.dart");
-    let test_path = workspace.path("test/a_test.dart");
+    let test_path = workspace
+        .path("test/a_test.dart")
+        .canonicalize()
+        .expect("canonical test path");
     let affected: Vec<(String, String)> = result["affected"]
         .as_array()
         .expect("affected")
@@ -303,9 +576,10 @@ fn dartq_impact_matches_the_cli_report() {
     assert_eq!(
         affected,
         vec![
-            (b.display().to_string(), "semantic".to_string()),
             (test_path.display().to_string(), "semantic".to_string()),
-        ]
+            ("package:fixture/b.dart".to_string(), "semantic".to_string()),
+        ],
+        "the test tree keeps its canonical path and sorts first: `/` before `p`"
     );
     let tests: Vec<String> = result["affected_tests"]
         .as_array()
@@ -319,10 +593,7 @@ fn dartq_impact_matches_the_cli_report() {
         json!([{ "label": "default", "compatible": true }]),
     );
 
-    // Shutdown answers, then exit is the clean end (a bare `exit` is
-    // EXIT_WITHOUT_SHUTDOWN).
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -354,7 +625,7 @@ fn seeded_explain_workspace() -> Workspace {
     workspace
 }
 
-/// dartq/explain: the §15.3 report over the fixture symbol, section for
+/// dartq/explain: the report over the fixture symbol, section for
 /// section (the same content the CLI's report pins — the faces share one
 /// implementation), the `since` delta filtering the use/import/test rows
 /// while the declaration-site sections stay, and the minimal tier's
@@ -362,18 +633,18 @@ fn seeded_explain_workspace() -> Workspace {
 /// (the `dartq/compat` posture — the report's harvest rides the semantic
 /// fan-out, which the session engine runs over recomputed libraries only).
 #[test]
+#[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 fn dartq_explain_answers_the_report() {
     let _guard = workspace_lock();
     let workspace = seeded_explain_workspace();
-    let animal = workspace.path("lib/animal.dart");
-    let dog = workspace.path("lib/dog.dart");
-    let main = workspace.path("lib/main.dart");
-    let dog_test = workspace.path("test/dog_test.dart");
+    let dog_test = workspace
+        .path("test/dog_test.dart")
+        .canonicalize()
+        .expect("canonical test path");
     let dog_source = "import 'animal.dart';\nclass Dog extends Animal {\n  void bark() {}\n}\n";
     let dog_at = dog_source.find("Dog").expect("Dog in source") as u64;
     let bark_at = dog_source.find("bark").expect("bark in source") as u64;
     let mut h = spawn(&workspace, &store_root("rpc-explain"));
-    handshake(&mut h, 0);
 
     h.step(
         &request(
@@ -389,7 +660,7 @@ fn dartq_explain_answers_the_report() {
     assert_eq!(
         result["declaration"],
         json!({
-            "file": dog.display().to_string(),
+            "file": "package:fixture/dog.dart",
             "name": "Dog",
             "kind": "class",
             "range": [dog_at, dog_at + 3],
@@ -397,7 +668,11 @@ fn dartq_explain_answers_the_report() {
     );
     assert_eq!(
         result["inheritance"],
-        json!([{ "name": "Animal", "file": animal.display().to_string() }])
+        json!([{
+            "name": "Animal",
+            "file": "package:fixture/animal.dart",
+            "clause": "extends",
+        }])
     );
     assert_eq!(
         result["methods"],
@@ -405,14 +680,16 @@ fn dartq_explain_answers_the_report() {
     );
     let references = result["references"].as_array().expect("references");
     assert_eq!(references.len(), 2, "the main use plus the test use");
-    assert_eq!(references[0]["file"], main.display().to_string());
+    // Row order keys on the projected label (`package:fixture/main.dart`
+    // vs the test tree's canonical path): `/` sorts before `p`.
+    assert_eq!(references[0]["file"], dog_test.display().to_string());
     assert_eq!(references[0]["kind"], "invoked");
-    assert_eq!(references[1]["file"], dog_test.display().to_string());
+    assert_eq!(references[1]["file"], "package:fixture/main.dart");
     assert_eq!(
         result["dependencies"],
         json!([
-            { "path": main.display().to_string() },
             { "path": dog_test.display().to_string() },
+            { "path": "package:fixture/main.dart" },
         ])
     );
     assert_eq!(
@@ -486,10 +763,7 @@ fn dartq_explain_answers_the_report() {
         "the rejection names the field: {error}"
     );
 
-    // The overlay-session suite's green lifecycle: shutdown answers, then
-    // exit is the clean end (a bare `exit` is EXIT_WITHOUT_SHUTDOWN).
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -500,7 +774,6 @@ fn dartq_explain_rejects_a_bad_symbol() {
     let _guard = workspace_lock();
     let workspace = seeded_explain_workspace();
     let mut h = spawn(&workspace, &store_root("rpc-explain-usage"));
-    handshake(&mut h, 0);
 
     for (id, params) in [
         (2, json!({ "symbol": "" })),
@@ -523,8 +796,7 @@ fn dartq_explain_rejects_a_bad_symbol() {
     );
     assert_eq!(answer_result(&h, 5)["symbol"], "Dog");
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -571,7 +843,6 @@ fn dartq_compat_matches_the_cli_matrix() {
     let mut h = spawn(&workspace, &store_root("rpc-compat"));
     // `lib/a.dart` imports `dart:async`, unresolvable under the session's
     // core-only SDK: the sweep publishes one push for it.
-    handshake(&mut h, 1);
     h.step(
         &request(
             2,
@@ -599,10 +870,7 @@ fn dartq_compat_matches_the_cli_matrix() {
     assert_eq!(matrix[1]["compatible"], true);
     assert!(matrix[1].get("first_failure").is_none());
 
-    // Shutdown answers, then exit is the clean end (a bare `exit` is
-    // EXIT_WITHOUT_SHUTDOWN).
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -617,7 +885,6 @@ fn dartq_fix_reports_the_schema_shaped_empty_document() {
     let _guard = workspace_lock();
     let workspace = Workspace::new(CLEAN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-fix"));
-    handshake(&mut h, 0);
 
     h.step(
         &request(2, "dartq/fix", json!({ "paths": [workspace.path("lib")] })),
@@ -644,10 +911,7 @@ fn dartq_fix_reports_the_schema_shaped_empty_document() {
         "the CLI's usage message body: {error}"
     );
 
-    // Shutdown answers, then exit is the clean end (a bare `exit` is
-    // EXIT_WITHOUT_SHUTDOWN).
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -659,7 +923,6 @@ fn cancel_of_a_queued_dartq_check_answers_request_cancelled() {
     let _guard = workspace_lock();
     let workspace = Workspace::new(BROKEN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-cancel"));
-    handshake(&mut h, 1);
 
     h.burst(
         &[
@@ -668,7 +931,7 @@ fn cancel_of_a_queued_dartq_check_answers_request_cancelled() {
                 "dartq/check",
                 json!({ "paths": [workspace.path("lib")] }),
             ),
-            notification("$/cancelRequest", json!({ "id": 2 })),
+            notification("dartq/cancel", json!({ "id": 2 })),
         ],
         1,
     );
@@ -683,10 +946,7 @@ fn cancel_of_a_queued_dartq_check_answers_request_cancelled() {
     );
     assert!(answer.get("result").is_none(), "no result rides the cancel");
 
-    // Shutdown answers, then exit is the clean end (a bare `exit` is
-    // EXIT_WITHOUT_SHUTDOWN).
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -698,7 +958,6 @@ fn dartq_verbosity_minimal_keeps_the_red_line_fields() {
     let _guard = workspace_lock();
     let workspace = Workspace::new(BROKEN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-verbosity"));
-    handshake(&mut h, 1);
 
     h.step(
         &request(2, "dartq/analyze", json!({ "verbosity": "minimal" })),
@@ -743,10 +1002,7 @@ fn dartq_verbosity_minimal_keeps_the_red_line_fields() {
     assert!(entry.get("severity").is_some(), "compact keeps severity");
     assert!(entry.get("message").is_some(), "compact keeps the message");
 
-    // Shutdown answers, then exit is the clean end (a bare `exit` is
-    // EXIT_WITHOUT_SHUTDOWN).
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
@@ -757,7 +1013,6 @@ fn dartq_invalid_verbosity_answers_invalid_params() {
     let _guard = workspace_lock();
     let workspace = Workspace::new(CLEAN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-invalid-verbosity"));
-    handshake(&mut h, 0);
 
     h.step(
         &request(
@@ -775,14 +1030,11 @@ fn dartq_invalid_verbosity_answers_invalid_params() {
     let answer = answer_result(&h, 3);
     assert_eq!(answer["schema_version"], 1);
 
-    // Shutdown answers, then exit is the clean end (a bare `exit` is
-    // EXIT_WITHOUT_SHUTDOWN).
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
-/// Multi-root context routing (PRD §16.2) over the wire: a `context` tag
+/// Multi-root context routing over the wire: a `context` tag
 /// routes the request to that declared context's engine — the
 /// conditional-import fixture resolves the heavy branch in the default
 /// context and the light branch in the `t` fork (which declares
@@ -801,7 +1053,6 @@ fn dartq_context_routes_and_unknown_tag_fails_loud() {
     .expect("write heavy");
     fs::write(workspace.path("lib/light.dart"), "void light() {}\n").expect("write light");
     let mut h = spawn_with_heavy_context(&workspace, &store_root("rpc-context"));
-    handshake(&mut h, 1);
 
     h.burst(
         &[
@@ -863,8 +1114,7 @@ fn dartq_context_routes_and_unknown_tag_fails_loud() {
         "the rejection names the selector set: {error}"
     );
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 
     fs::remove_dir_all(&workspace.root).ok();
@@ -881,8 +1131,14 @@ fn dartq_fix_emits_real_builtin_rows_with_provenance() {
     let workspace = Workspace::new(CLEAN_MAIN);
     let fixable = workspace.root.join("fixable.dart");
     fs::write(&fixable, "void f() { var a = new B(); }\n").expect("write fixable");
+    // The options file is the fixture's governing posture: options-less
+    // enables nothing (#936), so the rule rides an explicit enable.
+    fs::write(
+        workspace.root.join("analysis_options.yaml"),
+        "linter:\n  rules:\n    - unnecessary_new\n",
+    )
+    .expect("write options");
     let mut h = spawn(&workspace, &store_root("rpc-fix-rows"));
-    handshake(&mut h, 0);
 
     h.step(
         &request(
@@ -897,11 +1153,26 @@ fn dartq_fix_emits_real_builtin_rows_with_provenance() {
     let files = result["files"].as_array().expect("files array");
     assert_eq!(files.len(), 1, "the fixable file enters the document set");
     let edits = files[0]["edits"].as_array().expect("edits array");
-    assert_eq!(edits.len(), 1);
+    assert_eq!(edits.len(), 3, "the rewrite plus the two ignore offers");
     assert_eq!(edits[0]["source"], "builtin-lint");
     assert_eq!(edits[0]["offset"], 19);
     assert_eq!(edits[0]["length"], 4, "keyword plus trailing space");
     assert_eq!(edits[0]["anchor"]["line"], 1);
+    // Every diagnostic also rides the line and file ignore offers (the
+    // builtin-ignore provenance), both anchored at the file head.
+    assert_eq!(edits[1]["source"], "builtin-ignore");
+    assert_eq!(edits[1]["offset"], 0);
+    assert_eq!(edits[1]["length"], 0);
+    assert_eq!(edits[1]["replacement"], "// ignore: unnecessary_new\n");
+    assert_eq!(edits[1]["anchor"]["line"], 1);
+    assert_eq!(edits[2]["source"], "builtin-ignore");
+    assert_eq!(edits[2]["offset"], 0);
+    assert_eq!(edits[2]["length"], 0);
+    assert_eq!(
+        edits[2]["replacement"],
+        "// ignore_for_file: unnecessary_new\n\n"
+    );
+    assert_eq!(edits[2]["anchor"]["line"], 1);
 
     h.step(
         &request(
@@ -918,8 +1189,7 @@ fn dartq_fix_emits_real_builtin_rows_with_provenance() {
         "the disk-view rejection names the selector: {error}"
     );
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 
     fs::remove_dir_all(&workspace.root).ok();
@@ -927,14 +1197,13 @@ fn dartq_fix_emits_real_builtin_rows_with_provenance() {
 
 /// dartq/assists answers through the staged dispatch (progress notice at
 /// the drain, answer one worker hop later): with no plugins discovered the
-/// assist list is empty and schema-stamped; a missing target is the usage
-/// tier; an `agentId` selector is rejected.
+/// answer carries the built-in rows alone, schema-stamped; a missing target
+/// is the usage tier; an `agentId` selector is rejected.
 #[test]
 fn dartq_assists_answers_schema_stamped_without_plugins() {
     let _guard = workspace_lock();
     let workspace = Workspace::new(CLEAN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-assists"));
-    handshake(&mut h, 0);
 
     h.step(
         &request(
@@ -945,10 +1214,45 @@ fn dartq_assists_answers_schema_stamped_without_plugins() {
         1,
     );
     let result = answer_result(&h, 2);
+    // Offset 0 rests on the `void` return type, before the body's first
+    // token end, so the built-in async-body assist proposes (the official
+    // guard declines only past `body.block.beginToken.end`): one change,
+    // two edits — the `async ` insertion at the body's `{` and the
+    // `Future<void>` wrap over the written return type. Empty anchor
+    // flanks (the line start) are omitted.
     assert_eq!(
         result,
-        json!({ "file": workspace.path("lib/main.dart"), "schema_version": 1, "assists": [] }),
-        "no plugins, no assists, schema-stamped"
+        json!({
+            "file": workspace.path("lib/main.dart"),
+            "schema_version": 1,
+            "assists": [{
+                "message": "Convert to async function body",
+                "source": "builtin-assist",
+                "priority": 31,
+                "edits": [
+                    {
+                        "offset": 12,
+                        "length": 0,
+                        "replacement": "async ",
+                        "source": "builtin-assist",
+                        "anchor": {
+                            "line": 1,
+                            "column": 13,
+                            "context_before": " main() ",
+                            "context_after": "{}",
+                        },
+                    },
+                    {
+                        "offset": 0,
+                        "length": 4,
+                        "replacement": "Future<void>",
+                        "source": "builtin-assist",
+                        "anchor": { "line": 1, "column": 1, "context_after": " main() " },
+                    },
+                ],
+            }],
+        }),
+        "no plugins: the built-in async-body row alone, schema-stamped"
     );
 
     h.step(
@@ -980,8 +1284,46 @@ fn dartq_assists_answers_schema_stamped_without_plugins() {
     let error = answer_error(&h, 4);
     assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+
+    fs::remove_dir_all(&workspace.root).ok();
+}
+
+/// dartq/assists threads the session's SDK root into the resolved-light
+/// assist mount: `Add return type` is a resolved-only producer (silent
+/// without a mounted engine), so the row answers only when the commands
+/// layer receives the session's SDK — the synthetic fixture SDK, which no
+/// `DART_SDK` environment names. The pre-fix hard-coded `None` mounted
+/// nothing here and the row was silently absent.
+#[test]
+fn dartq_assists_mounts_the_session_sdk_for_resolved_rows() {
+    let _guard = workspace_lock();
+    let workspace = Workspace::new("f() { return 42; }\n");
+    let mut h = spawn(&workspace, &store_root("rpc-assists-sdk"));
+
+    h.step(
+        &request(
+            2,
+            "dartq/assists",
+            json!({ "path": workspace.path("lib/main.dart"), "offset": 0, "length": 0 }),
+        ),
+        1,
+    );
+    let result = answer_result(&h, 2);
+    let assists = result["assists"].as_array().expect("assists array");
+    let row = assists
+        .iter()
+        .find(|row| row["message"] == "Add return type")
+        .expect("the resolved-only row mounts through the session SDK");
+    assert_eq!(row["source"], "builtin-assist");
+    assert_eq!(row["priority"], 30);
+    // The inferred return type inserts before the name (the resolved mount's
+    // type, not the engine-free silence).
+    assert_eq!(row["edits"][0]["offset"], 0);
+    assert_eq!(row["edits"][0]["replacement"], "int ");
+
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 
     fs::remove_dir_all(&workspace.root).ok();
@@ -1017,7 +1359,6 @@ fn live_plugin_fixes_and_assists_dispatch_end_to_end() {
     fs::write(plugin_dir.join("dartq_plugin.json"), manifest).expect("manifest");
 
     let mut h = spawn(&workspace, &store_root("rpc-assists-live"));
-    handshake(&mut h, 0);
 
     h.step(
         &request(
@@ -1068,15 +1409,14 @@ fn live_plugin_fixes_and_assists_dispatch_end_to_end() {
     assert_eq!(edits[1]["offset"], 19);
     assert_eq!(edits[1]["replacement"], "const ");
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 
     fs::remove_dir_all(&workspace.root).ok();
 }
 
 // ---------------------------------------------------------------------------
-// dartq/index (the §15.1 family's eighth face) and the non-.dart watch
+// dartq/index and the non-.dart watch
 // reload — added by the #473 lane; everything above is the pre-existing
 // suite.
 // ---------------------------------------------------------------------------
@@ -1092,7 +1432,6 @@ fn dartq_index_matches_the_cli_totals() {
     let _guard = workspace_lock();
     let workspace = seeded_query_workspace();
     let mut h = spawn(&workspace, &store_root("rpc-index"));
-    handshake(&mut h, 0);
 
     h.step(&request(2, "dartq/index", json!({})), 1);
     let result = answer_result(&h, 2);
@@ -1137,14 +1476,13 @@ fn dartq_index_matches_the_cli_totals() {
         "{error}"
     );
 
-    h.step(&request(9, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 
     fs::remove_dir_all(&workspace.root).ok();
 }
 
-/// The §15.1 family answers 1:1 over the wire: all eight CLI commands have
+/// The family answers 1:1 over the wire: all eight CLI commands have
 /// a live daemon face on one fixture session — the round-trip pin the #474
 /// schema-freeze sweep builds on.
 #[test]
@@ -1153,26 +1491,28 @@ fn dartq_family_answers_one_to_one_over_the_fixture() {
     let workspace = seeded_query_workspace();
     let a = workspace.path("lib/a.dart");
     let mut h = spawn(&workspace, &store_root("rpc-family"));
-    handshake(&mut h, 0);
 
-    let cases: [(i64, &str, Value); 8] = [
-        (2, "dartq/index", json!({})),
+    let cases: [(i64, &str, Value, i64); 8] = [
+        (2, "dartq/index", json!({}), 1),
         (
             3,
             "dartq/check",
             json!({ "paths": [workspace.path("lib")] }),
+            1,
         ),
-        (4, "dartq/analyze", json!({})),
-        (5, "dartq/query", json!({ "name": "Foo" })),
+        (4, "dartq/analyze", json!({}), 1),
+        (5, "dartq/query", json!({ "name": "Foo" }), 1),
         (
             6,
             "dartq/impact",
             json!({ "path": a.display().to_string() }),
+            2, // the impact report stamps its own schema generation
         ),
         (
             7,
             "dartq/explain",
             json!({ "symbol": "Foo", "sdk": workspace.path("sdk") }),
+            1,
         ),
         (
             8,
@@ -1181,14 +1521,20 @@ fn dartq_family_answers_one_to_one_over_the_fixture() {
                 "path": a.display().to_string(),
                 "sdk_roots": [workspace.path("sdk")],
             }),
+            1,
         ),
-        (9, "dartq/fix", json!({ "paths": [workspace.path("lib")] })),
+        (
+            9,
+            "dartq/fix",
+            json!({ "paths": [workspace.path("lib")] }),
+            1,
+        ),
     ];
-    for (id, method, params) in cases {
+    for (id, method, params, schema) in cases {
         h.step(&request(id, method, params), 1);
         let result = answer_result(&h, id);
         assert_eq!(
-            result["schema_version"], 1,
+            result["schema_version"], schema,
             "{method} is schema-stamped: {result}"
         );
     }
@@ -1216,8 +1562,7 @@ fn dartq_family_answers_one_to_one_over_the_fixture() {
     );
     assert!(answer_result(&h, 9).get("files").is_some(), "fix documents");
 
-    h.step(&request(10, "shutdown", json!(null)), 1);
-    let (code, _) = h.exit();
+    let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 
     fs::remove_dir_all(&workspace.root).ok();
@@ -1265,7 +1610,7 @@ impl std::io::Read for WatchFeed {
 fn main_pushes(frames: &[Value]) -> Vec<Vec<Value>> {
     frames
         .iter()
-        .filter(|frame| frame["method"] == "textDocument/publishDiagnostics")
+        .filter(|frame| frame["method"] == "dartq/diagnostics")
         .filter_map(|frame| {
             let uri = frame["params"]["uri"].as_str()?;
             uri.ends_with("lib/main.dart").then(|| {
@@ -1295,9 +1640,9 @@ fn wait_for(mut probe: impl FnMut() -> Option<Vec<Value>>) -> Vec<Value> {
 
 /// A non-`.dart` watch change refreshes the context: after the manifest
 /// touch, the debounced batch carries it, the refresh re-reads every `.dart`
-/// file, and the on-disk fix the daemon was never told about through LSP
-/// converges into the pushed diagnostics — while the config bytes themselves
-/// never surface as analysis content.
+/// file, and the on-disk fix the daemon was never told about through
+/// `dartq/sync` converges into the pushed diagnostics — while the config
+/// bytes themselves never surface as analysis content.
 #[test]
 fn watch_refreshes_the_context_on_a_non_dart_change() {
     let _guard = workspace_lock();
@@ -1328,25 +1673,18 @@ fn watch_refreshes_the_context_on_a_non_dart_change() {
     // The transcript so far, decoded.
     let transcript = || common::frames(&output.0.lock().expect("output lock").clone());
 
-    // Handshake: the sweep publishes the broken fixture's diagnostic set.
-    client
-        .send(common::framed(&common::request(1, "initialize", json!({}))))
-        .expect("initialize send");
-    client
-        .send(common::framed(&common::notification(
-            "initialized",
-            json!({}),
-        )))
-        .expect("initialized send");
+    // The startup drain publishes the broken fixture's diagnostic set —
+    // no handshake, the sweep lands ahead of the first client frame.
     let first = wait_for(|| main_pushes(&transcript()).first().cloned());
     assert!(
         !first.is_empty(),
         "the broken fixture publishes errors: {first:?}"
     );
 
-    // The on-disk fix plus the manifest touch: neither is announced through
-    // LSP. The watch batch carries both; the split routes the manifest to
-    // the context refresh, whose re-discovery re-reads main.dart.
+    // The on-disk fix plus the manifest touch: neither is reported through
+    // `dartq/sync`. The watch batch carries both; the split routes the
+    // manifest to the context refresh, whose re-discovery re-reads
+    // main.dart.
     fs::write(workspace.path("lib/main.dart"), CLEAN_MAIN).expect("fix main on disk");
     fs::write(
         workspace.path("pubspec.yaml"),
@@ -1355,7 +1693,7 @@ fn watch_refreshes_the_context_on_a_non_dart_change() {
     .expect("touch the manifest");
 
     // The refresh converges the view to the disk state: main's diagnostics
-    // drop to empty without any didChange.
+    // drop to empty without any `dartq/sync` report.
     wait_for(|| {
         let empty = main_pushes(&transcript()).last().is_some_and(Vec::is_empty);
         empty.then(Vec::new)
@@ -1391,13 +1729,8 @@ fn watch_refreshes_the_context_on_a_non_dart_change() {
         );
     }
 
-    // Clean end: shutdown then exit.
-    client
-        .send(common::framed(&common::request(9, "shutdown", json!(null))))
-        .expect("shutdown send");
-    client
-        .send(common::framed(&common::notification("exit", json!(null))))
-        .expect("exit send");
+    // Clean end: EOF — a client close is the session's only end signal.
+    drop(client);
     let code = server
         .join()
         .expect("server thread does not panic")
