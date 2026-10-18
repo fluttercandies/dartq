@@ -772,6 +772,12 @@ pub(crate) struct LibraryInfo {
     /// formation clones an `Arc` refcount per formed library, never
     /// re-copies the bytes.
     pub uri: Arc<str>,
+    /// The declared `library <name>;` name, `""` when the defining file has
+    /// none (the oracle's empty default, `library_builder.dart:750-763`):
+    /// fed to the resolution graph at build time, where the semantic layer
+    /// reads it as the package:meta recognition key (upstream
+    /// `element.dart:2100-2117`). One boxed copy per library.
+    pub name: Box<str>,
     /// The defining (non-`part of`) file.
     pub defining: FileId,
     /// Included part files, part-directive order.
@@ -1282,6 +1288,15 @@ pub(crate) struct EngineState {
     /// sources; the reverse query (`importers`) cannot answer it because it
     /// only holds resident targets. Maintained like [`Self::part_offers`].
     pub import_sources: TargetRows<FileId>,
+    /// Raw `part of '<uri>'` sources (residency-independent): target file →
+    /// part files whose current facts carry a URI-form `part of` directive
+    /// resolving to it. The relink pass's holder index for the claim side
+    /// the two indexes above do not cover: a created file can satisfy a
+    /// previously missing `part of` URI, and a removed one must un-resolve
+    /// it. Name-form part-ofs carry no URI and never land here. Maintained
+    /// like [`Self::part_offers`]. Row-level CSR layout — see
+    /// [`TargetRows`].
+    pub part_of_sources: TargetRows<FileId>,
     /// Per-library result cache.
     pub results: FxHashMap<LibraryId, LibraryResult>,
     /// Change generation per library: bumped each time a fresh run is stored
@@ -1548,6 +1563,7 @@ impl EngineState {
             importers: TargetRows::default(),
             part_offers: TargetRows::default(),
             import_sources: TargetRows::default(),
+            part_of_sources: TargetRows::default(),
             results: FxHashMap::default(),
             library_generations: FxHashMap::default(),
             merged: None,
@@ -1993,15 +2009,17 @@ impl EngineState {
         std::mem::take(&mut self.capture_dirty)
     }
 
-    /// Exact byte footprint of the three per-target adjacency indexes —
+    /// Exact byte footprint of the four per-target adjacency indexes —
     /// [`Self::importers`] + [`Self::part_offers`] + [`Self::import_sources`]
-    /// slot arenas and live rows (the S6 graph-maps segment of the RSS
-    /// decomposition probe). Exact under the new row-level CSR layout: no
-    /// hash slack or per-entry shell remains uncounted.
+    /// + [`Self::part_of_sources`] slot arenas and live rows (the S6
+    /// graph-maps segment of the RSS decomposition probe). Exact under the
+    /// new row-level CSR layout: no hash slack or per-entry shell remains
+    /// uncounted.
     pub(crate) fn graph_maps_bytes(&self) -> u64 {
         (self.importers.memory_bytes()
             + self.part_offers.memory_bytes()
-            + self.import_sources.memory_bytes()) as u64
+            + self.import_sources.memory_bytes()
+            + self.part_of_sources.memory_bytes()) as u64
     }
 
     /// The structural resident state's byte estimate: the two immortal-id
@@ -2155,6 +2173,7 @@ mod tests {
     fn stub_info(uri: &str) -> LibraryInfo {
         LibraryInfo {
             uri: Arc::from(uri),
+            name: "".into(),
             defining: FileTable::new().intern(std::path::Path::new("/stub.dart")),
             parts: Vec::new(),
             content: Box::new([content_hash(uri.as_bytes())]),

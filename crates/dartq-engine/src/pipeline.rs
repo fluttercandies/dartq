@@ -125,6 +125,10 @@ pub(crate) fn analyze(
     let mut structure_changed = std::mem::take(&mut state.structure_changed);
     let mut structure_removed = std::mem::take(&mut state.structure_removed);
     structure_changed.extend(applied.changed.iter().copied());
+    // Relinked residents rewrote inside the apply: their digests refresh
+    // with the batch's — a resolved-target FileId flip (the generated-file
+    // fallback) moves the folded face, a pure `code` flip digests equal.
+    structure_changed.extend(applied.relinked.iter().copied());
     structure_removed.extend(applied.removed.iter().copied());
     let structure_moved = refresh_structure_digests(state, &structure_changed, &structure_removed);
 
@@ -1250,6 +1254,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
     for library in &live {
         let info = state.libraries.info(*library).expect("live library");
         let graph_id = builder.intern(&info.uri);
+        builder.library_name(graph_id, &info.name);
         builder.unit(graph_id, info.defining);
         for &file in &info.parts {
             builder.unit(graph_id, file);
@@ -2579,6 +2584,269 @@ mod tests {
         );
     }
 
+    /// The relink-up arm of the directive relink (#2100): a resident whose
+    /// import target was missing at intake must re-resolve when a later
+    /// batch creates the target — the intake resolution ran before the
+    /// target existed, and nothing else ever re-runs it. Without the
+    /// relink the holder keeps its stale `uri_does_not_exist` row while a
+    /// full recompute reports none (the recovery-missing-uri-relink
+    /// divergence).
+    #[test]
+    fn created_target_relinks_missing_import_holders() {
+        let fixture = crate::l1::tests::Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let holder = crate::l1::tests::set(
+            &mut state,
+            &lib.join("holder.dart"),
+            "import 'target.dart';\n",
+        );
+        let batch = crate::l1::apply(&mut state, &mut |_| {});
+        assert!(batch.relinked.is_empty(), "no move to relink against");
+        let facts = &state.residency[&holder];
+        assert_eq!(facts.diagnostics.len(), 1);
+        assert_eq!(facts.diagnostics[0].code.name, "uri_does_not_exist");
+        assert_eq!(
+            facts.directives[0].code,
+            Some(dartq_resolution::ResolutionCode::UriDoesNotExist),
+        );
+        let holder_lib = state.library_of_file[&holder];
+
+        // Batch 2 creates the target: the holder's directive target now
+        // exists — the row drops, the code clears, the holder reports as
+        // relinked, and its owner library re-enters the dirty set (its
+        // output face moved even though no folded identity input did).
+        crate::l1::tests::set(
+            &mut state,
+            &lib.join("target.dart"),
+            "int target() => 0;\n",
+        );
+        let batch = crate::l1::apply(&mut state, &mut |_| {});
+        assert_eq!(
+            batch.relinked,
+            vec![holder],
+            "the holder is the only relinked resident"
+        );
+        let facts = &state.residency[&holder];
+        assert_eq!(
+            facts.directives[0].code, None,
+            "the resolved target dropped its code"
+        );
+        assert!(
+            facts.diagnostics.is_empty(),
+            "the uri_does_not_exist tail row dropped: {:?}",
+            facts.diagnostics
+        );
+        assert!(
+            batch.invalidated.contains(&holder_lib),
+            "the holder's owner re-enters the dirty set"
+        );
+    }
+
+    /// The relink-down arm (#2100): removing a file whose target FileId a
+    /// resident's directive points at must re-code the directive
+    /// `uri_does_not_exist` and restore the tail row — symmetric to
+    /// relink-up, and the second half of the same divergence class.
+    #[test]
+    fn removed_target_unresolves_import_holders() {
+        let fixture = crate::l1::tests::Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let holder = crate::l1::tests::set(
+            &mut state,
+            &lib.join("holder.dart"),
+            "import 'target.dart';\n",
+        );
+        let target = crate::l1::tests::set(
+            &mut state,
+            &lib.join("target.dart"),
+            "int target() => 0;\n",
+        );
+        let batch = crate::l1::apply(&mut state, &mut |_| {});
+        assert!(batch.relinked.is_empty());
+        assert!(state.residency[&holder].diagnostics.is_empty());
+        let holder_lib = state.library_of_file[&holder];
+
+        // Batch 2 removes the target: the holder's directive un-resolves —
+        // the code returns, the tail row returns, and the holder reports
+        // relinked.
+        state.pending_order.push(target);
+        state
+            .pending
+            .insert(target, crate::state::PendingChange::Remove);
+        let batch = crate::l1::apply(&mut state, &mut |_| {});
+        assert_eq!(batch.removed, vec![target]);
+        assert_eq!(
+            batch.relinked,
+            vec![holder],
+            "the holder is the only relinked resident"
+        );
+        let facts = &state.residency[&holder];
+        assert_eq!(
+            facts.directives[0].code,
+            Some(dartq_resolution::ResolutionCode::UriDoesNotExist),
+        );
+        assert_eq!(facts.diagnostics.len(), 1);
+        assert_eq!(facts.diagnostics[0].code.name, "uri_does_not_exist");
+        assert!(
+            batch.invalidated.contains(&holder_lib),
+            "the holder's owner re-enters the dirty set"
+        );
+    }
+
+    /// The no-op arm (#2100): a set-moving batch that touches no holder —
+    /// the created file is nobody's directive target — must not relink
+    /// anything, must leave the bystander's owner library's recorded run
+    /// standing, and must not grow the invalidated set with it. The relink
+    /// is an index-driven exact set, not a residency scan that rewrites
+    /// every resident on every move.
+    #[test]
+    fn set_moving_batch_skips_unaffected_residents() {
+        let fixture = crate::l1::tests::Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let bystander = crate::l1::tests::set(
+            &mut state,
+            &lib.join("bystander.dart"),
+            "import 'other.dart';\n",
+        );
+        crate::l1::tests::set(
+            &mut state,
+            &lib.join("other.dart"),
+            "int other() => 0;\n",
+        );
+        let mut graph: Option<ResolvedGraph> = None;
+        let cancel = CancellationToken::new();
+        let merged = analyze(&mut state, &mut graph, None, &[], &mut |_| {}, &cancel)
+            .expect("cold analyze");
+        assert!(
+            merged
+                .iter()
+                .all(|row| row.file != bystander || row.code.name != "uri_does_not_exist"),
+            "the bystander's import resolved"
+        );
+        let bystander_lib = state.library_of_file[&bystander];
+        let recorded = state
+            .results
+            .get(&bystander_lib)
+            .map(|recorded| recorded.cycle_fingerprint);
+        assert!(recorded.is_some(), "the bystander's run recorded");
+
+        // Batch 2 creates an unrelated file: a set move, but nobody's
+        // directives point at it. The relink gathers zero holders.
+        crate::l1::tests::set(
+            &mut state,
+            &lib.join("unrelated.dart"),
+            "int unrelated() => 0;\n",
+        );
+        let batch = crate::l1::apply(&mut state, &mut |_| {});
+        assert!(
+            batch.relinked.is_empty(),
+            "no directive targets the created file: {:?}",
+            batch.relinked
+        );
+        assert!(
+            !batch.invalidated.contains(&bystander_lib),
+            "the bystander's library is untouched"
+        );
+        assert_eq!(
+            state
+                .results
+                .get(&bystander_lib)
+                .map(|recorded| recorded.cycle_fingerprint),
+            recorded,
+            "the bystander's recorded run stands"
+        );
+    }
+
+    /// The delete-create regression shape (#2100 follow-up): a resident
+    /// importer whose missing target is removed and re-created across two
+    /// batches keeps its reverse edge to the target, so a later signature
+    /// edit on the target propagates the dirty set to the importer's
+    /// library. The bug paired two facts: `was_resident` answered
+    /// post-batch residency, so the relinked holder's own edge event saw
+    /// the re-created target on both sides and never added the edge — and
+    /// `close`'s membership-move seed gate could not tell relinked files
+    /// (content-unchanged) from content-changed ones. Without the edge the
+    /// step-4 signature splice starved the importer's recompute (in the
+    /// sequence: `argument_type_not_assignable` at the `legacyCompute(2)`
+    /// call site never reached the incremental face).
+    #[test]
+    fn recreated_target_keeps_importer_edge_for_signature_propagation() {
+        let fixture = crate::l1::tests::Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let main = crate::l1::tests::set(
+            &mut state,
+            &lib.join("main.dart"),
+            "import 'legacy.dart';\nint useLegacy() => legacyCompute(2);\n",
+        );
+        let legacy = crate::l1::tests::set(
+            &mut state,
+            &lib.join("legacy.dart"),
+            "int legacyCompute(int x) => x;\n",
+        );
+        crate::l1::apply(&mut state, &mut |_| {});
+        let main_lib = state.library_of_file[&main];
+
+        // Step 2: remove the target — the importer relinks down and the
+        // edge to it drops with the target's residency.
+        state.pending_order.push(legacy);
+        state
+            .pending
+            .insert(legacy, crate::state::PendingChange::Remove);
+        let batch = crate::l1::apply(&mut state, &mut |_| {});
+        assert_eq!(batch.relinked, vec![main]);
+        assert!(
+            !state
+                .importers
+                .row(legacy)
+                .iter()
+                .any(|edge| edge.library == main_lib),
+            "the edge dropped with the removed target"
+        );
+
+        // Step 3: re-create the target — the importer relinks up AND its
+        // reverse edge must come back through its own edge event (the
+        // sources loop skips it as an own-event-ran file; `was_resident`
+        // must answer pre-apply residency so the add is not folded away).
+        crate::l1::tests::set(
+            &mut state,
+            &lib.join("legacy.dart"),
+            "int legacyCompute(int x) => x;\n",
+        );
+        let batch = crate::l1::apply(&mut state, &mut |_| {});
+        assert_eq!(batch.relinked, vec![main]);
+        assert!(
+            state
+                .importers
+                .row(legacy)
+                .iter()
+                .any(|edge| edge.library == main_lib),
+            "the reverse edge to the re-created target was restored"
+        );
+
+        // Step 4: a signature splice on the target — the seed propagates
+        // through the restored edge to the importer's library. The target
+        // library's id is re-read after re-creation: retirement freed the
+        // first incarnation's arena slot and re-interning may recycle it.
+        let legacy_lib = state.library_of_file[&legacy];
+        crate::l1::tests::set(
+            &mut state,
+            &lib.join("legacy.dart"),
+            "int legacyCompute(String x) => x.length;\n",
+        );
+        let batch = crate::l1::apply(&mut state, &mut |_| {});
+        assert!(
+            batch.invalidated.contains(&legacy_lib),
+            "the edited library dirties"
+        );
+        assert!(
+            batch.invalidated.contains(&main_lib),
+            "the importer's library dirties through the restored edge"
+        );
+    }
+
     /// The cache-reuse proof at the state level (#1039, audit g1034 F1): a
     /// zero-dirty cycle serves the standing merged output — the same Arc
     /// allocation, no rebuild — a signature edit advances the contributors'
@@ -3022,14 +3290,15 @@ mod tests {
 
     /// The retired serial walk of [`build_library_graph`], verbatim — the
     /// parity oracle the parallel pass must reproduce byte for byte: node
-    /// registration order, per-node declaration and edge sequences, and the
-    /// target numbering they carry.
+    /// registration order, per-node declared library names, per-node
+    /// declaration and edge sequences, and the target numbering they carry.
     fn serial_library_graph(state: &mut EngineState) -> LibraryGraph {
         let mut builder = LibraryGraphBuilder::new(&state.strings);
         let mut graph_ids: FxHashMap<LibraryId, dartq_resolution::LibraryId> = FxHashMap::default();
         for library in state.libraries.live() {
             let info = state.libraries.info(library).expect("live library");
             let graph_id = builder.intern(&info.uri);
+            builder.library_name(graph_id, &info.name);
             builder.unit(graph_id, info.defining);
             for &file in &info.parts {
                 builder.unit(graph_id, file);
@@ -3115,9 +3384,10 @@ mod tests {
 
     /// Byte-parity assert: the parallel-built graph and the serial oracle
     /// carry identical node counts and, for every engine library (ascending),
-    /// identical uri, import/export edge sequences (target ids included —
-    /// registration order is pinned), declaration lookups, class-modifier
-    /// faces, and `declaring_libraries` registration order.
+    /// identical uri, declared library name, import/export edge sequences
+    /// (target ids included — registration order is pinned), declaration
+    /// lookups, class-modifier faces, and `declaring_libraries` registration
+    /// order.
     fn assert_graphs_match(state: &EngineState, built: &ResolvedGraph, oracle: &LibraryGraph) {
         assert_eq!(built.graph.len(), oracle.len(), "node count");
         let mut names: Vec<StringId> = state
@@ -3138,6 +3408,11 @@ mod tests {
                 oracle.uri(built_id),
                 "node order at {}",
                 library.index()
+            );
+            assert_eq!(
+                built.graph.name(built_id),
+                oracle.name(built_id),
+                "declared name of {uri}"
             );
             assert_eq!(
                 format!("{:?}", built.graph.import_edges(built_id)),
@@ -3218,6 +3493,32 @@ mod tests {
         let built = build_library_graph(&mut state);
         let oracle = serial_library_graph(&mut state);
         assert_graphs_match(&state, &built, &oracle);
+    }
+
+    /// The library-name feed (#2117): the declared `library` name reaches
+    /// the built graph — the package:meta recognition key the semantic
+    /// layer reads (`element.dart:2100-2117`) — and a directive-less
+    /// library carries the oracle's empty-string name
+    /// (`library_builder.dart:750-763`). The serial oracle makes the
+    /// identical feed, so the two graphs stay byte-equal on the face.
+    #[test]
+    fn graph_library_name_carries_the_declared_name_or_empty() {
+        let fixture = crate::l1::tests::Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let meta_file = crate::l1::tests::set(&mut state, &lib.join("meta.dart"), "library meta;\n");
+        let plain_file =
+            crate::l1::tests::set(&mut state, &lib.join("plain.dart"), "int f() => 1;\n");
+        crate::l1::apply(&mut state, &mut |_| {});
+
+        let built = build_library_graph(&mut state);
+        let oracle = serial_library_graph(&mut state);
+        assert_graphs_match(&state, &built, &oracle);
+        for (file, expected) in [(meta_file, "meta"), (plain_file, "")] {
+            let graph_id = built.graph_ids[&state.library_of_file[&file]];
+            assert_eq!(built.graph.name(graph_id), expected, "fed name");
+            assert_eq!(oracle.name(graph_id), expected, "oracle name");
+        }
     }
 
     /// The core face carries dart:core's `Iterable` class: the engine's

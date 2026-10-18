@@ -1661,14 +1661,22 @@ fn the_diagnostic_name_universe_matches_on_name_not_unique_name() {
         "dead_code_late_wildcard_variable_initializer"
     ));
 }
-/// The YAML failure faces (#938): the initial file's broken YAML is one
-/// `parse_error` row — `COMPILE_TIME_ERROR` (the CLI's severity exit maps it
-/// to the errors tier), the raw failure point as a zero-length span, the
+/// The YAML failure faces (#938, machine-face posture re-adjudicated by the
+/// #1589 five-form oracle probe and landed #2002): the initial file's broken
+/// YAML is machine-face SILENT — the oracle emits no diagnostic row for a
+/// malformed options file on any output face — so the failure never joins
+/// `issues`; it is kept as data in `parse_failure` (same geometry, consumed
+/// by the faces' stderr advisory, `options_failure_notice` in
+/// dartq-commands::analyze) while the kept shape stays the probe's
+/// parse-error geometry: the raw failure point as a zero-length span, the
 /// message the located error text with its ` at line L column C` suffix
-/// stripped; an included file's failure wraps into
+/// stripped. An included file's failure still reports
 /// `included_file_parse_error` (`{message} in {file}({start}..{end})`,
-/// walker :48-66) at the branch anchor. `serde_yaml` yields one failure
-/// point, so the wrapped span shows it at both ends.
+/// walker :48-66) at the branch anchor — a probed-as-emitted code.
+/// `serde_yaml` yields one failure point, so the wrapped span shows it at
+/// both ends. This harness observes only the loaded struct, so the advisory
+/// itself is pinned at the commands layer; here the zero-row contract and
+/// the kept data shape are the pins.
 #[test]
 fn yaml_failures_report_parse_error_faces() {
     let dir = TempDir::new("parse_error");
@@ -1677,8 +1685,15 @@ fn yaml_failures_report_parse_error_faces() {
 
     let options =
         AnalysisOptions::load(&dir.path("analysis_options.yaml"), &empty_config(), &dir.0);
-    assert_eq!(options.issues.len(), 1, "{:?}", options.issues);
-    let issue = &options.issues[0];
+    assert!(
+        options.issues.is_empty(),
+        "the oracle emits no machine row for a malformed options file: {:?}",
+        options.issues
+    );
+    let issue = options
+        .parse_failure
+        .as_ref()
+        .expect("the failure is kept as data for the stderr advisory");
     assert_eq!(issue.code.name, "parse_error");
     assert_eq!(issue.code.machine, "PARSE_ERROR");
     assert_eq!(
@@ -1780,8 +1795,10 @@ fn plugins_section_reports_the_315_faces() {
         scalar.issues[0].message,
         "Invalid format for the 'plugins' section."
     );
-    assert_eq!(scalar.issues[0].offset, 0);
-    assert_eq!(scalar.issues[0].length, 7);
+    // The row anchors at the *value* node (`scalar`), not the section key —
+    // the upstream `plugins.span` face (the pinned probe's anchor).
+    assert_eq!(scalar.issues[0].offset, 9);
+    assert_eq!(scalar.issues[0].length, 6);
 
     dir.write("null.yaml", "plugins:\n");
     let nulled = AnalysisOptions::load(&dir.path("null.yaml"), &empty_config(), &dir.0);

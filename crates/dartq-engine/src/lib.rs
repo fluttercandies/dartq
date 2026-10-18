@@ -51,7 +51,7 @@ pub mod pipeline;
 pub mod query;
 pub mod reachability;
 pub mod scheduler;
-mod sdk_faces_gen;
+pub mod sdk_faces_gen;
 pub mod semdiag;
 pub mod state;
 pub mod store;
@@ -419,10 +419,15 @@ impl Engine {
         // an out-of-analyze apply leaves the analyze's own applied sets
         // empty, and without this record the gate would reuse a standing
         // graph that lacks the batch's formed libraries (the daemon's
-        // write face — every overlay apply lands here).
+        // write face — every overlay apply lands here). Relinked residents
+        // ride the same accumulator: their facts rewrote inside the apply,
+        // and a resolved-target FileId flip moves the folded digest face.
         self.state
             .structure_changed
             .extend(outcome.changed.iter().copied());
+        self.state
+            .structure_changed
+            .extend(outcome.relinked.iter().copied());
         self.state
             .structure_removed
             .extend(outcome.removed.iter().copied());

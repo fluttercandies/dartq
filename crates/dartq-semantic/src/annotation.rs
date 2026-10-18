@@ -27,10 +27,16 @@
 //!    a meta library and declares no local under the name (a local shadows
 //!    the import, so the annotation resolves to the local, never to meta);
 //!    prefixed: an import whose prefix matches;
-//! 3. the target library is meta — its canonical uri is
-//!    `package:meta/…`, the uri-space stand-in for the element's library
-//!    name (the corpus's vendored stand-in resolves `package:meta/meta.dart`
-//!    and carries `library meta;` for the oracle's own name test);
+//! 3. the target library is meta — the resolved import target's declared
+//!    `library <name>;` name equals `'meta'` ([`LibraryGraph::name`]), the
+//!    exact key the oracle's `_isPackageMetaGetter` tests
+//!    (`element.dart:2100-2102`: `element.library.name == _metaLibName`,
+//!    `_metaLibName` at `element.dart:1725`). A directive-less library's
+//!    name is `''` (`library_builder.dart:750-763`) — a vendored meta copy
+//!    that drops `library meta;` fails the test exactly as the oracle's
+//!    `hasLiteral` does, and the `package:meta/…` URI is never consulted:
+//!    the URI distinguishes neither a renamed real package nor a vendored
+//!    stand-in without the directive;
 //! 4. the import's combinators allow the getter name (a `show`/`hide`
 //!    filters the oracle's namespace build too).
 //!
@@ -247,19 +253,22 @@ fn imports_meta(
 ) -> bool {
     graph.import_edges(lib).iter().any(|edge| {
         edge.prefix == prefix
-            && edge
-                .target
-                .is_some_and(|target| is_meta_uri(graph.uri(target)))
+            && edge.target.is_some_and(|target| is_meta_library(graph, target))
             && edge.combinators.allows(getter_id)
     })
 }
 
-/// The canonical-uri form of the meta test: the official check reads the
-/// resolved element's library name (`_metaLibName`, `element.dart:1725`);
-/// the graph keys libraries by canonical uri, and every library of the
-/// meta package spells `package:meta/…`.
-fn is_meta_uri(uri: &str) -> bool {
-    uri.starts_with("package:meta/")
+/// The resolved-target form of the meta test: the official check reads the
+/// element's `library.name == 'meta'` (`_metaLibName`, `element.dart:1725`;
+/// `_isPackageMetaGetter`, `element.dart:2100-2102`) — the declaring
+/// library's `library meta;` directive name, not its URI and not the
+/// package it ships in. [`LibraryGraph::name`] carries exactly that
+/// directive text, `""` for a directive-less library — so a vendored meta
+/// copy that drops `library meta;` (the lints-new corpus stand-in) is
+/// unrecognized exactly as the oracle's `hasLiteral` is false there
+/// (`pkg/linter` `prefer_const_constructors.dart` gates the lint on it).
+fn is_meta_library(graph: &LibraryGraph, target: LibraryId) -> bool {
+    graph.name(target) == "meta"
 }
 
 #[cfg(test)]
@@ -271,7 +280,8 @@ mod tests {
 
     /// The shared rig: an analyzed library plus the imports and local
     /// declarations a pin needs, mirroring the engine's graph build
-    /// (`package:` canonical uris, one interned node per library).
+    /// (`package:` canonical uris, one interned node per library, the
+    /// declared `library <name>;` name registered per target).
     struct Rig {
         strings: StringTable,
         graph: LibraryGraph,
@@ -285,11 +295,17 @@ mod tests {
             // Pre-intern spellings and build the combinator lists while
             // `strings` is still exclusively ours (the builder holds a
             // shared borrow through `finish`).
-            let edges: Vec<(&'static str, Option<StringId>, Combinators)> = imports
+            let edges: Vec<(
+                &'static str,
+                Option<&'static str>,
+                Option<StringId>,
+                Combinators,
+            )> = imports
                 .iter()
                 .map(|import| {
                     (
                         import.uri,
+                        import.name,
                         import.prefix.map(|p| strings.intern(p)),
                         import.combinators(&mut strings),
                     )
@@ -302,8 +318,11 @@ mod tests {
                 let file = files.intern(Path::new("lib/app.dart"));
                 builder.declare(lib, local, file);
             }
-            for (uri, prefix, combinators) in edges {
+            for (uri, name, prefix, combinators) in edges {
                 let target = builder.intern(uri);
+                if let Some(name) = name {
+                    builder.library_name(target, name);
+                }
                 builder.import(
                     lib,
                     ImportEdge {
@@ -412,6 +431,10 @@ mod tests {
 
     struct Import {
         uri: &'static str,
+        /// The target's declared `library <name>;` name — `Some("meta")`
+        /// mirrors the real package:meta's directive; `None` is the
+        /// directive-less shape (the oracle's `''` library name).
+        name: Option<&'static str>,
         prefix: Option<&'static str>,
         show: Option<&'static [&'static str]>,
         hide: Option<&'static [&'static str]>,
@@ -421,18 +444,37 @@ mod tests {
         fn unprefixed(uri: &'static str) -> Self {
             Self {
                 uri,
+                name: None,
                 prefix: None,
                 show: None,
                 hide: None,
             }
         }
 
+        /// An unprefixed import of a library named `name` — the
+        /// `library <name>;` directive carries the oracle's identity.
+        fn named(uri: &'static str, name: &'static str) -> Self {
+            Self {
+                name: Some(name),
+                ..Self::unprefixed(uri)
+            }
+        }
+
         fn prefixed(uri: &'static str, prefix: &'static str) -> Self {
             Self {
                 uri,
+                name: None,
                 prefix: Some(prefix),
                 show: None,
                 hide: None,
+            }
+        }
+
+        /// A prefixed import of a library named `name`.
+        fn prefixed_named(uri: &'static str, name: &'static str, prefix: &'static str) -> Self {
+            Self {
+                name: Some(name),
+                ..Self::prefixed(uri, prefix)
             }
         }
 
@@ -462,7 +504,7 @@ mod tests {
     /// on the same spelling does not.
     #[test]
     fn bare_sealed_under_meta_import_recognizes() {
-        let rig = Rig::new(&[Import::unprefixed("package:meta/meta.dart")], &[]);
+        let rig = Rig::new(&[Import::named("package:meta/meta.dart", "meta")], &[]);
         assert!(rig.recognizes("sealed", "sealed"));
         assert!(!rig.recognizes("sealed", "literal"));
     }
@@ -475,19 +517,47 @@ mod tests {
     }
 
     /// An import of a non-meta package declaring its own top-level
-    /// `sealed`: the uri test rejects it — the getter identity is the
-    /// library, not the name.
+    /// `sealed`: the library-name test rejects it — the getter identity is
+    /// the resolved element's `library.name`, not the spelled name.
     #[test]
     fn same_named_getter_outside_meta_does_not_recognize() {
         let rig = Rig::new(&[Import::unprefixed("package:other/other.dart")], &[]);
         assert!(!rig.recognizes("sealed", "sealed"));
     }
 
+    /// The oracle's key is `library.name == 'meta'`, not the URI
+    /// (`element.dart:2100-2102`, `_metaLibName` at `element.dart:1725`):
+    /// the lints-new corpus's vendored `vendor/meta/lib/meta.dart` drops
+    /// `library meta;`, so a `package:meta/…` import of it must NOT
+    /// recognize — the oracle's `hasLiteral` is false there and the
+    /// `prefer_const_constructors` lint fires where a URI test would
+    /// suppress it. Conversely a `library meta;` outside the meta package
+    /// (a vendored or renamed copy keeping the directive) IS meta to the
+    /// oracle.
+    #[test]
+    fn library_name_is_the_meta_key_not_the_uri() {
+        // The vendored stand-in: package:meta URI, no `library meta;`
+        // directive — unrecognized exactly as the oracle sees it.
+        let vendored = Rig::new(&[Import::unprefixed("package:meta/meta.dart")], &[]);
+        assert!(!vendored.recognizes("sealed", "sealed"));
+        assert!(!vendored.meta_literal("literal"));
+
+        // The name travels with the directive, not the package: a
+        // `library meta;` copy under another URI still recognizes.
+        let copied = Rig::new(&[Import::named("package:vendor/m.dart", "meta")], &[]);
+        assert!(copied.recognizes("sealed", "sealed"));
+        assert!(copied.meta_literal("literal"));
+
+        // A different declared name on the same meta URI is not meta.
+        let renamed = Rig::new(&[Import::named("package:meta/meta.dart", "not_meta")], &[]);
+        assert!(!renamed.recognizes("sealed", "sealed"));
+    }
+
     /// A local top-level declaration shadows the unprefixed import: the
     /// annotation resolves locally, never to meta.
     #[test]
     fn local_shadow_suppresses_bare_recognition() {
-        let rig = Rig::new(&[Import::unprefixed("package:meta/meta.dart")], &["sealed"]);
+        let rig = Rig::new(&[Import::named("package:meta/meta.dart", "meta")], &["sealed"]);
         assert!(!rig.recognizes("sealed", "sealed"));
     }
 
@@ -497,7 +567,7 @@ mod tests {
     /// unresolved.
     #[test]
     fn prefixed_import_recognizes_by_prefix() {
-        let rig = Rig::new(&[Import::prefixed("package:meta/meta.dart", "meta")], &[]);
+        let rig = Rig::new(&[Import::prefixed_named("package:meta/meta.dart", "meta", "meta")], &[]);
         assert!(rig.recognizes("meta.sealed", "sealed"));
         assert!(!rig.recognizes("sealed", "sealed"));
         assert!(!rig.recognizes("p.sealed", "sealed"));
@@ -511,6 +581,7 @@ mod tests {
         let rig = Rig::new(
             &[Import {
                 uri: "package:meta/meta.dart",
+                name: Some("meta"),
                 prefix: None,
                 show: Some(&["literal"]),
                 hide: None,
@@ -527,7 +598,7 @@ mod tests {
     /// another meta name on the same spelling does not.
     #[test]
     fn bare_literal_recognizes() {
-        let rig = Rig::new(&[Import::unprefixed("package:meta/meta.dart")], &[]);
+        let rig = Rig::new(&[Import::named("package:meta/meta.dart", "meta")], &[]);
         assert!(rig.meta_literal("literal"));
         assert!(!rig.meta_literal("sealed"));
     }
@@ -537,7 +608,7 @@ mod tests {
     /// prefixed import, and a wrong prefix stays unresolved.
     #[test]
     fn prefixed_literal_recognizes_by_prefix() {
-        let rig = Rig::new(&[Import::prefixed("package:meta/meta.dart", "meta")], &[]);
+        let rig = Rig::new(&[Import::prefixed_named("package:meta/meta.dart", "meta", "meta")], &[]);
         assert!(rig.meta_literal("meta.literal"));
         assert!(!rig.meta_literal("literal"));
         assert!(!rig.meta_literal("p.literal"));
@@ -550,6 +621,7 @@ mod tests {
         let shown = Rig::new(
             &[Import {
                 uri: "package:meta/meta.dart",
+                name: Some("meta"),
                 prefix: None,
                 show: Some(&["literal"]),
                 hide: None,
@@ -562,6 +634,7 @@ mod tests {
         let hid = Rig::new(
             &[Import {
                 uri: "package:meta/meta.dart",
+                name: Some("meta"),
                 prefix: None,
                 show: None,
                 hide: Some(&["literal"]),
@@ -578,7 +651,8 @@ mod tests {
         assert!(!rig.meta_literal("literal"));
     }
 
-    /// A same-name declaration outside meta is rejected by the uri test.
+    /// A same-name declaration outside a `meta`-named library is rejected
+    /// by the library-name test.
     #[test]
     fn same_named_literal_outside_meta_does_not_recognize() {
         let rig = Rig::new(&[Import::unprefixed("package:other/other.dart")], &[]);
@@ -589,7 +663,7 @@ mod tests {
     #[test]
     fn local_literal_shadow_suppresses_recognition() {
         let rig = Rig::new(
-            &[Import::unprefixed("package:meta/meta.dart")],
+            &[Import::named("package:meta/meta.dart", "meta")],
             &["literal"],
         );
         assert!(!rig.meta_literal("literal"));
@@ -608,7 +682,7 @@ mod tests {
     /// under an unprefixed meta import returns the written literal's span.
     #[test]
     fn bare_unless_resolves_parameter_defined_span() {
-        let rig = Rig::new(&[Import::unprefixed("package:meta/meta.dart")], &[]);
+        let rig = Rig::new(&[Import::named("package:meta/meta.dart", "meta")], &[]);
         assert_eq!(
             rig.unless_span("UseResult.unless", &[rig.param_defined(Some(("p", SPAN)))]),
             Some(SPAN)
@@ -618,7 +692,7 @@ mod tests {
     /// Prefixed: `@meta.UseResult.unless` through `import ... as meta;`.
     #[test]
     fn prefixed_unless_resolves_parameter_defined_span() {
-        let rig = Rig::new(&[Import::prefixed("package:meta/meta.dart", "meta")], &[]);
+        let rig = Rig::new(&[Import::prefixed_named("package:meta/meta.dart", "meta", "meta")], &[]);
         assert_eq!(
             rig.unless_span(
                 "meta.UseResult.unless",
@@ -635,6 +709,7 @@ mod tests {
         let shown = Rig::new(
             &[Import {
                 uri: "package:meta/meta.dart",
+                name: Some("meta"),
                 prefix: None,
                 show: Some(&["UseResult"]),
                 hide: None,
@@ -652,6 +727,7 @@ mod tests {
         let filtered = Rig::new(
             &[Import {
                 uri: "package:meta/meta.dart",
+                name: Some("meta"),
                 prefix: None,
                 show: Some(&["literal"]),
                 hide: None,
@@ -669,6 +745,7 @@ mod tests {
         let hid = Rig::new(
             &[Import {
                 uri: "package:meta/meta.dart",
+                name: Some("meta"),
                 prefix: None,
                 show: None,
                 hide: Some(&["UseResult"]),
@@ -704,7 +781,7 @@ mod tests {
         );
 
         let shadowed = Rig::new(
-            &[Import::unprefixed("package:meta/meta.dart")],
+            &[Import::named("package:meta/meta.dart", "meta")],
             &["UseResult"],
         );
         assert_eq!(
@@ -720,7 +797,7 @@ mod tests {
     /// foreign head never fire.
     #[test]
     fn unless_requires_selector_and_head() {
-        let rig = Rig::new(&[Import::unprefixed("package:meta/meta.dart")], &[]);
+        let rig = Rig::new(&[Import::named("package:meta/meta.dart", "meta")], &[]);
         assert_eq!(
             rig.unless_span("UseResult", &[rig.param_defined(Some(("p", SPAN)))]),
             None
@@ -740,7 +817,7 @@ mod tests {
     /// non-string value all return `None`.
     #[test]
     fn unless_requires_string_parameter_defined() {
-        let rig = Rig::new(&[Import::unprefixed("package:meta/meta.dart")], &[]);
+        let rig = Rig::new(&[Import::named("package:meta/meta.dart", "meta")], &[]);
         assert_eq!(rig.unless_span("UseResult.unless", &[]), None);
         assert_eq!(
             rig.unless_span("UseResult.unless", &[rig.positional(Some(("p", SPAN)))]),
@@ -765,7 +842,7 @@ mod tests {
     /// the gate value stays with the caller's const environment.
     #[test]
     fn unless_reference_face_carries_the_written_name() {
-        let rig = Rig::new(&[Import::unprefixed("package:meta/meta.dart")], &[]);
+        let rig = Rig::new(&[Import::named("package:meta/meta.dart", "meta")], &[]);
         assert_eq!(
             rig.unless_span("UseResult.unless", &[rig.referenced("s", SPAN)]),
             Some(SPAN)

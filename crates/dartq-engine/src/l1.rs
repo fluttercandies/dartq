@@ -36,6 +36,15 @@ pub(crate) struct ApplyOutcome {
     pub changed: Vec<FileId>,
     pub removed: Vec<FileId>,
     pub invalidated: Vec<LibraryId>,
+    /// Residents outside the batch whose directive targets re-resolved to a
+    /// different outcome because the file set moved (a created file now
+    /// satisfies a previously missing target; a removed file un-resolves
+    /// one). Their content is untouched — only `target`/`code` columns and
+    /// the URI diagnostic tail moved — so they join the structure gate's
+    /// refresh input (a target FileId flip, e.g. the generated-file
+    /// fallback, moves the folded digest face; a pure code flip digests
+    /// equal).
+    pub relinked: Vec<FileId>,
 }
 
 impl ApplyOutcome {
@@ -197,6 +206,19 @@ pub(crate) fn apply(
         }
     }
 
+    // The directive relink (#2100): intake resolves every changed file
+    // against the post-batch world, but a batch that moves the FILE SET —
+    // a newly resident file, or a non-empty removal list — changes the
+    // existence face for residents that never entered the queue. A
+    // previously missing import target that just appeared must drop its
+    // `uri_does_not_exist` row; a removed target must re-acquire it. The
+    // holders are already indexed: every file scheme target interned its
+    // FileId at intake whether the file existed or not, so the maintained
+    // target→sources projections name exactly the affected residents — no
+    // residency scan. Runs before the graph delta so the relinked faces
+    // feed `UnitFace`/`build_library_info` like any changed file's.
+    let relinked = relink_directives(state, &recomputed, &removed, &old_facts);
+
     // The L2 classification: a file whose API signature moved (or that is
     // newly resident — no previous signature to match) re-seeds the cascade;
     // a body/comment edit with a stable face does not.
@@ -252,8 +274,14 @@ pub(crate) fn apply(
     // competitor library that no other seed reaches). The delta reads the
     // pre-apply owners straight out of `library_of_file` before it writes
     // any membership entry.
-    let (invalidated, retired_any) =
-        maintain_and_close(state, &changed, &removed, &old_facts, &sig_changed);
+    let (invalidated, retired_any) = maintain_and_close(
+        state,
+        &changed,
+        &removed,
+        &relinked,
+        &old_facts,
+        &sig_changed,
+    );
     state.invalidated.clone_from(&invalidated);
     // The resolution graph rebuilds only when its inputs moved: a
     // signature-bearing face (element or directive), a removal, or a library
@@ -325,6 +353,7 @@ pub(crate) fn apply(
         changed: changed_files,
         removed,
         invalidated,
+        relinked: relinked.iter().map(|(file, _)| *file).collect(),
     }
 }
 
@@ -1881,6 +1910,10 @@ struct UnitFace {
     /// Targets of `import`/`export` directives, source order (the reverse
     /// edges a file contributes).
     import_targets: Vec<FileId>,
+    /// Targets of URI-form `part of` directives, source order (the claim
+    /// side a part file makes; name-form part-ofs carry no URI and land
+    /// nowhere). Only ever populated on part files.
+    part_of_targets: Vec<FileId>,
 }
 
 impl UnitFace {
@@ -1889,6 +1922,7 @@ impl UnitFace {
             part: facts.is_part(),
             part_targets: Vec::new(),
             import_targets: Vec::new(),
+            part_of_targets: Vec::new(),
         };
         for directive in &facts.directives {
             if let ResolvedTarget::Resolved(target) = directive.target {
@@ -1897,12 +1931,142 @@ impl UnitFace {
                     DirectiveKind::Import | DirectiveKind::Export => {
                         face.import_targets.push(target);
                     }
-                    DirectiveKind::PartOf | DirectiveKind::Library => {}
+                    DirectiveKind::PartOf => face.part_of_targets.push(target),
+                    DirectiveKind::Library => {}
                 }
             }
         }
         face
     }
+}
+
+/// Re-resolves the directive faces of residents whose missing/existing
+/// verdicts the batch's file-set move just flipped (#2100): the intake
+/// resolution pass ran only over the batch's own files, so a resident
+/// holding a directive into a created or removed file would otherwise keep
+/// its pre-move `target`/`code` columns — and its URI diagnostic tail —
+/// forever.
+///
+/// The holder set is read out of the maintained target→sources
+/// projections ([`EngineState::import_sources`],
+/// [`EngineState::part_offers`], [`EngineState::part_of_sources`]): a file
+/// target interns its `FileId` at intake whether or not the file exists,
+/// so the rows for the set-moving files name exactly the residents that
+/// can relink — bounded by the live directive set, never a residency scan.
+/// Both indexes still carry pre-batch faces here (the delta's `reindex`
+/// runs below), which is precisely the holder set: batch members are
+/// excluded (they re-resolved fresh at intake) and removals are gone from
+/// residency.
+///
+/// Per holder the facts clone pays the URI-tail truncate +
+/// [`resolve_unit`] rebuild — the same idiom the warm-start
+/// materialization uses (one tail row per coded directive, after every
+/// other diagnostic). A holder whose directives re-resolve identically
+/// (a same-directory creation nobody imported) is not rewritten and not
+/// reported. Returns the `(file, pre-relink facts)` pairs so the delta
+/// below can fold them into the changed-file faces: a relink can move a
+/// directive's resolved `FileId` (the generated-file fallback flips which
+/// path a `package:` URI lands on), and only the paired face diff keeps
+/// the indexes and reverse edges exact.
+fn relink_directives(
+    state: &mut EngineState,
+    recomputed: &[RecomputedFacts],
+    removed: &[FileId],
+    old_facts: &FxHashMap<FileId, Arc<UnitFacts>>,
+) -> Vec<(FileId, Arc<UnitFacts>)> {
+    // The set-moving faces: files that entered residency this batch (no
+    // previous facts) and every removal. A pure content edit moves no
+    // existence verdict — short-circuit before touching the indexes.
+    let set_moved = !removed.is_empty()
+        || recomputed
+            .iter()
+            .any(|(file, _, _, _)| !old_facts.contains_key(file));
+    if !set_moved {
+        return Vec::new();
+    }
+
+    let changed_set: FxHashSet<FileId> =
+        recomputed.iter().map(|(file, _, _, _)| *file).collect();
+    let mut holders: FxHashSet<FileId> = FxHashSet::default();
+    let mut gather = |state: &EngineState, target: FileId| {
+        for &source in state
+            .import_sources
+            .row(target)
+            .iter()
+            .chain(state.part_offers.row(target))
+            .chain(state.part_of_sources.row(target))
+        {
+            if !changed_set.contains(&source) && state.residency.contains_key(&source) {
+                holders.insert(source);
+            }
+        }
+    };
+    for (file, _, _, _) in recomputed {
+        if !old_facts.contains_key(file) {
+            gather(state, *file);
+        }
+    }
+    for file in removed {
+        gather(state, *file);
+    }
+    if holders.is_empty() {
+        return Vec::new();
+    }
+
+    // The post-batch world: residency already holds this batch (removals
+    // left at the drain, changes admitted above) — the same existence face
+    // the intake pass resolves against. The resolver borrow ends before
+    // the residency rewrite below (field-disjoint: `files` mutates under
+    // the resolver while the `resident` closure reads residency).
+    let mut relinked: Vec<(FileId, Arc<UnitFacts>)> = Vec::new();
+    {
+        let resident = |id: FileId| state.residency.contains_key(&id);
+        let mut resolver = UriResolver::new(
+            &state.uri_packages,
+            &state.sdk,
+            &state.declared_variables,
+            &mut state.files,
+            &resident,
+        );
+        let mut rewritten: Vec<(FileId, UnitFacts)> = Vec::new();
+        for holder in holders {
+            let previous = Arc::clone(&state.residency[&holder]);
+            let mut facts = (*previous).clone();
+            // The URI diagnostic tail rebuilds one-for-one with the
+            // re-resolved coded directives: `resolve_unit`'s construction
+            // invariant is exactly one pushed row per coded directive,
+            // after every other diagnostic — the warm-start slice.
+            let uri_tail = facts
+                .directives
+                .iter()
+                .filter(|directive| directive.code.is_some())
+                .count();
+            facts
+                .diagnostics
+                .truncate(facts.diagnostics.len() - uri_tail);
+            resolve_unit(&mut facts, holder, &mut resolver, &state.declared_variables);
+            let moved = facts
+                .directives
+                .iter()
+                .zip(&previous.directives)
+                .any(|(new, old)| (new.target, new.code) != (old.target, old.code));
+            if moved {
+                rewritten.push((holder, facts));
+                relinked.push((holder, previous));
+            }
+        }
+        // The resolver's `&mut FileTable` borrow ends before residency
+        // writes; rewrite afterwards so the `resident` closure never
+        // observes a half-relinked world (and the memos freeze it anyway).
+        for (file, facts) in rewritten {
+            state.admit_residency(file, Arc::new(facts));
+        }
+    }
+    // Deterministic order: the hash gather visits rows unordered, and the
+    // delta below consumes the list positionally — a sorted face keeps the
+    // accumulator writes (and the outcome face) byte-stable.
+    relinked.sort_unstable_by_key(|(file, _)| *file);
+    relinked
 }
 
 /// Applies the identity-keyed library-graph delta for one batch and derives
@@ -1946,15 +2110,45 @@ fn maintain_and_close(
     state: &mut EngineState,
     changed: &[(FileId, ContentId, SourceText)],
     removed: &[FileId],
+    relinked: &[(FileId, Arc<UnitFacts>)],
     old_facts: &FxHashMap<FileId, Arc<UnitFacts>>,
     sig_changed: &[FileId],
 ) -> (Vec<LibraryId>, bool) {
     const NO_TARGETS: &[FileId] = &[];
-    let changed_set: FxHashSet<FileId> = changed.iter().map(|(file, _, _)| *file).collect();
+    // Two distinct "changed" notions: `changed_set` is the own-event-ran
+    // set — content-changed files plus relinked residents, whose paired
+    // face events below re-drive ownership, edges, and claim resolution.
+    // `content_changed` is the subset that actually re-parsed — the only
+    // files whose membership moves may seed the importer closure (the
+    // doctrine `close` documents: an unchanged file's claim flip never
+    // seeds, and a relinked file is content-unchanged by construction).
+    let content_changed: FxHashSet<FileId> =
+        changed.iter().map(|(file, _, _)| *file).collect();
+    let changed_set: FxHashSet<FileId> = content_changed
+        .iter()
+        .copied()
+        .chain(relinked.iter().map(|(file, _)| *file))
+        .collect();
     let removed_set: FxHashSet<FileId> = removed.iter().copied().collect();
+    // Files that entered residency this batch — the same newness test the
+    // relink pass uses (no `old_facts` entry means nothing to subtract).
+    // `was_resident` below needs it to answer PRE-apply residency: the live
+    // map at that point is post-batch, so an entry created this apply would
+    // otherwise look like an edge that already existed, and the paired
+    // delta would miss the add (the relinked-holder hole #2100: the holder's
+    // own retarget saw the created target on both sides and never added
+    // the reverse edge the entering-residency pass skips it for).
+    let new_residents: FxHashSet<FileId> = changed
+        .iter()
+        .filter(|(file, _, _)| !old_facts.contains_key(file))
+        .map(|(file, _, _)| *file)
+        .collect();
     // Old and new faces. A file entering residency here has no old face —
-    // nothing to subtract.
-    let changed_faces: Vec<(FileId, Option<UnitFace>, UnitFace)> = changed
+    // nothing to subtract. Relinked residents join as changed faces too:
+    // their pre-relink facts are the OLD face the delta subtracts (a
+    // target FileId flip under the generated-file fallback moves real
+    // edges; a pure code flip diffs empty and touches nothing).
+    let mut changed_faces: Vec<(FileId, Option<UnitFace>, UnitFace)> = changed
         .iter()
         .map(|(file, _, _)| {
             let new = UnitFace::of(&state.residency[file]);
@@ -1962,6 +2156,9 @@ fn maintain_and_close(
             (*file, old, new)
         })
         .collect();
+    changed_faces.extend(relinked.iter().map(|(file, old)| {
+        (*file, Some(UnitFace::of(old)), UnitFace::of(&state.residency[file]))
+    }));
     let removed_faces: Vec<(FileId, UnitFace)> = removed
         .iter()
         .map(|file| {
@@ -2008,6 +2205,16 @@ fn maintain_and_close(
             old_imports,
             &new.import_targets,
         );
+        let old_part_ofs: &[FileId] = match old {
+            Some(face) => &face.part_of_targets,
+            None => NO_TARGETS,
+        };
+        reindex(
+            &mut state.part_of_sources,
+            *file,
+            old_part_ofs,
+            &new.part_of_targets,
+        );
     }
     for (file, face) in &removed_faces {
         if !face.part {
@@ -2023,6 +2230,12 @@ fn maintain_and_close(
             &mut state.import_sources,
             *file,
             &face.import_targets,
+            NO_TARGETS,
+        );
+        reindex(
+            &mut state.part_of_sources,
+            *file,
+            &face.part_of_targets,
             NO_TARGETS,
         );
     }
@@ -2228,12 +2441,14 @@ fn maintain_and_close(
     // One paired edge event per file: the old face subtracted, the new face
     // added, multiplicity exact. Formation only ever created edges between
     // resident endpoints, so both sides filter to the same notion: an edge
-    // can exist exactly for a target resident pre-apply (post-update
-    // residency plus this batch's removals), and a new edge exactly for a
-    // target resident now. A stable owner over an identical effective target
-    // set performs zero map operations.
-    let was_resident =
-        |target: FileId| state.residency.contains_key(&target) || removed_set.contains(&target);
+    // can exist exactly for a target resident PRE-apply — the post-batch
+    // map minus this batch's entrants, plus its removals — and a new edge
+    // exactly for a target resident now. A stable owner over an identical
+    // effective target set performs zero map operations.
+    let was_resident = |target: FileId| {
+        removed_set.contains(&target)
+            || (state.residency.contains_key(&target) && !new_residents.contains(&target))
+    };
     for ((_, old, new), (_, old_owner, new_owner)) in changed_faces.iter().zip(&changed_owners) {
         let old_imports: Vec<FileId> = match old {
             Some(face) => face
@@ -2352,12 +2567,26 @@ fn maintain_and_close(
             state.libraries.set_info(*library, fresh);
         }
     }
+    // Relinked holders' owner libraries (#2100): a relink moves the
+    // holder's OUTPUT face — the URI diagnostic tail — without necessarily
+    // moving any folded identity input (a pure `code` flip folds into no
+    // `LibraryInfo` column). The cached result still carries the pre-relink
+    // rows, so the owner must be treated as identity-moved: drop the
+    // recorded run and enter the dirty set. No `set_info` write — the
+    // standing info is byte-correct; only the result's freshness broke.
+    for (file, _) in relinked {
+        if let Some(&owner) = state.library_of_file.get(file)
+            && state.libraries.info(owner).is_some()
+        {
+            identity_moved.insert(owner);
+        }
+    }
 
     let invalidated = close(
         state,
         sig_changed,
         &movers,
-        &changed_set,
+        &content_changed,
         &removed_owners,
         &affected,
         &identity_moved,
@@ -2521,6 +2750,7 @@ fn build_library_info(
         // The memo's allocation, shared: a refcount per formed library,
         // never a copy of the URI bytes.
         uri,
+        name: library_name.unwrap_or_default().into(),
         defining,
         parts,
         content,
@@ -2767,7 +2997,11 @@ fn close(
     state: &mut EngineState,
     sig_changed: &[FileId],
     movers: &[(FileId, Option<LibraryId>, LibraryId)],
-    changed_set: &FxHashSet<FileId>,
+    // Content-changed files only — the membership-move seed gate's notion
+    // of "changed". Relinked residents are content-unchanged and must not
+    // widen it (a relinked file's claim flip seeds through the endpoints'
+    // part-target moves, never through this filter).
+    content_changed: &FxHashSet<FileId>,
     removed_owners: &[Option<LibraryId>],
     touched: &FxHashSet<LibraryId>,
     identity_moved: &FxHashSet<LibraryId>,
@@ -2844,7 +3078,7 @@ fn close(
     // transfer shape, gated on a cached result exactly like the full
     // rebuild's pass over the live set.
     for (file, old_owner, new_owner) in movers {
-        if !changed_set.contains(file) {
+        if !content_changed.contains(file) {
             continue;
         }
         for owner in [*old_owner, Some(*new_owner)].into_iter().flatten() {

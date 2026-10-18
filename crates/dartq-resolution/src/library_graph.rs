@@ -542,6 +542,12 @@ pub struct LibraryGraphBuilder<'t> {
 
 struct NodeBuilder {
     uri: Box<str>,
+    /// The library's declared `library <name>;` name, `""` when the
+    /// directive is absent or unnamed — the oracle's `LibraryElement.name`
+    /// (a directive-less library's name is `''`,
+    /// `library_builder.dart:750-763`), not the URI. Registered by
+    /// [`LibraryGraphBuilder::library_name`].
+    name: Box<str>,
     /// The library's compilation units in registration order — the library's
     /// own file first, then each part ([`LibraryGraph::unit_files`]). One
     /// push per unit, no dedup: a file belongs to exactly one library, and
@@ -584,6 +590,7 @@ impl<'t> LibraryGraphBuilder<'t> {
         self.by_uri.insert(Box::from(canonical_uri), id);
         self.nodes.push(NodeBuilder {
             uri: Box::from(canonical_uri),
+            name: Box::from(""),
             units: Vec::new(),
             decls: Vec::new(),
             imports: Vec::new(),
@@ -600,6 +607,21 @@ impl<'t> LibraryGraphBuilder<'t> {
     /// [`LibraryGraph::unit_files`].
     pub fn unit(&mut self, lib: LibraryId, file: FileId) {
         self.nodes[lib.index() as usize].units.push(file);
+    }
+
+    /// Records `lib`'s declared `library <name>;` name — the oracle's
+    /// `LibraryElement.name` (the defining unit's directive name joined
+    /// lexeme for lexeme, `library_builder.dart:750-763`). The caller passes
+    /// the directive's dotted-name text; a library with no directive — or an
+    /// unnamed `library;` — never calls this and keeps the `""` default,
+    /// which is also the oracle's empty name. The read side is
+    /// [`LibraryGraph::name`]; the package:meta annotation faces
+    /// (`dartq-semantic`'s `annotation` layer) are the consumers: upstream
+    /// keys `@literal`/`@sealed`/`UseResult` recognition on the resolved
+    /// element's `library.name == 'meta'` (`_isPackageMetaGetter`,
+    /// `element.dart:2100-2102`), never the import URI.
+    pub fn library_name(&mut self, lib: LibraryId, name: &str) {
+        self.nodes[lib.index() as usize].name = Box::from(name);
     }
 
     /// Records one top-level declaration `name` of `lib`, declared in `file`
@@ -637,6 +659,35 @@ impl<'t> LibraryGraphBuilder<'t> {
     /// Records `lib`'s resolved `import` directive, in source order.
     pub fn import(&mut self, lib: LibraryId, edge: ImportEdge) {
         self.nodes[lib.index() as usize].imports.push(edge);
+    }
+
+    /// Seeds the implicit `dart:core` import every Dart library carries
+    /// (upstream Dart SDK source, `pkg/analyzer` — dart:core sits in every
+    /// library's import namespace without a directive): a synthetic
+    /// `dart:core` node (idempotent through [`Self::intern`]) declared with
+    /// `names` — the library's merged public export face, re-exports
+    /// included — wired into `lib` through one un-prefixed, unfiltered
+    /// import edge. The per-file contexts the lint driver builds carry no
+    /// directives, so without this seed every SDK name misses the import
+    /// namespace (`comment_references`' `/// [String]` false positive).
+    ///
+    /// `file` is the face's declaring file — the unindexed `<dart:core>`
+    /// synthetic the element index never carries, so SDK names resolve
+    /// "defined" with no element model (the engine graph's posture).
+    pub fn seed_implicit_core(&mut self, lib: LibraryId, file: FileId, names: &[&str]) {
+        let core = self.intern("dart:core");
+        for name in names {
+            self.declare(core, self.strings.intern(name), file);
+        }
+        self.import(
+            lib,
+            ImportEdge {
+                target: Some(core),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
     }
 
     /// Records `lib`'s resolved `export` directive, in source order.
@@ -788,6 +839,7 @@ impl<'t> LibraryGraphBuilder<'t> {
                 }
                 LibraryNode {
                     uri: node.uri,
+                    name: node.name,
                     units: node.units,
                     imports: node.imports,
                     exports: node.exports,
@@ -932,6 +984,10 @@ pub struct LibraryGraph {
 
 struct LibraryNode {
     uri: Box<str>,
+    /// The declared `library <name>;` name, `""` for an unnamed or
+    /// directive-less library ([`LibraryGraph::name`]) — the oracle's
+    /// `LibraryElement.name`.
+    name: Box<str>,
     /// The part-graph truth of `lib`'s membership: the library's own file and
     /// its parts, in registration order ([`LibraryGraph::unit_files`]). Not
     /// derived from `export_scope`, which re-exports foreign files and drops
@@ -977,6 +1033,21 @@ impl LibraryGraph {
     #[must_use]
     pub fn uri(&self, lib: LibraryId) -> &str {
         &self.nodes[lib.index() as usize].uri
+    }
+
+    /// The declared `library <name>;` name of `lib` — `""` when the
+    /// library carries no `library` directive or an unnamed one (the
+    /// oracle's `LibraryElement.name` is `''` there,
+    /// `library_builder.dart:750-763`); never the URI. This is the
+    /// authoritative half of package:meta detection: upstream recognizes
+    /// `@literal`, `@sealed` and the `UseResult` faces by the resolved
+    /// element's `library.name == 'meta'` (`_metaLibName`,
+    /// `element.dart:1725`; `_isPackageMetaGetter`, `element.dart:2100-2102`)
+    /// — a `package:meta/…` URI prefix is only the stand-in the import
+    /// faces once used and is wrong for a vendored or un-named meta copy.
+    #[must_use]
+    pub fn name(&self, lib: LibraryId) -> &str {
+        &self.nodes[lib.index() as usize].name
     }
 
     /// `lib`'s compilation units — the library's own file plus its parts —
@@ -2333,5 +2404,21 @@ mod tests {
                 .declaring_libraries(rig.strings.intern("Missing"))
                 .is_empty()
         );
+    }
+
+    /// The declared `library <name>;` name round-trips through the node,
+    /// and a library registered without one reads `""` — the oracle's
+    /// `LibraryElement.name` contract (`''` for a directive-less or
+    /// unnamed `library;`, `library_builder.dart:750-763`).
+    #[test]
+    fn library_name_round_trips_and_defaults_empty() {
+        let mut rig = Rig::new();
+        let meta = rig.builder.intern("package:meta/meta.dart");
+        let vendored = rig.builder.intern("package:vendored/meta.dart");
+        rig.builder.library_name(meta, "meta");
+        let graph = rig.builder.finish();
+
+        assert_eq!(graph.name(meta), "meta");
+        assert_eq!(graph.name(vendored), "");
     }
 }

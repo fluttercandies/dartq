@@ -267,6 +267,19 @@ const PARSE_ERROR: CodeInfo = CodeInfo::new(
     true,
 );
 
+/// `The plugin '{0}' is specified with a different source in '{1}'.`
+/// (registry :7870-7881, `STATIC_WARNING`; the correction is `Ensure that
+/// all specifications of the same plugin use an identical source.`). The
+/// cross-file conflict row of `_computePluginConflicts`
+/// (context_manager.dart:606-685) — emitted by the CLI face, which owns the
+/// whole loaded-options set the pairwise comparison scans.
+pub const INCOMPATIBLE_PLUGIN_SOURCE: CodeInfo = CodeInfo::new(
+    "incompatible_plugin_source",
+    "INCOMPATIBLE_PLUGIN_SOURCE",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
 /// `Warning in the included options file {0}({1}..{2}): {3}` (registry
 /// :7728-7746). `{1}..{2}` is the inner row's inclusive span; the correction
 /// is dropped (the official wrap carries the message only).
@@ -466,6 +479,31 @@ impl OptionsIssue {
             correction: Some(
                 "Try locally disabling all but one of the conflicting rules or \
                  removing one of the incompatible files."
+                    .to_owned(),
+            ),
+            offset: span.0,
+            length: span.1,
+        }
+    }
+
+    /// The `incompatible_plugin_source` row (`_computePluginConflicts`,
+    /// context_manager.dart:664-684): `name` is the conflicting plugin's
+    /// name, `other_file` the *other* options file's path (`{1}`), `span`
+    /// the reporting file's plugin-key anchor ([`AnalysisOptions::plugin_name_anchor`]).
+    #[must_use]
+    pub fn incompatible_plugin_source(
+        name: &str,
+        other_file: &Path,
+        span: (u32, u32),
+    ) -> Self {
+        OptionsIssue {
+            code: INCOMPATIBLE_PLUGIN_SOURCE,
+            message: format!(
+                "The plugin '{name}' is specified with a different source in '{}'.",
+                other_file.display()
+            ),
+            correction: Some(
+                "Ensure that all specifications of the same plugin use an identical source."
                     .to_owned(),
             ),
             offset: span.0,
@@ -847,6 +885,31 @@ pub struct AnalysisOptions {
     /// (linter_rule_options_validator.dart:188-225). The initial file never
     /// carries a group entry — it is not included.
     pub included_edges: Vec<IncludeEdge>,
+    /// The include-chain-merged top-level `plugins:` configurations — the
+    /// upstream `pluginConfigurations` (the `_applyPlugins` merge,
+    /// analysis_options_parser.dart:300-328): per name, a nearer file's
+    /// configuration replaces the farther one's whole entry; an invalid or
+    /// null-valued `plugins:` section in a nearer file clears everything the
+    /// chain merged before it (`clearsExisting`). Insertion-ordered far to
+    /// near — the upstream `configurations.values` list order.
+    pub plugins: Vec<PluginConfig>,
+    /// The merged `plugins/dependency_overrides` map (`_applyPlugins`
+    /// `addAll` — a nearer entry replaces per package name); `None` when no
+    /// file in the chain declares one or a nearer invalid section cleared it.
+    pub plugin_dependency_overrides: Option<FxHashMap<String, PluginSource>>,
+    /// The initial file's YAML parse failure, when any — the upstream
+    /// `parse_error` shape kept as data. The oracle emits no machine row for
+    /// a malformed options file (the pinned 2026-10-18 oracle probe: silent
+    /// on every output face), so the failure rides the faces' stderr
+    /// advisory channel — recorded here, never pushed into [`Self::issues`].
+    /// An *included* file's failure still reports `included_file_parse_error`
+    /// (a different, probed-as-emitted code) through `issues` unchanged.
+    pub parse_failure: Option<OptionsIssue>,
+    /// Whether the initial file declares a top-level `plugins:` key at all —
+    /// the upstream `_computePluginConflicts` membership gate (only files
+    /// whose own `plugins` node is a `YamlMap` contribute specs,
+    /// context_manager.dart:625-626).
+    pub has_plugins_map: bool,
 }
 
 /// One compiled exclude pattern plus the directory it is relative to
@@ -907,6 +970,104 @@ impl ExcludeGlob {
     }
 }
 
+/// The configured severity of one `plugins/<name>/diagnostics` entry — the
+/// upstream `ConfiguredSeverity` (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/lint/config.dart`: disable/enable/info/warning/
+/// error). A bool parses to enable/disable; a string must match the enum
+/// name *verbatim* (case-sensitive `asNameMap`, `_parseRuleConfig` — a miss,
+/// including `"false"` or `"Error"`, degrades to enable); any other scalar
+/// or container shape contributes no entry at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfiguredSeverity {
+    /// `false` or `disable` — disables the *rule* when the key names one;
+    /// naming a code it degrades to an INFO emit upstream (the closed
+    /// {INFO, WARNING, ERROR} protocol enum misses `DISABLE`, and the emit
+    /// site's `?? INFO` completes the fall — plugin_server.dart:624-648).
+    Disable,
+    /// `true` or `enable` — the declared severity stands.
+    Enable,
+    /// Re-level to info.
+    Info,
+    /// Re-level to warning.
+    Warning,
+    /// Re-level to error.
+    Error,
+}
+
+impl ConfiguredSeverity {
+    /// Upstream `RuleConfig.isEnabled` — every severity but `Disable`.
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        !matches!(self, Self::Disable)
+    }
+
+    /// The re-leveling severity of a code-level entry, mirroring the
+    /// upstream `_configuredSeverity` emit (plugin_server.dart:624-648):
+    /// `Enable` leaves the declared severity standing (`None`), `Disable`
+    /// coerces to INFO through the closed protocol enum's miss +
+    /// `?? INFO` fallback, the named tiers re-level.
+    #[must_use]
+    pub const fn severity(self) -> Option<Severity> {
+        match self {
+            Self::Enable => None,
+            Self::Disable | Self::Info => Some(Severity::Info),
+            Self::Warning => Some(Severity::Warning),
+            Self::Error => Some(Severity::Error),
+        }
+    }
+}
+
+/// A plugin's declared source — the upstream `PluginSource` sealed family
+/// (`_parsePluginSource`, upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/analysis_options/analysis_options_parse_model.dart`
+/// :1639-1693): a scalar is a version constraint; a map prefers
+/// `version`/`hosted`, then `git`, then `path` — first match wins.
+/// `PartialEq` is the upstream `==` that the cross-file conflict check
+/// compares (`_computePluginConflicts`, context_manager.dart:606-685).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginSource {
+    /// `name: <constraint>` or `name: {version: <constraint>, hosted: <url>}`.
+    Versioned {
+        /// The version constraint string.
+        constraint: String,
+        /// The `hosted:` URL, when present.
+        hosted: Option<String>,
+    },
+    /// `name: {git: <url>}` or `name: {git: {url:…, ref:…, path:…, tag_pattern:…}}`.
+    Git {
+        /// The repository URL.
+        url: String,
+        /// `git.path` — the in-repo subdirectory.
+        path: Option<String>,
+        /// `git.ref` — the pinned ref.
+        reference: Option<String>,
+        /// `git.tag_pattern`.
+        tag_pattern: Option<String>,
+    },
+    /// `name: {path: <dir>}` — the plugin package's directory; a relative
+    /// value joins and normalizes against the declaring options file's
+    /// directory (upstream `pathContext.join` + `normalize`).
+    Path(PathBuf),
+}
+
+/// One entry of the merged top-level `plugins:` section — the upstream
+/// `PluginConfiguration` slice this engine consumes (name, source, the
+/// `diagnostics` map of configured severities keyed lowercased — the
+/// upstream `LinkedHashMap` is case-insensitive). `isEnabled` has no parse
+/// path upstream (`enabled` is unimplemented — parse_model:1612) and is not
+/// modeled.
+#[derive(Debug)]
+pub struct PluginConfig {
+    /// The plugin name as written (`nameNode.toString()` — any scalar key
+    /// renders; the section's key case is preserved).
+    pub name: String,
+    /// The declared source.
+    pub source: PluginSource,
+    /// The `diagnostics:` map, lowercased code/rule names to their
+    /// configured severities (`parseDiagnosticsSection`, config.dart:11-64).
+    pub diagnostics: FxHashMap<String, ConfiguredSeverity>,
+}
+
 impl AnalysisOptions {
     /// Whether any exclude glob matches `path` (the context-root walk calls
     /// this per resource; globs are precompiled at load).
@@ -954,6 +1115,27 @@ impl AnalysisOptions {
     /// the application is the identity).
     pub(crate) fn has_severity_overrides(&self) -> bool {
         !self.severity_overrides.is_empty()
+    }
+
+    /// The span the cross-file plugin-conflict row anchors at for `name`
+    /// (the upstream `_computePluginConflicts` span: `configurationNode` —
+    /// the plugin's *key* node in this file's `plugins:` map — falling back
+    /// to the section's value node when the merged configuration arrived
+    /// through the include chain and no local key names it,
+    /// context_manager.dart:632-636). `(0, 0)` when the file's text carries
+    /// neither — a diagnostic row, never a panic.
+    #[must_use]
+    pub fn plugin_name_anchor(&self, name: &str) -> (u32, u32) {
+        let Some((text, _)) = &self.layout else {
+            return (0, 0);
+        };
+        let Some(section_at) = text.find("plugins") else {
+            return (0, 0);
+        };
+        if text[section_at..].find(name).is_some() {
+            return anchor_in_section(text, "plugins", name);
+        }
+        plugin_value_anchor(text, "plugins")
     }
 
     /// The compiled exclude globs, in declaration order (far to near). The
@@ -1148,6 +1330,19 @@ struct MergeState {
     /// source (the official `spanInChain` = the repeated file's own
     /// outgoing directive, walker :170-188).
     first_includes: FxHashMap<PathBuf, String>,
+    /// The `_applyPlugins` accumulator: per-name merged configurations,
+    /// insertion-ordered far to near (a nearer same-name entry replaces in
+    /// place — the upstream `configurations` map's `values` order).
+    plugins: Vec<PluginConfig>,
+    /// The `plugins/dependency_overrides` accumulator (addAll-merge).
+    plugin_overrides: Option<FxHashMap<String, PluginSource>>,
+    /// The initial file's YAML parse failure — rides
+    /// [`AnalysisOptions::parse_failure`], never `issues` (oracle-silent on
+    /// the machine face; stderr advisory only).
+    parse_failure: Option<OptionsIssue>,
+    /// The initial file declares a top-level `plugins:` *map* — the
+    /// `_computePluginConflicts` spec-membership gate.
+    has_plugins_map: bool,
 }
 
 impl MergeState {
@@ -1264,15 +1459,18 @@ impl MergeState {
                 yaml
             }
             Err(error) => {
-                // The YAML failure face: `parse_error` on the initial file
-                // (its message drives the CLI's exit tier),
-                // `included_file_parse_error` wrapped at the branch anchor
-                // for an included one (walker :48-66). `serde_yaml` yields
-                // one failure point, so the wrapped span shows it at both
-                // ends; `yaml_failure` already converted it to UTF-16.
+                // The YAML failure face: the initial file records
+                // [`AnalysisOptions::parse_failure`] — the oracle emits no
+                // machine row for a malformed options file (pinned 2026-10-18
+                // probe: silent), so the failure rides the faces' stderr
+                // advisory channel and never joins `issues`. An included
+                // file's failure reports `included_file_parse_error` wrapped
+                // at the branch anchor (walker :48-66) as before. `serde_yaml`
+                // yields one failure point, so the wrapped span shows it at
+                // both ends; `yaml_failure` already converted it to UTF-16.
                 let (message, at) = yaml_failure(&text, &error);
                 if file == self.initial {
-                    self.issues.push(OptionsIssue {
+                    self.parse_failure = Some(OptionsIssue {
                         code: PARSE_ERROR,
                         message,
                         correction: None,
@@ -1477,6 +1675,17 @@ impl MergeState {
         if let Some(experiments) = experiment_flags(map) {
             self.experiments = Some(experiments);
         }
+        // `_applyPlugins` (analysis_options_parser.dart:300-328) — merged
+        // per file like the other sections (nearer wins per name, an
+        // invalid or null-valued section clears the chain's merge). The
+        // section's row faces stay in `local_issues`/`plugin_issues`.
+        self.apply_plugins(map, declaring_dir);
+        if is_initial {
+            self.has_plugins_map = matches!(
+                map.get(Value::from("plugins")),
+                Some(Value::Mapping(_))
+            );
+        }
         if is_initial {
             self.issues.extend(local_issues(map, text));
             self.declared_errors.extend(declared_error_codes(map, text));
@@ -1526,6 +1735,36 @@ impl MergeState {
             declared_errors: self.declared_errors,
             included_groups: self.included_groups,
             included_edges: self.included_edges,
+            plugins: self.plugins,
+            plugin_dependency_overrides: self.plugin_overrides,
+            parse_failure: self.parse_failure,
+            has_plugins_map: self.has_plugins_map,
+        }
+    }
+
+    /// The `_applyPlugins` merge arm (analysis_options_parser.dart:300-328):
+    /// a `plugins:` section whose value is not a map — *including the bare
+    /// `plugins:` null* — clears everything the include chain merged before
+    /// this file (`clearsExisting`); a map merges per name (nearer replaces
+    /// the farther entry whole, keeping its position) and
+    /// `dependency_overrides` addAll-merges per package name.
+    fn apply_plugins(&mut self, map: &serde_yaml::Mapping, declaring_dir: &Path) {
+        let parsed = parse_plugins_section(map, declaring_dir);
+        if parsed.clears_existing {
+            self.plugins.clear();
+            self.plugin_overrides = None;
+            return;
+        }
+        for config in parsed.configurations {
+            match self.plugins.iter_mut().find(|c| c.name == config.name) {
+                Some(existing) => *existing = config,
+                None => self.plugins.push(config),
+            }
+        }
+        if let Some(overrides) = parsed.dependency_overrides {
+            self.plugin_overrides
+                .get_or_insert_default()
+                .extend(overrides);
         }
     }
 }
@@ -2461,9 +2700,11 @@ fn plugin_issues(map: &serde_yaml::Mapping, text: &str, issues: &mut Vec<Options
     };
     let Some(entries) = plugins.as_mapping() else {
         // A null scalar is silent (`YamlScalar(value: null)` breaks the
-        // switch without reporting); every other non-map shape reports.
+        // switch without reporting); every other non-map shape reports at
+        // the *value* node's span (`plugins.span`, parse_model:1543-1547 —
+        // the scalar or the block list itself).
         if !plugins.is_null() {
-            push_invalid_section(issues, text, "plugins", "plugins");
+            push_plugin_invalid_value(issues, text, "plugins", "plugins");
         }
         return;
     };
@@ -2492,7 +2733,8 @@ fn plugin_issues(map: &serde_yaml::Mapping, text: &str, issues: &mut Vec<Options
                         }
                     }
                 }
-                None => push_plugin_invalid_section(
+                // `pluginNode.span` — the value under `dependency_overrides:`.
+                None => push_plugin_invalid_value(
                     issues,
                     text,
                     "plugins/dependency_overrides",
@@ -2541,8 +2783,9 @@ fn validate_plugin_entry(
                 }
             }
         }
+        // `pluginValue.span` — the value node under `<name>:`.
         _ => {
-            push_plugin_invalid_section(issues, text, &section, name);
+            push_plugin_invalid_value(issues, text, &section, name);
         }
     }
 }
@@ -2561,12 +2804,16 @@ fn validate_plugin_diagnostics(
 ) {
     let section = format!("{plugin_path}/diagnostics");
     let Some(entries) = value.as_mapping() else {
-        push_plugin_invalid_section(issues, text, &section, "diagnostics");
+        // `diagnosticsValue.span` — the value node under `diagnostics:`.
+        push_plugin_invalid_value(issues, text, &section, "diagnostics");
         return;
     };
-    for (_, severity_node) in entries {
+    for (code_node, severity_node) in entries {
         let Some(action) = yaml_scalar_text(severity_node) else {
-            push_plugin_invalid_section(issues, text, &section, "diagnostics");
+            // `severityNode.span` — the entry's value node (its key locates
+            // the value span when the key is a scalar).
+            let token = yaml_scalar_text(code_node).unwrap_or_else(|| "diagnostics".to_owned());
+            push_plugin_invalid_value(issues, text, &section, &token);
             return;
         };
         if !ERROR_ACTIONS.contains(&action.to_lowercase().as_str()) {
@@ -2597,17 +2844,213 @@ fn validate_plugin_git(
                 if !GIT_OPTIONS.contains(&key) {
                     push_plugin_unsupported(issues, text, key, &section, &GIT_OPTIONS);
                 } else if !value_node.is_string() {
+                    // `valueNode.span` — the value node under `git/<key>:`.
                     let sub = format!("{section}/{key}");
-                    let token = yaml_scalar_text(value_node).unwrap_or_else(|| key.to_owned());
-                    push_plugin_invalid_section(issues, text, &sub, &token);
+                    push_plugin_invalid_value(issues, text, &sub, key);
                 }
             }
         }
         Value::String(_) => {}
+        // `gitValue.span` — the value node under `git:`.
         _ => {
-            push_plugin_invalid_section(issues, text, &section, "git");
+            push_plugin_invalid_value(issues, text, &section, "git");
         }
     }
+}
+
+/// The data half of one file's `plugins:` section — the upstream
+/// `_ParsedPluginsData` (parse_model:1529-1631): `clears_existing` mirrors
+/// `clearsExisting` (a non-map section — including the bare null scalar —
+/// clears the include chain's merge), `configurations` the parsed
+/// `PluginConfiguration`s, `dependency_overrides` the override map. The
+/// row faces stay in [`plugin_issues`]; this is the merge-time parse.
+struct PluginsSection {
+    clears_existing: bool,
+    configurations: Vec<PluginConfig>,
+    dependency_overrides: Option<FxHashMap<String, PluginSource>>,
+}
+
+/// Parses one file's top-level `plugins:` section into [`PluginsSection`]
+/// — `_ParsedPluginsData.parse` without the reporter (rows are
+/// [`plugin_issues`]'s): every scalar key contributes a configuration when
+/// its `_parsePluginSource` arm yields a source (name = the scalar's text);
+/// `dependency_overrides` parses each map entry's source; a non-map section
+/// (or the bare null) clears the chain's merge.
+fn parse_plugins_section(map: &serde_yaml::Mapping, declaring_dir: &Path) -> PluginsSection {
+    let mut parsed = PluginsSection {
+        clears_existing: false,
+        configurations: Vec::new(),
+        dependency_overrides: None,
+    };
+    let Some(plugins) = map.get(Value::from("plugins")) else {
+        return parsed;
+    };
+    let Some(entries) = plugins.as_mapping() else {
+        // `YamlScalar(value: null)` reports nothing but still clears.
+        parsed.clears_existing = true;
+        return parsed;
+    };
+    for (name_node, plugin_node) in entries {
+        let Some(name) = yaml_scalar_text(name_node) else {
+            continue;
+        };
+        if name == "dependency_overrides" {
+            if let Value::Mapping(overrides) = plugin_node {
+                for (override_key, override_value) in overrides {
+                    let Some(override_name) = yaml_scalar_text(override_key) else {
+                        continue;
+                    };
+                    if let Some(source) = parse_plugin_source(override_value, declaring_dir) {
+                        parsed
+                            .dependency_overrides
+                            .get_or_insert_default()
+                            .insert(override_name, source);
+                    }
+                }
+            }
+            continue;
+        }
+        let Some(source) = parse_plugin_source(plugin_node, declaring_dir) else {
+            continue;
+        };
+        // `diagnostics` parses whenever the entry is a map carrying the key
+        // (any node shape — `parseDiagnosticsSection` itself gates forms).
+        let diagnostics = match plugin_node {
+            Value::Mapping(plugin_map) => plugin_map
+                .get(Value::from("diagnostics"))
+                .map(parse_diagnostics_section)
+                .unwrap_or_default(),
+            _ => FxHashMap::default(),
+        };
+        parsed.configurations.push(PluginConfig {
+            name,
+            source,
+            diagnostics,
+        });
+    }
+    parsed
+}
+
+/// `_parsePluginSource` (parse_model:1639-1693) — the source arm order is
+/// the upstream decision order: string scalar → version constraint; map →
+/// `version`(+`hosted`) → `git` → `path`, first match wins. A relative
+/// `path` joins the declaring file's directory and normalizes
+/// (`pathContext.join` + `normalize` — the source enters the synthetic
+/// pub package, so it stores absolute before leaving options parsing).
+fn parse_plugin_source(node: &Value, declaring_dir: &Path) -> Option<PluginSource> {
+    if let Value::String(constraint) = node {
+        return Some(PluginSource::Versioned {
+            constraint: constraint.clone(),
+            hosted: None,
+        });
+    }
+    let Value::Mapping(map) = node else {
+        return None;
+    };
+    let string_at = |key: &str| match map.get(Value::from(key)) {
+        Some(Value::String(text)) => Some(text.clone()),
+        _ => None,
+    };
+    if let Some(constraint) = string_at("version") {
+        return Some(PluginSource::Versioned {
+            constraint,
+            hosted: string_at("hosted"),
+        });
+    }
+    match map.get(Value::from("git")) {
+        Some(Value::String(url)) => {
+            return Some(PluginSource::Git {
+                url: url.clone(),
+                path: None,
+                reference: None,
+                tag_pattern: None,
+            });
+        }
+        Some(Value::Mapping(git)) => {
+            let git_at = |key: &str| match git.get(Value::from(key)) {
+                Some(Value::String(text)) => Some(text.clone()),
+                _ => None,
+            };
+            if let Some(url) = git_at("url") {
+                return Some(PluginSource::Git {
+                    url,
+                    path: git_at("path"),
+                    reference: git_at("ref"),
+                    tag_pattern: git_at("tag_pattern"),
+                });
+            }
+        }
+        _ => {}
+    }
+    if let Some(path) = string_at("path") {
+        let path = PathBuf::from(path);
+        return Some(PluginSource::Path(if path.is_relative() {
+            dartq_pub::normalize(&declaring_dir.join(path))
+        } else {
+            dartq_pub::normalize(&path)
+        }));
+    }
+    None
+}
+
+/// `parseDiagnosticsSection` (lint/config.dart:11-64): a list enables each
+/// string entry; a map parses each entry through `_parseRuleConfig`
+/// (config.dart:83-104 — string keys only: a bool yields enable/disable, a
+/// string must name a `ConfiguredSeverity` *verbatim* — a miss degrades to
+/// enable — and any other shape contributes nothing), and a map *value*
+/// recurses one level as a named group. Keys lowercase into the map (the
+/// upstream `LinkedHashMap` is case-insensitive).
+fn parse_diagnostics_section(node: &Value) -> FxHashMap<String, ConfiguredSeverity> {
+    /// `_parseRuleConfig`: `Some(severity)` for the two parseable shapes.
+    fn rule_config(value: &Value) -> Option<ConfiguredSeverity> {
+        match value {
+            Value::Bool(enabled) => Some(if *enabled {
+                ConfiguredSeverity::Enable
+            } else {
+                ConfiguredSeverity::Disable
+            }),
+            Value::String(name) => Some(match name.as_str() {
+                "disable" => ConfiguredSeverity::Disable,
+                "enable" => ConfiguredSeverity::Enable,
+                "info" => ConfiguredSeverity::Info,
+                "warning" => ConfiguredSeverity::Warning,
+                "error" => ConfiguredSeverity::Error,
+                _ => ConfiguredSeverity::Enable,
+            }),
+            _ => None,
+        }
+    }
+    let mut configs = FxHashMap::default();
+    match node {
+        Value::Sequence(list) => {
+            for entry in list {
+                if let Value::String(name) = entry {
+                    configs.insert(name.to_lowercase(), ConfiguredSeverity::Enable);
+                }
+            }
+        }
+        Value::Mapping(map) => {
+            for (key_node, value) in map {
+                let Some(name) = key_node.as_str() else {
+                    continue;
+                };
+                if let Some(severity) = rule_config(value) {
+                    configs.insert(name.to_lowercase(), severity);
+                } else if let Value::Mapping(group) = value {
+                    for (inner_key, inner_value) in group {
+                        let Some(inner_name) = inner_key.as_str() else {
+                            continue;
+                        };
+                        if let Some(severity) = rule_config(inner_value) {
+                            configs.insert(inner_name.to_lowercase(), severity);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    configs
 }
 
 /// The plugins rows' anchor: upstream spans every row at the offending YAML
@@ -2618,16 +3061,193 @@ fn plugin_anchor(text: &str, token: &str) -> (u32, u32) {
     anchor_in_section(text, "plugins", token)
 }
 
+/// The UTF-16 `(offset, length)` of the *value* node of the `key` entry
+/// inside the `plugins` section — the upstream anchor of every
+/// `invalid_section_format` row in the plugins face (`plugins.span`,
+/// `pluginNode.span`, `pluginValue.span` — the span of the offending
+/// value, never the key; the pinned 2026-10-18 probe confirms the oracle
+/// anchors the scalar value / entry value / list block). `serde_yaml`
+/// keeps no spans, so the value's extent is re-derived from the text:
+/// same-line content after `key:` anchors the trimmed token (a trailing
+/// ` #` comment excluded); otherwise the block collection's span — the
+/// first non-blank, non-comment line more indented than the key (or a `-`
+/// item at the key's indentation, the same-indent sequence form) through
+/// the last line still inside the block. `(0, 0)` when the key or a value
+/// cannot be located.
+fn plugin_value_anchor(text: &str, key: &str) -> (u32, u32) {
+    // The key locates inside the `plugins` section (the
+    // [`anchor_in_section`] convention — the section key's first occurrence
+    // scopes the search); successive occurrences are tried until one reads
+    // as a real `key:` mapping entry (a `git` inside `gitlab:` is no hit).
+    let from = text.find("plugins").unwrap_or(0);
+    let mut scan = from;
+    while let Some(relative) = text[scan..].find(key) {
+        let key_at = scan + relative;
+        if let Some((start, end)) = value_span(text.as_bytes(), key, key_at) {
+            return (
+                byte_offset_to_utf16(text, start),
+                byte_offset_to_utf16(text, end)
+                    .saturating_sub(byte_offset_to_utf16(text, start)),
+            );
+        }
+        scan = key_at + key.len();
+    }
+    (0, 0)
+}
+
+/// The byte `(start, end)` of the value node of the mapping key `key` at
+/// `key_at` — `None` when `key_at` does not sit on a `key:` entry (a token
+/// inside a scalar or a longer key's head). The span machinery of
+/// [`plugin_value_anchor`], reading bytes (UTF-8 input is ASCII-safe for
+/// the ws/indent scans).
+fn value_span(bytes: &[u8], key: &str, key_at: usize) -> Option<(usize, usize)> {
+    let mut at = key_at + key.len();
+    // Skip to the `:` separating key from value; a `key` hit without one
+    // (inside a scalar or comment) is no key — no value.
+    while matches!(bytes.get(at), Some(b' ' | b'\t')) {
+        at += 1;
+    }
+    if bytes.get(at) != Some(&b':') {
+        return None;
+    }
+    at += 1;
+    while matches!(bytes.get(at), Some(b' ' | b'\t')) {
+        at += 1;
+    }
+    let key_line_start = bytes[..key_at].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let key_indent = indent_of(&bytes[key_line_start..key_at]);
+    match bytes.get(at) {
+        // Same-line content: the value token runs to the trimmed line end,
+        // a ` #` comment excluded; a flow collection continues across lines
+        // until its brackets balance.
+        Some(&c) if c != b'\n' && c != b'#' => Some(flow_span(bytes, at)),
+        // A `#` comment or bare EOL: the block collection (if any) lives on
+        // the deeper-indented lines below.
+        _ => block_span(bytes, at, key_indent),
+    }
+}
+
+/// The trailing-comment-trimmed same-line value span, extended across lines
+/// while a flow collection (`[`/`{`) stays unbalanced. `start` is the first
+/// non-ws byte after `key:`.
+fn flow_span(bytes: &[u8], start: usize) -> (usize, usize) {
+    let mut depth = 0_i32;
+    let mut quote = None;
+    let mut at = start;
+    while at < bytes.len() {
+        let c = bytes[at];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else if c == b'\\' && q == b'"' {
+                at += 1;
+            }
+        } else {
+            match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'[' | b'{' => depth += 1,
+                b']' | b'}' => depth -= 1,
+                b'\n' if depth <= 0 => break,
+                b'#' if depth <= 0
+                    && at > start
+                    && matches!(bytes[at - 1], b' ' | b'\t') =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        at += 1;
+    }
+    let mut end = at.min(bytes.len());
+    while end > start && matches!(bytes[end - 1], b' ' | b'\t' | b'\r' | b'\n') {
+        end -= 1;
+    }
+    (start, end.max(start))
+}
+
+/// The block-collection value span below a `key:` whose line carries no
+/// content: the first non-blank, non-comment line more indented than the
+/// key (or a `- ` item at the key's own indentation — YAML's same-indent
+/// sequence form) starts the block; it ends before the first content line
+/// that is neither deeper than the key nor a `- ` item at the block's
+/// sequence indentation. `at` sits at the line tail after `key:`.
+fn block_span(bytes: &[u8], mut at: usize, key_indent: usize) -> Option<(usize, usize)> {
+    let mut start = None;
+    let mut end = None;
+    let mut seq_indent = usize::MAX;
+    while at < bytes.len() {
+        // Step to the next line's start and measure it.
+        let line_start = bytes[at..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| at + i + 1)?;
+        at = line_start;
+        let mut cursor = at;
+        while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+            cursor += 1;
+        }
+        let indent = cursor - line_start;
+        let content_end = bytes[cursor..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |i| cursor + i);
+        let first = bytes.get(cursor).copied();
+        // Blank and comment-only lines ride inside the block's span but
+        // neither open nor close it.
+        if first.is_none() || first == Some(b'#') || cursor == content_end {
+            continue;
+        }
+        let dash_item = first == Some(b'-')
+            && matches!(bytes.get(cursor + 1), Some(b' ' | b'\t' | b'\n') | None);
+        let inside = indent > key_indent || (dash_item && indent == key_indent)
+            || (dash_item && indent == seq_indent);
+        if !inside {
+            break;
+        }
+        if start.is_none() {
+            start = Some(cursor);
+            if dash_item {
+                seq_indent = indent;
+            }
+        }
+        // The content's own end — a trailing ` #` comment stays inside the
+        // node's span upstream (the comment is part of the collection's
+        // extent); only trailing ws trims.
+        let mut line_end = content_end;
+        while line_end > cursor && matches!(bytes[line_end - 1], b' ' | b'\t' | b'\r') {
+            line_end -= 1;
+        }
+        end = Some(line_end);
+    }
+    start.zip(end)
+}
+
+/// The leading-space/tab count of a line head — indentation for the block
+/// scan (YAML bans tabs in indentation; a tab is still counted here, the
+/// malformed shape only shifts the span).
+fn indent_of(line_head: &[u8]) -> usize {
+    line_head
+        .iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count()
+}
+
 /// One `invalid_section_format` row whose message carries the nested
 /// section name (`plugins/<name>` / `plugins/<name>/git/…`) and whose
-/// anchor is `token`'s occurrence inside `plugins` ([`plugin_anchor`]).
-fn push_plugin_invalid_section(
+/// anchor is the *value* node's span under `key` — upstream's anchor for
+/// every plugins-face `invalid_section_format` is the offending value's
+/// `YamlNode.span`, never the key (the pinned 2026-10-18 probe: scalar →
+/// the value token, map entry → the entry value, list → the block's span).
+/// `key` is the entry's key token, resolved to its value's extent by
+/// [`plugin_value_anchor`].
+fn push_plugin_invalid_value(
     issues: &mut Vec<OptionsIssue>,
     text: &str,
     section: &str,
-    token: &str,
+    key: &str,
 ) {
-    let (offset, length) = plugin_anchor(text, token);
+    let (offset, length) = plugin_value_anchor(text, key);
     issues.push(OptionsIssue {
         code: INVALID_SECTION_FORMAT,
         message: format!("Invalid format for the '{section}' section."),
