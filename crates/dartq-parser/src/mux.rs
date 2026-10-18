@@ -931,11 +931,258 @@ impl<A: ParserListener, B: ParserListener> ParserListener for MultiplexListener<
     }
 }
 
+/// The explicit forward set of the [`ParserListener`] impl above: one entry
+/// per overridden method, sorted. Every in-tree consumer override must
+/// appear here — the `*_REQUIREMENTS` guard test in `mod tests` asserts
+/// exactly that. This list and the impl must change in the same edit: add
+/// the forward and the entry together, and never drop one without the
+/// other. The list is the guard's assertion input, so a forward removed
+/// from the impl while its entry stays here is the one drift the guard
+/// cannot see; keep them in lockstep.
+#[cfg(test)]
+const FORWARDED_METHODS: &[&str] = &[
+    "begin_block_function_body",
+    "begin_class_declaration",
+    "begin_class_or_mixin_or_extension_body",
+    "begin_constructor",
+    "begin_enum_body",
+    "begin_enum_declaration",
+    "begin_export",
+    "begin_extension_declaration",
+    "begin_extension_type_declaration",
+    "begin_factory",
+    "begin_fields",
+    "begin_formal_parameters",
+    "begin_function_type",
+    "begin_function_typed_formal_parameter",
+    "begin_import",
+    "begin_library_augmentation",
+    "begin_library_name",
+    "begin_method",
+    "begin_mixin_declaration",
+    "begin_named_mixin_application",
+    "begin_part",
+    "begin_record_type",
+    "begin_record_type_entry",
+    "begin_record_type_named_fields",
+    "begin_top_level_method",
+    "begin_type_arguments",
+    "begin_type_list",
+    "begin_type_variable",
+    "begin_type_variables",
+    "begin_typedef",
+    "end_class_declaration",
+    "end_class_or_mixin_or_extension_body",
+    "end_constructor",
+    "end_constructor_reference",
+    "end_enum_body",
+    "end_enum_declaration",
+    "end_extension_declaration",
+    "end_extension_type_declaration",
+    "end_factory",
+    "end_fields",
+    "end_formal_parameter",
+    "end_formal_parameters",
+    "end_function_type",
+    "end_function_typed_formal_parameter",
+    "end_metadata",
+    "end_metadata_star",
+    "end_method",
+    "end_mixin_declaration",
+    "end_named_mixin_application",
+    "end_record_type",
+    "end_record_type_entry",
+    "end_record_type_named_fields",
+    "end_top_level_fields",
+    "end_top_level_method",
+    "end_type_arguments",
+    "end_type_variables",
+    "end_typedef",
+    "handle_assignment_expression",
+    "handle_async_modifier",
+    "handle_cascade_access",
+    "handle_class_extends",
+    "handle_class_header",
+    "handle_class_with_clause",
+    "handle_enum_header",
+    "handle_enum_with_clause",
+    "handle_experiment_not_enabled",
+    "handle_expression_function_body",
+    "handle_identifier",
+    "handle_implements",
+    "handle_indexed_expression",
+    "handle_mixin_header",
+    "handle_mixin_on",
+    "handle_named_mixin_application_with_clause",
+    "handle_no_arguments",
+    "handle_no_class_body",
+    "handle_no_enum_body",
+    "handle_no_extension_body",
+    "handle_no_extension_type_body",
+    "handle_no_formal_parameters",
+    "handle_no_mixin_body",
+    "handle_no_name",
+    "handle_no_type",
+    "handle_null_aware_index_operand_begin",
+    "handle_null_aware_member_begin",
+    "handle_recoverable_error",
+    "handle_send",
+    "handle_send_without_arguments",
+    "handle_type",
+    "handle_void_keyword",
+    "handle_void_keyword_with_type_arguments",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::NullListener;
     use crate::expr_const::test_support::{parser, parser_ref};
+
+    /// The event surface each in-tree mux consumer depends on: one entry
+    /// per method that consumer's `impl ParserListener` explicitly
+    /// overrides, sorted. The guard test below asserts every entry is in
+    /// [`FORWARDED_METHODS`]. When a consumer gains or drops an override,
+    /// update its list in the same edit — the list is the guard's assertion
+    /// input, so an unlisted new override would starve behind the mux's
+    /// default no-op instead of failing here.
+    ///
+    /// The lists live here because these crates depend on dartq-parser, not
+    /// the reverse: parser's tests cannot name their items.
+    ///
+    /// Sources:
+    /// - `DiagCollector` — dartq-engine `src/l1.rs`
+    /// - `DeclarationCollector` — dartq-semantic `src/collector.rs`
+    /// - `Capturer` — dartq-index `src/capture.rs`
+    const DIAG_COLLECTOR_REQUIREMENTS: &[&str] =
+        &["handle_experiment_not_enabled", "handle_recoverable_error"];
+    const DECLARATION_COLLECTOR_REQUIREMENTS: &[&str] = &[
+        "begin_block_function_body",
+        "begin_class_declaration",
+        "begin_class_or_mixin_or_extension_body",
+        "begin_constructor",
+        "begin_enum_declaration",
+        "begin_export",
+        "begin_extension_declaration",
+        "begin_extension_type_declaration",
+        "begin_factory",
+        "begin_fields",
+        "begin_formal_parameters",
+        "begin_function_type",
+        "begin_function_typed_formal_parameter",
+        "begin_import",
+        "begin_library_augmentation",
+        "begin_library_name",
+        "begin_method",
+        "begin_mixin_declaration",
+        "begin_named_mixin_application",
+        "begin_part",
+        "begin_record_type",
+        "begin_record_type_entry",
+        "begin_top_level_method",
+        "begin_type_arguments",
+        "begin_type_variable",
+        "begin_type_variables",
+        "begin_typedef",
+        "end_class_declaration",
+        "end_constructor",
+        "end_enum_declaration",
+        "end_extension_declaration",
+        "end_extension_type_declaration",
+        "end_factory",
+        "end_fields",
+        "end_formal_parameter",
+        "end_formal_parameters",
+        "end_function_type",
+        "end_function_typed_formal_parameter",
+        "end_metadata",
+        "end_metadata_star",
+        "end_method",
+        "end_mixin_declaration",
+        "end_named_mixin_application",
+        "end_record_type",
+        "end_record_type_entry",
+        "end_record_type_named_fields",
+        "end_top_level_fields",
+        "end_top_level_method",
+        "end_type_arguments",
+        "end_type_variables",
+        "end_typedef",
+        "handle_async_modifier",
+        "handle_class_extends",
+        "handle_class_header",
+        "handle_class_with_clause",
+        "handle_enum_header",
+        "handle_enum_with_clause",
+        "handle_expression_function_body",
+        "handle_identifier",
+        "handle_implements",
+        "handle_mixin_header",
+        "handle_mixin_on",
+        "handle_named_mixin_application_with_clause",
+        "handle_no_class_body",
+        "handle_no_enum_body",
+        "handle_no_extension_body",
+        "handle_no_extension_type_body",
+        "handle_no_formal_parameters",
+        "handle_no_mixin_body",
+        "handle_no_name",
+        "handle_no_type",
+        "handle_type",
+        "handle_void_keyword",
+        "handle_void_keyword_with_type_arguments",
+    ];
+    const CAPTURER_REQUIREMENTS: &[&str] = &[
+        "begin_class_declaration",
+        "begin_class_or_mixin_or_extension_body",
+        "begin_enum_body",
+        "begin_enum_declaration",
+        "begin_extension_declaration",
+        "begin_extension_type_declaration",
+        "begin_fields",
+        "begin_method",
+        "begin_mixin_declaration",
+        "begin_named_mixin_application",
+        "begin_top_level_method",
+        "begin_type_arguments",
+        "begin_type_list",
+        "begin_type_variable",
+        "begin_typedef",
+        "end_class_declaration",
+        "end_class_or_mixin_or_extension_body",
+        "end_constructor_reference",
+        "end_enum_body",
+        "end_enum_declaration",
+        "end_extension_declaration",
+        "end_extension_type_declaration",
+        "end_fields",
+        "end_method",
+        "end_mixin_declaration",
+        "end_named_mixin_application",
+        "end_top_level_fields",
+        "end_top_level_method",
+        "end_type_arguments",
+        "end_typedef",
+        "handle_assignment_expression",
+        "handle_cascade_access",
+        "handle_class_extends",
+        "handle_class_with_clause",
+        "handle_enum_with_clause",
+        "handle_identifier",
+        "handle_implements",
+        "handle_indexed_expression",
+        "handle_mixin_on",
+        "handle_named_mixin_application_with_clause",
+        "handle_no_arguments",
+        "handle_no_class_body",
+        "handle_no_enum_body",
+        "handle_no_extension_body",
+        "handle_no_extension_type_body",
+        "handle_no_mixin_body",
+        "handle_send",
+        "handle_send_without_arguments",
+        "handle_type",
+    ];
 
     /// Records the forwarded event names in arrival order.
     #[derive(Default)]
@@ -1116,6 +1363,49 @@ mod tests {
         ] {
             assert!(a.events.contains(&event), "receiver a missed {event}");
             assert!(b.events.contains(&event), "receiver b missed {event}");
+        }
+    }
+
+    /// The forwarding-coverage guard: every method any in-tree mux consumer
+    /// overrides must be in [`FORWARDED_METHODS`], else the event falls
+    /// through to the trait's default no-op and every receiver silently
+    /// starves. The fan-out equality tests pin only the events their
+    /// corpora fire; this pins the contract for all of them.
+    #[test]
+    fn every_consumer_override_is_in_the_forward_set() {
+        // Sorted and duplicate-free, so a copy-paste slip surfaces as a
+        // strict-ordering failure instead of a silently redundant entry.
+        let sorted_unique = |names: &[&str]| {
+            assert!(
+                names.windows(2).all(|w| w[0] < w[1]),
+                "list must be sorted and duplicate-free: {names:?}"
+            );
+        };
+        sorted_unique(FORWARDED_METHODS);
+        for (consumer, requirements) in [
+            (
+                "DiagCollector (dartq-engine src/l1.rs)",
+                DIAG_COLLECTOR_REQUIREMENTS,
+            ),
+            (
+                "DeclarationCollector (dartq-semantic src/collector.rs)",
+                DECLARATION_COLLECTOR_REQUIREMENTS,
+            ),
+            (
+                "Capturer (dartq-index src/capture.rs)",
+                CAPTURER_REQUIREMENTS,
+            ),
+        ] {
+            sorted_unique(requirements);
+            for name in requirements {
+                assert!(
+                    FORWARDED_METHODS.contains(name),
+                    "{consumer} overrides `{name}` but MultiplexListener does \
+                     not forward it: the event hits the default no-op and \
+                     starves every receiver. Add the forward to the \
+                     ParserListener impl and an entry to FORWARDED_METHODS."
+                );
+            }
         }
     }
 
