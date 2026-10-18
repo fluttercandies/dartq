@@ -14,7 +14,14 @@ use std::fmt::Write as _;
 /// 10k, so the stress axis is size and nesting depth, not error count: every
 /// budget below renders syntactically VALID Dart.
 const PATHO_NEST_DEPTH: usize = 1_000; // nested list literal depth
-const PATHO_EXPR_TOKENS: usize = 20_000; // terms in one giant expression
+// Oracle crash bracket (2026-10-18, #2148): dart analyze 3.13.1 dies rc=255
+// "Internal error: Stack Overflow" on a left-nested `+` chain of 4,000
+// terms — unguarded recursive AST walks in the analyzer (repro trace tops at
+// NullSafetyDeadCodeVerifier.visitNode; at 20k terms the overflow instead
+// surfaces in summary2/informative_data.dart); 2,000 terms analyze clean.
+// 2,000 keeps the giant-expression stress inside the verified-clean regime —
+// do not raise without re-running that bracket.
+const PATHO_EXPR_TOKENS: usize = 2_000; // terms in one giant expression
 const PATHO_SWITCH_ARMS: usize = 600; // switch-expression arms
 const PATHO_CASCADE_LEN: usize = 800; // `..add(k)` chain length
 const PATHO_INTERP_CHAIN: usize = 400; // adjacent interpolated segments

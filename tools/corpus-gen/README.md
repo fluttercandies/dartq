@@ -28,10 +28,13 @@ after all base files — the base corpus's bytes are unchanged for existing
 seeds and the overlay is pure addition to the plan and the fingerprint):
 
 - `zadv/patho/patho_NNNNN.dart` — pathological single files (~0.1% of the
-  corpus, floored at 3): 1000-deep nested collections, ~20k-term
+  corpus, floored at 3): 1000-deep nested collections, ~2k-term
   expressions, 600-arm switch expressions, 800-segment cascades, 400-part
   interpolation chains, 300-deep nested closures. All syntactically valid —
-  the stress axis is size/depth, not error count.
+  the stress axis is size/depth, not error count. The expression term count
+  is capped where the analysis server survives (it stack-overflows on
+  deeper left-nested chains; see the bracket note on PATHO_EXPR_TOKENS in
+  src/emit/adversarial.rs).
 - `zadv/unicode/uni_NNNNN.dart` — unicode edge family (~1%): RTL literals,
   combining marks, astral escapes and raw astral characters, emoji/ZWJ
   sequences, zero-width characters, unicode doc comments, unicode URI
