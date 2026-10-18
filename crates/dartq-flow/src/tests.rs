@@ -315,6 +315,84 @@ fn nullable_lhs_if_null_reports_nothing() {
     assert!(dead_snippets(source).is_empty());
 }
 
+/// `??` nested in a call argument keeps the same anchor: the non-nullable
+/// LHS still kills the right path and the row opens at the `??` operator,
+/// covering the right operand (oracle `print(x ?? y)` → `dead_code` at
+/// `?? y`, beside the `dead_null_aware_expression` row on `y`). The end
+/// boundary is the send-leaf follower token — the right operand's own end —
+/// which is the parser's `end_binary_expression` convention; the anchor is
+/// what the diagnostic keys on.
+#[test]
+fn if_null_right_path_row_inside_call_argument() {
+    let source = "void f(int x, int y) { print(x ?? y); }";
+    let op_offset = source.find("??").unwrap() as u32;
+    let dead: Vec<_> = facts_of(source)
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::DeadCode { span } => Some(span.range),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dead.len(), 1, "facts: {dead:?}");
+    assert_eq!(dead[0].offset, op_offset);
+    // Covers `?? y` at minimum (the `)` follower rounds out the send leaf).
+    assert!(dead[0].end() >= source.find(')').unwrap() as u32);
+}
+
+/// A guaranteed-fail `as` cast (operand and cast types disjoint by
+/// nullability) makes the continuation unreachable: the next statement
+/// anchors the dead row — official `asExpression_end`,
+/// `_isTypeCheckGuaranteedToFailWithSoundNullSafety`.
+#[test]
+fn null_operand_cast_kills_the_continuation() {
+    let source = "void f(Null n) { var x = n as int; print(x); }";
+    assert_eq!(dead_snippets(source), ["print(x);"]);
+}
+
+/// The disjointness runs both directions: a non-nullable operand under a
+/// `Null` cast target is just as guaranteed to throw.
+#[test]
+fn non_null_operand_under_null_cast_kills_the_continuation() {
+    let source = "void f(int x) { var y = x as Null; print(y); }";
+    assert_eq!(dead_snippets(source), ["print(y);"]);
+}
+
+/// A cast that ends the block has no following node to anchor a row at — the
+/// unreachable state never surfaces.
+#[test]
+fn cast_as_last_statement_reports_nothing() {
+    let source = "void f(Null n) { var x = n as int; }";
+    assert!(dead_snippets(source).is_empty());
+}
+
+/// A nullable operand under a compatible cast keeps the continuation live.
+#[test]
+fn nullable_operand_cast_reports_nothing() {
+    let source = "void f(int? x) { var y = x as int; print(y); }";
+    assert!(dead_snippets(source).is_empty());
+}
+
+/// `case null:` against a matched value promoted to non-nullable can never
+/// match (official `_EqualityCheckHasKnownResult(areEqual: false)`): the
+/// matched state folds into the unmatched chain, `current` goes unreachable,
+/// and the case body anchors its dead row at its first statement.
+#[test]
+fn null_constant_pattern_kills_the_case_body() {
+    let source = "\
+void f(String? p) {
+  String? s = p;
+  if (s != null) {
+    switch (s) {
+      case null:
+        break;
+      case '':
+        break;
+    }
+  }
+}";
+    assert_eq!(dead_snippets(source), ["break;"]);
+}
+
 /// Dead conditional-expression arms (probe table C): each arm's row spans
 /// the arm's own range (`flowEnd(thenExpression)`/`flowEnd(elseExpression)`).
 #[test]
@@ -4249,20 +4327,21 @@ fn try_body_terminator_leaves_catch_clauses_reachable() {
     }
 }
 
-/// A cast whose operand type and target are disjoint by nullability keeps
-/// the continuation alive: the measured oracle emits no `dead_code` after
-/// `var a = null as int;` (the `cast_from_null_always_fails` row is the
-/// semantic layer's value face, and the written `Null` type names the core
-/// null type just like the null literal). The flow kill for a cast whose
-/// operand never completes comes from the operand's own `Ev::Exit`, not
-/// from the disjointness question.
+/// A cast whose operand type and target are disjoint by nullability kills
+/// the continuation: the oracle emits `dead_code` on the statement after
+/// `var a = null as int;` (`asExpression_end`'s
+/// `_isTypeCheckGuaranteedToFailWithSoundNullSafety` — a `Null`-typed operand
+/// under a non-nullable cast always throws, and the written `Null` type names
+/// the core null type just like the null literal). The flow kill for a cast
+/// whose operand never completes comes instead from the operand's own
+/// `Ev::Exit` — a separate face from the disjointness question.
 #[test]
-fn cast_from_null_keeps_the_following_statement_alive() {
+fn null_disjoint_cast_kills_the_following_statement() {
     for source in [
         "void f(Null n) { var x = n as int; print(x); }",
         "void f() { var x = null as int; print(x); }",
     ] {
-        assert!(dead_snippets(source).is_empty(), "{source:?}");
+        assert_eq!(dead_snippets(source), ["print(x);"], "{source:?}");
     }
 }
 
@@ -4272,10 +4351,10 @@ fn cast_from_null_keeps_the_following_statement_alive() {
 /// type): a nullable-declared `x` cast to `int` leaves the following read
 /// at the cast type. The operand's own read row precedes the promotion
 /// (the declared type stands at its evaluation point), the promotion
-/// surfaces as its own fact, and no dead code follows — a downcast can
-/// fail but is not guaranteed to (the measured oracle keeps even the
-/// guaranteed-fail continuation alive,
-/// `cast_from_null_keeps_the_following_statement_alive`). #1619 residual
+/// surfaces as its own fact, and no dead code follows — a nullable downcast
+/// can fail but is not disjoint by nullability, so it does not kill the
+/// continuation (`null_disjoint_cast_kills_the_following_statement` covers
+/// the guaranteed-fail face). #1619 residual
 /// pin: the arm's first live promotion face.
 #[test]
 fn expression_cast_promotes_the_operand() {
@@ -5956,3 +6035,66 @@ fn non_promotion_reasons_map_this_and_answer_empty_without_entries() {
         crate::facts::NonPromotionReason::This
     );
 }
+
+/// A `case null:` whose disjointness is declared-type-level stands down:
+/// the semantic layer's own case-body dead row owns the report (its space
+/// world computes over declared types), so the flow kill must not produce a
+/// second dead region — `switch_same_type_variable_pattern_chain_dead`
+/// duplicated `(95,19)` until the kill learned to defer. Promotion-derived
+/// disjointness stays live (above).
+#[test]
+fn null_constant_pattern_declared_disjoint_defers_to_semantic() {
+    let source = "void f(int a) { switch (a) { case null: print2(1); break; case 3: print2(2); } }";
+    assert!(dead_snippets(source).is_empty());
+}
+
+/// TEMP PROBE (#2122): observe read-type rows for the issue60264 shape.
+/// A matched object pattern promotes the switched variable for the case
+/// body's reads (official `promoteForPattern`, flow_analysis.dart:7703-7755,
+/// fed by `analyzeObjectPattern`): each clause's body read carries the
+/// clause's own matched type — `case Some():` reads `Some`, the following
+/// `case None():` reads `None` (the earlier promotion does not leak: the
+/// failed arm joined the unmatched chain, official `coversMatchedType`
+/// gate) — and the post-switch read is back at the declared type (the
+/// close join with the chain, `switch_end`).
+#[test]
+fn object_pattern_promotes_scrutinee_for_case_body_reads() {
+    let source = concat!(
+        "class Option<T> { const Option(); } ",
+        "class Some<T> extends Option<T> { final T value; const Some(this.value); } ",
+        "class None extends Option<Never> { bool get noneProp => false; } ",
+        "void fun<T>(Option<T> option) { switch (option) { case Some(): option.value; ",
+        "case None(): option.noneProp; } option; }"
+    );
+    let (flow, facts) = analyze(source);
+    let rows: Vec<(u32, String)> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::ReadType { span, ty, .. } => {
+                let name = match ty.base {
+                    crate::ty::Base::Name(id) => flow.0.borrow().name_lexeme(id).to_string(),
+                    _ => String::new(),
+                };
+                Some((span.range.offset, name))
+            }
+            _ => None,
+        })
+        .collect();
+    // Offsets: the scrutinee read, the two case-body reads, the post-switch
+    // read — all of `option`.
+    let scrutinee = source.find("switch (option)").unwrap() + 8;
+    let body_some = source.find("option.value").unwrap();
+    let body_none = source.find("option.noneProp").unwrap();
+    let post = source.rfind("option; }").unwrap();
+    let row = |offset: u32| {
+        rows.iter()
+            .find(|(o, _)| *o == offset as u32)
+            .map(|(_, name)| name.as_str())
+            .unwrap_or_else(|| panic!("no read row at {offset}: {rows:?}"))
+    };
+    assert_eq!(row(scrutinee as u32), "Option", "{rows:?}");
+    assert_eq!(row(body_some as u32), "Some", "{rows:?}");
+    assert_eq!(row(body_none as u32), "None", "{rows:?}");
+    assert_eq!(row(post as u32), "Option", "{rows:?}");
+}
+

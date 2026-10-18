@@ -309,6 +309,18 @@ impl<'a> Analysis<'a> {
         })
     }
 
+    /// Whether `binding`'s target is the synthetic SDK face: a declaration
+    /// whose file the element index never carries (`<dart:*>` — the engine
+    /// graph's SDK posture; a bare name resolved through the implicit
+    /// dart:core import lands here). The upstream element-identity checks
+    /// (`isDartCorePrint`, noop_primitive_operations.dart:60) read this
+    /// face: a binding into the SDK is the core symbol, a workspace
+    /// binding shadows it.
+    #[must_use]
+    pub fn is_sdk_binding(&self, binding: &Binding) -> bool {
+        self.index.get(binding.target_file).is_none()
+    }
+
     /// The constructor face of the container a type-reference position
     /// names (`new C.named()`, `const C()`): existence plus the formal
     /// table. `type_name` must be the type-reference's own span;

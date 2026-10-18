@@ -761,6 +761,12 @@ pub enum SemanticCode {
     /// code's business and is never sent from this consumer.
     /// `messages.yaml` :25633.
     BodyMightCompleteNormallyNullable,
+    /// `The body might complete normally, causing 'null' to be returned, but
+    /// the return type, '{0}', is a potentially non-nullable type.` — the
+    /// COMPILE_TIME_ERROR twin of the same walk (`isPotentiallyNonNullable`
+    /// picks it over the nullable warning, type_analyzer.dart:688), reported
+    /// at the block's `{`. `diagnostic.g.dart` :1571-1586.
+    BodyMightCompleteNormally,
     // —— #747: the W4 const-duplicate pair (all `STATIC_WARNING`) ———————————
     /// `Two elements in a set literal shouldn't be equal.` — a non-const
     /// set literal whose later top-level element constant-evaluates to a
@@ -846,6 +852,13 @@ pub enum SemanticCode {
     /// qualified member and prefixed shapes stay nameless) crossed with the
     /// required count's plurality.
     NotEnoughPositionalArguments(ArgCountShape),
+    /// `The named parameter '{0}' is required, but there's no corresponding
+    /// argument.` — a resolved callee's `required` named formal received no
+    /// same-named argument (`RequiredParametersVerifier._check`,
+    /// required_parameters_verifier.dart:123-156), reported at the
+    /// invocation's callee entity (the constructor reference / invoked
+    /// name). `diagnostic.g.dart` :11147-11161.
+    MissingRequiredArgument,
     // —— #1314 FAM7: the optional-parameter default-value cluster (all
     //    `COMPILE_TIME_ERROR`) ————————————————————————————————————————————
     /// `The parameter '{0}' can't have a value of 'null' because of its
@@ -1507,6 +1520,10 @@ impl SemanticCode {
                 "body_might_complete_normally_nullable",
                 "BODY_MIGHT_COMPLETE_NORMALLY_NULLABLE",
             ),
+            Self::BodyMightCompleteNormally => (
+                "body_might_complete_normally",
+                "BODY_MIGHT_COMPLETE_NORMALLY",
+            ),
             // The #747 W4 pair (messages.yaml :26904 and :26951 — both
             // `hasPublishedDocs: true`).
             Self::EqualElementsInSet => ("equal_elements_in_set", "EQUAL_ELEMENTS_IN_SET"),
@@ -1546,6 +1563,10 @@ impl SemanticCode {
             Self::NotEnoughPositionalArguments(_) => (
                 "not_enough_positional_arguments",
                 "NOT_ENOUGH_POSITIONAL_ARGUMENTS",
+            ),
+            Self::MissingRequiredArgument => (
+                "missing_required_argument",
+                "MISSING_REQUIRED_ARGUMENT",
             ),
             // The #1314 FAM7 cluster: the positional face shares the named
             // one's registry name (the `sharedName` split, messages.yaml
@@ -2223,6 +2244,12 @@ impl SemanticCode {
             Self::BodyMightCompleteNormallyNullable => {
                 format!("This function has a nullable return type of '{a0}', but ends without returning a value.")
             }
+            // The ERROR twin's verbatim template (diagnostic.g.dart
+            // :1576-1578 — `{0}` is the declared return type's display
+            // text).
+            Self::BodyMightCompleteNormally => {
+                format!("The body might complete normally, causing 'null' to be returned, but the return type, '{a0}', is a potentially non-nullable type.")
+            }
             // The #747 W4 pair: no-argument rows, verbatim
             // (messages.yaml :26907 and :26954).
             Self::EqualElementsInSet => {
@@ -2266,6 +2293,12 @@ impl SemanticCode {
             }
             Self::NotEnoughPositionalArguments(ArgCountShape::NamePlural) => {
                 self.message3(a0, a1, "")
+            }
+            // The required-named coverage's verbatim template
+            // (diagnostic.g.dart :11154-11156 — `{0}` is the parameter
+            // name).
+            Self::MissingRequiredArgument => {
+                format!("The named parameter '{a0}' is required, but there's no corresponding argument.")
             }
             // The #1314 FAM7 rows: the default-value pair shares one problem
             // template (messages.yaml :11383/:11439 — the face lives in the
@@ -2762,6 +2795,11 @@ impl SemanticCode {
                 "Try adding a return statement, or if no value is ever returned, try changing the return type to 'void'."
                     .to_string(),
             ),
+            // The ERROR twin's verbatim correctionMessage
+            // (diagnostic.g.dart :1579).
+            Self::BodyMightCompleteNormally => {
+                Some("Try adding either a return or a throw statement at the end.".to_string())
+            }
             // The #747 W4 pair's verbatim oracle correctionMessages
             // (messages.yaml :26908 and :26955).
             Self::EqualElementsInSet => {
@@ -2799,6 +2837,11 @@ impl SemanticCode {
             Self::NotEnoughPositionalArguments(ArgCountShape::Plural)
             | Self::NotEnoughPositionalArguments(ArgCountShape::NamePlural) => {
                 Some("Try adding the missing arguments.".to_string())
+            }
+            // `missingRequiredArgument`'s verbatim correctionMessage
+            // (diagnostic.g.dart :11157).
+            Self::MissingRequiredArgument => {
+                Some("Try adding the required argument.".to_string())
             }
             // The #1314 FAM7 rows' verbatim oracle correctionMessages
             // (messages.yaml :11384/:11440/:14667 — the positional face
@@ -3134,6 +3177,7 @@ mod tests {
             // The #746 W2b pair.
             SemanticCode::CastFromNullableAlwaysFails,
             SemanticCode::BodyMightCompleteNormallyNullable,
+            SemanticCode::BodyMightCompleteNormally,
             // The #747 W4 pair.
             SemanticCode::EqualElementsInSet,
             SemanticCode::EqualKeysInMap,
@@ -3151,6 +3195,7 @@ mod tests {
             SemanticCode::NotEnoughPositionalArguments(ArgCountShape::Plural),
             SemanticCode::NotEnoughPositionalArguments(ArgCountShape::NameSingular),
             SemanticCode::NotEnoughPositionalArguments(ArgCountShape::NamePlural),
+            SemanticCode::MissingRequiredArgument,
             // The #1314 default-value, type-position, class-clause, and
             // uninitialized-non-nullable clusters.
             SemanticCode::MissingDefaultValueForParameter,
@@ -3781,6 +3826,7 @@ mod tests {
             SemanticCode::AmbiguousExtensionMemberTwo
             | SemanticCode::AmbiguousExtensionMemberThreeOrMore
             | SemanticCode::ArgumentTypeNotAssignable
+            | SemanticCode::BodyMightCompleteNormally
             | SemanticCode::BodyMightCompleteNormallyNullable
             | SemanticCode::CastFromNullAlwaysFails
             | SemanticCode::CastFromNullableAlwaysFails
@@ -3837,6 +3883,7 @@ mod tests {
             | SemanticCode::MemberWithClassName
             | SemanticCode::MissingDefaultValueForParameter
             | SemanticCode::MissingDefaultValueForParameterPositional
+            | SemanticCode::MissingRequiredArgument
             | SemanticCode::MissingOverrideOfMustBeOverriddenOne
             | SemanticCode::MissingOverrideOfMustBeOverriddenThreePlus
             | SemanticCode::MissingOverrideOfMustBeOverriddenTwo
@@ -3970,6 +4017,7 @@ mod tests {
             SemanticCode::AmbiguousExtensionMemberTwo,
             SemanticCode::AmbiguousExtensionMemberThreeOrMore,
             SemanticCode::ArgumentTypeNotAssignable,
+            SemanticCode::BodyMightCompleteNormally,
             SemanticCode::BodyMightCompleteNormallyNullable,
             SemanticCode::CastFromNullAlwaysFails,
             SemanticCode::CastFromNullableAlwaysFails,
@@ -4025,6 +4073,7 @@ mod tests {
             SemanticCode::MemberWithClassName,
             SemanticCode::MissingDefaultValueForParameter,
             SemanticCode::MissingDefaultValueForParameterPositional,
+            SemanticCode::MissingRequiredArgument,
             SemanticCode::MissingOverrideOfMustBeOverriddenOne,
             SemanticCode::MissingOverrideOfMustBeOverriddenThreePlus,
             SemanticCode::MissingOverrideOfMustBeOverriddenTwo,

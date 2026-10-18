@@ -580,14 +580,22 @@ impl Interp<'_> {
                 // operand tops the expr stack.
                 if self.pattern_depth == 0 {
                     let operand = self.pop_value();
-                    // The measured oracle keeps the continuation of a
-                    // guaranteed-fail cast alive (`var a = null as int;` —
-                    // the `cast_from_null_always_fails` row is the semantic
-                    // layer's value face, not a flow kill), so the cast
-                    // fires no unreachable of its own; a cast operand that
+                    // Official `asExpression_end`
+                    // (flow_analysis.dart:6451-6477): a cast whose operand
+                    // type and cast type are disjoint by nullability is
+                    // guaranteed to throw
+                    // (`_isTypeCheckGuaranteedToFailWithSoundNullSafety`)
+                    // — the continuation goes unreachable here and the next
+                    // executable node anchors the dead row (probed: `null
+                    // as int`, `n as int` with `n: Null`, and `x as Null`
+                    // all kill; a cast that ends the block reports nothing —
+                    // no following node to anchor). A cast operand that
                     // never completes kills through its own `Ev::Exit`
-                    // instead, and the promotion below is the only
-                    // reachability effect.
+                    // before this point; the promotion below is the only
+                    // other reachability effect.
+                    if self.disjoint_by_nullability(operand.ty, cast_ty) {
+                        self.unreachable_cur();
+                    }
                     if let Some(var) = operand.reference
                         && let Some(promoted) =
                             self.promotion_candidate(var, cast_ty, self.as_cast_args)

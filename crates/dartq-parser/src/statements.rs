@@ -1471,6 +1471,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         let assert_kw = self.peek_span();
         self.cursor.advance();
         self.listener.begin_assert(assert_kw, kind);
+        if kind == AssertKind::Expression {
+            // The analyzer's `endAssert` fabricates a `CallInvocation` whose
+            // receiver is a `ParsedUnqualifiedNameImpl` naming the `assert`
+            // keyword (upstream Dart SDK source, pkg/analyzer/lib/src/fasta/
+            // ast_builder.dart:1083-1096) — the name resolves through the
+            // unqualified-read face, so `assert(...)` in expression position
+            // reports `undefined_identifier 'assert'` (the pseudoShared
+            // `assertAsExpression` parse row is dropped by the error
+            // converter). The identifier event carries that reference; no
+            // send fires — an invoked intent would mint `undefined_method`,
+            // not the oracle's bare-name row.
+            self.listener
+                .handle_identifier(assert_kw, IdentifierContext::Expression);
+        }
         let open = if self.peek_kind() == TokenKind::OpenParen {
             self.peek_span()
         } else {

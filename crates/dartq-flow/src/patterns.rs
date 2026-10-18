@@ -3,7 +3,7 @@
 
 use crate::ev::Ev;
 use crate::interp::{Expr, Frame, Interp, PatternKind, PatternState, Resolved, VarMeta};
-use crate::ty::{Base, Ty};
+use crate::ty::{Base, Classification, Ty};
 
 impl Interp<'_> {
     /// Handles one pattern-layer event.
@@ -64,24 +64,111 @@ impl Interp<'_> {
                 self.pattern_depth = self.pattern_depth.saturating_sub(1);
             }
             Ev::ConstantPatternEnd => {
-                // A `null` constant test promotes the scrutinee on the
-                // matched path (official tryMarkNonNullable).
                 let constant = self.exprs.pop();
-                if let Some(pattern) = self.pattern.as_ref()
-                    && constant.is_some_and(|e| e.ty.base == Base::Null)
-                    && let Some(var) = pattern.scrutinee
-                {
-                    let meta = &self.vars[var as usize];
-                    let declared = meta.ty;
-                    let (promoted, promoted_args) = self.promote_to_non_null(declared, meta.args);
-                    if promoted != declared {
-                        self.current = self.current.clone().finish_type_test(
+                // Only a TOP-LEVEL constant pattern is an equality check on
+                // the matched value — a field's constant sub-pattern
+                // (`case Point(x: 5)`) constrains that field, not the
+                // scrutinee (the same depth gate
+                // [`Interp::matched_object_pattern`] uses).
+                if self.pattern_depth != 1 {
+                    return;
+                }
+                let Some(constant) = constant else {
+                    return;
+                };
+                let Some(var) = self.pattern_scrutinee() else {
+                    return;
+                };
+                // Official `constantPattern_end` →
+                // `_handleEqualityCheckPattern` (flow_analysis.dart:8866-8948):
+                // the implicit `== operand` runs `_equalityCheck` on
+                // (matched value type, constant type).
+                //
+                // A nullability-disjoint pair returns
+                // `_EqualityCheckHasKnownResult(areEqual: false)` — the match
+                // is guaranteed to fail, so the live matched state folds into
+                // the unmatched chain and `current` goes unreachable; the
+                // case body runs dead and anchors its row at the first body
+                // statement.
+                let (matched, matched_args) = {
+                    let model = self.current.model(var);
+                    (
+                        self.promoted_type_of(var, &model),
+                        self.promoted_args_of(var, &model),
+                    )
+                };
+                if self.disjoint_by_nullability(matched, constant.ty) {
+                    let cur = self.current.clone();
+                    if let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) {
+                        let joined = self.join(Some(chain), Some(cur));
+                        if let Some(pattern) = self.pattern.as_mut() {
+                            pattern.unmatched = joined;
+                        }
+                    }
+                    // Officially `current` goes unreachable and the case
+                    // body dies. Emit it only when the disjointness is
+                    // promotion-derived — a nullable scrutinee promoted
+                    // non-null is invisible to the space world, so the flow
+                    // row is the sole source. When the DECLARED type is
+                    // already disjoint (`case null` over `int`), the
+                    // semantic layer's case-body row owns the report and a
+                    // flow row would duplicate it
+                    // (`switch_same_type_variable_pattern_chain_dead`'s
+                    // `case null` after a total `case A a2` — flow emits
+                    // once, semantic once, unless the kill stands down).
+                    let declared = self
+                        .vars
+                        .get(var as usize)
+                        .map_or(Ty::UNKNOWN, |meta| meta.ty);
+                    if !self.disjoint_by_nullability(declared, constant.ty) {
+                        self.unreachable_cur();
+                    }
+                    return;
+                }
+                // A null-or-equivalent constant is the null-check face
+                // (`case null:` → `_handleNullTestPattern` matchesIfNull).
+                // The pattern fails only where the matched value is non-null,
+                // so the unmatched chain takes the non-null-promoted state
+                // (official `_unmatched = _join(_unmatched!, ifNotNull)`);
+                // `current` — the matched path — stays the is-null state.
+                // When the matched value is already `Null`/equivalent the
+                // official marks that promoted state unreachable (it can never
+                // be non-null), which the join drops — an always-matching
+                // `case null` leaves the chain's reachability untouched.
+                if self.classify(constant.ty) == Classification::NullOrEquivalent {
+                    let (non_null, non_null_args) =
+                        self.promote_to_non_null(matched, matched_args);
+                    let mut if_not_null = if non_null != matched {
+                        self.current.clone().finish_type_test(
                             self.ops,
                             &mut self.lists,
                             var,
                             None,
-                            Some((promoted, promoted_args)),
-                        );
+                            Some((non_null, non_null_args)),
+                        )
+                    } else {
+                        self.current.clone()
+                    };
+                    if self.classify(matched) == Classification::NullOrEquivalent {
+                        if_not_null = if_not_null.set_unreachable(&mut self.reach);
+                    }
+                    if let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) {
+                        let joined = self.join(Some(chain), Some(if_not_null));
+                        if let Some(pattern) = self.pattern.as_mut() {
+                            pattern.unmatched = joined;
+                        }
+                    }
+                    return;
+                }
+                // Every other constant gives no narrowing
+                // (`_NoEqualityInformation`): the match may or may not hold
+                // on the same scrutinee state, so `current` joins the
+                // unmatched chain unchanged.
+                let cur = self.current.clone();
+                if let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) {
+                    let joined = self.join(Some(chain), Some(cur));
+                    if let Some(pattern) = self.pattern.as_mut() {
+                        pattern.unmatched = joined;
                     }
                 }
             }
@@ -172,29 +259,7 @@ impl Interp<'_> {
         if self.pattern_depth != 1 {
             return;
         }
-        // The promotion target: the switch scrutinee (statement or
-        // expression alternative), or the pattern context's own matched
-        // value — an if-case's condition or a declaration's initializer
-        // (the official `promoteForPattern` runs in every context, over
-        // the matched value's reference). The kind gate keeps an if-case
-        // nested in a case body from latching the switch frame's
-        // scrutinee; the if-case context retypes from Decl only at
-        // `ThenBegin`, after the pattern walk, so both standalone kinds
-        // read the context's scrutinee slot here.
-        let var = match self.pattern.as_ref().map(|p| p.kind) {
-            Some(PatternKind::Switch | PatternKind::SwitchExpr) => {
-                self.switch_frame()
-                    .and_then(|index| match &self.stack[index] {
-                        Frame::Switch { scrutinee, .. } => *scrutinee,
-                        _ => None,
-                    })
-            }
-            Some(PatternKind::IfCase | PatternKind::Decl) => {
-                self.pattern.as_ref().and_then(|p| p.scrutinee)
-            }
-            None => None,
-        };
-        let Some(var) = var else {
+        let Some(var) = self.pattern_scrutinee() else {
             return;
         };
         let known = Ty {
@@ -216,6 +281,28 @@ impl Interp<'_> {
             if let Some(pattern) = self.pattern.as_mut() {
                 pattern.unmatched = joined;
             }
+        }
+    }
+
+    /// The matched value's variable — the key every matched-type question
+    /// (`promoted_type_of`, `finish_type_test`) resolves against. The switch
+    /// scrutinee (statement or expression alternative) lives on the switch
+    /// frame; the standalone contexts (if-case, pattern declaration) carry
+    /// their own matched value's reference. The kind gate keeps an if-case
+    /// nested in a case body from latching the switch frame's scrutinee.
+    fn pattern_scrutinee(&self) -> Option<u32> {
+        match self.pattern.as_ref().map(|p| p.kind) {
+            Some(PatternKind::Switch | PatternKind::SwitchExpr) => {
+                self.switch_frame()
+                    .and_then(|index| match &self.stack[index] {
+                        Frame::Switch { scrutinee, .. } => *scrutinee,
+                        _ => None,
+                    })
+            }
+            Some(PatternKind::IfCase | PatternKind::Decl) => {
+                self.pattern.as_ref().and_then(|p| p.scrutinee)
+            }
+            None => None,
         }
     }
 

@@ -738,11 +738,17 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         // window ends at the header-closing event (`handle_class_header` /
         // `handle_enum_header` / `handle_mixin_header`). A named mixin
         // application fires none of those — its buffer commits at the
-        // declaration's end instead. Extension and extension-type headers
-        // carry no subtype edges (the representation type is not one).
+        // declaration's end instead. Extension headers carry no subtype
+        // edges; an extension type's `implements`/`with` names ARE clause
+        // faces (its instance-member interface — the representation type
+        // itself is not one and stays out through the `formal_depth` gate
+        // in `note_header_reference`).
         self.in_class_header = matches!(
             kind,
-            ContainerKind::Class | ContainerKind::Enum | ContainerKind::Mixin
+            ContainerKind::Class
+                | ContainerKind::Enum
+                | ContainerKind::Mixin
+                | ContainerKind::ExtensionType
         );
         self.header_interfaces.clear();
         self.header_residue.clear();
@@ -967,6 +973,13 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         // (a merged `>>` closer splits one `>` per group), so the depth is
         // exact.
         if self.type_arg_depth > 0 {
+            return;
+        }
+        // An extension type's representation formal parses its type inside
+        // the primary-constructor `()` — `formal_depth` covers it, so the
+        // rep type never lands in the clause buffer; only the `implements`/
+        // `with` names after the group are clause entries.
+        if self.formal_depth > 0 {
             return;
         }
         // The extension on-type latch (a container is always open here).

@@ -906,11 +906,14 @@ struct Window {
     kind: WindowKind,
     /// Operand-stack length at open — every pop/truncate clamps here.
     base: usize,
-    /// Spread/if/for elements seen inside the window (only the
-    /// [`WindowKind::NonConstDup`] consumer reads it: the oracle's
-    /// `whereType<Expression>` excludes those elements, and their folded
-    /// operands cannot be told apart here — the dup check skips the whole
-    /// literal instead, under-reporting by design).
+    /// Spread/if/for elements seen inside the window. Two consumers read
+    /// it: the [`WindowKind::NonConstDup`] dup check skips the whole
+    /// literal (the oracle's `whereType<Expression>` excludes those
+    /// elements, and their folded operands cannot be told apart here —
+    /// under-reporting by design), and the [`WindowKind::LiteralCtor`]
+    /// candidate folds a control-flow-bearing literal to `Expr::Other`
+    /// (a partial fold could value a literal the oracle's `canBeConst`
+    /// probe calls non-constant).
     ctl_elements: u32,
     /// The creation head a `ConstructorReference` identifier latched (a
     /// type head never reaches the operand stack, so a ctor-invocation
@@ -1116,8 +1119,19 @@ impl ConstCapture {
             return Vec::new();
         }
         self.apply_unaries_at(self.depth);
+        // The candidate's own argument level still holds the args flushed
+        // by `positional_argument` (the candidate window opened at its
+        // `begin_arguments`, so the level's `window_seq` is this window's
+        // own); the stack above the base is the unflushed tail. Both
+        // halves join — earlier args alone never reached the stack drain.
+        let mut args = match self.args.last_mut() {
+            Some(level) if level.window_seq == self.windows.len() => {
+                std::mem::take(&mut level.args)
+            }
+            _ => Vec::new(),
+        };
         let base = self.base();
-        let args = self.stack.split_off(base);
+        args.extend(self.stack.split_off(base));
         self.drop_latches_above(base);
         self.windows.pop();
         if self
@@ -1178,11 +1192,19 @@ impl ConstCapture {
         root
     }
 
-    /// A spread/if/for element opened inside the innermost window (the
-    /// dup check's wholesale-skip latch; no other window kind reads it).
+    /// A spread/if/for element opened inside the innermost window. The
+    /// dup check reads the latch as its wholesale-skip flag; the
+    /// literal-constructor candidate reads it as a conservative-silence
+    /// flag (a control-flow element's operands stay several stack nodes,
+    /// so folding the literal would drop the condition operand and could
+    /// value a collection the oracle's `canBeConst` probe calls
+    /// non-constant — `Other` keeps the under-report direction).
     pub fn begin_ctl_element(&mut self) {
         if let Some(window) = self.windows.last_mut()
-            && window.kind == WindowKind::NonConstDup
+            && matches!(
+                window.kind,
+                WindowKind::NonConstDup | WindowKind::LiteralCtor
+            )
         {
             window.ctl_elements += 1;
         }
@@ -1682,7 +1704,12 @@ impl ConstCapture {
     /// pushes the opaque value node afterwards. `None` with no window.
     /// Under a non-const duplicate window the literal is a foreign element
     /// of the enclosing dup literal, not a const-checked face: its
-    /// operands drain and nothing checks.
+    /// operands drain and nothing checks. Under a literal-constructor
+    /// candidate window the literal is one argument of a non-const
+    /// creation — there is no const context, so no element check runs
+    /// (the oracle element-checks only `const` literals); the operands
+    /// fold into a single [`Expr::List`] node so the candidate's
+    /// `canBeConst` probe evaluates the literal's own const-ness.
     pub fn literal_list(&mut self, count: usize, span: SourceRange) -> Option<Vec<Node>> {
         if !self.open() {
             return None;
@@ -1694,7 +1721,35 @@ impl ConstCapture {
             return None;
         }
         self.apply_unaries_at(self.depth);
+        if self.fold_literal_ctor_element(count, span, Expr::List) {
+            return None;
+        }
         Some(self.pop_operands(count))
+    }
+
+    /// The literal-constructor candidate fold shared by the collection
+    /// and record literals: only under a [`WindowKind::LiteralCtor`] top —
+    /// the literal is a non-const creation's argument, not a const-checked
+    /// face, so `build` folds its operands into one expression node on the
+    /// stack (a control-flow element folds `Expr::Other` instead: its
+    /// operand count the `count` arity cannot see, and a partial fold
+    /// could value a literal the oracle's `canBeConst` probe rejects).
+    /// Returns `true` when the fold ran; `false` leaves the operands for
+    /// the caller's per-element path.
+    fn fold_literal_ctor_element(
+        &mut self,
+        count: usize,
+        span: SourceRange,
+        build: impl FnOnce(Vec<Node>) -> Expr,
+    ) -> bool {
+        if !self.top_is_literal_ctor() {
+            return false;
+        }
+        let has_ctl = self.windows.last().is_some_and(|w| w.ctl_elements > 0);
+        let elements = self.pop_operands(count);
+        let expr = if has_ctl { Expr::Other } else { build(elements) };
+        self.push(Node { expr, span }, true);
+        true
     }
 
     /// A set-or-map literal (explicit or implicit const): staged `Entry`
@@ -1702,17 +1757,29 @@ impl ConstCapture {
     /// parts return for per-element checking. `{}` is a map (the official
     /// `isMap` default). Non-const duplicate windows never reach here —
     /// [`Self::close_non_const_dup`] owns them (the engine's literal
-    /// handler tries it first).
+    /// handler tries it first). Under a literal-constructor candidate the
+    /// literal is a non-const creation's argument: no element check runs,
+    /// and the operands fold into one [`Expr::Set`]/[`Expr::Map`] node for
+    /// the candidate's `canBeConst` probe (mirroring
+    /// [`Self::literal_list`]).
     pub fn literal_set_or_map(
         &mut self,
         count: usize,
-        _span: SourceRange,
+        span: SourceRange,
         has_set_entry: bool,
     ) -> Option<SetOrMap> {
         if !self.open() || self.top_is_non_const_dup() {
             return None;
         }
         self.apply_unaries_at(self.depth);
+        if self.fold_literal_ctor_element(count, span, |staged| {
+            match split_set_or_map(staged, has_set_entry) {
+                SetOrMap::Set(elements) => Expr::Set(elements),
+                SetOrMap::Map(entries) => Expr::Map(entries),
+            }
+        }) {
+            return None;
+        }
         let staged = self.pop_operands(count);
         Some(split_set_or_map(staged, has_set_entry))
     }
@@ -1744,7 +1811,10 @@ impl ConstCapture {
     /// A record literal (explicit or implicit const): its fields return
     /// for per-element checking. Under a non-const duplicate window the
     /// record is a foreign element of the enclosing dup literal: its
-    /// operands drain and nothing checks.
+    /// operands drain and nothing checks. Under a literal-constructor
+    /// candidate the record is a non-const creation's argument: no field
+    /// check runs and the operands fold into one [`Expr::Record`] node
+    /// (mirroring [`Self::literal_list`]).
     pub fn record_literal(&mut self, count: usize, span: SourceRange) -> Option<Vec<Node>> {
         if !self.open() {
             return None;
@@ -1756,6 +1826,9 @@ impl ConstCapture {
             return None;
         }
         self.apply_unaries_at(self.depth);
+        if self.fold_literal_ctor_element(count, span, Expr::Record) {
+            return None;
+        }
         Some(self.pop_operands(count))
     }
 
@@ -2810,6 +2883,164 @@ mod tests {
                 &ConstantValue::Int(2),
             ),
             Verdict::NotConstant(span)
+        );
+    }
+
+    // —— the literal-constructor candidate window (#2114) ————————————
+    //
+    // `WindowKind::LiteralCtor` brackets a NON-const creation's argument
+    // list for the `non_const_call_to_literal_constructor` `canBeConst`
+    // probe. A collection/record literal inside it is one argument of a
+    // runtime creation — the oracle element-checks only `const` literals —
+    // so the literal APIs return `None` (no element rows) and fold the
+    // operands into a single expression node the probe evaluates.
+
+    /// `A([i])` — a const constructor's plain send with a list argument:
+    /// the candidate window opens, the list folds into one `Expr::List`
+    /// node, and evaluating the folded argument rejects `i` — the
+    /// `non_constant_list_element` rows the corpus over-emitted never
+    /// existed, because no const context was open.
+    #[test]
+    fn literal_ctor_window_folds_list_argument() {
+        let world = w();
+        let mut capture = ConstCapture::new(world.id("identical"));
+        assert!(capture.open_literal_ctor());
+        capture.begin_arguments();
+        capture.literal(span(1), ConstantValue::Int(5));
+        capture.positional_argument();
+        // The nested list literal: one element, a provably non-const read
+        // (the rig's `nc` — an in-scope local/formal face).
+        capture.identifier(world.id("nc"), span(2));
+        assert!(
+            capture.literal_list(1, span(2)).is_none(),
+            "a non-const creation's list argument is no element-checked face"
+        );
+        capture.positional_argument();
+        // The engine closes the candidate window before the argument-list
+        // close drains the stack (`close_literal_ctor_args` precedes
+        // `const_capture.end_arguments`), so the stack still holds the
+        // operand nodes here.
+        let args = capture.close_literal_ctor(span(3));
+        capture.end_arguments(span(3));
+        // Two argument nodes: `5`, then the folded list. The list node
+        // evaluates its elements — `nc` is provably non-constant, so the
+        // whole argument is non-constant (the candidate's silence face).
+        assert_eq!(args.len(), 2);
+        match &args[1].expr {
+            Expr::List(elements) => {
+                assert_eq!(elements.len(), 1);
+            }
+            other => panic!("expected Expr::List, got {other:?}"),
+        }
+        assert_eq!(
+            eval(&args[1], &world),
+            Verdict::NotConstant(span(2)),
+            "the folded list rejects its non-const element"
+        );
+    }
+
+    /// `A({x: x})` — the map literal inside the candidate folds into one
+    /// `Expr::Map`; no `non_constant_map_element` rows exist because the
+    /// literal is not in a const context.
+    #[test]
+    fn literal_ctor_window_folds_map_argument() {
+        let world = w();
+        let mut capture = ConstCapture::new(world.id("identical"));
+        assert!(capture.open_literal_ctor());
+        capture.begin_arguments();
+        // `{nc: nc}` — key then value stage as one Entry pseudo-operand
+        // (the rig's `nc` is the provably non-const face).
+        capture.identifier(world.id("nc"), span(1));
+        capture.identifier(world.id("nc"), span(2));
+        capture.literal_map_entry(span(2));
+        assert!(
+            capture.literal_set_or_map(1, span(3), false).is_none(),
+            "a non-const creation's map argument is no element-checked face"
+        );
+        capture.positional_argument();
+        let args = capture.close_literal_ctor(span(4));
+        capture.end_arguments(span(4));
+        assert_eq!(args.len(), 1);
+        match &args[0].expr {
+            Expr::Map(entries) => {
+                assert_eq!(entries.len(), 1);
+            }
+            other => panic!("expected Expr::Map, got {other:?}"),
+        }
+        assert_eq!(
+            eval(&args[0], &world),
+            Verdict::NotConstant(span(1)),
+            "the folded map rejects its non-const key"
+        );
+    }
+
+    /// `A({1, 2})` — a set literal folds the same way (`has_set_entry`
+    /// splits `Expr::Entry` staging from bare elements); the folded node
+    /// keeps the collection's own value for `canBeConst`.
+    #[test]
+    fn literal_ctor_window_folds_set_argument() {
+        let world = w();
+        let mut capture = ConstCapture::new(world.id("identical"));
+        assert!(capture.open_literal_ctor());
+        capture.begin_arguments();
+        capture.literal(span(1), ConstantValue::Int(1));
+        capture.literal(span(2), ConstantValue::Int(2));
+        assert!(
+            capture.literal_set_or_map(2, span(3), true).is_none(),
+            "a non-const creation's set argument is no element-checked face"
+        );
+        capture.positional_argument();
+        let args = capture.close_literal_ctor(span(4));
+        capture.end_arguments(span(4));
+        assert_eq!(args.len(), 1);
+        assert_eq!(
+            eval(&args[0], &world),
+            Verdict::Value(ConstantValue::Instance(InstanceKind::Set)),
+            "a constant set stays const-feasible for the probe"
+        );
+    }
+
+    /// `A([for (...) e])` — a control-flow element's operand count is not
+    /// the literal's element arity: folding conservatively to `Expr::Other`
+    /// keeps the probe's non-constant verdict instead of valuing a partial
+    /// fold (the oracle's `canBeConst` rejects the shape anyway once a
+    /// single operand is non-constant).
+    #[test]
+    fn literal_ctor_window_ctl_element_folds_other() {
+        let world = w();
+        let mut capture = ConstCapture::new(world.id("identical"));
+        assert!(capture.open_literal_ctor());
+        capture.begin_arguments();
+        capture.begin_ctl_element();
+        capture.identifier(world.id("x"), span(1));
+        capture.literal(span(2), ConstantValue::Int(1));
+        assert!(
+            capture.literal_list(1, span(3)).is_none(),
+            "a control-flow element folds conservatively, no element face"
+        );
+        capture.positional_argument();
+        let args = capture.close_literal_ctor(span(4));
+        capture.end_arguments(span(4));
+        // The control-flow element's stray operand stays on the stack as a
+        // sibling node (the conservative-drift posture); the folded last
+        // node is `Expr::Other`.
+        assert!(matches!(args.last().map(|n| &n.expr), Some(Expr::Other)));
+    }
+
+    /// The const-context faces are unchanged: inside an explicit `const`
+    /// literal window the element list still returns for per-element
+    /// checking (the `non_constant_list_element` face itself).
+    #[test]
+    fn const_literal_window_still_returns_elements() {
+        let world = w();
+        let mut capture = ConstCapture::new(world.id("identical"));
+        capture.open_explicit_literal();
+        capture.identifier(world.id("nc"), span(1));
+        let elements = capture.literal_list(1, span(2));
+        assert_eq!(
+            elements.map(|e| e.len()),
+            Some(1),
+            "a const list's elements still return for the element check"
         );
     }
 

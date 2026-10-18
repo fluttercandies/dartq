@@ -874,3 +874,63 @@ fn ensure_identifier_leaves_separators_for_the_grammar() {
     assert_eq!((c.errors[0].1, c.errors[0].2), (11, 12), "{:?}", c.errors);
     assert_eq!(c.texts, ["Expected an identifier."]);
 }
+
+// —— #2093: assert-as-expression receiver reference ————————————————————————
+
+/// Listener capturing the `assert` reference face: identifier offsets +
+/// contexts and whether any `handle_send` fired (the assert receiver must
+/// stay a bare-name read — an invoked intent mints the wrong code).
+#[derive(Default)]
+struct AssertRefLog {
+    identifiers: Vec<(u32, crate::listener::IdentifierContext)>,
+    sends: usize,
+}
+
+impl crate::listener::ParserListener for AssertRefLog {
+    fn handle_identifier(
+        &mut self,
+        token: crate::listener::Token,
+        context: crate::listener::IdentifierContext,
+    ) {
+        self.identifiers.push((token.range.offset, context));
+    }
+    fn handle_send(&mut self, _: crate::listener::Token, _: crate::listener::Token) {
+        self.sends += 1;
+    }
+}
+
+#[test]
+fn assert_expression_emits_the_keyword_as_a_name_read() {
+    // Upstream `endAssert` (upstream Dart SDK source, pkg/analyzer/lib/src/
+    // fasta/ast_builder.dart:1083-1096) fabricates a `CallInvocation` whose
+    // receiver names the `assert` keyword; `_resolveUnqualifiedNameRead`
+    // then surfaces `undefined_identifier 'assert'` (oracle
+    // const_patterns.dart 47/68 — `case assert(false):`, `case const
+    // assert(false):`). The parser-side fact is the identifier event; no
+    // send rides it.
+    use crate::listener::IdentifierContext;
+    let mut p =
+        crate::expr_const::test_support::parser("assert(false)", AssertRefLog::default());
+    let _ = p.parse_expression();
+    assert_eq!(
+        p.listener.identifiers,
+        vec![(0, IdentifierContext::Expression)]
+    );
+    assert_eq!(p.listener.sends, 0);
+}
+
+#[test]
+fn assert_expression_in_constant_pattern_keeps_the_reference() {
+    // Same fabricated name inside `case assert(false):` — the
+    // constant-pattern lane's `assert` arm routes through `parse_assert(
+    // AssertKind::Expression)`, so the reference event fires there too.
+    use crate::listener::{IdentifierContext, PatternContext};
+    let mut p =
+        crate::expr_const::test_support::parser("assert(false)", AssertRefLog::default());
+    let _ = p.parse_pattern_entry(PatternContext::Matching);
+    assert_eq!(
+        p.listener.identifiers,
+        vec![(0, IdentifierContext::Expression)]
+    );
+    assert_eq!(p.listener.sends, 0);
+}
