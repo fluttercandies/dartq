@@ -214,9 +214,26 @@ pub fn run_overlaid<'a>(
         // same face: the lint registry lives in dartq-lints and the engine
         // holds no diagnostic-name universe either, so validity is resolved
         // here, at the lint stage's application point.
-        let registry_rows = options_registry_rows(engine, roots);
+        let loaded = loaded_options(engine, roots);
+        let registry_rows = options_registry_rows(engine, &loaded);
         if !registry_rows.is_empty() {
             diagnostics.extend(engine.apply_severity_options(registry_rows));
+        }
+        // The cross-file plugin-source conflicts ride the same options-file
+        // attribution (`_computePluginConflicts` reports on spec1's file),
+        // and a malformed options file's failure is the stderr advisory —
+        // the oracle's machine-face silence (pinned probe) means it joins
+        // no diagnostic row.
+        for options in &loaded {
+            if let Some(notice) = options_failure_notice(options) {
+                notices.push(notice);
+            }
+        }
+        let conflict_rows = plugin_conflict_rows(&loaded, &|path| {
+            engine.file_table().try_file_id(path)
+        });
+        if !conflict_rows.is_empty() {
+            diagnostics.extend(engine.apply_severity_options(conflict_rows));
         }
         // The ignore-comment removed-state rows (#1005) ride the same face.
         let removed_rows = removed_lint_use_rows(engine, roots);
@@ -332,13 +349,27 @@ pub fn run_targets<'a>(
     let (mut diagnostics, analysis, libraries_analyzed, libraries_from_cache, mut event_notices) =
         analyze_pass(engine)?;
     notices.append(&mut event_notices);
+    // The loaded options set lives past the roots block: the plugin weave's
+    // per-directory gate consumes the same governing directories.
+    let loaded = loaded_options(engine, roots);
     if !roots.is_empty() {
         let lint_rows =
             crate::lints::analyze_lints(engine, roots, &mut crate::lints::LintMemo::default());
         diagnostics.extend(engine.apply_severity_options(lint_rows));
-        let registry_rows = options_registry_rows(engine, roots);
+        let registry_rows = options_registry_rows(engine, &loaded);
         if !registry_rows.is_empty() {
             diagnostics.extend(engine.apply_severity_options(registry_rows));
+        }
+        for options in &loaded {
+            if let Some(notice) = options_failure_notice(options) {
+                notices.push(notice);
+            }
+        }
+        let conflict_rows = plugin_conflict_rows(&loaded, &|path| {
+            engine.file_table().try_file_id(path)
+        });
+        if !conflict_rows.is_empty() {
+            diagnostics.extend(engine.apply_severity_options(conflict_rows));
         }
         let removed_rows = removed_lint_use_rows(engine, roots);
         if !removed_rows.is_empty() {
@@ -396,13 +427,14 @@ pub fn run_targets<'a>(
                 )
             })
             .collect();
-        let options_file = roots
-            .first()
-            .and_then(|root| dartq_engine::analysis_options::AnalysisOptions::find_for_dir(root));
+        // The per-directory `plugins:` semantics resolve against the loaded
+        // options set — the same governing directories the conflict face
+        // scanned. `loaded` is `Vec<&AnalysisOptions>` already; the cycle
+        // borrows it directly.
         let context = crate::plugins::CycleContext {
             analyzed: &analyzed,
             overlays: &plugin_overlays,
-            options_file: options_file.as_deref(),
+            governing_options: &loaded,
             query_server: Some(&|query| crate::plugins::serve_query(engine, query)),
         };
         let cycle = plugin_set.cycle(&diagnostics, files, anchor, &context);
@@ -410,7 +442,7 @@ pub fn run_targets<'a>(
             let index = engine.line_index(file)?;
             let text = engine.content(file)?;
             Some((index, std::str::from_utf8(text).ok()?))
-        });
+        }, &loaded);
         // The covered emit filter applies to plugin rows identically: the
         // context analyzes the whole root, but the oracle emits rows only
         // inside the targets — a finding on a non-covered file never
@@ -589,8 +621,10 @@ impl dartq_diagnostics::FileLayoutProvider for MergedRun<'_> {
 /// anchors at load; this face validates and emits rows attributed to the
 /// options file itself. Distinct loaded files yield once (two roots sharing
 /// one options file are one parse, officially too).
-fn options_registry_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
-    let mut seen = FxHashSet::default();
+fn options_registry_rows(
+    engine: &Engine,
+    loaded: &[&analysis_options::AnalysisOptions],
+) -> Vec<Diagnostic> {
     let mut rows = Vec::new();
     // Every context root's options file validates, not just the workspace
     // root's (context_builder.dart:199-224 — `_createOptionsMap` parses
@@ -600,31 +634,18 @@ fn options_registry_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> 
     // own names). The workspace roots plus every package root beneath them
     // — the package table holds the nested package-config members; a root
     // outside the analyzed surface never joins.
-    let mut candidates: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
-    let lower_roots: Vec<PathBuf> = engine
-        .packages()
-        .iter()
-        .filter(|package| roots.iter().any(|root| package.root.starts_with(root)))
-        .map(|package| package.root.clone())
-        .collect();
-    for root in &lower_roots {
-        candidates.push(root.as_path());
-    }
-    for root in candidates {
-        let Some(options) = engine.options_for_root(root) else {
-            continue;
-        };
-        if !seen.insert(options.file_path.clone()) {
-            continue;
-        }
-        let Some(file) = engine.file_table().try_file_id(&options.file_path) else {
-            continue;
-        };
-        // The removed/deprecated state gate reads this root's own
+    for options in loaded {
+        // The removed/deprecated state gate reads this file's own package's
         // `sdkVersionConstraint` (`PubPackage.sdkVersionConstraint`,
         // pub.dart:516-530 — the pubspec `environment.sdk` constraint; each
         // analysis context parses the options with its package's value).
-        let constraint_min = sdk_constraint_min(root);
+        let Some(file) = engine.file_table().try_file_id(&options.file_path) else {
+            continue;
+        };
+        // The package the options file belongs to is its declaring
+        // directory's own — `sdk_constraint_min` reads `<dir>/pubspec.yaml`.
+        let constraint_min =
+            sdk_constraint_min(options.file_path.parent().unwrap_or_else(|| Path::new("")));
         // The include chain's own declarations wrap into
         // `included_file_warning` (the official walker reports every
         // included file's findings on the initial file, before its own
@@ -830,7 +851,96 @@ fn options_registry_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> 
     rows
 }
 
-/// The cross-file lint-rule checks for one options file (`reportIncompatibleIncluded`
+/// Every distinct loaded options file under the analyzed workspace — the
+/// candidate set [`options_registry_rows`] walks (roots plus the package
+/// roots beneath them), deduplicated by the options file's own path. The
+/// cross-file plugin-conflict check and the parse-failure advisory both
+/// consume it: upstream's `_computePluginConflicts` scans every options
+/// file parsed in the context (context_manager.dart:614-685).
+fn loaded_options<'a>(
+    engine: &'a Engine,
+    roots: &[PathBuf],
+) -> Vec<&'a analysis_options::AnalysisOptions> {
+    let mut candidates: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+    for package in engine.packages().iter() {
+        if roots.iter().any(|root| package.root.starts_with(root)) {
+            candidates.push(package.root.as_path());
+        }
+    }
+    let mut seen = FxHashSet::default();
+    candidates
+        .into_iter()
+        .filter_map(|root| engine.options_for_root(root))
+        .filter(|options| seen.insert(options.file_path.clone()))
+        .collect()
+}
+
+/// The `incompatible_plugin_source` rows (`_computePluginConflicts`,
+/// upstream Dart SDK source,
+/// `pkg/analysis_server/lib/src/context_manager.dart`:606-685): for each
+/// plugin name, every pair of options files that both declare it (their own
+/// `plugins:` node a map — [`AnalysisOptions::has_plugins_map`]) and whose
+/// declared sources differ reports one row on the *first* spec's file,
+/// anchored at the plugin's key there (the merged configuration may arrive
+/// through the include chain, so the anchor falls back to the section's
+/// value node when no local key names it —
+/// [`AnalysisOptions::plugin_name_anchor`]).
+fn plugin_conflict_rows(
+    loaded: &[&analysis_options::AnalysisOptions],
+    file_id: &dyn Fn(&Path) -> Option<FileId>,
+) -> Vec<Diagnostic> {
+    // Specs grouped by plugin name, in load order — upstream iterates the
+    // parse-results map's insertion order; ours is the candidates order.
+    let mut specs: Vec<(&str, Vec<(usize, &analysis_options::PluginConfig)>)> = Vec::new();
+    for (index, options) in loaded.iter().enumerate() {
+        if !options.has_plugins_map {
+            continue;
+        }
+        for config in &options.plugins {
+            match specs.iter_mut().find(|(name, _)| *name == config.name) {
+                Some((_, group)) => group.push((index, config)),
+                None => specs.push((config.name.as_str(), vec![(index, config)])),
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    for (name, group) in specs {
+        for first in 0..group.len() {
+            for second in (first + 1)..group.len() {
+                let (spec_file, spec1) = group[first];
+                let (_, spec2) = group[second];
+                if spec1.source != spec2.source {
+                    let options = loaded[spec_file];
+                    let Some(file) = file_id(&options.file_path) else {
+                        continue;
+                    };
+                    rows.push(
+                        analysis_options::OptionsIssue::incompatible_plugin_source(
+                            name,
+                            &loaded[group[second].0].file_path,
+                            options.plugin_name_anchor(name),
+                        )
+                        .to_diagnostic(file),
+                    );
+                }
+            }
+        }
+    }
+    rows
+}
+
+/// The `note:` advisory for one options file whose YAML failed to parse —
+/// the oracle emits no machine row for a malformed options file (the pinned
+/// 2026-10-18 probe), so the failure rides the faces' stderr channel.
+fn options_failure_notice(options: &analysis_options::AnalysisOptions) -> Option<String> {
+    options.parse_failure.as_ref().map(|issue| {
+        format!(
+            "note: {}: {}",
+            options.file_path.display(),
+            issue.message
+        )
+    })
+}
 /// + `reportIncompatibleWithIncluded`, upstream Dart SDK source,
 /// `pkg/analyzer/lib/src/analysis_options/linter_rule_options_validator.dart`
 /// :99-225) — returned as the *inner* contextual rows: for the initial

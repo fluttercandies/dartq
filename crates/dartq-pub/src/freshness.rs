@@ -60,6 +60,9 @@ pub enum StaleReason {
     MalformedPackageConfig(String),
     /// `pubspec.lock` absent.
     MissingLockFile,
+    /// `pubspec.lock` present but unreadable/unparseable — the analysis
+    /// faces degrade to the no-lock posture rather than refuse.
+    MalformedLockFile(String),
     /// The config's recorded environment key differs from the current one.
     EnvironmentChanged { key: &'static str },
     /// `generatorVersion` major.minor differs from the running SDK
@@ -90,6 +93,9 @@ impl std::fmt::Display for StaleReason {
                 write!(f, "package_config.json is malformed: {error}")
             }
             Self::MissingLockFile => write!(f, "pubspec.lock is missing"),
+            Self::MalformedLockFile(error) => {
+                write!(f, "pubspec.lock is malformed: {error}")
+            }
             Self::EnvironmentChanged { key } => {
                 write!(f, "{key} changed since the resolution was written")
             }

@@ -570,17 +570,19 @@ fn assemble(
         return degraded_assembly(&workspace.root, &config_path, &dir).map(AssemblyBody::Floor);
     }
     // A config face failure degrades (the oracle's `Packages.empty`
-    // catch-all, packages.dart `parsePackageConfigJsonFile`); the lock face
-    // still refuses, and a malformed pubspec degrades to the empty model
-    // (the oracle's `Pubspec.parse` catch).
-    let (config, lock, mut pubspec) = match load_workspace_faces(&workspace.root, &config_path) {
-        Ok(faces) => faces,
-        Err(WorkspaceFacesError::PackageConfig(reason)) => {
-            return corrupt_config_assembly(&workspace.root, &config_path, &dir, &reason)
-                .map(AssemblyBody::Floor);
-        }
-        Err(error) => return Err(WorkspaceError(error.to_string())),
-    };
+    // catch-all, packages.dart `parsePackageConfigJsonFile`); a malformed
+    // lock degrades to the lock-absent posture inside `load_workspace_faces`
+    // (the analyzer never reads `pubspec.lock`), and a malformed pubspec
+    // degrades to the empty model (the oracle's `Pubspec.parse` catch).
+    let (config, lock, mut pubspec, malformed_lock) =
+        match load_workspace_faces(&workspace.root, &config_path) {
+            Ok(faces) => faces,
+            Err(WorkspaceFacesError::PackageConfig(reason)) => {
+                return corrupt_config_assembly(&workspace.root, &config_path, &dir, &reason)
+                    .map(AssemblyBody::Floor);
+            }
+            Err(error) => return Err(WorkspaceError(error.to_string())),
+        };
     // The empty-model floor's root identity borrows the config's self-entry
     // name (`config_self_name`): the table's name grammar has no null, and
     // the attribution is root-based either way.
@@ -656,11 +658,17 @@ fn assemble(
     // vanished mid-run) keeps the conservative mtime verdict. The check
     // stats a fixed file set (config, lock, per-entry pubspecs); it adds no
     // directory scan. The lock's absence skips the freshness face entirely
-    // (#759): no lock means no freshness comparison, not an advisory.
+    // (#759): no lock means no freshness comparison, not an advisory. A
+    // malformed lock degrades to the same no-lock posture — the mtime chain
+    // is meaningless against a lock whose content cannot be trusted — and
+    // the parse failure itself is the staleness signal (pub would
+    // re-resolve): it surfaces as the `MalformedLockFile` reason.
     // Cross-run seam: the baseline reflects the bytes as analyzed, so a
     // pubspec edited after the real `pub get` but before this run is not
     // caught; catching it needs a baseline persisted at acceptance time.
-    let mut reasons = if workspace.root.join("pubspec.lock").is_file() {
+    let mut reasons = if let Some(error) = malformed_lock {
+        vec![StaleReason::MalformedLockFile(error)]
+    } else if workspace.root.join("pubspec.lock").is_file() {
         let baseline = ResolutionBaseline::capture(&workspace.root).ok();
         let env = EnvSnapshot {
             dart_version: dart_version.map(str::to_owned),
@@ -835,8 +843,9 @@ type Assembly = (
 pub enum WorkspaceFacesError {
     /// `package_config.json` is unreadable or unparseable.
     PackageConfig(String),
-    /// `pubspec.lock` is unreadable or unparseable, or `pubspec.yaml` is
-    /// missing (an unparseable pubspec degrades — [`load_pubspec_or_empty`]).
+    /// `pubspec.yaml` is missing (an unparseable pubspec degrades —
+    /// [`load_pubspec_or_empty`]; a malformed `pubspec.lock` degrades to
+    /// the lock-absent posture, never an error here).
     PubFaces(String),
 }
 
@@ -856,12 +865,16 @@ impl std::fmt::Display for WorkspaceFacesError {
 /// The lock is optional (#759): its absence yields an empty
 /// [`LockFile`] — the graph resolves every config entry as a local path
 /// source and the freshness face stays silent. A present but malformed
-/// lock still fails the assembly, and so does a missing or malformed
-/// config: the caller (`dartq compat`) owns the config-required posture;
-/// the analyze path matches the [`WorkspaceFacesError::PackageConfig`]
-/// variant into its degrade floor. A malformed `pubspec.yaml` degrades
-/// to the empty model ([`load_pubspec_or_empty`], the oracle's
-/// `Pubspec.parse` catch) instead of refusing.
+/// lock degrades the same way — the analyzer never reads `pubspec.lock`,
+/// so an unparseable (or unreadable) lock behaves exactly like a missing
+/// one: the assembly continues on the empty lock and the fourth tuple
+/// element carries the failure text for the caller's advisory. A missing
+/// or malformed config still fails the assembly: the caller
+/// (`dartq compat`) owns the config-required posture; the analyze path
+/// matches the [`WorkspaceFacesError::PackageConfig`] variant into its
+/// degrade floor. A malformed `pubspec.yaml` degrades to the empty model
+/// ([`load_pubspec_or_empty`], the oracle's `Pubspec.parse` catch) instead
+/// of refusing.
 ///
 /// # Errors
 ///
@@ -869,7 +882,7 @@ impl std::fmt::Display for WorkspaceFacesError {
 pub fn load_workspace_faces(
     dir: &Path,
     config_path: &Path,
-) -> Result<(Arc<PackageConfig>, LockFile, Pubspec), WorkspaceFacesError> {
+) -> Result<(Arc<PackageConfig>, LockFile, Pubspec, Option<String>), WorkspaceFacesError> {
     let config_text = fs::read_to_string(config_path).map_err(|_| {
         WorkspaceFacesError::PackageConfig(format!(
             "no package config at {} (run `dart pub get`)",
@@ -879,16 +892,23 @@ pub fn load_workspace_faces(
     let config = PackageConfig::parse(&config_text)
         .map_err(|error| WorkspaceFacesError::PackageConfig(error.to_string()))?;
     let lock_path = dir.join("pubspec.lock");
+    let mut malformed_lock = None;
     let lock = if lock_path.is_file() {
-        let lock_text = fs::read_to_string(&lock_path)
-            .map_err(|error| WorkspaceFacesError::PubFaces(format!("pubspec.lock: {error}")))?;
-        LockFile::parse(&lock_text)
-            .map_err(|error| WorkspaceFacesError::PubFaces(error.to_string()))?
+        match fs::read_to_string(&lock_path)
+            .map_err(|error| error.to_string())
+            .and_then(|text| LockFile::parse(&text).map_err(|error| error.to_string()))
+        {
+            Ok(lock) => lock,
+            Err(error) => {
+                malformed_lock = Some(error);
+                LockFile::empty()
+            }
+        }
     } else {
         LockFile::empty()
     };
     let pubspec = load_pubspec_or_empty(dir).map_err(WorkspaceFacesError::PubFaces)?;
-    Ok((Arc::new(config), lock, pubspec))
+    Ok((Arc::new(config), lock, pubspec, malformed_lock))
 }
 
 /// Loads `<dir>/pubspec.yaml` with its optional `pubspec_overrides.yaml`
@@ -1624,7 +1644,7 @@ mod tests {
             "the graph carries the member set"
         );
 
-        let (_, _, pubspec) =
+        let (_, _, pubspec, _) =
             load_workspace_faces(&root, &root.join(".dart_tool/package_config.json"))
                 .expect("faces");
         assert!(
@@ -1644,7 +1664,7 @@ mod tests {
         let member = root.join("packages/a");
         let workspace = find_workspace_root(&member).expect("layout");
         let config_dir = workspace.root.join(".dart_tool");
-        let (config, lock, pubspec) =
+        let (config, lock, pubspec, _) =
             load_workspace_faces(&workspace.root, &config_dir.join("package_config.json"))
                 .expect("faces");
         let (extra_pubspecs, member_names) = assemble_extra_pubspecs(&workspace, &pubspec);
@@ -1975,6 +1995,43 @@ mod tests {
             invalid.reason.contains("duplicate"),
             "the reason names the defect: {}",
             invalid.reason
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A malformed `pubspec.lock` never aborts the assembly: the analyzer
+    /// never reads the lock, so an unparseable one degrades to the
+    /// lock-absent posture — the run proceeds on the empty lock and the
+    /// failure surfaces as the stale advisory's `MalformedLockFile` reason,
+    /// never a refusal (daemon/CLI startup parity with the oracle).
+    #[test]
+    fn malformed_lock_degrades_to_lock_absent() {
+        let root = workspace("ws_badlock", &[]);
+        // A `source:` key nested inside `description:` — hand-mangled shape.
+        fs::write(
+            root.join("pubspec.lock"),
+            "packages:\n  a:\n    dependency: \"direct main\"\n    description:\n      name: a\n      source: hosted\n      url: \"https://pub.dev\"\n    version: \"1.0.0\"\n",
+        )
+        .expect("malformed lock");
+
+        let root = root.canonicalize().expect("root");
+        let (config, _, advisory) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
+            .expect("a malformed lock degrades, never refuses");
+        assert_eq!(config.packages.len(), 1, "the self package stays");
+        assert!(config.packages.get("fixture").is_some());
+
+        let advisory = advisory.expect("the malformed lock advisory");
+        let WorkspaceAdvisory::Stale(stale) = &advisory else {
+            panic!("stale advisory, got {advisory:?}")
+        };
+        assert!(
+            stale
+                .reasons
+                .iter()
+                .any(|reason| matches!(reason, StaleReason::MalformedLockFile(_))),
+            "the parse failure is named: {:?}",
+            stale.reasons
         );
 
         fs::remove_dir_all(&root).ok();

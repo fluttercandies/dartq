@@ -57,6 +57,7 @@ use std::time::{Duration, Instant};
 
 use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, FileId, Severity};
 use dartq_engine::Engine;
+use dartq_engine::analysis_options::{AnalysisOptions, ConfiguredSeverity};
 use dartq_index::{DeclRow, FileCapture};
 use dartq_plugin::{
     CycleConfig, CyclePush, PendingQuery, PluginDiagnostic, PluginRuntime, PubNative, QueryKind,
@@ -67,7 +68,6 @@ use dartq_pub::PackageConfig;
 use dartq_source::{FileTable, LineIndex, SourceRange, utf16_len_of};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{Value, json};
-use serde_yaml::Value as Yaml;
 
 use crate::fix::{DeclaredPlugin, declared_plugin_sources, plugin_package_config};
 use crate::query as commands_query;
@@ -76,137 +76,6 @@ use crate::query as commands_query;
 /// a warm plugin's push, short enough to keep the analyze run responsive.
 /// Rows arriving later are dropped at process end (the CLI runs one cycle).
 const DRAIN_BUDGET: Duration = Duration::from_millis(50);
-
-/// The severity a rule-config entry assigns, mirroring the official
-/// `ConfiguredSeverity` (`package:analyzer/src/lint/config.dart`): a
-/// boolean maps to enable/disable, a severity name re-levels, and an
-/// unknown name degrades to enable (`_parseRuleConfig`). `Enable` leaves
-/// the declared severity standing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConfiguredSeverity {
-    Enable,
-    Disable,
-    Error,
-    Warning,
-    Info,
-}
-
-impl ConfiguredSeverity {
-    /// Official `RuleConfig.isEnabled`: every severity but `Disable`.
-    const fn is_enabled(self) -> bool {
-        !matches!(self, Self::Disable)
-    }
-
-    /// The wire severity of a re-leveling entry; `None` when the entry does
-    /// not re-level (`Enable`/`Disable` — the enablement face, not
-    /// severity).
-    const fn wire_severity(self) -> Option<PluginSeverity> {
-        match self {
-            Self::Enable | Self::Disable => None,
-            Self::Error => Some(PluginSeverity::Error),
-            Self::Warning => Some(PluginSeverity::Warning),
-            Self::Info => Some(PluginSeverity::Info),
-        }
-    }
-
-    /// Parses one rule-config scalar: `true`/`false` or a severity name
-    /// (case-insensitive; unknown names degrade to enable).
-    fn parse(value: &Yaml) -> Self {
-        match value {
-            Yaml::Bool(false) => Self::Disable,
-            Yaml::String(name) => match name.to_ascii_lowercase().as_str() {
-                "disable" | "false" => Self::Disable,
-                "error" => Self::Error,
-                "warning" => Self::Warning,
-                "info" => Self::Info,
-                _ => Self::Enable,
-            },
-            _ => Self::Enable,
-        }
-    }
-}
-
-/// One plugin's entry in the governing options' `plugins:` section: the
-/// `diagnostics:` rule configs (name → severity), keyed lower-cased — the
-/// official enablement face for plugin rules
-/// (`_computeDiagnosticsFromPlugin`: `registry.enabled(configuration.
-/// diagnosticConfigs)`), not the `linter.rules` section.
-#[derive(Default)]
-struct PluginOptionsConfig {
-    diagnostics: FxHashMap<String, ConfiguredSeverity>,
-}
-
-/// The parsed `plugins:` section of the governing root analysis options
-/// file, keyed by plugin name (lower-cased). The default is the empty
-/// section: with no configuration, lint rules stay disabled and warning
-/// rules stay enabled — the official no-configuration posture.
-#[derive(Default)]
-pub struct PluginOptionsConfigs {
-    plugins: FxHashMap<String, PluginOptionsConfig>,
-}
-
-impl PluginOptionsConfigs {
-    /// The string scalar of a YAML node (mapping keys are scalars; anything
-    /// else is skipped).
-    fn scalar_text(node: &Yaml) -> Option<&str> {
-        match node {
-            Yaml::String(text) => Some(text),
-            _ => None,
-        }
-    }
-
-    /// Loads and parses [path]'s top-level `plugins:` section. Any failure
-    /// degrades to the empty section: the engine's options face already
-    /// reports options diagnostics, and an unreadable plugin configuration
-    /// must never take the cycle down.
-    pub fn load(path: &Path) -> Option<Self> {
-        let text = std::fs::read_to_string(path).ok()?;
-        Some(Self::parse(&text))
-    }
-
-    /// Parses the `plugins:` section out of one options file's YAML text.
-    /// Root-file-only semantics: the include chain is not followed.
-    fn parse(text: &str) -> Self {
-        let Ok(Yaml::Mapping(root)) = serde_yaml::from_str(text) else {
-            return Self::default();
-        };
-        let Some(Yaml::Mapping(plugins)) = root.get("plugins") else {
-            return Self::default();
-        };
-        let mut parsed = Self::default();
-        for (name_node, config_node) in plugins {
-            let Some(name) = Self::scalar_text(name_node) else {
-                continue;
-            };
-            let Yaml::Mapping(config) = config_node else {
-                continue;
-            };
-            if name.eq_ignore_ascii_case("dependency_overrides") {
-                continue;
-            }
-            let Some(Yaml::Mapping(diagnostics)) = config.get("diagnostics") else {
-                continue;
-            };
-            let mut entry = PluginOptionsConfig::default();
-            for (rule_node, severity_node) in diagnostics {
-                let Some(rule) = Self::scalar_text(rule_node) else {
-                    continue;
-                };
-                entry.diagnostics.insert(
-                    rule.to_ascii_lowercase(),
-                    ConfiguredSeverity::parse(severity_node),
-                );
-            }
-            parsed.plugins.insert(name.to_ascii_lowercase(), entry);
-        }
-        parsed
-    }
-
-    /// The configuration of the named plugin (matched case-insensitively).
-    fn for_plugin(&self, name: &str) -> Option<&PluginOptionsConfig> {
-        self.plugins.get(&name.to_ascii_lowercase())
-    }
-}
 
 /// One analyze cycle's caller-side context: what the plugin face needs
 /// beyond the engine diagnostics themselves.
@@ -217,9 +86,15 @@ pub struct CycleContext<'a> {
     /// The open-document overlays (path, unsaved text): the edited view of
     /// the analyzed set. Files not handed here read from disk.
     pub overlays: &'a [(String, String)],
-    /// The governing root analysis options file, when one exists — the
-    /// source of the `plugins:` rule configs enablement resolves against.
-    pub options_file: Option<&'a Path>,
+    /// The loaded options of the workspace's governing directories — every
+    /// distinct `AnalysisOptions` the context parsed (the root's plus the
+    /// nested options files inside the package roots). The per-directory
+    /// plugin semantics resolve against these: `plugins:` configurations
+    /// merged per file (upstream `AnalysisSetConfigurationsParams` —
+    /// `plugin_watcher.dart` pushes one `{dir → {plugin → config}}` map per
+    /// options directory), so a plugin serves only the directories whose
+    /// governing options actually declare it.
+    pub governing_options: &'a [&'a AnalysisOptions],
     /// The reverse-query server: answers the plugins' `request/query` pulls
     /// against the engine's current view — the analyze face always has one
     /// (it owns the engine). [`serve_query`] is the canonical
@@ -234,71 +109,98 @@ type QueryAnswer = Result<serde_json::Map<String, Value>, String>;
 /// A reverse-query server: answers one pending query with its reply params.
 type QueryServer<'a> = &'a dyn Fn(&PendingQuery) -> QueryAnswer;
 
-/// One rule of a census, resolved for the cycle: enablement plus the
-/// severity overrides for its codes.
-struct ResolvedRule {
-    name_lower: String,
-    enabled: bool,
-    code_overrides: Vec<(String, PluginSeverity)>,
+/// The census code's attribution for the finding conversion: the declaring
+/// rule's lowercased name (the `diagnostics` rule-level gate key) and its
+/// kind (the diagnostic-family pick).
+#[derive(Clone)]
+struct CodeMeta {
+    rule: String,
+    kind: RuleKind,
 }
 
-/// Resolves a plugin's census against its options configuration with the
-/// official `RegistryBase::enabled` semantics: warning rules enabled unless
-/// a config disables them, lint rules enabled only by an explicit config.
-/// Severity overrides come from the same entries keyed by code name.
+/// One rule of a census, resolved for the cycle.
+struct ResolvedRule {
+    name_lower: String,
+    /// Whether at least one governing options enables the rule — the push
+    /// face's enable set is the union across directories (a rule enabled
+    /// anywhere must run so its per-directory findings exist; the
+    /// per-directory gate itself applies host-side at conversion).
+    enabled: bool,
+}
+
+/// The `diagnostics` map the serving directory's options declares for
+/// `plugin` — `None` when the directory's own `plugins:` map does not name
+/// the plugin (upstream `_getConfigurationsForFile` longest-prefix match:
+/// the plugin serves nothing in a directory whose pluginMap omits it).
+/// `options` is the governing directory's merged `AnalysisOptions`; only a
+/// file whose own `plugins:` node is a map contributes a directory entry
+/// (upstream's `pluginsNode is YamlMap` gate, the [`AnalysisOptions::has_plugins_map`]
+/// face), so the root-fallback arm — upstream's `protocolConfigs == null`
+/// → `analysisOptions.pluginConfigurations` — never reaches here: every
+/// loaded options in the governing set is a pluginMap source itself.
+fn serving_diagnostics<'a>(
+    options: &'a AnalysisOptions,
+    plugin: &str,
+) -> Option<&'a FxHashMap<String, ConfiguredSeverity>> {
+    if !options.has_plugins_map {
+        return None;
+    }
+    options
+        .plugins
+        .iter()
+        .find(|config| config.name == plugin)
+        .map(|config| &config.diagnostics)
+}
+
+/// Resolves a plugin's census against every governing options' `plugins:`
+/// configuration with the official `RegistryBase::enabled` semantics —
+/// warning rules enabled unless the serving directory's config disables
+/// them, lint rules enabled only by an explicit entry. A plugin absent
+/// from a directory's plugin map serves nothing there (it contributes
+/// neither enablement nor severity entries for that directory).
 fn resolve_census(
     census: &[RuleCensus],
-    config: Option<&PluginOptionsConfig>,
+    plugin: &str,
+    governing: &[&AnalysisOptions],
 ) -> Vec<ResolvedRule> {
     census
         .iter()
         .map(|rule| {
             let name_lower = rule.name.to_ascii_lowercase();
-            let entry = config.and_then(|config| config.diagnostics.get(&name_lower));
-            let enabled = match rule.kind {
-                RuleKind::Warning => entry.is_none_or(|severity| severity.is_enabled()),
-                RuleKind::Lint => entry.is_some_and(|severity| severity.is_enabled()),
-            };
-            let code_overrides = rule
-                .codes
-                .iter()
-                .filter_map(|code| {
-                    let severity = config
-                        .and_then(|config| config.diagnostics.get(&code.name.to_ascii_lowercase()))
-                        .copied()
-                        .and_then(ConfiguredSeverity::wire_severity)?;
-                    Some((code.name.to_ascii_lowercase(), severity))
-                })
-                .collect();
+            let enabled = governing.iter().any(|options| {
+                let Some(diagnostics) = serving_diagnostics(options, plugin) else {
+                    return false;
+                };
+                let entry = diagnostics.get(name_lower.as_str());
+                match rule.kind {
+                    RuleKind::Warning => entry.is_none_or(|severity| severity.is_enabled()),
+                    RuleKind::Lint => entry.is_some_and(|severity| severity.is_enabled()),
+                }
+            });
             ResolvedRule {
                 name_lower,
                 enabled,
-                code_overrides,
             }
         })
         .collect()
 }
 
-/// Builds the cycle's [`CycleConfig`] from the resolved census: enabled
-/// rule names, the merged per-code severity overrides, and the overlays
-/// restricted to the analyzed set.
+/// Builds the cycle's [`CycleConfig`] from the resolved census: the union
+/// of enabled rule names across the governing directories, an empty
+/// severity-override map (the per-directory re-leveling applies host-side
+/// at conversion — a pushed override could encode only one directory's
+/// map), and the overlays restricted to the analyzed set.
 fn cycle_config(
     resolved: &[ResolvedRule],
     overlays: &[(String, String)],
     analyzed: &[String],
 ) -> CycleConfig {
     let analyzed_set: FxHashSet<&String> = analyzed.iter().collect();
-    let mut enabled_rules = Vec::new();
-    let mut severity_overrides: BTreeMap<String, PluginSeverity> = BTreeMap::new();
-    for rule in resolved {
-        if !rule.enabled {
-            continue;
-        }
-        enabled_rules.push(rule.name_lower.clone());
-        for (code, severity) in &rule.code_overrides {
-            severity_overrides.insert(code.clone(), *severity);
-        }
-    }
+    let enabled_rules = resolved
+        .iter()
+        .filter(|rule| rule.enabled)
+        .map(|rule| rule.name_lower.clone())
+        .collect();
     let overlays = overlays
         .iter()
         .filter(|(file, _)| analyzed_set.contains(file))
@@ -309,7 +211,7 @@ fn cycle_config(
         .collect();
     CycleConfig {
         enabled_rules,
-        severity_overrides,
+        severity_overrides: BTreeMap::new(),
         overlays,
     }
 }
@@ -490,15 +392,14 @@ impl PluginSet {
                 .as_ref()
                 .is_some_and(|runtime| !runtime.rule_census().is_empty())
         });
-        let configs = if has_rules {
-            context
-                .options_file
-                .and_then(PluginOptionsConfigs::load)
-                .unwrap_or_default()
+        // The per-directory rule resolution needs the options only when a
+        // live plugin actually registered rules.
+        let governing: &[&AnalysisOptions] = if has_rules {
+            context.governing_options
         } else {
-            PluginOptionsConfigs::default()
+            &[]
         };
-        let resolved_per_plugin: Vec<(String, CycleConfig, FxHashMap<String, RuleKind>)> = self
+        let resolved_per_plugin: Vec<(String, CycleConfig, FxHashMap<String, CodeMeta>)> = self
             .plugins
             .iter()
             .map(|slot| {
@@ -507,20 +408,26 @@ impl PluginSet {
                     .as_ref()
                     .map(PluginRuntime::rule_census)
                     .unwrap_or_default();
-                let resolved = resolve_census(&census, configs.for_plugin(&slot.name));
-                // The finding conversion's family lookup: every census code
-                // to its rule's kind (a code an uncensused emission names
-                // falls back to `STATIC_WARNING` at conversion).
-                let kinds = census
+                let resolved = resolve_census(&census, &slot.name, governing);
+                // The finding conversion's lookups: every census code to
+                // its rule's name and kind (a code an uncensused emission
+                // names falls back to `STATIC_WARNING` at conversion).
+                let codes = census
                     .iter()
                     .flat_map(|rule| {
-                        rule.codes
-                            .iter()
-                            .map(move |code| (code.name.to_ascii_lowercase(), rule.kind))
+                        rule.codes.iter().map(move |code| {
+                            (
+                                code.name.to_ascii_lowercase(),
+                                CodeMeta {
+                                    rule: rule.name.to_ascii_lowercase(),
+                                    kind: rule.kind,
+                                },
+                            )
+                        })
                     })
                     .collect();
                 let config = cycle_config(&resolved, context.overlays, context.analyzed);
-                (slot.name.clone(), config, kinds)
+                (slot.name.clone(), config, codes)
             })
             .collect();
         for (index, slot) in self.plugins.iter_mut().enumerate() {
@@ -535,7 +442,7 @@ impl PluginSet {
             let Some(runtime) = slot.runtime.as_mut() else {
                 continue;
             };
-            let (_, config, kinds) = &resolved_per_plugin[index];
+            let (_, config, codes) = &resolved_per_plugin[index];
             let push = CyclePush {
                 analyzed: context.analyzed.to_vec(),
                 config: config.clone(),
@@ -562,7 +469,7 @@ impl PluginSet {
                         );
                     }
                     runtime.observe_cycle(started.elapsed(), degraded);
-                    accept_rows(&mut cycle, &slot.name, kinds, rows);
+                    accept_rows(&mut cycle, &slot.name, codes, rows);
                 }
                 Err(error) => {
                     // First surfaced error ends the plugin's run (the
@@ -600,7 +507,7 @@ impl PluginSet {
 fn accept_rows(
     cycle: &mut Cycle,
     name: &str,
-    kinds: &FxHashMap<String, RuleKind>,
+    codes: &FxHashMap<String, CodeMeta>,
     rows: Vec<PluginDiagnostic>,
 ) {
     if rows.is_empty() {
@@ -608,7 +515,7 @@ fn accept_rows(
     }
     cycle.findings.push(PluginBatch {
         name: name.to_owned(),
-        kinds: kinds.clone(),
+        codes: codes.clone(),
         rows,
     });
 }
@@ -648,15 +555,66 @@ pub struct Cycle {
 }
 
 /// One plugin's drained findings, in wire arrival order, plus the
-/// census-derived `code → RuleKind` map the diagnostic-family conversion
-/// resolves against.
+/// census-derived `code → (rule, kind)` map the conversion resolves against.
 pub struct PluginBatch {
     /// The manifest name (the finding's provenance tag).
     pub name: String,
-    /// The plugin's census codes to their rule kind — the diagnostic
-    /// family lookup ([`intern_code`]); empty for a rule-less plugin.
-    kinds: FxHashMap<String, RuleKind>,
+    /// The plugin's census codes to their rule attribution — the
+    /// diagnostic-family lookup ([`intern_code`]) and the per-directory
+    /// rule-level `diagnostics` gate's key; empty for a rule-less plugin.
+    codes: FxHashMap<String, CodeMeta>,
     pub rows: Vec<PluginDiagnostic>,
+}
+
+/// The governing options for a file at `path` (its parent directory's
+/// longest-prefix match over the governing set) — `None` when no governing
+/// directory contains it, in which case upstream falls back to the
+/// context's own `pluginConfigurations` (`_getConfigurationsForFile`'s
+/// null arm, plugin_server.dart:719-735); the caller supplies the root
+/// entry as that fallback.
+fn governing_for<'a>(path: &Path, governing: &'a [&'a AnalysisOptions]) -> Option<&'a AnalysisOptions> {
+    governing
+        .iter()
+        .copied()
+        .filter(|options| {
+            options
+                .file_path
+                .parent()
+                .is_some_and(|dir| path.starts_with(dir))
+        })
+        .max_by_key(|options| options.file_path.components().count())
+}
+
+/// The severity the finding emits at under `diagnostics` (the serving
+/// directory's `plugins/<name>/diagnostics` map), or `None` when the row
+/// drops: a rule-name `disable` removes the finding entirely (the rule is
+/// not enabled in that directory — upstream `registry.enabled` gates the
+/// rule's run before any code emits), while a code-name entry re-levels
+/// (`ConfiguredSeverity::severity` — `enable` keeps the pushed severity,
+/// `disable` degrades to INFO through the upstream `?? INFO` fall).
+fn configured_severity(
+    batch: &PluginBatch,
+    row: &PluginDiagnostic,
+    diagnostics: &FxHashMap<String, ConfiguredSeverity>,
+) -> Option<Severity> {
+    let code_lower = row.code.to_ascii_lowercase();
+    if let Some(configured) = diagnostics.get(&code_lower) {
+        match configured.severity() {
+            Some(severity) => return Some(severity),
+            // `enable` leaves the emitted severity standing.
+            None => {}
+        }
+    }
+    if let Some(meta) = batch.codes.get(&code_lower)
+        && let Some(ConfiguredSeverity::Disable) = diagnostics.get(meta.rule.as_str())
+    {
+        return None;
+    }
+    Some(match row.severity {
+        PluginSeverity::Error => Severity::Error,
+        PluginSeverity::Warning => Severity::Warning,
+        PluginSeverity::Info => Severity::Info,
+    })
 }
 
 /// Resolves drained plugin rows onto the files they name and converts them
@@ -664,6 +622,15 @@ pub struct PluginBatch {
 /// `resident` answers a `FileId` with its line index and text (the engine
 /// faces); rows on files the engine does not know are skipped — the same
 /// posture the transport's own feed takes for unknown `FileId`s.
+///
+/// `governing` is the loaded options set of the workspace's governing
+/// directories (`analyze.rs`'s [`loaded_options`]): the per-directory
+/// `plugins:` semantics apply at this conversion — a plugin serves only
+/// the directories whose own `plugins:` map declares it (a file under no
+/// governing directory falls back to the context root's merged
+/// configuration), a `diagnostics` entry naming the finding's *rule* with
+/// `disable` drops it, and one naming its *code* re-levels the emitted
+/// severity (the upstream `severityMapping`/`_configuredSeverity` face).
 ///
 /// The finding's free-form code interns as a `&'static` [`CodeInfo`]
 /// (leaked — bounded by the distinct code count, reclaimed at the one-shot
@@ -676,6 +643,7 @@ pub fn resolve_findings<'a>(
     batches: &[PluginBatch],
     files: &FileTable,
     mut resident: impl FnMut(FileId) -> Option<(&'a LineIndex, &'a str)>,
+    governing: &[&AnalysisOptions],
 ) -> Vec<Diagnostic> {
     let mut interned: FxHashMap<String, CodeInfo> = FxHashMap::default();
     let mut findings: Vec<Diagnostic> = Vec::new();
@@ -691,9 +659,23 @@ pub fn resolve_findings<'a>(
             let Some((index, text)) = resident(file) else {
                 continue;
             };
+            // The serving directory's pluginMap for this plugin — `None`
+            // drops the row (the plugin is not configured for that
+            // directory). With no governing directory at all the context
+            // root's merged options stand in (the upstream null arm).
+            let row_path = Path::new(&row.file);
+            let diagnostics = governing_for(row_path, governing)
+                .or_else(|| governing.first().copied())
+                .and_then(|options| serving_diagnostics(options, &batch.name));
+            let Some(diagnostics) = diagnostics else {
+                continue;
+            };
+            let Some(severity) = configured_severity(batch, row, diagnostics) else {
+                continue;
+            };
             rows.push((
                 u32::try_from(row.offset).unwrap_or(u32::MAX),
-                to_diagnostic(batch, row, file, index, text, &mut interned),
+                to_diagnostic(batch, row, file, index, text, severity, &mut interned),
             ));
         }
         rows.sort_by_key(|(offset, _)| *offset);
@@ -734,6 +716,7 @@ fn to_diagnostic(
     file: FileId,
     index: &LineIndex,
     text: &str,
+    severity: Severity,
     interned: &mut FxHashMap<String, CodeInfo>,
 ) -> Diagnostic {
     let total = utf16_len_of(text);
@@ -746,15 +729,10 @@ fn to_diagnostic(
     // inside them. No line-column arithmetic runs here (the oracle sort is
     // offset-keyed; the writers resolve positions at render).
     let _ = index;
-    let severity = match row.severity {
-        PluginSeverity::Error => Severity::Error,
-        PluginSeverity::Warning => Severity::Warning,
-        PluginSeverity::Info => Severity::Info,
-    };
     let kind = batch
-        .kinds
+        .codes
         .get(&row.code.to_ascii_lowercase())
-        .copied()
+        .map(|meta| meta.kind)
         .unwrap_or(RuleKind::Warning);
     let code = intern_code(&row.code, kind, interned);
     Diagnostic::new(
@@ -974,7 +952,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use dartq_pub::{PackageConfigEntry, normalize};
+    use dartq_pub::PackageConfigEntry;
 
     use super::*;
 
@@ -1154,7 +1132,7 @@ mod tests {
         let context = CycleContext {
             analyzed: &analyzed,
             overlays: &[],
-            options_file: None,
+            governing_options: &[],
             query_server: None,
         };
         // A live runtime would feed here; the dead slot only records its

@@ -106,7 +106,10 @@
 //! # Delta cursor
 //!
 //! A per-session monotonic counter bumps once per applied content change
-//! (a base overlay apply, an `overlay.set`); the changed map records each
+//! staged through the session — a queued write's apply (a `dartq/sync`
+//! batch, a watch sync, an `overlay.commit` merge) or an `overlay.set`.
+//! The startup sweep's discovery is the cursor-0 baseline, not a change:
+//! a fresh session echoes `since: 0`. The changed map records each
 //! explicitly written path's last-change cursor. `since:` answers filter
 //! rows by that table and echo the current cursor. Cascade-invalidated
 //! dependents are deliberately not marked: the changed set is the files
@@ -2880,13 +2883,6 @@ impl Session {
         anchor: Option<FileId>,
         engine_rows: &[Diagnostic],
     ) -> (Vec<plugins::PluginFinding>, Vec<Diagnostic>) {
-        // The governing root options file, resolved before the closure: the
-        // resolver reads the workspace root through a whole-`self` method,
-        // which would defeat the closure's disjoint field capture (the
-        // plugins' mutable borrow must stay disjoint from the engine's
-        // read). Returns an owned path, so the borrow ends here.
-        let options_file =
-            dartq_engine::analysis_options::AnalysisOptions::find_for_dir(self.workspace_root());
         // Direct field access (not `self.engine`): the plugins' mutable
         // borrow and the engine's read must stay disjoint field borrows.
         // Invariant: the read task's context is session-lived, so the lookup cannot miss.
@@ -2894,6 +2890,23 @@ impl Session {
             .runtime
             .context_state(context)
             .expect("the read task's context lives for the session");
+        // The loaded options set the per-directory `plugins:` semantics
+        // resolve against: every distinct options file under the analyzed
+        // workspace (the workspace root's plus the package roots'), deduped
+        // by file path — the same candidate set the analyze face builds.
+        let root = self.workspace_root().to_path_buf();
+        let mut candidates: Vec<&Path> = vec![root.as_path()];
+        for package in engine.packages().iter() {
+            if package.root.starts_with(&root) {
+                candidates.push(package.root.as_path());
+            }
+        }
+        let mut seen = rustc_hash::FxHashSet::default();
+        let governing: Vec<&dartq_engine::analysis_options::AnalysisOptions> = candidates
+            .into_iter()
+            .filter_map(|dir| engine.options_for_root(dir))
+            .filter(|options| seen.insert(options.file_path.clone()))
+            .collect();
         // The cycle context: the analyzed set (the context's resident
         // libraries — the files the plugin's rules run over), the staged
         // documents' unsaved text (the upstream `_overlayState` face —
@@ -2918,7 +2931,6 @@ impl Session {
         // cycle was handed (the `CycleContext.overlays` face's evidence).
         #[cfg(test)]
         crate::probe::record_weave_overlays(&overlays);
-        let options = options_file.as_deref();
         // The T4 reverse-query server: the plugins' `request/query` pulls
         // answer against this context's engine view — the same analyzed
         // state the cycle's findings resolve against.
@@ -2926,7 +2938,7 @@ impl Session {
         let cycle_context = plugins::CycleContext {
             analyzed: &analyzed,
             overlays: &overlays,
-            options_file: options,
+            governing_options: &governing,
             query_server: Some(&query_server),
         };
         let woven = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2938,8 +2950,10 @@ impl Session {
             let cycle =
                 self.plugins
                     .cycle(engine_rows, engine.file_table(), anchor, &cycle_context);
-            let findings =
-                plugins::resolve_findings(&cycle.findings, engine.file_table(), |file| {
+            let findings = plugins::resolve_findings(
+                &cycle.findings,
+                engine.file_table(),
+                |file| {
                     let index = engine.line_index(file)?;
                     let text = engine.content(file)?;
                     // Invariant: the read layer decodes content lossily, so the bytes are
@@ -2948,7 +2962,9 @@ impl Session {
                         index,
                         std::str::from_utf8(text).expect("engine content is valid UTF-8"),
                     ))
-                });
+                },
+                &governing,
+            );
             (findings, cycle.crashes)
         }));
         if let Ok((findings, crashes)) = woven {
@@ -5819,7 +5835,7 @@ mod tests {
         // while the agent's view keeps its own
         // content — disk traffic never leaks into it.
         session
-            .set_overlay("A", vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())])
+            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
             .expect("stage A");
         fs::write(&main, SYNTAX_BROKEN).expect("another disk rewrite");
         session
@@ -6091,10 +6107,10 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())])
+            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
             .expect("stage A");
         session
-            .set_overlay("B", vec![(main, AGENT_B_MAIN.as_bytes().to_vec())])
+            .set_overlay("B", vec![(main, StagedFile::Bytes(AGENT_B_MAIN.as_bytes().to_vec()))])
             .expect("stage B");
 
         let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
@@ -6174,13 +6190,13 @@ mod tests {
             .set_overlay(
                 "A",
                 vec![
-                    (main.clone(), bombed),
-                    (other.clone(), b"var o = 2;".to_vec()),
+                    (main.clone(), StagedFile::Bytes(bombed)),
+                    (other.clone(), StagedFile::Bytes(b"var o = 2;".to_vec())),
                 ],
             )
             .expect("stage A");
         session
-            .set_overlay("B", vec![(main.clone(), b"var b = 3;".to_vec())])
+            .set_overlay("B", vec![(main.clone(), StagedFile::Bytes(b"var b = 3;".to_vec()))])
             .expect("stage B");
 
         let overlays = session.plugin_overlays();
@@ -6214,7 +6230,7 @@ mod tests {
         let main = workspace.path("lib/main.dart");
         session.inject_plugins(PluginSet::with_dead_plugin("dead", "spawn failed"));
         session
-            .set_overlay("A", vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())])
+            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
             .expect("stage");
 
         session.sweep().expect("sweep");
@@ -6238,7 +6254,7 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main, CLEAN_MAIN.as_bytes().to_vec())])
+            .set_overlay("A", vec![(main, StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
             .expect("stage");
 
         session.queue_command(
@@ -6303,7 +6319,7 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main.clone(), SYNTAX_BROKEN.as_bytes().to_vec())])
+            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(SYNTAX_BROKEN.as_bytes().to_vec()))])
             .expect("stage");
         // The base moves AFTER staging: the agent's capture must happen at
         // wear time, so A keeps seeing its own text and the base moves on.
@@ -6416,7 +6432,7 @@ mod tests {
         // the file. If the publish leaked A's view, the push would carry
         // `expected_token` instead of the base clear.
         session
-            .set_overlay("A", vec![(main.clone(), AGENT_B_MAIN.as_bytes().to_vec())])
+            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(AGENT_B_MAIN.as_bytes().to_vec()))])
             .expect("stage");
         let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
         session.queue_command(id_a, a);
@@ -6913,7 +6929,7 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main, CLEAN_MAIN.as_bytes().to_vec())])
+            .set_overlay("A", vec![(main, StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
             .expect("stage A");
         let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
         session.queue_command(id_a, a);
@@ -6977,7 +6993,7 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main.clone(), AGENT_B_MAIN.as_bytes().to_vec())])
+            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(AGENT_B_MAIN.as_bytes().to_vec()))])
             .expect("stage A");
         let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
         session.queue_command(id_a, a);
@@ -7268,7 +7284,7 @@ mod tests {
                     &agent,
                     vec![(
                         main.clone(),
-                        format!("void agent() {{}} // {index}\n").into_bytes(),
+                        StagedFile::Bytes(format!("void agent() {{}} // {index}\n").into_bytes()),
                     )],
                 )
                 .expect("under the agent cap");
@@ -7533,7 +7549,7 @@ mod tests {
             session
                 .set_overlay(
                     &format!("agent-{index}"),
-                    vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())],
+                    vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))],
                 )
                 .expect("under the cap");
         }
@@ -7541,14 +7557,14 @@ mod tests {
             session
                 .set_overlay(
                     "overflow",
-                    vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())]
+                    vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))]
                 )
                 .is_err(),
             "the cap rejects a new agent"
         );
         session.clear_overlay("agent-0");
         session
-            .set_overlay("overflow", vec![(main, CLEAN_MAIN.as_bytes().to_vec())])
+            .set_overlay("overflow", vec![(main, StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
             .expect("a cleared slot frees room");
     }
 
@@ -7558,11 +7574,11 @@ mod tests {
     #[test]
     fn agent_overlay_file_count_is_capped() {
         let (workspace, mut session) = fixture("agent-files-cap-unit");
-        let files: Vec<(PathBuf, Vec<u8>)> = (0..MAX_OVERLAY_FILES)
+        let files: Vec<(PathBuf, StagedFile)> = (0..MAX_OVERLAY_FILES)
             .map(|index| {
                 (
                     workspace.path(&format!("lib/f{index}.dart")),
-                    b"var x = 1;\n".to_vec(),
+                    StagedFile::Bytes(b"var x = 1;\n".to_vec()),
                 )
             })
             .collect();
@@ -7574,7 +7590,7 @@ mod tests {
         let error = session
             .set_overlay(
                 "A",
-                vec![(workspace.path("lib/extra.dart"), b"var y = 2;\n".to_vec())],
+                vec![(workspace.path("lib/extra.dart"), StagedFile::Bytes(b"var y = 2;\n".to_vec()))],
             )
             .expect_err("the cap rejects growth");
         assert!(
@@ -7591,7 +7607,7 @@ mod tests {
         session
             .set_overlay(
                 "A",
-                vec![(workspace.path("lib/f0.dart"), b"var z = 3;\n".to_vec())],
+                vec![(workspace.path("lib/f0.dart"), StagedFile::Bytes(b"var z = 3;\n".to_vec()))],
             )
             .expect("an overwrite stays at the cap");
         assert_eq!(session.agents["A"].files.len(), MAX_OVERLAY_FILES);
@@ -7605,11 +7621,11 @@ mod tests {
         let (workspace, mut session) = fixture("agent-bytes-cap-unit");
         let full = vec![0u8; MAX_OVERLAY_BYTES];
         session
-            .set_overlay("A", vec![(workspace.path("lib/big.dart"), full)])
+            .set_overlay("A", vec![(workspace.path("lib/big.dart"), StagedFile::Bytes(full))])
             .expect("exactly the byte cap fits");
 
         let error = session
-            .set_overlay("A", vec![(workspace.path("lib/one.dart"), b"x".to_vec())])
+            .set_overlay("A", vec![(workspace.path("lib/one.dart"), StagedFile::Bytes(b"x".to_vec()))])
             .expect_err("one byte past the cap rejects");
         assert!(
             matches!(error, SessionError::InvalidParams(ref message) if message.contains("byte cap")),
@@ -7631,13 +7647,13 @@ mod tests {
             let agent = format!("A{index}");
             let full = vec![0u8; MAX_OVERLAY_BYTES];
             session
-                .set_overlay(&agent, vec![(workspace.path("lib/big.dart"), full)])
+                .set_overlay(&agent, vec![(workspace.path("lib/big.dart"), StagedFile::Bytes(full))])
                 .expect("each agent holds its own cap within the session total");
         }
 
         // One byte past the session total rejects the staging agent only.
         let error = session
-            .set_overlay("E", vec![(workspace.path("lib/one.dart"), b"x".to_vec())])
+            .set_overlay("E", vec![(workspace.path("lib/one.dart"), StagedFile::Bytes(b"x".to_vec()))])
             .expect_err("the session total rejects growth");
         assert!(
             matches!(error, SessionError::InvalidParams(ref message) if message.contains("total cap")),
@@ -7652,7 +7668,7 @@ mod tests {
         // Clearing an agent frees its budget for the next stager.
         session.clear_overlay("A0");
         session
-            .set_overlay("E", vec![(workspace.path("lib/one.dart"), b"x".to_vec())])
+            .set_overlay("E", vec![(workspace.path("lib/one.dart"), StagedFile::Bytes(b"x".to_vec()))])
             .expect("a cleared agent frees session budget");
     }
 
@@ -7673,7 +7689,7 @@ mod tests {
         let error = session
             .set_overlay(
                 "A",
-                vec![(PathBuf::from("/etc/dartq-escape"), b"x".to_vec())],
+                vec![(PathBuf::from("/etc/dartq-escape"), StagedFile::Bytes(b"x".to_vec()))],
             )
             .expect_err("an absolute path outside the root rejects");
         assert!(
@@ -7683,7 +7699,7 @@ mod tests {
         // Relative `..` escape.
         let outside = session.set_overlay(
             "A",
-            vec![(workspace.path("../../outside.dart"), b"x".to_vec())],
+            vec![(workspace.path("../../outside.dart"), StagedFile::Bytes(b"x".to_vec()))],
         );
         assert!(
             matches!(outside, Err(SessionError::InvalidParams(ref message)) if message.contains("escapes")),
@@ -7698,7 +7714,7 @@ mod tests {
                 "A",
                 vec![(
                     workspace.path("lib/../lib/main.dart"),
-                    CLEAN_MAIN.as_bytes().to_vec(),
+                    StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()),
                 )],
             )
             .expect("an in-root detour stages");
@@ -7736,7 +7752,7 @@ mod tests {
         session
             .set_overlay(
                 "A",
-                vec![(link.join("x.dart"), CLEAN_MAIN.as_bytes().to_vec())],
+                vec![(link.join("x.dart"), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))],
             )
             .expect("staging is lexical: the symlink is not followed yet");
 
@@ -8660,7 +8676,7 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())])
+            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
             .expect("stage");
 
         let before = session.cursor;
@@ -8728,7 +8744,7 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main.clone(), CLEAN_MAIN.as_bytes().to_vec())])
+            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
             .expect("stage");
         assert_eq!(session.commit_overlay("A").expect("first commit"), 1);
         let _ = session.service();
