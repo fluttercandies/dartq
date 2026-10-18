@@ -149,6 +149,13 @@ pub struct Flow<'t> {
     /// type): a variables declaration under one is a member, not a
     /// top-level declaration.
     container_depth: usize,
+    /// The closed-declaration capture the replay's switch-end
+    /// exhaustiveness verdict reads (see [`crate::ty::ClosedNames`]):
+    /// `sealed` class and enum names interned as their declarations parse.
+    /// Like [`Flow::top_level`], a declaration parsed after the executable
+    /// that switches over it is captured too late — the verdict
+    /// under-reports there.
+    closed: crate::ty::ClosedNames,
     /// The recording [`Flow::begin_variable_initializer`] opened for a
     /// declaration outside any executable (a field or top-level
     /// initializer is its own executable — the official folds it):
@@ -197,6 +204,7 @@ impl<'t> Flow<'t> {
             top_last_type: None,
             top_decl: None,
             container_depth: 0,
+            closed: crate::ty::ClosedNames::default(),
             initializer_exec: false,
             facts: Vec::new(),
         }
@@ -567,11 +575,18 @@ impl<'t> Flow<'t> {
             self.intern_lexeme("mounted"),
             self.intern_lexeme("context"),
         );
+        // The exhaustiveness gate's core names (interned lazily, id-stable
+        // across replays): `bool` splits over `true`/`false`,
+        // `FutureOr<T>` recurses into `T`.
+        self.closed.bool_name = Some(self.intern_lexeme("bool"));
+        self.closed.future_or = Some(self.intern_lexeme("FutureOr"));
         let ops = NameTypeOps;
         let mut interp = Interp::new(&ops, &self.type_args, &self.boundaries);
         // The unit's top-level read face (captured so far — declarations
-        // parsed after this executable under-report there).
+        // parsed after this executable under-report there), and the closed
+        // declarations the switch-end verdict reads.
         interp.top_level = &self.top_level;
+        interp.closed = &self.closed;
         interp.run(&events);
         // The async-gap context face: one linear replay over the same
         // buffer (the ids are interned lazily — already-present names keep
@@ -750,6 +765,12 @@ impl ParserListener for Flow<'_> {
         _mixin_kw: Option<Token>,
         _name: Token,
     ) {
+        // The `isSealed` element face (type_system.dart:858): the switch
+        // scrutinee's always-exhaustive verdict reads it.
+        if _sealed_kw.is_some() {
+            let name = self.name(_name);
+            self.closed.names.insert(name);
+        }
         self.container_depth += 1;
     }
 
@@ -779,6 +800,10 @@ impl ParserListener for Flow<'_> {
         _enum_keyword: Token,
         _name: Token,
     ) {
+        // Enums are sealed by construction (upstream
+        // `element is EnumElement` arm, type_system.dart:855-856).
+        let name = self.name(_name);
+        self.closed.names.insert(name);
         self.container_depth += 1;
     }
 

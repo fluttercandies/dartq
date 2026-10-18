@@ -321,6 +321,21 @@ impl<'a> Analysis<'a> {
         self.index.get(binding.target_file).is_none()
     }
 
+    /// Whether this unit's declaring library spells `library meta;` — the
+    /// resolved form of the oracle's declaring-library test for the
+    /// package:meta annotations (`_isPackageMetaGetter`,
+    /// `element.dart:2100-2102`: `element.library.name == 'meta'`). The
+    /// name is the resolution graph's registered directive text
+    /// ([`LibraryGraph::name`], engine-fed from the defining unit's
+    /// `library` directive), so a part of a meta library answers true —
+    /// its elements' `element.library` is the enclosing library — and a
+    /// directive-less vendored meta copy answers false exactly as the
+    /// oracle's `hasLiteral` does there.
+    #[must_use]
+    pub fn is_meta_library(&self) -> bool {
+        self.graph.name(self.lib) == "meta"
+    }
+
     /// The constructor face of the container a type-reference position
     /// names (`new C.named()`, `const C()`): existence plus the formal
     /// table. `type_name` must be the type-reference's own span;

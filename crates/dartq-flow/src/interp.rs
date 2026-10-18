@@ -210,6 +210,12 @@ pub(crate) enum Frame {
         /// key the matched-type rows answer against (#1349). Any other
         /// scrutinee shape carries no flow-visible promotion.
         scrutinee: Option<u32>,
+        /// The scrutinee's flow type at the block's open (the promoted type
+        /// of a bare-read scrutinee — upstream's `scrutineeType` IS the
+        /// promoted static type) beside its written-argument tree: the
+        /// `switch_end` `isExhaustive` answer ([`Interp::is_always_exhaustive`]).
+        scrutinee_ty: Ty,
+        scrutinee_args: u32,
         /// The switch-expression latch: the match-time matched-type row a
         /// `SwitchExprCasePattern` computed, emitted at the alternative's
         /// `SwitchExprCaseEnd` where the clause anchor token arrives (the
@@ -685,6 +691,10 @@ pub(crate) struct Interp<'o> {
     /// recorder captured at parse time. Absent rows degrade to the
     /// syntactic classification.
     pub(crate) boundaries: &'o [Option<crate::ty::Boundary>],
+    /// The unit's closed-declaration names (sealed classes, enums, `bool`,
+    /// `FutureOr`) the switch-end exhaustiveness verdict reads — the
+    /// recorder's capture, mounted at replay time.
+    pub(crate) closed: &'o crate::ty::ClosedNames,
     /// The unit's top-level variable declarations (the recorder's capture,
     /// mounted at replay time): the lexical chain's outermost scope, the
     /// read fallback once every scope frame misses. The empty table is the
@@ -839,6 +849,12 @@ struct Snapshot {
 static NO_TOP_LEVEL: std::sync::LazyLock<FxHashMap<u32, crate::record::TopVar>> =
     std::sync::LazyLock::new(FxHashMap::default);
 
+/// The direct-construction default for [`Interp::closed`]: no closed
+/// declarations — every always-exhaustive verdict answers `false` (the
+/// pre-mount behavior).
+static NO_CLOSED: std::sync::LazyLock<crate::ty::ClosedNames> =
+    std::sync::LazyLock::new(crate::ty::ClosedNames::default);
+
 /// The resolution of one bare-name reference: a local variable id (the
 /// scope chain's answer — promotion and definite-assignment state track
 /// it) or a top-level declaration face (no flow state; the read row
@@ -858,6 +874,7 @@ impl<'o> Interp<'o> {
             ops,
             args,
             boundaries,
+            closed: &NO_CLOSED,
             top_level: &NO_TOP_LEVEL,
             reach: ReachArena::new(),
             lists: Lists::default(),
@@ -1519,16 +1536,23 @@ impl<'o> Interp<'o> {
     /// Reads of definitely-unassigned locals (official `isUnassigned`). A
     /// stale id (a scope binding stranded past its variable by a collect
     /// rollback) emits no fact: the fact's metadata would name the wrong
-    /// variable.
+    /// variable. The row emits under `!assigned` — the union of the two
+    /// consumer gates: upstream's `isDefinitelyUnassigned` (the
+    /// `unassigned` bit — the late-local and cast faces) is narrower than
+    /// the non-late reads' `!isAssigned` (the potentially-unassigned join
+    /// face); `definitely_unassigned` carries the bit so the consumer
+    /// picks its own gate.
     pub(crate) fn check_unassigned_read(&mut self, span: TokenSpan, var: u32) {
         let Some(meta) = self.vars.get(var as usize) else {
             return;
         };
-        if self.reachable() && !self.current.model(var).assigned {
+        let model = self.current.model(var);
+        if self.reachable() && !model.assigned {
             self.emit(FlowFact::UnassignedRead {
                 span,
                 is_late: meta.late,
                 is_final: meta.is_final,
+                definitely_unassigned: model.unassigned,
                 declared_type: meta.decl_span,
             });
         }
@@ -1574,6 +1598,40 @@ impl<'o> Interp<'o> {
             self.promoted_type_of(*var, &model),
             self.promoted_args_of(*var, &model),
         ))
+    }
+
+    /// `TypeSystem.isAlwaysExhaustive` (type_system.dart:846-888) at name
+    /// level, mirroring the official decision order: `Null` and `bool`
+    /// split completely, enums and sealed classes are closed by their
+    /// element faces (here: the recorder's declaration capture), and
+    /// `FutureOr<T>` recurses into its argument. Extension types (erasure
+    /// recursion), type parameters (bound recursion), records, and
+    /// function types are undecidable at this level — `false`, the
+    /// conservative arm: a missed verdict keeps the post-switch state live
+    /// (the pre-mount behavior), never a false dead report. Nullability is
+    /// agnostic exactly like the official's `InterfaceType` arm — `S?` of
+    /// a sealed `S` is still always-exhaustive (the null half is the
+    /// space model's split, not this gate's).
+    pub(crate) fn is_always_exhaustive(&self, ty: Ty, args: u32) -> bool {
+        let Base::Name(id) = ty.base else {
+            return matches!(ty.base, Base::Null);
+        };
+        if self.closed.names.contains(&id) || self.closed.bool_name == Some(id) {
+            return true;
+        }
+        if self.closed.future_or == Some(id)
+            && let Some(row) = self.args.get(args as usize)
+            && let [arg] = row.as_slice()
+        {
+            return self.is_always_exhaustive(
+                Ty {
+                    base: arg.base,
+                    nullable: arg.nullable,
+                },
+                arg.args,
+            );
+        }
+        false
     }
 
     // —— collect runs ——————————————————————————————————————————————————

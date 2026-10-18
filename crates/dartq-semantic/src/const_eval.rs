@@ -860,6 +860,417 @@ fn as_f64(v: &ConstantValue) -> Option<f64> {
     }
 }
 
+// —— written expressions: the lexeme-slice face ———————————————————————————
+
+/// The outcome of evaluating one written expression's lexeme slice
+/// ([`eval_written`]) for a value-comparison face — the lint equality
+/// checks upstream answers through `computeConstantValue`
+/// (`avoid_redundant_argument_values.dart:71-80`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum WrittenValue {
+    /// The subset knows the value.
+    Value(ConstantValue),
+    /// The shape evaluates but yields no known value — a `constEval*`
+    /// fault (`1 ~/ 0`) or a non-constant construct. The oracle's
+    /// `hasKnownValue` is false there and nothing compares equal, so a
+    /// comparison face stays silent — even against an identical spelling.
+    Unknown,
+    /// The subset does not cover the shape (identifiers, member accesses,
+    /// calls, `const`-written collections, interpolation). The comparison
+    /// face keeps its written-text comparison: identical spellings then
+    /// compare equal — the resolution-free posture the textual face always
+    /// had — and different spellings under-report.
+    NotEvaluable,
+}
+
+/// The written-slice bounds: beyond either, the slice answers
+/// [`WrittenValue::NotEvaluable`] — no real default value or argument
+/// needs value equality at that size, and the caps keep the parse and the
+/// built tree bounded on machine-generated input (the engine-wide
+/// termination invariant; the fold's own [`MAX_EVAL_DEPTH`] still bounds
+/// the value recursion under them).
+const MAX_WRITE_TOKENS: usize = 1024;
+const MAX_WRITE_DEPTH: u32 = 128;
+
+/// Evaluates one written constant expression from its token lexemes: the
+/// from-tokens sibling of [`eval`] for callers that hold a token span, not
+/// a captured event tree (a lint reading a written argument against a
+/// written default). The subset covers the resolution-free constant
+/// faces — numeric/string/bool/null literals (raw and cooked strings,
+/// escape-decoded, adjacent runs concatenated), parenthesized and
+/// conditional expressions, and Dart's binary/unary operator set — with
+/// the operator semantics evaluated by the same [`fold`] the captured
+/// trees take, so the two faces cannot drift. Everything else — any name
+/// the slice spells — answers [`WrittenValue::NotEvaluable`]: the slice
+/// alone cannot resolve it.
+#[must_use]
+pub fn eval_written(lexemes: &[&str]) -> WrittenValue {
+    if lexemes.len() > MAX_WRITE_TOKENS {
+        return WrittenValue::NotEvaluable;
+    }
+    let mut written = Written {
+        lexemes,
+        pos: 0,
+        depth: 0,
+    };
+    let Some(expr) = written.conditional() else {
+        return WrittenValue::NotEvaluable;
+    };
+    if written.pos != lexemes.len() {
+        return WrittenValue::NotEvaluable;
+    }
+    match eval(&expr, &WrittenLookup) {
+        Verdict::Value(v) => WrittenValue::Value(v),
+        // The depth fuse and the subset's deferral shapes answer Constant:
+        // a valid constant of unknown value, the same posture a
+        // not-covered shape takes here (identical spellings still compare
+        // equal through the caller's textual fallback, and they carry the
+        // same value — the subset is resolution-free).
+        Verdict::Constant => WrittenValue::NotEvaluable,
+        Verdict::Fault(..) | Verdict::NotConstant(_) => WrittenValue::Unknown,
+    }
+}
+
+/// The lookup [`eval_written`]'s trees never consult: the subset builds no
+/// `Ident`/`Member`/`Call` nodes (an unresolved name bails at the parse),
+/// so every arm is a conservative default that keeps the trait object
+/// total.
+struct WrittenLookup;
+
+impl ConstLookup for WrittenLookup {
+    fn ident(&self, _: StringId) -> IdentVerdict {
+        IdentVerdict::Constant
+    }
+
+    fn member(&self, _: &ConstantValue, _: StringId) -> Verdict {
+        Verdict::Constant
+    }
+
+    fn is_identical(&self, _: StringId) -> bool {
+        false
+    }
+}
+
+/// Zero span — the written face's faults carry no anchor (the comparison
+/// caller maps them to [`WrittenValue::Unknown`] before any span reads).
+const fn unanchored() -> SourceRange {
+    SourceRange {
+        offset: 0,
+        length: 0,
+    }
+}
+
+/// The recursive-descent half of [`eval_written`]: a Dart-precedence
+/// expression parser over the lexeme slice that emits [`Expr`] trees for
+/// [`fold`]. Every bail is `None` (the caller's `NotEvaluable`); the depth
+/// guard bounds the descent on pathological nesting.
+struct Written<'t> {
+    lexemes: &'t [&'t str],
+    pos: usize,
+    depth: u32,
+}
+
+/// The binary precedence ladder, loosest first (the official grammar's
+/// operator ordering); `?:` and `??` are handled at their own associativity
+/// outside it.
+const LEVELS: [&[&str]; 10] = [
+    &["||"],
+    &["&&"],
+    &["==", "!="],
+    &["<", ">", "<=", ">="],
+    &["|"],
+    &["^"],
+    &["&"],
+    &["<<", ">>", ">>>"],
+    &["+", "-"],
+    &["*", "/", "~/", "%"],
+];
+
+impl<'t> Written<'t> {
+    /// Runs `step` one nesting level deeper, `None` past the cap (the
+    /// caller's `NotEvaluable`).
+    fn nested<T>(&mut self, step: fn(&mut Self) -> Option<T>) -> Option<T> {
+        self.depth += 1;
+        if self.depth > MAX_WRITE_DEPTH {
+            self.depth -= 1;
+            return None;
+        }
+        let out = step(self);
+        self.depth -= 1;
+        out
+    }
+
+    fn eat(&mut self, lexeme: &str) -> bool {
+        if self.lexemes.get(self.pos) == Some(&lexeme) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `?:` — the conditional's branches recurse through `conditional`
+    /// (right-assoc, the official grammar's `expressionWithoutCascade`).
+    fn conditional(&mut self) -> Option<Node> {
+        let cond = Box::new(self.binary(0)?);
+        if !self.eat("?") {
+            return Some(*cond);
+        }
+        let then = Box::new(self.nested(Self::conditional)?);
+        if !self.eat(":") {
+            return None;
+        }
+        let els = Box::new(self.nested(Self::conditional)?);
+        Some(Node {
+            expr: Expr::Cond { cond, then, els },
+            span: unanchored(),
+        })
+    }
+
+    /// The [`LEVELS`] ladder, left-assoc per level (value-equal to the
+    /// official associativity for every operator in the table).
+    fn binary(&mut self, level: usize) -> Option<Node> {
+        let Some(ops) = LEVELS.get(level) else {
+            return self.unary();
+        };
+        let mut left = Box::new(self.binary(level + 1)?);
+        while let Some(&lexeme) = self.lexemes.get(self.pos) {
+            if !ops.contains(&lexeme) {
+                break;
+            }
+            let op = binary_op(lexeme);
+            self.pos += 1;
+            let right = Box::new(self.binary(level + 1)?);
+            left = Box::new(Node {
+                expr: Expr::Binary { op, left, right },
+                span: unanchored(),
+            });
+        }
+        Some(*left)
+    }
+
+    fn unary(&mut self) -> Option<Node> {
+        let Some(&lexeme) = self.lexemes.get(self.pos) else {
+            return None;
+        };
+        let op = match lexeme {
+            "-" => UnOp::Neg,
+            "!" => UnOp::Not,
+            "~" => UnOp::BitNot,
+            _ => return self.primary(),
+        };
+        self.pos += 1;
+        let operand = Box::new(self.nested(Self::unary)?);
+        Some(Node {
+            expr: Expr::Unary { op, operand },
+            span: unanchored(),
+        })
+    }
+
+    fn primary(&mut self) -> Option<Node> {
+        let Some(&lexeme) = self.lexemes.get(self.pos) else {
+            return None;
+        };
+        let expr = match lexeme {
+            "(" => {
+                self.pos += 1;
+                let inner = self.nested(Self::conditional)?;
+                if !self.eat(")") {
+                    return None;
+                }
+                return Some(inner);
+            }
+            "true" => {
+                self.pos += 1;
+                Expr::Value(ConstantValue::Bool(true))
+            }
+            "false" => {
+                self.pos += 1;
+                Expr::Value(ConstantValue::Bool(false))
+            }
+            "null" => {
+                self.pos += 1;
+                Expr::Value(ConstantValue::Null)
+            }
+            lexeme => {
+                if let Some(value) = number_value(lexeme) {
+                    self.pos += 1;
+                    Expr::Value(value)
+                } else if is_string_start(lexeme) {
+                    let mut parts = Vec::new();
+                    while let Some(&spelling) = self.lexemes.get(self.pos) {
+                        if !is_string_start(spelling) {
+                            break;
+                        }
+                        let text = string_value(spelling)?;
+                        parts.push(Node {
+                            expr: Expr::Value(ConstantValue::Str(text)),
+                            span: unanchored(),
+                        });
+                        self.pos += 1;
+                    }
+                    if parts.len() == 1 {
+                        return Some(parts.remove(0));
+                    }
+                    Expr::Adjacent(parts)
+                } else {
+                    // An identifier, a member access, a call, `const`-written
+                    // collections — every shape the slice alone cannot value.
+                    return None;
+                }
+            }
+        };
+        Some(Node {
+            expr,
+            span: unanchored(),
+        })
+    }
+}
+
+fn binary_op(lexeme: &str) -> BinOp {
+    match lexeme {
+        "??" => BinOp::IfNull,
+        "||" => BinOp::Or,
+        "&&" => BinOp::And,
+        "==" => BinOp::Eq,
+        "!=" => BinOp::Ne,
+        "<" => BinOp::Lt,
+        ">" => BinOp::Gt,
+        "<=" => BinOp::Le,
+        ">=" => BinOp::Ge,
+        "|" => BinOp::BitOr,
+        "^" => BinOp::BitXor,
+        "&" => BinOp::BitAnd,
+        "<<" => BinOp::Shl,
+        ">>" => BinOp::Shr,
+        ">>>" => BinOp::Ushr,
+        "+" => BinOp::Add,
+        "-" => BinOp::Sub,
+        "*" => BinOp::Mul,
+        "/" => BinOp::Div,
+        "~/" => BinOp::IntDiv,
+        _ => BinOp::Mod,
+    }
+}
+
+/// The literal's [`ConstantValue`], `None` when the lexeme is not a
+/// numeric literal or carries no representable value (a hex literal past
+/// 64 bits, a decimal past `i64` — error literals upstream).
+#[expect(clippy::cast_possible_wrap)] // a 64-bit hex literal wraps to i64 (the VM's bit pattern)
+fn number_value(lexeme: &str) -> Option<ConstantValue> {
+    if let Some(hex) = lexeme
+        .strip_prefix("0x")
+        .or_else(|| lexeme.strip_prefix("0X"))
+    {
+        let value = u64::from_str_radix(hex, 16).ok()?;
+        return Some(ConstantValue::Int(value as i64));
+    }
+    if lexeme.bytes().all(|b| b.is_ascii_digit()) {
+        return Some(ConstantValue::Int(lexeme.parse().ok()?));
+    }
+    // The remaining literal shapes are doubles (`1.5`, `1.`, `.5`, `1e3` —
+    // the scanner's NUMBER grammar); anything else fails the parse.
+    Some(ConstantValue::Double(lexeme.parse().ok()?))
+}
+
+/// Whether the lexeme opens a string literal (raw or cooked, single- or
+/// triple-quoted) — the discriminator `primary`'s string arm keys on.
+fn is_string_start(lexeme: &str) -> bool {
+    let rest = lexeme.strip_prefix('r').unwrap_or(lexeme);
+    rest.starts_with('\'') || rest.starts_with('"')
+}
+
+/// The string literal's interior value: quotes stripped, escapes decoded
+/// for cooked spellings, `None` for every shape outside the subset
+/// (interpolation — an unescaped `$` — an unterminated spelling, an
+/// invalid escape). Raw spellings keep their interior verbatim.
+fn string_value(lexeme: &str) -> Option<Box<str>> {
+    let (raw, rest) = match lexeme.strip_prefix('r') {
+        Some(rest) => (true, rest),
+        None => (false, lexeme),
+    };
+    let interior = if let Some(stripped) = rest.strip_prefix("'''") {
+        stripped.strip_suffix("'''")?
+    } else if let Some(stripped) = rest.strip_prefix("\"\"\"") {
+        stripped.strip_suffix("\"\"\"")?
+    } else if let Some(stripped) = rest.strip_prefix('\'') {
+        if stripped == "'" {
+            ""
+        } else {
+            stripped.strip_suffix('\'')?
+        }
+    } else {
+        let stripped = rest.strip_prefix('"')?;
+        if stripped == "\"" {
+            ""
+        } else {
+            stripped.strip_suffix('"')?
+        }
+    };
+    if raw {
+        return (!interior.contains('$')).then(|| Box::from(interior));
+    }
+    decode_cooked(interior).map(Into::into)
+}
+
+/// The cooked string's escape decoder (the official escape set:
+/// `pkg/front_end`'s single-line/triple string grammar). `None` on an
+/// unescaped `$` (interpolation), a trailing backslash, or an invalid
+/// `\x`/`\u` spelling — every face where the source itself is in error.
+fn decode_cooked(interior: &str) -> Option<String> {
+    let mut out = String::with_capacity(interior.len());
+    let mut rest = interior;
+    while let Some(head) = rest.chars().next() {
+        if head != '\\' {
+            if head == '$' {
+                return None; // interpolation — outside the subset
+            }
+            out.push(head);
+            rest = &rest[head.len_utf8()..];
+            continue;
+        }
+        let mut escapes = rest[1..].chars();
+        let Some(escape) = escapes.next() else {
+            return None; // a trailing backslash
+        };
+        rest = escapes.as_str();
+        match escape {
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            'f' => out.push('\u{0C}'),
+            'b' => out.push('\u{08}'),
+            't' => out.push('\t'),
+            'v' => out.push('\u{0B}'),
+            'x' => {
+                let hex = rest.get(..2)?;
+                let value = u32::from_str_radix(hex, 16).ok()?;
+                rest = &rest[2..];
+                out.push(char::from_u32(value)?);
+            }
+            'u' => {
+                let (hex, consumed) = if let Some(braced) = rest.strip_prefix('{') {
+                    let end = braced.find('}')?;
+                    let hex = braced.get(..end)?;
+                    if hex.is_empty() || hex.len() > 6 {
+                        return None;
+                    }
+                    (hex, end + 2)
+                } else {
+                    (rest.get(..4)?, 4)
+                };
+                let value = u32::from_str_radix(hex, 16).ok()?;
+                rest = &rest[consumed..];
+                out.push(char::from_u32(value)?);
+            }
+            // The identity escapes (`\'`, `\"`, `\\`, `\$`, …); a non-ASCII
+            // escape byte stays outside the subset.
+            escape if escape.is_ascii() => out.push(escape),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 // —— capture: the parser-event fold ——————————————————————————————————————
 
 /// Which const context a window brackets; the kind decides the reporting
@@ -3046,5 +3457,116 @@ mod tests {
 
     fn span(offset: u32) -> SourceRange {
         SourceRange { offset, length: 1 }
+    }
+
+    // —— eval_written: the lexeme-slice face ——————————————————————————
+
+    /// The slice's value, panicking with the verdict on any deferral (the
+    /// positive pins' helper).
+    fn written_value(lexemes: &[&str]) -> ConstantValue {
+        match eval_written(lexemes) {
+            WrittenValue::Value(v) => v,
+            other => panic!("expected a value for {lexemes:?}, got {other:?}"),
+        }
+    }
+
+    /// The comparison faces' values: the documented textual under-report
+    /// (`2` vs `1 + 1`) closes, precedence and the numeric kernel match the
+    /// captured fold (same [`eval`]), and the boundary literals keep the
+    /// VM's shapes.
+    #[test]
+    fn eval_written_routes_the_comparison_values() {
+        assert_eq!(written_value(&["1", "+", "1"]), written_value(&["2"]));
+        assert_ne!(written_value(&["1", "+", "2"]), written_value(&["2"]));
+        assert_eq!(
+            written_value(&["1", "+", "2", "*", "3"]),
+            ConstantValue::Int(7)
+        );
+        assert_eq!(
+            written_value(&["(", "1", "+", "2", ")", "*", "3"]),
+            ConstantValue::Int(9)
+        );
+        // `/` widens, `~/` stays int, unary minus and the hex shape.
+        assert_eq!(written_value(&["5", "/", "2"]), ConstantValue::Double(2.5));
+        assert_eq!(written_value(&["5", "~/", "2"]), ConstantValue::Int(2));
+        assert_eq!(written_value(&["-", "1"]), ConstantValue::Int(-1));
+        assert_eq!(written_value(&["0xFF"]), ConstantValue::Int(255));
+        // A hex literal at the sign boundary keeps the 64-bit pattern.
+        assert_eq!(
+            written_value(&["0x8000000000000000"]),
+            ConstantValue::Int(i64::MIN)
+        );
+        // `2` and `2.0` stay distinct (the `DartObjectImpl` type-equal
+        // posture the comparison face inherits).
+        assert_ne!(written_value(&["2"]), written_value(&["2.0"]));
+        assert_eq!(written_value(&["true"]), ConstantValue::Bool(true));
+        assert_eq!(written_value(&["null"]), ConstantValue::Null);
+        assert_eq!(
+            written_value(&["1", "==", "1", "?", "'y'", ":", "'n'"]),
+            ConstantValue::Str("y".into())
+        );
+    }
+
+    /// The string faces: adjacent runs and `+` concatenate alike, cooked
+    /// escapes decode, raw interiors stay verbatim, and an escaped `\$` is
+    /// not interpolation.
+    #[test]
+    fn eval_written_decodes_strings() {
+        assert_eq!(
+            written_value(&["'a'", "'b'"]),
+            ConstantValue::Str("ab".into())
+        );
+        assert_eq!(
+            written_value(&["'a'", "+", "'b'"]),
+            ConstantValue::Str("ab".into())
+        );
+        assert_eq!(
+            written_value(&["'\\x41\\u0042\\u{43}'"]),
+            ConstantValue::Str("ABC".into())
+        );
+        assert_eq!(
+            written_value(&["'a\\nb'"]),
+            ConstantValue::Str("a\nb".into())
+        );
+        assert_eq!(
+            written_value(&["r'a\\nb'"]),
+            ConstantValue::Str("a\\nb".into())
+        );
+        assert_eq!(written_value(&["''"]), ConstantValue::Str("".into()));
+        assert_eq!(
+            written_value(&["'a\\$b'"]),
+            ConstantValue::Str("a$b".into())
+        );
+    }
+
+    /// The deferral faces: a fault has no known value (the comparison
+    /// face's silence), every resolution-needing or uncovered shape is not
+    /// evaluable, and the nesting/token caps keep pathological slices on
+    /// the deferral path.
+    #[test]
+    fn eval_written_defers_and_bails() {
+        assert_eq!(eval_written(&["1", "~/", "0"]), WrittenValue::Unknown);
+        assert_eq!(eval_written(&["1", "+", "'a'"]), WrittenValue::Unknown);
+        for lexemes in [
+            &["foo"][..],
+            &["a", ".", "b"][..],
+            &["const", "[", "1", "]"][..],
+            &["'a$v'"][..],
+            &["'unterminated"][..],
+            &["2", "x"][..],
+            &["("][..],
+            &["'''"][..],
+            &[][..],
+        ] {
+            assert_eq!(
+                eval_written(lexemes),
+                WrittenValue::NotEvaluable,
+                "{lexemes:?}"
+            );
+        }
+        let deep = [vec!["("; 200], vec!["1"], vec![")"; 200]].concat();
+        assert_eq!(eval_written(&deep), WrittenValue::NotEvaluable);
+        let long = vec!["1"; 2000];
+        assert_eq!(eval_written(&long), WrittenValue::NotEvaluable);
     }
 }

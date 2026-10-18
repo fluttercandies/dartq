@@ -822,6 +822,39 @@ struct ArgLevel {
     /// argument supplies the after-the-last face.
     first_label: Option<SourceRange>,
     mark: usize,
+    /// The written signatures of the function literals that closed
+    /// directly inside this list (`C((List<int> x) {})`), keyed by the
+    /// literal's `(start, end)` offsets — the inference-failure face reads
+    /// them as the argument types the row recovery cannot carry (a
+    /// literal's row is a bare value row over its closing token).
+    closures: Vec<(u32, u32, Box<FnVarSig>)>,
+}
+
+/// One open function literal's written signature capture
+/// (`begin_function_expression`..`end_function_expression`): the literal's
+/// own formals' written types in declaration order. Anything the capture
+/// cannot render exactly (an untyped, named, or function-typed formal; an
+/// `async`/generator body) poisons it, and the consumers under-report. The
+/// literal's return renders `void`: the only consumer admits a
+/// `void`-returning formal context, under which the official inference
+/// types a synchronous literal's return as `void` for both the block and
+/// the `=>` body (oracle-pinned: `C((List<int> x) => 1)` against
+/// `void Function(X)` prints `void Function(List<int>)`).
+struct ClosureCapture {
+    /// The literal's start offset (its `(`).
+    offset: u32,
+    /// `frames.len()` with the literal's own frame open.
+    frame_depth: usize,
+    /// `formal_list_depth` of the literal's own formal list (0 until it
+    /// opens).
+    list_depth: u32,
+    /// The literal's own formal list is open (formals of later lists — a
+    /// local function in the body — never join the capture).
+    list_open: bool,
+    positional: Vec<Ty>,
+    /// The index of the first optional positional formal (`[`), if any.
+    optional_from: Option<usize>,
+    poisoned: bool,
 }
 
 /// One open record-type annotation's captured fields: `fields` holds one
@@ -1412,13 +1445,23 @@ struct PendingInitSuper {
 /// initializer list, or a redirecting factory's `= C.name` target — the
 /// enclosing constructor's spelling and container, the target's
 /// (`target_container` + `target` selector, or the container's unnamed
-/// face), and the report span.
+/// face), and the report span. `factory` separates the two origins (the
+/// oracle's faces differ: a factory target never reports
+/// `redirect_generative_to_non_generative_constructor`, a `this(...)`
+/// initializer never reports the factory-only return-type face);
+/// `is_const` carries the enclosing constructor's `const` modifier for the
+/// `redirect_to_non_const_constructor` query; `target_span` is the target
+/// selector's own token (the generative faces anchor
+/// `constructorSelector?.name2 ?? thisKeyword`).
 struct RedirectEdge {
     container: StringId,
     ctor: StringId,
     target_container: StringId,
     target: StringId,
     span: SourceRange,
+    target_span: SourceRange,
+    factory: bool,
+    is_const: bool,
 }
 
 /// One library-level declaration site of this file (the usage cluster's
@@ -1448,6 +1491,13 @@ struct DeclSite {
     /// `canBeConst` opens with `!element.isConst → false`
     /// (ast.dart:13743-13744), so a non-const constructor never reports.
     const_ctor: bool,
+    /// The declaration is a factory (`factory` keyword head): the
+    /// `redirect_generative_to_non_generative_constructor` face reads it —
+    /// a generative `this(...)` initializer whose target resolves here
+    /// reports (error_verifier.dart:4300-4306). Only constructor-kind
+    /// sites set it (the unnamed factory's member-captured head never
+    /// joins a `this()` edge, whose selector is what this bit keys).
+    is_factory: bool,
 }
 
 /// The package:meta `@UseResult` face of one declaration.
@@ -1895,6 +1945,11 @@ struct Engine<'a> {
     /// One liveness entry per open type-argument group, mirroring the
     /// `group_heads` stack.
     group_head_live: Vec<bool>,
+    /// One entry per open type-argument group: the head was dead but the
+    /// group is a function-type tail (the recovered old-style function
+    /// typedef — `typedef e = foo<F>(int x);`), whose arguments resolve
+    /// beside it like a live head's.
+    group_head_resolve_through: Vec<bool>,
     /// #1314 FAM13: the offsets of unresolved type references pushed inside
     /// a type-argument group (the `non_type_as_type_argument` face) and
     /// inside a creation head context (the `creation_with_non_type` face) —
@@ -1983,6 +2038,10 @@ struct Engine<'a> {
     /// signature (the row's `Ty` stays `Unknown` — the model has no
     /// function variant). Consumed by the argument check.
     arg_sigs: FxHashMap<u32, Box<FnVarSig>>,
+    /// The open function literals' signature captures (nested literals
+    /// stack); a closed literal's signature joins the enclosing argument
+    /// list's [`ArgLevel::closures`].
+    closure_caps: Vec<ClosureCapture>,
     /// The open formal's written `required` keyword (`begin_formal_parameter`
     /// latches, the written-signature capture's named slot consumes).
     capture_formal_required: bool,
@@ -2030,7 +2089,16 @@ struct Engine<'a> {
     /// (`element_resolver.dart`'s `ConstructorFieldInitializer` /
     /// `RedirectingConstructorInvocation` visits) and never reports the
     /// member trio or `undefined_identifier` there.
-    init_rows: FxHashSet<u32>,
+    init_rows: FxHashMap<u32, StringId>,
+    /// The offsets of bare/member rows pushed inside an instance field's
+    /// declaration initializer (`in_instance_field_initializer` is live
+    /// only at push time — pass 2 runs after the field group tears down).
+    /// The implicit-this face consults it at resolve time.
+    field_init_rows: FxHashSet<u32>,
+    /// The subset of [`Engine::field_init_rows`] whose name resolved to an
+    /// INSTANCE member of the enclosing container (the rows that ride
+    /// `this`) — statics and non-members never do.
+    field_init_this_rows: FxHashSet<u32>,
     /// F-C: the folded `super.`-selector candidates of the open list
     /// ([`PendingInitSuper`]); drained at `end_initializers`, where the
     /// invocation shape decides
@@ -2189,6 +2257,19 @@ struct Engine<'a> {
     /// so the emission waits (upstream resolves against the element model,
     /// which is whole-file by construction).
     pending_const_non_const: Vec<(StringId, SourceRange)>,
+    /// One const-declaration initializer failure candidate per creation or
+    /// checked argument seen inside the open window (innermost
+    /// initializer's entries in source order): the whole-file
+    /// const-constructor set is incomplete mid-parse, so the verdict
+    /// defers to the tail pass.
+    open_const_creations: Vec<(StringId, SourceRange, ConstCreationEntry)>,
+    /// Entries promoted at the initializer close (the verdict passed
+    /// silently): the tail pass re-decides each against the complete
+    /// const-ctor set — the first invalid entry per initializer anchors
+    /// `const_initialized_with_non_constant_value`, every invalid creation
+    /// with an existing non-const constructor adds the
+    /// `const_with_non_const` twin.
+    pending_const_creations: Vec<(StringId, SourceRange, ConstCreationEntry)>,
     /// The interned `identical` spelling (the one invocable const call).
     identical_id: StringId,
     /// Names of the const initializer windows currently open (innermost
@@ -3290,6 +3371,7 @@ impl<'a> Engine<'a> {
             type_arg_depth: 0,
             last_type_head_live: true,
             group_head_live: Vec::new(),
+            group_head_resolve_through: Vec::new(),
             type_arg_miss_rows: Vec::new(),
             non_type_anchors: Vec::new(),
             creation_miss_rows: Vec::new(),
@@ -3307,6 +3389,7 @@ impl<'a> Engine<'a> {
             fn_var_sigs: FxHashMap::default(),
             fn_formal_sigs: FxHashMap::default(),
             arg_sigs: FxHashMap::default(),
+            closure_caps: Vec::new(),
             capture_formal_required: false,
             fn_formal_named_section: false,
             fn_type_capture: Vec::new(),
@@ -3319,7 +3402,9 @@ impl<'a> Engine<'a> {
             members: MemberFace::new(strings),
             external_type_params: EXTERNAL_CORE_TYPE_PARAMS.map(|(n, k)| (strings.intern(n), k)),
             initializer_depth: 0,
-            init_rows: FxHashSet::default(),
+            init_rows: FxHashMap::default(),
+            field_init_rows: FxHashSet::default(),
+            field_init_this_rows: FxHashSet::default(),
             pending_init_super: Vec::new(),
             init_item_head: None,
             redirect_edges: Vec::new(),
@@ -3337,6 +3422,8 @@ impl<'a> Engine<'a> {
             const_field_values: FxHashMap::default(),
             const_ctors: FxHashSet::default(),
             pending_const_non_const: Vec::new(),
+            open_const_creations: Vec::new(),
+            pending_const_creations: Vec::new(),
             identical_id,
             pending_init_names: Vec::new(),
             arg_gates: Vec::new(),
@@ -5376,6 +5463,45 @@ impl<'a> Engine<'a> {
             })
             .collect();
         let has_generative_ctor = !ctor_spans.is_empty();
+        // `member_duplicate_definition_verifier.dart`'s constructor pass:
+        // per container, constructor names dedupe by selector — the unnamed
+        // spelling keys as `new` (`member.name?.lexeme ?? 'new'`), a named
+        // spelling by its selector — and every second-and-later declaration
+        // of a key reports `duplicate_constructor` at its own name span.
+        {
+            let new_name = self.intern("new");
+            let ctor_keys: Vec<(StringId, SourceRange)> = self
+                .decl_sites
+                .iter()
+                .filter(|site| {
+                    matches!(
+                        site.kind,
+                        DeclKind::Constructor { container: c } if c == container
+                    )
+                })
+                .map(|site| {
+                    (
+                        if site.name == container {
+                            new_name
+                        } else {
+                            site.name
+                        },
+                        site.range,
+                    )
+                })
+                .collect();
+            let mut seen_ctors: FxHashSet<StringId> = FxHashSet::default();
+            for (key, range) in ctor_keys {
+                if !seen_ctors.insert(key) {
+                    let arg = if key == new_name {
+                        ""
+                    } else {
+                        self.strings.resolve(key)
+                    };
+                    self.emit(SemanticCode::DuplicateConstructor, range, arg, "");
+                }
+            }
+        }
         let mut duplicates: FxHashSet<StringId> = FxHashSet::default();
         if has_generative_ctor {
             let mut seen: FxHashSet<StringId> = FxHashSet::default();
@@ -6016,6 +6142,116 @@ impl<'a> Engine<'a> {
     /// group).
     fn fn_stash_drop(&mut self) {
         self.fn_type_stash = None;
+    }
+
+    /// `begin_function_expression` (the literal's frame already open):
+    /// starts the literal's signature capture.
+    fn closure_capture_begin(&mut self, offset: u32) {
+        self.closure_caps.push(ClosureCapture {
+            offset,
+            frame_depth: self.frames.len(),
+            list_depth: 0,
+            list_open: false,
+            positional: Vec::new(),
+            optional_from: None,
+            poisoned: false,
+        });
+    }
+
+    /// `begin_formal_parameters` (depth already bumped): the first list
+    /// opened directly under the open literal's frame is the literal's own.
+    fn closure_formals_begin(&mut self) {
+        let depth = self.formal_list_depth;
+        let frames = self.frames.len();
+        if let Some(capture) = self.closure_caps.last_mut()
+            && capture.frame_depth == frames
+            && capture.list_depth == 0
+        {
+            capture.list_depth = depth;
+            capture.list_open = true;
+        }
+    }
+
+    /// `end_formal_parameters` (depth not yet dropped): the literal's own
+    /// list closed.
+    fn closure_formals_end(&mut self) {
+        let depth = self.formal_list_depth;
+        if let Some(capture) = self.closure_caps.last_mut()
+            && capture.list_open
+            && capture.list_depth == depth
+        {
+            capture.list_open = false;
+        }
+    }
+
+    /// The `[`/`{` opener inside the literal's own list: `[` starts the
+    /// optional-positional tail; a named section poisons (the consumer
+    /// renders positional signatures only).
+    fn closure_optional_group(&mut self, opener: &str) {
+        let depth = self.formal_list_depth;
+        if let Some(capture) = self.closure_caps.last_mut()
+            && capture.list_open
+            && capture.list_depth == depth
+        {
+            if opener == "[" {
+                capture.optional_from = Some(capture.positional.len());
+            } else {
+                capture.poisoned = true;
+            }
+        }
+    }
+
+    /// A formal of the literal's own list: its written type (still armed)
+    /// joins the capture; an untyped formal poisons — its type is the
+    /// solver's downward answer, which this face does not compute.
+    fn closure_formal(&mut self) {
+        let depth = self.formal_list_depth;
+        let ty = self.armed_ty;
+        if let Some(capture) = self.closure_caps.last_mut()
+            && capture.list_open
+            && capture.list_depth == depth
+        {
+            match ty {
+                Some(ty) if ty != Ty::Unknown => capture.positional.push(ty),
+                _ => capture.poisoned = true,
+            }
+        }
+    }
+
+    /// `end_function_expression` (the literal's frame still open): closes
+    /// the capture and hands an exact signature to the enclosing argument
+    /// list. An `async`/generator body changes the literal's return type
+    /// (`Future<void>`), which this capture does not render — poisoned.
+    fn closure_capture_end(&mut self, end: u32) {
+        let Some(capture) = self.closure_caps.pop() else {
+            return;
+        };
+        let suspends = self.frames.last().is_some_and(|frame| {
+            matches!(
+                frame.kind,
+                FrameKind::Executable {
+                    is_async: true,
+                    ..
+                } | FrameKind::Executable {
+                    generator: true,
+                    ..
+                }
+            )
+        });
+        if capture.poisoned || capture.list_depth == 0 || suspends {
+            return;
+        }
+        let required = capture.optional_from.unwrap_or(capture.positional.len());
+        let sig = Box::new(FnVarSig {
+            params: Box::default(),
+            required_positional: u16::try_from(required).unwrap_or(u16::MAX),
+            positional: capture.positional.into_boxed_slice(),
+            named: Box::default(),
+            return_ty: Ty::Void,
+        });
+        if let Some(level) = self.arg_levels.last_mut() {
+            level.closures.push((capture.offset, end, sig));
+        }
     }
 
     /// An unattributable shape inside the open capture (an inline
@@ -7313,6 +7549,7 @@ impl<'a> Engine<'a> {
             // selector's in-place rewrite keeps it (`begin_constructor` /
             // `begin_factory` set it before any site of theirs exists).
             const_ctor: self.in_const_ctor,
+            is_factory: false,
         });
         self.decl_sites.len() - 1
     }
@@ -8767,7 +9004,15 @@ impl<'a> Engine<'a> {
             .frames
             .last()
             .is_some_and(|frame| matches!(&frame.kind, FrameKind::Executable { ret: None, .. }));
-        self.open_return_span = in_return_position.then_some(span);
+        // Only the return-position completion writes the slot: once `ret`
+        // latches (at the name token) every later completion is a formal's
+        // or a nested type's — it must not clobber the annotation span the
+        // setter face reads (`int set s(int v)`: the formal `int`
+        // completes after `ret` latches, and wiping the slot would lose
+        // the `non_void_return_for_setter` row).
+        if in_return_position {
+            self.open_return_span = Some(span);
+        }
     }
 
     /// The `non_void_return_for_setter` face (error_verifier.dart:7015-7025,
@@ -12515,6 +12760,30 @@ impl<'a> Engine<'a> {
         {
             self.field_read_rows.insert(range.offset);
         }
+        // The implicit-this face's push-time snapshots: the field-group
+        // state tears down before pass 2 resolves the row. The second set
+        // carries the member-ness verdict (an instance member of the
+        // enclosing container only — statics and non-members never ride
+        // `this`).
+        if self.in_instance_field_initializer() {
+            self.field_init_rows.insert(range.offset);
+            let instance_member = match &target {
+                RefTarget::Member { container } => match self.walk_members(*container, name) {
+                    Walk::Found(entry) => !entry.is_static,
+                    Walk::ChainBroken => true,
+                    Walk::Missing => false,
+                },
+                _ => {
+                    self.container_context().is_some_and(|(_, kind)| {
+                        kind == ContainerKind::Enum
+                            && self.members.enum_synth_members.contains(&name)
+                    }) || self.members.object_members.contains(&name)
+                }
+            };
+            if instance_member {
+                self.field_init_this_rows.insert(range.offset);
+            }
+        }
         if self.ctor_pos > 0 && matches!(info, BareInfo::Missing { .. }) {
             self.push_row(Row {
                 name,
@@ -12531,8 +12800,10 @@ impl<'a> Engine<'a> {
         // the initializer world — the write intent is the field-initializer
         // LHS (`x = e`) and resolves through that face at pass 2, never
         // `undefined_identifier`. Reads keep the ordinary resolution.
-        if self.initializer_depth > 0 {
-            self.init_rows.insert(range.offset);
+        if self.initializer_depth > 0
+            && let Some((container, _)) = self.container_context()
+        {
+            self.init_rows.insert(range.offset, container);
         }
         let ty = match info {
             BareInfo::Plain { ty } if ty != Ty::UNKNOWN => ty,
@@ -12574,6 +12845,10 @@ impl<'a> Engine<'a> {
 
     /// An identifier after a dot, awaiting the merge at the dot event.
     fn push_member(&mut self, name: StringId, range: SourceRange) {
+        // The implicit-this face's push-time snapshot (see `push_bare`).
+        if self.in_instance_field_initializer() {
+            self.field_init_rows.insert(range.offset);
+        }
         self.push_row(Row {
             name,
             range,
@@ -12879,6 +13154,38 @@ impl<'a> Engine<'a> {
                 // code set; the extension instance `this` is legal.
                 ReceiverState::Skip | ReceiverState::Valid => {}
             }
+        } else if !is_super {
+            // `this` as the bare initializer TARGET — `this = 0` parses its
+            // `this` as the field-initializer's head but no `.field` follows.
+            // Upstream `buildInitializer` (ast_builder.dart:634-756) folds
+            // `this = expr` as a `ConstructorFieldInitializer` whose target
+            // is a bare `ThisExpression` — the verifier reports
+            // `invalid_reference_to_this` at the keyword
+            // (element_resolver.dart:357-374's `isThisAccessible` is true,
+            // so the `invalidReferenceToThis` fallthrough reports), and the
+            // empty field name then walks `initializer_for_non_existent_field`
+            // at `''`. Peek past the keyword: `= ` ends the target, `.`
+            // opens a selector, `(` opens a redirect invocation — only the
+            // bare `=` shape is the misfire.
+            let next = self.skip_whitespace(token.range.end());
+            if self.source.as_bytes().get(next as usize) == Some(&b'=') {
+                self.emit(
+                    SemanticCode::InvalidReferenceToThis,
+                    token.range,
+                    "",
+                    "",
+                );
+                // The empty-name field-initializer face — oracle's
+                // `_checkForInvalidField` walks `''` against the field set,
+                // misses, and reports `initializer_for_non_existent_field`
+                // at the same span.
+                self.emit(
+                    SemanticCode::InitializerForNonExistentField,
+                    token.range,
+                    "",
+                    "",
+                );
+            }
         }
         let recv = match self.container_context() {
             Some((container, kind)) => {
@@ -12951,10 +13258,10 @@ impl<'a> Engine<'a> {
                             self.last_type_head_live = true;
                             // A type-argument position replaces the plain
                             // face (`non_type_as_type_argument`, the same
-                            // context chain the miss rows ride).
-                            if self.type_arg_depth > 0
-                                && *self.group_head_live.last().unwrap_or(&true)
-                            {
+                            // context chain the miss rows ride). A dead
+                            // head's group arms only through the
+                            // function-tail carve (`arg_group_resolves`).
+                            if self.type_arg_depth > 0 && self.arg_group_resolves() {
                                 self.type_arg_miss_rows.push(range.offset);
                             }
                             // The plain face's declaration anchor rides the
@@ -13023,9 +13330,10 @@ impl<'a> Engine<'a> {
                     // A type-argument position under a dead head stays
                     // silent entirely (the resolver's bail marks the whole
                     // NamedType invalid before the arguments resolve); a
-                    // live head's misses code through the context chain.
-                    let dead_arg_group =
-                        self.type_arg_depth > 0 && !*self.group_head_live.last().unwrap_or(&true);
+                    // live head's misses — and a dead head's group in the
+                    // function-type tail shape — code through the context
+                    // chain (`arg_group_resolves`).
+                    let dead_arg_group = self.type_arg_depth > 0 && !self.arg_group_resolves();
                     if self.type_arg_depth > 0 && !dead_arg_group {
                         self.type_arg_miss_rows.push(range.offset);
                     } else if self.ctor_pos > 0 && self.type_arg_depth == 0 {
@@ -13081,6 +13389,46 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Whether the open type-argument group resolves its members' misses
+    /// like a live head's: either the head resolved, or the group sits in
+    /// the function-type tail shape (`dead_head_function_tail`).
+    fn arg_group_resolves(&self) -> bool {
+        *self.group_head_live.last().unwrap_or(&true)
+            || *self.group_head_resolve_through.last().unwrap_or(&false)
+    }
+
+    /// Whether this dead type head opens a function-type tail: the angle
+    /// group it starts is directly followed by a parameter list's open
+    /// paren — the recovered old-style function-typed typedef
+    /// (`typedef e = foo<F>(int x);`, the parser's missing-`Function`
+    /// recovery). The official resolver reaches the group's children
+    /// anyway (the recovery keeps the arguments real type references), so
+    /// the oracle reports the dead head AND each unresolved argument.
+    fn dead_head_function_tail(&self, head: SourceRange) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut i = head.end() as usize;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'<') {
+            return false;
+        }
+        let mut depth = 1usize;
+        i += 1;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'<' => depth += 1,
+                b'>' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        bytes.get(i) == Some(&b'(')
+    }
+
     /// The type-position lookup's full answer for a bare type head — the
     /// official chain (`named_type_resolver.dart:129-131` `_lookupGetter
     /// (nameScope, …)` over the member's scope), keeping the element kind
@@ -13106,8 +13454,7 @@ impl<'a> Engine<'a> {
     /// element's declaration (file, name span) when the face fires and the
     /// span is carried; `None` keeps the plain row.
     fn type_resolution(&self, name: StringId) -> (TypeResolution, Option<(FileId, SourceRange)>) {
-        if self.members.builtin_types.contains(&name)
-            || self.type_params.contains(&name)
+        if self.type_params.contains(&name)
             || self.pending_type_params.contains(&name)
             || self
                 .fn_type_capture
@@ -13157,6 +13504,26 @@ impl<'a> Engine<'a> {
             } else {
                 (TypeResolution::Missing, None)
             };
+        }
+        // The getter namespace answers before the type table
+        // (`_lookupGetter(nameScope, …)` runs first): an extension's name
+        // lives there as a sole entry — class/mixin/typedef declarations
+        // sharing the name sit in the type namespace only (the corpus's
+        // `class Function {}` + `extension Function on List {}` shape) — so
+        // a type position resolving to an extension's name finds a
+        // non-type element and reports `not_a_type`. Every closer scope
+        // (type parameters, locals, the container's own members) already
+        // answered above; the built-in type names sit behind it (they are
+        // the no-declaration fallback).
+        if self
+            .index
+            .get(self.file)
+            .is_some_and(|f| f.extension_faces.iter().any(|face| face.name == Some(name)))
+        {
+            return (TypeResolution::NonType, None);
+        }
+        if self.members.builtin_types.contains(&name) {
+            return (TypeResolution::Type, None);
         }
         match lookup_scoped(
             self.graph,
@@ -13777,7 +14144,7 @@ impl<'a> Engine<'a> {
         if self.initializer_depth > 0
             && let Receiver::This { container, .. } = recv
         {
-            self.init_rows.insert(member.range.offset);
+            self.init_rows.insert(member.range.offset, container);
             if self
                 .source
                 .get(member.range.end() as usize..)
@@ -13791,6 +14158,7 @@ impl<'a> Engine<'a> {
                         offset: begin,
                         length: member.range.end() - begin,
                     },
+                    member.range,
                 );
             }
         }
@@ -13828,8 +14196,15 @@ impl<'a> Engine<'a> {
     /// F-C: records a redirecting-constructor invocation edge
     /// (`this(...)` in an initializer list). The enclosing constructor's
     /// spelling comes from its open declaration site; the site-less shapes
-    /// (a factory never carries `this`) drop.
-    fn note_redirect_edge(&mut self, container: StringId, target: StringId, span: SourceRange) {
+    /// (a factory never carries `this`) drop. `member_span` is the target
+    /// selector's own token — the generative faces' anchor.
+    fn note_redirect_edge(
+        &mut self,
+        container: StringId,
+        target: StringId,
+        span: SourceRange,
+        member_span: SourceRange,
+    ) {
         let Some((_, Some(site))) = self.ctor_pending else {
             return;
         };
@@ -13842,7 +14217,67 @@ impl<'a> Engine<'a> {
             target_container: container,
             target,
             span,
+            target_span: member_span,
+            factory: false,
+            is_const: self.in_const_ctor,
         });
+    }
+
+    /// The declared constructor site for `(container, selector)` — the
+    /// last registration wins (a file declares a spelling once; recovery
+    /// residue keeps the settled face). Foreign containers hold no sites
+    /// here (`None` — the under-report posture).
+    fn ctor_decl_site(&self, container: StringId, selector: StringId) -> Option<&DeclSite> {
+        self.decl_sites
+            .iter()
+            .rev()
+            .find(|s| s.name == selector && matches!(s.kind, DeclKind::Constructor { container: c } if c == container))
+    }
+
+    /// Whether `(container, selector)` denotes a declared constructor face
+    /// of `decl`: a named selector joins through the container's selector
+    /// set, the unnamed spellings (the head itself, `new`) through the
+    /// implicit/explicit unnamed face.
+    fn ctor_face_exists(&self, decl: &Container, container: StringId, selector: StringId) -> bool {
+        decl.constructors.contains(&selector)
+            || ((selector == container || selector == self.intern("new"))
+                && decl.has_unnamed_constructor)
+    }
+
+    /// The offset just past the argument group whose `(` sits at `open`:
+    /// a depth-balanced scan with string-literal awareness — the
+    /// redirecting invocation's node extent, the generative faces' anchor
+    /// (`.at(invocation)`).
+    fn argument_group_end(&self, open: u32) -> u32 {
+        let bytes = self.source.as_bytes();
+        let mut i = open as usize;
+        let mut depth = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (i + 1) as u32;
+                    }
+                }
+                b'\'' | b'"' => {
+                    let quote = bytes[i];
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        } else if bytes[i] == quote {
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        open + 1 // unterminated: keep the open paren covered
     }
 
     /// F-C: the `recursive_constructor_redirect` walk — a redirecting
@@ -13854,9 +14289,82 @@ impl<'a> Engine<'a> {
     /// class — the walk keys on `(target_container, target)`. The visited
     /// set bounds the walk: every step either terminates or interns a fresh
     /// key.
+    ///
+    /// The redirect-target faces ride the same drain: the whole file's
+    /// declaration sites are complete here, so a forward-declared target
+    /// (`factory W.n()` declared after its `W() : this.n()` user) judges
+    /// exactly (`_checkForConflictingInitializerErrorCodes` /
+    /// `_checkForRedirectingConstructorErrorCodes` run on settled elements).
     fn finalize_redirects(&mut self) {
         let edges = std::mem::take(&mut self.redirect_edges);
         for edge in &edges {
+            // The generative target's face
+            // (`_checkForConflictingInitializerErrorCodes`'s
+            // `RedirectingConstructorInvocation` arm,
+            // error_verifier.dart:4300-4306): a resolved target that is a
+            // factory reports `redirect_generative_to_non_generative_
+            // constructor` at the invocation node; a missing target is the
+            // missing-constructor face, outside the burn set — silence.
+            if !edge.factory
+                && self
+                    .ctor_decl_site(edge.target_container, edge.target)
+                    .is_some_and(|site| site.is_factory)
+            {
+                let length = if self.source.as_bytes().get(edge.span.end() as usize) == Some(&b'(')
+                {
+                    self.argument_group_end(edge.span.end()) - edge.span.offset
+                } else {
+                    edge.span.length
+                };
+                self.emit(
+                    SemanticCode::RedirectGenerativeToNonGenerativeConstructor,
+                    SourceRange {
+                        offset: edge.span.offset,
+                        length,
+                    },
+                    "",
+                    "",
+                );
+            }
+            // The const redirect's target constness
+            // (`_checkForRedirectToNonConstConstructor`,
+            // error_verifier.dart:7335-7347): a `const` redirecting
+            // constructor or factory whose target constructor is not const
+            // reports at the target — the selector for a `this.b()` shape
+            // (`constructorSelector?.name2 ?? thisKeyword`), the `= C.name`
+            // extent for a factory. The target's element must resolve (the
+            // null redirectedElement arm skips): a same-file declaration
+            // reads its own const bit, a same-file implicit unnamed default
+            // is non-const, anything foreign or missing stays silent.
+            if edge.is_const {
+                let target_const = self
+                    .ctor_decl_site(edge.target_container, edge.target)
+                    .map(|site| site.const_ctor)
+                    .or_else(|| {
+                        let (decl, owner) = resolve_container(
+                            self.graph,
+                            self.namespaces,
+                            self.index,
+                            self.lib,
+                            self.file,
+                            edge.target_container,
+                        )?;
+                        if owner != self.file
+                            || !self.ctor_face_exists(decl, edge.target_container, edge.target)
+                        {
+                            return None;
+                        }
+                        Some(false) // the implicit unnamed default: never const
+                    });
+                if target_const == Some(false) {
+                    let span = if edge.factory {
+                        edge.span
+                    } else {
+                        edge.target_span
+                    };
+                    self.emit(SemanticCode::RedirectToNonConstConstructor, span, "", "");
+                }
+            }
             let mut current_container = edge.target_container;
             let mut current = edge.target;
             let mut visited: FxHashSet<(StringId, StringId)> =
@@ -14093,7 +14601,11 @@ impl<'a> Engine<'a> {
             && let RowShape::Receiver(Receiver::This { container, .. }) = row.shape
             && row.name == self.intern("")
         {
-            self.note_redirect_edge(container, container, row.range);
+            // The `this` keyword row is both the invocation anchor and the
+            // unnamed face's target spelling (`constructorSelector?.
+            // name2 ?? thisKeyword` — no selector here).
+            let keyword_range = row.range;
+            self.note_redirect_edge(container, container, keyword_range, keyword_range);
         }
         // The callee is the head row only when it ABUTS the open paren: a
         // recovery shape can open a fresh group while an unrelated row sits
@@ -14159,6 +14671,7 @@ impl<'a> Engine<'a> {
             pending_name: None,
             first_label: None,
             mark,
+            closures: Vec::new(),
         });
     }
 
@@ -14363,6 +14876,289 @@ impl<'a> Engine<'a> {
         None
     }
 
+    /// `ty` with every bare occurrence of a mapped type parameter replaced
+    /// (`List<T>` under `T := Object?` → `List<Object?>`). `None` for the
+    /// shapes this face does not rewrite (records, function types, a
+    /// nullable type-parameter occurrence) — the caller suppresses.
+    fn subst_params(&self, ty: Ty, map: &[(StringId, Ty)]) -> Option<Ty> {
+        match ty {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                if args == ArgListId::EMPTY {
+                    return match map.iter().find(|(param, _)| *param == name) {
+                        Some(_) if nullable => None,
+                        Some((_, to)) => Some(*to),
+                        None => Some(ty),
+                    };
+                }
+                let list: Vec<Ty> = self.boundary.args.borrow().get(args).to_vec();
+                let mut out = Vec::with_capacity(list.len());
+                for arg in list {
+                    out.push(self.subst_params(arg, map)?);
+                }
+                Some(Ty::Named {
+                    name,
+                    nullable,
+                    args: self.boundary.intern_list(&out),
+                })
+            }
+            Ty::Record { .. } | Ty::Function { .. } => None,
+            other => Some(other),
+        }
+    }
+
+    /// The generic inference-failure face (`couldNotInfer`, upstream Dart
+    /// SDK source, pkg/analyzer/lib/src/dart/element/generic_inferrer.dart
+    /// `tryChooseFinalTypes` :298-380, message assembly `_formatError`
+    /// :538-585 / `_formatConstraints` :789-818; the origin lines are
+    /// `TypeConstraintFromArgument` / `TypeConstraintFromReturnType`,
+    /// pkg/_fe_analyzer_shared/lib/src/type_inference/type_constraint.dart).
+    /// The solver checks each inferred type against every recorded
+    /// constraint and reports, at the invocation's constructor name, the
+    /// first type parameter whose solution violates one.
+    ///
+    /// Implemented for one shape class: an unnamed generic creation
+    /// `C(<literal>)` without explicit type arguments, passed straight as
+    /// a positional argument of an uninstantiated same-library generic
+    /// function call that is the whole initializer of an unannotated
+    /// declaration (`var x = check(C((List<int> x) {}));`). There the
+    /// creation's downward schema is the outer formal (`C<List<T>>`) with
+    /// the outer, still-unknown parameters as `_` (`C<List<_>>`); a class
+    /// parameter whose schema slot holds `_` is solved by the return
+    /// constraint alone to the slot with `_` := `Object?` (oracle-pinned,
+    /// `List<Object?>` / `Map<String, Object?>`), and the function-literal
+    /// argument's constraint is then checked against that solution. Slots
+    /// without `_` are fixed in the downward phase and never re-checked
+    /// (`_typesInferredSoFar`). Any context on the outer call (an
+    /// annotated declaration, an enclosing argument, a return) fixes its
+    /// parameters, the schema loses its `_`, and nothing reports — so
+    /// every other placement suppresses (under-report). The general face
+    /// — constraint gathering over arbitrary argument/context types,
+    /// constraint merging, and the solver's choice — needs a constraint
+    /// solver this engine does not have; this verdict is its seam.
+    fn check_could_not_infer(
+        &mut self,
+        callee: usize,
+        container: StringId,
+        params: &[(StringId, Option<Ty>)],
+        formals: &Formals,
+        level: &ArgLevel,
+        close: SourceRange,
+    ) {
+        // The outer generic call: its argument list is the innermost open
+        // one, and it is the whole initializer of an unannotated
+        // declaration (no downward context for its own parameters).
+        let Some(outer_level) = self.arg_levels.last() else {
+            return;
+        };
+        if self.arg_levels.len() != 1
+            || outer_level.arg_open && outer_level.pending_name.is_some()
+            || !self.in_initializer
+            || self.pending_decl_ty.is_some()
+            || self.init_frame_depth != self.frames.len()
+        {
+            return;
+        }
+        let Some(&Some(outer)) = self
+            .invokes
+            .len()
+            .checked_sub(2)
+            .and_then(|index| self.invokes.get(index))
+        else {
+            return;
+        };
+        // The creation is the outer call's first argument (an earlier
+        // compound argument would leave the positional index unattributed).
+        if self.init_mark != Some(outer)
+            || callee != outer + 1
+            || !outer_level.args.is_empty()
+            || self.call_type_args.iter().any(|(row, _)| *row == outer)
+        {
+            return;
+        }
+        let Some(outer_row) = self.rows.get(outer) else {
+            return;
+        };
+        if outer_row.qualified || !matches!(outer_row.shape, RowShape::Bare(BareInfo::Plain { .. }))
+        {
+            return;
+        }
+        let outer_name = outer_row.name;
+        if self.frames.iter().any(|f| f.locals.contains(&outer_name)) {
+            return;
+        }
+        let Some(outer_params) = self.exec_bounds.get(&outer_name).filter(|p| !p.is_empty())
+        else {
+            return;
+        };
+        let Some(outer_formal) = self.top_level_decl(outer_name).and_then(|decl| {
+            decl.formals
+                .as_deref()
+                .and_then(|f| f.positional.first())
+                .map(|f| f.ty)
+        }) else {
+            return;
+        };
+        let Ty::Named {
+            name: head,
+            nullable: false,
+            args: schema_args,
+        } = outer_formal
+        else {
+            return;
+        };
+        let schema_args: Vec<Ty> = self.boundary.args.borrow().get(schema_args).to_vec();
+        if head != container || schema_args.len() != params.len() {
+            return;
+        }
+        // The schema (`_` for the outer parameters) and the return-only
+        // solution (`Object?` for them), slot by slot.
+        let hole = Ty::named(self.intern("_"));
+        let top = Ty::Named {
+            name: self.intern("Object"),
+            nullable: true,
+            args: ArgListId::EMPTY,
+        };
+        let to_hole: Vec<(StringId, Ty)> = outer_params.iter().map(|(p, _)| (*p, hole)).collect();
+        let to_top: Vec<(StringId, Ty)> = outer_params.iter().map(|(p, _)| (*p, top)).collect();
+        let mut schema = Vec::with_capacity(params.len());
+        let mut solved = Vec::with_capacity(params.len());
+        let mut open = Vec::with_capacity(params.len());
+        for arg in &schema_args {
+            let (Some(with_hole), Some(with_top)) =
+                (self.subst_params(*arg, &to_hole), self.subst_params(*arg, &to_top))
+            else {
+                return;
+            };
+            open.push(with_hole != *arg);
+            schema.push(with_hole);
+            solved.push(with_top);
+        }
+        // A declared bound joins the constraint set (the `extends` check);
+        // this face does not model it.
+        if params.iter().any(|(_, bound)| bound.is_some()) {
+            return;
+        }
+        // The constructor's written function-typed formals pair with its
+        // positional formals one to one (the argument check's slot face).
+        let Some(table) = self.fn_formal_sigs.get(&container) else {
+            return;
+        };
+        // The argument list is exactly one function literal: its window
+        // spans the body's rows, so the row recovery leaves it
+        // unattributed — the literal pairs by source adjacency instead
+        // (`C(` then the literal then `)`, trivia only between).
+        let callee_end = self.rows[callee].range.end();
+        let [(start, end, arg_sig)] = level.closures.as_slice() else {
+            return;
+        };
+        let opens = self
+            .source
+            .get(callee_end as usize..*start as usize)
+            .is_some_and(|text| text.trim() == "(");
+        if !opens
+            || !self.trivia_between(*end, close.offset)
+            || !formals.named.is_empty()
+            || formals.positional.len() != 1
+            || table.positional.len() != 1
+        {
+            return;
+        }
+        let mut reports = Vec::new();
+        let class_map: Vec<(StringId, Ty)> = params
+            .iter()
+            .zip(&solved)
+            .map(|((param, _), ty)| (*param, *ty))
+            .collect();
+        for (index, (param, _)) in params.iter().enumerate() {
+            if !open[index] {
+                continue;
+            }
+            let probe = [(*param, hole)];
+            // The argument constraints on this parameter: exactly one formal
+            // signature mentions it (more origins need the merge order).
+            let mut mentioning = table.positional.iter().enumerate().filter(|(_, sig)| {
+                sig.positional
+                    .iter()
+                    .any(|ty| self.subst_params(*ty, &probe) != Some(*ty))
+            });
+            let Some((slot, formal_sig)) = mentioning.next() else {
+                continue;
+            };
+            if mentioning.next().is_some()
+                || !formal_sig.params.is_empty()
+                || !formal_sig.named.is_empty()
+                || self.subst_params(formal_sig.return_ty, &probe) != Some(formal_sig.return_ty)
+            {
+                return;
+            }
+            let mut positional = Vec::with_capacity(formal_sig.positional.len());
+            for ty in &formal_sig.positional {
+                let Some(ty) = self.subst_params(*ty, &class_map) else {
+                    return;
+                };
+                positional.push(ty);
+            }
+            let instantiated = FnVarSig {
+                params: Box::default(),
+                positional: positional.into_boxed_slice(),
+                required_positional: formal_sig.required_positional,
+                named: Box::default(),
+                return_ty: formal_sig.return_ty,
+            };
+            if self.fn_sig_subtype(arg_sig, &instantiated) != Some(false) {
+                continue;
+            }
+            let param_text = self.strings.resolve(*param).to_string();
+            let formal_name = self.strings.resolve(formals.positional[slot].name).to_string();
+            let inferred = self.ty_display(solved[index]);
+            let declared_args: Vec<Ty> = params.iter().map(|(p, _)| Ty::named(*p)).collect();
+            let declared = Ty::Named {
+                name: container,
+                nullable: false,
+                args: self.boundary.intern_list(&declared_args),
+            };
+            let context = Ty::Named {
+                name: container,
+                nullable: false,
+                args: self.boundary.intern_list(&schema),
+            };
+            // `_formatConstraints`: `  {prefix}{pad} {middle}` then
+            // `\n  {pad to the group's widest prefix} {end}` — one origin
+            // per group here, so the pad is the prefix's own width.
+            let arg_prefix = format!("Parameter '{formal_name}'");
+            let unsatisfied = format!(
+                "  {arg_prefix} declared as     '{}'\n  {} but argument is '{}'.",
+                self.fn_sig_display(formal_sig),
+                " ".repeat(arg_prefix.len()),
+                self.fn_sig_display(arg_sig),
+            );
+            let ret_prefix = "Return type";
+            let satisfied = format!(
+                "\nThe type '{inferred}' was inferred from:\n  {ret_prefix} declared as '{}'\n  {} used where  '{}' is required.",
+                self.ty_display(declared),
+                " ".repeat(ret_prefix.len()),
+                self.ty_display(context),
+            );
+            let detail = format!(
+                "\n\nTried to infer '{inferred}' for '{param_text}' which doesn't work:\n\
+                 {unsatisfied}{satisfied}\n\n\
+                 Consider passing explicit type argument(s) to the generic.\n\n"
+            );
+            reports.push(SemanticCode::CouldNotInfer.message(&param_text, &detail));
+        }
+        // One row per failing parameter, in declaration order, all at the
+        // constructor name (the solver keeps the erroneous type and walks
+        // on — `_diagnosticEntity(errorEntity!)`).
+        let range = self.rows[callee].range;
+        for message in reports {
+            self.emit_message_with_correction(SemanticCode::CouldNotInfer, range, message);
+        }
+    }
+
     /// Pairs the closed argument list against the callee's declared formals:
     /// positional by index, named by spelling. The count decisions precede
     /// the assignability walk (`extra_positional_arguments[_could_be_named]`
@@ -14398,6 +15194,101 @@ impl<'a> Engine<'a> {
         };
         if let Some(name) = extension_override {
             self.check_extension_override_argument(name, &level.args);
+        }
+        // The unnamed constructor's existence face (`_resolveConstructor`'s
+        // unnamed arm, constructor_invocation_resolver.dart): an in-file
+        // class whose declaration leaves the unnamed face absent
+        // (`has_unnamed_constructor` false — every constructor named, as in
+        // `factory H()` inside `class G`) reports
+        // `new_with_undefined_constructor_default` at the creation head.
+        // Foreign and unresolved containers defer (the under-report posture
+        // every creation face shares). Decided in a scoped borrow before
+        // the callee row's borrow below.
+        let unnamed_creation_miss: Option<(StringId, SourceRange)> =
+            self.rows.get(callee).and_then(|head| {
+                let RowShape::Bare(BareInfo::Container {
+                    name,
+                    kind: ContainerKind::Class,
+                }) = &head.shape
+                else {
+                    return None;
+                };
+                if head.qualified {
+                    return None;
+                }
+                resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    *name,
+                )
+                .filter(|(decl, _)| !decl.has_unnamed_constructor)
+                .map(|_| (*name, head.range))
+            });
+        if let Some((container, head_range)) = unnamed_creation_miss {
+            let name_text = self.strings.resolve(container).to_string();
+            self.emit(
+                SemanticCode::NewWithUndefinedConstructorDefault,
+                head_range,
+                &name_text,
+                "",
+            );
+        }
+        // The const-declaration initializer's selector-miss creation
+        // (`const y = C.named()` over `class C { const C(); }`): the const
+        // capture defers member invocations, so the face reads the send's
+        // own rows — a creation-shaped member invocation whose selector no
+        // constructor answers fails the initializer beside the resolution
+        // row. The tail pass stages the
+        // `const_initialized_with_non_constant_value` row at the creation
+        // (the const_with_undefined_constructor fixture pins the span).
+        if let Some(init) = self.pending_init_names.last().copied() {
+            let miss: Option<(StringId, SourceRange)> = self.rows.get(callee).and_then(|row| {
+                let RowShape::Bare(BareInfo::Plain { ty: Ty::UNKNOWN }) = &row.shape else {
+                    return None;
+                };
+                if !row.qualified {
+                    return None;
+                }
+                let receiver = callee.checked_sub(1).and_then(|i| self.rows.get(i))?;
+                let container = match &receiver.shape {
+                    RowShape::Receiver(Receiver::Created {
+                        name,
+                        kind: ContainerKind::Class,
+                    })
+                    | RowShape::Bare(BareInfo::Container {
+                        name,
+                        kind: ContainerKind::Class,
+                    }) => *name,
+                    _ => return None,
+                };
+                let resolves = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    container,
+                )
+                .is_some_and(|(decl, _)| decl.constructors.contains(&row.name));
+                if resolves || !self.const_ctor_target(container) {
+                    return None;
+                }
+                let start = receiver.range.offset;
+                Some((
+                    container,
+                    SourceRange {
+                        offset: start,
+                        length: close.end().saturating_sub(start),
+                    },
+                ))
+            });
+            if let Some((container, span)) = miss {
+                self.open_const_creations
+                    .push((init, span, ConstCreationEntry::Creation { container }));
+            }
         }
         let Some(row) = self.rows.get(callee) else {
             return;
@@ -14789,6 +15680,12 @@ impl<'a> Engine<'a> {
         // fixed type. Consumed even without parameters so a stale entry
         // cannot answer a later send on a reused row.
         let explicit_args = self.call_args_for(callee);
+        if unnamed_creation
+            && explicit_args.is_none()
+            && let (Some(container), Some(params)) = (creation_container, &exec_params)
+        {
+            self.check_could_not_infer(callee, container, params, &formals, &level, close);
+        }
         if let Some(params) = &exec_params {
             let param_index = |name: StringId| params.iter().position(|(param, _)| *param == name);
             // The explicit fix precedes every inference face.
@@ -16181,6 +17078,168 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The typed list literal's element check (`listLiteral`'s resolution,
+    /// type_analyzer.dart's element loop): each element's static type must
+    /// be assignable to the written element type —
+    /// `list_element_type_not_assignable` at the failing element. Untyped
+    /// literals infer, an unresolvable element type leaves the row to its
+    /// own face, and untypeable elements stay silent (the under-report
+    /// posture every assignability face shares).
+    fn check_list_literal_elements(&mut self, left: Token, right: Token) {
+        let bytes = self.source.as_bytes();
+        // A typed literal's `<` group sits immediately before the `[`.
+        let mut cursor = left.range.offset as usize;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor == 0 || bytes[cursor - 1] != b'>' {
+            return;
+        }
+        // The nearest type reference ending before the bracket is the
+        // element type (every bare type reference ships `(span, name)`).
+        let Some((_, name)) = self
+            .type_uses
+            .iter()
+            .rev()
+            .find(|(range, _)| range.end() <= left.range.offset)
+            .copied()
+        else {
+            return;
+        };
+        if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
+            return;
+        }
+        let declared = Ty::named(name);
+        // Top-level element segments: comma splits at bracket depth 0,
+        // string-literal contents skipped.
+        let mut segments: Vec<(usize, usize)> = Vec::new();
+        let mut seg_start = left.range.end() as usize;
+        let end = right.range.offset as usize;
+        let mut i = seg_start;
+        let mut depth = 0usize;
+        while i < end {
+            match bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => {
+                    segments.push((seg_start, i));
+                    seg_start = i + 1;
+                }
+                b'\'' | b'"' => {
+                    let quote = bytes[i];
+                    i += 1;
+                    while i < end && bytes[i] != quote {
+                        if bytes[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        segments.push((seg_start, end));
+        for (start, stop) in segments {
+            let Some(row) = self.rows.iter().rev().find(|row| {
+                row.ty != Ty::UNKNOWN
+                    && row.range.offset >= start as u32
+                    && row.range.end() <= stop as u32
+            }) else {
+                continue;
+            };
+            if self.assignable(row.ty, declared, false) == Some(false) {
+                let (a0, a1) = (self.ty_display(row.ty), self.ty_display(declared));
+                let range = row.range;
+                self.emit(SemanticCode::ListElementTypeNotAssignable, range, &a0, &a1);
+            }
+        }
+    }
+
+    /// The written `on` clause of a named extension, its head and written
+    /// type-argument names re-read from the source (the face model is
+    /// name-level): `extension E on List<Book>` answers
+    /// `(List, [Book])`. `None` when the header never reaches an honest
+    /// `on` — the caller keeps the name-level type.
+    fn extension_on_type_args(&self, name: StringId) -> Option<(StringId, Vec<StringId>)> {
+        // Extensions never join `decl_sites` (the unused-element face owns
+        // that table's membership), so the header is located textually: the
+        // `extension <name>` needle is word-bounded on both sides and the
+        // read continues only over the honest `on` clause shape — anything
+        // else (a string literal or comment mention) fails the shape and
+        // falls back to the bare-head verdict.
+        let name_text = self.strings.resolve(name);
+        let needle = format!("extension {name_text}");
+        let bytes = self.source.as_bytes();
+        let ident_byte =
+            |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut search = 0usize;
+        loop {
+            let at = self.source[search..].find(&needle)? + search;
+            let before_ok = at == 0 || !ident_byte(bytes[at - 1]);
+            let mut i = at + needle.len();
+            let after_ok = !bytes.get(i).is_some_and(|b| ident_byte(*b));
+            search = at + 1;
+            if !before_ok || !after_ok {
+                continue;
+            }
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            // The `on` keyword, word-bounded.
+            if !(bytes.get(i) == Some(&b'o')
+                && bytes.get(i + 1) == Some(&b'n')
+                && !bytes
+                    .get(i + 2)
+                    .is_some_and(|b| ident_byte(*b)))
+            {
+                continue;
+            }
+            i += 2;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let head_start = i;
+            while i < bytes.len() && ident_byte(bytes[i]) {
+                i += 1;
+            }
+            if i == head_start {
+                return None;
+            }
+            let head = self.intern(&self.source[head_start..i]);
+            let mut args = Vec::new();
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if bytes.get(j) == Some(&b'<') {
+                j += 1;
+                let mut depth = 1usize;
+                let mut arg_start = j;
+                loop {
+                    match bytes.get(j) {
+                        Some(b'<') => depth += 1,
+                        Some(b'>') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        Some(b',') if depth == 1 => {
+                            args.push(self.intern(self.source[arg_start..j].trim()));
+                            arg_start = j + 1;
+                        }
+                        None => return None,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                args.push(self.intern(self.source[arg_start..j].trim()));
+            }
+            return Some((head, args));
+        }
+    }
+
     /// The explicit extension override's argument check
     /// (`extension_member_resolver.dart:290-313`): the single argument is the
     /// receiver, and `!isAssignableTo(receiverType, extendedType)` reports
@@ -16206,7 +17265,16 @@ impl<'a> Engine<'a> {
         else {
             return;
         };
-        let extended = Ty::named(on_type);
+        // A written type-argument group rides the head (`on List<Book>`) —
+        // the assignability verdict is generic-aware only when the
+        // extension's own face carries the arguments.
+        let extended = match self.extension_on_type_args(name) {
+            Some((head, args)) if head == on_type && !args.is_empty() => {
+                let arg_tys: Vec<Ty> = args.iter().map(|arg| Ty::named(*arg)).collect();
+                self.boundary.args.borrow_mut().named(head, false, &arg_tys)
+            }
+            _ => Ty::named(on_type),
+        };
         let [(_, arg_ty, literal, arg_range)] = args else {
             return;
         };
@@ -16216,7 +17284,50 @@ impl<'a> Engine<'a> {
         if *arg_ty == Ty::Void {
             return;
         }
-        if self.assignable(*arg_ty, extended, *literal) != Some(false) {
+        let rejects = match self.assignable(*arg_ty, extended, *literal) {
+            Some(verdict) => !verdict,
+            // Name-level generic faces answer `None` (`on List<Book>`
+            // against a `List<int>` receiver — the subtype walk cannot
+            // compare unresolved argument names). The resolver's invariance
+            // decides from the written arguments alone: different heads
+            // reject outright, a same-head pair rejects on any differing
+            // argument (unknown slots defer — the under-report posture).
+            None => match (*arg_ty, extended) {
+                (
+                    Ty::Named {
+                        name: from_name,
+                        args: from_args,
+                        ..
+                    },
+                    Ty::Named {
+                        name: to_name,
+                        args: to_args,
+                        ..
+                    },
+                ) => {
+                    if from_name != to_name {
+                        true
+                    } else {
+                        let pool = self.boundary.pool();
+                        let (from_args, to_args) = (pool.get(from_args), pool.get(to_args));
+                        from_args.len() == to_args.len()
+                            && from_args
+                                .iter()
+                                .zip(to_args.iter())
+                                .any(|(a, b)| match (a, b) {
+                                    (Ty::Named { name: an, .. }, Ty::Named { name: bn, .. }) => {
+                                        an != bn
+                                    }
+                                    (a, b) => {
+                                        a != b && !matches!(a, Ty::Unknown) && !matches!(b, Ty::Unknown)
+                                    }
+                                })
+                    }
+                }
+                _ => false,
+            },
+        };
+        if !rejects {
             return;
         }
         let range = self.property_access_span(*arg_range).unwrap_or(*arg_range);
@@ -17904,6 +19015,19 @@ impl<'a> Engine<'a> {
                 if !self.self_scope_rows.contains(&row.range.offset) {
                     self.used_names.insert(row.name);
                 }
+                // The implicit-this face (`_checkForInvalidInstanceMember
+                // Access2`, upstream Dart SDK source, pkg/analyzer/lib/src/
+                // generated/error_verifier.dart — `ThisContext.
+                // instanceFieldDeclaration` disallows `this`): a bare READ
+                // in an instance field initializer resolving to an instance
+                // member of the enclosing container reports at the name.
+                // Both facts snapshot at push time (the field group and the
+                // container stack tear down before pass 2).
+                if !matches!(row.intent, Intent::Write | Intent::ReadWrite)
+                    && self.field_init_this_rows.contains(&row.range.offset)
+                {
+                    self.emit(SemanticCode::ImplicitThisReferenceInInitializer, row.range, name_text, "");
+                }
                 // The discarded-value face (`_check` + `checkNameExpression`,
                 // use_result_verifier.dart): an invocation or bare read of a
                 // UseResult-carrying top-level declaration, not sealed used.
@@ -17987,10 +19111,40 @@ impl<'a> Engine<'a> {
                         // field` / `field_initialized_outside_declaring_
                         // class`), never `undefined_identifier`.
                         let is_write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
-                        let initializer_lhs =
-                            is_write && self.init_rows.contains(&row.range.offset);
-                        if !initializer_lhs
-                            && !Self::synthetic_reference(row.range)
+                        let initializer_container = is_write
+                            .then(|| self.init_rows.get(&row.range.offset))
+                            .flatten()
+                            .copied();
+                        if let Some(container) = initializer_container {
+                            // `_checkForInvalidField` reads the ENCLOSING
+                            // class's own field map (`enclosingInstanceElement
+                            // .getField` — superclass fields never initialize
+                            // here): a miss or a non-field member (method,
+                            // getter/setter) codes the whole initializer. The
+                            // static-field arm (`initializer_for_static_
+                            // field`) has no code-table variant yet — that hit
+                            // stays silent rather than mis-code.
+                            let own_field = resolve_container(
+                                self.graph,
+                                self.namespaces,
+                                self.index,
+                                self.lib,
+                                self.file,
+                                container,
+                            )
+                            .and_then(|(decl, _)| decl.members.get(&row.name))
+                            .is_some_and(|entry| {
+                                entry.kind == MemberKind::Field && !entry.is_static
+                            });
+                            if !own_field {
+                                self.emit(
+                                    SemanticCode::InitializerForNonExistentField,
+                                    row.range,
+                                    name_text,
+                                    "",
+                                );
+                            }
+                        } else if !Self::synthetic_reference(row.range)
                             && !self.keyword_bare_reference(row.range)
                             && !self.guard.ignore(None, row.name)
                         {
@@ -18623,7 +19777,7 @@ impl<'a> Engine<'a> {
         // field) codes `initializer_for_non_existent_field`; read and
         // invocation intents stay silent (the under-report posture the
         // redirect face shares).
-        if self.init_rows.contains(&row.range.offset) {
+        if self.init_rows.contains_key(&row.range.offset) {
             if matches!(row.intent, Intent::Write | Intent::ReadWrite) {
                 // `_checkForInvalidField`: the name must be a real field of
                 // the enclosing class — a miss or an accessor spelling
@@ -18668,6 +19822,28 @@ impl<'a> Engine<'a> {
             }
         }
         if self.member_defined(container, row, false, receiver_nullable) {
+            // The implicit-this face (`_checkForInvalidInstanceMemberAccess2`,
+            // error_verifier.dart — `ThisContext.instanceFieldDeclaration`
+            // disallows `this`): an instance-member reference — implicit or
+            // explicit `this` — inside an instance field's declaration
+            // initializer reports at the referencing expression. The
+            // push-time snapshot set decides (the field group tears down
+            // before pass 2); a static member rides no `this` and stays
+            // silent.
+            if self.field_init_rows.contains(&row.range.offset)
+                && !matches!(
+                    self.walk_members(container, row.name),
+                    Walk::Found(entry) if entry.is_static
+                )
+            {
+                let name_text = self.strings.resolve(row.name);
+                self.emit(
+                    SemanticCode::ImplicitThisReferenceInInitializer,
+                    row.range,
+                    &name_text,
+                    "",
+                );
+            }
             self.check_member_unused_result(
                 row,
                 container,
@@ -18690,6 +19866,18 @@ impl<'a> Engine<'a> {
             return; // external receiver type: suppress
         };
         if kind == ContainerKind::Enum && self.members.enum_synth_members.contains(&row.name) {
+            // The synthesized `index`/`values`/`names` getters are instance
+            // members: the initializer-context face fires for them too (the
+            // corpus's `final int code = index;` resolves exactly here).
+            if self.field_init_rows.contains(&row.range.offset) {
+                let name_text = self.strings.resolve(row.name);
+                self.emit(
+                    SemanticCode::ImplicitThisReferenceInInitializer,
+                    row.range,
+                    &name_text,
+                    "",
+                );
+            }
             return;
         }
         if matches!(kind, ContainerKind::Mixin | ContainerKind::Extension) {
@@ -19003,6 +20191,19 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Whether an instance field's declaration initializer is open: the
+    /// variable-initializer bracket (`in_initializer`) inside a member
+    /// field group at the group's own frame depth (a closure body inside
+    /// the initializer is not the initializer), with the group non-static
+    /// — the instance context `_checkForImplicitThisReferenceInInitializer`
+    /// arms on.
+    fn in_instance_field_initializer(&self) -> bool {
+        self.in_initializer
+            && self.field_group_open
+            && self.init_frame_depth == self.field_group_depth
+            && !self.open_member_static
+    }
+
     /// Runs the walk(s) an access needs and applies the shared suppressions
     /// (broken chain, extension application, `Object` members). A write also
     /// accepts the setter spelling (`name=`): a same-named getter, field, or
@@ -19022,6 +20223,22 @@ impl<'a> Engine<'a> {
             found = self.member_found(container, spelling, super_walk);
         }
         if found {
+            // The nullable-dereference face (nullable_dereference_verifier
+            // .dart report): an interface member reached through a
+            // merely-nullable receiver reads a possibly-null receiver —
+            // `unchecked_use_of_nullable_value` at the selector. A member
+            // applied through a nullable `on` extension face never
+            // dereferences (the applicability test already accepted the
+            // nullable type), and a `?.` access unwrapped the receiver —
+            // both stay silent here.
+            if receiver_nullable && !matches!(row.intent, Intent::Invoke) {
+                let name_text = self.strings.resolve(row.name);
+                self.emit_corrected(
+                    SemanticCode::UncheckedUseOfNullableValue,
+                    row.range,
+                    name_text,
+                );
+            }
             return true;
         }
         if row.name == self.intern("==") || self.members.object_members.contains(&row.name) {
@@ -19262,6 +20479,17 @@ impl<'a> Engine<'a> {
 
 // —— #279: the constant-evaluation face ——————————————————————————————————
 
+/// One const-declaration initializer failure candidate's shape: the
+/// verdict each entry re-decides against the whole-file const-ctor set.
+enum ConstCreationEntry {
+    /// An instance creation (`C(...)` / `C.named(...)`) inside the
+    /// initializer — constant iff a const constructor answers the call.
+    Creation { container: StringId },
+    /// A checked argument of a const creation evaluated non-constant —
+    /// the initializer fails at the argument unconditionally.
+    ArgFailure,
+}
+
 /// One formal's binding in the creation-time initializer walk (#1351): a
 /// known constant value, a valid-but-opaque deference, or an invalid
 /// (`dynamic`) binding.
@@ -19441,6 +20669,16 @@ impl Engine<'_> {
             .as_ref()
             .map_or(Verdict::Constant, |node| eval(node, self));
         self.resolve_const_verdict(&verdict);
+        // This initializer's creation candidates: an immediate failure
+        // (a genuine non-constant operand) already reported — the oracle
+        // codes one row per initializer, so the deferred entries drop; a
+        // passing verdict promotes them to the tail pass, whose whole-file
+        // const-ctor set decides.
+        for (init, span, kind) in std::mem::take(&mut self.open_const_creations) {
+            if matches!(verdict, Verdict::Value(_) | Verdict::Constant) {
+                self.pending_const_creations.push((init, span, kind));
+            }
+        }
         if let Verdict::Value(value) = &verdict {
             let folded = self.folded_ty(value);
             if local {
@@ -19646,6 +20884,42 @@ impl Engine<'_> {
                 .is_some_and(|f| f.container(container).is_some())
     }
 
+    /// Whether a const-declaration initializer's creation is a valid
+    /// constant creation: the container must carry a const constructor
+    /// answering the written selector. The selector re-reads the written
+    /// source (the capture carries the head only): `C.named(...)` needs a
+    /// declared `named` constructor — a miss fails the creation
+    /// (`const_with_undefined_constructor`'s initializer row) without the
+    /// `const_with_non_const` twin (no constructor exists to be
+    /// non-const).
+    fn const_creation_valid(&self, container: StringId, span: SourceRange) -> bool {
+        if !self.const_ctor_target(container) {
+            return false;
+        }
+        let text = self
+            .source
+            .get(span.offset as usize..span.end() as usize)
+            .unwrap_or("");
+        let head = self.strings.resolve(container);
+        let selector = text
+            .strip_prefix(head)
+            .and_then(|rest| rest.strip_prefix('.'))
+            .map(|rest| {
+                rest.split(['(', ' ', '?', '\n', '\t'])
+                    .next()
+                    .unwrap_or("")
+            })
+            .unwrap_or("");
+        if selector.is_empty() || selector == "new" {
+            return true;
+        }
+        let sel = self.intern(selector);
+        self.index
+            .get(self.file)
+            .and_then(|f| f.container(container))
+            .is_some_and(|decl| decl.constructors.contains(&sel))
+    }
+
     /// The callee classification a closed bare-identifier call resolves
     /// to (`evaluation.dart` `_invalidConstantForMethodInvocation`).
     fn classify_call(&self, name: StringId) -> CallClass {
@@ -19668,7 +20942,11 @@ impl Engine<'_> {
 
     /// Arguments of a closed const creation: each evaluates against the
     /// `const_with_non_constant_argument` default
-    /// (`constant_verifier.dart` `_validateConstantArguments`).
+    /// (`constant_verifier.dart` `_validateConstantArguments`). A
+    /// non-constant argument also fails the enclosing const declaration's
+    /// initializer (`const_initialized_with_non_constant_value` at the
+    /// same argument) — the entry defers to the tail pass beside the
+    /// creation faces.
     pub fn check_const_args(&mut self, gate: bool, args: &[crate::const_eval::Node]) {
         if !gate {
             return;
@@ -19679,6 +20957,10 @@ impl Engine<'_> {
                 Verdict::Value(_) | Verdict::Constant => {}
                 Verdict::NotConstant(span) => {
                     self.emit(SemanticCode::ConstWithNonConstantArgument, span, "", "");
+                    if let Some(init) = self.pending_init_names.last().copied() {
+                        self.open_const_creations
+                            .push((init, span, ConstCreationEntry::ArgFailure));
+                    }
                 }
                 Verdict::Fault(fault, span) => self.emit_const_fault(fault, span),
             }
@@ -20911,7 +22193,29 @@ pub fn fold_unit(
             }
             // The definite-unassignment face (#746): the cast join reads it
             // after the fold, when the promotions are complete too.
-            FlowFact::UnassignedRead { span, .. } => {
+            // A `late` local read while definitely unassigned reports
+            // `definitely_unassigned_late_local_variable` at the read
+            // (type_analyzer.dart `_checkReadOfNotAssignedLocalVariable`:
+            // the late arm gates on `isDefinitelyUnassigned` alone).
+            FlowFact::UnassignedRead {
+                span,
+                is_late,
+                definitely_unassigned,
+                ..
+            } => {
+                if is_late && definitely_unassigned {
+                    let range = span.range;
+                    let name = &source[range.offset as usize..range.end() as usize];
+                    let code = SemanticCode::DefinitelyUnassignedLateLocalVariable;
+                    flow_diagnostics.push(Diagnostic::new(
+                        code.severity(),
+                        code.code_info(),
+                        code.message(name, ""),
+                        file,
+                        range,
+                        code.correction_message(""),
+                    ));
+                }
                 unassigned.stage(span.range);
             }
             // The promoted-property spans (#1409): the offset-keyed rows
@@ -21097,6 +22401,38 @@ pub fn fold_unit(
     for (name, kw) in std::mem::take(&mut engine.pending_const_non_const) {
         if !engine.const_ctor_target(name) {
             engine.stage_usage(SemanticCode::ConstWithNonConst, kw, "");
+        }
+    }
+    // The const-declaration initializer creations (deferred for the
+    // whole-file const-ctor set): the first invalid entry per initializer
+    // anchors `const_initialized_with_non_constant_value` (the oracle's
+    // one-row-per-initializer verdict at the deepest failing node), and
+    // every invalid creation whose constructor exists but is non-const
+    // adds the `const_with_non_const` twin at the creation.
+    {
+        let mut reported: FxHashSet<StringId> = FxHashSet::default();
+        for (init, span, kind) in std::mem::take(&mut engine.pending_const_creations) {
+            let invalid = match kind {
+                ConstCreationEntry::ArgFailure => true,
+                ConstCreationEntry::Creation { container } => {
+                    !engine.const_creation_valid(container, span)
+                }
+            };
+            if !invalid {
+                continue;
+            }
+            if reported.insert(init) {
+                engine.stage_usage(
+                    SemanticCode::ConstInitializedWithNonConstantValue,
+                    span,
+                    "",
+                );
+            }
+            if let ConstCreationEntry::Creation { container } = kind
+                && !engine.const_ctor_target(container)
+            {
+                engine.stage_usage(SemanticCode::ConstWithNonConst, span, "");
+            }
         }
     }
     // The #612 variance family runs after the parse — the capture must see
@@ -22185,6 +23521,49 @@ impl ParserListener for DiagnoseListener<'_> {
         // #1444: the safety-net close (the body open normally dropped the
         // capture).
         engine.extension_clause_phase = ExtensionClausePhase::Off;
+        // The representation field's constructor face: `error_verifier.dart`
+        // drives `ConstructorFieldsVerifier.addConstructors` for extension
+        // types exactly like classes (visitExtensionTypeDeclaration), so
+        // every declared constructor that leaves the representation field
+        // unbound reports `final_not_initialized_constructor` at its own
+        // head. The representation joins the pending set as a final
+        // instance field (the primary's formal binds it only for the
+        // primary, which is not a member site — secondaries never spare it
+        // except through a `this.i` formal or an initializer assignment).
+        if let Some(container) = engine.container_context().map(|(c, _)| c) {
+            // Only DECLARED constructors join the verifier (the implicit
+            // constructor binds the representation from the primary formal
+            // itself — a constructor-less extension type stays silent).
+            let declares_ctors = engine
+                .index
+                .get(engine.file)
+                .and_then(|f| f.container(container))
+                .is_some_and(|decl| !decl.constructors.is_empty());
+            if declares_ctors {
+                let reps: Vec<(StringId, SourceRange)> = engine
+                    .index
+                    .get(engine.file)
+                    .and_then(|f| f.container(container))
+                    .map(|decl| {
+                        decl.primary_formals
+                            .iter()
+                            .map(|rep| (rep.formal.name, rep.name_range))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                for (name, range) in reps {
+                    engine.pending_init_variables.push(PendingInitVariable {
+                        name,
+                        range,
+                        container: Some(container),
+                        is_static: false,
+                        initialized: false,
+                        is_final: true,
+                    });
+                }
+                engine.flush_init_instance_fields(container);
+            }
+        }
         engine.bounds.drop_header();
         engine.var_drop_header();
         engine.pop_frame();
@@ -22471,6 +23850,7 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.super_formal_positional_index = 0;
         }
         engine.formal_list_depth += 1;
+        engine.closure_formals_begin();
         if engine.formal_list_depth > 1 {
             // A function-typed formal's nested list: park the outer formal's
             // written-type snapshot — the inner formals re-arm the type.
@@ -22487,6 +23867,7 @@ impl ParserListener for DiagnoseListener<'_> {
     ) {
         self.engine.var_formal_region_end();
         self.engine.fn_capture_formals_end();
+        self.engine.closure_formals_end();
         // The #1351 capture: the open typedef RHS's formals region closed.
         self.engine.bounds.alias_formals_closed();
         let engine = &mut self.engine;
@@ -22520,6 +23901,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // The written-signature capture: the section split.
         let section = opener.clone();
         self.engine.fn_capture_optional_group(&section);
+        self.engine.closure_optional_group(&opener);
     }
 
     fn begin_formal_parameter_default_value_expression(&mut self, token: Token) {
@@ -22554,6 +23936,11 @@ impl ParserListener for DiagnoseListener<'_> {
         // An inline function-typed formal inside a written-signature
         // capture poisons it (the face cannot attribute the nested list).
         engine.fn_capture_poison();
+        // The open literal's capture cannot render an inline
+        // function-typed formal either.
+        if let Some(capture) = engine.closure_caps.last_mut() {
+            capture.poisoned = true;
+        }
         // #1463: the formal's name token is consumed without an identifier
         // event — latch the shape for the `end_formal_parameter` bind.
         engine.fn_typed_formal_open = true;
@@ -22983,12 +24370,14 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.open_exec_augment = false;
         }
         engine.push_executable_frame(instance);
+        engine.closure_capture_begin(token.range.offset);
     }
 
     fn end_function_expression(&mut self, begin: Token, end: Token) {
         self.flow().end_function_expression(begin, end);
 
         let engine = &mut self.engine;
+        engine.closure_capture_end(end.range.end());
         engine.const_capture.end_opaque_group(end.range);
         // #1314 FAM7: recovery paths without a body event drop the rows.
         engine.drop_default_checks();
@@ -23438,6 +24827,9 @@ impl ParserListener for DiagnoseListener<'_> {
                     // here — `bind_parameter_type` consumes it (the nested
                     // function-typed lists park and restore the snapshot).
                     engine.formal_written = engine.armed_ty;
+                    // The open literal's signature capture records the
+                    // formal's written type before the bind consumes it.
+                    engine.closure_formal();
                     // The written-signature capture binds the formal.
                     engine.fn_capture_formal(name);
                     // The written-signature claim for the formal: a generic
@@ -23744,6 +25136,11 @@ impl ParserListener for DiagnoseListener<'_> {
                             token.range,
                             DeclKind::Constructor { container },
                         );
+                        // The `factory` head opened this declaration (a
+                        // constructor's provisional is always `Some`) — the
+                        // site joins with the factory bit set (the
+                        // redirect_generative face's target query).
+                        engine.decl_sites[site].is_factory = true;
                         engine.open_exec_site = Some(site);
                     }
                 }
@@ -25019,6 +26416,23 @@ impl ParserListener for DiagnoseListener<'_> {
                         // branch's order.
                         engine.check_ctor_initializers(name, &closed.args, closed.span);
                         engine.check_const_args(true, &closed.args);
+                        // The selector face: a const-constructor container
+                        // whose written selector never resolves (`const y =
+                        // C.named()` over `class C { const C(); }`) fails
+                        // the initializer beside the resolution row — the
+                        // tail pass stages the
+                        // `const_initialized_with_non_constant_value` row
+                        // at the creation (the oracle's
+                        // const_with_undefined_constructor fixture).
+                        if let Some(init) = engine.pending_init_names.last().copied()
+                            && !engine.const_creation_valid(name, closed.span)
+                        {
+                            engine.open_const_creations.push((
+                                init,
+                                closed.span,
+                                ConstCreationEntry::Creation { container: name },
+                            ));
+                        }
                         engine
                             .const_capture
                             .push_value(closed.span, ConstantValue::Created(name));
@@ -25027,7 +26441,32 @@ impl ParserListener for DiagnoseListener<'_> {
                         engine.emit(SemanticCode::ConstEvalMethodInvocation, closed.span, "", "");
                         engine.const_capture.opaque_leaf(closed.span);
                     }
-                    CallClass::Unknown => engine.const_capture.opaque_leaf(closed.span),
+                    CallClass::Unknown => {
+                        // The implicit const creation face: a class
+                        // container's plain send inside a const-declaration
+                        // initializer is the implicit `const C(...)` —
+                        // constant only when a const constructor answers
+                        // the call (the oracle's constant verifier).
+                        // Foreign/unresolved names keep the opaque defer.
+                        if let Some(init) = engine.pending_init_names.last().copied()
+                            && let Some((decl, _)) = resolve_container(
+                                engine.graph,
+                                engine.namespaces,
+                                engine.index,
+                                engine.lib,
+                                engine.file,
+                                name,
+                            )
+                            && decl.kind == ContainerKind::Class
+                        {
+                            engine.open_const_creations.push((
+                                init,
+                                closed.span,
+                                ConstCreationEntry::Creation { container: name },
+                            ));
+                        }
+                        engine.const_capture.opaque_leaf(closed.span);
+                    }
                 }
             } else {
                 engine.const_capture.opaque_leaf(closed.span);
@@ -26072,6 +27511,14 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.type_arg_depth += 1;
         // The head's liveness adopts this group (the resolver's bail face).
         engine.group_head_live.push(engine.last_type_head_live);
+        // The dead head's arguments still resolve when the group sits in
+        // the function-type tail shape (see `dead_head_function_tail`).
+        let resolve_through = !engine.last_type_head_live
+            && engine
+                .type_uses
+                .last()
+                .is_some_and(|(range, _)| engine.dead_head_function_tail(*range));
+        engine.group_head_resolve_through.push(resolve_through);
         let base = engine.rows.len();
         engine.group_heads.push((head, base));
     }
@@ -26087,6 +27534,7 @@ impl ParserListener for DiagnoseListener<'_> {
             // #1314 FAM13: the group closed.
             engine.type_arg_depth = engine.type_arg_depth.saturating_sub(1);
             engine.group_head_live.pop();
+            engine.group_head_resolve_through.pop();
         }
         self.engine.end_type_arguments(count, begin, end);
     }
@@ -26346,6 +27794,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 ConstantValue::Instance(crate::const_eval::InstanceKind::List),
             );
         }
+        engine.check_list_literal_elements(left, right);
         engine.push_value_row(right);
     }
 
@@ -26432,17 +27881,29 @@ impl ParserListener for DiagnoseListener<'_> {
         // a recovery shape with no inner row keeps the opaque face. The
         // inner rows stay below: their own resolutions owe their
         // diagnostics as before.
-        let inner_ty = engine
-            .record_marks
-            .last()
-            .and_then(|(_, open)| {
-                engine
-                    .rows
-                    .last()
-                    .filter(|row| row.range.offset >= open.range.offset)
-                    .map(|row| row.ty)
-            })
-            .unwrap_or(Ty::UNKNOWN);
+        // When the inner extent sits inside a statically-`bool` composite
+        // span (a comparison's latched `left..right` extent — a binary
+        // expression pushes no result row, so the last row's type is the
+        // right operand's, not the comparison's `bool`), the parent's
+        // `inner_ty` is `bool` — the composite's own static type.
+        let inner_row = engine.record_marks.last().and_then(|(_, open)| {
+            engine
+                .rows
+                .last()
+                .filter(|row| row.range.offset >= open.range.offset)
+        });
+        let inner_ty = match inner_row {
+            Some(row)
+                if engine
+                    .bool_decided
+                    .iter()
+                    .any(|span| span.offset <= row.range.offset && row.range.end() <= span.end()) =>
+            {
+                Ty::named(engine.members.primitive_ids[3])
+            }
+            Some(row) => row.ty,
+            None => Ty::UNKNOWN,
+        };
         engine.record_marks.pop();
         engine.record_literal_names.pop();
         engine.push_row(Row {
@@ -27613,12 +29074,74 @@ impl ParserListener for DiagnoseListener<'_> {
             && let Some(container) = engine.container_context().map(|(c, _)| c)
         {
             let ctor = engine.decl_sites[site].name;
+            // The redirect-target faces
+            // (`_checkForRedirectToInvalidReturnType`,
+            // error_verifier.dart:2983-3009, and `_reportRedirectToNonClass`,
+            // named_type_resolver.dart:587-594): the head name resolves to a
+            // container first — an unresolved or non-container head is the
+            // `redirect_to_non_class` row at the target span; a resolved head
+            // whose class is not a subtype of the enclosing class is the
+            // `redirect_to_invalid_return_type` row (the official `at` is the
+            // `factoryRedirectionTarget` = the `C.name` extent). The enclosing
+            // face's return type IS the enclosing class itself — the
+            // assignability check reduces to a class-vs-class subtype query.
+            let target_resolved = resolve_container(
+                engine.graph,
+                engine.namespaces,
+                engine.index,
+                engine.lib,
+                engine.file,
+                target_container,
+            );
+            match target_resolved {
+                None => {
+                    let name_text = engine.strings.resolve(target_container).to_string();
+                    engine.emit(
+                        SemanticCode::RedirectToNonClass,
+                        span,
+                        &name_text,
+                        "",
+                    );
+                }
+                Some((target_decl, _)) => {
+                    // The faces key on a resolved CONSTRUCTOR element
+                    // upstream (`redirectedElement == null` early-returns
+                    // into the missing-constructor face — a class with no
+                    // matching constructor never reports here): the
+                    // selector joins through the container's selector set,
+                    // the unnamed spellings (the head itself, `new`)
+                    // through the implicit/explicit unnamed face.
+                    if engine.ctor_face_exists(target_decl, target_container, target) {
+                        // Subtype check: the target's declared type against the
+                        // enclosing class's own name (the factory's declared
+                        // return type). `declared_subtype_negative` walks the
+                        // `from` container's supertype closure — a `Some(false)`
+                        // verdict means both resolve and `to` is absent, the
+                        // exact under-report shape the official gate picks.
+                        let from_ty = Ty::named(target_container);
+                        let to_ty = Ty::named(container);
+                        if engine.declared_subtype_negative(&from_ty, &to_ty) == Some(false) {
+                            let redirected_text = engine.render_ty(from_ty);
+                            let redirecting_text = engine.render_ty(to_ty);
+                            engine.emit(
+                                SemanticCode::RedirectToInvalidReturnType,
+                                span,
+                                &redirected_text,
+                                &redirecting_text,
+                            );
+                        }
+                    }
+                }
+            }
             engine.redirect_edges.push(RedirectEdge {
                 container,
                 ctor,
                 target_container,
                 target,
                 span,
+                target_span: span,
+                factory: true,
+                is_const: engine.in_const_ctor,
             });
         }
     }
@@ -28644,20 +30167,25 @@ mod tests {
 
     /// The constructor-initializer face (F-C): a bare LHS name in an
     /// initializer list is the field-initializer shape — the oracle codes
-    /// the miss `initializer_for_non_existent_field` (under-reported here),
-    /// never `undefined_identifier`; the list's right-hand sides keep the
+    /// the miss `initializer_for_non_existent_field` (`_checkForInvalidField`
+    /// reads the enclosing class's own field map), never
+    /// `undefined_identifier`; the list's right-hand sides keep the
     /// ordinary resolution.
     ///
     /// Hand-trace: the bare `x` row pushes while `initializer_depth` is up
-    /// (`init_rows` stamp) and the `=` flips it to the write intent — the
-    /// missing-name arm folds it. The RHS `gone` keeps its read intent and
-    /// reports.
+    /// (`init_rows` stamp keyed to the container) and the `=` flips it to
+    /// the write intent — the missing-name arm folds it and the pass-2
+    /// field check reports `x` against the (empty) field set. The RHS
+    /// `gone` keeps its read intent and reports beside it.
     #[test]
     fn initializer_lhs_never_reports_undefined_identifier() {
         let lhs = report("class C { C() : x = 0; }");
-        assert!(lhs.diagnostics.is_empty(), "{:?}", code_names(&lhs));
+        assert_eq!(code_names(&lhs), ["initializer_for_non_existent_field"]);
         let rhs = report("class C { C() : x = gone; }");
-        assert_eq!(code_names(&rhs), ["undefined_identifier"]);
+        assert_eq!(
+            code_names(&rhs),
+            ["initializer_for_non_existent_field", "undefined_identifier"]
+        );
     }
 
     /// The recovery shapes keep the face: an initializer LHS recovered out
@@ -28907,24 +30435,33 @@ mod tests {
 
     /// A redirecting-factory target (`= prefix.C.new;`) resolves through
     /// the redirect face: the head miss is the oracle's
-    /// `redirect_to_non_class` (outside the frozen gate, under-reported),
-    /// never the scored `undefined_class` a plain type use carries. The
-    /// initializer recovery reuses the same body parse (`this.new =
-    /// null;`), so it drops the misfire too.
+    /// `redirect_to_non_class` (named_type_resolver.dart:587-594, the
+    /// `_reportRedirectToNonClass` shape — inside the frozen gate since the
+    /// #2129 redirect family landed), never the scored `undefined_class` a
+    /// plain type use carries. The initializer recovery reuses the same
+    /// body parse (`this.new = null;`), so it drops the misfire too.
     ///
     /// Hand-trace: `begin_redirecting_factory_body` raises the depth; the
     /// head row pushes with the `RedirectTarget` verdict, whose pass-2 arm
-    /// records without a report.
+    /// records without a report; `end_redirecting_factory_body` then runs
+    /// the redirect-target checks (`resolve_container` for the head
+    /// container) and emits `redirect_to_non_class` on an unresolved head.
     #[test]
     fn redirect_target_head_never_reports_undefined_class() {
         let prefixed = report("class D { factory D.r() = prefix.C.new; }");
-        assert!(
-            prefixed.diagnostics.is_empty(),
+        assert_eq!(
+            code_names(&prefixed),
+            ["redirect_to_non_class"],
             "{:?}",
             code_names(&prefixed)
         );
         let missing = report("class D { factory D.r() = Missing.new; }");
-        assert!(missing.diagnostics.is_empty(), "{:?}", code_names(&missing));
+        assert_eq!(
+            code_names(&missing),
+            ["redirect_to_non_class"],
+            "{:?}",
+            code_names(&missing)
+        );
         let initializer =
             report("class C { C.constructor_field_initializer() : this.new = null; }");
         let names = code_names(&initializer);
@@ -28936,7 +30473,151 @@ mod tests {
         );
     }
 
-    /// A factory's `=>` body checks against the container, whatever the
+    /// `redirect_to_invalid_return_type` at the `= S` head (`S` is not a
+    /// subtype of `T`), verbatim from `redirect_to_invalid_return_type.dart`
+    /// and `clean_constructor_forms.dart`'s `const factory B() = A;` —
+    /// `_checkForRedirectToInvalidReturnType`'s assignability arm
+    /// (error_verifier.dart:2986-2999). The `B extends A ⇒ B() = A` arm
+    /// fires too: the official `isAssignableTo(redirectedReturnType=A,
+    /// constructorReturnType=B)` checks the TARGET's type against the
+    /// REDIRECTING's — a supertype target is no subtype of the factory's
+    /// class, so the diagnostic still reports.
+    #[test]
+    fn redirect_to_invalid_return_type_reports_on_unrelated_target() {
+        let r = report("class S {} class T { factory T() = S; }");
+        assert_eq!(
+            code_names(&r),
+            ["redirect_to_invalid_return_type"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The return type 'S' of the redirected constructor isn't a subtype of 'T'."
+        );
+        // Supertype target: still fires — `A` is not a subtype of `B`.
+        let r = report("class A {} class B extends A { factory B() = A; }");
+        assert!(
+            code_names(&r).contains(&"redirect_to_invalid_return_type"),
+            "{:?}",
+            code_names(&r)
+        );
+        // Self-target stays silent: `B` is trivially a subtype of `B`.
+        let r = report("class B { factory B.dup() = B; }");
+        assert!(
+            !code_names(&r).contains(&"redirect_to_invalid_return_type"),
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// `redirect_to_non_class` on an unresolvable head —
+    /// `redirect_to_non_class.dart`'s `factory Q() = NoSuch;` shape.
+    #[test]
+    fn redirect_to_non_class_reports_on_missing_head() {
+        let r = report("class Q { factory Q() = NoSuch; }");
+        assert_eq!(
+            code_names(&r),
+            ["redirect_to_non_class"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The name 'NoSuch' isn't a type and can't be used in a redirected constructor."
+        );
+    }
+
+    /// `redirect_to_non_const_constructor` beside
+    /// `redirect_to_invalid_return_type` — `redirect_to_non_const_
+    /// constructor.dart`'s `const factory B() = A;` fires BOTH faces at the
+    /// same `= A` extent (`_checkForRedirectToNonConstConstructor`,
+    /// error_verifier.dart:7335-7347, runs independently of the return-type
+    /// arm), while a const target (`const A();`) silences only the const
+    /// face.
+    #[test]
+    fn redirect_to_non_const_constructor_pairs_with_return_type_face() {
+        let r = report("class A { A(); } class B { const factory B() = A; }");
+        assert_eq!(
+            code_names(&r),
+            [
+                "redirect_to_invalid_return_type",
+                "redirect_to_non_const_constructor"
+            ],
+            "{:?}",
+            code_names(&r)
+        );
+        // Both rows anchor the `= A` target extent (oracle line 10, col 23,
+        // length 1).
+        assert_eq!(r.diagnostics[0].range.offset, r.diagnostics[1].range.offset);
+        assert_eq!(r.diagnostics[1].range.length, 1);
+        // A const target silences the const face only.
+        let r = report("class A { const A(); } class B { const factory B() = A; }");
+        assert_eq!(
+            code_names(&r),
+            ["redirect_to_invalid_return_type"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// `redirect_generative_to_non_generative_constructor` —
+    /// redirect_generative_to_non_generative_constructor.dart's generative
+    /// `W() : this.n();` whose target resolves to the factory `W.n`
+    /// (error_verifier.dart:4300-4306, `.at(invocation)` = the whole
+    /// `this.n()` node extent); a generative target stays silent.
+    #[test]
+    fn redirect_generative_to_factory_constructor_reports_at_invocation() {
+        let r = report("class W { factory W.n() => W();\n  W() : this.n(); }");
+        assert_eq!(
+            code_names(&r),
+            ["redirect_generative_to_non_generative_constructor"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "Generative constructors can't redirect to a factory constructor."
+        );
+        // The invocation node extent: `this.n()` — 8 characters.
+        assert_eq!(r.diagnostics[0].range.length, 8);
+        // A generative target (`W.n` without the `factory` head) stays
+        // silent.
+        let r = report("class W { W.n();\n  W() : this.n(); }");
+        assert!(
+            !code_names(&r).contains(&"redirect_generative_to_non_generative_constructor"),
+            "{:?}",
+            code_names(&r)
+        );
+        // A forward-declared factory target judges the same — the face
+        // rides the post-parse drain, where every declaration site is
+        // complete.
+        let r = report("class W { W() : this.n();\n  factory W.n() => W(); }");
+        assert_eq!(
+            code_names(&r),
+            ["redirect_generative_to_non_generative_constructor"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// The const generative redirect's non-const face — the official
+    /// messages-example shape (`const C.a() : this.b();` over `C.b();`):
+    /// `_checkForRedirectToNonConstConstructor` anchors the target selector
+    /// token (`constructorSelector?.name2 ?? thisKeyword`).
+    #[test]
+    fn const_generative_redirect_reports_at_target_selector() {
+        let r = report("class C { const C.a() : this.b(); C.b(); }");
+        assert_eq!(
+            code_names(&r)
+                .iter()
+                .filter(|name| **name == "redirect_to_non_const_constructor")
+                .count(),
+            1,
+            "{:?}",
+            code_names(&r)
+        );
+    }
     /// head's recovery shape: `factory new() => 0;` reports
     /// `return_of_invalid_type` (`int` is no `C` — the declared-container
     /// negative closes the nominal blind spot), and a satisfied body stays
@@ -29536,6 +31217,7 @@ mod tests {
                 "const_eval_type_string",
                 "const_with_non_constant_argument",
                 "undefined_identifier",
+                "const_initialized_with_non_constant_value",
             ],
             "{:?}",
             code_names(&report)
@@ -31679,9 +33361,15 @@ mod tests {
     #[test]
     fn no_type_late_declarations_declare_their_names() {
         let local = report("void main() {\n  late x;\n  x;\n}\n");
+        // The read `x;` is a definitely-unassigned late local: the flow
+        // fact's row rides beside the declaration's own parser row (the
+        // oracle's definitelyUnassignedLateLocalVariable at the read).
         assert_eq!(
             code_names(&local),
-            ["missing_const_final_var_or_type"],
+            [
+                "missing_const_final_var_or_type",
+                "definitely_unassigned_late_local_variable"
+            ],
             "{:?}",
             code_names(&local)
         );
@@ -33768,14 +35456,19 @@ mod tests {
              void m() { var l = 1; const a = C(l); const b = const C(l); }",
         );
         // The const locals `a`/`b` are never read (the official read-only
-        // use rule); the argument verdicts anchor at their `l` arguments.
+        // use rule); the argument verdicts anchor at their `l` arguments,
+        // each carrying the initializer row beside it (the oracle's
+        // const_with_non_constant_argument fixture emits both codes at the
+        // argument).
         assert_eq!(
             code_names(&rep),
             [
                 "unused_local_variable",
                 "const_with_non_constant_argument",
+                "const_initialized_with_non_constant_value",
                 "unused_local_variable",
                 "const_with_non_constant_argument",
+                "const_initialized_with_non_constant_value",
             ],
             "{:?}",
             code_names(&rep)
@@ -33819,13 +35512,24 @@ mod tests {
         assert_eq!(code_names(&rep), ["unused_local_variable"]);
     }
 
-    /// A container without a const constructor and an unresolvable name
-    /// both defer (`const_with_non_const*` is outside the family) — no
-    /// const verdict either way.
+    /// A container without a const constructor reports both initializer
+    /// rows at the creation (the oracle's const_with_non_const fixture:
+    /// `const x = C()` over `class C { C(); }` emits
+    /// `const_with_non_const` AND `const_initialized_with_non_constant_
+    /// value` at the same span); an unresolvable name defers (its own
+    /// undefined row reports).
     #[test]
     fn non_const_and_unknown_creation_targets_defer() {
         let rep = report("class C { C(); } const x = C();");
-        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        assert_eq!(
+            code_names(&rep),
+            [
+                "const_initialized_with_non_constant_value",
+                "const_with_non_const",
+            ],
+            "{:?}",
+            code_names(&rep)
+        );
 
         let rep = report("const y = Gone();");
         assert!(
@@ -38190,6 +39894,58 @@ mod tests {
         );
     }
 
+    /// The switch-end `isExhaustive` arm (flow_analysis.dart `switch_end`,
+    /// type_analyzer.dart:638-712 reads `isReachable` at the body end): a
+    /// `default`-less statement switch over a sealed scrutinee whose cases
+    /// all return leaves the body end unreachable — silent; the same shape
+    /// over a non-exhaustive scrutinee still reports (#2134).
+    #[test]
+    fn body_might_complete_normally_respects_an_exhaustive_switch() {
+        let r = report(concat!(
+            "class int {} sealed class S {} class A extends S {} class B extends S {}",
+            " int f(S s) { switch (s) { case A _: return 0; case B _: return 1; } }"
+        ));
+        assert!(
+            !code_names(&r).contains(&"body_might_complete_normally"),
+            "{:?}",
+            code_names(&r)
+        );
+        let r = report(concat!(
+            "class int {} class S {} class A extends S {} class B extends S {}",
+            " int f(S s) { switch (s) { case A _: return 0; case B _: return 1; } }"
+        ));
+        assert!(
+            code_names(&r).contains(&"body_might_complete_normally"),
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// `_checkReadOfNotAssignedLocalVariable`'s late arm
+    /// (type_analyzer.dart:4999-5008): a `late` local read before every
+    /// assignment reports at the read; a read after a partial-path
+    /// assignment (potentially, not definitely, unassigned) stays silent.
+    #[test]
+    fn definitely_unassigned_late_local_variable_reports_at_the_read() {
+        let late = |r: &FileReport| -> Vec<(u32, String)> {
+            r.diagnostics
+                .iter()
+                .filter(|d| d.code.name == "definitely_unassigned_late_local_variable")
+                .map(|d| (d.range.offset, d.message.to_string()))
+                .collect()
+        };
+        let r = report("class int {} void f() { late int x; try { x; x = 1; } finally { } }");
+        assert_eq!(
+            late(&r),
+            [(
+                42,
+                "The late local variable 'x' is definitely unassigned at this point.".to_string()
+            )]
+        );
+        let r = report("class int {} class bool {} void f(bool b) { late int x; if (b) { x = 1; } x; }");
+        assert!(late(&r).is_empty(), "{:?}", code_names(&r));
+    }
+
     /// The operand's resolved static type decides `x is T`
     /// (`leftNode.typeOrThrow`, best_practices_verifier.dart:1011): a
     /// `var`-inferred local reads its initializer's type, so the
@@ -38561,6 +40317,64 @@ mod tests {
             rows[0].message,
             "The argument type 'double' can't be assigned to the parameter type 'int'. "
         );
+    }
+
+    /// The inference-failure face (`couldNotInfer`, generic_inferrer.dart
+    /// `tryChooseFinalTypes`): the creation's return constraint against
+    /// the outer formal's `C<List<_>>` schema solves `X := List<Object?>`,
+    /// which the function literal's `void Function(List<int>)` violates.
+    /// Oracle-pinned (3.13.1): the row sits on the constructor name with
+    /// the exact multi-line detail.
+    #[test]
+    fn could_not_infer_reports_return_solved_violation() {
+        let src = "class C<X> {\n  C(void Function(X) x);\n}\n\
+                   T check<T>(C<List<T>> f) => throw 0;\n\
+                   void main() {\n  var x = check(C((List<int> x) {}));\n  print(x);\n}\n";
+        let r = report(src);
+        let rows: Vec<_> = r
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "could_not_infer")
+            .collect();
+        assert_eq!(rows.len(), 1, "{:?}", code_names(&r));
+        assert_eq!(&src[rows[0].range.offset as usize..rows[0].range.end() as usize], "C");
+        assert_eq!(
+            rows[0].message,
+            "Couldn't infer type parameter 'X'.\n\n\
+             Tried to infer 'List<Object?>' for 'X' which doesn't work:\n  \
+             Parameter 'x' declared as     'void Function(X)'\n                \
+             but argument is 'void Function(List<int>)'.\n\
+             The type 'List<Object?>' was inferred from:\n  \
+             Return type declared as 'C<X>'\n              \
+             used where  'C<List<_>>' is required.\n\n\
+             Consider passing explicit type argument(s) to the generic.\n\n"
+        );
+    }
+
+    /// The satisfiable and context-fixed neighbours stay silent (all
+    /// oracle-clean for `could_not_infer`): a literal accepting the solved
+    /// `List<Object?>`, explicit type arguments on the outer call, an
+    /// annotated declaration (its context fixes `T`), an enclosing
+    /// argument, and an untyped literal formal.
+    #[test]
+    fn could_not_infer_stays_silent_when_satisfied_or_fixed() {
+        let head = "class C<X> {\n  C(void Function(X) x);\n}\n\
+                    T check<T>(C<List<T>> f) => throw 0;\nvoid sink(int v) {}\n";
+        for body in [
+            "var a = check(C((List<Object?> x) {}));",
+            "var b = check<int>(C((List<int> x) {}));",
+            "int c = check(C((List<int> x) {}));",
+            "sink(check(C((List<int> x) {})));",
+            "var e = check(C((x) {}));",
+        ] {
+            let src = format!("{head}void main() {{\n  {body}\n}}\n");
+            let r = report(&src);
+            assert!(
+                !code_names(&r).contains(&"could_not_infer"),
+                "{body}: {:?}",
+                code_names(&r)
+            );
+        }
     }
 
     /// #1314 FAM14 (scope_analyzer.dart `_resolveType`'s clause switch):
@@ -43001,6 +44815,27 @@ mod ticket_1351_tests {
         assert_eq!(count_code(&report, "unchecked_use_of_nullable_value"), 1);
     }
 
+    /// `!(x < 0)` is a statically-`bool` parenthesized comparison — the
+    /// parenthesized row's `inner_ty` reads the comparison's latched `bool`
+    /// extent (not the last operand row's type, which would be the right
+    /// operand's `int`), so the `!` operand's negation face stays silent.
+    /// Regression pin: `clean_members_and_bodies.dart`'s `!(c.m() < 0)`
+    /// over-fired `non_bool_negation_expression` when the group's row
+    /// adopted the right operand's `int`.
+    #[test]
+    fn parenthesized_comparison_negation_stays_silent() {
+        let report = unit_report(
+            "class int {} class C { int m() => 1; } \
+             void f(C c) { if (!(c.m() < 0)) {} }",
+        );
+        assert_eq!(
+            count_code(&report, "non_bool_negation_expression"),
+            0,
+            "{:?}",
+            report.diagnostics.iter().map(|d| &d.code.name).collect::<Vec<_>>()
+        );
+    }
+
     /// The matched-type re-decision: `'a'` against the declared `Object`
     /// scrutinee passes at parse time (String can equal an Object), but
     /// the clause's promoted matched type (`o is int`) can never equal it
@@ -43239,6 +45074,14 @@ mod ticket_1351_tests {
             .iter()
             .filter(|d| d.code.name == name)
             .count()
+    }
+
+    fn code_names(report: &FileReport) -> Vec<&'static str> {
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name.as_ref())
+            .collect()
     }
 
     // —— Field promotion pins (#1409). Each pin cites its upstream
@@ -43555,6 +45398,227 @@ mod ticket_1351_tests {
         assert!(
             !rows.iter().any(|(name, _, _)| *name == "undefined_getter"),
             "{rows:?}"
+        );
+    }
+
+    /// `final_not_initialized_constructor` on the extension-type
+    /// representation field: every declared constructor that leaves the
+    /// representation unbound reports at its own head (error_verifier.dart
+    /// drives `ConstructorFieldsVerifier.addConstructors` for extension
+    /// types like classes).
+    #[test]
+    fn extension_type_representation_reports_per_constructor() {
+        let report = unit_report(
+            "class int {} extension type ET(int i) {\n  new.named();\n  factory.named();\n}",
+        );
+        assert_eq!(
+            count_code(&report, "final_not_initialized_constructor"),
+            2,
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            count_code(&report, "duplicate_constructor"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// `new_with_undefined_constructor_default` on the unnamed miss: a
+    /// class whose every constructor is named (`factory H` inside
+    /// `class G`) leaves the unnamed face absent, and `G()` reports at the
+    /// creation head.
+    #[test]
+    fn unnamed_creation_miss_reports_default_code() {
+        let report = unit_report("class G {\n  factory H() => G();\n}");
+        let rows: Vec<&str> = code_names(&report);
+        assert!(
+            rows.contains(&"new_with_undefined_constructor_default"),
+            "{rows:?}"
+        );
+        // A class with only the implicit default stays silent.
+        let implicit = unit_report("class A {}\nvoid f() {\n  var a = A();\n  print(a);\n}");
+        assert_eq!(
+            count_code(&implicit, "new_with_undefined_constructor_default"),
+            0,
+            "{:?}",
+            code_names(&implicit)
+        );
+    }
+
+    /// `implicit_this_reference_in_initializer`: an instance-member
+    /// reference inside an instance field's initializer reports at the
+    /// referencing expression — the enum's synthesized `index` getter is
+    /// the corpus's implicit shape; a static field's initializer stays
+    /// silent and a method body's reads never reach the face.
+    #[test]
+    fn instance_member_in_field_initializer_reports() {
+        let report = unit_report("class int {} enum G {\n  a,\n  b;\n\n  final int code = index;\n}");
+        assert_eq!(
+            count_code(&report, "implicit_this_reference_in_initializer"),
+            1,
+            "{:?}",
+            code_names(&report)
+        );
+        let method_body =
+            unit_report("class int {} class C {\n  int m() => 1;\n\n  final int x = 0;\n}");
+        assert_eq!(
+            count_code(&method_body, "implicit_this_reference_in_initializer"),
+            0,
+            "{:?}",
+            code_names(&method_body)
+        );
+    }
+
+    /// `not_a_type` on an extension-shadowed name: a type position sharing
+    /// an extension's name resolves to the extension element
+    /// (`_lookupGetter`'s sole getter-namespace entry) and reports — the
+    /// built-in `Function` type included.
+    #[test]
+    fn extension_name_in_type_position_is_not_a_type() {
+        let report = unit_report(
+            "class Function {}\ntypedef Function = int;\nextension Function on List {}\nmixin Function {}\nvoid main() {\n  Function ok;\n}",
+        );
+        let rows: Vec<&str> = code_names(&report);
+        assert!(rows.contains(&"not_a_type"), "{rows:?}");
+        // A plain extension name in a type position reports too.
+        let plain =
+            unit_report("extension E on int {}\nvoid f() {\n  E x;\n  print(x);\n}");
+        assert_eq!(
+            count_code(&plain, "not_a_type"),
+            1,
+            "{:?}",
+            code_names(&plain)
+        );
+    }
+
+    /// `non_type_as_type_argument` for the recovered old-style function
+    /// typedef: the return type's type arguments resolve beside their dead
+    /// head (`typedef e = foo<F>(int x)` — the oracle reports
+    /// undefined_class on `foo` and non_type_as_type_argument on `F`, six
+    /// rows over the corpus's two typedefs).
+    #[test]
+    fn type_arguments_resolve_beside_a_dead_head() {
+        let report = unit_report("typedef e = foo<F>(int x);\ntypedef g = foo<F, G, H, I, J>(int x);");
+        assert_eq!(
+            count_code(&report, "non_type_as_type_argument"),
+            6,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The const-declaration creation faces: `const x = C()` over a
+    /// non-const constructor reports `const_with_non_const` at the
+    /// creation, `const z = C(n)` over a non-constant argument reports
+    /// `const_initialized_with_non_constant_value` at the argument, and
+    /// `const y = C.named()` over a missing selector reports the
+    /// initializer row without the `const_with_non_const` twin.
+    #[test]
+    fn const_declaration_creations_report_per_verdict() {
+        let non_const = unit_report("class C {\n  C();\n}\n\nconst x = C();");
+        assert_eq!(
+            count_code(&non_const, "const_with_non_const"),
+            1,
+            "{:?}",
+            code_names(&non_const)
+        );
+        assert_eq!(
+            count_code(&non_const, "const_initialized_with_non_constant_value"),
+            1,
+            "{:?}",
+            code_names(&non_const)
+        );
+        let arg =
+            unit_report("class int {} class C {\n  final int x;\n  const C(this.x);\n}\n\nvar n = 1;\n\nconst z = C(n);");
+        assert_eq!(
+            count_code(&arg, "const_initialized_with_non_constant_value"),
+            1,
+            "{:?}",
+            code_names(&arg)
+        );
+        let undefined = unit_report("class C {\n  const C();\n}\n\nconst y = C.named();");
+        // The unresolved selector keeps the resolution row and fails the
+        // initializer at the whole creation (the oracle's
+        // const_with_undefined_constructor fixture emits both).
+        assert_eq!(
+            count_code(&undefined, "undefined_method"),
+            1,
+            "{:?}",
+            code_names(&undefined)
+        );
+        assert_eq!(
+            count_code(&undefined, "const_initialized_with_non_constant_value"),
+            1,
+            "{:?}",
+            code_names(&undefined)
+        );
+        assert_eq!(
+            count_code(&undefined, "const_with_non_const"),
+            0,
+            "{:?}",
+            code_names(&undefined)
+        );
+        // A forward const constructor stays silent (the whole-file verdict).
+        let forward = unit_report("const x = C();\n\nclass C {\n  const C();\n}");
+        assert_eq!(
+            count_code(&forward, "const_with_non_const"),
+            0,
+            "{:?}",
+            code_names(&forward)
+        );
+    }
+
+    /// `list_element_type_not_assignable`: a typed list literal's element
+    /// checks against the written element type at the failing element.
+    #[test]
+    fn typed_list_literal_checks_element_type() {
+        let report = unit_report("class int {} class String {} void main() {\n  var l = <int>['a'];\n  print(l);\n}");
+        assert_eq!(
+            count_code(&report, "list_element_type_not_assignable"),
+            1,
+            "{:?}",
+            code_names(&report)
+        );
+        let clean = unit_report("class int {} class String {} void main() {\n  var l = <int>['a', 1];\n  print(l);\n}");
+        assert_eq!(
+            count_code(&clean, "list_element_type_not_assignable"),
+            1,
+            "{:?}",
+            code_names(&clean)
+        );
+    }
+
+    /// `extension_override_argument_not_assignable` with a generic on-type:
+    /// the override argument checks against the written `on List<Book>`
+    /// face, not the erasure head.
+    #[test]
+    fn extension_override_checks_generic_on_type() {
+        let report = unit_report(
+            "class int {} class Book {}\nclass List<T> {}\nclass String {}\nextension CatalogExt on List<Book> {\n  List<String> shelfMarks() => const [];\n}\n\nvoid overrideFace(List<int> numbers) {\n  print(CatalogExt(numbers).shelfMarks());\n}",
+        );
+        assert_eq!(
+            count_code(&report, "extension_override_argument_not_assignable"),
+            1,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The nullable-receiver property face: an interface member reached
+    /// through a merely-nullable receiver reports the property variant at
+    /// the selector; a nullable-on extension member never dereferences.
+    #[test]
+    fn nullable_receiver_property_access_reports() {
+        let report = unit_report(
+            "class int {} class String {\n  int get length => 0;\n}\nclass C {\n  String? s;\n  int f() {\n    return s.length;\n  }\n}",
+        );
+        assert_eq!(
+            count_code(&report, "unchecked_use_of_nullable_value"),
+            1,
+            "{:?}",
+            code_names(&report)
         );
     }
 }

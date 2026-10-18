@@ -141,9 +141,13 @@ struct OpenContainer {
     /// The named constructor selectors declared so far, and whether a
     /// declared constructor is unnamed (the implicit default joins at the
     /// container's close, where an empty `ctor_named` without the flag
-    /// means no constructor was declared at all).
+    /// means no constructor was declared at all). `ctor_declared` counts
+    /// declarations so a mismatched-name factory (`factory H` in
+    /// `class G` — a named constructor registering no selector here)
+    /// still kills the implicit default.
     ctor_named: Vec<StringId>,
     ctor_has_unnamed: bool,
+    ctor_declared: u32,
     /// The constructors' formal-parameter tables by lookup spelling (the
     /// selector for `A.named`, the container's name for `A()`); flushed
     /// into the finished [`Container::ctor_formals`].
@@ -286,6 +290,13 @@ struct Builder<'src, 'tab> {
     /// named selectors it declares plus its unnamed flag. `A()` records the
     /// unnamed shape; `A.named()` records `named` only.
     ctor_open: Option<CtorCapture>,
+    /// A factory declaration is open (`begin_factory`..`end_factory`): its
+    /// name event is a constructor shape, not a method one.
+    factory_ctor_open: bool,
+    /// A mismatched factory selector (`factory H` in `class G`) latched at
+    /// the name event — `end_factory` registers it unless a `.name`
+    /// continuation already did (`factory G.named` keeps only `named`).
+    factory_ctor_head: Option<StringId>,
     /// The open constructor's formal-parameter capture: its lookup spelling
     /// (the class-name token at `begin_constructor` — the unnamed face's
     /// key — rewritten to the selector at the continuation event) and the
@@ -391,6 +402,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             pending_top: None,
             pending_typedef: None,
             ctor_open: None,
+            factory_ctor_open: false,
+            factory_ctor_head: None,
             pending_ctor_formals: None,
             formal_depth: 0,
             positional_formals: Vec::new(),
@@ -423,19 +436,30 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     }
 
     /// The named segment of an open constructor (`A.named` keeps `named`).
-    /// A qualified non-constructor name is invalid Dart — ignored.
+    /// A qualified non-constructor name is invalid Dart — ignored. The
+    /// `.new` selector IS the unnamed constructor's canonical spelling
+    /// (`class C { C.new(); }` keeps `C()` callable; `factory C.new()`
+    /// likewise) — it flags the unnamed face instead of registering a
+    /// named selector.
     fn note_constructor_continuation(&mut self, name: Option<StringId>) {
         if let Some(capture) = &mut self.ctor_open
             && let Some(name) = name
         {
             capture.has_unnamed = false;
-            capture.named.push(name);
+            if self.strings.resolve(name) == "new" {
+                capture.has_unnamed = true;
+            } else {
+                capture.named.push(name);
+            }
         }
         // The formal table's lookup key follows the selector: the unnamed
         // face's class-name key (set at `begin_constructor`) is rewritten
         // before any formal can fire (the selector precedes the parameter
-        // list in the header).
+        // list in the header). The `.new` selector keeps the class-name
+        // key — it names the unnamed constructor, whose creations look up
+        // by the class spelling.
         if let Some(name) = name
+            && self.strings.resolve(name) != "new"
             && let Some((key, _)) = &mut self.pending_ctor_formals
         {
             *key = name;
@@ -780,6 +804,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             enum_constants: Vec::new(),
             ctor_named: Vec::new(),
             ctor_has_unnamed: false,
+            ctor_declared: 0,
             ctor_formals: NameMapBuilder::default(),
             annotations,
         });
@@ -837,7 +862,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             // none was at all — the implicit default stands (a named-only
             // declaration kills it). Read before `ctor_named` moves into
             // `constructors`.
-            let has_unnamed_constructor = open.ctor_has_unnamed || open.ctor_named.is_empty();
+            let has_unnamed_constructor =
+                open.ctor_has_unnamed || (open.ctor_named.is_empty() && open.ctor_declared == 0);
             self.named_containers.or_insert_with(name, || Container {
                 kind: open.kind,
                 is_abstract: open.is_abstract,
@@ -1797,6 +1823,22 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 if let Some(pending) = &mut builder.pending_member {
                     pending.return_ty = armed;
                 }
+                // A factory declaration's name is a constructor shape:
+                // matching the container it is the unnamed face
+                // (`factory G()`); a mismatched selector opens the capture
+                // so the `.name` continuation rewrites it (`factory
+                // G.named()`), else `end_factory` registers the spelling.
+                if builder.factory_ctor_open
+                    && let Some((name, _)) = name_with_range
+                    && let Some(open) = builder.containers.last()
+                {
+                    let is_unnamed = open.name.is_some_and(|(container, _)| container == name);
+                    builder.ctor_open = Some(CtorCapture {
+                        named: Vec::new(),
+                        has_unnamed: is_unnamed,
+                    });
+                    builder.factory_ctor_head = (!is_unnamed).then_some(name);
+                }
             }
             IdentifierContext::MethodDeclarationContinuation => {
                 builder.note_constructor_continuation(name);
@@ -2240,6 +2282,55 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         });
     }
 
+    /// A factory declaration is a constructor declaration for the
+    /// constructor-set faces: it kills the implicit default the same way
+    /// (`class G { factory H() ... }` leaves `G()` undefined — the oracle's
+    /// `new_with_undefined_constructor_default`). The name event captures
+    /// the unnamed/named shape; `end_factory` settles the capture.
+    fn begin_factory(
+        &mut self,
+        _kind: DeclarationKind,
+        _last_consumed: Token,
+        _augment_kw: Option<Token>,
+        _external_kw: Option<Token>,
+        _const_keyword: Option<Token>,
+    ) {
+        let builder = &mut self.builder;
+        builder.drop_pending_annotations();
+        if let Some(open) = builder.containers.last_mut() {
+            open.ctor_declared += 1;
+        }
+        builder.factory_ctor_open = true;
+        builder.factory_ctor_head = None;
+    }
+
+    fn end_factory(&mut self, _kind: DeclarationKind, _begin: Token, _factory: Token, _end: Token) {
+        let builder = &mut self.builder;
+        builder.factory_ctor_open = false;
+        if let Some(capture) = builder.ctor_open.take()
+            && let Some(open) = builder.containers.last_mut()
+        {
+            let mut named = capture.named;
+            if named.is_empty()
+                && !capture.has_unnamed
+                && let Some(head) = builder.factory_ctor_head.take()
+            {
+                // `factory H()` — the mismatched selector is itself the
+                // constructor's spelling (`G.H()` is callable). A
+                // continuation already registered its own selector, so the
+                // head fallback only fires on the undotted shape.
+                named.push(head);
+            }
+            for name in named {
+                if !open.ctor_named.contains(&name) {
+                    open.ctor_named.push(name);
+                }
+            }
+            open.ctor_has_unnamed |= capture.has_unnamed;
+        }
+        builder.factory_ctor_head = None;
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn begin_constructor(
         &mut self,
@@ -2259,6 +2350,19 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // model keeps no constructor entry) — claim it so it can neither
         // leak into the next member nor into the next container's star.
         builder.drop_pending_annotations();
+        // The unnamed shape is the constructor's declared name matching the
+        // enclosing class (`A()` — or the head recovered); a mismatched
+        // factory selector (`class G { factory H() ... }`) declares a NAMED
+        // constructor and kills the implicit default (the oracle reports
+        // `new_with_undefined_constructor_default` on `G()`). `A.named`
+        // heads still match (the head token is the class name) — the
+        // continuation below rewrites them to the selector.
+        let declared_unnamed = builder
+            .capture_name(_name)
+            .is_some_and(|(key, _)| {
+                _enclosing_declaration_name
+                    .is_some_and(|enclosing| builder.strings.resolve(key) == enclosing)
+            });
         // `A()` (or the head recovered): the unnamed shape until a
         // `A.named` continuation says otherwise. The formal table's key is
         // the head token's name — the class name, which is exactly the
@@ -2266,9 +2370,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // the continuation rewrites it to the selector.
         builder.ctor_open = Some(CtorCapture {
             named: Vec::new(),
-            has_unnamed: true,
+            has_unnamed: declared_unnamed,
         });
         builder.pending_ctor_formals = builder.capture_name(_name).map(|(key, _)| (key, None));
+        // Every declared constructor kills the close's "none at all" fold —
+        // including a mismatched-name factory registering no selector.
+        if let Some(open) = builder.containers.last_mut() {
+            open.ctor_declared += 1;
+        }
     }
 
     fn end_constructor(

@@ -1070,6 +1070,59 @@ pub enum SemanticCode {
     /// (`super_in_invalid_context`, element_resolver.dart:365 with the
     /// `SuperContext` classification, super_context.dart).
     SuperInInvalidContext,
+    /// `The return type '{0}' of the redirected constructor isn't a subtype of
+    /// '{1}'.` — a redirecting factory's target constructor whose return type
+    /// is not a subtype of the factory's declared return type
+    /// (`redirect_to_invalid_return_type`, diagnostic.g.dart:14931;
+    /// error_verifier.dart:2986-2999 `_checkForRedirectToInvalidReturnType`).
+    RedirectToInvalidReturnType,
+    /// `Generative constructors can't redirect to a factory constructor.` —
+    /// a generative constructor's `this(...)` initializer resolves to a
+    /// factory constructor
+    /// (`redirect_generative_to_non_generative_constructor`,
+    /// diagnostic.g.dart:14840; error_verifier.dart:4300-4306).
+    RedirectGenerativeToNonGenerativeConstructor,
+    /// `The name '{0}' isn't a type and can't be used in a redirected
+    /// constructor.` — a redirecting factory's `= X` target where `X` is
+    /// not a class element
+    /// (`redirect_to_non_class`, diagnostic.g.dart:14971;
+    /// named_type_resolver.dart:587-594 `_reportRedirectToNonClass`).
+    RedirectToNonClass,
+    /// `A constant redirecting constructor can't redirect to a non-constant
+    /// constructor.` — a `const factory` redirecting to a non-`const` target
+    /// (`redirect_to_non_const_constructor`, diagnostic.g.dart:14985;
+    /// error_verifier.dart:7335-7347 `_checkForRedirectToNonConstConstructor`).
+    RedirectToNonConstConstructor,
+    /// `The class '{0}' doesn't have an unnamed constructor.` — a `new C()`
+    /// or implicit `C()` creation where `C` declares no unnamed constructor
+    /// (`new_with_undefined_constructor_default`, diagnostic.g.dart; the
+    /// `undefined_constructor` family folded into the unnamed-selector
+    /// face).
+    NewWithUndefinedConstructorDefault,
+    /// `The unnamed constructor is already defined.` — two unnamed
+    /// constructors in a single container
+    /// (`duplicate_constructor_default`, diagnostic.g.dart:4463; the named
+    /// variant `duplicate_constructor_name` shares the code with its own
+    /// `The constructor with name '{0}' is already defined.` message —
+    /// `message` picks by the `a0` emptiness convention).
+    DuplicateConstructor,
+    /// `The instance member '{0}' can't be accessed in an initializer.` —
+    /// a constructor initializer referencing an instance member of the
+    /// enclosing class
+    /// (`implicit_this_reference_in_initializer`, diagnostic.g.dart;
+    /// error_verifier.dart `_checkForImplicitThisReferenceInInitializer`).
+    ImplicitThisReferenceInInitializer,
+    /// `The element type '{0}' can't be assigned to the list type '{1}'.`
+    /// — a list literal element whose type is not assignable to the list's
+    /// element type (`list_element_type_not_assignable`,
+    /// diagnostic.g.dart; error_verifier.dart list-element walk).
+    ListElementTypeNotAssignable,
+    /// `The late local variable '{0}' is definitely unassigned at this
+    /// point.` — a `late` local variable read while flow analysis proves
+    /// it definitely unassigned
+    /// (`definitely_unassigned_late_local_variable`, diagnostic.g.dart;
+    /// type_analyzer.dart `_checkReadOfNotAssignedLocalVariable`).
+    DefinitelyUnassignedLateLocalVariable,
 }
 
 /// The message face of [`SemanticCode::NotEnoughPositionalArguments`]: the
@@ -1667,6 +1720,36 @@ impl SemanticCode {
             Self::FinalNotInitializedConstructor => (
                 "final_not_initialized_constructor",
                 "FINAL_NOT_INITIALIZED_CONSTRUCTOR",
+            ),
+            Self::RedirectToInvalidReturnType => (
+                "redirect_to_invalid_return_type",
+                "REDIRECT_TO_INVALID_RETURN_TYPE",
+            ),
+            Self::RedirectGenerativeToNonGenerativeConstructor => (
+                "redirect_generative_to_non_generative_constructor",
+                "REDIRECT_GENERATIVE_TO_NON_GENERATIVE_CONSTRUCTOR",
+            ),
+            Self::RedirectToNonClass => ("redirect_to_non_class", "REDIRECT_TO_NON_CLASS"),
+            Self::RedirectToNonConstConstructor => (
+                "redirect_to_non_const_constructor",
+                "REDIRECT_TO_NON_CONST_CONSTRUCTOR",
+            ),
+            Self::NewWithUndefinedConstructorDefault => (
+                "new_with_undefined_constructor_default",
+                "NEW_WITH_UNDEFINED_CONSTRUCTOR_DEFAULT",
+            ),
+            Self::DuplicateConstructor => ("duplicate_constructor", "DUPLICATE_CONSTRUCTOR"),
+            Self::ImplicitThisReferenceInInitializer => (
+                "implicit_this_reference_in_initializer",
+                "IMPLICIT_THIS_REFERENCE_IN_INITIALIZER",
+            ),
+            Self::ListElementTypeNotAssignable => (
+                "list_element_type_not_assignable",
+                "LIST_ELEMENT_TYPE_NOT_ASSIGNABLE",
+            ),
+            Self::DefinitelyUnassignedLateLocalVariable => (
+                "definitely_unassigned_late_local_variable",
+                "DEFINITELY_UNASSIGNED_LATE_LOCAL_VARIABLE",
             ),
         };
         let dtype = self.dtype();
@@ -2405,6 +2488,37 @@ impl SemanticCode {
             }
             Self::InvalidReferenceToThis => "Invalid reference to 'this' expression.".to_string(),
             Self::SuperInInvalidContext => "Invalid context for 'super' invocation.".to_string(),
+            Self::RedirectToInvalidReturnType => format!(
+                "The return type '{a0}' of the redirected constructor isn't a subtype of '{a1}'."
+            ),
+            Self::RedirectGenerativeToNonGenerativeConstructor => {
+                "Generative constructors can't redirect to a factory constructor.".to_string()
+            }
+            Self::RedirectToNonClass => format!(
+                "The name '{a0}' isn't a type and can't be used in a redirected constructor."
+            ),
+            Self::RedirectToNonConstConstructor => {
+                "A constant redirecting constructor can't redirect to a non-constant constructor."
+                    .to_string()
+            }
+            Self::NewWithUndefinedConstructorDefault => {
+                format!("The class '{a0}' doesn't have an unnamed constructor.")
+            }
+            Self::DuplicateConstructor if a0.is_empty() => {
+                "The unnamed constructor is already defined.".to_string()
+            }
+            Self::DuplicateConstructor => {
+                format!("The constructor with name '{a0}' is already defined.")
+            }
+            Self::ImplicitThisReferenceInInitializer => {
+                format!("The instance member '{a0}' can't be accessed in an initializer.")
+            }
+            Self::ListElementTypeNotAssignable => {
+                format!("The element type '{a0}' can't be assigned to the list type '{a1}'.")
+            }
+            Self::DefinitelyUnassignedLateLocalVariable => format!(
+                "The late local variable '{a0}' is definitely unassigned at this point."
+            ),
         }
     }
 
@@ -2951,6 +3065,41 @@ impl SemanticCode {
             Self::ConstantPatternWithNonConstantExpression => {
                 Some("Try making the expression a valid constant.".to_string())
             }
+            // The redirect family's shared correctionMessage
+            // (diagnostic.g.dart :14936/:14976/:14992/:14846 — every face
+            // carries the identical `Try redirecting to a different
+            // constructor.` text).
+            Self::RedirectToInvalidReturnType
+            | Self::RedirectToNonClass
+            | Self::RedirectToNonConstConstructor
+            | Self::RedirectGenerativeToNonGenerativeConstructor => {
+                Some("Try redirecting to a different constructor.".to_string())
+            }
+            // `new_with_undefined_constructor_default`'s `{0}`-placeholder
+            // correction (diagnostic.g.dart :12357-12360 — the class name
+            // fills both slots).
+            Self::NewWithUndefinedConstructorDefault => Some(format!(
+                "Try using one of the named constructors defined in '{a2}'."
+            )),
+            // `duplicate_constructor`'s per-shape correctionMessages
+            // (diagnostic.g.dart :4467/:4482).
+            Self::DuplicateConstructor if a2.is_empty() => {
+                Some("Try giving one of the constructors a name.".to_string())
+            }
+            Self::DuplicateConstructor => {
+                Some("Try renaming one of the constructors.".to_string())
+            }
+            // `implicit_this_reference_in_initializer`'s verbatim text
+            // (diagnostic.g.dart :7614-7617).
+            Self::ImplicitThisReferenceInInitializer => Some(
+                "Try replacing the reference to the instance member with a different expression"
+                    .to_string(),
+            ),
+            // `definitely_unassigned_late_local_variable`'s correction
+            // (diagnostic.g.dart :3734).
+            Self::DefinitelyUnassignedLateLocalVariable => Some(
+                "Ensure that it is assigned on necessary execution paths.".to_string(),
+            ),
             _ => None,
         }
     }
@@ -4002,7 +4151,16 @@ mod tests {
             | SemanticCode::InvalidUseOfNullValue
             | SemanticCode::InvocationOfNonFunctionExpression
             | SemanticCode::InvalidReferenceToThis
-            | SemanticCode::SuperInInvalidContext => code.code_info(),
+            | SemanticCode::SuperInInvalidContext
+            | SemanticCode::RedirectToInvalidReturnType
+            | SemanticCode::RedirectGenerativeToNonGenerativeConstructor
+            | SemanticCode::RedirectToNonClass
+            | SemanticCode::RedirectToNonConstConstructor
+            | SemanticCode::NewWithUndefinedConstructorDefault
+            | SemanticCode::DuplicateConstructor
+            | SemanticCode::ImplicitThisReferenceInInitializer
+            | SemanticCode::ListElementTypeNotAssignable
+            | SemanticCode::DefinitelyUnassignedLateLocalVariable => code.code_info(),
         }
     }
 

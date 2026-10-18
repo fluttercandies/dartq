@@ -568,8 +568,17 @@ impl Interp<'_> {
                 // The scrutinee expression value is on the stack; its
                 // variable (when the scrutinee is a bare read) is the
                 // promotion key the matched-type rows answer against
-                // (#1349).
-                let scrutinee = self.exprs.pop().and_then(|e| e.reference);
+                // (#1349). Its flow type and written arguments feed the
+                // `switch_end` always-exhaustive verdict
+                // ([`Interp::is_always_exhaustive`]) — upstream's
+                // `scrutineeType` is the promoted static type, which the
+                // value's own row already carries.
+                let (scrutinee, scrutinee_ty, scrutinee_args) = self
+                    .exprs
+                    .pop()
+                    .map_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS), |e| {
+                        (e.reference, e.ty, e.args)
+                    });
                 // An unmatched begin (parser recovery) scopes no block
                 // events: the block range stays empty.
                 let end = match_of[i];
@@ -582,6 +591,8 @@ impl Interp<'_> {
                     unmatched: self.current.clone(),
                     break_model: None,
                     scrutinee,
+                    scrutinee_ty,
+                    scrutinee_args,
                     pending_matched: None,
                     case_open: false,
                     group_labels: false,
@@ -749,6 +760,8 @@ impl Interp<'_> {
                     unmatched: self.current.clone(),
                     break_model: None,
                     scrutinee,
+                    scrutinee_ty: Ty::UNKNOWN,
+                    scrutinee_args: crate::ty::EMPTY_ARGS,
                     pending_matched: None,
                     case_open: false,
                     group_labels: false,
@@ -1433,22 +1446,47 @@ impl Interp<'_> {
         }
     }
 
-    /// Pops the switch frame at `SwitchBlockEnd`: joins the break model and
-    /// the unmatched chain (official `switch_end`, isExhaustive always
-    /// false — exhaustiveness needs the resolver).
+    /// Pops the switch frame at `SwitchBlockEnd`: the official `switch_end`
+    /// (flow_analysis.dart:7979-8000). `isExhaustive` is the scrutinee's
+    /// always-exhaustive verdict ([`Interp::is_always_exhaustive`], the
+    /// `hasDefault` arm already covered — a default group's close marked
+    /// the unmatched chain unreachable): an exhaustive switch never joins
+    /// the unmatched chain into the exit, and with no break/fall-through
+    /// state at all the post-switch state is `previous` unreachable — the
+    /// unreachable body-completion silence upstream's
+    /// `checkForBodyMayCompleteNormally` reads through `isReachable`
+    /// (type_analyzer.dart:647-652).
     fn switch_statement_end(&mut self, switch_index: usize) {
-        let (unmatched, previous, break_model) = match &self.stack[switch_index] {
+        let (unmatched, previous, break_model, exhaustive) = match &self.stack[switch_index] {
             Frame::Switch {
                 unmatched,
                 previous,
                 break_model,
+                scrutinee_ty,
+                scrutinee_args,
                 ..
-            } => (unmatched.clone(), previous.clone(), break_model.clone()),
+            } => (
+                unmatched.clone(),
+                previous.clone(),
+                break_model.clone(),
+                self.is_always_exhaustive(*scrutinee_ty, *scrutinee_args),
+            ),
             _ => return,
         };
         self.stack.remove(switch_index);
-        let exit = self.join(break_model, Some(unmatched));
-        self.current = exit.inherit_tested(&previous, &mut self.lists);
+        let exit = if exhaustive {
+            // No implicit fall-through default joins the unmatched chain
+            // (official `if (!isExhaustive) breakState = _join(...)`);
+            // `breakState ??= previous.setUnreachable()` — an exhaustive
+            // switch whose bodies all terminate leaves the code after it
+            // dead (the scrutinee type is uninhabited past the cases).
+            break_model.unwrap_or_else(|| previous.clone().set_unreachable(&mut self.reach))
+        } else {
+            self.join(break_model, Some(unmatched))
+        };
+        self.current = exit
+            .unsplit(&mut self.reach)
+            .inherit_tested(&previous, &mut self.lists);
     }
 
     /// Statement-position if-case: the pattern's matched state becomes the

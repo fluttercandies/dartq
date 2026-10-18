@@ -753,7 +753,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 if !handled && !type_is_gft {
                     // Official :1543-1561: `<return type>? '(' ... ')';` —
                     // assume the type is the return type of a missing
-                    // `Function`.
+                    // `Function`. The type itself still parses as a type
+                    // (the oracle reports its head and each unresolved type
+                    // argument beside the missing-`Function` row), so the
+                    // events drive through the normal type parse; the
+                    // read-only `skip_type` only probes the boundary.
                     let head_end = type_info.skip_type(self);
                     let paren = self.offset_of(head_end) + 1;
                     if self.kind_at(paren) == TokenKind::OpenParen
@@ -764,7 +768,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                             msg::expected_token("Function"),
                             self.span_of(self.real_id(paren)),
                         );
-                        self.skip_to_token(self.real_id(paren));
+                        type_info.ensure_type_or_void(self);
                         self.parse_formal_parameters_required_opt(
                             crate::listener::MemberKind::GeneralizedFunctionType,
                         );

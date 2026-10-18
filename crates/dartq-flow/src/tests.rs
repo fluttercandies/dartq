@@ -895,6 +895,47 @@ fn switch_case_inner_dead_code() {
     assert_eq!(dead_snippets(source), ["2;"]);
 }
 
+/// `switch_end`'s `isExhaustive` arm (flow_analysis.dart:7985-7996): a
+/// switch over an always-exhaustive scrutinee (sealed class, enum, bool)
+/// never joins the unmatched chain — with no break or fall-through the
+/// post-switch state is `previous` unreachable, so the body's end stays
+/// unreachable and no completion fact emits (the sealed-scrutinee
+/// `body_might_complete_normally` regression, #2134). The non-exhaustive
+/// `int` twin still emits: `isExhaustive` is the only difference.
+#[test]
+fn switch_over_sealed_scrutinee_without_default_kills_exit() {
+    // Every sealed subclass has a returning case: the post-switch code is
+    // unreachable upstream, so the body emits no completion row.
+    let source = concat!(
+        "sealed class S {} class A extends S {} class B extends S {}",
+        " int f(S s) { switch (s) { case A _: return 0; case B _: return 1; } }"
+    );
+    assert!(completion_offsets(source).is_empty());
+    // A `default`-less non-exhaustive switch over the same shape keeps the
+    // post-switch path live — the completion row still fires.
+    let source =
+        "int f(int i) { switch (i) { case 1: return 0; case 2: return 1; } }";
+    assert_eq!(completion_offsets(source).len(), 1);
+    // The same exhaustive shape over `bool` and an enum.
+    let source = "int f(bool b) { switch (b) { case true: return 0; case false: return 1; } }";
+    assert!(completion_offsets(source).is_empty());
+    let source = "enum E { a, b } int f(E e) { switch (e) { case E.a: return 0; case E.b: return 1; } }";
+    assert!(completion_offsets(source).is_empty());
+    // A sealed scrutinee whose cases leave a live path (a body falls
+    // through) still completes — `isExhaustive` only drops the unmatched
+    // arm, not the break model.
+    let source = concat!(
+        "sealed class S {} class A extends S {} class B extends S {}",
+        " int f(S s) { switch (s) { case A _: 0; case B _: return 1; } }"
+    );
+    assert_eq!(completion_offsets(source).len(), 1);
+    // `FutureOr` recursion (type_system.dart:865): `FutureOr<bool>` is
+    // always-exhaustive.
+    let source =
+        "int f(FutureOr<bool> b) { switch (b) { case true: return 0; case false: return 1; } }";
+    assert!(completion_offsets(source).is_empty());
+}
+
 /// official `definite_assignment/data/closure.dart`: writes inside closures
 /// do not make outer reads assigned.
 #[test]
@@ -937,6 +978,41 @@ fn try_catch_open_catch_leaves_unassigned() {
 fn late_local_read_unassigned() {
     let source = "void f() { late int x; x; }";
     assert_eq!(unassigned_snippets(source), ["x"]);
+}
+
+/// The `definitely_unassigned` bit separates the upstream gates
+/// (type_analyzer.dart:4990-5028): a `late` read before ANY path assigns
+/// is `unassigned` — the `definitely_unassigned_late_local_variable`
+/// shape; a `late` read after a partial-path assignment is `!assigned`
+/// but NOT `unassigned` — the try/finally fixture's `digest` is the
+/// former (read inside the try, assigned later on the same path).
+#[test]
+fn unassigned_read_carries_the_definite_bit() {
+    let definite = |source: &str| -> Vec<bool> {
+        facts_of(source)
+            .into_iter()
+            .filter_map(|fact| match fact {
+                FlowFact::UnassignedRead {
+                    definitely_unassigned,
+                    ..
+                } => Some(definitely_unassigned),
+                _ => None,
+            })
+            .collect()
+    };
+    // promotion_patterns_flow_tryfinally's `seal` shape: the read precedes
+    // every assignment on every path → definitely unassigned.
+    let source = "void f() { late int x; try { x; x = 1; } finally { } }";
+    assert_eq!(definite(source), [true]);
+    // Assigned on one branch only: the read after the join is
+    // potentially (not definitely) unassigned → `false`. (A
+    // `try { x = 1; } finally { }` would leave `x` definitely assigned:
+    // the post-finally state is the try body's.)
+    let source = "void f(bool b) { late int x; if (b) { x = 1; } x; }";
+    assert_eq!(definite(source), [false]);
+    // Same split for a `final` local: the fixture's `settle` shape.
+    let source = "void f() { final int x; try { x = 1; } catch (e) { } x; }";
+    assert_eq!(definite(source), [false]);
 }
 
 /// Plain locals start assigned when initialized.
