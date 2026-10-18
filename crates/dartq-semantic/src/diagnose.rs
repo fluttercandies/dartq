@@ -19914,9 +19914,28 @@ impl<'a> Engine<'a> {
         // A postfix-`!` receiver already carries its non-null static type:
         // the flow read at the variable's span describes the pre-assert
         // state, not the asserted expression — `x!.m` resolves on `C`
-        // even when `x`'s flow type at the read is `C?` (#2161). Only a
-        // still-nullable static face re-decides against the flow type.
-        if matches!(static_ty, Ty::Named { nullable: false, .. }) {
+        // even when `x`'s flow type at the read is `C?` (#2161). That
+        // pre-state's signature is the static face's own head widened back
+        // to nullable — promotion never widens nullability, so only the
+        // `!` rewrite produces it. Every other differing flow face is a
+        // promotion and re-decides, including one of a non-nullable
+        // declared type (`other is Money11 && other.cents` on an
+        // `Object other`, #2167).
+        if matches!(
+            (&flow_ty, &static_ty),
+            (
+                Ty::Named {
+                    name: flow_head,
+                    nullable: true,
+                    ..
+                },
+                Ty::Named {
+                    name: static_head,
+                    nullable: false,
+                    ..
+                },
+            ) if flow_head == static_head
+        ) {
             return recv;
         }
         Receiver::Typed {
@@ -33210,6 +33229,45 @@ mod tests {
         assert_eq!(
             assignments[0].message,
             "A value of type 'int?' can't be assigned to a variable of type 'int'."
+        );
+    }
+
+    /// #2167: the `is` type-test on a `&&` LHS promotes the variable into
+    /// the RHS, so the RHS member read resolves on the promoted type — the
+    /// app corpus's generated `==` override shape
+    /// (`other is Money11 && other.cents == cents`, one shape × ~100
+    /// dartq-only `undefined_getter` rows; the oracle is silent). The
+    /// pass-2 promoted-receiver re-decision (#1465) reads the flow type at
+    /// the receiver read's span; the static face being non-nullable
+    /// (`Object other`) is not an exit — only the `!` pre-assert widening
+    /// is (#2161's same-head nullable flow face).
+    #[test]
+    fn is_promotion_types_the_and_rhs_member_read() {
+        let report = report(
+            "class int {} class bool {} class Object {} \
+             class Money11 { int cents = 0; } \
+             class C { int cents = 0; bool operator ==(Object other) => other is Money11 && other.cents == cents; }",
+        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// #2167's negative: without the `is` test the RHS read stays on the
+    /// declared `Object` and the getter miss fires with the oracle text.
+    #[test]
+    fn unpromoted_object_member_read_still_reports() {
+        let report = report(
+            "class int {} class bool {} class Object {} \
+             class C { int cents = 0; bool operator ==(Object other) => other.cents == cents; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_getter"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The getter 'cents' isn't defined for the type 'Object'."
         );
     }
 
