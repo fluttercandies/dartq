@@ -2578,6 +2578,12 @@ struct Engine<'a> {
     /// span the flow layer's read-type rows key on. Latched at the dot
     /// event, re-decided in pass 2 when the read types are in.
     promoted_recv_reads: Vec<(u32, SourceRange)>,
+    /// The promoted-property spans (#1409) re-homed for pass 2: the flow
+    /// fold completes before `resolve_rows`, so the nullable-dereference
+    /// verdict inside `member_defined` can ask the same promotable-field
+    /// question the teardown join asks — `x.m` on a promoted private
+    /// final field never was an unchecked use.
+    prop_promotion_rows: PropPromotionStaging,
     /// One record per `receiver.member` fold (#1409/B5): the merged row's
     /// name, receiver classification, and the receiver read's span,
     /// offset-keyed. The staged-join re-decides against it after pass 2 —
@@ -3519,6 +3525,7 @@ impl<'a> Engine<'a> {
             null_assert_staged: Vec::new(),
             null_aware_staged: Vec::new(),
             promoted_recv_reads: Vec::new(),
+            prop_promotion_rows: PropPromotionStaging::default(),
             member_reads: Vec::new(),
             non_promotions: Vec::new(),
             pending_non_promotion: Vec::new(),
@@ -4517,7 +4524,63 @@ impl<'a> Engine<'a> {
             RowShape::Receiver(Receiver::Typed { ty, .. }) => *ty,
             _ => self.operand_static_ty(row),
         };
-        (ty != Ty::UNKNOWN).then_some(ty)
+        if ty != Ty::UNKNOWN {
+            return Some(ty);
+        }
+        // A method tear-off initializer (`var t = C<int>().m`): the member
+        // row's `ty` stays `Unknown` (the model does not render method
+        // function types on the row), but the tear-off's static type IS
+        // the method's signature — the `t<A,B>` instantiation face reads
+        // its parameter count (`wrong_number_of_type_arguments_function`,
+        // upstream's `InvocationTargetFunctionTypedExpression` shape).
+        self.tearoff_ty(row)
+    }
+
+    /// The tear-off function type of a member row resolving to a declared
+    /// method: `M Function<M>(M)` for `m`'s `M m<M>(M)` — the member's own
+    /// type-parameter count, written return type, and formal table
+    /// interned into the pool's canonical shape. Getters, fields, broken
+    /// chains, and unresolvable receivers suppress (`None`) — the
+    /// under-report direction every `Unknown`-typed initializer shares.
+    fn tearoff_ty(&self, row: &Row) -> Option<Ty> {
+        let RowShape::Member { recv } = &row.shape else {
+            return None;
+        };
+        if !matches!(row.intent, Intent::Read) {
+            return None;
+        }
+        let container = match *recv {
+            Receiver::This { container, .. }
+            | Receiver::Super { container, .. }
+            | Receiver::Typed {
+                type_name: container,
+                ..
+            }
+            | Receiver::Container {
+                name: container, ..
+            }
+            | Receiver::Created {
+                name: container, ..
+            } => container,
+            _ => return None,
+        };
+        let entry = self.resolved_member(container, row.name)?;
+        if entry.kind != MemberKind::Method {
+            return None;
+        }
+        let formals = entry.formals.as_deref();
+        let positional: Vec<Ty> = formals
+            .map(|f| f.positional.iter().map(|p| p.ty).collect())
+            .unwrap_or_default();
+        let named: Vec<(StringId, Ty)> = formals
+            .map(|f| f.named.iter().map(|p| (p.name, p.ty)).collect())
+            .unwrap_or_default();
+        Some(
+            self.boundary
+                .args
+                .borrow_mut()
+                .function(entry.type_params, entry.return_ty, &positional, &named, false),
+        )
     }
 
     /// The `e!` pair (`visitNullAssertionExpression`,
@@ -20179,12 +20242,35 @@ impl<'a> Engine<'a> {
         // accesses `m` on the non-null `C`, so a non-nullable `on C` face
         // still applies (the oracle's `applicableTo` runs against the
         // promoted non-null static type, not `C?`).
-        let receiver_nullable = match &recv {
+        let mut receiver_nullable = match &recv {
             Receiver::Typed { ty, .. } => {
                 Self::is_nullable_ty(*ty) && !self.null_aware_members.contains(&row.range.offset)
             }
             _ => false,
         };
+        // The promoted-property face (#1409, pass-2 leg): a member access
+        // whose receiver read stood promoted (`_r != null` in the guard)
+        // reads a non-null receiver — the promotable-field substitution
+        // decides eligibility exactly like the teardown join's staged
+        // checks (`isPropertyPromotable`, field_promotability.dart:70-76).
+        // The receiver read's span is the `promoted_recv_reads` entry keyed
+        // on this member's offset.
+        if receiver_nullable
+            && let Some(read_span) = self
+                .promoted_recv_reads
+                .binary_search_by(|(member, _)| member.cmp(&row.range.offset))
+                .ok()
+                .map(|index| self.promoted_recv_reads[index].1)
+            && let Some(ty) = match &recv {
+                Receiver::Typed { ty, .. } => Some(*ty),
+                _ => None,
+            }
+            && self
+                .promotable_field_substitution(&self.prop_promotion_rows, read_span, ty)
+                .is_some()
+        {
+            receiver_nullable = false;
+        }
         // F-C: a selector pushed inside a constructor-initializer list
         // resolves through the dedicated initializer world — the field name
         // against the field set (`_checkForInvalidField`), the invocation
@@ -22844,6 +22930,14 @@ pub fn fold_unit(
     engine
         .read_types
         .sort_unstable_by_key(|(range, _)| range.offset);
+    // The promoted-property spans ride into pass 2 beside the read types:
+    // `member_defined`'s nullable-dereference verdict re-decides against
+    // them through `promotable_field_substitution` (a promoted private
+    // final field's receiver is non-null at the use). The local table
+    // stays for `filter_staged`'s own join below.
+    engine.prop_promotion_rows = PropPromotionStaging {
+        rows: prop_promotions.rows.clone(),
+    };
     engine.resolve_rows();
     // The discarded-value folds (`checkConstructorInvocation`) and the
     // `unless` parameter co-row (`_findUndefinedUseResultParameter`) run
@@ -46571,6 +46665,33 @@ mod ticket_1351_tests {
             0,
             "{:?}",
             code_names(&report)
+        );
+    }
+    /// #2144: a method tear-off's static type is the method's signature —
+    /// `var t = C<int>().m; t<A,B>` reports `wrong_number_of_type_arguments_
+    /// function` when the written count differs (broken_type_arguments.dart's
+    /// `handle<int, String>` on `M Function<M>(M)`). Without `tearoff_ty`
+    /// the local bound `Unknown` and the `_function` face slept.
+    #[test]
+    fn method_tearoff_instantiation_reports_function_arity() {
+        let report = unit_report(
+            "class int {} class String {}\nclass Box<T> {\n  M take<M>(M value) => value;\n}\nvoid open() {\n  final handle = Box<int>().take;\n  var bound = handle<int, String>;\n  print(bound);\n}",
+        );
+        assert_eq!(
+            count_code(&report, "wrong_number_of_type_arguments_function"),
+            1,
+            "{:?}",
+            code_names(&report)
+        );
+        // The matching count stays silent.
+        let ok = unit_report(
+            "class int {} class String {}\nclass Box<T> {\n  M take<M>(M value) => value;\n}\nvoid open() {\n  final handle = Box<int>().take;\n  var bound = handle<int>;\n  print(bound);\n}",
+        );
+        assert_eq!(
+            count_code(&ok, "wrong_number_of_type_arguments_function"),
+            0,
+            "{:?}",
+            code_names(&ok)
         );
     }
 }
