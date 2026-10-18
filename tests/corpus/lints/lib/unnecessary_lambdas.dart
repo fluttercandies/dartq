@@ -12,11 +12,17 @@
 // semantic face mounts — the fixture documents the same trigger shape for
 // either posture and the gate compares both sides under whatever face is
 // live.
-// Expected rows: 1 — UNNECESSARY_LAMBDAS keyed unnecessary_lambdas.dart,
+// Expected rows: 2 — UNNECESSARY_LAMBDAS keyed unnecessary_lambdas.dart,
 // message "Closure should be a tearoff.":
 //   the `(e) => print(e)` lambda in `forEach`
+//   the `(e) => print(e)` lambda in `h2`'s initializer — the oracle-of-
+//   record's arrow-in-initializer face (3.13.1 reports there while the
+//   block-body initializer stays silent; #2095)
 void f() {
   [].forEach((e) => print(e));
+
+  final h2 = (e) => print(e);
+  h2(1);
 
   // GOOD: a non-`final` receiver demotes the tear-off verdict, and an
   // async lambda never reduces.

@@ -1022,10 +1022,16 @@ mod tests {
     }
 
     /// The context fixture (the config tests' twin, plus an importer): a
-    /// real package directory with two stub SDKs — `new` carries
-    /// `dart:async`, `old` does not, so `a.dart`'s `dart:async` import is
-    /// the ERROR-severity discriminator between the axes — and `b.dart`
-    /// importing `a.dart`, so the affected set spans two libraries.
+    /// real package directory with two stub SDKs — `new`'s
+    /// `allowed_experiments.json` grants package `fixture` the `variance`
+    /// experiment, `old`'s does not, so `a.dart`'s `<in T>` modifier is the
+    /// ERROR-severity discriminator between the axes (the `dart:` library
+    /// table is the generated oracle-pinned flat face — axis-independent —
+    /// so the per-package experiment whitelist is the surviving per-axis
+    /// lever; `variance` has no `experimentalReleaseVersion`, so the grant
+    /// applies only at the current language version, pinned to 3.13 by
+    /// `package_config.json`) — and `b.dart` importing `a.dart`, so the
+    /// affected set spans two libraries.
     fn context_fixture(tag: &str) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("dq_cmd_impact_ctx_{tag}_{}", std::process::id()));
@@ -1044,7 +1050,7 @@ mod tests {
         );
         write(
             ".dart_tool/package_config.json",
-            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.13"}], "generator": "pub"}"#,
         );
         write("sdks/new/version", "3.13.1\n");
         write(
@@ -1057,13 +1063,15 @@ mod tests {
             "sdks/old/lib/libraries.json",
             r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
         );
-        for sdk in ["new", "old"] {
-            write(
-                &format!("sdks/{sdk}/lib/_internal/allowed_experiments.json"),
-                r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
-            );
-        }
-        write("lib/a.dart", "import 'dart:async';\nclass Foo {}\n");
+        write(
+            "sdks/new/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"grants": ["variance"]}, "sdk": {"default": {"experimentSet": "grants"}}, "packages": {"fixture": {"experimentSet": "grants"}}}"#,
+        );
+        write(
+            "sdks/old/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        );
+        write("lib/a.dart", "class Foo<in T> {}\n");
         write("lib/b.dart", "import 'a.dart';\nclass B {}\n");
         root
     }
@@ -1074,9 +1082,9 @@ mod tests {
 
     /// The declared contexts are the matrix, in file order, each judged by
     /// the compat verdict rule over the affected set: `a.dart`'s
-    /// `dart:async` import is clean under `new` and an ERROR under `old`,
-    /// so the seed-and-importer set flips exactly the `old` row. The
-    /// primary sections ride unchanged.
+    /// `variance`-gated modifier is clean under `new` (which grants the
+    /// experiment) and an ERROR under `old`, so the seed-and-importer set
+    /// flips exactly the `old` row. The primary sections ride unchanged.
     #[test]
     fn declared_contexts_drive_the_environment_matrix() {
         let root = context_fixture("matrix");
@@ -1134,9 +1142,9 @@ mod tests {
 
     /// The contextless verdict is derived, never an unevaluated
     /// affirmative: with the main engine on the `old` SDK, `a.dart`'s
-    /// `dart:async` import is an ERROR on the affected set (the seed is in
-    /// it), and the default row answers `compatible: false` — the same
-    /// verdict the compat face's axis answers for the same SDK.
+    /// `variance`-gated modifier is an ERROR on the affected set (the seed
+    /// is in it), and the default row answers `compatible: false` — the
+    /// same verdict the compat face's axis answers for the same SDK.
     #[test]
     fn a_contextless_target_with_an_error_answers_incompatible() {
         let root = context_fixture("default_error");

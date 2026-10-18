@@ -241,6 +241,16 @@
         66
       ]
     },
+    "lib/unnecessary_ignore.dart": {
+      "unnecessary_ignore": [
+        19
+      ]
+    },
+    "lib/unnecessary_ignore_line.dart": {
+      "unnecessary_ignore": [
+        13
+      ]
+    },
     "lib/use_enums.dart": {
       "prefer_const_constructors": [
         133,
@@ -560,7 +570,7 @@
         "lib/unnecessary_ignore.dart",
         "lib/unnecessary_ignore_line.dart"
       ],
-      "reason": "The official rule body is the analyzer's IgnoreValidator post-pass (needs the complete diagnostic set of a location); dartq mounts the spec not_dispatched until an engine post-pass exists. Oracle reports 1 row per file; the dartq leg is structurally silent (0 rows enforced here). A dartq UNNECESSARY_IGNORE row in lib/test.g.dart additionally reds the gate by design (the generated-file parity probe, README family 3)."
+      "reason": "RESOLVED 2026-10-17 (#2116): the analyzer-layer join answers citations naming analyzer diagnostic codes against the semantic layer's produced rows for the file, so the 2 POSITIVE rows fire on the dartq leg and the expected table carries them (lines 19/13); the necessary citations (invalid_null_aware_operator) stay silent because their rows appear in the consumption record. The whole validator is silent on generated files (library_analyzer.dart:331-334), so test.g.dart remains 0 rows on both legs and family 3's probe holds."
     },
     {
       "family": "remove_deprecations_in_breaking_versions",

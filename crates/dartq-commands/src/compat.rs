@@ -516,11 +516,12 @@ mod tests {
     #[test]
     fn first_failure_file_is_the_package_label() {
         let root = fixture("pkglabel");
-        // `dart:async` maps to no library on the stub SDK (only `core` is
-        // declared), so the import lands `uri_does_not_exist`.
+        // A missing file target lands `uri_does_not_exist` on every stub SDK
+        // (the file-existence face is axis-independent; the `dart:` table is
+        // the generated oracle-pinned one).
         std::fs::write(
             root.join("lib/a.dart"),
-            "import 'dart:async';\nclass Foo {}\n",
+            "import 'gone.dart';\nclass Foo {}\n",
         )
         .expect("lib file");
         let target = root.join("lib/a.dart");

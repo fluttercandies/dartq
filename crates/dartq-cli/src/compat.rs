@@ -155,9 +155,13 @@ mod tests {
     /// directory with stub SDKs (`version` + `lib/libraries.json` +
     /// `lib/_internal/allowed_experiments.json` are all
     /// `dartq_sdk::SdkSnapshot::load` needs) and one lib file whose
-    /// `dart:async` import resolves only on the SDK whose library table
-    /// carries it (the URI layer needs no source bodies; the stub body
-    /// exists so a lazy read finds a file).
+    /// `variance`-gated `<in T>` modifier resolves cleanly only under the
+    /// SDK whose `allowed_experiments.json` grants package `fixture` the
+    /// experiment (the `dart:` library table is the generated oracle-pinned
+    /// flat face — axis-independent — so the per-package whitelist is the
+    /// surviving per-axis lever; `variance` has no
+    /// `experimentalReleaseVersion`, so the grant applies only at the
+    /// current language version, pinned to 3.13 by `package_config.json`).
     fn fixture(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("dq_cli_compat_{tag}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -176,17 +180,17 @@ mod tests {
         );
         write(
             ".dart_tool/package_config.json",
-            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.13"}], "generator": "pub"}"#,
         );
-        // The async-carrying SDK (the compatible axis).
+        // The grant-carrying SDK (the compatible axis).
         write("sdks/new/version", "3.13.1\n");
         write(
             "sdks/new/lib/libraries.json",
             r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}, "async": {"uri": "async/async.dart"}}}}"#,
         );
         write("sdks/new/lib/async/async.dart", "library dart.async;\n");
-        // The async-less SDK (the incompatible axis): `dart:async` maps to
-        // no library, `import 'dart:async';` codes `uri_does_not_exist`.
+        // The grant-less SDK (the incompatible axis): `class Foo<in T>`
+        // codes `experiment_not_enabled_off_by_default` at the modifier.
         write("sdks/old/version", "3.5.0\n");
         write(
             "sdks/old/lib/libraries.json",
@@ -194,20 +198,23 @@ mod tests {
         );
         // The broken SDK root (the isolated axis): exists, but no `version`.
         fs::create_dir_all(root.join("sdks/broken")).expect("dir");
-        for sdk in ["new", "old"] {
-            write(
-                &format!("sdks/{sdk}/lib/_internal/allowed_experiments.json"),
-                r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
-            );
-        }
-        write("lib/a.dart", "import 'dart:async';\nclass Foo {}\n");
+        write(
+            "sdks/new/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"grants": ["variance"]}, "sdk": {"default": {"experimentSet": "grants"}}, "packages": {"fixture": {"experimentSet": "grants"}}}"#,
+        );
+        write(
+            "sdks/old/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        );
+        write("lib/a.dart", "class Foo<in T> {}\n");
         root
     }
 
-    /// End to end over stub SDK roots: the async-less axis answers
-    /// incompatible with the `uri_does_not_exist` failure at the URI
-    /// literal, the async-carrying axis clean, and the broken root is one
-    /// isolated `sdk_unavailable` row — all under one successful exit.
+    /// End to end over stub SDK roots: the grant-less axis answers
+    /// incompatible with the `experiment_not_enabled_off_by_default` failure
+    /// at the `in` modifier, the grant-carrying axis clean, and the broken
+    /// root is one isolated `sdk_unavailable` row — all under one
+    /// successful exit.
     #[test]
     fn compat_end_to_end_differentiated_matrix() {
         let root = fixture("e2e");
@@ -242,13 +249,19 @@ mod tests {
 
         assert_eq!(matrix[0]["sdk"], "3.5.0");
         assert_eq!(matrix[0]["compatible"], false);
-        assert_eq!(matrix[0]["first_failure"]["code"], "uri_does_not_exist");
+        assert_eq!(
+            matrix[0]["first_failure"]["code"],
+            "experiment_not_enabled_off_by_default"
+        );
         assert_eq!(
             matrix[0]["first_failure"]["file"], "package:fixture/a.dart",
             "the failure file is the package-form label, not the raw path"
         );
         assert_eq!(matrix[0]["first_failure"]["line"], 1);
-        assert_eq!(matrix[0]["first_failure"]["col"], 8, "the URI literal span");
+        assert_eq!(
+            matrix[0]["first_failure"]["col"], 11,
+            "the `in` modifier span"
+        );
         assert!(matrix[0].get("error").is_none());
 
         assert_eq!(matrix[1]["sdk"], "3.13.1");
@@ -397,7 +410,10 @@ mod tests {
         assert_eq!(matrix[0]["compatible"], true);
         assert_eq!(matrix[1]["sdk"], "3.5.0");
         assert_eq!(matrix[1]["compatible"], false);
-        assert_eq!(matrix[1]["first_failure"]["code"], "uri_does_not_exist");
+        assert_eq!(
+            matrix[1]["first_failure"]["code"],
+            "experiment_not_enabled_off_by_default"
+        );
         fs::remove_dir_all(&root).ok();
     }
 

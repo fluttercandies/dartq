@@ -342,8 +342,16 @@ mod tests {
     use super::*;
 
     /// The compat face's fixture shape (the CLI compat tests' twin): a real
-    /// package directory with two stub SDKs — `new` carries `dart:async`,
-    /// `old` does not, so the matrix verdicts are differentiated.
+    /// package directory with two stub SDKs. Per-axis differentiation rides
+    /// the experiment whitelist — `new` grants package `fixture` the
+    /// `variance` experiment in `allowed_experiments.json`, `old` does not,
+    /// so `a.dart`'s `<in T>` modifier is clean under `new` and an
+    /// `experiment_not_enabled_off_by_default` ERROR under `old`. (The
+    /// `dart:` library table is the generated oracle-pinned flat face —
+    /// axis-independent — so a `dart:` import can no longer differentiate
+    /// stub SDKs; `variance` has no `experimentalReleaseVersion`, so the
+    /// grant applies only at the current language version, pinned here to
+    /// 3.13 by `package_config.json`.)
     fn fixture(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("dq_cmd_config_{tag}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -362,7 +370,7 @@ mod tests {
         );
         write(
             ".dart_tool/package_config.json",
-            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.13"}], "generator": "pub"}"#,
         );
         write("sdks/new/version", "3.13.1\n");
         write(
@@ -375,13 +383,15 @@ mod tests {
             "sdks/old/lib/libraries.json",
             r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
         );
-        for sdk in ["new", "old"] {
-            write(
-                &format!("sdks/{sdk}/lib/_internal/allowed_experiments.json"),
-                r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
-            );
-        }
-        write("lib/a.dart", "import 'dart:async';\nclass Foo {}\n");
+        write(
+            "sdks/new/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"grants": ["variance"]}, "sdk": {"default": {"experimentSet": "grants"}}, "packages": {"fixture": {"experimentSet": "grants"}}}"#,
+        );
+        write(
+            "sdks/old/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        );
+        write("lib/a.dart", "class Foo<in T> {}\n");
         root
     }
 

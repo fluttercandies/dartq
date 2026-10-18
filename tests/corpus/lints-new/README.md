@@ -44,11 +44,18 @@ per-block provenance comments.
 
 ### Adjudication families (dartq leg structurally silent)
 
-1. `unnecessary_ignore` — the official rule body is the analyzer's
-   `IgnoreValidator` post-pass (needs the whole diagnostic set of a
-   location); dartq mounts the spec `not_dispatched` until an engine
-   post-pass exists. Oracle: 1 row each in `unnecessary_ignore.dart` and
-   `unnecessary_ignore_line.dart`; dartq: 0.
+1. `unnecessary_ignore` — RESOLVED 2026-10-17 (#2116): the rule mounts as
+   the unnecessary-ignore join it always was, now in three halves. The
+   analyzer-layer half answers citations naming analyzer diagnostic codes
+   (`unused_local_variable`) against the semantic layer's produced rows for
+   the file, so the oracle's 2 rows fire on the dartq leg too (the
+   `expected` table carries them since 2026-10-17) and the necessary
+   citations (`invalid_null_aware_operator`) stay silent because the rows
+   they suppress appear in the consumption record. The whole validator is
+   silent on generated files (`library_analyzer.dart`:331-334), so
+   `test.g.dart` stays 0 rows on both legs. A file whose enable set mounts
+   no semantic context (no fold-consuming rule enabled) keeps the
+   pre-#2116 silence — the under-report direction.
 2. `remove_deprecations_in_breaking_versions` — RESOLVED 2026-10-18: the
    promotion wave implemented the version-gated registration (the pubspec
    mounting seam), so the breaking twin now fires the same 2 rows on both
@@ -64,8 +71,11 @@ per-block provenance comments.
 Fixtures transcribe upstream's `// ignore:` / `// ignore_for_file:`
 comments verbatim. Where the ignored diagnostic is not produced on a leg
 (e.g. `unused_field` on a used field), the ignore is itself unnecessary —
-that is exactly the `unnecessary_ignore` rule's subject on the oracle leg.
-These rows ride adjudication family 1 (dartq structurally silent); the
+that is exactly the `unnecessary_ignore` rule's subject. Since #2116
+(2026-10-17) both legs answer it: the dartq analyzer-layer join consumes a
+citation only when the semantic layer's produced rows carry the code (at
+the cited line, or anywhere in the file for `ignore_for_file:`), so the
+POSITIVE rows report and the necessary citations stay silent. The
 remaining rule rows are unaffected because the gate filters to the 19
 codes.
 
