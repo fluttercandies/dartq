@@ -6174,3 +6174,37 @@ fn object_pattern_promotes_scrutinee_for_case_body_reads() {
     assert_eq!(row(post as u32), "Option", "{rows:?}");
 }
 
+
+/// Refutable pattern shapes join their failure arm into the if-case's
+/// unmatched chain: the statement after `if (v case (int a, int b))` stays
+/// live (official `_unmatched` accumulates every can-fail shape's else arm —
+/// flow_analysis.dart's pattern dispatch). Without the join the chain sits
+/// at its initial unreachable state and the fall-through reads dead.
+#[test]
+fn if_case_record_pattern_leaves_fall_through_live() {
+    let source = r#"String f(Object v) {
+  if (v case (int a, int b)) {
+    return 'pair';
+  }
+  return 'other';
+}
+String g(Object v) {
+  if (v case (int a, int b) when a < b) {
+    return 'asc';
+  }
+  if (v case (x: final l, y: final r)) {
+    return 'pt';
+  }
+  if (v case (var only,)) {
+    return 's';
+  }
+  return 'other';
+}
+String h(Object v) {
+  if (v case int n) {
+    return 'n';
+  }
+  return 'o';
+}"#;
+    assert!(dead_snippets(source).is_empty());
+}

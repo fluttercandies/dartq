@@ -351,7 +351,9 @@ use crate::const_tracker::ConstTracker;
 use crate::library::{
     ElementIndex, ScopedHit, lookup_scoped, owner_library, prefixed_container, resolve_container,
 };
-use crate::member_face::{CORE_TYPE_MEMBERS, EqualsCheck, MemberFace, NsmCheck, NsmShape};
+use crate::member_face::{
+    CORE_INTERFACE_MEMBERS, CORE_TYPE_MEMBERS, EqualsCheck, MemberFace, NsmCheck, NsmShape,
+};
 use crate::model::{
     ArgListId, ArgPool, ArityViolation, Container, ContainerKind, ExtensionFace, FileElements,
     Formal, Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
@@ -410,6 +412,45 @@ const EXTERNAL_CORE_TYPE_PARAMS: [(&str, u16); 11] = [
 /// User-definable binary operators (operator-name spellings the model keeps).
 const USER_OPERATORS: [&str; 16] = [
     "+", "-", "*", "/", "%", "~/", "|", "&", "^", "<<", ">>", ">>>", "<", ">", "<=", ">=",
+];
+
+/// The `dart:core` binary-operator signatures the member walk cannot reach
+/// (`sdk/lib/core/{num,int,double,bool,string}.dart`): `(param head, result
+/// head)` per `(receiver, operator)` — `int` inherits `num`'s arithmetic and
+/// relational face (`num operator +(num)` etc.) and adds the bit operators
+/// (`int operator &(int)`); `double` overrides the arithmetic result as
+/// `double`; `bool` declares only the boolean `&`/`|`/`^` face; `String`'s
+/// one user operator is `+`. The numeric-refinement face
+/// (`_refineNumericInvocationTypeNullSafe`, type_system.dart:2059-2121)
+/// post-processes `+`/`-`/`*`/`%` on `num`-family receivers, so the table's
+/// declared result is the refinement's input, not the node's answer.
+const CORE_BINARY_OPERATORS: [(&str, &str, &str, &str); 26] = [
+    ("num", "+", "num", "num"),
+    ("num", "-", "num", "num"),
+    ("num", "*", "num", "num"),
+    ("num", "%", "num", "num"),
+    ("num", "/", "num", "double"),
+    ("num", "~/", "num", "int"),
+    ("num", "<", "num", "bool"),
+    ("num", "<=", "num", "bool"),
+    ("num", ">", "num", "bool"),
+    ("num", ">=", "num", "bool"),
+    ("int", "&", "int", "int"),
+    ("int", "|", "int", "int"),
+    ("int", "^", "int", "int"),
+    ("int", "<<", "int", "int"),
+    ("int", ">>", "int", "int"),
+    ("int", ">>>", "int", "int"),
+    ("double", "+", "num", "double"),
+    ("double", "-", "num", "double"),
+    ("double", "*", "num", "double"),
+    ("double", "%", "num", "double"),
+    ("double", "/", "num", "double"),
+    ("double", "~/", "num", "int"),
+    ("bool", "&", "bool", "bool"),
+    ("bool", "|", "bool", "bool"),
+    ("bool", "^", "bool", "bool"),
+    ("String", "+", "String", "String"),
 ];
 
 /// The reference shape a recorded name stands for (the names-table `kind`
@@ -2346,6 +2387,22 @@ struct Engine<'a> {
     pattern_group_open: Option<u32>,
     /// The pattern-group sequence (group ids).
     pattern_group_seq: u32,
+    /// The untyped bare variables the in-flight pattern declaration bound,
+    /// in field order (`final (a, b) = …`): [`Engine::destructure_record`]
+    /// distributes the scrutinee's positional record slots over them when
+    /// the whole pattern is one flat record. A variable already carrying a
+    /// written type (`final (int a, b)`) never enters the list — its own
+    /// bind runs at declaration.
+    pattern_bind_vars: Vec<StringId>,
+    /// The record-pattern closes observed inside the in-flight pattern
+    /// declaration (a flat `(a, b)` closes exactly once; nesting closes
+    /// more). Any other shape marks the window non-record.
+    pattern_bind_records: u16,
+    /// Non-flat-record evidence inside the in-flight pattern declaration:
+    /// a named field (`:a`/`a: p`), an object/list/map/parenthesized/
+    /// rest/cast/relational pattern, or a typed leaf — anything whose
+    /// field-to-variable map isn't the flat positional walk.
+    pattern_bind_dirty: bool,
     /// The parameters of the executable declaration in flight attach to
     /// this declaration site (set at the site-creating begin events,
     /// read by the formal-parameter identifiers).
@@ -3479,6 +3536,9 @@ impl<'a> Engine<'a> {
             local_hits: FxHashMap::default(),
             pattern_group_open: None,
             pattern_group_seq: 0,
+            pattern_bind_vars: Vec::new(),
+            pattern_bind_records: 0,
+            pattern_bind_dirty: false,
             open_exec_site: None,
             decl_sites: Vec::new(),
             pending_annotations: Vec::new(),
@@ -4497,6 +4557,17 @@ impl<'a> Engine<'a> {
         {
             return sig.return_ty;
         }
+        // The parameterized function-type alias face (`Predicate<T> test`
+        // invoked as `test(item)`): the send's static type is the alias
+        // RHS's return, the same face `callee_return_ty` answers.
+        if !row.qualified
+            && let RowShape::Bare(BareInfo::Plain {
+                ty: Ty::Named { name, .. },
+            }) = &row.shape
+            && let Some(sig) = self.alias_fn_sig(*name)
+        {
+            return sig.return_ty;
+        }
         if row.ty != Ty::UNKNOWN {
             if let Ty::Function { shape, .. } = row.ty {
                 return self.boundary.pool().function_shape(shape).return_ty;
@@ -4831,6 +4902,265 @@ impl<'a> Engine<'a> {
         // the same attachment the sibling argument faces carry
         // (error_detection_helpers.dart:359-365 passes `whyNotPromoted`
         // through the equality face too).
+        let index = self.report.diagnostics.len();
+        self.emit_message_with_correction(code, range, message);
+        self.pending_non_promotion.push((index, right.range.offset));
+    }
+
+    /// The resolved binary-operator signature of `left OP right`: the
+    /// `(param type, result type)` pair the oracle's resolved element
+    /// declares (`_resolveUserDefinableType`,
+    /// binary_expression_resolver.dart:479-515 reads
+    /// `element.returnType`). A primitive receiver's signature answers
+    /// from [`CORE_BINARY_OPERATORS`] (the SDK declarations are external,
+    /// unreachable by the member walk); an indexed container's resolves
+    /// through the ordinary member face. Unresolved receivers, absent
+    /// operators (`undefined_operator` reports its own row), `dynamic`,
+    /// and `Never` answer `None` — the under-report direction.
+    fn binary_operator_sig(&self, op: &str, left: &Row) -> Option<(Ty, Ty)> {
+        let left_ty = self.equality_operand_ty(left);
+        let Ty::Named { name, .. } = left_ty else {
+            return None;
+        };
+        // `dynamic`/type-parameter heads never reach the member face.
+        if left_ty == Ty::Dynamic
+            || self.type_params.contains(&name)
+            || self.pending_type_params.contains(&name)
+        {
+            return None;
+        }
+        let recv_text = self.strings.resolve(name);
+        // `int`/`double` inherit `num`'s arithmetic and relational face;
+        // their own rows (`int.&`, `double.+`) shadow it in the table.
+        let num_family = recv_text == "int" || recv_text == "double";
+        if let Some((_, _, param, ret)) = CORE_BINARY_OPERATORS
+            .iter()
+            .find(|(recv, o, ..)| *o == op && *recv == recv_text)
+            // `int`/`double` inherit `num`'s arithmetic and relational face
+            // where their own rows stay silent (the `num.+` signature
+            // answers `1 + x` on `int` receivers too); `String`/`bool` are
+            // not `num` receivers and never take this fallback.
+            .or_else(|| {
+                num_family.then(|| {
+                    CORE_BINARY_OPERATORS
+                        .iter()
+                        .find(|(recv, o, ..)| *o == op && *recv == "num")
+                })
+                .flatten()
+            })
+        {
+            return Some((Ty::named(self.intern(*param)), Ty::named(self.intern(*ret))));
+        }
+        // The indexed-container arm: the user operator's declared formals
+        // and return type (`Money operator +(Money)`).
+        let entry = self.resolved_member(name, self.intern(op))?;
+        if entry.kind != MemberKind::Method {
+            return None;
+        }
+        let formals = entry.formals.as_deref()?;
+        let formal = formals.positional.first()?;
+        Some((formal.ty, entry.return_ty))
+    }
+
+    /// The `+`/`-`/`*`/`%` numeric refinement
+    /// (`_refineNumericInvocationTypeNullSafe`, type_system.dart:
+    /// 2059-2121): on a resolved operator whose receiver `T` reads
+    /// `num?`-bounded, the node answers `double` when `T <: double?` or
+    /// `S <: double?` (S non-Never), `int` when both sides read `int?`
+    /// (S non-Never), `num` otherwise. The gate is the receiver's own
+    /// bound — a user `extends num` class refines identically — so the
+    /// call is unconditional on the resolved signature; non-`num`
+    /// receivers and the other operators keep the declared return.
+    fn refine_numeric_binary(&self, op: &str, left_ty: Ty, right_ty: Ty, declared: Ty) -> Ty {
+        if !matches!(op, "+" | "-" | "*" | "%") {
+            return declared;
+        }
+        let (int, double, num) = (
+            self.members.primitive_ids[0],
+            self.members.primitive_ids[1],
+            self.members.primitive_ids[2],
+        );
+        let named_q = |name| Ty::Named {
+            name,
+            nullable: true,
+            args: ArgListId::EMPTY,
+        };
+        if !self.name_subtype(left_ty, named_q(num)) {
+            return declared;
+        }
+        if self.name_subtype(left_ty, named_q(double)) {
+            return Ty::named(double);
+        }
+        if right_ty != Ty::Never && self.name_subtype(right_ty, named_q(double)) {
+            return Ty::named(double);
+        }
+        if right_ty != Ty::Never
+            && self.name_subtype(left_ty, named_q(int))
+            && self.name_subtype(right_ty, named_q(int))
+        {
+            return Ty::named(int);
+        }
+        Ty::named(num)
+    }
+
+    /// The binary expression's fold (`end_binary_expression`'s tail): the
+    /// oracle's `BinaryExpression`/`LogicalExpression` node carries one
+    /// static type — the resolved operator's return, numeric-refined for
+    /// `+ - * %` on `num`-family receivers, `bool` for the `==`/`!=`/
+    /// `&&`/`||` composites. The operand rows leave the live stack for
+    /// `deferred_miss_rows` (their own resolution — `undefined_operator`,
+    /// the `used_names` marks, the operand misses — still runs in pass 2),
+    /// and one [`RowShape::Value`] row spanning `left..right` takes their
+    /// place so the enclosing single-row checks (`return_of_invalid_type`,
+    /// the argument faces, the assignability consumers) read the node's
+    /// own type.
+    ///
+    /// The right operand's `checkForArgumentTypeNotAssignableForArgument`
+    /// (binary_expression_resolver.dart:364-367, non-nullable formals —
+    /// `promoteParameterToNullable` is the `==` face's own) runs against
+    /// the resolved first formal under the same suppress gates the `==`
+    /// check applies.
+    fn fold_binary(&mut self, op: &str, op_range: SourceRange) {
+        let op = self.intern(op);
+        // The left operand row carries the operator mark
+        // (`begin_binary_expression`'s `mark_operator`); the right operand
+        // is the last non-TypeUse row above it. Anything else between
+        // them is debris the pass-2 walk still owes a verdict.
+        let Some(left_index) = self
+            .rows
+            .iter()
+            .rposition(|row| matches!(row.intent, Intent::Operator(o, _) if o == op))
+        else {
+            return;
+        };
+        let Some(right_index) = self
+            .rows
+            .iter()
+            .rposition(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+        else {
+            return;
+        };
+        if right_index <= left_index {
+            return;
+        }
+        let left = self.rows[left_index].clone();
+        let right = self.rows[right_index].clone();
+        let left_ty = self.equality_operand_ty(&left);
+        let right_ty = self.equality_operand_ty(&right);
+        let bool_id = self.members.primitive_ids[3];
+        let result = if matches!(op, o if o == self.intern("==") || o == self.intern("!=") || o == self.intern("&&") || o == self.intern("||")) {
+            // `==`/`!=` and the lazy boolean composites are `bool` by
+            // construction (binary_expression_resolver.dart:499-500 and
+            // `_resolveLogicalExpression`).
+            Ty::named(bool_id)
+        } else if op == self.intern("??") {
+            // The if-null LUB is outside the name-level model — the
+            // under-report direction.
+            Ty::UNKNOWN
+        } else {
+            let op_text = self.strings.resolve(op).to_string();
+            match self.binary_operator_sig(&op_text, &left) {
+                Some((formal, declared)) => {
+                    // The argument face: the right operand against the
+                    // resolved formal — same gating as
+                    // [`Self::check_equals_argument`], minus the
+                    // nullable-formal promotion (the generic call passes
+                    // the declared formal unchanged).
+                    self.check_binary_argument(right_ty, formal, &right);
+                    if left_ty == Ty::Dynamic {
+                        // `d + 1` on `dynamic` keeps the dynamic face
+                        // (binary_expression_resolver.dart:501-502).
+                        Ty::Dynamic
+                    } else {
+                        // The refinement's own `num?` receiver gate
+                        // decides — unconditional here.
+                        self.refine_numeric_binary(&op_text, left_ty, right_ty, declared)
+                    }
+                }
+                None => Ty::UNKNOWN,
+            }
+        };
+        let _ = op_range;
+        // Fold: the operands defer to pass 2 (their uses, misses, and
+        // operator-definedness verdicts ride `deferred_miss_rows`), the
+        // node's own row answers the enclosing check. A `mark_operator`
+        // on an outer operator re-tags the folded row by intent — the
+        // operand face needs `Read` here.
+        for row in self.rows.drain(left_index..) {
+            self.deferred_miss_rows.push(row);
+        }
+        self.rows.push(Row {
+            name: self.intern(""),
+            range: SourceRange {
+                offset: left.range.offset,
+                length: right.range.end().saturating_sub(left.range.offset),
+            },
+            qualified: false,
+            shape: RowShape::Value,
+            intent: Intent::Read,
+            write_op: None,
+            ty: result,
+        });
+    }
+
+    /// The right operand's `argument_type_not_assignable` verdict against
+    /// the operator's first formal — the generic face of
+    /// [`Self::check_equals_argument`]'s
+    /// `checkForArgumentTypeNotAssignableForArgument` (the
+    /// `promoteParameterToNullable: true` overlay is the `==`/`!=`
+    /// spelling's own; the other user operators' calls pass the declared
+    /// formal unchanged). The suppress gates mirror it: unknown or `void`
+    /// sides, in-scope type-parameter heads, the `Object?` top-type
+    /// formal, and the int-literal → `double` conversion all stay silent.
+    fn check_binary_argument(&mut self, right_ty: Ty, formal: Ty, right: &Row) {
+        if matches!(formal, Ty::Unknown | Ty::Void) || matches!(right_ty, Ty::Unknown | Ty::Void) {
+            return;
+        }
+        let unbound = |engine: &Self, head| {
+            engine.type_params.contains(&head) || engine.pending_type_params.contains(&head)
+        };
+        if let Ty::Named { name: head, .. } = formal
+            && unbound(self, head)
+        {
+            return;
+        }
+        if let Ty::Named { name: head, .. } = right_ty
+            && unbound(self, head)
+        {
+            return;
+        }
+        // The `Object?` target degenerates (every value inhabits it —
+        // `name_subtype`'s written-edge walk carries no implicit
+        // `extends Object` row, so the top-type face answers first).
+        if matches!(
+            formal,
+            Ty::Named {
+                name: head,
+                nullable: true,
+                ..
+            } if head == self.intern("Object")
+        ) {
+            return;
+        }
+        // `analyzeIntLiteral`'s `convertToDouble`: the schema-typed int
+        // literal converts into a `double` formal.
+        let literal_converts = Self::primitive_literal(right, &self.members.primitive_ids)
+            && matches!(
+                (right_ty, formal),
+                (Ty::Named { name: from, .. }, Ty::Named { name: to, .. })
+                    if from == self.members.primitive_ids[0]
+                        && to == self.members.primitive_ids[1]
+            );
+        if literal_converts || self.name_subtype(right_ty, formal) {
+            return;
+        }
+        let code = SemanticCode::ArgumentTypeNotAssignable;
+        let from_text = self.ty_display(right_ty);
+        let to_text = self.ty_display(formal);
+        let message = code.message3(&from_text, &to_text, "");
+        let range = self
+            .property_access_span(right.range)
+            .unwrap_or(right.range);
         let index = self.report.diagnostics.len();
         self.emit_message_with_correction(code, range, message);
         self.pending_non_promotion.push((index, right.range.offset));
@@ -5650,7 +5980,24 @@ impl<'a> Engine<'a> {
             // shape's source ctor's site-index.
             .filter(|(index, _)| !self.ctor_redirects.contains(index))
             .collect();
-        let has_generative_ctor = !ctor_spans.is_empty();
+        // Upstream `hasGenerativeConstructor` (error_verifier.dart:7114 —
+        // `element.constructors.any(isGenerative && isOriginDeclaration)`)
+        // counts EVERY declared generative constructor, redirecting ones
+        // included: their presence routes instance fields to the
+        // `ConstructorFieldsVerifier` face (which then silences each
+        // redirecting ctor per-ctor via its own
+        // `hasRedirectingConstructorInvocation` early return). A
+        // redirecting-only set — the extension-type
+        // `extension type S(int v) { S.fwd() : this(0); }` shape — keeps the
+        // declaration face OFF: the primary formal binds the representation
+        // field for the redirect target. `DeclKind::Constructor` sites are
+        // generative ctor declarations only (factories register none).
+        let has_generative_ctor = self
+            .decl_sites
+            .iter()
+            .any(|site| {
+                matches!(site.kind, DeclKind::Constructor { container: c } if c == container)
+            });
         // `member_duplicate_definition_verifier.dart`'s constructor pass:
         // per container, constructor names dedupe by selector — the unnamed
         // spelling keys as `new` (`member.name?.lexeme ?? 'new'`), a named
@@ -5753,17 +6100,25 @@ impl<'a> Engine<'a> {
             // No anchored generative constructor: the declaration walk owns
             // the face, per field at its name in declaration order
             // (error_verifier.dart's
-            // `_checkForNotInitializedFieldDeclaration` variable loop).
-            for (name, range) in &finals {
-                self.emit(SemanticCode::FinalNotInitialized, *range, name, "");
-            }
-            for (name, range) in &non_finals {
-                self.emit(
-                    SemanticCode::NotInitializedNonNullableInstanceField,
-                    *range,
-                    name,
-                    "",
-                );
+            // `_checkForNotInitializedFieldDeclaration` variable loop) —
+            // but only when no generative constructor is declared at all
+            // (`hasGenerativeConstructor` upstream; redirecting ctors count
+            // — `class C { final int f; C.fwd() : this(0); }` and the
+            // extension-type `extension type S(int v) { S.fwd() : this(0); }`
+            // report nothing, the verifier's redirect early-return silencing
+            // each one).
+            if !has_generative_ctor {
+                for (name, range) in &finals {
+                    self.emit(SemanticCode::FinalNotInitialized, *range, name, "");
+                }
+                for (name, range) in &non_finals {
+                    self.emit(
+                        SemanticCode::NotInitializedNonNullableInstanceField,
+                        *range,
+                        name,
+                        "",
+                    );
+                }
             }
             return;
         }
@@ -8796,6 +9151,62 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The flat record destructure bind (`final (a, b) = pair()`): the
+    /// pattern variables carry no written type — the oracle infers each
+    /// from the matched record's positional slots
+    /// (`analyzeRecordPattern`, type_analyzer.dart's positional walk). The
+    /// initializer's folded row sits between `init_start` (the `=`'s end)
+    /// and `semi` (the `;`'s offset); exactly one non-TypeUse row there is
+    /// the expression's own. The bind runs only when the whole declaration
+    /// is one flat positional record — `pattern_bind_records == 1`, no
+    /// named field or other shape left its `pattern_bind_dirty` mark, and
+    /// the collected untyped variables line up one-per-positional-slot —
+    /// so every unsupported shape (nested records, named fields, object/
+    /// list/map/cast members, typed leaves beside bare ones) keeps the
+    /// documented under-report instead of binding a wrong type.
+    ///
+    /// Case-head and assignment-pattern windows share the same append-only
+    /// collection — their variables linger into the next declaration's
+    /// window, where the count mismatch suppresses the bind (the
+    /// under-report direction either way).
+    fn destructure_record(&mut self, init_start: u32, semi: u32) {
+        let vars = std::mem::take(&mut self.pattern_bind_vars);
+        let records = self.pattern_bind_records;
+        let dirty = self.pattern_bind_dirty;
+        self.pattern_bind_records = 0;
+        self.pattern_bind_dirty = false;
+        if dirty || records != 1 || vars.is_empty() {
+            return;
+        }
+        let mut inits = self
+            .rows
+            .iter()
+            .filter(|row| {
+                !matches!(row.shape, RowShape::TypeUse(..))
+                    && row.range.offset >= init_start
+                    && row.range.end() <= semi
+            })
+            .cloned();
+        let (Some(row), None) = (inits.next(), inits.next()) else {
+            return;
+        };
+        let Some(ty) = self.initializer_static_ty(&row) else {
+            return;
+        };
+        let Ty::Record { shape, .. } = ty else {
+            return;
+        };
+        let fields = self.boundary.pool().record_shape(shape).positional.to_vec();
+        if fields.len() != vars.len() {
+            return;
+        }
+        if let Some(frame) = self.frames.last_mut() {
+            for (name, ty) in vars.iter().zip(fields) {
+                frame.var_types.insert(*name, ty);
+            }
+        }
+    }
+
     /// Classifies a constant pattern whose events left no literal: a
     /// qualified `E.c` tail (enum container + member row) becomes the
     /// enum-value leaf; everything else is unrepresentable.
@@ -9492,6 +9903,84 @@ impl<'a> Engine<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The callable signature a parameterized function-type alias spells
+    /// (`typedef Predicate<T> = bool Function(T)`): the element model keeps
+    /// no RHS for a parameterized alias (its substitution face is
+    /// unmodeled), but the bounds capture stores the written shape — the
+    /// use-site callable verdict (`Predicate<T> test` invoked as
+    /// `test(item)`), the invocation's return type, and its formal table
+    /// all read it. Type parameters stay as leaf names (the written-shape
+    /// face; `T`-typed formals/returns answer `T`, matching the oracle's
+    /// unsubstituted-name behavior at this layer).
+    /// `None` when `name` is no this-file alias or aliases a non-function
+    /// type; a cross-file alias is invisible to the capture (under-report).
+    /// A named-type RHS chases its co-alias's function shape with the
+    /// written arguments substituted (`typedef B = A<int>` over
+    /// `A<X> = X Function()` resolves `B` to `int Function()`).
+    fn alias_fn_sig(&self, name: StringId) -> Option<Box<FnVarSig>> {
+        // The co-alias substitution maps a parameter name to its written
+        // argument tree; it applies at the terminal `Fn` shape's leaves.
+        let mut subst: FxHashMap<StringId, TypeTree> = FxHashMap::default();
+        let mut seen: FxHashSet<StringId> = FxHashSet::default();
+        let mut cur = name;
+        // Deferred binding: a `Named` RHS's written arguments bind the NEXT
+        // alias's parameters, whose names only surface once that alias's own
+        // shape answers — carry the (substituted) argument trees forward and
+        // zip them against the arriving param list. `B = A<int, String>`
+        // over `A<S, T>` binds `S → int`, `T → String`.
+        let mut pending_args: Vec<TypeTree> = Vec::new();
+        let (ret, positional, named, required_positional) = loop {
+            if !seen.insert(cur) {
+                return None;
+            }
+            let args = std::mem::take(&mut pending_args);
+            let subst_args: Vec<TypeTree> =
+                args.iter().map(|a| subst_tree(a, &subst)).collect();
+            if let Some((params, ret, positional, named, required_positional)) =
+                self.bounds.alias_fn_shape(cur)
+            {
+                subst.clear();
+                for ((param, _, _), arg) in params.iter().zip(subst_args.iter()) {
+                    subst.insert(*param, arg.clone());
+                }
+                break (
+                    ret.cloned(),
+                    positional.to_vec(),
+                    named.to_vec(),
+                    required_positional,
+                );
+            }
+            let (_params, tree) = self.bounds.alias_named_shape(cur)?;
+            pending_args = tree.args.clone();
+            cur = tree.head;
+        };
+        let sig = FnVarSig {
+            // The alias's own type parameters are bound by the written use
+            // (`Predicate<T> test` already instantiates them) — they are
+            // not call-site inference variables, so the signature carries
+            // none; their leaves stay named `T` in the formal types.
+            params: Box::default(),
+            positional: positional
+                .iter()
+                .map(|tree| self.tree_ty(&subst_tree(tree, &subst)))
+                .collect(),
+            required_positional: u16::try_from(
+                required_positional.unwrap_or(positional.len()),
+            )
+            .unwrap_or(u16::MAX),
+            named: named
+                .iter()
+                .map(|(name, tree, required)| {
+                    (*name, self.tree_ty(&subst_tree(tree, &subst)), *required)
+                })
+                .collect(),
+            return_ty: ret
+                .map(|tree| self.tree_ty(&subst_tree(&tree, &subst)))
+                .unwrap_or(Ty::Dynamic),
+        };
+        Some(Box::new(sig))
     }
 
     /// A container member's declared field type from a clean walk
@@ -10373,17 +10862,42 @@ impl<'a> Engine<'a> {
         &self,
         found: &'a Container,
         found_owner: FileId,
-        mut scope_lib: LibraryId,
+        scope_lib: LibraryId,
         member: StringId,
         seen: &mut FxHashSet<StringId>,
     ) -> Walk<'a> {
+        self.walk_face_list(
+            found.implements_clause.iter().copied(),
+            found_owner,
+            scope_lib,
+            member,
+            seen,
+            false,
+        )
+    }
+
+    /// The shared breadth-first face-list climb behind
+    /// [`Engine::walk_implements_members`] and the mixin's `on`-constraint
+    /// super walk: each seed name contributes its own (non-static) members
+    /// and, transitively, its supertypes' (a class climbs `extends`/`with`/
+    /// `implements`, a mixin interface its own interfaces, a nested extension
+    /// type its `implements`). A resolved member ends the walk (`Found`); an
+    /// unresolvable or cyclic face poisons the chain (`ChainBroken`, the
+    /// under-report boundary) only when nothing answered. The face names are
+    /// written in `seed_owner` and resolve through that container's library.
+    fn walk_face_list(
+        &self,
+        seeds: impl Iterator<Item = StringId>,
+        seed_owner: FileId,
+        mut scope_lib: LibraryId,
+        member: StringId,
+        seen: &mut FxHashSet<StringId>,
+        climb_on: bool,
+    ) -> Walk<'a> {
         // Breadth-first: the declaration order is the oracle's face order,
         // and a shallower hit shadows a deeper one.
-        let mut queue: VecDeque<(StringId, FileId)> = found
-            .implements_clause
-            .iter()
-            .map(|face| (*face, found_owner))
-            .collect();
+        let mut queue: VecDeque<(StringId, FileId)> =
+            seeds.map(|face| (face, seed_owner)).collect();
         let mut missing = false;
         while let Some((face, face_owner)) = queue.pop_front() {
             if !seen.insert(face) {
@@ -10417,13 +10931,22 @@ impl<'a> Engine<'a> {
                 ));
             }
             // Climb the face's own supertypes: `extends` and `with` for
-            // classes/mixins, `implements` for extension types, and a mixin
-            // interface's own interfaces.
+            // classes, `implements` for extension types, and a mixin
+            // interface's own interfaces. A mixin constraint face also climbs
+            // its own `on` constraints — the oracle's `superLookupType`
+            // interface includes them — but only on the mixin-super walk;
+            // the extension-type `implements` walk leaves `on` untouched.
+            let on_clause = if climb_on {
+                face_container.on_clause.as_slice()
+            } else {
+                &[]
+            };
             for super_face in face_container
                 .superclass
                 .into_iter()
                 .chain(face_container.with_clause.iter().copied())
                 .chain(face_container.implements_clause.iter().copied())
+                .chain(on_clause.iter().copied())
             {
                 queue.push_back((super_face, face_container_owner));
             }
@@ -10449,6 +10972,25 @@ impl<'a> Engine<'a> {
             return Walk::ChainBroken;
         };
         if container_decl.superclass.is_none() && container_decl.with_clause.is_empty() {
+            // A mixin's super face is its `on` clause: `super.m` inside
+            // `mixin M on A, B` resolves `m` against the superclass
+            // constraints' member pools (each constraint's own members, then
+            // its supertypes — the oracle's `unpromotedThisType` interface,
+            // type_analyzer.dart `superLookupType`). Constraints are not
+            // supertype edges in the model, so the regular `walk_from` never
+            // sees them; seed the shared face-list climb with the `on` list.
+            if container_decl.kind == ContainerKind::Mixin && !container_decl.on_clause.is_empty() {
+                let mut seen: FxHashSet<StringId> = FxHashSet::default();
+                seen.insert(container);
+                return self.walk_face_list(
+                    container_decl.on_clause.iter().copied(),
+                    self.file,
+                    self.lib,
+                    member,
+                    &mut seen,
+                    true,
+                );
+            }
             // No explicit supertype: the super face is still `Object`. The
             // official walk answers every class through it, so a clean miss
             // reports (`undefined_super_member` keeps firing after the
@@ -10640,16 +11182,42 @@ impl<'a> Engine<'a> {
 
     /// Whether any direct super-face carries a same-named non-static member
     /// (the oracle's transitive `getOverridden`, via [`Engine::face_member`]'s
-    /// per-face climb). An unresolvable face simply contributes nothing.
+    /// per-face climb). An unresolvable face simply contributes nothing —
+    /// except an unindexed dart:core interface, whose declared members the
+    /// frozen [`CORE_INTERFACE_MEMBERS`] face answers (a user-declared
+    /// same-named container resolves indexed and wins the face first).
     fn face_member_any(&self, decl: &Container, spelling: StringId) -> bool {
         let mut faces = Vec::new();
         faces.extend(decl.superclass);
         faces.extend(decl.with_clause.iter().copied());
         faces.extend(decl.implements_clause.iter().copied());
         faces.extend(decl.on_clause.iter().copied());
-        faces
-            .into_iter()
-            .any(|face| self.face_member(face, spelling).is_some())
+        faces.into_iter().any(|face| {
+            if self.face_member(face, spelling).is_some() {
+                return true;
+            }
+            // The external dart:core face: `resolve_container` resolves the
+            // name through the namespace but its unit is never indexed, so
+            // `face_member` breaks on it; the frozen member face decides.
+            if resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                face,
+            )
+            .is_some()
+            {
+                return false; // an indexed container answered (miss is real)
+            }
+            CORE_INTERFACE_MEMBERS
+                .iter()
+                .find(|(name, _)| self.strings.resolve(face) == *name)
+                .is_some_and(|(_, members)| {
+                    members.contains(&self.strings.resolve(spelling))
+                })
+        })
     }
 
     /// The `must_call_super` probe (`must_call_super_verifier.dart:19-175`),
@@ -12690,6 +13258,27 @@ impl<'a> Engine<'a> {
                 "",
             );
         }
+        // `_verifyExtensionElementImplements` (scope_analyzer.dart:1309-1360):
+        // every `implements` face must be a supertype of the representation
+        // type (`isSubtypeOf(declaredRepresentation, type)`). Name-level: the
+        // rep type's head name against the face's head. An undecidable pair
+        // (a cross-file face whose edges are invisible, `decide_subtype`'s
+        // `None`) suppresses — the under-report direction. The extension-type
+        // face's own `RepresentationNotSupertype` twin stays unmodeled here.
+        if let Ty::Named { name: rep_name, .. } = rep.formal.ty {
+            let rep_text = self.strings.resolve(rep_name).to_string();
+            for face in decl.implements_clause.iter().copied() {
+                if let Some(false) = self.name_world().decide_subtype(rep_name, face) {
+                    let face_text = self.strings.resolve(face).to_string();
+                    self.emit(
+                        SemanticCode::ExtensionTypeImplementsNotSupertype,
+                        rep.name_range,
+                        &face_text,
+                        &rep_text,
+                    );
+                }
+            }
+        }
     }
 
     /// The nearest non-static `spelling` member on `face`'s linearized
@@ -13137,14 +13726,52 @@ impl<'a> Engine<'a> {
         if self.in_instance_field_initializer() {
             self.field_init_rows.insert(range.offset);
         }
+        // A record-typed receiver's field access is resolvable without the
+        // member face: the record shape the receiver's row carries names
+        // the positional `$n` and named slots (`rect.width` on
+        // `({int width, int height})`). The row keeps the resolved field
+        // type so the binary fold and the initializer faces read the
+        // access's own type (record fields carry no member walk — the
+        // `Receiver` is `Unknown`, so pass-2 stays silent on it either way).
+        let recv_ty = self.rows.last().map(|recv| {
+            if recv.ty != Ty::UNKNOWN {
+                recv.ty
+            } else if let RowShape::Bare(BareInfo::Plain { ty }) = &recv.shape {
+                *ty
+            } else {
+                Ty::UNKNOWN
+            }
+        });
+        let ty = match recv_ty {
+            Some(Ty::Record { shape, .. }) => {
+                let pool = self.boundary.pool();
+                let shape = pool.record_shape(shape);
+                let text = self.strings.resolve(name);
+                let field_ty = if let Some(index) = text
+                    .strip_prefix('$')
+                    .and_then(|digits| digits.parse::<usize>().ok())
+                    .and_then(|index| index.checked_sub(1))
+                {
+                    shape.positional.get(index).copied()
+                } else {
+                    shape
+                        .named
+                        .iter()
+                        .find(|(field, _)| *field == name)
+                        .map(|(_, ty)| *ty)
+                };
+                field_ty.unwrap_or(Ty::UNKNOWN)
+            }
+            _ => Ty::UNKNOWN,
+        };
         self.push_row(Row {
             name,
             range,
             qualified: true,
-            shape: RowShape::Bare(BareInfo::Plain { ty: Ty::UNKNOWN }),
+            shape: RowShape::Bare(BareInfo::Plain { ty }),
             intent: Intent::Read,
             write_op: None,
-            ty: Ty::UNKNOWN,
+            ty,
         });
     }
 
@@ -15710,6 +16337,23 @@ impl<'a> Engine<'a> {
                         })
                         .flatten()
                 });
+                // A local callee typed by a parameterized function-type
+                // alias (`Predicate<T> test` invoked as `test(item)`): the
+                // captured alias RHS is the signature the oracle's
+                // `resolveArgumentsToParameters` counts against — the
+                // element model never records it (the parameterized-alias
+                // substitution face is unmodeled), so the captured shape
+                // stands in.
+                let sig_formals = sig_formals.or_else(|| {
+                    let RowShape::Bare(BareInfo::Plain {
+                        ty: Ty::Named { name, .. },
+                    }) = &row.shape
+                    else {
+                        return None;
+                    };
+                    self.alias_fn_sig(*name)
+                        .map(|sig| Some((sig.formals(self.intern("")), sig)))
+                });
                 match (member, sig_formals) {
                     (Some(formals), _) => {
                         sig_from_row = None;
@@ -16414,6 +17058,25 @@ impl<'a> Engine<'a> {
                 // A `Function`-typed value is the function-type supertype —
                 // callable.
                 if self.strings.resolve(*name) == "Function" {
+                    return;
+                }
+                // A parameterized function-type alias is callable the same
+                // way: `typedef P<T> = bool Function(T)` types `P<T> test`,
+                // and `test(item)` invokes the aliased signature (the
+                // captured alias RHS stands in for the unmodeled
+                // substitution). An alias chain (`typedef B = A<int>` where
+                // `A` is the fn alias) chases to its terminal function shape.
+                if self.alias_fn_sig(*name).is_some() {
+                    return;
+                }
+                // An interface-typed callee resolves its `call` member like
+                // the oracle's type-property resolve (`sum(1, 2)` over
+                // `Adder` with `int call(int, int)`); a present `call`
+                // method is callable, anything else reports.
+                if matches!(
+                    self.resolved_member(*name, self.intern("call")),
+                    Some(entry) if entry.kind == MemberKind::Method
+                ) {
                     return;
                 }
                 let range = row.range;
@@ -17916,10 +18579,23 @@ impl<'a> Engine<'a> {
                 {
                     return ret;
                 }
-                return self
-                    .fn_var_sigs
-                    .get(&row.name)
-                    .map_or(Ty::UNKNOWN, |sig| sig.return_ty);
+                if let Some(sig) = self.fn_var_sigs.get(&row.name) {
+                    return sig.return_ty;
+                }
+                // A local typed by a parameterized function-type alias
+                // (`Predicate<T> test` — the alias expands to a signature
+                // whose return drives the send's result; without it the
+                // unknown result over-fires `non_bool_condition` on
+                // `if (test(item))`).
+                if let RowShape::Bare(BareInfo::Plain {
+                    ty: Ty::Named { name, .. },
+                }) = &row.shape
+                {
+                    if let Some(sig) = self.alias_fn_sig(*name) {
+                        return sig.return_ty;
+                    }
+                }
+                return Ty::UNKNOWN;
             }
             return self
                 .top_level_decl(row.name)
@@ -18082,8 +18758,10 @@ impl<'a> Engine<'a> {
     }
 
     /// Marks an operator operand: the closest row wholly before `op`, when it
-    /// is a bare identifier, a typed receiver, or a member access (`a + b`,
-    /// `this + b`, `a.b + c` — the operator applies to the member result).
+    /// is a bare identifier, a typed receiver, a member access, or an already
+    /// folded value (`a + b`, `this + b`, `a.b + c`, `a + b + c` — the inner
+    /// fold's [`RowShape::Value`] result row is the outer operator's left
+    /// operand).
     fn mark_operator(&mut self, op: StringId, range: SourceRange) {
         for row in self.rows.iter_mut().rev() {
             if row.range.end() > range.offset {
@@ -18095,6 +18773,7 @@ impl<'a> Engine<'a> {
                     | RowShape::Receiver(_)
                     | RowShape::Member { .. }
                     | RowShape::Record(_)
+                    | RowShape::Value
             ) && row.intent == Intent::Read
             {
                 row.intent = Intent::Operator(op, range);
@@ -21945,6 +22624,52 @@ fn parse_int_literal(text: &str) -> Option<i64> {
         (10, cleaned.as_str())
     };
     i64::from_str_radix(digits, radix).ok()
+}
+
+/// Substitutes a type-parameter map into a written type tree: every leaf
+/// whose head names a parameter becomes a clone of its argument tree
+/// (`B<X> = A<X>` binds `X` to the use site's tree). Named/record/function
+/// nodes substitute their children; an empty map returns the tree as-is.
+fn subst_tree(tree: &TypeTree, map: &FxHashMap<StringId, TypeTree>) -> TypeTree {
+    if map.is_empty() {
+        return tree.clone();
+    }
+    if let Some(replacement) = map.get(&tree.head)
+        && tree.args.is_empty()
+        && tree.record.is_none()
+        && tree.function.is_none()
+    {
+        let mut out = replacement.clone();
+        out.nullable |= tree.nullable;
+        return out;
+    }
+    let mut out = tree.clone();
+    out.args = tree.args.iter().map(|arg| subst_tree(arg, map)).collect();
+    if let Some((positional, named)) = &tree.record {
+        out.record = Some((
+            positional.iter().map(|f| subst_tree(f, map)).collect(),
+            named
+                .iter()
+                .map(|(n, f)| (*n, subst_tree(f, map)))
+                .collect(),
+        ));
+    }
+    if let Some(f) = &tree.function {
+        out.function = Some(crate::capture::FnTree {
+            ret: f
+                .ret
+                .as_ref()
+                .map(|r| Box::new(subst_tree(r, map))),
+            type_params: f.type_params,
+            positional: f.positional.iter().map(|p| subst_tree(p, map)).collect(),
+            named: f
+                .named
+                .iter()
+                .map(|(n, p)| (*n, subst_tree(p, map)))
+                .collect(),
+        });
+    }
+    out
 }
 
 /// The capture operator for a binary operator spelling (`??=` and
@@ -26607,6 +27332,18 @@ impl ParserListener for DiagnoseListener<'_> {
             }
             _ => {}
         }
+        // The binary node's own static type folds the operand rows into
+        // one result row (`fold_binary`): every enclosing single-row check
+        // — `return_of_invalid_type`, the argument faces, the
+        // assignability consumers — reads the node's type, and the right
+        // operand's `argument_type_not_assignable` verdict runs against
+        // the resolved operator formal. All arms above already read the
+        // operand rows; the fold runs last so their two-row window is
+        // undisturbed.
+        if let Some(op_text) = engine.text_of(operator) {
+            let op_text = op_text.to_string();
+            engine.fold_binary(&op_text, operator.range);
+        }
     }
 
     fn handle_unary_prefix_expression(&mut self, operator: Token) {
@@ -27043,22 +27780,46 @@ impl ParserListener for DiagnoseListener<'_> {
                         // constant only when a const constructor answers
                         // the call (the oracle's constant verifier).
                         // Foreign/unresolved names keep the opaque defer.
-                        if let Some(init) = engine.pending_init_names.last().copied()
-                            && let Some((decl, _)) = resolve_container(
+                        if let Some(init) = engine.pending_init_names.last().copied() {
+                            match resolve_container(
                                 engine.graph,
                                 engine.namespaces,
                                 engine.index,
                                 engine.lib,
                                 engine.file,
                                 name,
-                            )
-                            && decl.kind == ContainerKind::Class
-                        {
-                            engine.open_const_creations.push((
-                                init,
-                                closed.span,
-                                ConstCreationEntry::Creation { container: name },
-                            ));
+                            ) {
+                                Some((decl, _)) if decl.kind == ContainerKind::Class => {
+                                    engine.open_const_creations.push((
+                                        init,
+                                        closed.span,
+                                        ConstCreationEntry::Creation { container: name },
+                                    ));
+                                }
+                                // An unresolved or non-container callee
+                                // (`const x = Missing()`, `const x = F()`
+                                // over a function typedef): the oracle's
+                                // constant evaluation is known-invalid at
+                                // the initializer — the
+                                // `const_initialized_with_non_constant_value`
+                                // row rides beside the callee's own
+                                // resolution report (probed: `dart analyze`
+                                // 3.13.1 pairs the `undefined_function` /
+                                // `invocation_of_non_function` row with the
+                                // initializer's). Enum/mixin/extension-type
+                                // heads resolve to their own faces
+                                // (`invalid_reference_to_generative_enum_
+                                // constructor`), so the failure entry only
+                                // stages when no container answers.
+                                None => {
+                                    engine.open_const_creations.push((
+                                        init,
+                                        closed.span,
+                                        ConstCreationEntry::ArgFailure,
+                                    ));
+                                }
+                                _ => {}
+                            }
                         }
                         engine.const_capture.opaque_leaf(closed.span);
                     }
@@ -27328,19 +28089,16 @@ impl ParserListener for DiagnoseListener<'_> {
         ) && engine.rows[pos].intent == Intent::Read
         {
             let index_op = engine.intern("[]");
-            // The operand rows leave the stack, but an unresolved operand
-            // still owes its report — the official resolves every
-            // subexpression (`builder..foo[bar]`'s `bar` reports,
-            // issue_42267) — so they join the fold-deferred set like the
-            // creation fold's dropped span.
-            let dropped: Vec<Row> = engine.rows.drain(pos + 1..).collect();
-            for row in dropped {
-                if matches!(
-                    row.shape,
-                    RowShape::Bare(BareInfo::Missing { .. }) | RowShape::TypeUse(..)
-                ) {
-                    engine.deferred_miss_rows.push(row);
-                }
+            // The operand rows leave the stack, but every operand still
+            // owes its pass-2 resolution — the official resolves every
+            // subexpression (`builder..foo[bar]`'s `bar` reports its
+            // `undefined_identifier`, issue_42267, and a resolved operand's
+            // `used_names`/`read_names` marks stand — `a[_key]` reads the
+            // field for `unused_field`). They defer to pass 2 through the
+            // same set the send fold drains into; only their mergeable
+            // stack position dies here.
+            for row in engine.rows.drain(pos + 1..) {
+                engine.deferred_miss_rows.push(row);
             }
             engine.rows[pos].intent = Intent::Operator(index_op, bracket);
             engine.push_value_row(close);
@@ -27450,10 +28208,12 @@ impl ParserListener for DiagnoseListener<'_> {
         // The armed type was the cast pattern's — never a declaration's.
         engine.armed_ty = None;
         engine.armed_ty_span = None;
+        engine.pattern_bind_dirty = true;
     }
 
     fn handle_null_assert_pattern(&mut self, bang: Token) {
         // `p!` covers the non-null side of the context.
+        self.engine.pattern_bind_dirty = true;
         let engine = &mut self.engine;
         engine.check_null_pattern(bang.range, true);
         let leaf = match NameTy::from_semantic(
@@ -27470,10 +28230,15 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_null_check_pattern(&mut self, question: Token) {
+        // `p?` can fail on the null path: the flow recorder promotes the
+        // matched arm non-null and joins the null arm into the unmatched
+        // chain (official `_handleNullCheckPattern`).
+        self.flow().handle_null_check_pattern(question);
         // `p?` covers the context values plus `null` (`nullCheckToSpace`):
         // a nullable context already covers null; a non-null context
         // unions with it.
         let engine = &mut self.engine;
+        engine.pattern_bind_dirty = true;
         engine.check_null_pattern(question.range, false);
         let leaf = match NameTy::from_semantic(
             engine
@@ -27491,26 +28256,76 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.pattern_leaf(leaf);
     }
 
-    fn handle_relational_pattern(&mut self, _operator: Token) {
+    fn handle_relational_pattern(&mut self, operator: Token) {
+        // The shape's failure arm joins the flow's unmatched chain — a
+        // top-level `case == 5`/`case > 0` can fail, so the code after an
+        // if-case stays live (flow_analysis.dart's pattern dispatch).
+        self.flow().handle_relational_pattern(operator);
         // Value comparisons are not representable at name level.
         self.engine.pattern_leaf(Restriction::Unknown);
+        self.engine.pattern_bind_dirty = true;
     }
 
-    fn handle_list_pattern(&mut self, _count: usize, _left: Token, _right: Token) {
+    fn handle_list_pattern(&mut self, count: usize, left: Token, right: Token) {
+        self.flow().handle_list_pattern(count, left, right);
         // The list face arrives through keysOfInterest/additional properties
         // — not modeled at name level (documented under-report).
         self.engine.pattern_leaf(Restriction::Unknown);
+        self.engine.pattern_bind_dirty = true;
     }
 
-    fn handle_map_pattern(&mut self, _count: usize, _left: Token, _right: Token) {
+    fn handle_map_pattern(&mut self, count: usize, left: Token, right: Token) {
+        self.flow().handle_map_pattern(count, left, right);
         self.engine.pattern_leaf(Restriction::Unknown);
+        self.engine.pattern_bind_dirty = true;
     }
 
-    fn handle_record_pattern(&mut self, _left_paren: Token, _count: usize) {
+    fn begin_map_pattern_key(&mut self) {
+        // `visitMapPattern`'s per-entry `_evaluateAndReportError`
+        // (constant_verifier.dart:342-358): each `key:` expression is a
+        // constant context. Open the capture window before the parser reads
+        // the key so its nodes accumulate.
+        self.engine.const_capture.open_map_pattern_key();
+    }
+
+    fn handle_map_pattern_entry(&mut self, colon: Token, _end: Token) {
+        // Close the key's window and evaluate it: a non-constant key reports
+        // `non_constant_map_pattern_key` at the key's own span. Unlike the
+        // constant-pattern face there is no InvalidType early-return — the
+        // oracle reports the row even beside a resolution miss (`{id: n}` on
+        // an undefined `id` carries both `undefined_identifier` and
+        // `non_constant_map_pattern_key`), so no suppression probe here.
+        if let Some(node) = self.engine.const_capture.close_map_pattern_key() {
+            match eval(&node, &self.engine) {
+                Verdict::Value(_) | Verdict::Constant => {}
+                Verdict::NotConstant(span)
+                | Verdict::Unresolved(span)
+                | Verdict::Fault(_, span) => {
+                    let span = if span.length > 0 { span } else { colon.range };
+                    self.engine.emit_corrected(
+                        SemanticCode::NonConstantMapPatternKey,
+                        span,
+                        "",
+                    );
+                }
+            }
+        }
+    }
+
+    fn handle_record_pattern(&mut self, left_paren: Token, count: usize) {
+        // The record shape test can fail — the flow recorder joins the
+        // failure arm into the unmatched chain so the statement after an
+        // if-case stays live.
+        self.flow().handle_record_pattern(left_paren, count);
         // Record shapes live in the interned lattice (`dartq-types`); the
         // name level has no record type, so the row is unknown-shaped and
         // the engine under-reports.
         self.engine.pattern_leaf(Restriction::Unknown);
+        // One close per record pattern in the declaration window — the
+        // flat `final (a, b) = pair()` binds read exactly one; nested
+        // records close more and gate the destructure bind off.
+        self.engine.pattern_bind_records =
+            self.engine.pattern_bind_records.saturating_add(1);
     }
 
     fn begin_constant_pattern(&mut self, const_keyword: Option<Token>) {
@@ -27657,6 +28472,8 @@ impl ParserListener for DiagnoseListener<'_> {
             .last_mut()
             .map_or(Vec::new(), |frame| std::mem::take(&mut frame.fields));
         engine.close_object_fields(head, &fields);
+        // An object pattern's fields are member reads, not record slots.
+        engine.pattern_bind_dirty = true;
     }
 
     fn handle_pattern_field(&mut self, colon: Option<Token>) {
@@ -27669,6 +28486,11 @@ impl ParserListener for DiagnoseListener<'_> {
         // fire the same boundary on their own frames; their buckets have
         // no consumer and die with the bracket.
         let name = colon.and_then(|token| engine.name_of(token));
+        // A named field (`:a` / `a: p`) is never a positional record slot —
+        // the flat destructure bind requires an all-positional window.
+        if colon.is_some() {
+            engine.pattern_bind_dirty = true;
+        }
         let mut leaves = engine
             .switch
             .pattern_stack
@@ -27731,6 +28553,13 @@ impl ParserListener for DiagnoseListener<'_> {
                 ty => {
                     if let Some(ty) = ty {
                         engine.bind_var_type(name, ty);
+                    } else if !in_assignment_pattern {
+                        // A bare pattern variable (`(a, b)`'s `a`): its type
+                        // is the scrutinee record's slot — recorded for the
+                        // declaration-statement bind ([`Self::
+                        // destructure_record`]). Assignment patterns rebind
+                        // existing locals and never enter the list.
+                        engine.pattern_bind_vars.push(name);
                     }
                     // A type-free variable covers its context: no leaf.
                 }
@@ -29554,6 +30383,17 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_invalid_await_expression(&mut self, begin: Token, end: Token) {
         self.flow().end_invalid_await_expression(begin, end);
+
+        // The parser fired `endInvalidAwaitExpression` — `await e` inside a
+        // sync (non-async, non-generator) body. The fasta `AwaitInSync`
+        // recoverable error converts to `await_in_wrong_context` at the
+        // `await` keyword (error_converter.dart). There is no suppression
+        // face: the oracle reports it unconditionally.
+        self.engine.emit_corrected(
+            SemanticCode::AwaitInWrongContext,
+            begin.range,
+            "",
+        );
     }
 
     fn end_invalid_yield_statement(&mut self, begin: Token, star: Option<Token>, end: Token) {
@@ -29934,6 +30774,10 @@ impl ParserListener for DiagnoseListener<'_> {
         // The statement boundary closes the group window (the next
         // declaration is its own all-or-nothing set).
         self.engine.pattern_group_open = None;
+        // The flat record destructure bind: `final (a, b) = pair()` — the
+        // pattern bound no types of its own, but the scrutinee's record
+        // carries them; the name-level locals take the positional slots.
+        self.engine.destructure_record(equals.range.end(), semicolon.range.offset);
     }
 
     fn handle_recoverable_error(&mut self, p0: Message, p1: Token, p2: Token) {
@@ -34823,6 +35667,10 @@ mod tests {
         assert_eq!(
             code_names(&report),
             [
+                // The binary fold's argument face joins the operator
+                // checks (`c + d` resolves `C.operator +(C)`, whose formal
+                // `D` cannot satisfy).
+                "argument_type_not_assignable",
                 "undefined_operator",
                 "undefined_operator",
                 "undefined_super_member",
@@ -34832,18 +35680,22 @@ mod tests {
         );
         assert_eq!(
             report.diagnostics[0].message,
-            "The operator '+' isn't defined for the type 'D'."
+            "The argument type 'D' can't be assigned to the parameter type 'C'. "
         );
         assert_eq!(
             report.diagnostics[1].message,
-            "The operator '-' isn't defined for the type 'E'."
+            "The operator '+' isn't defined for the type 'D'."
         );
         assert_eq!(
             report.diagnostics[2].message,
+            "The operator '-' isn't defined for the type 'E'."
+        );
+        assert_eq!(
+            report.diagnostics[3].message,
             "The operator '*' isn't defined in a superclass of 'S'."
         );
         assert_eq!(
-            report.diagnostics[0].range.offset,
+            report.diagnostics[1].range.offset,
             u32::try_from(
                 "class C { C operator +(C o) => this; } class D {} void f(C c, D d, D d2) { c + d; d "
                     .len()
@@ -34884,6 +35736,195 @@ mod tests {
         assert_eq!(
             report.diagnostics[1].message,
             "The operator '+' isn't defined for the type 'R'."
+        );
+    }
+
+    /// The binary fold's result-type face (`_resolveUserDefinableType` +
+    /// `_refineNumericInvocationTypeNullSafe`): `a + b` is one node of the
+    /// refined numeric type — `int`-receiver `+` yields `num` unless both
+    /// operands read `int`, so a `String` operand drags the result to
+    /// `num` and the enclosing `int` return reports both rows (the oracle
+    /// anchors the argument at the right operand and the return at the
+    /// whole expression).
+    ///
+    /// Hand-trace: `a + b` — `a`'s row carries `Operator('+')`; the fold
+    /// resolves `num.+`'s `(num) -> num` signature, runs the argument's
+    /// assignability cut (`String` vs `num` fails), and leaves one `num`
+    /// row the `int` return host rejects.
+    #[test]
+    fn binary_arithmetic_folds_to_the_numeric_result() {
+        // `int`/`double` extend the declared `num` — the member walk
+        // resolves `num.+` on their receivers exactly as it does on the
+        // SDK face, and the numeric refinement's `num?` gate applies to
+        // the subtypes identically.
+        let report = report(
+            "class num { num operator +(num o) => this; } \
+             class int extends num {} \
+             class double extends num {} \
+             class String {} \
+             int sum(int a, String b) { return a + b; } \
+             int clean(int a, int b) { return a + b; } \
+             double widen(int a, double b) => a + b;",
+        );
+        assert_eq!(
+            code_names(&report),
+            [
+                "return_of_invalid_type",
+                "argument_type_not_assignable",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The argument type 'String' can't be assigned to the parameter type 'num'. "
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A value of type 'num' can't be returned from the function 'sum' because it has a return type of 'int'."
+        );
+    }
+
+    /// The user-operator arm of the same fold: an indexed container's
+    /// declared signature checks the right operand and yields the
+    /// declared return (`Money`'s `operator <` answers `bool` — the `int`
+    /// return host rejects it).
+    #[test]
+    fn binary_user_operator_checks_against_the_declared_signature() {
+        let report = report(
+            "class int {} class bool {} class String {} \
+             class M { M operator +(M other) => this; \
+             bool operator <(M other) => true; } \
+             int f(M m, String s) { return m < s; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            [
+                "return_of_invalid_type",
+                "argument_type_not_assignable",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The argument type 'String' can't be assigned to the parameter type 'M'. "
+        );
+    }
+
+    /// `const x = Missing()` — an unresolved callee inside a const
+    /// initializer is known-invalid at the initializer (the oracle pairs
+    /// `const_initialized_with_non_constant_value` with the callee's own
+    /// resolution row, anchored at the whole call).
+    #[test]
+    fn const_initializer_unresolved_call_reports_both_faces() {
+        let report = report("const config = Config();");
+        assert_eq!(
+            code_names(&report),
+            [
+                "undefined_function",
+                "const_initialized_with_non_constant_value",
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "Const variables must be initialized with a constant value."
+        );
+        // The row anchors at the `Config()` call span (the call's own
+        // range — `config = ` precedes it).
+        assert_eq!(
+            report.diagnostics[1].range.offset,
+            u32::try_from("const config = ".len()).unwrap()
+        );
+        assert_eq!(
+            report.diagnostics[1].range.length,
+            u32::try_from("Config()".len()).unwrap()
+        );
+    }
+
+    /// The flat positional destructure bind (`final (a, b) = pair()` — the
+    /// generated corpus's `sumN` shape): the bound locals read the matched
+    /// record's positional slots, so `a + b` checks `int + String` and the
+    /// refined `num` result faults the `int` return. Named fields, nested
+    /// records, and a var-count mismatch keep the under-report.
+    ///
+    /// Hand-trace: `pair()`'s row is `Ty::Record (int, String)`; the
+    /// statement close distributes slots 0/1 onto `a`/`b`, so `a + b` is
+    /// `num.+`'s `(num) -> num` signature checking `String` and folding
+    /// `num`.
+    #[test]
+    fn record_pattern_binds_the_scrutinee_positional_slots() {
+        let rep = report(
+            "class num { num operator +(num o) => this; } \
+             class int extends num {} \
+             class String {} \
+             (int, String) pair() => (1, 'x'); \
+             int sum() { final (a, b) = pair(); return a + b; } \
+             (int, int) size() => (3, 4); \
+             int clean() { final (a, b) = size(); return a + b; }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            [
+                "return_of_invalid_type",
+                "argument_type_not_assignable",
+            ],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[1].message,
+            "The argument type 'String' can't be assigned to the parameter type 'num'. "
+        );
+        // A named field keeps the window non-flat — the bind suppresses
+        // and `a`'s unknown type never reaches the return check.
+        let named = report(
+            "({int a, String b}) pair() => (a: 1, b: 'x'); \
+             int sum() { final (:a, :b) = pair(); return a + b; }",
+        );
+        assert!(
+            named
+                .diagnostics
+                .iter()
+                .all(|d| d.code.name != "argument_type_not_assignable"
+                    && d.code.name != "return_of_invalid_type"),
+            "{:?}",
+            code_names(&named)
+        );
+    }
+
+    /// The record-field selector face the destructure feeds (`rect.width`
+    /// on a `({int width, int height})`-typed local): the member row reads
+    /// the field's declared slot type, so the full `sum10` chain
+    /// `a + b + rect.width * rect.height` folds to `num` and both oracle
+    /// rows land.
+    #[test]
+    fn record_field_access_types_the_member_row() {
+        let rep = report(
+            "class num { num operator +(num o) => this; num operator *(num o) => this; } \
+             class int extends num {} \
+             class String {} \
+             (int, String) pair() => (1, 'x'); \
+             ({int width, int height}) size() => (width: 3, height: 4); \
+             int sum() { \
+             final (a, b) = pair(); \
+             final rect = size(); \
+             return a + b + rect.width * rect.height; }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            [
+                "return_of_invalid_type",
+                "argument_type_not_assignable",
+            ],
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            rep.diagnostics[0].message,
+            "A value of type 'num' can't be returned from the function 'sum' because it has a return type of 'int'."
         );
     }
 
@@ -36223,8 +37264,11 @@ mod tests {
     /// rows at the creation (the oracle's const_with_non_const fixture:
     /// `const x = C()` over `class C { C(); }` emits
     /// `const_with_non_const` AND `const_initialized_with_non_constant_
-    /// value` at the same span); an unresolvable name defers (its own
-    /// undefined row reports).
+    /// value` at the same span); an unresolvable name keeps only the
+    /// `const_initialized` half beside its own undefined row (probed
+    /// 3.13.1: `const y = Gone()` emits `undefined_function` +
+    /// `const_initialized_with_non_constant_value` — the non-const-
+    /// constructor row needs a resolved constructor).
     #[test]
     fn non_const_and_unknown_creation_targets_defer() {
         let rep = report("class C { C(); } const x = C();");
@@ -36239,10 +37283,12 @@ mod tests {
         );
 
         let rep = report("const y = Gone();");
-        assert!(
-            code_names(&rep)
-                .iter()
-                .all(|c| !c.starts_with("const_") && !c.starts_with("non_constant_")),
+        assert_eq!(
+            code_names(&rep),
+            [
+                "undefined_function",
+                "const_initialized_with_non_constant_value",
+            ],
             "{:?}",
             code_names(&rep)
         );
@@ -36352,14 +37398,21 @@ mod tests {
             code_names(&rep)
         );
         // Operand-type asserts, left operand first
-        // (evaluation_test.dart:1895 anchors the bool case).
+        // (evaluation_test.dart:1895 anchors the bool case). The binary
+        // fold's argument face joins the const-eval faults — probed
+        // 3.13.1: `const c = 1 + 'a'` emits `const_eval_type_num` AND
+        // `argument_type_not_assignable` (String vs num); `1 & true` and
+        // `'a' + 1` pair their fault rows the same way.
         let rep = report("const c = !1; const d = 1 + 'a'; const e = 1 & true; const f = 'a' + 1;");
         assert_eq!(
             code_names(&rep),
             [
                 "const_eval_type_bool",
+                "argument_type_not_assignable",
                 "const_eval_type_num",
+                "argument_type_not_assignable",
                 "const_eval_type_bool_int",
+                "argument_type_not_assignable",
                 "const_eval_throws_exception",
             ],
             "{:?}",
@@ -46692,6 +47745,92 @@ mod ticket_1351_tests {
             0,
             "{:?}",
             code_names(&ok)
+        );
+    }
+
+    /// #2152: an alias chain through a named-type RHS resolves to its
+    /// terminal function shape — `typedef B = A<int, String>` over
+    /// `A<S, T> = T Function(S)` makes a `B`-typed local invocable
+    /// (`IntToStringN f; f(3)` in the torture `g006/g018/g030` files
+    /// reported `invocation_of_non_function_expression` while the alias
+    /// capture left `B`'s `Named` RHS unexpanded).
+    #[test]
+    fn named_alias_chain_to_fn_rhs_is_invocable() {
+        let report = unit_report(
+            "typedef Mapper6<S, T> = T Function(S);\n\
+             typedef IntToString6 = Mapper6<int, String>;\n\
+             String conv6(int n) => 'n$n';\n\
+             String use6() {\n  final IntToString6 f = conv6;\n  return '${f(3)}';\n}",
+        );
+        assert_eq!(
+            count_code(&report, "invocation_of_non_function_expression"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// #2152: a bare `Named`-typed callee whose class declares a `call`
+    /// method is invocable — `Adder` carries `int call(int, int)`, so
+    /// `sum(1, 2)` over `const Adder(10)` stays silent (the torture
+    /// `m011/m023/m035` files reported `invocation_of_non_function_expression`
+    /// without the member resolve).
+    #[test]
+    fn call_member_typed_callee_is_invocable() {
+        let report = unit_report(
+            "class int {}\n\
+             class Adder {\n  const Adder([this.base = 0]);\n  final int base;\n  int call(int a, int b) => base + a + b;\n}\n\
+             int use() {\n  const sum = Adder(10);\n  return sum(1, 2);\n}",
+        );
+        assert_eq!(
+            count_code(&report, "invocation_of_non_function_expression"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// #2152: a parameterized function-type alias used as a local's
+    /// annotation is callable at the declared arity —
+    /// `Modern3<int> dbl; dbl(3)` stays silent and `Modern3<int>` itself
+    /// reports no `wrong_number_of_type_arguments` (the torture `m003`
+    /// family — a stale header latch once hid the typedef's own `<T>` from
+    /// its declared arity).
+    #[test]
+    fn parameterized_fn_alias_is_invocable() {
+        let report = unit_report(
+            "typedef Modern3<T> = T Function(T);\n\
+             int use() {\n  Modern3<int> dbl = (n) => n * 2;\n  return dbl(3);\n}",
+        );
+        assert_eq!(
+            count_code(&report, "invocation_of_non_function_expression"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            count_code(&report, "wrong_number_of_type_arguments"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// #2152: an extension type's representation variable is initialized by
+    /// its primary constructor — a redirecting generative constructor
+    /// (`S.fwd() : this(0)`) leaves `final_not_initialized` silent (the
+    /// torture `e006..e038` files reported the field face while every
+    /// generative ctor redirected).
+    #[test]
+    fn extension_type_rep_var_redirecting_ctor_stays_silent() {
+        let report = unit_report(
+            "extension type Seconds6(int v) {\n  Seconds6.fromMinutes(int m) : this(m * 60);\n}",
+        );
+        assert_eq!(
+            count_code(&report, "final_not_initialized"),
+            0,
+            "{:?}",
+            code_names(&report)
         );
     }
 }

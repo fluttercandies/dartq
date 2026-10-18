@@ -757,6 +757,10 @@ impl ParserListener for SharedFlow<'_> {
         self.0.borrow_mut().handle_map_pattern(count, left, right);
     }
 
+    fn begin_map_pattern_key(&mut self) {
+        self.0.borrow_mut().begin_map_pattern_key();
+    }
+
     fn handle_map_pattern_entry(&mut self, colon: Token, end: Token) {
         self.0.borrow_mut().handle_map_pattern_entry(colon, end);
     }

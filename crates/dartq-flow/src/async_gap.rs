@@ -893,6 +893,8 @@ impl GapPass {
             | Ev::PatternBegin
             | Ev::PatternEnd
             | Ev::ObjectPattern { .. }
+            | Ev::ShapePattern
+            | Ev::NullCheckPattern
             | Ev::ConstantPatternBegin
             | Ev::ConstantPatternEnd
             | Ev::GuardBegin

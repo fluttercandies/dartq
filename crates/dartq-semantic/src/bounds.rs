@@ -982,6 +982,59 @@ impl<'a> Bounds<'a> {
         )
     }
 
+    /// The captured right-hand function shape of the file's own alias
+    /// `name` (`typedef P<T> = bool Function(T)`): the type-parameter
+    /// triples in declaration order and the RHS's written pieces. `None`
+    /// when `name` has no capture or its RHS is a named-type alias — the
+    /// use-site faces that read a callable answer (`Predicate<T> p` invoked
+    /// as `p(x)`) treat `None` as uncallable-shaped.
+    /// This-file declarations only — a cross-file alias's capture lives in
+    /// that unit's own parse; callers fall back silent.
+    pub(crate) fn alias_fn_shape(
+        &self,
+        name: StringId,
+    ) -> Option<(
+        &[(StringId, Option<TypeTree>, bool)],
+        Option<&TypeTree>,
+        &[TypeTree],
+        &[(StringId, TypeTree, bool)],
+        Option<usize>,
+    )> {
+        let capture = self.index.aliases.get(&name)?;
+        match &*capture.rhs {
+            AliasRhs::Fn {
+                ret,
+                positional,
+                named,
+                required_positional,
+            } => Some((
+                &capture.params,
+                ret.as_ref(),
+                positional,
+                named,
+                *required_positional,
+            )),
+            AliasRhs::Named(_) => None,
+        }
+    }
+
+    /// The captured right-hand named type of the file's own alias `name`
+    /// (`typedef B = A<int, String>`): the type-parameter triples in
+    /// declaration order and the named RHS tree. `None` when `name` has no
+    /// capture or its RHS is a function type — the use-site callers read
+    /// this to chase a co-alias's function shape (`B`'s invocable face is
+    /// `A`'s RHS with `B`'s arguments substituted).
+    pub(crate) fn alias_named_shape(
+        &self,
+        name: StringId,
+    ) -> Option<(&[(StringId, Option<TypeTree>, bool)], &TypeTree)> {
+        let capture = self.index.aliases.get(&name)?;
+        match &*capture.rhs {
+            AliasRhs::Named(tree) => Some((&capture.params, tree)),
+            AliasRhs::Fn { .. } => None,
+        }
+    }
+
     /// The `strict_raw_type` display face (`_checkForRawTypeName`,
     /// type_arguments_verifier.dart:303-336): the written head with its
     /// instantiated-to-bounds arguments (`Box<dynamic>`), which the

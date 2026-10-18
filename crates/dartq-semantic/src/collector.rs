@@ -2315,6 +2315,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             type_params: 0,
             saw_type_params: false,
         });
+        // The typedef opens a fresh declaration header: a preceding
+        // declaration's (or a previous typedef RHS's) closed formal list
+        // left this latched, which would route the typedef's own `<T>`
+        // count to `header_type_params` instead of the pending typedef —
+        // `typedef A = …; typedef B<T> = …;` then reported `B` declaring 0
+        // type parameters at every `B<x>` use.
+        builder.executable_header_done = false;
     }
 
     /// A factory declaration is a constructor declaration for the
@@ -2523,6 +2530,31 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         if builder.formal_depth == 0 {
             builder.positional_formals.clear();
             builder.named_formals.clear();
+            // An operator declaration's name token is the operator spelling
+            // itself, not an identifier — no `MethodDeclaration` context
+            // ever fires for it, so the armed return type (`bool` in
+            // `bool operator <(M o)`) goes unclaimed and the entry's
+            // `return_ty` would stay `Unknown` (the member face the binary
+            // fold's result arm reads). The return type parsed before the
+            // name, so it sits armed here; latch it while the spelling is
+            // an operator's — every other member claims it at the
+            // identifier context unchanged.
+            let operator_spelling = builder
+                .pending_member
+                .as_ref()
+                .filter(|p| p.return_ty == Ty::UNKNOWN)
+                .and_then(|p| p.shape)
+                .filter(|(_, kind, _)| *kind == MemberKind::Method)
+                .map(|(spelling, _, _)| spelling)
+                .filter(|spelling| {
+                    let text = builder.strings.resolve(*spelling);
+                    OPERATORS_WITH_ONE_PARAMETER.contains(&text)
+                        || matches!(text, "[]" | "[]=" | "~" | "-")
+                });
+            if operator_spelling.is_some() {
+                builder.pending_member.as_mut().expect("just read").return_ty =
+                    builder.take_armed();
+            }
             // The executable's type parameters must all precede its formals.
             builder.executable_header_done = true;
         }

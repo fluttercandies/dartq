@@ -471,6 +471,21 @@ pub enum Ev {
     },
     ConstantPatternBegin,
     ConstantPatternEnd,
+    /// A pattern shape whose match can fail without pinning a named type:
+    /// record, list, map, and relational patterns. At the top level of a
+    /// refutable context the failure arm joins the pattern context's
+    /// `unmatched` chain (official `_unmatched` accumulation — without it
+    /// the else arm reads unreachable and code after an `if (v case (a, b))`
+    /// folds dead). Sub-patterns constrain their own field, not the
+    /// scrutinee — the depth gate in the handler keeps them out.
+    ShapePattern,
+    /// A null-check pattern (`sub?`): the matched arm promotes the matched
+    /// value non-null; the failure arm (the null path) joins `unmatched`.
+    NullCheckPattern,
+    /// A declared-variable or wildcard pattern carrying a written type
+    /// (`case int n`, `case num _`): a type test on the matched value — the
+    /// matched arm promotes, the failure arm joins `unmatched`. An untyped
+    /// `var x`/`_` always matches and never fires here.
     DeclaredVarPattern {
         name: u32,
         is_final: bool,

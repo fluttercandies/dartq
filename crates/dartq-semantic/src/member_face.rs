@@ -455,6 +455,20 @@ pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 10] = [
 /// the one supertype edge (`int`/`double` fit it).
 pub(crate) const FINAL_PRIMITIVES: [&str; 5] = ["int", "double", "num", "bool", "String"];
 
+/// The dart:core interface member faces the element index never carries:
+/// `dart:core` declarations resolve through the namespace but land on
+/// unindexed (external) units, so the `@override` walk's
+/// [`crate::diagnose::Engine::face_member`] answers `None` for them and a
+/// legal `class C implements Comparable<C> { @override compareTo }`
+/// over-reports `override_on_non_overriding_member`. The listed members
+/// are the reference SDK's declared instance members
+/// (`sdk/lib/core/comparable.dart`, `sdk/lib/core/pattern.dart`) — the
+/// name-level set the oracle's `getOverridden` would find.
+pub(crate) const CORE_INTERFACE_MEMBERS: [(&str, &[&str]); 2] = [
+    ("Comparable", &["compareTo"]),
+    ("Pattern", &["allMatches", "matchAsPrefix"]),
+];
+
 /// The member-face state: one engine owns one face; the caches and latches
 /// were engine fields before the extraction (behavior byte-identical).
 pub(crate) struct MemberFace {

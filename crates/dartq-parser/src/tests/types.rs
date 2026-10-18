@@ -401,3 +401,28 @@ fn shared_compound_closer_keeps_gft_and_nested_type() {
     let info = compute_shape("List<List<int>> x", false);
     assert!(matches!(info, TypeInfo::Complex(_)));
 }
+
+#[test]
+fn bound_ending_on_shared_closer_closes_variable_group() {
+    // `T extends Comparable<T>>`: the variable's bound ends on the
+    // compound `>>` — the shared closer also closes this `<...>` group
+    // (official `isCloser` breaks the forward variable scan on the bound's
+    // last token, type_info_impl.dart:1539). Without the break the scanner
+    // consumed the `>>` remainder as a new variable head and the group
+    // never closed — the torture `g007/g019/g031` faces
+    // (`expected_token`/`expected_body`/`expected_type_name`).
+    for source in [
+        "extension Best7<T extends Comparable<T>> on List<T> {}",
+        "class C<T extends Comparable<T>> {}",
+        "typedef F<T extends Comparable<T>> = T Function(T);",
+        "void g<T extends Comparable<T>>() {}",
+    ] {
+        let mut p = setup(source);
+        p.parse_unit();
+        assert!(
+            p.listener.errors.is_empty(),
+            "{source:?}: {:?}",
+            p.listener.errors
+        );
+    }
+}

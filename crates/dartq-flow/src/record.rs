@@ -2181,6 +2181,28 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::ObjectPattern { name, args });
     }
 
+    /// A record pattern's close: the shape test can fail — the refutable
+    /// context's unmatched chain needs the failure arm.
+    fn handle_record_pattern(&mut self, _left_paren: Token, _count: usize) {
+        self.record(Ev::ShapePattern);
+    }
+
+    fn handle_list_pattern(&mut self, _count: usize, _left: Token, _right: Token) {
+        self.record(Ev::ShapePattern);
+    }
+
+    fn handle_map_pattern(&mut self, _count: usize, _left: Token, _right: Token) {
+        self.record(Ev::ShapePattern);
+    }
+
+    fn handle_relational_pattern(&mut self, _operator: Token) {
+        self.record(Ev::ShapePattern);
+    }
+
+    fn handle_null_check_pattern(&mut self, _question: Token) {
+        self.record(Ev::NullCheckPattern);
+    }
+
     // —— deliberately unrecorded faces ———————————————————————————————————
 
     fn handle_recoverable_error(&mut self, _message: Message, _start: Token, _end: Token) {}

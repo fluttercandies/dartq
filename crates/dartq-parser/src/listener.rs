@@ -667,6 +667,12 @@ pub trait ParserListener {
     fn end_binary_pattern(&mut self, operator: Token) {}
     fn handle_list_pattern(&mut self, count: usize, left: Token, right: Token) {}
     fn handle_map_pattern(&mut self, count: usize, left: Token, right: Token) {}
+    /// A `key: value` map-pattern entry's key expression is about to be
+    /// parsed (`parseMapPatternSuffix`'s entry arm, parser_impl.dart:12087).
+    /// The constant-evaluation face brackets the key in a capture window so
+    /// a non-constant key reports `non_constant_map_pattern_key`
+    /// (constant_verifier.dart:342-358 `_evaluateAndReportError`).
+    fn begin_map_pattern_key(&mut self) {}
     fn handle_map_pattern_entry(&mut self, colon: Token, end: Token) {}
     fn handle_rest_pattern(&mut self, dots: Token, has_sub_pattern: bool) {}
     fn handle_record_pattern(&mut self, left_paren: Token, count: usize) {}

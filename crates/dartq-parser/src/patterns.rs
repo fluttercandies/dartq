@@ -626,6 +626,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             } else {
                 // entry: expression `:` pattern
                 let key_before = self.cursor.progress();
+                self.listener.begin_map_pattern_key();
                 self.parse_constant_expression(ConstantPatternContext::None);
                 // #2024 separator anchor: when the key IS the unrelocated
                 // blocker (the `,` recovery re-parses it as the next key),

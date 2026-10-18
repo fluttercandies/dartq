@@ -1113,6 +1113,14 @@ impl ComplexTypeParamOrArg {
             parser.listener.begin_type_variable(name);
             starts.push(name);
 
+            // Official `isCloser(token)` (type_info_impl.dart:1539): the
+            // break tests the BOUND's last token, not the follower — a
+            // bound ending on a `>`-family token (e.g. `T extends C<D>>`
+            // where the shared `>>` also closes this group) ends the
+            // variable list; the completion pass re-parses the bound and
+            // the tail's `consume_closer` takes the split remainder as the
+            // group's own closer.
+            let mut bound_ends_on_closer = false;
             if parser.peek_kind() == TokenKind::Keyword(Keyword::Extends) {
                 let extends_span = parser.peek_span();
                 parser.cursor.advance();
@@ -1123,6 +1131,7 @@ impl ComplexTypeParamOrArg {
                 // `skipType` = the token before the type, i.e. no move.
                 if !matches!(info, TypeInfo::NoType) {
                     let last = info.skip_type(parser);
+                    bound_ends_on_closer = is_closer(parser.kind_at(parser.offset_of(last)));
                     parser.skip_to_token(last);
                     parser.cursor.advance();
                 }
@@ -1136,6 +1145,7 @@ impl ComplexTypeParamOrArg {
                 TokenKind::Comma => {
                     parser.cursor.advance();
                 }
+                _ if bound_ends_on_closer => break,
                 k if is_closer(k) => break,
                 _ => {
                     // Recovery: keep going over parameter-like shapes with a

@@ -131,6 +131,13 @@ pub enum SemanticCode {
     /// `Undefined name 'await' in function body not marked with 'async'.`
     /// (no arguments — `CompileTimeErrorWithoutArguments`)
     UndefinedIdentifierAwait,
+    /// `The await expression can only be used in an async function.` — an
+    /// `await e` inside a sync (non-generator, non-async) body
+    /// (`awaitInWrongContext`, diagnostic.g.dart:1475-1484; the fasta
+    /// `AwaitInSync` recoverable error converted at
+    /// error_converter.dart — the event arrives as
+    /// `end_invalid_await_expression`).
+    AwaitInWrongContext,
     /// `The method '{0}' isn't defined for the type '{1}'.`
     UndefinedMethod,
     /// `The named parameter '{0}' isn't defined.`
@@ -281,6 +288,12 @@ pub enum SemanticCode {
     /// :12650-12658; `CaseExpression`'s constant requirement,
     /// constant_verifier.dart's switch-case visit).
     NonConstantCaseExpression,
+    /// `Key expressions in map patterns must be constants.` — a
+    /// `MapPatternEntry`'s key expression that fails const-evaluation
+    /// (`nonConstantMapPatternKey`, diagnostic.g.dart:12776-12783;
+    /// `visitMapPattern`'s per-entry `_evaluateAndReportError`,
+    /// constant_verifier.dart:342-358).
+    NonConstantMapPatternKey,
     /// `In constant expressions, operands of this operator must be of type
     /// 'bool'.`
     ConstEvalTypeBool,
@@ -424,6 +437,13 @@ pub enum SemanticCode {
     /// (`error_verifier.dart:5343-5354`; the M1 name-level approximation of
     /// `hasRepresentationSelfReference` — direct self references only).
     ExtensionTypeRepresentationDependsOnItself,
+    /// `'{0}' is not a supertype of '{1}', the representation type.` — an
+    /// extension type's `implements` face that the representation type is
+    /// not a subtype of (`extensionTypeImplementsNotSupertype`,
+    /// diagnostic.g.dart:5931-5939; `_verifyExtensionElementImplements`'s
+    /// `isSubtypeOf(declaredRepresentation, type)` gate,
+    /// scope_analyzer.dart:1309-1360).
+    ExtensionTypeImplementsNotSupertype,
     // —— #498: the abstract-completeness family (all `COMPILE_TIME_ERROR`) ——
     /// `Missing concrete implementation of '{0}'.` — a concrete class or
     /// enum lacks an implementation of one inherited abstract member
@@ -1241,6 +1261,9 @@ impl SemanticCode {
             Self::UndefinedIdentifierAwait => {
                 ("undefined_identifier_await", "UNDEFINED_IDENTIFIER_AWAIT")
             }
+            Self::AwaitInWrongContext => {
+                ("await_in_wrong_context", "AWAIT_IN_WRONG_CONTEXT")
+            }
             Self::UndefinedMethod => ("undefined_method", "UNDEFINED_METHOD"),
             Self::UndefinedNamedParameter => {
                 ("undefined_named_parameter", "UNDEFINED_NAMED_PARAMETER")
@@ -1347,6 +1370,10 @@ impl SemanticCode {
                 "constant_pattern_with_non_constant_expression",
                 "CONSTANT_PATTERN_WITH_NON_CONSTANT_EXPRESSION",
             ),
+            Self::NonConstantMapPatternKey => (
+                "non_constant_map_pattern_key",
+                "NON_CONSTANT_MAP_PATTERN_KEY",
+            ),
             Self::ConstEvalTypeBool => ("const_eval_type_bool", "CONST_EVAL_TYPE_BOOL"),
             Self::ConstEvalTypeBoolInt => ("const_eval_type_bool_int", "CONST_EVAL_TYPE_BOOL_INT"),
             Self::ConstEvalTypeBoolNumString => (
@@ -1429,6 +1456,10 @@ impl SemanticCode {
             Self::ExtensionTypeRepresentationDependsOnItself => (
                 "extension_type_representation_depends_on_itself",
                 "EXTENSION_TYPE_REPRESENTATION_DEPENDS_ON_ITSELF",
+            ),
+            Self::ExtensionTypeImplementsNotSupertype => (
+                "extension_type_implements_not_supertype",
+                "EXTENSION_TYPE_IMPLEMENTS_NOT_SUPERTYPE",
             ),
             // One registry code across the five tiers (the `sharedName`
             // split); the tier lives in the message shape.
@@ -2075,6 +2106,9 @@ impl SemanticCode {
             Self::UndefinedIdentifierAwait => {
                 "Undefined name 'await' in function body not marked with 'async'.".to_string()
             }
+            Self::AwaitInWrongContext => {
+                "The await expression can only be used in an async function.".to_string()
+            }
             Self::UndefinedMethod => {
                 format!("The method '{a0}' isn't defined for the type '{a1}'.")
             }
@@ -2137,6 +2171,9 @@ impl SemanticCode {
             }
             Self::NonConstantCaseExpression => {
                 "Case expressions must be constant.".to_string()
+            }
+            Self::NonConstantMapPatternKey => {
+                "Key expressions in map patterns must be constants.".to_string()
             }
             Self::ConstEvalTypeBool => {
                 "In constant expressions, operands of this operator must be of type 'bool'."
@@ -2211,6 +2248,9 @@ impl SemanticCode {
             // The no-argument representation rows route through `message3`.
             Self::ExtensionTypeDeclaresMemberOfObject
             | Self::ExtensionTypeRepresentationDependsOnItself => self.message3("", "", ""),
+            Self::ExtensionTypeImplementsNotSupertype => {
+                format!("'{a0}' is not a supertype of '{a1}', the representation type.")
+            }
             // The #498 abstract-completeness tiers route to their slot
             // counts; the two- and three-member tiers and the getter/method
             // row fill their slots through `message3`.
@@ -3060,6 +3100,16 @@ impl SemanticCode {
             Self::EnumWithoutConstants => {
                 Some("Try declaring an enum constant.".to_string())
             }
+            // The `non_constant_map_pattern_key` correction
+            // (diagnostic.g.dart / messages.yaml `nonConstantMapPatternKey`).
+            Self::NonConstantMapPatternKey => {
+                Some("Try using constants instead.".to_string())
+            }
+            // The `await_in_wrong_context` correction (diagnostic.g.dart
+            // :1478-1480).
+            Self::AwaitInWrongContext => Some(
+                "Try marking the function body with either 'async' or 'async*'.".to_string(),
+            ),
             // The `constant_pattern_with_non_constant_expression`
             // correction (diagnostic.g.dart :2533).
             Self::ConstantPatternWithNonConstantExpression => {
@@ -3191,6 +3241,7 @@ mod tests {
             SemanticCode::UndefinedGetter,
             SemanticCode::UndefinedIdentifier,
             SemanticCode::UndefinedIdentifierAwait,
+            SemanticCode::AwaitInWrongContext,
             SemanticCode::UndefinedMethod,
             SemanticCode::UndefinedNamedParameter,
             SemanticCode::UndefinedOperator,
@@ -3234,6 +3285,7 @@ mod tests {
             SemanticCode::NonConstantRecordField,
             SemanticCode::ConstantPatternWithNonConstantExpression,
             SemanticCode::NonConstantCaseExpression,
+            SemanticCode::NonConstantMapPatternKey,
             SemanticCode::ConstEvalTypeBool,
             SemanticCode::ConstEvalTypeBoolInt,
             SemanticCode::ConstEvalTypeBoolNumString,
@@ -3266,6 +3318,7 @@ mod tests {
             SemanticCode::ExtensionTypeDeclaresMemberOfObject,
             SemanticCode::ExpectedRepresentationType,
             SemanticCode::ExtensionTypeRepresentationDependsOnItself,
+            SemanticCode::ExtensionTypeImplementsNotSupertype,
             SemanticCode::InheritsAbstractMemberOne,
             SemanticCode::InheritsAbstractMemberTwo,
             SemanticCode::InheritsAbstractMemberThree,
@@ -3996,6 +4049,7 @@ mod tests {
             | SemanticCode::ConstantPatternNeverMatchesValueType
             | SemanticCode::ConstantPatternWithNonConstantExpression
             | SemanticCode::NonConstantCaseExpression
+            | SemanticCode::NonConstantMapPatternKey
             | SemanticCode::CouldNotInfer
             | SemanticCode::CreationWithNonType
             | SemanticCode::DeadCode
@@ -4011,6 +4065,7 @@ mod tests {
             | SemanticCode::ExtensionOverrideArgumentNotAssignable
             | SemanticCode::ExtensionTypeDeclaresMemberOfObject
             | SemanticCode::ExtensionTypeRepresentationDependsOnItself
+            | SemanticCode::ExtensionTypeImplementsNotSupertype
             | SemanticCode::ExtraPositionalArguments
             | SemanticCode::ExtraPositionalArgumentsCouldBeNamed
             | SemanticCode::ExtendsNonClass
@@ -4093,6 +4148,7 @@ mod tests {
             | SemanticCode::UndefinedGetter
             | SemanticCode::UndefinedIdentifier
             | SemanticCode::UndefinedIdentifierAwait
+            | SemanticCode::AwaitInWrongContext
             | SemanticCode::UndefinedMethod
             | SemanticCode::UndefinedNamedParameter
             | SemanticCode::UndefinedOperator
@@ -4196,6 +4252,7 @@ mod tests {
             SemanticCode::ConstantPatternNeverMatchesValueType,
             SemanticCode::ConstantPatternWithNonConstantExpression,
             SemanticCode::NonConstantCaseExpression,
+            SemanticCode::NonConstantMapPatternKey,
             SemanticCode::CreationWithNonType,
             SemanticCode::DeadCode,
             SemanticCode::DeadCodeCatchFollowingCatch,
@@ -4210,6 +4267,7 @@ mod tests {
             SemanticCode::ExtensionOverrideArgumentNotAssignable,
             SemanticCode::ExtensionTypeDeclaresMemberOfObject,
             SemanticCode::ExtensionTypeRepresentationDependsOnItself,
+            SemanticCode::ExtensionTypeImplementsNotSupertype,
             SemanticCode::ExtraPositionalArguments,
             SemanticCode::ExtraPositionalArgumentsCouldBeNamed,
             SemanticCode::ExtendsNonClass,
@@ -4290,6 +4348,7 @@ mod tests {
             SemanticCode::UndefinedGetter,
             SemanticCode::UndefinedIdentifier,
             SemanticCode::UndefinedIdentifierAwait,
+            SemanticCode::AwaitInWrongContext,
             SemanticCode::UndefinedMethod,
             SemanticCode::UndefinedNamedParameter,
             SemanticCode::UndefinedOperator,

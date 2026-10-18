@@ -1330,6 +1330,12 @@ pub enum WindowKind {
     /// (`constant_verifier.dart`'s `visitConstantPattern` →
     /// `_evaluateAndReportError`, :128-142).
     ConstantPattern,
+    /// A map-pattern entry's key expression (the `key` of a `key: value`
+    /// `MapPatternEntry`): the root verdict reports
+    /// `non_constant_map_pattern_key` (`visitMapPattern`'s per-entry
+    /// `_evaluateAndReportError`, constant_verifier.dart:342-358). Opens per
+    /// key, never nested — a key is a leaf constant context.
+    MapPatternKey,
 }
 
 struct Window {
@@ -1619,6 +1625,36 @@ impl ConstCapture {
         // The closed window's node does not join a parent window's
         // operands — a pattern expression is a leaf context, nothing below
         // reads it.
+        root
+    }
+
+    /// Opens a map-pattern-key window (the `key` of a `key: value`
+    /// `MapPatternEntry`). A key is a leaf constant context — the window
+    /// nests by construction (no key contains a sub-key).
+    pub fn open_map_pattern_key(&mut self) {
+        self.open_window(WindowKind::MapPatternKey);
+    }
+
+    /// Whether a map-pattern-key window is innermost.
+    #[must_use]
+    pub fn top_is_map_pattern_key(&self) -> bool {
+        self.windows
+            .last()
+            .is_some_and(|w| w.kind == WindowKind::MapPatternKey)
+    }
+
+    /// Closes a map-pattern-key window, returning its root node for the
+    /// caller to evaluate. `None` without such a window on top.
+    pub fn close_map_pattern_key(&mut self) -> Option<Node> {
+        if !self.top_is_map_pattern_key() {
+            return None;
+        }
+        self.apply_unaries();
+        let base = self.base();
+        let root = self.take_root();
+        self.stack.truncate(base);
+        self.drop_latches_above(base);
+        self.windows.pop();
         root
     }
 

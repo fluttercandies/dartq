@@ -20,6 +20,8 @@ impl Interp<'_> {
                 Ev::PatternBegin
                     | Ev::PatternEnd
                     | Ev::ObjectPattern { .. }
+                    | Ev::ShapePattern
+                    | Ev::NullCheckPattern
                     | Ev::GuardBegin
                     | Ev::GuardEnd
             )
@@ -180,6 +182,58 @@ impl Interp<'_> {
                     }
                 }
             }
+            Ev::ShapePattern => {
+                // A top-level record/list/map/relational pattern can fail
+                // (the shape or comparison decides): the failure arm joins
+                // the pattern context's `unmatched` chain. Without the join
+                // the chain stays at its initial unreachable state and the
+                // code after `if (v case (a, b))` folds dead — the official
+                // `_unmatched` accumulates every refutable shape's failure
+                // arm (flow_analysis.dart's pattern dispatch). Nested
+                // instances constrain their own field, not the scrutinee —
+                // the depth gate keeps them out (their failure folds into
+                // the enclosing pattern's own may-fail join).
+                if self.pattern_depth == 1
+                    && let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone())
+                {
+                    let cur = self.current.clone();
+                    let joined = self.join(Some(chain), Some(cur));
+                    if let Some(pattern) = self.pattern.as_mut() {
+                        pattern.unmatched = joined;
+                    }
+                }
+            }
+            Ev::NullCheckPattern => {
+                // `sub?` at the top level: the matched arm promotes the
+                // matched value non-null (official `_handleNullCheckPattern`),
+                // the failure arm — the null path — joins `unmatched`.
+                if self.pattern_depth != 1 {
+                    return;
+                }
+                if let Some(var) = self.pattern_scrutinee() {
+                    let model = self.current.model(var);
+                    let (matched, matched_args) = (
+                        self.promoted_type_of(var, &model),
+                        self.promoted_args_of(var, &model),
+                    );
+                    let (non_null, non_null_args) =
+                        self.promote_to_non_null(matched, matched_args);
+                    self.current = self.current.clone().finish_type_test(
+                        self.ops,
+                        &mut self.lists,
+                        var,
+                        None,
+                        Some((non_null, non_null_args)),
+                    );
+                }
+                if let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) {
+                    let cur = self.current.clone();
+                    let joined = self.join(Some(chain), Some(cur));
+                    if let Some(pattern) = self.pattern.as_mut() {
+                        pattern.unmatched = joined;
+                    }
+                }
+            }
             Ev::DeclaredVarPattern {
                 name,
                 is_final,
@@ -194,9 +248,11 @@ impl Interp<'_> {
                 // variable's declared type (official `declare` carries it):
                 // the unmatched-branch factoring reads it, and a resolved
                 // back-end's promotion gate keys on it.
+                let declared = self.pending_ty.take().unwrap_or(Ty::UNKNOWN);
+                let declared_args = std::mem::take(&mut self.pending_ty_args);
                 let meta = VarMeta {
-                    ty: self.pending_ty.take().unwrap_or(Ty::UNKNOWN),
-                    args: std::mem::take(&mut self.pending_ty_args),
+                    ty: declared,
+                    args: declared_args,
                     late: false,
                     is_final: *is_final,
                     decl_span: Some(token.range),
@@ -204,6 +260,34 @@ impl Interp<'_> {
                 self.declare_var(*name, meta, true);
                 if let Some(pattern) = self.pattern.as_mut() {
                     pattern.pending_decls.push((*name, *is_final));
+                }
+                // A typed declared-variable pattern at the top level IS the
+                // pattern's type test (`case int n` — official
+                // `promoteForPattern` over `analyzeDeclaredVariablePattern`):
+                // the matched arm promotes the matched value, the failure
+                // arm joins `unmatched` when the test can fail. `var x`
+                // (no written type) always matches and never joins.
+                if !self.collecting()
+                    && self.pattern_depth == 1
+                    && declared != Ty::UNKNOWN
+                    && let Some(var) = self.pattern_scrutinee()
+                {
+                    let model = self.current.model(var);
+                    let matched_ty = self.promoted_type_of(var, &model);
+                    let candidate =
+                        self.pattern_promotion_candidate(var, declared, declared_args);
+                    let (matched_arm, unmatched_arm) =
+                        self.branch_type_test(var, declared, declared_args, candidate);
+                    self.current = matched_arm;
+                    if !self.ops.is_subtype(matched_ty, declared)
+                        && let Some(chain) =
+                            self.pattern.as_ref().map(|p| p.unmatched.clone())
+                    {
+                        let joined = self.join(Some(chain), Some(unmatched_arm));
+                        if let Some(pattern) = self.pattern.as_mut() {
+                            pattern.unmatched = joined;
+                        }
+                    }
                 }
             }
             Ev::AssignedVarPattern { name } => {
@@ -215,12 +299,39 @@ impl Interp<'_> {
                 }
             }
             Ev::Wildcard { .. } => {
-                // A typed wildcard (`num _`) parses its annotation but
-                // declares nothing: drop the pending type so it cannot
-                // leak into the next consumer (`Formal`,
-                // `DeclaredVarPattern`).
-                self.pending_ty = None;
-                self.pending_ty_args = crate::ty::EMPTY_ARGS;
+                // A typed wildcard (`num _`) declares nothing but still runs
+                // the pattern's type test at the top level: the matched arm
+                // promotes the matched value, the failure arm joins
+                // `unmatched` when the test can fail (official
+                // `analyzeWildcardPattern` → the same `promoteForPattern`
+                // the declared-variable face shares). An untyped `_` always
+                // matches — its annotation-less form drops `pending_ty`
+                // untouched. The test is a flow-walk act, skipped under a
+                // collect pre-pass (the rollback does not cover `pattern`).
+                let declared = self.pending_ty.take().unwrap_or(Ty::UNKNOWN);
+                let declared_args = std::mem::take(&mut self.pending_ty_args);
+                if !self.collecting()
+                    && self.pattern_depth == 1
+                    && declared != Ty::UNKNOWN
+                    && let Some(var) = self.pattern_scrutinee()
+                {
+                    let model = self.current.model(var);
+                    let matched_ty = self.promoted_type_of(var, &model);
+                    let candidate =
+                        self.pattern_promotion_candidate(var, declared, declared_args);
+                    let (matched_arm, unmatched_arm) =
+                        self.branch_type_test(var, declared, declared_args, candidate);
+                    self.current = matched_arm;
+                    if !self.ops.is_subtype(matched_ty, declared)
+                        && let Some(chain) =
+                            self.pattern.as_ref().map(|p| p.unmatched.clone())
+                    {
+                        let joined = self.join(Some(chain), Some(unmatched_arm));
+                        if let Some(pattern) = self.pattern.as_mut() {
+                            pattern.unmatched = joined;
+                        }
+                    }
+                }
             }
             Ev::GuardBegin => {
                 // Snapshot the pre-guard state: the guard's own events run
