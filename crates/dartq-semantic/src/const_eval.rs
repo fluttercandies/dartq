@@ -173,6 +173,14 @@ pub enum Verdict {
     /// construct that broke const-ness (the oracle's error entity), and
     /// the reporting site supplies its default code.
     NotConstant(SourceRange),
+    /// A reference the resolution layer cannot name (`undefined_identifier`
+    /// territory): the oracle's evaluator substitutes an unknown object, so
+    /// the argument face still reports (`const_with_non_constant_argument`)
+    /// while the enclosing declaration's own verdict stays silent
+    /// (`hasKnownValue` false — the undefined name is the reported root
+    /// cause). Consumed like [`Verdict::NotConstant`] at declaration roots
+    /// and merged into it by every combining fold.
+    Unresolved(SourceRange),
     /// A decidable `constEval*` fault at its own span — reported verbatim,
     /// overriding any site default.
     Fault(ConstFault, SourceRange),
@@ -298,6 +306,10 @@ pub enum IdentVerdict {
     /// Provably non-const: an in-scope local/formal, or a top-level
     /// variable this pass saw declared without `const`.
     NotConstant,
+    /// A name the resolution layer cannot classify (`B(x)`'s undefined
+    /// `x`): argument-face reportable, declaration-silent — see
+    /// [`Verdict::Unresolved`].
+    Unresolved,
 }
 
 /// The evaluation-depth fuse: beyond it, the value defers to
@@ -328,12 +340,13 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
             IdentVerdict::Constant => Verdict::Constant,
             IdentVerdict::InProgress => Verdict::Fault(ConstFault::Recursive, node.span),
             IdentVerdict::NotConstant => Verdict::NotConstant(node.span),
+            IdentVerdict::Unresolved => Verdict::Unresolved(node.span),
         },
         Expr::Member { recv, name } => {
             let r = fold(recv, lookup, depth);
             match r {
                 Verdict::Value(v) if v != ConstantValue::Null => lookup.member(&v, *name),
-                Verdict::Fault(..) | Verdict::NotConstant(_) => r,
+                Verdict::Fault(..) | Verdict::NotConstant(_) | Verdict::Unresolved(_) => r,
                 _ => Verdict::Constant,
             }
         }
@@ -375,7 +388,8 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
                 let e = fold(els, lookup, depth);
                 match (t, e) {
                     (Verdict::Fault(f, s), _) | (_, Verdict::Fault(f, s)) => Verdict::Fault(f, s),
-                    (Verdict::NotConstant(s), _) | (_, Verdict::NotConstant(s)) => {
+                    (Verdict::NotConstant(s) | Verdict::Unresolved(s), _)
+                    | (_, Verdict::NotConstant(s) | Verdict::Unresolved(s)) => {
                         Verdict::NotConstant(s)
                     }
                     _ => Verdict::Constant,
@@ -417,8 +431,8 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
         Expr::Map(entries) => {
             for (k, v) in entries {
                 for part in [k, v] {
-                    if let other @ (Verdict::Fault(..) | Verdict::NotConstant(_)) =
-                        fold(part, lookup, depth)
+                    if let other @ (Verdict::Fault(..) | Verdict::NotConstant(_)
+                    | Verdict::Unresolved(_)) = fold(part, lookup, depth)
                     {
                         return other;
                     }
@@ -493,7 +507,9 @@ fn primarily_identical(a: &ConstantValue, b: &ConstantValue) -> bool {
 /// `constant_verifier.dart` `_evaluateAndReportError`).
 fn eval_each(parts: &[Node], lookup: &dyn ConstLookup, kind: InstanceKind, depth: u32) -> Verdict {
     for part in parts {
-        if let other @ (Verdict::Fault(..) | Verdict::NotConstant(_)) = fold(part, lookup, depth) {
+        if let other @ (Verdict::Fault(..) | Verdict::NotConstant(_) | Verdict::Unresolved(_)) =
+            fold(part, lookup, depth)
+        {
             return other;
         }
     }
@@ -523,7 +539,9 @@ fn eval_binary(
                                 Verdict::Value(ConstantValue::Bool(rb))
                             }
                             Verdict::Fault(f, s) => Verdict::Fault(f, s),
-                            Verdict::NotConstant(s) => Verdict::NotConstant(s),
+                            Verdict::NotConstant(s) | Verdict::Unresolved(s) => {
+                                Verdict::NotConstant(s)
+                            }
                             _ => Verdict::Constant,
                         }
                     }
@@ -545,9 +563,8 @@ fn eval_binary(
             match (l, r) {
                 (Verdict::Value(a), Verdict::Value(b)) => binary_values(op, span, &a, &b),
                 (Verdict::Fault(f, s), _) | (_, Verdict::Fault(f, s)) => Verdict::Fault(f, s),
-                (Verdict::NotConstant(s), _) | (_, Verdict::NotConstant(s)) => {
-                    Verdict::NotConstant(s)
-                }
+                (Verdict::NotConstant(s) | Verdict::Unresolved(s), _)
+                | (_, Verdict::NotConstant(s) | Verdict::Unresolved(s)) => Verdict::NotConstant(s),
                 _ => Verdict::Constant,
             }
         }
@@ -927,7 +944,9 @@ pub fn eval_written(lexemes: &[&str]) -> WrittenValue {
         // equal through the caller's textual fallback, and they carry the
         // same value — the subset is resolution-free).
         Verdict::Constant => WrittenValue::NotEvaluable,
-        Verdict::Fault(..) | Verdict::NotConstant(_) => WrittenValue::Unknown,
+        Verdict::Fault(..) | Verdict::NotConstant(_) | Verdict::Unresolved(_) => {
+            WrittenValue::Unknown
+        }
     }
 }
 

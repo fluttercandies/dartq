@@ -132,6 +132,44 @@ impl<A: ParserListener, B: ParserListener> ParserListener for MultiplexListener<
         self.b.begin_record_type(left_paren);
     }
 
+    fn end_record_type(
+        &mut self,
+        left_paren: Token,
+        question: Option<Token>,
+        count: usize,
+        has_named_fields: bool,
+    ) {
+        self.a
+            .end_record_type(left_paren, question, count, has_named_fields);
+        self.b
+            .end_record_type(left_paren, question, count, has_named_fields);
+    }
+
+    fn begin_record_type_entry(&mut self, first: Token) {
+        self.a.begin_record_type_entry(first);
+        self.b.begin_record_type_entry(first);
+    }
+
+    fn end_record_type_entry(&mut self, last: Token) {
+        self.a.end_record_type_entry(last);
+        self.b.end_record_type_entry(last);
+    }
+
+    fn handle_no_name(&mut self, token: Token) {
+        self.a.handle_no_name(token);
+        self.b.handle_no_name(token);
+    }
+
+    fn begin_record_type_named_fields(&mut self, left_brace: Token) {
+        self.a.begin_record_type_named_fields(left_brace);
+        self.b.begin_record_type_named_fields(left_brace);
+    }
+
+    fn end_record_type_named_fields(&mut self, count: usize, left_brace: Token) {
+        self.a.end_record_type_named_fields(count, left_brace);
+        self.b.end_record_type_named_fields(count, left_brace);
+    }
+
     fn begin_function_type(&mut self, begin: Token) {
         self.a.begin_function_type(begin);
         self.b.begin_function_type(begin);
@@ -471,6 +509,25 @@ impl<A: ParserListener, B: ParserListener> ParserListener for MultiplexListener<
             .end_constructor(kind, begin, new_kw, begin_param, begin_initializers, end);
         self.b
             .end_constructor(kind, begin, new_kw, begin_param, begin_initializers, end);
+    }
+
+    fn begin_factory(
+        &mut self,
+        kind: DeclarationKind,
+        last_consumed: Token,
+        augment_kw: Option<Token>,
+        external_kw: Option<Token>,
+        const_keyword: Option<Token>,
+    ) {
+        self.a
+            .begin_factory(kind, last_consumed, augment_kw, external_kw, const_keyword);
+        self.b
+            .begin_factory(kind, last_consumed, augment_kw, external_kw, const_keyword);
+    }
+
+    fn end_factory(&mut self, kind: DeclarationKind, begin: Token, factory: Token, end: Token) {
+        self.a.end_factory(kind, begin, factory, end);
+        self.b.end_factory(kind, begin, factory, end);
     }
 
     fn begin_method(
@@ -950,6 +1007,24 @@ mod tests {
         fn end_function_type(&mut self, _: Token, _: Option<Token>) {
             self.events.push("end_function_type");
         }
+        fn end_record_type(&mut self, _: Token, _: Option<Token>, _: usize, _: bool) {
+            self.events.push("end_record_type");
+        }
+        fn begin_record_type_entry(&mut self, _: Token) {
+            self.events.push("begin_record_type_entry");
+        }
+        fn end_record_type_entry(&mut self, _: Token) {
+            self.events.push("end_record_type_entry");
+        }
+        fn handle_no_name(&mut self, _: Token) {
+            self.events.push("handle_no_name");
+        }
+        fn begin_record_type_named_fields(&mut self, _: Token) {
+            self.events.push("begin_record_type_named_fields");
+        }
+        fn end_record_type_named_fields(&mut self, _: usize, _: Token) {
+            self.events.push("end_record_type_named_fields");
+        }
         fn begin_typedef(&mut self, _: Token) {
             self.events.push("begin_typedef");
         }
@@ -965,7 +1040,7 @@ mod tests {
     }
 
     /// A corpus firing every event the recorder overrides.
-    const CORPUS: &str = "typedef IntList = List<int>;\n\nclass Point extends Base implements Draw {\n  int x = 0;\n  void move(int dx) {\n    x = x + dx;\n  }\n}\n\nenum Color { red, green }\n\nmixin Walker on Base {\n  void walk() {}\n}\n\ntypedef Handler = int Function(String name);\n\ntypedef Pred = bool Function()?;\n\nvoid top(int callback(String value)) {}\n\nvoid legacy(int hook()?) {}\n";
+    const CORPUS: &str = "typedef IntList = List<int>;\n\nclass Point extends Base implements Draw {\n  int x = 0;\n  void move(int dx) {\n    x = x + dx;\n  }\n}\n\nenum Color { red, green }\n\nmixin Walker on Base {\n  void walk() {}\n}\n\ntypedef Handler = int Function(String name);\n\ntypedef Pred = bool Function()?;\n\nvoid top(int callback(String value)) {}\n\nvoid legacy(int hook()?) {}\n\ntypedef Pair = (bool?, {int n});\n";
 
     /// A recovery-error corpus: the class header never closes.
     const BROKEN: &str = "class {\n";
@@ -1020,7 +1095,7 @@ mod tests {
 
     #[test]
     fn function_type_events_fan_out_to_both_sides() {
-        // The forwarding-coverage pin: these three events have in-tree
+        // The forwarding-coverage pin: these events have in-tree
         // consumers overriding them, so a missing forward falls through to
         // the default no-op and silently starves every receiver.
         let mut a = Recorder::default();
@@ -1032,6 +1107,12 @@ mod tests {
             "begin_function_typed_formal_parameter",
             "end_function_typed_formal_parameter",
             "end_function_type",
+            "end_record_type",
+            "begin_record_type_entry",
+            "end_record_type_entry",
+            "handle_no_name",
+            "begin_record_type_named_fields",
+            "end_record_type_named_fields",
         ] {
             assert!(a.events.contains(&event), "receiver a missed {event}");
             assert!(b.events.contains(&event), "receiver b missed {event}");

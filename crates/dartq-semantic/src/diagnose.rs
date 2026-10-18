@@ -2263,6 +2263,11 @@ struct Engine<'a> {
     /// const-constructor set is incomplete mid-parse, so the verdict
     /// defers to the tail pass.
     open_const_creations: Vec<(StringId, SourceRange, ConstCreationEntry)>,
+    /// The open event's source-spelled bare head when the row transport
+    /// dropped the callee row outright (the engine's creation posture for
+    /// targets whose unnamed resolution fails): the close gate re-asks the
+    /// unnamed-face question from the spelling.
+    pending_bare_creation: Option<(StringId, SourceRange)>,
     /// Entries promoted at the initializer close (the verdict passed
     /// silently): the tail pass re-decides each against the complete
     /// const-ctor set — the first invalid entry per initializer anchors
@@ -3423,6 +3428,7 @@ impl<'a> Engine<'a> {
             const_ctors: FxHashSet::default(),
             pending_const_non_const: Vec::new(),
             open_const_creations: Vec::new(),
+            pending_bare_creation: None,
             pending_const_creations: Vec::new(),
             identical_id,
             pending_init_names: Vec::new(),
@@ -5228,6 +5234,91 @@ impl<'a> Engine<'a> {
             .all(|b| b.is_ascii_whitespace())
     }
 
+    /// The bare-identifier spelling at `range`, when the bytes before it
+    /// don't make it a selector (`.`/`?.`/`..` left-guards) and the range
+    /// itself is one plain Dart identifier (ASCII letter or `_` head,
+    /// identifier characters after — the scanner's ASCII-only identifier
+    /// contract). The unnamed-creation face's direct-transport head: a
+    /// creation whose callee row resolved outside the container shape
+    /// still names its class here.
+    fn bare_creation_head_name(&self, range: SourceRange) -> Option<StringId> {
+        let start = range.offset;
+        let end = start.checked_add(range.length)?;
+        if start > end || end > self.source.len() as u32 {
+            return None;
+        }
+        if start > 0 {
+            let bytes = self.source.as_bytes();
+            if bytes[(start - 1) as usize] == b'.' {
+                return None;
+            }
+        }
+        let text = &self.source[start as usize..end as usize];
+        let mut chars = text.bytes();
+        let head = chars.next()?;
+        if !(head.is_ascii_alphabetic() || head == b'_') {
+            return None;
+        }
+        if !chars.all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+        Some(self.intern(text))
+    }
+
+    /// The bare identifier immediately before an argument group's open
+    /// paren (the invocation open's fallback head): strict adjacency, the
+    /// selector left-guard and identifier shape come from
+    /// [`Self::bare_creation_head_name`].
+    fn bare_creation_head_before(&self, open: u32) -> Option<(StringId, SourceRange)> {
+        let open = open as usize;
+        if open == 0 || open > self.source.len() {
+            return None;
+        }
+        let bytes = self.source.as_bytes();
+        let mut start = open;
+        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+            start -= 1;
+        }
+        if start == open {
+            return None;
+        }
+        let range = SourceRange {
+            offset: start as u32,
+            length: (open - start) as u32,
+        };
+        let name = self.bare_creation_head_name(range)?;
+        Some((name, range))
+    }
+
+    /// The unnamed-creation face over the open event's source-spelled head:
+    /// the row transport can drop the callee row outright (the engine's
+    /// creation posture for factory-only targets), so the close gate re-asks
+    /// the same `constructor_invocation_resolver` question from the
+    /// spelling — an in-scope class with no unnamed face reports.
+    fn report_bare_creation_miss(&mut self) {
+        let Some((name, range)) = self.pending_bare_creation.take() else {
+            return;
+        };
+        if resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        )
+        .is_some_and(|(decl, _)| !decl.has_unnamed_constructor)
+        {
+            let name_text = self.strings.resolve(name).to_string();
+            self.emit(
+                SemanticCode::NewWithUndefinedConstructorDefault,
+                range,
+                &name_text,
+                "",
+            );
+        }
+    }
+
     /// The trivia-only test between two offsets — whitespace plus `//…` and
     /// `/*…*/` comments. Comments are trivia upstream (the parser attaches
     /// them to the following token, `parser_impl.dart`'s comment skip): a
@@ -5468,7 +5559,22 @@ impl<'a> Engine<'a> {
         // spelling keys as `new` (`member.name?.lexeme ?? 'new'`), a named
         // spelling by its selector — and every second-and-later declaration
         // of a key reports `duplicate_constructor` at its own name span.
+        // The pass runs per class ELEMENT (one declaration): a duplicate
+        // class name declares a fresh constructor set, so same-named
+        // earlier declarations' sites stay out (the oracle reports
+        // `duplicate_definition` on the class name and never a
+        // cross-declaration `duplicate_constructor`). The current
+        // declaration is the last container site of the name; its
+        // constructors all start at or after its name token.
         {
+            let decl_start = self
+                .decl_sites
+                .iter()
+                .rev()
+                .find(|site| {
+                    matches!(site.kind, DeclKind::Container) && site.name == container
+                })
+                .map(|site| site.range.offset);
             let new_name = self.intern("new");
             let ctor_keys: Vec<(StringId, SourceRange)> = self
                 .decl_sites
@@ -5479,6 +5585,7 @@ impl<'a> Engine<'a> {
                         DeclKind::Constructor { container: c } if c == container
                     )
                 })
+                .filter(|site| decl_start.is_none_or(|start| site.range.offset >= start))
                 .map(|site| {
                     (
                         if site.name == container {
@@ -9189,6 +9296,49 @@ impl<'a> Engine<'a> {
             nullable: head_nullable,
             args: ArgListId::EMPTY,
         }
+    }
+
+    /// A record field getter's static type (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/type.dart `RecordTypeImpl`
+    /// `namedField`/`positionalField` — the property-access resolver reads
+    /// the field off the receiver's record type, `$1`-based positional
+    /// spellings included). `receiver` folds through a type alias first
+    /// (`typedef R = ({bool? strict}); r.strict`). A nullable record
+    /// receiver answers `None` unless the access is null-aware (a plain
+    /// access is the unchecked dereference face, not a field read; `r?.f`
+    /// reads the field off the promoted non-null record and the caller
+    /// joins the `?`), as does any non-record receiver, a
+    /// `$0`/out-of-range/non-numeric spelling, and an absent named field
+    /// (the `Object` members stay unmodeled — under-report).
+    fn record_field_ty(&self, receiver: Ty, field: StringId, null_aware: bool) -> Option<Ty> {
+        let Ty::Record { shape, nullable } = self.fold_alias_ty(receiver) else {
+            return None;
+        };
+        if nullable && !null_aware {
+            return None;
+        }
+        let pool = self.boundary.pool();
+        let shape = pool.record_shape(shape);
+        let ty = match shape.named.iter().find(|(name, _)| *name == field) {
+            Some(&(_, ty)) => ty,
+            None => {
+                // Positional getters are `$1`, `$2`, … (1-based decimal, no
+                // sign and no leading zero — `$01` is not a field getter).
+                let index = self
+                    .strings
+                    .resolve(field)
+                    .strip_prefix('$')
+                    .filter(|digits| {
+                        !digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit())
+                    })
+                    .and_then(|digits| digits.parse::<usize>().ok())?;
+                *shape.positional.get(index.checked_sub(1)?)?
+            }
+        };
+        drop(pool);
+        // A field spelled through an alias reads as the aliased type, like
+        // every declared type the frames bind.
+        Some(self.fold_alias_ty(ty))
     }
 
     /// The captured right-hand type of the non-parameterized type alias
@@ -14111,7 +14261,15 @@ impl<'a> Engine<'a> {
                 _ => Ty::UNKNOWN,
             },
             Receiver::Typed { type_name, .. } => self.member_declared_ty(*type_name, member.name),
-            _ => Ty::UNKNOWN,
+            // A record-typed receiver (`config.strict`, `pair.$1`): the
+            // field getter's type is the shape's own field type (records
+            // carry no interface members besides `Object`'s, which stay
+            // `Unknown`); a `?.` read joins the null-aware `?`.
+            _ => match self.record_field_ty(merged_receiver_ty, member.name, is_null_aware) {
+                Some(field) if is_null_aware => Self::nullable_form(field),
+                Some(field) => field,
+                None => Ty::UNKNOWN,
+            },
         };
         // A redirecting factory's `= C.name` target: the constructor
         // reference parses as a `head.selector` member merge under
@@ -14664,6 +14822,15 @@ impl<'a> Engine<'a> {
             None
         };
         self.invokes.push(callee);
+        // The source-spelled fallback head: only when the row transport
+        // dropped the callee outright. Strict adjacency (no trivia skip) —
+        // the commented-head shape keeps the under-report posture.
+        let bare_head = if callee.is_none() {
+            self.bare_creation_head_before(open_offset)
+        } else {
+            None
+        };
+        self.pending_bare_creation = bare_head;
         let mark = self.rows.len();
         self.arg_levels.push(ArgLevel {
             args: Vec::new(),
@@ -15172,6 +15339,7 @@ impl<'a> Engine<'a> {
     fn check_arguments(&mut self, level: Option<ArgLevel>, positional: u16, close: SourceRange) {
         let Some(level) = level else { return };
         let Some(callee) = self.invokes.last().and_then(|slot| *slot) else {
+            self.report_bare_creation_miss();
             return;
         };
         // The null-argument face runs before the row borrow opens (it
@@ -15232,6 +15400,33 @@ impl<'a> Engine<'a> {
             self.emit(
                 SemanticCode::NewWithUndefinedConstructorDefault,
                 head_range,
+                &name_text,
+                "",
+            );
+        } else if let Some(head) = self.rows.get(callee)
+            && !head.qualified
+            && let Some(name) = self.bare_creation_head_name(head.range)
+            && resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                name,
+            )
+            .is_some_and(|(decl, _)| !decl.has_unnamed_constructor)
+        {
+            // The row-transport under-report seam: a bare creation whose
+            // callee row resolved outside the container shape (the
+            // unresolved-selector posture) still names its class in the
+            // source — the face reads the spelling directly and re-asks the
+            // same unnamed-face question (`constructor_invocation_resolver`
+            // has no row-shape gate). Qualified and non-identifier heads
+            // keep the under-report posture.
+            let name_text = self.strings.resolve(name).to_string();
+            self.emit(
+                SemanticCode::NewWithUndefinedConstructorDefault,
+                head.range,
                 &name_text,
                 "",
             );
@@ -18311,8 +18506,14 @@ impl<'a> Engine<'a> {
         // may be falsely negative and the expression face — always
         // must-be-exhaustive — suppresses (under-report direction).
         // The statement face is already gated on in-file sealed facts.
+        // An unmodelable scrutinee (record/function shapes fold to one
+        // fixed `Unknown` — no field columns, so even a `_` row cannot be
+        // proven to cover it) never decides the face either: the verdict
+        // would be the world's blind spot, not the program's (#2139 — a
+        // record alias now folds to its shape, surfacing the face).
         let expression_face_decides = match value {
             NameTy::Named(name, _) => world.name_resolvable(name),
+            NameTy::Unknown(u64::MAX) => false,
             _ => true,
         };
         let must_be_exhaustive =
@@ -20559,12 +20760,15 @@ impl ConstLookup for Engine<'_> {
             // evaluates it `dynamic`, which fails every constant-argument
             // check — `const_with_non_constant_argument`); a broken-import
             // suppression stays deferential (the undefined name is the
-            // reported root cause, #1351).
+            // reported root cause, #1351). The Unresolved grade keeps the
+            // argument face hot while the declaration's own verdict stays
+            // silent (the oracle's `hasKnownValue` gate — the undefined
+            // name already carries the report).
             BareInfo::Missing { .. } => {
                 if self.guard.ignore(None, name) {
                     IdentVerdict::Constant
                 } else {
-                    IdentVerdict::NotConstant
+                    IdentVerdict::Unresolved
                 }
             }
             _ => IdentVerdict::Constant,
@@ -20710,7 +20914,10 @@ impl Engine<'_> {
     fn resolve_const_verdict(&mut self, verdict: &Verdict) {
         match verdict {
             Verdict::Value(_) | Verdict::Constant => {}
-            Verdict::NotConstant(span) => {
+            // An unresolved root (`const a = x`) reports like a plain
+            // non-constancy: the oracle's evaluation of the unresolvable
+            // reference is known-invalid at the variable.
+            Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
                 self.emit(
                     SemanticCode::ConstInitializedWithNonConstantValue,
                     *span,
@@ -20962,6 +21169,13 @@ impl Engine<'_> {
                             .push((init, span, ConstCreationEntry::ArgFailure));
                     }
                 }
+                // An unresolved argument reports its own face but leaves the
+                // declaration's verdict silent (`B(x)`'s undefined `x`: the
+                // oracle's evaluation is unknown, not known-invalid — the
+                // ArgFailure staging stays out, #2138).
+                Verdict::Unresolved(span) => {
+                    self.emit(SemanticCode::ConstWithNonConstantArgument, span, "", "");
+                }
                 Verdict::Fault(fault, span) => self.emit_const_fault(fault, span),
             }
         }
@@ -21012,7 +21226,9 @@ impl Engine<'_> {
                 let binding = match eval(arg, self) {
                     Verdict::Value(v) => CtorBinding::Value(v),
                     Verdict::Constant => CtorBinding::Opaque,
-                    Verdict::NotConstant(_) | Verdict::Fault(..) => CtorBinding::Invalid,
+                    Verdict::NotConstant(_) | Verdict::Unresolved(_) | Verdict::Fault(..) => {
+                        CtorBinding::Invalid
+                    }
                 };
                 env.insert(formal.name, binding);
             }
@@ -21263,7 +21479,9 @@ impl Engine<'_> {
         for part in parts {
             match eval(part, self) {
                 Verdict::Value(_) | Verdict::Constant => {}
-                Verdict::NotConstant(span) => self.emit(code, span, "", ""),
+                Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
+                    self.emit(code, span, "", "")
+                }
                 Verdict::Fault(fault, span) => self.emit_const_fault(fault, span),
             }
         }
@@ -26965,7 +27183,7 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some(node) = engine.const_capture.close_constant_pattern() {
             match eval(&node, engine) {
                 Verdict::Value(_) | Verdict::Constant => {}
-                Verdict::NotConstant(span) => {
+                Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
                     // The oracle's `InvalidType` early-return
                     // (constant_verifier.dart:134-136): when resolution
                     // already answered inside the expression's span — an
@@ -27226,25 +27444,25 @@ impl ParserListener for DiagnoseListener<'_> {
         if engine.const_capture.top_is_constant_pattern()
             && let Some(node) = engine.const_capture.close_constant_pattern()
         {
-            match eval(&node, engine) {
-                Verdict::Value(_) | Verdict::Constant => {}
-                Verdict::NotConstant(span) => {
-                    // The same `InvalidType` early-return shape as the
-                    // constant-pattern face: a resolution verdict already
-                    // anchored inside the expression's span suppresses the
-                    // generic row (constant_verifier.dart:134-136).
-                    let already_answered = engine.report.diagnostics.iter().any(|d| {
-                        d.range.offset >= span.offset
-                            && d.range.end() <= span.end()
-                            && d.range.length > 0
-                            && d.range != span
-                    });
-                    if !already_answered {
-                        engine.emit(SemanticCode::NonConstantCaseExpression, span, "", "");
+                match eval(&node, engine) {
+                    Verdict::Value(_) | Verdict::Constant => {}
+                    Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
+                        // The same `InvalidType` early-return shape as the
+                        // constant-pattern face: a resolution verdict already
+                        // anchored inside the expression's span suppresses the
+                        // generic row (constant_verifier.dart:134-136).
+                        let already_answered = engine.report.diagnostics.iter().any(|d| {
+                            d.range.offset >= span.offset
+                                && d.range.end() <= span.end()
+                                && d.range.length > 0
+                                && d.range != span
+                        });
+                        if !already_answered {
+                            engine.emit(SemanticCode::NonConstantCaseExpression, span, "", "");
+                        }
                     }
+                    Verdict::Fault(fault, span) => engine.emit_const_fault(fault, span),
                 }
-                Verdict::Fault(fault, span) => engine.emit_const_fault(fault, span),
-            }
         }
         let root = engine.close_case_sink();
         let space = engine.substitute_root(root);
@@ -31191,11 +31409,14 @@ mod tests {
     }
 
     /// An unresolved identifier inside a creation's argument list still
-    /// reports, and co-fires the creation's own const rows (the oracle
+    /// reports, and co-fires the creation's own const rows — the oracle
     /// triple on the `const_eval_type_string` corpus: the creation-level
     /// fault at the creation node, the non-constant argument at `x`, the
-    /// undefined name at `x` — evaluation.dart's `genericError` upgrade
-    /// feeds the argument face beside the resolution row).
+    /// undefined name at `x`. The declaration's own
+    /// `const_initialized_with_non_constant_value` stays silent: the
+    /// oracle's evaluation of `B(x)` is unknown (`hasKnownValue` false —
+    /// the undefined name is the reported root cause), not known-invalid
+    /// (#2138; oracle 3.13.1 probe on the corpus fixture).
     ///
     /// Hand-trace: `B` resolves as a `BareInfo::Container` callee, so
     /// `consume_send` folds the creation and drops the rows above the
@@ -31217,7 +31438,6 @@ mod tests {
                 "const_eval_type_string",
                 "const_with_non_constant_argument",
                 "undefined_identifier",
-                "const_initialized_with_non_constant_value",
             ],
             "{:?}",
             code_names(&report)
@@ -44881,6 +45101,53 @@ mod ticket_1351_tests {
         );
     }
 
+    /// Record field getters carry the shape's field type (#2139): a
+    /// `bool?` named field (`r.strict`) and a `bool?` positional field
+    /// (`p.$1`) in condition position report over the whole
+    /// property-access span — record fields are synthesized getters, never
+    /// promotable, so the parse-time verdict is final (probe: `dart
+    /// analyze` reports `UNCHECKED_USE_OF_NULLABLE_VALUE` at both).
+    #[test]
+    fn nullable_record_fields_report_as_conditions() {
+        let source = "void f(({bool? strict, int n}) r, (bool?, int) p) { \
+                      if (r.strict) {} if (p.$1) {} }";
+        let report = unit_report(source);
+        let starts: Vec<u32> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unchecked_use_of_nullable_value")
+            .map(|d| d.range.offset)
+            .collect();
+        assert_eq!(
+            starts,
+            [at(source, "r.strict) {}"), at(source, "p.$1) {}")],
+            "{source}"
+        );
+    }
+
+    /// The typedef face: a record alias folds to its shape before the field
+    /// read (`typedef R = ({bool? strict}); r.strict`), so the alias use
+    /// reports exactly like the inline record type.
+    #[test]
+    fn aliased_record_field_reports_as_condition() {
+        let source = "typedef R = ({bool? strict, int n}); typedef T = (bool?, int); \
+                      void f(R r, T t) { if (r.strict) {} if (t.$1) {} }";
+        let report = unit_report(source);
+        assert_eq!(count_code(&report, "unchecked_use_of_nullable_value"), 2);
+    }
+
+    /// Non-nullable record fields stay silent, and so do the spellings the
+    /// field face does not own: `$0`, an out-of-range `$3`, a leading-zero
+    /// `$01`, and a missing named field (unmodeled — under-report).
+    #[test]
+    fn non_nullable_and_unowned_record_fields_stay_silent() {
+        let source = "void f(({bool strict}) r, (bool, bool?) p) { \
+                      if (r.strict) {} if (p.$1) {} if (p.$0) {} if (p.$3) {} \
+                      if (p.$01) {} if (r.other) {} }";
+        let report = unit_report(source);
+        assert_eq!(count_code(&report, "unchecked_use_of_nullable_value"), 0);
+    }
+
     /// The named creation's selector resolves the constructor's formals
     /// through the receiver fallback (`ctor_formals` keys the selector —
     /// the collector's both-lookup-spellings contract): `String` against
@@ -45432,10 +45699,11 @@ mod ticket_1351_tests {
     #[test]
     fn unnamed_creation_miss_reports_default_code() {
         let report = unit_report("class G {\n  factory H() => G();\n}");
-        let rows: Vec<&str> = code_names(&report);
-        assert!(
-            rows.contains(&"new_with_undefined_constructor_default"),
-            "{rows:?}"
+        assert_eq!(
+            count_code(&report, "new_with_undefined_constructor_default"),
+            1,
+            "{:?}",
+            code_names(&report)
         );
         // A class with only the implicit default stays silent.
         let implicit = unit_report("class A {}\nvoid f() {\n  var a = A();\n  print(a);\n}");
@@ -45445,6 +45713,63 @@ mod ticket_1351_tests {
             "{:?}",
             code_names(&implicit)
         );
+    }
+
+    /// `duplicate_constructor` never crosses same-named class declarations
+    /// (#2138): each `class C(...)` declaration owns its constructor set —
+    /// the oracle reports `duplicate_definition` on the repeated class name
+    /// and no constructor-level row — while the same declaration's second
+    /// unnamed constructor still reports.
+    #[test]
+    fn duplicate_constructor_never_crosses_declarations() {
+        let report = unit_report(
+            "class C(var this.str);\nclass C(final this.str);\nclass C(const this.str);\nclass D(var super.str);\nclass D(final super.str);\nclass D(const super.str);",
+        );
+        assert_eq!(
+            count_code(&report, "duplicate_constructor"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            count_code(&report, "duplicate_definition"),
+            4,
+            "{:?}",
+            code_names(&report)
+        );
+        // Same-declaration repeats keep the constructor-level row.
+        let same = unit_report("class A {\n  A();\n  A();\n}");
+        assert_eq!(
+            count_code(&same, "duplicate_constructor"),
+            1,
+            "{:?}",
+            code_names(&same)
+        );
+    }
+
+    /// An unresolved identifier in a const creation's argument list
+    /// (#2138): the argument face reports (`const_with_non_constant_argument`
+    /// — the oracle's `dynamic` substitution) while the declaration's own
+    /// `const_initialized_with_non_constant_value` stays silent
+    /// (`hasKnownValue` false). A bare unresolved initializer and a defined
+    /// non-const argument still report at their spans.
+    #[test]
+    fn unresolved_const_argument_stays_declaration_silent() {
+        let report = unit_report(
+            "var v = 0;\nclass B {\n  final l;\n  const B(String o) : l = o.length;\n}\nconst a = x;\nconst y = B(x);\nconst w = B(v);",
+        );
+        let rows: Vec<&str> = code_names(&report);
+        assert_eq!(
+            count_code(&report, "const_initialized_with_non_constant_value"),
+            2,
+            "{rows:?}"
+        );
+        assert_eq!(
+            count_code(&report, "const_with_non_constant_argument"),
+            2,
+            "{rows:?}"
+        );
+        assert_eq!(count_code(&report, "undefined_identifier"), 2, "{rows:?}");
     }
 
     /// `implicit_this_reference_in_initializer`: an instance-member
