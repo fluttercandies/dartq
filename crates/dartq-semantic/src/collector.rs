@@ -605,6 +605,17 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             }
             return self.function_from_tree(tree);
         }
+        // A hole leaf (`head == StringId::NONE` — `record_entry_end`'s
+        // recovery splice for `(int, ,)` and any other unnamed node that
+        // reached an argument slot) maps to `Unknown`, the InvalidType
+        // reading [`Self::record_field_ty`] already applies. A nested
+        // record node converts through its own arm the same way.
+        if tree.head == StringId::NONE {
+            return match tree.record {
+                Some(_) if !tree.poisoned => self.record_from_tree(tree),
+                _ => Ty::Unknown,
+            };
+        }
         match self.strings.resolve(tree.head) {
             "dynamic" => Ty::Dynamic,
             "void" => Ty::Void,
@@ -1832,7 +1843,15 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     && let Some((name, _)) = name_with_range
                     && let Some(open) = builder.containers.last()
                 {
-                    let is_unnamed = open.name.is_some_and(|(container, _)| container == name);
+                    // The bare `new` spelling is the unnamed constructor's
+                    // own name: `factory new()` (the
+                    // FACTORY_CONSTRUCTOR_NEW_NAME recovery head) IS the
+                    // unnamed face, so `K()` stays callable after it. The
+                    // dotted shape (`factory new.named()`) replaces the
+                    // capture at its own name event — the unnamed face
+                    // stays absent there.
+                    let is_unnamed = open.name.is_some_and(|(container, _)| container == name)
+                        || builder.strings.resolve(name) == "new";
                     builder.ctor_open = Some(CtorCapture {
                         named: Vec::new(),
                         has_unnamed: is_unnamed,
@@ -2190,8 +2209,24 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                         slot.insert(entry);
                     }
                     // Same-bit collisions are duplicates; cross-bit ones are not.
+                    // The `unary -`/`binary -` pair is exempt: Dart keeps
+                    // the two signatures as distinct members (0 vs 1
+                    // positional formals), so an `operator -()` beside
+                    // `operator -(o)` is not a redeclaration (the oracle's
+                    // `operator_minus` count table already reflects the
+                    // split — the pair only duplicates a same-arity `-`).
                     Entry::Occupied(existing) => {
-                        if existing.is_static == pending.is_static {
+                        let arity = |e: &MemberEntry| {
+                            e.formals.as_ref().map_or(u16::MAX, |f| {
+                                u16::try_from(f.positional.len() + f.named.len())
+                                    .unwrap_or(u16::MAX)
+                            })
+                        };
+                        let is_minus_split = builder.strings.resolve(name) == "-"
+                            && existing.kind == MemberKind::Method
+                            && entry.kind == MemberKind::Method
+                            && arity(existing) != arity(&entry);
+                        if existing.is_static == pending.is_static && !is_minus_split {
                             builder.record_duplicate(name, range);
                         }
                     }
@@ -2634,6 +2669,27 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             let open = builder.containers.last_mut().expect("checked above");
             open.primary_formals.push(RepFormal {
                 formal,
+                name_range: range,
+            });
+            // The representation field is also the extension type's own
+            // public instance member — the oracle's element model keeps it
+            // as `fields.first`, so `money.cents` resolves through the
+            // ordinary member walk (extension_type's interface includes the
+            // representation's getter). Register it as a Field; a body
+            // member redeclaring the name reports the duplicate upstream
+            // (keep-first leaves the rep entry untouched).
+            open.members.or_insert_with(name, || MemberEntry {
+                kind: MemberKind::Field,
+                is_static: false,
+                is_abstract: false,
+                is_external: false,
+                is_final: true,
+                type_params: 0,
+                type_param_names: Box::default(),
+                var_ty: ty,
+                return_ty: Ty::UNKNOWN,
+                formals: None,
+                annotations: Box::default(),
                 name_range: range,
             });
         }
@@ -3458,7 +3514,9 @@ mod tests {
     }
 
     /// The extension type's primary-constructor formals are the
-    /// representation-field capture; body members stay out.
+    /// representation-field capture; the representation field also joins
+    /// the member face (the oracle resolves `e.x` against it), while the
+    /// body's own members stay out of `primary_formals`.
     #[test]
     fn extension_type_captures_representation_formals() {
         let strings = StringTable::new();
@@ -3469,7 +3527,7 @@ mod tests {
         assert_eq!(rep.formal.name, id(&strings, "x"));
         assert_eq!(rep.formal.ty, Ty::named(id(&strings, "int")));
         assert!(e.members.contains_key(&id(&strings, "m")));
-        assert!(!e.members.contains_key(&id(&strings, "x")));
+        assert!(e.members.contains_key(&id(&strings, "x")));
     }
 
     /// Constructor formals join the container facts under their lookup

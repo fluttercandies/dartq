@@ -2404,12 +2404,20 @@ impl ConstCapture {
                     );
                     return None;
                 }
-                // A bare call inside a literal-ctor candidate window is an
-                // ordinary runtime call: provably not a constant for the
-                // candidate's `canBeConst` face. The const-context
-                // interpretations below never apply — the window only
-                // opens outside const contexts.
-                if self.top_is_literal_ctor() {
+                // A bare call inside a non-const face window is an ordinary
+                // runtime call — provably not a constant for that window's
+                // own question (the `canBeConst` probe of `LiteralCtor`, the
+                // duplicate check of `NonConstDup`). Neither window is a
+                // const context, so the const-context interpretations below
+                // (`const_eval_method_invocation` on `f(x)`, the implicit
+                // `const C(x)` creation) never apply; the call folds to a
+                // non-constant leaf and the caller sees no `ClosedArgs`.
+                if self.top_is_literal_ctor()
+                    || self
+                        .windows
+                        .last()
+                        .is_some_and(|w| w.kind == WindowKind::NonConstDup)
+                {
                     self.push(
                         Node {
                             expr: Expr::Other,

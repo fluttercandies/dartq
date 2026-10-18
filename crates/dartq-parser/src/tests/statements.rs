@@ -909,8 +909,7 @@ fn assert_expression_emits_the_keyword_as_a_name_read() {
     // assert(false):`). The parser-side fact is the identifier event; no
     // send rides it.
     use crate::listener::IdentifierContext;
-    let mut p =
-        crate::expr_const::test_support::parser("assert(false)", AssertRefLog::default());
+    let mut p = crate::expr_const::test_support::parser("assert(false)", AssertRefLog::default());
     let _ = p.parse_expression();
     assert_eq!(
         p.listener.identifiers,
@@ -925,8 +924,7 @@ fn assert_expression_in_constant_pattern_keeps_the_reference() {
     // constant-pattern lane's `assert` arm routes through `parse_assert(
     // AssertKind::Expression)`, so the reference event fires there too.
     use crate::listener::{IdentifierContext, PatternContext};
-    let mut p =
-        crate::expr_const::test_support::parser("assert(false)", AssertRefLog::default());
+    let mut p = crate::expr_const::test_support::parser("assert(false)", AssertRefLog::default());
     let _ = p.parse_pattern_entry(PatternContext::Matching);
     assert_eq!(
         p.listener.identifiers,

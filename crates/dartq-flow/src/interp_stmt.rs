@@ -1049,6 +1049,24 @@ impl Interp<'_> {
                 let var = self.pending_inits.pop();
                 let rhs = self.exprs.pop();
                 if let (Some(var), Some(rhs)) = (var, rhs) {
+                    // The declared-type slot the written header left
+                    // unknown adopts the semantic layer's staged inferred
+                    // type (#2140): the initializer's resolved static type
+                    // IS the local's declared type (the official
+                    // `_inferLocalVariable`), so every later read's flow
+                    // type and the promotion machinery answer exactly like
+                    // an annotated declarator's. Adoption precedes the
+                    // initialization write, which then compares against
+                    // the real declared face. Shapes the flow lattice
+                    // cannot spell never arrive (the stager drops them) —
+                    // the unknown-declared under-report stands.
+                    if let Some(meta) = self.vars.get_mut(var as usize)
+                        && meta.ty.base == crate::ty::Base::Unknown
+                        && let Some(span) = meta.decl_span
+                        && let Some(&staged) = self.inferred_locals.get(&span.offset)
+                    {
+                        meta.ty = staged;
+                    }
                     // The declaration's own initialization moves the flow
                     // state (assignments, promotions) but is not a write in
                     // the official `AssignedVariables` sets — the

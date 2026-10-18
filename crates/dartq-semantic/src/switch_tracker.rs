@@ -969,6 +969,20 @@ impl NameWorld<'_> {
         {
             return Some(true);
         }
+        // An unresolvable TARGET is undecidable, not disproved: a type
+        // parameter (`Self` in `Self retuned(int)` over `Tunable<Self>`), a
+        // cross-file head, or a misspelling has no declaration or core edge
+        // the walk could ever reach — a closed walk would answer
+        // `Some(false)` having never compared the real face. The walk's own
+        // `cut` covers undeclared nodes it dequeues; the target needs the
+        // same gate up front.
+        if self.container(sup).is_none()
+            && !self.primitive_ids.contains(&sup)
+            && sup != self.object_id
+            && !self.core_supertypes.iter().any(|(_, parent)| *parent == sup)
+        {
+            return None;
+        }
         let mut queue = std::collections::VecDeque::new();
         let mut seen = rustc_hash::FxHashSet::default();
         queue.push_back(sub);

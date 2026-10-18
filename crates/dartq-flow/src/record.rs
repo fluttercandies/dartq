@@ -60,6 +60,16 @@ pub struct Flow<'t> {
     /// before the row (official `parseArguments`,
     /// `type_info_impl.dart:1158/1191`).
     pending_type_args: u32,
+    /// Inferred locals' declared types keyed on the declarator name
+    /// token's offset (#2140): the semantic layer derives a `var`/`final`
+    /// declarator's static type from its initializer (the property-read
+    /// and callee faces live there), and stages it here before this
+    /// executable's replay. The fold adopts the staged type at
+    /// `InitializerEnd` when the written header left the slot unknown, so
+    /// the promotion machinery answers on inferred locals exactly like
+    /// annotated ones. Entries whose executable never replays are inert
+    /// (bounded by the unit's declarator count).
+    inferred_locals: FxHashMap<u32, crate::ty::Ty>,
     /// The most recent label-reference identifier (a break/continue
     /// target's name, consumed by the next break/continue event).
     pending_label_ref: Option<u32>,
@@ -185,6 +195,7 @@ impl<'t> Flow<'t> {
             type_args: vec![Vec::new()],
             non_promotions: vec![Vec::new()],
             pending_type_args: crate::ty::EMPTY_ARGS,
+            inferred_locals: FxHashMap::default(),
             pending_label_ref: None,
             pending_labels: Vec::new(),
             pending_label_token: None,
@@ -500,6 +511,25 @@ impl<'t> Flow<'t> {
         facts
     }
 
+    /// Interns a name lexeme from outside the event stream — the
+    /// staged-declaration face (#2140): an inferred local's flow-declared
+    /// type spells a name the file may never write. Written occurrences
+    /// share the id, so `Base::Name` equality stays lexeme equality.
+    pub fn intern_name(&mut self, lexeme: &str) -> u32 {
+        self.intern_lexeme(lexeme)
+    }
+
+    /// Stages one inferred local's declared type (#2140): the semantic
+    /// layer's initializer-derived static type for a `var`/`final`
+    /// declarator, keyed on the declarator name token's offset. The fold
+    /// adopts it at `InitializerEnd` when the written header left the
+    /// slot unknown ([`crate::interp::VarMeta`] keeps the same anchor);
+    /// staged shapes the flow lattice cannot spell never arrive (the
+    /// stager drops them, the unknown-declared under-report stands).
+    pub fn stage_inferred_local(&mut self, decl_offset: u32, ty: crate::ty::Ty) {
+        self.inferred_locals.insert(decl_offset, ty);
+    }
+
     /// Records the `handleExit` contract: a subexpression's static type is
     /// Never, so the flow state goes unreachable from the expression's end
     /// (official `FlowAnalysis.handleExit`, flow_analysis.dart:919-925).
@@ -587,6 +617,10 @@ impl<'t> Flow<'t> {
         // declarations the switch-end verdict reads.
         interp.top_level = &self.top_level;
         interp.closed = &self.closed;
+        // The inferred locals' declared types the semantic layer staged
+        // for this unit (#2140) — read-only here, adopted at
+        // `InitializerEnd`.
+        interp.inferred_locals = &self.inferred_locals;
         interp.run(&events);
         // The async-gap context face: one linear replay over the same
         // buffer (the ids are interned lazily — already-present names keep

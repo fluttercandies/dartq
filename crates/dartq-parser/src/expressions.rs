@@ -1819,6 +1819,11 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             let _ = self.parse_expression();
             if let Some(colon) = colon {
                 self.listener.handle_named_argument(colon);
+            } else {
+                // `handlePositionalArgument` fires once per positional
+                // argument, after its expression parse (parser_impl.dart
+                // :9608) — the const capture flushes one operand per event.
+                self.listener.handle_positional_argument(self.peek_span());
             }
             count += 1;
             if self.peek_kind() != TokenKind::Comma {

@@ -633,7 +633,25 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 TokenKind::StringInterpolationIdentifier => {
                     let dollar = self.peek_span();
                     self.cursor.advance();
-                    let id = self.ensure_identifier(IdentifierContext::Expression);
+                    // `$this` routes to the `this` expression face
+                    // (upstream parser_impl.dart:9311
+                    // `parseIdentifierExpression`: the `this` keyword in
+                    // interpolation is the primary expression, never the
+                    // identifier context's `expectedIdentifierButGotKeyword`
+                    // recovery). Other keywords still take the identifier
+                    // path and report.
+                    let id = if matches!(
+                        self.peek_kind(),
+                        TokenKind::Keyword(Keyword::This)
+                    ) {
+                        let this_kw = self.peek_span();
+                        self.cursor.advance();
+                        self.listener
+                            .handle_this_expression(this_kw, IdentifierContext::Expression);
+                        this_kw
+                    } else {
+                        self.ensure_identifier(IdentifierContext::Expression)
+                    };
                     if first_interpolation.is_none() {
                         first_interpolation = Some((dollar, id));
                     }

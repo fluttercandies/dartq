@@ -1653,6 +1653,12 @@ struct Engine<'a> {
     /// Per-constructor explicit super-call satisfaction: a `super(...)`
     /// initializer or a `super.x` formal (both invoke the superclass).
     ctor_super_init: FxHashSet<usize>,
+    /// Redirecting generative ctors (`C.named(...) : this(...)`): their
+    /// final fields initialize through the redirect target's `this.`
+    /// formals, so `final_not_initialized_constructor` skips them
+    /// (`ConstructorFieldsVerifier` walks non-redirecting generative
+    /// ctors only). Keyed by the ctor's `decl_sites` index.
+    ctor_redirects: FxHashSet<usize>,
     /// Per-constructor head anchors (the class-name token a generative head
     /// starts at): the `not_initialized_non_nullable_instance_field` and
     /// `implicit_super_initializer_missing_arguments` rows anchor there for
@@ -2286,8 +2292,10 @@ struct Engine<'a> {
     /// A `var`/`final`-inferred local declarator awaiting its
     /// initializer's close: the resolved expression type binds as the
     /// local's static type (the `var self = this` face — upstream's
-    /// inferred `this` type decides `self is T` verdicts).
-    var_infer_pending: Option<StringId>,
+    /// inferred `this` type decides `self is T` verdicts) and stages as
+    /// the flow layer's declared type (#2140), keyed on the declarator
+    /// name token.
+    var_infer_pending: Option<(StringId, SourceRange)>,
     /// An enum-constant window is open (`handle_enum_element` doubles as
     /// the previous element's close).
     enum_element_open: bool,
@@ -2744,8 +2752,10 @@ struct Engine<'a> {
     /// end token (the `BodyMayCompleteNormally` fact's span): the declared
     /// return type plus the block body's `{` when the body is a block.
     /// One row per method/top-level declaration ([`Engine::
-    /// stage_body_completion`]).
-    body_completions: Vec<(SourceRange, Ty, Option<SourceRange>)>,
+    /// stage_body_completion`]). The `bool` is the body's `async` flag —
+    /// the completion verdict reads the future-flattened return for it
+    /// (`TypeSystem.flatten`), not the declared `Future<...>` head.
+    body_completions: Vec<(SourceRange, Ty, Option<SourceRange>, bool)>,
 }
 
 /// One deferred boundedness check (the [`Engine::pending_bounded_checks`]
@@ -3322,6 +3332,7 @@ impl<'a> Engine<'a> {
             open_ctor_site: None,
             ctor_formals_init: FxHashSet::default(),
             ctor_super_init: FxHashSet::default(),
+            ctor_redirects: FxHashSet::default(),
             ctor_head_anchors: FxHashMap::default(),
             group_heads: Vec::new(),
             pending_type_head: None,
@@ -4466,7 +4477,23 @@ impl<'a> Engine<'a> {
     /// callee's return type, the same face [`Self::receiver_static_ty`]
     /// reads at the junctions).
     fn operand_static_ty(&self, row: &Row) -> Ty {
-        if row.ty != Ty::UNKNOWN || !matches!(row.intent, Intent::Invoke) {
+        if !matches!(row.intent, Intent::Invoke) {
+            return row.ty;
+        }
+        // A send on a formal whose written annotation is a function type
+        // (`bool Function(E) test`) reads its signature's return — the
+        // row's `ty` is the formal's own declared type (or a fragment of
+        // the annotation the armed slot last completed), never the call's
+        // result.
+        if !row.qualified
+            && let Some(sig) = self.fn_var_sigs.get(&row.name)
+        {
+            return sig.return_ty;
+        }
+        if row.ty != Ty::UNKNOWN {
+            if let Ty::Function { shape, .. } = row.ty {
+                return self.boundary.pool().function_shape(shape).return_ty;
+            }
             return row.ty;
         }
         self.callee_return_ty(row)
@@ -5552,6 +5579,13 @@ impl<'a> Engine<'a> {
             .filter_map(|(index, _)| {
                 self.ctor_head_anchors.get(&index).map(|span| (index, *span))
             })
+            // A redirecting generative ctor (`C.named(...) : this(...)`)
+            // satisfies its finals through the redirect target — the
+            // `final_not_initialized_constructor` verifier
+            // (`ConstructorFieldsVerifier`) walks only non-redirecting
+            // generative ctors. `redirect_edges` records the `this(...)`
+            // shape's source ctor's site-index.
+            .filter(|(index, _)| !self.ctor_redirects.contains(index))
             .collect();
         let has_generative_ctor = !ctor_spans.is_empty();
         // `member_duplicate_definition_verifier.dart`'s constructor pass:
@@ -8941,7 +8975,7 @@ impl<'a> Engine<'a> {
         if *generator || (*is_async && !self.legal_async_return(exec.ty)) {
             return;
         }
-        let row = (end.range, exec.ty, *body_brace);
+        let row = (end.range, exec.ty, *body_brace, *is_async);
         match self
             .body_completions
             .binary_search_by(|(r, ..)| r.offset.cmp(&row.0.offset))
@@ -8996,12 +9030,21 @@ impl<'a> Engine<'a> {
             .body_completions
             .binary_search_by(|(r, ..)| r.offset.cmp(&end.offset))
             .ok()?;
-        let (staged, ret, brace) = &self.body_completions[index];
+        let (staged, declared, brace, is_async) = &self.body_completions[index];
         if *staged != end {
             return None;
         }
         let brace = (*brace)?;
-        let code = match *ret {
+        // An `async` body's completion type is the declared return's
+        // future-flattened form (`TypeSystem.flatten`,
+        // type_analyzer.dart:682-704): `Future<void>` flattens to `void`
+        // (silent), `Future<T>`/`FutureOr<T>` to `flatten(T)`.
+        let ret = if *is_async {
+            self.flatten_future(*declared)
+        } else {
+            *declared
+        };
+        let code = match ret {
             // (b)'s top faces: each is its own `FutureOr` base.
             Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Void => return None,
             // (a): a non-nullable name, record, function, or `Never` (the
@@ -9027,7 +9070,7 @@ impl<'a> Engine<'a> {
             | Ty::Record { nullable: true, .. }
             | Ty::Function { nullable: true, .. } => {
                 if matches!(
-                    self.future_or_base(*ret),
+                    self.future_or_base(ret),
                     // (b): the base is one of the silent faces.
                     Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Void // (c): the warning.
                 ) {
@@ -9039,7 +9082,28 @@ impl<'a> Engine<'a> {
             // nullability question — silent.
             _ => return None,
         };
-        Some((code, *ret, brace))
+        Some((code, ret, brace))
+    }
+
+    /// `TypeSystem::flatten` at name level for an `async` body's declared
+    /// return: `Future<T>`/`FutureOr<T>` unwrap to `flatten(T)`, `dynamic`
+    /// stays `dynamic`, every other type is its own flatten.
+    fn flatten_future(&self, ty: Ty) -> Ty {
+        let Ty::Named { name, args, .. } = ty else {
+            return ty;
+        };
+        if name != self.intern("Future")
+            && name != self.intern("FutureOr")
+            || args == ArgListId::EMPTY
+        {
+            return ty;
+        }
+        let pool = self.boundary.pool();
+        let list = pool.get(args);
+        if list.len() != 1 {
+            return ty;
+        }
+        self.flatten_future(list[0])
     }
 
     /// `TypeSystem::futureOrBase` at name level: a written `FutureOr<T>`
@@ -12735,8 +12799,16 @@ impl<'a> Engine<'a> {
                 }
                 // The parameter faces, contravariant (the function-subtype
                 // rule's parameter arm): the declared parameter must accept
-                // the inherited parameter's values.
+                // the inherited parameter's values. A `covariant` formal is
+                // exempt — the oracle rewrites its type to `Object?` before
+                // the subtype question (correct_override.dart
+                // `_computeThisTypeForSubtype`), so a covariant parameter
+                // never makes the override invalid; its narrowing is
+                // enforced by the runtime check instead.
                 for (d, i) in a.positional.iter().zip(&b.positional) {
+                    if d.covariant {
+                        continue;
+                    }
                     match decide(i.ty, d.ty) {
                         Some(false) => return true,
                         Some(true) => {}
@@ -12744,6 +12816,9 @@ impl<'a> Engine<'a> {
                     }
                 }
                 for d in &a.named {
+                    if d.covariant {
+                        continue;
+                    }
                     let Some(i) = b.named_formal(d.name) else {
                         return false;
                     };
@@ -14369,6 +14444,11 @@ impl<'a> Engine<'a> {
         let Some(ctor) = self.decl_sites.get(site).map(|s| s.name) else {
             return;
         };
+        // The redirecting generative ctor's own site — its finals route
+        // through the target's `this.` formals, so the
+        // `final_not_initialized_constructor` pass skips it
+        // (`ConstructorFieldsVerifier` walks only non-redirecting ctors).
+        self.ctor_redirects.insert(site);
         self.redirect_edges.push(RedirectEdge {
             container,
             ctor,
@@ -16824,13 +16904,29 @@ impl<'a> Engine<'a> {
             RowShape::Bare(BareInfo::Plain { ty }) => {
                 // A named top-level function tear-off, or an implicit call
                 // reference through a declaration-typed receiver (`c<int>`
-                // checks `call`).
+                // checks `call`), or a function-typed local's
+                // instantiation (`var t = C<int>().m; t<A,B>` — the
+                // tear-off's static type carries the parameter count the
+                // `_function` face reports against, upstream's
+                // `InvocationTargetFunctionTypedExpression` shape).
                 let named_fn = self
                     .top_level_decl(row.name)
                     .filter(|d| d.kind == MicroKind::TopLevelFn && d.formals.is_some())
                     .map(|d| (d.type_params, ExecKind::Function));
                 if let Some((declared, kind)) = named_fn {
                     self.emit_element_arity(row.name, declared, kind, count, range);
+                } else if let Ty::Function { shape, .. } = *ty {
+                    let declared = self.boundary.pool().function_shape(shape).type_params;
+                    if declared != count {
+                        let display = self.ty_display(*ty);
+                        self.emit3(
+                            SemanticCode::WrongNumberOfTypeArgumentsFunction,
+                            range,
+                            &display,
+                            &declared.to_string(),
+                            &count.to_string(),
+                        );
+                    }
                 } else if let Ty::Named { name, .. } = *ty
                     && let Some(entry) = self.resolved_member(name, self.intern("call"))
                     && entry.kind == MemberKind::Method
@@ -17273,6 +17369,34 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// A typed list literal's `List<E>` static type, `None` for the
+    /// untyped/inferred shape or when the element type does not resolve to
+    /// a type (the same gates [`Self::check_list_literal_elements`] applies
+    /// to its assignability loop — the row face keeps that posture).
+    fn typed_list_literal_ty(&mut self, left: Token) -> Option<Ty> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = left.range.offset as usize;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor == 0 || bytes[cursor - 1] != b'>' {
+            return None;
+        }
+        let (_, name) = self
+            .type_uses
+            .iter()
+            .rev()
+            .find(|(range, _)| range.end() <= left.range.offset)
+            .copied()?;
+        if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
+            return None;
+        }
+        let elem = Ty::named(name);
+        let list = self.intern("List");
+        let ty = self.boundary.args.borrow_mut().named(list, false, &[elem]);
+        Some(ty)
+    }
+
     /// The typed list literal's element check (`listLiteral`'s resolution,
     /// type_analyzer.dart's element loop): each element's static type must
     /// be assignable to the written element type —
@@ -17336,6 +17460,15 @@ impl<'a> Engine<'a> {
         }
         segments.push((seg_start, end));
         for (start, stop) in segments {
+            // A null-aware element (`?primary`) contributes its unwrapped
+            // value — the oracle's null-aware element resolver types the
+            // element itself as the element type when the `?` marker is
+            // present and asks no assignability question of it (the
+            // `?` gate already admits the nullable operand).
+            let seg_text = &self.source[start..stop];
+            if seg_text.trim_start().starts_with('?') {
+                continue;
+            }
             let Some(row) = self.rows.iter().rev().find(|row| {
                 row.ty != Ty::UNKNOWN
                     && row.range.offset >= start as u32
@@ -17706,13 +17839,24 @@ impl<'a> Engine<'a> {
                 // function-typed formal carries a written one
                 // (`int f()` — its `fn_formal_rets` slot, #1758). Every
                 // other local's annotation is its own type, not a
-                // signature's, so the under-report posture stands.
-                return self
+                // signature's, so the under-report posture stands — except
+                // a formal whose written annotation IS a function type
+                // (`bool Function(E) test`): its signature is stashed in
+                // `fn_var_sigs`, and the invoke's return is its `return_ty`
+                // (`if (test(event))` reads `bool` — without which
+                // `non_bool_condition` over-fires).
+                if let Some(ret) = self
                     .frames
                     .iter()
                     .rev()
                     .find_map(|f| f.fn_formal_rets.get(&row.name).copied())
-                    .unwrap_or(Ty::UNKNOWN);
+                {
+                    return ret;
+                }
+                return self
+                    .fn_var_sigs
+                    .get(&row.name)
+                    .map_or(Ty::UNKNOWN, |sig| sig.return_ty);
             }
             return self
                 .top_level_decl(row.name)
@@ -18047,15 +18191,24 @@ impl<'a> Engine<'a> {
     /// [`Engine::return_verdict`]; a failing one stages — the teardown may
     /// still clean it against the expression's promoted read.
     fn check_return(&mut self, from: Ty, range: SourceRange, from_literal: bool) {
+        // The innermost executable frame owns the return. A frame with no
+        // latched return (`ret: None` — a function literal or closure whose
+        // return type is context-inferred) stops the walk: its `return`/`=>`
+        // checks against the literal's own face, which the name-level model
+        // leaves undecided — under-report, never leak to the enclosing
+        // method's declared return (`firstDepleted`'s `Future<InventoryEvent?>`
+        // must not adjudicate `onTimeout: () => null`).
         let Some(ret) = self.frames.iter().rev().find_map(|f| match &f.kind {
-            FrameKind::Executable { ret: Some(ret), .. } => {
-                Some((ret.ty, ret.host, ret.name, ret.ctor))
+            FrameKind::Executable { ret, .. } => {
+                Some(ret.as_ref().map(|ret| (ret.ty, ret.host, ret.name, ret.ctor)))
             }
             _ => None,
         }) else {
             return;
         };
-        let (to, host, name, ctor) = ret;
+        let Some((to, host, name, ctor)) = ret else {
+            return;
+        };
         // The declared host's own NamedType resolution gates the whole check
         // (`named_type_resolver.dart` `_resolveToElement`: a head that misses
         // or names a non-type element leaves the annotation `InvalidType`,
@@ -18941,6 +19094,20 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// A value row with a resolved static type — the typed list literal's
+    /// carrier (the `List<E>` read the assignability faces decide on).
+    fn push_typed_value_row(&mut self, range: SourceRange, ty: Ty) {
+        self.push_row(Row {
+            name: self.intern(""),
+            range,
+            qualified: false,
+            shape: RowShape::Value,
+            intent: Intent::Read,
+            write_op: None,
+            ty,
+        });
+    }
+
     /// A literal whose type is a final primitive (`push_value_row` plus the
     /// type the static-nullability checks decide on).
     fn push_primitive_row(&mut self, token: Token, primitive: usize) {
@@ -19101,16 +19268,29 @@ impl<'a> Engine<'a> {
         let (read, write) = self.operator_spellings(row);
         match recv {
             Receiver::This { container, .. } => {
+                // Inside `extension E on T`/`extension type E(T)`, `this`
+                // carries the `on` type's static face — the operator
+                // resolves through `T`'s member table, not `E`'s
+                // (upstream `extension_member_resolver.dart`: `this[0]`
+                // inside `extension on List` resolves `List.operator []`,
+                // never an extension member). A class/mixin/enum's `this`
+                // reads its own container unchanged.
+                let resolved = match self.container_kind_of(container) {
+                    Some(ContainerKind::Extension) => self
+                        .extension_on_type_args(container)
+                        .map_or(container, |(head, _)| head),
+                    _ => container,
+                };
                 let mut missing: Vec<String> = Vec::new();
                 for spelling in [read, write].into_iter().flatten() {
-                    if matches!(self.walk_members(container, spelling), Walk::Missing) {
+                    if matches!(self.walk_members(resolved, spelling), Walk::Missing) {
                         missing.push(self.strings.resolve(spelling).to_string());
                     }
                 }
                 if missing.is_empty() {
                     return;
                 }
-                let type_text = self.strings.resolve(container).to_string();
+                let type_text = self.strings.resolve(resolved).to_string();
                 for text in missing {
                     self.emit(
                         SemanticCode::UndefinedOperator,
@@ -19739,6 +19919,22 @@ impl<'a> Engine<'a> {
                 }
             }
             Receiver::Prefix { name: prefix } => {
+                // `lazy.loadLibrary()` is the deferred-load runtime face
+                // the oracle synthesizes on a `deferred as` prefix — it
+                // joins no declared table, so the prefixed hit probe
+                // misses it by construction. Skip it here (upstream
+                // `DeferredLoad` synthesis: every deferred prefix carries
+                // a `loadLibrary` function returning `Future<void>`).
+                if row.name == self.intern("loadLibrary")
+                    && row.intent == Intent::Invoke
+                    && self
+                        .graph
+                        .import_edges(self.lib)
+                        .iter()
+                        .any(|edge| edge.deferred && edge.prefix == Some(prefix))
+                {
+                    return;
+                }
                 if self.prefixed_hit(prefix, row.name) || self.guard.ignore(Some(prefix), row.name)
                 {
                     return;
@@ -19868,11 +20064,32 @@ impl<'a> Engine<'a> {
         kind: ContainerKind,
     ) {
         let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
-        let mut defined = resolved.members.contains_key(&row.name);
-        if !defined && write {
-            defined = resolved
+        // Write intent resolves through the SETTER spelling plus a
+        // non-final field's implicit setter — a getter under the base
+        // name never satisfies a write (`Ext(item).g = x` on a
+        // getter-only `g` reports `undefined_extension_setter`, the
+        // same verdict the class-face `undefined_setter` shares).
+        let defined = if write {
+            resolved
                 .members
-                .contains_key(&self.setter_spelling(row.name));
+                .contains_key(&self.setter_spelling(row.name))
+                || resolved.members.get(&row.name).is_some_and(|entry| {
+                    matches!(entry.kind, MemberKind::Field) && !entry.is_final
+                })
+        } else {
+            resolved.members.contains_key(&row.name)
+        };
+        // An enum's synthesized STATIC `values` getter joins the
+        // interface face without an entry in `members` — a static read
+        // through the container's own name resolves the accessor
+        // upstream (`EnumElementImpl`'s synthesized static members; the
+        // `index`/`name` synth twins are instance members and keep the
+        // miss at this face).
+        if !defined
+            && kind == ContainerKind::Enum
+            && row.name == self.members.enum_synth_members[0]
+        {
+            return;
         }
         if !defined
             && (resolved.constructors.contains(&row.name)
@@ -20059,8 +20276,11 @@ impl<'a> Engine<'a> {
         if matches!(self.walk_members(container, row.name), Walk::ChainBroken) {
             // A chain broken at the root type (`int x; x.noSuchGetter`) is
             // the external-primitive face: the core member table decides.
-            // A broken superclass hop suppresses as before.
-            self.check_core_type_member(container, row);
+            // A broken superclass hop suppresses as before. The receiver's
+            // nullability rides along (#2140): a member the core table
+            // defines is the dereference face's found-arm, gated exactly
+            // like the walkable-model face above.
+            self.check_core_type_member(container, row, receiver_nullable);
             return;
         }
         let Some(kind) = self.container_kind_of(container) else {
@@ -20210,7 +20430,7 @@ impl<'a> Engine<'a> {
     /// [`CORE_TYPE_MEMBERS`] keys and resolves to no indexed container.
     /// Extension members still apply implicitly, so the pool gates first; a
     /// table hit is defined, a miss reports the access-intent trio.
-    fn check_core_type_member(&mut self, container: StringId, row: &Row) {
+    fn check_core_type_member(&mut self, container: StringId, row: &Row, receiver_nullable: bool) {
         let container_text = self.strings.resolve(container);
         // `Symbol` rides the same face: every symbol literal is
         // `Symbol`-typed (`#void.foo;` resolves `.foo` against it —
@@ -20259,6 +20479,26 @@ impl<'a> Engine<'a> {
         if members.contains(&name_text)
             || (write && members.contains(&self.strings.resolve(self.setter_spelling(row.name))))
         {
+            // The nullable-dereference face (nullable_dereference_verifier
+            // .dart report — the same emission the walkable-model found-arm
+            // makes): a member defined on the core type read through a
+            // merely-nullable receiver is the unchecked-access row at the
+            // selector. The oracle's Object-member reads (`s.hashCode`,
+            // `s.toString()`, `s == other`) stay silent — the member face
+            // answers without a dereference question — so the
+            // `==`/Object arm below keeps its under-report, and an
+            // invocation intent keeps the send face's ownership (the
+            // `member_defined` found-arm's split).
+            if receiver_nullable
+                && !matches!(row.intent, Intent::Invoke)
+                && !self.members.object_members.contains(&row.name)
+            {
+                self.emit_corrected(
+                    SemanticCode::UncheckedUseOfNullableValue,
+                    row.range,
+                    name_text,
+                );
+            }
             return;
         }
         if row.name == self.intern("==") || self.members.object_members.contains(&row.name) {
@@ -20399,10 +20639,16 @@ impl<'a> Engine<'a> {
     /// — the instance context `_checkForImplicitThisReferenceInInitializer`
     /// arms on.
     fn in_instance_field_initializer(&self) -> bool {
+        // A `late` instance field's initializer is lazy — `this` is
+        // in scope there (upstream `SuperContext.fieldDeclaration`'s
+        // late arm falls through to the enclosing class), so the
+        // `_checkForImplicitThisReferenceInInitializer` face arms only
+        // on a non-late instance group.
         self.in_initializer
             && self.field_group_open
             && self.init_frame_depth == self.field_group_depth
             && !self.open_member_static
+            && !self.group_late
     }
 
     /// Runs the walk(s) an access needs and applies the shared suppressions
@@ -24795,25 +25041,60 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_variable_initializer(&mut self, token: Token) {
-        self.flow().end_variable_initializer(token);
-
-        let engine = &mut self.engine;
-        // `VariableDeclaration` is in the official used set.
-        engine.ur_seal_used();
-        engine.in_initializer = false;
         // A `var`-inferred declarator's static type binds from the
         // initializer's resolved expression type — the single-row window
         // (`var self = this` leaves the `this` receiver row) answers it;
         // anything wider or unresolved keeps the `Unknown` slot every
-        // verdict reads as suppress.
-        if let Some(name) = engine.var_infer_pending.take() {
-            if let Some(mark) = engine.init_mark
+        // verdict reads as suppress. The bind and its flow staging
+        // precede the flow forward: a top-level/field initializer folds
+        // as its own executable inside that call, and the staged declared
+        // type must stand before the replay (#2140).
+        let staged = {
+            let engine = &mut self.engine;
+            engine.ur_seal_used();
+            engine.in_initializer = false;
+            let mut staged = None;
+            if let Some((name, decl_range)) = engine.var_infer_pending.take()
+                && let Some(mark) = engine.init_mark
                 && engine.rows.len() == mark + 1
                 && let Some(ty) = engine.initializer_static_ty(&engine.rows[mark])
             {
                 engine.bind_var_type(name, ty);
+                // The promotion face rides the flow layer's declared-type
+                // slot (#2140): a name-level type with no written
+                // arguments stages as the flow declared type, keyed on
+                // the declarator's name token — the fold adopts it at the
+                // initializer's end, so `case null`/`!= null` promotion
+                // and every read's flow type answer on inferred locals
+                // exactly like annotated ones. Argument-bearing and
+                // non-named shapes stay untyped downstream (the flow
+                // lattice cannot spell them; the unknown-declared
+                // under-report stands).
+                if let Ty::Named {
+                    name: ty_name,
+                    nullable,
+                    args: ArgListId::EMPTY,
+                } = ty
+                {
+                    let lexeme = engine.strings.resolve(ty_name).to_string();
+                    staged = Some((decl_range.offset, lexeme, nullable));
+                }
             }
+            staged
+        };
+        if let Some((offset, lexeme, nullable)) = staged {
+            let base = self.flow().intern_name(&lexeme);
+            self.flow().stage_inferred_local(
+                offset,
+                FlowTy {
+                    base: FlowBase::Name(base),
+                    nullable,
+                },
+            );
         }
+        self.flow().end_variable_initializer(token);
+
+        let engine = &mut self.engine;
         // The const close face: a member field group's own initializers
         // (began at the group's frame depth) and file-scope initializers
         // close on the field face — the value joins `const_field_values` /
@@ -25023,13 +25304,15 @@ impl ParserListener for DiagnoseListener<'_> {
                 if let Some(name) = name {
                     engine.note_local(name, token.range);
                     engine.const_decl_name(name, false);
-                    // A `var`/type-inferred declarator parks its name: the
-                    // initializer's resolved expression type binds as the
-                    // declared type at `end_variable_initializer` (the
-                    // `var self = this` face — the inferred `this` type is
-                    // the operand's static type for `self is T` verdicts).
+                    // A `var`/type-inferred declarator parks its name and
+                    // name token: the initializer's resolved expression
+                    // type binds as the declared type at
+                    // `end_variable_initializer` (the `var self = this`
+                    // face — the inferred `this` type is the operand's
+                    // static type for `self is T` verdicts) and stages as
+                    // the flow declared type (#2140).
                     engine.var_infer_pending = if engine.pending_decl_ty.is_none() {
-                        Some(name)
+                        Some((name, token.range))
                     } else {
                         None
                     };
@@ -28013,7 +28296,67 @@ impl ParserListener for DiagnoseListener<'_> {
             );
         }
         engine.check_list_literal_elements(left, right);
-        engine.push_value_row(right);
+        // The literal folds to one expression node upstream: its element
+        // rows belong to the node, not the stack — drain them into the
+        // deferred pass-2 queue exactly like the send fold does, so the
+        // enclosing single-row faces (`x = <num>[1]`'s `invalid_assignment`,
+        // `init_mark`'s `rows.len() == mark + 1` window) see the literal's
+        // own row alone. Element checks above already read their rows; the
+        // drained rows still owe their own reports (`undefined_getter`
+        // inside an element, `used_names` marks) through pass 2.
+        let literal_end = right.range.end();
+        let split = engine
+            .rows
+            .iter()
+            .position(|row| row.range.offset > left.range.offset && row.range.end() <= literal_end)
+            .unwrap_or(engine.rows.len());
+        for row in engine.rows.drain(split..) {
+            engine.deferred_miss_rows.push(row);
+        }
+        // A typed literal (`<num>[...]` / `const <num>[...]`) carries its
+        // written `List<E>` static type: the enclosing single-row faces
+        // (`invalid_assignment`, `argument_type_not_assignable`,
+        // `return_of_invalid_type`) ask their assignability question of it
+        // exactly like a typed expression. The row spans the whole literal
+        // — `const`/`>`-start through the `]` — matching the oracle's
+        // listLiteral anchor.
+        if let Some(ty) = engine.typed_list_literal_ty(left) {
+            let span_start = const_keyword.map_or_else(
+                || {
+                    // Locate the `<` group's head byte for the anchor's
+                    // start: walk back from `[` past the `>` and the group.
+                    let bytes = engine.source.as_bytes();
+                    let mut cursor = left.range.offset as usize;
+                    while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+                        cursor -= 1;
+                    }
+                    // cursor sits just after `>`; walk back over the group.
+                    let mut depth = 0usize;
+                    while cursor > 0 {
+                        cursor -= 1;
+                        match bytes[cursor] {
+                            b'>' => depth += 1,
+                            b'<' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    cursor as u32
+                },
+                |token| token.range.offset,
+            );
+            let range = SourceRange {
+                offset: span_start,
+                length: right.range.end() - span_start,
+            };
+            engine.push_typed_value_row(range, ty);
+        } else {
+            engine.push_value_row(right);
+        }
     }
 
     fn begin_literal_set_or_map(&mut self, _left: Token, const_keyword: Option<Token>) {
@@ -29010,7 +29353,10 @@ impl ParserListener for DiagnoseListener<'_> {
                 // so the formal waits for `end_initializers`/`end_constructor`
                 // (a secondary constructor) or the primary-constructor body's
                 // `this : super.x()` initializer / the class's own close.
-                let named = kind == FormalParameterKind::OptionalNamed;
+                let named = matches!(
+                    kind,
+                    FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
+                );
                 let super_index = if named {
                     u32::MAX
                 } else {
@@ -33228,6 +33574,31 @@ mod tests {
         );
     }
 
+    /// A function literal's `return`/`=>` body checks against the literal's
+    /// own context-inferred return, never the enclosing method's declared
+    /// return: `onTimeout: () => null` inside `firstDepleted`'s `.timeout`
+    /// call stays silent (the `Null` operand is legal for the literal's
+    /// `FutureOr<InventoryEvent?>` face — the enclosing `Future<InventoryEvent?>`
+    /// is not the literal's return type). Before the boundary fix the inner
+    /// `=>` leaked to the method's frame and over-fired.
+    #[test]
+    fn closure_return_stays_inside_the_literal_frame() {
+        let report = report(
+            "class int {} class Future<T> {} class InventoryEvent {} \
+             class C { \
+               Future<InventoryEvent?> firstDepleted() { \
+                 return fetch().timeout(t, onTimeout: () => null); \
+               } \
+               Future<InventoryEvent?> fetch() => first; \
+             }",
+        );
+        assert!(
+            !code_names(&report).contains(&"return_of_invalid_type"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
     /// The void-host arm of the return matrix: `return <non-void>` in a
     /// `void` function reports; `return null` in a void function is
     /// oracle-legal.
@@ -35708,6 +36079,28 @@ mod tests {
                 "const_with_non_constant_argument",
                 "final_not_initialized_constructor",
             ],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// A multi-positional const creation evaluates each argument on its
+    /// own: the parser emits `handle_positional_argument` once per
+    /// positional operand (parser_impl.dart:9608), so `const v = C(0, 0)`
+    /// captures two `Value` nodes — not one merged `Other`. Before the
+    /// event landed every positional list collapsed to a single
+    /// non-constant leaf and over-fired both `const_with_non_constant_argument`
+    /// and `const_initialized_with_non_constant_value` at the argument.
+    #[test]
+    fn const_creation_positional_arguments_fold_per_argument() {
+        let rep = report(
+            "class int {} class C { const C(int a, int b); } \
+             const C v = C(0, 0);",
+        );
+        assert!(
+            !code_names(&rep)
+                .iter()
+                .any(|c| c.starts_with("const_")),
             "{:?}",
             code_names(&rep)
         );
@@ -40076,6 +40469,40 @@ mod tests {
         assert_eq!(
             code_names(&report("class int {} int? k() {}")),
             ["body_might_complete_normally_nullable"]
+        );
+    }
+
+    /// An `async` body's completion verdict reads the declared return's
+    /// future-flattened face (`TypeSystem.flatten`,
+    /// type_analyzer.dart:682-704), not the `Future<...>` head: a
+    /// `Future<void>` async body flattens to `void` and stays silent, a
+    /// `FutureOr<int>` async body flattens to the potentially non-nullable
+    /// `int` and reports. The declared `Future<int>` head itself is
+    /// non-nullable — reading it raw would over-fire (the
+    /// `notifications/audit_log.dart` `record()` row).
+    #[test]
+    fn body_might_complete_normally_reads_the_async_flattened_return() {
+        assert_eq!(
+            code_names(&report(
+                "class Future<T> {} Future<void> f() async {}"
+            )),
+            [] as [&str; 0],
+            "{:?}",
+            code_names(&report(
+                "class Future<T> {} Future<void> f() async {}"
+            ))
+        );
+        assert_eq!(
+            code_names(&report(
+                "class int {} class Future<T> {} class FutureOr<T> {} \
+                 FutureOr<int> g() async {}"
+            )),
+            ["body_might_complete_normally"],
+            "{:?}",
+            code_names(&report(
+                "class int {} class Future<T> {} class FutureOr<T> {} \
+                 FutureOr<int> g() async {}"
+            ))
         );
     }
 
@@ -45148,6 +45575,100 @@ mod ticket_1351_tests {
         assert_eq!(count_code(&report, "unchecked_use_of_nullable_value"), 0);
     }
 
+    // —— #2140: the core-type nullable-dereference face ——————————————————
+
+    /// A member the core table defines, read through a merely-nullable
+    /// receiver, reports `unchecked_use_of_nullable_value` at the selector
+    /// (nullable_dereference_verifier.dart report — the found-arm the
+    /// walkable-model face already makes, extended to the
+    /// external-primitive face; probe: `int f(String? s) { return
+    /// s.length; }` reports at `length`). Declared and inferred
+    /// (`final x = e`) locals share the receiver face.
+    #[test]
+    fn core_type_nullable_receiver_dereference_reports() {
+        let source = "int f(String? s) { return s.length; }";
+        one_at(
+            &unit_report(source),
+            "unchecked_use_of_nullable_value",
+            at(source, "length"),
+            source,
+        );
+        let inferred = "int f(String? s) { final alias = s; return alias.length; }";
+        one_at(
+            &unit_report(inferred),
+            "unchecked_use_of_nullable_value",
+            at(inferred, "length"),
+            inferred,
+        );
+    }
+
+    /// The corpus fixture row (sem2 promotion_patterns_flow_records.dart
+    /// 70:18): the `case null` branch's dereference reports at the
+    /// selector while the fall-through read below stays clean — the same
+    /// pattern demotes inside the branch and promotes `alias` to `String`
+    /// on the fall-through, so the promotion machinery (the flow layer's
+    /// declared-type adoption, #2140) silences the second read.
+    #[test]
+    fn case_null_branch_dereference_reports_and_fall_through_stays_clean() {
+        let source = "int f(({String? alias}) r) { final alias = r.alias; \
+                      if (alias case null) { return alias.length; } \
+                      return alias.length; }";
+        let report = unit_report(source);
+        assert_eq!(count_code(&report, "unchecked_use_of_nullable_value"), 1);
+        one_at(
+            &report,
+            "unchecked_use_of_nullable_value",
+            at(source, "length"),
+            source,
+        );
+    }
+
+    /// The promotion silences: an `!= null`-guarded read and a `?.` chain
+    /// stay clean over an inferred local, exactly like an annotated one.
+    #[test]
+    fn promoted_and_null_aware_inferred_local_reads_stay_clean() {
+        let guarded = "int f(String? s) { final alias = s; \
+                       if (alias != null) { return alias.length; } return 0; }";
+        assert_eq!(
+            count_code(&unit_report(guarded), "unchecked_use_of_nullable_value"),
+            0,
+            "{guarded}"
+        );
+        let null_aware =
+            "int f(String? s) { final alias = s; return alias?.length ?? 0; }";
+        assert_eq!(
+            count_code(&unit_report(null_aware), "unchecked_use_of_nullable_value"),
+            0,
+            "{null_aware}"
+        );
+    }
+
+    /// The dereference question never reaches the Object members
+    /// (`s.hashCode`, `s.toString()`, `s.runtimeType` — the oracle's
+    /// property resolution answers them without a dereference check;
+    /// probe-verified silent), and a non-nullable receiver stays clean.
+    #[test]
+    fn object_members_and_non_nullable_receivers_stay_clean() {
+        let source = "void f(String? s, String t) { \
+                      s.hashCode; s.runtimeType; s.toString(); t.length; }";
+        let report = unit_report(source);
+        assert_eq!(count_code(&report, "unchecked_use_of_nullable_value"), 0);
+    }
+
+    /// The write face: a core-settable member (`List`'s `length=`) through
+    /// a nullable receiver reports the same code at the selector (probe:
+    /// `void f(List? l) { l.length = 2; }` — the property message).
+    #[test]
+    fn core_type_nullable_receiver_write_reports() {
+        let source = "void f(List? l) { l.length = 2; }";
+        one_at(
+            &unit_report(source),
+            "unchecked_use_of_nullable_value",
+            at(source, "length"),
+            source,
+        );
+    }
+
     /// The named creation's selector resolves the constructor's formals
     /// through the receiver fallback (`ctor_formals` keys the selector —
     /// the collector's both-lookup-spellings contract): `String` against
@@ -45715,6 +46236,29 @@ mod ticket_1351_tests {
         );
     }
 
+    /// `factory new()` (the FACTORY_CONSTRUCTOR_NEW_NAME recovery head):
+    /// the bare-`new` spelling IS the unnamed constructor's name, so `K()`
+    /// in the body resolves and the unnamed-miss code stays silent — while
+    /// the dotted `new.named()` shape keeps the unnamed face absent (the
+    /// oracle reports the miss there).
+    #[test]
+    fn factory_new_head_serves_the_unnamed_face() {
+        let bare = unit_report("class K {\n  factory new() => K();\n}");
+        assert_eq!(
+            count_code(&bare, "new_with_undefined_constructor_default"),
+            0,
+            "{:?}",
+            code_names(&bare)
+        );
+        let dotted = unit_report("class K {\n  factory new.named() => K();\n}");
+        assert_eq!(
+            count_code(&dotted, "new_with_undefined_constructor_default"),
+            1,
+            "{:?}",
+            code_names(&dotted)
+        );
+    }
+
     /// `duplicate_constructor` never crosses same-named class declarations
     /// (#2138): each `class C(...)` declaration owns its constructor set —
     /// the oracle reports `duplicate_definition` on the repeated class name
@@ -45942,6 +46486,89 @@ mod ticket_1351_tests {
         assert_eq!(
             count_code(&report, "unchecked_use_of_nullable_value"),
             1,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// #2144: a new-style function-typed formal's invocation reads its
+    /// shape's return type — `bool Function(E) test` makes `if (test(e))`
+    /// a `bool` condition. Without the `var_types`→`Ty::Function` arm in
+    /// `callee_return_ty` the send's return stayed `Unknown` and
+    /// `non_bool_condition` over-fired (events.dart's collection-`if`).
+    #[test]
+    fn function_typed_formal_new_style_return_resolves() {
+        let report = unit_report(
+            "class bool {} class E {}\nclass List<T> { void add(T t) {} }\nclass C {\n  List<E> pick(bool Function(E) test) => [for (final e in _src()) if (test(e)) e];\n  List<E> _src() => [];\n}",
+        );
+        assert_eq!(
+            count_code(&report, "non_bool_condition"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+        // The negative control: an `int`-returning formal still fires.
+        let bad = unit_report(
+            "class bool {} class int {} class E {}\nvoid f(int Function(E) test, E e) {\n  if (test(e)) {}\n}",
+        );
+        assert_eq!(
+            count_code(&bad, "non_bool_condition"),
+            1,
+            "{:?}",
+            code_names(&bad)
+        );
+    }
+
+    /// #2144: a typed list literal folds to one row — the `List<int> x =
+    /// const <num>[...]` declaration initializer asks its assignability
+    /// question of the literal's `List<num>` and reports
+    /// `invalid_assignment` (broken_argument_types.dart). The element rows
+    /// drain to pass 2 like the send fold's arguments; without the drain
+    /// the `init_mark` single-row window never saw the literal.
+    #[test]
+    fn const_typed_list_initializer_reports_invalid_assignment() {
+        let report = unit_report(
+            "class int {} class num {} class List<T> {}\nvoid f() {\n  List<int> sizes = const <num>[1, 2, 3];\n  print(sizes);\n}",
+        );
+        assert_eq!(
+            count_code(&report, "invalid_assignment"),
+            1,
+            "{:?}",
+            code_names(&report)
+        );
+        // The non-const spelling folds the same way.
+        let plain = unit_report(
+            "class int {} class num {} class List<T> {}\nvoid f() {\n  List<int> sizes = <num>[1, 2, 3];\n  print(sizes);\n}",
+        );
+        assert_eq!(
+            count_code(&plain, "invalid_assignment"),
+            1,
+            "{:?}",
+            code_names(&plain)
+        );
+        // Matching element type stays silent.
+        let ok = unit_report(
+            "class int {} class num {} class List<T> {}\nvoid f() {\n  List<num> sizes = const <num>[1, 2, 3];\n  print(sizes);\n}",
+        );
+        assert_eq!(
+            count_code(&ok, "invalid_assignment"),
+            0,
+            "{:?}",
+            code_names(&ok)
+        );
+    }
+    /// #2144 probe: the `&&`-chain field promotion — a private final field
+    /// tested in a later conjunct promotes into the guarded block, through
+    /// an implicit-`this` read inside a getter (promotion_chains.dart's
+    /// `hasAnnotation`).
+    #[test]
+    fn and_chain_private_final_field_promotes_into_block() {
+        let report = unit_report(
+            "class String { bool get isNotEmpty => true; }\nclass C {\n  final String? _a;\n  final String? _r;\n  bool get has {\n    if (_a != null && _r != null) {\n      return _r.isNotEmpty;\n    }\n    return false;\n  }\n}",
+        );
+        assert_eq!(
+            count_code(&report, "unchecked_use_of_nullable_value"),
+            0,
             "{:?}",
             code_names(&report)
         );

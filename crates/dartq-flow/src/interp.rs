@@ -700,6 +700,11 @@ pub(crate) struct Interp<'o> {
     /// read fallback once every scope frame misses. The empty table is the
     /// direct-construction default.
     pub(crate) top_level: &'o FxHashMap<u32, crate::record::TopVar>,
+    /// The inferred locals' declared types the semantic layer staged for
+    /// this unit (#2140), keyed on the declarator name token's offset —
+    /// adopted at `InitializerEnd` when the written header left the slot
+    /// unknown. Read-only for the replay.
+    pub(crate) inferred_locals: &'o FxHashMap<u32, crate::ty::Ty>,
     pub(crate) reach: ReachArena,
     pub(crate) lists: Lists,
     /// The non-promotion history pool beside [`Interp::lists`] — the same
@@ -849,6 +854,12 @@ struct Snapshot {
 static NO_TOP_LEVEL: std::sync::LazyLock<FxHashMap<u32, crate::record::TopVar>> =
     std::sync::LazyLock::new(FxHashMap::default);
 
+/// The direct-construction default for [`Interp::inferred_locals`]: no
+/// staged inferred-local types — every `var`/`final` declarator keeps its
+/// unknown-declared slot (the pre-#2140 behavior).
+static NO_INFERRED_LOCALS: std::sync::LazyLock<FxHashMap<u32, crate::ty::Ty>> =
+    std::sync::LazyLock::new(FxHashMap::default);
+
 /// The direct-construction default for [`Interp::closed`]: no closed
 /// declarations — every always-exhaustive verdict answers `false` (the
 /// pre-mount behavior).
@@ -876,6 +887,7 @@ impl<'o> Interp<'o> {
             boundaries,
             closed: &NO_CLOSED,
             top_level: &NO_TOP_LEVEL,
+            inferred_locals: &NO_INFERRED_LOCALS,
             reach: ReachArena::new(),
             lists: Lists::default(),
             reasons: Reasons::default(),

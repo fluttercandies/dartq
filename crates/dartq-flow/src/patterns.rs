@@ -43,12 +43,20 @@ impl Interp<'_> {
                     } else {
                         // Standalone pattern context (if-case, pattern
                         // variable declaration): official `_pushPattern` —
-                        // the unmatched sibling is the pre-split state; the
-                        // matched path continues in `current`.
-                        let unmatched = self.current.clone();
+                        // the working unmatched chain starts UNREACHABLE
+                        // (`_unmatched = _current.setUnreachable()`), so
+                        // the first clause's `_join(_unmatched, promoted)`
+                        // short-circuits to the promoted state undiluted —
+                        // an if-case's `case null` promotes the scrutinee
+                        // on the fall-through (the oracle's
+                        // promotion_patterns fixture 70-72: the branch
+                        // demotes, the fall-through read is clean). The
+                        // pre-split reachable state here would intersect
+                        // the promotion away at the chain join.
                         self.split_cur();
                         // An if-case's scrutinee expression is on the stack.
                         let scrutinee = self.exprs.pop().and_then(|e| e.reference);
+                        let unmatched = self.current.clone().set_unreachable(&mut self.reach);
                         self.pattern = Some(PatternState {
                             kind: std::mem::replace(&mut self.pattern_kind_hint, PatternKind::Decl),
                             unmatched,
