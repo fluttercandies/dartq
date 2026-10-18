@@ -333,8 +333,7 @@ fn named_only_record_type_shapes_parse_clean() {
 /// closer (ensureSemicolon's walked-back anchor), `expected_executable` on
 /// the leftover `)` (top-level invalid declaration), `unexpected_token` on
 /// the final `;` (oracle 3.13.1 `stack_overflow` line 2, cols 510/1208/1209/
-/// 1210; dartq's fuse anchor sits one entry earlier, a tracked position
-/// delta only).
+/// 1210 — the fuse trips on the entry past the cap, `depth++ > 500`).
 #[test]
 fn stack_overflow_fuse_tail_normal_unwind() {
     let src = format!("var x = {}1{};\n", "(".repeat(600), ")".repeat(600));
@@ -344,7 +343,7 @@ fn stack_overflow_fuse_tail_normal_unwind() {
     assert_eq!(
         p.listener.errors,
         vec![
-            ("stack_overflow".to_owned(), 508, 509),
+            ("stack_overflow".to_owned(), 509, 510),
             ("expected_token".to_owned(), 1207, 1208),
             ("expected_executable".to_owned(), 1208, 1209),
             ("unexpected_token".to_owned(), 1209, 1210),
@@ -540,6 +539,98 @@ fn unexpected_end_open_paren_arm_reports_once() {
             .iter()
             .any(|(_, s, e)| *s == 42 && *e == 43),
         "no row on the skipped `b`: {:?}",
+        p.listener.errors
+    );
+}
+
+// —— family: #2165 app-gate recovery singles ———————————————————————————————
+
+/// A list literal whose closer the scanner parked at EOF: the official
+/// `parseLiteralListSuffix` recovery (`parser_impl.dart:8536-8541`) moves the
+/// synthetic `]` in front of the stray token (`moveSynthetic`), so the
+/// unmatched-group row lands at the `;`, not at the end of the source
+/// (oracle 3.13.1: `var v = [1, 2, 3;` → `expected_token ']'` 1:17).
+#[test]
+fn list_literal_adopts_parked_closer_at_stray_token() {
+    let mut p = setup("var v = [1, 2, 3;\n");
+    p.parse_unit();
+    assert_eq!(
+        p.listener.errors,
+        vec![("expected_token".to_owned(), 16, 17)],
+        "{:?}",
+        p.listener.errors
+    );
+}
+
+/// An unclosed type-argument group in a declaration head: the official
+/// `ComplexTypeParamOrArgInfo.compute` recovery tail
+/// (`type_info_impl.dart:1408-1423`) ends the group on a synthetic `>`
+/// before the junk follower, so the name stays out of the type and the
+/// declaration keeps its parameters and body — one `expected_token`
+/// (`Expected '>' after this`) row on the last argument (oracle 3.13.1, top level and member).
+#[test]
+fn unclosed_type_args_in_declaration_head_end_before_name() {
+    for (source, at) in [
+        ("Map<String, int m0() => {};\n", (12, 15)),
+        ("class C { Map<String, int m0() => {}; }\n", (22, 25)),
+    ] {
+        let mut p = setup(source);
+        p.parse_unit();
+        assert_eq!(
+            p.listener.errors,
+            vec![("expected_token".to_owned(), at.0, at.1)],
+            "{source}: {:?}",
+            p.listener.errors
+        );
+    }
+}
+
+/// The same shape in a block is not a type-argument group at all: the
+/// statement path computes the type with `inDeclaration` false
+/// (`parser_impl.dart:9923`, `looksLikeLocalFunction` :9742), and outside a
+/// declaration a member followed by neither `,` nor a closer yields
+/// `noTypeParamOrArg` (`type_info_impl.dart:1395-1397`) — `Map < String`
+/// then reads as a relational expression (oracle 3.13.1: `expected_token`
+/// on `String`, then `missing_identifier` + `unexpected_token` on `,`).
+#[test]
+fn unclosed_type_args_in_block_read_as_expressions() {
+    let mut p = setup("void f() { Map<String, int m0() => {}; }\n");
+    p.parse_unit();
+    let got = &p.listener.errors;
+    for want in [
+        ("expected_token".to_owned(), 15, 21),
+        ("missing_identifier".to_owned(), 21, 22),
+        ("unexpected_token".to_owned(), 21, 22),
+    ] {
+        assert!(got.contains(&want), "missing {want:?}: {got:?}");
+    }
+    assert!(
+        !got.iter().any(|(code, _, _)| code == "missing_function_body"
+            || code == "missing_function_parameters"),
+        "no declaration-shaped rows: {got:?}"
+    );
+}
+
+/// The nesting fuse trips on the entry PAST the cap (`depth++ > 500`,
+/// `parser_impl.dart:6939`): 501 nested list literals parse, the 502nd
+/// opener reports (oracle 3.13.1 `final x = [[…]]` at 505 deep →
+/// `stack_overflow` at col 512, the 502nd `[`, then the normal-unwind tail
+/// at cols 1020/1021/1022).
+#[test]
+fn nesting_fuse_trips_past_the_cap() {
+    let src = format!("final x = {}{};\n", "[".repeat(505), "]".repeat(505));
+    let src: &'static str = Box::leak(src.into_boxed_str());
+    let mut p = setup(src);
+    p.parse_unit();
+    assert_eq!(
+        p.listener.errors,
+        vec![
+            ("stack_overflow".to_owned(), 511, 512),
+            ("expected_token".to_owned(), 1018, 1019),
+            ("expected_executable".to_owned(), 1019, 1020),
+            ("unexpected_token".to_owned(), 1020, 1021),
+        ],
+        "{:?}",
         p.listener.errors
     );
 }

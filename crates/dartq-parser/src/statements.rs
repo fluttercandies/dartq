@@ -73,7 +73,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// Official `parseStatement`: the statement-depth guard (official
     /// `statementDepth`, 500) wraps [`Self::parse_statement_x`].
     pub(crate) fn parse_statement(&mut self) {
-        if self.statement_depth >= MAX_DEPTH {
+        if self.statement_depth > MAX_DEPTH {
             // Official `recoverFromStackOverflow` (:11386): report +
             // empty-statement event + skip to `}`/EOF, then stop.
             self.recover_from_stack_overflow();
@@ -565,7 +565,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             }
         }
 
-        let type_info = self.compute_type(false, true);
+        // Official `computeType(beforeType, required: false)` (:9923) — the
+        // statement path never enables the declaration-only `<...>`
+        // recovery (`inDeclaration` defaults false), so `Map<String, int
+        // m() => {};` in a block reads as relational expressions.
+        let type_info = self.compute_type(false, false);
         type_info.skip_type_raw(self);
 
         if for_parts && let Some(late) = late_kw {
@@ -824,7 +828,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         }
         let mut after_name = 1usize;
         if self.cursor.look_kind(1) == TokenKind::Lt {
-            let type_param = self.compute_type_param_or_arg(true);
+            let type_param = self.compute_type_param_or_arg(false); // official `computeTypeParamOrArg(token)` (:9742), inDeclaration false
             if matches!(type_param, TypeParamOrArg::None) {
                 return false;
             }

@@ -562,6 +562,32 @@ fn supertype_edges(container: &Container) -> impl Iterator<Item = StringId> + '_
 /// tentative `false`, a definite `true` outranks the open one). A written
 /// supertype cycle is impossible in code the oracle analyzes; the seen-set
 /// makes it terminate as an ordinary shared node.
+/// Whether an unresolvable supertype hop is a dead edge rather than a
+/// broken chain. A name the scope cannot resolve at all — undefined,
+/// ambiguous, a non-class declaration — is the oracle's InvalidType
+/// supertype: it contributes nothing to the interface. A name that resolves
+/// to a declaration whose file carries no model (the synthetic SDK face)
+/// is the broken chain: the oracle sees members we cannot index.
+pub(crate) fn supertype_hop_dead(
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    lib: LibraryId,
+    file: FileId,
+    name: StringId,
+) -> bool {
+    if index
+        .get(file)
+        .is_some_and(|f| f.container(name).is_some())
+    {
+        return false;
+    }
+    match namespaces.lookup(graph, lib, name) {
+        Lookup::Found(NamespaceEntry::Decl(owner)) => index.get(owner).is_some(),
+        _ => true,
+    }
+}
+
 pub(crate) fn implements_interface(
     graph: &LibraryGraph,
     namespaces: &Namespaces,
@@ -571,6 +597,7 @@ pub(crate) fn implements_interface(
     file: FileId,
     name: StringId,
     interface: StringId,
+    entity_ask: bool,
 ) -> Option<bool> {
     // The core face, pre-interned once per query: the walk compares ids,
     // never re-resolves spellings per node.
@@ -607,9 +634,24 @@ pub(crate) fn implements_interface(
         }
     }
     let (start, start_file, start_lib) = seed;
+    // An entity ask whose interface spelling resolves to nothing (an
+    // undefined name or a type formal — formals answer through their
+    // bound, never the graph) is the oracle's InvalidType target: the
+    // assignability faces stay silent. A core ask keeps the core-face
+    // answer.
+    if entity_ask
+        && resolve_container(graph, namespaces, index, lib, file, interface).is_none()
+    {
+        return None;
+    }
     let Some((container, owner)) =
         resolve_container(graph, namespaces, index, start_lib, start_file, start)
     else {
+        if entity_ask {
+            // An InvalidType source is dynamic-shaped: assignable to
+            // anything the oracle would still check — the open verdict.
+            return None;
+        }
         return core_implements(&core, start, interface).then_some(true);
     };
     let mut answer = Some(false);
@@ -620,23 +662,47 @@ pub(crate) fn implements_interface(
     while let Some((current, current_owner, scope_lib, container)) = queue.pop() {
         let owner_lib = owner_library(graph, lib, current_owner, current).unwrap_or(scope_lib);
         for edge in supertype_edges(container) {
+            let resolved =
+                resolve_container(graph, namespaces, index, owner_lib, current_owner, edge);
+            // Entity-level asks match the interface the moment the chain
+            // spells it through a live edge. A dead edge spelled the same
+            // is the oracle's InvalidType — it contributes nothing (the
+            // `LocaleImplementation implements Locale` shape with the
+            // Locale edge unresolved is a definite miss). Core-face asks
+            // never spelling-match an indexed edge: a user declaration
+            // shadowing the spelling is not the core face — the
+            // resolution decides, never the spelling.
+            if entity_ask && edge == interface && resolved.is_some() {
+                return Some(true);
+            }
             if !seen.insert(edge) {
                 continue;
             }
-            match resolve_container(graph, namespaces, index, owner_lib, current_owner, edge) {
+            match resolved {
                 Some((next, next_owner)) => queue.push((edge, next_owner, owner_lib, next)),
                 // An indexed name spelled `interface` is a user type, never
                 // the core spelling (the oracle compares the defining
                 // library, extensions.dart:335-340) — it walked above. Only
-                // an unindexed edge can be the core face; any other
-                // unindexed edge could implement the interface, and the
+                // an unindexed edge can be the core face; a dead edge (the
+                // oracle's InvalidType — undefined, ambiguous, or non-class)
+                // contributes nothing to the interface, and any other
+                // unindexed edge could implement the interface, so the
                 // definite answer dies (a later definite `true` still
                 // outranks it).
                 None => {
                     if core_implements(&core, edge, interface) {
                         return Some(true);
                     }
-                    answer = None;
+                    if !supertype_hop_dead(
+                        graph,
+                        namespaces,
+                        index,
+                        owner_lib,
+                        current_owner,
+                        edge,
+                    ) {
+                        answer = None;
+                    }
                 }
             }
         }

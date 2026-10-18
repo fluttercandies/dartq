@@ -14,21 +14,21 @@ fn discovery_includes_symlinked_files_not_symlinked_dirs() {
 
     use common::Fixture;
 
-    // `hidden/` is not a discovery surface — `nested.dart` can only enter
-    // the discovered set through one of the dir links below, so interning
-    // it would mean a dir link was descended. (The file table canonicalizes
+    // `.hidden/` is a dot directory, never walked — `nested.dart` can only
+    // enter the discovered set through one of the dir links below, so
+    // interning it would mean a dir link was descended. (The file table canonicalizes
     // lookups, so a file reachable canonically can't serve as this pin.)
     let fixture = Fixture::new(&[
         ("lib/real.dart", "void real() {}\n"),
-        ("hidden/nested.dart", "void nested() {}\n"),
+        (".hidden/nested.dart", "void nested() {}\n"),
     ]);
     std::fs::create_dir(fixture.path("test")).expect("mkdir test");
     symlink(fixture.path("lib/real.dart"), fixture.path("lib/link.dart")).expect("file link");
-    symlink(fixture.path("hidden"), fixture.path("test/linked_lib")).expect("dir link");
+    symlink(fixture.path(".hidden"), fixture.path("test/linked_lib")).expect("dir link");
     // A dir link named `*.dart`: without the target stat it would fall
     // into the file branch and crash discovery reading a directory.
     symlink(
-        fixture.path("hidden"),
+        fixture.path(".hidden"),
         fixture.path("test/dir_as_dart.dart"),
     )
     .expect("dir link with dart name");
@@ -59,7 +59,7 @@ fn discovery_includes_symlinked_files_not_symlinked_dirs() {
         "bytes read through the link"
     );
 
-    for skipped in ["hidden/nested.dart", "lib/dangling.dart"] {
+    for skipped in [".hidden/nested.dart", "lib/dangling.dart"] {
         assert!(
             engine
                 .file_table()

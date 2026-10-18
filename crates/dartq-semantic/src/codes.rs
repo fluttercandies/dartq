@@ -916,6 +916,22 @@ pub enum SemanticCode {
     /// clause, `as` operand, `is` operand, then the type-argument list —
     /// the first matching context reports and returns).
     NonTypeAsTypeArgument,
+    /// `The name '{0}' isn't defined, so it can't be used in an 'is'
+    /// expression.` — an unresolved simple name in an `is` operand
+    /// (`type_test_with_undefined_name`, error_verifier.dart
+    /// `visitIsExpression`; the metadata-path twin of the FAM13 context
+    /// faces — the operand's type row reports this instead of staying
+    /// silent).
+    TypeTestWithUndefinedName,
+    /// `The name '{0}' isn't a type, so it can't be used in an 'as'
+    /// expression.` — an unresolved simple name in an `as` operand
+    /// (`cast_to_non_type`, error_verifier.dart `visitAsExpression`).
+    CastToNonType,
+    /// `The class '{0}' can't be used as a mixin because it's neither a
+    /// mixin class nor a mixin.` — a `with` entry resolving to a plain
+    /// class (`class_used_as_mixin`, messages.yaml :2737-2741; the
+    /// resolved-shape twin of the FAM14 `mixin_of_non_class` clause face).
+    ClassUsedAsMixin,
     /// `The name '{0}' isn't a class.` — an unresolved simple name heading
     /// an instance creation reports this context face instead of
     /// `undefined_class` (`newWithNonType`/`constWithNonType`, the
@@ -1680,6 +1696,12 @@ impl SemanticCode {
             Self::NonTypeAsTypeArgument => {
                 ("non_type_as_type_argument", "NON_TYPE_AS_TYPE_ARGUMENT")
             }
+            Self::TypeTestWithUndefinedName => (
+                "type_test_with_undefined_name",
+                "TYPE_TEST_WITH_UNDEFINED_NAME",
+            ),
+            Self::CastToNonType => ("cast_to_non_type", "CAST_TO_NON_TYPE"),
+            Self::ClassUsedAsMixin => ("class_used_as_mixin", "CLASS_USED_AS_MIXIN"),
             Self::CreationWithNonType => ("creation_with_non_type", "CREATION_WITH_NON_TYPE"),
             Self::CouldNotInfer => ("could_not_infer", "COULD_NOT_INFER"),
             Self::NonTypeInCatchClause => ("non_type_in_catch_clause", "NON_TYPE_IN_CATCH_CLAUSE"),
@@ -2463,6 +2485,15 @@ impl SemanticCode {
                     "The name '{a0}' isn't a type, so it can't be used as a type argument."
                 )
             }
+            Self::TypeTestWithUndefinedName => format!(
+                "The name '{a0}' isn't defined, so it can't be used in an 'is' expression."
+            ),
+            Self::CastToNonType => {
+                format!("The name '{a0}' isn't a type, so it can't be used in an 'as' expression.")
+            }
+            Self::ClassUsedAsMixin => format!(
+                "The class '{a0}' can't be used as a mixin because it's neither a mixin class nor a mixin."
+            ),
             Self::CreationWithNonType => format!("The name '{a0}' isn't a class."),
             Self::CouldNotInfer => format!("Couldn't infer type parameter '{a0}'.{a1}"),
             Self::NonTypeInCatchClause => format!(
@@ -3042,6 +3073,9 @@ impl SemanticCode {
             Self::NonTypeAsTypeArgument => Some(format!(
                 "Try correcting the name to an existing type, or defining a type named '{a2}'."
             )),
+            Self::TypeTestWithUndefinedName | Self::CastToNonType => Some(format!(
+                "Try changing the name to the name of an existing type, or creating a type with the name '{a2}'."
+            )),
             Self::CreationWithNonType | Self::NonTypeInCatchClause => {
                 Some("Try correcting the name to match an existing class.".to_string())
             }
@@ -3440,6 +3474,9 @@ mod tests {
             SemanticCode::ObsoleteColonForDefaultValue,
             SemanticCode::NonTypeAsTypeArgument,
             SemanticCode::CreationWithNonType,
+            SemanticCode::TypeTestWithUndefinedName,
+            SemanticCode::CastToNonType,
+            SemanticCode::ClassUsedAsMixin,
             SemanticCode::NonTypeInCatchClause,
             SemanticCode::MixinOfNonClass,
             SemanticCode::ImplementsNonClass,
@@ -4253,7 +4290,10 @@ mod tests {
             | SemanticCode::DuplicateConstructor
             | SemanticCode::ImplicitThisReferenceInInitializer
             | SemanticCode::ListElementTypeNotAssignable
-            | SemanticCode::DefinitelyUnassignedLateLocalVariable => code.code_info(),
+            | SemanticCode::DefinitelyUnassignedLateLocalVariable
+            | SemanticCode::TypeTestWithUndefinedName
+            | SemanticCode::CastToNonType
+            | SemanticCode::ClassUsedAsMixin => code.code_info(),
         }
     }
 
@@ -4344,6 +4384,9 @@ mod tests {
             SemanticCode::NonExhaustiveSwitchStatement,
             SemanticCode::NonNullableEqualsParameter,
             SemanticCode::NonTypeAsTypeArgument,
+            SemanticCode::TypeTestWithUndefinedName,
+            SemanticCode::CastToNonType,
+            SemanticCode::ClassUsedAsMixin,
             SemanticCode::NotEnoughPositionalArguments(ArgCountShape::Singular),
             SemanticCode::NotEnoughPositionalArguments(ArgCountShape::Plural),
             SemanticCode::NotEnoughPositionalArguments(ArgCountShape::NameSingular),

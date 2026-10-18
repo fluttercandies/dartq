@@ -2517,14 +2517,14 @@ fn code_style_and_formatter_shapes_report_rows() {
     assert!(nulled.issues.is_empty(), "{:?}", nulled.issues);
 }
 
-/// G-7: the nested-options boundary. `locate_nested` walks the four
-/// discovery surfaces (`lib`/`bin`/`test`/`tool`) — the same surfaces
-/// discovery analyzes — so an options file under any other directory is
-/// neither located nor honored, and the surface directory still registers.
-/// The combined posture ("options outside the four surfaces never govern")
-/// is a differential face of the discovery axis, not this module's.
+/// G-7: the nested-options boundary. `locate_nested` walks the whole
+/// package root (every non-dot directory, the same set discovery analyzes —
+/// `context_root.dart` `_includedFilesInFolder`), so an options file under
+/// any directory registers as its own governing entry. Oracle 3.13.1:
+/// `example/analysis_options.yaml` with `strict-casts: true` reports
+/// `invalid_assignment` for `int x = d;` in `example/` only (#2165).
 #[test]
-fn nested_options_outside_the_surfaces_do_not_govern() {
+fn nested_options_in_any_directory_govern() {
     let dir = TempDir::new("nested_boundary");
     dir.write(
         "analysis_options.yaml",
@@ -2546,13 +2546,13 @@ fn nested_options_outside_the_surfaces_do_not_govern() {
     // file is parsed on its own, context_builder.dart:196-206) — the
     // containing root takes only the nested excludes into its walk
     // predicate (context_locator.dart:402-409), never the nested rules or
-    // strictness. The non-surface subtree is not even located.
+    // strictness.
     let root = per_root.get(&dir.path("")).expect("root entry");
     assert_eq!(root.lint_rules, ["alpha_rule"]);
     assert_eq!(root.strict_casts, None);
-    // The non-surface directory has no governing entry at all.
-    assert!(!per_root.contains_key(&dir.path("example")));
-    // The surface directory does.
+    // Every directory carrying an options file governs its subtree.
+    let example = per_root.get(&dir.path("example")).expect("example entry");
+    assert_eq!(example.strict_casts, Some(true));
     assert!(per_root.contains_key(&dir.path("tool")));
 }
 

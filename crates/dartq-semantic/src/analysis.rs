@@ -697,6 +697,7 @@ impl<'a> Analysis<'a> {
             self.file,
             name,
             interface,
+            false,
         )
     }
 
@@ -2244,11 +2245,13 @@ mod tests {
 
     /// `implements_core_interface` answers the declared supertype graph: a
     /// chain reaching the interface spelling answers `true` (a definite
-    /// `true` outranks an open edge), a fully indexed chain without it
-    /// answers `false`, an unindexed edge outside the core face leaves the
-    /// answer open, and the core face answers the SDK spellings directly —
-    /// while a user container spelled `Iterable` resolves indexed and is
-    /// walked as a user type, never a core match.
+    /// `true` outranks everything), a chain whose only miss is a dead edge
+    /// (an undefined/non-class spelling — the oracle's InvalidType
+    /// contributes nothing to the interface) answers `false`, an edge that
+    /// resolves but sits outside the indexed set leaves the answer open,
+    /// and the core face answers the SDK spellings directly — while a user
+    /// container spelled `Iterable` resolves indexed and is walked as a
+    /// user type, never a core match.
     #[test]
     fn implements_core_interface_walks_the_supertype_graph() {
         let source = "class A implements B {} \
@@ -2268,9 +2271,12 @@ mod tests {
         assert_eq!(asks("B"), Some(true));
         // Fully indexed, no hit anywhere on the graph.
         assert_eq!(asks("Alone"), Some(false));
-        // An unindexed edge outside the core face: the question stays open.
-        assert_eq!(asks("Open"), None);
-        // …but a definite `true` on a sibling edge outranks the open one.
+        // A dead edge (undefined spelling) contributes nothing: the definite
+        // miss survives as `false` (the oracle decides
+        // `argument_type_not_assignable` on such receivers — the
+        // `dead_implements_edge_breaks_assignability` pin).
+        assert_eq!(asks("Open"), Some(false));
+        // …but a definite `true` on a sibling edge outranks the dead one.
         assert_eq!(asks("HalfOpen"), Some(true));
         // The core face: `List` implements `Iterable` by definition, so
         // `ThroughCore<T> implements List<T>` answers without the written

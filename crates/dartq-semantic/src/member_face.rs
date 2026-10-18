@@ -80,7 +80,21 @@ pub(crate) const BUILTIN_TYPES: [&str; 1] = ["dynamic"];
 /// type bounds are invisible to the name-level model, so folding them is
 /// the suppress direction (a bound violation the oracle would report stays
 /// silent); omitting one would report a genuinely present member.
-pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 10] = [
+pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 13] = [
+    (
+        "Object",
+        &[
+            "hashCode",
+            "runtimeType",
+            "noSuchMethod",
+            "toString",
+            "==",
+        ],
+    ),
+    (
+        "Iterator",
+        &["current", "moveNext", "hashCode", "runtimeType", "noSuchMethod", "toString"],
+    ),
     (
         "int",
         &[
@@ -326,6 +340,16 @@ pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 10] = [
             "setAll",
             "setRange",
             "shuffle",
+            // The mutating/index faces `undefined_method` must not fire on
+            // (#2161): `insert`/`insertAll` are declared on `List` itself
+            // (sdk/lib/core/list.dart:630/645), `[]`/`[]=` are the index
+            // read/write spellings the member/operator rows carry, `+` is
+            // the concat operator.
+            "insert",
+            "insertAll",
+            "[]",
+            "[]=",
+            "+",
             "single",
             "singleOrNull",
             "singleWhere",
@@ -369,6 +393,12 @@ pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 10] = [
             "update",
             "updateAll",
             "values",
+            // The index faces `undefined_method`/`undefined_operator` must
+            // not fire on (#2161): `m['k']`/`m['k']=v` are `Map`'s `[]`/
+            // `[]=` operators (sdk/lib/core/map.dart) carried on the member
+            // row as `[]`/`[]=`.
+            "[]",
+            "[]=",
         ],
     ),
     (
@@ -447,6 +477,67 @@ pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 10] = [
             "whenComplete",
         ],
     ),
+    // The `dart:collection` interface faces (unindexed like `dart:core`):
+    // `Queue`'s declared members plus the `Iterable` set it re-exports —
+    // `class Q implements Queue { @override add }` must not over-report
+    // `override_on_non_overriding_member` (#2161's DelegatingQueue).
+    (
+        "Queue",
+        &[
+            "add",
+            "addAll",
+            "addFirst",
+            "addLast",
+            "any",
+            "asNameMap",
+            "cast",
+            "clear",
+            "contains",
+            "elementAt",
+            "elementAtOrNull",
+            "every",
+            "expand",
+            "first",
+            "firstOrNull",
+            "firstWhere",
+            "followedBy",
+            "fold",
+            "forEach",
+            "hashCode",
+            "indexed",
+            "isEmpty",
+            "isNotEmpty",
+            "iterator",
+            "join",
+            "last",
+            "lastOrNull",
+            "lastWhere",
+            "length",
+            "map",
+            "noSuchMethod",
+            "nonNulls",
+            "reduce",
+            "remove",
+            "removeFirst",
+            "removeLast",
+            "removeWhere",
+            "retainWhere",
+            "runtimeType",
+            "single",
+            "singleOrNull",
+            "singleWhere",
+            "skip",
+            "skipWhile",
+            "take",
+            "takeWhile",
+            "toList",
+            "toSet",
+            "toString",
+            "wait",
+            "where",
+            "whereType",
+        ],
+    ),
 ];
 
 /// The dart:core primitives whose assignability the name level decides: a
@@ -467,6 +558,81 @@ pub(crate) const FINAL_PRIMITIVES: [&str; 5] = ["int", "double", "num", "bool", 
 pub(crate) const CORE_INTERFACE_MEMBERS: [(&str, &[&str]); 2] = [
     ("Comparable", &["compareTo"]),
     ("Pattern", &["allMatches", "matchAsPrefix"]),
+];
+
+/// The `dart:collection` mixin/base faces that share a `dart:core`
+/// interface's member set (the `getOverridden` walk lands on them through
+/// `extends`/`with`/`implements`, but their units are unindexed like
+/// `dart:core` — #2161's `ListBase`/`ListMixin` `replaceRange`/`[]=` rows).
+/// Each maps to the [`CORE_TYPE_MEMBERS`] row whose members it re-exports:
+/// `ListMixin` implements `List` (which is `Iterable`), `SetMixin`
+/// implements `Set`, `MapMixin`/`MapView` implement `Map`, `IterableBase`/
+/// `IterableMixin` implement `Iterable`. The union of the mapped rows is the
+/// face's member set; the base/mixin's OWN members (`ListMixin.add`…) are a
+/// subset of that face.
+pub(crate) const COLLECTION_INTERFACE_ALIASES: [(&str, &[&str]); 33] = [
+    ("ListBase", &["List", "Iterable"]),
+    ("ListMixin", &["List", "Iterable"]),
+    ("UnmodifiableListBase", &["List", "Iterable"]),
+    ("UnmodifiableListMixin", &["List", "Iterable"]),
+    ("UnmodifiableListView", &["List", "Iterable"]),
+    ("LinkedList", &["List", "Iterable"]),
+    ("SetBase", &["Set", "Iterable"]),
+    ("SetMixin", &["Set", "Iterable"]),
+    ("UnmodifiableSetMixin", &["Set", "Iterable"]),
+    ("UnmodifiableSetView", &["Set", "Iterable"]),
+    ("HashSet", &["Set", "Iterable"]),
+    ("LinkedHashSet", &["Set", "Iterable"]),
+    ("SplayTreeSet", &["Set", "Iterable"]),
+    ("MapBase", &["Map"]),
+    ("MapMixin", &["Map"]),
+    ("MapView", &["Map"]),
+    ("UnmodifiableMapBase", &["Map"]),
+    ("UnmodifiableMapMixin", &["Map"]),
+    ("UnmodifiableMapView", &["Map"]),
+    ("HashMap", &["Map"]),
+    ("LinkedHashMap", &["Map"]),
+    ("SplayTreeMap", &["Map"]),
+    ("IterableBase", &["Iterable"]),
+    ("IterableMixin", &["Iterable"]),
+    ("UnmodifiableIterableBase", &["Iterable"]),
+    ("Queue", &["Queue", "Iterable"]),
+    ("Deque", &["Queue", "Iterable"]),
+    ("ListQueue", &["Queue", "Iterable"]),
+    ("DoubleLinkedQueue", &["Queue", "Iterable"]),
+    ("UnmodifiableQueueView", &["Queue", "Iterable"]),
+    ("HasNext", &["Iterator"]),
+    ("HasNextIterator", &["Iterator"]),
+    ("LinkedListEntry", &["Object"]),
+];
+
+/// The `dart:core` classes whose constructors are const-constructible but
+/// whose units are never indexed (the CLI's SDK posture): a `const C(...)` /
+/// `C.named(...)` — or the implicit `const` inside a const-declaration
+/// initializer — over one of these containers is a valid constant creation,
+/// never a `const_initialized_with_non_constant_value` failure. Each row
+/// maps the container spelling to its const-constructible selector set: `""`
+/// is the unnamed-face entry (`pragma(` calls the const factory `pragma`,
+/// which redirects to `pragma._`), and the named spellings cover the
+/// factory/generative selectors (`Deprecated.implement`, `bool.fromEnvironment`).
+/// Asserted against upstream `pkg:core` — a container absent here falls
+/// through to the indexed-container walk unchanged.
+pub(crate) const CORE_CONST_CTOR: [(&str, &[&str]); 15] = [
+    ("bool", &["fromEnvironment", "hasEnvironment"]),
+    ("Deprecated", &["", "extend", "implement", "instantiate", "mixin", "optional", "subclass"]),
+    ("Duration", &[""]),
+    ("FormatException", &[""]),
+    ("int", &["fromEnvironment"]),
+    ("IntegerDivisionByZeroException", &[""]),
+    ("Iterable", &["", "empty"]),
+    ("MapEntry", &[""]),
+    ("Object", &[""]),
+    ("OutOfMemoryError", &[""]),
+    ("pragma", &[""]),
+    ("StackOverflowError", &[""]),
+    ("String", &["fromEnvironment"]),
+    ("Symbol", &[""]),
+    ("_Enum", &[""]),
 ];
 
 /// The member-face state: one engine owns one face; the caches and latches

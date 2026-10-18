@@ -15,7 +15,8 @@ use crate::recovery::is_identifier;
 use crate::token_id::{TokenId, TokenSpan};
 
 /// Maximum structural nesting before the parser forces unwinding (official
-/// `recoverFromStackOverflow` cap of 500, `parser_impl.dart:6709`).
+/// `recoverFromStackOverflow` cap, `parser_impl.dart:6709/:6939`): the guards
+/// trip once the depth EXCEEDS it (`depth++ > 500` — the 502nd nested entry).
 pub(crate) const MAX_DEPTH: u32 = 500;
 
 /// Per-file diagnostics cap (rust-analyzer parser-bailout practice). A
@@ -307,7 +308,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
         if self.bailed {
             return false;
         }
-        if self.depth >= MAX_DEPTH {
+        if self.depth > MAX_DEPTH {
             // One report per deep form: once the fuse latched (the official
             // local guard, `parser_impl.dart:6947`), further cap entries
             // unwind silently; the latch clears only at a form boundary that
@@ -340,7 +341,7 @@ impl<'s, 't, 'l, L: ParserListener> Parser<'s, 't, 'l, L> {
     /// entry check (official `expressionDepth++ > 500`) before
     /// [`Self::enter_depth`] would consume the slot.
     pub(crate) fn at_depth_cap(&self) -> bool {
-        self.depth >= MAX_DEPTH
+        self.depth > MAX_DEPTH
     }
 
     /// Whether the terminal bailout latched: every grammar loop checks this

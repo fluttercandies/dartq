@@ -1215,15 +1215,25 @@ impl AnalysisOptions {
             };
             per_root.insert(root.clone(), options);
         }
+        let all_roots: rustc_hash::FxHashSet<PathBuf> = roots.iter().cloned().collect();
         for root in roots {
             let base = per_root[root].clone();
-            Self::locate_nested(root, base, &mut loaded, &mut per_root, packages, config_dir);
+            Self::locate_nested(
+                root,
+                base,
+                &mut loaded,
+                &mut per_root,
+                packages,
+                config_dir,
+                &all_roots,
+            );
         }
         per_root
     }
 
-    /// Walks `root`'s discovery surfaces (the same dot rule and exclude
-    /// pruning discovery applies) registering every nested options file at
+    /// Walks `root` whole (the same dot rule and exclude pruning discovery
+    /// applies; a nested package root is its own walk's, never descended
+    /// here) registering every nested options file at
     /// its directory. Descent prunes against the globs accumulated so far —
     /// the root's own first, each nested file's as it registers — mirroring
     /// the official locator's walk under `containingRoot.excludedGlobs`
@@ -1237,8 +1247,8 @@ impl AnalysisOptions {
         out: &mut FxHashMap<PathBuf, Arc<AnalysisOptions>>,
         packages: &PackageConfig,
         config_dir: &Path,
+        all_roots: &rustc_hash::FxHashSet<PathBuf>,
     ) {
-        const SURFACES: [&str; 4] = ["lib", "bin", "test", "tool"];
         // The accumulated governing entries: the root's own first, each
         // nested file's as it registers. Exclusion tests every entry's
         // globs, each anchored to its declaring directory.
@@ -1246,7 +1256,19 @@ impl AnalysisOptions {
         let excluded = |path: &Path, governing: &[Arc<AnalysisOptions>]| {
             governing.iter().any(|options| options.is_excluded(path))
         };
-        let mut queue: Vec<PathBuf> = SURFACES.iter().map(|s| root.join(s)).collect();
+        // The whole root, like discovery's walk (every non-dot child
+        // directory; the root's own options file is `base`).
+        let mut queue: Vec<PathBuf> = std::fs::read_dir(root)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+                    .filter(|entry| !entry.file_name().as_encoded_bytes().starts_with(b"."))
+                    .map(|entry| entry.path())
+                    .filter(|path| !all_roots.contains(path))
+                    .collect()
+            })
+            .unwrap_or_default();
         while let Some(dir) = queue.pop() {
             // Pop-time exclusion: a glob registered while this dir sat in
             // the queue (its parent batch found a nested options file) must
@@ -1266,7 +1288,7 @@ impl AnalysisOptions {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if file_type.is_dir() {
-                    if !name.starts_with('.') {
+                    if !name.starts_with('.') && !all_roots.contains(&path) {
                         queue.push(path);
                     }
                 } else if name == OPTIONS_FILE_NAME {

@@ -317,9 +317,18 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     }
                     if let Some(close) = self.current_matching_end_for_open(left) {
                         let (_, synthetic) = self.cursor.resolve(close);
-                        if !synthetic {
-                            self.report(msg::expected_but_got("]"), self.peek_span());
+                        if synthetic {
+                            // The scanner parked `]` at the wrong spot:
+                            // `moveSynthetic` (:8537-8540) relocates it here.
+                            end = self.move_synthetic_close(
+                                left,
+                                close,
+                                TokenKind::CloseSquare,
+                                "]",
+                            );
+                            break;
                         }
+                        self.report(msg::expected_but_got("]"), self.peek_span());
                         self.skip_to_token(close);
                         end = self.peek_span();
                         self.cursor.advance();

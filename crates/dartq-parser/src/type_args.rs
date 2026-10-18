@@ -579,8 +579,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 if scan == lt_offset + 1 && !in_declaration {
                     return None;
                 }
-                recovered = true;
-                return Some((self.real_id(scan), recovered, false));
+                return Some(self.recovered_group_end(scan));
             }
             let (end, mut backed_up) = self.step_over_type(scan, len);
             scan = end;
@@ -604,6 +603,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     ));
                 }
                 _ => {
+                    // Official :1395-1397: outside a declaration a member
+                    // followed by neither `,` nor a closer means this is no
+                    // type-argument group at all (`Map<String, int m()` in
+                    // a block reads as relational expressions).
+                    if !in_declaration {
+                        return None;
+                    }
                     // Official missing-comma continuation
                     // (type_info_impl.dart:1399-1404): in a declaration an
                     // identifier followed by another identifier, `,`, or a
@@ -627,17 +633,33 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     }
                     // Recovery: declaration-style content missing commas —
                     // stop at the first non-member shape.
-                    recovered = true;
-                    let mut probe = scan;
-                    if self.kind_at(probe) == TokenKind::OpenParen
-                        && let Some(end) = self.cursor.table_matching_end(self.real_id(probe))
-                    {
-                        probe = self.offset_of(end) + 1;
-                    }
-                    return Some((self.real_id(probe), recovered, false));
+                    return Some(self.recovered_group_end(scan));
                 }
             }
         }
+    }
+
+    /// The recovery tail of `ComplexTypeParamOrArgInfo.compute`
+    /// (type_info_impl.dart:1408-1423) at the junk offset `next`: a `(`
+    /// group is stepped over, then a closer at the follower or one token
+    /// further ends the group (`splitCloser`), else the group ends on a
+    /// synthetic `>` in front of the follower (`syntheticGt`) — encoded as
+    /// the token before the follower being the group's last token, so the
+    /// type ends there and the follower (a declaration's name) stays out of
+    /// the type.
+    fn recovered_group_end(&self, mut next: usize) -> (TokenId, bool, bool) {
+        if self.kind_at(next) == TokenKind::OpenParen
+            && let Some(end) = self.cursor.table_matching_end(self.real_id(next))
+        {
+            next = self.offset_of(end) + 1;
+        }
+        for at in [next, next + 1] {
+            let kind = self.kind_at(at);
+            if is_closer(kind) {
+                return (self.real_id(at), true, is_compound_closer(kind));
+            }
+        }
+        (self.real_id(next - 1), true, false)
     }
 
     /// Advance from a type's first token past its `skipType` length. When the

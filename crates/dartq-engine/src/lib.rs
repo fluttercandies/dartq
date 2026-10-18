@@ -892,9 +892,12 @@ impl Engine {
         query::complete_at(&self.state, file, offset)
     }
 
-    /// discovery face: package roots (from the identity table)
-    /// plus `lib`/`bin`/`test`/`tool` per root and root-level `*.dart`
-    /// files; never a blind tree walk. The only built-in exclusion is the
+    /// discovery face: every package root (from the identity table),
+    /// walked whole — each root-level `*.dart` file and every non-dot,
+    /// non-excluded subdirectory, the oracle's included-folder walk
+    /// (context_root.dart `_includedFilesInFolder`). A nested package root
+    /// is walked by its own pass, never by its parent's, so each file is
+    /// discovered once under its own package. The only built-in exclusion is the
     /// oracle's dot rule, checked on every child path — directories and
     /// files alike (context_root.dart:146-166 `_isExcluded`; the same rule
     /// the CLI walk ships). `build`/`node_modules` are `analysis_options`
@@ -916,8 +919,6 @@ impl Engine {
     ///
     /// Propagates I/O errors from reading discovered files.
     pub fn discover_workspace(&mut self) -> std::io::Result<DiscoveryStats> {
-        const SURFACES: [&str; 4] = ["lib", "bin", "test", "tool"];
-
         let mut roots: Vec<PathBuf> = self
             .state
             .packages
@@ -928,6 +929,10 @@ impl Engine {
         roots.dedup();
 
         let mut stats = DiscoveryStats::default();
+        // Every package root, so a parent's walk stops at a nested root:
+        // the nested package's files belong to the nested walk (each file
+        // is discovered exactly once, attributed to its own package).
+        let all_roots: FxHashSet<PathBuf> = roots.iter().cloned().collect();
         for root in &roots {
             // The governing options: the root's entry plus every
             // nested options directory under it. Excluded paths leave the
@@ -949,11 +954,24 @@ impl Engine {
                     .iter()
                     .any(|(key, options)| path.starts_with(key) && options.is_excluded(path))
             };
-            // The four declared surfaces; directly-in-root dart files are
-            // collected below, never queued (the walk's `read_dir` on a file
-            // is ENOTDIR and would silently drop them).
-            let mut queue: Vec<PathBuf> =
-                SURFACES.iter().map(|surface| root.join(surface)).collect();
+            // The whole root, like the oracle's included-folder walk
+            // (context_root.dart `_includedFilesInFolder`: every child folder
+            // not excluded by the dot rule or the options globs) — not only
+            // the conventional `lib`/`bin`/`test`/`tool` surfaces: a `tests/`
+            // or `example/` directory is analyzed too. Directly-in-root dart
+            // files are collected below, never queued (the walk's `read_dir`
+            // on a file is ENOTDIR and would silently drop them).
+            let mut queue: Vec<PathBuf> = std::fs::read_dir(root)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+                        .filter(|entry| !entry.file_name().as_encoded_bytes().starts_with(b"."))
+                        .map(|entry| entry.path())
+                        .filter(|path| !all_roots.contains(path) && !is_excluded(path))
+                        .collect()
+                })
+                .unwrap_or_default();
             // Accepts one `.dart` file — the shared tail of the root pass
             // and the walk below. Reading and enqueueing happen after the
             // walk, parallelized over the sorted path list.
@@ -992,7 +1010,8 @@ impl Engine {
                     let name = entry.file_name();
                     let name = name.to_string_lossy();
                     if file_type.is_dir() {
-                        if name.starts_with('.') || is_excluded(&path) {
+                        if name.starts_with('.') || is_excluded(&path) || all_roots.contains(&path)
+                        {
                             continue;
                         }
                         queue.push(path);

@@ -728,19 +728,8 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
             let (_, synthetic) = self.cursor.resolve(close_id);
             if synthetic {
                 // Scanner-synthesized closer parked at the wrong spot (EOF
-                // for an unclosed `(`): relocate it in front of the current
-                // token (official `moveSynthetic`, :5035-5037), reporting the
-                // row the official translation would emit for the pair — the
-                // enclosing parse resumes at the current token.
-                self.spill_after = Some(self.span_of(close_id).range.offset);
-                let at = self.peek_span();
-                self.report_unmatched_row(")", at);
-                self.unmatched_reported.push(open.id);
-                let id = self
-                    .cursor
-                    .insert_synthetic(TokenKind::CloseParen, at.range.offset);
-                self.cursor.advance();
-                return self.span_of(id);
+                // for an unclosed `(`): relocate it (:5035-5037).
+                return self.move_synthetic_close(open, close_id, TokenKind::CloseParen, ")");
             }
             let at = self.peek_span();
             self.report(msg::expected_token(")"), at);
@@ -755,6 +744,28 @@ impl<L: crate::listener::ParserListener> Parser<'_, '_, '_, L> {
         let id = self
             .cursor
             .insert_synthetic(TokenKind::CloseParen, at.range.offset);
+        self.cursor.advance();
+        self.span_of(id)
+    }
+
+    /// Official `moveSynthetic`: relocate the scanner-synthesized closer
+    /// `close_id` of `open` in front of the current token and consume it,
+    /// reporting the unmatched-group row the post-parse translation emits at
+    /// the relocated offset (it reads `begin.endGroup.charOffset`); the
+    /// enclosing parse resumes at the current token. The begin id latches
+    /// [`Self::unmatched_reported`] so the parse-end pass skips the pair.
+    pub(crate) fn move_synthetic_close(
+        &mut self,
+        open: TokenSpan,
+        close_id: crate::token_id::TokenId,
+        kind: TokenKind,
+        lexeme: &'static str,
+    ) -> TokenSpan {
+        self.spill_after = Some(self.span_of(close_id).range.offset);
+        let at = self.peek_span();
+        self.report_unmatched_row(lexeme, at);
+        self.unmatched_reported.push(open.id);
+        let id = self.cursor.insert_synthetic(kind, at.range.offset);
         self.cursor.advance();
         self.span_of(id)
     }
