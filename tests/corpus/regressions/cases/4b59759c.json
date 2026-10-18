@@ -1,0 +1,41 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/const_with_non_const.dart",
+  "corpus": "tests/corpus/sem2",
+  "oracle": [
+    {
+      "code": "const_initialized_with_non_constant_value",
+      "line": 8,
+      "column": 11,
+      "length": 3,
+      "message": "Const variables must be initialized with a constant value."
+    },
+    {
+      "code": "const_with_non_const",
+      "line": 8,
+      "column": 11,
+      "length": 3,
+      "message": "The constructor being called isn't a const constructor."
+    }
+  ],
+  "dartq": [],
+  "source": "// Targets const_with_non_const: a const creation invoking a non-const\n// constructor. Oracle message (nail-pinned): \"The constructor being called\n// isn't a const constructor.\"\nclass C {\n  C();\n}\n\nconst x = C();\n",
+  "captured_at": 1792309801,
+  "source_run": {
+    "report": "target/evidence/gate-sem2/sem2-r1-rcE/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/sem2",
+    "--edits",
+    "tests/corpus/regressions/cases/4b59759c.edits.jsonl",
+    "--dartq-cmd",
+    "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/debug/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

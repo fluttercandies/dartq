@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/const_with_undefined_constructor.dart","length":252,"line":1,"new_text":"// Targets const_with_undefined_constructor: a const creation naming a\n// constructor the class does not have. Oracle message (nail-pinned): \"The\n// class 'C' doesn't have a constant constructor 'named'.\"\nclass C {\n  const C();\n}\n\nconst y = C.named();\n"}

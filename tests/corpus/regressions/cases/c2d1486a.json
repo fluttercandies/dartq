@@ -258,6 +258,13 @@
       "message": "Binary operator 'or' is written as '|' instead of the written out word."
     },
     {
+      "code": "duplicate_constructor",
+      "line": 33,
+      "column": 3,
+      "length": 3,
+      "message": "The unnamed constructor is already defined."
+    },
+    {
       "code": "expected_token",
       "line": 38,
       "column": 7,
@@ -265,32 +272,53 @@
       "message": "Expected to find ';'."
     },
     {
-      "code": "undefined_identifier",
+      "code": "initializer_for_non_existent_field",
       "line": 29,
       "column": 23,
       "length": 3,
-      "message": "Undefined name 'foo'."
+      "message": "'foo' isn't a field in the enclosing class."
     },
     {
-      "code": "undefined_identifier",
+      "code": "initializer_for_non_existent_field",
       "line": 29,
       "column": 37,
       "length": 3,
-      "message": "Undefined name 'bar'."
+      "message": "'bar' isn't a field in the enclosing class."
     },
     {
-      "code": "undefined_identifier",
+      "code": "initializer_for_non_existent_field",
       "line": 33,
       "column": 23,
       "length": 3,
-      "message": "Undefined name 'foo'."
+      "message": "'foo' isn't a field in the enclosing class."
     },
     {
-      "code": "undefined_identifier",
+      "code": "initializer_for_non_existent_field",
       "line": 33,
       "column": 36,
       "length": 3,
-      "message": "Undefined name 'bar'."
+      "message": "'bar' isn't a field in the enclosing class."
+    },
+    {
+      "code": "not_a_type",
+      "line": 38,
+      "column": 5,
+      "length": 1,
+      "message": "'x' isn't a type."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 7,
+      "column": 16,
+      "length": 45,
+      "message": "A value of type 'num' can't be returned from the method 'e' because it has a return type of 'int'."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 9,
+      "column": 22,
+      "length": 45,
+      "message": "A value of type 'num' can't be returned from the method 'g' because it has a return type of 'int'."
     },
     {
       "code": "unused_local_variable",
@@ -301,9 +329,9 @@
     }
   ],
   "source": "abstract class Key {\n  int get a => runtimeType.hashCode or null.hashCode;\n  int get b => runtimeType.hashCode | null.hashCode;\n  int get c { return runtimeType.hashCode or null.hashCode; }\n  int get d { return runtimeType.hashCode | null.hashCode; }\n\n  int get e => 1 + runtimeType.hashCode or null.hashCode + 3;\n  int get f => 1 + runtimeType.hashCode | null.hashCode + 3;\n  int get g { return 1 + runtimeType.hashCode or null.hashCode + 3; }\n  int get h { return 1 + runtimeType.hashCode | null.hashCode + 3; }\n\n  int i(int x, int y) => x or y;\n  int j(int x, int y) => x | y;\n  int k(int x, int y) { return x or y; }\n  int l(int x, int y) { return x | y; }\n  int m(int x, int y) { int z =  x or y; return z; }\n  int n(int x, int y) { int z = x | y; return z; }\n\n  int o(int x, int y) => 1 + x or y + 3;\n  int p(int x, int y) => 1 + x | y + 3;\n  int q(int x, int y) { return 1 + x or y + 3; }\n  int r(int x, int y) { return 1 + x | y + 3; }\n\n  s(int x, int y) {\n    s(x or y, x or y);\n    s(x | y, x | y);\n  }\n\n  Key(int x, int y) : foo = x or y, bar = x or y {\n    print(\"hello ${x or y}\");\n  }\n\n  Key(int x, int y) : foo = x | y, bar = x | y {\n    print(\"hello ${x | y}\");\n  }\n\n  not_currently_working(int x, int y) {\n    x or y;\n    x | y;\n  }\n}\n",
-  "captured_at": 1792056733,
+  "captured_at": 1792338226,
   "source_run": {
-    "report": "target/evidence/gate-m0/trend-w5-sp3-union/report.json",
+    "report": "target/evidence/gate-m0/trend-w5-rcK-union/report.json",
     "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
@@ -315,8 +343,8 @@
     "--edits",
     "tests/corpus/regressions/cases/c2d1486a.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq analyze --format=machine --sdk $DART_SDK",
+    "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "--daemon-cmd",
-    "./target/release/dartq daemon {dir} --sdk $DART_SDK"
+    "./target/release/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
   ]
 }

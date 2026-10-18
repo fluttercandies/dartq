@@ -1,0 +1,231 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/built_in_identifier_in_declaration.dart",
+  "corpus": "tests/corpus/sem2",
+  "oracle": [
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 7,
+      "column": 7,
+      "length": 8,
+      "message": "The built-in identifier 'Function' can't be used as a type name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 9,
+      "column": 9,
+      "length": 8,
+      "message": "The built-in identifier 'Function' can't be used as a type parameter name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 11,
+      "column": 9,
+      "length": 8,
+      "message": "The built-in identifier 'Function' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 13,
+      "column": 11,
+      "length": 8,
+      "message": "The built-in identifier 'Function' can't be used as a type parameter name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 15,
+      "column": 11,
+      "length": 8,
+      "message": "The built-in identifier 'Function' can't be used as an extension name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 17,
+      "column": 13,
+      "length": 8,
+      "message": "The built-in identifier 'Function' can't be used as a type parameter name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 19,
+      "column": 7,
+      "length": 8,
+      "message": "The built-in identifier 'Function' can't be used as a type name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 21,
+      "column": 9,
+      "length": 8,
+      "message": "The built-in identifier 'Function' can't be used as a type parameter name."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 11,
+      "column": 9,
+      "length": 8,
+      "message": "The name 'Function' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 15,
+      "column": 11,
+      "length": 8,
+      "message": "The name 'Function' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 19,
+      "column": 7,
+      "length": 8,
+      "message": "The name 'Function' is already defined."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 11,
+      "column": 9,
+      "length": 8,
+      "message": "'Function' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "not_a_type",
+      "line": 24,
+      "column": 3,
+      "length": 8,
+      "message": "Function isn't a type."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 24,
+      "column": 12,
+      "length": 2,
+      "message": "The value of the local variable 'ok' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 25,
+      "column": 11,
+      "length": 5,
+      "message": "The value of the local variable 'okToo' isn't used."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 7,
+      "column": 7,
+      "length": 8,
+      "message": "Can't use 'Function' as a name here."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 11,
+      "column": 9,
+      "length": 8,
+      "message": "The built-in identifier 'Function' can't be used as a typedef name."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 15,
+      "column": 11,
+      "length": 8,
+      "message": "Can't use 'Function' as a name here."
+    },
+    {
+      "code": "built_in_identifier_in_declaration",
+      "line": 19,
+      "column": 7,
+      "length": 8,
+      "message": "Can't use 'Function' as a name here."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 11,
+      "column": 9,
+      "length": 8,
+      "message": "The name 'Function' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 15,
+      "column": 11,
+      "length": 8,
+      "message": "The name 'Function' is already defined."
+    },
+    {
+      "code": "duplicate_definition",
+      "line": 19,
+      "column": 7,
+      "length": 8,
+      "message": "The name 'Function' is already defined."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 9,
+      "column": 9,
+      "length": 8,
+      "message": "'Function' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 11,
+      "column": 9,
+      "length": 8,
+      "message": "'Function' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 13,
+      "column": 11,
+      "length": 8,
+      "message": "'Function' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 17,
+      "column": 13,
+      "length": 8,
+      "message": "'Function' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "expected_identifier_but_got_keyword",
+      "line": 21,
+      "column": 9,
+      "length": 8,
+      "message": "'Function' can't be used as an identifier because it's a keyword."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 24,
+      "column": 12,
+      "length": 2,
+      "message": "The value of the local variable 'ok' isn't used."
+    },
+    {
+      "code": "unused_local_variable",
+      "line": 25,
+      "column": 11,
+      "length": 5,
+      "message": "The value of the local variable 'okToo' isn't used."
+    }
+  ],
+  "source": "// Targets built_in_identifier_in_declaration and not_a_type: the built-in\n// identifier 'Function' used as a declaration name (class/typedef/mixin/\n// extension and type-parameter positions) and then as a type. Verbatim\n// mirror of the regression-nail source (oracle 3.13.1 rows pinned there):\n// each declaration position reports the built-in misuse; the type\n// positions report not_a_type.\nclass Function {}\n\nclass C<Function> {}\n\ntypedef Function = int;\n\ntypedef F<Function> = int;\n\nextension Function on List {}\n\nextension E<Function> on List<Function> {}\n\nmixin Function {}\n\nmixin M<Function> implements List<Function> {}\n\nvoid main() {\n  Function ok;\n  dynamic okToo;\n}\n",
+  "captured_at": 1792309801,
+  "source_run": {
+    "report": "target/evidence/gate-sem2/sem2-r1-rcE/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/sem2",
+    "--edits",
+    "tests/corpus/regressions/cases/cadb52f0.edits.jsonl",
+    "--dartq-cmd",
+    "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/debug/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/promotion_patterns_flow_tryfinally.dart",
+  "corpus": "tests/corpus/sem2",
+  "oracle": [
+    {
+      "code": "definitely_unassigned_late_local_variable",
+      "line": 62,
+      "column": 24,
+      "length": 6,
+      "message": "The late local variable 'digest' is definitely unassigned at this point."
+    },
+    {
+      "code": "not_assigned_potentially_non_nullable_local_variable",
+      "line": 126,
+      "column": 10,
+      "length": 4,
+      "message": "The non-nullable local variable 'port' must be assigned before it can be used."
+    },
+    {
+      "code": "read_potentially_unassigned_final",
+      "line": 93,
+      "column": 12,
+      "length": 7,
+      "message": "The final variable 'settled' can't be read because it's potentially unassigned at this point."
+    }
+  ],
+  "dartq": [],
+  "source": "// promotion_patterns_flow_tryfinally — interaction fixture set A (ticket\n// #1425): definite-assignment analysis × exception flow × labeled jumps, with\n// promotion held across try/finally and labeled continue/break.\n//\n// Grounding (upstream Dart SDK source):\n// - pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart,\n//   FlowAnalysisImpl.tryFinallyStatement_end: with no catch clause, the state\n//   after a try/finally is the try body's normal-completion state with the\n//   finally's effects attached (the exception path exits the function), so a\n//   variable assigned unconditionally in the try body is definitely assigned\n//   after the statement.\n// - pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart,\n//   FlowAnalysisImpl.tryFinallyStatement_finallyBegin: entering the finally,\n//   only variables WRITTEN or CAPTURED in the try body are conservatively\n//   demoted — an untouched promotion survives into the finally and past the\n//   statement.\n// - pkg/analyzer/lib/src/dart/resolver/type_analyzer.dart,\n//   _checkReadOfNotAssignedLocalVariable: a late local read while definitely\n//   unassigned reports definitely_unassigned_late_local_variable; a non-late\n//   final local read while not definitely assigned reports\n//   read_potentially_unassigned_final; a non-late non-final local of\n//   potentially non-nullable type read while not definitely assigned reports\n//   not_assigned_potentially_non_nullable_local_variable (all three\n//   COMPILE_TIME_ERROR).\n// - Labeled continue/break are plain jumps for flow analysis\n//   (handleContinue/handleBreak): they neither write nor demote variables\n//   they do not assign, so a promotion held before the loop survives a\n//   back-edge join that does not write it.\n//\n// Expected rows: 3 — definitely_unassigned_late_local_variable keyed\n// promotion_patterns_flow_tryfinally.dart (1 row: the late digest read\n// before any path assigns it), read_potentially_unassigned_final keyed\n// promotion_patterns_flow_tryfinally.dart (1 row: the settled read after a\n// try/catch whose handler leaves it unassigned), and\n// not_assigned_potentially_non_nullable_local_variable keyed\n// promotion_patterns_flow_tryfinally.dart (1 row: the port read after a\n// labeled loop that may exit without running its body).\n//\n// Gate tier note: the three definite-assignment codes above sit outside the\n// frozen sem2 code universe (the gate's codes file filters them out); they\n// are grounded anchors for full-plane differential runs.\n//\n// Deliberate silences, grounded: rebuild (try/finally definite assignment),\n// holdAcrossFinally (promotion survives try/finally for an unwritten final\n// field), compactLength (promotion survives labeled continue/break), and\n// firstOpen (a while(true) loop whose every exit assigns first gives the\n// definite-assignment guarantee the port face lacks).\nvoid trace(String message) {\n  print(message);\n}\n\nclass StatusLine {\n  final String? _status;\n\n  StatusLine(this._status);\n\n  // Row: definitely_unassigned_late_local_variable — `digest` is read inside\n  // the try before the only assignment on any path has executed.\n  String seal(String raw) {\n    late String digest;\n    try {\n      trace('sealing ${digest.length}');\n      digest = raw.trim();\n      return digest;\n    } finally {\n      trace('sealed');\n    }\n  }\n\n  // Silence: `settled` assigned unconditionally in the try, read after the\n  // try/finally — the exception path leaves the function, so the read is\n  // definitely assigned (tryFinallyStatement_end).\n  String rebuild(String raw) {\n    late final String settled;\n    try {\n      settled = raw.trim();\n    } finally {\n      trace('rebuild done');\n    }\n    return settled;\n  }\n\n  // Row: read_potentially_unassigned_final — the catch path completes\n  // normally without assigning `settled`, so the trailing read is only\n  // potentially assigned.\n  int settle(String raw) {\n    final int settled;\n    try {\n      settled = int.parse(raw);\n    } catch (error) {\n      trace('$error');\n    }\n    return settled;\n  }\n\n  // Silence: `_status` is a private final field promoted by the null check;\n  // the try body and finally never write or capture it, so the promotion\n  // holds inside the body, inside the finally, and after the statement\n  // (tryFinallyStatement_finallyBegin demotes only written/captured\n  // variables).\n  String render() {\n    if (_status == null) {\n      return 'idle';\n    }\n    try {\n      trace(_status.toUpperCase());\n    } finally {\n      trace('status=$_status');\n    }\n    return _status.trim();\n  }\n}\n\n// Row: not_assigned_potentially_non_nullable_local_variable — the loop body\n// may run zero times (or never hit the prefix), leaving `port` unassigned on\n// the loop's normal-completion path that reaches the return.\nint chosenPort(List<String> nodes) {\n  int port;\n  outer:\n  for (final node in nodes) {\n    if (node.startsWith('edge:')) {\n      port = 443;\n      break outer;\n    }\n  }\n  return port;\n}\n\n// Silence: while(true) never completes normally, and every break is preceded\n// by an assignment to `open`, so the read after the loop is definitely\n// assigned — the guarantee the chosenPort face lacks.\nint firstOpen(List<int> probes) {\n  var index = 0;\n  int open;\n  outer:\n  while (true) {\n    open = probes[index];\n    if (open > 0) {\n      break outer;\n    }\n    index++;\n    if (index == probes.length) {\n      open = -1;\n      break outer;\n    }\n  }\n  return open;\n}\n\n// Silence: `head` is promoted to String before the loop; the labeled\n// continue and break jump without writing it, so the promotion survives the\n// back-edge join and the post-loop read needs no re-check.\nint compactLength(List<String?> cells) {\n  if (cells.isEmpty) {\n    return 0;\n  }\n  final head = cells.first;\n  if (head == null) {\n    return 0;\n  }\n  outer:\n  for (var i = 0; i < cells.length; i++) {\n    final cell = cells[i];\n    if (cell == null) {\n      continue outer;\n    }\n    if (cell.isEmpty) {\n      break outer;\n    }\n  }\n  return head.length;\n}\n\nvoid main() {\n  var line = StatusLine(' ready ');\n  print(line.rebuild(' draft '));\n  print(line.render());\n  print(firstOpen([0, 3]));\n  print(compactLength(['a', null, 'b']));\n}\n",
+  "captured_at": 1792309801,
+  "source_run": {
+    "report": "target/evidence/gate-sem2/sem2-r1-rcE/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/sem2",
+    "--edits",
+    "tests/corpus/regressions/cases/cfd3e639.edits.jsonl",
+    "--dartq-cmd",
+    "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/debug/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

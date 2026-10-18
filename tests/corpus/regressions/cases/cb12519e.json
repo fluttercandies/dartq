@@ -1,0 +1,41 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/clean_constructor_forms.dart",
+  "corpus": "tests/corpus/sem2",
+  "oracle": [
+    {
+      "code": "redirect_to_invalid_return_type",
+      "line": 13,
+      "column": 23,
+      "length": 1,
+      "message": "The return type 'A' of the redirected constructor isn't a subtype of 'B'."
+    },
+    {
+      "code": "redirect_to_invalid_return_type",
+      "line": 15,
+      "column": 29,
+      "length": 7,
+      "message": "The return type 'A' of the redirected constructor isn't a subtype of 'B'."
+    }
+  ],
+  "dartq": [],
+  "source": "// Clean face for the constructor-form families (duplicate_constructor,\n// invalid_factory_name_not_a_class, factory_constructor_new_name, the\n// redirect family, new_with_undefined_constructor_default, and the primary\n// constructors in bucket b): well-formed factories, redirects and primary\n// constructors; both sides must stay silent.\nclass A {\n  const A();\n\n  const A.named();\n}\n\nclass B {\n  const factory B() = A;\n\n  const factory B.named() = A.named;\n}\n\nclass P(int i);\n\nextension type ET(int i) {}\n\nenum G { a, b }\n",
+  "captured_at": 1792309801,
+  "source_run": {
+    "report": "target/evidence/gate-sem2/sem2-r1-rcE/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/sem2",
+    "--edits",
+    "tests/corpus/regressions/cases/cb12519e.edits.jsonl",
+    "--dartq-cmd",
+    "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/debug/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

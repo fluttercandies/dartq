@@ -1,0 +1,34 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/redirect_to_invalid_return_type.dart",
+  "corpus": "tests/corpus/sem2",
+  "oracle": [
+    {
+      "code": "redirect_to_invalid_return_type",
+      "line": 8,
+      "column": 17,
+      "length": 1,
+      "message": "The return type 'S' of the redirected constructor isn't a subtype of 'T'."
+    }
+  ],
+  "dartq": [],
+  "source": "// Targets redirect_to_invalid_return_type: a redirecting factory whose\n// target's class is not a subtype of the enclosing class. Oracle message\n// (nail-pinned): \"The return type 'S' of the redirected constructor isn't\n// a subtype of 'T'.\"\nclass S {}\n\nclass T {\n  factory T() = S;\n}\n",
+  "captured_at": 1792309801,
+  "source_run": {
+    "report": "target/evidence/gate-sem2/sem2-r1-rcE/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/sem2",
+    "--edits",
+    "tests/corpus/regressions/cases/0ccd0854.edits.jsonl",
+    "--dartq-cmd",
+    "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/debug/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

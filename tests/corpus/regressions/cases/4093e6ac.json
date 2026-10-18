@@ -1007,6 +1007,90 @@
       "message": "A continue statement can't be used outside of a loop or switch statement."
     },
     {
+      "code": "dead_code",
+      "line": 29,
+      "column": 12,
+      "length": 15,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 54,
+      "column": 12,
+      "length": 18,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 74,
+      "column": 12,
+      "length": 15,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 84,
+      "column": 12,
+      "length": 14,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 124,
+      "column": 17,
+      "length": 10,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 134,
+      "column": 12,
+      "length": 13,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 154,
+      "column": 12,
+      "length": 12,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 184,
+      "column": 20,
+      "length": 4,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 314,
+      "column": 12,
+      "length": 13,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 324,
+      "column": 15,
+      "length": 10,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 329,
+      "column": 16,
+      "length": 10,
+      "message": "Dead code."
+    },
+    {
+      "code": "dead_code",
+      "line": 334,
+      "column": 12,
+      "length": 15,
+      "message": "Dead code."
+    },
+    {
       "code": "expected_body",
       "line": 289,
       "column": 22,
@@ -1368,21 +1452,14 @@
       "line": 75,
       "column": 3,
       "length": 1,
-      "message": "Expected '(' before this."
+      "message": "Expected to find '('."
     },
     {
       "code": "expected_token",
       "line": 75,
       "column": 3,
       "length": 1,
-      "message": "Expected 'while' before this."
-    },
-    {
-      "code": "expected_token",
-      "line": 84,
-      "column": 5,
-      "length": 6,
-      "message": "Expected to find ';'."
+      "message": "Expected to find 'while'."
     },
     {
       "code": "expected_token",
@@ -1421,30 +1498,9 @@
     },
     {
       "code": "expected_token",
-      "line": 134,
-      "column": 18,
-      "length": 1,
-      "message": "Expected to find ';'."
-    },
-    {
-      "code": "expected_token",
-      "line": 134,
-      "column": 21,
-      "length": 1,
-      "message": "Expected to find ';'."
-    },
-    {
-      "code": "expected_token",
       "line": 154,
       "column": 5,
       "length": 6,
-      "message": "Expected to find ';'."
-    },
-    {
-      "code": "expected_token",
-      "line": 154,
-      "column": 20,
-      "length": 1,
       "message": "Expected to find ';'."
     },
     {
@@ -1458,13 +1514,6 @@
       "code": "expected_token",
       "line": 184,
       "column": 18,
-      "length": 1,
-      "message": "Expected to find ';'."
-    },
-    {
-      "code": "expected_token",
-      "line": 184,
-      "column": 20,
       "length": 1,
       "message": "Expected to find ';'."
     },
@@ -1518,11 +1567,39 @@
       "message": "Expected to find ';'."
     },
     {
-      "code": "expected_token",
-      "line": 334,
-      "column": 23,
-      "length": 1,
-      "message": "Expected to find ';'."
+      "code": "invalid_use_of_null_value",
+      "line": 214,
+      "column": 12,
+      "length": 4,
+      "message": "An expression whose value is always 'null' can't be dereferenced."
+    },
+    {
+      "code": "invocation_of_non_function_expression",
+      "line": 119,
+      "column": 12,
+      "length": 5,
+      "message": "The expression doesn't evaluate to a function, so it can't be invoked."
+    },
+    {
+      "code": "invocation_of_non_function_expression",
+      "line": 284,
+      "column": 12,
+      "length": 5,
+      "message": "The expression doesn't evaluate to a function, so it can't be invoked."
+    },
+    {
+      "code": "invocation_of_non_function_expression",
+      "line": 299,
+      "column": 12,
+      "length": 4,
+      "message": "The expression doesn't evaluate to a function, so it can't be invoked."
+    },
+    {
+      "code": "invocation_of_non_function_expression",
+      "line": 309,
+      "column": 12,
+      "length": 4,
+      "message": "The expression doesn't evaluate to a function, so it can't be invoked."
     },
     {
       "code": "missing_catch_or_finally",
@@ -1536,42 +1613,35 @@
       "line": 29,
       "column": 12,
       "length": 5,
-      "message": "Expected an identifier, but got 'break'."
+      "message": "Expected an identifier."
     },
     {
       "code": "missing_identifier",
       "line": 54,
       "column": 12,
       "length": 8,
-      "message": "Expected an identifier, but got 'continue'."
+      "message": "Expected an identifier."
     },
     {
       "code": "missing_identifier",
       "line": 74,
       "column": 12,
       "length": 2,
-      "message": "Expected an identifier, but got 'do'."
+      "message": "Expected an identifier."
     },
     {
       "code": "missing_identifier",
       "line": 84,
       "column": 12,
       "length": 4,
-      "message": "Expected an identifier, but got 'else'."
-    },
-    {
-      "code": "missing_identifier",
-      "line": 84,
-      "column": 12,
-      "length": 4,
-      "message": "Expected an identifier, but got 'else'."
+      "message": "Expected an identifier."
     },
     {
       "code": "missing_identifier",
       "line": 124,
       "column": 12,
       "length": 5,
-      "message": "Expected an identifier, but got 'final'."
+      "message": "Expected an identifier."
     },
     {
       "code": "missing_identifier",
@@ -1585,14 +1655,14 @@
       "line": 134,
       "column": 12,
       "length": 3,
-      "message": "Expected an identifier, but got 'for'."
+      "message": "Expected an identifier."
     },
     {
       "code": "missing_identifier",
       "line": 134,
       "column": 19,
       "length": 1,
-      "message": "Expected an identifier, but got ')'."
+      "message": "Expected an identifier."
     },
     {
       "code": "missing_identifier",
@@ -1606,7 +1676,7 @@
       "line": 154,
       "column": 12,
       "length": 2,
-      "message": "Expected an identifier, but got 'if'."
+      "message": "Expected an identifier."
     },
     {
       "code": "missing_identifier",
@@ -1620,7 +1690,7 @@
       "line": 184,
       "column": 12,
       "length": 2,
-      "message": "Expected an identifier, but got 'is'."
+      "message": "Expected an identifier."
     },
     {
       "code": "missing_identifier",
@@ -1648,14 +1718,14 @@
       "line": 314,
       "column": 12,
       "length": 3,
-      "message": "Expected an identifier, but got 'try'."
+      "message": "Expected an identifier."
     },
     {
       "code": "missing_identifier",
       "line": 324,
       "column": 12,
       "length": 3,
-      "message": "Expected an identifier, but got 'var'."
+      "message": "Expected an identifier."
     },
     {
       "code": "missing_identifier",
@@ -1669,7 +1739,7 @@
       "line": 329,
       "column": 12,
       "length": 4,
-      "message": "Expected an identifier, but got 'void'."
+      "message": "Expected an identifier."
     },
     {
       "code": "missing_identifier",
@@ -1683,7 +1753,7 @@
       "line": 334,
       "column": 12,
       "length": 5,
-      "message": "Expected an identifier, but got 'while'."
+      "message": "Expected an identifier."
     },
     {
       "code": "missing_identifier",
@@ -1691,6 +1761,41 @@
       "column": 23,
       "length": 1,
       "message": "Expected an identifier."
+    },
+    {
+      "code": "non_bool_condition",
+      "line": 154,
+      "column": 15,
+      "length": 3,
+      "message": "Conditions must have a static type of 'bool'."
+    },
+    {
+      "code": "non_bool_condition",
+      "line": 334,
+      "column": 18,
+      "length": 3,
+      "message": "Conditions must have a static type of 'bool'."
+    },
+    {
+      "code": "non_constant_record_field",
+      "line": 49,
+      "column": 18,
+      "length": 1,
+      "message": "The fields in a const record literal must be constants."
+    },
+    {
+      "code": "not_a_type",
+      "line": 184,
+      "column": 15,
+      "length": 1,
+      "message": "'x' isn't a type."
+    },
+    {
+      "code": "not_initialized_non_nullable_instance_field",
+      "line": 282,
+      "column": 7,
+      "length": 5,
+      "message": "Non-nullable instance field 'super' must be initialized."
     },
     {
       "code": "record_literal_one_positional_no_trailing_comma",
@@ -1705,6 +1810,27 @@
       "column": 18,
       "length": 1,
       "message": "A record type with exactly one positional field requires a trailing comma."
+    },
+    {
+      "code": "return_of_invalid_type",
+      "line": 184,
+      "column": 12,
+      "length": 2,
+      "message": "A value of type 'bool' can't be returned from the method 'is' because it has a return type of 'int'."
+    },
+    {
+      "code": "undefined_method",
+      "line": 229,
+      "column": 12,
+      "length": 8,
+      "message": "The method 'operator' isn't defined for the type 'WrapperClass'."
+    },
+    {
+      "code": "undefined_operator",
+      "line": 49,
+      "column": 23,
+      "length": 1,
+      "message": "The operator '+' isn't defined for the type '(int,)'."
     },
     {
       "code": "unexpected_token",
@@ -1722,11 +1848,11 @@
     }
   ],
   "source": "class WrapperClass {\n  int abstract(int x) {\n    if (x == 0) return 42;\n    return abstract(x-1) + 1;\n  }\n\n  int as(int x) {\n    if (x == 0) return 42;\n    return as(x-1) + 1;\n  }\n\n  int assert(int x) {\n    if (x == 0) return 42;\n    return assert(x-1) + 1;\n  }\n\n  int async(int x) {\n    if (x == 0) return 42;\n    return async(x-1) + 1;\n  }\n\n  int await(int x) {\n    if (x == 0) return 42;\n    return await(x-1) + 1;\n  }\n\n  int break(int x) {\n    if (x == 0) return 42;\n    return break(x-1) + 1;\n  }\n\n  int case(int x) {\n    if (x == 0) return 42;\n    return case(x-1) + 1;\n  }\n\n  int catch(int x) {\n    if (x == 0) return 42;\n    return catch(x-1) + 1;\n  }\n\n  int class(int x) {\n    if (x == 0) return 42;\n    return class(x-1) + 1;\n  }\n\n  int const(int x) {\n    if (x == 0) return 42;\n    return const(x-1) + 1;\n  }\n\n  int continue(int x) {\n    if (x == 0) return 42;\n    return continue(x-1) + 1;\n  }\n\n  int covariant(int x) {\n    if (x == 0) return 42;\n    return covariant(x-1) + 1;\n  }\n\n  int default(int x) {\n    if (x == 0) return 42;\n    return default(x-1) + 1;\n  }\n\n  int deferred(int x) {\n    if (x == 0) return 42;\n    return deferred(x-1) + 1;\n  }\n\n  int do(int x) {\n    if (x == 0) return 42;\n    return do(x-1) + 1;\n  }\n\n  int dynamic(int x) {\n    if (x == 0) return 42;\n    return dynamic(x-1) + 1;\n  }\n\n  int else(int x) {\n    if (x == 0) return 42;\n    return else(x-1) + 1;\n  }\n\n  int enum(int x) {\n    if (x == 0) return 42;\n    return enum(x-1) + 1;\n  }\n\n  int export(int x) {\n    if (x == 0) return 42;\n    return export(x-1) + 1;\n  }\n\n  int extends(int x) {\n    if (x == 0) return 42;\n    return extends(x-1) + 1;\n  }\n\n  int extension(int x) {\n    if (x == 0) return 42;\n    return extension(x-1) + 1;\n  }\n\n  int external(int x) {\n    if (x == 0) return 42;\n    return external(x-1) + 1;\n  }\n\n  int factory(int x) {\n    if (x == 0) return 42;\n    return factory(x-1) + 1;\n  }\n\n  int false(int x) {\n    if (x == 0) return 42;\n    return false(x-1) + 1;\n  }\n\n  int final(int x) {\n    if (x == 0) return 42;\n    return final(x-1) + 1;\n  }\n\n  int finally(int x) {\n    if (x == 0) return 42;\n    return finally(x-1) + 1;\n  }\n\n  int for(int x) {\n    if (x == 0) return 42;\n    return for(x-1) + 1;\n  }\n\n  int Function(int x) {\n    if (x == 0) return 42;\n    return Function(x-1) + 1;\n  }\n\n  int get(int x) {\n    if (x == 0) return 42;\n    return get(x-1) + 1;\n  }\n\n  int hide(int x) {\n    if (x == 0) return 42;\n    return hide(x-1) + 1;\n  }\n\n  int if(int x) {\n    if (x == 0) return 42;\n    return if(x-1) + 1;\n  }\n\n  int implements(int x) {\n    if (x == 0) return 42;\n    return implements(x-1) + 1;\n  }\n\n  int import(int x) {\n    if (x == 0) return 42;\n    return import(x-1) + 1;\n  }\n\n  int in(int x) {\n    if (x == 0) return 42;\n    return in(x-1) + 1;\n  }\n\n  int inout(int x) {\n    if (x == 0) return 42;\n    return inout(x-1) + 1;\n  }\n\n  int interface(int x) {\n    if (x == 0) return 42;\n    return interface(x-1) + 1;\n  }\n\n  int is(int x) {\n    if (x == 0) return 42;\n    return is(x-1) + 1;\n  }\n\n  int late(int x) {\n    if (x == 0) return 42;\n    return late(x-1) + 1;\n  }\n\n  int library(int x) {\n    if (x == 0) return 42;\n    return library(x-1) + 1;\n  }\n\n  int mixin(int x) {\n    if (x == 0) return 42;\n    return mixin(x-1) + 1;\n  }\n\n  int native(int x) {\n    if (x == 0) return 42;\n    return native(x-1) + 1;\n  }\n\n  int new(int x) {\n    if (x == 0) return 42;\n    return new(x-1) + 1;\n  }\n\n  int null(int x) {\n    if (x == 0) return 42;\n    return null(x-1) + 1;\n  }\n\n  int of(int x) {\n    if (x == 0) return 42;\n    return of(x-1) + 1;\n  }\n\n  int on(int x) {\n    if (x == 0) return 42;\n    return on(x-1) + 1;\n  }\n\n  int operator(int x) {\n    if (x == 0) return 42;\n    return operator(x-1) + 1;\n  }\n\n  int out(int x) {\n    if (x == 0) return 42;\n    return out(x-1) + 1;\n  }\n\n  int part(int x) {\n    if (x == 0) return 42;\n    return part(x-1) + 1;\n  }\n\n  int patch(int x) {\n    if (x == 0) return 42;\n    return patch(x-1) + 1;\n  }\n\n  int required(int x) {\n    if (x == 0) return 42;\n    return required(x-1) + 1;\n  }\n\n  int rethrow(int x) {\n    if (x == 0) return 42;\n    return rethrow(x-1) + 1;\n  }\n\n  int return(int x) {\n    if (x == 0) return 42;\n    return return(x-1) + 1;\n  }\n\n  int set(int x) {\n    if (x == 0) return 42;\n    return set(x-1) + 1;\n  }\n\n  int show(int x) {\n    if (x == 0) return 42;\n    return show(x-1) + 1;\n  }\n\n  int source(int x) {\n    if (x == 0) return 42;\n    return source(x-1) + 1;\n  }\n\n  int static(int x) {\n    if (x == 0) return 42;\n    return static(x-1) + 1;\n  }\n\n  int super(int x) {\n    if (x == 0) return 42;\n    return super(x-1) + 1;\n  }\n\n  int switch(int x) {\n    if (x == 0) return 42;\n    return switch(x-1) + 1;\n  }\n\n  int sync(int x) {\n    if (x == 0) return 42;\n    return sync(x-1) + 1;\n  }\n\n  int this(int x) {\n    if (x == 0) return 42;\n    return this(x-1) + 1;\n  }\n\n  int throw(int x) {\n    if (x == 0) return 42;\n    return throw(x-1) + 1;\n  }\n\n  int true(int x) {\n    if (x == 0) return 42;\n    return true(x-1) + 1;\n  }\n\n  int try(int x) {\n    if (x == 0) return 42;\n    return try(x-1) + 1;\n  }\n\n  int typedef(int x) {\n    if (x == 0) return 42;\n    return typedef(x-1) + 1;\n  }\n\n  int var(int x) {\n    if (x == 0) return 42;\n    return var(x-1) + 1;\n  }\n\n  int void(int x) {\n    if (x == 0) return 42;\n    return void(x-1) + 1;\n  }\n\n  int while(int x) {\n    if (x == 0) return 42;\n    return while(x-1) + 1;\n  }\n\n  int with(int x) {\n    if (x == 0) return 42;\n    return with(x-1) + 1;\n  }\n\n  int yield(int x) {\n    if (x == 0) return 42;\n    return yield(x-1) + 1;\n  }\n}\n",
-  "captured_at": 1791787153,
+  "captured_at": 1792338226,
   "source_run": {
-    "report": "gate-m0/trend-w4b-union/report.json",
-    "dartq_cmd": "./target/release/dartq check --format=machine",
-    "oracle_cmd": "$HOME/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+    "report": "target/evidence/gate-m0/trend-w5-rcK-union/report.json",
+    "dartq_cmd": "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
   },
   "replay_command": [
     "target/debug/harness",
@@ -1736,8 +1862,8 @@
     "--edits",
     "tests/corpus/regressions/cases/4093e6ac.edits.jsonl",
     "--dartq-cmd",
-    "./target/release/dartq check --format=machine",
+    "./target/release/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
     "--daemon-cmd",
-    "./target/release/dartq daemon {dir}"
+    "./target/release/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
   ]
 }

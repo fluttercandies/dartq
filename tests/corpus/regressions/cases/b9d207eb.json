@@ -1,0 +1,49 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/const_with_non_constant_argument.dart",
+  "corpus": "tests/corpus/sem2",
+  "oracle": [
+    {
+      "code": "const_initialized_with_non_constant_value",
+      "line": 10,
+      "column": 13,
+      "length": 1,
+      "message": "Const variables must be initialized with a constant value."
+    },
+    {
+      "code": "const_with_non_constant_argument",
+      "line": 10,
+      "column": 13,
+      "length": 1,
+      "message": "Arguments of a constant creation must be constant expressions."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "const_with_non_constant_argument",
+      "line": 10,
+      "column": 13,
+      "length": 1,
+      "message": "Arguments of a constant creation must be constant expressions."
+    }
+  ],
+  "source": "// Targets const_with_non_constant_argument: a constant creation whose\n// argument is not a constant expression (the non-const variable 'n').\nclass C {\n  final int x;\n  const C(this.x);\n}\n\nvar n = 1;\n\nconst z = C(n);\n",
+  "captured_at": 1792309801,
+  "source_run": {
+    "report": "target/evidence/gate-sem2/sem2-r1-rcE/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/sem2",
+    "--edits",
+    "tests/corpus/regressions/cases/b9d207eb.edits.jsonl",
+    "--dartq-cmd",
+    "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/debug/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

@@ -1,0 +1,98 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/promotion_patterns_flow_records.dart",
+  "corpus": "tests/corpus/sem2",
+  "oracle": [
+    {
+      "code": "pattern_never_matches_value_type",
+      "line": 99,
+      "column": 5,
+      "length": 37,
+      "message": "The matched value type 'RuleToggles' can never match the required type '({Object? severity, Object? strict})'."
+    },
+    {
+      "code": "pattern_never_matches_value_type",
+      "line": 100,
+      "column": 5,
+      "length": 37,
+      "message": "The matched value type 'RuleToggles' can never match the required type '({Object? severity, Object? strict})'."
+    },
+    {
+      "code": "pattern_type_mismatch_in_irrefutable_context",
+      "line": 78,
+      "column": 9,
+      "length": 19,
+      "message": "The matched value of type 'RuleToggles' isn't assignable to the required type '({Object? alias, Object? severity})'."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 47,
+      "column": 7,
+      "length": 13,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 56,
+      "column": 7,
+      "length": 12,
+      "message": "A nullable expression can't be used as a condition."
+    },
+    {
+      "code": "unchecked_use_of_nullable_value",
+      "line": 70,
+      "column": 18,
+      "length": 6,
+      "message": "The property 'length' can't be unconditionally accessed because the receiver can be 'null'."
+    },
+    {
+      "code": "undefined_getter",
+      "line": 79,
+      "column": 30,
+      "length": 7,
+      "message": "The getter 'isEmpty' isn't defined for the type 'Object'."
+    }
+  ],
+  "dartq": [
+    {
+      "code": "undefined_getter",
+      "line": 47,
+      "column": 14,
+      "length": 6,
+      "message": "The getter 'strict' isn't defined for the type 'int'."
+    },
+    {
+      "code": "undefined_getter",
+      "line": 68,
+      "column": 24,
+      "length": 5,
+      "message": "The getter 'alias' isn't defined for the type 'int'."
+    },
+    {
+      "code": "undefined_getter",
+      "line": 109,
+      "column": 14,
+      "length": 5,
+      "message": "The getter 'alias' isn't defined for the type 'int'."
+    }
+  ],
+  "source": "// promotion_patterns_flow_records — interaction fixture set A (ticket\n// #1425): null-safety promotion × records (positional and named fields) ×\n// pattern deconstruction.\n//\n// Grounding (upstream Dart SDK source):\n// - pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart,\n//   FlowAnalysisOperations.isPropertyPromotable (analyzer binding in\n//   pkg/analyzer/lib/src/dart/resolver/flow_analysis_visitor.dart): only\n//   promotable FIELDS of classes feed property promotion. Record fields are\n//   synthesized getters, never backing fields, so a record field read is\n//   never promotable — a null check on it cannot feed a later read.\n// - pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart,\n//   FlowAnalysisImpl.constantPattern_end → _handleEqualityCheckPattern: a\n//   `null` constant pattern is handled exactly like a null-check pattern\n//   (matchesIfNull), so the matched variable is demoted to Null inside the\n//   taken branch and promoted to non-Null on the fall-through.\n// - pkg/analyzer/lib/src/error/nullable_dereference_verifier.dart, report:\n//   when the receiver's static type is exactly Null, the dereference\n//   diagnostic is swapped to invalid_use_of_null_value (\"An expression whose\n//   value is always 'null' can't be dereferenced\"); on a merely-nullable\n//   receiver in condition position the oracle reports\n//   unchecked_use_of_nullable_value (\"A nullable expression can't be used as\n//   a condition\", nail-pinned in this corpus).\n// - Pattern-bound variables are fresh locals, so deconstructing a record\n//   (via a record pattern or an if-case typed pattern) yields promotable\n//   bindings even though the record's own fields are not promotable.\n//\n// Expected rows: 3 — unchecked_use_of_nullable_value keyed\n// promotion_patterns_flow_records.dart (2 rows: the named field `strict` in\n// condition position, and positional field $1 in condition position), and\n// invalid_use_of_null_value keyed promotion_patterns_flow_records.dart (1\n// row: `alias` demoted to Null by the `case null` pattern, then\n// dereferenced).\n//\n// Deliberate silences, grounded: describe (the || demotion join promotes the\n// deconstructed binding), envelope (if-case typed pattern binds a promoted\n// local), gateMode (or-pattern of named record patterns sharing `level`),\n// and recheckAlias (the field read is not promotable, so the guarded read\n// goes through a fresh binding that does promote).\ntypedef RuleToggles = ({String? alias, bool? strict, int severity});\n\ntypedef Tagged = (String?, int);\n\n// Row: unchecked_use_of_nullable_value — `config.strict` is a synthesized\n// record getter; no null check can promote it, so the condition sees bool?.\nString gateLabel(RuleToggles config) {\n  if (config.strict) {\n    return 'enforced';\n  }\n  return 'advisory';\n}\n\n// Row: unchecked_use_of_nullable_value — positional record field $1 has the\n// same never-promotable getter face as named fields.\nbool preferFastLane((bool?, int) candidate) {\n  if (candidate.$1) {\n    return true;\n  }\n  return candidate.$2 > 0;\n}\n\n// Row: invalid_use_of_null_value — the `case null` pattern demotes `alias`\n// to Null inside the branch (constantPattern_end treats it as a null check),\n// and a dereference of a Null-typed receiver reports\n// invalid_use_of_null_value; the fall-through read below is clean because\n// the same pattern promotes `alias` to String on that path.\nint aliasWidth(RuleToggles config) {\n  final alias = config.alias;\n  if (alias case null) {\n    return alias.length;\n  }\n  return alias.length;\n}\n\n// Silence: the deconstructed bindings are fresh locals; the `||` chain\n// demotes on both disjuncts, so `alias` is a non-empty String after the if.\nString describe(RuleToggles config) {\n  final (:alias, :severity) = config;\n  if (alias == null || alias.isEmpty) {\n    return 'anon:$severity';\n  }\n  return '$alias:$severity';\n}\n\n// Silence: an if-case typed pattern binds `label` as String (fresh local,\n// promoted by construction) even though `Tagged`'s first field is String?.\nString envelope(Tagged tag) {\n  final (name, weight) = tag;\n  if (name case final String label when label.isNotEmpty) {\n    return '$label#$weight';\n  }\n  return '#$weight';\n}\n\n// Silence: a logical-or of named record patterns; both sides bind `level`\n// with the same type, and the wildcard arm keeps the switch exhaustive.\nString gateMode(RuleToggles config) {\n  return switch (config) {\n    (strict: true, severity: final level) ||\n    (strict: null, severity: final level) => 'hard:$level',\n    _ => 'soft',\n  };\n}\n\n// Silence: the field read `config.alias` never promotes, so the guard reads\n// a fresh binding whose null check does promote — the fix face for the\n// gateLabel shape above.\nString recheckAlias(RuleToggles config) {\n  if (config.alias case final String alias) {\n    return alias.substring(1);\n  }\n  return '';\n}\n\nvoid main() {\n  const toggles = (alias: null, strict: null, severity: 2);\n  print(gateLabel(toggles));\n  print(preferFastLane((true, 7)));\n  print(aliasWidth((alias: 'edge', strict: null, severity: 3)));\n  print(describe(toggles));\n  print(envelope((null, 5)));\n  print(gateMode(toggles));\n  print(recheckAlias((alias: 'mirror', strict: true, severity: 1)));\n}\n",
+  "captured_at": 1792320737,
+  "source_run": {
+    "report": "target/evidence/gate-sem2/sem2-r1-rcF/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/sem2",
+    "--edits",
+    "tests/corpus/regressions/cases/74d22d08.edits.jsonl",
+    "--dartq-cmd",
+    "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/debug/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

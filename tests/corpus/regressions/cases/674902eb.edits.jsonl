@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/invalid_reference_to_this.dart","length":195,"line":1,"new_text":"// Targets invalid_reference_to_this: 'this' used as a constructor\n// initializer target. Oracle message (nail-pinned): \"Invalid reference to\n// 'this' expression.\"\nclass C {\n  C() : this = 0;\n}\n"}

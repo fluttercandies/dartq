@@ -1,0 +1,34 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/non_void_return_for_setter.dart",
+  "corpus": "tests/corpus/sem2",
+  "oracle": [
+    {
+      "code": "non_void_return_for_setter",
+      "line": 5,
+      "column": 3,
+      "length": 3,
+      "message": "The return type of the setter must be 'void' or absent."
+    }
+  ],
+  "dartq": [],
+  "source": "// Targets non_void_return_for_setter: a setter with a non-void declared\n// return type. Oracle message (nail-pinned): \"The return type of the\n// setter must be 'void' or absent.\"\nclass C {\n  int set s(int v) => 1;\n}\n",
+  "captured_at": 1792309801,
+  "source_run": {
+    "report": "target/evidence/gate-sem2/sem2-r1-rcE/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/sem2",
+    "--edits",
+    "tests/corpus/regressions/cases/c40d0e9a.edits.jsonl",
+    "--dartq-cmd",
+    "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/debug/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

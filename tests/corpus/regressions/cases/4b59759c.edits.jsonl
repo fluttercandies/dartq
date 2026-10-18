@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/const_with_non_const.dart","length":213,"line":1,"new_text":"// Targets const_with_non_const: a const creation invoking a non-const\n// constructor. Oracle message (nail-pinned): \"The constructor being called\n// isn't a const constructor.\"\nclass C {\n  C();\n}\n\nconst x = C();\n"}

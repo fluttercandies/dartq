@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/list_element_type_not_assignable.dart","length":177,"line":1,"new_text":"// Targets list_element_type_not_assignable: a typed list literal whose\n// element type is not assignable to the element type.\nvoid main() {\n  var l = <int>['a'];\n  print(l);\n}\n"}

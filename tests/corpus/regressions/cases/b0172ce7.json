@@ -1,0 +1,34 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/list_element_type_not_assignable.dart",
+  "corpus": "tests/corpus/sem2",
+  "oracle": [
+    {
+      "code": "list_element_type_not_assignable",
+      "line": 4,
+      "column": 17,
+      "length": 3,
+      "message": "The element type 'String' can't be assigned to the list type 'int'."
+    }
+  ],
+  "dartq": [],
+  "source": "// Targets list_element_type_not_assignable: a typed list literal whose\n// element type is not assignable to the element type.\nvoid main() {\n  var l = <int>['a'];\n  print(l);\n}\n",
+  "captured_at": 1792309801,
+  "source_run": {
+    "report": "target/evidence/gate-sem2/sem2-r1-rcE/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/sem2",
+    "--edits",
+    "tests/corpus/regressions/cases/b0172ce7.edits.jsonl",
+    "--dartq-cmd",
+    "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/debug/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

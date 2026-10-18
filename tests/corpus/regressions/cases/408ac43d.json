@@ -1,0 +1,41 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/could_not_infer.dart",
+  "corpus": "tests/corpus/sem2",
+  "oracle": [
+    {
+      "code": "argument_type_not_assignable",
+      "line": 19,
+      "column": 11,
+      "length": 16,
+      "message": "The argument type 'void Function(List<int>)' can't be assigned to the parameter type 'void Function(List<Object?>)'. "
+    },
+    {
+      "code": "could_not_infer",
+      "line": 19,
+      "column": 9,
+      "length": 1,
+      "message": "Couldn't infer type parameter 'X'.\n\nTried to infer 'List<Object?>' for 'X' which doesn't work:\n  Parameter 'x' declared as     'void Function(X)'\n                but argument is 'void Function(List<int>)'.\nThe type 'List<Object?>' was inferred from:\n  Return type declared as 'C<X>'\n              used where  'C<List<_>>' is required.\n\nConsider passing explicit type argument(s) to the generic.\n\n"
+    }
+  ],
+  "dartq": [],
+  "source": "// Targets could_not_infer: type inference fails for the generic\n// constructor invocation's type parameter. Verbatim mirror of the\n// regression-nail source (oracle 3.13.1 pins could_not_infer at the 'C'\n// position and argument_type_not_assignable, m1, at the closure); the nail\n// also records dartq emitting nothing there, which is exactly the gap the\n// sem2 tier makes visible.\nclass C<X> {\n  C(void Function(X) x);\n}\n\nT check<T>(C<List<T>> f) {\n  print('check<$T>(...)');\n  return 42 as T;\n}\n\nvoid main() {\n  var x =\n      check(\n        C((List<int> x) {}),\n      );\n  print(x);\n}\n",
+  "captured_at": 1792309801,
+  "source_run": {
+    "report": "target/evidence/gate-sem2/sem2-r1-rcE/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/sem2",
+    "--edits",
+    "tests/corpus/regressions/cases/408ac43d.edits.jsonl",
+    "--dartq-cmd",
+    "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/debug/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

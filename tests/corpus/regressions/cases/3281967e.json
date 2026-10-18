@@ -1,0 +1,34 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/invalid_factory_name_not_a_class.dart",
+  "corpus": "tests/corpus/sem2",
+  "oracle": [
+    {
+      "code": "new_with_undefined_constructor_default",
+      "line": 6,
+      "column": 18,
+      "length": 1,
+      "message": "The class 'G' doesn't have an unnamed constructor."
+    }
+  ],
+  "dartq": [],
+  "source": "// Targets invalid_factory_name_not_a_class: a factory constructor whose\n// name is not the enclosing class. Oracle message (nail-pinned): \"The name\n// of a factory constructor must be the same as the name of the immediately\n// enclosing class.\"\nclass G {\n  factory H() => G();\n}\n",
+  "captured_at": 1792323479,
+  "source_run": {
+    "report": "target/evidence/gate-sem2/rcG/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/sem2",
+    "--edits",
+    "tests/corpus/regressions/cases/3281967e.edits.jsonl",
+    "--dartq-cmd",
+    "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/debug/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

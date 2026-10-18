@@ -1,0 +1,41 @@
+{
+  "schema": "regression-case-v1",
+  "file": "lib/targeted/redirect_to_non_const_constructor.dart",
+  "corpus": "tests/corpus/sem2",
+  "oracle": [
+    {
+      "code": "redirect_to_invalid_return_type",
+      "line": 10,
+      "column": 23,
+      "length": 1,
+      "message": "The return type 'A' of the redirected constructor isn't a subtype of 'B'."
+    },
+    {
+      "code": "redirect_to_non_const_constructor",
+      "line": 10,
+      "column": 23,
+      "length": 1,
+      "message": "A constant redirecting constructor can't redirect to a non-constant constructor."
+    }
+  ],
+  "dartq": [],
+  "source": "// Targets redirect_to_non_const_constructor: a constant redirecting\n// factory whose target constructor is not const. Oracle message\n// (nail-pinned): \"A constant redirecting constructor can't redirect to a\n// non-constant constructor.\"\nclass A {\n  A();\n}\n\nclass B {\n  const factory B() = A;\n}\n",
+  "captured_at": 1792309801,
+  "source_run": {
+    "report": "target/evidence/gate-sem2/sem2-r1-rcE/report.json",
+    "dartq_cmd": "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "oracle_cmd": "~/fvm/default/bin/cache/dart-sdk/bin/dart analyze --format=machine"
+  },
+  "replay_command": [
+    "target/debug/harness",
+    "replay",
+    "--corpus-dir",
+    "tests/corpus/sem2",
+    "--edits",
+    "tests/corpus/regressions/cases/da91db43.edits.jsonl",
+    "--dartq-cmd",
+    "./target/debug/dartq analyze --format=machine --sdk ~/fvm/default/bin/cache/dart-sdk",
+    "--daemon-cmd",
+    "./target/debug/dartq daemon {dir} --sdk ~/fvm/default/bin/cache/dart-sdk"
+  ]
+}

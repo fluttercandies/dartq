@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/initializer_for_non_existent_field.dart","length":234,"line":1,"new_text":"// Targets initializer_for_non_existent_field: a constructor initializer\n// naming a field the class does not declare. Oracle message form\n// (nail-pinned): \"<name> isn't a field in the enclosing class.\"\nclass C {\n  C() : nope = 0;\n}\n"}

@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/redirect_to_non_class.dart","length":138,"line":1,"new_text":"// Targets redirect_to_non_class: a redirecting factory whose target name\n// does not denote a class.\nclass Q {\n  factory Q() = NoSuch;\n}\n"}

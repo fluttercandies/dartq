@@ -1,0 +1,1 @@
+{"column":1,"file":"lib/targeted/factory_constructor_new_name.dart","length":236,"line":1,"new_text":"// Targets factory_constructor_new_name: a factory constructor named 'new'.\n// Oracle message (nail-pinned): \"Factory constructors can't be named\n// 'new'.\" (shape mirrored from the regression nail).\nclass K {\n  factory new() => K();\n}\n"}
