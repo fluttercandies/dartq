@@ -29,13 +29,15 @@ pub enum FlowFact {
         /// Span of the dead statement's first token.
         span: TokenSpan,
     },
-    /// A read of a local variable (or parameter) that is definitely
-    /// unassigned on this control-flow path. The consumer decides the
-    /// diagnostic: non-late, non-nullable locals are compile errors
-    /// (`not_assigned_potentially_non_nullable_local_variable`); final
-    /// locals read before assignment error as well. `late` variables
-    /// never surface here as errors but are still reported for parity
-    /// tooling.
+    /// A read of a local variable (or parameter) that is not definitely
+    /// assigned on this control-flow path. The consumer decides the
+    /// diagnostic: `late` locals read while `definitely_unassigned` report
+    /// `definitely_unassigned_late_local_variable`; non-late final locals
+    /// report `read_potentially_unassigned_final`; non-late,
+    /// non-nullable locals report
+    /// `not_assigned_potentially_non_nullable_local_variable`
+    /// (type_analyzer.dart `_checkReadOfNotAssignedLocalVariable`,
+    /// :4990-5030).
     UnassignedRead {
         /// Span of the read's identifier token.
         span: TokenSpan,
@@ -43,6 +45,15 @@ pub enum FlowFact {
         is_late: bool,
         /// Whether the variable was declared `final` (or `const`).
         is_final: bool,
+        /// The model's `unassigned` bit — upstream's
+        /// `isDefinitelyUnassigned`/`isUnassigned` (flow_analysis.dart
+        /// `:7221`): the variable is unassigned on EVERY incoming path.
+        /// `false` marks the potentially-unassigned join face (assigned on
+        /// some path, not others), which only the non-late read gates
+        /// (`!isAssigned`, type_analyzer.dart:5010) consume. A
+        /// `definitely_unassigned` read is also `!assigned` — the bits are
+        /// exclusive (model.rs `PromotionModel` invariant).
+        definitely_unassigned: bool,
         /// The variable's declared type, when the declaration carried one.
         declared_type: Option<dartq_source::SourceRange>,
     },

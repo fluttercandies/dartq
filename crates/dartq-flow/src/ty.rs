@@ -133,6 +133,25 @@ pub(crate) struct Boundary {
     pub(crate) target: Option<(Ty, u32)>,
 }
 
+/// The closed-declaration facts a switch scrutinee's always-exhaustive
+/// verdict reads (upstream `TypeSystem.isAlwaysExhaustive`,
+/// type_system.dart:846-888), captured at record time from the unit's own
+/// container declarations. A declaration parsed after the executable that
+/// reads it arrives too late — the under-report direction (the verdict
+/// answers `false`, keeping the post-switch state live).
+#[derive(Default)]
+pub(crate) struct ClosedNames {
+    /// Interned name ids of the unit's `sealed` classes and enums (enums
+    /// are sealed by construction, static_type.dart:67).
+    pub(crate) names: rustc_hash::FxHashSet<u32>,
+    /// `bool`'s interned id — `isDartCoreBool` is a name check at this
+    /// level; `None` until the recorder interns it.
+    pub(crate) bool_name: Option<u32>,
+    /// `FutureOr`'s interned id — the verdict recurses into its single
+    /// argument (type_system.dart:865); `None` until interned.
+    pub(crate) future_or: Option<u32>,
+}
+
 /// The client-supplied type operations seam (official
 /// `FlowAnalysisTypeOperations`, cut to the questions the engine asks).
 pub trait TypeOps {
