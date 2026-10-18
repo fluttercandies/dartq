@@ -454,7 +454,11 @@ mod tests {
         );
         write(
             ".dart_tool/package_config.json",
-            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+            // The pub-writer shape: pub always emits `packageUri: "lib/"`
+            // (upstream pub source, lib/src/entrypoint.dart:511) — without
+            // it the reader contract anchors the source root at the
+            // package root itself (package_config_json.dart:152).
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub"}"#,
         );
         write("sdks/clean/version", "3.13.1\n");
         write("sdks/skew/version", "3.9.0\n");

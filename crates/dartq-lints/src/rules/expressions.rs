@@ -491,10 +491,11 @@ pub(crate) mod avoid_bool_literals_in_conditional_expressions {
     /// `if (b)` answers, as the analyzer's staticType does), or the
     /// resolution face over the run (a bare send through the callee, a
     /// single-name access through the member — cross-file declarations
-    /// included). A missing or unknown face answers `false`: the gate
-    /// stays silent for unresolved and inferred-`var` arms (the
-    /// documented under-report family), and the rule reads the semantic
-    /// face (the wave posture: no face, no report — the engine contract).
+    /// included, an initializer-inferred local through the staged type
+    /// adoption). A missing or unknown face answers `false`: the gate
+    /// stays silent for arms with no decided face, and the rule reads
+    /// the semantic face (the wave posture: no face, no report — the
+    /// engine contract).
     ///
     /// Message: `diagnostic.g.dart`
     /// `avoidBoolLiteralsInConditionalExpressions`.
@@ -25015,9 +25016,13 @@ mod b4_expr_pins {
     /// callee — and one report at the whole conditional when an arm is a
     /// `bool` literal (the oracle observable: the upstream per-arm pair
     /// (:48-49) collapses to one identical diagnostic at one span).
-    /// Dynamic, unpromoted `bool?`, inferred-`var`, and resolved
-    /// non-`bool` arms keep the gate silent, the plain run stays silent
-    /// (the wave posture), and an if-statement is not a target (:34).
+    /// Dynamic, unpromoted `bool?`, and resolved non-`bool` arms keep
+    /// the gate silent, the plain run stays silent (the wave posture),
+    /// and an if-statement is not a target (:34). An initializer-inferred
+    /// local answers at its read like a declared arm (`var t = c` adopts
+    /// the staged inferred type — the oracle reports on that fixture,
+    /// `INFO|LINT|AVOID_BOOL_LITERALS_IN_CONDITIONAL_EXPRESSIONS` at the
+    /// conditional span); only an arm with no decided face stays silent.
     #[test]
     fn bool_literal_conditional_faces() {
         // Both literal arms collapse to ONE lint at the whole conditional;
@@ -25053,6 +25058,18 @@ mod b4_expr_pins {
             1
         );
 
+        // The initializer-inferred local answers at its flow read too:
+        // `var t = c` adopts the staged inferred type, so the arm is
+        // exactly `bool` (the oracle reports on this fixture at the
+        // conditional span). The report anchors the condition's `c` —
+        // the third spelling occurrence.
+        let inferred = "void f(bool c) {\n  var t = c;\n  var x = c ? t : true;\n}\n";
+        let lints = run_semantic(inferred, "avoid_bool_literals_in_conditional_expressions");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let f = Fixture::parse(inferred);
+        let c = tok(&f.source, &f.tokens, "c", 2);
+        assert_eq!(lints[0].range.start, utf16_at(&f, c));
+
         for source in [
             // A resolved non-`bool` arm fails the gate.
             "void f(bool c, int i) {\n  var x = c ? i : true;\n}\n",
@@ -25060,8 +25077,6 @@ mod b4_expr_pins {
             "void f(bool c, dynamic d) {\n  var x = c ? d : true;\n}\n",
             // An unpromoted `bool?` arm is not `bool`.
             "void f(bool c, bool? b) {\n  var x = c ? b : true;\n}\n",
-            // An inferred-`var` arm carries no decided face — silent.
-            "void f(bool c) {\n  var t = c;\n  var x = c ? t : true;\n}\n",
             // An if-statement is not a conditional expression (:30).
             "void f(bool c) {\n  if (c) {\n    var x = true;\n  }\n}\n",
         ] {

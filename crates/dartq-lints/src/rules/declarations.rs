@@ -22887,8 +22887,11 @@ mod unreachable_from_main_tests {
     }
 
     /// A bare-name initializer answers at its flow read: a declared-`int`
-    /// read reports, an inferred-`var` read (the bridge's `Unknown`) stays
-    /// silent.
+    /// read reports, and an inferred-`var` read reports too — the local
+    /// adopts the staged initializer type (`_inferLocalVariable`), so its
+    /// read is exactly `int` (the oracle reports on that fixture,
+    /// `INFO|LINT|UNNECESSARY_NULLABLE_FOR_FINAL_VARIABLE_DECLARATIONS`
+    /// at the variable name).
     #[test]
     fn unnecessary_nullable_read_initializer_faces() {
         let declared = "void f() {\n  int y = 1;\n  final int? x = y;\n}\n";
@@ -22902,14 +22905,15 @@ mod unreachable_from_main_tests {
         let x = tok(&f.source, &f.tokens, "x", 0);
         assert_eq!(lints[0].range.start, utf16_at(&f, x));
         let inferred = "void f() {\n  var y = 1;\n  final int? x = y;\n}\n";
-        assert!(
-            run_semantic(
-                inferred,
-                "unnecessary_nullable_for_final_variable_declarations",
-                None
-            )
-            .is_empty()
+        let lints = run_semantic(
+            inferred,
+            "unnecessary_nullable_for_final_variable_declarations",
+            None,
         );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let f = Fixture::parse(inferred);
+        let x = tok(&f.source, &f.tokens, "x", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, x));
     }
 
     /// Creation and member-access initializers answer through the
