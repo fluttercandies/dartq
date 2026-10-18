@@ -96,11 +96,10 @@ label="${INCREMENTAL_LABEL:-incr-r1}"
 # Adjudicated-skip sequences (comma-separated dir names under CORPUS_ROOT).
 # Every name here carries an open engine ticket whose fix un-skips it; the
 # skip is a documented convergence-debt disposition (the trend-w5-B
-# pattern), never a silent pass. Current: recovery-missing-uri-relink —
-# the relink face (#2100): directive targets resolve at intake only, so a
-# created file does not yet satisfy a previously-missing import target on
-# the incremental face.
-SKIP_SEQUENCES="${DARTQ_INCR_SKIP:-recovery-missing-uri-relink}"
+# pattern), never a silent pass. Current: none — the relink face (#2100)
+# landed (set-moving batches re-resolve affected directive holders), so
+# recovery-missing-uri-relink runs live again.
+SKIP_SEQUENCES="${DARTQ_INCR_SKIP:-}"
 negative_control=0
 
 usage() {

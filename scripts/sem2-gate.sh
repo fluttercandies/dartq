@@ -67,7 +67,7 @@ EXPECTED_VERSION="${DARTQ_ORACLE_VERSION:-3.13.1}"
 OUT_ROOT="target/evidence/gate-sem2"
 HARNESS="./target/debug/harness"
 DEFAULT_LABEL="sem2-r1"
-EXPECTED_CODES=65
+EXPECTED_CODES=77
 
 usage() {
   sed -n '2,/^set -u -o pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
@@ -109,7 +109,9 @@ fi
 # hand-truncation during a window would otherwise pass with no runtime
 # trace. Rows are counted exactly as the harness's parse_codes_file reads
 # them (trim; skip blank and '#'-comment lines): the frozen wave-2 universe
-# is 65 codes at the 2026-10-13 derivation. The derivation pin
+# is 77 codes at the 2026-10-18 re-freeze (waves 312ed6c/3b239d6 added 12
+# rows over the 2026-10-13 freeze; the derivation pin was green at HEAD
+# before this bump). The derivation pin
 # (sem2_codes_file_matches_derivation) re-derives the set live in `cargo
 # test -p harness`; this count is the cheap runtime cross-check.
 sem2_count="$(grep -cv -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$CODES_FILE")"
