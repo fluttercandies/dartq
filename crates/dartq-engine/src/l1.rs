@@ -2687,23 +2687,44 @@ fn build_library_info(
     // so a second equally-named library still sees the part's members in its
     // namespace. The path-smallest `library_of_file` winner stays the
     // attribution owner and is irrelevant here.
-    let parts: Vec<FileId> = defining_facts
-        .directives
-        .iter()
-        .filter(|directive| directive.kind == DirectiveKind::Part)
-        .filter_map(|directive| match directive.target {
-            ResolvedTarget::Resolved(target) => Some(target),
-            _ => None,
-        })
-        .filter(|target| {
-            *target != defining
-                && state.residency.contains_key(target)
-                && may_claim(state, defining, library_name, *target)
-        })
-        .collect();
-    let mut members = Vec::with_capacity(parts.len() + 1);
+    //
+    // The walk is breadth-first over each member's own part directives: a
+    // depth-2 chain (`root ← mid ← leaf`, leaf's part-of binding to mid)
+    // joins the leaf through the attached middle — the oracle's library
+    // builds transitively (a `g()` declared in the leaf resolves bare in
+    // the root), the URI-form claim testing each hop against its DIRECT
+    // includer (`may_claim(state, member, …)`).
+    let mut members: Vec<FileId> = Vec::new();
+    let mut claimed: FxHashSet<FileId> = FxHashSet::default();
     members.push(defining);
-    members.extend_from_slice(&parts);
+    claimed.insert(defining);
+    let mut hop = 0;
+    while hop < members.len() {
+        let member = members[hop];
+        hop += 1;
+        let mut joined: Vec<FileId> = Vec::new();
+        for directive in &state.residency[&member].directives {
+            if directive.kind != DirectiveKind::Part {
+                continue;
+            }
+            let ResolvedTarget::Resolved(target) = directive.target else {
+                continue;
+            };
+            if target == defining
+                || !state.residency.contains_key(&target)
+                || !claimed.insert(target)
+            {
+                continue;
+            }
+            if may_claim(state, member, library_name, target) {
+                joined.push(target);
+            } else {
+                claimed.remove(&target);
+            }
+        }
+        joined.sort_unstable_by_key(|file| path_key(state, *file));
+        members.extend(joined);
+    }
     let content: Box<[ContentId]> = members
         .iter()
         .map(|member| state.residency[member].content)
@@ -2733,7 +2754,7 @@ fn build_library_info(
                     // the parts list uses, so a member never double-rides.
                     if state.residency.contains_key(&target)
                         && target != defining
-                        && !may_claim(state, defining, library_name, target)
+                        && !claimed.contains(&target)
                     {
                         part_targets.push(target);
                     }
@@ -2746,6 +2767,8 @@ fn build_library_info(
     deps.dedup();
     part_targets.sort_unstable_by_key(|file| file.index());
     part_targets.dedup();
+    // `parts` is membership minus the defining file (`members` carries both).
+    let parts: Vec<FileId> = members[1..].to_vec();
     LibraryInfo {
         // The memo's allocation, shared: a refcount per formed library,
         // never a copy of the URI bytes.

@@ -347,6 +347,12 @@ pub enum Ev {
     AsOperator,
     Assign {
         plain: bool,
+        /// `??=` (official `ifNullExpression_*` wiring on the
+        /// `lvalue ??= e` resolution path,
+        /// assignment_expression_resolver.dart:665-707): the written type is
+        /// `LUB(NonNull(readType), rhsType)` and the write promotes through
+        /// types-of-interest, unlike other compound operators.
+        if_null: bool,
         /// The assignment expression's end (`handleAssignmentExpression`'s
         /// `end`): a dead updater's row ends here (`i = 0`, `i += 1` — the
         /// header parts carry no statement wrapper).

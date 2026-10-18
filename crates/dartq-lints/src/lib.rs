@@ -249,6 +249,7 @@ pub use rules::declarations::remove_deprecations_in_breaking_versions::is_breaki
 pub use rules::pubspec::package_names::check_name;
 pub use rules::pubspec::path_dependencies::{
     PathVerdict, check_path_entry, resolve_dependency_path, scan_path_entries,
+    scan_screenshot_entries,
 };
 pub use rules::pubspec::secure_pubspec_urls::check_url;
 pub use rules::pubspec::sort_pub_dependencies::check_section;

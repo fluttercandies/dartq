@@ -74,8 +74,10 @@ use crate::model::{
 /// variant (`Ty::Function`) — a formal, field, or return type written as a
 /// function type hashes its columns (return, formals, parameter count)
 /// instead of capturing `Unknown`, so a function-shape-only edit is an
-/// element-face edit.
-pub const SIGNATURE_VERSION: u32 = 7;
+/// element-face edit. v8: the container's const-constructor bit (a
+/// `const`-only constructor edit flips the cross-file const-creation
+/// faces of every dependent).
+pub const SIGNATURE_VERSION: u32 = 8;
 
 /// The 128-bit blake3 digest of a file's canonical element face — the same
 /// width family as [`dartq_source::ContentId`].
@@ -497,6 +499,7 @@ impl<'a> Face<'a> {
             enum_constants,
             constructors,
             has_unnamed_constructor,
+            has_const_constructor,
             ctor_formals,
             annotations,
         } = container;
@@ -577,6 +580,11 @@ impl<'a> Face<'a> {
             "unnamed"
         } else {
             "no-unnamed"
+        });
+        self.field(if *has_const_constructor {
+            "const-ctor"
+        } else {
+            "no-const-ctor"
         });
         // The constructor formals by lookup spelling (the
         // `unused_element_parameter` constructor face's facts): a hash

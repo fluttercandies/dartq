@@ -1054,7 +1054,7 @@ mod tests {
         config.packages.push(PackageConfigEntry {
             name: "resolved".to_owned(),
             root_uri: "file:///real/resolved".to_owned(),
-            package_uri: "lib/".to_owned(),
+            package_uri: Some("lib/".to_owned()),
             language_version: None,
             additional_properties: BTreeMap::new(),
         });

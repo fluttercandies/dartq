@@ -80,8 +80,8 @@ use dartq_lints::{
     ReachabilityFace, RuleId, UnignorableIgnore, WorkspaceFacts, check_name, check_path_entry,
     check_section, check_url, is_breaking_version, mounts_semantics, parse_unit,
     resolve_dependency_path, rule_by_name, run, run_breaking_version_annotations,
-    scan_path_entries, type_use_counts, unignorable_ignores, unnecessary_ignore_analyzer_rows,
-    unnecessary_ignore_late_rows,
+    scan_path_entries, scan_screenshot_entries, type_use_counts, unignorable_ignores,
+    unnecessary_ignore_analyzer_rows, unnecessary_ignore_late_rows,
 };
 use dartq_package::PackageIdentity;
 use dartq_parser::ParserFeatures;
@@ -1011,11 +1011,10 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
                 // suppress a diagnostic, so the fold is paid either way
                 // (#2131/#2136). The unnecessary report filter itself stays
                 // name-only (ignore_validator.dart:208-213).
-                if entries
-                    .iter()
-                    .any(|entry| is_known_diagnostic_code(&entry.name)
-                        || canonical_diagnostic_name(&entry.name).is_some())
-                {
+                if entries.iter().any(|entry| {
+                    is_known_diagnostic_code(&entry.name)
+                        || canonical_diagnostic_name(&entry.name).is_some()
+                }) {
                     // The substrate (#2132): the shell's mount when a
                     // fold-consuming rule needs the Analysis anyway, a
                     // per-hit build otherwise — the probe gate above keeps
@@ -1391,7 +1390,13 @@ fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
         let names_on = names_rule.is_some_and(|id| set.is_enabled(id));
         let sort_on = sort_rule.is_some_and(|id| set.is_enabled(id));
         let path_entries = scan_path_entries(text);
-        if !urls_on && !names_on && !sort_on && path_entries.is_empty() {
+        let screenshot_entries = scan_screenshot_entries(text);
+        if !urls_on
+            && !names_on
+            && !sort_on
+            && path_entries.is_empty()
+            && screenshot_entries.is_empty()
+        {
             continue;
         }
         let facts = scan_pubspec(text);
@@ -1477,6 +1482,33 @@ fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
                 continue;
             };
             let rule = path_rule(verdict).expect("registry-pinned dependency-validator code");
+            let spec = &RULES[rule.0 as usize];
+            let (line, _) =
+                lines.byte_to_line_col(u32::try_from(entry.range.start).unwrap_or(u32::MAX));
+            if ignores.ignored(line, spec.name) {
+                continue;
+            }
+            rows.push(Lint {
+                rule,
+                range: utf16_range(&lines, text, &entry.range),
+                message: spec.render_problem(&[entry.path.as_str()]),
+                correction: spec.render_correction(&[]),
+            });
+        }
+        // The `screenshotsValidator` walk (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/pubspec/validators/screenshot_validator.dart
+        // :12-38): each `screenshots:` list item's `path` field, judged
+        // against the resolved *file*'s existence (`provider.getFile` —
+        // a directory at the resolved path still misses). Shares the
+        // pass's `IgnoreInfo.forYaml` suppression face and the
+        // `path_does_not_exist` spec.
+        for entry in screenshot_entries {
+            let resolved = resolve_dependency_path(&dir, &entry.path);
+            if resolved.is_file() {
+                continue;
+            }
+            let rule =
+                rule_by_name("path_does_not_exist").expect("registry-pinned path_does_not_exist");
             let spec = &RULES[rule.0 as usize];
             let (line, _) =
                 lines.byte_to_line_col(u32::try_from(entry.range.start).unwrap_or(u32::MAX));

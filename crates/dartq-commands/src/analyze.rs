@@ -241,7 +241,12 @@ pub fn run_overlaid<'a>(
             diagnostics.extend(engine.apply_severity_options(removed_rows));
         }
     }
-    let layout = EngineLayout::over(engine, diagnostics.iter().map(|d| d.file));
+    // The layout snapshot covers every location the writers resolve — a
+    // context message may anchor in a file that carries no row of its own
+    // (#2164: its id joins the output set or the merged lookups panic).
+    let layout = EngineLayout::over(engine, diagnostics.iter().flat_map(|d| {
+        std::iter::once(d.file).chain(d.context.iter().flatten().map(|m| m.file))
+    }));
     diagnostics.sort_by(|a, b| oracle_cmp(a, b, &layout));
     Ok(AnalyzeRun {
         diagnostics,
@@ -462,7 +467,12 @@ pub fn run_targets<'a>(
         );
         diagnostics = plugin_rows;
     }
-    let layout = EngineLayout::over(engine, diagnostics.iter().map(|d| d.file));
+    // The layout snapshot covers every location the writers resolve — a
+    // context message may anchor in a file that carries no row of its own
+    // (#2164: its id joins the output set or the merged lookups panic).
+    let layout = EngineLayout::over(engine, diagnostics.iter().flat_map(|d| {
+        std::iter::once(d.file).chain(d.context.iter().flatten().map(|m| m.file))
+    }));
     diagnostics.sort_by(|a, b| oracle_cmp(a, b, &layout));
     Ok(AnalyzeRun {
         diagnostics,
@@ -486,8 +496,8 @@ pub fn run_targets<'a>(
 /// layout delegates position lookups to the owning run's
 /// [`EngineLayout`].
 pub struct MergedRun<'a> {
-    /// The union diagnostic set, oracle display order, `file` remapped onto
-    /// `files`.
+    /// The union diagnostic set, oracle display order, `file` and every
+    /// context message's `file` remapped onto `files`.
     pub diagnostics: Vec<Diagnostic>,
     /// Merged run facts: per-phase wall-clock summed across the sequential
     /// engine runs; counters summed.
@@ -537,12 +547,16 @@ pub fn merge_runs<'a>(runs: Vec<AnalyzeRun<'a>>) -> MergedRun<'a> {
     // existing id for a repeated path, so the table is filled by id, not
     // by push order (the `resize` keeps the sparse positions defaultable).
     let mut owners: Vec<Option<(usize, FileId)>> = Vec::new();
-    let mut diagnostics = Vec::with_capacity(keyed.len());
-    for (run_index, mut diagnostic) in keyed {
-        let path = runs[run_index].layout.file_path(diagnostic.file);
-        let original = diagnostic.file;
-        diagnostic.file = files.intern(path);
-        let slot = diagnostic.file.index() as usize;
+    // Every location the writers resolve — the diagnostic's own and each
+    // context message's — interns onto the merged table: context messages
+    // point at secondary locations, often in other files, whose ids would
+    // otherwise stay raw engine ids (an out-of-table lookup panics on the
+    // merged provider; a colliding id silently resolves a different
+    // file's line and column).
+    let mut remap = |run_index: usize, id: FileId| -> FileId {
+        let original = id;
+        let merged = files.intern(runs[run_index].layout.file_path(id));
+        let slot = merged.index() as usize;
         if owners.len() <= slot {
             owners.resize_with(slot + 1, || None);
         }
@@ -550,6 +564,16 @@ pub fn merge_runs<'a>(runs: Vec<AnalyzeRun<'a>>) -> MergedRun<'a> {
         // read identical bytes (deterministic analysis), so either layout
         // resolves the position equivalently.
         owners[slot].get_or_insert((run_index, original));
+        merged
+    };
+    let mut diagnostics = Vec::with_capacity(keyed.len());
+    for (run_index, mut diagnostic) in keyed {
+        diagnostic.file = remap(run_index, diagnostic.file);
+        if let Some(context) = &mut diagnostic.context {
+            for message in context.iter_mut() {
+                message.file = remap(run_index, message.file);
+            }
+        }
         diagnostics.push(diagnostic);
     }
     let owners: Vec<(usize, FileId)> = owners

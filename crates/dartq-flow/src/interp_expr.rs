@@ -194,6 +194,19 @@ impl Interp<'_> {
                             self.exprs.push(expr);
                         }
                     },
+                    // A constructor-reference head (`new C()`, `const C()`,
+                    // `C<T>.named(...)`) is the creation's value — its
+                    // static type is the head's class, so the expression
+                    // carries the named non-null face and a following
+                    // `x = C()` write can promote `x` to it. The selector
+                    // continuations (`.named`) push nothing: the head's
+                    // entry already is the invocation's result.
+                    Ctx::ConstructorReference => {
+                        self.exprs.push(Expr::trivial(Ty {
+                            base: Base::Name(*name),
+                            nullable: false,
+                        }));
+                    }
                     // Named-argument labels and declaration names carry no
                     // value; catch/declaration names never reach the
                     // expression stack.
@@ -624,14 +637,15 @@ impl Interp<'_> {
                     );
                 }
             }
-            Ev::Assign { plain, end } => {
+            Ev::Assign { plain, if_null, end } => {
                 let base = self.consumer_base(2);
                 let rhs = self.pop_value();
                 let target = self.pop_value();
                 // The read-back value's written arguments are the right-hand
-                // side's when the write carried its type (a plain `=`), and
-                // argument-less for the compound operators' unknown face.
-                let rhs_args = if *plain {
+                // side's when the write carried its type (a plain `=` or the
+                // `??=` if-null combination), and argument-less for the
+                // compound operators' unknown face.
+                let rhs_args = if *plain || *if_null {
                     rhs.args
                 } else {
                     crate::ty::EMPTY_ARGS
@@ -658,7 +672,36 @@ impl Interp<'_> {
                     });
                 }
                 if let Some(var) = target.reference {
-                    let written = if *plain { rhs.ty } else { Ty::UNKNOWN };
+                    // `x ??= e`: the write's type is `LUB(NonNull(readType),
+                    // rhsType)` (official `_computeIfNullType`,
+                    // assignment_expression_resolver.dart:872-907) and the
+                    // write promotes through types-of-interest — `x ??= 0`
+                    // on `int? x` leaves it promoted to `int`, exactly like
+                    // the desugared `x = x ?? 0`. Other compound operators
+                    // write the unresolved operator face (UNKNOWN) and never
+                    // promote. The RHS evaluated on the unsplit path — the
+                    // official null-path split (`ifNullExpression_rightBegin`)
+                    // only changes flow inside `e`, which a flattened replay
+                    // cannot recreate; the post-state (the write + the
+                    // joined result) is the oracle-visible part.
+                    let written = if *plain {
+                        rhs.ty
+                    } else if *if_null {
+                        // `LUB(NonNull(readType), rhsType)` — the boundary-
+                        // aware non-null form first, then the name-level
+                        // least upper bound (a subtype-ordered join; a real
+                        // hierarchy LUB is the semantic layer's question).
+                        // An untyped RHS still leaves the lvalue non-null —
+                        // `x ??= e` can never widen x back to nullable.
+                        let (lhs_nn, _) = self.promote_to_non_null(target.ty, target.args);
+                        if rhs.ty == Ty::UNKNOWN {
+                            lhs_nn
+                        } else {
+                            self.name_lub(lhs_nn, rhs.ty)
+                        }
+                    } else {
+                        Ty::UNKNOWN
+                    };
                     // The write's own range: the assignment expression (the
                     // official `flow.write` node,
                     // assignment_expression_resolver.dart:322-329 — target
@@ -668,7 +711,7 @@ impl Interp<'_> {
                         offset: token.range.offset,
                         length: end.saturating_sub(token.range.offset),
                     });
-                    self.write_var(var, written, *plain, write_span);
+                    self.write_var(var, written, *plain || *if_null, write_span);
                     // The assignment expression reads back the variable.
                     self.exprs.push(Expr::of_reference(var, written, rhs_args));
                 } else {
@@ -960,7 +1003,29 @@ impl Interp<'_> {
                 // The callee flows through as the send's result: a bare
                 // identifier keeps its variable reference and promoted type
                 // (a plain assignment's target is exactly such a reference).
-                if let Some(callee) = self.exprs.pop() {
+                if let Some(mut callee) = self.exprs.pop() {
+                    // An invoked bare head that resolved to nothing
+                    // (`C()`/`C<T>()` spelled without `new`/`const`): the
+                    // implicit-creation face — the call's static type is the
+                    // named class, so `x = C()` can promote `x` to `C`. The
+                    // gate: the send actually carried an argument list (the
+                    // preceding `ArgumentsEnd`; a bare leaf fires `Send`
+                    // too, and a tear-off names the callable, not the
+                    // class), and the callee is the unresolved bare-head
+                    // expression (a `prop` slot marks it — member callees
+                    // carry none, resolved callees keep their own type).
+                    if matches!(ev, Ev::Send)
+                        && matches!(events.get(i.wrapping_sub(1)), Some(Ev::ArgumentsEnd { .. }))
+                        && callee.reference.is_none()
+                        && callee.prop.is_some()
+                        && let Some(name) = callee.name
+                    {
+                        callee.ty = Ty {
+                            base: Base::Name(name),
+                            nullable: false,
+                        };
+                        callee.prop = None;
+                    }
                     self.exprs.push(callee);
                 }
             }

@@ -1038,6 +1038,17 @@ fn part_family_diagnostics(
                 },
                 Some(_) => {}
                 None => {
+                    // URI form: the claim binds to the file that directly
+                    // includes this part, not the defining library — a
+                    // depth-2 chain (`root ← mid ← leaf`, leaf's
+                    // `part of 'mid.dart'`) joins through the attached
+                    // middle (upstream Dart SDK source, file_state.dart's
+                    // `LibraryFileKind` part check: `Expected this library
+                    // to be part of '<includer uri>'`).
+                    if part_of.target == ResolvedTarget::Resolved(*file) {
+                        attached.insert(target);
+                        continue;
+                    }
                     let enclosing_uri = canonical_uri_spelling(state, *file);
                     out.push(Arc::new(part_diagnostic(
                         ResolutionCode::PartOfDifferentLibrary.info(),

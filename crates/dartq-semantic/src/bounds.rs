@@ -81,6 +81,20 @@ pub(crate) struct HeaderSink {
     /// unattributed root remained at body time: the capture is
     /// unfaithful.
     open: bool,
+    /// An extension type's header: the representation type and the
+    /// `implements` faces as written, argument-bearing (the
+    /// `extension_type_implements_not_supertype` face's facts).
+    extension: Option<ExtFaceCapture>,
+}
+
+/// One extension type's written representation type and `implements`
+/// faces. The representation is `None` when the primary constructor did
+/// not leave exactly one completed type root (an untyped or recovered
+/// formal list) — its faces then decide nothing.
+#[derive(Clone)]
+pub(crate) struct ExtFaceCapture {
+    pub(crate) rep: Option<TypeTree>,
+    pub(crate) faces: Vec<TypeTree>,
 }
 
 /// Which clause completed. `On` trees are constraints, not supertypes —
@@ -121,11 +135,11 @@ impl HeaderSink {
 
     /// Body time: a root no clause claimed means the capture is not the
     /// faithful supertype set.
-    fn finish(mut self) -> (Vec<TypeTree>, bool) {
+    fn finish(mut self) -> (Vec<TypeTree>, bool, Option<ExtFaceCapture>) {
         if !self.sink.unclaimed(self.claimed).is_empty() || !self.sink.stack.is_empty() {
             self.open = true;
         }
-        (self.sink.done, self.open)
+        (self.sink.done, self.open, self.extension)
     }
 }
 
@@ -165,6 +179,33 @@ struct BoundsIndex {
     /// bounds snapshot expands an alias head through its captured RHS —
     /// the only alias face the M1 decision order observes (#1351).
     aliases: FxHashMap<StringId, AliasCapture>,
+    /// The file's extension types with a captured representation, in
+    /// declaration order: `(name, capture)`.
+    ext_faces: Vec<(StringId, ExtFaceCapture)>,
+    /// Every extension type this file declares (a primary constructor
+    /// opened under its header). Non-generic ones register in the snapshot
+    /// as bare declarations so a face's type argument can name them.
+    ext_names: Vec<StringId>,
+}
+
+/// One extension type `implements` face, decided where the snapshot can:
+/// the oracle's `isSubtypeOf(declaredRepresentation, face)`
+/// (scope_analyzer.dart:1312-1360).
+pub(crate) struct ExtFaceRow {
+    /// The face's own span (the oracle anchors the row at the face's
+    /// named type).
+    pub(crate) range: SourceRange,
+    /// The face's head name when written bare (no type arguments) — the
+    /// name-level fallback's input.
+    pub(crate) face_bare: Option<StringId>,
+    /// The representation's head name when written bare (no arguments, no
+    /// `?`, not a record/function shape).
+    pub(crate) rep_bare: Option<StringId>,
+    /// `Some` when the snapshot decided the subtype question.
+    pub(crate) verdict: Option<bool>,
+    /// The snapshot's displays (`Comparable<Score5>`, `int`), when it
+    /// mapped both sides.
+    pub(crate) displays: Option<(String, String)>,
 }
 
 /// One function-type alias's captured declaration: its type parameters
@@ -246,6 +287,25 @@ fn tree_mentions(tree: &TypeTree, params: &[StringId]) -> bool {
             .any(|field| tree_mentions(field, params));
     }
     params.contains(&tree.head) || tree.args.iter().any(|arg| tree_mentions(arg, params))
+}
+
+/// Whether any named head in the tree (the root or any argument, record
+/// field, or function column) satisfies `pred`; a poisoned tree answers
+/// `true` (the conservative direction for the caller's gate).
+fn tree_any_head(tree: &TypeTree, pred: &dyn Fn(StringId) -> bool) -> bool {
+    if tree.poisoned {
+        return true;
+    }
+    if let Some((positional, named)) = &tree.record {
+        return positional
+            .iter()
+            .chain(named.iter().map(|(_, ty)| ty))
+            .any(|field| tree_any_head(field, pred));
+    }
+    if tree.function.is_some() {
+        return true;
+    }
+    pred(tree.head) || tree.args.iter().any(|arg| tree_any_head(arg, pred))
 }
 
 /// Maps an alias's captured RHS in the alias's own parameter scope: the
@@ -378,6 +438,10 @@ pub(crate) struct Bounds<'a> {
     header: Option<(StringId, HeaderSink)>,
     /// The outermost explicit type-argument site capture.
     site: Option<TreeSink>,
+    /// The open header's root count when an extension type's primary
+    /// constructor formals opened: the roots completed since are the
+    /// representation formal's type, not supertype clauses.
+    rep_mark: Option<usize>,
     /// The open `typedef A<X> = ...` RHS capture (#1351). Top-level
     /// declarations cannot nest, so one slot serves; a container's
     /// `VarHeader`-equivalent overwrite path never coexists with it.
@@ -491,8 +555,45 @@ impl<'a> Bounds<'a> {
                 sink: TreeSink::default(),
                 claimed: 0,
                 open: false,
+                extension: None,
             },
         ));
+    }
+
+    /// An extension type's primary-constructor formals opened inside the
+    /// header window: the roots they complete are the representation type.
+    pub(crate) fn begin_representation(&mut self) {
+        if let Some((name, header)) = self.header.as_ref() {
+            self.rep_mark = Some(header.sink.done.len());
+            if !self.index.ext_names.contains(name) {
+                self.index.ext_names.push(*name);
+            }
+        }
+    }
+
+    /// The representation formals closed: their completed roots leave the
+    /// header sink (they are no supertype clause) and latch as the
+    /// representation type — exactly one root, else none.
+    pub(crate) fn end_representation(&mut self) {
+        let Some(mark) = self.rep_mark.take() else {
+            return;
+        };
+        let Some((_, header)) = self.header.as_mut() else {
+            return;
+        };
+        if !header.sink.stack.is_empty() || mark > header.sink.done.len() {
+            header.extension = Some(ExtFaceCapture {
+                rep: None,
+                faces: Vec::new(),
+            });
+            return;
+        }
+        let mut roots: Vec<TypeTree> = header.sink.done.drain(mark..).collect();
+        let rep = if roots.len() == 1 { roots.pop() } else { None };
+        header.extension = Some(ExtFaceCapture {
+            rep,
+            faces: Vec::new(),
+        });
     }
 
     /// A header clause completed; its trees join the supertype set
@@ -502,6 +603,16 @@ impl<'a> Bounds<'a> {
             return;
         };
         let trees = header.clause(clause);
+        // An extension type's `implements` faces latch argument-bearing;
+        // a count mismatch leaves the faces unattributable.
+        if matches!(clause, Clause::Implements(_))
+            && let Some(extension) = header.extension.as_mut()
+        {
+            if header.open {
+                extension.rep = None;
+            }
+            extension.faces.extend(trees.iter().cloned());
+        }
         if trees.is_empty() {
             return;
         }
@@ -515,10 +626,20 @@ impl<'a> Bounds<'a> {
         let Some((name, header)) = self.header.take() else {
             return;
         };
-        let (supers, open) = header.finish();
+        let (supers, open, extension) = header.finish();
+        if let Some(extension) = extension
+            && extension.rep.is_some()
+            && !extension.faces.is_empty()
+        {
+            self.index.ext_faces.push((name, extension));
+        }
         if let Some(capture) = self.index.containers.get_mut(&name) {
             capture.supers = supers;
-            capture.open = open;
+            // An extension type's supertype face is not its class-style
+            // edge set (the representation type is no supertype and the
+            // faces need not be interfaces of it): the capture stays
+            // unfaithful, the snapshot never walks through it.
+            capture.open = open || capture.is_extension_type;
         }
     }
 
@@ -526,6 +647,7 @@ impl<'a> Bounds<'a> {
     /// at the body).
     pub(crate) fn drop_header(&mut self) {
         self.header = None;
+        self.rep_mark = None;
     }
 
     /// A simple type completed inside an open capture window.
@@ -1069,6 +1191,108 @@ impl<'a> Bounds<'a> {
         Some(format!("{name}<{}>", rendered.join(", ")))
     }
 
+    /// The extension-type `implements` faces of this file, in declaration
+    /// then clause order. A face the snapshot cannot model leaves
+    /// `verdict: None` (the caller may still decide it at name level); a
+    /// face that is not an interface-typed superinterface the
+    /// representation check reads (an extension type — the
+    /// representation-not-supertype twin, unmodeled — or an invalid
+    /// superinterface shape that reports its own code) yields no row.
+    ///
+    /// `declared` answers whether this file's element model declares a
+    /// container of the name: such a name the snapshot did not register
+    /// (a non-generic class — only generic heads are captured) would map
+    /// to a same-named builtin or not at all, so a tree naming one is left
+    /// to the name-level fallback.
+    pub(crate) fn ext_face_rows(
+        &mut self,
+        strings: &'a StringTable,
+        declared: impl Fn(StringId) -> bool,
+    ) -> Vec<ExtFaceRow> {
+        if self.index.ext_faces.is_empty() {
+            return Vec::new();
+        }
+        let ext_faces = std::mem::take(&mut self.index.ext_faces);
+        let invalid_heads = ["dynamic", "void", "Never", "Null", "FutureOr", "Function", "Record"];
+        // Plan with the capture index borrowed, decide with the snapshot:
+        // each row carries the tree pair the snapshot may map.
+        let mut plan: Vec<(ExtFaceRow, Option<(&TypeTree, &TypeTree)>)> = Vec::new();
+        {
+            let index = &self.index;
+            let unregistered = |name: StringId| {
+                declared(name)
+                    && !index.containers.contains_key(&name)
+                    && !index.ext_names.contains(&name)
+            };
+            for (name, capture) in &ext_faces {
+                let Some(rep) = capture.rep.as_ref() else {
+                    continue;
+                };
+                let own_params: &[StringId] = index
+                    .containers
+                    .get(name)
+                    .map_or(&[], |c| c.params.as_slice());
+                let rep_bare = (rep.record.is_none()
+                    && rep.function.is_none()
+                    && !rep.poisoned
+                    && !rep.nullable
+                    && rep.args.is_empty())
+                .then_some(rep.head);
+                // The representation may name neither the extension type's
+                // own parameters (their bounds are not modeled here) nor
+                // any extension type (registered edge-less, so its own
+                // faces would be missing from the walk), nor a container
+                // the snapshot did not register.
+                let rep_mappable = !tree_mentions(rep, own_params)
+                    && !tree_mentions(rep, &index.ext_names)
+                    && !tree_any_head(rep, &unregistered);
+                for face in &capture.faces {
+                    if face.poisoned || face.record.is_some() || face.function.is_some() {
+                        continue;
+                    }
+                    let face_text = strings.resolve(face.head);
+                    if face.nullable
+                        || invalid_heads.contains(&face_text)
+                        || index.ext_names.contains(&face.head)
+                    {
+                        continue;
+                    }
+                    let row = ExtFaceRow {
+                        range: face.range,
+                        face_bare: face.args.is_empty().then_some(face.head),
+                        rep_bare,
+                        verdict: None,
+                        displays: None,
+                    };
+                    let mappable = rep_mappable
+                        && !tree_mentions(face, own_params)
+                        && !tree_any_head(face, &unregistered);
+                    plan.push((row, mappable.then_some((rep, face))));
+                }
+            }
+        }
+        if plan.iter().all(|(_, trees)| trees.is_none()) {
+            return plan.into_iter().map(|(row, _)| row).collect();
+        }
+        let snapshot = self.snapshot(strings);
+        let ctx = snapshot.ctx();
+        let empty = FxHashMap::default();
+        plan.into_iter()
+            .map(|(mut row, trees)| {
+                if let Some((rep, face)) = trees
+                    && let (Some(rep_ty), Some(face_ty)) =
+                        (ctx.map_tree(rep, &empty), ctx.map_tree(face, &empty))
+                    && snapshot.type_is_safe(rep_ty)
+                    && matches!(snapshot.table.get(face_ty).kind(), TypeKind::Interface { .. })
+                {
+                    row.verdict = Some(snapshot.system().is_subtype(rep_ty, face_ty));
+                    row.displays = Some((snapshot.display(face_ty), snapshot.display(rep_ty)));
+                }
+                row
+            })
+            .collect()
+    }
+
     /// Builds (once) or returns the snapshot.
     fn snapshot<'s>(&'s mut self, strings: &'a StringTable) -> &'s Snapshot<'a> {
         if self.snapshot.is_none() {
@@ -1088,17 +1312,19 @@ const FIRST_FILE_RAW: u32 = 100;
 
 /// The curated dart:core builtin face: `(name, type-parameter names,
 /// supertypes as written heads)`. The edges are the fixed public
-/// declarations of the reference SDK (`sdk/lib/core/*.dart`): `abstract
-/// class int extends num implements Comparable<int>`, the `num` and
-/// `double` counterparts, `abstract class String implements
+/// declarations of the reference SDK (`sdk/lib/core/*.dart`): `sealed
+/// class num implements Comparable<num>`, `abstract final class int
+/// extends num` and its `double` twin (neither re-implements
+/// `Comparable` — `int`'s `Comparable` instantiation is `Comparable<num>`,
+/// so `int` does not satisfy `T extends Comparable<T>`), `abstract class String implements
 /// Comparable<String>, Pattern`, and the collection roots (`List<E>`
 /// implements `Iterable<E>`, `Set<E>` reachable to `Iterable<E>` through
 /// its public face). A builtin missing from the table simply suppresses
 /// the checks it would enter.
 const BUILTINS: &[(&str, &[&str], &[&str])] = &[
     ("num", &[], &["Comparable<num>"]),
-    ("int", &[], &["num", "Comparable<int>"]),
-    ("double", &[], &["num", "Comparable<double>"]),
+    ("int", &[], &["num"]),
+    ("double", &[], &["num"]),
     ("String", &[], &["Comparable<String>", "Pattern"]),
     ("bool", &[], &[]),
     ("Pattern", &[], &[]),
@@ -1377,6 +1603,23 @@ impl<'a> Snapshot<'a> {
             builder = builder.decl(decl, param_ids.clone());
             decl_params.insert(decl, param_ids);
             file_scopes.insert(decl, scope);
+        }
+
+        // The file's non-generic extension types register edge-less (a
+        // generic one is a container capture above): a face's type
+        // argument may name them (`implements Comparable<Score>`). Their
+        // closure is never walked as a representation — the face check
+        // excludes representations that mention any extension type.
+        for name in &index.ext_names {
+            if index.containers.contains_key(name) {
+                continue;
+            }
+            let decl = TypeDeclId::from_raw(next_decl);
+            next_decl += 1;
+            registry.insert(*name, decl);
+            decl_text.insert(decl, strings.resolve(*name).to_string());
+            builder = builder.decl(decl, Vec::new());
+            decl_params.insert(decl, Vec::new());
         }
 
         // The fresh in-file declarations are all registered by now. The

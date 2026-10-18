@@ -2230,6 +2230,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 end,
                 const_keyword,
                 has_constructor_name,
+                constructor_name,
             );
         } else {
             if kind == DeclarationKind::ExtensionType {

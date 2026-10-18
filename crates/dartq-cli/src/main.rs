@@ -3021,6 +3021,68 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The JSON face over a context-carrying single-file target (#2164, D1):
+    /// the envelope's `contextMessages` resolve through the merged layout
+    /// provider too, so a diagnostic whose context anchor carries a raw
+    /// engine-table file id (not the merged union's id) used to panic
+    /// mid-stream — rc 4 with a truncated, unparseable envelope (the
+    /// full-corpus shape: a colliding id silently resolved a DIFFERENT
+    /// file's line/column). The clean sibling forces the engine's id for
+    /// the analyzed file apart from the merged table's, and the file target
+    /// keeps the merged table minimal — the exact divergence shape.
+    #[test]
+    fn analyze_json_face_resolves_context_messages_through_the_merged_table() {
+        let root = analyze_fixture(
+            "json-context",
+            &[
+                ("lib/aaa_clean.dart", "int clean = 0;\n"),
+                ("lib/bbb_broken.dart", "int x = 0;\nint x = 1;\n"),
+            ],
+        );
+
+        let mut args = analyze_args(&root, AnalyzeFormat::Json, None);
+        args.targets = vec![root.join("lib/bbb_broken.dart")];
+        let mut out: Vec<u8> = Vec::new();
+        let code = analyze_run(&args, &mut out);
+        assert_eq!(code, exit::ERRORS, "the ERROR-tier duplicate reports");
+        let text = String::from_utf8(out).expect("UTF-8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1, "one line: the envelope only");
+        let envelope: serde_json::Value = serde_json::from_str(lines[0])
+            .expect("a complete envelope: no panic truncated the stream");
+        let rows = envelope["diagnostics"].as_array().expect("rows");
+        let duplicate = rows
+            .iter()
+            .find(|row| row["code"] == "duplicate_definition")
+            .expect("the duplicate_definition row");
+        let file = root
+            .canonicalize()
+            .expect("canonical root")
+            .join("lib/bbb_broken.dart");
+        let file = file.display().to_string();
+        assert_eq!(
+            duplicate["location"]["file"], file,
+            "the row's own location resolves through the merged table"
+        );
+        let context = duplicate["contextMessages"].as_array().expect("context");
+        assert_eq!(context.len(), 1, "one anchor: the first definition");
+        assert_eq!(
+            context[0]["location"]["file"], file,
+            "the context anchor resolves to the same canonical file — a raw \
+             engine id here is the #2164 corruption"
+        );
+        assert_eq!(
+            context[0]["location"]["range"]["start"]["line"], 1,
+            "the anchor is the first definition's name"
+        );
+        assert_eq!(
+            context[0]["message"], "The first definition of this name.",
+            "the oracle's context wording"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// The degrade notice's machine-format invariant (#1311): a skewed SDK
     /// whitelist surfaces the notice on stderr only — the machine rows and
     /// the JSON envelope (the parity-caliber stdout faces) carry no trace of

@@ -2082,15 +2082,72 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         false
     }
 
-    /// `skipOuterPattern` (compute-only): the id of the outer pattern's last
-    /// token when the cursor starts one.
-    fn skip_outer_pattern_id(&self) -> Option<TokenId> {
-        match self.peek_kind() {
-            TokenKind::OpenSquare | TokenKind::OpenCurly | TokenKind::OpenParen => {
-                self.current_matching_end()
+    /// `skipOuterPattern` (compute-only, `parser_impl.dart:12333`): the id of
+    /// the outer pattern's last token when the cursor starts one. The cursor
+    /// sits on the pattern's first token (the official `token` is
+    /// `beforeType`, so its `token.next` reads our `look_kind(0)`).
+    pub(crate) fn skip_outer_pattern_id(&mut self) -> Option<TokenId> {
+        if is_identifier(self.peek_kind()) {
+            // objectPattern ::= typeName typeArguments? '(' ...
+            let name_offset = if self.cursor.look_kind(1) == TokenKind::Period {
+                // `prefix . Name` — IDENTIFIER `.` NON-IDENTIFIER is not a
+                // pattern.
+                if !is_identifier(self.cursor.look_kind(2)) {
+                    return None;
+                }
+                2
+            } else {
+                0
+            };
+            return self.skip_object_pattern_rest_at(name_offset);
+        }
+        // `<` directly after the cursor position: typed list/map patterns
+        // (`var <int>[a] = ...`). The official `computeTypeParamOrArg(token)`
+        // probes `token.next` — our `look_kind(0)`; `skip` then anchors on
+        // the token *before* the `<` (one back from the cursor).
+        let tpa = self.compute_type_param_or_arg_on_lt(false);
+        let before = self.real_id(self.cursor.real_pos().saturating_sub(1));
+        let last = tpa.skip(before);
+        let next_offset = self.offset_of(last) + 1;
+        let next = self.kind_at(next_offset);
+        match next {
+            // Empty list pattern `[]` (the scanner's fused INDEX token).
+            TokenKind::Index => Some(self.real_id(next_offset)),
+            TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                self.group_close_id_at(next_offset)
+            }
+            // Record or parenthesized pattern — only when no `<...>` group
+            // was consumed (`<T>(...)` is a generic invocation, not a
+            // pattern).
+            TokenKind::OpenParen if matches!(tpa, TypeParamOrArg::None) => {
+                self.group_close_id_at(next_offset)
             }
             _ => None,
         }
+    }
+
+    /// `skipObjectPatternRest` (`parser_impl.dart:12368`): the object
+    /// pattern's type-name token sits at relative offset `n`; returns the
+    /// `(` group's closer when the name (plus optional type arguments) is
+    /// followed by `(`.
+    fn skip_object_pattern_rest_at(&mut self, n: usize) -> Option<TokenId> {
+        // `computeTypeParamOrArg(token)` with `token` = the name: the `<`
+        // probe is one past the name.
+        let tpa = self.compute_type_param_or_arg_at(n + 1, false);
+        let name_id = self.real_id(self.cursor.real_pos() + n);
+        let last = tpa.skip(name_id);
+        let paren_offset = self.offset_of(last) + 1;
+        if self.kind_at(paren_offset) != TokenKind::OpenParen {
+            return None;
+        }
+        self.group_close_id_at(paren_offset)
+    }
+
+    /// Matching close id for the group whose open token sits at absolute
+    /// table offset `offset` (`endGroup`; the scanner-pinned synthetic
+    /// closer is accepted, mirroring the original `current_matching_end`).
+    fn group_close_id_at(&self, offset: usize) -> Option<TokenId> {
+        self.cursor.table_matching_end(self.real_id(offset))
     }
 
     /// Official `looksLikeExpressionAfterAwaitOrYield` (`parser_impl.dart:

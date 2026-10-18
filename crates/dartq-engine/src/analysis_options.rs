@@ -3735,7 +3735,13 @@ fn resolve_include(
         }
         let entry = packages.entry(name)?;
         let root = entry.resolve_root(config_dir).ok()?;
-        let path = root.join(&entry.package_uri).join(percent_decode(subpath));
+        // `packageUri` absent anchors the source root at `rootUri` itself —
+        // the reader contract (package_config_json.dart:152), matching
+        // `PackageConfig::resolve`'s `lib_dir`.
+        let path = match &entry.package_uri {
+            Some(uri) => root.join(uri).join(percent_decode(subpath)),
+            None => root.join(percent_decode(subpath)),
+        };
         Some(dartq_pub::normalize(&path))
     } else if let Some(rest) = uri.strip_prefix("file:") {
         let path = rest.strip_prefix("//").unwrap_or(rest);

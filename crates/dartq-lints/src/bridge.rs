@@ -1652,6 +1652,7 @@ impl ParserListener for AstListener {
         end: TokenSpan,
         const_keyword: Option<TokenSpan>,
         has_constructor_name: bool,
+        _name: Option<TokenSpan>,
     ) {
         self.b.patch(0, kind as u32);
         self.patch_token(1, const_keyword);

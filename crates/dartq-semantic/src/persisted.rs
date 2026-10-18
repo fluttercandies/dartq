@@ -217,6 +217,12 @@ pub struct PersistedContainer {
     pub enum_constants: Vec<u32>,
     pub constructors: Vec<u32>,
     pub has_unnamed_constructor: bool,
+    /// Some declared constructor carries `const` (the const-creation faces'
+    /// resolved-container fact). `default` decodes older payloads as
+    /// `false`; the facts-shape bump keeps such payloads from ever being
+    /// served.
+    #[serde(default)]
+    pub has_const_constructor: bool,
     /// Additive after the format shipped: `default` so payloads persisted
     /// before the field existed decode with no constructor formals (the
     /// #539 additive-field discipline).
@@ -719,6 +725,7 @@ impl PersistedContainer {
             enum_constants: s.ids(&container.enum_constants),
             constructors: s.ids(&container.constructors),
             has_unnamed_constructor: container.has_unnamed_constructor,
+            has_const_constructor: container.has_const_constructor,
             ctor_formals: container
                 .ctor_formals
                 .iter()
@@ -794,6 +801,7 @@ impl PersistedContainer {
                 .map(|&at| ids[at as usize])
                 .collect(),
             has_unnamed_constructor: self.has_unnamed_constructor,
+            has_const_constructor: self.has_const_constructor,
             ctor_formals: self
                 .ctor_formals
                 .into_iter()
@@ -1039,6 +1047,7 @@ mod tests {
                 enum_constants: Vec::new(),
                 constructors: Box::new([name("named")]),
                 has_unnamed_constructor: false,
+                has_const_constructor: false,
                 ctor_formals: [(
                     name("named"),
                     Box::new(Formals {
@@ -1195,6 +1204,7 @@ mod tests {
                 enum_constants: Vec::new(),
                 constructors: Box::new([]),
                 has_unnamed_constructor: true,
+                has_const_constructor: false,
                 ctor_formals: [(
                     name("C"),
                     Box::new(Formals {

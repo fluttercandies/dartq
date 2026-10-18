@@ -87,9 +87,11 @@ fn custom_package_uri_lands_on_lib_dir() {
     );
     assert_eq!(hosted.category, SourceCategory::PubCache);
 
-    // Entries without `packageUri` keep the default `lib/`.
+    // Entries without `packageUri` anchor the source root at `rootUri`
+    // itself — the reader contract (package_config_json.dart:152), never
+    // a `lib/` default.
     let app = table.get("app").expect("root entry");
-    assert_eq!(app.lib_dir, PathBuf::from("/proj/lib"));
+    assert_eq!(app.lib_dir, PathBuf::from("/proj"));
 }
 
 #[test]

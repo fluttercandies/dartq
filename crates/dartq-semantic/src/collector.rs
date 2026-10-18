@@ -148,6 +148,8 @@ struct OpenContainer {
     ctor_named: Vec<StringId>,
     ctor_has_unnamed: bool,
     ctor_declared: u32,
+    /// A declared constructor or factory carried `const`.
+    ctor_const: bool,
     /// The constructors' formal-parameter tables by lookup spelling (the
     /// selector for `A.named`, the container's name for `A()`); flushed
     /// into the finished [`Container::ctor_formals`].
@@ -816,6 +818,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             ctor_named: Vec::new(),
             ctor_has_unnamed: false,
             ctor_declared: 0,
+            ctor_const: false,
             ctor_formals: NameMapBuilder::default(),
             annotations,
         });
@@ -894,6 +897,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 enum_constants: open.enum_constants,
                 constructors: open.ctor_named.into_boxed_slice(),
                 has_unnamed_constructor,
+                has_const_constructor: open.ctor_const,
                 ctor_formals: open.ctor_formals.finish(),
                 annotations: open.annotations.into_boxed_slice(),
             });
@@ -2341,6 +2345,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.drop_pending_annotations();
         if let Some(open) = builder.containers.last_mut() {
             open.ctor_declared += 1;
+            open.ctor_const |= _const_keyword.is_some();
         }
         builder.factory_ctor_open = true;
         builder.factory_ctor_head = None;
@@ -2383,7 +2388,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _covariant_kw: Option<Token>,
         _var_final_or_const: Option<Token>,
         _get_or_set: Option<Token>,
-        _new_kw: Option<Token>,
+        new_kw: Option<Token>,
         _name: Token,
         _enclosing_declaration_name: Option<&str>,
     ) {
@@ -2399,9 +2404,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // `new_with_undefined_constructor_default` on `G()`). `A.named`
         // heads still match (the head token is the class name) — the
         // continuation below rewrites them to the selector.
-        let declared_unnamed = builder
-            .capture_name(_name)
-            .is_some_and(|(key, _)| {
+        let head_key = builder.capture_name(_name).map(|(key, _)| key);
+        // The reserved `new` head (`class C { new(); }`) is the unnamed
+        // constructor spelled with its own keyword — the declared name is
+        // the class itself, and the head token carries no name (the parser
+        // advances past `new`, leaving the `(` as the name slot).
+        let declared_unnamed = new_kw.is_some()
+            || head_key.is_some_and(|key| {
                 _enclosing_declaration_name
                     .is_some_and(|enclosing| builder.strings.resolve(key) == enclosing)
             });
@@ -2409,16 +2418,38 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // `A.named` continuation says otherwise. The formal table's key is
         // the head token's name — the class name, which is exactly the
         // unnamed face's lookup spelling (`A()` creation rows carry it);
-        // the continuation rewrites it to the selector.
+        // the continuation rewrites it to the selector. A `new` head keys
+        // the table on the enclosing class's name for the same reason.
         builder.ctor_open = Some(CtorCapture {
             named: Vec::new(),
             has_unnamed: declared_unnamed,
         });
-        builder.pending_ctor_formals = builder.capture_name(_name).map(|(key, _)| (key, None));
+        builder.pending_ctor_formals = match (head_key, new_kw) {
+            (Some(key), Some(_)) => {
+                let key = builder
+                    .containers
+                    .last()
+                    .and_then(|open| open.name)
+                    .map(|(name, _)| name)
+                    .unwrap_or(key);
+                Some((key, None))
+            }
+            (Some(key), None) => Some((key, None)),
+            (None, Some(_)) => builder
+                .containers
+                .last()
+                .and_then(|open| open.name)
+                .map(|(name, _)| (name, None)),
+            (None, None) => None,
+        };
         // Every declared constructor kills the close's "none at all" fold —
         // including a mismatched-name factory registering no selector.
+        let is_const = _var_final_or_const
+            .and_then(|token| builder.tokens.get(token.id as usize))
+            .is_some_and(|t| &builder.source[t.byte_range()] == "const");
         if let Some(open) = builder.containers.last_mut() {
             open.ctor_declared += 1;
+            open.ctor_const |= is_const;
         }
     }
 
@@ -2460,6 +2491,52 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // (local-declaration and parameter metadata) binds to no modeled
         // row — drop it with the constructor.
         builder.drop_pending_annotations();
+    }
+
+    fn begin_primary_constructor(&mut self, _begin: Token) {
+        let builder = &mut self.builder;
+        builder.drop_pending_annotations();
+        // The header's formal group binds to this constructor: key the
+        // table by the enclosing class's name (the unnamed face's lookup
+        // spelling); a `.name` selector rewrites the key at the close, the
+        // same rewrite the `A.named` body-constructor continuation does.
+        if let Some(open) = builder.containers.last()
+            && let Some((name, _)) = open.name
+        {
+            builder.pending_ctor_formals = Some((name, None));
+        }
+    }
+
+    fn end_primary_constructor(
+        &mut self,
+        _kind: DeclarationKind,
+        _begin: Token,
+        _end: Token,
+        const_keyword: Option<Token>,
+        _has_constructor_name: bool,
+        name: Option<Token>,
+    ) {
+        let builder = &mut self.builder;
+        let selector = name.and_then(|token| builder.capture_name(token).map(|(key, _)| key));
+        if let Some(open) = builder.containers.last_mut() {
+            open.ctor_declared += 1;
+            open.ctor_const |= const_keyword.is_some();
+            match selector {
+                Some(selector) => {
+                    if !open.ctor_named.contains(&selector) {
+                        open.ctor_named.push(selector);
+                    }
+                }
+                // The selector-less header IS the unnamed constructor
+                // (`class C(int x);` answers `C(...)` creations).
+                None => open.ctor_has_unnamed = true,
+            }
+            if let Some((key, formals)) = builder.pending_ctor_formals.take()
+                && let Some(formals) = formals
+            {
+                open.ctor_formals.insert(selector.unwrap_or(key), formals);
+            }
+        }
     }
 
     fn end_typedef(

@@ -81,7 +81,7 @@ use dartq_resolution::LibraryClassModifiers;
 use dartq_semantic::{
     ElementIndex, ExportUseFace, ImportUseFace, LibraryUsages, StrictModes, UnitUseFace,
 };
-use dartq_source::{ContentId, FileId};
+use dartq_source::{ContentId, FileId, LineIndex, SourceRange, StringId, StringTable};
 use rustc_hash::FxHashMap;
 use std::sync::PoisonError;
 
@@ -107,6 +107,33 @@ fn duplicate_definition_name() -> &'static str {
     dartq_semantic::codes::SemanticCode::DuplicateDefinition
         .code_info()
         .name
+}
+
+/// The `unused_element` code name — the one family the library-wide close
+/// re-decides (see [`MemberFold::unused`]).
+fn unused_element_name() -> &'static str {
+    dartq_semantic::codes::SemanticCode::UnusedElement
+        .code_info()
+        .name
+}
+
+/// The declaration name an `unused_element` row's verdict tested: the
+/// written spelling at the row's anchor — the declaration-name token the
+/// per-file pass anchored on (a named constructor's rewritten selector, a
+/// setter's bare written name) — interned against the shared table so the
+/// release test reads the same [`StringId`] the unit use faces recorded.
+/// The nameless recovery anchor resolves to whatever text stands there or
+/// to nothing; neither is ever a recorded use name, so such a row releases
+/// unchanged.
+fn staged_decl_name(
+    text: &str,
+    index: &LineIndex,
+    range: SourceRange,
+    strings: &StringTable,
+) -> StringId {
+    let start = index.utf16_to_byte(text, range.offset);
+    let end = index.utf16_to_byte(text, range.end());
+    strings.intern(text.get(start as usize..end as usize).unwrap_or_default())
 }
 
 /// The analyze's element index: every resident file's model enters as an
@@ -220,16 +247,26 @@ pub(crate) struct FoldInputs {
 /// One member's memoized fold (#1384): the identity the product was folded
 /// under and the product itself — the duplicate-filtered diagnostic rows
 /// (the bake in `l1::duplicate_diagnostics` is the single source, and the
-/// filter is a pure function of the report) and the unit use face the
+/// filter is a pure function of the report) split into the rows that report
+/// outright and the `unused_element` candidates, plus the unit use face the
 /// substrate closes per library. `names` stays unmounted exactly as the
 /// live fold leaves it (#122). The rows are refcounted once here (#1501):
 /// the per-library results hold handles to these very rows, so a fold's
 /// bytes exist once across the memo, its library's run, and the merged
 /// output's clone.
+///
+/// The `unused_element` split is the part-file verdict face (#2156): the
+/// per-file pass fires against its own unit's use set, but the oracle runs
+/// the warning pass against the *library-merged* `UsedLocalElements`
+/// (library_analyzer.dart:305-315) — a use in any file of the library
+/// spares a declaration in every other file. The candidate rows ride the
+/// fold with the declaration name their verdict tested, and the library
+/// close releases only those the merged set still shows unused.
 pub(crate) struct MemberFold {
     inputs: FoldInputs,
     content: ContentId,
     diagnostics: Arc<[Arc<Diagnostic>]>,
+    unused: Arc<[(Arc<Diagnostic>, StringId)]>,
     face: Arc<UnitUseFace>,
 }
 
@@ -310,15 +347,22 @@ fn clone_use_face(face: &UnitUseFace) -> UnitUseFace {
 impl SemanticDiagnoser for Diagnoser {
     fn diagnose_library(&self, library: LibraryView<'_>, out: &mut Vec<Arc<Diagnostic>>) {
         let duplicate = duplicate_definition_name();
+        let unused = unused_element_name();
         // The M3 U1 use-face substrate (#767): every fold emits its unit's
         // face alongside the report, and the library's faces close into the
         // per-library consumed set once the member loop ends — the
         // gather-per-file/merge-per-library pair
         // (library_analyzer.dart:305-315), live in every full analysis.
-        // The consumed set's consumers mount with the M3 incremental layer
-        // (the unused-element/unused-import families close over it); today
-        // the run exercises the substrate hot.
+        // The consumed set decides the `unused_element` verdicts at the
+        // close below (#2156): the per-file pass fired them against their
+        // own unit's set, and the merged set is what spares a declaration
+        // used from a sibling file of the same library (part files).
         let mut usages = LibraryUsages::default();
+        // The per-library staging of the family: candidate rows with the
+        // declaration names their verdicts tested. Populated by both fold
+        // paths (fresh and memo-served — the split is part of the memoized
+        // product), released after the close.
+        let mut staged: Vec<(Arc<Diagnostic>, StringId)> = Vec::new();
         for &file in library.files {
             let facts = &library.facts[&file];
             // The member-level memo (#1384): a member whose identity inputs
@@ -328,6 +372,11 @@ impl SemanticDiagnoser for Diagnoser {
             // set closes exactly as a re-fold would have closed it.
             if let Some(fold) = library.memo.hit(file, facts.content) {
                 out.extend(fold.diagnostics.iter().cloned());
+                staged.extend(
+                    fold.unused
+                        .iter()
+                        .map(|(row, name)| (Arc::clone(row), *name)),
+                );
                 usages.add_unit(library.graph_library, clone_use_face(&fold.face));
                 continue;
             }
@@ -392,29 +441,65 @@ impl SemanticDiagnoser for Diagnoser {
             );
             // The bake in `l1::duplicate_diagnostics` is the single source,
             // so the fold drops the re-issued rows; the filtered set is
-            // what the memo stores (the filter is a pure function of the
-            // report and the constant code name). Each row takes its
-            // refcount once here (#1501): the run and the merged output
-            // hold handles or a single served clone, never fresh bytes.
-            let rows: Vec<Arc<Diagnostic>> = report
-                .diagnostics
-                .into_iter()
-                .filter(|diagnostic| diagnostic.code.name != duplicate)
-                .map(Arc::new)
-                .collect();
-            out.extend(rows.iter().cloned());
+            // what the memo stores. The `unused_element` candidates split
+            // off here (#2156) — the per-file verdict stays the fire
+            // decision, the library close below owns the release — and
+            // each candidate rides the declaration name its verdict
+            // tested. Each row takes its refcount once here (#1501): the
+            // run and the merged output hold handles or a single served
+            // clone, never fresh bytes.
+            let mut live: Vec<Arc<Diagnostic>> = Vec::new();
+            let mut candidates: Vec<(Arc<Diagnostic>, StringId)> = Vec::new();
+            for diagnostic in report.diagnostics {
+                if diagnostic.code.name == duplicate {
+                    continue;
+                }
+                let row = Arc::new(diagnostic);
+                if row.code.name == unused {
+                    let name = staged_decl_name(
+                        text,
+                        &facts.line_index,
+                        row.range,
+                        library.strings,
+                    );
+                    candidates.push((row, name));
+                } else {
+                    live.push(row);
+                }
+            }
+            out.extend(live.iter().cloned());
+            // The memo owns the rows; the staging holds refcount bumps
+            // released at the close below.
+            staged.extend(
+                candidates
+                    .iter()
+                    .map(|(row, name)| (Arc::clone(row), *name)),
+            );
             usages.add_unit(library.graph_library, clone_use_face(&face));
             library.memo.insert(
                 file,
                 MemberFold {
                     inputs: library.memo.inputs,
                     content: facts.content,
-                    diagnostics: rows.into(),
+                    diagnostics: live.into(),
+                    unused: candidates.into(),
                     face: Arc::new(face),
                 },
             );
         }
-        let _consumed = usages.close_library_usage(library.graph_library);
+        // The library close (#2156): the merged consumed set is what the
+        // oracle's warning pass runs against, so the staged candidates
+        // release exactly when the library shows them still unused — a use
+        // in any member file spares the declaration (the part-file shapes),
+        // and a genuinely unused private stays reported. Uses from *other*
+        // libraries never enter the set (the close folds this library's
+        // faces only), so a same-named private elsewhere cannot spare.
+        let consumed = usages.close_library_usage(library.graph_library);
+        out.extend(
+            staged
+                .into_iter()
+                .filter_map(|(row, name)| (!consumed.used(name)).then_some(row)),
+        );
     }
 }
 
@@ -997,5 +1082,99 @@ mod tests {
             "the fingerprint move forks every key — nothing stale is served"
         );
         assert_matches_wholesale(&root, &engine, &current, &out);
+    }
+
+    /// The `unused_element` rows as (file path, message) — the message
+    /// carries the declared name the verdict anchored.
+    fn unused_rows(engine: &Engine, rows: &[Diagnostic]) -> Vec<(String, String)> {
+        rows.iter()
+            .filter(|row| row.code.name == unused_element_name())
+            .map(|row| {
+                (
+                    engine
+                        .file_table()
+                        .path(row.file)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                    row.message.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The part-file unused-element close (#2156): the per-file pass fires
+    /// `unused_element` against its own unit's use set, but the oracle runs
+    /// the warning pass against the library-merged `UsedLocalElements`
+    /// (library_analyzer.dart:305-315) — a use in any member file spares a
+    /// declaration in every other file. The app corpus's family-B shape (a
+    /// part-declared private class used only in the host) stays silent, the
+    /// mirror (a host-declared private used only in the part) likewise,
+    /// same-file sparing is untouched, and a genuinely unused part private
+    /// still reports. Another library's use of a same-named private never
+    /// spares — the close folds this library's faces only. A trailing host
+    /// comment then salvages the part's fold (#1384) and the memo-served
+    /// staging releases byte-identically to the wholesale recompute.
+    #[test]
+    fn part_file_unused_element_closes_library_wide() {
+        let root = memo_workspace();
+        let mut engine = memo_engine(&root);
+        let main_base = "part 'p.dart';\n\nclass _Host {}\n\nvoid main() {\n  _Tile();\n  _tileFn();\n}\n";
+        let p_base = "part of 'main.dart';\n\nclass _Tile {\n  const _Tile();\n}\n\nvoid _tileFn() {}\n\nclass _Orphan {}\n\nvoid _makeHost() {\n  _Host();\n}\n\nvoid _useSelf() {\n  _SelfUsed();\n}\n\nclass _SelfUsed {}\n\nclass _Shadow {}\n";
+        let other_base =
+            "class _Shadow {\n  void m() {}\n}\n\nvoid useOwn() {\n  _Shadow().m();\n}\n";
+        let mut current: Vec<(String, String)> = vec![
+            ("lib/main.dart".into(), main_base.into()),
+            ("lib/p.dart".into(), p_base.into()),
+            ("lib/other.dart".into(), other_base.into()),
+        ];
+        for (relative, content) in &current {
+            engine.set_content(&root.join(relative), content.as_bytes());
+        }
+        let out = engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        assert_matches_wholesale(&root, &engine, &current, &out);
+        let unused = unused_rows(&engine, &out);
+        // The part file: only the genuinely unused privates report, in
+        // source order (`_Tile`/`_tileFn` are used from the host,
+        // `_SelfUsed` from its own file — all spared by the merged set).
+        assert_eq!(
+            unused,
+            vec![
+                (
+                    root.join("lib/p.dart").display().to_string(),
+                    "The declaration '_Orphan' isn't referenced.".into()
+                ),
+                (
+                    root.join("lib/p.dart").display().to_string(),
+                    "The declaration '_makeHost' isn't referenced.".into()
+                ),
+                (
+                    root.join("lib/p.dart").display().to_string(),
+                    "The declaration '_useSelf' isn't referenced.".into()
+                ),
+                (
+                    root.join("lib/p.dart").display().to_string(),
+                    "The declaration '_Shadow' isn't referenced.".into()
+                ),
+            ],
+            "the family-B shapes must be spared, the orphans kept: {unused:?}"
+        );
+
+        // A trailing host comment churns only the host's bytes: the part's
+        // fold is memo-served, and its staged rows release identically —
+        // the merged set re-decides the same verdicts.
+        current[0].1 = format!("{main_base}// churn\n");
+        engine.set_content(&root.join("lib/main.dart"), current[0].1.as_bytes());
+        let out = engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        assert_eq!(
+            memo_serves(&engine),
+            1,
+            "the standing part is salvaged and its staging re-released"
+        );
+        assert_matches_wholesale(&root, &engine, &current, &out);
+        assert_eq!(unused_rows(&engine, &out), unused, "served == fresh");
     }
 }

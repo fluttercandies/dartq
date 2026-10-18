@@ -63,7 +63,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // replaced by a diet skip of the pattern tokens).
         if let Some(vfc) = mods.var_final_or_const
             && self.cursor.lexeme(vfc.id) != "const"
-            && let Some(after_pattern) = self.skip_outer_pattern()
+            && let Some(after_pattern) = self.skip_outer_pattern_id()
         {
             let eq_offset = self.offset_of(after_pattern) + 1;
             if self.kind_at(eq_offset) == TokenKind::Eq {
@@ -447,7 +447,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         // dropRange; the pattern tokens are diet-skipped).
         if let Some(vfc) = mods.var_final_or_const
             && self.cursor.lexeme(vfc.id) != "const"
-            && let Some(after_pattern) = self.skip_outer_pattern()
+            && let Some(after_pattern) = self.skip_outer_pattern_id()
         {
             let eq_offset = self.offset_of(after_pattern) + 1;
             if self.kind_at(eq_offset) == TokenKind::Eq {
@@ -2531,17 +2531,6 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             return false;
         }
         enclosing_declaration_name == Some(self.cursor.lexeme(name.id))
-    }
-
-    /// `skipOuterPattern` (compute-only): returns the id of the pattern's
-    /// last token when the cursor currently starts an outer pattern.
-    fn skip_outer_pattern(&self) -> Option<TokenId> {
-        match self.peek_kind() {
-            TokenKind::OpenSquare | TokenKind::OpenCurly | TokenKind::OpenParen => {
-                self.current_matching_end()
-            }
-            _ => None,
-        }
     }
 
     /// Span of the token at a saved mark.

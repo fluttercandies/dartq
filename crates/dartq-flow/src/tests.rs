@@ -2793,6 +2793,7 @@ fn assert_condition_write_unassigned_after() {
         Ev::OtherExpr { span: span(4) },
         Ev::Assign {
             plain: true,
+            if_null: false,
             end: 0,
         },
         Ev::BinaryBegin {
@@ -3075,6 +3076,7 @@ fn closure_await_demotes_captured_reads() {
         Ev::OtherExpr { span: span(7) },
         Ev::Assign {
             plain: true,
+            if_null: false,
             end: 0,
         },
         Ev::ExprStmt { span: span(8) },
@@ -3175,6 +3177,7 @@ fn for_in_statement_replay_invariants() {
         Ev::OtherExpr { span: span(4) },
         Ev::Assign {
             plain: true,
+            if_null: false,
             end: 0,
         },
         Ev::ExprStmt { span: span(5) },
@@ -4026,6 +4029,7 @@ fn assignment_demotion_keeps_the_least_specific_suffix() {
             read(OTHER),
             Ev::Assign {
                 plain: true,
+                if_null: false,
                 end: 0,
             },
             Ev::ExecEnd {
@@ -4193,6 +4197,7 @@ fn if_null_write_repromotes_via_types_of_interest() {
             },
             Ev::Assign {
                 plain: true,
+                if_null: false,
                 end: 0,
             },
             Ev::ExecEnd {
@@ -4213,11 +4218,49 @@ fn if_null_write_repromotes_via_types_of_interest() {
     );
 }
 
-/// The true-branch promotion-step gates (official `tryPromoteToType` +
-/// `isValidPromotionStep`, flow_analysis.dart:4137-4145, :7229-7246): a
-/// redundant `x is int` on `int x` must NOT promote (the old factoring
-/// pass fed `factor(int, int) = Never` straight into the chain, and an
-/// `x is int?` on `int x` promoted to `int?`).
+/// `x ??= e` (official `ifNullExpression_*` wiring on the null-aware
+/// assignment path, assignment_expression_resolver.dart:665-707): the
+/// write's type is `LUB(NonNull(readType), rhsType)` and it promotes through
+/// types-of-interest — `int? x; x ??= 0` leaves `x` promoted to `int`, while
+/// a nullable RHS keeps it at `int?`. Real-corpus root: `hangingIndent ??= 0`
+/// inside package:args `utils.dart`.
+#[test]
+fn if_null_assign_repromotes_through_written_join() {
+    use crate::ev::Ev;
+    use crate::model::NIL;
+    use crate::ty::{Base, Ty};
+    const INT: u32 = 102;
+    const X: u32 = 7;
+    // `int? x; x ??= 0` — the compound marker (plain=false, if_null=true)
+    // writes `LUB(NonNull(int?), int) = int` and promotes.
+    let events: Vec<Ev> = [
+        declared(X, named_ty(INT, true)),
+        vec![
+            read(X),
+            named_ty(INT, false), // the `0` literal's static type
+            Ev::OtherExpr { span: tspan(1) },
+            Ev::Assign {
+                plain: false,
+                if_null: true,
+                end: 0,
+            },
+            Ev::ExecEnd {
+                is_expr: false,
+                end: tspan(0),
+            },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(&events);
+    assert_ne!(interp.current.model(0).promoted, NIL);
+    assert_eq!(
+        interp.lists.head(interp.current.model(0).promoted),
+        Ty {
+            base: Base::Name(INT),
+            nullable: false
+        }
+    );
+}
 #[test]
 fn redundant_is_checks_do_not_promote() {
     use crate::ev::Ev;
@@ -6208,3 +6251,26 @@ String h(Object v) {
 }"#;
     assert!(dead_snippets(source).is_empty());
 }
+
+/// #2158 pin: a creation RHS types the write — `x = C()..m()` (the cascade
+/// keeps the head's named type as the target's), `x = new C()`,
+/// `x = const C()`, `x = C<T>.named()` and `x = C<T>()` all promote a `C?`
+/// local to `C` (each read after the write is a promoted read).
+#[test]
+fn creation_rhs_types_the_write() {
+    use crate::ty::{Base, Ty};
+    let source = r#"void f() {
+  Object? a; a = Object()..toString(); a;
+  Object? b; b = new Object(); b;
+  Object? c; c = const Object(); c;
+  Object? d; d = Object<int>.from('x'); d;
+  Object? e; e = Object<int>(); e;
+}"#;
+    let promoted: Vec<Ty> = promoted_tys(source);
+    let non_null_named = promoted
+        .iter()
+        .filter(|t| matches!(t.base, Base::Name(_)) && !t.nullable)
+        .count();
+    assert_eq!(non_null_named, 5, "{promoted:?}");
+}
+

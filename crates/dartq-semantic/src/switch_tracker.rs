@@ -7,10 +7,13 @@
 //! its event handlers; [`NameWorld`] resolves the sealed/enum/subtype facts
 //! the exhaustiveness verdict reads, over the unit's element model.
 
-use crate::library::ElementIndex;
-use crate::model::{Container, ContainerKind, FileElements, MemberKind, Ty};
+use crate::library::{ElementIndex, resolve_container};
+use crate::model::{Container, ContainerKind, MemberKind, Ty};
+use dartq_resolution::{LibraryGraph, LibraryId, Namespaces};
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use dartq_types::{ExhaustivenessWorld, Key, Single, Space};
+use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 
 /// The open-switch/pattern state: one engine owns one tracker; the state
 /// and its update rules were engine fields/methods before the extraction
@@ -357,6 +360,11 @@ pub(crate) struct ObjectField {
     /// their columns are unresolvable at name level.
     pub(crate) name: Option<StringId>,
     pub(crate) leaves: Vec<Restriction>,
+    /// The getter the field reads and its anchor: the written name
+    /// (`x: p`), or the shorthand's variable (`:var x`, `:x`) — the
+    /// oracle's `resolveObjectPatternPropertyGet` name token. `None` for a
+    /// positional field.
+    pub(crate) getter: Option<(StringId, SourceRange)>,
 }
 
 /// The name-level coverage a pattern leaf contributes (the space-building
@@ -443,14 +451,33 @@ fn collect_singles(
 }
 
 /// The name-level [`ExhaustivenessWorld`]: sealed/enum facts come from the
-/// unit's element model, subtype edges from the superclass and
-/// `with`/`implements` names of the unit's containers, plus the fixed core
-/// chain (`int`/`double` <: `num` <: `Object`) the nullability codes
-/// already assume.
+/// element model, subtype edges from the superclass and
+/// `with`/`implements` names of the containers, plus the fixed core chain
+/// (`int`/`double` <: `num` <: `Object`) the nullability codes already
+/// assume.
+///
+/// Names resolve file-local first (the unchanged fast path), then — when
+/// the world carries a [`NameScope`] — through the library graph: the
+/// diagnosing library's namespace (imports, exports, combinators), then a
+/// graph-wide unique-declaration fallback for the hops a foreign container
+/// writes in its own library's scope (`ChainB255 extends ChainB254`, where
+/// `ChainB254` is imported by the declaring library, not the diagnosing
+/// one). An ambiguous or absent name stays unresolved — the walks treat it
+/// as a cut (undecided), the under-report direction. A sealed or enum
+/// root's closed subclass set is enumerated over its own library's units
+/// (the language confines a sealed class's direct subtypes to its
+/// library), in unit then declaration order — the oracle's witness order.
 pub(crate) struct NameWorld<'a> {
     pub(crate) index: &'a ElementIndex,
     pub(crate) file: FileId,
     pub(crate) strings: &'a StringTable,
+    /// The library-graph face of the cross-file resolution; `None` keeps
+    /// the world file-scoped (the unit-test rigs that build a bare world).
+    pub(crate) scope: Option<NameScope<'a>>,
+    /// Per-world memo of the cross-file resolutions (file-local hits never
+    /// enter it). One world serves one verdict, so the memo is bounded by
+    /// the names that verdict touches.
+    pub(crate) resolved: RefCell<FxHashMap<StringId, Option<(&'a Container, FileId)>>>,
     /// The interned `bool` spelling (`BoolValue` subtyping compares ids,
     /// never re-interns per query).
     pub(crate) bool_id: StringId,
@@ -468,6 +495,15 @@ pub(crate) struct NameWorld<'a> {
     /// BFS compares ids, never re-resolving/re-interning per dequeued node.
     pub(crate) core_supertypes: [(StringId, StringId); 3],
     pub(crate) unknowns: std::cell::Cell<u64>,
+}
+
+/// The library-graph face a [`NameWorld`] resolves cross-file names
+/// through: the graph, its namespaces, and the diagnosing library.
+#[derive(Clone, Copy)]
+pub(crate) struct NameScope<'a> {
+    pub(crate) graph: &'a LibraryGraph,
+    pub(crate) namespaces: &'a Namespaces,
+    pub(crate) lib: LibraryId,
 }
 
 /// The two core edges every unit sees without a declaration (`num` has no
@@ -658,7 +694,7 @@ impl ExhaustivenessWorld for NameWorld<'_> {
     }
 }
 
-impl NameWorld<'_> {
+impl<'a> NameWorld<'a> {
     /// Whether some runtime value can inhabit both regions:
     /// `canBeSubtypeOf` (type_system.dart:150-330), the verified
     /// `TypeSystem::can_be_subtype_of` port mirrored at name level — the
@@ -725,7 +761,7 @@ impl NameWorld<'_> {
         true
     }
 
-    /// Whether any transitive in-file subclass of the closed `root` can
+    /// Whether any transitive subclass of the closed `root` can
     /// reach `target` (the official candidate scan's subclass half,
     /// type_system.dart:243-262): a sealed root's subclass tree is fully
     /// known even through non-sealed intermediate nodes, so the walk
@@ -750,18 +786,15 @@ impl NameWorld<'_> {
         false
     }
 
-    /// The in-file containers directly extending/with/implementing/on
-    /// `name` (the same edge scan [`Self::name_subtypes`] uses, without
-    /// its sealed gate).
+    /// The containers of `name`'s library ([`Self::scan_order`]) directly
+    /// extending/with/implementing/on `name` (the same edge scan
+    /// [`Self::name_subtypes`] uses, without its sealed gate).
     fn direct_subcontainers(&self, name: StringId) -> Vec<StringId> {
         let mut out = Vec::new();
-        for &decl in self.container_order() {
+        for (decl, declared) in self.scan_order(name) {
             if decl == name {
                 continue;
             }
-            let Some(declared) = self.container(decl) else {
-                continue;
-            };
             let edge = declared.superclass == Some(name)
                 || declared.with_clause.contains(&name)
                 || declared.implements_clause.contains(&name)
@@ -816,9 +849,95 @@ impl NameWorld<'_> {
         }
     }
 
-    /// The unit's container record for `name`.
-    fn container(&self, name: StringId) -> Option<&Container> {
-        self.index.get(self.file).and_then(|f| f.container(name))
+    /// The container record `name` resolves to: this unit's own first,
+    /// then the library graph ([`Self::resolve_foreign`]).
+    fn container(&self, name: StringId) -> Option<&'a Container> {
+        self.locate(name).map(|(container, _)| container)
+    }
+
+    /// The container `name` resolves to with its declaring file.
+    fn locate(&self, name: StringId) -> Option<(&'a Container, FileId)> {
+        if let Some(container) = self.index.get(self.file).and_then(|f| f.container(name)) {
+            return Some((container, self.file));
+        }
+        let scope = self.scope?;
+        if let Some(&hit) = self.resolved.borrow().get(&name) {
+            return hit;
+        }
+        let hit = self.resolve_foreign(scope, name);
+        self.resolved.borrow_mut().insert(name, hit);
+        hit
+    }
+
+    /// The cross-file resolution: the diagnosing library's namespace, then
+    /// the unique graph-wide class declaration (a foreign container's own
+    /// clause names resolve in its declaring library, which the diagnosing
+    /// library need not import). Several declaring libraries answer `None`
+    /// — the name level cannot pick the one the declaring scope sees.
+    fn resolve_foreign(&self, scope: NameScope<'a>, name: StringId) -> Option<(&'a Container, FileId)> {
+        if let Some(hit) = resolve_container(
+            scope.graph,
+            scope.namespaces,
+            self.index,
+            scope.lib,
+            self.file,
+            name,
+        ) {
+            return Some(hit);
+        }
+        let [owner_lib] = scope.graph.declaring_libraries(name) else {
+            return None;
+        };
+        scope
+            .graph
+            .unit_files(*owner_lib)
+            .iter()
+            .find_map(|&file| self.index.get(file)?.container(name).map(|c| (c, file)))
+    }
+
+    /// The declaration-ordered containers a closed subclass scan over
+    /// `root` walks: the units of the library declaring `root` (sealed
+    /// subtypes live in their root's library), else this unit's own. Each
+    /// candidate is read from its own unit — never re-resolved by name
+    /// from the diagnosing file, where a same-named local could shadow it.
+    fn scan_order(&self, root: StringId) -> Vec<(StringId, &'a Container)> {
+        let units: Vec<FileId> = match (self.scope, self.locate(root)) {
+            (Some(scope), Some((_, owner))) => scope
+                .graph
+                .library_of_file(owner)
+                .map_or_else(|| vec![owner], |lib| scope.graph.unit_files(lib).to_vec()),
+            _ => vec![self.file],
+        };
+        let mut order = Vec::new();
+        for unit in units {
+            let Some(elements) = self.index.get(unit) else {
+                continue;
+            };
+            for &name in elements.container_order() {
+                if let Some(container) = elements.container(name) {
+                    order.push((name, container));
+                }
+            }
+        }
+        order
+    }
+
+    /// Whether `name` resolves to a container declared outside the
+    /// diagnosing library (the private-enum face gate of the covering
+    /// report, constant_verifier.dart:1110-1121).
+    pub(crate) fn is_foreign_library(&self, name: StringId) -> bool {
+        let Some(scope) = self.scope else {
+            return false;
+        };
+        self.locate(name).is_some_and(|(_, owner)| {
+            owner != self.file && scope.graph.library_of_file(owner) != Some(scope.lib)
+        })
+    }
+
+    /// Whether `name` resolves to an enum declaration.
+    pub(crate) fn is_enum_name(&self, name: StringId) -> bool {
+        self.container(name)
+            .is_some_and(|c| c.kind == ContainerKind::Enum)
     }
 
     /// Whether `name` declares an interface type in this unit: a class
@@ -857,13 +976,6 @@ impl NameWorld<'_> {
             current = container.superclass?;
         }
         None
-    }
-
-    /// The unit's container names in declaration order.
-    fn container_order(&self) -> &[StringId] {
-        self.index
-            .get(self.file)
-            .map_or(&[], FileElements::container_order)
     }
 
     /// The witness/diagnostic text for a static type.
@@ -1042,19 +1154,12 @@ impl NameWorld<'_> {
             .is_some_and(|c| c.sealed || c.kind == ContainerKind::Enum)
     }
 
-    /// Whether the unit's own facts decide `name`'s sealedness and
-    /// subclass set: the declaration lives in this file, or the name is a
-    /// core sealed type (`bool`). A cross-file name is opaque to the
-    /// file-scoped index — its sealed classes and enum constants are
-    /// invisible here, so a non-exhaustive verdict over it may be false.
-    ///
-    /// Interim under-report seam: the expression-face covering emit
-    /// suppresses while this answers false. The oracle resolves
-    /// cross-library facts through the whole library graph, down to the
-    /// private-enum variant rows (`diagnostic.g.dart`
-    /// `non_exhaustive_switch_expression_private`); feeding sealed and
-    /// subclass facts from the library graph is future work, deferred
-    /// together with those variants.
+    /// Whether the world decides `name`'s sealedness and subclass set:
+    /// the name resolves to a container (this unit's, or one the library
+    /// graph reaches — [`Self::locate`]), or it is a core sealed type
+    /// (`bool`). An unresolvable name is opaque — its sealed classes and
+    /// enum constants are invisible, so a non-exhaustive verdict over it
+    /// may be false and the expression-face covering emit suppresses.
     pub(crate) fn name_resolvable(&self, name: StringId) -> bool {
         self.container(name).is_some() || self.is_sealed_name(name)
     }
@@ -1079,16 +1184,13 @@ impl NameWorld<'_> {
             return Vec::new();
         }
         let mut subtypes = Vec::new();
-        for &decl in self.container_order() {
+        for (decl, declared) in self.scan_order(name) {
             // A well-founded closed set never contains its root: a
             // self-edge (`sealed S extends S`) drops here, before the
             // walk's cycle guard would discard it.
             if decl == name {
                 continue;
             }
-            let Some(declared) = self.container(decl) else {
-                continue;
-            };
             let edge = declared.superclass == Some(name)
                 || declared.with_clause.contains(&name)
                 || declared.implements_clause.contains(&name)

@@ -387,16 +387,20 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     }
                 });
                 match lhs_last {
-                    // `this` ends in a selector-able expression per the
-                    // initializer recovery shapes (`this = 0` is rewritten
-                    // to `<synthetic> = this . <synthetic>` by the
-                    // initializer lane), so a real `this`-ending target only
-                    // occurs through selector chains ending in a name.
-                    Some(
-                        TokenKind::Identifier
-                        | TokenKind::CloseSquare
-                        | TokenKind::Keyword(Keyword::This),
-                    ) => {}
+                    // Official `_isAssignable` (ast_builder.dart:6607) tests
+                    // the parsed EXPRESSION shape — a bare name qualifies,
+                    // and `parsePrimary` reads pseudo/built-in keywords as
+                    // names (:7558-7576), so the name-ending face is
+                    // official `token.isIdentifier`: identifiers plus
+                    // pseudo/built-in keywords (`out = 1`), reserved words
+                    // never (`is_identifier`, recovery.rs). `this` ends in a
+                    // selector-able expression per the initializer recovery
+                    // shapes (`this = 0` is rewritten to
+                    // `<synthetic> = this . <synthetic>` by the initializer
+                    // lane), so a real `this`-ending target only occurs
+                    // through selector chains ending in a name.
+                    Some(kind) if is_identifier(kind) => {}
+                    Some(TokenKind::CloseSquare | TokenKind::Keyword(Keyword::This)) => {}
                     Some(TokenKind::Keyword(Keyword::Super)) => {
                         self.report(msg::missing_assignable_selector(), left);
                     }

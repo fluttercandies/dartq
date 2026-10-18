@@ -302,6 +302,148 @@ pub(crate) mod path_dependencies {
         }
     }
 
+    /// Scans the `path:` scalars inside the top-level `screenshots:` list —
+    /// the analyzer's `screenshotsValidator` walk (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/pubspec/validators/screenshot_validator.dart`
+    /// :12-38): `screenshots` must be a `YamlList` whose entries are
+    /// `YamlMap`s, each map's `path` field a `YamlScalar` whose `value` is a
+    /// `String`. A missing file reports `path_does_not_exist` at the value
+    /// node.
+    ///
+    /// Shape parity with [`scan_path_entries`]: a top-level `screenshots:`
+    /// key opens the section (block form only — `screenshots: <scalar>` is
+    /// not a `YamlList`), an indented `- ` opens each entry, and the item's
+    /// `path:` sits either inline on the dash line (`- path: a.png`) or at
+    /// the item's key-indent on a following line (`- description: ...`
+    /// then `path: a.png` under it). A second `path:` inside the same item
+    /// or a `path:` deeper than the item's key-indent is not the map's
+    /// `path` field and does not report. Linear in the text.
+    #[must_use]
+    pub fn scan_screenshot_entries(text: &str) -> Vec<PathEntry> {
+        let mut scan = ScreenshotScan::default();
+        let mut offset = 0usize;
+        for raw in text.split_inclusive('\n') {
+            let line = raw.strip_suffix('\n').unwrap_or(raw);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            scan.line(line, offset);
+            offset += raw.len();
+        }
+        scan.entries
+    }
+
+    /// Per-line walk state for [`scan_screenshot_entries`]: the open
+    /// `screenshots:` section flag, the list-item indent (the column of
+    /// the `- ` marker's owning line), and the item's key-indent (the
+    /// column the item's `path:` key sits at — either the char after the
+    /// `- ` for an inline key, or the first non-dash line's indent).
+    #[derive(Default)]
+    struct ScreenshotScan {
+        entries: Vec<PathEntry>,
+        section: bool,
+        /// The indent of the `screenshots:` list's own `- ` items — fixed
+        /// by the first `- ` under the section. A `- ` at a different
+        /// indent belongs to a nested list inside an item's map value,
+        /// never to `screenshots:` itself.
+        list_indent: Option<usize>,
+        item_indent: Option<usize>,
+        key_indent: Option<usize>,
+        seen_path_in_item: bool,
+    }
+
+    impl ScreenshotScan {
+        fn line(&mut self, line: &str, offset: usize) {
+            let indent = line.len() - line.trim_start_matches(' ').len();
+            let body = &line[indent..];
+            // Blank and comment-only lines carry no keys.
+            if body.is_empty() || body.starts_with('#') {
+                return;
+            }
+            // A `- ` dash at the list's own indent opens a new list item.
+            // A `- ` at any *other* indent is a nested list inside the
+            // current item's map value — its `path:` is a different field
+            // and must not open a new screenshot item.
+            let is_dash_line = self.section && body.starts_with("- ");
+            let item_dash = is_dash_line
+                && match self.list_indent {
+                    // The first dash under the section fixes the list's
+                    // own indent.
+                    None => {
+                        self.list_indent = Some(indent);
+                        true
+                    }
+                    Some(list) => indent == list,
+                };
+            let (content, content_offset) = if item_dash {
+                (&body[2..], offset + indent + 2)
+            } else {
+                (body, offset + indent)
+            };
+            let Some(colon) = find_key_colon(content) else {
+                // A non-key line ends any in-flight item.
+                return;
+            };
+            let key = content[..colon].trim();
+            let (range, value, quoted) = scalar(&content[colon + 1..], content_offset + colon + 1);
+
+            if indent == 0 {
+                // A `screenshots:` section opens only in block form; any
+                // other top-level key closes it.
+                self.section = key == "screenshots" && value.is_empty();
+                self.list_indent = None;
+                self.item_indent = None;
+                self.key_indent = None;
+                self.seen_path_in_item = false;
+                return;
+            }
+            if !self.section {
+                return;
+            }
+            if item_dash {
+                // New list item at the list's own indent: the `-` itself
+                // is the item indent; the inline `key:` (if this line
+                // carries one) sits at virtual indent `indent + 2`.
+                self.item_indent = Some(indent);
+                self.key_indent = Some(indent + 2);
+                self.seen_path_in_item = false;
+            } else if is_dash_line {
+                // A `- ` deeper than the list indent: a nested list inside
+                // the current item's map value. The line's content is not
+                // the item's own `path:` field regardless of what follows
+                // the dash — treat the line as opaque and move on.
+                return;
+            } else {
+                // A non-dash line: it belongs to the open item only when it
+                // sits *deeper* than the item's own indent. A line at or
+                // above the item indent closes the item.
+                match self.item_indent {
+                    None => return,
+                    Some(item) if indent <= item => {
+                        self.item_indent = None;
+                        self.key_indent = None;
+                        self.seen_path_in_item = false;
+                        return;
+                    }
+                    Some(_) => {}
+                }
+                // Only lines at the item's key-indent are the item's own
+                // fields; a deeper line is inside a nested map value.
+                match self.key_indent {
+                    Some(k) if indent != k => return,
+                    Some(_) => {}
+                    None => self.key_indent = Some(indent),
+                }
+            }
+            if key == "path"
+                && !self.seen_path_in_item
+                && !value.is_empty()
+                && (quoted || yaml_plain_is_string(&value))
+            {
+                self.entries.push(PathEntry { range, path: value });
+                self.seen_path_in_item = true;
+            }
+        }
+    }
+
     /// The first `:` of `body` that terminates a key (followed by a space
     /// or end of line — the `../a:b` colons inside path values never are).
     fn find_key_colon(body: &str) -> Option<usize> {
@@ -743,6 +885,87 @@ pub(crate) mod path_dependencies {
             assert_eq!(
                 resolve_dependency_path(Path::new("/"), ".."),
                 PathBuf::from("/")
+            );
+        }
+
+        /// The `screenshotsValidator` walk (upstream Dart SDK source,
+        /// `pkg/analyzer/lib/src/pubspec/validators/screenshot_validator.dart`
+        /// :22-37): the section must be a `YamlList` (block form opens the
+        /// section; an inline scalar never does), and each `YamlMap` item's
+        /// `path` field records once with its value span and cooked text.
+        #[test]
+        fn screenshots_scan_picks_every_items_path_field() {
+            let text = concat!(
+                "screenshots:\n",
+                "  - description: 'PetitParser'\n",
+                "    path: petitparser.png\n",
+                "  - path: other.png\n",
+            );
+            let entries = scan_screenshot_entries(text);
+            assert_eq!(
+                entries,
+                vec![
+                    PathEntry {
+                        range: span(text, "petitparser.png"),
+                        path: "petitparser.png".to_owned()
+                    },
+                    PathEntry {
+                        range: span(text, "other.png"),
+                        path: "other.png".to_owned()
+                    },
+                ]
+            );
+        }
+
+        /// A `path:` deeper than the item's key-indent is a nested map's
+        /// field — never the item's own `path` (the official reads
+        /// `entry.valueAt(PATH_FIELD)` on the item's top-level map).
+        #[test]
+        fn screenshots_scan_skips_nested_map_path() {
+            let text = concat!(
+                "screenshots:\n",
+                "  - description: x\n",
+                "    nested:\n",
+                "      path: not_the_field.png\n",
+                "    path: real.png\n",
+            );
+            assert_eq!(
+                scan_screenshot_entries(text)
+                    .into_iter()
+                    .map(|entry| entry.path)
+                    .collect::<Vec<_>>(),
+                vec!["real.png"]
+            );
+        }
+
+        /// Inline `path:` on the `- ` dash line is the item's own field
+        /// (`- path: a.png` is a one-key YamlMap) — same span/cook faces
+        /// as the indented form.
+        #[test]
+        fn screenshots_scan_inline_path_is_the_field() {
+            let text =
+                "screenshots:\n  - path: inline.png\n  - description: d\n    path: next.png\n";
+            assert_eq!(
+                scan_screenshot_entries(text)
+                    .into_iter()
+                    .map(|entry| entry.path)
+                    .collect::<Vec<_>>(),
+                vec!["inline.png", "next.png"]
+            );
+        }
+
+        /// `screenshots:` non-block scalar is not a `YamlList` — silent;
+        /// a sibling top-level key closes the section, and a `path:`
+        /// outside `screenshots:` is never this validator's field.
+        #[test]
+        fn screenshots_scan_stays_silent_outside_the_section() {
+            assert!(scan_screenshot_entries("screenshots: none\n").is_empty());
+            assert!(scan_screenshot_entries("path: x.png\n").is_empty());
+            assert!(
+                scan_screenshot_entries("screenshots:\n  - path: a.png\nother: 1\npath: b.png\n")
+                    .into_iter()
+                    .map(|entry| entry.path)
+                    .eq(["a.png".to_owned()])
             );
         }
     }

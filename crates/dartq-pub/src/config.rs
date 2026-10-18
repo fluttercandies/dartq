@@ -59,9 +59,15 @@ pub struct PackageConfigEntry {
     /// pub-cache packages, or a relative URI path based at the config's
     /// directory (`"../"` for the root, `"../pkg_b"` for members).
     pub root_uri: String,
-    /// Subdirectory inside the package root holding Dart sources; defaults
-    /// to and is normalized with a trailing `"lib/"`.
-    pub package_uri: String,
+    /// Subdirectory inside the package root holding Dart sources; `None`
+    /// when the entry was written without `packageUri`. The reader contract
+    /// (`package_config_json.dart:151-155`) resolves `packageUri` onto the
+    /// root and **absent `packageUri` means the package root itself is the
+    /// source root** — never a `lib/` default. Pub's writer always emits
+    /// `packageUri: "lib/"` (entrypoint.dart:511), so real pub-generated
+    /// configs carry it; an absent `packageUri` is a hand-written or
+    /// foreign-generator shape, and the oracle still reads it.
+    pub package_uri: Option<String>,
     /// The package's language version (`^\d+\.\d+$`), pub's materialization
     /// of that package's own pubspec sdk lower bound.
     pub language_version: Option<LanguageVersion>,
@@ -306,8 +312,15 @@ impl PackageConfig {
                 )));
             }
             let root = normalize(&entry.resolve_root(config_dir)?);
-            let lib_dir = normalize(&root.join(&entry.package_uri));
-            if lib_dir.strip_prefix(&root).is_err() {
+            let lib_dir = match &entry.package_uri {
+                // packageUri absent: the package root itself is the source
+                // root — the reader contract (package_config_json.dart:152
+                // `packageRoot = root` when `packageUri == null`), not the
+                // `lib/` shape pub's writer emits.
+                None => root.clone(),
+                Some(uri) => normalize(&root.join(uri)),
+            };
+            if lib_dir != root && lib_dir.strip_prefix(&root).is_err() {
                 return Err(PubError::PackageConfig(format!(
                     "package `{name}`: the package URI root `{lib}` is not below \
                      the package root `{root}`",
@@ -360,18 +373,21 @@ fn parse_entry(entry: &serde_json::Value) -> Result<PackageConfigEntry, PubError
         .filter(|uri| !uri.is_empty())
         .ok_or_else(|| invalid(format!("package `{name}` needs a non-empty `rootUri`")))?;
 
-    // The read side normalizes `packageUri` with a trailing slash and
-    // defaults to `lib/` (package_config.dart:219-233).
+    // The read side normalizes a written `packageUri` with a trailing
+    // slash; absent `packageUri` stays `None` so `resolve` can anchor the
+    // source root at `rootUri` itself — the oracle's reader contract
+    // (package_config_json.dart:151-155), not the `lib/` default pub's
+    // writer emits.
     let package_uri = match object.get("packageUri") {
-        None | Some(serde_json::Value::Null) => "lib/".to_owned(),
+        None | Some(serde_json::Value::Null) => None,
         Some(value) => {
             let text = value
                 .as_str()
                 .ok_or_else(|| invalid("packageUri must be a string".into()))?;
             if text.ends_with('/') {
-                text.to_owned()
+                Some(text.to_owned())
             } else {
-                format!("{text}/")
+                Some(format!("{text}/"))
             }
         }
     };
@@ -528,14 +544,15 @@ mod tests {
         let with_slash = r#"{"configVersion": 2, "packages": [
             {"name": "a", "rootUri": "../", "packageUri": "lib/"}]}"#;
         let config = PackageConfig::parse(with_slash).expect("ok");
-        assert_eq!(config.packages[0].package_uri, "lib/");
+        assert_eq!(config.packages[0].package_uri.as_deref(), Some("lib/"));
         let without_slash = with_slash.replace("lib/", "src");
         let config = PackageConfig::parse(&without_slash).expect("ok");
-        assert_eq!(config.packages[0].package_uri, "src/");
-        // Absent defaults to lib/.
+        assert_eq!(config.packages[0].package_uri.as_deref(), Some("src/"));
+        // Absent stays `None` — the reader's `packageRoot = root` face,
+        // never a `lib/` default.
         let absent = r#"{"configVersion": 2, "packages": [{"name": "a", "rootUri": "../"}]}"#;
         let config = PackageConfig::parse(absent).expect("ok");
-        assert_eq!(config.packages[0].package_uri, "lib/");
+        assert_eq!(config.packages[0].package_uri, None);
     }
 
     #[test]
@@ -684,7 +701,7 @@ mod tests {
             r#"{
               "configVersion": 2,
               "packages": [
-                {"name": "app", "rootUri": "../", "languageVersion": "3.5"},
+                {"name": "app", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"},
                 {"name": "dep", "rootUri": "../deps/../deps/dep", "packageUri": "src/"}
               ],
               "generator": "pub"
@@ -698,6 +715,31 @@ mod tests {
         );
         // Dot segments in rootUri and the trailing slash in packageUri
         // collapse lexically.
+        assert_eq!(resolved[1].root, PathBuf::from("/proj/deps/dep"));
+        assert_eq!(resolved[1].lib_dir, PathBuf::from("/proj/deps/dep/src"));
+    }
+
+    /// `packageUri` absent: the reader anchors `packageUriRoot` at the
+    /// `rootUri` itself (package_config_json.dart:152 — `packageRoot = root`
+    /// when `packageUri == null`), so `lib_dir == root`. Pub's writer always
+    /// emits `packageUri: "lib/"` (entrypoint.dart:511), so this shape only
+    /// arises from hand-written or foreign-generated configs, but the
+    /// analyzer still reads it — and `package:meta/meta.dart` under such a
+    /// config must look under the package root, not under `lib/`.
+    #[test]
+    fn resolve_anchors_lib_dir_at_root_when_package_uri_absent() {
+        let resolved = resolve_ok(
+            r#"{
+              "configVersion": 2,
+              "packages": [
+                {"name": "app", "rootUri": "../"},
+                {"name": "dep", "rootUri": "../deps/dep", "packageUri": "src/"}
+              ],
+              "generator": "pub"
+            }"#,
+        );
+        assert_eq!(resolved[0].root, PathBuf::from("/proj"));
+        assert_eq!(resolved[0].lib_dir, PathBuf::from("/proj"));
         assert_eq!(resolved[1].root, PathBuf::from("/proj/deps/dep"));
         assert_eq!(resolved[1].lib_dir, PathBuf::from("/proj/deps/dep/src"));
     }

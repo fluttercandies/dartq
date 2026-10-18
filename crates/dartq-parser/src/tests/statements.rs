@@ -228,6 +228,45 @@ fn pattern_for_in() {
     c.assert_sequence(&[("begin", "for_statement"), ("end", "for_in")]);
 }
 
+/// `skipOuterPattern`'s object-pattern arm (`parser_impl.dart:12333`): the
+/// real-corpus idiom `for (var MapEntry(key: k, value: v) in m.entries)`
+/// (package:args `usage.dart`) — bare, qualified, and generic type names
+/// all reach the for-in rest, while `Foo<T>[...]`/`x.y()` stay expressions.
+#[test]
+fn object_pattern_for_in() {
+    for (source, label) in [
+        (
+            "void f() { for (var MapEntry(key: k, value: v) in m.entries) { c; } }",
+            "bare type name",
+        ),
+        (
+            "void f() { for (var p.MapEntry(key: k) in m.entries) { c; } }",
+            "qualified type name",
+        ),
+        (
+            "void f() { for (var Box<int>(value: v) in xs) { c; } }",
+            "generic type name",
+        ),
+        (
+            "void f() { for (var <int>[a, b] in xs) { c; } }",
+            "typed list pattern",
+        ),
+        (
+            "void f() { for (var <String, int>{'k': v} in xs) { c; } }",
+            "typed map pattern",
+        ),
+    ] {
+        let c = parse(source);
+        assert!(c.errors.is_empty(), "{label}: {:?}", c.errors);
+        c.assert_sequence(&[("begin", "for_statement"), ("end", "for_in")]);
+    }
+    // A typed list literal is NOT a pattern — but `for (<expr> in xs)` is
+    // not legal Dart either, so the disambiguation never sees this shape.
+    // The statement form stays an expression:
+    let c = parse("void f() { var x = <int>[1]; var y = Foo<int>(1); }");
+    assert!(c.errors.is_empty(), "{:?}", c.errors);
+}
+
 #[test]
 fn pattern_variable_declaration_statement() {
     let c = parse("void f() { final (a, b) = (1, 2); }");

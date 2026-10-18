@@ -401,6 +401,44 @@ fn name_form_part_bounded_name_scan() {
     );
 }
 
+/// The depth-2 chain joins through the attached middle: `root ← mid ← leaf`
+/// where leaf's `part of 'mid.dart'` binds to its direct includer — the
+/// URI-form claim is against the including file, not the defining library
+/// (upstream file_state.dart's `LibraryFileKind` part check; the lints-new
+/// `deprecated_member_use_from_same_package/part_mid.dart` shape carries
+/// no `part_of_different_library`). The middle's own `part` directive
+/// keeps its `non_part_of_directive_in_part` row — the oracle emits it on
+/// this exact shape — and the leaf still joins the library through it.
+#[test]
+fn depth2_part_chain_joins_through_the_attached_middle() {
+    const ROOT: &str = "library root;\npart 'mid.dart';\nint f() => 1;\n";
+    const MID: &str = "part of 'root.dart';\npart 'leaf.dart';\n";
+    const LEAF: &str = "part of 'mid.dart';\nint g() => 1;\n";
+
+    let fixture = Fixture::new(&[
+        ("lib/root.dart", ROOT),
+        ("lib/mid.dart", MID),
+        ("lib/leaf.dart", LEAF),
+    ]);
+    let mut engine = fixture.engine();
+    engine.set_content(&fixture.path("lib/root.dart"), ROOT.as_bytes());
+    engine.set_content(&fixture.path("lib/mid.dart"), MID.as_bytes());
+    engine.set_content(&fixture.path("lib/leaf.dart"), LEAF.as_bytes());
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
+        .expect("cold");
+    // The plate row stays gone: the include's own `non_part_of_directive_
+    // in_part` fires (the oracle emits it on this exact shape) and NO
+    // `part_of_different_library` — the URI-form claim binds to the direct
+    // includer, so the leaf never reports the defining-library mismatch.
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics[0].code.name,
+        "non_part_of_directive_in_part",
+        "{diagnostics:?}"
+    );
+}
+
 /// The same include face below the enhanced-parts horizon (package language
 /// 3.5, no grants): the URI include of a name-form part whose part-of name
 /// does not match the includer's declared library name reports

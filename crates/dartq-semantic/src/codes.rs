@@ -1018,6 +1018,11 @@ pub enum SemanticCode {
     /// (`recursive_constructor_redirect`, diagnostic.g.dart:14638;
     /// error_verifier.dart `_checkForRecursiveConstructorRedirect`).
     RecursiveConstructorRedirect,
+    /// `The constant constructor depends on itself.` — a const constructor
+    /// whose own formal default values const-instantiate the same
+    /// constructor (`recursive_constant_constructor`, the default-value
+    /// arm of the constant-dependency cycle).
+    RecursiveConstantConstructor,
     // —— the final-field faces (both `COMPILE_TIME_ERROR`) ———————————————
     /// `The final variable '{0}' must be initialized.` — a non-late `final`
     /// declaration without an initializer in the declaration walk
@@ -1143,6 +1148,13 @@ pub enum SemanticCode {
     /// (`definitely_unassigned_late_local_variable`, diagnostic.g.dart;
     /// type_analyzer.dart `_checkReadOfNotAssignedLocalVariable`).
     DefinitelyUnassignedLateLocalVariable,
+    /// `A value of type '{0}' can't be assigned to a parameter of type
+    /// '{1}' in a const constructor.` — a constant constructor
+    /// invocation's argument whose runtime value does not match the
+    /// parameter (or the initializing field's) type
+    /// (`const_constructor_param_type_mismatch`, diagnostic.g.dart:2619;
+    /// `evaluation.dart` `_checkArgumentType` / the field-formal arm).
+    ConstConstructorParamTypeMismatch,
 }
 
 /// The message face of [`SemanticCode::NotEnoughPositionalArguments`]: the
@@ -1722,6 +1734,10 @@ impl SemanticCode {
                 "recursive_constructor_redirect",
                 "RECURSIVE_CONSTRUCTOR_REDIRECT",
             ),
+            Self::RecursiveConstantConstructor => (
+                "recursive_constant_constructor",
+                "RECURSIVE_CONSTANT_CONSTRUCTOR",
+            ),
             Self::FinalNotInitialized => ("final_not_initialized", "FINAL_NOT_INITIALIZED"),
             Self::ConflictingStaticAndInstance => (
                 "conflicting_static_and_instance",
@@ -1781,6 +1797,10 @@ impl SemanticCode {
             Self::DefinitelyUnassignedLateLocalVariable => (
                 "definitely_unassigned_late_local_variable",
                 "DEFINITELY_UNASSIGNED_LATE_LOCAL_VARIABLE",
+            ),
+            Self::ConstConstructorParamTypeMismatch => (
+                "const_constructor_param_type_mismatch",
+                "CONST_CONSTRUCTOR_PARAM_TYPE_MISMATCH",
             ),
         };
         let dtype = self.dtype();
@@ -2495,6 +2515,9 @@ impl SemanticCode {
                 "Constructors can't redirect to themselves either directly or indirectly."
                     .to_string()
             }
+            Self::RecursiveConstantConstructor => {
+                "The constant constructor depends on itself.".to_string()
+            }
             Self::FinalNotInitialized => {
                 format!("The final variable '{a0}' must be initialized.")
             }
@@ -2558,6 +2581,9 @@ impl SemanticCode {
             }
             Self::DefinitelyUnassignedLateLocalVariable => format!(
                 "The late local variable '{a0}' is definitely unassigned at this point."
+            ),
+            Self::ConstConstructorParamTypeMismatch => format!(
+                "A value of type '{a0}' can't be assigned to a parameter of type '{a1}' in a const constructor."
             ),
         }
     }
@@ -3080,6 +3106,10 @@ impl SemanticCode {
                 "Try changing one of the constructors in the loop to not redirect."
                     .to_string(),
             ),
+            Self::RecursiveConstantConstructor => Some(
+                "Try removing the constant dependency on the constructor itself."
+                    .to_string(),
+            ),
             Self::FinalNotInitialized => Some("Try initializing the variable.".to_string()),
             Self::FinalNotInitializedConstructor => {
                 Some("Try adding an initializer for the field.".to_string())
@@ -3149,6 +3179,11 @@ impl SemanticCode {
             // (diagnostic.g.dart :3734).
             Self::DefinitelyUnassignedLateLocalVariable => Some(
                 "Ensure that it is assigned on necessary execution paths.".to_string(),
+            ),
+            // `const_constructor_param_type_mismatch`'s verbatim
+            // correctionMessage (diagnostic.g.dart :2625).
+            Self::ConstConstructorParamTypeMismatch => Some(
+                "Try using a subtype, or removing the keyword 'const'.".to_string(),
             ),
             _ => None,
         }
@@ -4114,6 +4149,8 @@ mod tests {
             | SemanticCode::SuperFormalParameterWithoutAssociatedNamed
             | SemanticCode::SuperFormalParameterWithoutAssociatedPositional
             | SemanticCode::RecursiveConstructorRedirect
+            | SemanticCode::RecursiveConstantConstructor
+            | SemanticCode::ConstConstructorParamTypeMismatch
             | SemanticCode::NotInitializedNonNullableInstanceField
             | SemanticCode::ImplicitSuperInitializerMissingArguments
             | SemanticCode::NonFinalFieldInEnum

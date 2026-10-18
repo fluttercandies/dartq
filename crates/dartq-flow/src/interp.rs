@@ -1361,6 +1361,20 @@ impl<'o> Interp<'o> {
         (self.ops.promote_to_non_null(t), args)
     }
 
+    /// Name-level least upper bound (official `typeOperations.join`): the
+    /// subtype-ordered join — `a <: b` gives `b`, `b <: a` gives `a`, and a
+    /// name-unordered pair joins to the unknown face (the real hierarchy's
+    /// LUB is the resolved back-end's question, not the name layer's).
+    pub(crate) fn name_lub(&self, a: Ty, b: Ty) -> Ty {
+        if self.ops.is_subtype(a, b) {
+            return b;
+        }
+        if self.ops.is_subtype(b, a) {
+            return a;
+        }
+        Ty::UNKNOWN
+    }
+
     /// Official `_typesAreDisjointDueToNullability`: one side is
     /// null-or-equivalent (`classifyType` → nullOrEquivalent) while the
     /// other is non-nullable — every value of either lies outside the

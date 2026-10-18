@@ -1439,6 +1439,12 @@ pub struct Container {
     /// `false` — the `undefined_constructor_in_initializer` /
     /// `undefined_enum_constructor` unnamed-selector queries read it.
     pub has_unnamed_constructor: bool,
+    /// Some declared constructor or factory carries the `const` modifier.
+    /// The const-creation faces read it on the RESOLVED container, so a
+    /// const constructor declared in another library answers like an
+    /// in-file one (the oracle resolves the creation's element, whatever
+    /// unit declares it).
+    pub has_const_constructor: bool,
     /// Constructor formals by lookup spelling: the selector for a named
     /// constructor (`A.named` → `named`), the container's own name for the
     /// unnamed face (`A()` → `A` — the same spelling a creation's folded

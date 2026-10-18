@@ -100,6 +100,13 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// function shapes), so the folded `FACTS_SEMANTIC_VERSION` moves on
 /// both lanes. The function-typed formal row first pins through the
 /// populated-elements probe (the v11 precedent).
+/// v13: containers carry the const-constructor bit
+/// (`PersistedContainer::has_const_constructor`) — a v12 payload decodes
+/// every container const-less, so a warm start would re-fire the
+/// cross-file `const_with_non_const` /
+/// `const_initialized_with_non_constant_value` over-report the bit
+/// closes. The same train raised `dartq_semantic::SIGNATURE_VERSION` to
+/// 8.
 ///
 /// # Bump contract (structural guard)
 ///
@@ -118,7 +125,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// version too.) The bump lane also forks on capture-behavior changes with
 /// no layout delta: a payload the old producer wrote must not be served to
 /// a producer whose capture output diverges from it.
-const FACTS_SHAPE_VERSION: u32 = 12;
+const FACTS_SHAPE_VERSION: u32 = 13;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component of
 /// `EngineSemanticVersion`): the engine facts shape folded with

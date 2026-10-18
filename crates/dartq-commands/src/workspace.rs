@@ -1199,7 +1199,7 @@ fn extend_config_with_nested_roots(
         entries.push(PackageConfigEntry {
             name: spec.name.clone(),
             root_uri: relative_root_uri(relative),
-            package_uri: "lib/".to_owned(),
+            package_uri: Some("lib/".to_owned()),
             language_version: Some(LanguageVersion::from_sdk_constraint(
                 spec.environment.sdk.as_ref(),
             )),

@@ -1627,6 +1627,7 @@ impl ParserListener for SharedFlow<'_> {
         end: Token,
         const_keyword: Option<Token>,
         has_constructor_name: bool,
+        name: Option<Token>,
     ) {
         self.0.borrow_mut().end_primary_constructor(
             kind,
@@ -1634,6 +1635,7 @@ impl ParserListener for SharedFlow<'_> {
             end,
             const_keyword,
             has_constructor_name,
+            name,
         );
     }
 

@@ -527,7 +527,7 @@ pub fn plugin_package_config(
         config.packages.push(PackageConfigEntry {
             name: decl.name.clone(),
             root_uri: format!("file://{}", path.display()),
-            package_uri: "lib/".to_owned(),
+            package_uri: Some("lib/".to_owned()),
             language_version: None,
             additional_properties: BTreeMap::new(),
         });

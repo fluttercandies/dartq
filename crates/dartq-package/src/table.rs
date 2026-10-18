@@ -597,7 +597,10 @@ dependencies:
         let root = table.get("app").expect("root entry");
         // `../` against .dart_tool resolves and normalizes to the project.
         assert_eq!(root.root, PathBuf::from("/proj"));
-        assert_eq!(root.lib_dir, PathBuf::from("/proj/lib"));
+        // `packageUri` absent in CONFIG: the source root anchors at
+        // `rootUri` itself — the reader contract (package_config_json.dart
+        // :152), never a `lib/` default.
+        assert_eq!(root.lib_dir, PathBuf::from("/proj"));
         assert_eq!(
             root.language_version.map(|v| v.to_string()).as_deref(),
             Some("3.5")
@@ -1238,7 +1241,8 @@ sdks:
         let canonical = root.canonicalize().expect("canonical root");
         let app = table.get("app").expect("app entry");
         assert_eq!(app.root, canonical, "stored root must be canonical");
-        assert_eq!(app.lib_dir, canonical.join("lib"));
+        // `packageUri` absent: `lib_dir` anchors at `root` itself.
+        assert_eq!(app.lib_dir, canonical);
 
         // Attribution in both spellings: the canonical one (what the
         // resolver and FileTable produce — pre-#323 an alias-assembled

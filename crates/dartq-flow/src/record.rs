@@ -1725,7 +1725,12 @@ impl ParserListener for Flow<'_> {
             | IdentifierContext::ExpressionContinuation
             | IdentifierContext::NamedArgumentReference
             | IdentifierContext::CatchParameter
-            | IdentifierContext::LocalVariableDeclaration => {
+            | IdentifierContext::LocalVariableDeclaration
+            // A constructor-reference head (`new C()`, `const C()`,
+            // `C<T>.named(...)`): the creation's value carries the head's
+            // named type — without it the invocation nets no stack entry
+            // and a following `x = C()` write consumes the wrong operand.
+            | IdentifierContext::ConstructorReference => {
                 let name = self.name(token);
                 self.record(Ev::Ident {
                     name,
@@ -1889,6 +1894,10 @@ impl ParserListener for Flow<'_> {
         // dead_code_verifier.dart:361-375's `updaters.endToken`).
         self.record(Ev::Assign {
             plain: self.is_plain_assign(operator),
+            if_null: matches!(
+                self.kind(operator),
+                Some(dartq_scanner::TokenKind::QuestionQuestionEq)
+            ),
             end: end.range.end(),
         });
     }

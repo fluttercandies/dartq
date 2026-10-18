@@ -990,7 +990,8 @@ mod tests {
         r#""default_value":5}]},"annotations":[{"name":8,"offset":0,"length":16,"args_text":9}],"#,
         r#""name_range":[34,1]}]],"type_params":0,"sealed":false,"with_clause":[],"implements_clause":[],"#,
         r#""on_clause":[],"header_residue":[],"primary_formals":[],"enum_constants":[],"constructors":[],"#,
-        r#""has_unnamed_constructor":false,"ctor_formals":[],"annotations":[]}]],"container_order":[0],"#,
+        r#""has_unnamed_constructor":false,"has_const_constructor":false,"ctor_formals":[],"annotations":[]}]],"#,
+        r#""container_order":[0],"#,
         r#""extension_faces":[],"duplicates":[],"arity_violations":[]}"#,
     );
 
@@ -1124,6 +1125,7 @@ mod tests {
                     enum_constants: Vec::new(),
                     constructors: Vec::new(),
                     has_unnamed_constructor: false,
+                    has_const_constructor: false,
                     ctor_formals: Vec::new(),
                     annotations: Vec::new(),
                 },

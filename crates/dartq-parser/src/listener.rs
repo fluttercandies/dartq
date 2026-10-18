@@ -1159,7 +1159,9 @@ pub trait ParserListener {
     /// `beginPrimaryConstructor(beginToken)`.
     fn begin_primary_constructor(&mut self, begin: Token) {}
     /// `endPrimaryConstructor(kind, begin, end, constKeyword,
-    /// hasConstructorName)`.
+    /// hasConstructorName, name)` — `name` is the written `.name` selector
+    /// token when the header carried one (the model capture keys the
+    /// named-constructor face on it).
     fn end_primary_constructor(
         &mut self,
         kind: DeclarationKind,
@@ -1167,6 +1169,7 @@ pub trait ParserListener {
         end: Token,
         const_keyword: Option<Token>,
         has_constructor_name: bool,
+        name: Option<Token>,
     ) {
     }
     /// `handleNoPrimaryConstructor(kind, token, constKeyword)`.

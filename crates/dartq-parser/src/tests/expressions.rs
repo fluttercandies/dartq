@@ -1005,6 +1005,36 @@ fn const_record_lhs_reports_missing_selector() {
 }
 
 #[test]
+fn builtin_identifier_assignment_target_stays_assignable() {
+    // `out` lexes as a pseudo keyword (variance face), and parsePrimary
+    // reads pseudo/built-in keywords as names (:7558-7576), so the
+    // assignment-target check sees a name expression and stays silent
+    // (official `_isAssignable` ast_builder.dart:6607 admits
+    // ParsedUnqualifiedNameImpl). The captured-variable compound shape is
+    // the torture m003/m015/m027/m039 face (`out += x` inside a local
+    // function): both the parser-proxy misfire regression and the plain
+    // `=`/pseudo-name forms stay silent, while a parenthesized name target
+    // keeps its parse-level silence too.
+    assert!(
+        sorted_unit_codes(
+            "void f(int x) {\n  var out = 0;\n  void collect(int y) {\n    out += y;\n  }\n  collect(x);\n  out = 1;\n  out += 2;\n  when = 3;\n  (out) = x;\n  print(out);\n}\n",
+        )
+        .is_empty(),
+        "pseudo/built-in keyword names are assignable targets"
+    );
+    // The rider stays armed for genuinely non-assignable targets: a
+    // one-field const record literal LHS still takes both codes.
+    assert_eq!(
+        sorted_unit_codes("f(x) {\n  const (q,) = x;\n}\n"),
+        [
+            "illegal_assignment_to_non_assignable",
+            "missing_assignable_selector"
+        ],
+        "const record literal target keeps both codes"
+    );
+}
+
+#[test]
 fn const_dot_shorthand_incomplete_member_recovers() {
     // `Color c = const .;` (oracle dot_shorthands/const_no_identifier_recovery):
     // the member after `.` is missing. The pinned 3.13.1 oracle faces
