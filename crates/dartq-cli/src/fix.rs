@@ -104,9 +104,12 @@ fn write_machine(
 /// One file's edits in report order: the built-in rows first, then each
 /// plugin change's edits flattened (the same order the patch document and
 /// the human listing use, and the order [`fix::apply`]'s outcomes report).
+/// The cross-file rows ([`fix::RuleFix::target`]) never ride the hit
+/// file's patch set — their edit addresses another file and stages whole.
 fn edits_of(set: &FileFixSet) -> Vec<fix::Edit> {
     set.fixes
         .iter()
+        .filter(|f| f.target.is_none())
         .map(|f| f.edit.clone())
         .chain(set.plugin.iter().flat_map(|p| p.edits.iter().cloned()))
         .collect()
@@ -135,15 +138,17 @@ fn write_human(
         let mut consumed = 0usize;
         for fix_row in &set.fixes {
             fix_count += 1;
-            write!(
-                out,
-                "{}:{}:{} • {} • {}",
-                set.path,
-                fix_row.edit.anchor.line,
-                fix_row.edit.anchor.column,
-                fix_row.rule,
-                fix_row.message
-            )?;
+            // The cross-file row names the file it creates, at the head
+            // the content lands at — never the hit file's coordinates.
+            let (file, line, column) = match &fix_row.target {
+                Some(target) => (target.as_str(), fix_row.edit.anchor.line, fix_row.edit.anchor.column),
+                None => (
+                    set.path.as_str(),
+                    fix_row.edit.anchor.line,
+                    fix_row.edit.anchor.column,
+                ),
+            };
+            write!(out, "{file}:{line}:{column} • {} • {}", fix_row.rule, fix_row.message)?;
             consumed += write_status(out, status.get(consumed), &mut applied, &mut stale)?;
         }
         for plugin_row in &set.plugin {
@@ -412,8 +417,12 @@ fn apply_and_report(
     out: &mut impl Write,
 ) -> u8 {
     let mut staged: Vec<(&str, String, Vec<EditOutcome>)> = Vec::new();
+    // The cross-file rows: `(target, born content, set index, row index)`
+    // — the write is the file coming into existence, and the set/row
+    // indices let a late-appearing target flip its status to stale.
+    let mut created: Vec<(&str, &str, usize, usize)> = Vec::new();
     if !dry_run {
-        for set in per_file {
+        for (set_index, set) in per_file.iter().enumerate() {
             // Span-capacity gates (#1543 bypass face): this is the last
             // read before the edits' `LineIndex`, so the stat refuses
             // before the bytes are read and the byte length is the
@@ -441,7 +450,25 @@ fn apply_and_report(
             }
             let edits = edits_of(set);
             let (patched, outcome) = fix::apply(&text, &edits);
-            staged.push((&set.path, patched, outcome));
+            // Full row order for the report faces: the same-file rows take
+            // apply()'s outcomes in order, each cross-file row holds its
+            // slot until its own write answers, the plugin rows' outcomes
+            // follow. The `unwrap_or` arm is unreachable by construction —
+            // `edits_of` mirrors exactly this partition — and reports
+            // stale rather than lying applied if it ever moved.
+            let mut statuses = Vec::with_capacity(set.fixes.len());
+            let mut same_file = outcome.into_iter();
+            for (row_index, fix_row) in set.fixes.iter().enumerate() {
+                match &fix_row.target {
+                    Some(target) => {
+                        created.push((target, fix_row.edit.replacement.as_str(), set_index, row_index));
+                        statuses.push(EditOutcome::Applied);
+                    }
+                    None => statuses.push(same_file.next().unwrap_or(EditOutcome::Stale)),
+                }
+            }
+            statuses.extend(same_file);
+            staged.push((&set.path, patched, statuses));
         }
     }
 
@@ -459,6 +486,32 @@ fn apply_and_report(
             return exit::INTERNAL_ERROR;
         }
         statuses.push(outcome.clone());
+    }
+    // The created files, after the hit files' writes: a target that
+    // appeared between the offer and the write keeps the run's snapshot
+    // honesty (stale, skipped — first writer wins), the write itself
+    // brings the parent dirs the URI names into being.
+    for (target, content, set_index, row_index) in &created {
+        let target_path = Path::new(target);
+        let outcome = if target_path.exists() {
+            EditOutcome::Stale
+        } else {
+            let parent = target_path.parent().filter(|p| !p.as_os_str().is_empty());
+            if let Some(parent) = parent
+                && let Err(error) = fs::create_dir_all(parent)
+            {
+                eprintln!("dartq: internal error: creating {parent:?} failed: {error}");
+                return exit::INTERNAL_ERROR;
+            }
+            match fs::write(target_path, content) {
+                Ok(()) => EditOutcome::Applied,
+                Err(error) => {
+                    eprintln!("dartq: internal error: writing {target} failed: {error}");
+                    return exit::INTERNAL_ERROR;
+                }
+            }
+        };
+        statuses[*set_index][*row_index] = outcome;
     }
 
     let written = match format {
@@ -610,6 +663,7 @@ mod tests {
                 message: "Unnecessary 'new' keyword.".to_owned(),
                 source: fix::BUILTIN_SOURCE,
                 edit: fix::anchored_edit(source, &lines, 19, 4, ""),
+                target: None,
             }],
             plugin: Vec::new(),
         }
@@ -884,6 +938,85 @@ mod tests {
         let args = parse(&["assists", "/nonexistent/dq_assists_target"]);
         assert_eq!(run_assists(&args, &mut out), exit::USAGE);
         assert!(out.is_empty(), "stdout stays empty on usage errors");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The cross-file row end to end: the apply run materializes the born
+    /// file (the nested dir the URI names included), the hit file's bytes
+    /// stay untouched, the human listing names the created file at its
+    /// head, and a target that already exists flips the row stale — the
+    /// first writer wins. `--dry-run` never writes.
+    #[test]
+    fn fix_apply_materializes_the_created_file() {
+        let root = std::env::temp_dir().join(format!("dq_cli_fix_create_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let hit = root.join("test.dart");
+        fs::write(&hit, "import 'src/missing.dart';\n").expect("write");
+        let target = root.join("src/missing.dart");
+        let born = "// TODO Implement this library.";
+        let lines = LineIndex::new("");
+        let per_file = vec![FileFixSet {
+            path: hit.display().to_string(),
+            fixes: vec![fix::RuleFix {
+                rule: "uri_does_not_exist",
+                message: "Target of URI doesn't exist: 'src/missing.dart'.".to_owned(),
+                source: fix::BUILTIN_SEMANTIC_SOURCE,
+                edit: fix::anchored_edit("", &lines, 0, 0, born),
+                target: Some(target.display().to_string()),
+            }],
+            plugin: Vec::new(),
+        }];
+
+        // Dry-run: the proposal names the created file, nothing on disk.
+        let mut out = Vec::new();
+        assert_eq!(
+            apply_and_report(&per_file, true, FixFormat::Default, &mut out),
+            exit::CLEAN
+        );
+        assert!(
+            !target.exists(),
+            "a dry run never materializes the born file"
+        );
+        let listing = String::from_utf8(out).expect("utf-8");
+        assert!(
+            listing.starts_with(&format!(
+                "{}:1:1 • uri_does_not_exist • Target of URI",
+                target.display()
+            )),
+            "the listing names the created file at its head: {listing:?}"
+        );
+
+        // The apply run: the file comes into existence with the stub, the
+        // row reports applied.
+        let mut out = Vec::new();
+        assert_eq!(
+            apply_and_report(&per_file, false, FixFormat::Default, &mut out),
+            exit::CLEAN
+        );
+        assert_eq!(fs::read_to_string(&target).expect("born text"), born);
+        assert!(
+            String::from_utf8(out).expect("utf-8").contains("[applied]"),
+            "the written row tags applied"
+        );
+
+        // The target now exists: the executor's write-time re-check flips
+        // the row stale and leaves the file's bytes alone.
+        let mut out = Vec::new();
+        assert_eq!(
+            apply_and_report(&per_file, false, FixFormat::Default, &mut out),
+            exit::CLEAN
+        );
+        assert_eq!(
+            fs::read_to_string(&target).expect("born text"),
+            born,
+            "first writer wins"
+        );
+        assert!(
+            String::from_utf8(out).expect("utf-8").contains("[stale]"),
+            "the already-satisfied row tags stale"
+        );
 
         fs::remove_dir_all(&root).ok();
     }

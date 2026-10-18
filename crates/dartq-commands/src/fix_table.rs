@@ -39,7 +39,21 @@
 //!   official `InsertBody` insertion at the report's end);
 //! - [`FixAction::Rewrite`] — a verified rewriter that expands the
 //!   diagnostic's span into the edit, re-checking the reported shape
-//!   against the text or the token stream (everything structural).
+//!   against the text or the token stream (everything structural);
+//! - [`FixAction::MultiRewrite`] — the same verified rewriter producing
+//!   several disjoint same-file edits at once (the official multi-edit
+//!   producers: `OrganizeImports`' block rebuild, the field/parameter
+//!   pairs of the initializing-formal family, `AddAsync`'s
+//!   marker-plus-`await` pair). The executors emit one `RuleFix` per
+//!   edit, and `apply()`'s snapshot-coordinate drift correction lands
+//!   them in any order.
+//! - [`FixAction::CreateFile`] — a verified producer composing the
+//!   cross-file edit: the file the official change creates (the path rides
+//!   [`FixInput::path`], the one field the same-file producers ignore) and
+//!   the content it is born with, inserted at offset 0 of its empty text.
+//!   The executor anchors the row to the target (the `RuleFix::target`
+//!   address) and offers it only while the target is absent — the
+//!   `uri_does_not_exist` create face.
 //!
 //! The rewriters themselves live in [`crate::fix`] beside the anchoring
 //! substrate they feed; the thin adapters here fit the legacy signatures
@@ -58,7 +72,7 @@
 //! type-display pair: the fix is offered only where the promoted `from`
 //! display reads as the `to` display, the nullable-only mismatch the
 //! official assignability gate serves. The written-surface family —
-//! thirty-two emitted codes whose official producer's edit is provable
+//! forty-one emitted codes whose official producer's edit is provable
 //! from the report span, the file text, and the token stream — covers
 //! `RemoveConst`/`RemoveNew`/`ReplaceNewWithConst`, `RemoveQuestionMark`,
 //! `RemoveNonNullAssertion`, `ReplaceWithNotNullAware`, `UseEqEqNull` /
@@ -67,8 +81,14 @@
 //! rewrites, `RemoveDeadCode`'s statement-run and catch-clause arms,
 //! `RemoveDeadIfNull`, the unreachable switch-member drop, the
 //! `RemoveUnusedElement`/`RemoveUnusedField`/`RemoveUnusedParameter`
-//! faces, `MoveTypeArgumentsToClass`, `AddReturnNull`, and
-//! `RemoveNameFromDeclarationClause`. Where a diagnostic's official set
+//! faces, `MoveTypeArgumentsToClass`, `AddReturnNull`,
+//! `RemoveNameFromDeclarationClause`, and the multi-edit faces —
+//! `AddLate` over the uninitialized non-nullable declarations,
+//! `AddNeNull` on the non-bool condition, `AddStatic` on the const
+//! instance field, `AddConst` on the non-constant pattern operand,
+//! `RemoveConst`'s head drop on the non-constant initializer,
+//! `RemoveMethodDeclaration` on the extension-type Object member, and
+//! `AddAsync`'s two-edit await pair. Where a diagnostic's official set
 //! also lists non-mechanical producers (`ImportLibrary`,
 //! `ChangeTo.classOrMixin`, the `if`/`assert`/`conditional` arms of
 //! `RemoveComparison`), the row serves the mechanical arm and the
@@ -81,6 +101,24 @@
 //! inventory (`ChangeTo`'s rename suggestions, `AddMissingParameterNamed`'s
 //! callee declaration; `undefined_prefixed_name` is served by data-driven
 //! fixes only).
+//!
+//! The [`FixAction::CreateFile`] family serves the one cross-file face the
+//! evidence proves: `uri_does_not_exist`, whose official producer
+//! (`CreateFile`, upstream Dart SDK source,
+//! pkg/analysis_server/lib/src/services/correction/dart/create_file.dart)
+//! creates the missing URI target — the import/export face born with the
+//! `// TODO Implement this library.` stub, the `part` face with the
+//! `part of '<library>';` head. The row re-verifies the shape the code
+//! reports: the span must slice to the directive's single plain string
+//! literal whose inner text the message quotes, the directive keyword
+//! must stand before it, and the URI must be a relative `.dart` path the
+//! hit file's directory can name. The faces whose target needs the
+//! resolver's world drop: `package:`/`dart:` and other scheme URIs (the
+//! official producer resolves them through the source factory — the
+//! known-diff face), `part of` directives (`PartOfDirective` is neither
+//! arm of the official parent dispatch), escaped and interpolated URIs
+//! (the official `node is SimpleStringLiteral` guard), and conditional-
+//! import arms (the official `Configuration` TODO).
 //!
 //! # Parser rows
 //!
@@ -117,7 +155,10 @@
 //! flattening (comparison and conditional), the literal pads and raw
 //! conversions, the combinator/case/comma list edits, the argument and
 //! parameter removals, the null-aware element and truncating-division
-//! folds, and the comment rebuilds (`///`, flutter TODO).
+//! folds, the comment rebuilds (`///`, flutter TODO), and the multi-edit
+//! faces — `OrganizeImports`' directive-block sort, `MoveInitializationToFieldDeclaration`'s
+//! initializer carry, and the initializing-formal/declaring-parameter
+//! pairs.
 //!
 //! The census's remaining lint codes have no row; the official producer
 //! reads a fact the row does not carry (the #1883 re-adjudication against
@@ -145,20 +186,15 @@
 //!   (`always_use_package_imports`, `avoid_relative_lib_imports`,
 //!   `prefer_relative_imports`, `simple_directive_paths`,
 //!   `use_string_in_part_of_directives`' owning-library URI);
-//!   `directives_ordering`'s `OrganizeImports` is a whole-directive-block
-//!   multi-edit pass; `discarded_futures`' `AddAsync` leg rewrites the
-//!   return type through the type system and its `WrapInUnawaited` leg
-//!   adds the `dart:async` import — a second, disjoint edit;
+//!   `discarded_futures`' `AddAsync` leg rewrites the return type through
+//!   the type system and its `WrapInUnawaited` leg adds the `dart:async`
+//!   import — a second, disjoint edit;
 //! - reference and constant inventories (`comment_references`' import
 //!   leg, `diagnostic_describe_all_properties`' property assertions,
 //!   `unreachable_from_main`'s `findAllReferences().isEmpty` gate,
 //!   `unnecessary_this_alias`'s local-element reference set,
 //!   `exhaustive_cases`' enum constants, `hash_and_equals`' field
 //!   inventory, `implicit_reopen`'s imported-name dependency check);
-//! - disjoint multi-edit faces (`initialize_in_field_declaration`,
-//!   `prefer_initializing_formals`, `use_declaring_parameters` — the
-//!   parameter rewrite plus the initializer/field removal the one-span
-//!   row cannot carry);
 //! - structural synthesis (`avoid_unnecessary_containers`' parent-splice,
 //!   `use_enums`, `use_primary_constructors`, `use_super_parameters`'
 //!   cross-file super-parameter names);
@@ -189,43 +225,48 @@ use dartq_source::SourceRange;
 
 use crate::fix;
 use crate::fix::{
-    add_const_prefix, add_eol, add_explicit_call_entry, add_leading_newline,
+    add_async_await_entry, add_const_pattern_entry, add_const_prefix, add_eol,
+    add_explicit_call_entry, add_late_entry, add_leading_newline,
     add_library_directive_entry, add_missing_trailing_comma, add_required_keyword, add_return_null,
-    add_super_key, add_trailing_comma, add_typedef_parameters, annotate_overrides_entry,
-    annotate_redeclares_entry, annotation_library_directive_entry, await_future_expression,
-    await_return_entry, bool_comparison, bool_conditional, cascade_merge, cascade_with_dot,
-    cast_null_check, catch_to_on_type, child_property_last, colon_to_equals,
-    conditional_assignment, conditional_to_if_element, const_pattern_binary, const_pattern_generic,
-    const_pattern_literal, const_pattern_negation, constructor_first, convert_inner_quotes,
-    convert_to_raw_string_entry, curly_braces_body, curly_braces_head, doc_comment_to_line,
-    double_to_int_literal, drop_as_cast, drop_bang_expression, drop_bang_pattern,
-    drop_break_statement, drop_clause_name, drop_combinator_name, drop_comparison_operand,
-    drop_constructor_type_name, drop_dead_catch, drop_dead_code, drop_dead_if_null,
-    drop_empty_container_body, drop_empty_statement, drop_enclosing_const,
-    drop_getter_invocation_parens, drop_library_directive, drop_library_name,
-    drop_non_null_assertion, drop_pattern_field_name, drop_primary_constructor_body,
-    drop_switch_member, drop_type_question, drop_unused_element, drop_unused_field,
-    drop_unused_parameter, drop_wildcard_and_operand, eight_digit_hex, equality_is_check,
-    equality_null_operand, expected_token_fix, expression_function_body, field_public,
-    flutter_style_todo, for_each_tear_off, for_in_from_for_each, function_type_syntax,
-    generic_alias_syntax, if_null_bools, inline_typedef, is_empty_call, is_not_empty_access,
-    is_null_to_eq_null, make_declaration_final, make_parameter_final,
-    map_from_iterable_for_element, missing_body_block, move_type_args_to_class,
+    add_static_entry, add_super_key, add_trailing_comma, add_typedef_parameters,
+    annotate_overrides_entry, annotate_redeclares_entry, annotation_library_directive_entry,
+    append_ne_null_entry, await_future_expression, await_return_entry, bool_comparison,
+    bool_conditional, cascade_merge, cascade_with_dot, cast_null_check, catch_to_on_type,
+    child_property_last, colon_to_equals, conditional_assignment, conditional_to_if_element,
+    const_pattern_binary, const_pattern_generic, const_pattern_literal, const_pattern_negation,
+    constructor_first, convert_inner_quotes, convert_to_declaring_param_entry,
+    convert_to_init_formal_entry, convert_to_raw_string_entry, create_missing_uri_target,
+    curly_braces_body, curly_braces_head, doc_comment_to_line, double_to_int_literal, drop_as_cast,
+    drop_bang_expression, drop_bang_pattern, drop_break_statement, drop_clause_name,
+    drop_combinator_name, drop_comparison_operand, drop_constructor_type_name, drop_dead_catch,
+    drop_dead_code, drop_dead_if_null, drop_empty_container_body, drop_empty_statement,
+    drop_enclosing_const, drop_getter_invocation_parens, drop_head_const_entry,
+    drop_library_directive, drop_library_name, drop_non_null_assertion, drop_object_member_entry,
+    drop_pattern_field_name, drop_primary_constructor_body, drop_switch_member,
+    drop_type_question, drop_unused_element, drop_unused_field, drop_unused_parameter,
+    drop_wildcard_and_operand, eight_digit_hex, equality_is_check, equality_null_operand,
+    expected_token_fix, expression_function_body, field_public, flutter_style_todo,
+    for_each_tear_off, for_in_from_for_each, function_type_syntax, generic_alias_syntax,
+    if_null_bools, inline_typedef, is_empty_call, is_not_empty_access, is_null_to_eq_null,
+    make_declaration_final, make_parameter_final, map_from_iterable_for_element,
+    missing_body_block, move_init_to_field_entry, move_type_args_to_class,
     named_constant_reference, new_to_const, not_null_aware_operator, null_aware_element,
     null_check_argument, null_check_assignment, null_check_condition, omit_type_with_var,
-    remove_abstract_member, remove_argument_entry, remove_constructor, remove_duplicate_case,
-    remove_getter_parameters, remove_hit_lexeme, remove_ignore_comment, remove_number_separators,
-    remove_on_clause, remove_override_annotation, remove_override_member, remove_parameter_entry,
-    remove_pattern_var_keyword, remove_print_entry, remove_raw_prefix, remove_reported_type,
-    remove_returned_value, remove_to_list, replace_null_with_void, required_named_parameters_first,
-    rethrow_span, return_type_future, semicolon_body, sort_combinator_names, split_declarations,
-    spread_addition, surround_with_parentheses, sync_value_entry, tear_off_lambda,
-    truncating_division, unnamed_constructor_first, where_type_entry, wildcard_underscore,
+    organize_directives_entry, remove_abstract_member, remove_argument_entry, remove_constructor,
+    remove_duplicate_case, remove_getter_parameters, remove_hit_lexeme, remove_ignore_comment,
+    remove_number_separators, remove_on_clause, remove_override_annotation, remove_override_member,
+    remove_parameter_entry, remove_pattern_var_keyword, remove_print_entry, remove_raw_prefix,
+    remove_reported_type, remove_returned_value, remove_to_list, replace_null_with_void,
+    required_named_parameters_first, rethrow_span, return_type_future, semicolon_body,
+    sort_combinator_names, split_declarations, spread_addition, surround_with_parentheses,
+    sync_value_entry, tear_off_lambda, truncating_division, unnamed_constructor_first,
+    where_type_entry, wildcard_underscore,
 };
 
 /// The evidence one fix expansion reads: the file text, the diagnostic's
-/// UTF-16 span, its problem message, and the token stream when the run
-/// parsed one.
+/// UTF-16 span, its problem message, the token stream when the run
+/// parsed one, and the hit file's own path — the last only the
+/// cross-file producers read.
 pub struct FixInput<'a> {
     pub text: &'a str,
     pub range: core::ops::Range<u32>,
@@ -237,6 +278,12 @@ pub struct FixInput<'a> {
     /// Present when a hit of a [`FixSpec::needs_tokens`] family drove the
     /// parse; a rewrite that needs it and finds none drops the fix.
     pub tokens: Option<&'a TokenTable>,
+    /// The hit file's own path, as the run discovered it. The same-file
+    /// producers ignore it; the [`FixAction::CreateFile`] producers join
+    /// their target against it (`uri_does_not_exist`'s missing URI is
+    /// file-relative, and the `part` face's `part of` head names the hit
+    /// file itself).
+    pub path: &'a std::path::Path,
 }
 
 /// Which pipeline serves the code — the executors filter on it (a lint hit
@@ -256,6 +303,21 @@ pub enum FixSource {
 /// A verified span rewriter: the [`FixInput`] in, the replacement triple
 /// (UTF-16 offset, length, text) out — `None` drops the fix.
 pub type Rewrite = fn(&FixInput<'_>) -> Option<(u32, u32, String)>;
+
+/// A verified multi-span rewriter: the [`FixInput`] in, the disjoint
+/// replacement triples (UTF-16 offset, length, text) out — `None` drops
+/// the fix. The spans must not overlap (the applier's overlap guard drops
+/// the later write); the producers verify that at build time by
+/// construction.
+pub type MultiRewrite = fn(&FixInput<'_>) -> Option<Vec<(u32, u32, String)>>;
+
+/// A verified cross-file producer: the [`FixInput`] in, `(target path,
+/// born content)` out — `None` drops the fix. The target is the file the
+/// official change creates (absolute, lexically normalized), the content
+/// what it is born with; the executor anchors the content at offset 0 of
+/// the target's empty text and offers the row only while the target is
+/// absent.
+pub type CreateFile = fn(&FixInput<'_>) -> Option<(String, String)>;
 
 /// The mechanical transform of one family — the closed action-kind set of
 /// the module docs.
@@ -288,10 +350,29 @@ pub enum FixAction {
         replacement: &'static str,
     },
     /// `text` is inserted at the hit end (the official `InsertBody` /
-    /// `AddEmptyArgumentList` insertion at the report's end offset).
+    /// `AddEmptyArgumentList` insertion at the report's end).
     InsertAfter(&'static str),
     /// A verified rewriter over the diagnostic's span.
     Rewrite(Rewrite),
+    /// A verified rewriter producing several disjoint same-file edits —
+    /// the official multi-edit producers whose change carries more than
+    /// one span (`MoveInitializationToFieldDeclaration`'s delete-plus-
+    /// insert, `ConvertToInitializingFormal`'s parameter rewrite plus the
+    /// initializer/statement removal, `OrganizeImports`' whole-block
+    /// reorder, `AddAsync`'s body-plus-expression pair, the parameter-
+    /// rewrite-plus-field-drop faces). The producer returns `None` unless
+    /// every edit verifies — the change is offered whole or not at all;
+    /// the executors materialize one row per edit, the same shape the
+    /// applier's snapshot pass already keeps coherent.
+    MultiRewrite(MultiRewrite),
+    /// A verified cross-file producer — the change targets a file other
+    /// than the hit file, creating it (`uri_does_not_exist`'s official
+    /// `CreateFile`: the missing import target is born with the upstream
+    /// TODO stub, the missing `part` target with the `part of` head). The
+    /// producer composes the target from [`FixInput::path`] and the hit's
+    /// own evidence; the executor anchors the row to the target and
+    /// offers it only while the target is absent.
+    CreateFile(CreateFile),
 }
 
 /// One mechanical fix family: the diagnostic code it serves, the pipeline
@@ -652,6 +733,29 @@ static FIX_TABLE: &[FixSpec] = &[
         needs_tokens: false,
         action: FixAction::RemoveKeywordAcrossComments("const"),
     },
+    // `const x = v` where `v` is not constant — the list's `const`
+    // becomes `final` (upstream `RemoveConst`'s
+    // `VariableDeclarationList` arm); a `const`/`new` heading the
+    // reported creation itself drops with its trivia run
+    // (`startStart(keyword, keyword.next!)`, `RemoveConst`/`RemoveNew`).
+    // The push-`const`-down legs read the file's diagnostic inventory
+    // and stay absent.
+    FixSpec {
+        code: "const_initialized_with_non_constant_value",
+        source: FixSource::Semantic,
+        needs_tokens: true,
+        action: FixAction::MultiRewrite(drop_head_const_entry),
+    },
+    // A `const` field group's keyword becomes `static ` — the official
+    // `AddStatic` insertion at the member's head (`const` stays, the
+    // group gains `static`; upstream serves `const_instance_field` with
+    // `AddStatic` only).
+    FixSpec {
+        code: "const_instance_field",
+        source: FixSource::Semantic,
+        needs_tokens: true,
+        action: FixAction::MultiRewrite(add_static_entry),
+    },
     // `const void m() {}` in a class body — the keyword through the next
     // token, trivia run included, the `RemoveConst` keyword-deletion
     // shape (the official producer resolves the covering node; the
@@ -671,6 +775,17 @@ static FIX_TABLE: &[FixSpec] = &[
         source: FixSource::Semantic,
         needs_tokens: false,
         action: FixAction::RemoveKeywordAcrossComments("const"),
+    },
+    // `const ` lands before the reported pattern operand — the official
+    // `AddConst` `ConstantPattern` arm: a const-eligible atom takes the
+    // bare insertion; any other expression wraps whole (`const (` +
+    // `)`). The type-literal parens arm reads the resolved type and
+    // stays absent.
+    FixSpec {
+        code: "constant_pattern_with_non_constant_expression",
+        source: FixSource::Semantic,
+        needs_tokens: true,
+        action: FixAction::MultiRewrite(add_const_pattern_entry),
     },
     // `covariant void m() {}` — the modifier plus one character (official
     // `RemoveLexeme.modifier`).
@@ -739,6 +854,19 @@ static FIX_TABLE: &[FixSpec] = &[
             expect: "default",
             replacement: "_",
         },
+    },
+    // The whole directive block re-sorts — the official
+    // `OrganizeImports` face (all four `directives_ordering_*`
+    // spellings): `dart:`/`package:`/other/relative groups, exports
+    // after imports, `part` last, alphabetical inside a group, leading
+    // comments moving with their directive. The unused-import and
+    // shown-name removal legs read the file's diagnostic set and stay
+    // absent; a `library` directive inside the block bounds the face.
+    FixSpec {
+        code: "directives_ordering",
+        source: FixSource::Lint,
+        needs_tokens: true,
+        action: FixAction::MultiRewrite(organize_directives_entry),
     },
     // The reported combinator name leaves its `show`/`hide` clause — with
     // one adjacent comma edge when listed, the whole combinator when lone
@@ -884,6 +1012,16 @@ static FIX_TABLE: &[FixSpec] = &[
         needs_tokens: true,
         action: FixAction::Rewrite(remove_constructor),
     },
+    // The member declaring an `Object` member name goes — its whole line
+    // block, doc comments and annotations with it (official
+    // `RemoveMethodDeclaration`'s `getLinesRange` deletion). The report
+    // anchors the member's name.
+    FixSpec {
+        code: "extension_type_declares_member_of_object",
+        source: FixSource::Semantic,
+        needs_tokens: true,
+        action: FixAction::MultiRewrite(drop_object_member_entry),
+    },
     // `external class C {}` — the modifier plus one character (official
     // `RemoveLexeme.modifier`).
     FixSpec {
@@ -957,6 +1095,18 @@ static FIX_TABLE: &[FixSpec] = &[
         needs_tokens: false,
         action: FixAction::RemoveLexeme("final"),
     },
+    // `late ` lands at the declaration head — before `final`/`var`, else
+    // before the written type, else before the first declarator
+    // (official `AddLate`'s `VariableDeclarationList` arm; the
+    // `CreateConstructorForFinalFields` synthesis legs and the
+    // `MakeVariableNullable` arm stay absent). The report anchors the
+    // variable's name.
+    FixSpec {
+        code: "final_not_initialized",
+        source: FixSource::Semantic,
+        needs_tokens: true,
+        action: FixAction::MultiRewrite(add_late_entry),
+    },
     // The comment rebuilds in the flutter TODO shape — `TODO(author): `
     // with the spacing, case, and backtick normalizations (official
     // `ConvertToFlutterStyleTodo`; a rebuilt comment that still fails the
@@ -1009,6 +1159,17 @@ static FIX_TABLE: &[FixSpec] = &[
         source: FixSource::Semantic,
         needs_tokens: false,
         action: FixAction::Rewrite(drop_import_directive_entry),
+    },
+    // The `: x = expr` initializer moves onto the field's declarator —
+    // the initializer leaves its list (`nodeInList`) and ` = expr` lands
+    // at the field declaration's end (official
+    // `MoveInitializationToFieldDeclaration`; the report anchors the
+    // field name).
+    FixSpec {
+        code: "initialize_in_field_declaration",
+        source: FixSource::Lint,
+        needs_tokens: true,
+        action: FixAction::MultiRewrite(move_init_to_field_entry),
     },
     // `interface mixin M {}` / `interface mixin class C {}` (official
     // `RemoveLexeme.modifier`).
@@ -1214,6 +1375,15 @@ static FIX_TABLE: &[FixSpec] = &[
         needs_tokens: true,
         action: FixAction::Rewrite(bool_comparison),
     },
+    // ` != null` lands at the reported condition's end (official
+    // `AddNeNull`; the `AddAwait.nonBool` arm's resolved-type gate stays
+    // absent). The report anchors the whole condition expression.
+    FixSpec {
+        code: "non_bool_condition",
+        source: FixSource::Semantic,
+        needs_tokens: false,
+        action: FixAction::MultiRewrite(append_ne_null_entry),
+    },
     // The reported `new` becomes `const` (official `UseConst`).
     FixSpec {
         code: "non_const_call_to_literal_constructor",
@@ -1250,6 +1420,26 @@ static FIX_TABLE: &[FixSpec] = &[
         source: FixSource::Lint,
         needs_tokens: true,
         action: FixAction::Rewrite(remove_invocation_entry),
+    },
+    // `late ` lands at the field's declaration head — before
+    // `final`/`var`, else before the written type, else before the
+    // declarator (official `AddLate`; the
+    // `CreateConstructorForFinalFields` and `MakeVariableNullable` arms
+    // stay absent). The report anchors the field's name.
+    FixSpec {
+        code: "not_initialized_non_nullable_instance_field",
+        source: FixSource::Semantic,
+        needs_tokens: true,
+        action: FixAction::MultiRewrite(add_late_entry),
+    },
+    // `late ` lands at the variable's declaration head — the same
+    // `AddLate` `VariableDeclarationList` arm (the `MakeVariableNullable`
+    // arm stays absent). The report anchors the variable's name.
+    FixSpec {
+        code: "not_initialized_non_nullable_variable",
+        source: FixSource::Semantic,
+        needs_tokens: true,
+        action: FixAction::MultiRewrite(add_late_entry),
     },
     // The reported `!` goes (official `RemoveNonNullAssertion` — the
     // operator plus its trailing trivia).
@@ -1491,6 +1681,18 @@ static FIX_TABLE: &[FixSpec] = &[
         source: FixSource::Lint,
         needs_tokens: true,
         action: FixAction::Rewrite(if_null_operators_entry),
+    },
+    // `this.` lands at the parameter's name — its written type drops
+    // when it equals the field's — and the reported `: x = p`
+    // initializer entry or `this.x = p;` body statement goes (official
+    // `ConvertToInitializingFormal`'s pair; the private-field rename
+    // `_x`, doc-comment reference, and extra-reference legs stay
+    // absent). The report anchors the assignment.
+    FixSpec {
+        code: "prefer_initializing_formals",
+        source: FixSource::Lint,
+        needs_tokens: true,
+        action: FixAction::MultiRewrite(convert_to_init_formal_entry),
     },
     FixSpec {
         code: "prefer_inlined_adds",
@@ -1784,6 +1986,17 @@ static FIX_TABLE: &[FixSpec] = &[
         source: FixSource::Semantic,
         needs_tokens: true,
         action: FixAction::Rewrite(drop_combinator_name),
+    },
+    // `await ` lands before the reported miss and `async ` at the
+    // enclosing function's body — the official `AddAsync` default face
+    // (`convertFunctionFromSyncToAsync` plus the `await` insertion; the
+    // return-type rewrite reads the resolved type and stays absent). An
+    // already-`async`/`sync*`/`async*` body refuses.
+    FixSpec {
+        code: "undefined_identifier_await",
+        source: FixSource::Semantic,
+        needs_tokens: true,
+        action: FixAction::MultiRewrite(add_async_await_entry),
     },
     FixSpec {
         code: "undefined_shown_name",
@@ -2217,6 +2430,17 @@ static FIX_TABLE: &[FixSpec] = &[
         needs_tokens: false,
         action: FixAction::Rewrite(drop_shown_name_entry),
     },
+    // The missing URI target is created: an import/export target is born
+    // with the upstream TODO stub, a `part` target with the
+    // `part of '<library>';` head (official `CreateFile` — the cross-file
+    // face the module docs pin; the row's executor offers it only while
+    // the target is absent).
+    FixSpec {
+        code: "uri_does_not_exist",
+        source: FixSource::Semantic,
+        needs_tokens: true,
+        action: FixAction::CreateFile(create_missing_uri_target),
+    },
     // `Container(...)` → `ColoredBox(...)` (official
     // `ReplaceContainerWithColoredBox` — the report sits on the
     // constructor name).
@@ -2228,6 +2452,21 @@ static FIX_TABLE: &[FixSpec] = &[
             expect: "Container",
             replacement: "ColoredBox",
         },
+    },
+    // The reported primary-constructor parameter becomes a declaring
+    // parameter — `final `/`var ` by the field's own keyword — and the
+    // field's lines go; a `this.f` field formal replaces its `this.`
+    // region, a plain parameter assigned by a `: f = p` initializer
+    // inserts the keyword and drops the initializer with the field
+    // (official `ConvertToDeclaringParameter`; the metadata-move,
+    // body-block-assignment, multi-declarator-field, and
+    // constructor-adjacent-field legs stay absent). The report anchors
+    // the parameter's name.
+    FixSpec {
+        code: "use_declaring_parameters",
+        source: FixSource::Lint,
+        needs_tokens: true,
+        action: FixAction::MultiRewrite(convert_to_declaring_param_entry),
     },
     // The short hex literal pads to eight digits — a value re-render, an
     // in-place separator padding, or the `aa_bb_cc` → `00_aa_bb_cc`
@@ -2477,6 +2716,47 @@ pub fn expand(spec: &FixSpec, input: &FixInput<'_>) -> Option<(u32, u32, String)
         } => fix::replace_exact(input.text, &input.range, expect, replacement),
         FixAction::InsertAfter(text) => Some((input.range.end, 0, text.to_owned())),
         FixAction::Rewrite(rewrite) => rewrite(input),
+        FixAction::MultiRewrite(rewrite) => rewrite(input).and_then(|edits| {
+            // The multi face never answers through this single-edit entry;
+            // an executor that forgot `expand_multi` would silently take
+            // the first edit. Refuse rather than half-serve the change.
+            debug_assert!(edits.is_empty(), "MultiRewrite behind expand()");
+            None
+        }),
+        // The cross-file face never answers through this same-file entry —
+        // its edit is addressed to another file. The executors consult
+        // [`expand_create`] first; an executor that skipped it would
+        // silently drop the change, never misaddress it.
+        FixAction::CreateFile(_) => None,
+    }
+}
+
+/// Runs a row's transform like [`expand`], but the multi-edit kinds keep
+/// their full disjoint set — the executors' entry, materializing one row
+/// per edit in the producer's own order. A producer returning an empty
+/// list is a no-op fix and drops.
+#[must_use]
+pub fn expand_multi(spec: &FixSpec, input: &FixInput<'_>) -> Option<Vec<(u32, u32, String)>> {
+    match spec.action {
+        FixAction::MultiRewrite(rewrite) => match rewrite(input)? {
+            edits if edits.is_empty() => None,
+            edits => Some(edits),
+        },
+        _ => expand(spec, input).map(|edit| vec![edit]),
+    }
+}
+
+/// Runs a row's transform when it is a cross-file kind — the created-file
+/// face — answering `(target path, born content)`; `None` for every
+/// same-file kind, so the executors try this first and fall through to
+/// [`expand_multi`]. A `CreateFile` row never serves a same-file edit
+/// ([`expand`] matches no data kind for it), and a same-file kind never
+/// answers here — the two entries partition the action set.
+#[must_use]
+pub fn expand_create(spec: &FixSpec, input: &FixInput<'_>) -> Option<(String, String)> {
+    match spec.action {
+        FixAction::CreateFile(producer) => producer(input),
+        _ => None,
     }
 }
 
@@ -2643,7 +2923,10 @@ mod tests {
         let written_family: &[&str] = &[
             "body_might_complete_normally_nullable",
             "const_eval_method_invocation",
+            "const_initialized_with_non_constant_value",
+            "const_instance_field",
             "const_with_non_const",
+            "constant_pattern_with_non_constant_expression",
             "dead_code",
             "dead_code_catch_following_catch",
             "dead_code_on_catch_subtype",
@@ -2652,21 +2935,27 @@ mod tests {
             "duplicate_import",
             "duplicate_shown_name",
             "extends_non_class",
+            "extension_type_declares_member_of_object",
+            "final_not_initialized",
             "import_of_non_library",
             "invalid_null_aware_operator",
             "invocation_of_non_function_expression",
             "mixin_super_class_constraint_non_interface",
             "missing_default_value_for_parameter",
+            "non_bool_condition",
             "non_const_call_to_literal_constructor",
             "non_constant_list_element",
             "non_constant_map_element",
             "non_constant_set_element",
+            "not_initialized_non_nullable_instance_field",
+            "not_initialized_non_nullable_variable",
             "null_check_always_fails",
             "nullable_type_in_catch_clause",
             "obsolete_colon_for_default_value",
             "override_on_non_overriding_member",
             "type_check_with_null",
             "undefined_hidden_name",
+            "undefined_identifier_await",
             "undefined_shown_name",
             "unnecessary_cast",
             "unnecessary_nan_comparison",
@@ -2684,6 +2973,10 @@ mod tests {
             "unused_element_parameter",
             "unused_field",
         ];
+        // The create-file family: the cross-file face whose official
+        // producer's change targets a file other than the hit file — the
+        // missing URI target the report names.
+        let create_family: &[&str] = &["uri_does_not_exist"];
         let registry = CodeRegistry::builtin();
         for spec in FIX_TABLE {
             match spec.source {
@@ -2698,7 +2991,8 @@ mod tests {
                     assert!(
                         drop_family.contains(&spec.code)
                             || null_check_family.contains(&spec.code)
-                            || written_family.contains(&spec.code),
+                            || written_family.contains(&spec.code)
+                            || create_family.contains(&spec.code),
                         "semantic code {} is outside the engine fix families",
                         spec.code,
                     );
@@ -2732,9 +3026,10 @@ mod tests {
     /// producers code for code: 60 rows, and the three type-dependent
     /// producers (`AddTypeName`, `AddMissingClosureParameters`,
     /// `AddTypeAnnotation`) stay unclaimed. The semantic face holds its own
-    /// count pin: 51 rows over the drop, null-check, and written-surface
-    /// families (the #2069 wave-1 combinator/drop/insert additions
-    /// included).
+    /// count pin: 61 rows over the drop, null-check, and written-surface
+    /// families (the #2069 wave-1 combinator/drop/insert additions, the
+    /// #2070 wave-2 multi-edit faces, and the `uri_does_not_exist`
+    /// create-file face included).
     #[test]
     fn parser_face_covers_the_mechanical_registry() {
         let parser_rows = FIX_TABLE
@@ -2746,7 +3041,7 @@ mod tests {
             .iter()
             .filter(|spec| spec.source == FixSource::Semantic)
             .count();
-        assert_eq!(semantic_rows, 51);
+        assert_eq!(semantic_rows, 61);
         for code in [
             "experiment_not_enabled",
             "missing_identifier",

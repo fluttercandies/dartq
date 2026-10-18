@@ -319,13 +319,20 @@ pub struct Edit {
 /// One materialized fix: the anchored edit plus the human-facing row.
 /// `source` is the row's provenance tag ([`BUILTIN_SOURCE`] or
 /// [`BUILTIN_SEMANTIC_SOURCE`] by construction — the plugin source emits
-/// [`PluginFix`]es).
+/// [`PluginFix`]es). A row whose `target` is `Some` is the cross-file
+/// face ([`crate::fix_table::FixAction::CreateFile`]): its edit anchors
+/// against the target file's text — empty, the file does not exist yet —
+/// not the hit file's, and it never rides the hit file's own edit set.
 #[derive(Debug, Clone)]
 pub struct RuleFix {
     pub rule: &'static str,
     pub message: String,
     pub source: &'static str,
     pub edit: Edit,
+    /// The file this row's edit writes when it is not the hit file — the
+    /// created file's path, lexically normalized. `None` (every same-file
+    /// row) addresses the edit to the hit file itself.
+    pub target: Option<String>,
 }
 
 /// One plugin-proposed change: a titled proposal (the analyzer's
@@ -473,7 +480,11 @@ pub fn declared_plugin_sources(workspace_root: &Path) -> Option<(PathBuf, Vec<De
         .iter()
         .filter_map(|(key, value)| {
             let name = key.as_str()?;
-            if name.eq_ignore_ascii_case("dependency_overrides") {
+            // The upstream key match is exact — `dependencyOverrides` on a
+            // differently-cased spelling is a plugin name, not the
+            // overrides section (parse_model:1561 `pluginName ==
+            // AnalysisOptionsFileKeys.dependencyOverrides`).
+            if name == "dependency_overrides" {
                 return None;
             }
             Some(DeclaredPlugin {
@@ -888,12 +899,12 @@ pub fn collect_set_with_evidence(
         } else {
             run(&parsed.unit(Some(path)), set, unignorable)
         };
-        let mut applied = from_lints(&hits, &text, &parsed.lines, &fuse);
+        let mut applied = from_lints(&hits, &text, &parsed.lines, path, &fuse);
         if fuse.tripped() {
             break 'files;
         }
-        applied.extend(from_semantic(semantic_rows, &text, &parsed.lines, &fuse));
-        applied.extend(from_parser(semantic_rows, &text, &parsed.lines, &fuse));
+        applied.extend(from_semantic(semantic_rows, &text, &parsed.lines, path, &fuse));
+        applied.extend(from_parser(semantic_rows, &text, &parsed.lines, path, &fuse));
         if fuse.tripped() {
             break 'files;
         }
@@ -975,6 +986,7 @@ pub fn collect_set_with_evidence(
                     message: format!("Ignore '{code}' in `analysis_options.yaml`"),
                     source: BUILTIN_IGNORE_SOURCE,
                     edit: anchored_edit(&options_text, &lines, offset, length, &replacement),
+                    target: None,
                 })
             })
             .collect();
@@ -1708,12 +1720,15 @@ pub fn apply(text: &str, edits: &[Edit]) -> (String, Vec<EditOutcome>) {
 /// row, and rules without one never produce an edit; a wired hit whose
 /// slice no longer verifies is dropped rather than patched on faith.
 /// Each hit's expansion routes through the planner fuse's counted step
-/// and the walk stops consuming hits on a spent budget.
+/// and the walk stops consuming hits on a spent budget. The cross-file
+/// rows ([`crate::fix_table::FixAction::CreateFile`]) address their
+/// target instead (`RuleFix::target`), offered only while it is absent.
 #[must_use]
 pub(crate) fn from_lints(
     hits: &[Lint],
     text: &str,
     lines: &LineIndex,
+    path: &Path,
     fuse: &PlannerFuse,
 ) -> Vec<RuleFix> {
     // The structural rewriters verify against the token stream (keyword
@@ -1736,23 +1751,37 @@ pub(crate) fn from_lints(
         if spec.source != FixSource::Lint {
             continue;
         }
-        let Some((offset, length, replacement)) = crate::fix_table::expand(
-            spec,
-            &FixInput {
-                text,
-                range: hit.range.clone(),
-                message: &hit.message,
-                tokens: tokens.as_ref(),
-            },
-        ) else {
+        let input = FixInput {
+            text,
+            range: hit.range.clone(),
+            message: &hit.message,
+            tokens: tokens.as_ref(),
+            path,
+        };
+        if let Some((target, content)) = crate::fix_table::expand_create(spec, &input) {
+            if !Path::new(&target).exists() {
+                rows.push(created_file_row(
+                    rule,
+                    &hit.message,
+                    BUILTIN_SOURCE,
+                    target,
+                    &content,
+                ));
+            }
+            continue;
+        }
+        let Some(edits) = crate::fix_table::expand_multi(spec, &input) else {
             continue;
         };
-        rows.push(RuleFix {
-            rule,
-            message: hit.message.clone(),
-            source: BUILTIN_SOURCE,
-            edit: anchored_edit(text, lines, offset, length, &replacement),
-        });
+        for (offset, length, replacement) in edits {
+            rows.push(RuleFix {
+                rule,
+                message: hit.message.clone(),
+                source: BUILTIN_SOURCE,
+                edit: anchored_edit(text, lines, offset, length, &replacement),
+                target: None,
+            });
+        }
     }
     rows
 }
@@ -1772,12 +1801,14 @@ pub(crate) fn from_semantic(
     diagnostics: &[Diagnostic],
     text: &str,
     lines: &LineIndex,
+    path: &Path,
     fuse: &PlannerFuse,
 ) -> Vec<RuleFix> {
     engine_rows(
         diagnostics,
         text,
         lines,
+        path,
         FixSource::Semantic,
         BUILTIN_SEMANTIC_SOURCE,
         fuse,
@@ -1797,12 +1828,14 @@ pub(crate) fn from_parser(
     diagnostics: &[Diagnostic],
     text: &str,
     lines: &LineIndex,
+    path: &Path,
     fuse: &PlannerFuse,
 ) -> Vec<RuleFix> {
     let mut rows = engine_rows(
         diagnostics,
         text,
         lines,
+        path,
         FixSource::Parser,
         BUILTIN_PARSER_SOURCE,
         fuse,
@@ -1819,11 +1852,14 @@ pub(crate) fn from_parser(
 /// [`from_parser`]: the rows of `source` among `diagnostics`, expanded
 /// through the table and anchored, tagged `provenance`. Each diagnostic's
 /// expansion routes through the planner fuse's counted step and the walk
-/// stops consuming diagnostics on a spent budget.
+/// stops consuming diagnostics on a spent budget. The cross-file rows
+/// ([`crate::fix_table::FixAction::CreateFile`]) address their target
+/// instead (`RuleFix::target`), offered only while it is absent.
 fn engine_rows(
     diagnostics: &[Diagnostic],
     text: &str,
     lines: &LineIndex,
+    path: &Path,
     source: FixSource,
     provenance: &'static str,
     fuse: &PlannerFuse,
@@ -1844,25 +1880,60 @@ fn engine_rows(
         if spec.source != source {
             continue;
         }
-        let Some((offset, length, replacement)) = crate::fix_table::expand(
-            spec,
-            &FixInput {
-                text,
-                range: d.range.offset..d.range.offset + d.range.length,
-                message: &d.message,
-                tokens: tokens.as_ref(),
-            },
-        ) else {
+        let input = FixInput {
+            text,
+            range: d.range.offset..d.range.offset + d.range.length,
+            message: &d.message,
+            tokens: tokens.as_ref(),
+            path,
+        };
+        if let Some((target, content)) = crate::fix_table::expand_create(spec, &input) {
+            if !Path::new(&target).exists() {
+                rows.push(created_file_row(
+                    d.code.name,
+                    &d.message,
+                    provenance,
+                    target,
+                    &content,
+                ));
+            }
+            continue;
+        }
+        let Some(edits) = crate::fix_table::expand_multi(spec, &input) else {
             continue;
         };
-        rows.push(RuleFix {
-            rule: d.code.name,
-            message: d.message.to_string(),
-            source: provenance,
-            edit: anchored_edit(text, lines, offset, length, &replacement),
-        });
+        for (offset, length, replacement) in edits {
+            rows.push(RuleFix {
+                rule: d.code.name,
+                message: d.message.to_string(),
+                source: provenance,
+                edit: anchored_edit(text, lines, offset, length, &replacement),
+                target: None,
+            });
+        }
     }
     rows
+}
+
+/// The cross-file row: the created file's content anchored at offset 0 of
+/// its empty text, the row addressed to the target ([`RuleFix::target`])
+/// — the shape the apply face materializes by writing the patched empty
+/// buffer, which is the file coming into existence.
+fn created_file_row(
+    rule: &'static str,
+    message: &str,
+    provenance: &'static str,
+    target: String,
+    content: &str,
+) -> RuleFix {
+    let lines = LineIndex::new("");
+    RuleFix {
+        rule,
+        message: message.to_owned(),
+        source: provenance,
+        edit: anchored_edit("", &lines, 0, 0, content),
+        target: Some(target),
+    }
 }
 
 /// Maps one plugin's `request/fixes` reply to anchored rows, priority
@@ -5328,14 +5399,116 @@ pub(crate) fn function_declaration(
 }
 
 // ---------------------------------------------------------------------------
-// Breadth rewriters
+// Semantic source: the cross-file create-file family
 //
-// The table's mechanically-provable additions: each rewrites the span its
-// diagnostic reports into the official producer's edit, re-verifying the
-// reported shape first — an unverifiable hit drops, never patches on
-// faith. Text-verified faces read the slice; structural faces read the
-// token stream.
+// The one face whose official change targets a file other than the hit
+// file: the missing URI target is created, not patched in place. The
+// producer rebuilds the official `CreateFile` shape (upstream Dart SDK
+// source, pkg/analysis_server/lib/src/services/correction/dart/
+// create_file.dart) from the row's own evidence and drops where the
+// evidence cannot prove it — an unprovable hit never invents a file.
 // ---------------------------------------------------------------------------
+
+/// `uri_does_not_exist`'s created-file edit: the missing target of an
+/// `import`/`export` is born with the upstream TODO stub, the missing
+/// target of a `part` with the `part of '<library>';` head — inserted at
+/// offset 0 of the target's empty text. The evidence must prove the face:
+/// the span slices to the directive's single plain string literal whose
+/// inner text the message quotes (`node is SimpleStringLiteral`), the
+/// directive keyword stands directly before it (`NamespaceDirective` /
+/// `PartDirective` are the official parent dispatch's two arms), and the
+/// URI is a relative `.dart` path the hit file's directory can name. The
+/// resolver's-world faces drop: `package:`/`dart:` and every other scheme
+/// URI, `part of` (`PartOfDirective`), conditional-import arms, escaped
+/// and adjacent-string literals.
+pub(crate) fn create_missing_uri_target(input: &FixInput<'_>) -> Option<(String, String)> {
+    let tokens = input.tokens?;
+    let (first, last) = hit_tokens(tokens, &input.range)?;
+    // One plain literal: a concatenation or interpolation span is never
+    // the `SimpleStringLiteral` the official producer guards on.
+    if first != last {
+        return None;
+    }
+    // The directive keyword stands directly before the URI — trivia never
+    // reaches the token stream, and directives carry no tokens between
+    // keyword and URI.
+    match kind_of(tokens, first.checked_sub(1)?)? {
+        TokenKind::Keyword(Keyword::Import)
+        | TokenKind::Keyword(Keyword::Export)
+        | TokenKind::Keyword(Keyword::Part) => {}
+        _ => return None,
+    }
+    // The quoted URI must be the literal's inner text — the plain-literal
+    // proof, and the decoded-URI read in one comparison (an escaped or
+    // interpolated literal decodes to something else and drops).
+    let uri = quoted_uri(input.text, input.range.clone(), input.message)?;
+    // A relative `.dart` path only: scheme URIs resolve through the
+    // resolver's package and SDK world the row's evidence does not carry
+    // (the known-diff face), and `isDart` is the official gate on the
+    // target the change would create.
+    if uri.contains(':') || !uri.ends_with(".dart") {
+        return None;
+    }
+    let dir = input.path.parent()?;
+    let target = dartq_pub::normalize(&dir.join(uri));
+    let content = match kind_of(tokens, first - 1)? {
+        // The official stub, verbatim — no trailing newline.
+        TokenKind::Keyword(Keyword::Import | Keyword::Export) => {
+            "// TODO Implement this library.".to_owned()
+        }
+        // `part of '<library-relative-to-the-part-file's-dir>';` + the
+        // builder's blank-line tail — URIs carry `/` on every platform.
+        TokenKind::Keyword(Keyword::Part) => {
+            let library = dartq_pub::normalize(input.path);
+            let from = target.parent()?;
+            format!("part of '{}';\n\n", relative_uri(from, &library)?)
+        }
+        _ => return None,
+    };
+    Some((target.display().to_string(), content))
+}
+
+/// The URI the `uri_does_not_exist` message quotes —
+/// `Target of URI doesn't exist: '<uri>'.` — accepted only when it equals
+/// the hit span's inner text (a single quoted literal, quotes stripped).
+fn quoted_uri<'a>(text: &'a str, range: core::ops::Range<u32>, message: &str) -> Option<&'a str> {
+    let rest = message.strip_suffix("'.")?;
+    let quoted = &rest[rest.rfind('\'')? + 1..];
+    let literal = &text[utf16_offset_to_byte(text, range.start)..utf16_offset_to_byte(text, range.end)];
+    let quote = literal.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let inner = literal.strip_prefix(quote)?.strip_suffix(quote)?;
+    (inner == quoted && !inner.is_empty()).then_some(inner)
+}
+
+/// `to_file` relative to `from_dir`, `/`-separated — the official
+/// `pathContext.relative(...)` + `split/join('/')` shape. Both sides
+/// share the run's path spelling, so the component walk is exact.
+fn relative_uri(from_dir: &Path, to_file: &Path) -> Option<String> {
+    let from: Vec<_> = from_dir.components().collect();
+    let to: Vec<_> = to_file.components().collect();
+    let shared = from
+        .iter()
+        .zip(to.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (ups, downs) = (&from[shared..], &to[shared..]);
+    let mut out = String::new();
+    for _ in ups {
+        out.push_str("../");
+    }
+    for (index, component) in downs.iter().enumerate() {
+        if index > 0 {
+            out.push('/');
+        }
+        out.push_str(component.as_os_str().to_str()?);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+
 
 /// Whether the slice is an identifier shape: non-empty, not digit-led, all
 /// Dart word characters (the drop-family rewrites' name proof).
@@ -11238,32 +11411,39 @@ fn segment_text(text: &str, tokens: &TokenTable, range: (usize, usize)) -> Strin
 fn enclosing_class_body(tokens: &TokenTable, at: usize) -> Option<(usize, usize)> {
     let mut depth = 0u32;
     let mut cursor = at;
-    let body = loop {
-        cursor = cursor.checked_sub(1)?;
-        match kind_of(tokens, cursor)? {
-            TokenKind::CloseCurly => depth += 1,
-            TokenKind::OpenCurly => {
-                if depth == 0 {
-                    break cursor;
+    'outer: loop {
+        let body = loop {
+            cursor = cursor.checked_sub(1)?;
+            match kind_of(tokens, cursor)? {
+                TokenKind::CloseCurly => depth += 1,
+                TokenKind::OpenCurly => {
+                    if depth == 0 {
+                        break cursor;
+                    }
+                    depth -= 1;
                 }
-                depth -= 1;
+                _ => {}
             }
-            _ => {}
+        };
+        // Confirm the `{` heads a class-like declaration: scan its header
+        // for the keyword. A method or block `{` fails the check — keep
+        // walking out past it (its matching `}` lies after `at`, so the
+        // depth count is untouched).
+        let mut head = body;
+        while let Some(prev) = head.checked_sub(1) {
+            match kind_of(tokens, prev) {
+                Some(TokenKind::Keyword(
+                    Keyword::Class | Keyword::Enum | Keyword::Mixin | Keyword::Extension,
+                )) => return Some((body, tokens.matching_end(body)?)),
+                Some(TokenKind::Semicolon | TokenKind::CloseCurly) => {
+                    cursor = body;
+                    continue 'outer;
+                }
+                _ => head = prev,
+            }
         }
-    };
-    // Confirm the `{` heads a class-like declaration: scan its header for
-    // the keyword.
-    let mut head = body;
-    while let Some(prev) = head.checked_sub(1) {
-        match kind_of(tokens, prev) {
-            Some(TokenKind::Keyword(
-                Keyword::Class | Keyword::Enum | Keyword::Mixin | Keyword::Extension,
-            )) => return Some((body, tokens.matching_end(body)?)),
-            Some(TokenKind::Semicolon | TokenKind::CloseCurly) => return None,
-            _ => head = prev,
-        }
+        return None;
     }
-    None
 }
 
 /// The member boundaries inside a class-like body: `(start, end)` token
@@ -12438,16 +12618,1579 @@ fn params_text(tokens: &TokenTable, text: &str, range: core::ops::Range<usize>) 
 }
 
 // ---------------------------------------------------------------------------
-// Ignore-diagnostic fixes
+// Multi-edit producers — the M-band disjoint-edit face
 //
-// The three text-surgery producers the official registry registers for
-// every diagnostic (upstream Dart SDK source, pkg/analysis_server_plugin,
-// ignore_diagnostic.dart): `// ignore:` on the line before the hit,
-// `// ignore_for_file:` beside the file's header, and an
-// `analyzer: errors: <code>: ignore` entry in the governing
-// analysis_options.yaml. Each offered row is an anchored insertion (or
-// options-file edit) the caller can apply like any other edit.
+// The producers below answer [`crate::fix_table::FixAction::MultiRewrite`]:
+// several disjoint same-file spans, verified together and offered whole or
+// not at all. The applier's snapshot pass keeps a change coherent — every
+// span locates against the buffer as it stood at birth — so the producers
+// never order their edits against each other's writes.
 // ---------------------------------------------------------------------------
+
+/// `const_instance_field`: `static ` lands at the member's head — the
+/// official `AddStatic` insertion at
+/// `declaration.firstTokenAfterCommentAndMetadata.offset` (the member's
+/// own first token, annotations and doc comments left above). The report
+/// anchors the `const` keyword itself; the member head is the contiguous
+/// modifier run's first token — `const`/`late`/`var`/`final`/`covariant`
+/// — walking back while such a modifier stands.
+pub(crate) fn add_static_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u32, String)>> {
+    let tokens = input.tokens?;
+    let mut head = token_starting_at(tokens, input.range.start)?;
+    while let Some(prev) = head.checked_sub(1) {
+        match kind_of(tokens, prev)? {
+            TokenKind::Keyword(
+                Keyword::Const | Keyword::Late | Keyword::Var | Keyword::Final | Keyword::Covariant,
+            ) => head = prev,
+            _ => break,
+        }
+    }
+    Some(vec![(tokens.get(head)?.utf16_offset, 0, "static ".to_owned())])
+}
+
+/// The head of the variable declaration list owning the reported name —
+/// the insertion-target walk the `AddLate`/`RemoveConst` faces share:
+/// from the hit's first token back over the list's modifiers and written
+/// type (the official `VariableDeclarationList`/`keyword`/`type` read).
+/// Returns `(list_head, type_head, keyword)` — the declaration's first
+/// token, the written type's first token when the list is typed, and the
+/// `var`/`final`/`const`/`late` keyword's index when one heads it. The
+/// walk stops at the declaration's boundaries — `,`, `;`, `=`, the
+/// statement openers — so a `for`-part or parameter list never swallows
+/// the report's own declarator.
+fn variable_list_head(
+    tokens: &TokenTable,
+    text: &str,
+    name_index: usize,
+) -> Option<(usize, Option<usize>, Option<usize>)> {
+    let _ = text;
+    let head = name_index;
+    // The list head: modifiers and the written type sit before the
+    // declarator, in that order — keep walking while the predecessor is a
+    // declaration keyword or a type-shaped token run (identifier with its
+    // `.`/`<…>`/`?` tail), remembering where each run started.
+    let mut list_head = head;
+    let mut keyword = None;
+    let mut type_run_start = None;
+    loop {
+        let Some(prev) = list_head.checked_sub(1) else {
+            break;
+        };
+        match kind_of(tokens, prev)? {
+            TokenKind::Keyword(
+                Keyword::Var | Keyword::Final | Keyword::Const | Keyword::Late,
+            ) => {
+                keyword = Some(prev);
+                list_head = prev;
+            }
+            TokenKind::Identifier
+            | TokenKind::Keyword(Keyword::Void | Keyword::Dynamic)
+            | TokenKind::Question
+            | TokenKind::Period => {
+                type_run_start = Some(prev);
+                list_head = prev;
+            }
+            TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt => {
+                let open = angle_group_start(tokens, prev)?;
+                type_run_start = Some(open);
+                list_head = open;
+            }
+            _ => break,
+        }
+    }
+    // A bare `a.b`-shaped walk can land on a statement keyword's operand —
+    // `return x`, `case y` — or a `;`-adjacent name that is no type at
+    // all. The declaration context never has one of those tokens
+    // immediately before its head.
+    if let Some(start) = type_run_start
+        && keyword.is_none()
+        && let Some(prev) = start.checked_sub(1)
+        && matches!(
+            kind_of(tokens, prev),
+            Some(TokenKind::Keyword(
+                Keyword::Return
+                    | Keyword::Case
+                    | Keyword::In
+                    | Keyword::Is
+                    | Keyword::As
+                    | Keyword::Throw
+                    | Keyword::Extends
+                    | Keyword::Implements
+                    | Keyword::With
+                    | Keyword::On
+                    | Keyword::Import
+                    | Keyword::Export
+            )) | Some(TokenKind::Semicolon | TokenKind::Comma | TokenKind::Eq)
+        )
+    {
+        type_run_start = None;
+        list_head = head;
+    }
+    Some((list_head, type_run_start, keyword))
+}
+
+/// `final_not_initialized` / `not_initialized_non_nullable_instance_field`
+/// / `not_initialized_non_nullable_variable`: `late ` lands at the
+/// declaration head — the official `AddLate`'s `VariableDeclarationList`
+/// face: before the list's keyword (`final int x` → `late final int x`),
+/// else before the written type (`int x` → `late int x`), else before the
+/// first declarator (`x = …` → `late x = …`), and never at a `const`
+/// head. The `MakeVariableNullable` leg — `int x` → `int? x` — is the
+/// second official arm; one fix serves one rewrite, so the row carries
+/// the `AddLate` arm and names the nullable arm absent. The report
+/// anchors the field's or variable's name.
+pub(crate) fn add_late_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u32, String)>> {
+    let tokens = input.tokens?;
+    let (first, _) = hit_tokens(tokens, &input.range)?;
+    let (head, type_head, keyword) = variable_list_head(tokens, input.text, first)?;
+    // The `const` head refuses — `late const` is no legal declaration.
+    if keyword.is_some_and(|k| kind_of(tokens, k) == Some(TokenKind::Keyword(Keyword::Const))) {
+        return None;
+    }
+    // Already `late` is the shape the diagnostic cannot fire on.
+    if keyword.is_some_and(|k| kind_of(tokens, k) == Some(TokenKind::Keyword(Keyword::Late))) {
+        return None;
+    }
+    let at = keyword.or(type_head).unwrap_or(head);
+    Some(vec![(tokens.get(at)?.utf16_offset, 0, "late ".to_owned())])
+}
+
+/// `non_bool_condition`: ` != null` lands at the reported expression's
+/// end (the official `AddNeNull` insertion at `problemMessage.offset +
+/// length`; the `AddAwait.nonBool` arm's resolved-type gate reads the
+/// expression's static type and stays absent). The report anchors the
+/// whole condition expression.
+pub(crate) fn append_ne_null_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u32, String)>> {
+    Some(vec![(input.range.end, 0, " != null".to_owned())])
+}
+
+/// `extension_type_declares_member_of_object`: the member's lines go —
+/// the official `RemoveMethodDeclaration` `getLinesRange` deletion over
+/// the member (doc comments and annotations ride, the
+/// [`member_block_start`] walk). The report anchors the member's name.
+pub(crate) fn drop_object_member_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u32, String)>> {
+    let (offset, length, replacement) = remove_override_member(input)?;
+    Some(vec![(offset, length, replacement)])
+}
+
+/// `const_initialized_with_non_constant_value`: the `const` drops — the
+/// official `RemoveConst`/`RemoveNew` face over the report's owning
+/// declaration. A `const`-headed variable list rewrites `const` → `final`
+/// (upstream's `VariableDeclarationList` arm — the declarator's value is
+/// no longer const, but the declaration stays assign-once); a `const` or
+/// `new` keyword heading the reported creation drops with its trivia run
+/// (`startStart(keyword, next)`, comments included). The push-`const`-
+/// down legs (the `_PushConstVisitor` rewrite over the sibling diagnostic
+/// set) read the file's diagnostic inventory the row cannot see — absent.
+/// The report anchors the non-constant value expression.
+pub(crate) fn drop_head_const_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u32, String)>> {
+    let tokens = input.tokens?;
+    let text = input.text;
+    let (first, _) = hit_tokens(tokens, &input.range)?;
+    // The owning list's head: the report sits on the value expression,
+    // so the `=` boundary inside `variable_list_head` stops at the name.
+    // Walk the declarator first — the name is the last identifier before
+    // the `=` (a `const C()` creation's `const` is the value's own head,
+    // handled below).
+    let declarator = {
+        let mut cursor = first;
+        loop {
+            let Some(prev) = cursor.checked_sub(1) else {
+                return None;
+            };
+            match kind_of(tokens, prev)? {
+                TokenKind::Identifier | TokenKind::Keyword(_) => cursor = prev,
+                TokenKind::Period | TokenKind::Question => cursor = prev,
+                // The `=` before the value — the declarator is the name
+                // immediately before it.
+                TokenKind::Eq => break prev.checked_sub(1)?,
+                TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt => {
+                    cursor = angle_group_start(tokens, prev)?;
+                }
+                TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                    cursor = matching_begin(tokens, prev)?;
+                }
+                _ => break first,
+            }
+        }
+    };
+    let (head, type_head, keyword) = variable_list_head(tokens, text, declarator)?;
+    if let Some(kw) = keyword {
+        match kind_of(tokens, kw)? {
+            // `const x = v` → `final x = v` (the upstream list arm).
+            TokenKind::Keyword(Keyword::Const) => {
+                let start = tokens.get(kw)?.utf16_offset;
+                let end = utf16_end(tokens, text, kw)?;
+                return Some(vec![(start, end - start, "final".to_owned())]);
+            }
+            // `var`/`final`-headed lists never carry the const the
+            // diagnostic reports — the keyword sits on the creation
+            // itself; fall through to the `new`/`const` hunt below.
+            _ => {}
+        }
+    }
+    // A `const`/`new` heading the reported creation: `const C(...)`,
+    // `const <T>[...]`, `new C(...)`. The report anchors the whole
+    // creation — the keyword is its first token, or stands one modifier
+    // back when the report opens inside the creation (`const <T>[` — the
+    // report's head can be the `<`).
+    let _ = (head, type_head);
+    let expr_head = match kind_of(tokens, first)? {
+        TokenKind::Keyword(Keyword::Const | Keyword::New) => first,
+        _ => {
+            let mut head = first;
+            loop {
+                match kind_of(tokens, head.checked_sub(1)?)? {
+                    TokenKind::Identifier
+                    | TokenKind::Period
+                    | TokenKind::Question
+                    | TokenKind::Keyword(Keyword::Void | Keyword::Dynamic) => head -= 1,
+                    TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt => {
+                        head = angle_group_start(tokens, head - 1)?;
+                    }
+                    TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                        head = matching_begin(tokens, head - 1)?;
+                    }
+                    _ => break,
+                }
+            }
+            head
+        }
+    };
+    match kind_of(tokens, expr_head)? {
+        TokenKind::Keyword(Keyword::Const | Keyword::New) => {
+            // `startStart(keyword, keyword.next!)` — the trivia run
+            // between two real tokens rides (comments included).
+            let start = tokens.get(expr_head)?.utf16_offset;
+            let end = tokens.get(expr_head + 1)?.utf16_offset;
+            Some(vec![(start, end.checked_sub(start)?, String::new())])
+        }
+        _ => {
+            let prev = expr_head.checked_sub(1)?;
+            match kind_of(tokens, prev)? {
+                TokenKind::Keyword(Keyword::Const | Keyword::New) => {
+                    let start = tokens.get(prev)?.utf16_offset;
+                    let end = tokens.get(expr_head)?.utf16_offset;
+                    Some(vec![(start, end.checked_sub(start)?, String::new())])
+                }
+                _ => None,
+            }
+        }
+    }
+}
+
+/// `constant_pattern_with_non_constant_expression`: `const ` lands before
+/// the reported operand — the official `AddConst` `ConstantPattern` arm.
+/// A const-eligible single operand (literal, identifier, named reference,
+/// an already-parenthesized expression's contents) takes the bare `const `
+/// insertion; any other expression shape wraps whole — `const (` before
+/// and `)` after (upstream `addParensAndConst`). The `canBeConst` gate
+/// upstream reads is the operand's own shape; the producer's type-literal
+/// parens arm needs the resolved-type answer and stays absent.
+pub(crate) fn add_const_pattern_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u32, String)>> {
+    let tokens = input.tokens?;
+    let (first, last) = hit_tokens(tokens, &input.range)?;
+    // A single-atom operand: a literal, identifier, `null`/`true`/`false`,
+    // a named type (`a.B`), a qualified reference — takes `const `.
+    let atom = if first == last {
+        matches!(
+            kind_of(tokens, first)?,
+            TokenKind::Identifier
+                | TokenKind::Int
+                | TokenKind::Double
+                | TokenKind::Hexadecimal
+                | TokenKind::String
+                | TokenKind::Keyword(
+                    Keyword::Null
+                        | Keyword::True
+                        | Keyword::False
+                        | Keyword::This
+                        | Keyword::Super
+                )
+        )
+    } else {
+        // `a.b` / `a<T>` / `a.b<T>`-shaped reference runs stay atomic;
+        // anything with an operator at depth 0 wraps.
+        let mut atomic = true;
+        let mut cursor = first;
+        while cursor <= last {
+            match kind_of(tokens, cursor)? {
+                TokenKind::Identifier
+                | TokenKind::Period
+                | TokenKind::Question
+                | TokenKind::Keyword(Keyword::Void | Keyword::Dynamic) => cursor += 1,
+                TokenKind::Lt => cursor = angle_group_end(tokens, cursor)? + 1,
+                _ => {
+                    atomic = false;
+                    break;
+                }
+            }
+        }
+        atomic
+    };
+    if atom {
+        return Some(vec![(input.range.start, 0, "const ".to_owned())]);
+    }
+    Some(vec![
+        (input.range.start, 0, "const (".to_owned()),
+        (input.range.end, 0, ")".to_owned()),
+    ])
+}
+
+/// `undefined_identifier_await`: `async ` lands at the enclosing
+/// function's body — the official `AddAsync` default face
+/// (`convertFunctionFromSyncToAsync`'s `body.offset` insertion; the
+/// `await` lexeme is already written — the diagnostic is it parsing as
+/// an identifier, so the fix carries no `await` insertion). The
+/// return-type rewrite (`Future<…>`-wrapping) reads the resolved type
+/// and stays absent; an already-`async`/`sync*`/`async*` body refuses
+/// (the producer's `body.keyword == null` gate). The report anchors the
+/// `await` identifier miss.
+pub(crate) fn add_async_await_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u32, String)>> {
+    let tokens = input.tokens?;
+    let (first, _) = hit_tokens(tokens, &input.range)?;
+    // The enclosing function body: the nearest `{` or `=>` opener the
+    // backward walk meets at a boundary — `(` groups skip whole so a
+    // nested call's argument list never reads as the body.
+    let mut cursor = first;
+    let body_head = loop {
+        cursor = cursor.checked_sub(1)?;
+        match kind_of(tokens, cursor)? {
+            TokenKind::OpenCurly => break cursor,
+            TokenKind::Function => break cursor,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                cursor = matching_begin(tokens, cursor)?;
+            }
+            // A statement boundary behind the body opener ends the hunt —
+            // the report's expression has no enclosing function body.
+            TokenKind::Semicolon | TokenKind::Eof => return None,
+            _ => {}
+        }
+    };
+    // The body's own modifiers sit immediately before its opener
+    // (`async`/`sync*`); the `*` of the generator marks belongs to the
+    // keyword's token in this stream (`async*` is `async` + `*`). An
+    // already-marked body refuses.
+    if kind_of(tokens, body_head.checked_sub(1)?) == Some(TokenKind::Star)
+        || matches!(
+            kind_of(tokens, body_head.checked_sub(1)?),
+            Some(TokenKind::Keyword(Keyword::Async | Keyword::Sync))
+        )
+    {
+        return None;
+    }
+    // `addInsertion(body.offset, …)` — a ` ` lead when the body opener
+    // fuses with the previous token (`f()=>` writes ` async `).
+    let at = tokens.get(body_head)?.utf16_offset;
+    let fused =
+        body_head > 0 && utf16_end(tokens, input.text, body_head - 1)? == at;
+    let text = if fused { " async " } else { "async " };
+    Some(vec![(at, 0, text.to_owned())])
+}
+
+// ---------------------------------------------------------------------------
+// The lint face's disjoint producers (the M-band constructor and directive
+// rows)
+// ---------------------------------------------------------------------------
+
+/// One formal parameter's token span inside a `(`…`)` list — the
+/// `(start, end)` run between the group's depth-0 commas (the default
+/// value's `=`/`:` tail rides the run). `list` is the `(` index.
+fn formal_spans(tokens: &TokenTable, list: usize) -> Option<Vec<(usize, usize)>> {
+    let close = tokens.matching_end(list)?;
+    let mut spans = Vec::new();
+    let mut start = list + 1;
+    let mut cursor = list + 1;
+    while cursor < close {
+        match kind_of(tokens, cursor)? {
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                cursor = tokens.matching_end(cursor)?;
+            }
+            TokenKind::Lt => {
+                cursor = angle_group_end(tokens, cursor)?;
+            }
+            TokenKind::Comma => {
+                spans.push((start, cursor));
+                start = cursor + 1;
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    if start < close {
+        spans.push((start, close));
+    }
+    Some(spans)
+}
+
+/// The parameter name's token index inside one formal span — the span's
+/// last identifier before an optional `:`/`=` default tail (the named
+/// parameter's `required`, type, and `covariant` lead it; the `this.` /
+/// `super.` receiver's own name side is still the parameter name).
+fn formal_name_token(tokens: &TokenTable, text: &str, span: (usize, usize)) -> Option<usize> {
+    let mut end = span.1;
+    // The default tail (`= expr` / `: expr`) is not part of the
+    // declaration shape — walk it off at depth 0 of the span.
+    let mut cursor = span.0;
+    let mut depth = 0u32;
+    while cursor < end {
+        match kind_of(tokens, cursor)? {
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth = depth.checked_sub(1)?;
+            }
+            TokenKind::Eq | TokenKind::Colon if depth == 0 => {
+                end = cursor;
+                break;
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    let mut name = None;
+    let mut cursor = span.0;
+    while cursor < end {
+        if matches!(
+            kind_of(tokens, cursor),
+            Some(TokenKind::Identifier | TokenKind::Keyword(_))
+        ) && !matches!(
+            kind_of(tokens, cursor),
+            Some(TokenKind::Keyword(
+                Keyword::Required
+                    | Keyword::Covariant
+                    | Keyword::Final
+                    | Keyword::Var
+                    | Keyword::This
+                    | Keyword::Super
+                    | Keyword::Void
+                    | Keyword::Dynamic
+            ))
+        ) {
+            name = Some(cursor);
+        }
+        cursor += 1;
+    }
+    let _ = text;
+    name
+}
+
+/// The `(` list of the constructor owning the reported initializer or
+/// body assignment — walking back from the hit over the `:`-list entries
+/// or the body's own text to the `)` closing the parameter list, then its
+/// `(`.
+fn constructor_params_list(tokens: &TokenTable, at: usize) -> Option<usize> {
+    let mut cursor = at;
+    loop {
+        // A candidate `(`: constructor parameters are followed by `:`,
+        // `{`, `=>`, or `;`.
+        if kind_of(tokens, cursor)? == TokenKind::OpenParen {
+            let close = tokens.matching_end(cursor)?;
+            match kind_of(tokens, close + 1)? {
+                TokenKind::Colon
+                | TokenKind::OpenCurly
+                | TokenKind::Function
+                | TokenKind::Semicolon => return Some(cursor),
+                _ => {}
+            }
+        }
+        match kind_of(tokens, cursor)? {
+            TokenKind::CloseParen | TokenKind::CloseCurly | TokenKind::CloseSquare => {
+                cursor = matching_begin(tokens, cursor)?;
+            }
+            TokenKind::Semicolon | TokenKind::Eof => return None,
+            _ => cursor = cursor.checked_sub(1)?,
+        }
+    }
+}
+
+/// The enclosing class body's field member with the declarator `name` —
+/// `(member, declarator_name_token)`: the `;`-terminated member whose
+/// depth-0 declarator list contains `name` (a `T x = e, y` group reports
+/// each declarator). The `name` token must be a declarator head —
+/// followed at its own level by `=`, `,`, or `;`.
+fn field_member_named<'m>(
+    tokens: &TokenTable,
+    text: &str,
+    members: &'m [(usize, usize)],
+    name: &str,
+) -> Option<((usize, usize), usize)> {
+    for &member in members {
+        let (start, end) = member;
+        // A `this : …` primary-body row or a constructor (name followed
+        // by `(`) is no field declaration — the declarator hunt below
+        // would read the `:`-entry names as fields.
+        if matches!(
+            kind_of(tokens, start),
+            Some(TokenKind::Keyword(Keyword::This | Keyword::Super))
+        ) {
+            continue;
+        }
+        let mut cursor = start;
+        while cursor < end {
+            match kind_of(tokens, cursor)? {
+                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                    cursor = tokens.matching_end(cursor)?;
+                }
+                TokenKind::Colon => {
+                    // A `:` before any match marks the row a
+                    // constructor's initializer list — skip it.
+                    break;
+                }
+                TokenKind::Lt => {
+                    cursor = angle_group_end(tokens, cursor)?;
+                }
+                TokenKind::Identifier | TokenKind::Keyword(_)
+                    if tokens.lexeme(text, cursor) == name =>
+                {
+                    match kind_of(tokens, cursor + 1)? {
+                        TokenKind::Eq | TokenKind::Comma | TokenKind::Semicolon => {
+                            return Some((member, cursor));
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+    }
+    None
+}
+
+/// The `nodeInList` deletion range for entry `index` inside a
+/// comma-separated list — the official `range.nodeInList` shape the
+/// initializer and parameter removals share: a non-last entry cuts
+/// `startStart(entry, next)` (the next entry's own start bounds the cut,
+/// comma and gap included); the last entry cuts `endEnd(prev, entry)`
+/// (the previous entry's end through this entry's end).
+fn node_in_list_cut(
+    tokens: &TokenTable,
+    text: &str,
+    list: &[(usize, usize)],
+    index: usize,
+) -> Option<(u32, u32, String)> {
+    let (start, end) = if index + 1 < list.len() {
+        (
+            tokens.get(list[index].0)?.utf16_offset,
+            tokens.get(list[index + 1].0)?.utf16_offset,
+        )
+    } else {
+        let prev_end = utf16_end(tokens, text, list[index].0.checked_sub(1)?)?;
+        let this_end = utf16_end(tokens, text, list[index].1.checked_sub(1)?)?;
+        (prev_end, this_end)
+    };
+    Some((start, end.checked_sub(start)?, String::new()))
+}
+
+/// The `(` list's own entries for `node_in_list_cut` — a
+/// [`formal_spans`-style] split over an arbitrary `(start, close)` token
+/// range split at its depth-0 commas (the `:`-initializer list shape).
+fn comma_entries(
+    tokens: &TokenTable,
+    from: usize,
+    to: usize,
+) -> Option<Vec<(usize, usize)>> {
+    let mut entries = Vec::new();
+    let mut start = from;
+    let mut cursor = from;
+    while cursor < to {
+        match kind_of(tokens, cursor)? {
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                cursor = tokens.matching_end(cursor)?;
+            }
+            TokenKind::Lt => {
+                cursor = angle_group_end(tokens, cursor)?;
+            }
+            TokenKind::Comma => {
+                entries.push((start, cursor));
+                start = cursor + 1;
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    if start < to {
+        entries.push((start, to));
+    }
+    Some(entries)
+}
+
+/// `initialize_in_field_declaration`: the `: x = expr` initializer moves
+/// to the field's declarator — the official
+/// `MoveInitializationToFieldDeclaration` pair: the initializer leaves
+/// its list (`nodeInList`) and ` = expr` lands at the field declaration's
+/// end (the field must declare `x` without an initializer). The report
+/// anchors the initializer's field name.
+pub(crate) fn move_init_to_field_entry(
+    input: &FixInput<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
+    let tokens = input.tokens?;
+    let text = input.text;
+    let (first, _) = hit_tokens(tokens, &input.range)?;
+    // The `:` heading the initializer list — the report's own name sits
+    // inside the list: walk back over the entry tokens to it.
+    let colon = {
+        let mut cursor = first;
+        loop {
+            cursor = cursor.checked_sub(1)?;
+            match kind_of(tokens, cursor)? {
+                TokenKind::Colon => break cursor,
+                TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                    cursor = matching_begin(tokens, cursor)?;
+                }
+                TokenKind::Semicolon
+                | TokenKind::OpenCurly
+                | TokenKind::Eof => return None,
+                _ => {}
+            }
+        }
+    };
+    // The `=` after the reported name, then the expression through the
+    // next `,` or the list's end (the body's `{`, `=>`, or `;`).
+    let eq = first + 1;
+    if kind_of(tokens, eq)? != TokenKind::Eq {
+        return None;
+    }
+    let (body_open, body_close) = enclosing_class_body(tokens, first)?;
+    // The reported entry's expression runs to the next `,` or the list's
+    // end; the initializer list itself runs to the constructor body's
+    // `{`, `=>`, or `;`.
+    let mut expr_end = eq + 1;
+    let mut depth = 0u32;
+    let entry_end = loop {
+        match kind_of(tokens, expr_end)? {
+            TokenKind::OpenCurly | TokenKind::Function | TokenKind::Semicolon | TokenKind::Eof
+            | TokenKind::Comma
+                if depth == 0 =>
+            {
+                break expr_end;
+            }
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth = depth.checked_sub(1)?;
+            }
+            _ => {}
+        }
+        expr_end += 1;
+    };
+    let mut list_end = entry_end;
+    let mut depth = 0u32;
+    loop {
+        match kind_of(tokens, list_end)? {
+            TokenKind::OpenCurly | TokenKind::Function | TokenKind::Semicolon | TokenKind::Eof
+                if depth == 0 =>
+            {
+                break;
+            }
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly
+            | TokenKind::StringInterpolationExpression => depth += 1,
+            TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                depth = depth.checked_sub(1)?;
+            }
+            _ => {}
+        }
+        list_end += 1;
+    }
+    // The initializer list runs `colon + 1 .. list_end`, comma-split.
+    // A single entry in a `this : …;` primary body cuts
+    // `endStart(owner.thisKeyword, owner.body)` — the ` : y = x` run goes
+    // whole, leaving `this;` (upstream `nodeInList`'s
+    // `PrimaryConstructorBody` arm).
+    let entries = comma_entries(tokens, colon + 1, list_end)?;
+    let entry = entries.iter().position(|&(s, e)| first >= s && first < e)?;
+    let delete = if entries.len() == 1 {
+        // The `this` keyword heading the primary body — the token before
+        // the `:` that is not `)`/`;`/`{` (the parameter list's close or
+        // a previous member's terminator).
+        let mut this_tok = colon;
+        loop {
+            this_tok = this_tok.checked_sub(1)?;
+            match kind_of(tokens, this_tok)? {
+                TokenKind::Keyword(Keyword::This) => break,
+                _ => return None,
+            }
+        }
+        let start = utf16_end(tokens, text, this_tok)?;
+        let stop = tokens.get(list_end)?.utf16_offset;
+        (start, stop.checked_sub(start)?, String::new())
+    } else {
+        node_in_list_cut(tokens, text, &entries, entry)?
+    };
+    // The field: a same-named, initializer-free declarator in the class
+    // body (the official's `fieldDeclaration.equals == null &&
+    // initializer == null` gate).
+    let name = tokens.lexeme(text, first);
+    let members = class_members(tokens, body_open + 1, body_close);
+    let (_, field_tok) = field_member_named(tokens, text, &members, name)?;
+    if kind_of(tokens, field_tok + 1)? == TokenKind::Eq {
+        return None;
+    }
+    let insert_at = utf16_end(tokens, text, field_tok)?;
+    let expr_text = slice16(
+        text,
+        &(tokens.get(eq + 1)?.utf16_offset..utf16_end(tokens, text, expr_end - 1)?),
+    )?;
+    Some(vec![
+        delete,
+        (insert_at, 0, format!(" = {}", expr_text.trim())),
+    ])
+}
+
+/// `prefer_initializing_formals`: the reported `x = p` initializer (or
+/// `this.x = p;` body assignment) folds into `this.x` on the parameter —
+/// the official `ConvertToInitializingFormal` pair: `this.` lands at the
+/// parameter's name (the parameter's written type drops when it equals
+/// the field's — the lint's own resolved-subtype gate is the shape of
+/// record), and the initializer entry or assignment statement goes.
+/// The report anchors the assignment: the lint covers the initializer
+/// list entry and the `this.x = p;` body statement faces; the named-
+/// parameter private-field rename (`_x`), doc-comment reference, and
+/// extra-reference legs are feature- or element-gated and absent.
+pub(crate) fn convert_to_init_formal_entry(
+    input: &FixInput<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
+    let tokens = input.tokens?;
+    let text = input.text;
+    let (first, last) = hit_tokens(tokens, &input.range)?;
+    // The `=` inside the report: the field name precedes it (a `this.x`
+    // prefix rides the body-assignment face), the parameter's identifier
+    // follows it.
+    let eq = depth0_find(tokens, text, first, last + 1, |kind, _| kind == TokenKind::Eq)?;
+    let field_tok = {
+        let mut cursor = eq;
+        loop {
+            cursor = cursor.checked_sub(1)?;
+            match kind_of(tokens, cursor)? {
+                TokenKind::Identifier | TokenKind::Keyword(_) => break cursor,
+                TokenKind::Period => {}
+                _ => return None,
+            }
+        }
+    };
+    let field_name = tokens.lexeme(text, field_tok);
+    // The parameter: the last identifier of the report — the RHS is the
+    // bare parameter by the lint's own gate.
+    let param_name = tokens.lexeme(text, last);
+    let list = constructor_params_list(tokens, first)?;
+    let spans = formal_spans(tokens, list)?;
+    let param = spans.iter().copied().find(|&span| {
+        formal_name_token(tokens, text, span)
+            .is_some_and(|name| tokens.lexeme(text, name) == param_name)
+    })?;
+    let param_name_tok = formal_name_token(tokens, text, param)?;
+    // The parameter's written type: the run before the name after any
+    // `required`/`covariant` lead (a `this.`-formal or untyped parameter
+    // has none — the lint refuses both). The type spans `param.0 .. name`
+    // minus the lead keywords.
+    let mut type_start = param.0;
+    while type_start < param_name_tok
+        && matches!(
+            kind_of(tokens, type_start),
+            Some(TokenKind::Keyword(
+                Keyword::Required | Keyword::Covariant | Keyword::Final | Keyword::Var
+            ))
+        )
+    {
+        type_start += 1;
+    }
+    // The field's written type for the equality check — the declarator's
+    // own member, the type run before the declarator name.
+    let (body_open, body_close) = enclosing_class_body(tokens, first)?;
+    let members = class_members(tokens, body_open + 1, body_close);
+    let (field_member, field_name_tok) = field_member_named(tokens, text, &members, field_name)?;
+    let mut field_type_start = field_member.0;
+    while field_type_start < field_name_tok
+        && matches!(
+            kind_of(tokens, field_type_start),
+            Some(TokenKind::Keyword(
+                Keyword::Static
+                    | Keyword::Late
+                    | Keyword::Final
+                    | Keyword::Var
+                    | Keyword::Const
+                    | Keyword::Covariant
+            ))
+        )
+    {
+        field_type_start += 1;
+    }
+    let mut edits = Vec::new();
+    // The parameter edit, upstream's three writes composed: `this.`
+    // inserted at the name (`addSimpleInsertion(name.offset, 'this.')`),
+    // the name renamed to the field's when they differ
+    // (`addSimpleReplacement(name, fieldName)` — a positional pair; the
+    // named-parameter mismatch is upstream's refuse leg), and the
+    // written type dropped when it reads identically to the field's
+    // (`parameter.type == field.type`, the same-lexeme face — the
+    // `range.deletionRange(type)` cut covers the type plus its trailing
+    // trivia run).
+    let replacement = format!("this.{field_name}");
+    let param_type = (type_start < param_name_tok).then(|| (type_start, param_name_tok));
+    let field_type =
+        (field_type_start < field_name_tok).then(|| (field_type_start, field_name_tok));
+    let same_type = match (param_type, field_type) {
+        (Some((ps, pe)), Some((fs, fe))) => {
+            let p_text = span_over(text, tokens, ps, pe - 1)?;
+            let f_text = span_over(text, tokens, fs, fe - 1)?;
+            let p_slice = slice16(text, &(p_text.0..p_text.0 + p_text.1))?;
+            let f_slice = slice16(text, &(f_text.0..f_text.0 + f_text.1))?;
+            p_slice.trim() == f_slice.trim()
+        }
+        _ => false,
+    };
+    if same_type
+        && let Some((ps, _)) = param_type
+    {
+        // `int v` → `this.x` — the type through the name goes in one
+        // span (the type deletion plus the `this.`-insert plus the
+        // rename compose to the same replacement).
+        let start = tokens.get(ps)?.utf16_offset;
+        let end = utf16_end(tokens, text, param_name_tok)?;
+        edits.push((start, end - start, replacement));
+    } else {
+        // `num v` → `num this.x` — the type stays; `this.` plus the
+        // rename rewrite the name's own span.
+        let start = tokens.get(param_name_tok)?.utf16_offset;
+        let end = utf16_end(tokens, text, param_name_tok)?;
+        edits.push((start, end - start, replacement));
+    }
+    // The initializer/assignment removal: an initializer-list entry cuts
+    // `nodeInList`; a body assignment drops its own statement (`{ this.x
+    // = p; }` single-statement body rewrites to `;` — the upstream
+    // `statements.length == 1` face).
+    let colon = {
+        let mut cursor = first;
+        let mut found = None;
+        while let Some(prev) = cursor.checked_sub(1) {
+            match kind_of(tokens, prev)? {
+                TokenKind::Colon => {
+                    found = Some(prev);
+                    break;
+                }
+                TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                    cursor = matching_begin(tokens, prev)?;
+                }
+                TokenKind::OpenCurly | TokenKind::Semicolon | TokenKind::Eof => break,
+                _ => cursor = prev,
+            }
+        }
+        found
+    };
+    if let Some(colon) = colon {
+        // The entry list: `colon + 1 .. body` (`{`/`=>`/`;`).
+        let mut end = colon + 1;
+        let mut depth = 0u32;
+        let list_end = loop {
+            match kind_of(tokens, end)? {
+                TokenKind::OpenCurly | TokenKind::Function | TokenKind::Semicolon
+                    if depth == 0 =>
+                {
+                    break end;
+                }
+                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly
+                | TokenKind::StringInterpolationExpression => depth += 1,
+                TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                    depth = depth.checked_sub(1)?;
+                }
+                _ => {}
+            }
+            end += 1;
+        };
+        let entries = comma_entries(tokens, colon + 1, list_end)?;
+        let index = entries.iter().position(|&(s, e)| first >= s && first < e)?;
+        if entries.len() == 1 {
+            // The only initializer: `endEnd(parameterList, initializer)`
+            // — the ` : x = p` run goes whole.
+            let start = utf16_end(tokens, text, tokens.matching_end(list)?)?;
+            let stop = utf16_end(tokens, text, list_end - 1)?;
+            edits.push((start, stop - start, String::new()));
+        } else {
+            edits.push(node_in_list_cut(tokens, text, &entries, index)?);
+        }
+        Some(edits)
+    } else {
+        // The body-statement face: `this.x = p;` inside the constructor's
+        // `{ … }`. The statement's `;` is the next `;` at the report's own
+        // depth — the first `;` after the value, `(`/`<` groups skipped
+        // whole (a nested call's argument list never reads as the
+        // terminator).
+        let semi = {
+            let mut cursor = last;
+            loop {
+                cursor += 1;
+                match kind_of(tokens, cursor)? {
+                    TokenKind::Semicolon => break cursor,
+                    TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                        cursor = tokens.matching_end(cursor)?;
+                    }
+                    TokenKind::Lt => {
+                        cursor = angle_group_end(tokens, cursor)?;
+                    }
+                    TokenKind::Eof | TokenKind::CloseCurly => return None,
+                    _ => {}
+                }
+            }
+        };
+        // The enclosing body `{`: innermost unmatched opener before the
+        // statement.
+        let mut cursor = semi;
+        let block = loop {
+            cursor = cursor.checked_sub(1)?;
+            match kind_of(tokens, cursor)? {
+                TokenKind::CloseParen | TokenKind::CloseSquare | TokenKind::CloseCurly => {
+                    cursor = matching_begin(tokens, cursor)?;
+                }
+                TokenKind::OpenCurly => break cursor,
+                TokenKind::Eof => return None,
+                _ => {}
+            }
+        };
+        let block_close = tokens.matching_end(block)?;
+        // The statement's head: the report's first token, pulled back
+        // over a `this.` receiver prefix (the lint's span can drop it).
+        let stmt_head = if first.checked_sub(2).is_some_and(|prev| {
+            kind_of(tokens, prev + 1) == Some(TokenKind::Period)
+                && kind_of(tokens, prev) == Some(TokenKind::Keyword(Keyword::This))
+        }) {
+            first - 2
+        } else {
+            first
+        };
+        // Lone-statement body: the statement is the block's whole content
+        // — its head is the first token inside `{` and its `;` the last
+        // before `}` — so `endEnd(parameterList, functionBody)` rewrites
+        // the body to `;` (upstream `statements.length == 1`).
+        if stmt_head == block + 1 && semi + 1 == block_close {
+            let start = utf16_end(tokens, text, tokens.matching_end(list)?)?;
+            let stop = utf16_end(tokens, text, block_close)?;
+            edits.push((start, stop - start, ";".to_owned()));
+        } else {
+            // `nodeInList(statements, assignment)` — a non-last statement
+            // cuts `startStart(stmt, next)` (the next statement's own
+            // head bounds the cut, `;` and gap included); the last cuts
+            // `endEnd(prev, stmt)`.
+            if semi + 1 == block_close {
+                // The previous statement's end — the `;` or `}`-closed
+                // statement immediately before the head at the block's
+                // own level (`stmt_head - 1` is exactly that token).
+                let prev_end = utf16_end(tokens, text, stmt_head.checked_sub(1)?)?;
+                let stop = utf16_end(tokens, text, semi)?;
+                edits.push((prev_end, stop - prev_end, String::new()));
+            } else {
+                let start = tokens.get(stmt_head)?.utf16_offset;
+                let stop = tokens.get(semi + 1)?.utf16_offset;
+                edits.push((start, stop - start, String::new()));
+            }
+        }
+        Some(edits)
+    }
+}
+
+/// `use_declaring_parameters`: the reported primary-constructor parameter
+/// becomes a declaring parameter and its field goes — the official
+/// `ConvertToDeclaringParameter` faces. A `this.f` field formal replaces
+/// its `this.` region with `final `/`var ` (the field's own type lands
+/// when the parameter writes none); a plain parameter assigned by a
+/// body-side `: f = p` initializer takes `final `/`var ` before its type
+/// and the initializer goes with the field. `final` vs `var` reads the
+/// field declaration's own keyword. The metadata-move, body-block
+/// assignment, multi-declarator-field, and constructor-adjacent-field
+/// legs are upstream's secondary shapes and stay absent (the
+/// single-declarator field is the bounded face). The report anchors the
+/// parameter's name.
+pub(crate) fn convert_to_declaring_param_entry(
+    input: &FixInput<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
+    let tokens = input.tokens?;
+    let text = input.text;
+    let (first, _) = hit_tokens(tokens, &input.range)?;
+    let name = tokens.lexeme(text, first);
+    // The class body: the parameter name sits in the primary
+    // constructor's `(` list, BEFORE the `{` — walk forward to the
+    // list's `)` then the body's opener (`class C(…)` / `class C(…);`
+    // for a body-less primary, which the bounded face refuses anyway).
+    let (body_open, body_close) = {
+        let mut cursor = first;
+        let list = loop {
+            match kind_of(tokens, cursor)? {
+                TokenKind::OpenParen => break cursor,
+                TokenKind::Semicolon | TokenKind::Eof => return None,
+                _ => cursor = cursor.checked_sub(1)?,
+            }
+        };
+        let close = tokens.matching_end(list)?;
+        match kind_of(tokens, close + 1)? {
+            TokenKind::OpenCurly => (close + 1, tokens.matching_end(close + 1)?),
+            _ => return None,
+        }
+    };
+    let members = class_members(tokens, body_open + 1, body_close);
+    // The field: same name, or the `_x`-under-`x` pair the lint's
+    // `names_match` allows.
+    let (field_member, field_name_tok) = field_member_named(tokens, text, &members, name)
+        .or_else(|| {
+            field_member_named(tokens, text, &members, &format!("_{name}"))
+        })?;
+    // The field declaration's `final`/`var`/absent keyword — the
+    // storage keyword the declaring parameter spells (`var` for the
+    // mutable faces).
+    let is_final = {
+        let (start, end) = field_member;
+        (start..end).any(|i| kind_of(tokens, i) == Some(TokenKind::Keyword(Keyword::Final)))
+    };
+    let keyword = if is_final { "final" } else { "var" };
+    // The field's written type — its declarator's prefix minus modifiers
+    // — for the untyped-parameter carry.
+    let field_type = {
+        let mut cursor = field_member.0;
+        while cursor < field_name_tok
+            && matches!(
+                kind_of(tokens, cursor),
+                Some(TokenKind::Keyword(
+                    Keyword::Static
+                        | Keyword::Late
+                        | Keyword::Final
+                        | Keyword::Var
+                        | Keyword::Const
+                        | Keyword::Covariant
+                ))
+            )
+        {
+            cursor += 1;
+        }
+        (cursor < field_name_tok).then(|| (cursor, field_name_tok))
+    };
+    // The field's declarator is single — the upstream's own lines-range
+    // face; a multi-declarator list is out of the bounded face.
+    if kind_of(tokens, field_name_tok + 1)? == TokenKind::Comma {
+        return None;
+    }
+    if (field_member.0..field_name_tok).any(|i| kind_of(tokens, i) == Some(TokenKind::Comma)) {
+        return None;
+    }
+    let mut edits = Vec::new();
+    // The parameter rewrite: a `this.` field formal replaces
+    // `[this_start, name_start)` with the keyword plus the field's type
+    // when the parameter writes none; a plain parameter inserts
+    // `'$keyword '` before its type (or ` $keyword` after `required`),
+    // the field's type following an untyped one.
+    let this_tok = first.checked_sub(2).and_then(|t| {
+        (kind_of(tokens, t) == Some(TokenKind::Keyword(Keyword::This))
+            && kind_of(tokens, t + 1) == Some(TokenKind::Period))
+        .then_some(t)
+    });
+    if let Some(this_tok) = this_tok {
+        // `this.f` — the field-formal face. Anything before `this.` (a
+        // written type) makes the `this.` a pure deletion; a bare
+        // `this.f` replaces the prefix with the keyword, then the type
+        // carry when untyped.
+        let mut cursor = this_tok;
+        let mut head = this_tok;
+        while let Some(prev) = cursor.checked_sub(1) {
+            match kind_of(tokens, prev)? {
+                TokenKind::Identifier
+                | TokenKind::Question
+                | TokenKind::Period
+                | TokenKind::Keyword(Keyword::Void | Keyword::Dynamic) => {
+                    head = prev;
+                    cursor = prev;
+                }
+                TokenKind::Gt | TokenKind::GtGt | TokenKind::GtGtGt => {
+                    head = angle_group_start(tokens, prev)?;
+                    cursor = head;
+                }
+                _ => break,
+            }
+        }
+        let bare = head == this_tok;
+        let start = tokens.get(this_tok)?.utf16_offset;
+        let end = tokens.get(first)?.utf16_offset;
+        if bare {
+            let mut replacement = format!("{keyword} ");
+            if let Some((fs, fe)) = field_type {
+                let (o, l) = span_over(text, tokens, fs, fe - 1)?;
+                replacement.push_str(slice16(text, &(o..o + l))?.trim());
+                replacement.push(' ');
+            }
+            edits.push((start, end - start, replacement));
+        } else {
+            // `int this.f` — the `this.` goes; the keyword lands before
+            // the written type (the `!insertedVariable` arm).
+            edits.push((start, end - start, String::new()));
+            edits.push((tokens.get(head)?.utf16_offset, 0, format!("{keyword} ")));
+        }
+    } else {
+        // The plain-parameter face: `int f` → `final int f`, `f` →
+        // `var f` + the field's type; `required` rides before the
+        // keyword (upstream `' $keyword'` after it). The name changes to
+        // the field's when the pair differs — upstream
+        // `addSimpleReplacement(range.token(parameterName), fieldName)`.
+        let field_name = tokens.lexeme(text, field_name_tok);
+        if field_name != name {
+            let start = tokens.get(first)?.utf16_offset;
+            let end = utf16_end(tokens, text, first)?;
+            edits.push((start, end - start, field_name.to_owned()));
+        }
+        let required_tok = first.checked_sub(1).filter(|&t| {
+            kind_of(tokens, t) == Some(TokenKind::Keyword(Keyword::Required))
+        });
+        // The parameter's lead: back to its `(`/`,` boundary, then its
+        // written type is what the modifier lead leaves before the name.
+        let mut boundary = first;
+        while let Some(prev) = boundary.checked_sub(1) {
+            match kind_of(tokens, prev)? {
+                TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly
+                | TokenKind::Comma => break,
+                _ => boundary = prev,
+            }
+        }
+        let mut type_start = boundary;
+        while type_start < first
+            && matches!(
+                kind_of(tokens, type_start),
+                Some(TokenKind::Keyword(
+                    Keyword::Required | Keyword::Covariant | Keyword::Final | Keyword::Var
+                ))
+            )
+        {
+            type_start += 1;
+        }
+        let has_type = type_start < first;
+        // The keyword plus, for an untyped parameter, the field's own
+        // written type — composed into one insertion (upstream writes
+        // the two at the same offset; one edit keeps the composition
+        // order explicit).
+        let mut inserted = format!("{keyword} ");
+        if !has_type
+            && let Some((fs, fe)) = field_type
+        {
+            let (o, l) = span_over(text, tokens, fs, fe - 1)?;
+            inserted.push_str(slice16(text, &(o..o + l))?.trim());
+            inserted.push(' ');
+        }
+        if let Some(required) = required_tok {
+            let trimmed = inserted.trim_end().to_owned();
+            edits.push((utf16_end(tokens, text, required)?, 0, format!(" {trimmed}")));
+        } else {
+            edits.push((tokens.get(type_start)?.utf16_offset, 0, inserted));
+        }
+    }
+    // The initializer removal for the non-declaring face — the primary
+    // body's own `this` row: `this : f = p;` (empty body) deletes the
+    // whole `this`-row lines when it is the only initializer;
+    // `this { … }` cuts `startStart(colon, body.beginToken)`; a
+    // multi-entry list cuts `nodeInList`. The `this` row's head is the
+    // depth-0 `this`/`;` before the class-body close.
+    let mut field_plus_ctor: Option<(u32, u32)> = None;
+    if this_tok.is_none() {
+        // The primary body: `this : …` / `this { … }` / `this;` — the
+        // member row whose first token is `this`.
+        let ctor = members
+            .iter()
+            .copied()
+            .find(|&(s, _)| kind_of(tokens, s) == Some(TokenKind::Keyword(Keyword::This)));
+        if let Some((ctor_start, ctor_end)) = ctor {
+            // `:` heading the initializer list inside this member.
+            let colon = (ctor_start..ctor_end).find(|&i| {
+                kind_of(tokens, i) == Some(TokenKind::Colon)
+            });
+            // The body token after the initializer list: `{` (block) or
+            // `;` (empty body).
+            let body_tok = colon.and_then(|colon| {
+                (colon + 1..ctor_end).find(|&i| {
+                    matches!(
+                        kind_of(tokens, i),
+                        Some(TokenKind::OpenCurly | TokenKind::Semicolon)
+                    )
+                })
+            });
+            if let (Some(colon), Some(body_tok)) = (colon, body_tok) {
+                let entries = comma_entries(tokens, colon + 1, body_tok)?;
+                let single = entries.len() == 1;
+                let empty_body = kind_of(tokens, body_tok) == Some(TokenKind::Semicolon);
+                if single && empty_body {
+                    // `_getLinesRangeWithNextBlankLine(constructorBody)` —
+                    // the whole `this : _x = x;` row's lines. When the
+                    // field's own `;` runs directly into `this` (the
+                    // `fieldNode.endToken.next == this` arm), the two
+                    // delete as one `startEnd(field, constructor)` span.
+                    let ctor_start16 = tokens.get(ctor_start)?.utf16_offset;
+                    let member_start = member_block_start(text, ctor_start16);
+                    let ctor_end_byte = token_end(tokens.get(ctor_end - 1)?);
+                    let line_end = text[ctor_end_byte..]
+                        .find('\n')
+                        .map_or(text.len(), |i| ctor_end_byte + i);
+                    let (o16, l16) = cut_line(text, member_start, line_end);
+                    // The merge: the field's `;` is the token right
+                    // before `this` (nothing between the member rows).
+                    let field_last = field_member.1 - 1;
+                    if field_last + 1 == ctor_start
+                        && kind_of(tokens, field_last) == Some(TokenKind::Semicolon)
+                    {
+                        // `startEnd(fieldNode, constructorNode)` lines —
+                        // one span from the field's line head through
+                        // the constructor row's line end (`getLinesRange`
+                        // — no next-blank tail on this arm).
+                        let field_head16 = tokens.get(field_member.0)?.utf16_offset;
+                        let field_start = member_block_start(text, field_head16);
+                        let (fo16, _) = cut_line(text, field_start, field_start);
+                        field_plus_ctor = Some((fo16, (o16 + l16).checked_sub(fo16)?));
+                    } else {
+                        // `_getLinesRangeWithNextBlankLine` — the row's
+                        // lines plus one trailing blank.
+                        let blank = {
+                            let end_byte = utf16_offset_to_byte(text, o16 + l16);
+                            let rest = text.get(end_byte..).unwrap_or("");
+                            rest.strip_prefix("\r\n\r\n")
+                                .map(|_| 4usize)
+                                .or_else(|| rest.strip_prefix("\n\n").map(|_| 2))
+                                .unwrap_or(0)
+                        };
+                        edits.push((o16, l16 + u32::try_from(blank).ok()?, String::new()));
+                    }
+                } else if single {
+                    // `startStart(colon, body.beginToken)` — the ` : _x = x`
+                    // run goes whole, trivia to `{` included.
+                    let start = tokens.get(colon)?.utf16_offset;
+                    let end = tokens.get(body_tok)?.utf16_offset;
+                    edits.push((start, end - start, String::new()));
+                } else if let Some(index) = entries.iter().position(|&(s, e)| {
+                    (s..e).any(|i| {
+                        let lexeme = tokens.lexeme(text, i);
+                        lexeme == name || lexeme == format!("_{name}").as_str()
+                    })
+                }) {
+                    edits.push(node_in_list_cut(tokens, text, &entries, index)?);
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+    // The field's lines go — the member's own line block plus the blank
+    // line after it (`_getLinesRangeWithNextBlankLine`); the merge arm
+    // already carries the pair as one span.
+    if let Some((off16, len16)) = field_plus_ctor {
+        edits.push((off16, len16, String::new()));
+    } else {
+        let member_start = member_block_start(text, tokens.get(field_member.0)?.utf16_offset);
+        let member_end = token_end(tokens.get(field_member.1 - 1)?);
+        let (off16, len16) = cut_line(text, member_start, {
+            text[member_end..]
+                .find('\n')
+                .map_or(text.len(), |i| member_end + i)
+        });
+        let end_byte = utf16_offset_to_byte(text, off16 + len16);
+        let rest = text.get(end_byte..).unwrap_or("");
+        let blank = rest
+            .strip_prefix("\r\n\r\n")
+            .map(|_| 4usize)
+            .or_else(|| rest.strip_prefix("\n\n").map(|_| 2))
+            .unwrap_or(0);
+        edits.push((off16, len16 + u32::try_from(blank).ok()?, String::new()));
+    }
+    Some(edits)
+}
+
+/// One top-level directive's piece for the organize pass: its sort
+/// priority (the upstream `DirectiveSortPriority` ordinal), its URI text
+/// for the alphabetical compare, and the byte span of the text that
+/// moves — leading comments through the trailing same-line comment.
+struct DirectivePiece {
+    priority: u8,
+    uri: String,
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+/// `directives_ordering`: the whole directive block re-sorts — the
+/// official `OrganizeImports` face over the file's own tokens. `dart:`
+/// imports first, then `package:`, other schemes, and relative URIs —
+/// alphabetical inside a group, a blank line between groups; exports
+/// follow imports through the same four groups, `part` directives last.
+/// Each directive's leading comments move with it (the pseudo-first
+/// directive's doc/annotation lines and blank-separated comment groups
+/// stay at the top, as upstream); a trailing `//` on the directive's own
+/// line rides. The unused-import removal, unused-shown-name removal, and
+/// `@docImport` sort read the file's diagnostic set and stay absent; a
+/// `library` directive or non-directive content inside the block bounds
+/// the face and drops the fix.
+pub(crate) fn organize_directives_entry(
+    input: &FixInput<'_>,
+) -> Option<Vec<(u32, u32, String)>> {
+    let tokens = input.tokens?;
+    let text = input.text;
+    let line_starts = byte_line_starts(text);
+    let eol = eol_of(text);
+    // The directive rows at the top level: `import`/`export`/`part`
+    // keywords at depth 0 through their `;`. `library` is indexed but
+    // never sorted.
+    let mut library_seen = false;
+    let mut spans: Vec<(usize, usize, u8)> = Vec::new(); // (kw_index, semi_index, priority)
+    let mut cursor = 0usize;
+    let len = tokens.as_slice().len();
+    while cursor < len {
+        match kind_of(tokens, cursor)? {
+            TokenKind::Keyword(Keyword::Library) => {
+                library_seen = true;
+                let semi = depth0_find(tokens, text, cursor + 1, len, |kind, _| {
+                    kind == TokenKind::Semicolon
+                })?;
+                cursor = semi + 1;
+            }
+            TokenKind::Keyword(Keyword::Import | Keyword::Export | Keyword::Part) => {
+                let kw = cursor;
+                let semi = depth0_find(tokens, text, cursor + 1, len, |kind, _| {
+                    kind == TokenKind::Semicolon
+                })?;
+                let uri = {
+                    // The URI literal is the first string token of the
+                    // directive.
+                    let mut found = None;
+                    for index in kw + 1..semi {
+                        if kind_of(tokens, index)? == TokenKind::String {
+                            let lexeme = tokens.lexeme(text, index);
+                            found = Some(
+                                lexeme
+                                    .trim_matches(|c| matches!(c, '\'' | '"' | 'r'))
+                                    .to_owned(),
+                            );
+                            break;
+                        }
+                    }
+                    found?
+                };
+                let kind = kind_of(tokens, kw)?;
+                let priority = match (kind, uri.as_str()) {
+                    (TokenKind::Keyword(Keyword::Import), u) if u.starts_with("dart:") => 0u8,
+                    (TokenKind::Keyword(Keyword::Import), u) if u.starts_with("package:") => 1,
+                    (TokenKind::Keyword(Keyword::Import), u) if u.contains("://") => 2,
+                    (TokenKind::Keyword(Keyword::Import), _) => 3,
+                    (TokenKind::Keyword(Keyword::Export), u) if u.starts_with("dart:") => 4,
+                    (TokenKind::Keyword(Keyword::Export), u) if u.starts_with("package:") => 5,
+                    (TokenKind::Keyword(Keyword::Export), u) if u.contains("://") => 6,
+                    (TokenKind::Keyword(Keyword::Export), _) => 7,
+                    _ => 8,
+                };
+                spans.push((kw, semi, priority));
+                cursor = semi + 1;
+            }
+            // Metadata and the script tag ride the scan; a member or
+            // declaration keyword ends the directive run for good.
+            TokenKind::ScriptTag
+            | TokenKind::Semicolon
+            | TokenKind::At
+            | TokenKind::Identifier
+            | TokenKind::Period
+            | TokenKind::Comma => cursor += 1,
+            TokenKind::OpenParen | TokenKind::OpenSquare | TokenKind::OpenCurly => {
+                cursor = tokens.matching_end(cursor)? + 1;
+            }
+            TokenKind::Lt => {
+                cursor = angle_group_end(tokens, cursor)? + 1;
+            }
+            TokenKind::String => cursor += 1,
+            TokenKind::Eof => break,
+            _ => break,
+        }
+    }
+    if spans.len() < 2 {
+        return None; // nothing to reorder
+    }
+    // A `library` directive must precede the block — inside it the
+    // replace span would swallow it (upstream's own edge, unfixable in
+    // the row model).
+    if library_seen {
+        // The `library`'s `;` must precede the first sortable keyword.
+        let mut check = 0usize;
+        let mut lib_end = None;
+        while check < len {
+            match kind_of(tokens, check)? {
+                TokenKind::Keyword(Keyword::Library) => {
+                    lib_end = depth0_find(tokens, text, check + 1, len, |kind, _| {
+                        kind == TokenKind::Semicolon
+                    });
+                    break;
+                }
+                TokenKind::Eof => break,
+                _ => check += 1,
+            }
+        }
+        if lib_end.is_none_or(|end| end > spans.first().map_or(usize::MAX, |s| s.0)) {
+            return None;
+        }
+    }
+    // The text regions: each directive's own line block, leading
+    // comments included — every line between the previous directive's
+    // trailing line and this one's start attaches (blank lines inside
+    // the attached run ride the substring). For the first sortable
+    // directive with no `library`, only the adjacent non-doc comment
+    // group attaches; `///`/`/**` docs, `@` annotations, and
+    // blank-separated groups stay at the top (upstream's
+    // pseudo-library-directive face).
+    let line_of = |byte: usize| -> usize {
+        line_starts.partition_point(|&s| s <= byte) - 1
+    };
+    let line_start_byte = |line: usize| -> usize { line_starts[line] };
+    let line_end_byte = |line: usize| -> usize {
+        if line + 1 < line_starts.len() {
+            line_starts[line + 1]
+        } else {
+            text.len()
+        }
+    };
+    let mut pieces: Vec<DirectivePiece> = Vec::new();
+    let mut prev_trailing_line = None::<usize>;
+    for (index, &(kw, semi, priority)) in spans.iter().enumerate() {
+        let kw_byte = tokens.get(kw)?.byte_offset as usize;
+        let semi_end = token_end(tokens.get(semi)?);
+        let dir_start_line = line_of(kw_byte);
+        let dir_end_line = line_of(semi_end);
+        // The region ends at the `;`'s end — the line's own `\n` stays
+        // (upstream `directive.end` is "after the last token, including
+        // the end-of-line comment": a trailing `//` on the `;`'s line
+        // extends the end to the comment's own end, still before `\n`).
+        let line_text = text.get(semi_end..line_end_byte(dir_end_line))?;
+        let mut end_byte = semi_end;
+        if let Some(at) = line_text.find("//") {
+            end_byte = semi_end + at + line_text[at..].find('\n').unwrap_or(line_text.len() - at);
+        }
+        // The leading attach: lines between the previous region's end
+        // line and the directive's first line. Only comment/blank lines
+        // qualify — anything else (a stray statement) refuses the pass.
+        let floor_line = prev_trailing_line.map_or(0, |l| l + 1);
+        let is_first = index == 0 && !library_seen;
+        let attach_line = if is_first {
+            // Only the LAST contiguous comment group adjacent to the
+            // directive attaches; doc/annotation lines never do; a
+            // `// @dart=` language-version line never does.
+            let mut scan = dir_start_line;
+            while scan > floor_line {
+                let prev_text = text
+                    .get(line_start_byte(scan - 1)..line_end_byte(scan - 1))?
+                    .trim();
+                if prev_text.is_empty()
+                    || prev_text.starts_with("///")
+                    || prev_text.starts_with("/**")
+                    || prev_text.starts_with('*')
+                    || prev_text.starts_with('@')
+                    || prev_text.starts_with("// @dart")
+                {
+                    break;
+                }
+                if prev_text.starts_with("//") || prev_text.starts_with("/*") {
+                    scan -= 1;
+                    continue;
+                }
+                break;
+            }
+            scan
+        } else {
+            // Every line back to the previous region's trailing line
+            // attaches — the block must be comments/blank only.
+            let mut scan = dir_start_line;
+            while scan > floor_line {
+                let prev_text = text
+                    .get(line_start_byte(scan - 1)..line_end_byte(scan - 1))?
+                    .trim();
+                if prev_text.is_empty()
+                    || prev_text.starts_with("//")
+                    || prev_text.starts_with("/*")
+                    || prev_text.starts_with('*')
+                    || prev_text.starts_with("*/")
+                    || prev_text.starts_with("///")
+                {
+                    scan -= 1;
+                    continue;
+                }
+                return None;
+            }
+            scan
+        };
+        // The first attach line starts at the first comment's own
+        // offset — blank lines above it stay outside (upstream's
+        // `offset = leadingComment.offset`).
+        let mut start_byte = line_start_byte(attach_line);
+        if !is_first {
+            while start_byte < kw_byte
+                && text
+                    .get(start_byte..line_end_byte(line_of(start_byte)))
+                    .is_some_and(|l| l.trim().is_empty())
+            {
+                start_byte = line_start_byte(line_of(start_byte) + 1);
+            }
+        }
+        let uri = {
+            let mut found = String::new();
+            for i in kw + 1..semi {
+                if kind_of(tokens, i)? == TokenKind::String {
+                    found = tokens
+                        .lexeme(text, i)
+                        .trim_matches(|c| matches!(c, '\'' | '"' | 'r'))
+                        .to_owned();
+                    break;
+                }
+            }
+            found
+        };
+        pieces.push(DirectivePiece {
+            priority,
+            uri,
+            start: start_byte,
+            end: end_byte,
+            text: text.get(start_byte..end_byte)?.to_owned(),
+        });
+        prev_trailing_line = Some(dir_end_line);
+    }
+    // The sort: priority group, then the URI compare (the upstream
+    // `compareDirectiveUri` — package URIs compare path-first), then the
+    // verbatim text.
+    let compare_uri = |a: &str, b: &str| -> core::cmp::Ordering {
+        if !(a.starts_with("package:") && b.starts_with("package:"))
+            || (a.starts_with('/') && b.starts_with('/'))
+        {
+            let (ia, ib) = (a.find('/'), b.find('/'));
+            if let (Some(ia), Some(ib)) = (ia, ib) {
+                let head = a[..ia].cmp(&b[..ib]);
+                if head != core::cmp::Ordering::Equal {
+                    return head;
+                }
+                return a[ia + 1..].cmp(&b[ib + 1..]);
+            }
+        }
+        a.cmp(b)
+    };
+    let mut sorted: Vec<&DirectivePiece> = pieces.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.priority
+            .cmp(&b.priority)
+            .then_with(|| compare_uri(&a.uri, &b.uri))
+            .then_with(|| a.text.cmp(&b.text))
+    });
+    // The join: eol between rows, a blank line between priority groups,
+    // right-trimmed (upstream `sb + trimRight`).
+    let mut out = String::new();
+    let mut current = None::<u8>;
+    for piece in &sorted {
+        if let Some(prev) = current {
+            out.push_str(eol);
+            if prev != piece.priority {
+                out.push_str(eol);
+            }
+        }
+        current = Some(piece.priority);
+        out.push_str(piece.text.trim_end_matches(['\n', '\r']));
+    }
+    let replace_start = pieces.first()?.start;
+    let replace_end = pieces.last()?.end;
+    let (s16, e16) = (
+        utf16_count(&text[..replace_start]),
+        utf16_count(&text[..replace_end]),
+    );
+    Some(vec![(s16, e16 - s16, out)])
+}
 
 /// The `// ignore: <code>` row for the diagnostic at `range`: spliced
 /// into the previous line's ignore comment when one is there (the new
@@ -12488,6 +14231,7 @@ pub fn ignore_line_fix(
         message: format!("Ignore '{code}' for this line"),
         source: BUILTIN_IGNORE_SOURCE,
         edit: anchored_edit(text, lines, offset, 0, &insertion),
+        target: None,
     })
 }
 
@@ -12592,6 +14336,7 @@ pub fn ignore_file_fix(code: &'static str, text: &str, lines: &LineIndex) -> Opt
         message: format!("Ignore '{code}' for the whole file"),
         source: BUILTIN_IGNORE_SOURCE,
         edit: anchored_edit(text, lines, offset, 0, &insertion),
+        target: None,
     })
 }
 
@@ -12836,6 +14581,11 @@ fn patch_document(
         let mut row = edit_floor(&fix.edit, fix.source);
         if anchored {
             row.insert("anchor".into(), anchor_json(&fix.edit.anchor).into());
+        }
+        // The cross-file row names its created file — the hit file's
+        // coordinates never appear for it.
+        if let Some(target) = &fix.target {
+            row.insert("target".into(), target.clone().into());
         }
         if verbosity == Verbosity::Full {
             row.insert("rule".into(), fix.rule.into());
@@ -13777,6 +15527,10 @@ fn convert_to_line_doc(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, Str
         range: span,
         message: "",
         tokens: None,
+        // The assist face is same-file by construction — no producer here
+        // reads the path (only [`FixAction::CreateFile`] does), so the
+        // empty path never misaddresses.
+        path: Path::new(""),
     };
     let (offset, length, replacement) = doc_comment_to_line(&input)?;
     Some(vec![(offset, length, replacement)])
@@ -18517,7 +20271,7 @@ mod tests {
     /// The single fix of `hits[0]`, materialized over `source`.
     fn one_fix(source: &str, hits: &[Lint]) -> RuleFix {
         let lines = LineIndex::new(source);
-        let fixes = from_lints(hits, source, &lines, &walk_fuse());
+        let fixes = from_lints(hits, source, &lines, test_path(), &walk_fuse());
         assert_eq!(fixes.len(), 1, "expected exactly one fix for {source:?}");
         fixes.into_iter().next().expect("one fix")
     }
@@ -18527,6 +20281,13 @@ mod tests {
     /// truncation is pinned by [`fused_walk_stops_consuming_input`]).
     fn walk_fuse() -> PlannerFuse {
         PlannerFuse::new(1)
+    }
+
+    /// The same-file pins' hit-file path — every same-file row ignores it
+    /// ([`FixInput::path`] is only the create-file face's input); the
+    /// create-file pins name their own fixtures.
+    fn test_path() -> &'static std::path::Path {
+        Path::new("/gen/lib/test.dart")
     }
 
     /// A width-0 `unnecessary_new` row over the keyword at `offset` — the
@@ -18565,7 +20326,7 @@ mod tests {
     /// No fix materializes for `rule` over `range` on `source`.
     fn assert_no_fix(rule: &str, source: &str, range: core::ops::Range<u32>) {
         let lines = LineIndex::new(source);
-        let fixes = from_lints(&[row(rule, range)], source, &lines, &walk_fuse());
+        let fixes = from_lints(&[row(rule, range)], source, &lines, test_path(), &walk_fuse());
         assert!(fixes.is_empty(), "{rule} on {source:?} produced a fix");
     }
 
@@ -19568,7 +21329,7 @@ mod tests {
             &[row("prefer_inlined_adds", 21..24)],
             source,
             &lines,
-            &walk_fuse(),
+            test_path(), &walk_fuse(),
         );
         assert!(second.is_empty());
     }
@@ -19686,7 +21447,7 @@ mod tests {
         let doc = patch_json(
             &FileFixSet {
                 path: "/abs/t.dart".to_owned(),
-                fixes: from_lints(&[new_row(19)], source, &lines, &walk_fuse()),
+                fixes: from_lints(&[new_row(19)], source, &lines, test_path(), &walk_fuse()),
                 plugin: vec![plugin],
             },
             Verbosity::Compact,
@@ -19735,7 +21496,7 @@ mod tests {
         // drops the anchor; the full tier adds the human names.
         let set = FileFixSet {
             path: "t.dart".to_owned(),
-            fixes: from_lints(&[new_row(19)], source, &lines, &walk_fuse()),
+            fixes: from_lints(&[new_row(19)], source, &lines, test_path(), &walk_fuse()),
             plugin: vec![one_plugin_fix(source, 19, 4)],
         };
         let minimal = patch_json(&set, Verbosity::Minimal);
@@ -19809,6 +21570,7 @@ mod tests {
                     message: String::new(),
                     source: BUILTIN_SOURCE,
                     edit: anchored_edit(text, &lines, 0, 3, "out"),
+                    target: None,
                 }],
                 plugin: Vec::new(),
             },
@@ -19833,7 +21595,7 @@ mod tests {
         let lines = LineIndex::new(source);
         let set = FileFixSet {
             path: "t.dart".to_owned(),
-            fixes: from_lints(&[new_row(19)], source, &lines, &walk_fuse()),
+            fixes: from_lints(&[new_row(19)], source, &lines, test_path(), &walk_fuse()),
             plugin: vec![one_plugin_fix(source, 19, 4)],
         };
 
@@ -19908,15 +21670,15 @@ mod tests {
             message: "Type names should be CamelCase.".to_owned(),
             correction: None,
         }];
-        assert!(from_lints(&non_wired, source, &lines, &walk_fuse()).is_empty());
+        assert!(from_lints(&non_wired, source, &lines, test_path(), &walk_fuse()).is_empty());
 
         // `unnecessary_new` over text that does not start with the keyword.
         let wrong = vec![new_row(6)];
-        assert!(from_lints(&wrong, source, &lines, &walk_fuse()).is_empty());
+        assert!(from_lints(&wrong, source, &lines, test_path(), &walk_fuse()).is_empty());
 
         // `avoid_empty_else` over a span that is not the `;`.
         let wrong = vec![empty_else_row(0)];
-        assert!(from_lints(&wrong, source, &lines, &walk_fuse()).is_empty());
+        assert!(from_lints(&wrong, source, &lines, test_path(), &walk_fuse()).is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -20355,7 +22117,7 @@ mod tests {
     /// The single fix of one semantic row over `source`.
     fn one_sem_fix(source: &str, diagnostic: Diagnostic) -> RuleFix {
         let lines = LineIndex::new(source);
-        let fixes = from_semantic(&[diagnostic], source, &lines, &walk_fuse());
+        let fixes = from_semantic(&[diagnostic], source, &lines, test_path(), &walk_fuse());
         assert_eq!(fixes.len(), 1, "expected exactly one fix for {source:?}");
         fixes.into_iter().next().expect("one fix")
     }
@@ -20408,7 +22170,7 @@ mod tests {
             &[sem_row(code, machine, offset, length)],
             source,
             &lines,
-            &walk_fuse(),
+            test_path(), &walk_fuse(),
         );
         assert!(fixes.is_empty(), "{code} on {source:?} produced a fix");
     }
@@ -21797,7 +23559,7 @@ mod tests {
                 &[row("use_named_constants", full_span(source, "const"))],
                 source,
                 &lines,
-                &walk_fuse()
+                test_path(), &walk_fuse()
             )
             .is_empty()
         );
@@ -22400,7 +24162,7 @@ mod tests {
     /// `builtin-parser`.
     fn one_parser_fix(source: &str, diagnostic: Diagnostic) -> RuleFix {
         let lines = LineIndex::new(source);
-        let fixes = from_parser(&[diagnostic], source, &lines, &walk_fuse());
+        let fixes = from_parser(&[diagnostic], source, &lines, test_path(), &walk_fuse());
         assert_eq!(fixes.len(), 1, "expected exactly one fix for {source:?}");
         fixes.into_iter().next().expect("one fix")
     }
@@ -22437,7 +24199,7 @@ mod tests {
             &[parser_row(code, message, offset, length)],
             source,
             &lines,
-            &walk_fuse(),
+            test_path(), &walk_fuse(),
         );
         assert!(fixes.is_empty(), "{code} on {source:?} produced a fix");
     }
@@ -23059,7 +24821,7 @@ mod tests {
             ],
             source,
             &lines,
-            &walk_fuse(),
+            test_path(), &walk_fuse(),
         );
         assert_eq!(fixes.len(), 1, "identical consecutive edits collapse");
         let (patched, _) = apply(source, std::slice::from_ref(&fixes[0].edit));
@@ -23237,7 +24999,7 @@ mod tests {
                 &[sem_row("unused_import", "UNUSED_IMPORT", 0, 5)],
                 source,
                 &lines,
-                &walk_fuse()
+                test_path(), &walk_fuse()
             )
             .is_empty()
         );
@@ -23246,7 +25008,7 @@ mod tests {
                 &[parser_row("final_mixin", "", 0, 5)],
                 source,
                 &lines,
-                &walk_fuse()
+                test_path(), &walk_fuse()
             )
             .is_empty()
         );
@@ -23286,7 +25048,7 @@ mod tests {
             &[null_check_row(code, message, offset, length)],
             source,
             &lines,
-            &walk_fuse(),
+            test_path(), &walk_fuse(),
         );
         assert_eq!(fixes.len(), 1, "expected exactly one fix for {source:?}");
         let fix = fixes.into_iter().next().expect("one fix");
@@ -23311,7 +25073,7 @@ mod tests {
             &[null_check_row(code, message, offset, length)],
             source,
             &lines,
-            &walk_fuse(),
+            test_path(), &walk_fuse(),
         );
         assert!(fixes.is_empty(), "{code} on {source:?} produced a fix");
     }
@@ -25792,11 +27554,11 @@ mod tests {
             new_row(source.find("new C().c").unwrap() as u32),
         ];
         let fuse = PlannerFuse::with_budget(1);
-        let fixes = from_lints(&hits, source, &lines, &fuse);
+        let fixes = from_lints(&hits, source, &lines, test_path(), &fuse);
         assert_eq!(fixes.len(), 1, "one step, one fix: {fixes:?}");
         assert!(fuse.tripped(), "the spent budget latched");
         // The full-budget walk over the same rows materializes every fix.
-        assert_eq!(from_lints(&hits, source, &lines, &walk_fuse()).len(), 3);
+        assert_eq!(from_lints(&hits, source, &lines, test_path(), &walk_fuse()).len(), 3);
     }
 
     /// The evidence rows' total key (determinism audit R3): two rows tied
@@ -25975,5 +27737,535 @@ mod tests {
         assert_eq!(unknown_row["name"]["use"], "type");
         assert_eq!(unknown_row["name"]["qualified"], true);
         assert!(unknown_row.get("insertion").is_none(), "{unknown_row}");
+    }
+
+    // -----------------------------------------------------------------------
+    // T12: the multi-edit face — one diagnostic, several disjoint edits
+    // -----------------------------------------------------------------------
+
+    /// The lint multi-edit golden: the hit materializes `count` rows whose
+    /// edits apply together and rewrite `source` into `expected`.
+    fn assert_lint_multi(
+        rule: &str,
+        source: &str,
+        range: core::ops::Range<u32>,
+        count: usize,
+        expected: &str,
+    ) {
+        let lines = LineIndex::new(source);
+        let fixes = from_lints(&[row(rule, range)], source, &lines, test_path(), &walk_fuse());
+        assert_eq!(fixes.len(), count, "{rule} on {source:?}");
+        assert!(fixes.iter().all(|fix| fix.rule == rule));
+        let edits: Vec<Edit> = fixes.iter().map(|fix| fix.edit.clone()).collect();
+        let (patched, outcomes) = apply(source, &edits);
+        assert!(
+            outcomes.iter().all(|o| *o == EditOutcome::Applied),
+            "{rule} on {source:?}: {outcomes:?}"
+        );
+        assert_eq!(patched, expected, "{rule} on {source:?}");
+    }
+
+    /// The semantic multi-edit golden: the row materializes `count` rows
+    /// tagged `builtin-semantic` whose edits apply together and rewrite
+    /// `source` into `expected`.
+    fn assert_sem_multi(
+        code: &'static str,
+        machine: &'static str,
+        source: &str,
+        offset: u32,
+        length: u32,
+        count: usize,
+        expected: &str,
+    ) {
+        let lines = LineIndex::new(source);
+        let fixes = from_semantic(
+            &[sem_row(code, machine, offset, length)],
+            source,
+            &lines,
+            test_path(), &walk_fuse(),
+        );
+        assert_eq!(fixes.len(), count, "{code} on {source:?}");
+        assert!(
+            fixes
+                .iter()
+                .all(|fix| fix.rule == code && fix.source == BUILTIN_SEMANTIC_SOURCE)
+        );
+        let edits: Vec<Edit> = fixes.iter().map(|fix| fix.edit.clone()).collect();
+        let (patched, outcomes) = apply(source, &edits);
+        assert!(
+            outcomes.iter().all(|o| *o == EditOutcome::Applied),
+            "{code} on {source:?}: {outcomes:?}"
+        );
+        assert_eq!(patched, expected, "{code} on {source:?}");
+    }
+
+    /// `AddStatic`: `static ` lands at the member head — a `const` field's
+    /// own `const` is the head when no earlier modifier stands.
+    #[test]
+    fn const_instance_field_inserts_static() {
+        let source = "class C {\n  const x = 0;\n}\n";
+        // The `const` keyword at 12 — the report's own anchor.
+        assert_sem_multi(
+            "const_instance_field",
+            "COMPILE_TIME_ERROR_CODE.CONST_INSTANCE_FIELD",
+            source,
+            12,
+            5,
+            1,
+            "class C {\n  static const x = 0;\n}\n",
+        );
+        // A `late const` head: `static` lands before `late`.
+        let source = "class C {\n  late const x = 0;\n}\n";
+        assert_sem_multi(
+            "const_instance_field",
+            "COMPILE_TIME_ERROR_CODE.CONST_INSTANCE_FIELD",
+            source,
+            17,
+            5,
+            1,
+            "class C {\n  static late const x = 0;\n}\n",
+        );
+    }
+
+    /// `AddLate`: `late ` lands before the keyword, before the written
+    /// type, or before the bare declarator — and a `const` head refuses.
+    #[test]
+    fn uninitialized_declarations_insert_late() {
+        // `final int x` — before `final` (the report anchors the name).
+        let source = "class C {\n  final int x;\n}\n";
+        assert_sem_multi(
+            "final_not_initialized",
+            "COMPILE_TIME_ERROR_CODE.FINAL_NOT_INITIALIZED",
+            source,
+            22,
+            1,
+            1,
+            "class C {\n  late final int x;\n}\n",
+        );
+        // `int x` — before the type.
+        let source = "int x;\n";
+        assert_sem_multi(
+            "not_initialized_non_nullable_variable",
+            "COMPILE_TIME_ERROR_CODE.NOT_INITIALIZED_NON_NULLABLE_VARIABLE",
+            source,
+            4,
+            1,
+            1,
+            "late int x;\n",
+        );
+        // `x = 0`-style inference stays the type-less head.
+        let source = "class C {\n  final x;\n}\n";
+        assert_sem_multi(
+            "not_initialized_non_nullable_instance_field",
+            "COMPILE_TIME_ERROR_CODE.NOT_INITIALIZED_NON_NULLABLE_INSTANCE_FIELD",
+            source,
+            19,
+            1,
+            1,
+            "class C {\n  late final x;\n}\n",
+        );
+    }
+
+    /// `AddNeNull`: ` != null` lands at the reported condition's end.
+    #[test]
+    fn non_bool_condition_appends_ne_null() {
+        let source = "void f(int? x) {\n  if (x) {}\n}\n";
+        // `x` at 23..24.
+        assert_sem_multi(
+            "non_bool_condition",
+            "STATIC_WARNING_CODE.NON_BOOL_CONDITION",
+            source,
+            23,
+            1,
+            1,
+            "void f(int? x) {\n  if (x != null) {}\n}\n",
+        );
+    }
+
+    /// `RemoveMethodDeclaration`: the Object-member's lines go whole —
+    /// the method plus its own line.
+    #[test]
+    fn extension_type_object_member_drops() {
+        let source = "extension type E(int i) {\n  int hashCode() => 0;\n}\n";
+        // `hashCode` at 33..41.
+        assert_sem_multi(
+            "extension_type_declares_member_of_object",
+            "COMPILE_TIME_ERROR_CODE.EXTENSION_TYPE_DECLARES_MEMBER_OF_OBJECT",
+            source,
+            33,
+            8,
+            1,
+            "extension type E(int i) {\n}\n",
+        );
+    }
+
+    /// `RemoveConst`'s head drops: a `const`-headed list rewrites to
+    /// `final`; a `const`/`new` heading the creation drops with its
+    /// trivia.
+    #[test]
+    fn non_constant_initializer_drops_head_const() {
+        // `const x = v` → `final x = v` (the list arm; the report anchors
+        // the value expression `v`).
+        let source = "void f() {\n  const x = y();\n}\n";
+        assert_sem_multi(
+            "const_initialized_with_non_constant_value",
+            "COMPILE_TIME_ERROR_CODE.CONST_INITIALIZED_WITH_NON_CONSTANT_VALUE",
+            source,
+            23,
+            3,
+            1,
+            "void f() {\n  final x = y();\n}\n",
+        );
+        // `var x = const C()` — the `const` heading the creation drops.
+        let source = "class C {\n  const C();\n}\nvoid f() {\n  var x = const C();\n}\n";
+        // The `const` inside the initializer at 46..51, the creation at
+        // 46..52 (`const C`); the report anchors the creation expression.
+        assert_sem_multi(
+            "const_initialized_with_non_constant_value",
+            "COMPILE_TIME_ERROR_CODE.CONST_INITIALIZED_WITH_NON_CONSTANT_VALUE",
+            source,
+            46,
+            8,
+            1,
+            "class C {\n  const C();\n}\nvoid f() {\n  var x = C();\n}\n",
+        );
+    }
+
+    /// `AddConst` on the pattern operand: an atomic operand takes `const `;
+    /// a composite wraps `const (…)`.
+    #[test]
+    fn non_constant_pattern_adds_const() {
+        // `case x:` — atomic.
+        let source = "void f(int v, int x) {\n  switch (v) {\n    case x:\n      break;\n  }\n}\n";
+        assert_sem_multi(
+            "constant_pattern_with_non_constant_expression",
+            "COMPILE_TIME_ERROR_CODE.CONSTANT_PATTERN_WITH_NON_CONSTANT_EXPRESSION",
+            source,
+            47,
+            1,
+            1,
+            "void f(int v, int x) {\n  switch (v) {\n    case const x:\n      break;\n  }\n}\n",
+        );
+        // `case x + 1:` — composite wraps.
+        let source = "void f(int v, int x) {\n  switch (v) {\n    case x + 1:\n      break;\n  }\n}\n";
+        assert_sem_multi(
+            "constant_pattern_with_non_constant_expression",
+            "COMPILE_TIME_ERROR_CODE.CONSTANT_PATTERN_WITH_NON_CONSTANT_EXPRESSION",
+            source,
+            47,
+            5,
+            2,
+            "void f(int v, int x) {\n  switch (v) {\n    case const (x + 1):\n      break;\n  }\n}\n",
+        );
+    }
+
+    /// `AddAsync`: `async ` lands at the enclosing body's opener — the
+    /// `await` lexeme is already written (the diagnostic is it parsing
+    /// as an identifier). An already-`async` body refuses.
+    #[test]
+    fn undefined_await_inserts_async() {
+        let source = "void f() {\n  await g();\n}\n";
+        // `await` at 13..18.
+        assert_sem_multi(
+            "undefined_identifier_await",
+            "COMPILE_TIME_ERROR_CODE.UNDEFINED_IDENTIFIER_AWAIT",
+            source,
+            13,
+            5,
+            1,
+            "void f() async {\n  await g();\n}\n",
+        );
+        // A fused `=>` head writes ` async ` (the lead space upstream's
+        // fused-token check adds).
+        let source = "void f()=>await g();\n";
+        assert_sem_multi(
+            "undefined_identifier_await",
+            "COMPILE_TIME_ERROR_CODE.UNDEFINED_IDENTIFIER_AWAIT",
+            source,
+            10,
+            5,
+            1,
+            "void f() async =>await g();\n",
+        );
+        // An async body refuses — `await` is legal there.
+        let source = "void f() async {\n  await g();\n}\n";
+        assert_sem_no_fix(
+            "undefined_identifier_await",
+            "COMPILE_TIME_ERROR_CODE.UNDEFINED_IDENTIFIER_AWAIT",
+            source,
+            19,
+            5,
+        );
+    }
+
+    /// `MoveInitializationToFieldDeclaration`: the `: y = x` entry goes,
+    /// ` = x` lands at the field's declarator — the primary-constructor
+    /// face (the rule reports the field name inside the initializer).
+    #[test]
+    fn initializer_moves_to_field_declaration() {
+        let source = "class C(int x) {\n  this : y = x;\n  int y;\n}\n";
+        // `y` inside `: y = x` — at 26..27.
+        assert_lint_multi(
+            "initialize_in_field_declaration",
+            source,
+            26..27,
+            2,
+            "class C(int x) {\n  this;\n  int y = x;\n}\n",
+        );
+        // A second initializer survives: `, z = x` stays.
+        let source = "class C(int x) {\n  this : y = x, z = x;\n  int y;\n  int z;\n}\n";
+        assert_lint_multi(
+            "initialize_in_field_declaration",
+            source,
+            26..27,
+            2,
+            "class C(int x) {\n  this : z = x;\n  int y = x;\n  int z;\n}\n",
+        );
+    }
+
+    /// `ConvertToInitializingFormal`: `this.` lands at the parameter, the
+    /// initializer goes; equal written types fold the parameter's type
+    /// away. The rule reports the whole `x = v` entry.
+    #[test]
+    fn initializer_folds_into_initializing_formal() {
+        // Same-type face: `int v` → `this.x`.
+        let source = "class C {\n  int x;\n  C(int v) : x = v;\n}\n";
+        // `x = v` at 32..37.
+        assert_lint_multi(
+            "prefer_initializing_formals",
+            source,
+            32..37,
+            2,
+            "class C {\n  int x;\n  C(this.x);\n}\n",
+        );
+        // Different types keep the parameter's: `num v` → `num this.x`.
+        let source = "class C {\n  int x;\n  C(num v) : x = v;\n}\n";
+        assert_lint_multi(
+            "prefer_initializing_formals",
+            source,
+            32..37,
+            2,
+            "class C {\n  int x;\n  C(num this.x);\n}\n",
+        );
+        // The lone-statement body face: `{ this.x = v; }` → `;`.
+        let source = "class C {\n  int x;\n  C(int v) {\n    this.x = v;\n  }\n}\n";
+        // The lint reports `this.x = v` — at 36..46.
+        assert_lint_multi(
+            "prefer_initializing_formals",
+            source,
+            36..46,
+            2,
+            "class C {\n  int x;\n  C(this.x);\n}\n",
+        );
+    }
+
+    /// `ConvertToDeclaringParameter`: a `this.i` field formal takes
+    /// `final`/the field's type and the field goes; a plain parameter
+    /// assigned by a `this : f = i` initializer takes the keyword before
+    /// its type, the initializer and field lines go. The rule reports the
+    /// parameter name.
+    #[test]
+    fn parameter_becomes_declaring() {
+        // `this.i` bare → `final int i` (the field's type carries); the
+        // report anchors the parameter's `i` at 13..14.
+        let source = "class C(this.i) {\n  final int i;\n}\n";
+        assert_lint_multi(
+            "use_declaring_parameters",
+            source,
+            13..14,
+            2,
+            "class C(final int i) {\n}\n",
+        );
+        // `var` field: `this.i` → `var int i`.
+        let source = "class C(this.i) {\n  int i;\n}\n";
+        assert_lint_multi(
+            "use_declaring_parameters",
+            source,
+            13..14,
+            2,
+            "class C(var int i) {\n}\n",
+        );
+        // Plain parameter + `this : _x = x` initializer (the upstream
+        // `test_privateField` face): `x` renames to the field's `_x`,
+        // `var ` lands (the field is mutable), and the field-plus-body
+        // merge drops both lines.
+        let source = "class C(int x) {\n  int _x;\n\n  this : _x = x;\n\n  int get y => _x + 1;\n}\n";
+        // The parameter `x` at 12..13.
+        assert_lint_multi(
+            "use_declaring_parameters",
+            source,
+            12..13,
+            3,
+            "class C(var int _x) {\n\n  int get y => _x + 1;\n}\n",
+        );
+    }
+
+    /// `OrganizeImports`: the block re-sorts — `dart:` before `package:`,
+    /// alphabetical inside a group, a blank line between groups.
+    #[test]
+    fn directives_sort_into_groups() {
+        let source = "import 'package:b/b.dart';\nimport 'dart:io';\nimport 'package:a/a.dart';\nimport 'dart:async';\nvoid f() {}\n";
+        // `directives_ordering` reports each out-of-order directive — the
+        // row anchors one directive's span (`import 'dart:io';` at
+        // 26..43).
+        assert_lint_multi(
+            "directives_ordering",
+            source,
+            26..43,
+            1,
+            "import 'dart:async';\nimport 'dart:io';\n\nimport 'package:a/a.dart';\nimport 'package:b/b.dart';\nvoid f() {}\n",
+        );
+        // An export-out-of-order face: imports group first, exports
+        // follow through the same groups.
+        let source = "export 'package:e/e.dart';\nimport 'dart:io';\n";
+        assert_lint_multi(
+            "directives_ordering",
+            source,
+            0..27,
+            1,
+            "import 'dart:io';\n\nexport 'package:e/e.dart';\n",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Create-file face: uri_does_not_exist's cross-file row
+    // -----------------------------------------------------------------------
+
+    /// The `uri_does_not_exist` row the official resolver emits — the
+    /// message carries the URI (`quoted_uri` reads it; the span must
+    /// slice to the same literal), anchored on the quoted literal itself.
+    fn uri_row(offset: u32, length: u32, uri: &str) -> Diagnostic {
+        Diagnostic::new(
+            Severity::Warning,
+            CodeInfo::new(
+                "uri_does_not_exist",
+                "URI_DOES_NOT_EXIST",
+                DiagnosticType::StaticWarning,
+                false,
+            ),
+            format!("Target of URI doesn't exist: '{uri}'."),
+            FileTable::new().intern(Path::new("t.dart")),
+            SourceRange {
+                offset,
+                length,
+            },
+            None,
+        )
+    }
+
+    /// The create-file offer end to end over a real workspace: the missing
+    /// relative target of an import is offered as a cross-file row (the
+    /// target named, the upstream TODO stub as the born content, the hit
+    /// file carrying no edit of its own), and the same hit over a target
+    /// that exists on disk offers nothing — the row rides only while the
+    /// target is absent.
+    #[test]
+    fn uri_create_file_offers_only_a_missing_relative_target() {
+        static SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let tag = format!(
+            "uri_create_{}",
+            SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        );
+        let root = crate::workspace::test_fixture::workspace(
+            &tag,
+            &[("lib/test.dart", "import 'missing.dart';\n")],
+        );
+        let path = root.join("lib/test.dart");
+        let text = std::fs::read_to_string(&path).expect("fixture text");
+        let lines = LineIndex::new(&text);
+        // The report anchors the quoted literal — `7..21` slices
+        // `'missing.dart'`, the span the official `SimpleStringLiteral`
+        // guard reads.
+        let fixes = from_semantic(
+            &[uri_row(7, 14, "missing.dart")],
+            &text,
+            &lines,
+            &path,
+            &walk_fuse(),
+        );
+        assert_eq!(fixes.len(), 1, "the missing target offers the born file");
+        assert_eq!(
+            fixes[0].target.as_deref(),
+            Some(root.join("lib/missing.dart").to_str().expect("utf-8"))
+        );
+        assert_eq!(fixes[0].edit.replacement, "// TODO Implement this library.");
+        // The row's edit addresses the target's empty text, not the hit
+        // file's — the executor's contract ([`created_file_row`]): applied
+        // to the empty buffer it writes exactly the born content, and the
+        // hit file's own edit set stays clean.
+        let (patched, outcomes) = apply("", std::slice::from_ref(&fixes[0].edit));
+        assert_eq!(outcomes, &[EditOutcome::Applied]);
+        assert_eq!(patched, "// TODO Implement this library.");
+
+        // The target on disk: no fix — offered only while absent.
+        std::fs::write(root.join("lib/missing.dart"), "library t;\n").expect("write target");
+        let fixes = from_semantic(
+            &[uri_row(7, 14, "missing.dart")],
+            &text,
+            &lines,
+            &path,
+            &walk_fuse(),
+        );
+        assert!(fixes.is_empty(), "an existing target offers no create row");
+    }
+
+    /// The `part` face: the born file carries the `part of '<library>';`
+    /// head naming the hit file, `/`-joined relative to the part file's
+    /// own directory (the official `pathContext.relative` +
+    /// `split/join('/')` shape) plus the builder's blank-line tail.
+    #[test]
+    fn uri_create_file_part_face_names_the_library() {
+        static SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let tag = format!(
+            "uri_part_{}",
+            SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        );
+        let root = crate::workspace::test_fixture::workspace(
+            &tag,
+            &[("lib/test.dart", "part 'src/piece.dart';\n")],
+        );
+        let path = root.join("lib/test.dart");
+        let text = std::fs::read_to_string(&path).expect("fixture text");
+        let lines = LineIndex::new(&text);
+        let fixes = from_semantic(
+            &[uri_row(5, 16, "src/piece.dart")],
+            &text,
+            &lines,
+            &path,
+            &walk_fuse(),
+        );
+        assert_eq!(fixes.len(), 1, "the missing part target offers the file");
+        assert_eq!(
+            fixes[0].target.as_deref(),
+            Some(root.join("lib/src/piece.dart").to_str().expect("utf-8"))
+        );
+        assert_eq!(fixes[0].edit.replacement, "part of '../test.dart';\n\n");
+    }
+
+    /// The faces the evidence cannot prove drop — the row never invents a
+    /// file: resolver-world URIs (`package:` resolves through the source
+    /// factory — the known-diff face), non-Dart targets, adjacent-string
+    /// spans (never the single `SimpleStringLiteral`), and `part of` (no
+    /// arm of the official parent dispatch).
+    #[test]
+    fn uri_create_file_drops_the_unprovable_faces() {
+        let drop = |source: &str, uri: &str, offset: u32, length: u32| {
+            let lines = LineIndex::new(source);
+            assert!(
+                from_semantic(
+                    &[uri_row(offset, length, uri)],
+                    source,
+                    &lines,
+                    test_path(),
+                    &walk_fuse()
+                )
+                .is_empty(),
+                "{source:?} must drop"
+            );
+        };
+        drop("import 'package:a/a.dart';\n", "package:a/a.dart", 7, 18);
+        drop("import 'notes.txt';\n", "notes.txt", 7, 11);
+        drop("import 'a.dart' 'b.dart';\n", "a.dart", 7, 18);
+        drop("part of 'a.dart';\n", "a.dart", 8, 8);
     }
 }
