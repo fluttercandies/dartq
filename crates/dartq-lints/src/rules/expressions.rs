@@ -10860,11 +10860,11 @@ pub(crate) mod noop_primitive_operations {
     /// name not being a same-file declaration. Approximations (documented):
     /// a member-chain receiver beyond the first hop, an unknown-type
     /// (`var`) binding, and a written core-type name shadowed by a
-    /// same-file declaration stay silent; the core `print` identity is the
-    /// conservative name-table face — a bare unshadowed `print` is core
-    /// (any resolved binding of the name is a user declaration) — which
-    /// under-reports a shadowing import. Message: `diagnostic.g.dart`
-    /// `noopPrimitiveOperations`.
+    /// same-file declaration stay silent; the core `print` identity is
+    /// the name-table face (`isDartCorePrint`) — a bare `print` binding
+    /// into the synthetic SDK face is core, a workspace binding shadows
+    /// it, which under-reports a shadowing import. Message:
+    /// `diagnostic.g.dart` `noopPrimitiveOperations`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "noop_primitive_operations",
         group: Group::Standalone,
@@ -10900,12 +10900,17 @@ pub(crate) mod noop_primitive_operations {
         if slice::access_marker(c, &kids, pos, NodeKind::DotAccess).is_none() {
             // The bare-invocation face (:59-66): core `print` with exactly
             // one argument descends for the toString shape. The identity is
-            // the conservative name-table face: any resolved binding of the
-            // bare name is a user declaration, not the core function.
+            // the name-table face (`isDartCorePrint`): a bare `print`
+            // resolving into the synthetic SDK face is the core function —
+            // descend; a resolved workspace binding shadows it (kept
+            // under-reported).
             if name != "print" || arguments.is_none() {
                 return;
             }
-            if analysis.binding_of(query_site(c, kids[selector])).is_some() {
+            if analysis
+                .binding_of(query_site(c, kids[selector]))
+                .is_some_and(|binding| !analysis.is_sdk_binding(&binding))
+            {
                 return;
             }
             // Exactly one argument (:60-61): the `Arguments` row is a single
@@ -11247,33 +11252,40 @@ pub(crate) mod unnecessary_lambdas {
     /// (`body_inference_context.dart:183-207`), or the typing context's
     /// `void` (:157-181), and an expression-statement block body's `Null`
     /// (:197-199) only ever meets the permissive fallback upstream. The
-    /// verdict is [`FnSig::assignable_from`]'s tri-state: `Some(true)` —
-    /// provably assignable from written declarations — reports; `None`
-    /// (undecidable) and `Some(false)` (provably not) both stay silent,
-    /// the conservative under-report channel on the resolved face.
-    /// Upstream's permissive `parametersMatch` fallback (:107-151,
-    /// consulted at :247) is ported on the no-signature face: a callee
-    /// the model resolves to no function type — a local function, a
-    /// function-typed variable, an unresolved spelling (the dart:core
-    /// names the gate rows exercise) — takes the fallback's
-    /// non-`FunctionType` arm (:108-111, "We must assume is valid here")
-    /// and reports: in a compiling forward every invocable callee carries
-    /// a function-typed invocation type whose required counts the
-    /// arguments-match gate has already tied, so the arm cannot fail the
-    /// assignability relation. The bare creation head keeps its cut
-    /// below: a class-like name is the one bare callee whose invocation
-    /// is no function-type composition at all.
+    /// verdict is [`FnSig::assignable_from`]'s tri-state read in the
+    /// upstream decision order (:246-249,
+    /// `!isAssignableTo(invocationType, nodeType) &&
+    /// !parametersMatch(invocationType, nodeType)`): `Some(true)` —
+    /// provably assignable from written declarations — reports;
+    /// `Some(false)` (provably not) stays silent; `None` (undecidable —
+    /// the inferred channel: an untyped lambda formal's context type,
+    /// generics, hierarchy and parameterized leaves the declared facts
+    /// cannot decide) consults the `parametersMatch` fallback (:107-151).
+    /// The fallback is ported on both faces. The no-signature face: a
+    /// callee the model resolves to no function type — a local function,
+    /// a function-typed variable, an unresolved spelling (the dart:core
+    /// names the gate rows exercise) — takes the non-`FunctionType` arm
+    /// (:108-111, "We must assume is valid here") and reports: in a
+    /// compiling forward every invocable callee carries a function-typed
+    /// invocation type whose required counts the arguments-match gate has
+    /// already tied, so the arm cannot fail the assignability relation.
+    /// The FunctionType path (:112-150): the required-positional counts
+    /// match, the optional-positional pairs to the minimum length and the
+    /// invocation's named formals assign — an undecided leaf passing, a
+    /// decided-false one failing. The constructor gate keeps plain
+    /// assignability (:208 — no fallback consultation upstream), and the
+    /// bare creation head keeps its cut below: a class-like name is the
+    /// one bare callee whose invocation is no function-type composition
+    /// at all.
     ///
-    /// Deliberate silences, every one a `None` face: an untyped lambda
-    /// formal (its type is inferred from the context upstream — not
-    /// modeled); a written `dynamic` lambda formal (the model leaf's
-    /// `dynamic`-downcast arm is `isAssignableTo`'s whole-type rule, not
-    /// the function-subtype parameter leaf's `isSubtypeOf`,
-    /// `subtype.dart:127` — a non-top target formal would over-prove); a
-    /// parameterized, prefixed, function-typed, record-typed, or `void`
-    /// written formal; a getter, field, or prefix callee (the member
-    /// face's accessor cut — no method signature composes); a generic
-    /// callee (its instantiation the model does not name); a
+    /// Deliberate silences. The `Some(false)` faces: a nullable written
+    /// formal at a non-nullable target formal, a required target formal
+    /// the lambda lacks, a constructor formal the lambda lacks. The
+    /// undecided `None` faces the fallback's gates fail: a
+    /// required-positional count mismatch (an optional target formal
+    /// against the untyped forward's required slot). The faces that never
+    /// reach the gate: a getter, field, or prefix callee (the member
+    /// face's accessor cut — no method signature composes); a
     /// `receiver.method` whose receiver type the model cannot name; a
     /// prefixed or unresolved creation head; a creation head published as
     /// a value reference (the bare `C(a)` send, no type-use row) — of
@@ -11283,7 +11295,13 @@ pub(crate) mod unnecessary_lambdas {
     /// construction, since a compiling zero-argument call means the
     /// constructor declares no required formal and optional leftovers on
     /// the replacement side are admissible (`subtype.dart:141-146`,
-    /// :157-165). Message: `diagnostic.g.dart` `unnecessaryLambdas`.
+    /// :157-165). The undecided-but-plausible faces report through the
+    /// fallback — an untyped, `dynamic`, `void`, parameterized,
+    /// prefixed, function-typed, or record-typed written formal, a
+    /// generic callee, distinct named types — matching upstream, where
+    /// the context-inferred lambda type makes the tear-off stand (the
+    /// #2095 lane's live probes on 3.13.1; #2109's resolved-callee
+    /// channel). Message: `diagnostic.g.dart` `unnecessaryLambdas`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "unnecessary_lambdas",
         group: Group::Standalone,
@@ -11536,7 +11554,9 @@ pub(crate) mod unnecessary_lambdas {
             }
         };
         let fires = match target {
-            Some(target) => lambda_accepts(c, analysis, &formals, target),
+            // The :246-249 gate — assignability, else the fallback on the
+            // undecided face.
+            Some(target) => lambda_accepts(c, analysis, &formals, target, true),
             // No callable face composes. A same-file class-like name is
             // the creation head: only the zero-argument shape is provable
             // (the constructor formals the model cannot name stay
@@ -11637,7 +11657,8 @@ pub(crate) mod unnecessary_lambdas {
             Ty::named(binding.container),
             binding.formals.unwrap_or(&implicit),
         );
-        if lambda_accepts(c, analysis, &formals, target) {
+        // :208 reads plain assignability — no fallback consultation.
+        if lambda_accepts(c, analysis, &formals, target, false) {
             let range = c.utf16_span(lambda);
             c.report(range, &[]);
         }
@@ -11665,16 +11686,75 @@ pub(crate) mod unnecessary_lambdas {
     }
 
     /// The assignability gate (:208, :246): the callee's signature stands
-    /// where the lambda's does — `Some(true)` only; `None` (undecidable
-    /// from written facts) and `Some(false)` both stay silent.
+    /// where the lambda's does. `Some(true)` reports, `Some(false)` stays
+    /// silent, and the undecided `None` consults the `parametersMatch`
+    /// fallback — the invocation gate only (:246-249; the constructor
+    /// gate :208 reads plain assignability upstream), per `fallback`.
     fn lambda_accepts(
         c: &Check<'_>,
         analysis: &Analysis<'_>,
         formals: &[LambdaFormal<'_>],
         target: FnSig<'_>,
+        fallback: bool,
     ) -> bool {
         let own = lambda_formal_table(c, analysis, formals);
-        FnSig::new(0, Ty::Void, &own).assignable_from(target) == Some(true)
+        match FnSig::new(0, Ty::Void, &own).assignable_from(target) {
+            Some(accepts) => accepts,
+            None => fallback && parameters_match(&target, &own),
+        }
+    }
+
+    /// The `parametersMatch` FunctionType path (:112-150), the undecided
+    /// face's gate: the required-positional counts match (:112-120); the
+    /// optional-positional pairs to the minimum length (:121-128) and the
+    /// invocation's named formals (:129-149 — absent required fails,
+    /// absent optional skips, required flags agree) assign, an undecided
+    /// leaf passing (the "we must assume is valid here" posture, :109)
+    /// and a decided-false one failing. The invocation type is a function
+    /// type here by construction: a callee composing no model signature
+    /// takes the non-`FunctionType` arm at the call site (:108-111).
+    fn parameters_match(invocation: &FnSig<'_>, node: &Formals) -> bool {
+        let invocation_positional = &invocation.formals.positional;
+        if invocation_positional
+            .iter()
+            .filter(|formal| formal.required)
+            .count()
+            != node
+                .positional
+                .iter()
+                .filter(|formal| formal.required)
+                .count()
+        {
+            return false;
+        }
+        let node_optional = node.positional.iter().filter(|formal| !formal.required);
+        if invocation_positional
+            .iter()
+            .filter(|formal| !formal.required)
+            .zip(node_optional)
+            .any(|(invocation_param, node_param)| {
+                node_param.ty.assignable_from(invocation_param.ty) == Some(false)
+            })
+        {
+            return false;
+        }
+        for invocation_param in invocation.formals.named.iter() {
+            match node.named_formal(invocation_param.name) {
+                None => {
+                    if invocation_param.required {
+                        return false;
+                    }
+                }
+                Some(node_param) => {
+                    if invocation_param.required != node_param.required
+                        || node_param.ty.assignable_from(invocation_param.ty) == Some(false)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// The `argumentsMatchParameters` face (dart_type_utilities.dart:13-64):
@@ -13302,7 +13382,10 @@ void k(List<int> xs) {
 
     /// The official `constantContext` face: a const-marked literal under a
     /// const variable declaration reports (`test_constConstructor` family —
-    /// `const c = [!const!] C()`).
+    /// `const c = [!const!] C()`). The declaration sits at the top level, so
+    /// the parser tiles the `VariablesDeclaration` under `TopLevelFields`
+    /// (the member face — the declaration row heads at the `const` keyword
+    /// itself, `variables_decl_is_const`'s member arm).
     #[test]
     fn unnecessary_const_reports_inside_const_declaration() {
         let source = "const x = [const A()];";
@@ -13310,6 +13393,7 @@ void k(List<int> xs) {
         let f = Fixture::build(
             source,
             unit_of(|b, _t| {
+                b.begin(NodeKind::TopLevelFields, 0);
                 b.begin(NodeKind::VariablesDeclaration, 0);
                 b.patch(0, NONE);
                 b.begin(NodeKind::InitializedIdentifier, 1);
@@ -13326,11 +13410,18 @@ void k(List<int> xs) {
                 b.end(NodeKind::VariableInitializer, 9);
                 b.end(NodeKind::InitializedIdentifier, 9);
                 b.end(NodeKind::VariablesDeclaration, 10);
+                b.end(NodeKind::TopLevelFields, 10);
             }),
         );
         let lints = f.run(&one_rule("unnecessary_const"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].message, "Unnecessary 'const' keyword.");
+        assert_eq!(lints[0].range.start, utf16_at(&f, 4));
+        // The production bridge agrees: the same source parsed for real
+        // reports identically (the fixture mirrors `endTopLevelFields`'s
+        // tiling — `TopLevelFields` wrapping the member declaration).
+        let lints = Fixture::parse(source).run(&one_rule("unnecessary_const"));
+        assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].range.start, utf16_at(&f, 4));
     }
 
@@ -15016,9 +15107,13 @@ void k(List<int> xs) {
     /// 3.13.1): a block-body lambda in variable-initializer position
     /// stays silent — only arrow bodies report there — while argument
     /// positions report for both body forms (`locals_family.dart`'s
-    /// rc2 divergence, the `handler` initializer).
+    /// rc2 divergence, the `handler` initializer). The arrow-initializer
+    /// row fires through the `parametersMatch` fallback arm: `print`
+    /// resolves to no model signature (the unindexed dart:core name), so
+    /// the no-signature face reports — verified end to end against the
+    /// 3.13.1 SDK (#2095).
     #[test]
-    fn unnecessary_lambdas_block_body_initializer_stays_silent() {
+    fn unnecessary_lambdas_initializer_faces() {
         let initializer = "void f() {\n  final handler = (int input) {\n    print(input);\n  };\n  handler(1);\n}\n";
         assert!(
             Fixture::parse(initializer)
@@ -15026,12 +15121,30 @@ void k(List<int> xs) {
                 .is_empty(),
             "block body in initializer position stays silent"
         );
+        // The arrow initializer reports in the semantic run; the plain
+        // run stays silent (the wave posture). Both positions — the local
+        // declaration and the top-level member — read the same face.
         let arrow_initializer = "void f() {\n  final h2 = (e) => print(e);\n  h2(1);\n}\n";
-        let lints = Fixture::parse(arrow_initializer).run(&one_rule("unnecessary_lambdas"));
-        // dartq under-reports the arrow-initializer face (no corpus entry
-        // yet; #2095 carries the gap) — pinned silent here, oracle-probed
-        // firing on 3.13.1.
-        assert!(lints.is_empty(), "{lints:?}");
+        assert!(
+            Fixture::parse(arrow_initializer)
+                .run(&one_rule("unnecessary_lambdas"))
+                .is_empty(),
+            "the plain run stays silent (the wave posture)"
+        );
+        let lints = run_semantic(arrow_initializer, "unnecessary_lambdas", None);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let top_level = "final h2 = (e) => print(e);\nvoid f() {\n  h2(1);\n}\n";
+        let lints = run_semantic(top_level, "unnecessary_lambdas", None);
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        // The resolved-callee channel (#2109): a same-file `print` composes
+        // `void Function(Object?)`, the untyped formal's inferred channel
+        // leaves the verdict `None`, and the `parametersMatch` FunctionType
+        // path carries the face — the oracle fires the same way (the #2095
+        // lane's live probe on 3.13.1).
+        let resolved =
+            "void print(Object? e) {}\nvoid f() {\n  final h3 = (e) => print(e);\n  h3(1);\n}\n";
+        let lints = run_semantic(resolved, "unnecessary_lambdas", None);
+        assert_eq!(lints.len(), 1, "{lints:?}");
         let argument = "void f() {\n  [1].forEach((e) {\n    print(e);\n  });\n}\n";
         let lints = run_semantic(argument, "unnecessary_lambdas", None);
         assert_eq!(lints.len(), 1, "{lints:?}");
@@ -20785,7 +20898,12 @@ pub(crate) mod prefer_const_constructors {
     /// conservative direction — suggesting `const` there can change
     /// inference, #4531; the downward-inference face that does report
     /// upstream under-reports). The `@literal` gate reads the resolved
-    /// same-file constructor's own metadata. Message: `diagnostic.g.dart`
+    /// same-file constructor's own metadata over the analyzer's
+    /// declaring-library gate (`library meta;` — the unnamed vendored
+    /// meta of a differential corpus never recognizes it, and the
+    /// creation reports; the written-type-argument face of `canBeConst`
+    /// — a type variable in `C<T>()` — lives in the shared const-ability
+    /// face). Message: `diagnostic.g.dart`
     /// `preferConstConstructors`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_const_constructors",
@@ -20808,6 +20926,12 @@ pub(crate) mod prefer_const_constructors {
         if in_const_context(c) {
             return;
         }
+        // The dot-shorthand creation resolves through the context type, so
+        // `is_const_able` (a same-file-name face) cannot see it — handle it
+        // before the shared const-ability early-return.
+        if c.kind(node) == NodeKind::Send && shorthand_send_face(c) {
+            return;
+        }
         // `element.isConst` (:46/:69) + `node.canBeConst` (:57/:99) — the
         // same-file const-ability face.
         if !crate::rules::const_ability::is_const_able(c.unit, node) {
@@ -20827,7 +20951,7 @@ pub(crate) mod prefer_const_constructors {
                 else {
                     return;
                 };
-                if gate_generic(c, class_name, written_type_arguments)
+                if gate_generic(c, node, class_name, written_type_arguments)
                     || ctor_has_literal(c, class_name, selector)
                 {
                     return;
@@ -20840,6 +20964,78 @@ pub(crate) mod prefer_const_constructors {
             }
             _ => send_face(c),
         }
+    }
+
+    /// The dot-shorthand creation face (`A a = .new()`, `.tightFor(…)`,
+    /// `C get f => .new(1)`): the dispatch `Send` carries the `new (…)` /
+    /// `selector (…)` invocation, the `DotShorthandHead` leaf for the `.`
+    /// tiles immediately before its callee head, and the class resolves
+    /// through the enclosing context's written type. The report spans the
+    /// `.` through the argument list (`upstream Dart SDK source,
+    /// pkg/linter/lib/src/rules/prefer_const_constructors.dart` :39-60
+    /// `visitDotShorthandInvocation` — `canBeConst` gates the same way).
+    /// Returns `true` when the node was the shorthand send (reported or
+    /// resolved-silent), `false` to fall through to the generic faces.
+    fn shorthand_send_face(c: &mut Check<'_>) -> bool {
+        let Some((kids, pos)) = slice::owner_slice(c) else {
+            return false;
+        };
+        let Some((head, arguments)) = slice::send_parts(c, &kids, pos) else {
+            return false;
+        };
+        let Some(arguments) = arguments else {
+            return false;
+        };
+        let selector_row = kids[head];
+        // The `.` head leaf seals immediately after the send in the owner
+        // run, its span butting the callee selector's start (`.new` — the
+        // leaf owns the `.`, the send owns `new (…)`).
+        let Some(&head_row) = kids.get(pos + 1) else {
+            return false;
+        };
+        if c.kind(head_row) != NodeKind::DotShorthandHead
+            || c.unit.ast.token_range(head_row).end != c.head_token(selector_row)
+        {
+            return false;
+        }
+        let selector = c.lexeme(c.head_token(selector_row));
+        let Some(class_name) = shorthand_context_type(c) else {
+            return true;
+        };
+        if !crate::rules::const_ability::send_shorthand_able(
+            c.unit, class_name, selector, arguments,
+        ) || ctor_has_literal(c, class_name, (selector != "new").then_some(selector))
+        {
+            return true;
+        }
+        let start = c.utf16_span(head_row).start;
+        c.report(start..c.utf16_span(arguments).end, &[]);
+        true
+    }
+
+    /// The class the shorthand's `.new`/`.named` resolves against — the
+    /// enclosing `VariablesDeclaration`'s written type (`A a = .new()`),
+    /// else the enclosing function/getter's return type (`C get f =>
+    /// .new(1)`). `None` when no context type is written (under-report).
+    fn shorthand_context_type<'a>(c: &'a Check<'_>) -> Option<&'a str> {
+        for &ancestor in c.path[..c.path.len() - 1].iter().rev() {
+            let ty = match c.kind(ancestor) {
+                NodeKind::VariablesDeclaration | NodeKind::InitializedIdentifier => {
+                    declared_type_left_sibling(c, ancestor)
+                }
+                NodeKind::TopLevelMethod
+                | NodeKind::Method
+                | NodeKind::LocalFunctionDeclaration => c
+                    .collect_direct(ancestor)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::Type),
+                _ => None,
+            };
+            if let Some(ty) = ty {
+                return Some(c.lexeme(c.head_token(ty)));
+            }
+        }
+        None
     }
 
     /// The invocation-send face: the callee resolves through the same
@@ -20877,7 +21073,7 @@ pub(crate) mod prefer_const_constructors {
         else {
             return;
         };
-        if gate_generic(c, class_name, written_type_arguments)
+        if gate_generic(c, c.node(), class_name, written_type_arguments)
             || ctor_has_literal(c, class_name, selector)
         {
             return;
@@ -20955,24 +21151,139 @@ pub(crate) mod prefer_const_constructors {
     }
 
     /// The generic-context-type skip (:80-97): a same-file class that
-    /// declares type parameters, created without written type arguments —
-    /// the conservative bail (see the spec doc). The header's
-    /// `TypeVariables` tiles beside the `ClassDeclaration` row under the
-    /// top-level wrapper.
-    fn gate_generic(c: &Check<'_>, class_name: &str, written_type_arguments: bool) -> bool {
-        !written_type_arguments
-            && same_file_declaration(c, class_name).is_some_and(|class_row| {
-                c.unit.ast.parent(class_row).is_some_and(|top| {
-                    c.collect_direct(top)
-                        .iter()
-                        .any(|&kid| c.kind(kid) == NodeKind::TypeVariables)
-                })
+    /// declares type parameters, created without written type arguments,
+    /// whose CONTEXT type's written type arguments name an enclosing type
+    /// parameter (`TypeParameterType`, dart-lang/linter#4531) — suggesting
+    /// `const` there changes inference. A generic creation without written
+    /// arguments whose context type is concrete (or absent) still reports.
+    /// The header's `TypeVariables` tiles beside the `ClassDeclaration`
+    /// row under the top-level wrapper; the context type read is the
+    /// enclosing declarator's declared type or the enclosing function's
+    /// return type.
+    fn gate_generic(
+        c: &Check<'_>,
+        node: u32,
+        class_name: &str,
+        written_type_arguments: bool,
+    ) -> bool {
+        if written_type_arguments {
+            return false;
+        }
+        let generic = same_file_declaration(c, class_name).is_some_and(|class_row| {
+            c.unit.ast.parent(class_row).is_some_and(|top| {
+                c.collect_direct(top)
+                    .iter()
+                    .any(|&kid| c.kind(kid) == NodeKind::TypeVariables)
             })
+        });
+        generic && context_mentions_type_variable(c, node)
+    }
+
+    /// Whether the creation's context type's written type arguments name
+    /// an in-scope type parameter — the upstream `TypeParameterType` face
+    /// (:85-97). Reads the enclosing `VariablesDeclaration` declared type
+    /// or the enclosing function's return type, then tests each type
+    /// argument's head name against the type variables in scope. `false`
+    /// (the conservative under-report keep) when no context type is
+    /// written or none of its arguments is a type parameter.
+    fn context_mentions_type_variable(c: &Check<'_>, node: u32) -> bool {
+        // The in-scope type variables: the enclosing generic declaration's
+        // `TypeVariables` heads (class or function).
+        let mut names = Vec::new();
+        let mut current = Some(node);
+        while let Some(row) = current {
+            for kid in c.collect_direct(row) {
+                if c.kind(kid) == NodeKind::TypeVariables {
+                    names.extend(type_variable_names(c, kid));
+                }
+            }
+            current = c.unit.ast.parent(row);
+        }
+        if names.is_empty() {
+            return false;
+        }
+        // The context type's written type arguments: the enclosing
+        // declarator's declared type, or the enclosing function's return
+        // type — each a `Type` row whose `TypeArguments` carry the args.
+        let mut current = Some(node);
+        while let Some(row) = current {
+            let ty = match c.kind(row) {
+                NodeKind::VariablesDeclaration | NodeKind::InitializedIdentifier => {
+                    declared_type_left_sibling(c, row)
+                }
+                // The function faces: the return type is the method's /
+                // function's own `Type` child (`G<int> f() => …`).
+                NodeKind::TopLevelMethod
+                | NodeKind::Method
+                | NodeKind::LocalFunctionDeclaration => c
+                    .collect_direct(row)
+                    .into_iter()
+                    .find(|&kid| c.kind(kid) == NodeKind::Type),
+                _ => None,
+            };
+            if let Some(ty) = ty {
+                return type_args_name_type_variables(c, ty, &names);
+            }
+            current = c.unit.ast.parent(row);
+        }
+        false
+    }
+
+    /// The left-sibling `Type` of a `VariablesDeclaration` — the declared
+    /// type's row tiles before the declaration (which heads at the name).
+    fn declared_type_left_sibling(c: &Check<'_>, decl: u32) -> Option<u32> {
+        let parent = c.unit.ast.parent(decl)?;
+        let siblings = c.collect_direct(parent);
+        let pos = siblings.iter().position(|&kid| kid == decl)?;
+        siblings[..pos]
+            .iter()
+            .rev()
+            .find(|&&kid| c.kind(kid) == NodeKind::Type)
+            .copied()
+    }
+
+    /// The names a `TypeVariables` row declares (`<T, S>` → `T`, `S`).
+    fn type_variable_names<'a>(c: &'a Check<'_>, vars: u32) -> Vec<&'a str> {
+        c.collect_direct(vars)
+            .into_iter()
+            .filter(|&kid| c.kind(kid) == NodeKind::TypeVariable)
+            .map(|var| c.lexeme(c.head_token(var)))
+            .collect()
+    }
+
+    /// Whether the `Type` row's written type arguments' head names hit any
+    /// of `vars` — the `AImplicit<T>` / `ADownward<int>` split. The
+    /// `TypeArguments` tiles as the `Type`'s right sibling in the owner run
+    /// (production tiling keeps them flat, not nested).
+    fn type_args_name_type_variables(c: &Check<'_>, ty: u32, vars: &[&str]) -> bool {
+        let Some(parent) = c.unit.ast.parent(ty) else {
+            return false;
+        };
+        let args = c
+            .collect_direct(parent)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::TypeArguments);
+        let Some(args) = args else {
+            return false;
+        };
+        c.collect_direct(args).iter().any(|&arg| {
+            c.kind(arg) == NodeKind::Type && vars.contains(&c.lexeme(c.head_token(arg)))
+        })
     }
 
     /// `element.metadata.hasLiteral` (:49/:72): the resolved constructor's
-    /// own metadata names `literal`.
+    /// own metadata names `literal`. The analyzer recognizes the annotation
+    /// only over the declaring-library gate — `_isPackageMetaGetter`
+    /// requires `element.library.name == 'meta'` — so the same-file
+    /// spelling read answers only when the unit declares `library meta;`
+    /// (the same face [`crate::rules::const_ability::spells_meta_library`]
+    /// reads). A corpus importing an unnamed vendored meta — the live
+    /// oracle's own face — never recognizes the annotation, and the
+    /// creation reports like any other.
     fn ctor_has_literal(c: &Check<'_>, class_name: &str, selector: Option<&str>) -> bool {
+        if !crate::rules::const_ability::spells_meta_library(c.unit) {
+            return false;
+        }
         let Some(class_row) = same_file_declaration(c, class_name) else {
             return false;
         };
@@ -21043,41 +21354,211 @@ pub(crate) mod use_named_constants {
     /// `node.isConst` gate, :53-84 the field walk, `reportAtNode` :80).
     ///
     /// dartq faces: the dispatch rows are the written-`const` wrappers
-    /// ([`NodeKind::ConstExpression`] / [`NodeKind::ConstLiteral`] — the
-    /// `isConst` gate IS the dispatch shape) and the whole structural face
+    /// ([`NodeKind::ConstExpression`] / [`NodeKind::ConstLiteral`]) and the
+    /// contextually-const creations — a bare `Send`/`ImplicitCreation`/
+    /// `ConstructorReference`/`NewExpression` inside a `const` context
+    /// ([`crate::rules::in_const_context`] answers upstream's `isConst`,
+    /// which covers the `const a = A(0)` declarator-const face), plus the
+    /// dot-shorthand rows ([`NodeKind::ConstDotShorthand`] for the
+    /// written-`const .new(0)` and [`NodeKind::DotShorthandHead`] under a
+    /// const context for `const A a = .new(0)`). The whole structural face
     /// is the shared named-constant proxy
-    /// ([`crate::rules::const_ability::matches_named_constant`]: the
-    /// creation compared, token for token, against the same-file class's
-    /// `static const` initializers in declaration order, the own-class
-    /// static-initializer guard included). Approximations (documented,
-    /// under-report): the contextually-const face (`const A a = A(0)` —
-    /// upstream's `isConst` answers through resolution) and the const
-    /// dot-shorthands never carry a written wrapper row here, a
-    /// constant-pattern creation reports only when it carries the written
-    /// `const`, and cross-file classes are outside the proxy's
-    /// same-file resolution. Message: `diagnostic.g.dart`
-    /// `useNamedConstants` (the `{0}` slot carries `Type.field`).
+    /// ([`crate::rules::const_ability::matches_named_constant`] /
+    /// [`matches_shorthand_constant`]): the creation compared, token for
+    /// token, against the same-file class's `static const` initializers in
+    /// declaration order — loosened to the callee name when the class
+    /// stores no instance state (upstream's computed-value equality makes
+    /// `A(1)` match `_zero = A(0)` under a discarded-parameter ctor) — and
+    /// the own-class static-initializer guard included. Approximations
+    /// (documented, under-report): the shorthand's context type resolves
+    /// through the enclosing declared type only (a return/parameter
+    /// context type under-reports), a constant-pattern creation reports
+    /// only when it carries the written `const`, and cross-file classes
+    /// are outside the proxy's same-file resolution. Message:
+    /// `diagnostic.g.dart` `useNamedConstants` (the `{0}` slot carries
+    /// `Type.field`).
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "use_named_constants",
         group: Group::Standalone,
         problem: "Use the constant '{0}' rather than a constructor returning the same object.",
         correction: "Try using '{0}'.",
-        kinds: &[NodeKind::ConstExpression, NodeKind::ConstLiteral],
+        kinds: &[
+            NodeKind::ConstExpression,
+            NodeKind::ConstLiteral,
+            NodeKind::ConstantPattern,
+            NodeKind::Send,
+            NodeKind::ImplicitCreation,
+            NodeKind::ConstructorReference,
+            NodeKind::NewExpression,
+        ],
         check,
     };
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        // The written-const gate is the dispatch row itself; the proxy
-        // carries the type/extension-type face, the declaration-order
-        // first match, and the own-static-initializer guard (:56-77).
-        let Some((type_name, field)) =
-            crate::rules::const_ability::matches_named_constant(c.unit, node)
-        else {
+        // A written-const constant pattern (`case const A(0)`, `if (x case
+        // const A(0))`): upstream `visitInstanceCreationExpression` fires
+        // on the operand and reports at the creation, not the pattern —
+        // the pattern row only owns `const` + `Arguments` (the callee send
+        // tiles as a flat sibling), so the extent is reconstructed and the
+        // report lands on it rather than on `node`.
+        if c.kind(node) == NodeKind::ConstantPattern {
+            if c.lexeme(c.head_token(node)) != "const" {
+                return;
+            }
+            let Some((type_name, extent)) =
+                crate::rules::const_ability::pattern_creation(c.unit, node)
+            else {
+                return;
+            };
+            let Some((type_name, field)) = crate::rules::const_ability::matches_bare_constant(
+                c.unit,
+                node,
+                type_name,
+                extent.clone(),
+            ) else {
+                return;
+            };
+            let (Some(start), Some(end)) = (
+                c.utf16_of_token(extent.start),
+                extent
+                    .end
+                    .checked_sub(1)
+                    .and_then(|token| c.utf16_end_of_token(token)),
+            ) else {
+                return;
+            };
+            let constant = format!("{type_name}.{field}");
+            c.report(start..end, &[constant.as_str()]);
+            return;
+        }
+        let found = match c.kind(node) {
+            NodeKind::ConstExpression | NodeKind::ConstLiteral => {
+                crate::rules::const_ability::matches_named_constant(c.unit, node)
+            }
+            // The dot-shorthand invocation (`A a = const .new(0)` /
+            // `const A a = .new(0)`): the `Send` carries the `new (…)`
+            // invocation; the `DotShorthandHead` leaf for the `.` and the
+            // `ConstDotShorthand` marker for a written `const` tile as its
+            // owner-run siblings before it. Const-ness is a `const` marker
+            // sibling (written) or `in_const_context` (the `const A a =`
+            // declarator face); the `.new` callee's class resolves through
+            // the enclosing declared type.
+            NodeKind::Send if shorthand_send(c, node) => {
+                let const_written = shorthand_const_marker(c, node);
+                if const_written || crate::rules::in_const_context(c) {
+                    shorthand_constant(c, node)
+                } else {
+                    None
+                }
+            }
+            // A bare creation inside a const context (`const a = A(0)`):
+            // the written-const gate is `in_const_context`, then the same
+            // written-shape proxy judges the creation against the class's
+            // static consts. The `creation` face is the row itself.
+            NodeKind::Send
+            | NodeKind::ImplicitCreation
+            | NodeKind::ConstructorReference
+            | NodeKind::NewExpression => {
+                // A creation already bracketed by its own `const` wrapper
+                // (`const A(0)` under `case const …:`) dispatches on the
+                // wrapper row — reporting the bare row too would double
+                // the row.
+                if c.path[..c.path.len() - 1].iter().any(|&ancestor| {
+                    matches!(
+                        c.kind(ancestor),
+                        NodeKind::ConstExpression
+                            | NodeKind::ConstLiteral
+                            | NodeKind::ConstDotShorthand
+                    )
+                }) || !crate::rules::in_const_context(c)
+                {
+                    return;
+                }
+                let Some((type_name, extent)) =
+                    crate::rules::const_ability::bare_creation_extent(c.unit, node)
+                else {
+                    return;
+                };
+                crate::rules::const_ability::matches_bare_constant(c.unit, node, type_name, extent)
+            }
+            _ => return,
+        };
+        let Some((type_name, field)) = found else {
             return;
         };
         let constant = format!("{type_name}.{field}");
         c.report(c.utf16_span(node), &[constant.as_str()]);
+    }
+
+    /// The const dot-shorthand's named-constant match: the `.new` callee's
+    /// class is the enclosing context's declared type (the `const A a =
+    /// .new(0)` declarator face). `node` is the shorthand's `Send` row
+    /// (the `new (…)` invocation).
+    fn shorthand_constant<'a>(c: &'a Check<'_>, node: u32) -> Option<(&'a str, &'a str)> {
+        let type_name = shorthand_context_type(c)?;
+        crate::rules::const_ability::matches_shorthand_constant(c.unit, node, type_name)
+    }
+
+    /// Whether the `Send` is a dot-shorthand invocation — the
+    /// `DotShorthandHead` leaf for the `.` tiles immediately before its
+    /// span in the enclosing owner run (`.new(0)` lands as head-leaf +
+    /// `new (…)` send).
+    fn shorthand_send(c: &Check<'_>, node: u32) -> bool {
+        let start = c.head_token(node);
+        let Some(parent) = c.ancestor(1) else {
+            return false;
+        };
+        c.children(parent).any(|kid| {
+            c.kind(kid) == NodeKind::DotShorthandHead && c.unit.ast.token_range(kid).end == start
+        })
+    }
+
+    /// Whether the shorthand's `Send` carries a written `const` — its
+    /// parent is the `ConstDotShorthand` wrapper (`const .new(0)`; the
+    /// wrapper's own span is the `const` keyword leaf).
+    fn shorthand_const_marker(c: &Check<'_>, _node: u32) -> bool {
+        c.ancestor(1)
+            .is_some_and(|parent| c.kind(parent) == NodeKind::ConstDotShorthand)
+    }
+
+    /// The declared type the shorthand's `.new` resolves against — the
+    /// enclosing `VariablesDeclaration`'s written type (`const A a =
+    /// .new(0)`). `None` when no declared type names the context (the
+    /// return/parameter type faces under-report).
+    fn shorthand_context_type<'a>(c: &'a Check<'_>) -> Option<&'a str> {
+        let decl = c
+            .path
+            .iter()
+            .rev()
+            .find(|&ancestor| c.kind(*ancestor) == NodeKind::VariablesDeclaration)?;
+        written_decl_type(c, *decl)
+    }
+
+    /// The written type a `VariablesDeclaration`/`Fields` run spells.
+    /// Production tiling: for `A a = …` the `Type` row tiles as the
+    /// declaration's left sibling (the declaration itself heads at the
+    /// name `a`); the run is the parent's window scanned backward from
+    /// `decl` for the `Type` row.
+    fn written_decl_type<'a>(c: &'a Check<'_>, decl: u32) -> Option<&'a str> {
+        // Inside the declaration first (a member `const A a` keeps the
+        // type in the same row's window).
+        if let Some(ty) = c
+            .collect_direct(decl)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::Type)
+        {
+            return Some(c.lexeme(c.head_token(ty)));
+        }
+        // The left-sibling face: the type precedes the declaration row.
+        let parent = c.unit.ast.parent(decl)?;
+        let siblings = c.collect_direct(parent);
+        let pos = siblings.iter().position(|&kid| kid == decl)?;
+        siblings[..pos]
+            .iter()
+            .rev()
+            .find(|&&kid| c.kind(kid) == NodeKind::Type)
+            .map(|&ty| c.lexeme(c.head_token(ty)))
     }
 }
 
@@ -21117,11 +21598,25 @@ pub(crate) mod avoid_redundant_argument_values {
     /// the class name (the named selector rides the
     /// `MethodDeclarationContinuation` identifier) and factory rows at the
     /// `factory` keyword (the name two or four tokens ahead); both faces
-    /// matched accordingly. Approximations (documented, under-report): the
-    /// element-model faces that leave the file — SDK members like
-    /// `toList(growable: true)`, prefixed annotations and creations,
-    /// function-typed parameters' own lists, `A.new` tear-off variables,
-    /// and cross-file declarations — resolve to nothing and stay silent.
+    /// matched accordingly. The bare selector resolves innermost-first: a
+    /// block-local function declared before the call (or an ancestor's own
+    /// name — self-recursion), a function-typed formal of an enclosing
+    /// executable (its signature rides the `FunctionType` child of the
+    /// `FormalParameter` row), a local variable bound to a same-file
+    /// constructor tear-off (`var a = A.new` — the two-`Send` group inside
+    /// the `VariableInitializer`), then a top-level function, a same-file
+    /// constructor, or the enclosing class's implicit-`this` method. The
+    /// enum element's `Arguments` tile under the `EnumBody` as the
+    /// `EnumElement` marker's left sibling, and the enum's constructor is
+    /// read inside the `EnumBody` (not `DeclarationBody`). Approximations
+    /// (documented, under-report): the element-model faces that leave the
+    /// file — SDK members like `toList(growable: true)`, prefixed
+    /// annotations and creations, and cross-file declarations — resolve to
+    /// nothing and stay silent. The exception is the vendored-meta
+    /// annotation face: `@Immutable(…)`/`@Literal(…)` resolve through the
+    /// pinned `META_ANNOTATION_DEFAULTS` table (one optional-positional
+    /// parameter defaulting to `''`), the corpus vendor's transcription of
+    /// upstream meta.dart.
     /// The upstream options face (`ignoredParameters`) does not exist in
     /// the current rule source. Message: `diagnostic.g.dart`
     /// `avoidRedundantArgumentValues`.
@@ -21136,12 +21631,21 @@ pub(crate) mod avoid_redundant_argument_values {
 
     /// The callee's resolved formal rows: positional in declaration order
     /// (required group first, then the optional-positional group), named
-    /// in declaration order.
+    /// in declaration order. `meta_default` rides the vendored-meta
+    /// annotation face (no formal rows): the pinned optional-positional
+    /// parameter's default spelling.
     struct Formals<'a> {
         params_row: u32,
         positional: Vec<u32>,
         named: Vec<(&'a str, u32)>,
+        meta_default: Option<&'static str>,
     }
+
+    /// The vendored-meta annotation classes the meta face pins: both
+    /// declare one optional-positional `String` parameter defaulting to
+    /// `''` (upstream meta.dart `const Immutable([this.reason = ''])` /
+    /// `const Literal([this.comment = ''])`).
+    const META_ANNOTATION_DEFAULTS: &[(&str, &str)] = &[("Immutable", "''"), ("Literal", "''")];
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -21187,7 +21691,7 @@ pub(crate) mod avoid_redundant_argument_values {
                     .find(|&&(formal, _)| formal == name)
                     .map(|&(_, row)| row)
             };
-            check_argument(c, &formals, &pieces, &ranges[i], param);
+            check_argument(c, &formals, &pieces, &ranges[i], param, indices[i]);
             if param.is_some_and(|p| {
                 formal_kind(c, p) == dartq_parser::FormalParameterKind::OptionalPositional as u32
             }) {
@@ -21204,19 +21708,27 @@ pub(crate) mod avoid_redundant_argument_values {
         pieces: &[u32],
         range: &core::ops::Range<usize>,
         param: Option<u32>,
+        index: Option<usize>,
     ) {
-        let Some(param) = param else {
-            return;
-        };
-        // `param.isRequired` (:67-69): only the two optional kinds answer.
-        let kind = formal_kind(c, param);
-        if kind != dartq_parser::FormalParameterKind::OptionalNamed as u32
-            && kind != dartq_parser::FormalParameterKind::OptionalPositional as u32
-        {
-            return;
-        }
-        // `param.metadata.hasRequired` (:68).
-        if param_has_required_annotation(c, formals.params_row, param) {
+        // The vendored-meta annotation face: the resolved class is
+        // package:meta's `Immutable`/`Literal` — its single
+        // optional-positional parameter defaults to the pinned spelling,
+        // so the first positional argument equal to it reports.
+        let meta_default = formals.meta_default.filter(|_| param.is_none());
+        if let Some(param) = param {
+            // `param.isRequired` (:67-69): only the two optional kinds
+            // answer.
+            let kind = formal_kind(c, param);
+            if kind != dartq_parser::FormalParameterKind::OptionalNamed as u32
+                && kind != dartq_parser::FormalParameterKind::OptionalPositional as u32
+            {
+                return;
+            }
+            // `param.metadata.hasRequired` (:68).
+            if param_has_required_annotation(c, formals.params_row, param) {
+                return;
+            }
+        } else if meta_default.is_none() || index != Some(0) {
             return;
         }
         // The value face: the argument expression's own pieces (a named
@@ -21238,12 +21750,17 @@ pub(crate) mod avoid_redundant_argument_values {
         else {
             return;
         };
-        let redundant = match default_clause(c, param) {
-            Some((start, end)) => tokens_equal(c, value_start..=value_end, start..=end),
-            // No default clause: the implicit `null` — only a written
-            // `null` argument equals it (the `computeConstantValue`
-            // null-value face).
-            None => first == last && c.kind(pieces[first]) == NodeKind::LiteralNull,
+        let redundant = if let Some(default) = meta_default {
+            // The pinned meta default: one `''` token.
+            value_start == value_end && c.lexeme(value_start) == default
+        } else {
+            match default_clause(c, param.expect("resolved formal")) {
+                Some((start, end)) => tokens_equal(c, value_start..=value_end, start..=end),
+                // No default clause: the implicit `null` — only a written
+                // `null` argument equals it (the `computeConstantValue`
+                // null-value face).
+                None => first == last && c.kind(pieces[first]) == NodeKind::LiteralNull,
+            }
         };
         if redundant {
             let start = crate::rules::utf16_token_span(c, value_start).start;
@@ -21344,17 +21861,16 @@ pub(crate) mod avoid_redundant_argument_values {
             NodeKind::EnumElement => enum_constant_formals(c, parent),
             _ => {
                 // The invocation faces: a `Send` sibling right after the
-                // argument list (the send row completes after it).
+                // argument list (the send row completes after it). The enum
+                // face: `EnumBody` parents the `Arguments` directly, the
+                // `EnumElement` constant marker tiles as the next sibling.
                 let siblings = c.collect_direct(parent);
                 let pos = siblings.iter().position(|&kid| kid == args)?;
-                if siblings
-                    .get(pos + 1)
-                    .copied()
-                    .is_none_or(|send| c.kind(send) != NodeKind::Send)
-                {
-                    return None;
+                match siblings.get(pos + 1).copied().map(|row| c.kind(row)) {
+                    Some(NodeKind::Send) => invocation_formals(c, &siblings, pos + 1),
+                    Some(NodeKind::EnumElement) => enum_constant_formals(c, siblings[pos + 1]),
+                    _ => None,
                 }
-                invocation_formals(c, &siblings, pos + 1)
             }
         }
     }
@@ -21386,14 +21902,24 @@ pub(crate) mod avoid_redundant_argument_values {
             let class_row = same_file_declaration(c, receiver_name)?;
             return method_formals(c, class_row, name);
         }
-        // The bare face: a top-level function, a local function on the
-        // path, a same-file class constructor (`A(...)` — the upstream
-        // InstanceCreationExpression rewrite), or the implicit-`this`
-        // method of the enclosing class.
-        if let Some(formals) = top_level_function_formals(c, name) {
+        // The bare face, innermost binding first (upstream scope order):
+        // a local function declared before the call in an enclosing block
+        // (or an ancestor's own name — self-recursion), a function-typed
+        // formal of an enclosing executable, a local variable initialized
+        // to a same-file constructor tear-off (`var a = A.new; a(...)`),
+        // then a top-level function, a same-file class constructor
+        // (`A(...)` — the upstream InstanceCreationExpression rewrite), or
+        // the implicit-`this` method of the enclosing class.
+        if let Some(formals) = local_function_formals(c, name) {
             return Some(formals);
         }
-        if let Some(formals) = local_function_formals(c, name) {
+        if let Some(formals) = function_typed_param_formals(c, name) {
+            return Some(formals);
+        }
+        if let Some(formals) = tearoff_variable_formals(c, name) {
+            return Some(formals);
+        }
+        if let Some(formals) = top_level_function_formals(c, name) {
             return Some(formals);
         }
         if let Some(class_row) = same_file_declaration(c, name) {
@@ -21446,17 +21972,172 @@ pub(crate) mod avoid_redundant_argument_values {
         None
     }
 
-    /// The local function `name` declared along the call's path (the
-    /// innermost binder — shadowing wins).
+    /// The local function `name` in scope at the call: an ancestor
+    /// declaration first (the self-recursion face — the innermost binder
+    /// wins), else a same-named `LocalFunctionDeclaration` /
+    /// `NamedFunctionExpression` statement preceding the call's statement in
+    /// an enclosing block (the blocks tile their statements flat —
+    /// `BlockBody`/`Block`/`SwitchBlock` children are the declaration
+    /// rows). Innermost block first; within a block, declaration order.
     fn local_function_formals<'a>(c: &Check<'a>, name: &str) -> Option<Formals<'a>> {
-        let row = c.path.iter().rev().copied().find(|&row| {
+        let is_named_fn = |c: &Check<'_>, row: u32| {
             matches!(
                 c.kind(row),
                 NodeKind::LocalFunctionDeclaration | NodeKind::NamedFunctionExpression
             ) && crate::rules::declarations::member_declaration_name(c, row)
                 .is_some_and(|n| c.lexeme(c.head_token(n)) == name)
-        })?;
-        formals_of(c, row)
+        };
+        if let Some(row) = c
+            .path
+            .iter()
+            .rev()
+            .copied()
+            .find(|&row| is_named_fn(c, row))
+        {
+            return formals_of(c, row);
+        }
+        for (i, &block) in c.path.iter().enumerate().rev() {
+            if !matches!(
+                c.kind(block),
+                NodeKind::BlockBody | NodeKind::Block | NodeKind::SwitchBlock
+            ) {
+                continue;
+            }
+            // Only siblings before the statement on the path bind.
+            let stop = c.path.get(i + 1).copied().unwrap_or(u32::MAX);
+            for kid in c.collect_direct(block) {
+                if kid == stop {
+                    break;
+                }
+                if is_named_fn(c, kid) {
+                    return formals_of(c, kid);
+                }
+            }
+        }
+        None
+    }
+
+    /// The direct `FormalParameter`/`FunctionTypedFormalParameter` rows of a
+    /// parameter-list row, flattened over the `OptionalFormalParameters`
+    /// group (the `[...]`/`{...}` children tile inside it).
+    fn params_of(c: &Check<'_>, params_row: u32) -> Vec<u32> {
+        let mut params = Vec::new();
+        for kid in c.collect_direct(params_row) {
+            match c.kind(kid) {
+                NodeKind::FormalParameter | NodeKind::FunctionTypedFormalParameter => {
+                    params.push(kid);
+                }
+                NodeKind::OptionalFormalParameters => {
+                    params.extend(c.collect_direct(kid).into_iter().filter(|&row| {
+                        matches!(
+                            c.kind(row),
+                            NodeKind::FormalParameter | NodeKind::FunctionTypedFormalParameter
+                        )
+                    }))
+                }
+                _ => {}
+            }
+        }
+        params
+    }
+
+    /// The bare-selector face `g(...)` where `g` is a function-typed formal
+    /// of an enclosing executable (`void f(void Function({int? p}) g)` —
+    /// upstream `ExecutableElement` parameters are `FunctionTypedElement`s
+    /// whose own parameter list supplies the defaults). The function-typed
+    /// formal's signature rides a `FunctionType` child on the
+    /// `FormalParameter` row (production tiling); the legacy
+    /// `FunctionTypedFormalParameter` carries its list directly.
+    fn function_typed_param_formals<'a>(c: &Check<'a>, name: &str) -> Option<Formals<'a>> {
+        for &owner in c.path.iter().rev() {
+            let Some(params_row) = formal_params_row(c, owner) else {
+                continue;
+            };
+            let Some(param) = params_of(c, params_row)
+                .into_iter()
+                .find(|&param| formal_name(c, param) == Some(name))
+            else {
+                continue;
+            };
+            let signature = c
+                .collect_direct(param)
+                .into_iter()
+                .find(|&kid| c.kind(kid) == NodeKind::FunctionType)
+                .unwrap_or(param);
+            return formals_of(c, signature).or_else(|| formals_of(c, param));
+        }
+        None
+    }
+
+    /// The bare-selector face `a(...)` where `a` is a local variable
+    /// initialized to a same-file constructor tear-off (`var a = A.new` —
+    /// upstream resolves the variable's `FunctionType` from the tear-off's
+    /// constructor). The initializer tiles as a two-`Send` group (`A.` +
+    /// `new`) inside the `VariableInitializer`; a name chain without a `.`
+    /// selector (`var a = b`) is not a tear-off. Only siblings before the
+    /// call's statement bind.
+    fn tearoff_variable_formals<'a>(c: &Check<'a>, name: &str) -> Option<Formals<'a>> {
+        for (i, &block) in c.path.iter().enumerate().rev() {
+            if !matches!(
+                c.kind(block),
+                NodeKind::BlockBody | NodeKind::Block | NodeKind::SwitchBlock
+            ) {
+                continue;
+            }
+            let stop = c.path.get(i + 1).copied().unwrap_or(u32::MAX);
+            for kid in c.collect_direct(block) {
+                if kid == stop {
+                    break;
+                }
+                if c.kind(kid) != NodeKind::VariablesDeclaration {
+                    continue;
+                }
+                let Some(var) = c.collect_direct(kid).into_iter().find(|&var| {
+                    c.kind(var) == NodeKind::InitializedIdentifier
+                        && crate::rules::initialized_identifier_name(c, var)
+                            .is_some_and(|token| c.lexeme(token) == name)
+                }) else {
+                    continue;
+                };
+                let Some(init) = c
+                    .collect_direct(var)
+                    .into_iter()
+                    .find(|&piece| c.kind(piece) == NodeKind::VariableInitializer)
+                else {
+                    continue;
+                };
+                // The pure tear-off shape: two `Send` pieces joined by a
+                // `.` with no `Arguments` (`A.new` / `A<int>.named`). A
+                // `var a = A.new()` creation or a plain `var a = b` binding
+                // is not the face.
+                let pieces = c.collect_direct(init);
+                let sends: Vec<u32> = pieces
+                    .iter()
+                    .copied()
+                    .filter(|&piece| c.kind(piece) == NodeKind::Send)
+                    .collect();
+                if sends.len() < 2
+                    || pieces
+                        .iter()
+                        .any(|&piece| c.kind(piece) == NodeKind::Arguments)
+                {
+                    continue;
+                }
+                let class_name = c.lexeme(c.head_token(sends[0]));
+                let selector = c.lexeme(c.head_token(*sends.last().expect("nonempty")));
+                let Some(class_row) = same_file_declaration(c, class_name) else {
+                    continue;
+                };
+                return constructor_formals(
+                    c,
+                    class_row,
+                    class_name,
+                    Some(selector),
+                    &mut Vec::new(),
+                );
+            }
+        }
+        None
     }
 
     /// The creation face (:122-127): the class constructor (the unnamed
@@ -21491,24 +22172,62 @@ pub(crate) mod avoid_redundant_argument_values {
             .collect();
         let selector = (ids.len() >= 2).then(|| ids.swap_remove(1));
         let class_name = ids.pop()?;
-        let class_row = same_file_declaration(c, class_name)?;
+        let Some(class_row) = same_file_declaration(c, class_name) else {
+            // The vendored-meta face: `@Immutable(…)` / `@Literal(…)` — the
+            // annotation classes live in package:meta (the corpus vendor),
+            // whose single optional-positional parameter defaults to `''`
+            // (upstream meta.dart `const Immutable([this.reason = ''])`).
+            // The element model resolves the annotation; the text face pins
+            // the same spelling and default.
+            return META_ANNOTATION_DEFAULTS
+                .iter()
+                .find(|&&(name, _)| name == class_name)
+                .map(|&(_, default)| Formals {
+                    params_row: metadata,
+                    positional: Vec::new(),
+                    named: Vec::new(),
+                    meta_default: Some(default),
+                });
+        };
         constructor_formals(c, class_row, class_name, selector, &mut Vec::new())
     }
 
-    /// The enum-constant face (:107-114): the enum's constructor, named
-    /// or unnamed.
+    /// The enum-constant face (:107-114): the enum's own constructor —
+    /// the constant's name is the element's span head; an optional
+    /// `.name` between it and the argument list selects a named
+    /// constructor (`a.n(…)`).
     fn enum_constant_formals<'a>(c: &Check<'a>, element: u32) -> Option<Formals<'a>> {
         let body = c.unit.ast.parent(element)?;
         let enum_row = c.unit.ast.parent(body)?;
         if c.kind(enum_row) != NodeKind::EnumDeclaration {
             return None;
         }
+        // Production tiles the `Arguments` as the element's left sibling
+        // inside the `EnumBody` (the `EnumElement` constant marker closes
+        // after the list); hand-built trees nest the list inside the
+        // element row itself.
         let args = c
             .collect_direct(element)
             .into_iter()
-            .find(|&kid| c.kind(kid) == NodeKind::Arguments)?;
-        let (class_name, selector) = creation_names(c, c.head_token(element), c.head_token(args))?;
-        constructor_formals(c, enum_row, class_name, selector, &mut Vec::new())
+            .find(|&kid| c.kind(kid) == NodeKind::Arguments)
+            .or_else(|| {
+                let siblings = c.collect_direct(body);
+                siblings
+                    .iter()
+                    .position(|&kid| kid == element)
+                    .and_then(|pos| siblings.get(pos.wrapping_sub(1)).copied())
+                    .filter(|&kid| c.kind(kid) == NodeKind::Arguments)
+            })?;
+        // The selector rides a `.` directly after the constant's name.
+        let name_end = c.unit.ast.token_range(element);
+        let args_head = c.head_token(args);
+        let selector = (name_end.start + 1 < args_head && c.lexeme(name_end.start + 1) == ".")
+            .then(|| c.lexeme(name_end.start + 2));
+        let class_name = crate::rules::class_declaration_name(c, enum_row)?;
+        // The enum's members tile inside the `EnumBody` (not a
+        // `DeclarationBody`) — `body_members` reads through the container
+        // row directly.
+        constructor_formals(c, body, class_name, selector, &mut Vec::new())
     }
 
     /// The creation header's names: the first identifier token names the
@@ -21539,7 +22258,11 @@ pub(crate) mod avoid_redundant_argument_values {
     /// The constructor row spelling `selector` on the class-like row, its
     /// formals after the factory-redirect walk (:143-199). `visited`
     /// carries the redirect cycle guard (:150-153 — a cycle is a
-    /// compile-time error; silent).
+    /// compile-time error; silent). When no `Constructor`/`Factory` member
+    /// matches, the class-like's own `PrimaryConstructor` header row
+    /// carries the formals (`class C({bool p = true})` /
+    /// `class C.named(…)` — the unnamed face matches a nameless primary,
+    /// the `.named` face its `PrimaryConstructorDeclaration` identifier).
     fn constructor_formals<'a>(
         c: &Check<'a>,
         class_row: u32,
@@ -21549,14 +22272,19 @@ pub(crate) mod avoid_redundant_argument_values {
     ) -> Option<Formals<'a>> {
         let unnamed = selector.is_none() || selector == Some("new");
         let wanted: Option<&str> = if unnamed { None } else { selector };
-        let mut row =
-            body_members(c, class_row)
-                .into_iter()
-                .find(|&member| match c.kind(member) {
-                    NodeKind::Constructor => constructor_matches(c, member, class_name, wanted),
-                    NodeKind::Factory => factory_matches(c, member, class_name, wanted),
-                    _ => false,
-                })?;
+        let mut row = body_members(c, class_row)
+            .into_iter()
+            .find(|&member| match c.kind(member) {
+                NodeKind::Constructor => constructor_matches(c, member, class_name, wanted),
+                NodeKind::Factory => factory_matches(c, member, class_name, wanted),
+                _ => false,
+            })
+            .or_else(|| {
+                c.collect_direct(class_row).into_iter().find(|&kid| {
+                    c.kind(kid) == NodeKind::PrimaryConstructor
+                        && primary_ctor_matches(c, kid, wanted)
+                })
+            })?;
         // The factory-redirect walk: `= Target` resolves to the target
         // constructor whose defaults decide.
         while c.kind(row) == NodeKind::Factory {
@@ -21576,6 +22304,25 @@ pub(crate) mod avoid_redundant_argument_values {
                 })?;
         }
         formals_of(c, row)
+    }
+
+    /// Whether the class-like's `PrimaryConstructor` row spells `selector`
+    /// (`None` = the unnamed face — a nameless primary or one written
+    /// `.new`; `Some(name)` = the `PrimaryConstructorDeclaration`
+    /// identifier match).
+    fn primary_ctor_matches(c: &Check<'_>, primary: u32, selector: Option<&str>) -> bool {
+        let named = c.collect_direct(primary).into_iter().find(|&kid| {
+            c.kind(kid) == NodeKind::Identifier
+                && c.payload(kid).first()
+                    == Some(
+                        &(dartq_parser::IdentifierContext::PrimaryConstructorDeclaration as u32),
+                    )
+        });
+        match (selector, named.map(|kid| c.lexeme(c.head_token(kid)))) {
+            (None, None | Some("new")) => true,
+            (Some(wanted), Some(name)) => name == wanted,
+            _ => false,
+        }
     }
 
     /// Whether the constructor row names `class_name` (its anchor) with
@@ -21697,6 +22444,7 @@ pub(crate) mod avoid_redundant_argument_values {
             params_row,
             positional,
             named,
+            meta_default: None,
         })
     }
 
@@ -21831,9 +22579,61 @@ pub(crate) mod avoid_slow_async_io {
         if same_file_declaration(c, class).is_some() {
             return;
         }
+        // The extension-type receiver face (`test_*_extensionType_implements`):
+        // a same-file extension type is the user's own declaration — its
+        // members answer first (a redeclared `exists` shadows the slow
+        // interface member — `test_*_redeclares`), else an `implements`
+        // interface's slow set applies.
+        if let Some(ext_row) = extension_type_row(c, class) {
+            if extension_type_redeclares(c, ext_row, name) {
+                return;
+            }
+            let slow = crate::rules::supertypes(c, ext_row)
+                .iter()
+                .find_map(|&(sup, clause)| {
+                    (clause == crate::rules::SupertypeClause::Implements
+                        && same_file_declaration(c, sup).is_none()
+                        && extension_type_row(c, sup).is_none())
+                    .then_some(sup)
+                    .and_then(instance_slow)
+                });
+            if slow.is_some_and(|slow| slow.contains(&name)) {
+                report_invocation(c, receiver, arguments);
+            }
+            return;
+        }
         if instance_slow(class).is_some_and(|slow| slow.contains(&name)) {
             report_invocation(c, receiver, arguments);
         }
+    }
+
+    /// The same-file extension-type row named `name`: the header's payload
+    /// word 2 is the name token (`begin_extension_type_declaration`), so
+    /// the row never surfaces in `same_file_declaration`'s identifier
+    /// index.
+    fn extension_type_row(c: &Check<'_>, name: &str) -> Option<u32> {
+        let root = c.unit.ast.root()?;
+        c.collect_direct(root).into_iter().find_map(|top| {
+            c.collect_direct(top).into_iter().find(|&kid| {
+                c.kind(kid) == NodeKind::ExtensionTypeDeclaration
+                    && c.payload(kid).get(2).copied().is_some_and(|token| {
+                        token != crate::rules::NONE_TOKEN && c.lexeme(token) == name
+                    })
+            })
+        })
+    }
+
+    /// Whether the extension type declares its own `name` member (a method
+    /// or the representation getter would shadow the interface's slow
+    /// member — the upstream member lookup answers the extension type
+    /// first).
+    fn extension_type_redeclares(c: &Check<'_>, ext_row: u32, name: &str) -> bool {
+        crate::rules::body_members(c, ext_row)
+            .iter()
+            .any(|&member| {
+                crate::rules::declarations::member_declaration_name(c, member)
+                    .is_some_and(|token| c.lexeme(token) == name)
+            })
     }
 
     /// The upstream anchor is the whole invocation (`reportAtNode(node)`).
@@ -22786,8 +23586,9 @@ mod w2_expr_pins {
     /// `prefer_const_constructors` production-bridge pins: a const
     /// constructor's unnamed, named, and written-type-argument creations
     /// report spanning the whole creation; a non-const constructor, a
-    /// written `const`, a generic creation without written type arguments
-    /// (the conservative bail), and a `@literal` constructor stay silent.
+    /// written `const`, and a generic creation without written type
+    /// arguments (the conservative bail) stay silent; the `@literal` and
+    /// type-variable faces decide per the gates below.
     #[test]
     fn prefer_const_constructors_faces() {
         let lints = Fixture::parse("class C {\n  const C();\n}\nvoid f() {\n  C();\n}\n")
@@ -22815,16 +23616,152 @@ mod w2_expr_pins {
             .run(&one_rule("prefer_const_constructors"));
         assert_eq!(lints.len(), 1, "{lints:?}");
 
+        // The downward-inference face (:80-97 — a generic class created
+        // without written type arguments still reports when the context
+        // type's written arguments are concrete, `G<int> f() => G()`).
+        let lints = Fixture::parse("class G<T> {\n  const G();\n}\nG<int> f() => G();\n")
+            .run(&one_rule("prefer_const_constructors"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+
+        // The named primary-constructor face (`CPrimaryNamed.named(1)` —
+        // the whole `C.named(1)` send, 66..88); the `const`-declaring
+        // primary ctor resolves through the `.named` selector's
+        // declaration-name head.
+        let lints = Fixture::parse(
+            "class const CPrimaryNamed.named(final int x);\nvar cPrimaryNamed = CPrimaryNamed.named(1);\n",
+        )
+        .run(&one_rule("prefer_const_constructors"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range, 66..88);
+
+        // The unnamed and extension-type primary-constructor faces (the
+        // corpus's `CPrimaryConst(1)` / `EConstPrimary(1)` rows): the
+        // header `const` decides through the primary-constructor row.
+        for source in [
+            "class const CPrimaryConst(final int x);\nvar cPrimaryConst = CPrimaryConst(1);\n",
+            "extension type const EConstPrimary(int i) {}\nvar eConstPrimary = EConstPrimary(1);\n",
+        ] {
+            let lints = Fixture::parse(source).run(&one_rule("prefer_const_constructors"));
+            assert_eq!(lints.len(), 1, "{source}");
+        }
+
+        // The `const new()` declaring-constructor face (`ANewSyntax()` —
+        // 60..72): the `new` name sits one token before the `(` head, the
+        // ctor still reads as declaring-`const`.
+        let lints = Fixture::parse(
+            "class ANewSyntax {\n  const new();\n}\nANewSyntax aNewSyntax = ANewSyntax();\n",
+        )
+        .run(&one_rule("prefer_const_constructors"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range, 60..72);
+
         for source in [
             // A non-const constructor never reports.
             "class C {\n  C();\n}\nvoid f() {\n  C();\n}\n",
             // A written `const` is the dispatch bail.
             "class C {\n  const C();\n}\nvoid f() {\n  const C();\n}\n",
             // A generic class created without written type arguments
-            // bails (the conservative direction, linter#4531).
-            "class G<T> {\n  const G();\n}\nvoid f() {\n  G();\n}\n",
-            // A `@literal` constructor is the analyzer's own warning.
-            "class C {\n  @literal\n  const C();\n}\nvoid f() {\n  C();\n}\n",
+            // bails only when the context type names a type parameter
+            // (linter#4531): `AImplicit<T, int> fImplicit<T>() => AImplicit()`.
+            "class AImplicit<T, U> {\n  const AImplicit();\n}\nAImplicit<T, int> fImplicit<T>() => AImplicit();\n",
+        ] {
+            let fixture = Fixture::parse(source);
+            assert!(
+                fixture
+                    .run(&one_rule("prefer_const_constructors"))
+                    .is_empty(),
+                "{source}"
+            );
+        }
+
+        // The `@literal` gate rides the analyzer's declaring-library read
+        // (`_isPackageMetaGetter`, `library.name == 'meta'`): an unnamed
+        // meta never recognizes the annotation and the creation reports —
+        // the live oracle's own face over a differential corpus's vendored
+        // meta — while a `library meta;` unit resolves it and bails.
+        let lints =
+            Fixture::parse("class C {\n  @literal\n  const C();\n}\nvoid f() {\n  C();\n}\n")
+                .run(&one_rule("prefer_const_constructors"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let fixture = Fixture::parse(
+            "library meta;\nclass C {\n  @literal\n  const C();\n}\nvoid f() {\n  C();\n}\n",
+        );
+        assert!(
+            fixture
+                .run(&one_rule("prefer_const_constructors"))
+                .is_empty()
+        );
+
+        // A written type argument naming an in-scope type variable is not
+        // constable — `const C<U>()` is a constant-creation error (the
+        // upstream test_cannotBeConst_explicitTypeArgument_typeVariable_*
+        // faces) — on the creation's header and nested inside its
+        // arguments. A concrete written argument keeps the fire.
+        for source in [
+            "class ATypeVarFn<T> {\n  const ATypeVarFn();\n}\nvoid fTypeVarFn<U>() => ATypeVarFn<U>();\n",
+            "class ATypeVarCtor<T> {\n  const ATypeVarCtor({required List<T> p});\n  factory ATypeVarCtor.named() => ATypeVarCtor(p: <T>[]);\n}\n",
+        ] {
+            let fixture = Fixture::parse(source);
+            assert!(
+                fixture
+                    .run(&one_rule("prefer_const_constructors"))
+                    .is_empty(),
+                "{source}"
+            );
+        }
+        let lints = Fixture::parse(
+            "class ADynArg<T> {\n  const ADynArg();\n}\nvar aDynArg = ADynArg<dynamic>();\n",
+        )
+        .run(&one_rule("prefer_const_constructors"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+
+        // The canBeConst tail is per creation: a creation inside a
+        // collection-for element reports (its own const-ability is
+        // independent of the enclosing literal's), and a map argument
+        // holding a const entry is constable.
+        let lints = Fixture::parse(
+            "class K {\n  const K();\n}\nfinal k = K([for (var i = 0; i < 5; ++i) K()]);\n",
+        )
+        .run(&one_rule("prefer_const_constructors"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let lints = Fixture::parse(
+            "class C {\n  const C(Map<int, C?> p);\n}\nvar x = C({1: const C(null)});\n",
+        )
+        .run(&one_rule("prefer_const_constructors"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+    }
+
+    /// `prefer_const_constructors` const-context suppression pins: a
+    /// creation inside a `static const` field initializer, a `const` local
+    /// declaration, an annotation argument, an enum element's arguments,
+    /// or a `const` collection literal is already const — the upstream
+    /// `canBeConst`/`isConst` gate stays silent and no row reports. The
+    /// corpus-shaped member faces ride the same walk: typed declarations,
+    /// named private constructors, multi-declarator lists, and self-class
+    /// references.
+    #[test]
+    fn prefer_const_constructors_const_context_suppressed() {
+        for source in [
+            // A `static const` field's own initializer is in a const
+            // context — `B()` inside `static const b = B()` stays silent.
+            "class B {\n  const B();\n}\nclass A {\n  static const b = B();\n}\n",
+            // A `const` local's initializer likewise (`const b = B()`).
+            "class B {\n  const B();\n}\nvoid f() {\n  const b = B();\n}\n",
+            // An enum element's argument list is a constant context.
+            "class B {\n  const B();\n}\nenum E {\n  a(B()),\n  b(B());\n  const E(B b);\n}\n",
+            // An annotation's argument list is a constant context.
+            "class B {\n  const B();\n}\n@B()\nvoid f() {}\n",
+            // Inside a written `const [...]` every element is const.
+            "class B {\n  const B();\n}\nvoid f() {\n  const l = [B()];\n}\n",
+            // The use_enums corpus face: typed declarators, named private
+            // constructors, multi-declarator lists, self-class references —
+            // every creation inside the const declarator is already const.
+            "class A {\n  const A._(this.v);\n  final int v;\n}\nclass U {\n  static const A a = A._(1), b = A._(2);\n}\n",
+            // The const-ability tail stays per creation: `F()` resolves to
+            // the factory — the class's const NAMED constructor must not
+            // make the unnamed face const-able (the upstream
+            // test_no_lint_factorySome face).
+            "class F {\n  factory F() => g();\n  const F._();\n}\nvoid g() {\n  F();\n}\n",
         ] {
             let fixture = Fixture::parse(source);
             assert!(
@@ -22836,7 +23773,130 @@ mod w2_expr_pins {
         }
     }
 
-    /// `use_named_constants` production-bridge pins: a written-`const`
+    /// `prefer_const_constructors` dot-shorthand pins: a `.new()` /
+    /// `.named(…)` shorthand under a written context type reports spanning
+    /// the `.` through the argument list; a written `const` (the dispatch
+    /// bail), a non-const constructor, and a non-const argument stay
+    /// silent; the `@literal` face rides the declaring-library gate. A
+    /// chained method call after the creation (`.tightFor(…).copyWith(…)`)
+    /// reports once, at the creation.
+    #[test]
+    fn prefer_const_constructors_dot_shorthand_faces() {
+        for (source, want) in [
+            // The `.new()` shorthand under a declared type.
+            ("class A {\n  const A();\n}\nA a = .new();\n", 1),
+            // The named shorthand with a trailing method call — the
+            // creation reports; `copyWith` is an ordinary method send.
+            (
+                "class A {\n  const A.t({int? h});\n  A cw({int? w}) => this;\n}\n\
+                 void f() {\n  A a = .t(h: 4).cw(w: 4);\n}\n",
+                1,
+            ),
+            // The getter-return context type (`C get f => .new(1)`).
+            ("class const C(final int x);\nC get f => .new(1);\n", 1),
+            // A written `const` is the dispatch bail.
+            (
+                "class A {\n  const A.t({int? h});\n}\n\
+                 void f() {\n  A a = const .t(h: 4);\n}\n",
+                0,
+            ),
+            // The `@literal` gate rides the declaring-library read: an
+            // unnamed meta never recognizes the annotation, so the
+            // shorthand creation reports like any other.
+            ("class K {\n  @literal\n  const K();\n}\nK k = .new();\n", 1),
+            // A non-const constructor stays silent.
+            ("class A {\n  A();\n}\nA a = .new();\n", 0),
+            // A non-const argument stays silent (`ANotConst()` cannot be
+            // const, so the shorthand creation cannot).
+            (
+                "class A {\n  int c;\n  A(): c = 0;\n}\n\
+                 extension type const B(A a) {}\nB get g => .new(A());\n",
+                0,
+            ),
+        ] {
+            let lints = Fixture::parse(source).run(&one_rule("prefer_const_constructors"));
+            assert_eq!(lints.len(), want, "{source}");
+        }
+    }
+
+    /// `use_named_constants` remaining resolved faces: the constant
+    /// pattern's written-`const` operand (`if (a case const A(0))`,
+    /// `case const A(1):`) reports at the creation — not the pattern —
+    /// and the extension-type const declaration resolves through payload
+    /// word 2. A private `static const` still matches (upstream judges
+    /// accessibility against the same library).
+    #[test]
+    fn use_named_constants_pattern_and_extension_type_faces() {
+        for (source, range) in [
+            (
+                "class A {\n  const A(this.v);\n  final int v;\n  static const zero = A(0);\n}\nvoid f(A a) {\n  if (a case const A(0)) {}\n}\n",
+                107..111,
+            ),
+            (
+                "class A {\n  const A(this.v);\n  final int v;\n  static const one = A(1);\n}\nvoid f(A a) {\n  switch (a) {\n    case const A(1):\n  }\n}\n",
+                117..121,
+            ),
+            (
+                "extension type const A(int i) {\n  static const zero = A(0);\n}\nvoid f() {\n  const a = A(0);\n}\n",
+                85..89,
+            ),
+        ] {
+            let lints = Fixture::parse(source).run(&one_rule("use_named_constants"));
+            assert_eq!(lints.len(), 1, "{source}");
+            assert_eq!(lints[0].range, range, "{source}");
+        }
+    }
+
+    /// `avoid_redundant_argument_values` scope-resolved callee faces: the
+    /// enum-constant's `EnumBody`-sibling `Arguments` (issue 3617), the
+    /// block-local function, the function-typed formal of an enclosing
+    /// executable (the implicit-`null` default reports on a written `null`),
+    /// and the `var a = A.new` tear-off variable.
+    #[test]
+    fn avoid_redundant_argument_values_scope_faces() {
+        for (source, range) in [
+            // The enum element's arguments tile under the `EnumBody`.
+            (
+                "enum E {\n  a(test: false);\n  const E({bool test = false});\n}\n",
+                19..24,
+            ),
+            // The block-local function's own list.
+            (
+                "void f() {\n  void g({bool p = true}) {}\n  g(p: true);\n}\n",
+                47..51,
+            ),
+            // The function-typed formal's implicit `null` default.
+            (
+                "void f(void Function({int? p}) g) {\n  g(p: null);\n}\n",
+                43..47,
+            ),
+            (
+                "void f(void Function([int? p]) g) {\n  g(null);\n}\n",
+                40..44,
+            ),
+            // The tear-off variable resolves to `A`'s constructor list.
+            (
+                "class A {\n  A({bool p = true});\n}\nvoid f() {\n  var a = A.new;\n  a(p: true);\n}\n",
+                69..73,
+            ),
+            // The primary-constructor face (`class C({bool p = true})`).
+            (
+                "class C({bool p = true});\nvoid f() {\n  C(p: true);\n}\n",
+                44..48,
+            ),
+        ] {
+            let lints = Fixture::parse(source).run(&one_rule("avoid_redundant_argument_values"));
+            assert_eq!(lints.len(), 1, "{source}");
+            assert_eq!(lints[0].range, range, "{source}");
+        }
+        // A local function declared AFTER the call does not bind.
+        assert!(
+            Fixture::parse("void f() {\n  g(p: true);\n  void g({bool p = true}) {}\n}\n")
+                .run(&one_rule("avoid_redundant_argument_values"))
+                .is_empty()
+        );
+    }
+
     /// creation equal to the class's `static const` initializer reports
     /// with `Type.field`; an unmatched creation stays silent.
     #[test]
@@ -22857,6 +23917,83 @@ mod w2_expr_pins {
         // No matching static constant — silent.
         let fixture = Fixture::parse("class C {\n  const C();\n}\nvoid f() {\n  const C();\n}\n");
         assert!(fixture.run(&one_rule("use_named_constants")).is_empty());
+    }
+
+    /// `use_named_constants` shorthand + contextual-const faces: the
+    /// written-`const` shorthand (`const .new(0)`), the contextually-const
+    /// shorthand (`const A a = .new(0)`), and the contextually-const bare
+    /// creation (`const a = A(0)`) report; a stateless class's `A(1)`
+    /// matches `zero = A(0)` (upstream's computed-value equality under a
+    /// discarded-parameter ctor), and the `A.zero` read is never a
+    /// reconstruction.
+    #[test]
+    fn use_named_constants_shorthand_and_context_faces() {
+        // `const .new(0)` — the explicit-const shorthand.
+        let lints = Fixture::parse(
+            "void f() {\n  A a = const .new(0);\n}\nclass A {\n  const A(int value);\n  static const zero = A(0);\n}\n",
+        )
+        .run(&one_rule("use_named_constants"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Use the constant 'A.zero' rather than a constructor returning the same object."
+        );
+
+        // `const A a = .new(0)` — the contextually-const shorthand.
+        let lints = Fixture::parse(
+            "void f() {\n  const A a = .new(0);\n}\nclass A {\n  const A(int value);\n  static const zero = A(0);\n}\n",
+        )
+        .run(&one_rule("use_named_constants"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+
+        // `const a = A(0)` — the implicit-const declarator face.
+        let lints = Fixture::parse(
+            "void f() {\n  const a = A(0);\n}\nclass A {\n  const A(int value);\n  static const zero = A(0);\n}\n",
+        )
+        .run(&one_rule("use_named_constants"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+
+        // The stateless loose match: `A(1)` equals `zero = A(0)` when the
+        // ctor discards the parameter (empty constant state).
+        let lints = Fixture::parse(
+            "void f() {\n  const A(1);\n}\nclass A {\n  const A(int value);\n  // ignore: unused_field\n  static const _zero = A(0);\n}\n",
+        )
+        .run(&one_rule("use_named_constants"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "Use the constant 'A._zero' rather than a constructor returning the same object."
+        );
+
+        // A bare `A.zero` read is not a reconstruction — silent.
+        let fixture = Fixture::parse(
+            "void f() {\n  A.zero;\n}\nclass A {\n  const A(int value);\n  static const zero = A(0);\n}\n",
+        );
+        assert!(fixture.run(&one_rule("use_named_constants")).is_empty());
+    }
+
+    #[test]
+    fn avoid_redundant_argument_values_meta_annotation_faces() {
+        let report = |source: &str| {
+            Fixture::parse(source)
+                .run(&one_rule("avoid_redundant_argument_values"))
+                .len()
+        };
+        // The vendored-meta face: the pinned `''` default reports.
+        assert_eq!(report("@Immutable('')\nclass C {}\n"), 1);
+        assert_eq!(report("@Literal('')\nclass C {}\n"), 1);
+        // A different value stays silent.
+        assert_eq!(report("@Immutable('x')\nclass C {}\n"), 0);
+        // A named argument cannot match the positional-only parameter.
+        assert_eq!(report("@Immutable(reason: '')\nclass C {}\n"), 0);
+        // A same-file `Immutable` class shadows the meta face; its
+        // constructor has no defaults, so `''` stays silent.
+        assert_eq!(
+            report(
+                "class Immutable {\n  const Immutable(String reason);\n}\n@Immutable('')\nclass C {}\n",
+            ),
+            0
+        );
     }
 
     /// `avoid_redundant_argument_values` production-bridge pins: named
@@ -22961,6 +24098,27 @@ mod w2_expr_pins {
         assert!(
             run_semantic(
                 "import 'dart:io';\nvoid f(Directory dir) {\n  dir.existsSync();\n}\n",
+                "avoid_slow_async_io",
+            )
+            .is_empty()
+        );
+
+        // The extension-type face (upstream
+        // `test_extensionType_implementsDirectory` /
+        // `test_extensionType_redeclares_exists`): a receiver declared as an
+        // extension type `implements Directory` reports the invocation
+        // (`ext.exists()` — 126..138); an extension type that redeclares the
+        // member stays silent (the redeclared member is the extension
+        // type's own, not `dart:io`'s).
+        let lints = run_semantic(
+            "import 'dart:io';\nextension type ExtDirExists(Directory dir) implements Directory {}\nvoid f(ExtDirExists dir) async {\n  await dir.exists();\n}\n",
+            "avoid_slow_async_io",
+        );
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range, 126..138);
+        assert!(
+            run_semantic(
+                "import 'dart:io';\nextension type ExtFileRedeclares(File file) {\n  void exists() {}\n}\nvoid f(ExtFileRedeclares file) async {\n  file.exists();\n}\n",
                 "avoid_slow_async_io",
             )
             .is_empty()
@@ -23941,11 +25099,16 @@ mod b4_expr_pins {
     }
 
     /// `unnecessary_lambdas`, the `parametersMatch` fallback's report
-    /// faces (:108-111, "We must assume is valid here"): a callee the
+    /// faces (:107-151, consulted at :246-249). The non-`FunctionType`
+    /// arm (:108-111, "We must assume is valid here"): a callee the
     /// model resolves to no function type — a local function, an
-    /// unresolved spelling, the untyped-formal forward onto one —
-    /// reports once the arguments-match, finality, type-argument, and
-    /// null-aware gates hold.
+    /// unresolved spelling, the untyped-formal forward onto one. The
+    /// FunctionType path (:112-150) over the undecided `None` verdict —
+    /// the inferred channel: an untyped, `dynamic`, or parameterized
+    /// formal the context types upstream, a generic callee's
+    /// instantiation, distinct named types — rides the required-positional
+    /// counts, oracle-verified (the #2095 lane's live probes on 3.13.1;
+    /// #2109's resolved-callee shape).
     #[test]
     fn unnecessary_lambdas_fallback_faces() {
         for source in [
@@ -23956,6 +25119,28 @@ mod b4_expr_pins {
             // The gate row itself: an untyped formal forwarding to an
             // unresolved core spelling.
             "void f(List<int> xs) {\n  xs.forEach((e) => print(e));\n}\n",
+            // The #2109 shape: the callee resolves (`void Function(Object?)`)
+            // but the untyped formal's inferred channel returns `None`; the
+            // required-positional counts (1 == 1) carry the face. The
+            // oracle infers `e` from the context formal's
+            // `void Function(Object)` and fires.
+            "void print(Object? e) {}\nvoid handler(void Function(Object) f) {}\nvoid main() {\n  handler((e) => print(e));\n}\n",
+            // `None`: the untyped formal is inferred upstream.
+            "void g(int a) {}\nvoid f(List<int> xs) {\n  xs.forEach((a) => g(a));\n}\n",
+            // `None`: the generic callee's instantiation (the model does
+            // not name it); upstream fires on the instantiated invoke
+            // type.
+            "void g<T>(T a) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) => g(a));\n}\n",
+            // `None`: distinct named types are undecided at M1; upstream's
+            // subtype check proves the tear-off stands (`int <: num` on
+            // the contravariant leaf).
+            "void g(num a) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) => g(a));\n}\n",
+            // `None`: a written `dynamic` formal (upstream: `dynamic` is
+            // top on the contravariant leaf).
+            "void g(int a) {}\nvoid f(List<int> xs) {\n  xs.forEach((dynamic a) => g(a));\n}\n",
+            // `None`: a parameterized written formal (the argument slots
+            // are pool-bound); upstream's types are identical.
+            "void g(List<int> a) {}\nvoid f(List<List<int>> xs) {\n  xs.forEach((List<int> a) => g(a));\n}\n",
         ] {
             let lints = run_semantic(source, "unnecessary_lambdas");
             assert_eq!(lints.len(), 1, "{source}\n{lints:?}");
@@ -23971,11 +25156,12 @@ mod b4_expr_pins {
     /// :283/:70-76); the `Some(false)` faces (a nullable lambda formal
     /// against a non-nullable target formal, a required target formal
     /// the lambda lacks, a constructor with a required formal the lambda
-    /// lacks); and the `None` faces (an untyped lambda formal, a generic
-    /// callee, distinct named types, a written `dynamic` formal, a
-    /// parameterized formal, a bare creation with arguments). The local
-    /// function and the unresolved callee moved to the fallback arm's
-    /// report faces (`unnecessary_lambdas_fallback_faces`).
+    /// lacks); the `None` faces the `parametersMatch` gates fail (an
+    /// optional target formal against the untyped forward's required
+    /// count, :112-120); and the faces that never reach the gate (the
+    /// bare creation with arguments). The undecided `None` faces that
+    /// used to sit here report through the fallback now
+    /// (`unnecessary_lambdas_fallback_faces`).
     #[test]
     fn unnecessary_lambdas_silent_faces() {
         for source in [
@@ -24006,16 +25192,10 @@ mod b4_expr_pins {
             "void g(int a, int b) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) => g(a));\n}\n",
             // `Some(false)`: a constructor formal the lambda lacks.
             "class C {\n  C(int a);\n}\nvoid f() {\n  var mk = () => new C();\n}\n",
-            // `None`: an untyped lambda formal is inferred upstream.
-            "void g(int a) {}\nvoid f(List<int> xs) {\n  xs.forEach((a) => g(a));\n}\n",
-            // `None`: a generic callee.
-            "void g<T>(T a) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) => g(a));\n}\n",
-            // `None`: distinct named types are undecided at M1.
-            "void g(num a) {}\nvoid f(List<int> xs) {\n  xs.forEach((int a) => g(a));\n}\n",
-            // `None`: a written `dynamic` formal.
-            "void g(int a) {}\nvoid f(List<int> xs) {\n  xs.forEach((dynamic a) => g(a));\n}\n",
-            // `None`: a parameterized written formal.
-            "void g(List<int> a) {}\nvoid f(List<List<int>> xs) {\n  xs.forEach((List<int> a) => g(a));\n}\n",
+            // `None` the fallback fails: the optional target formal
+            // cannot face the untyped forward's required count
+            // (:112-120).
+            "void g([int? a]) {}\nvoid f(List<int> xs) {\n  xs.forEach((e) => g(e));\n}\n",
             // `None`: a bare creation with arguments carries no type-use
             // row (only the zero-argument shape is provable).
             "class C {\n  C(int a);\n}\nvoid f() {\n  var mk = (int a) => C(a);\n}\n",

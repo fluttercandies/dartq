@@ -3781,6 +3781,59 @@ mod w5_approx_pins {
         assert!(f.run(&one_rule("comment_references")).is_empty());
     }
 
+    /// The upstream corpus's unresolvable POSITIVE shapes (lints-new
+    /// `comment_references.dart:33/38/43/48/53`), each one row at the
+    /// reference text: an unknown bare name, a dotted name whose head
+    /// resolves to nothing, a twice-dotted name, a `[y]:` line-initial
+    /// colon shape (the colon is only a link definition when the bracket
+    /// opens the line), and the constructor doc whose `[x]` cannot see the
+    /// private named parameter (`this._x` — the formal's own name is
+    /// `_x`, the field's `_x`; `x` resolves nowhere).
+    #[test]
+    fn comment_references_unresolvable_sites_report() {
+        let f = Fixture::parse("/// Text [y].\nclass CUnknown {}\n");
+        let lints = f.run_semantic(&one_rule("comment_references"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+
+        let f = Fixture::parse("/// Parameter [y.z].\nclass CUnknownDotted {}\n");
+        assert_eq!(f.run_semantic(&one_rule("comment_references")).len(), 1);
+
+        let f = Fixture::parse("/// Parameter [x.y.z].\nclass CUnknownTwiceDotted {}\n");
+        assert_eq!(f.run_semantic(&one_rule("comment_references")).len(), 1);
+
+        let f = Fixture::parse("/// Parameter [y]: z.\nvoid fUnknownFollowedByColon(int x) {}\n");
+        assert_eq!(f.run_semantic(&one_rule("comment_references")).len(), 1);
+
+        let f = Fixture::parse(
+            "class CPrivateNamedInvalid {\n  final int _x;\n\n  /// [x]\n  \
+             CPrivateNamedInvalid({required this._x});\n}\n",
+        );
+        assert_eq!(f.run_semantic(&one_rule("comment_references")).len(), 1);
+    }
+
+    /// The resolvable mirrors stay silent: a core type name, a core
+    /// named-constructor reference, the enclosing field, the method's own
+    /// parameter, the constructor's `this.x` initializing formal, and the
+    /// private named form (`[_x]` over `this._x`).
+    #[test]
+    fn comment_references_resolvable_sites_stay_silent() {
+        let sources = [
+            "/// [String] is OK.\nclass CImported {}\n",
+            "/// Text [Future.delayed].\nclass CPrefixedTearoff {}\n",
+            "class CField {\n  int x = 0;\n  /// Assigns to [x].\n  void m() {}\n}\n",
+            "class CParameter {\n  /// Reads [x].\n  void m(int x) {}\n}\n",
+            "class CParameterConstructorField {\n  final int x;\n\n  /// [x]\n  \
+             CParameterConstructorField(this.x);\n}\n",
+            "class CPrivateNamedValid {\n  final int _x;\n\n  /// [_x]\n  \
+             CPrivateNamedValid({required this._x});\n}\n",
+        ];
+        for source in sources {
+            let f = Fixture::parse(source);
+            let lints = f.run_semantic(&one_rule("comment_references"));
+            assert!(lints.is_empty(), "{source:?} -> {lints:?}");
+        }
+    }
+
     // —— unnecessary_ignore ————————————————————————————————————————————————
 
     /// The upstream primary code's texts, mirrored verbatim

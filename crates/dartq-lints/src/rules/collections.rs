@@ -4578,9 +4578,14 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
     /// face, :102-105). `hasImmutable` reads the written annotations by
     /// spelling (`immutable` / `Immutable` — the `package:meta` getter and
     /// class faces) over the class and its extends chain; a chain that
-    /// leaves the file under-reports. `canBeConst` is the syntactic
-    /// `const_ability` face. Message: `diagnostic.g.dart`
-    /// `preferConstLiteralsToCreateImmutables`.
+    /// leaves the file under-reports. The analyzer resolves the annotation
+    /// only over the declaring-library gate (`_isPackageMetaGetter`/
+    /// `_isPackageMetaConstructor`, `element.library.name == 'meta'`), so
+    /// the spelling read answers only over a `library meta;` unit — an
+    /// unnamed vendored meta never recognizes it and the rule stays
+    /// silent (the live oracle's own face over a differential corpus).
+    /// `canBeConst` is the syntactic `const_ability` face. Message:
+    /// `diagnostic.g.dart` `preferConstLiteralsToCreateImmutables`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "prefer_const_literals_to_create_immutables",
         group: Group::Standalone,
@@ -4692,6 +4697,11 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
     /// written `immutable`/`Immutable` annotation; an unresolvable link
     /// ends the chain (the under-report).
     fn spelling_has_immutable(c: &Check<'_>, name: &str) -> bool {
+        // The declaring-library gate first: the annotation resolves only
+        // out of a library named `meta` (the doc block).
+        if !const_ability::spells_meta_library(c.unit) {
+            return false;
+        }
         let Some(first) = same_file_class_like(c, name) else {
             return false;
         };
@@ -4746,10 +4756,13 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
         use super::SPEC;
 
         /// `test_listLiteral_noConst` — a mutable-position list literal
-        /// under an `@immutable` creation reports at the literal.
+        /// under an `@immutable` creation reports at the literal. The
+        /// annotation resolves only over a `library meta;` unit (the
+        /// declaring-library gate), so every firing fixture declares it.
         #[test]
         fn list_literal_under_immutable_creation_reports() {
             let source = concat!(
+                "library meta;\n",
                 "@immutable\n",
                 "class C {\n",
                 "  const C(List<Object> p);\n",
@@ -4767,22 +4780,31 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
             assert_eq!(lints[0].range.start, utf16_at(&f, open));
         }
 
+        /// The corpus's own face: the unnamed vendored meta (no `library
+        /// meta;` in the importing unit) never resolves the annotation,
+        /// and no row reports — the live oracle emits zero rows for the
+        /// rule over that corpus.
+        #[test]
+        fn unnamed_meta_library_stays_silent() {
+            let source = "@immutable\nclass C {\n  const C(List<Object> p);\n}\nvar x = C([]);\n";
+            let f = Fixture::parse(source);
+            assert!(f.run(&one_rule(SPEC.name)).is_empty());
+        }
+
         /// `test_listLiteral_nested_noConst` — a nested literal reports
         /// once per level; `test_listLiteral_const` and the nested-const
         /// shape stay silent.
         #[test]
         fn nested_and_const_faces() {
-            let source =
-                "@immutable\nclass C {\n  const C(List<Object> p);\n}\nvar x = C([\n  [],\n]);\n";
+            let source = "library meta;\n@immutable\nclass C {\n  const C(List<Object> p);\n}\nvar x = C([\n  [],\n]);\n";
             let f = Fixture::parse(source);
             assert_eq!(f.run(&one_rule(SPEC.name)).len(), 2);
 
-            let source =
-                "@immutable\nclass C {\n  const C(List<Object> p);\n}\nvar x = C(const []);\n";
+            let source = "library meta;\n@immutable\nclass C {\n  const C(List<Object> p);\n}\nvar x = C(const []);\n";
             let f = Fixture::parse(source);
             assert!(f.run(&one_rule(SPEC.name)).is_empty());
 
-            let source = "@immutable\nclass C {\n  const C(List<Object> p);\n}\nvar x = C(const [\n  const [],\n]);\n";
+            let source = "library meta;\n@immutable\nclass C {\n  const C(List<Object> p);\n}\nvar x = C(const [\n  const [],\n]);\n";
             let f = Fixture::parse(source);
             assert!(f.run(&one_rule(SPEC.name)).is_empty());
         }
@@ -4792,11 +4814,11 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
         /// inherited annotation over the extends chain answers.
         #[test]
         fn immutable_spellings_and_inheritance() {
-            let source =
-                "@Immutable('')\nclass C {\n  const C(List<Object> p);\n}\nvar x = C([]);\n";
+            let source = "library meta;\n@Immutable('')\nclass C {\n  const C(List<Object> p);\n}\nvar x = C([]);\n";
             assert_eq!(Fixture::parse(source).run(&one_rule(SPEC.name)).len(), 1);
 
             let source = concat!(
+                "library meta;\n",
                 "@immutable\n",
                 "class B {\n",
                 "  const B();\n",
@@ -4810,6 +4832,7 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
             assert!(f.run(&one_rule(SPEC.name)).is_empty());
 
             let source = concat!(
+                "library meta;\n",
                 "@immutable\n",
                 "class B {\n",
                 "  const B(List<Object> p);\n",
@@ -4825,7 +4848,8 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
         /// `@immutable` extension type reports.
         #[test]
         fn extension_type_creation_reports() {
-            let source = "@immutable\nextension type E(List<int> i) {}\nvar e = E([1]);\n";
+            let source =
+                "library meta;\n@immutable\nextension type E(List<int> i) {}\nvar e = E([1]);\n";
             let f = Fixture::parse(source);
             assert_eq!(
                 f.run(&one_rule(SPEC.name)).len(),
@@ -4863,15 +4887,13 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
         /// map-entry climbs.
         #[test]
         fn new_expression_and_transparent_parents() {
-            let source =
-                "@immutable\nclass C {\n  const C(List<Object> p);\n}\nvar x = new C([]);\n";
+            let source = "library meta;\n@immutable\nclass C {\n  const C(List<Object> p);\n}\nvar x = new C([]);\n";
             assert_eq!(Fixture::parse(source).run(&one_rule(SPEC.name)).len(), 1);
 
-            let source =
-                "@immutable\nclass C {\n  const C({List<Object>? p});\n}\nvar x = C(p: []);\n";
+            let source = "library meta;\n@immutable\nclass C {\n  const C({List<Object>? p});\n}\nvar x = C(p: []);\n";
             assert_eq!(Fixture::parse(source).run(&one_rule(SPEC.name)).len(), 1);
 
-            let source = "@immutable\nclass C {\n  const C(Map<Object, Object> p);\n}\nvar x = C({'k': [1]});\n";
+            let source = "library meta;\n@immutable\nclass C {\n  const C(Map<Object, Object> p);\n}\nvar x = C({'k': [1]});\n";
             assert_eq!(Fixture::parse(source).run(&one_rule(SPEC.name)).len(), 2);
         }
     }

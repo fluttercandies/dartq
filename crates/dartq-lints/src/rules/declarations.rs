@@ -12607,36 +12607,55 @@ pub(crate) mod use_late_for_private_fields_and_variables {
 
 pub(crate) mod deprecated_member_use_from_same_package {
     use super::{
-        Check, Group, NodeKind, RuleSpec, container_members, is_deprecated_metadata,
+        Check, Group, NodeKind, RuleSpec, container_members, is_deprecated_metadata, narrow_u32,
         top_level_annotations,
     };
     use crate::rules::initialized_identifier_name;
+    use std::path::{Path, PathBuf};
 
     /// Official: `pkg/linter/lib/src/rules/deprecated_member_use_from_same_package.dart`
     /// — a use of a deprecated element from inside the declaring package
-    /// reports at the use (`deprecated_member_use_verifier.dart`'s
-    /// `DeprecatedElementUsageSet` driven by the
-    /// `ElementUsageFrontierDetector`, mounted per compilation unit :58-71).
-    /// Two message variants under one name: the normalized `@Deprecated`
-    /// tag with the message (:42-52), a bare `@deprecated` without.
+    /// reports at the use. The official mount is one
+    /// `ElementUsageFrontierVisitor` per compilation unit (:102-113): every
+    /// declaration is pushed onto the frontier stack while its contents are
+    /// visited (`element_usage_frontier_visitor.dart`), so a use inside a
+    /// deprecated ancestor — the deprecated `library` directive, a
+    /// deprecated class/member/parameter — never reports (the
+    /// `test_deprecatedClass_usedInDeprecated*` family). Two message
+    /// variants under one name: the normalized `@Deprecated` tag with the
+    /// message, a bare `@deprecated` without.
     ///
-    /// M1 approximation (GAP-4, documented): same-package usage needs the
-    /// element model's package attribution, so the mounted face is
-    /// same-file — a reference-context identifier whose lexeme matches a
-    /// same-file deprecated declaration reports at itself. Under-report:
-    /// cross-file same-package uses (the official face's bulk) never fire;
-    /// call-site named-argument labels, tear-offs of operators, and labels
-    /// are not reference contexts here. Over-report: a shadowing import of
-    /// the same lexeme (the file cannot attribute the identifier); a
-    /// use inside another declaration's `@deprecated`-annotated formal
-    /// parameter default (the corpus's parameter-level exemption lives on
-    /// the parameter, not the enclosing declaration). The frontier
-    /// exemption (:75-77 — uses lexically inside a deprecated declaration
-    /// never report, `test_deprecatedClass_usedInDeprecatedEnum` family) is
-    /// span containment. Reference contexts are the identifier-context
-    /// payload's expression/type/constructor-reference faces. Messages:
-    /// `diagnostic.g.dart` `deprecatedMemberUseFromSamePackageWithMessage`
-    /// and `…WithoutMessage`.
+    /// Faces over the single-unit arena:
+    ///
+    /// - Library face (the frontier's root push, visitor :51-59): a
+    ///   `@deprecated` `library` directive suppresses every use in the
+    ///   unit — the whole file goes silent.
+    /// - Same-file reference face (approximation, documented): a
+    ///   reference-context identifier whose lexeme matches a same-file
+    ///   deprecated declaration reports at itself, unless its byte start
+    ///   sits inside any deprecated frontier declaration's span (the
+    ///   ancestor suppression). Pushed shapes mirror the visitor's
+    ///   overrides: class-likes, mixin applications, typedefs, top-level
+    ///   fields/methods, members, constructors/factories, fields, formal
+    ///   parameters (regular and function-typed); locals, closures and
+    ///   enum constants are not pushed upstream and not here.
+    ///   Under-report: cross-file same-package uses through other names.
+    /// - Directive face (upstream `importDirective`/`exportDirective` +
+    ///   `combinatorName`, detector :769-775/:614-624): an import/export
+    ///   of a library whose `library` directive is deprecated reports at
+    ///   the whole directive with the target's package URI as the name; a
+    ///   `show` combinator name matching a deprecated top-level
+    ///   class-family declaration of the directly imported file reports
+    ///   at the name (`hide` is forgiving and stays silent). The face
+    ///   needs the workspace facts to resolve the URI and compose the
+    ///   `package:` display name — without them it stays silent; the
+    ///   target file is re-scanned at the token level, so only the
+    ///   directly imported file's own declarations answer (re-export
+    ///   chains under-report).
+    ///
+    /// Messages: `diagnostic.g.dart`
+    /// `deprecatedMemberUseFromSamePackageWithMessage` and
+    /// `…WithoutMessage`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "deprecated_member_use_from_same_package",
         group: Group::Standalone,
@@ -12651,51 +12670,61 @@ pub(crate) mod deprecated_member_use_from_same_package {
     const CORRECTION: &str = "Try replacing the use of the deprecated member with the replacement, \
          if a replacement is specified.";
 
-    /// One same-file deprecated declaration: the name lexeme, the
-    /// normalized message (`None` = the bare `@deprecated` shape), and the
-    /// declaring row's byte span (the frontier exemption).
+    /// One same-file deprecated declaration: the name lexeme and the
+    /// normalized message (`None` = the bare `@deprecated` shape).
     struct DeprecatedDecl<'a> {
         name: &'a str,
         message: Option<String>,
-        span: core::ops::Range<usize>,
     }
 
     fn check(c: &mut Check<'_>) {
-        let node = c.node();
-        let decls = collect_deprecated(c, node);
+        // The frontier's root push (visitor `visitCompilationUnit`): a
+        // deprecated `library` directive silences the whole unit.
+        if unit_library_deprecated(c) {
+            return;
+        }
+        // The directive faces — import/export of a deprecated library and
+        // the `show` combinator names (workspace-gated: the URI resolution
+        // and the `package:` display name are package facts).
+        directive_faces(c);
+        let decls = collect_deprecated(c, c.node());
         if decls.is_empty() {
             return;
         }
-        // One pass over the unit's rows: a reference-context identifier of a
-        // deprecated lexeme reports unless it sits inside any deprecated
-        // declaration's span. The window borrows die before the reports
-        // below read nothing but spans and lexemes off the unit.
-        let window = c.children(node);
-        let mut hits = Vec::new();
-        for row in window.start..window.end {
-            if c.kind(row) != NodeKind::Identifier {
-                continue;
+        // One pass over the unit's rows: every deprecated frontier
+        // declaration contributes its span (the ancestor suppression), and
+        // every reference-context identifier of a deprecated lexeme is a
+        // candidate hit. The upstream push set (`_withDeclaration` /
+        // `_withFormalParameter` overrides) is `is_frontier_declaration`;
+        // a use inside any deprecated declaration's span never reports.
+        let len = narrow_u32(c.unit.ast.len());
+        let mut suppressed: Vec<core::ops::Range<usize>> = Vec::new();
+        let mut hits: Vec<(u32, Option<String>)> = Vec::new();
+        for row in 0..len {
+            if c.kind(row) == NodeKind::Identifier {
+                let Some(&context) = c.payload(row).first() else {
+                    continue;
+                };
+                if !is_reference_context(context) {
+                    continue;
+                }
+                let name = c.lexeme(c.head_token(row));
+                let Some(hit) = decls.iter().find(|decl| decl.name == name) else {
+                    continue;
+                };
+                hits.push((row, hit.message.clone()));
+            } else if is_frontier_declaration(c.kind(row)) && frontier_deprecated(c, row) {
+                suppressed.push(frontier_span(c, row));
             }
-            let Some(&context) = c.payload(row).first() else {
-                continue;
-            };
-            if !is_reference_context(context) {
-                continue;
-            }
-            let name = c.lexeme(c.head_token(row));
-            let Some(hit) = decls.iter().find(|decl| decl.name == name) else {
-                continue;
-            };
+        }
+        for (row, message) in hits {
             let byte = c.byte_span(row);
-            if decls
+            if suppressed
                 .iter()
-                .any(|decl| decl.span.start <= byte.start && byte.start < decl.span.end)
+                .any(|span| span.start <= byte.start && byte.start < span.end)
             {
                 continue;
             }
-            hits.push((row, hit.message.clone()));
-        }
-        for (row, message) in hits {
             let name = c.lexeme(c.head_token(row));
             let range = c.utf16_span(row);
             match message {
@@ -12705,6 +12734,422 @@ pub(crate) mod deprecated_member_use_from_same_package {
                 None => c.report_texts(range, WITHOUT_MESSAGE, CORRECTION, &[name]),
             }
         }
+    }
+
+    /// The declaration shapes the upstream frontier visitor pushes while
+    /// their contents are visited (`element_usage_frontier_visitor.dart`:
+    /// the `_withDeclaration` class/enum/extension/mixin/typedef/function
+    /// overrides, the constructor/method overrides, the field and top-level
+    /// variable pushes, and the formal-parameter overrides). Enum constants,
+    /// locals and closures are not pushed upstream and not here.
+    fn is_frontier_declaration(kind: NodeKind) -> bool {
+        matches!(
+            kind,
+            NodeKind::ClassDeclaration
+                | NodeKind::MixinDeclaration
+                | NodeKind::ExtensionDeclaration
+                | NodeKind::ExtensionTypeDeclaration
+                | NodeKind::EnumDeclaration
+                | NodeKind::NamedMixinApplication
+                | NodeKind::Typedef
+                | NodeKind::TopLevelMethod
+                | NodeKind::TopLevelFields
+                | NodeKind::Method
+                | NodeKind::Constructor
+                | NodeKind::Factory
+                | NodeKind::Fields
+                | NodeKind::FormalParameter
+                | NodeKind::FunctionTypedFormalParameter
+        )
+    }
+
+    /// Whether `row` sits under a deprecated frontier annotation: the
+    /// metadata star is the row's left sibling (the uniform
+    /// `parseMetadataStar` emission order — the star parses before the row
+    /// opens), and class-likes behind a `TopLevelDeclaration` wrapper carry
+    /// the star beside the wrapper.
+    fn frontier_deprecated(c: &Check<'_>, row: u32) -> bool {
+        if row_is_deprecated(c, row) {
+            return true;
+        }
+        match c.unit.ast.parent(row) {
+            Some(wrapper) if c.kind(wrapper) == NodeKind::TopLevelDeclaration => {
+                row_is_deprecated(c, wrapper)
+            }
+            _ => false,
+        }
+    }
+
+    /// The suppression span of a frontier declaration: the wrapper's span
+    /// for the wrapper-nested top-level rows (it covers the hoisted name),
+    /// the row's own span otherwise — extended to the row's subtree extent,
+    /// because some tilings seal the row short of its children (the
+    /// function-typed parameter's outer row seals at `void p` while the
+    /// nested parameter list rides beside it).
+    fn frontier_span(c: &Check<'_>, row: u32) -> core::ops::Range<usize> {
+        let (base, base_row) = match c.unit.ast.parent(row) {
+            Some(wrapper) if c.kind(wrapper) == NodeKind::TopLevelDeclaration => {
+                (c.byte_span(wrapper), wrapper)
+            }
+            _ => (c.byte_span(row), row),
+        };
+        let window = c.unit.ast.children(base_row);
+        let end = (window.start..window.end)
+            .map(|kid| c.byte_span(kid).end)
+            .max()
+            .unwrap_or(base.end)
+            .max(base.end);
+        base.start..end
+    }
+
+    /// Whether any `library` directive of the unit carries `@deprecated` —
+    /// the deprecated-library face that silences the whole unit (the
+    /// frontier's root push). Position-independent: a raw row walk over the
+    /// `LibraryName` rows. The star read is recovery-tolerant — a mid-file
+    /// `library` directive (the ordering diagnostic) emits a
+    /// `RecoverableError` row between the metadata star and the wrapper, so
+    /// the scan skips recovery rows before requiring the star; nothing but
+    /// recovery markers can interleave there (the star parses immediately
+    /// before the directive opens).
+    fn unit_library_deprecated(c: &Check<'_>) -> bool {
+        for row in 0..narrow_u32(c.unit.ast.len()) {
+            if c.kind(row) != NodeKind::LibraryName {
+                continue;
+            }
+            if row_is_deprecated(c, row) {
+                return true;
+            }
+            let Some(wrapper) = c.unit.ast.parent(row) else {
+                continue;
+            };
+            if c.kind(wrapper) != NodeKind::TopLevelDeclaration {
+                continue;
+            }
+            let Some(parent) = c.unit.ast.parent(wrapper) else {
+                continue;
+            };
+            let siblings = c.collect_direct(parent);
+            let Some(pos) = siblings.iter().position(|&s| s == wrapper) else {
+                continue;
+            };
+            for prev in siblings[..pos].iter().rev().copied() {
+                match c.kind(prev) {
+                    NodeKind::RecoverableError => continue,
+                    NodeKind::MetadataStar => {
+                        if c.collect_direct(prev)
+                            .into_iter()
+                            .any(|meta| is_deprecated_metadata(c, meta))
+                        {
+                            return true;
+                        }
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        false
+    }
+
+    /// The directive faces over the unit's `Import`/`Export` rows. Silent
+    /// without the workspace facts (no URI resolution, no package URI).
+    fn directive_faces(c: &mut Check<'_>) {
+        let Some(workspace) = c.unit.workspace else {
+            return;
+        };
+        let Some(path) = c.unit.path else {
+            return;
+        };
+        for row in 0..narrow_u32(c.unit.ast.len()) {
+            let kind = c.kind(row);
+            if kind != NodeKind::Import && kind != NodeKind::Export {
+                continue;
+            }
+            let kids = c.collect_direct(row);
+            let Some(uri_row) = kids
+                .iter()
+                .copied()
+                .find(|&kid| c.kind(kid) == NodeKind::StringLiteral)
+            else {
+                continue;
+            };
+            let Some(uri) = string_literal_value(c, c.head_token(uri_row)) else {
+                continue;
+            };
+            let Some(target) = resolve_same_package(workspace, path, &uri) else {
+                continue;
+            };
+            let Ok(source) = std::fs::read_to_string(&target) else {
+                continue;
+            };
+            let face = scan_target_deprecations(&source, &target);
+            // The library face: the whole directive reports with the
+            // target's package URI as the display name (upstream
+            // `displayName = element.uri.toString()`).
+            if face.library.is_some() {
+                if let Some(display) = package_uri(workspace, &target) {
+                    let range = c.utf16_span(row);
+                    match face.library.unwrap() {
+                        Some(message) => {
+                            c.report_texts(range, WITH_MESSAGE, CORRECTION, &[&display, &message]);
+                        }
+                        None => c.report_texts(range, WITHOUT_MESSAGE, CORRECTION, &[&display]),
+                    }
+                }
+            }
+            // The `show` combinator face: a shown name matching a deprecated
+            // top-level class-family declaration of the target reports at
+            // the name (`hide` is forgiving — no `Hide` walk). The rows
+            // materialize first: the report borrows `c` mutably.
+            let shows: Vec<u32> = kids
+                .iter()
+                .copied()
+                .filter(|&kid| c.kind(kid) == NodeKind::Show)
+                .collect();
+            for show in shows {
+                let names: Vec<u32> = c
+                    .collect_direct(show)
+                    .into_iter()
+                    .filter(|&kid| c.kind(kid) == NodeKind::Identifier)
+                    .collect();
+                for name in names {
+                    let lexeme = c.lexeme(c.head_token(name));
+                    let Some((_, message)) = face
+                        .declared
+                        .iter()
+                        .find(|(declared, _)| declared.as_str() == lexeme)
+                    else {
+                        continue;
+                    };
+                    let range = c.utf16_span(name);
+                    match message {
+                        Some(message) => {
+                            c.report_texts(range, WITH_MESSAGE, CORRECTION, &[lexeme, message]);
+                        }
+                        None => c.report_texts(range, WITHOUT_MESSAGE, CORRECTION, &[lexeme]),
+                    }
+                }
+            }
+        }
+    }
+
+    /// One `Import`/`Export` row's directive-face verdicts, read off the
+    /// target file: the deprecated `library` directive (`Some(message)` —
+    /// `None` inside for the bare `@deprecated` shape) and the deprecated
+    /// top-level class-family names for the combinator face.
+    #[derive(Default)]
+    struct TargetDeprecations {
+        library: Option<Option<String>>,
+        declared: Vec<(String, Option<String>)>,
+    }
+
+    /// The URI literal's value: the lexeme with one level of quotes
+    /// stripped (interpolation segments stay unreported).
+    fn unquote(raw: &str) -> Option<&str> {
+        let bytes = raw.as_bytes();
+        if bytes.len() >= 2
+            && (bytes[0] == b'\'' || bytes[0] == b'"')
+            && bytes[0] == bytes[bytes.len() - 1]
+        {
+            Some(&raw[1..raw.len() - 1])
+        } else {
+            None
+        }
+    }
+
+    /// The URI literal's value off the unit's own token table.
+    fn string_literal_value<'a>(c: &'a Check<'_>, token: u32) -> Option<&'a str> {
+        unquote(c.lexeme(token))
+    }
+
+    /// The file a same-package URI resolves to: `package:<own>/…` through
+    /// the package's URI directory, anything else relative to the importing
+    /// file. Cross-package and SDK URIs answer `None` (those uses are the
+    /// analyzer's `DEPRECATED_MEMBER_USE`, not this rule's); a relative
+    /// target that escapes the analyzed package too (the `isInSamePackage`
+    /// gate) answers `None`.
+    fn resolve_same_package(
+        workspace: &crate::WorkspaceFacts,
+        path: &Path,
+        uri: &str,
+    ) -> Option<PathBuf> {
+        if let Some(rest) = uri.strip_prefix("package:") {
+            let own = format!("{}/", workspace.own_package);
+            let relative = rest.strip_prefix(&own)?;
+            return Some(workspace.lib_dir.join(relative));
+        }
+        if uri.starts_with("dart:") {
+            return None;
+        }
+        let base = path.parent()?;
+        let target = base.join(uri);
+        target.starts_with(&workspace.root).then_some(target)
+    }
+
+    /// The target's `package:` display URI — `package:<own>/<path under the
+    /// package URI directory>`; a target outside it has no package URI and
+    /// stays unreported (the official face's `element.uri` has no
+    /// `package:` form for it either).
+    fn package_uri(workspace: &crate::WorkspaceFacts, target: &Path) -> Option<String> {
+        let relative = target.strip_prefix(&workspace.lib_dir).ok()?;
+        let mut display = format!("package:{}", workspace.own_package);
+        for component in relative.components() {
+            display.push('/');
+            display.push_str(&component.as_os_str().to_string_lossy());
+        }
+        Some(display)
+    }
+
+    /// The token-level deprecation scan of a target file: the deprecation
+    /// annotation directly preceding a `library` directive, and the
+    /// deprecated top-level class-family declarations (the shapes the
+    /// directive faces read). Token-level so comments and strings never
+    /// answer; the `library` face wins over the per-declaration list.
+    fn scan_target_deprecations(source: &str, path: &Path) -> TargetDeprecations {
+        let mut face = TargetDeprecations::default();
+        let mut files = dartq_source::FileTable::default();
+        let tokens = dartq_scanner::scan(
+            source,
+            dartq_scanner::ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            files.intern(path),
+        )
+        .tokens;
+        let lexeme = |index: usize| tokens.lexeme(source, index);
+        let kind = |index: usize| tokens.get(index).map(|token| token.kind);
+        let mut index = 0;
+        while index < tokens.len() {
+            if lexeme(index) != "@" {
+                index += 1;
+                continue;
+            }
+            // The annotation name must hug the `@`.
+            let Some(name_token) = (tokens.get(index + 1))
+                .filter(|token| token.kind == dartq_scanner::TokenKind::Identifier)
+                .map(|_| index + 1)
+            else {
+                index += 1;
+                continue;
+            };
+            let name = lexeme(name_token);
+            if name != "deprecated" && name != "Deprecated" {
+                index += 1;
+                continue;
+            }
+            // `@Deprecated('…')`: the first string argument is the message,
+            // run through the official normalization.
+            let mut cursor = name_token + 1;
+            let mut message = None;
+            if kind(cursor) == Some(dartq_scanner::TokenKind::OpenParen) {
+                let mut depth = 0usize;
+                let mut close = cursor;
+                while close < tokens.len() {
+                    match kind(close) {
+                        Some(dartq_scanner::TokenKind::OpenParen) => depth += 1,
+                        Some(dartq_scanner::TokenKind::CloseParen) => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        Some(dartq_scanner::TokenKind::Eof) => break,
+                        Some(dartq_scanner::TokenKind::String)
+                            if depth == 1 && message.is_none() =>
+                        {
+                            let token = tokens.get(close);
+                            let raw = token.map(|token| {
+                                &source[token.byte_offset as usize
+                                    ..(token.byte_offset + token.byte_len) as usize]
+                            });
+                            message = normalize_deprecation_message(raw.and_then(unquote));
+                        }
+                        _ => {}
+                    }
+                    close += 1;
+                }
+                cursor = close + 1;
+            }
+            // The annotated head decides the face: `library` (the directive
+            // face) or the class-family keyword run (the combinator face).
+            // Every read clamps to the table (the Eof terminator's empty
+            // lexeme answers every keyword probe) — a malformed target
+            // degrades to silence, never out of bounds.
+            let last = tokens.len() - 1;
+            let cursor = cursor.min(last);
+            let head = lexeme(cursor);
+            if head == "library" {
+                face.library = Some(message);
+            } else if matches!(
+                head,
+                "class" | "mixin" | "enum" | "extension" | "type" | "typedef"
+            ) {
+                let mut head = cursor;
+                while head < last
+                    && matches!(
+                        lexeme(head),
+                        "class"
+                            | "mixin"
+                            | "enum"
+                            | "extension"
+                            | "type"
+                            | "typedef"
+                            | "sealed"
+                            | "base"
+                            | "abstract"
+                            | "final"
+                            | "augment"
+                    )
+                {
+                    head += 1;
+                }
+                if kind(head) == Some(dartq_scanner::TokenKind::Identifier) {
+                    face.declared.push((lexeme(head).to_owned(), message));
+                }
+            }
+            index = cursor.max(index + 1);
+        }
+        face
+    }
+
+    /// `normalizeDeprecationMessage`
+    /// (deprecated_member_use_verifier.dart:18-29): trimmed; empty and `.`
+    /// normalize to `None`; a trailing `.`, `?` or `!` stays as written,
+    /// anything else gains a `.`.
+    fn normalize_deprecation_message(value: Option<&str>) -> Option<String> {
+        let trimmed = value?.trim();
+        if trimmed.is_empty() || trimmed == "." {
+            return None;
+        }
+        if trimmed.ends_with(['.', '?', '!']) {
+            Some(trimmed.to_owned())
+        } else {
+            Some(format!("{trimmed}."))
+        }
+    }
+
+    /// Whether `row` carries `@deprecated` metadata — the metadata star is
+    /// the row's left sibling in its parent's children (the uniform
+    /// `parseMetadataStar` emission order for declarations, members, formal
+    /// parameters and directives).
+    fn row_is_deprecated(c: &Check<'_>, row: u32) -> bool {
+        let Some(parent) = c.unit.ast.parent(row) else {
+            return false;
+        };
+        let siblings = c.collect_direct(parent);
+        let Some(pos) = siblings.iter().position(|&s| s == row) else {
+            return false;
+        };
+        let Some(&star) = pos.checked_sub(1).and_then(|i| siblings.get(i)) else {
+            return false;
+        };
+        if c.kind(star) != NodeKind::MetadataStar {
+            return false;
+        }
+        c.collect_direct(star)
+            .into_iter()
+            .any(|meta| is_deprecated_metadata(c, meta))
     }
 
     /// The unit's deprecated declarations, in declaration order: the
@@ -12881,7 +13326,32 @@ pub(crate) mod deprecated_member_use_from_same_package {
                 .map(|kid| c.lexeme(c.head_token(kid)))
                 .collect(),
             // Class-likes, typedefs, enum constants, constructors (the type
-            // name): the first `Identifier` child of the name row.
+            // name): the first `Identifier` child of the name row — except
+            // the mixin application, whose alias name rides the wrapper as
+            // the declaration-context identifier (its row's own identifier
+            // children start at the `=` supertype).
+            NodeKind::NamedMixinApplication => {
+                let name = c
+                    .unit
+                    .ast
+                    .parent(row)
+                    .map(|parent| c.collect_direct(parent))
+                    .and_then(|siblings| {
+                        let pos = siblings.iter().position(|&s| s == row)?;
+                        siblings[..pos].iter().rev().copied().find(|&kid| {
+                            c.kind(kid) == NodeKind::Identifier
+                                && c.payload(kid).first().copied()
+                                    == Some(
+                                        dartq_parser::IdentifierContext::
+                                            ClassOrMixinOrExtensionDeclaration as u32,
+                                    )
+                        })
+                    });
+                match name {
+                    Some(kid) => vec![c.lexeme(c.head_token(kid))],
+                    None => return,
+                }
+            }
             _ => match c
                 .collect_direct(name_row)
                 .into_iter()
@@ -12891,14 +13361,12 @@ pub(crate) mod deprecated_member_use_from_same_package {
                 None => return,
             },
         };
-        let span = c.byte_span(row);
         for meta in deprecated {
             let message = deprecation_message(c, meta);
             for &name in &names {
                 out.push(DeprecatedDecl {
                     name,
                     message: message.clone(),
-                    span: span.clone(),
                 });
             }
         }
@@ -13171,7 +13639,12 @@ pub(crate) mod prefer_const_declarations {
             let verdict = if wrapped {
                 Some(true)
             } else {
+                // The tear-off/creation expression: the LAST send owns the
+                // whole access (`C<int>.new` tiles the generic `C<int>`
+                // send beside the `.new` tail send — the tail is the
+                // constant face).
                 kids.iter()
+                    .rev()
                     .find(|&&kid| c.kind(kid) == NodeKind::Send)
                     .or_else(|| kids.last())
                     .copied()
@@ -20827,6 +21300,55 @@ set size(int input) {\n    _size = input;\n  }\n}\n";
         }
     }
 
+    /// The tear-off faces (upstream `test_*Tearoff*`): a `final` variable
+    /// initialized to a constructor tear-off (`C.new`, `C.new` on a
+    /// generic class with or without written type arguments) or a
+    /// `static` method tear-off (`C.m`, `C.m<int>`) holds a constant
+    /// expression — the tear-off is constant regardless of the
+    /// constructor's own `const`-ness — so the list reports.
+    #[test]
+    fn prefer_const_declarations_tearoffs_report() {
+        for source in [
+            // Constructor tear-off, declared-type inference.
+            "class C<T> {\n  C();\n}\nvoid f() {\n  final C<int> Function() c = C.new;\n}\n",
+            // Constructor tear-off, instantiated.
+            "class C<T> {\n  C();\n}\nvoid f() {\n  final c = C<int>.new;\n}\n",
+            // Constructor tear-off, uninstantiated.
+            "class C {\n  C();\n}\nvoid f() {\n  final x = C.new;\n}\n",
+            // Static-method tear-off, declared-type inference.
+            "class C {\n  static void m<T>(T t) {}\n}\nvoid f() {\n  final C<int> Function() c = C.m;\n}\n",
+            // Static-method tear-off, instantiated.
+            "class C {\n  static void m<T>(T t) {}\n}\nvoid f() {\n  final c = C.m<int>;\n}\n",
+            // Static-method tear-off, uninstantiated.
+            "class C {\n  static void m() {}\n}\nvoid f() {\n  final x = C.m;\n}\n",
+        ] {
+            let f = Fixture::parse(source);
+            assert_eq!(
+                f.run(&one_rule("prefer_const_declarations")).len(),
+                1,
+                "{source}"
+            );
+        }
+    }
+
+    /// The corpus mirror of the under-fire blocks (gate
+    /// lints-new/oracle-2026-10-18): static-method tear-offs inside the
+    /// corpus's own context — generic classes whose static members return
+    /// the (undefined-here) `C<X>`, functions before their classes. The
+    /// constructor-tear-off blocks (`X.new` over a constructor-less class)
+    /// ride the implicit-constructor tear-off face owned by the
+    /// const-ability module; the `m<T>` type-variable instantiation negative
+    /// (upstream test_staticFunctionTearoff_instantiatedWithTypeVariable)
+    /// is gated by that module's type-argument read too.
+    #[test]
+    fn prefer_const_declarations_corpus_tearoff_blocks_report() {
+        let f = Fixture::parse(
+            "// POSITIVE upstream test_staticFunctionTearoff_inference (1 row at `c`).\nvoid fStaticTearoffInference() {\n  final CStaticTear<int> Function() c = CStaticTear.m;\n}\n\nclass CStaticTear<T> {\n  static C<X> m<X>() => C<X>();\n}\n\n// POSITIVE upstream test_staticFunctionTearoff_instantiatedWithType (1 row\n// at `c`).\nvoid fStaticTearoffInstantiated() {\n  final c = CStaticTearInst.m<int>;\n}\n\nclass CStaticTearInst<T> {\n  static C<X> m<X>() => C<X>();\n}\n\n// POSITIVE upstream test_staticFunctionTearoff_uninstantiated (1 row at\n// `x`).\nvoid fStaticTearoffUninstantiated() {\n  final x = CStaticTearUninst.m;\n}\n\nclass CStaticTearUninst<T> {\n  static C<X> m<X>() => C<X>();\n}\n",
+        );
+        let lints = f.run(&one_rule("prefer_const_declarations"));
+        assert_eq!(lints.len(), 3, "static tear-off blocks: {lints:?}");
+    }
+
     /// `test_localVariable_final_constructorInvocation_new` vs `_const` —
     /// a creation is a constant only when `const` is written.
     #[test]
@@ -21172,8 +21694,164 @@ mod w5_approx_pins {
         );
     }
 
-    // —— remove_deprecations_in_breaking_versions ——————————————————————————
+    /// The deprecated-context suppression (upstream
+    /// `test_deprecatedClass_usedInDeprecated*`): a use inside another
+    /// `@deprecated` declaration's span never reports — only the
+    /// non-deprecated container's uses do. And a `@deprecated` `library`
+    /// directive suppresses every use in the unit.
+    #[test]
+    fn deprecated_context_suppresses_uses() {
+        // A use inside a deprecated sibling is suppressed; a use in a
+        // non-deprecated function still reports.
+        let f = Fixture::parse(
+            "@deprecated\nclass C {}\n\n@deprecated\nvoid g(C c) {}\n\nvoid f(C c) {}\n",
+        );
+        let lints = f.run(&one_rule("deprecated_member_use_from_same_package"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        // Only `f`'s `C` (the last `C` reference) reports.
+        assert_eq!(lints[0].message, "'C' is deprecated and shouldn't be used.");
 
+        // A `@deprecated library` directive suppresses the whole unit.
+        let f = Fixture::parse(
+            "@deprecated\nlibrary lib;\n\n@deprecated\nclass C {}\n\nvoid f(C c) {}\n",
+        );
+        assert!(
+            f.run(&one_rule("deprecated_member_use_from_same_package"))
+                .is_empty()
+        );
+    }
+
+    /// The corpus's mid-file face (`test_deprecatedClass_usedInDeprecatedLibrary`
+    /// transcribed into a shared file): the deprecated `library` directive
+    /// sits after other declarations — the unit still goes fully silent
+    /// (the live oracle leg keys zero rows on the corpus file).
+    #[test]
+    fn deprecated_midfile_library_suppresses_the_unit() {
+        let f = Fixture::parse(
+            "@deprecated\nclass Early {}\n\nvoid useEarly(Early e) {}\n\n// NEGATIVE upstream test_deprecatedClass_usedInDeprecatedLibrary.\n@deprecated\nlibrary aDepLib;\n\n@deprecated\nclass CDepLib {}\n\nCDepLib? xDepLib;\n",
+        );
+        assert!(
+            f.run(&one_rule("deprecated_member_use_from_same_package"))
+                .is_empty()
+        );
+    }
+
+    /// The remaining corpus negative families (upstream
+    /// `test_deprecatedClass_usedInDeprecated*`): the use rides inside a
+    /// deprecated field, formal parameter, function-typed parameter,
+    /// field-formal parameter, extension, extension type or mixin
+    /// application — every pushed shape suppresses its contents.
+    #[test]
+    fn deprecated_member_faces_suppress_their_contents() {
+        for source in [
+            // Deprecated field initializer + type annotation.
+            "@deprecated\nclass CDepFieldInit {}\n\nclass DFieldInit {\n  @deprecated\n  Object f = CDepFieldInit;\n}\n",
+            "@deprecated\nclass CDepFieldType {}\n\nclass DFieldType {\n  @deprecated\n  CDepFieldType? f;\n}\n",
+            // Deprecated simple / function-typed / field-formal parameters.
+            "@deprecated\nclass CDepSimple {}\n\nvoid fDepSimple({@deprecated CDepSimple? c}) {}\n",
+            "@deprecated\nclass CDepFnTyped {}\n\nvoid fFnTyped({@deprecated required void p(CDepFnTyped c)}) {}\n",
+            "@deprecated\nclass CDepFieldFormal {}\n\nclass DFieldFormal {\n  Object c;\n  DFieldFormal({@deprecated required CDepFieldFormal this.c});\n}\n",
+            // Deprecated extension / extension type / mixin application.
+            "@deprecated\nclass CDepExt {}\n\n@deprecated\nextension EDepExt on CDepExt {}\n",
+            "@deprecated\nclass CDepExtType {}\n\n@deprecated\nextension type EDepExtType(CDepExtType c) { }\n",
+            "@deprecated\nmixin class CDepAlias {}\n\n@deprecated\nclass DFromDepAlias = Object with CDepAlias;\n",
+        ] {
+            let f = Fixture::parse(source);
+            assert!(
+                f.run(&one_rule("deprecated_member_use_from_same_package"))
+                    .is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The mixin application's alias name — not the `=` supertype — keys
+    /// the declaration table: a plain `Object` use never reports.
+    #[test]
+    fn mixin_application_keys_on_the_alias_name() {
+        let f = Fixture::parse(
+            "@deprecated\nmixin class CDepAlias {}\n\n@deprecated\nclass DFromDepAlias = Object with CDepAlias;\n\nvoid g(Object o) {}\n",
+        );
+        assert!(
+            f.run(&one_rule("deprecated_member_use_from_same_package"))
+                .is_empty(),
+            "the deprecated alias suppresses its own clause and `Object` is not a deprecated name"
+        );
+    }
+
+    /// The directive faces (upstream `test_deprecatedLibrary_*` /
+    /// `test_deprecatedClass_usedInShowCombinator`): an import/export of a
+    /// deprecated library reports at the whole directive with the target's
+    /// package URI; a `show` combinator name of a deprecated class reports
+    /// at the name; `hide` and a non-deprecated import stay silent.
+    #[test]
+    fn directive_faces_report_at_the_directive_and_the_shown_name() {
+        let root = std::env::temp_dir().join("dartq_f5_directive_faces");
+        let lib = root.join("lib");
+        std::fs::create_dir_all(&lib).expect("temp lib dir");
+        std::fs::write(lib.join("deprecated_lib.dart"), "@deprecated\nlibrary a;\n")
+            .expect("fixture file");
+        std::fs::write(
+            lib.join("deprecated_class.dart"),
+            "@deprecated\nclass C {}\n",
+        )
+        .expect("fixture file");
+        std::fs::write(lib.join("plain.dart"), "class P {}\n").expect("fixture file");
+        let facts = crate::WorkspaceFacts {
+            own_package: "probe".to_owned(),
+            dependencies: rustc_hash::FxHashSet::default(),
+            dev_dependencies: rustc_hash::FxHashSet::default(),
+            root: root.clone(),
+            lib_dir: lib.clone(),
+        };
+        let run = |source: &str| {
+            let mut f = Fixture::parse(source);
+            f.path = lib.join("importer.dart");
+            f.run_workspace(&one_rule("deprecated_member_use_from_same_package"), &facts)
+        };
+
+        // The export face: the whole directive, the package URI as the name.
+        let lints = run("export 'deprecated_lib.dart';\n");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "'package:probe/deprecated_lib.dart' is deprecated and shouldn't be used."
+        );
+        assert_eq!(lints[0].range, 0..29);
+
+        // The import face, with-message variant through the tag.
+        std::fs::write(
+            lib.join("deprecated_lib.dart"),
+            "@Deprecated('Use B instead')\nlibrary a;\n",
+        )
+        .expect("fixture file");
+        let lints = run("import 'deprecated_lib.dart';\n");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].message,
+            "'package:probe/deprecated_lib.dart' is deprecated and shouldn't be used. Use B instead."
+        );
+
+        // The `show` combinator face: the shown deprecated class name.
+        let lints = run("import 'deprecated_class.dart' show C;\n");
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].message, "'C' is deprecated and shouldn't be used.");
+        let f = Fixture::parse("import 'deprecated_class.dart' show C;\n");
+        let c = tok(&f.source, &f.tokens, "C", 0);
+        assert_eq!(lints[0].range.start, utf16_at(&f, c));
+
+        // `hide` is forgiving; a non-deprecated import stays silent.
+        assert!(run("import 'deprecated_class.dart' hide C;\n").is_empty());
+        assert!(run("import 'plain.dart' show P;\n").is_empty());
+        // A cross-package URI is the analyzer's face, not this rule's.
+        assert!(run("import 'package:other/other.dart';\n").is_empty());
+
+        let _ = std::fs::remove_file(lib.join("deprecated_lib.dart"));
+        let _ = std::fs::remove_file(lib.join("deprecated_class.dart"));
+        let _ = std::fs::remove_file(lib.join("plain.dart"));
+    }
+
+    // —— remove_deprecations_in_breaking_versions ——————————————————————————
     /// The upstream corpus matrix (`test_breakingFirstMajor` through
     /// `test_breakingBuild`): a zero-segment boundary with no build
     /// metadata is breaking; a prerelease counts, a build does not, and a
@@ -22901,46 +23579,5 @@ mod unreachable_from_main_tests {
         let missing_target =
             "class S { S(int y); }\nclass C extends S { C(int super.y) : super.named(); }\n";
         assert!(run_semantic(missing_target, "type_init_formals", None).is_empty());
-    }
-
-    // TEMP probe — delete before close.
-    #[test]
-    fn temp_probe_row_trees() {
-        for src in [
-            "typedef F = void Function(final int inner);",
-            "class E {\n  final int i;\n}",
-            "void f() {\n  for (final a in [1]) {\n    print(a);\n  }\n}",
-            "void f(dynamic o) {}",
-            "var v;",
-        ] {
-            println!("==== {src:?}");
-            let f = Fixture::parse(src);
-            fn dump(f: &Fixture, id: u32, depth: usize) {
-                let range = f.ast.token_range(id);
-                let text: String = (range.start..range.end)
-                    .filter_map(|t| {
-                        f.tokens.get(t as usize).map(|tok| {
-                            &f.source[tok.byte_offset as usize
-                                ..(tok.byte_offset + tok.byte_len) as usize]
-                        })
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                println!(
-                    "{}{:?} [{}..{}) {:?}",
-                    "  ".repeat(depth),
-                    f.ast.kind(id),
-                    range.start,
-                    range.end,
-                    text
-                );
-                for kid in f.ast.children(id) {
-                    dump(f, kid, depth + 1);
-                }
-            }
-            for id in f.ast.children(f.ast.root().expect("root")) {
-                dump(&f, id, 0);
-            }
-        }
     }
 }

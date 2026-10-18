@@ -22,8 +22,11 @@ rustc-hash = { workspace = true }
 
 # The semantic-rule tests build the library context the #1049 face takes
 # (graph, namespaces) — a test-only edge; the production crate never
-# walks the resolution layer.
+# walks the resolution layer. The engine joins for the same reason: the
+# implicit dart:core face the driver seeds comes from its generated SDK
+# table.
 [dev-dependencies]
+dartq-engine = { workspace = true }
 dartq-resolution = { workspace = true }
 
 [lints]

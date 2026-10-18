@@ -5118,6 +5118,15 @@ use crate::rules::{
 struct LeakPredicates {
     types: &'static [&'static str],
     methods: &'static [&'static str],
+    /// Whether the field and primary-constructor faces mount. The live
+    /// oracle the differential gate keys on (fvm 3.13.1, the lints-new
+    /// expectations rebuilt 2026-10-18) answers the twin rules
+    /// asymmetrically on this face — `cancel_subscriptions` reports an
+    /// uncancelled field or primary formal, `close_sinks` stays silent
+    /// there (its 3.13 rule predates the shared 3.15 leak detector's
+    /// field face; the corpus README pins the drift). Locals mount for
+    /// both rules.
+    field_faces: bool,
 }
 
 /// `cancel_subscriptions`: a `StreamSubscription` is released by `cancel`
@@ -5125,6 +5134,7 @@ struct LeakPredicates {
 const CANCEL_PREDICATES: LeakPredicates = LeakPredicates {
     types: &["StreamSubscription"],
     methods: &["cancel"],
+    field_faces: true,
 };
 
 /// `close_sinks`: a `Sink` (or an `IOSink`/`Socket` implementor) is
@@ -5132,6 +5142,7 @@ const CANCEL_PREDICATES: LeakPredicates = LeakPredicates {
 const CLOSE_PREDICATES: LeakPredicates = LeakPredicates {
     types: &["Sink", "IOSink", "Socket"],
     methods: &["close", "destroy"],
+    field_faces: false,
 };
 
 /// One watched declaration: the row the report anchors at, its name, the
@@ -5165,14 +5176,36 @@ fn leak_detector_check(c: &mut Check<'_>, predicates: &LeakPredicates) {
     let mut candidates: Vec<LeakCandidate<'_>> = Vec::new();
     match c.kind(node) {
         // `visitFieldDeclaration` (:68-85): every variable of every field
-        // declaration, container = the compilation unit.
+        // declaration, container = the compilation unit. The face is
+        // per-rule (the oracle-drift gate on `LeakPredicates::field_faces`).
         NodeKind::Fields => {
-            let type_spelling = c
-                .collect_direct(node)
-                .into_iter()
+            if !predicates.field_faces {
+                return;
+            }
+            let direct = c.collect_direct(node);
+            // The written type's head spelling. The plain shape tiles the
+            // `Type` row beside the `VariablesDeclaration` (the row anchors
+            // at the type start); the keyword-anchored shape (`late`/`var`/
+            // `final` heads the row, members.rs `decl_head`) tiles it INSIDE
+            // the declaration row, before the names — read there as the
+            // fallback.
+            let type_spelling = direct
+                .iter()
+                .copied()
                 .find(|&kid| c.kind(kid) == NodeKind::Type)
+                .or_else(|| {
+                    direct
+                        .iter()
+                        .copied()
+                        .find(|&kid| c.kind(kid) == NodeKind::VariablesDeclaration)
+                        .and_then(|decl| {
+                            c.collect_direct(decl)
+                                .into_iter()
+                                .find(|&kid| c.kind(kid) == NodeKind::Type)
+                        })
+                })
                 .map(|type_row| c.lexeme(c.head_token(type_row)).to_owned());
-            for decl in c.collect_direct(node) {
+            for decl in direct {
                 if c.kind(decl) != NodeKind::VariablesDeclaration {
                     continue;
                 }
@@ -5225,8 +5258,12 @@ fn leak_detector_check(c: &mut Check<'_>, predicates: &LeakPredicates) {
         // admits only the declaring forms — `var`/`final` on the formal
         // (`finalOrVarKeyword != null`, element_builder.dart:2091); a plain
         // formal and a `this.`/`super.` initializing formal are not
-        // declaring and never become candidates.
+        // declaring and never become candidates. The face is per-rule (the
+        // oracle-drift gate).
         NodeKind::PrimaryConstructor => {
+            if !predicates.field_faces {
+                return;
+            }
             if c.ancestor(1)
                 .is_some_and(|parent| c.kind(parent) == NodeKind::ExtensionTypeDeclaration)
             {
@@ -5330,9 +5367,53 @@ fn push_leak_candidate<'a>(
 /// Whether the written type spelling names a watched library type: the
 /// spelling matches a predicate entry and no same-file declaration owns
 /// the name (a user class of a library name is not the library type — the
-/// element-resolution posture this face stands in for).
+/// element-resolution posture this face stands in for). An extension type
+/// conforming to a watched type through its `implements` clause is
+/// watched too (`implementsInterface` folds to the same-file clause read
+/// — `extension type E(…) implements StreamSubscription` spells the
+/// interface in the header). The extension type resolves through its own
+/// top-level scan — the class-like index does not carry the kind.
 fn leak_watched(c: &Check<'_>, spelling: &str, predicates: &LeakPredicates) -> bool {
-    predicates.types.contains(&spelling) && same_file_declaration(c, spelling).is_none()
+    if predicates.types.contains(&spelling) && same_file_declaration(c, spelling).is_none() {
+        return true;
+    }
+    extension_type_implements(c, spelling, predicates)
+}
+
+/// Whether `spelling` names a same-file `ExtensionTypeDeclaration` whose
+/// `implements` clause names a watched library type (the upstream
+/// `implementsInterface` conformance face, folded to the header's
+/// written `implements` `Type` rows).
+fn extension_type_implements(c: &Check<'_>, spelling: &str, predicates: &LeakPredicates) -> bool {
+    let Some(root) = c.unit.ast.root() else {
+        return false;
+    };
+    for top in c.collect_direct(root) {
+        for kid in c.collect_direct(top) {
+            if c.kind(kid) != NodeKind::ExtensionTypeDeclaration {
+                continue;
+            }
+            // The extension-type name is the header's payload word — the
+            // `begin_extension_type_declaration` name anchor.
+            let names = c
+                .payload(kid)
+                .get(2)
+                .copied()
+                .filter(|&token| token != crate::rules::NONE_TOKEN)
+                .map(|token| c.lexeme(token));
+            if names != Some(spelling) {
+                continue;
+            }
+            return crate::rules::supertypes(c, kid)
+                .iter()
+                .any(|&(name, clause)| {
+                    clause == crate::rules::SupertypeClause::Implements
+                        && predicates.types.contains(&name)
+                        && same_file_declaration(c, name).is_none()
+                });
+        }
+    }
+    false
 }
 
 /// Whether the container holds a valid use of the candidate
@@ -5740,12 +5821,10 @@ pub(crate) mod cancel_subscriptions {
     /// Approximation (documented): the interface question folds to the
     /// written-type spelling with the same-file shadow gate — `var`-typed
     /// (inferred) candidates, prefixed spellings, and subtype implementors
-    /// under-report, a user class of the name stays silent through the
-    /// shadow gate, and extension-type conformances are invisible (the
-    /// declared spelling is the extension type, not `StreamSubscription` —
-    /// the upstream `test_extensionType_implementsStreamSubscription_*`
-    /// faces under-report). Message: `diagnostic.g.dart`
-    /// `cancelSubscriptions`.
+    /// under-report, and a user class of the name stays silent through the
+    /// shadow gate; an extension type conforming through its `implements`
+    /// clause is watched (the header spells the interface). Message:
+    /// `diagnostic.g.dart` `cancelSubscriptions`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "cancel_subscriptions",
         group: Group::Standalone,
@@ -5772,8 +5851,11 @@ pub(crate) mod close_sinks {
     /// `IOSink`/`Socket`) field, local, or primary-constructor field
     /// formal with no `close`/`destroy` release in its container reports
     /// at the declaration (the shared leak-detector face; the
-    /// approximation register is the shared module's). Message:
-    /// `diagnostic.g.dart` `closeSinks`.
+    /// approximation register is the shared module's). The field and
+    /// primary faces stay unmounted (the shared face's `field_faces`
+    /// gate): the differential gate's live oracle (fvm 3.13.1) answers
+    /// this rule local-only there, the documented version drift the
+    /// lints-new corpus pins. Message: `diagnostic.g.dart` `closeSinks`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "close_sinks",
         group: Group::Standalone,
@@ -6688,7 +6770,103 @@ mod wave1_types_tests {
         }
     }
 
-    // —— close_sinks —————————————————————————————————————————————————————
+    /// The extension-type `implements` conformance faces: a local declared
+    /// with an extension type that `implements` a watched library type is
+    /// a leak candidate (`implementsInterface` folds to the header's
+    /// written `implements` clause); the same conformance under
+    /// `close_sinks` reports through `IOSink`, and a canceled extension
+    /// type or a representation-only extension type stays silent.
+    #[test]
+    fn cancel_subscriptions_extension_type_implements_reports() {
+        // `implements StreamSubscription` conformance (the corpus's
+        // `test_extensionType_implementsStreamSubscription_notCanceled`).
+        let f = Fixture::parse(
+            "void f(Stream stream) {\n  ECancelExt e = ECancelExt(stream.listen((_) {}));\n}\n\
+             extension type ECancelExt(StreamSubscription _s)\n    implements StreamSubscription {}\n",
+        );
+        assert_eq!(f.run(&one_rule("cancel_subscriptions")).len(), 1);
+
+        // The `close_sinks` twin: `implements IOSink`.
+        let f = Fixture::parse(
+            "void f(IOSink sink) {\n  ECloseExt e = ECloseExt(sink);\n}\n\
+             extension type ECloseExt(IOSink _s) implements IOSink {}\n",
+        );
+        assert_eq!(f.run(&one_rule("close_sinks")).len(), 1);
+    }
+
+    /// The conformance's negative faces: an extension type whose
+    /// subscription is canceled and a representation-only extension type
+    /// (no `implements`) stay silent.
+    #[test]
+    fn cancel_subscriptions_extension_type_negatives() {
+        for source in [
+            // Canceled through `e.cancel()`.
+            "void f(Stream stream) {\n  ECancelExtClosed e = ECancelExtClosed(stream.listen((_) {}));\n  e.cancel();\n}\n\
+             extension type ECancelExtClosed(StreamSubscription _s)\n    implements StreamSubscription {}\n",
+            // Representation only — no `implements`, never watched.
+            "void f(Stream stream) {\n  ERepr e = ERepr(stream.listen((_) {}));\n}\n\
+             extension type ERepr(StreamSubscription _s) {}\n",
+        ] {
+            let f = Fixture::parse(source);
+            assert!(
+                f.run(&one_rule("cancel_subscriptions")).is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The corpus's late-field faces (lints-new
+    /// `cancel_subscriptions.dart:36/55`): a `late` field assigned from
+    /// `listen` in a method and never canceled reports at its declaration,
+    /// private or public; the released twin (a `cancel()` anywhere in the
+    /// unit) stays silent. The keyword-anchored tiling (`late` heads the
+    /// VariablesDeclaration row, members.rs `decl_head`) puts the written
+    /// type INSIDE the declaration row — the lookup reads it there.
+    #[test]
+    fn cancel_subscriptions_late_field_reports() {
+        for name in ["_subscription", "subscription"] {
+            let f = Fixture::parse(&format!(
+                "class C {{\n  late StreamSubscription {name};\n  void f(Stream stream) {{\n    \
+                 {name} = stream.listen((_) {{}});\n  }}\n}}\n"
+            ));
+            assert_eq!(f.run(&one_rule("cancel_subscriptions")).len(), 1, "{name}");
+        }
+
+        let f = Fixture::parse(
+            "class C {\n  late StreamSubscription s;\n  void f(Stream stream) {\n    \
+             s = stream.listen((_) {});\n  }\n  void g() {\n    s.cancel();\n  }\n}\n",
+        );
+        assert!(f.run(&one_rule("cancel_subscriptions")).is_empty());
+    }
+
+    /// The corpus's primary-constructor face
+    /// (`cancel_subscriptions.dart:47`): a declaring formal assigned from
+    /// `listen` in a method and never canceled reports at the formal.
+    #[test]
+    fn cancel_subscriptions_primary_formal_method_assignment_reports() {
+        let f = Fixture::parse(
+            "class C(var StreamSubscription s) {\n  void f(Stream stream) {\n    \
+             s = stream.listen((_) {});\n  }\n}\n",
+        );
+        assert_eq!(f.run(&one_rule("cancel_subscriptions")).len(), 1);
+    }
+
+    /// The oracle-drift face (lints-new `close_sinks.dart` expected
+    /// [18, 56]): the close rule's field and primary faces stay silent —
+    /// the gate's live oracle (fvm 3.13.1) answers this rule local-only
+    /// there, unlike the cancel twin — while its local face still fires.
+    #[test]
+    fn close_sinks_field_and_primary_faces_stay_silent() {
+        let f = Fixture::parse(
+            "class C {\n  late IOSink s;\n  void f() {\n    s = File('').openWrite();\n  }\n}\n",
+        );
+        assert!(f.run(&one_rule("close_sinks")).is_empty());
+
+        let f = Fixture::parse(
+            "class C(var IOSink s) {\n  void f() {\n    s = File('').openWrite();\n  }\n}\n",
+        );
+        assert!(f.run(&one_rule("close_sinks")).is_empty());
+    }
 
     /// `test/rules/close_sinks_test.dart` — an unclosed `Sink` local
     /// reports; the `IOSink`/`Socket` family folds into the same predicate

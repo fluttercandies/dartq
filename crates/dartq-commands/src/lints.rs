@@ -69,15 +69,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
 use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, SourceRange};
-use dartq_engine::analysis_options::AnalysisOptions;
+use dartq_engine::analysis_options::{AnalysisOptions, is_known_diagnostic_code};
 use dartq_engine::{Engine, LibraryId, Reachability};
 use dartq_flow::FlowFact;
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
 use dartq_lints::{
-    AsyncContextUse, EnableSet, Features, Lint, PathVerdict, RULES, ReachabilityFace, RuleId,
-    UnignorableIgnore, WorkspaceFacts, check_name, check_path_entry, check_section, check_url,
-    is_breaking_version, parse_unit, resolve_dependency_path, rule_by_name, run,
-    run_breaking_version_annotations, scan_path_entries, type_use_counts, unignorable_ignores,
+    AsyncContextUse, Comments, EnableSet, Features, IgnoreInfo, Lint, PathVerdict, RULES,
+    ReachabilityFace, RuleId, UnignorableIgnore, WorkspaceFacts, check_name, check_path_entry,
+    check_section, check_url, is_breaking_version, mounts_semantics, parse_unit,
+    resolve_dependency_path, rule_by_name, run, run_breaking_version_annotations,
+    scan_path_entries, type_use_counts, unignorable_ignores, unnecessary_ignore_analyzer_rows,
     unnecessary_ignore_late_rows,
 };
 use dartq_package::PackageIdentity;
@@ -85,7 +86,9 @@ use dartq_parser::ParserFeatures;
 use dartq_pub::pubspec_facts::scan as scan_pubspec;
 use dartq_pub::{Pubspec, pubspec_facts::Scalar};
 use dartq_resolution::{LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces};
-use dartq_semantic::{ElementIndex, MicroKind, StrictModes, analyze_unit, container_modifiers};
+use dartq_semantic::{
+    ElementIndex, MicroKind, StrictModes, analyze_unit, container_modifiers, fold_unit,
+};
 use dartq_source::{ContentId, FileId, LineIndex};
 
 /// The enable set one governing entry selects: `None` (no options file in
@@ -205,22 +208,6 @@ pub(crate) fn features_for(version: LanguageVersion) -> Features {
     features_of(FeatureSet::for_language_version(version))
 }
 
-/// The lint rules whose run consumes the per-file semantic fold — either
-/// through the query face ([`dartq_lints::Unit::run_with_semantics`], the
-/// #1049 bridge) or through the fold's flow-fact rows (the async-gap seam,
-/// #1198: `use_build_context_synchronously`'s verdict rows are the
-/// `FlowFact::AsyncContextUse` facts the fold records beside the reference
-/// work). A file whose enabled set includes any of them runs the fold once,
-/// with the `dartq_semantic::Analysis` mounted, and its memo key widens with
-/// the library-context generation ([`semantic_generation`]). Name-based — the
-/// registry is name-addressed and the rule modules own their registration —
-/// so this list stays in step with them.
-const FOLD_RULES: &[&str] = &[
-    "prefer_null_aware_method_calls",
-    "unnecessary_lambdas",
-    "use_build_context_synchronously",
-];
-
 /// The semantic fold's scan posture: the lints bridge's fixed production
 /// surface (bridge `SCAN_CONFIG`, Dart 3.15 — `>>>` and `augment` gated on),
 /// so the face's token stream is the same one the rules dispatch over.
@@ -240,16 +227,6 @@ pub(crate) const SEMANTIC_PARSE_FEATURES: ParserFeatures = ParserFeatures {
     enhanced_parts_enabled: false,
     dot_shorthands_enabled: true,
 };
-
-/// Whether `set` enables any fold-consuming rule (`FOLD_RULES`) — the
-/// predicate behind the per-file [`analyze_unit`] build and the memo key's
-/// generation half. A handful of bit tests; a file that runs no fold-facing
-/// rule pays it once per partition step and nothing else.
-fn fold_rules_enabled(set: &EnableSet) -> bool {
-    FOLD_RULES
-        .iter()
-        .any(|name| rule_by_name(name).is_some_and(|id| set.is_enabled(id)))
-}
 
 /// Whether `set` enables the library type-use face's consumer
 /// (`avoid_private_typedef_functions`, #1640). The face's mounted counts
@@ -600,7 +577,8 @@ fn fold_names(names: &FxHashSet<String>) -> u64 {
 /// `Unit.workspace` and the unit's features from the engine's settled
 /// per-file face (#722) — the `@dart` override and grants already folded
 /// in — falling back to the containing package's language version where no
-/// face is settled. The fold-facing rules (`FOLD_RULES`) read the per-file
+/// face is settled. The fold-consuming rules
+/// ([`dartq_lints::SEMANTIC_RULES`]) read the per-file
 /// [`dartq_semantic::Analysis`] the job builds before the unit — the
 /// owning library's isolated context (declarations and element models, no
 /// import edges) folded once per miss, mounted through
@@ -765,7 +743,7 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
             // alike), and the library type-use face (#1640) folds the
             // member units' contents. A sibling's edit re-keys this file's
             // rows either way.
-            if fold_rules_enabled(set) || type_use_rule_enabled(set) {
+            if mounts_semantics(set) || type_use_rule_enabled(set) {
                 semantic_generation(engine, *file, &library_members)
             } else {
                 None
@@ -823,7 +801,7 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
             // flow-fact rows the async-gap seam mounts come off the analysis
             // (#1198). Only where the enabled set consumes the fold — a
             // fold-less file parses and runs as before.
-            let context = if fold_rules_enabled(set) && !members.is_empty() {
+            let context = if mounts_semantics(set) && !members.is_empty() {
                 let strict = stricts
                     .get(dir)
                     .copied()
@@ -987,6 +965,69 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
                 cannot_ignore,
                 &late_drops,
             ));
+            // The analyzer-layer half (#2116): citations naming analyzer
+            // diagnostic codes answer against the rows the semantic layer
+            // produces for this file — the official match pass consumes a
+            // citation for every reported diagnostic, lint and analyzer row
+            // alike (ignore_validator.dart:137-144). The fold's own ignore
+            // gate strips suppressed rows before its report returns, so the
+            // consumption facts come from one neutralized re-fold: the
+            // `ignore` keywords rewrite to same-length filler inside comment
+            // bytes only, the fold sees no suppression entries, and its rows
+            // are the pre-filter production set. Gated on the semantic
+            // context (a fold-less posture keeps the pre-#2116 silence — the
+            // under-report direction — never a false row) and on the probe:
+            // only a file citing a known diagnostic code pays the fold.
+            if let Some((context, strict)) = &context {
+                let comments = Comments::extract(text, &parsed.tokens);
+                let ignore = IgnoreInfo::parse(text, &comments);
+                let entries = ignore.name_entries(text);
+                if entries
+                    .iter()
+                    .any(|entry| is_known_diagnostic_code(&entry.name))
+                {
+                    let neutral = neutralize_ignore_keywords(text, &comments);
+                    let posture = LibraryClassModifiers::default();
+                    let fold = fold_unit(
+                        &neutral,
+                        &context.scanned.tokens,
+                        SEMANTIC_PARSE_FEATURES,
+                        engine.strings(),
+                        file,
+                        context.lib,
+                        &context.graph,
+                        &context.namespaces,
+                        &context.index,
+                        *strict,
+                        &posture,
+                        true,
+                    );
+                    let mut suppressed: Vec<(u32, &'static str)> = Vec::new();
+                    for diagnostic in fold
+                        .report
+                        .diagnostics
+                        .iter()
+                        .chain(fold.parse_diagnostics.iter())
+                    {
+                        let name = diagnostic.code.name;
+                        if entries
+                            .iter()
+                            .any(|entry| entry.name.eq_ignore_ascii_case(name))
+                        {
+                            let (line, _) =
+                                parsed.lines.line_col_utf16(text, diagnostic.range.offset);
+                            suppressed.push((line, name));
+                        }
+                    }
+                    rows.extend(unnecessary_ignore_analyzer_rows(
+                        &unit,
+                        set,
+                        cannot_ignore,
+                        &suppressed,
+                        is_known_diagnostic_code,
+                    ));
+                }
+            }
             (slot, rows)
         })
         .collect();
@@ -1013,6 +1054,39 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
     out.extend(unignorable_rows(engine, &files, &unignorable));
     out.extend(pubspec_rows(engine, roots));
     out
+}
+
+/// One copy of `text` with every `ignore` keyword inside a comment lexeme
+/// rewritten to same-length filler — the neutralized source the #2116
+/// re-fold reads. The semantic fold's ignore gate parses suppression
+/// entries straight from source lines, so blanking the keyword (wherever it
+/// occurs inside a comment — a superset of the gate's standalone-line
+/// grammar) leaves the fold with an empty suppression table and its rows
+/// come back pre-filter. Comment byte ranges only (each comment carries a
+/// byte span): string literals and code bytes never move, offsets and line
+/// structure are preserved, and the swap writes ASCII over ASCII.
+fn neutralize_ignore_keywords(text: &str, comments: &Comments) -> String {
+    const KEYWORD: &[u8] = b"ignore";
+    let mut bytes = text.as_bytes().to_vec();
+    for comment in comments.all() {
+        let start = comment.range.start as usize;
+        let end = comment.range.end as usize;
+        let mut cursor = start;
+        while cursor + KEYWORD.len() <= end {
+            if let Some(found) = bytes[cursor..end]
+                .windows(KEYWORD.len())
+                .position(|window| window == KEYWORD)
+            {
+                let at = cursor + found;
+                bytes[at..at + KEYWORD.len()].fill(b'x');
+                cursor = at + KEYWORD.len();
+            } else {
+                break;
+            }
+        }
+    }
+    // ASCII-for-ASCII swaps over valid UTF-8: the bytes stay valid UTF-8.
+    String::from_utf8(bytes).expect("same-length ASCII substitution keeps UTF-8")
 }
 
 /// One file's semantic-fold substrate, job-local: the owning library's
@@ -1073,6 +1147,21 @@ pub(crate) fn build_semantic_context(
             }
         }
     }
+    // The implicit dart:core import the oracle adds to every library: the
+    // generated core face (own surface plus the async/collection
+    // re-exports) declared at the engine's synthetic `<dart:core>` file
+    // when a graph build already interned it, the analyzed file otherwise
+    // (both stay outside the per-file index, so SDK names resolve
+    // "defined" with no element model).
+    let core_file = engine
+        .file_table()
+        .try_file_id(Path::new("<dart:core>"))
+        .unwrap_or(file);
+    let (_, core_face) = dartq_engine::sdk_faces_gen::SDK_LIBRARY_FACES
+        .iter()
+        .find(|(uri, _)| *uri == "core")
+        .expect("generated SDK table carries dart:core");
+    builder.seed_implicit_core(lib, core_file, core_face);
     let graph = builder.finish();
     let namespaces = Namespaces::build(&graph);
     let mut index = ElementIndex::default();

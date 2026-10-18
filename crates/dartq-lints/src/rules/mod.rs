@@ -435,14 +435,23 @@ pub(crate) const NONE_TOKEN: u32 = dartq_ast::TOKEN_NONE;
 ///
 /// The node's own const keyword never counts (`includeSelf: false`).
 pub(crate) fn in_const_context(c: &Check<'_>) -> bool {
-    for &ancestor in c.path.iter().take(c.path.len() - 1).rev() {
+    for i in (0..c.path.len().saturating_sub(1)).rev() {
+        let ancestor = c.path[i];
         match c.kind(ancestor) {
             NodeKind::Metadata | NodeKind::EnumElement | NodeKind::SwitchCase => return true,
             // Without its own `const` a constant pattern is not a context and
             // the official walk stops (`return null`); a non-const variable
             // declaration list stops the same way.
-            NodeKind::ConstantPattern | NodeKind::VariablesDeclaration => {
-                return head_is_const(c, ancestor);
+            NodeKind::ConstantPattern => return head_is_const(c, ancestor),
+            NodeKind::VariablesDeclaration => {
+                // Member rows nest under `Fields`/`TopLevelFields`; every
+                // other parent shape is a local/for-parts declaration.
+                let member = i > 0
+                    && matches!(
+                        c.kind(c.path[i - 1]),
+                        NodeKind::Fields | NodeKind::TopLevelFields
+                    );
+                return variables_decl_is_const(c, ancestor, member);
             }
             NodeKind::ConstExpression
             | NodeKind::ConstLiteral
@@ -453,9 +462,29 @@ pub(crate) fn in_const_context(c: &Check<'_>) -> bool {
                     return true;
                 }
             }
+            // The `const .name` shorthand brackets a written `const`
+            // keyword (`begin/endConstDotShorthand`) — always a const
+            // context for the shorthand inside.
+            NodeKind::ConstDotShorthand => return true,
+            // An enum element's argument list is a constant context —
+            // the enum's own element args tile as `Arguments` rows under
+            // the `EnumBody` (the `EnumElement` constant marker is a
+            // sibling, not a container). Members (the `const E(…)`
+            // constructor, fields) nest under `DeclarationBody`, so the
+            // face keys on the path's `EnumBody` child being `Arguments`.
+            NodeKind::EnumBody => {
+                return c
+                    .path
+                    .get(i + 1)
+                    .is_some_and(|&child| c.kind(child) == NodeKind::Arguments);
+            }
             // The official transparent set: every expression kind plus the
             // argument/element wrappers and the variable-declaration chain.
-            NodeKind::Arguments
+            // `DotShorthandHead` is the `.`-anchor leaf the shorthand's
+            // `new`/selector/arguments tile beside — transparent so the
+            // shorthand reads its enclosing context.
+            NodeKind::DotShorthandHead
+            | NodeKind::Arguments
             | NodeKind::NamedArgument
             | NodeKind::MapEntry
             | NodeKind::Spread
@@ -514,35 +543,52 @@ pub(crate) fn const_keyword(c: &Check<'_>, node: u32) -> Option<u32> {
 /// Whether `node`'s span head lexeme is the `const` keyword (the head-when-
 /// present eliminations of derivable words).
 fn head_is_const(c: &Check<'_>, node: u32) -> bool {
-    if c.kind(node) != NodeKind::VariablesDeclaration {
-        // A constant pattern anchors at the keyword itself.
-        return c.lexeme(c.head_token(node)) == "const";
-    }
-    // The declaration row anchors at the declared name and the keyword
-    // token rides no row: the modifier run (keywords plus the written
-    // type's identifiers/punctuation) sits before the anchor, bounded by
-    // the previous statement's terminator.
-    let mut token = c.unit.ast.token_range(node).start;
-    loop {
-        let Some(prev) = token.checked_sub(1) else {
-            break;
-        };
-        match c.lexeme(prev) {
-            "const" | "final" | "var" | "late" | "?" | "<" | ">" => token = prev,
-            other if is_identifier_lexeme_mod(other) => token = prev,
-            _ => break,
-        }
-    }
-    c.lexeme(token) == "const"
+    // A constant pattern anchors at the keyword itself.
+    c.lexeme(c.head_token(node)) == "const"
 }
 
-/// The identifier-shaped lexeme the modifier walk crosses (a written type
-/// part).
-fn is_identifier_lexeme_mod(lexeme: &str) -> bool {
-    lexeme
-        .as_bytes()
-        .first()
-        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_' || *b == b'$')
+/// Whether a [`NodeKind::VariablesDeclaration`] carries the `const` keyword
+/// — the official `VariableDeclarationList.keyword?.keyword == CONST` face
+/// (`constantContext`, ast.dart:17892-17897). `member` says the row nests
+/// under `Fields`/`TopLevelFields`.
+///
+/// The row's head convention differs by lane: member/top-level rows head at
+/// `late`, else the `varFinalOrConst` keyword, else the written type's
+/// first token (upstream `beginVariablesDeclaration` — members.rs
+/// `decl_head`), while local/for-parts rows head at the declared name and
+/// the keyword run sits before the row's own span (statements.rs `name`).
+/// `const` is a reserved word — never a type or variable name — so a member
+/// head answers directly and a local head resolves by scanning backward
+/// over the written type to the modifier run; the first
+/// `var`/`final`/`const` reached is the list's keyword. Balanced `()[]{}`
+/// groups on the way (function-type parameter lists, record types, default
+/// values inside them) are skipped — a `const` nested inside one is part of
+/// the type, not the declaration keyword.
+fn variables_decl_is_const(c: &Check<'_>, node: u32, member: bool) -> bool {
+    let head = c.head_token(node);
+    if member {
+        // `late` heads when present and `late const` is not a grammar
+        // shape, so the head answers alone.
+        return c.lexeme(head) == "const";
+    }
+    let mut depth = 0u32;
+    let mut token = head;
+    while let Some(prev) = token.checked_sub(1) {
+        match c.lexeme(prev) {
+            ")" | "]" | "}" => depth += 1,
+            "(" | "[" | "{" => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            "const" if depth == 0 => return true,
+            "var" | "final" | ";" | "=>" if depth == 0 => return false,
+            _ => {}
+        }
+        token = prev;
+    }
+    false
 }
 
 /// The last token of `id`'s span (the span's `end` is exclusive).

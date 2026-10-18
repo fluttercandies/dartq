@@ -16,8 +16,11 @@
 //!   first character that does not fit terminates the list — trailing prose
 //!   is never a name (ignore_info.dart:372-386, 424-438).
 //! - Name matching (`IgnoredDiagnosticName._matches`, ignore_info.dart:39-52):
-//!   case-insensitive against the code name. `plugin/name` entries match only
-//!   their plugin; wave 1 has no plugins, so they match nothing.
+//!   plugin equality first — a `plugin/name` entry matches only diagnostics
+//!   reported under that plugin name (compared verbatim, case-sensitive), and
+//!   an unqualified name entry matches only diagnostics reported with no
+//!   plugin; then the rule name compared case-insensitively against the
+//!   code's name, falling back to the unique name minus its class prefix.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -31,19 +34,35 @@ enum Entry {
     /// anchor (`IgnoreValidator`, `ignore_validator.dart:170`: offset of the
     /// ignored element, length of the name).
     Name { name: String, start: usize },
-    /// A `plugin/name` entry; wave 1 has no plugins, matches nothing
-    /// (ignore_info.dart:40-42 requires pluginName equality).
-    PluginName,
+    /// A `plugin/name` entry (`IgnoredDiagnosticName` with a non-null
+    /// `pluginName`, ignore_info.dart:27-53). `plugin` keeps the comment's
+    /// verbatim spelling — the official equality test is case-sensitive
+    /// (`this.pluginName != pluginName`, :40); `name` compares
+    /// case-insensitively like a plain `Name`.
+    PluginName { plugin: String, name: String },
     /// A `type=x` entry; covers lints when `x` is `lint`
-    /// (`IgnoredDiagnosticType._matches`, ignore_info.dart:67-76).
+    /// (`IgnoredDiagnosticType._matches`, ignore_info.dart:67-76 — plugin
+    /// name irrelevant there, :68).
     Type(String),
 }
 
 impl Entry {
-    fn matches(&self, name: &str) -> bool {
+    /// `IgnoredElement._matches` (ignore_info.dart:81). `plugin_name` is the
+    /// reporting plugin's name — `None` for built-in codes
+    /// (`IgnoreInfo.ignored`'s `pluginName` argument, :186-189, fed from the
+    /// plugin's `configuration.name`, plugin_server.dart:444-450).
+    fn matches(&self, name: &str, plugin_name: Option<&str>) -> bool {
         match self {
-            Entry::Name { name: entry, .. } => entry.eq_ignore_ascii_case(name),
-            Entry::PluginName => false,
+            // An unqualified entry requires an unqualified report
+            // (`this.pluginName != pluginName` with a null entry plugin,
+            // ignore_info.dart:40-42): it never suppresses a plugin code.
+            Entry::Name { name: entry, .. } => {
+                plugin_name.is_none() && entry.eq_ignore_ascii_case(name)
+            }
+            Entry::PluginName {
+                plugin,
+                name: entry,
+            } => plugin_name == Some(plugin.as_str()) && entry.eq_ignore_ascii_case(name),
             Entry::Type(t) => t.eq_ignore_ascii_case("lint"),
         }
     }
@@ -93,14 +112,35 @@ impl IgnoreInfo {
 
     /// Whether a lint named `name` reported on 1-based `line` is suppressed
     /// (`IgnoreInfo._ignoredAt`, ignore_info.dart:192-212: file-wide first,
-    /// then the report's line).
+    /// then the report's line). Built-in codes report with no plugin
+    /// (`pluginName` omitted, `library_analyzer.dart:560`), so a
+    /// `plugin/name` entry never matches here.
     #[must_use]
     pub fn ignored(&self, line: u32, name: &str) -> bool {
-        self.for_file.iter().any(|e| e.matches(name))
+        self.ignored_at(line, name, None)
+    }
+
+    /// Whether a diagnostic named `name` reported under plugin `plugin`
+    /// on 1-based `line` is suppressed — `IgnoreInfo.ignored` with the
+    /// `pluginName` argument (ignore_info.dart:186-189); the plugin server
+    /// feeds it the contributing plugin's `configuration.name`
+    /// (plugin_server.dart:444-450). Only `plugin/name` entries citing that
+    /// exact plugin name match — unqualified entries require a null report
+    /// plugin (ignore_info.dart:40-42).
+    #[must_use]
+    pub fn ignored_in_plugin(&self, line: u32, plugin: &str, name: &str) -> bool {
+        self.ignored_at(line, name, Some(plugin))
+    }
+
+    /// The shared suppression walk (`IgnoreInfo._ignoredAt`,
+    /// ignore_info.dart:192-212): file-wide entries first, then the
+    /// report's line.
+    fn ignored_at(&self, line: u32, name: &str, plugin: Option<&str>) -> bool {
+        self.for_file.iter().any(|e| e.matches(name, plugin))
             || self
                 .on_line
                 .get(&line)
-                .is_some_and(|entries| entries.iter().any(|e| e.matches(name)))
+                .is_some_and(|entries| entries.iter().any(|e| e.matches(name, plugin)))
     }
 }
 
@@ -209,13 +249,19 @@ fn parse_element_list(rest: &str, base: usize) -> Vec<Entry> {
             offset = type_end;
             entries.push(Entry::Type(rest[type_start..type_end].to_owned()));
         } else if offset < n && bytes[offset] == b'/' {
-            // `plugin/name` (ignore_info.dart:398-423).
-            offset = skip_ws(offset + 1);
-            let name_end = read_word(offset);
-            if name_end == offset || !list_continues(name_end) {
+            // `plugin/name` (ignore_info.dart:398-423): `word` is the
+            // plugin name — kept verbatim, the official plugin comparison
+            // is case-sensitive (:40) — and the word immediately after `/`
+            // is the diagnostic name (no whitespace skip upstream, :405-409).
+            let name_start = offset + 1;
+            let name_end = read_word(name_start);
+            if name_end == name_start || !list_continues(name_end) {
                 return entries;
             }
-            entries.push(Entry::PluginName);
+            entries.push(Entry::PluginName {
+                plugin: word.to_owned(),
+                name: rest[name_start..name_end].to_owned(),
+            });
             offset = name_end;
         } else {
             if !list_continues(offset) {
@@ -488,7 +534,10 @@ mod tests {
         assert_eq!(names("// ignore: http://x"), Vec::<String>::new());
         assert_eq!(names("// ignore: type=lint").len(), 0); // Type entry, not Name
         assert!(matches!(parse("// ignore: type=lint")[0], Entry::Type(_)));
-        assert!(matches!(parse("// ignore: p/q")[0], Entry::PluginName));
+        assert!(matches!(
+            parse("// ignore: p/q")[0],
+            Entry::PluginName { .. }
+        ));
     }
 
     #[test]
@@ -502,6 +551,74 @@ mod tests {
         };
         assert!(info.ignored(1, "empty_statements"));
         assert!(!info.ignored(1, "avoid_empty_else"));
+    }
+
+    #[test]
+    fn plugin_qualified_entries_parse_both_halves() {
+        // `plugin/name` splits on `/` (ignore_info.dart:398-423): the plugin
+        // name keeps its verbatim spelling (the match test is
+        // case-sensitive, :40); the rule name compares case-insensitively.
+        let Entry::PluginName { plugin, name } = &parse("// ignore: Some_Plugin/Some_Rule")[0]
+        else {
+            panic!("expected a PluginName entry");
+        };
+        assert_eq!(plugin, "Some_Plugin");
+        assert_eq!(name, "Some_Rule");
+        // The rule half must be a word: `p/` alone yields no entry
+        // (ignore_info.dart:410-421).
+        assert_eq!(parse("// ignore: p/").len(), 0);
+    }
+
+    #[test]
+    fn plugin_qualified_ignore_suppresses_only_its_plugin() {
+        use crate::testsupport::Fixture;
+        // `IgnoredDiagnosticName._matches` gates on plugin equality first
+        // (ignore_info.dart:40-42): the entry hits iff the diagnostic is
+        // reported under that exact plugin name.
+        let f = Fixture::build("var x = 1; // ignore: some_plugin/rule_name\n", |_, _| {});
+        let comments = crate::comments::Comments::extract(&f.source, &f.tokens);
+        let info = IgnoreInfo::parse(&f.source, &comments);
+        assert!(info.ignored_in_plugin(1, "some_plugin", "rule_name"));
+        // Rule-name matching stays case-insensitive; the plugin name stays
+        // case-sensitive (ignore_info.dart:36, 40).
+        assert!(info.ignored_in_plugin(1, "some_plugin", "Rule_Name"));
+        assert!(!info.ignored_in_plugin(1, "Some_Plugin", "rule_name"));
+        assert!(!info.ignored_in_plugin(1, "other_plugin", "rule_name"));
+        // An unqualified report (`pluginName: null`) never matches a
+        // qualified entry (ignore_info.dart:40).
+        assert!(!info.ignored(1, "rule_name"));
+    }
+
+    #[test]
+    fn unqualified_ignore_never_suppresses_plugin_codes() {
+        use crate::testsupport::Fixture;
+        // A null entry plugin requires a null report plugin
+        // (`this.pluginName != pluginName`, ignore_info.dart:40) — plain
+        // `// ignore: rule_name` leaves plugin diagnostics unsuppressed.
+        let f = Fixture::build("var x = 1; // ignore: rule_name\n", |_, _| {});
+        let comments = crate::comments::Comments::extract(&f.source, &f.tokens);
+        let info = IgnoreInfo::parse(&f.source, &comments);
+        assert!(info.ignored(1, "rule_name"));
+        assert!(!info.ignored_in_plugin(1, "any_plugin", "rule_name"));
+    }
+
+    #[test]
+    fn plugin_qualified_for_file_and_comma_lists() {
+        use crate::testsupport::Fixture;
+        // `ignore_for_file:` takes the same element grammar
+        // (ignore_info.dart:137-139), and qualified names mix freely with
+        // unqualified ones in a comma list (:327-470).
+        let f = Fixture::build(
+            "// ignore_for_file: some_plugin/rule_name, other_rule\nvar x = 1;\n",
+            |_, _| {},
+        );
+        let comments = crate::comments::Comments::extract(&f.source, &f.tokens);
+        let info = IgnoreInfo::parse(&f.source, &comments);
+        assert!(info.ignored_in_plugin(2, "some_plugin", "rule_name"));
+        assert!(info.ignored(2, "other_rule"));
+        // The qualified entry's plugin gate still applies at file scope.
+        assert!(!info.ignored_in_plugin(2, "wrong_plugin", "rule_name"));
+        assert!(!info.ignored(2, "rule_name"));
     }
 
     #[test]

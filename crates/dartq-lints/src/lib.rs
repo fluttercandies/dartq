@@ -234,12 +234,13 @@ pub use bridge::{ParsedUnit, parse_unit};
 pub use comments::{Comment, CommentKind, Comments};
 pub use engine::{
     AsyncContextUse, Check, Features, Lint, ReachabilityFace, Unit, WorkspaceFacts, run,
-    run_breaking_version_annotations, type_use_counts, unnecessary_ignore_late_rows,
+    run_breaking_version_annotations, type_use_counts, unnecessary_ignore_analyzer_rows,
+    unnecessary_ignore_late_rows,
 };
 pub use ignore::{IgnoreInfo, UnignorableIgnore, ignored_name_entries, unignorable_ignores};
 pub use registry::{
-    EnableSet, Group, RULES, RuleId, RuleSpec, emittable_rule_names, incompatible_rules,
-    rule_by_name, rules,
+    EnableSet, Group, RULES, RuleId, RuleSpec, SEMANTIC_RULES, emittable_rule_names,
+    incompatible_rules, mounts_semantics, rule_by_name, rules,
 };
 // The pubspec-pass verdicts (#434): the mounting face (dartq-commands'
 // `analyze_lints`) walks the scanned pubspec facts through these — the

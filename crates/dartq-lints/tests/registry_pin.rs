@@ -19,7 +19,10 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use dartq_lints::{EnableSet, Group, emittable_rule_names, rule_by_name, rules};
+use dartq_lints::{
+    EnableSet, Group, SEMANTIC_RULES, emittable_rule_names, mounts_semantics, rule_by_name,
+    rules,
+};
 
 /// The pinned `package:lints` snapshot's `core.yaml` — the critical set,
 /// pinned verbatim.
@@ -651,6 +654,84 @@ fn enable_set_all_and_resolve_agree() {
     let (resolved, unknown) = EnableSet::resolve(rules().iter().map(|s| s.name));
     assert!(unknown.is_empty());
     assert_eq!(resolved, all);
+}
+
+// —— the semantic-fold mount predicate (`SEMANTIC_RULES` / `mounts_semantics`) ——
+
+/// The mount's membership pin: `SEMANTIC_RULES` is exactly the rules whose
+/// run consumes the per-file semantic fold — every rule whose check
+/// call-graph reads `Check::semantics()` (directly or through a shared
+/// semantics-reading helper), plus `use_build_context_synchronously` (the
+/// fold-fact consumer). Membership drift is a correctness break in both
+/// directions: a missing name silently drops that rule's production rows
+/// (the fold never mounts), a stale name mounts the fold for nothing.
+#[test]
+fn semantic_rules_membership() {
+    // Every name is a registered rule, once — the derivation is name-based
+    // and a duplicate or dangling name is a stale edit.
+    let mut seen = BTreeSet::new();
+    for name in SEMANTIC_RULES {
+        assert!(
+            rule_by_name(name).is_some(),
+            "SEMANTIC_RULES names unregistered rule {name}"
+        );
+        assert!(seen.insert(*name), "SEMANTIC_RULES repeats {name}");
+    }
+
+    // The named members the mount was built for: the three names the old
+    // hand list carried, the hard-gated semantic rules it missed, and the
+    // shared-helper consumers (the transitive reads a name list cannot
+    // see). A regression here is the mount silently reverting to a partial
+    // set.
+    for name in [
+        "prefer_null_aware_method_calls",
+        "unnecessary_lambdas",
+        "use_build_context_synchronously",
+        "matching_super_parameters",
+        "avoid_slow_async_io",
+        "comment_references",
+        "future_sync_value",
+        "unnecessary_this_alias",
+        "unnecessary_to_list_in_spreads",
+        "unnecessary_parenthesis",
+        "avoid_unnecessary_containers",
+        "type_init_formals",
+    ] {
+        assert!(seen.contains(name), "SEMANTIC_RULES lost {name}");
+    }
+
+    // The membership contract both ways: a rule in the table mounts the
+    // fold when enabled alone; a rule outside it does not. One pass per
+    // registered rule — the full enabled-set × property product.
+    let semantic: BTreeSet<&str> = SEMANTIC_RULES.iter().copied().collect();
+    for spec in rules() {
+        let (set, _) = EnableSet::resolve([spec.name]);
+        if semantic.contains(spec.name) {
+            assert!(
+                mounts_semantics(&set),
+                "{} consumes the fold but mounts nothing — missing from SEMANTIC_RULES",
+                spec.name
+            );
+        } else {
+            assert!(
+                !mounts_semantics(&set),
+                "{} mounts the fold without consuming it — a stale SEMANTIC_RULES entry \
+                 (a new rule that reads `Check::semantics()` must join the table; one that \
+                 does not must stay out so corpora pay no fold cost for it)",
+                spec.name
+            );
+        }
+    }
+}
+
+/// The empty and non-semantic sets mount nothing — the zero-fold cost the
+/// gate exists to keep (a file whose enabled set touches no consumer runs
+/// the plain run exactly as before).
+#[test]
+fn mounts_semantics_stays_off_without_consumers() {
+    assert!(!mounts_semantics(&EnableSet::none()));
+    let (set, _) = EnableSet::resolve(["empty_statements", "file_names"]);
+    assert!(!mounts_semantics(&set));
 }
 
 /// Every template renders: problem texts are non-empty and `{n}` slots fill

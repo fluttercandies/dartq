@@ -3794,13 +3794,13 @@ pub(crate) mod matching_super_parameters {
     /// pkg/linter/lib/src/rules/matching_super_parameters.dart` — a
     /// positional super formal whose name differs from the super
     /// constructor's positional formal at the same index reports at the
-    /// formal (`reportAtNode(superParameter)`, :74-84), the names as
+    /// formal (`reportAtNode(superParameter)`, :89-100), the names as
     /// `[ours, super's]`. Only positional super formals participate
-    /// (:41-49); the super constructor comes from an explicit
+    /// (:55-64); the super constructor comes from an explicit
     /// `super(...)`/`super.named(...)` invocation's resolved element, else
-    /// the supertype's unnamed constructor (:52-64); more positional
+    /// the supertype's unnamed constructor (:65-79); more positional
     /// formals passed than the super has is an error face and stays
-    /// silent (:68-72).
+    /// silent (:84-88).
     ///
     /// Approximation (documented): the resolved element face is the
     /// semantic query — the extends-clause type position resolves the
@@ -3811,12 +3811,16 @@ pub(crate) mod matching_super_parameters {
     /// keys on the written selector, not the resolved invocation element.
     /// Enum and extension-type containers carry no extends type and stay
     /// silent — upstream's fallback only answers for `ClassDeclaration`
-    /// (:56-63). Message: `diagnostic.g.dart`
-    /// `matchingSuperParameters`.
+    /// (:69-78). Message: `diagnostic.g.dart` `matchingSuperParameters` —
+    /// the pinned oracle (Dart 3.13.1) renders the name slot with a doubled
+    /// closing apostrophe (`named 'y''`), the shipped 3.13 template's
+    /// quirk since normalized in main's `#p0` scheme (the vendored main
+    /// template carries single quotes); mirrored verbatim, the gate
+    /// oracle is 3.13.1.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
         name: "matching_super_parameters",
         group: Group::Standalone,
-        problem: "The super parameter named '{0}' does not share the same name as the corresponding parameter in the super constructor, '{1}'.",
+        problem: "The super parameter named '{0}'' does not share the same name as the corresponding parameter in the super constructor, '{1}'.",
         correction: "Try using the name of the corresponding parameter in the super constructor.",
         kinds: &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
         check,
@@ -3834,7 +3838,7 @@ pub(crate) mod matching_super_parameters {
         else {
             return;
         };
-        // The positional super formals (:41-49) — the `super` receiver
+        // The positional super formals (:55-64) — the `super` receiver
         // keyword and a positional kind discriminant.
         let ours: Vec<u32> = leak_formal_rows(c, parameters)
             .into_iter()
@@ -3858,7 +3862,7 @@ pub(crate) mod matching_super_parameters {
             return;
         };
         // The initializer list: the constructor's own, or the paired
-        // primary-constructor body's (:28-38).
+        // primary-constructor body's (:41-48).
         let initializers = match c.kind(node) {
             NodeKind::Constructor => c
                 .collect_direct(node)
@@ -3883,19 +3887,43 @@ pub(crate) mod matching_super_parameters {
         let Some(type_row) = extends_type_row(c, class_row) else {
             return;
         };
-        let selector = selector.map(|name| analysis.strings().intern(name));
+        let selector_text = selector;
+        let selector = selector_text.map(|name| analysis.strings().intern(name));
         let Some(binding) = analysis.resolve_constructor(query_site(c, type_row), selector) else {
             return;
         };
-        if !binding.exists {
-            return;
-        }
-        let Some(formals) = binding.formals else {
-            return;
+        // The super constructor's positional formal names. The element
+        // table is the primary face (it resolves cross-file and across the
+        // in-body + unnamed-primary spellings). When the table can't serve
+        // the written face — a `!exists` selector hit, or a resolved ctor
+        // whose `ctor_formals` entry never tabulated — the face is the
+        // primary constructor (`class C.named(...)`/`class C(...)` register
+        // no `ctor_named`/`ctor_formals` entry): the fallback reads the
+        // selector-matched primary header's own formal list off the
+        // same-file declaration, names verbatim. Anything the fallback
+        // cannot see (non-existent ctor, non-same-file container) stays
+        // silent (under-report).
+        let super_positionals: Vec<String> = match binding.exists.then(|| binding.formals).flatten()
+        {
+            Some(formals) => formals
+                .positional
+                .iter()
+                .map(|formal| analysis.strings().resolve(formal.name).to_string())
+                .collect(),
+            None => {
+                let Some(names) = primary_super_positionals(
+                    c,
+                    analysis.strings().resolve(binding.container),
+                    selector_text,
+                ) else {
+                    return;
+                };
+                names
+            }
         };
         // More positional formals passed to super than it has — an error
-        // upstream too (:68-72).
-        if formals.positional.len() < ours.len() {
+        // upstream too (:84-88).
+        if super_positionals.len() < ours.len() {
             return;
         }
         for (index, &param) in ours.iter().enumerate() {
@@ -3906,14 +3934,64 @@ pub(crate) mod matching_super_parameters {
                 continue;
             }
             let our_name = c.lexeme(name_token);
-            let Some(super_formal) = formals.positional.get(index) else {
+            let Some(super_name) = super_positionals.get(index) else {
                 continue;
             };
-            let super_name = analysis.strings().resolve(super_formal.name);
             if our_name != super_name {
                 c.report(c.utf16_span(param), &[our_name, super_name]);
             }
         }
+    }
+
+    /// The positional formal names of `container`'s primary constructor,
+    /// read off the same-file `ClassDeclaration`'s `PrimaryConstructor`
+    /// child — the face the element table's `ctor_formals` omits. `selector`
+    /// selects the written ctor name: `None` wants the unnamed primary face
+    /// (`class C(...)`), `Some(n)` the `class C.n(...)` head. `None`
+    /// under-reports: the container is not same-file, has no matching
+    /// primary ctor, or names a face the table already served.
+    fn primary_super_positionals(
+        c: &Check<'_>,
+        container: &str,
+        selector: Option<&str>,
+    ) -> Option<Vec<String>> {
+        let class_row = crate::rules::same_file_declaration(c, container)?;
+        let primary =
+            c.children(class_row).find(|&kid| {
+                if c.kind(kid) != NodeKind::PrimaryConstructor {
+                    return false;
+                }
+                // `payload[2]` = has_constructor_name; the selector itself is the
+                // `Identifier` child with the PrimaryConstructorDeclaration
+                // context.
+                let named = c.payload(kid).get(2).copied() == Some(1);
+                match selector {
+                    None => !named,
+                    Some(want) => named && c.children(kid).any(|name_row| {
+                        c.kind(name_row) == NodeKind::Identifier
+                            && c.payload(name_row).first().copied()
+                                == Some(
+                                    dartq_parser::IdentifierContext::PrimaryConstructorDeclaration
+                                        as u32,
+                                )
+                            && c.lexeme(c.head_token(name_row)) == want
+                    }),
+                }
+            })?;
+        let params = c
+            .collect_direct(primary)
+            .into_iter()
+            .find(|&kid| c.kind(kid) == NodeKind::FormalParameters)?;
+        Some(
+            leak_formal_rows(c, params)
+                .into_iter()
+                .filter(|&param| matches!(c.payload(param).get(4).copied(), Some(0 | 3)))
+                .filter_map(|param| {
+                    let token = c.payload(param).get(1).copied()?;
+                    (token != NONE_TOKEN).then(|| c.lexeme(token).to_string())
+                })
+                .collect(),
+        )
     }
 
     /// The selector name of the initializers' first super invocation: the
@@ -4043,7 +4121,7 @@ pub(crate) mod matching_super_parameters {
             assert_eq!(lints.len(), 1, "{lints:?}");
             assert_eq!(
                 lints[0].message,
-                "The super parameter named 'abc' does not share the same name as the corresponding parameter in the super constructor, 'xyz'."
+                "The super parameter named 'abc'' does not share the same name as the corresponding parameter in the super constructor, 'xyz'."
             );
         }
 
@@ -4071,7 +4149,7 @@ pub(crate) mod matching_super_parameters {
             assert_eq!(lints.len(), 1, "{lints:?}");
             assert_eq!(
                 lints[0].message,
-                "The super parameter named 'abc' does not share the same name as the corresponding parameter in the super constructor, 'xyz'."
+                "The super parameter named 'abc'' does not share the same name as the corresponding parameter in the super constructor, 'xyz'."
             );
 
             let source = "class A {\n  A(int xyz);\n}\n\nclass B extends A {\n  B(super.abc);\n}\n";
@@ -4101,6 +4179,60 @@ pub(crate) mod matching_super_parameters {
             let source = "class A {\n  A(int xyz);\n}\n\nclass B extends A {\n  B(super.abc);\n}\n";
             let f = Fixture::parse(source);
             assert!(f.run(&one_rule(SPEC.name)).is_empty());
+        }
+
+        /// The corpus faces over all three miss shapes — explicit
+        /// `super.named()` invocation, implicit in-body invocation, and the
+        /// primary-constructor header + `this :` body. Exercises the
+        /// same-file primary-constructor fallback (the element table omits
+        /// `ctor_formals` for `class C.named(...)` and `class C(...)`
+        /// primary spellings).
+        #[test]
+        fn corpus_faces_report() {
+            // Explicit invocation: D4/C4 (`: super.named()`).
+            let source = "class D4 extends C4 {\n  final String w;\n\n  D4(\n    this.w,\n    super.y,\n    super.x,\n  ) : super.named();\n}\n\nclass C4 {\n  final int x;\n  final int y;\n\n  C4.named(this.x, this.y);\n}\n";
+            let lints = run_semantic(source);
+            assert_eq!(lints.len(), 2, "D4: {lints:?}");
+
+            // Implicit invocation: D7/C7 (no initializer list).
+            let source = "class D7 extends C7 {\n  final String w;\n\n  D7(\n    this.w,\n    super.y,\n    super.x,\n  );\n}\n\nclass C7 {\n  final int x;\n  final int y;\n\n  C7(this.x, this.y);\n}\n";
+            let lints = run_semantic(source);
+            assert_eq!(lints.len(), 2, "D7: {lints:?}");
+
+            // Omitted-optional implicit: D8/C8 (super has `[this.y]`).
+            let source = "class D8 extends C8 {\n  final String w;\n\n  D8(\n    this.w,\n    super.y,\n  );\n}\n\nclass C8 {\n  final int x;\n  final int? y;\n\n  C8(this.x, [this.y]);\n}\n";
+            let lints = run_semantic(source);
+            assert_eq!(lints.len(), 1, "D8: {lints:?}");
+
+            // Primary ctor header to in-body super, explicit invocation.
+            let source = "class D23(this.w, super.y, super.x) extends C23 {\n  final String w;\n\n  this : super.named();\n}\n\nclass C23 {\n  final int x;\n  final int y;\n\n  C23.named(this.x, this.y);\n}\n";
+            let lints = run_semantic(source);
+            assert_eq!(lints.len(), 2, "D23: {lints:?}");
+
+            // Primary ctor header, implicit invocation.
+            let source = "class D26(this.w, super.y, super.x) extends C26 {\n  final String w;\n}\n\nclass C26 {\n  final int x;\n  final int y;\n\n  C26(this.x, this.y);\n}\n";
+            let lints = run_semantic(source);
+            assert_eq!(lints.len(), 2, "D26: {lints:?}");
+
+            // Primary ctor header, omitted-optional.
+            let source = "class D27(this.w, super.y) extends C27 {\n  final String w;\n}\n\nclass C27 {\n  final int x;\n  final int? y;\n\n  C27(this.x, [this.y]);\n}\n";
+            let lints = run_semantic(source);
+            assert_eq!(lints.len(), 1, "D27: {lints:?}");
+
+            // Primary ctor header to primary super, explicit.
+            let source = "class D32(this.w, super.y, super.x) extends C32 {\n  final String w;\n\n  this : super.named();\n}\n\nclass C32.named(this.x, this.y) {\n  final int x;\n  final int y;\n}\n";
+            let lints = run_semantic(source);
+            assert_eq!(lints.len(), 2, "D32: {lints:?}");
+
+            // Primary ctor header to primary super, implicit.
+            let source = "class D35(this.w, super.y, super.x) extends C35 {\n  final String w;\n}\n\nclass C35(this.x, this.y) {\n  final int x;\n  final int y;\n}\n";
+            let lints = run_semantic(source);
+            assert_eq!(lints.len(), 2, "D35: {lints:?}");
+
+            // Primary ctor header to primary super, omitted-optional.
+            let source = "class D36(this.w, super.y) extends C36 {\n  final String w;\n}\n\nclass C36(this.x, [this.y]) {\n  final int x;\n  final int? y;\n}\n";
+            let lints = run_semantic(source);
+            assert_eq!(lints.len(), 1, "D36: {lints:?}");
         }
     }
 }

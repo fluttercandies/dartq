@@ -17,7 +17,7 @@ use dartq_source::LineIndex;
 use rustc_hash::FxHashMap;
 
 use crate::comments::Comments;
-use crate::ignore::IgnoreInfo;
+use crate::ignore::{IgnoreInfo, NameEntry};
 use crate::registry::{EnableSet, Group, LATE_JOIN_RULES, RuleId, rule_by_name, rules};
 use crate::rules::SupertypeClause;
 use crate::rules::declarations::remove_deprecations_in_breaking_versions::check_annotation;
@@ -617,9 +617,21 @@ fn run_semantics(
     // runs after all other diagnostics but before the list is filtered).
     if rule_by_name("unnecessary_ignore").is_some_and(|id| enabled.is_enabled(id)) {
         let suppressed = suppressed.into_inner();
-        // The run half (`late_only` = false): the late-join names belong to
-        // the shell's re-join (`unnecessary_ignore_late_rows`).
-        unnecessary_ignore_rows(unit, &ignore, unignorable, &suppressed, false, &mut out);
+        let entries = ignore.name_entries(unit.source);
+        // The run half: the late-join and analyzer-code names belong to the
+        // shell's re-joins (`unnecessary_ignore_late_rows` /
+        // `unnecessary_ignore_analyzer_rows`) — their suppression facts are
+        // records this run structurally cannot hold.
+        unnecessary_ignore_rows(
+            unit,
+            &ignore,
+            unignorable,
+            &suppressed,
+            JoinHalf::Run,
+            &entries,
+            |_| false,
+            &mut out,
+        );
     }
 
     collapse_duplicate_rows(&mut out);
@@ -672,39 +684,50 @@ fn collapse_duplicate_rows(out: &mut Vec<Lint>) {
 /// dropped a hit — file-wide when the name dropped anywhere, line-scoped
 /// when the drop sat on the entry's line (the official match pass removes
 /// the name from the file list and the diagnostic's line list,
-/// :137-144). Three gates mirror the official unnecessary pass
+/// :137-144). Gates mirror the official unnecessary pass
 /// (:199-249): names in the `cannot-ignore` set never report (the official
 /// unignorable branch removes them from the lists first, :89/:113/:164-174);
-/// names outside the registry never report (the official plugin-code bail,
-/// :211-218 — analyzer error codes this run never produces are the same
-/// face); removed rules never report here (the official removed-state face
-/// reports `removed_lint_use` instead and continues, :219-235). Fourth,
-/// the late-join seam: the join runs in two halves (`late_only`) — the
-/// run's epilogue (`false`) owns the names whose rows this run produced;
-/// the [`LATE_JOIN_RULES`] names belong to the shell's re-join
-/// ([`unnecessary_ignore_late_rows`]), whose suppression record is the
-/// drops the shell's own breaking-version walk made. Each citation answers
-/// against the rows its producing walk carried; the union is the official
-/// single pass over the unfiltered final list (`library_analyzer.dart`
-/// :327-341). The rows then pass the same suppression gate every lint
-/// passes — the official validator's rows run before the pipeline's ignore
-/// filter (`library_analyzer.dart`:135) — so a `// ignore:
-/// unnecessary_ignore` still silences its own verdict.
+/// removed rules never report here (the official removed-state face
+/// reports `removed_lint_use` instead and continues, :219-235). Fourth, the
+/// ownership seam: the join runs in three halves ([`JoinHalf`]) — the run's
+/// epilogue owns the lint names whose rows this run produced; the
+/// [`LATE_JOIN_RULES`] names belong to the shell's breaking-version re-join
+/// ([`unnecessary_ignore_late_rows`]); analyzer diagnostic codes belong to
+/// the shell's analyzer re-join ([`unnecessary_ignore_analyzer_rows`]).
+/// Each half answers against the rows its producing walk carried; the union
+/// is the official single pass over the unfiltered final list
+/// (`library_analyzer.dart`:327-341). The whole validator is silent on
+/// generated files (the official mount filters them before the validator
+/// constructs, `library_analyzer.dart`:331-334 `whereNot(isGenerated)`).
+/// The rows then pass the same suppression gate every lint passes — the
+/// official validator's rows run before the pipeline's ignore filter
+/// (`library_analyzer.dart`:135) — so a `// ignore: unnecessary_ignore`
+/// still silences its own verdict.
 ///
 /// Bounded: one pass over the citations plus one pass over the suppression
 /// record into two hash sets — linear in citations + suppressed hits.
+#[expect(
+    clippy::implicit_hasher,
+    reason = "FxHashSet is the workspace-mandated concrete hasher               (deterministic iteration, hot-path cost)"
+)]
 fn unnecessary_ignore_rows(
     unit: &Unit<'_>,
     ignore: &IgnoreInfo,
     unignorable: &rustc_hash::FxHashSet<String>,
     suppressed: &[(u32, &'static str)],
-    late_only: bool,
+    half: JoinHalf,
+    entries: &[NameEntry],
+    known_code: impl Fn(&str) -> bool,
     out: &mut Vec<Lint>,
 ) {
     let Some(rule) = rule_by_name("unnecessary_ignore") else {
         return;
     };
-    let entries = ignore.name_entries(unit.source);
+    // The official mount's generated-file filter (`library_analyzer.dart`
+    // :331-334): the whole validator — every half — skips generated files.
+    if unit.path.is_some_and(path_is_generated) {
+        return;
+    }
     if entries.is_empty() {
         return;
     }
@@ -722,25 +745,39 @@ fn unnecessary_ignore_rows(
         if unignorable.contains(entry.name.as_str()) {
             continue;
         }
-        // A name outside the registry could be a plugin's or an
-        // analyzer-error code this lint-only run never produces — the
-        // official skip keeps both silent.
-        let Some(id) = rule_by_name(&entry.name) else {
-            continue;
-        };
-        if rules()[id.0 as usize].group == Group::Removed {
-            continue;
-        }
-        // The late-join seam (#1353, the #1904 ownership split): a name in
-        // [`LATE_JOIN_RULES`] has its rows joined by the mounting shell's
-        // walk after this run returns, so this run's suppression record can
-        // never hold its citation — yet the citation genuinely suppresses
-        // in the final list the official validator walks unfiltered
-        // (`library_analyzer.dart`:327-341). The run half skips those
-        // names; the shell's re-join (the `late_only` half) owns them,
-        // fed the drops the shell's walk itself recorded.
-        if LATE_JOIN_RULES.contains(&rules()[id.0 as usize].name) != late_only {
-            continue;
+        match rule_by_name(&entry.name) {
+            Some(id) => {
+                if rules()[id.0 as usize].group == Group::Removed {
+                    continue;
+                }
+                // The ownership seam (#1353, the #1904/#2116 splits): a
+                // late-join name has its rows joined by the mounting
+                // shell's breaking-version walk, an analyzer code by the
+                // shell's semantic fold — each name answers in its owning
+                // half only, and a lint name never answers in the
+                // analyzer half at all.
+                let late = LATE_JOIN_RULES.contains(&rules()[id.0 as usize].name);
+                if match half {
+                    JoinHalf::Run => late,
+                    JoinHalf::Late => !late,
+                    JoinHalf::Analyzer => true,
+                } {
+                    continue;
+                }
+            }
+            None => {
+                // Not a lint name: the official validator admits a name the
+                // lint registry does not know only when the diagnostic-code
+                // registry knows it (`ignore_validator.dart`:208-213 — an
+                // unknown name could come from a plugin and never reports);
+                // a known code falls through to the unnecessary walk. Those
+                // codes' rows are the analyzer layer's, so their facts live
+                // at the shell's analyzer half — the run and late halves
+                // skip them unconditionally.
+                if half != JoinHalf::Analyzer || !known_code(&entry.name) {
+                    continue;
+                }
+            }
         }
         let used = match entry.scope {
             None => used_names.contains(entry.name.as_str()),
@@ -761,6 +798,100 @@ fn unnecessary_ignore_rows(
                 .then(|| crate::registry::render(spec.correction, &[&entry.name])),
         });
     }
+}
+
+/// Which walk's facts the join answers over — the ownership split that
+/// keeps each citation answered by the record that actually saw its drops.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JoinHalf {
+    /// The run epilogue: lint names this run dispatched (`run`'s own
+    /// suppression record).
+    Run,
+    /// The shell's breaking-version re-join: the [`LATE_JOIN_RULES`] names.
+    Late,
+    /// The shell's analyzer re-join: known analyzer diagnostic codes, the
+    /// #2116 face.
+    Analyzer,
+}
+
+/// The upstream generated-file suffix table (`file_paths.dart:89-104`
+/// `isGenerated`): the official validator mount skips generated files
+/// entirely (`library_analyzer.dart`:331-334), so every `unnecessary_ignore`
+/// half is silent on them.
+const GENERATED_SUFFIXES: [&str; 6] = [
+    ".g.dart",
+    ".pb.dart",
+    ".pbenum.dart",
+    ".pbserver.dart",
+    ".pbjson.dart",
+    ".template.dart",
+];
+
+/// Whether `path` is a generated file per the official suffix table
+/// ([`GENERATED_SUFFIXES`]).
+fn path_is_generated(path: &Path) -> bool {
+    GENERATED_SUFFIXES.iter().any(|suffix| {
+        path.as_os_str()
+            .as_encoded_bytes()
+            .ends_with(suffix.as_bytes())
+    })
+}
+
+/// The analyzer half of the `unnecessary_ignore` join (#2116): citations
+/// naming analyzer diagnostic codes answer against the rows the semantic
+/// layer produced for this file — the official match pass walks every
+/// reported diagnostic, lint and analyzer row alike
+/// (`ignore_validator.dart`:137-144), and a non-lint name the diagnostic
+/// registry knows falls through to the unnecessary walk (:208-213). The
+/// mounting shell derives the suppression record from the pre-filter
+/// production rows (the fold's own ignore gate strips suppressed rows
+/// before its report returns, so the shell neutralizes the ignore
+/// keywords for that one fold — the pairs are what the unfiltered list
+/// held). An empty record answers upstream-true: nothing consumed the
+/// citation, it reports.
+///
+/// `known_code` is the diagnostic-code registry's membership test (the
+/// shell passes the engine's known-codes face; the dartq-lints crate keeps
+/// no dependency on it). Plain runs — test harnesses, embedded consumers
+/// without the shell — keep the #1353 silence on these names: the run
+/// epilogue's record never holds analyzer drops, so the verdict belongs
+/// here. Generated files stay silent ([`GENERATED_SUFFIXES`]).
+#[must_use]
+#[expect(
+    clippy::implicit_hasher,
+    reason = "FxHashSet is the workspace-mandated concrete hasher               (deterministic iteration, hot-path cost)"
+)]
+pub fn unnecessary_ignore_analyzer_rows(
+    unit: &Unit<'_>,
+    enabled: &EnableSet,
+    unignorable: &rustc_hash::FxHashSet<String>,
+    analyzer_suppressed: &[(u32, &'static str)],
+    known_code: impl Fn(&str) -> bool,
+) -> Vec<Lint> {
+    if !rule_by_name("unnecessary_ignore").is_some_and(|id| enabled.is_enabled(id)) {
+        return Vec::new();
+    }
+    let comments = Comments::extract(unit.source, unit.tokens);
+    let ignore = IgnoreInfo::parse(unit.source, &comments);
+    let entries = ignore.name_entries(unit.source);
+    // Nothing to admit unless a citation names a code the registry knows —
+    // the same probe the shell pays before its fold, repeated here so the
+    // face is self-contained for direct callers.
+    if !entries.iter().any(|entry| known_code(entry.name.as_str())) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    unnecessary_ignore_rows(
+        unit,
+        &ignore,
+        unignorable,
+        analyzer_suppressed,
+        JoinHalf::Analyzer,
+        &entries,
+        known_code,
+        &mut out,
+    );
+    out
 }
 
 /// The late-join half of the `unnecessary_ignore` join (#1904): the
@@ -806,8 +937,18 @@ pub fn unnecessary_ignore_late_rows(
     }
     let comments = Comments::extract(unit.source, unit.tokens);
     let ignore = IgnoreInfo::parse(unit.source, &comments);
+    let entries = ignore.name_entries(unit.source);
     let mut out = Vec::new();
-    unnecessary_ignore_rows(unit, &ignore, unignorable, late_suppressed, true, &mut out);
+    unnecessary_ignore_rows(
+        unit,
+        &ignore,
+        unignorable,
+        late_suppressed,
+        JoinHalf::Late,
+        &entries,
+        |_| false,
+        &mut out,
+    );
     out
 }
 
@@ -1558,6 +1699,190 @@ mod tests {
             lints[0].message.contains("avoid_empty_else"),
             "{:?}",
             lints[0].message
+        );
+    }
+
+    /// Builds the fixture-plus-unit pair the analyzer-half tests share: one
+    /// fixture bound to `$f` and the unit to `$u`, both in the caller's
+    /// scope (the unit borrows the fixture; macro hygiene demands both
+    /// idents passed).
+    macro_rules! analyzer_unit {
+        ($f:ident, $u:ident, $source:expr, $path:expr) => {
+            let $f = Fixture::parse($source);
+            let $u = Unit {
+                source: &$f.source,
+                tokens: &$f.tokens,
+                ast: &$f.ast,
+                lines: &$f.lines,
+                path: $path,
+                features: $f.features,
+                version: $f.version,
+                workspace: None,
+                reachability: None,
+                async_context_uses: None,
+                library_type_uses: None,
+            };
+        };
+    }
+
+    /// The #2116 POSITIVE face: an ignore naming a known analyzer diagnostic
+    /// code that produced nothing here reports at the name token — the
+    /// official validator admits a non-lint name the diagnostic registry
+    /// knows and falls through to the unnecessary walk
+    /// (ignore_validator.dart:208-213, :284-288).
+    #[test]
+    fn analyzer_code_citation_reports_when_nothing_suppresses() {
+        analyzer_unit!(
+            f,
+            unit,
+            "// ignore: unused_local_variable\nvoid f() {}\n",
+            Some(Path::new("lint_fixture.dart"))
+        );
+        let rows = unnecessary_ignore_analyzer_rows(
+            &unit,
+            &one_rule("unnecessary_ignore"),
+            &rustc_hash::FxHashSet::default(),
+            &[],
+            |name| name == "unused_local_variable",
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        // The name token: `// ignore: ` is 11 chars, the name 21.
+        assert_eq!(rows[0].range, 11..32);
+        assert!(rows[0].message.contains("unused_local_variable"));
+    }
+
+    /// The #2116 NEGATIVE faces: a citation the analyzer layer consumed
+    /// stays silent — line-scoped when a diagnostic with that code sat on
+    /// the cited line (the standalone comment's target), file-scoped when
+    /// one sat anywhere under an `ignore_for_file:` (the official match
+    /// pass removes the name from the line's and the file's lists,
+    /// ignore_validator.dart:137-144).
+    #[test]
+    fn analyzer_code_citation_silenced_when_produced() {
+        analyzer_unit!(
+            f1,
+            unit,
+            "// ignore: unused_local_variable\nvoid f() {}\n",
+            Some(Path::new("lint_fixture.dart"))
+        );
+        // The standalone comment's entry scope is the next line (2).
+        assert!(
+            unnecessary_ignore_analyzer_rows(
+                &unit,
+                &one_rule("unnecessary_ignore"),
+                &rustc_hash::FxHashSet::default(),
+                &[(2, "unused_local_variable")],
+                |name| name == "unused_local_variable",
+            )
+            .is_empty()
+        );
+        drop(unit);
+        analyzer_unit!(
+            f2,
+            unit,
+            "// ignore_for_file: unused_local_variable\nvoid f() {}\n",
+            Some(Path::new("lint_fixture.dart"))
+        );
+        assert!(
+            unnecessary_ignore_analyzer_rows(
+                &unit,
+                &one_rule("unnecessary_ignore"),
+                &rustc_hash::FxHashSet::default(),
+                &[(2, "unused_local_variable")],
+                |name| name == "unused_local_variable",
+            )
+            .is_empty()
+        );
+    }
+
+    /// Ownership: the plain run never reports an analyzer-code citation —
+    /// its suppression record structurally cannot hold analyzer drops, so
+    /// the verdict belongs to the shell's analyzer half (the #1353
+    /// posture). A bare `run` stays silent.
+    #[test]
+    fn analyzer_codes_never_report_from_the_plain_run() {
+        analyzer_unit!(
+            f,
+            unit,
+            "// ignore: unused_local_variable\nvoid f() {}\n",
+            Some(Path::new("lint_fixture.dart"))
+        );
+        assert!(
+            run(
+                &unit,
+                &one_rule("unnecessary_ignore"),
+                &rustc_hash::FxHashSet::default()
+            )
+            .is_empty()
+        );
+    }
+
+    /// The plugin bail survives: a name neither registry knows never
+    /// reports, whatever the record holds (ignore_validator.dart:209-213).
+    #[test]
+    fn unknown_analyzer_names_stay_silent() {
+        analyzer_unit!(
+            f,
+            unit,
+            "// ignore: undefined_diagnostic_code\nvoid f() {}\n",
+            Some(Path::new("lint_fixture.dart"))
+        );
+        assert!(
+            unnecessary_ignore_analyzer_rows(
+                &unit,
+                &one_rule("unnecessary_ignore"),
+                &rustc_hash::FxHashSet::default(),
+                &[],
+                |name| name == "unused_local_variable",
+            )
+            .is_empty()
+        );
+    }
+
+    /// Routing: a lint-name citation never answers in the analyzer half —
+    /// the lint registry admits it first and the ownership seam sends it to
+    /// the run or late half.
+    #[test]
+    fn lint_name_citations_stay_out_of_the_analyzer_half() {
+        analyzer_unit!(
+            f,
+            unit,
+            "// ignore: avoid_empty_else\nvoid f() {}\n",
+            Some(Path::new("lint_fixture.dart"))
+        );
+        assert!(
+            unnecessary_ignore_analyzer_rows(
+                &unit,
+                &one_rule("unnecessary_ignore"),
+                &rustc_hash::FxHashSet::default(),
+                &[],
+                |_| true,
+            )
+            .is_empty()
+        );
+    }
+
+    /// The official mount's generated-file filter
+    /// (`library_analyzer.dart`:331-334 `whereNot(isGenerated)`,
+    /// `file_paths.dart:89-104`): the whole validator is silent on
+    /// generated files.
+    #[test]
+    fn generated_files_stay_silent() {
+        analyzer_unit!(
+            f,
+            unit,
+            "// ignore: unused_local_variable\nvoid f() {}\n",
+            Some(Path::new("lib/test.g.dart"))
+        );
+        assert!(
+            unnecessary_ignore_analyzer_rows(
+                &unit,
+                &one_rule("unnecessary_ignore"),
+                &rustc_hash::FxHashSet::default(),
+                &[],
+                |name| name == "unused_local_variable",
+            )
+            .is_empty()
         );
     }
 

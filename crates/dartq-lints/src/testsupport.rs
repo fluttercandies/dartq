@@ -198,6 +198,16 @@ impl Fixture {
             }
             builder.declare(lib, name, file);
         }
+        // The driver's implicit dart:core import (the unindexed synthetic
+        // face the oracle's scope chain consults without a directive) — the
+        // generated engine table's merged core surface, same source the
+        // production context seeds.
+        let core_file = files.intern(Path::new("<dart:core>"));
+        let (_, core_face) = dartq_engine::sdk_faces_gen::SDK_LIBRARY_FACES
+            .iter()
+            .find(|(uri, _)| *uri == "core")
+            .expect("generated SDK table carries dart:core");
+        builder.seed_implicit_core(lib, core_file, core_face);
         let mut index = dartq_semantic::ElementIndex::default();
         index.insert(file, elements);
         let graph: &'static dartq_resolution::LibraryGraph = Box::leak(Box::new(builder.finish()));

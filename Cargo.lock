@@ -369,6 +369,7 @@ name = "dartq-lints"
 version = "1.0.0"
 dependencies = [
  "dartq-ast",
+ "dartq-engine",
  "dartq-language",
  "dartq-parser",
  "dartq-resolution",

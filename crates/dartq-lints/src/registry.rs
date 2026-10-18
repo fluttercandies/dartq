@@ -740,6 +740,16 @@ impl EnableSet {
     fn clear(&mut self, id: RuleId) {
         self.words[id.0 as usize / 64] &= !(1 << (id.0 as usize % 64));
     }
+
+    /// Whether the two sets share any enabled rule — the word-AND the
+    /// property gates test ([`mounts_semantics`]).
+    #[must_use]
+    pub fn intersects(&self, other: &Self) -> bool {
+        self.words
+            .iter()
+            .zip(other.words.iter())
+            .any(|(a, b)| a & b != 0)
+    }
 }
 
 /// A registration's language-version predicate: the upstream registration
@@ -781,6 +791,113 @@ static VERSION_GATES: &[(&str, VersionGate)] = &[(
     "require_trailing_commas",
     VersionGate::Below(LanguageVersion::new(3, 7)),
 )];
+
+/// The registered rules whose run consumes the per-file semantic fold: every
+/// rule whose check call-graph reads [`crate::engine::Check::semantics`] —
+/// directly, or through a shared semantics-reading helper
+/// (`same_file::nullable_extension_member`,
+/// `declarations::bridge_inherited_member` /
+/// `super_formal_provably_unmatched`,
+/// `collections::inferred_binding_type_face`, the flutter domain's
+/// `spells_framework`/`resolves_user_container`/`chain_spells_root`
+/// refutation faces) — plus `use_build_context_synchronously`, which reads
+/// the fold's `AsyncContextUse` facts through
+/// [`crate::engine::Unit::async_context_uses`] instead of the query face.
+/// Enumerated like [`INCOMPATIBLE_RULES`]; membership is what mounts the
+/// driver-side fold ([`mounts_semantics`]), and the pin test
+/// (`tests/registry_pin.rs`) holds the list against the accessor's readers.
+pub static SEMANTIC_RULES: &[&str] = &[
+    "always_put_required_named_parameters_first",
+    "annotate_overrides",
+    "avoid_bool_literals_in_conditional_expressions",
+    "avoid_classes_with_only_static_members",
+    "avoid_dynamic_calls",
+    "avoid_function_literals_in_foreach_calls",
+    "avoid_print",
+    "avoid_renaming_method_parameters",
+    "avoid_slow_async_io",
+    "avoid_type_to_string",
+    "avoid_types_on_closure_parameters",
+    "avoid_unnecessary_containers",
+    "await_only_futures",
+    "cast_nullable_to_non_nullable",
+    "collection_methods_unrelated_type",
+    "comment_references",
+    "diagnostic_describe_all_properties",
+    "future_sync_value",
+    "implicit_call_tearoffs",
+    "invalid_runtime_check_with_js_interop_types",
+    "literal_only_boolean_expressions",
+    "matching_super_parameters",
+    "no_dynamic_casts",
+    "no_literal_bool_comparisons",
+    "no_logic_in_create_state",
+    "no_runtimetype_tostring",
+    "noop_primitive_operations",
+    "null_check_on_nullable_type_parameter",
+    "null_closures",
+    "overridden_fields",
+    "prefer_collection_literals",
+    "prefer_contains",
+    "prefer_for_elements_to_map_fromIterable",
+    "prefer_initializing_formals",
+    "prefer_int_literals",
+    "prefer_is_empty",
+    "prefer_is_not_empty",
+    "prefer_iterable_whereType",
+    "prefer_null_aware_method_calls",
+    "sized_box_for_whitespace",
+    "sized_box_shrink_expand",
+    "sort_child_properties_last",
+    "type_annotate_public_apis",
+    "type_init_formals",
+    "unnecessary_getters_setters",
+    "unnecessary_lambdas",
+    "unnecessary_null_aware_operator_on_extension_on_nullable",
+    "unnecessary_null_checks",
+    "unnecessary_nullable_for_final_variable_declarations",
+    "unnecessary_parenthesis",
+    "unnecessary_statements",
+    "unnecessary_string_interpolations",
+    "unnecessary_this",
+    "unnecessary_this_alias",
+    "unnecessary_to_list_in_spreads",
+    "unnecessary_unawaited",
+    "unrelated_type_equality_checks",
+    "use_build_context_synchronously",
+    "use_colored_box",
+    "use_decorated_box",
+    "use_full_hex_values_for_flutter_colors",
+    "use_key_in_widget_constructors",
+    "use_super_parameters",
+    "use_truncating_division",
+    "void_checks",
+];
+
+/// The fold-consumer set resolved from [`SEMANTIC_RULES`]: the word-AND
+/// target behind [`mounts_semantics`]. Built once — the names are
+/// compile-time constants, the positions registry-derived.
+static SEMANTIC_SET: LazyLock<EnableSet> = LazyLock::new(|| {
+    let (set, unknown) = EnableSet::resolve(SEMANTIC_RULES.iter().copied());
+    // A name drifted out of the registry is a build-invariant break — the
+    // table above enumerates registered rules only (the pin test holds the
+    // membership); surface it loudly instead of silently shrinking the
+    // mount set.
+    debug_assert!(
+        unknown.is_empty(),
+        "SEMANTIC_RULES names unregistered rules: {unknown:?}"
+    );
+    set
+});
+
+/// Whether `set` enables any fold-consuming rule — the predicate behind the
+/// per-file semantic-fold mount (the driver's `Analysis` build) and the memo
+/// key's library-context generation half. One word-AND per call; a file
+/// whose enabled set touches no member mounts nothing.
+#[must_use]
+pub fn mounts_semantics(set: &EnableSet) -> bool {
+    set.intersects(&SEMANTIC_SET)
+}
 
 /// `enabled` without the gated rules `version` rejects — the registration
 /// consult of one run. One pass over `VERSION_GATES` (a two-entry-scale

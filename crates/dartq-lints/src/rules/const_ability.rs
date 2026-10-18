@@ -110,6 +110,97 @@ pub(crate) fn matches_named_constant<'a>(
     };
     let index = ConstIndex::build(unit);
     let (type_name, extent) = creation_face(unit, inner)?;
+    named_constant_match(unit, &index, creation, type_name, extent)
+}
+
+/// The const dot-shorthand face (`const .new(0)`, and the contextually
+/// const `.new(0)` the caller has already gated): the type name is not
+/// written, so `type_name` is the resolved context type the caller passes
+/// (the enclosing variable's declared type). The shorthand spells the
+/// `new` selector — the unnamed constructor — so only the stateless
+/// loose match applies (a stateful `A(0)`/`A(1)` split can never be told
+/// apart from a `.new` spelling).
+#[must_use]
+pub(crate) fn matches_shorthand_constant<'a>(
+    unit: &'a Unit<'_>,
+    creation: u32,
+    type_name: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    let index = ConstIndex::build(unit);
+    let class_row = index.types.get(type_name).copied()?;
+    if !matches!(
+        unit.ast.kind(class_row),
+        NodeKind::ClassDeclaration | NodeKind::ExtensionTypeDeclaration
+    ) || !class_stateless(unit, class_row)
+        || enclosing_static_field_class(unit, creation) == Some(class_row)
+    {
+        return None;
+    }
+    for member in class_members(unit, class_row) {
+        if unit.ast.kind(member) != NodeKind::Fields
+            || mod_flags(unit.ast, member) & STATIC_BIT == 0
+        {
+            continue;
+        }
+        for decl in child_rows(unit, member) {
+            if unit.ast.kind(decl) != NodeKind::VariablesDeclaration || !spells_const(unit, decl) {
+                continue;
+            }
+            for field in child_rows(unit, decl) {
+                if unit.ast.kind(field) == NodeKind::InitializedIdentifier
+                    && stateless_initializer_matches(unit, field, type_name)
+                {
+                    let name = head_token(unit, field);
+                    return Some((type_name, lexeme(unit, name)));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The `(type name, comparison extent)` a bare (unwrapped) creation row
+/// spells — `use_named_constants`' contextually-const face (`const a =
+/// A(0)`), where the caller has already proven `in_const_context`. The
+/// row is a `Send`/`ImplicitCreation`/`ConstructorReference`/
+/// `NewExpression`; a member access without an argument list (`A.zero`)
+/// is a constant read, not a creation — upstream only visits the
+/// invocation shapes — so a bare `Send` must carry `Arguments`.
+#[must_use]
+pub(crate) fn bare_creation_extent<'a>(
+    unit: &Unit<'a>,
+    row: u32,
+) -> Option<(&'a str, core::ops::Range<u32>)> {
+    if unit.ast.kind(row) == NodeKind::Send && parse_callee(unit, row)?.args.is_none() {
+        return None;
+    }
+    creation_face(unit, row)
+}
+
+/// The bare-creation match: `named_constant_match` over a caller-resolved
+/// `type_name`/`extent` — the contextually-const entry point.
+#[must_use]
+pub(crate) fn matches_bare_constant<'a>(
+    unit: &'a Unit<'_>,
+    creation: u32,
+    type_name: &'a str,
+    extent: core::ops::Range<u32>,
+) -> Option<(&'a str, &'a str)> {
+    let index = ConstIndex::build(unit);
+    named_constant_match(unit, &index, creation, type_name, extent)
+}
+
+/// The shared tail of the named-constant proxy given the resolved
+/// `type_name` and the creation's comparison `extent`: the class lookup,
+/// the shape gate, the self-field guard, and the declaration-order field
+/// walk. `creation` is the outermost row the self-field guard reads.
+fn named_constant_match<'a>(
+    unit: &'a Unit<'_>,
+    index: &ConstIndex<'_>,
+    creation: u32,
+    type_name: &'a str,
+    extent: core::ops::Range<u32>,
+) -> Option<(&'a str, &'a str)> {
     let class_row = index.types.get(type_name).copied()?;
     if !matches!(
         unit.ast.kind(class_row),
@@ -123,6 +214,15 @@ pub(crate) fn matches_named_constant<'a>(
     if enclosing_static_field_class(unit, creation) == Some(class_row) {
         return None;
     }
+    // Upstream compares the *computed* values (`field.computeConstantValue()
+    // == value`, :79), not the spellings. When the created type stores no
+    // instance state — a discarded-parameter ctor (`const A(int value)`) or
+    // an extension type — the constant-evaluated `GenericState` field map is
+    // empty for every instance, so `A(1)` value-equals `A(0)`. The proxy
+    // reproduces that face by loosening the spelling equality to the callee
+    // name when the class carries no instance fields (the arguments never
+    // reach the stored state, so they are free).
+    let stateless = class_stateless(unit, class_row);
     for member in class_members(unit, class_row) {
         if unit.ast.kind(member) != NodeKind::Fields
             || mod_flags(unit.ast, member) & STATIC_BIT == 0
@@ -137,7 +237,9 @@ pub(crate) fn matches_named_constant<'a>(
                 if unit.ast.kind(field) != NodeKind::InitializedIdentifier {
                     continue;
                 }
-                if initializer_matches(unit, field, extent.clone()) {
+                if initializer_matches(unit, field, extent.clone())
+                    || (stateless && stateless_initializer_matches(unit, field, type_name))
+                {
                     let name = head_token(unit, field);
                     return Some((type_name, lexeme(unit, name)));
                 }
@@ -145,6 +247,42 @@ pub(crate) fn matches_named_constant<'a>(
         }
     }
     None
+}
+
+/// Whether the class-like declaration stores any instance state — a
+/// non-static `Fields` row. The upstream value comparison's empty
+/// `GenericState._fieldMap` face: a class carrying no instance fields
+/// makes every const instance of it structurally equal (`A(1) == A(0)`
+/// when the ctor discards the parameter).
+fn class_stateless(unit: &Unit<'_>, class_row: u32) -> bool {
+    !class_members(unit, class_row).into_iter().any(|member| {
+        unit.ast.kind(member) == NodeKind::Fields && mod_flags(unit.ast, member) & STATIC_BIT == 0
+    })
+}
+
+/// The stateless face of `initializer_matches`: the field's initializer
+/// is a creation of `type_name` — the arguments never reach the stored
+/// state, so their spellings are free. Only the callee name must match.
+fn stateless_initializer_matches(unit: &Unit<'_>, field: u32, type_name: &str) -> bool {
+    let range = unit.ast.token_range(field);
+    let Some(eq) = range.clone().find(|&token| lexeme(unit, token) == "=") else {
+        return false;
+    };
+    let read = |token: u32| (token < range.end).then(|| lexeme(unit, token));
+    let mut token = eq + 1;
+    if read(token) == Some("const") {
+        token += 1;
+    }
+    if read(token) != Some(type_name) {
+        return false;
+    }
+    // The optional `.selector` run (`C.named(…)`), then the argument list
+    // must follow — a tear-off or bare type reference is not a creation.
+    token += 1;
+    if read(token) == Some(".") {
+        token += 2; // dot + selector
+    }
+    read(token) == Some("(")
 }
 
 /// The unit's same-file const resolution index: class-like and enum names
@@ -269,11 +407,20 @@ fn able(unit: &Unit<'_>, index: &ConstIndex<'_>, row: u32) -> bool {
         | NodeKind::Qualified
         | NodeKind::Identifier
         | NodeKind::NoIdentifier
-        | NodeKind::FunctionName => true,
+        | NodeKind::FunctionName
+        // A constructor reference is a constant tear-off by shape (the
+        // upstream tear-off faces are constant regardless of the
+        // constructor's own `const`-ness); `NoCtorRefContinuation` is its
+        // recovery sentinel. Both also seal as sibling tiles inside a
+        // written `const` wrapper's extent — judging them false there
+        // would poison the wrapper's own verdict (the
+        // `C({1: const C(null)})` face).
+        | NodeKind::ConstructorReference
+        | NodeKind::NoCtorRefContinuation => true,
         // Every other shape — assignments, awaits, throws, closures,
         // cascades, indexing, spreads, loop and null-aware elements,
-        // constructor references, postfix mutations, recovery sentinels —
-        // is not a constant expression by shape.
+        // postfix mutations, recovery sentinels — is not a constant
+        // expression by shape.
         _ => false,
     }
 }
@@ -460,8 +607,135 @@ fn creation_able(unit: &Unit<'_>, index: &ConstIndex<'_>, row: u32) -> bool {
     let Some(class_row) = index.types.get(type_name).copied() else {
         return false;
     };
-    const_ctor_face(unit, class_row, ctor_name)
-        && args.is_some_and(|args| extent_able(unit, index, args))
+    if !const_ctor_face(unit, class_row, ctor_name) {
+        return false;
+    }
+    if let Some(args) = args
+        && !extent_able(unit, index, args)
+    {
+        return false;
+    }
+    !written_type_args_name_type_variable(unit, row, args, creation_extent(unit, row))
+}
+
+/// The written-type-argument face of `canBeConst`: a written type argument
+/// naming an in-scope type variable bails — type variables never appear in
+/// a constant creation (`const C<T>()` is a constant-creation error), the
+/// upstream `test_cannotBeConst_explicitTypeArgument_typeVariable_*`
+/// faces. The scan covers the creation's whole token extent — the header's
+/// own type arguments (`C<T>(…)`) and nested ones inside the arguments
+/// (`C(p: <T>[])`). The in-scope names are the `TypeVariables` rows along
+/// the ancestor chain (class and function headers tile beside their
+/// declaration row under the top-level wrapper, so each climbed level
+/// reads its sibling run); sibling declarations' variables collect too,
+/// which only ever silences code whose written type argument is already
+/// an undefined-identifier error row.
+fn written_type_args_name_type_variable(
+    unit: &Unit<'_>,
+    row: u32,
+    args: Option<u32>,
+    extent: (u32, u32),
+) -> bool {
+    let (start, end) = extent;
+    let mut names = Vec::new();
+    let mut current = unit.ast.parent(row);
+    while let Some(node) = current {
+        for kid in child_rows(unit, node) {
+            if unit.ast.kind(kid) == NodeKind::TypeVariables {
+                for var in child_rows(unit, kid) {
+                    if unit.ast.kind(var) == NodeKind::TypeVariable {
+                        names.push(lexeme(unit, head_token(unit, var)));
+                    }
+                }
+            }
+        }
+        current = unit.ast.parent(node);
+    }
+    if names.is_empty() {
+        return false;
+    }
+    // The header face: the type arguments tile beside the send chain in
+    // the owner run.
+    let mut current = unit.ast.parent(row);
+    while let Some(node) = current {
+        for kid in child_rows(unit, node) {
+            if unit.ast.kind(kid) == NodeKind::TypeArguments
+                && nested(unit, kid, start..end)
+                && type_args_name_variable(unit, kid, &names)
+            {
+                return true;
+            }
+        }
+        current = unit.ast.parent(node);
+    }
+    // The nested face: type arguments inside the arguments' subtree
+    // (`C(p: <T>[])` — the parens' contents tile under the arguments).
+    if let Some(args) = args
+        && scan_type_arguments_named(unit, args, &names)
+    {
+        return true;
+    }
+    false
+}
+
+/// Whether any [`NodeKind::TypeArguments`] row in `row`'s subtree names
+/// `names` (the arguments-subtree descent; spans nest strictly, so the
+/// recursion terminates).
+fn scan_type_arguments_named(unit: &Unit<'_>, row: u32, names: &[&str]) -> bool {
+    for kid in child_rows(unit, row) {
+        match unit.ast.kind(kid) {
+            NodeKind::TypeArguments if type_args_name_variable(unit, kid, names) => return true,
+            _ => {
+                if scan_type_arguments_named(unit, kid, names) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The whole creation's token extent — the send chain's receiver head
+/// through the arguments' end; the implicit creation and the `new`
+/// keyword's tail span it directly.
+fn creation_extent(unit: &Unit<'_>, row: u32) -> (u32, u32) {
+    match unit.ast.kind(row) {
+        NodeKind::Send => parse_callee(unit, row).map_or_else(
+            || {
+                let range = unit.ast.token_range(row);
+                (range.start, range.end)
+            },
+            |callee| {
+                (
+                    callee.head,
+                    callee.args.map_or(unit.ast.token_range(row).end, |args| {
+                        unit.ast.token_range(args).end
+                    }),
+                )
+            },
+        ),
+        NodeKind::NewExpression => {
+            let end = new_tail(unit, row).map_or_else(
+                || unit.ast.token_range(row).end,
+                |(_, args)| unit.ast.token_range(args).end,
+            );
+            (head_token(unit, row), end)
+        }
+        _ => (head_token(unit, row), unit.ast.token_range(row).end),
+    }
+}
+
+/// Whether the `TypeArguments` row's written arguments (recursing through
+/// nested generics) name any of `names`.
+fn type_args_name_variable(unit: &Unit<'_>, args: u32, names: &[&str]) -> bool {
+    for kid in child_rows(unit, args) {
+        match unit.ast.kind(kid) {
+            NodeKind::Type if names.contains(&lexeme(unit, head_token(unit, kid))) => return true,
+            NodeKind::TypeArguments if type_args_name_variable(unit, kid, names) => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The `(type name, creation token extent)` a const-written creation row
@@ -559,6 +833,16 @@ fn send_able(unit: &Unit<'_>, index: &ConstIndex<'_>, send: u32) -> bool {
     let Some(callee) = parse_callee(unit, send) else {
         return false;
     };
+    // The written-type-argument face (`C<U>()`): the whole creation's
+    // extent runs from the chain head through the arguments.
+    let type_var_bail = |args: u32| {
+        written_type_args_name_type_variable(
+            unit,
+            send,
+            Some(args),
+            (callee.head, unit.ast.token_range(args).end),
+        )
+    };
     let creation_face = |selector: &str, args: u32| {
         index
             .types
@@ -569,9 +853,9 @@ fn send_able(unit: &Unit<'_>, index: &ConstIndex<'_>, send: u32) -> bool {
     };
     match (callee.args, callee.selector) {
         // Bare creation `C(...)`: a same-file const constructor.
-        (Some(args), None) => creation_face(callee.name, args),
+        (Some(args), None) => creation_face(callee.name, args) && !type_var_bail(args),
         // Member invocation `C.named(...)`: a named const constructor.
-        (Some(args), Some(selector)) => creation_face(selector, args),
+        (Some(args), Some(selector)) => creation_face(selector, args) && !type_var_bail(args),
         // Bare name: a top-level `const` variable.
         (None, None) => index.consts.contains_key(callee.name),
         // Member read `Color.red` / `K.z`: an enum value or a `static
@@ -581,12 +865,14 @@ fn send_able(unit: &Unit<'_>, index: &ConstIndex<'_>, send: u32) -> bool {
 }
 
 /// One send chain's callee as the const faces read it: the receiver head
-/// name, the selector spelling (`Some` for `C.named` / `Color.red`), and
-/// the tail segment's argument row (`None` for a bare read).
+/// name, the selector spelling (`Some` for `C.named` / `Color.red`), the
+/// tail segment's argument row (`None` for a bare read), and the chain
+/// head's first token (the whole-creation extent read).
 struct Callee<'a> {
     name: &'a str,
     selector: Option<&'a str>,
     args: Option<u32>,
+    head: u32,
 }
 
 /// The callee face of the send `send`: resolves the contiguous chain it
@@ -599,13 +885,39 @@ struct Callee<'a> {
 fn parse_callee<'s>(unit: &Unit<'s>, send: u32) -> Option<Callee<'s>> {
     let (run, pos) = owner_run(unit, send)?;
     // Chain endpoints by span contiguity: each segment's span starts
-    // exactly where the previous ended.
+    // exactly where the previous ended. A generic-instantiated receiver
+    // (`C<int>` of `C<int>.new`) leaves a `TypeArguments`/`Identifier` gap
+    // between its send and the tail — a leftward send separated only by
+    // send-group pieces still counts as the receiver.
     let mut head_pos = pos;
     loop {
         let start = unit.ast.token_range(run[head_pos]).start;
-        match run[..head_pos].iter().rposition(|&row| {
-            unit.ast.kind(row) == NodeKind::Send && unit.ast.token_range(row).end == start
-        }) {
+        let prev_send = run[..head_pos]
+            .iter()
+            .rposition(|&row| unit.ast.kind(row) == NodeKind::Send);
+        let receiver = prev_send.filter(|&prev| {
+            let prev_end = unit.ast.token_range(run[prev]).end;
+            prev_end <= start
+                && run[prev + 1..head_pos].iter().all(|&row| {
+                    matches!(
+                        unit.ast.kind(row),
+                        NodeKind::Identifier
+                            | NodeKind::NoTypeArguments
+                            | NodeKind::TypeArguments
+                            | NodeKind::TypeApplication
+                            | NodeKind::NoArguments
+                    )
+                        // The tail segment's own argument list tiles as a
+                        // flat run row inside the tail's span
+                        // (`C.named(1)`: the `Arguments` seals before the
+                        // `named (…)` send and sits between the receiver
+                        // and the tail in completion-window order) — rows
+                        // span-nested inside the tail are its own pieces.
+                        || (unit.ast.kind(row) == NodeKind::Arguments
+                            && unit.ast.token_range(row).start >= start)
+                })
+        });
+        match receiver {
             Some(prev) => head_pos = prev,
             None => break,
         }
@@ -653,6 +965,7 @@ fn parse_callee<'s>(unit: &Unit<'s>, send: u32) -> Option<Callee<'s>> {
         name,
         selector,
         args,
+        head: head_token(unit, run[head_pos]),
     })
 }
 
@@ -695,6 +1008,12 @@ fn creation_parts<'s>(unit: &Unit<'s>, row: u32) -> Option<(&'s str, &'s str, Op
 /// The written name read: a named constructor's selector is its second
 /// `Identifier` child (`const C . x` — the span head stays at `C`), so
 /// the match runs over the member's identifier children, not the head.
+/// The primary-constructor face (`class const C(…)` / `class const
+/// C.named(…)`, `extension type const E(…)`) rides the header
+/// [`NodeKind::PrimaryConstructor`] row: payload word 1 is the `const`
+/// keyword (`TOKEN_NONE` when absent), and the
+/// `PrimaryConstructorDeclaration`-context identifier spells the `.named`
+/// selector — the unnamed face answers when no selector row exists.
 fn const_ctor_face(unit: &Unit<'_>, class_row: u32, selector: &str) -> bool {
     let class_name = declaration_name(unit, class_row);
     let unnamed = selector == "new" || Some(selector) == class_name;
@@ -704,15 +1023,98 @@ fn const_ctor_face(unit: &Unit<'_>, class_row: u32, selector: &str) -> bool {
     class_members(unit, class_row).into_iter().any(|member| {
         unit.ast.kind(member) == NodeKind::Constructor
             && spells_const_back(unit, member, class_name)
-            && child_rows(unit, member).into_iter().any(|kid| {
-                unit.ast.kind(kid) == NodeKind::Identifier
-                    && lexeme(unit, head_token(unit, kid)) == wanted
-            })
-    })
+            && match ctor_member_selector(unit, member) {
+                // The unnamed face spells the class name (`const C()`),
+                // the `new` declaring-constructor keyword (`const new()`),
+                // or nothing at all (the tiling with no anchored name —
+                // `declares_new_ctor` reads the token before the header).
+                // A named constructor's class-name identifier must NOT
+                // satisfy the unnamed face: `const C._()` leaves `C()`
+                // resolving to a factory/absent unnamed constructor.
+                Some(s) => s == wanted || (unnamed && s == "new"),
+                None => unnamed && declares_new_ctor(unit, member),
+            }
+    }) || primary_ctor_const_face(unit, class_row, class_name, selector)
+}
+
+/// The `const new()` declaring-constructor face: the production tiling
+/// anchors no name identifier on the constructor row — the `new` keyword
+/// sits one token before the parameter list's `(` (the row's span head),
+/// with a `NoIdentifier` marker child standing in for the name.
+fn declares_new_ctor(unit: &Unit<'_>, member: u32) -> bool {
+    unit.ast
+        .token_range(member)
+        .start
+        .checked_sub(1)
+        .is_some_and(|prev| lexeme(unit, prev) == "new")
+}
+
+/// The primary-constructor const face: the class-like's own
+/// [`NodeKind::PrimaryConstructor`] child carries the header `const` and,
+/// for a `.named` spelling, the selector identifier.
+fn primary_ctor_const_face(
+    unit: &Unit<'_>,
+    class_row: u32,
+    class_name: Option<&str>,
+    selector: &str,
+) -> bool {
+    child_rows(unit, class_row)
+        .into_iter()
+        .find(|&kid| unit.ast.kind(kid) == NodeKind::PrimaryConstructor)
+        .is_some_and(|primary| {
+            // Payload word 1 is the `const` keyword (TOKEN_NONE when absent);
+            // word 2 is `has_constructor_name`.
+            let const_kw = unit.ast.payload(primary).get(1).copied();
+            if const_kw.is_none_or(|kw| kw == dartq_ast::TOKEN_NONE) {
+                return false;
+            }
+            let named = child_rows(unit, primary)
+                .into_iter()
+                .find(|&kid| {
+                    unit.ast.kind(kid) == NodeKind::Identifier
+                        && unit.ast.payload(kid).first().copied()
+                            == Some(
+                                dartq_parser::IdentifierContext::PrimaryConstructorDeclaration
+                                    as u32,
+                            )
+                })
+                .map(|kid| lexeme(unit, head_token(unit, kid)));
+            if selector == "new" || Some(selector) == class_name {
+                named.is_none()
+            } else {
+                named == Some(selector)
+            }
+        })
+}
+
+/// The dot-shorthand creation face (`.new(…)` / `.named(…)` under a
+/// written context type): `type_name` is the caller-resolved context type
+/// and `selector` the shorthand's callee head (`new` for the unnamed
+/// constructor). Every argument is judged through the argument list's
+/// extent — the same `canBeConst` the named faces use, with the class
+/// resolution done by the caller.
+#[must_use]
+pub(crate) fn send_shorthand_able(
+    unit: &Unit<'_>,
+    type_name: &str,
+    selector: &str,
+    args: u32,
+) -> bool {
+    let index = ConstIndex::build(unit);
+    index
+        .types
+        .get(type_name)
+        .copied()
+        .is_some_and(|class_row| const_ctor_face(unit, class_row, selector))
+        && extent_able(unit, &index, args)
 }
 
 /// The member-const face: `type.selector` is an enum value or a `static
-/// const` field of the same-file type.
+/// const` field of the same-file type — or a constant tear-off: a
+/// constructor (`C.new`, `C.named` — the tear-off captures the
+/// constructor, so its own `const`-ness is immaterial to the tear-off's
+/// constancy) or a `static` method (`C.m`). An instance member or a
+/// `static var`/`static final` read stays non-const (the under-report).
 fn member_const_face(
     unit: &Unit<'_>,
     index: &ConstIndex<'_>,
@@ -724,12 +1126,70 @@ fn member_const_face(
     };
     match unit.ast.kind(type_row) {
         NodeKind::EnumDeclaration => enum_value_names(unit, type_row).contains(&selector),
-        _ => class_members(unit, type_row).into_iter().any(|member| {
-            unit.ast.kind(member) == NodeKind::Fields
-                && mod_flags(unit.ast, member) & STATIC_BIT != 0
-                && static_const_names(unit, member).contains(&selector)
-        }),
+        _ => {
+            let members = class_members(unit, type_row);
+            // No generative constructor declared — the implicit default
+            // answers `new` (a factory does not suppress it): the
+            // `final c = CInference.new;` tear-off face.
+            if selector == "new"
+                && !members
+                    .iter()
+                    .any(|&member| unit.ast.kind(member) == NodeKind::Constructor)
+            {
+                return true;
+            }
+            members.into_iter().any(|member| {
+                match unit.ast.kind(member) {
+                    NodeKind::Fields => {
+                        mod_flags(unit.ast, member) & STATIC_BIT != 0
+                            && static_const_names(unit, member).contains(&selector)
+                    }
+                    // A constructor tear-off: `C.new` / `C.named` — the
+                    // `new` selector and the class's own name spell the
+                    // unnamed constructor; otherwise the second identifier is
+                    // the named selector (the `const_ctor_face` header read,
+                    // minus the `const` requirement — a tear-off is constant
+                    // even over a non-const constructor).
+                    NodeKind::Constructor => {
+                        ctor_member_selector(unit, member).is_some_and(|s| s == selector)
+                            || (selector == "new"
+                                && ctor_member_selector(unit, member)
+                                    .is_none_or(|s| s == type_name || s == "new"))
+                    }
+                    // A static-method tear-off: `static T m(…)` — the head
+                    // names the method; `get`/`set` accessors are not
+                    // tear-off-able as `C.m` (a `static` getter reads as a
+                    // static property — still non-const upstream).
+                    NodeKind::Method => {
+                        mod_flags(unit.ast, member) & STATIC_BIT != 0
+                            && lexeme(unit, head_token(unit, member)) == selector
+                    }
+                    _ => false,
+                }
+            })
+        }
     }
+}
+
+/// A constructor member's selector: the class name or `new` for the
+/// unnamed face (`const C()` / `const new()`), the `.named` identifier
+/// for a named constructor (`C.named` — the second `Identifier` whose
+/// context is the method-continuation marker).
+fn ctor_member_selector<'s>(unit: &Unit<'s>, member: u32) -> Option<&'s str> {
+    let mut ids = child_rows(unit, member)
+        .into_iter()
+        .filter(|&kid| unit.ast.kind(kid) == NodeKind::Identifier);
+    let first = ids.next()?;
+    // A named constructor's selector rides the continuation-context
+    // identifier; the unnamed face's own name is the answer.
+    for id in ids {
+        if unit.ast.payload(id).first().copied()
+            == Some(dartq_parser::IdentifierContext::MethodDeclarationContinuation as u32)
+        {
+            return Some(lexeme(unit, head_token(unit, id)));
+        }
+    }
+    Some(lexeme(unit, head_token(unit, first)))
 }
 
 /// The member rows of a class-like declaration (its body's children).
@@ -783,6 +1243,13 @@ fn static_const_names<'s>(unit: &Unit<'s>, fields: u32) -> Vec<&'s str> {
 /// `class_declaration_name` face in rules/mod.rs); hand-built trees may
 /// nest it inside the row.
 fn declaration_name<'s>(unit: &Unit<'s>, row: u32) -> Option<&'s str> {
+    // The extension type's name never tiles as an `Identifier` child —
+    // `begin_extension_type_declaration` patches it into payload word 2.
+    if unit.ast.kind(row) == NodeKind::ExtensionTypeDeclaration {
+        if let Some(&name) = unit.ast.payload(row).get(2) {
+            return Some(lexeme(unit, name));
+        }
+    }
     let is_name = |kid: u32| {
         unit.ast.kind(kid) == NodeKind::Identifier
             && matches!(
@@ -815,6 +1282,38 @@ fn top_level_const_name<'s>(unit: &Unit<'s>, field: u32) -> Option<&'s str> {
         .then(|| lexeme(unit, head_token(unit, field)))
 }
 
+/// Whether the unit's library directive spells `library meta;` — the
+/// declaring-library gate the analyzer applies to the package:meta
+/// annotations (`_isPackageMetaGetter`/`_isPackageMetaConstructor`,
+/// `element.library.name == 'meta'`). The annotation faces
+/// (`@literal`, `@immutable`/`@Immutable`) are recognized only over it,
+/// so a corpus importing an unnamed vendored meta — the oracle's own
+/// observed face — never recognizes them.
+pub(crate) fn spells_meta_library(unit: &Unit<'_>) -> bool {
+    let Some(root) = unit.ast.root() else {
+        return false;
+    };
+    for top in child_rows(unit, root) {
+        // Directives wrap in a `TopLevelDeclaration` prelude row; the
+        // directive is its first child.
+        let node = if unit.ast.kind(top) == NodeKind::TopLevelDeclaration {
+            child_rows(unit, top).first().copied()
+        } else {
+            Some(top)
+        };
+        let Some(node) = node else {
+            continue;
+        };
+        if unit.ast.kind(node) != NodeKind::LibraryName {
+            continue;
+        }
+        // The row anchors at the `library` keyword; the name follows it.
+        let name = head_token(unit, node) + 1;
+        return lexeme(unit, name) == "meta";
+    }
+    false
+}
+
 /// Whether the declaration's modifier run spells `const` (a forward scan
 /// from the span head — the run is the head-when-present modifier
 /// sequence, bounded by the grammar to a couple of tokens).
@@ -845,6 +1344,9 @@ fn spells_const_back(unit: &Unit<'_>, row: u32, class_name: Option<&str>) -> boo
             "const" => return true,
             lexeme if MODIFIER_LEXEMES.contains(&lexeme) => {}
             "." => {}
+            // The `const new()` declaring-constructor face: `new` stands
+            // where the class name otherwise anchors the walk.
+            "new" => {}
             lexeme if Some(lexeme) == class_name => {}
             _ => return false,
         }
@@ -929,6 +1431,59 @@ fn inner_creation(unit: &Unit<'_>, wrapper: u32) -> Option<u32> {
     })
 }
 
+/// The `const <creation>` operand a constant pattern spells (`case const
+/// A(0)`, `if (x case const A(0))`): `(type name, comparison extent)`.
+/// Production tiling adopts only the argument list and its operand rows
+/// under the `ConstantPattern`; the callee's send chain tiles as flat
+/// rows span-nested beside the pattern inside the enclosing statement's
+/// completion window — the pattern's `const` keyword takes the span head
+/// and the `A` send sits one parent level up. The extent runs from the
+/// chain head through the arguments' end — the upstream
+/// `InstanceCreationExpression` node's own extent, so the caller reports
+/// it rather than the pattern row.
+#[must_use]
+pub(crate) fn pattern_creation<'s>(
+    unit: &Unit<'s>,
+    pattern: u32,
+) -> Option<(&'s str, core::ops::Range<u32>)> {
+    let args = child_rows(unit, pattern)
+        .into_iter()
+        .find(|&kid| unit.ast.kind(kid) == NodeKind::Arguments)?;
+    let args_range = unit.ast.token_range(args);
+    let pat_start = unit.ast.token_range(pattern).start;
+    // The send chain the operand spells: every `Send` row whose span
+    // nests inside the pattern before the arguments — flat siblings in
+    // an ancestor window, so the scan climbs owner windows until the
+    // level that carries them (`if`-condition: the `ParenthesizedCondition`
+    // window holds only the pattern; the statement's holds the sends).
+    let mut sends = Vec::new();
+    let mut owner = unit.ast.parent(pattern);
+    while let Some(node) = owner {
+        sends.extend(unit.ast.children(node).filter(|&row| {
+            unit.ast.kind(row) == NodeKind::Send
+                && unit.ast.token_range(row).start >= pat_start
+                && unit.ast.token_range(row).end <= args_range.start
+        }));
+        if sends
+            .iter()
+            .any(|&row| unit.ast.token_range(row).end == args_range.start)
+        {
+            break;
+        }
+        owner = unit.ast.parent(node);
+    }
+    // `C(0)` is one send; `C.named(0)` is the receiver plus the selector
+    // tail. A chain past the first selector is never a const face.
+    sends.sort_unstable_by_key(|&row| unit.ast.token_range(row).start);
+    sends.dedup();
+    if sends.is_empty() || sends.len() > 2 {
+        return None;
+    }
+    let head = sends[0];
+    let name = lexeme(unit, head_token(unit, head));
+    Some((name, unit.ast.token_range(head).start..args_range.end))
+}
+
 /// The row's owner run: the parent window's direct rows (parent-linked,
 /// the clean-window posture — expression containers never carry the
 /// switch-member borrow) with the row's position.
@@ -961,7 +1516,7 @@ fn lexeme<'s>(unit: &Unit<'s>, token: u32) -> &'s str {
 mod w3_const_pins {
     use dartq_ast::NodeKind;
 
-    use super::{head_token, is_const_able, lexeme, matches_named_constant};
+    use super::{head_token, is_const_able, lexeme, matches_named_constant, spells_meta_library};
     use crate::engine::Unit;
     use crate::engine::narrow_u32;
     use crate::testsupport::Fixture;
@@ -1065,6 +1620,88 @@ mod w3_const_pins {
                 assert!(!is_const_able(&unit, row), "{name}-send must bail");
             }
         }
+    }
+
+    /// The unnamed face is selector-correct: a class whose only const
+    /// constructor is NAMED (`._`) never makes the unnamed creation
+    /// const-able — the unnamed constructor resolves elsewhere (absent or
+    /// a factory, the upstream test_no_lint_factorySome face) — while the
+    /// unnamed const constructor answers its own face.
+    #[test]
+    fn const_ctor_face_is_selector_correct() {
+        {
+            let source = "class A {\n  const A._();\n}\nvoid f() {\n  A();\n}\n";
+            let f = Fixture::parse(source);
+            let unit = unit(&f);
+            let bare = sends_named(&f, &unit, "A")[0];
+            assert!(!is_const_able(&unit, bare), "named-only class must bail");
+        }
+        {
+            let source = "class A {\n  const A._();\n  const A();\n}\nvoid f() {\n  A();\n}\n";
+            let f = Fixture::parse(source);
+            let unit = unit(&f);
+            let bare = sends_named(&f, &unit, "A")[0];
+            assert!(is_const_able(&unit, bare), "unnamed const ctor answers");
+        }
+    }
+
+    /// A written type argument naming an in-scope type variable bails —
+    /// the header face (`C<U>()`) and the nested face (`K(p: <T>[])`) —
+    /// while a concrete written argument answers.
+    #[test]
+    fn written_type_arguments_name_type_variables() {
+        {
+            let source = "class C<T> {\n  const C();\n}\nvoid f<U>() {\n  C<U>();\n}\n";
+            let f = Fixture::parse(source);
+            let unit = unit(&f);
+            let bare = sends_named(&f, &unit, "C")[0];
+            assert!(!is_const_able(&unit, bare), "header <U> must bail");
+        }
+        {
+            let source =
+                "class K<T> {\n  const K({required List<T> p});\n  K m() => K(p: <T>[]);\n}\n";
+            let f = Fixture::parse(source);
+            let unit = unit(&f);
+            let bare = sends_named(&f, &unit, "K")[0];
+            assert!(!is_const_able(&unit, bare), "nested <T> must bail");
+        }
+        let source = "class C<T> {\n  const C();\n}\nvar v = C<int>();\n";
+        let f = Fixture::parse(source);
+        let unit = unit(&f);
+        let bare = sends_named(&f, &unit, "C")[0];
+        assert!(is_const_able(&unit, bare), "<int> answers");
+    }
+
+    /// The meta-library face: only `library meta;` answers — the gate the
+    /// `@literal`/`@immutable` annotation reads ride.
+    #[test]
+    fn meta_library_name_face() {
+        for (source, want) in [
+            ("library meta;\nvar x = 1;\n", true),
+            ("library other;\nvar x = 1;\n", false),
+            ("library;\nvar x = 1;\n", false),
+            ("var x = 1;\n", false),
+        ] {
+            let f = Fixture::parse(source);
+            assert_eq!(spells_meta_library(&unit(&f)), want, "{source}");
+        }
+    }
+
+    /// The tear-off faces: `C.new` over a class with no generative
+    /// constructor answers the implicit default (the
+    /// prefer_const_declarations corpus face); over `const F._()` it
+    /// answers false — the generative constructor suppresses the
+    /// implicit `new`.
+    #[test]
+    fn tearoff_implicit_new_face() {
+        let f = Fixture::parse(
+            "class CI<T> {}\nclass F {\n  factory F() => g();\n  const F._();\n}\nvoid g() {\n  final a = CI<int>.new;\n  final b = F.new;\n}\n",
+        );
+        let unit = unit(&f);
+        let news = sends_named(&f, &unit, "new");
+        assert_eq!(news.len(), 2);
+        assert!(is_const_able(&unit, news[0]), "CI<int>.new");
+        assert!(!is_const_able(&unit, news[1]), "F.new over const F._()");
     }
 
     /// The named-constant proxy: `const Color(1)` matches the class's
