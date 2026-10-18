@@ -69,7 +69,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 
 use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, SourceRange};
-use dartq_engine::analysis_options::{AnalysisOptions, is_known_diagnostic_code};
+use dartq_engine::analysis_options::{
+    AnalysisOptions, canonical_diagnostic_name, is_known_diagnostic_code,
+};
 use dartq_engine::{Engine, LibraryId, Reachability};
 use dartq_flow::FlowFact;
 use dartq_language::{DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion};
@@ -236,6 +238,17 @@ pub(crate) const SEMANTIC_PARSE_FEATURES: ParserFeatures = ParserFeatures {
 /// rules' generation does).
 fn type_use_rule_enabled(set: &EnableSet) -> bool {
     rule_by_name("avoid_private_typedef_functions").is_some_and(|id| set.is_enabled(id))
+}
+
+/// Whether `set` arms the `unnecessary_ignore` analyzer-half join (#2132):
+/// the rule's own enable bit, a mount predicate separate from the fold's
+/// ([`mounts_semantics`]). The join's substrate builds per citing file
+/// inside the fan-out — the graph and element tables only, never the full
+/// `Analysis` fold, which stays keyed to [`crate::lints`]' fold-consuming
+/// rules — so a corpus enabling the rule without any fold consumer reaches
+/// the analyzer half instead of the pre-#2132 dark silence.
+fn unnecessary_ignore_enabled(set: &EnableSet) -> bool {
+    rule_by_name("unnecessary_ignore").is_some_and(|id| set.is_enabled(id))
 }
 
 /// The semantic rows' library-context generation: a fold over the owning
@@ -740,10 +753,18 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
             // The semantic fold's generation half: folded only where the set
             // makes rows sibling-dependent — the fold-facing rules read the
             // library context (the query face and the async-gap facts
-            // alike), and the library type-use face (#1640) folds the
-            // member units' contents. A sibling's edit re-keys this file's
-            // rows either way.
-            if mounts_semantics(set) || type_use_rule_enabled(set) {
+            // alike), the library type-use face (#1640) folds the member
+            // units' contents, and the `unnecessary_ignore` analyzer half
+            // (#2132) re-folds over the same member-derived substrate. The
+            // citation probe that would narrow that last case needs a scan
+            // this parse-free partition doesn't pay, so the rule's enable
+            // bit keys the generation half — over-keying, the safe
+            // direction. A sibling's edit re-keys this file's rows in every
+            // mounted case.
+            if mounts_semantics(set)
+                || type_use_rule_enabled(set)
+                || unnecessary_ignore_enabled(set)
+            {
                 semantic_generation(engine, *file, &library_members)
             } else {
                 None
@@ -974,18 +995,46 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
             // consumption facts come from one neutralized re-fold: the
             // `ignore` keywords rewrite to same-length filler inside comment
             // bytes only, the fold sees no suppression entries, and its rows
-            // are the pre-filter production set. Gated on the semantic
-            // context (a fold-less posture keeps the pre-#2116 silence — the
-            // under-report direction — never a false row) and on the probe:
-            // only a file citing a known diagnostic code pays the fold.
-            if let Some((context, strict)) = &context {
+            // are the pre-filter production set. Gated on the rule (#2132 —
+            // the mount predicate is the rule's enable bit, not the fold's:
+            // a corpus enabling it with no fold-consuming rule reaches this
+            // half instead of the pre-#2132 dark silence, the under-report
+            // direction — never a false row) and on the probe: only a file
+            // citing a known diagnostic code pays the substrate and the
+            // fold.
+            if unnecessary_ignore_enabled(set) {
                 let comments = Comments::extract(text, &parsed.tokens);
                 let ignore = IgnoreInfo::parse(text, &comments);
                 let entries = ignore.name_entries(text);
+                // The citation match (ignore_info.dart:39-52) admits a name
+                // OR a uniqueName spelling — a uniqueName citation can
+                // suppress a diagnostic, so the fold is paid either way
+                // (#2131/#2136). The unnecessary report filter itself stays
+                // name-only (ignore_validator.dart:208-213).
                 if entries
                     .iter()
-                    .any(|entry| is_known_diagnostic_code(&entry.name))
+                    .any(|entry| is_known_diagnostic_code(&entry.name)
+                        || canonical_diagnostic_name(&entry.name).is_some())
                 {
+                    // The substrate (#2132): the shell's mount when a
+                    // fold-consuming rule needs the Analysis anyway, a
+                    // per-hit build otherwise — the probe gate above keeps
+                    // the tables to the files whose citations can answer,
+                    // and the full `Analysis` fold never runs for this face
+                    // alone.
+                    let join_context;
+                    let (context, strict) = match &context {
+                        Some(mounted) => (&mounted.0, mounted.1),
+                        None => {
+                            join_context = (
+                                build_semantic_context(engine, text, file, members),
+                                stricts.get(dir).copied().expect(
+                                    "strict modes precomputed for every resident file's directory",
+                                ),
+                            );
+                            (&join_context.0, join_context.1)
+                        }
+                    };
                     let neutral = neutralize_ignore_keywords(text, &comments);
                     let posture = LibraryClassModifiers::default();
                     let fold = fold_unit(
@@ -998,7 +1047,7 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
                         &context.graph,
                         &context.namespaces,
                         &context.index,
-                        *strict,
+                        strict,
                         &posture,
                         true,
                     );
@@ -1010,10 +1059,16 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
                         .chain(fold.parse_diagnostics.iter())
                     {
                         let name = diagnostic.code.name;
-                        if entries
-                            .iter()
-                            .any(|entry| entry.name.eq_ignore_ascii_case(name))
-                        {
+                        // Suppression match = name OR uniqueName
+                        // (ignore_info.dart:39-52): a citation of a
+                        // uniqueName suppresses the diagnostic reported
+                        // under its shared name, and the record keeps the
+                        // canonical name (#2136).
+                        if entries.iter().any(|entry| {
+                            entry.name.eq_ignore_ascii_case(name)
+                                || canonical_diagnostic_name(&entry.name)
+                                    .is_some_and(|c| c.eq_ignore_ascii_case(name))
+                        }) {
                             let (line, _) =
                                 parsed.lines.line_col_utf16(text, diagnostic.range.offset);
                             suppressed.push((line, name));
@@ -1025,6 +1080,7 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
                         cannot_ignore,
                         &suppressed,
                         is_known_diagnostic_code,
+                        canonical_diagnostic_name,
                     ));
                 }
             }
@@ -1827,6 +1883,148 @@ mod tests {
             "the semantic row still flows: {rows:?}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Drives the full pipeline over a fixture workspace and returns the
+    /// `unnecessary_ignore` rows as (file path, offset) pairs — the shared
+    /// harness of the #2132 gating pins. The `files` slice carries the
+    /// options entry, exactly as [`crate::workspace::test_fixture::workspace`]
+    /// takes it.
+    fn unnecessary_ignore_rows_for(tag: &str, files: &[(&str, &str)]) -> Vec<(String, u32)> {
+        let root = crate::workspace::test_fixture::workspace(tag, files);
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("run");
+        let rows = run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unnecessary_ignore")
+            .map(|d| {
+                let path = engine
+                    .file_table()
+                    .path(d.file)
+                    .map_or_else(String::new, |path| path.display().to_string());
+                (path, d.range.offset)
+            })
+            .collect();
+        std::fs::remove_dir_all(&root).ok();
+        rows
+    }
+
+    /// The #2132 gate: a corpus enabling `unnecessary_ignore` with no
+    /// fold-consuming rule reaches the analyzer half. An unused citation of
+    /// a known diagnostic code reports at the name token (the pre-#2132
+    /// posture left it dark); the same code, produced on the cited line,
+    /// keeps the citation silent — the join's substrate builds per citing
+    /// file and the full `Analysis` fold never runs.
+    #[test]
+    fn analyzer_half_reaches_fold_less_corpora() {
+        let rows = unnecessary_ignore_rows_for(
+            "lints_ignore_gate_foldless",
+            &[
+                (
+                    "analysis_options.yaml",
+                    "linter:\n  rules:\n    - unnecessary_ignore\n",
+                ),
+                (
+                    "lib/cites.dart",
+                    "// ignore: undefined_identifier\nvoid f() {}\n",
+                ),
+                (
+                    "lib/uses.dart",
+                    "void f() {\n  // ignore: undefined_identifier\n  var x = unknown;\n}\n",
+                ),
+            ],
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].0.ends_with("lib/cites.dart"), "{:?}", rows[0].0);
+        assert_eq!(rows[0].1, 11, "the name token after `// ignore: `");
+    }
+
+    /// The fold-mounted posture is unchanged (#2132's invariant): with a
+    /// fold-consuming rule also enabled the same citation faces answer
+    /// identically — the join takes the shell's mounted substrate and the
+    /// verdicts hold.
+    #[test]
+    fn fold_mounted_corpus_keeps_the_analyzer_half_verdicts() {
+        let rows = unnecessary_ignore_rows_for(
+            "lints_ignore_gate_mounted",
+            &[
+                (
+                    "analysis_options.yaml",
+                    "linter:\n  rules:\n    - unnecessary_ignore\n    - avoid_print\n",
+                ),
+                (
+                    "lib/cites.dart",
+                    "// ignore: undefined_identifier\nvoid f() {}\n",
+                ),
+                (
+                    "lib/uses.dart",
+                    "void f() {\n  // ignore: undefined_identifier\n  var x = unknown;\n}\n",
+                ),
+            ],
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].0.ends_with("lib/cites.dart"), "{:?}", rows[0].0);
+        assert_eq!(rows[0].1, 11);
+    }
+
+    /// The #2136 join (#2131's deferred consumer): a `uniqueName` citation
+    /// is now a recognized analyzer-code citation — the joined probe pays
+    /// the fold for it — while the name-only report filter
+    /// (ignore_validator.dart:208-213) keeps the entry silent: no
+    /// `unnecessary_ignore` row either way, exactly as upstream
+    /// (necessaryIgnore_uniqueName fixtures). Fold-less corpus.
+    #[test]
+    fn unique_name_citation_stays_silent_fold_less() {
+        let rows = unnecessary_ignore_rows_for(
+            "lints_ignore_gate_uniquename",
+            &[
+                (
+                    "analysis_options.yaml",
+                    "linter:\n  rules:\n    - unnecessary_ignore\n",
+                ),
+                (
+                    "lib/unique.dart",
+                    "// ignore: invalid_null_aware_operator_after_short_circuit\nvoid f() {}\n",
+                ),
+                (
+                    "lib/named.dart",
+                    "// ignore: undefined_identifier\nvoid f() {}\n",
+                ),
+            ],
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].0.ends_with("lib/named.dart"), "{:?}", rows[0].0);
+    }
+
+    /// Same #2136 verdict under the fold-mounted posture: the uniqueName
+    /// citation stays silent and the unused name citation still reports —
+    /// the join holds identically on the mounted substrate.
+    #[test]
+    fn unique_name_citation_stays_silent_fold_mounted() {
+        let rows = unnecessary_ignore_rows_for(
+            "lints_ignore_gate_uniquename_mounted",
+            &[
+                (
+                    "analysis_options.yaml",
+                    "linter:\n  rules:\n    - unnecessary_ignore\n    - avoid_print\n",
+                ),
+                (
+                    "lib/unique.dart",
+                    "// ignore: invalid_null_aware_operator_after_short_circuit\nvoid f() {}\n",
+                ),
+                (
+                    "lib/named.dart",
+                    "// ignore: undefined_identifier\nvoid f() {}\n",
+                ),
+            ],
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].0.ends_with("lib/named.dart"), "{:?}", rows[0].0);
     }
 
     /// The type-check mirror's differential face: the row emits always-on

@@ -220,6 +220,7 @@
 //! `ReplaceWithBrackets` face on a construct body (`while (x) ;` →
 //! `while (x) {}`).
 
+use dartq_diagnostics::Diagnostic;
 use dartq_scanner::TokenTable;
 use dartq_source::SourceRange;
 
@@ -265,8 +266,13 @@ use crate::fix::{
 
 /// The evidence one fix expansion reads: the file text, the diagnostic's
 /// UTF-16 span, its problem message, the token stream when the run
-/// parsed one, and the hit file's own path — the last only the
-/// cross-file producers read.
+/// parsed one, the hit file's own path — the last only the
+/// cross-file producers read — and the file's whole semantic diagnostic
+/// set, the one producer that reads it being the whole-file
+/// `directives_ordering` organize (the official `ImportOrganizer` takes the
+/// resolved unit's diagnostics: the unused-import and shown-name removal
+/// legs match rows at URI/name offsets and the unresolved-identifier gate
+/// reads the file, not the hit).
 pub struct FixInput<'a> {
     pub text: &'a str,
     pub range: core::ops::Range<u32>,
@@ -284,6 +290,10 @@ pub struct FixInput<'a> {
     /// file-relative, and the `part` face's `part of` head names the hit
     /// file itself).
     pub path: &'a std::path::Path,
+    /// The file's semantic diagnostics (the engine's rows, in production
+    /// order). Only the whole-file organize reads it; every other producer
+    /// sees an empty slice.
+    pub diagnostics: &'a [Diagnostic],
 }
 
 /// Which pipeline serves the code — the executors filter on it (a lint hit

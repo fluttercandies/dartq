@@ -899,7 +899,7 @@ pub fn collect_set_with_evidence(
         } else {
             run(&parsed.unit(Some(path)), set, unignorable)
         };
-        let mut applied = from_lints(&hits, &text, &parsed.lines, path, &fuse);
+        let mut applied = from_lints(&hits, &text, &parsed.lines, path, semantic_rows, &fuse);
         if fuse.tripped() {
             break 'files;
         }
@@ -1729,6 +1729,7 @@ pub(crate) fn from_lints(
     text: &str,
     lines: &LineIndex,
     path: &Path,
+    semantic: &[Diagnostic],
     fuse: &PlannerFuse,
 ) -> Vec<RuleFix> {
     // The structural rewriters verify against the token stream (keyword
@@ -1757,6 +1758,7 @@ pub(crate) fn from_lints(
             message: &hit.message,
             tokens: tokens.as_ref(),
             path,
+            diagnostics: semantic,
         };
         if let Some((target, content)) = crate::fix_table::expand_create(spec, &input) {
             if !Path::new(&target).exists() {
@@ -1886,6 +1888,7 @@ fn engine_rows(
             message: &d.message,
             tokens: tokens.as_ref(),
             path,
+            diagnostics,
         };
         if let Some((target, content)) = crate::fix_table::expand_create(spec, &input) {
             if !Path::new(&target).exists() {
@@ -13895,14 +13898,50 @@ pub(crate) fn convert_to_declaring_param_entry(
 
 /// One top-level directive's piece for the organize pass: its sort
 /// priority (the upstream `DirectiveSortPriority` ordinal), its URI text
-/// for the alphabetical compare, and the byte span of the text that
-/// moves — leading comments through the trailing same-line comment.
+/// for the alphabetical compare, the URI literal's UTF-16 offset (the
+/// removal legs' match anchor), the shown names the file's
+/// `unused_shown_name` rows flag (imports only), and the byte span of the
+/// text that moves — leading comments through the trailing same-line
+/// comment.
 struct DirectivePiece {
     priority: u8,
     uri: String,
+    uri16: u32,
+    unused_shown: Vec<String>,
     start: usize,
     end: usize,
     text: String,
+}
+
+/// The diagnostic codes the official organizer reads off
+/// `DiagnosticCode.isUnresolvedIdentifier` (`diagnostic.g.dart` flags the
+/// six; the `organize` removals stand down when the file carries any of
+/// them — `ImportOrganizer.hasUnresolvedIdentifierError`).
+const UNRESOLVED_IDENTIFIER_CODES: [&str; 6] = [
+    "creation_with_non_type",
+    "extends_non_class",
+    "non_type_as_type_argument",
+    "undefined_class",
+    "undefined_function",
+    "undefined_identifier",
+];
+
+/// The alphabetical directive-URI compare (the upstream
+/// `compareDirectiveUri` — package URIs compare path-first).
+fn compare_directive_uri(a: &str, b: &str) -> core::cmp::Ordering {
+    if !(a.starts_with("package:") && b.starts_with("package:"))
+        || (a.starts_with('/') && b.starts_with('/'))
+    {
+        let (ia, ib) = (a.find('/'), b.find('/'));
+        if let (Some(ia), Some(ib)) = (ia, ib) {
+            let head = a[..ia].cmp(&b[..ib]);
+            if head != core::cmp::Ordering::Equal {
+                return head;
+            }
+            return a[ia + 1..].cmp(&b[ib + 1..]);
+        }
+    }
+    a.cmp(b)
 }
 
 /// `directives_ordering`: the whole directive block re-sorts — the
@@ -13913,10 +13952,19 @@ struct DirectivePiece {
 /// Each directive's leading comments move with it (the pseudo-first
 /// directive's doc/annotation lines and blank-separated comment groups
 /// stay at the top, as upstream); a trailing `//` on the directive's own
-/// line rides. The unused-import removal, unused-shown-name removal, and
-/// `@docImport` sort read the file's diagnostic set and stay absent; a
-/// `library` directive or non-directive content inside the block bounds
-/// the face and drops the fix.
+/// line rides. The removal legs read the file's diagnostic set
+/// (`input.diagnostics`, the official `ImportOrganizer`'s diagnostics
+/// parameter): a directive whose URI carries an `unused_import`,
+/// `duplicate_import`, or `unnecessary_import` row drops whole, an import
+/// row whose text repeats the previous kept row's drops, and shown names
+/// flagged `unused_shown_name` excise from their `show` clause — all
+/// three standing down when the file carries an unresolved-identifier
+/// error (`hasUnresolvedIdentifierError`). The library directive's doc
+/// comment sorts its `@docImport` lines the same priority groups (the
+/// `_organizeDocImports` legs, line and block comments both). A `library`
+/// directive or non-directive content inside the block bounds the face
+/// and drops the fix; a rebuild that changes nothing drops it too (the
+/// official `organize()` returns no edits then).
 pub(crate) fn organize_directives_entry(
     input: &FixInput<'_>,
 ) -> Option<Vec<(u32, u32, String)>> {
@@ -13924,17 +13972,50 @@ pub(crate) fn organize_directives_entry(
     let text = input.text;
     let line_starts = byte_line_starts(text);
     let eol = eol_of(text);
+    // The removal legs' admission sets (empty under the unresolved gate —
+    // the official `if (!hasUnresolvedIdentifierError)` wraps every
+    // removal decision).
+    let unresolved_gate = input
+        .diagnostics
+        .iter()
+        .any(|d| UNRESOLVED_IDENTIFIER_CODES.contains(&d.code.name));
+    let unused_uris: FxHashSet<u32> = if unresolved_gate {
+        FxHashSet::default()
+    } else {
+        input
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.code.name,
+                    "duplicate_import" | "unused_import" | "unnecessary_import"
+                )
+            })
+            .map(|d| d.range.offset)
+            .collect()
+    };
+    let unused_shown: FxHashSet<u32> = if unresolved_gate {
+        FxHashSet::default()
+    } else {
+        input
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unused_shown_name")
+            .map(|d| d.range.offset)
+            .collect()
+    };
     // The directive rows at the top level: `import`/`export`/`part`
     // keywords at depth 0 through their `;`. `library` is indexed but
-    // never sorted.
-    let mut library_seen = false;
+    // never sorted (the last one owns the doc-import leg, as upstream's
+    // `libraryDirective` variable).
+    let mut library_kw = None::<usize>;
     let mut spans: Vec<(usize, usize, u8)> = Vec::new(); // (kw_index, semi_index, priority)
     let mut cursor = 0usize;
     let len = tokens.as_slice().len();
     while cursor < len {
         match kind_of(tokens, cursor)? {
             TokenKind::Keyword(Keyword::Library) => {
-                library_seen = true;
+                library_kw = Some(cursor);
                 let semi = depth0_find(tokens, text, cursor + 1, len, |kind, _| {
                     kind == TokenKind::Semicolon
                 })?;
@@ -13996,28 +14077,17 @@ pub(crate) fn organize_directives_entry(
             _ => break,
         }
     }
-    if spans.len() < 2 {
-        return None; // nothing to reorder
+    if spans.is_empty() && library_kw.is_none() {
+        return None; // nothing to organize
     }
     // A `library` directive must precede the block — inside it the
     // replace span would swallow it (upstream's own edge, unfixable in
     // the row model).
-    if library_seen {
+    if let Some(lib) = library_kw {
         // The `library`'s `;` must precede the first sortable keyword.
-        let mut check = 0usize;
-        let mut lib_end = None;
-        while check < len {
-            match kind_of(tokens, check)? {
-                TokenKind::Keyword(Keyword::Library) => {
-                    lib_end = depth0_find(tokens, text, check + 1, len, |kind, _| {
-                        kind == TokenKind::Semicolon
-                    });
-                    break;
-                }
-                TokenKind::Eof => break,
-                _ => check += 1,
-            }
-        }
+        let lib_end = depth0_find(tokens, text, lib + 1, len, |kind, _| {
+            kind == TokenKind::Semicolon
+        });
         if lib_end.is_none_or(|end| end > spans.first().map_or(usize::MAX, |s| s.0)) {
             return None;
         }
@@ -14042,6 +14112,14 @@ pub(crate) fn organize_directives_entry(
         }
     };
     let mut pieces: Vec<DirectivePiece> = Vec::new();
+    // The `library` row bounds the attach walk — the row model must not
+    // climb across it (the official walk reads the directive's own leading
+    // trivia, which stops at the library's tokens).
+    let library_floor = library_kw
+        .and_then(|lib| {
+            depth0_find(tokens, text, lib + 1, len, |kind, _| kind == TokenKind::Semicolon)
+        })
+        .and_then(|semi| tokens.get(semi).map(|t| line_of(t.byte_offset as usize)));
     let mut prev_trailing_line = None::<usize>;
     for (index, &(kw, semi, priority)) in spans.iter().enumerate() {
         let kw_byte = tokens.get(kw)?.byte_offset as usize;
@@ -14060,8 +14138,10 @@ pub(crate) fn organize_directives_entry(
         // The leading attach: lines between the previous region's end
         // line and the directive's first line. Only comment/blank lines
         // qualify — anything else (a stray statement) refuses the pass.
-        let floor_line = prev_trailing_line.map_or(0, |l| l + 1);
-        let is_first = index == 0 && !library_seen;
+        let floor_line = prev_trailing_line
+            .map_or(0, |l| l + 1)
+            .max(library_floor.map_or(0, |l| l + 1));
+        let is_first = index == 0 && library_kw.is_none();
         let attach_line = if is_first {
             // Only the LAST contiguous comment group adjacent to the
             // directive attaches; doc/annotation lines never do; a
@@ -14135,9 +14215,43 @@ pub(crate) fn organize_directives_entry(
             }
             found
         };
+        // The URI literal's UTF-16 offset (the removal rows' match anchor —
+        // the official `_isUnusedImport` compares `directive.uri.offset`);
+        // a directive with no string token (a broken file) can never match
+        // a removal row, so the sentinel stands in.
+        let uri16 = (kw + 1..semi)
+            .find(|&i| kind_of(tokens, i) == Some(TokenKind::String))
+            .and_then(|i| tokens.get(i))
+            .map(|token| token.utf16_offset)
+            .unwrap_or(u32::MAX);
+        // The shown names the file flags `unused_shown_name` (imports only
+        // — the official collection gates on `directive is ImportDirective`),
+        // in written order: identifiers between a `show` keyword and the
+        // directive's `;` (`hide` ends the run) whose own offset a row
+        // sits on.
+        let mut flagged_shown = Vec::new();
+        if !unused_shown.is_empty()
+            && kind_of(tokens, kw)? == TokenKind::Keyword(Keyword::Import)
+        {
+            let mut in_show = false;
+            for i in kw + 1..semi {
+                match kind_of(tokens, i)? {
+                    TokenKind::Keyword(Keyword::Show) => in_show = true,
+                    TokenKind::Keyword(Keyword::Hide) => in_show = false,
+                    TokenKind::Identifier if in_show => {
+                        if unused_shown.contains(&tokens.get(i)?.utf16_offset) {
+                            flagged_shown.push(tokens.lexeme(text, i).to_owned());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         pieces.push(DirectivePiece {
             priority,
             uri,
+            uri16,
+            unused_shown: flagged_shown,
             start: start_byte,
             end: end_byte,
             text: text.get(start_byte..end_byte)?.to_owned(),
@@ -14147,33 +14261,50 @@ pub(crate) fn organize_directives_entry(
     // The sort: priority group, then the URI compare (the upstream
     // `compareDirectiveUri` — package URIs compare path-first), then the
     // verbatim text.
-    let compare_uri = |a: &str, b: &str| -> core::cmp::Ordering {
-        if !(a.starts_with("package:") && b.starts_with("package:"))
-            || (a.starts_with('/') && b.starts_with('/'))
-        {
-            let (ia, ib) = (a.find('/'), b.find('/'));
-            if let (Some(ia), Some(ib)) = (ia, ib) {
-                let head = a[..ia].cmp(&b[..ib]);
-                if head != core::cmp::Ordering::Equal {
-                    return head;
-                }
-                return a[ia + 1..].cmp(&b[ib + 1..]);
-            }
-        }
-        a.cmp(b)
-    };
     let mut sorted: Vec<&DirectivePiece> = pieces.iter().collect();
     sorted.sort_by(|a, b| {
         a.priority
             .cmp(&b.priority)
-            .then_with(|| compare_uri(&a.uri, &b.uri))
+            .then_with(|| compare_directive_uri(&a.uri, &b.uri))
             .then_with(|| a.text.cmp(&b.text))
     });
     // The join: eol between rows, a blank line between priority groups,
-    // right-trimmed (upstream `sb + trimRight`).
+    // right-trimmed (upstream `sb + trimRight`). The removal legs walk the
+    // sorted rows exactly as the official write loop does — an unused
+    // import or an exact repeat of the previous kept row's text drops
+    // whole (and never updates that text), a flagged shown name excises
+    // from its `show` clause by the official string surgery (`name, `
+    // whole-comma first, else `, name`, both searched from the clause's
+    // own `show`), and the resulting row text is what the repeat compare
+    // sees next.
     let mut out = String::new();
     let mut current = None::<u8>;
+    let mut previous_text = String::new();
     for piece in &sorted {
+        if !unresolved_gate
+            && (unused_uris.contains(&piece.uri16) || previous_text == piece.text)
+        {
+            continue;
+        }
+        let mut written = piece.text.clone();
+        if !piece.unused_shown.is_empty()
+            && let Some(show_at) = written.find("show")
+        {
+            for name in &piece.unused_shown {
+                // The official surgery (`replaceFirst` from the `show`):
+                // the comma containment decides the arm, the comma-space
+                // needle removes.
+                let needle = if written.contains(&format!("{name},")) {
+                    format!("{name}, ")
+                } else {
+                    format!(", {name}")
+                };
+                if let Some(at) = written[show_at..].find(&needle) {
+                    let at = show_at + at;
+                    written.replace_range(at..at + needle.len(), "");
+                }
+            }
+        }
         if let Some(prev) = current {
             out.push_str(eol);
             if prev != piece.priority {
@@ -14181,15 +14312,333 @@ pub(crate) fn organize_directives_entry(
             }
         }
         current = Some(piece.priority);
-        out.push_str(piece.text.trim_end_matches(['\n', '\r']));
+        out.push_str(written.trim_end_matches(['\n', '\r']));
+        previous_text = written;
     }
-    let replace_start = pieces.first()?.start;
-    let replace_end = pieces.last()?.end;
+    let block_edit = if pieces.is_empty() {
+        None
+    } else {
+        let replace_start = pieces.first().map(|p| p.start)?;
+        let replace_end = pieces.last().map(|p| p.end)?;
+        if out == text[replace_start..replace_end] {
+            None // the official no-edit face: organize changed nothing
+        } else {
+            let (s16, e16) = (
+                utf16_count(&text[..replace_start]),
+                utf16_count(&text[..replace_end]),
+            );
+            Some((s16, e16 - s16, out))
+        }
+    };
+    // The doc-import leg: the library directive's doc comment sorts its
+    // `@docImport` lines (upstream `_organizeDocImports`, run before the
+    // directive write loop and independent of it).
+    let doc_edit = library_kw
+        .and_then(|lib| organize_doc_imports(tokens, text, lib, &line_starts, eol));
+    match (doc_edit, block_edit) {
+        (None, None) => None,
+        (doc, block) => {
+            let mut edits = Vec::new();
+            if let Some(edit) = doc {
+                edits.push(edit);
+            }
+            if let Some(edit) = block {
+                edits.push(edit);
+            }
+            Some(edits)
+        }
+    }
+}
+
+/// The doc-import leg: the last `library` directive's doc comment sorts
+/// its `@docImport` lines into the same priority groups as imports — the
+/// official `_organizeDocImports` (line comments) and
+/// `_organizeDocImportsInBlockComment` (one `/** */` token) over the
+/// file's own text. Returns the `(utf16 offset, length, replacement)` for
+/// the doc-comment region, or `None` when there is no attached doc
+/// comment, no parseable `@docImport` line in it, or the rebuild changes
+/// nothing.
+///
+/// Detection mirrors the comment builder: a line is a doc import when its
+/// marker-stripped content (whitespace skipped) starts with
+/// `'@docImport '` and the rest opens with a string literal — the
+/// synthetic `import` parse's success path (`_parseDocImport`); a failed
+/// parse keeps its line in place. Block comments drop the `*/` tail on
+/// the closing line and the `* `/lone-`*` marker on the others (the first
+/// line's `/**` prefix stays — a doc import sharing its line with the
+/// opening is not one, the analyzer's own edge).
+fn organize_doc_imports(
+    tokens: &TokenTable,
+    text: &str,
+    lib_kw: usize,
+    line_starts: &[usize],
+    eol: &str,
+) -> Option<(u32, u32, String)> {
+    let lib_byte = tokens.get(lib_kw)?.byte_offset as usize;
+    let line_of = |byte: usize| -> Option<usize> {
+        line_starts.partition_point(|&s| s <= byte).checked_sub(1)
+    };
+    // The line's `[start, end)` byte span without its terminator.
+    let line_span = |line: usize| -> Option<(usize, usize)> {
+        let start = *line_starts.get(line)?;
+        let raw_end = line_starts.get(line + 1).copied().unwrap_or(text.len());
+        let mut end = raw_end;
+        if text[..end].ends_with('\n') {
+            end -= 1;
+            if text[..end].ends_with('\r') {
+                end -= 1;
+            }
+        }
+        Some((start, end))
+    };
+    let lib_line = line_of(lib_byte)?;
+    if lib_line == 0 {
+        return None;
+    }
+    // The attached doc comment: the contiguous run ending on the line
+    // directly above the `library` keyword (a blank line or any other
+    // content between unattaches it).
+    let above = lib_line - 1;
+    let (top, block) = {
+        let (above_start, above_end) = line_span(above)?;
+        let above_text = text[above_start..above_end].trim();
+        if above_text.starts_with("///") {
+            let mut top = above;
+            while top > 0 {
+                let (s, e) = line_span(top - 1)?;
+                if !text[s..e].trim_start().starts_with("///") {
+                    break;
+                }
+                top -= 1;
+            }
+            (top, false)
+        } else if above_text.ends_with("*/") {
+            let mut top = above;
+            loop {
+                let (s, e) = line_span(top)?;
+                let trimmed = text[s..e].trim_start();
+                if trimmed.starts_with("/**") {
+                    break;
+                }
+                if top == 0 || !(trimmed.starts_with('*') || trimmed.starts_with("/*")) {
+                    return None;
+                }
+                top -= 1;
+            }
+            (top, true)
+        } else {
+            return None;
+        }
+    };
+    // The physical lines of the doc comment as byte spans.
+    let lines: Vec<(usize, usize)> = (top..=above).map(line_span).collect::<Option<_>>()?;
+    let line_count = lines.len();
+    // The official `rawContent` for a block-comment line: the closing
+    // line's `\s*\*/$` strip, the first line's `^/\*\*\s?` strip, the
+    // others' `^\s*\*\s?` strip.
+    let raw_content = |index: usize| -> &str {
+        let (start, end) = lines[index];
+        let raw = &text[start..end];
+        let body = if index + 1 == line_count {
+            raw.strip_suffix("*/").map(str::trim_end).unwrap_or(raw)
+        } else {
+            raw
+        };
+        if index == 0 {
+            let head = body.strip_prefix("/**").unwrap_or(body);
+            head.strip_prefix(' ').unwrap_or(head)
+        } else {
+            let body = body.trim_start();
+            body.strip_prefix("* ")
+                .unwrap_or(body.strip_prefix('*').unwrap_or(body))
+        }
+    };
+    // The builder's per-line content — the doc-import detection face. The
+    // first block line keeps its `/**` prefix (never a doc import); the
+    // closing line drops `*/`; the others drop `* `/lone-`*`.
+    let builder_content = |index: usize| -> &str {
+        if !block {
+            // The `///` token text minus its marker.
+            let (start, end) = lines[index];
+            let raw = text[start..end].trim_start();
+            return raw[3..].trim_start();
+        }
+        if index == 0 {
+            let (start, end) = lines[index];
+            return &text[start..end];
+        }
+        let (start, end) = lines[index];
+        let raw = &text[start..end];
+        let body = if index + 1 == line_count {
+            raw.strip_suffix("*/").unwrap_or(raw)
+        } else {
+            raw
+        };
+        let body = body.trim_start();
+        let body = match body.strip_prefix("* ") {
+            Some(rest) => rest,
+            None if body == "*" => "",
+            None => body,
+        };
+        body.trim_start()
+    };
+    // The doc imports: line index, sort priority, URI, compare/print text.
+    let mut doc_imports: Vec<(usize, u8, String, &str)> = Vec::new();
+    for index in 0..line_count {
+        let Some(rest) = builder_content(index).strip_prefix("@docImport ") else {
+            continue;
+        };
+        let Some(uri) = doc_import_uri(rest) else {
+            continue;
+        };
+        let priority = if uri.starts_with("dart:") {
+            0
+        } else if uri.starts_with("package:") {
+            1
+        } else if uri.contains("://") {
+            2
+        } else {
+            3
+        };
+        // The official `_DocImportInfo` text: the whole `///` line for a
+        // line comment, the marker-stripped content for a block comment.
+        let info_text = if block {
+            raw_content(index)
+        } else {
+            let (start, end) = lines[index];
+            text[start..end].trim_start()
+        };
+        doc_imports.push((index, priority, uri, info_text));
+    }
+    if doc_imports.is_empty() {
+        return None;
+    }
+    // The insertion position is the first doc-import line in FILE order
+    // (upstream `lines.indexWhere(docImportByLine.containsKey)`), captured
+    // before the sort reorders `doc_imports`.
+    let first_doc = doc_imports[0].0;
+    let last_doc = doc_imports[doc_imports.len() - 1].0;
+    doc_imports.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| compare_directive_uri(&a.2, &b.2))
+            .then_with(|| a.3.cmp(&b.3))
+    });
+    // A blank comment line separates priority groups, styled by the first
+    // sorted row (`docCommentLinePrefix`); a block comment uses the empty
+    // string the re-marking formats as ` *`.
+    let blank: &str = if block {
+        ""
+    } else {
+        let marker = doc_imports[0].3;
+        if marker.starts_with('*') {
+            "*"
+        } else {
+            "///"
+        }
+    };
+    let mut sorted_texts: Vec<&str> = Vec::new();
+    let mut previous_priority = None;
+    for &(_, priority, _, info_text) in &doc_imports {
+        if previous_priority.is_some_and(|prev| prev != priority) {
+            sorted_texts.push(blank);
+        }
+        sorted_texts.push(info_text);
+        previous_priority = Some(priority);
+    }
+    // The untouched lines keep their order; the sorted block sits where the
+    // first doc-import line was; blank comment lines between doc-import
+    // lines drop (the grouping already separates the groups).
+    let is_doc_line = |index: usize| doc_imports.iter().any(|info| info.0 == index);
+    let is_blank_between = |index: usize| -> bool {
+        index > first_doc
+            && index < last_doc
+            && matches!(
+                text[lines[index].0..lines[index].1].trim(),
+                "///" | "*"
+            )
+    };
+    let mut others: Vec<&str> = Vec::new();
+    for index in 0..line_count {
+        if is_doc_line(index) || is_blank_between(index) {
+            continue;
+        }
+        if block {
+            // The official `otherContents`: a closing line holding only the
+            // `*/` marker contributes nothing (it is re-added below).
+            let content = raw_content(index);
+            if index + 1 == line_count && content.is_empty() {
+                continue;
+            }
+            others.push(content);
+        } else {
+            let (start, end) = lines[index];
+            others.push(text[start..end].trim_start());
+        }
+    }
+    let before = (0..first_doc)
+        .filter(|&index| !is_doc_line(index) && !is_blank_between(index))
+        .count();
+    let mut new_texts: Vec<&str> = Vec::new();
+    new_texts.extend(others[..before].iter().copied());
+    new_texts.extend(sorted_texts.iter().copied());
+    new_texts.extend(others[before..].iter().copied());
+    // The rebuild: a line comment joins the kept texts; a block comment
+    // re-marks every line (`/** …` first, ` * …` after, ` */` last — the
+    // official `newLines` shape).
+    let rebuilt = if block {
+        let mut out = String::new();
+        for (index, content) in new_texts.iter().copied().enumerate() {
+            if index > 0 {
+                out.push_str(eol);
+            }
+            if content.is_empty() {
+                out.push_str(if index == 0 { "/**" } else { " *" });
+            } else {
+                out.push_str(if index == 0 { "/** " } else { " * " });
+                out.push_str(content);
+            }
+        }
+        out.push_str(eol);
+        out.push_str(" */");
+        out
+    } else {
+        new_texts.join(eol)
+    };
+    let region_start = lines[0].0;
+    let region_end = lines[line_count - 1].1;
+    if rebuilt == text[region_start..region_end] {
+        return None;
+    }
     let (s16, e16) = (
-        utf16_count(&text[..replace_start]),
-        utf16_count(&text[..replace_end]),
+        utf16_count(&text[..region_start]),
+        utf16_count(&text[..region_end]),
     );
-    Some(vec![(s16, e16 - s16, out)])
+    Some((s16, e16 - s16, rebuilt))
+}
+
+/// The URI of a synthetic `import` body: adjacent simple string literals'
+/// raw inner text joined (`stringValue`'s adjacent-literal concatenation),
+/// or `None` when the body does not open with one (the official parse
+/// failure keeps the line in place).
+fn doc_import_uri(rest: &str) -> Option<String> {
+    let mut s = rest.trim_start();
+    let mut uri = String::new();
+    loop {
+        let body = s.strip_prefix('r').unwrap_or(s);
+        let quote = body.as_bytes().first().copied()?;
+        if quote != b'\'' && quote != b'"' {
+            return None;
+        }
+        let quote = quote as char;
+        let close = body[1..].find(quote)?;
+        uri.push_str(&body[1..1 + close]);
+        s = body[1 + close + 1..].trim_start();
+        let next = s.strip_prefix('r').unwrap_or(s);
+        if next.starts_with('\'') || next.starts_with('"') {
+            continue;
+        }
+        return Some(uri);
+    }
 }
 
 /// The `// ignore: <code>` row for the diagnostic at `range`: spliced
@@ -15529,8 +15978,10 @@ fn convert_to_line_doc(context: &AssistContext<'_>) -> Option<Vec<(u32, u32, Str
         tokens: None,
         // The assist face is same-file by construction — no producer here
         // reads the path (only [`FixAction::CreateFile`] does), so the
-        // empty path never misaddresses.
+        // empty path never misaddresses. The organize producer is not on
+        // the assist face, so the diagnostic set rides empty too.
         path: Path::new(""),
+        diagnostics: &[],
     };
     let (offset, length, replacement) = doc_comment_to_line(&input)?;
     Some(vec![(offset, length, replacement)])
@@ -20271,7 +20722,7 @@ mod tests {
     /// The single fix of `hits[0]`, materialized over `source`.
     fn one_fix(source: &str, hits: &[Lint]) -> RuleFix {
         let lines = LineIndex::new(source);
-        let fixes = from_lints(hits, source, &lines, test_path(), &walk_fuse());
+        let fixes = from_lints(hits, source, &lines, test_path(), &[], &walk_fuse());
         assert_eq!(fixes.len(), 1, "expected exactly one fix for {source:?}");
         fixes.into_iter().next().expect("one fix")
     }
@@ -20326,7 +20777,7 @@ mod tests {
     /// No fix materializes for `rule` over `range` on `source`.
     fn assert_no_fix(rule: &str, source: &str, range: core::ops::Range<u32>) {
         let lines = LineIndex::new(source);
-        let fixes = from_lints(&[row(rule, range)], source, &lines, test_path(), &walk_fuse());
+        let fixes = from_lints(&[row(rule, range)], source, &lines, test_path(), &[], &walk_fuse());
         assert!(fixes.is_empty(), "{rule} on {source:?} produced a fix");
     }
 
@@ -21329,7 +21780,9 @@ mod tests {
             &[row("prefer_inlined_adds", 21..24)],
             source,
             &lines,
-            test_path(), &walk_fuse(),
+            test_path(),
+            &[],
+            &walk_fuse(),
         );
         assert!(second.is_empty());
     }
@@ -21447,7 +21900,7 @@ mod tests {
         let doc = patch_json(
             &FileFixSet {
                 path: "/abs/t.dart".to_owned(),
-                fixes: from_lints(&[new_row(19)], source, &lines, test_path(), &walk_fuse()),
+                fixes: from_lints(&[new_row(19)], source, &lines, test_path(), &[], &walk_fuse()),
                 plugin: vec![plugin],
             },
             Verbosity::Compact,
@@ -21496,7 +21949,7 @@ mod tests {
         // drops the anchor; the full tier adds the human names.
         let set = FileFixSet {
             path: "t.dart".to_owned(),
-            fixes: from_lints(&[new_row(19)], source, &lines, test_path(), &walk_fuse()),
+            fixes: from_lints(&[new_row(19)], source, &lines, test_path(), &[], &walk_fuse()),
             plugin: vec![one_plugin_fix(source, 19, 4)],
         };
         let minimal = patch_json(&set, Verbosity::Minimal);
@@ -21595,7 +22048,7 @@ mod tests {
         let lines = LineIndex::new(source);
         let set = FileFixSet {
             path: "t.dart".to_owned(),
-            fixes: from_lints(&[new_row(19)], source, &lines, test_path(), &walk_fuse()),
+            fixes: from_lints(&[new_row(19)], source, &lines, test_path(), &[], &walk_fuse()),
             plugin: vec![one_plugin_fix(source, 19, 4)],
         };
 
@@ -21670,15 +22123,15 @@ mod tests {
             message: "Type names should be CamelCase.".to_owned(),
             correction: None,
         }];
-        assert!(from_lints(&non_wired, source, &lines, test_path(), &walk_fuse()).is_empty());
+        assert!(from_lints(&non_wired, source, &lines, test_path(), &[], &walk_fuse()).is_empty());
 
         // `unnecessary_new` over text that does not start with the keyword.
         let wrong = vec![new_row(6)];
-        assert!(from_lints(&wrong, source, &lines, test_path(), &walk_fuse()).is_empty());
+        assert!(from_lints(&wrong, source, &lines, test_path(), &[], &walk_fuse()).is_empty());
 
         // `avoid_empty_else` over a span that is not the `;`.
         let wrong = vec![empty_else_row(0)];
-        assert!(from_lints(&wrong, source, &lines, test_path(), &walk_fuse()).is_empty());
+        assert!(from_lints(&wrong, source, &lines, test_path(), &[], &walk_fuse()).is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -22170,7 +22623,8 @@ mod tests {
             &[sem_row(code, machine, offset, length)],
             source,
             &lines,
-            test_path(), &walk_fuse(),
+            test_path(),
+            &walk_fuse(),
         );
         assert!(fixes.is_empty(), "{code} on {source:?} produced a fix");
     }
@@ -23559,7 +24013,9 @@ mod tests {
                 &[row("use_named_constants", full_span(source, "const"))],
                 source,
                 &lines,
-                test_path(), &walk_fuse()
+                test_path(),
+                &[],
+                &walk_fuse()
             )
             .is_empty()
         );
@@ -24199,7 +24655,8 @@ mod tests {
             &[parser_row(code, message, offset, length)],
             source,
             &lines,
-            test_path(), &walk_fuse(),
+            test_path(),
+            &walk_fuse(),
         );
         assert!(fixes.is_empty(), "{code} on {source:?} produced a fix");
     }
@@ -24821,7 +25278,8 @@ mod tests {
             ],
             source,
             &lines,
-            test_path(), &walk_fuse(),
+            test_path(),
+            &walk_fuse(),
         );
         assert_eq!(fixes.len(), 1, "identical consecutive edits collapse");
         let (patched, _) = apply(source, std::slice::from_ref(&fixes[0].edit));
@@ -24999,7 +25457,8 @@ mod tests {
                 &[sem_row("unused_import", "UNUSED_IMPORT", 0, 5)],
                 source,
                 &lines,
-                test_path(), &walk_fuse()
+                test_path(),
+                &walk_fuse()
             )
             .is_empty()
         );
@@ -25008,7 +25467,8 @@ mod tests {
                 &[parser_row("final_mixin", "", 0, 5)],
                 source,
                 &lines,
-                test_path(), &walk_fuse()
+                test_path(),
+                &walk_fuse()
             )
             .is_empty()
         );
@@ -25048,7 +25508,8 @@ mod tests {
             &[null_check_row(code, message, offset, length)],
             source,
             &lines,
-            test_path(), &walk_fuse(),
+            test_path(),
+            &walk_fuse(),
         );
         assert_eq!(fixes.len(), 1, "expected exactly one fix for {source:?}");
         let fix = fixes.into_iter().next().expect("one fix");
@@ -25073,7 +25534,8 @@ mod tests {
             &[null_check_row(code, message, offset, length)],
             source,
             &lines,
-            test_path(), &walk_fuse(),
+            test_path(),
+            &walk_fuse(),
         );
         assert!(fixes.is_empty(), "{code} on {source:?} produced a fix");
     }
@@ -27554,11 +28016,11 @@ mod tests {
             new_row(source.find("new C().c").unwrap() as u32),
         ];
         let fuse = PlannerFuse::with_budget(1);
-        let fixes = from_lints(&hits, source, &lines, test_path(), &fuse);
+        let fixes = from_lints(&hits, source, &lines, test_path(), &[], &fuse);
         assert_eq!(fixes.len(), 1, "one step, one fix: {fixes:?}");
         assert!(fuse.tripped(), "the spent budget latched");
         // The full-budget walk over the same rows materializes every fix.
-        assert_eq!(from_lints(&hits, source, &lines, test_path(), &walk_fuse()).len(), 3);
+        assert_eq!(from_lints(&hits, source, &lines, test_path(), &[], &walk_fuse()).len(), 3);
     }
 
     /// The evidence rows' total key (determinism audit R3): two rows tied
@@ -27753,7 +28215,7 @@ mod tests {
         expected: &str,
     ) {
         let lines = LineIndex::new(source);
-        let fixes = from_lints(&[row(rule, range)], source, &lines, test_path(), &walk_fuse());
+        let fixes = from_lints(&[row(rule, range)], source, &lines, test_path(), &[], &walk_fuse());
         assert_eq!(fixes.len(), count, "{rule} on {source:?}");
         assert!(fixes.iter().all(|fix| fix.rule == rule));
         let edits: Vec<Edit> = fixes.iter().map(|fix| fix.edit.clone()).collect();
@@ -27782,7 +28244,8 @@ mod tests {
             &[sem_row(code, machine, offset, length)],
             source,
             &lines,
-            test_path(), &walk_fuse(),
+            test_path(),
+            &walk_fuse(),
         );
         assert_eq!(fixes.len(), count, "{code} on {source:?}");
         assert!(
@@ -28125,6 +28588,215 @@ mod tests {
             1,
             "import 'dart:io';\n\nexport 'package:e/e.dart';\n",
         );
+    }
+
+    /// The organize golden with the file's diagnostic set — the rows feed
+    /// the removal legs (`ImportOrganizer`'s diagnostics parameter), the
+    /// hit drives the whole-file face.
+    #[allow(clippy::too_many_arguments)]
+    fn assert_organize_with_diags(
+        source: &str,
+        range: core::ops::Range<u32>,
+        diags: &[Diagnostic],
+        count: usize,
+        expected: &str,
+    ) {
+        let lines = LineIndex::new(source);
+        let fixes = from_lints(
+            &[row("directives_ordering", range)],
+            source,
+            &lines,
+            test_path(),
+            diags,
+            &walk_fuse(),
+        );
+        assert_eq!(fixes.len(), count, "on {source:?}");
+        let edits: Vec<Edit> = fixes.iter().map(|fix| fix.edit.clone()).collect();
+        let (patched, outcomes) = apply(source, &edits);
+        assert!(
+            outcomes.iter().all(|o| *o == EditOutcome::Applied),
+            "{source:?}: {outcomes:?}"
+        );
+        assert_eq!(patched, expected, "on {source:?}");
+    }
+
+    /// `OrganizeImports`' unused-import leg: a directive whose URI carries
+    /// an `unused_import` row drops whole (`_isUnusedImport` matches the
+    /// diagnostic offset against `directive.uri.offset`), removed rows
+    /// never joining the sorted block.
+    #[test]
+    fn directives_organize_removes_the_unused_import() {
+        // Upstream `test_remove_unusedImports` shape: the unused 'b.dart'
+        // (its URI at 7..15) goes while the block sorts.
+        let source = "import 'b.dart';\nimport 'a.dart';\n";
+        assert_organize_with_diags(
+            source,
+            0..16,
+            &[sem_row("unused_import", "UNUSED_IMPORT", 7, 8)],
+            1,
+            "import 'a.dart';\n",
+        );
+    }
+
+    /// The duplicate legs: an adjacent repeat of the previous kept row's
+    /// exact text drops with no diagnostics at all (`previousDirectiveText`
+    /// compare), and a `duplicate_import` row on a non-adjacent repeat's
+    /// URI drops by the diagnostic match.
+    #[test]
+    fn directives_organize_removes_duplicates() {
+        // The adjacent repeat: no rows, the text compare alone drops the
+        // second import.
+        let source = "import 'a.dart';\nimport 'a.dart';\n";
+        assert_organize_with_diags(source, 0..16, &[], 1, "import 'a.dart';\n");
+        // The separated repeat: only the row at the later URI removes it
+        // (the adjacent compare never sees the first copy again).
+        let source = "import 'a.dart';\nimport 'b.dart';\nimport 'a.dart';\n";
+        assert_organize_with_diags(
+            source,
+            0..16,
+            &[sem_row("duplicate_import", "DUPLICATE_IMPORT", 42, 8)],
+            1,
+            "import 'a.dart';\nimport 'b.dart';\n",
+        );
+    }
+
+    /// The unused-shown-name leg: a shown name whose own offset an
+    /// `unused_shown_name` row sits on excises from its `show` clause —
+    /// `, name` mid-list, `name, ` heading it (the official
+    /// `replaceFirst` surgery searched from the clause's own `show`).
+    #[test]
+    fn directives_organize_excises_the_unused_shown_name() {
+        // Mid-list: the `, c` needle removes (the name `c` sits at 24).
+        let source = "import 'a.dart' show b, c;\n";
+        assert_organize_with_diags(
+            source,
+            0..26,
+            &[sem_row("unused_shown_name", "UNUSED_SHOWN_NAME", 24, 1)],
+            1,
+            "import 'a.dart' show b;\n",
+        );
+        // Heading the list: the `b, ` needle removes (the name `b` at 21).
+        assert_organize_with_diags(
+            source,
+            0..26,
+            &[sem_row("unused_shown_name", "UNUSED_SHOWN_NAME", 21, 1)],
+            1,
+            "import 'a.dart' show c;\n",
+        );
+    }
+
+    /// The unresolved-identifier gate: a file carrying any
+    /// `isUnresolvedIdentifier` code stands the removals down (`ImportOrganizer`
+    /// constructor's `hasUnresolvedIdentifierError`) — the block sorts, the
+    /// flagged import stays, the shown name stays.
+    #[test]
+    fn directives_organize_stands_down_on_unresolved_identifiers() {
+        let source = "import 'b.dart';\nimport 'a.dart';\n\nvar a = new B();\n";
+        let diags = &[
+            sem_row("unused_import", "UNUSED_IMPORT", 7, 8),
+            sem_row(
+                "undefined_identifier",
+                "UNDEFINED_IDENTIFIER",
+                36,
+                1,
+            ),
+        ];
+        assert_organize_with_diags(
+            source,
+            0..16,
+            diags,
+            1,
+            "import 'a.dart';\nimport 'b.dart';\n\nvar a = new B();\n",
+        );
+        // The shown name stays too — and a rebuild that changes nothing
+        // offers no fix (the second source already sorts).
+        let source = "import 'a.dart' show b, c;\n";
+        assert_organize_with_diags(
+            source,
+            0..26,
+            &[
+                sem_row("unused_shown_name", "UNUSED_SHOWN_NAME", 24, 1),
+                sem_row("undefined_class", "UNDEFINED_CLASS", 10, 1),
+            ],
+            0,
+            source,
+        );
+    }
+
+    /// The `@docImport` leg over a `///` doc comment: the sorted rows move
+    /// to the first doc import's line, `dart:` sorts before relative, the
+    /// group blank separates priorities, and the comment's other lines keep
+    /// their order (upstream `_organizeDocImports`).
+    #[test]
+    fn directives_organize_sorts_doc_imports() {
+        // Upstream `test_organizeImports_docImports`.
+        let source = "/// @docImport 'a.dart';\n/// @docImport 'dart:math';\nlibrary;\n";
+        assert_organize_with_diags(
+            source,
+            0..24,
+            &[],
+            1,
+            "/// @docImport 'dart:math';\n///\n/// @docImport 'a.dart';\nlibrary;\n",
+        );
+        // Upstream `test_organizeImports_docImports_multiple`: prose lines
+        // stay put around the regrouped doc imports.
+        let source = "/// Text\n/// @docImport 'dart:math';\n/// one\n/// @docImport 'dart:async';\n/// two\n/// @docImport 'dart:io';\n/// three\nlibrary;\n";
+        assert_organize_with_diags(
+            source,
+            9..33,
+            &[],
+            1,
+            "/// Text\n/// @docImport 'dart:async';\n/// @docImport 'dart:io';\n/// @docImport 'dart:math';\n/// one\n/// two\n/// three\nlibrary;\n",
+        );
+    }
+
+    /// The `@docImport` leg over a block doc comment: the lines re-mark
+    /// under ` *`, the closing ` */` lands on its own line (upstream
+    /// `_organizeDocImportsInBlockComment`'s `newLines` shape).
+    #[test]
+    fn directives_organize_sorts_doc_imports_in_a_block_comment() {
+        let source = "/**\n * @docImport 'a.dart';\n * @docImport 'dart:math';\n */\nlibrary;\n";
+        assert_organize_with_diags(
+            source,
+            0..27,
+            &[],
+            1,
+            "/**\n * @docImport 'dart:math';\n *\n * @docImport 'a.dart';\n */\nlibrary;\n",
+        );
+    }
+
+    /// The two legs in one pass: a file with disordered doc imports AND
+    /// disordered directives offers one fix carrying both disjoint edits
+    /// (the official organizer splices both before comparing against the
+    /// initial code).
+    #[test]
+    fn directives_organize_reaches_both_faces_in_one_pass() {
+        let source = "/// @docImport 'a.dart';\n/// @docImport 'dart:math';\nlibrary;\n\nimport 'b/b.dart';\nimport 'a/a.dart';\nvoid f() {}\n";
+        assert_organize_with_diags(
+            source,
+            0..24,
+            &[],
+            2,
+            "/// @docImport 'dart:math';\n///\n/// @docImport 'a.dart';\nlibrary;\n\nimport 'a/a.dart';\nimport 'b/b.dart';\nvoid f() {}\n",
+        );
+    }
+
+
+    /// The no-edit face: a rebuild that changes nothing offers no fix (the
+    /// official `organize()` returns an empty edit list then).
+    #[test]
+    fn directives_organize_drops_when_rebuild_is_identical() {
+        let source = "import 'a.dart';\nimport 'b.dart';\n";
+        let lines = LineIndex::new(source);
+        let fixes = from_lints(
+            &[row("directives_ordering", 0..16)],
+            source,
+            &lines,
+            test_path(),
+            &[],
+            &walk_fuse(),
+        );
+        assert!(fixes.is_empty(), "an identical rebuild offers no fix");
     }
 
     // -----------------------------------------------------------------------

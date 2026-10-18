@@ -850,9 +850,17 @@ fn path_is_generated(path: &Path) -> bool {
 /// held). An empty record answers upstream-true: nothing consumed the
 /// citation, it reports.
 ///
-/// `known_code` is the diagnostic-code registry's membership test (the
-/// shell passes the engine's known-codes face; the dartq-lints crate keeps
-/// no dependency on it). Plain runs — test harnesses, embedded consumers
+/// `known_code` is the diagnostic-code registry's membership test — the
+/// REPORT filter leg (name-only, `ignore_validator.dart`:208-213);
+/// `canonical_code` resolves a `uniqueName` spelling to its shared
+/// registry `name` — the citation match's second leg
+/// (`ignore_info.dart`:39-52). The admission probe joins both: a file
+/// citing only a `uniqueName` still qualifies as an analyzer-code
+/// citation (it can suppress a diagnostic), while the per-entry
+/// unnecessary report stays name-only — a `uniqueName` entry is skipped
+/// by `known_code` and stays silent, exactly as upstream. The shell
+/// passes the engine's two faces; the dartq-lints crate keeps no
+/// dependency on it. Plain runs — test harnesses, embedded consumers
 /// without the shell — keep the #1353 silence on these names: the run
 /// epilogue's record never holds analyzer drops, so the verdict belongs
 /// here. Generated files stay silent ([`GENERATED_SUFFIXES`]).
@@ -867,6 +875,7 @@ pub fn unnecessary_ignore_analyzer_rows(
     unignorable: &rustc_hash::FxHashSet<String>,
     analyzer_suppressed: &[(u32, &'static str)],
     known_code: impl Fn(&str) -> bool,
+    canonical_code: impl Fn(&str) -> Option<&'static str>,
 ) -> Vec<Lint> {
     if !rule_by_name("unnecessary_ignore").is_some_and(|id| enabled.is_enabled(id)) {
         return Vec::new();
@@ -875,9 +884,13 @@ pub fn unnecessary_ignore_analyzer_rows(
     let ignore = IgnoreInfo::parse(unit.source, &comments);
     let entries = ignore.name_entries(unit.source);
     // Nothing to admit unless a citation names a code the registry knows —
+    // in either spelling (name OR uniqueName, `ignore_info.dart`:39-52);
     // the same probe the shell pays before its fold, repeated here so the
-    // face is self-contained for direct callers.
-    if !entries.iter().any(|entry| known_code(entry.name.as_str())) {
+    // face is self-contained for direct callers (#2136).
+    if !entries
+        .iter()
+        .any(|entry| known_code(entry.name.as_str()) || canonical_code(&entry.name).is_some())
+    {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -1744,6 +1757,7 @@ mod tests {
             &rustc_hash::FxHashSet::default(),
             &[],
             |name| name == "unused_local_variable",
+            |_| None,
         );
         assert_eq!(rows.len(), 1, "{rows:?}");
         // The name token: `// ignore: ` is 11 chars, the name 21.
@@ -1773,6 +1787,7 @@ mod tests {
                 &rustc_hash::FxHashSet::default(),
                 &[(2, "unused_local_variable")],
                 |name| name == "unused_local_variable",
+                |_| None,
             )
             .is_empty()
         );
@@ -1790,6 +1805,7 @@ mod tests {
                 &rustc_hash::FxHashSet::default(),
                 &[(2, "unused_local_variable")],
                 |name| name == "unused_local_variable",
+                |_| None,
             )
             .is_empty()
         );
@@ -1834,6 +1850,7 @@ mod tests {
                 &rustc_hash::FxHashSet::default(),
                 &[],
                 |name| name == "unused_local_variable",
+                |_| None,
             )
             .is_empty()
         );
@@ -1857,6 +1874,7 @@ mod tests {
                 &rustc_hash::FxHashSet::default(),
                 &[],
                 |_| true,
+                |_| None,
             )
             .is_empty()
         );
@@ -1881,6 +1899,58 @@ mod tests {
                 &rustc_hash::FxHashSet::default(),
                 &[],
                 |name| name == "unused_local_variable",
+                |_| None,
+            )
+            .is_empty()
+        );
+    }
+
+    /// The #2136 citation-match leg (#2131's deferred consumer): a
+    /// `uniqueName` citation IS an analyzer-code citation — the admission
+    /// probe admits it (name OR uniqueName, `ignore_info.dart`:39-52), and
+    /// when the canonical-named diagnostic was suppressed the record's
+    /// `(line, canonical)` pair exists — yet the REPORT filter stays
+    /// name-only (`ignore_validator.dart`:208-213), so the uniqueName
+    /// entry never reports `unnecessary_ignore` — suppressed or not —
+    /// exactly as upstream.
+    #[test]
+    fn unique_name_citation_admitted_by_probe_but_never_reports() {
+        analyzer_unit!(
+            f,
+            unit,
+            "// ignore: invalid_null_aware_operator_after_short_circuit\n\
+             void f() {}\n",
+            Some(Path::new("lint_fixture.dart"))
+        );
+        let known = |name: &str| name == "invalid_null_aware_operator";
+        let canonical = |name: &str| {
+            (name == "invalid_null_aware_operator_after_short_circuit")
+                .then_some("invalid_null_aware_operator" as &'static str)
+        };
+        // The joined probe admits the file (only a uniqueName is cited):
+        // the face does NOT early-return — it runs the walk and finds the
+        // entry skipped by the name-only report filter.
+        assert!(
+            unnecessary_ignore_analyzer_rows(
+                &unit,
+                &one_rule("unnecessary_ignore"),
+                &rustc_hash::FxHashSet::default(),
+                &[(2, "invalid_null_aware_operator")],
+                known,
+                canonical,
+            )
+            .is_empty()
+        );
+        // Same verdict with an empty record: the upstream
+        // valid-names bail keeps an unused uniqueName citation silent too.
+        assert!(
+            unnecessary_ignore_analyzer_rows(
+                &unit,
+                &one_rule("unnecessary_ignore"),
+                &rustc_hash::FxHashSet::default(),
+                &[],
+                known,
+                canonical,
             )
             .is_empty()
         );

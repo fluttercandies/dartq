@@ -50,6 +50,7 @@
 //! ([`crate::testsupport::Fixture::parse`]) for exactly that reason.
 
 use dartq_ast::{NodeKind, mod_flags};
+use dartq_semantic::Analysis;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::engine::Unit;
@@ -1282,14 +1283,23 @@ fn top_level_const_name<'s>(unit: &Unit<'s>, field: u32) -> Option<&'s str> {
         .then(|| lexeme(unit, head_token(unit, field)))
 }
 
-/// Whether the unit's library directive spells `library meta;` — the
-/// declaring-library gate the analyzer applies to the package:meta
-/// annotations (`_isPackageMetaGetter`/`_isPackageMetaConstructor`,
+/// Whether the unit's declaring library is meta — the declaring-library
+/// gate the analyzer applies to the package:meta annotations
+/// (`_isPackageMetaGetter`/`_isPackageMetaConstructor`,
 /// `element.library.name == 'meta'`). The annotation faces
 /// (`@literal`, `@immutable`/`@Immutable`) are recognized only over it,
 /// so a corpus importing an unnamed vendored meta — the oracle's own
 /// observed face — never recognizes them.
-pub(crate) fn spells_meta_library(unit: &Unit<'_>) -> bool {
+///
+/// The answer reads the mounted fold's resolution face when one travels
+/// with the run ([`Analysis::is_meta_library`] — the graph's registered
+/// directive name, authoritative for parts and multi-unit libraries), and
+/// falls back to the written `library meta;` scan below only where no
+/// fold is mounted (the plain-run posture).
+pub(crate) fn spells_meta_library(unit: &Unit<'_>, semantics: Option<&Analysis<'_>>) -> bool {
+    if let Some(semantics) = semantics {
+        return semantics.is_meta_library();
+    }
     let Some(root) = unit.ast.root() else {
         return false;
     };
@@ -1673,7 +1683,9 @@ mod w3_const_pins {
     }
 
     /// The meta-library face: only `library meta;` answers — the gate the
-    /// `@literal`/`@immutable` annotation reads ride.
+    /// `@literal`/`@immutable` annotation reads ride. The pins run the
+    /// written-directive fallback (`None` semantics — the plain-run
+    /// posture).
     #[test]
     fn meta_library_name_face() {
         for (source, want) in [
@@ -1683,8 +1695,78 @@ mod w3_const_pins {
             ("var x = 1;\n", false),
         ] {
             let f = Fixture::parse(source);
-            assert_eq!(spells_meta_library(&unit(&f)), want, "{source}");
+            assert_eq!(spells_meta_library(&unit(&f), None), want, "{source}");
         }
+    }
+
+    /// Both faces agree — the gate's unification pin: a vendored no-directive
+    /// meta copy is unrecognized and a named meta recognized, through the
+    /// written-directive fallback and the mounted resolution face
+    /// ([`dartq_semantic::Analysis::is_meta_library`], the graph's
+    /// registered directive name) alike.
+    #[test]
+    fn meta_library_faces_agree() {
+        const VENDORED: &str = "class Immutable {\n\
+                                \x20 const Immutable([this.reason = '']);\n\
+                                \x20 final String reason;\n\
+                                }\n";
+        const NAMED: &str = "library meta;\nclass Immutable {\n\
+                             \x20 const Immutable([this.reason = '']);\n\
+                             \x20 final String reason;\n\
+                             }\n";
+        let vendored = Fixture::parse(VENDORED);
+        let named = Fixture::parse(NAMED);
+        // The fallback (the plain-run posture).
+        assert!(!spells_meta_library(&unit(&vendored), None), "vendored meta");
+        assert!(spells_meta_library(&unit(&named), None), "named meta");
+        // The mounted fold, the graph's declared name fed as the engine
+        // feeds it.
+        assert!(!mounted_gate(&vendored, None), "vendored meta, unnamed graph");
+        assert!(mounted_gate(&named, Some("meta")), "named meta, named graph");
+    }
+
+    /// The gate over a semantics-mounted run: the source folded as the sole
+    /// analyzed file of `package:t`, with `graph_name` registered as the
+    /// library's declared directive name (the engine's feeding face). The
+    /// context tables leak (`'static`); tests are one-shot processes.
+    fn mounted_gate(f: &Fixture, graph_name: Option<&str>) -> bool {
+        let strings: &'static dartq_source::StringTable =
+            Box::leak(Box::new(dartq_source::StringTable::new()));
+        let mut files = dartq_source::FileTable::new();
+        let file = files.intern(std::path::Path::new("m.dart"));
+        let features = dartq_parser::ParserFeatures::from_feature_set(
+            dartq_language::FeatureSet::for_language_version(dartq_language::LanguageVersion::new(
+                3, 15,
+            )),
+        );
+        let elements = dartq_semantic::collect(&f.source, &f.tokens, features, strings);
+        let mut builder = dartq_resolution::LibraryGraphBuilder::new(strings);
+        let lib = builder.intern("package:t/m.dart");
+        builder.unit(lib, file);
+        if let Some(name) = graph_name {
+            builder.library_name(lib, name);
+        }
+        let mut index = dartq_semantic::ElementIndex::default();
+        index.insert(file, elements);
+        let graph: &'static dartq_resolution::LibraryGraph =
+            Box::leak(Box::new(builder.finish()));
+        let namespaces: &'static dartq_resolution::Namespaces =
+            Box::leak(Box::new(dartq_resolution::Namespaces::build(graph)));
+        let index: &'static dartq_semantic::ElementIndex = Box::leak(Box::new(index));
+        let analysis = dartq_semantic::analyze_unit(
+            &f.source,
+            &f.tokens,
+            features,
+            strings,
+            file,
+            lib,
+            graph,
+            namespaces,
+            index,
+            dartq_semantic::StrictModes::default(),
+            &dartq_resolution::LibraryClassModifiers::default(),
+        );
+        spells_meta_library(&unit(f), Some(&analysis))
     }
 
     /// The tear-off faces: `C.new` over a class with no generative

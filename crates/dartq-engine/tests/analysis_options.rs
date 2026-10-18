@@ -1661,6 +1661,52 @@ fn the_diagnostic_name_universe_matches_on_name_not_unique_name() {
         "dead_code_late_wildcard_variable_initializer"
     ));
 }
+
+/// The ignore-citation faces' second leg (#2131): a citation matches a
+/// diagnostic by the registry `name` OR the `uniqueName`
+/// (`IgnoredDiagnosticName._matches`, ignore_info.dart:39-52), so the
+/// uniqueName spellings resolve through [`canonical_diagnostic_name`] while
+/// staying out of the `analyzer.errors` universe. The match shape a file
+/// rides is `is_known_diagnostic_code(citation) ||
+/// canonical_diagnostic_name(citation).is_some()` — name-spelling
+/// citations answer on the first leg, uniqueName-spelling citations on the
+/// second, and the two legs never disagree about a dead name.
+#[test]
+fn the_unique_name_spelling_resolves_for_citation_matching() {
+    use dartq_engine::analysis_options::{canonical_diagnostic_name, is_known_diagnostic_code};
+
+    // The dispatch's case: the second `invalid_null_aware_operator`
+    // constant.
+    assert_eq!(
+        canonical_diagnostic_name("invalid_null_aware_operator_after_short_circuit"),
+        Some("invalid_null_aware_operator")
+    );
+    // Documented name/uniqueName divergences resolve too.
+    assert_eq!(
+        canonical_diagnostic_name("dead_code_late_wildcard_variable_initializer"),
+        Some("dead_code")
+    );
+    assert_eq!(
+        canonical_diagnostic_name("undefined_super_getter"),
+        Some("undefined_super_member")
+    );
+    // The match is case-insensitive (the citation match lowercases,
+    // `IgnoredDiagnosticName`'s constructor).
+    assert_eq!(
+        canonical_diagnostic_name("INVALID_NULL_AWARE_OPERATOR_AFTER_SHORT_CIRCUIT"),
+        Some("invalid_null_aware_operator")
+    );
+    // Unknown and name-field spellings name nothing through this face.
+    assert_eq!(canonical_diagnostic_name("not_a_real_code"), None);
+    assert_eq!(canonical_diagnostic_name("invalid_null_aware_operator"), None);
+    // The joined admission never fires on a dead name.
+    let admitted = |citation: &str| {
+        is_known_diagnostic_code(citation) || canonical_diagnostic_name(citation).is_some()
+    };
+    assert!(admitted("invalid_null_aware_operator_after_short_circuit"));
+    assert!(admitted("invalid_null_aware_operator"));
+    assert!(!admitted("not_a_real_code"));
+}
 /// The YAML failure faces (#938, machine-face posture re-adjudicated by the
 /// #1589 five-form oracle probe and landed #2002): the initial file's broken
 /// YAML is machine-face SILENT — the oracle emits no diagnostic row for a

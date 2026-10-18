@@ -4698,8 +4698,10 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
     /// ends the chain (the under-report).
     fn spelling_has_immutable(c: &Check<'_>, name: &str) -> bool {
         // The declaring-library gate first: the annotation resolves only
-        // out of a library named `meta` (the doc block).
-        if !const_ability::spells_meta_library(c.unit) {
+        // out of a library named `meta` (the doc block) — the mounted
+        // fold's resolution face, the written-directive scan as the
+        // plain-run fallback.
+        if !const_ability::spells_meta_library(c.unit, c.semantics()) {
             return false;
         }
         let Some(first) = same_file_class_like(c, name) else {

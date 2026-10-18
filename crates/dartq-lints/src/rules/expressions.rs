@@ -21275,13 +21275,14 @@ pub(crate) mod prefer_const_constructors {
     /// own metadata names `literal`. The analyzer recognizes the annotation
     /// only over the declaring-library gate — `_isPackageMetaGetter`
     /// requires `element.library.name == 'meta'` — so the same-file
-    /// spelling read answers only when the unit declares `library meta;`
-    /// (the same face [`crate::rules::const_ability::spells_meta_library`]
-    /// reads). A corpus importing an unnamed vendored meta — the live
-    /// oracle's own face — never recognizes the annotation, and the
-    /// creation reports like any other.
+    /// spelling read answers only when the library is meta (the
+    /// [`crate::rules::const_ability::spells_meta_library`] gate: the
+    /// mounted fold's resolution face, the written-directive scan as the
+    /// plain-run fallback). A corpus importing an unnamed vendored meta —
+    /// the live oracle's own face — never recognizes the annotation, and
+    /// the creation reports like any other.
     fn ctor_has_literal(c: &Check<'_>, class_name: &str, selector: Option<&str>) -> bool {
-        if !crate::rules::const_ability::spells_meta_library(c.unit) {
+        if !crate::rules::const_ability::spells_meta_library(c.unit, c.semantics()) {
             return false;
         }
         let Some(class_row) = same_file_declaration(c, class_name) else {
@@ -21590,9 +21591,13 @@ pub(crate) mod avoid_redundant_argument_values {
     /// factory redirects walked to the target with a cycle guard), and a
     /// top-level or local function for the bare face. The parameter's
     /// default is its written `=`/`:` expression (the bridge init words —
-    /// upstream compares the computed constant values); equality is
-    /// token-for-token, so values spelled differently (`2` vs `1 + 1`)
-    /// under-report. A parameter without a default clause carries the
+    /// upstream compares the computed constant values); the equality runs
+    /// both faces through the written-constant subset
+    /// ([`dartq_semantic::const_eval::eval_written`]) so differently
+    /// spelled but equal values (`2` vs `1 + 1`) report, with the
+    /// token-for-token comparison kept for shapes outside the subset —
+    /// identical spellings still compare equal, differently spelled
+    /// shapes under-report. A parameter without a default clause carries the
     /// implicit `null`: only a written `null` argument reports (the
     /// `computeConstantValue` null-value face). Constructor rows anchor at
     /// the class name (the named selector rides the
@@ -21755,7 +21760,7 @@ pub(crate) mod avoid_redundant_argument_values {
             value_start == value_end && c.lexeme(value_start) == default
         } else {
             match default_clause(c, param.expect("resolved formal")) {
-                Some((start, end)) => tokens_equal(c, value_start..=value_end, start..=end),
+                Some((start, end)) => constants_equal(c, value_start..=value_end, start..=end),
                 // No default clause: the implicit `null` — only a written
                 // `null` argument equals it (the `computeConstantValue`
                 // null-value face).
@@ -21781,22 +21786,45 @@ pub(crate) mod avoid_redundant_argument_values {
         Some((start, end - 1))
     }
 
-    /// Whether two token ranges spell the same lexeme sequence (the
-    /// `computeConstantValue()` equality at the written face).
-    fn tokens_equal(
+    /// The `computeConstantValue()` equality (:71-80): both faces evaluated
+    /// through the written-constant subset
+    /// ([`dartq_semantic::const_eval::eval_written`]) — values spelled
+    /// differently but equal (`2` vs `1 + 1`) report; shapes outside the
+    /// subset keep the token-for-token spelling comparison, where identical
+    /// spellings compare equal (the documented resolution-blind fallback)
+    /// and different spellings stay silent; a slice with no known value
+    /// never matches — not even at the identical spelling (the oracle's
+    /// `hasKnownValue` gate). A subset value against a shape outside it
+    /// stays silent too (the under-report).
+    fn constants_equal(
         c: &Check<'_>,
         left: core::ops::RangeInclusive<u32>,
         right: core::ops::RangeInclusive<u32>,
     ) -> bool {
+        use dartq_semantic::const_eval::WrittenValue;
         let (left_len, right_len) = (
             left.end() - left.start() + 1,
             right.end() - right.start() + 1,
         );
-        left_len == right_len
-            && (0..left_len).all(|offset| {
-                let (left_tok, right_tok) = (left.start() + offset, right.start() + offset);
-                left_tok == right_tok || c.lexeme(left_tok) == c.lexeme(right_tok)
-            })
+        let written = |range: &core::ops::RangeInclusive<u32>, len: u32| {
+            let lexemes: Vec<&str> =
+                (0..len).map(|offset| c.lexeme(range.start() + offset)).collect();
+            dartq_semantic::const_eval::eval_written(&lexemes)
+        };
+        match (written(&left, left_len), written(&right, right_len)) {
+            (WrittenValue::Value(l), WrittenValue::Value(r)) => l == r,
+            // Both outside the subset: the spelling comparison — the
+            // `tokens_equal` face this equality started as.
+            (WrittenValue::NotEvaluable, WrittenValue::NotEvaluable) => {
+                left_len == right_len
+                    && (0..left_len).all(|offset| {
+                        let (left_tok, right_tok) =
+                            (left.start() + offset, right.start() + offset);
+                        left_tok == right_tok || c.lexeme(left_tok) == c.lexeme(right_tok)
+                    })
+            }
+            _ => false,
+        }
     }
 
     /// The formal's kind word (bridge `end_formal_parameter` payload 4).
@@ -24049,6 +24077,45 @@ mod w2_expr_pins {
             "void g({@required int x = 1}) {}\nvoid f() {\n  g(x: 1);\n}\n",
             // A required positional cannot be written.
             "void g(int x) {}\nvoid f() {\n  g(1);\n}\n",
+        ] {
+            let fixture = Fixture::parse(source);
+            assert!(
+                fixture
+                    .run(&one_rule("avoid_redundant_argument_values"))
+                    .is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    /// The evaluated-value equality (`checkArgument`'s `computeConstantValue`
+    /// comparison, :71-80): values spelled differently but equal report
+    /// where upstream does, unequal values stay silent, num kinds never
+    /// cross (`DartObjectImpl` equality is type-equal), a throwing constant
+    /// never matches — not even at the identical spelling (`hasKnownValue`
+    /// false) — and an escape-decoded string equals its cooked spelling.
+    #[test]
+    fn avoid_redundant_argument_values_evaluated_equality() {
+        for source in [
+            // The documented textual under-report: `1 + 1` equals the `2`
+            // default.
+            "void g({int x = 2}) {}\nvoid f() {\n  g(x: 1 + 1);\n}\n",
+            // Identical multi-token spellings still report.
+            "void g({int x = 1 + 1}) {}\nvoid f() {\n  g(x: 1 + 1);\n}\n",
+            // `'\x41'` cooks to `'A'` on both faces.
+            "void g({String s = 'A'}) {}\nvoid f() {\n  g(s: '\\x41');\n}\n",
+        ] {
+            let lints = Fixture::parse(source).run(&one_rule("avoid_redundant_argument_values"));
+            assert_eq!(lints.len(), 1, "{source}");
+        }
+        for source in [
+            // A different evaluated value never reports.
+            "void g({int x = 2}) {}\nvoid f() {\n  g(x: 1 + 2);\n}\n",
+            // `2` and `2.0` are distinct `DartObjectImpl`s (int vs double).
+            "void g({num x = 2}) {}\nvoid f() {\n  g(x: 2.0);\n}\n",
+            // A throwing default has no known value — the same spelling of
+            // the argument stays silent with it.
+            "void g({int x = 1 ~/ 0}) {}\nvoid f() {\n  g(x: 1 ~/ 0);\n}\n",
         ] {
             let fixture = Fixture::parse(source);
             assert!(
