@@ -172,8 +172,21 @@ fn broken_framing_ends_the_session() {
     let (code, transcript) = h.join_ended();
 
     assert_eq!(code, dartq_daemon::EXIT_PROTOCOL);
-    assert_eq!(transcript.len(), 1, "one answer, then the session ends");
-    assert_eq!(transcript[0]["error"]["code"], -32700);
+    // The spawn baseline's settle probe (an id >= 1000 harness artifact)
+    // may drain ahead of the broken frame; the contract pins the
+    // client-driven faces: the broken frame's best-effort ParseError is
+    // the final word and the piped `dartq/analyze` (id 1) was never
+    // processed (`answered` counts client ids only, below the probe
+    // range).
+    assert_eq!(
+        transcript.last().expect("the ParseError answered")["error"]["code"],
+        -32700,
+        "the best-effort ParseError answer: {transcript:?}"
+    );
+    assert!(
+        answered(&transcript).is_empty(),
+        "the next frame is never processed: {transcript:?}"
+    );
 }
 
 /// A frame truncated mid-body (headers delivered, body short) ends the
@@ -188,8 +201,19 @@ fn truncated_frame_body_ends_with_protocol_exit() {
     let (code, transcript) = h.join_ended();
 
     assert_eq!(code, dartq_daemon::EXIT_PROTOCOL);
-    assert_eq!(transcript.len(), 1, "the best-effort ParseError answer");
-    assert_eq!(transcript[0]["error"]["code"], -32700);
+    // The spawn baseline's settle probe (an id >= 1000 harness artifact)
+    // may drain ahead of the truncated frame; the contract pins the
+    // client-driven face: the best-effort ParseError is the final word
+    // and nothing else was ever answered.
+    assert_eq!(
+        transcript.last().expect("the ParseError answered")["error"]["code"],
+        -32700,
+        "the best-effort ParseError answer: {transcript:?}"
+    );
+    assert!(
+        answered(&transcript).is_empty(),
+        "the truncated frame answers nothing else: {transcript:?}"
+    );
 }
 
 /// The burst path's first use: `dartq/sync` + `dartq/analyze` +

@@ -24,14 +24,13 @@ use common::{BROKEN_MAIN, CLEAN_MAIN, Workspace, request, spawn, store_root};
 use dartq_schema::{Domain, Verbosity, validate, validate_at_tier};
 use serde_json::{Value, json};
 
-/// The `result` of the answer frame for `id`.
+/// The `result` of the answer frame for `id`. Waits the answer out: the
+/// staged dispatch faces (`dartq/fix`, `dartq/assists`) write their progress
+/// notice at the drain and answer one worker hop later, so a scan of the
+/// settled transcript can race the completion (the window's heavier fix
+/// dispatch loses that race consistently).
 fn answer_result(h: &common::Harness, id: i64) -> Value {
-    let transcript = h.transcript();
-    transcript
-        .iter()
-        .find(|frame| frame.get("id") == Some(&json!(id)))
-        .unwrap_or_else(|| panic!("request {id} answers: {transcript:?}"))["result"]
-        .clone()
+    h.wait_answer(id)["result"].clone()
 }
 
 /// Serializes `result` and validates it against `domain` — the union check
@@ -216,11 +215,21 @@ fn dartq_impact_validates_and_is_tier_invariant() {
 #[test]
 fn dartq_compat_answers_validate_at_every_tier() {
     let workspace = Workspace::new(CLEAN_MAIN);
+    // The per-axis lever is the SDK whitelist, not the `dart:` library
+    // table (dafa65b made the `dart:` face the oracle-pinned flat table,
+    // axis-independent): the same re-differentiation the CLI and
+    // rpc_commands compat fixtures took — `class Foo<in T>` codes
+    // `experiment_not_enabled_off_by_default` only under the axis whose
+    // `allowed_experiments.json` denies `fixture` the `variance` grant,
+    // which applies only at the package's pinned 3.13 language version
+    // (the exact-equality gate; the compat face re-reads the config from
+    // disk per query).
+    fs::write(workspace.path("lib/a.dart"), "class Foo<in T> {}\n").expect("write a.dart");
     fs::write(
-        workspace.path("lib/a.dart"),
-        "import 'dart:async';\nclass Foo {}\n",
+        workspace.path(".dart_tool/package_config.json"),
+        r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.13"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
     )
-    .expect("write a.dart");
+    .expect("write package config");
     // The SDK axes live under `sdks/`, which the base fixture doesn't
     // create: each write establishes its parent directories.
     let write = |relative: &str, content: &str| {
@@ -228,28 +237,32 @@ fn dartq_compat_answers_validate_at_every_tier() {
         fs::create_dir_all(path.parent().expect("parent")).expect("dir");
         fs::write(path, content).expect("file");
     };
+    // The grant-carrying axis (the compatible one).
     write("sdks/new/version", "3.13.1\n");
     write(
         "sdks/new/lib/libraries.json",
         r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}, "async": {"uri": "async/async.dart"}}}}"#,
     );
     write("sdks/new/lib/async/async.dart", "library dart.async;\n");
+    write(
+        "sdks/new/lib/_internal/allowed_experiments.json",
+        r#"{"version": 1, "experimentSets": {"grants": ["variance"]}, "sdk": {"default": {"experimentSet": "grants"}}, "packages": {"fixture": {"experimentSet": "grants"}}}"#,
+    );
+    // The grant-less axis (the incompatible one).
     write("sdks/old/version", "3.5.0\n");
     write(
         "sdks/old/lib/libraries.json",
         r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
     );
-    for sdk in ["new", "old"] {
-        write(
-            &format!("sdks/{sdk}/lib/_internal/allowed_experiments.json"),
-            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
-        );
-    }
+    write(
+        "sdks/old/lib/_internal/allowed_experiments.json",
+        r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+    );
 
     let a = workspace.path("lib/a.dart");
     let mut h = spawn(&workspace, &store_root("schema-compat"));
-    // `lib/a.dart` imports `dart:async`, unresolvable under the session's
-    // core-only SDK: the sweep's startup drain pushes it before the first
+    // `lib/a.dart` carries the variance modifier the session's SDK never
+    // grants: the sweep's startup drain pushes it before the first
     // request — already in the transcript when these steps run.
 
     for (id, tier) in [
@@ -288,7 +301,8 @@ fn dartq_compat_answers_validate_at_every_tier() {
     }
     let compact = answer_result(&h, 3);
     assert_eq!(
-        compact["matrix"][0]["first_failure"]["code"], "uri_does_not_exist",
+        compact["matrix"][0]["first_failure"]["code"],
+        "experiment_not_enabled_off_by_default",
         "the compact tier carries the evidence"
     );
 
@@ -343,17 +357,25 @@ fn dartq_explain_answers_validate_at_every_tier() {
     }
 
     // The arbitration pin (#623B): the full-tier table maps short ids to
-    // the substituted rows' file paths — `s1` is the first-seen repeated
-    // path (main.dart, a reference and a dependency), assigned in the
-    // economics' deterministic first-seen order.
+    // the substituted rows' file paths, assigned in the economics'
+    // deterministic first-seen order. Under the package-form label wave the
+    // lib rows carry `package:fixture/main.dart` (a reference and a
+    // dependency over the declaration), while `test/` has no `package:`
+    // URI and keeps the canonical path — the label wave flipped the
+    // first-seen repeat order, so the test file is `s1` and the labeled
+    // main.dart `s2`.
     let full = answer_result(&h, 4);
     let symbols = full["symbols"]
         .as_object()
         .expect("the short-id table pays on the fixture's long temp paths");
     assert_eq!(
         symbols["s1"],
-        workspace.path("lib/main.dart").display().to_string(),
+        workspace.path("test/dog_test.dart").display().to_string(),
         "the table maps ids to file paths: {symbols:?}"
+    );
+    assert_eq!(
+        symbols["s2"], "package:fixture/main.dart",
+        "lib members carry the package-form label: {symbols:?}"
     );
 
     // Delta economics: nothing was written through this session, so the
@@ -388,12 +410,23 @@ fn dartq_explain_answers_validate_at_every_tier() {
 /// absence-tolerant edit field. The builtin row carries the `builtin-lint`
 /// tag, and the full tier adds its rule id and human message (a plugin
 /// row's `message` + `priority` ride the same full-only rule; the
-/// live-plugin dispatch is the ignored serial test's scene).
+/// live-plugin dispatch is the ignored serial test's scene). The governing
+/// options file joins the document set (the window's cross-file fix face),
+/// so the envelope carries two stamped documents.
 #[test]
 fn dartq_fix_documents_validate_with_their_provenance() {
     let workspace = Workspace::new(CLEAN_MAIN);
     let fixable = workspace.root.join("fixable.dart");
     fs::write(&fixable, "void f() { var a = new B(); }\n").expect("write fixable");
+    // The options file is the fixture's governing posture: options-less
+    // enables nothing (#936), so the pinned `builtin-lint` row rides an
+    // explicit enable — the same fixture shape the rpc_commands fix test
+    // pins.
+    fs::write(
+        workspace.root.join("analysis_options.yaml"),
+        "linter:\n  rules:\n    - unnecessary_new\n",
+    )
+    .expect("write options");
     let mut h = spawn(&workspace, &store_root("schema-fix"));
 
     for (id, tier) in [
@@ -414,9 +447,22 @@ fn dartq_fix_documents_validate_with_their_provenance() {
         );
         let result = answer_result(&h, id);
         let files = result["files"].as_array().expect("files array");
-        assert_eq!(files.len(), 1, "the fixable file's document: {result}");
+        assert_eq!(
+            files.len(),
+            2,
+            "the hit file plus the governing options file (the cross-file document set): {result}"
+        );
+        assert_eq!(
+            files[0]["file"],
+            fixable.display().to_string(),
+            "the fixable file's document comes first: {result}"
+        );
         assert_valid_at_tier(&files[0], Domain::FixPatch, tier);
-        assert_eq!(stamp_count(&result), 2, "envelope plus document: {result}");
+        assert_eq!(
+            stamp_count(&result),
+            3,
+            "envelope plus one stamp per document: {result}"
+        );
 
         let edit = &files[0]["edits"][0];
         assert_eq!(

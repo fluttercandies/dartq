@@ -169,47 +169,48 @@ fn two_agents_edit_and_delta_over_one_base() {
 
     // Delta mode: agent B's overlay masks the base edit, so
     // B's view changed at its overlay.set — `since` cuts by that cursor.
-    // Cursors: the sweep = 1, overlay.set A = 2, overlay.set B = 3,
-    // the sync's drain = 4.
+    // The cursor counts session-observed writes only — the startup sweep
+    // is the cursor-0 baseline, not a change: overlay.set A = 1,
+    // overlay.set B = 2, the sync's drain = 3.
     h.burst(
         &[
             request(
                 10,
                 "dartq/check",
-                json!({"paths": ["lib"], "agentId": "B", "since": 3}),
+                json!({"paths": ["lib"], "agentId": "B", "since": 2}),
             ),
             request(
                 11,
                 "dartq/check",
-                json!({"paths": ["lib"], "agentId": "B", "since": 2}),
+                json!({"paths": ["lib"], "agentId": "B", "since": 1}),
             ),
-            request(12, "dartq/check", json!({"paths": ["lib"], "since": 3})),
+            request(12, "dartq/check", json!({"paths": ["lib"], "since": 2})),
         ],
         3,
     );
-    // B overlaid main at cursor 3: since=3 excludes it — the error row
-    // vanishes; since=2 keeps it. The answer echoes the current cursor (4).
+    // B overlaid main at cursor 2: since=2 excludes it — the error row
+    // vanishes; since=1 keeps it. The answer echoes the current cursor (3).
     assert!(
         codes(&answer_result(&h, 10)).is_empty(),
         "delta since the overlay's own cursor: {:?}",
         answer_result(&h, 10)
     );
-    assert_eq!(answer_result(&h, 10)["since"], 4, "the cursor echoes");
+    assert_eq!(answer_result(&h, 10)["since"], 3, "the cursor echoes");
     assert_eq!(
         codes(&answer_result(&h, 11)),
         ["expected_token", "undefined_identifier"],
         "delta before the overlay's cursor keeps the rows: {:?}",
         answer_result(&h, 11)
     );
-    // The base view changed at the sync drain (4 > 3): the engine saw the
+    // The base view changed at the sync drain (3 > 2): the engine saw the
     // fixed text, so the URI error is gone — but the rows' change stamp is
     // what the delta includes, and the fresh clean set has nothing to list.
     assert!(
         codes(&answer_result(&h, 12)).is_empty(),
-        "base delta since 3 carries no rows (the fix cleared them): {:?}",
+        "base delta since 2 carries no rows (the fix cleared them): {:?}",
         answer_result(&h, 12)
     );
-    assert_eq!(answer_result(&h, 12)["since"], 4);
+    assert_eq!(answer_result(&h, 12)["since"], 3);
 
     // Teardown evicts: a cleared agent answers INVALID_PARAMS, fail loud.
     h.step(

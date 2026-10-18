@@ -807,11 +807,24 @@ fn dartq_explain_rejects_a_bad_symbol() {
 fn dartq_compat_matches_the_cli_matrix() {
     let _guard = workspace_lock();
     let workspace = Workspace::new(CLEAN_MAIN);
+    // The per-axis lever is the SDK whitelist, not the `dart:` library
+    // table: dafa65b made the `dart:` URI face the generated oracle-pinned
+    // flat table (axis-independent), so the same re-differentiation the
+    // CLI compat fixture took applies here — `class Foo<in T>` codes
+    // `experiment_not_enabled_off_by_default` only under the SDK whose
+    // `allowed_experiments.json` denies package `fixture` the `variance`
+    // grant (oracle-cited `experiment_not_enabled_off_by_default@1:11`).
+    fs::write(workspace.path("lib/a.dart"), "class Foo<in T> {}\n").expect("write a.dart");
+    // `variance` has no experimental release version, so a grant applies
+    // only at the current language version (the exact-equality gate in
+    // `dartq-language`): the package pins 3.13. The compat face re-reads
+    // the config from disk per query (the disk-view rule), so the
+    // overwrite after `Workspace::new` is what the axes see.
     fs::write(
-        workspace.path("lib/a.dart"),
-        "import 'dart:async';\nclass Foo {}\n",
+        workspace.path(".dart_tool/package_config.json"),
+        r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.13"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
     )
-    .expect("write a.dart");
+    .expect("write package config");
     // The SDK axes live under `sdks/`, which the base fixture doesn't
     // create: each write establishes its parent directories.
     let write = |relative: &str, content: &str| {
@@ -819,30 +832,32 @@ fn dartq_compat_matches_the_cli_matrix() {
         fs::create_dir_all(path.parent().expect("parent")).expect("dir");
         fs::write(path, content).expect("file");
     };
-    // The async-carrying axis.
+    // The grant-carrying axis (the compatible one).
     write("sdks/new/version", "3.13.1\n");
     write(
         "sdks/new/lib/libraries.json",
         r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}, "async": {"uri": "async/async.dart"}}}}"#,
     );
     write("sdks/new/lib/async/async.dart", "library dart.async;\n");
-    // The async-less axis.
+    write(
+        "sdks/new/lib/_internal/allowed_experiments.json",
+        r#"{"version": 1, "experimentSets": {"grants": ["variance"]}, "sdk": {"default": {"experimentSet": "grants"}}, "packages": {"fixture": {"experimentSet": "grants"}}}"#,
+    );
+    // The grant-less axis (the incompatible one).
     write("sdks/old/version", "3.5.0\n");
     write(
         "sdks/old/lib/libraries.json",
         r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
     );
-    for sdk in ["new", "old"] {
-        write(
-            &format!("sdks/{sdk}/lib/_internal/allowed_experiments.json"),
-            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
-        );
-    }
+    write(
+        "sdks/old/lib/_internal/allowed_experiments.json",
+        r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+    );
 
     let a = workspace.path("lib/a.dart");
     let mut h = spawn(&workspace, &store_root("rpc-compat"));
-    // `lib/a.dart` imports `dart:async`, unresolvable under the session's
-    // core-only SDK: the sweep publishes one push for it.
+    // `lib/a.dart` carries the variance modifier the session's SDK never
+    // grants: the sweep publishes one push for it.
     h.step(
         &request(
             2,
@@ -862,10 +877,17 @@ fn dartq_compat_matches_the_cli_matrix() {
     assert_eq!(matrix.len(), 2, "one row per axis, in request order");
     assert_eq!(matrix[0]["sdk"], "3.5.0");
     assert_eq!(matrix[0]["compatible"], false);
-    assert_eq!(matrix[0]["first_failure"]["code"], "uri_does_not_exist");
-    assert_eq!(matrix[0]["first_failure"]["file"], a.display().to_string());
+    assert_eq!(
+        matrix[0]["first_failure"]["code"],
+        "experiment_not_enabled_off_by_default"
+    );
+    assert_eq!(
+        matrix[0]["first_failure"]["file"],
+        "package:fixture/a.dart",
+        "the failure file is the package-form label, matching the CLI matrix"
+    );
     assert_eq!(matrix[0]["first_failure"]["line"], 1);
-    assert_eq!(matrix[0]["first_failure"]["col"], 8, "the URI literal span");
+    assert_eq!(matrix[0]["first_failure"]["col"], 11, "the `in` modifier span");
     assert_eq!(matrix[1]["sdk"], "3.13.1");
     assert_eq!(matrix[1]["compatible"], true);
     assert!(matrix[1].get("first_failure").is_none());
@@ -1124,7 +1146,11 @@ fn dartq_context_routes_and_unknown_tag_fails_loud() {
 /// notice at the drain, answer one worker hop later): a file carrying an
 /// `unnecessary_new` hit materializes an anchored edit through the #355
 /// bridge, provenance-tagged `builtin-lint`, and an `agentId` selector is
-/// rejected (the disk-view rule).
+/// rejected (the disk-view rule). The #2070/#2120-window fix face widens
+/// the answer legitimately: the unused local rides its `builtin-semantic`
+/// rename producer, every diagnostic rides the line/file ignore offers,
+/// and the governing `analysis_options.yaml` enters the document set with
+/// its own per-code ignore rows.
 #[test]
 fn dartq_fix_emits_real_builtin_rows_with_provenance() {
     let _guard = workspace_lock();
@@ -1151,28 +1177,81 @@ fn dartq_fix_emits_real_builtin_rows_with_provenance() {
     let result = answer_result(&h, 2);
     assert_eq!(result["schema_version"], 1);
     let files = result["files"].as_array().expect("files array");
-    assert_eq!(files.len(), 1, "the fixable file enters the document set");
+    assert_eq!(
+        files.len(),
+        2,
+        "the hit file plus the governing options file (the cross-file document set)"
+    );
+    assert_eq!(files[0]["file"], fixable.display().to_string());
     let edits = files[0]["edits"].as_array().expect("edits array");
-    assert_eq!(edits.len(), 3, "the rewrite plus the two ignore offers");
+    assert_eq!(
+        edits.len(),
+        6,
+        "the rewrite, the unused-local rename, and the two codes' ignore offers"
+    );
     assert_eq!(edits[0]["source"], "builtin-lint");
     assert_eq!(edits[0]["offset"], 19);
     assert_eq!(edits[0]["length"], 4, "keyword plus trailing space");
     assert_eq!(edits[0]["anchor"]["line"], 1);
-    // Every diagnostic also rides the line and file ignore offers (the
-    // builtin-ignore provenance), both anchored at the file head.
-    assert_eq!(edits[1]["source"], "builtin-ignore");
-    assert_eq!(edits[1]["offset"], 0);
-    assert_eq!(edits[1]["length"], 0);
-    assert_eq!(edits[1]["replacement"], "// ignore: unnecessary_new\n");
+    // The `unused_local_variable` semantic row rides its rename producer
+    // (the #2070 producer wave): `a` never reads, so it becomes `_a`.
+    assert_eq!(edits[1]["source"], "builtin-semantic");
+    assert_eq!(edits[1]["offset"], 15);
+    assert_eq!(edits[1]["length"], 1);
+    assert_eq!(edits[1]["replacement"], "_a");
     assert_eq!(edits[1]["anchor"]["line"], 1);
+    // Every diagnostic also rides the line and file ignore offers (the
+    // builtin-ignore provenance), both anchored at the file head — the
+    // lint code first, then the semantic one.
     assert_eq!(edits[2]["source"], "builtin-ignore");
     assert_eq!(edits[2]["offset"], 0);
     assert_eq!(edits[2]["length"], 0);
+    assert_eq!(edits[2]["replacement"], "// ignore: unnecessary_new\n");
+    assert_eq!(edits[2]["anchor"]["line"], 1);
+    assert_eq!(edits[3]["source"], "builtin-ignore");
+    assert_eq!(edits[3]["offset"], 0);
+    assert_eq!(edits[3]["length"], 0);
     assert_eq!(
-        edits[2]["replacement"],
+        edits[3]["replacement"],
         "// ignore_for_file: unnecessary_new\n\n"
     );
-    assert_eq!(edits[2]["anchor"]["line"], 1);
+    assert_eq!(edits[3]["anchor"]["line"], 1);
+    assert_eq!(edits[4]["source"], "builtin-ignore");
+    assert_eq!(edits[4]["offset"], 0);
+    assert_eq!(edits[4]["length"], 0);
+    assert_eq!(edits[4]["replacement"], "// ignore: unused_local_variable\n");
+    assert_eq!(edits[4]["anchor"]["line"], 1);
+    assert_eq!(edits[5]["source"], "builtin-ignore");
+    assert_eq!(edits[5]["offset"], 0);
+    assert_eq!(edits[5]["length"], 0);
+    assert_eq!(
+        edits[5]["replacement"],
+        "// ignore_for_file: unused_local_variable\n\n"
+    );
+    assert_eq!(edits[5]["anchor"]["line"], 1);
+    // The options-file set: one row per code in sorted order, each
+    // appending the `analyzer: errors:` ignore at the options file's end
+    // (offset = its UTF-16 length), anchored against the options text.
+    assert_eq!(
+        files[1]["file"],
+        workspace.path("analysis_options.yaml").display().to_string()
+    );
+    let options = files[1]["edits"].as_array().expect("options edits array");
+    assert_eq!(options.len(), 2, "one ignore row per code");
+    assert_eq!(options[0]["source"], "builtin-ignore");
+    assert_eq!(options[0]["offset"], 39);
+    assert_eq!(options[0]["length"], 0);
+    assert_eq!(
+        options[0]["replacement"],
+        "analyzer:\n  errors:\n    unnecessary_new: ignore\n"
+    );
+    assert_eq!(options[0]["anchor"]["line"], 4);
+    assert_eq!(options[1]["source"], "builtin-ignore");
+    assert_eq!(options[1]["offset"], 39);
+    assert_eq!(
+        options[1]["replacement"],
+        "analyzer:\n  errors:\n    unused_local_variable: ignore\n"
+    );
 
     h.step(
         &request(
@@ -1684,17 +1763,20 @@ fn watch_refreshes_the_context_on_a_non_dart_change() {
     // The on-disk fix plus the manifest touch: neither is reported through
     // `dartq/sync`. The watch batch carries both; the split routes the
     // manifest to the context refresh, whose re-discovery re-reads
-    // main.dart.
+    // main.dart. The manifest touch retriggers until the refresh lands:
+    // the OS substrate arms asynchronously and a pre-arm change is
+    // absorbed by design (the intake contract watch.rs pins), so a single
+    // write can race the arm — the same retrigger tolerance the
+    // substrate's spawned-thread pin uses. Same-byte rewrites dedup in
+    // the debounce (bounded further by the max-hold flush), and the
+    // config lever heals main.dart regardless of whether main's own event
+    // survived the arm.
     fs::write(workspace.path("lib/main.dart"), CLEAN_MAIN).expect("fix main on disk");
-    fs::write(
-        workspace.path("pubspec.yaml"),
-        "name: fixture\nversion: 0.1.0\n# watched touch\nenvironment:\n  sdk: ^3.5.0\n",
-    )
-    .expect("touch the manifest");
-
-    // The refresh converges the view to the disk state: main's diagnostics
-    // drop to empty without any `dartq/sync` report.
+    let manifest = workspace.path("pubspec.yaml");
+    let touched_manifest =
+        "name: fixture\nversion: 0.1.0\n# watched touch\nenvironment:\n  sdk: ^3.5.0\n";
     wait_for(|| {
+        fs::write(&manifest, touched_manifest).expect("touch the manifest");
         let empty = main_pushes(&transcript()).last().is_some_and(Vec::is_empty);
         empty.then(Vec::new)
     });

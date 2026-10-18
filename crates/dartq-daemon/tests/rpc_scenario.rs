@@ -127,16 +127,27 @@ fn assert_schema_valid(result: &Value, domain: dartq_schema::Domain) {
 }
 
 /// The scenario, end to end. The cursor arithmetic every delta below chains
-/// from: the startup sweep = 1, the overlay.set = 2, the commit merge = 3,
-/// the sync's drain = 4.
+/// from: the startup sweep is the cursor-0 baseline (discovery lands inside
+/// the engine, never through the session's write path — the `since: 0`
+/// echo pins assert a fresh session sits at 0), the overlay.set = 1, the
+/// commit merge = 2, the sync's drain = 3. File references in the query /
+/// explain / impact answers carry the package-form label (`lib/` members
+/// spell `package:fixture/<tail>`; `test/` has no `package:` URI, so it
+/// keeps the canonical path) — the publish channel's URIs stay
+/// `file://` + canonical path.
 #[test]
 fn agent_script_over_the_daemon_rpc_surface() {
     let _guard = workspace_lock();
     let workspace = scenario_workspace();
-    let a = workspace.path("lib/a.dart");
     let b = workspace.path("lib/b.dart");
     let main = workspace.path("lib/main.dart");
     let a_test = workspace.path("test/a_test.dart");
+    // The package-form labels the report rows carry.
+    let (a_label, b_label, main_label) = (
+        "package:fixture/a.dart",
+        "package:fixture/b.dart",
+        "package:fixture/main.dart",
+    );
     let main_uri = format!("file://{}", main.display());
     let mut h = spawn(&workspace, &store_root("rpc-scenario"));
 
@@ -152,7 +163,7 @@ fn agent_script_over_the_daemon_rpc_surface() {
                 assert_eq!(result["schema_version"], 1);
                 let declarations = result["declarations"].as_array().expect("declarations");
                 assert_eq!(declarations.len(), 1);
-                assert_eq!(declarations[0]["file"], a.display().to_string());
+                assert_eq!(declarations[0]["file"], a_label);
                 assert_eq!(declarations[0]["kind"], "class");
                 assert_eq!(declarations[0]["name"], "Foo");
                 assert_eq!(declarations[0]["line"], 1);
@@ -166,8 +177,7 @@ fn agent_script_over_the_daemon_rpc_surface() {
                     .iter()
                     .map(|row| {
                         assert_eq!(
-                            row["target_file"],
-                            a.display().to_string(),
+                            row["target_file"], a_label,
                             "target_file names the declaring file: {row}"
                         );
                         (
@@ -179,8 +189,8 @@ fn agent_script_over_the_daemon_rpc_surface() {
                     .collect();
                 uses.sort();
                 let mut expected: Vec<(String, &str, i64)> = vec![
-                    (b.display().to_string(), "reference", 33),
-                    (b.display().to_string(), "invoked", 42),
+                    (b_label.to_owned(), "reference", 33),
+                    (b_label.to_owned(), "invoked", 42),
                     (a_test.display().to_string(), "reference", 49),
                     (a_test.display().to_string(), "invoked", 58),
                 ];
@@ -244,8 +254,7 @@ fn agent_script_over_the_daemon_rpc_surface() {
                     .iter()
                     .map(|row| {
                         assert_eq!(
-                            row["target_file"],
-                            a.display().to_string(),
+                            row["target_file"], a_label,
                             "target_file names the declaring file: {row}"
                         );
                         (
@@ -257,10 +266,10 @@ fn agent_script_over_the_daemon_rpc_surface() {
                     .collect();
                 uses.sort();
                 let mut expected: Vec<(String, &str, i64)> = vec![
-                    (b.display().to_string(), "reference", 33),
-                    (b.display().to_string(), "invoked", 42),
-                    (b.display().to_string(), "reference", 64),
-                    (b.display().to_string(), "invoked", 73),
+                    (b_label.to_owned(), "reference", 33),
+                    (b_label.to_owned(), "invoked", 42),
+                    (b_label.to_owned(), "reference", 64),
+                    (b_label.to_owned(), "invoked", 73),
                     (a_test.display().to_string(), "reference", 49),
                     (a_test.display().to_string(), "invoked", 58),
                 ];
@@ -270,8 +279,9 @@ fn agent_script_over_the_daemon_rpc_surface() {
             },
         ),
         // -- the merge: the staged buffer reaches the worktree and the base
-        // view; b.dart's rows are unchanged (clean before, clean after), so
-        // the publish diff stays silent --
+        // view; b.dart's rows are unchanged (clean before, clean after), but
+        // the committed path still owes the client one publish of its fresh
+        // state — the merge's push carries its (empty) set --
         step(
             request(6, "dartq/overlay.commit", json!({"agentId": "A"})),
             1,
@@ -287,7 +297,7 @@ fn agent_script_over_the_daemon_rpc_surface() {
             },
         ),
         // -- delta mode: only the session-written files' rows survive
-        // (b.dart at cursor 3; the test file was never written through this
+        // (b.dart at cursor 2; the test file was never written through this
         // session) --
         step(
             request(7, "dartq/query", json!({"name": "main", "since": 0})),
@@ -295,12 +305,12 @@ fn agent_script_over_the_daemon_rpc_surface() {
             |h| {
                 let result = answer_result(h, 7);
                 assert_eq!(
-                    result["since"], 3,
-                    "the cursor echoes (sweep 1 + overlay.set 2 + commit merge 3)"
+                    result["since"], 2,
+                    "the cursor echoes (overlay.set 1 + commit merge 2)"
                 );
                 assert_eq!(
                     declaration_files(&result),
-                    [b.display().to_string()],
+                    [b_label],
                     "only files written through this session"
                 );
             },
@@ -320,8 +330,23 @@ fn agent_script_over_the_daemon_rpc_surface() {
             1,
             |h| {
                 let pushed = publishes(h);
-                assert_eq!(pushed.len(), 1, "the sync's diff: {pushed:?}");
-                let params = &pushed[0]["params"];
+                // The commit merge's own push landed with its turn (the
+                // touched path's fresh — empty — set); the sync's diff is
+                // the second push.
+                assert_eq!(pushed.len(), 2, "the sync's diff: {pushed:?}");
+                assert_eq!(
+                    pushed[0]["params"]["uri"],
+                    format!("file://{}", b.display()),
+                    "the commit's merge push carries b.dart's fresh set"
+                );
+                assert!(
+                    pushed[0]["params"]["diagnostics"]
+                        .as_array()
+                        .expect("diagnostics")
+                        .is_empty(),
+                    "the merged file stays clean: {pushed:?}"
+                );
+                let params = &pushed[1]["params"];
                 assert_eq!(params["uri"], main_uri);
                 assert!(
                     params.get("version").is_none(),
@@ -342,8 +367,8 @@ fn agent_script_over_the_daemon_rpc_surface() {
                 assert_eq!(
                     declaration_files(&result),
                     [
-                        b.display().to_string(),
-                        main.display().to_string(),
+                        b_label.to_owned(),
+                        main_label.to_owned(),
                         a_test.display().to_string(),
                     ],
                     "every declaration, canonical path order"
@@ -357,13 +382,13 @@ fn agent_script_over_the_daemon_rpc_surface() {
         // -- the second query, since the commit cursor: only the file that
         // changed after it (the sync's drain) keeps its rows --
         step(
-            request(9, "dartq/query", json!({"name": "main", "since": 3})),
+            request(9, "dartq/query", json!({"name": "main", "since": 2})),
             1,
             |h| {
                 let result = answer_result(h, 9);
                 assert_eq!(
                     declaration_files(&result),
-                    [main.display().to_string()],
+                    [main_label],
                     "only the delta rows survive"
                 );
                 assert!(
@@ -373,7 +398,7 @@ fn agent_script_over_the_daemon_rpc_surface() {
                         .is_empty(),
                     "no references to main anywhere"
                 );
-                assert_eq!(result["since"], 4, "the cursor echoes (the sync's drain)");
+                assert_eq!(result["since"], 3, "the cursor echoes (the sync's drain)");
                 assert_schema_valid(&result, dartq_schema::Domain::Query);
             },
         ),
@@ -383,7 +408,12 @@ fn agent_script_over_the_daemon_rpc_surface() {
             1,
             |h| {
                 let result = answer_result(h, 10);
-                assert_eq!(result["schema_version"], 1);
+                // The impact domain's frozen version is 2 — per-domain
+                // constants are authoritative, not the shared v1.
+                assert_eq!(
+                    result["schema_version"],
+                    dartq_schema::SCHEMA_VERSION_IMPACT
+                );
                 let changed: Vec<String> = result["changed"]
                     .as_array()
                     .expect("changed")
@@ -392,7 +422,7 @@ fn agent_script_over_the_daemon_rpc_surface() {
                     .collect();
                 assert_eq!(
                     changed,
-                    [format!("{}|main", b.display())],
+                    [format!("{b_label}|main")],
                     "the target library's face names"
                 );
                 assert!(
@@ -412,8 +442,10 @@ fn agent_script_over_the_daemon_rpc_surface() {
             },
         ),
         // -- explain at the full tier: the session short-ids are assigned on
-        // first payable use — the repeat paths (b.dart, then the test file)
-        // become s1/s2, announced by the symbols table, and every
+        // first payable use — the repeat paths become s1/s2 in first-seen
+        // order across the label-sorted row arrays (the test file's
+        // canonical path sorts ahead of b.dart's `package:` label, so the
+        // test file takes s1), announced by the symbols table, and every
         // path-valued row back-references them --
         step(
             request(
@@ -427,18 +459,17 @@ fn agent_script_over_the_daemon_rpc_surface() {
                 assert_eq!(result["schema_version"], 1);
                 assert_eq!(result["symbol"], "Foo");
                 assert_eq!(
-                    result["declaration"]["file"],
-                    a.display().to_string(),
+                    result["declaration"]["file"], a_label,
                     "the single-occurrence declaration stays spelled out"
                 );
                 let symbols = result["symbols"].as_object().expect("symbols preamble");
                 assert_eq!(symbols.len(), 2, "both repeat paths announced: {symbols:?}");
                 assert_eq!(
                     symbols["s1"],
-                    b.display().to_string(),
-                    "first-seen path (b.dart) maps to s1"
+                    a_test.display().to_string(),
+                    "first-seen path (the label-sorted test file) maps to s1"
                 );
-                assert_eq!(symbols["s2"], a_test.display().to_string());
+                assert_eq!(symbols["s2"], b_label);
                 let references = result["references"].as_array().expect("references");
                 assert_eq!(
                     references.len(),
@@ -490,8 +521,7 @@ fn agent_script_over_the_daemon_rpc_surface() {
                     "the id mapping is session-stable"
                 );
                 assert_eq!(
-                    result["declaration"]["file"],
-                    a.display().to_string(),
+                    result["declaration"]["file"], a_label,
                     "the declaration stays spelled out"
                 );
                 assert_schema_valid(&result, dartq_schema::Domain::Explain);
@@ -509,17 +539,17 @@ fn agent_script_over_the_daemon_rpc_surface() {
         .iter()
         .filter(|frame| frame["method"] == "dartq/diagnostics")
         .collect();
-    // One push: the sync's diff. Nothing else publishes — b.dart's merge
-    // left its (empty) set unchanged, and reads never re-push an unchanged
-    // baseline.
+    // Two pushes: the commit merge's fresh-set push for b.dart, then the
+    // sync's diff. Nothing else publishes — reads never re-push an
+    // unchanged baseline.
     assert_eq!(
         pushed.len(),
-        1,
+        2,
         "the publish face is a pure diff: {pushed:?}"
     );
-    assert_eq!(pushed[0]["params"]["uri"], main_uri);
+    assert_eq!(pushed[1]["params"]["uri"], main_uri);
     assert_eq!(
-        pushed[0]["params"]["diagnostics"]
+        pushed[1]["params"]["diagnostics"]
             .as_array()
             .expect("d")
             .len(),
