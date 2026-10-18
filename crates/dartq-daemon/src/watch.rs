@@ -895,9 +895,26 @@ mod tests {
         );
 
         fs::remove_file(&extra).expect("delete");
-        let deleted = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the deletion surfaced within the window");
+        // The same bounded window as `settle_rewrite`, minus the retry (a
+        // deletion cannot be re-triggered): sliced receives until the
+        // removal batch surfaces. One fixed 5-second `recv_timeout`
+        // mistook coverage instrumentation's slowdown for a dropped
+        // removal; the window is an upper bound, the slices keep the wait
+        // interruptible.
+        let deadline = Instant::now() + SETTLE_WINDOW;
+        let deleted = loop {
+            assert!(
+                Instant::now() < deadline,
+                "the deletion surfaced within the window"
+            );
+            match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(item) => break item,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("the watch thread exited before answering")
+                }
+            }
+        };
         assert_eq!(
             watch_paths(&deleted),
             vec![extra],
@@ -1143,6 +1160,13 @@ mod tests {
         }
     }
 
+    /// Upper bound for one settle phase (a write or a removal surfacing as a
+    /// batch) — only ever reached on a starved or instrumented build
+    /// (coverage runs the watch thread an order of magnitude slower under
+    /// load); a healthy answer arrives in the first slice, so the bound
+    /// costs nothing on normal targets.
+    const SETTLE_WINDOW: Duration = Duration::from_secs(15);
+
     /// Rewrites `path` until the watch thread answers with a Watch batch,
     /// and returns that batch plus the number of empty filler items skipped.
     ///
@@ -1159,7 +1183,7 @@ mod tests {
         content: &str,
         receiver: &Receiver<Vec<Incoming>>,
     ) -> (Vec<PathBuf>, usize) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + SETTLE_WINDOW;
         let mut fillers = 0;
         loop {
             assert!(

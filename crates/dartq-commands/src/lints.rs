@@ -1917,6 +1917,72 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The #2169 corpus-shape pin: the engine run's fold resolves a bare
+    /// `print` through the implicit dart:core face and arms the synthetic
+    /// SDK binding row at the callee — the shape the unit `run_semantic`
+    /// substrate never arms (its fold answers `None` at the same site, so
+    /// the rule pins stayed green while the driver went silent). The rule
+    /// must read that row as the core symbol (`is_sdk_binding`, never a
+    /// user shadow) and report; the options gate the run; a local `print`
+    /// declaration still shadows.
+    #[test]
+    fn avoid_print_faces_over_the_engine_sdk_binding() {
+        let root = crate::workspace::test_fixture::workspace(
+            "lints_avoid_print_sdk_face",
+            &[
+                (
+                    "analysis_options.yaml",
+                    "linter:\n  rules:\n    avoid_print: true\n",
+                ),
+                ("lib/fires.dart", "void f() {\n  print('x');\n}\n"),
+                (
+                    "lib/shadows.dart",
+                    "void g() {\n  void print(Object? o) {}\n  print('local');\n}\n",
+                ),
+            ],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("run");
+        let rows: Vec<(String, u32)> = run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "avoid_print")
+            .map(|d| {
+                let path = engine
+                    .file_table()
+                    .path(d.file)
+                    .map_or_else(String::new, |path| path.display().to_string());
+                (path, d.range.offset)
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "avoid_print rows: {rows:?}");
+        assert!(rows[0].0.ends_with("lib/fires.dart"), "{rows:?}");
+        assert_eq!(rows[0].1, 13, "the `print` callee token");
+        std::fs::remove_dir_all(&root).ok();
+
+        // The same shape without the rule name: the corpus stays silent.
+        let root = crate::workspace::test_fixture::workspace(
+            "lints_avoid_print_unenabled",
+            &[("lib/t.dart", "void f() {\n  print('x');\n}\n")],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("run");
+        assert!(
+            run.diagnostics.iter().all(|d| d.code.name != "avoid_print"),
+            "the unenabled corpus stays silent: {:?}",
+            run.diagnostics
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// Drives the full pipeline over a fixture workspace and returns the
     /// `unnecessary_ignore` rows as (file path, offset) pairs — the shared
     /// harness of the #2132 gating pins. The `files` slice carries the

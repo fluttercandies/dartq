@@ -1436,6 +1436,15 @@ fn live_plugin_fixes_and_assists_dispatch_end_to_end() {
         script.display(),
     );
     fs::write(plugin_dir.join("dartq_plugin.json"), manifest).expect("manifest");
+    // The fix dispatch is hit-directed: a plugin is consulted per lint hit,
+    // so the hit the dispatch keys on rides an explicit enable — options-less
+    // enables nothing (#936), the same fixture shape the rpc_schema fix pins
+    // use.
+    fs::write(
+        workspace.root.join("analysis_options.yaml"),
+        "linter:\n  rules:\n    - unnecessary_new\n",
+    )
+    .expect("write options");
 
     let mut h = spawn(&workspace, &store_root("rpc-assists-live"));
 
@@ -1474,19 +1483,41 @@ fn live_plugin_fixes_and_assists_dispatch_end_to_end() {
     );
     let result = answer_result(&h, 3);
     let files = result["files"].as_array().expect("files array");
-    assert_eq!(files.len(), 1);
+    assert_eq!(
+        files.len(),
+        2,
+        "the hit file plus its governing options file (the cross-file set): {result}"
+    );
     let edits = files[0]["edits"].as_array().expect("edits array");
     let sources: Vec<&str> = edits
         .iter()
         .map(|edit| edit["source"].as_str().expect("source"))
         .collect();
     assert_eq!(
-        sources,
-        ["builtin-lint", "fixer"],
+        sources.first(),
+        Some(&"builtin-lint"),
+        "the built-in lint rows lead: {edits:?}"
+    );
+    assert!(
+        sources[..sources.len() - 1]
+            .iter()
+            .all(|source| matches!(
+                *source,
+                "builtin-lint" | "builtin-semantic" | "builtin-ignore"
+            )),
+        "the built-in provenance spellings (the SDK face rides the daemon's fix pass): {sources:?}"
+    );
+    assert_eq!(
+        sources.last(),
+        Some(&"fixer"),
         "built-in rows first, then the plugin change flattened: {edits:?}"
     );
-    assert_eq!(edits[1]["offset"], 19);
-    assert_eq!(edits[1]["replacement"], "const ");
+    // The dispatch pin: the plugin was consulted at the lint hit's range and
+    // echoed it back — the discovery -> spawn -> push -> fixes path over a
+    // real child process.
+    let fixer = edits.last().expect("the plugin row").clone();
+    assert_eq!(fixer["offset"], 19);
+    assert_eq!(fixer["replacement"], "const ");
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);

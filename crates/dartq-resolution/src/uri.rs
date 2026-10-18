@@ -1703,12 +1703,17 @@ mod tests {
                 &format!(
                     // rootUris resolve against the config dir
                     // (`app/.dart_tool`), so `../../pkg_a` is the fixture's
-                    // sibling package.
+                    // sibling package. `packageUri: "lib/"` is the pub
+                    // writer's shape; an omitted field anchors the source
+                    // root at the package root itself
+                    // (package_config_json.dart:150-152, `packageRoot =
+                    // root`), which would put every `package:` target one
+                    // level short of these `lib/` files.
                     r#"{{
                       "configVersion": 2,
                       "packages": [
-                        {{"name": "pkg_a", "rootUri": "../../pkg_a"}},
-                        {{"name": "hosted", "rootUri": "file://{}"}}
+                        {{"name": "pkg_a", "rootUri": "../../pkg_a", "packageUri": "lib/"}},
+                        {{"name": "hosted", "rootUri": "file://{}", "packageUri": "lib/"}}
                       ]
                     }}"#,
                     encode_uri_path(&root.join("hosted").to_string_lossy()),
@@ -2692,11 +2697,14 @@ mod tests {
             fs::create_dir_all(path.parent().expect("parent")).expect("dir");
             fs::write(&path, content).expect("file");
         };
-        // The as-written truth: only `app`.
+        // The as-written truth: only `app`. `packageUri: "lib/"` is the pub
+        // writer's shape (an omitted field anchors the source root at the
+        // package root — package_config_json.dart:150-152 — one level short
+        // of these `lib/` files).
         write("app/lib/main.dart", "// fixture\n");
         write(
             "app/.dart_tool/package_config.json",
-            r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub"}"#,
         );
         // The nested self-resolved root, with its own dep closure.
         write(
@@ -2713,7 +2721,7 @@ mod tests {
         // The extended config the assembly hands the engine: the as-written
         // entry plus the nested root (rootUri relative to `app/.dart_tool`).
         let extended = PackageConfig::parse(
-            r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../", "languageVersion": "3.5"}, {"name": "nested", "rootUri": "../nested", "languageVersion": "3.2"}], "generator": "pub"}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}, {"name": "nested", "rootUri": "../nested", "packageUri": "lib/", "languageVersion": "3.2"}], "generator": "pub"}"#,
         )
 .expect("valid extended config");
         (root, extended)
@@ -2732,7 +2740,7 @@ mod tests {
     fn nested_context_resolves_only_its_own_universe() {
         let (root, extended) = nested_workspace(
             "boundary",
-            r#"{"configVersion": 2, "packages": [{"name": "nested", "rootUri": "../"}, {"name": "nested_dep", "rootUri": "../../dep"}], "generator": "pub"}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "nested", "rootUri": "../", "packageUri": "lib/"}, {"name": "nested_dep", "rootUri": "../../dep", "packageUri": "lib/"}], "generator": "pub"}"#,
         );
         let config_dir = root.join("app/.dart_tool");
         let table = PackageTable::new(&extended, &config_dir).expect("indexable config");
@@ -2876,10 +2884,13 @@ mod tests {
             fs::write(&path, content).expect("file");
         };
         write("app/lib/main.dart", "// fixture\n");
-        // The root config AS WRITTEN lists both app and dep.
+        // The root config AS WRITTEN lists both app and dep (`packageUri:
+        // "lib/"` — the pub writer's shape; the omitted-field reader
+        // default anchors the source root at the package root itself,
+        // package_config_json.dart:150-152).
         write(
             "app/.dart_tool/package_config.json",
-            r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../"}, {"name": "dep", "rootUri": "../dep"}], "generator": "pub"}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../", "packageUri": "lib/"}, {"name": "dep", "rootUri": "../dep", "packageUri": "lib/"}], "generator": "pub"}"#,
         );
         write(
             "app/dep/pubspec.yaml",
@@ -2888,7 +2899,7 @@ mod tests {
         write("app/dep/lib/d.dart", "// fixture\n");
         write(
             "app/dep/.dart_tool/package_config.json",
-            r#"{"configVersion": 2, "packages": [{"name": "dep", "rootUri": "../"}], "generator": "pub"}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "dep", "rootUri": "../", "packageUri": "lib/"}], "generator": "pub"}"#,
         );
         let root = root.canonicalize().expect("canonical root");
         let config_dir = root.join("app/.dart_tool");

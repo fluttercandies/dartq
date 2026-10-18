@@ -194,14 +194,36 @@ if [ ! -x "$dart_bin" ]; then
   die "oracle dart not found at $dart_bin (FVM_HOME=$FVM_HOME) — install the fvm default pin or point FVM_HOME at it"
 fi
 
+# Oracle-crash bracket guard: a tree whose patho mega-expression exceeds the
+# verified-clean bracket pre-dates the generator's term cap (#2148) and
+# crashes `dart analyze` (rc 255, "Internal error: Stack Overflow") wherever
+# the file enters the analyzed set — subset materialization cannot make such
+# a tree self-consistent, the stale fixture itself is the fault. The pinned
+# generator (tools/corpus-gen, PATHO_EXPR_TOKENS) caps the left-nested `+`
+# chain at 2,000 terms (>=4,000 overflows the analyzer's unguarded recursive
+# AST walks; at ~20k terms the overflow surfaces in summary2 informative
+# data). Fresh trees emit at most 1,999 `+` per patho file and every other
+# shape emits a handful, so >=4,000 in one file is the deterministic
+# stale-generator signature.
+scale_is_stale() {
+  dir="tests/corpus/mega-x/$1"
+  for f in "$dir"/zadv/patho/patho_*.dart; do
+    [ -f "$f" ] || return 1
+    if [ "$(tr -cd '+' < "$f" | wc -c)" -ge 4000 ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 need_regen=""
 for s in 1k 100k; do
-  if [ ! -f "tests/corpus/mega-x/$s/manifest.json" ]; then
+  if [ ! -f "tests/corpus/mega-x/$s/manifest.json" ] || scale_is_stale "$s"; then
     need_regen="$need_regen $s"
   fi
 done
 if [ -n "$need_regen" ] && [ "$dry_run" -eq 0 ] && ! command -v cargo >/dev/null 2>&1; then
-  die "cargo is required to regenerate missing scales:$need_regen"
+  die "cargo is required to regenerate missing or stale scales:$need_regen"
 fi
 
 # A 100k-file batch analysis exceeds the harness's 120 s default budget.
@@ -211,15 +233,16 @@ fi
 
 # --- helpers (run path only; --dry-run never calls these) --------------------
 
-# Regenerate one mega-x scale with the pinned seed if its tree is absent.
-# The 1k tree additionally carries the replay sequence (axis 2a) for X4.
+# Regenerate one mega-x scale with the pinned seed if its tree is absent or
+# stale (the oracle-crash bracket guard above). The 1k tree additionally
+# carries the replay sequence (axis 2a) for X4.
 regen_scale() {
   s="$1"
   dir="tests/corpus/mega-x/$s"
-  if [ -f "$dir/manifest.json" ]; then
+  if [ -f "$dir/manifest.json" ] && ! scale_is_stale "$s"; then
     return 0
   fi
-  echo "-- [$s] tree absent; regenerating (corpus-gen --seed 0)"
+  echo "-- [$s] tree absent or stale; regenerating (corpus-gen --seed 0)"
   if [ "$s" = "1k" ]; then
     cargo run -q -p corpus-gen -- --out "$dir" --scale "$s" --seed 0 \
       --emit-replay-seq "$REPLAY_STEPS" || return 1

@@ -433,15 +433,16 @@ impl PendingOutput {
     /// Parks until diagnostics arrived and the reply burst settled, or a
     /// reverse query arrived (a query wakes the wait immediately, no settle:
     /// the plugin is stalled awaiting its answer), or `deadline` passes
-    /// (`None`). Returns the queued diagnostics and how many reverse queries
-    /// are queued (a peek — the queries stay queued for `serve_queries`, the
-    /// one consumer that can answer them). The deadline bounds the whole
-    /// wait exactly — the settle window never extends past it.
-    fn wait_for_output(&self, deadline: Instant) -> (Vec<PluginDiagnostic>, usize) {
+    /// (`None`). `Some` carries the queued diagnostics and how many reverse
+    /// queries are queued (a peek — the queries stay queued for
+    /// `serve_queries`, the one consumer that can answer them). The deadline
+    /// bounds the whole wait exactly — the settle window never extends past
+    /// it.
+    fn wait_for_output(&self, deadline: Instant) -> Option<(Vec<PluginDiagnostic>, usize)> {
         let mut queues = self.queues.lock().expect("pending output lock");
         while queues.diagnostics.is_empty() && queues.queries.is_empty() {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return (Vec::new(), 0);
+                return None;
             };
             let (woken, _) = self
                 .signal
@@ -452,10 +453,10 @@ impl PendingOutput {
         if queues.diagnostics.is_empty() {
             // Queries only: no burst to settle — hand the diagnostics over
             // now; the queries stay queued for the pump.
-            return (
+            return Some((
                 std::mem::take(&mut queues.diagnostics),
                 queues.queries.len(),
-            );
+            ));
         }
         // First diagnostic row is in. The plugin answers one analyze cycle
         // with contiguous notification frames; hold through a quiet window
@@ -484,10 +485,10 @@ impl PendingOutput {
             }
             // Spurious wake: keep waiting within the same window.
         }
-        (
+        Some((
             std::mem::take(&mut queues.diagnostics),
             queues.queries.len(),
-        )
+        ))
     }
 }
 
@@ -938,7 +939,20 @@ impl PluginRuntime {
         // posture: restart at the caller's interaction, never lazily).
         self.ensure_alive()?;
         let deadline = Instant::now() + timeout;
-        let (diagnostics, pending_queries) = self.pending.wait_for_output(deadline);
+        if let Some((diagnostics, pending_queries)) = self.pending.wait_for_output(deadline) {
+            return Ok(CycleDrain {
+                diagnostics,
+                pending_queries,
+            });
+        }
+        // Deadline: one final alive-gated drain — a push racing the expiry is
+        // still honored, and a death during the wait gets its restart (or its
+        // error) here rather than at the next interaction.
+        self.ensure_alive()?;
+        let (diagnostics, pending_queries) = self
+            .pending
+            .wait_for_output(Instant::now())
+            .unwrap_or((Vec::new(), 0));
         Ok(CycleDrain {
             diagnostics,
             pending_queries,
@@ -2752,7 +2766,10 @@ mod tests {
             })
         };
         let start = Instant::now();
-        let (batch, pending_queries) = pending.wait_for_output(start + Duration::from_secs(5));
+        let (batch, pending_queries) =
+            pending
+                .wait_for_output(start + Duration::from_secs(5))
+                .expect("the push woke the wait");
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "woke on the push signal, long before the deadline"
@@ -2771,21 +2788,25 @@ mod tests {
         // A non-empty queue skips the first-row wait and only settles the
         // burst; the settle window (5 ms) bounds this far below the old
         // full-deadline shape.
-        let (batch, pending_queries) = pending.wait_for_output(start + Duration::from_millis(50));
+        let (batch, pending_queries) =
+            pending
+                .wait_for_output(start + Duration::from_millis(50))
+                .expect("the queued row skips the park");
         assert!(start.elapsed() < Duration::from_millis(50));
         assert_eq!(batch.len(), 1);
         assert_eq!(pending_queries, 0);
 
-        // An empty queue rides to the deadline and hands over what it holds.
+        // An empty queue rides to the deadline and reports the expiry —
+        // `wait_output`'s final alive gate turns `None` into the restart.
         let empty = PendingOutput::default();
         let start = Instant::now();
-        let (batch, pending_queries) = empty.wait_for_output(start + Duration::from_millis(50));
         assert!(
-            start.elapsed() >= Duration::from_millis(40),
+            empty
+                .wait_for_output(start + Duration::from_millis(50))
+                .is_none(),
             "the deadline bounds the wait"
         );
-        assert_eq!(batch.len(), 0);
-        assert_eq!(pending_queries, 0);
+        assert!(start.elapsed() >= Duration::from_millis(40));
     }
 
     #[test]
@@ -2802,8 +2823,9 @@ mod tests {
                 pending.push(row("second")).expect("under the cap");
             })
         };
-        let (batch, pending_queries) =
-            pending.wait_for_output(Instant::now() + Duration::from_secs(5));
+        let (batch, pending_queries) = pending
+            .wait_for_output(Instant::now() + Duration::from_secs(5))
+            .expect("the burst arrived");
         assert_eq!(batch.len(), 2, "both rows of the burst, one drain");
         assert_eq!(batch[0].message, "first");
         assert_eq!(batch[1].message, "second");
@@ -2834,7 +2856,10 @@ mod tests {
             })
         };
         let start = Instant::now();
-        let (batch, pending_queries) = pending.wait_for_output(start + Duration::from_secs(5));
+        let (batch, pending_queries) =
+            pending
+                .wait_for_output(start + Duration::from_secs(5))
+                .expect("the query woke the wait");
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "the query woke the wait immediately"
@@ -2864,11 +2889,15 @@ mod tests {
             })
         };
         let start = Instant::now();
-        let (batch, _) = pending.wait_for_output(start + Duration::from_secs(5));
+        let (batch, _) = pending
+            .wait_for_output(start + Duration::from_secs(5))
+            .expect("the first row arrived");
         assert_eq!(batch.len(), 1, "the window closed on a quiet pipe");
         assert_eq!(batch[0].message, "first");
 
-        let (late, _) = pending.wait_for_output(start + Duration::from_secs(5));
+        let (late, _) = pending
+            .wait_for_output(start + Duration::from_secs(5))
+            .expect("the late row arrived");
         assert_eq!(late.len(), 1);
         assert_eq!(late[0].message, "late");
         reader.join().expect("reader joins");

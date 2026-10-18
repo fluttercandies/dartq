@@ -517,19 +517,30 @@ chk "full: rows keep the compact 8-field set" jq_true "$body" \
 end_face
 
 # --- face: rpc-fix-answer ------------------------------------------------------
+# Re-frozen 2026-10-18 (rcP adjudication): the fix face's v1 surface here is
+# the cross-file document set — the hit file first, the governing options
+# file second (the contract rpc_schema.rs
+# `dartq_fix_documents_validate_with_their_provenance` has pinned since the
+# #631/#632 provenance window), and the provenance spellings are the three
+# builtin families of the shared fix assembly (dartq-commands fix.rs:
+# `builtin-lint` / `builtin-semantic` / `builtin-ignore`). The semantic rows
+# ride the SDK face the daemon drives with, so the answer is wider than a
+# bare CLI pass without `--sdk`. Additive-only: no field moved, v1 stands.
 face rpc-fix-answer
 body="$work/body_5.json"
 chk "compact: the intake answer is {schema_version, files}" jq_true "$body" \
   '(.result | keys | sort) == ["files", "schema_version"]'
 chk "compact: schema_version is 1" jq_eq "$body" '.result.schema_version' 1
-chk "compact: the fixme probe answers a patch document" jq_true "$body" \
-  '(.result.files | length) == 1 and (.result.files[0].file | endswith("fixme.dart"))'
+chk "compact: the cross-file document set (hit file first, options second)" jq_true "$body" \
+  '(.result.files | length) == 2 and (.result.files[0].file | endswith("fixme.dart")) and (.result.files[1].file | endswith("analysis_options.yaml"))'
 chk "compact: file rows are exactly {file, schema_version, edits}" jq_true "$body" \
   '[.result.files[] | (keys | sort) == ["edits", "file", "schema_version"] and .schema_version == 1] | all'
 chk "compact: edits ride the red-line floor plus the anchor" jq_true "$body" \
   '[.result.files[].edits[] | (keys | sort) == ["anchor", "length", "offset", "replacement", "source"]] | all'
-chk "compact: builtin provenance and a located anchor" jq_true "$body" \
-  '[.result.files[].edits[] | .source == "builtin-lint" and (.anchor | has("line") and has("column"))] | all'
+chk "compact: builtin provenance spellings and a located anchor on every edit" jq_true "$body" \
+  '[.result.files[].edits[] | (.source == "builtin-lint" or .source == "builtin-semantic" or .source == "builtin-ignore") and (.anchor | has("line") and has("column"))] | all'
+chk "compact: the probe lint deletions are present and builtin-lint" jq_true "$body" \
+  '[.result.files[0].edits[] | select(.source == "builtin-lint" and .replacement == "")] | length >= 1'
 
 body="$work/body_6.json"
 chk "full: edits add the builtin rule/message columns" jq_true "$body" \

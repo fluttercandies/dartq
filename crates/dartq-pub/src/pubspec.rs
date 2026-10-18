@@ -259,7 +259,8 @@ impl Pubspec {
 fn require_workspaces(language_version: LanguageVersion) -> Result<(), PubError> {
     if language_version < LanguageVersion::FIRST_WITH_WORKSPACES {
         // Pub's hint names the running SDK's version (`sdk.version`); dartq's
-        // stand-in is the vendored registry default (`SDK_DEFAULT`, 3.15).
+        // stand-in is the vendored registry default (`SDK_DEFAULT`, 3.13 —
+        // the pinned oracle-era snapshot).
         return Err(PubError::Pubspec(format!(
             "`workspace` and `resolution` requires at least language version {}\n\
              Consider updating the SDK constraint to:\n\n\
@@ -1026,7 +1027,7 @@ dev_dependencies:
 
         // <3.5: both keys rejected, with pub's wording and hint
         // (pubspec.dart:73-86; the hint names the running SDK's version,
-        // dartq's vendored default 3.15).
+        // dartq's vendored default 3.13 — the pinned oracle-era snapshot).
         let old = "name: r\nenvironment:\n  sdk: '>=3.0.0 <4.0.0'\nresolution: workspace\n";
         let err = match Pubspec::parse(old) {
             Err(error) => error,
@@ -1041,7 +1042,7 @@ dev_dependencies:
             text.contains("Consider updating the SDK constraint to:"),
             "unexpected error: {text}"
         );
-        assert!(text.contains("sdk: '^3.15.0'"), "unexpected error: {text}");
+        assert!(text.contains("sdk: '^3.13.0'"), "unexpected error: {text}");
         // No sdk constraint: pub default 2.7 < 3.5 -> rejected.
         let no_sdk = "name: r\nworkspace:\n  - pkg_b\n";
         assert!(matches!(Pubspec::parse(no_sdk), Err(PubError::Pubspec(_))));

@@ -20470,12 +20470,15 @@ pub(crate) mod avoid_print {
     ///
     /// dartq faces over the production tiling: the bare-invocation
     /// callee face — the selector is the bare identifier `print` and
-    /// carries no binding (the static-type wave's core-name posture: a
-    /// resolvable same-file, local, type-parameter, or imported
-    /// declaration shadows the core function and stays silent, the
-    /// under-report direction; the shadow join validates the matched
-    /// reference row's own name, so only a row that IS this `print` use
-    /// answers the shadow). The tear-off argument face rides the
+    /// carries no workspace binding (the static-type wave's core-name
+    /// posture: a resolvable same-file, local, type-parameter, or
+    /// imported workspace declaration shadows the core function and
+    /// stays silent, the under-report direction; the synthetic SDK face
+    /// the implicit dart:core import arms at the resolved bare name is
+    /// the core symbol itself — the `is_sdk_binding` cut keeps it
+    /// reporting; the shadow join validates the matched reference row's
+    /// own name, so only a row that IS this `print` use answers the
+    /// shadow). The tear-off argument face rides the
     /// bare-name argument's own four-piece send group dispatch, gated on
     /// the group's top-level membership in an `Arguments` row — the
     /// `SimpleIdentifier`-argument posture; every other bare use
@@ -20568,17 +20571,22 @@ pub(crate) mod avoid_print {
     }
 
     /// Whether the reference row joined at `selector_row`'s site is the
-    /// `print` use itself bound to a user declaration — the shadow face.
+    /// `print` use itself bound to a USER declaration — the shadow face.
     /// The row's own name validates the join: a reference row naming any
     /// other identifier is not this use's resolution (the offset join is
     /// positional, so a foreign-name row answers `false` and the core
-    /// function's unshadowed verdict stands), and the dart:core spelling
-    /// carries no user binding at all (`RefTarget::Missing` answers
-    /// `None` upstream of the name read).
+    /// function's unshadowed verdict stands). The synthetic SDK face is
+    /// the core `print` symbol itself (the engine graph's implicit
+    /// dart:core import lands the resolved bare name on an unindexed
+    /// `<dart:core>` row), so the [`dartq_semantic::Analysis::is_sdk_binding`]
+    /// cut keeps it reporting — only a workspace declaration shadows.
     fn shadowed(c: &Check<'_>, analysis: &dartq_semantic::Analysis<'_>, selector_row: u32) -> bool {
         analysis
             .binding_of(query_site(c, selector_row))
-            .is_some_and(|binding| binding.target_name == analysis.strings().intern("print"))
+            .is_some_and(|binding| {
+                !analysis.is_sdk_binding(&binding)
+                    && binding.target_name == analysis.strings().intern("print")
+            })
     }
 
     /// The `_isDebugOnly` walk (:52-68): the call sits in a then branch

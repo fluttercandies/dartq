@@ -622,19 +622,20 @@ pub(crate) mod prefer_collection_literals {
     /// so the official stays silent on its creations. The probe is the
     /// semantic lane's own resolution faces on the callee row's span: the
     /// creation-type use (`resolve_constructor`, any constructor) or the
-    /// bare reference's binding (`BindingKind::Decl`). A core spelling
-    /// resolves to no unit. Without the semantic run the plain-run
-    /// posture holds — no bail.
+    /// bare reference's binding (`BindingKind::Decl`) — a workspace
+    /// declaration only, the synthetic SDK face (`is_sdk_binding`) being
+    /// the core symbol itself and never a bail. Without the semantic run
+    /// the plain-run posture holds — no bail.
     fn cross_file_collection_head(c: &Check<'_>, callee: u32) -> bool {
         let Some(analysis) = c.semantics() else {
             return false;
         };
         let site = crate::rules::expressions::query_site(c, callee);
         analysis.resolve_constructor(site, None).is_some()
-            || matches!(
-                analysis.binding_of(site).map(|binding| binding.kind),
-                Some(dartq_semantic::BindingKind::Decl)
-            )
+            || analysis.binding_of(site).is_some_and(|binding| {
+                !analysis.is_sdk_binding(&binding)
+                    && binding.kind == dartq_semantic::BindingKind::Decl
+            })
     }
 
     /// `['a'].toSet()` (:87-95): a list literal ends right before the dot —
@@ -1304,19 +1305,20 @@ pub(crate) mod prefer_for_elements_to_map_from_iterable {
     /// faces on the head row's span: the creation-type use
     /// (`resolve_constructor`, any constructor — the enclosing-element
     /// check keys on the container, not the member) or the static-call
-    /// receiver's bare binding (`BindingKind::Decl`). A core `Map`
-    /// resolves to no unit. Without the semantic run the plain-run
-    /// posture holds — no bail.
+    /// receiver's bare binding (`BindingKind::Decl`) — a workspace
+    /// declaration only, the synthetic SDK face (`is_sdk_binding`) being
+    /// the core `Map` itself and never a bail. Without the semantic run
+    /// the plain-run posture holds — no bail.
     fn cross_file_map_head(c: &Check<'_>, map_row: u32) -> bool {
         let Some(analysis) = c.semantics() else {
             return false;
         };
         let site = crate::rules::expressions::query_site(c, map_row);
         analysis.resolve_constructor(site, None).is_some()
-            || matches!(
-                analysis.binding_of(site).map(|binding| binding.kind),
-                Some(dartq_semantic::BindingKind::Decl)
-            )
+            || analysis.binding_of(site).is_some_and(|binding| {
+                !analysis.is_sdk_binding(&binding)
+                    && binding.kind == dartq_semantic::BindingKind::Decl
+            })
     }
 
     /// `_extractClosure` (:71-88): a named argument whose expression (no

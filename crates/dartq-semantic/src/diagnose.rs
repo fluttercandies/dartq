@@ -5278,10 +5278,16 @@ impl<'a> Engine<'a> {
     /// `promoteParameterToNullable: true` overlay is the `==`/`!=`
     /// spelling's own; the other user operators' calls pass the declared
     /// formal unchanged). The suppress gates mirror it: unknown or `void`
-    /// sides, in-scope type-parameter heads, the `Object?` top-type
-    /// formal, and the int-literal → `double` conversion all stay silent.
+    /// sides, a `dynamic` operand (`isAssignableTo` — the oracle's verdict
+    /// is assignability, and `dynamic` fits every target; probed 3.13.1:
+    /// `const x = 'a' + b` with `const dynamic b = true` emits only the
+    /// const-eval fault), in-scope type-parameter heads, the `Object?`
+    /// top-type formal, and the int-literal → `double` conversion all
+    /// stay silent.
     fn check_binary_argument(&mut self, right_ty: Ty, formal: Ty, right: &Row) {
-        if matches!(formal, Ty::Unknown | Ty::Void) || matches!(right_ty, Ty::Unknown | Ty::Void) {
+        if matches!(formal, Ty::Unknown | Ty::Void)
+            || matches!(right_ty, Ty::Unknown | Ty::Void | Ty::Dynamic)
+        {
             return;
         }
         let unbound = |engine: &Self, head| {
@@ -40086,6 +40092,25 @@ mod tests {
             "{:?}",
             code_names(&rep)
         );
+    }
+
+    /// The dynamic operand face (tests/corpus/m1-semantic
+    /// lib/targeted/const_eval_type_num_string.dart:9): a `dynamic` right
+    /// operand is assignable to the operator's formal — the argument face
+    /// stays silent and only the const-eval fault reports, const context
+    /// or not. The literal operand keeps the co-fire the oracle probes
+    /// under [`Self::const_eval_faults_match_the_official_codes`] pin.
+    #[test]
+    fn binary_argument_face_spares_the_dynamic_operand() {
+        let rep = report("const dynamic b = true;\nconst x = 'a' + b;\n");
+        assert_eq!(
+            code_names(&rep),
+            ["const_eval_type_num_string"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let rep = report("void f(dynamic b) {\n  'a' + b;\n}");
+        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
     }
 
     /// The throws-exception face links its throw site (#1876 W5): the

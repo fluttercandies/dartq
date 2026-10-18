@@ -53,10 +53,18 @@ fn nested_engine(tag: &str) -> (Engine, PathBuf) {
         "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
     );
     // The as-written root config: only the root package. `example` joins
-    // through the extension, never this file.
+    // through the extension, never this file. `packageUri: "lib/"` is
+    // load-bearing: pub's writer always emits it (entrypoint.dart:511),
+    // and an omitted field is NOT defaulted to `lib/` by the reader —
+    // `packageRoot = root` (package_config_json.dart:150-152, the
+    // `package_config` parser the analyzer consumes through
+    // `parsePackageConfigJsonFile`). Probed on 3.13.1: a config without
+    // the field leaves `package:<name>/<file>` landing on the package
+    // root, so files under `lib/` do not resolve and every import in this
+    // fixture reports `uri_does_not_exist`.
     write(
         ".dart_tool/package_config.json",
-        r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+        r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub"}"#,
     );
     write("sdk/version", "3.13.1\n");
     write(
@@ -75,7 +83,7 @@ fn nested_engine(tag: &str) -> (Engine, PathBuf) {
     );
     write(
         "example/.dart_tool/package_config.json",
-        r#"{"configVersion": 2, "packages": [{"name": "example", "rootUri": "../", "languageVersion": "3.2"}], "generator": "pub"}"#,
+        r#"{"configVersion": 2, "packages": [{"name": "example", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.2"}], "generator": "pub"}"#,
     );
     write("example/lib/greet.dart", "void hi() {}\n");
     write("lib/helper.dart", "void helper() {}\n");
@@ -88,7 +96,7 @@ fn nested_engine(tag: &str) -> (Engine, PathBuf) {
     // identity the extension gives the nested package (#1340), which the
     // resolution universe must NOT let leak into the root context.
     let extended = PackageConfig::parse(
-        r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}, {"name": "example", "rootUri": "../example", "languageVersion": "3.2"}], "generator": "pub"}"#,
+        r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}, {"name": "example", "rootUri": "../example", "packageUri": "lib/", "languageVersion": "3.2"}], "generator": "pub"}"#,
     )
     .expect("valid extended config");
     let lock = LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n").expect("lock");
@@ -145,6 +153,15 @@ fn nested_context_boundary_matches_the_oracle_split() {
     let root_main = "import 'package:example/greet.dart';\n\nvoid main() {\n  hi();\n}\n";
     let example_main = "import 'package:example/greet.dart';\n\nvoid main() {\n  hi();\n}\n";
     let example_other = "import 'package:fixture/helper.dart';\n\nvoid tool() {\n  helper();\n}\n";
+    // The analyzed world is caller-fed: the CLI's `discover_workspace`
+    // enqueues every package root's files before the overlays, and
+    // resolution consults the disk only for target EXISTENCE — content
+    // enters through the same intake. Without the feed the import targets
+    // resolve (their universe membership is what this pin exercises) but
+    // stay unresident, which the diagnose-time staleness face codes as
+    // `uri_does_not_exist` — the under-feed's own row, not a universe cut.
+    engine.set_content(&root.join("example/lib/greet.dart"), b"void hi() {}\n");
+    engine.set_content(&root.join("lib/helper.dart"), b"void helper() {}\n");
     engine.set_content(&root.join("lib/main.dart"), root_main.as_bytes());
     engine.set_content(&root.join("example/lib/main.dart"), example_main.as_bytes());
     engine.set_content(
@@ -219,6 +236,10 @@ fn nested_context_boundary_matches_the_oracle_split() {
 fn root_files_still_resolve_their_own_universe() {
     let (mut engine, root) = nested_engine("own-universe");
     let tool = "import 'package:fixture/helper.dart';\n\nvoid tool() {\n  helper();\n}\n";
+    // The import target joins the analyzed world, exactly as the CLI's
+    // `discover_workspace` feeds it before the overlay (see the boundary
+    // test's note) — residency, not disk, is the content face.
+    engine.set_content(&root.join("lib/helper.dart"), b"void helper() {}\n");
     engine.set_content(&root.join("lib/tool.dart"), tool.as_bytes());
     let diagnostics = engine
         .analyze(
