@@ -5,12 +5,12 @@
 //! # Shape (a substrate seam + the hand-wired debouncer)
 //!
 //! The watch face is a [`WatchSource`] seam carrying two substrates into
-//! the same drain-debounce-hand-off cycle: the **bounded-interval
-//! directory poll** (the default, the watch face's proven shape) and the
-//! OS-event substrate — `notify`'s recommended watcher, FSEvents on macOS
-//! and inotify on Linux — opt-in via `DARTQ_WATCH_SUBSTRATE=os` while its
-//! watcher-thread integration is being proven (the substrate itself is
-//! pinned by a smoke test: delivery, kinds, path forms). The poll source
+//! the same drain-debounce-hand-off cycle: the **OS-event substrate**
+//! (the default — `notify`'s recommended watcher, FSEvents on macOS and
+//! inotify on Linux, pinned end to end by the spawned-thread test) and the
+//! **bounded-interval directory poll** — the watch face's proven shape,
+//! kept as the `DARTQ_WATCH_SUBSTRATE=poll` escape hatch and the
+//! init-failure fallback. The poll source
 //! re-walks the workspace per drain (reusing
 //! `dartq_commands::discover` for exact walk-rule parity with the CLI's
 //! discovery), fingerprints each `.dart` file by `(mtime, len)` — plus the
@@ -307,7 +307,24 @@ impl WatchSource for NotifySource {
                     };
                     events.extend(event.paths.into_iter().filter_map(|path| {
                         let path = self.normalize(path)?;
-                        Some(SourceEvent { path, kind, at })
+                        // The intake contract is the poll substrate's walk
+                        // surface: `.dart` files under non-hidden names
+                        // (the walk's dot-prefix rule) plus the watched
+                        // context inputs. Directory events and the rest of
+                        // the tree (`.dart_tool` churn, editor scratch) are
+                        // not change hints — staging them would intern dead
+                        // paths against the session's live-path ceiling.
+                        let watched_dart = path.extension().is_some_and(|ext| ext == "dart")
+                            && path.strip_prefix(&self.root).is_ok_and(|relative| {
+                                !relative.components().any(|component| {
+                                    component.as_os_str().as_encoded_bytes().starts_with(b".")
+                                })
+                            });
+                        if watched_dart || is_config_input(&path, &self.root) {
+                            Some(SourceEvent { path, kind, at })
+                        } else {
+                            None
+                        }
                     }));
                 }
                 Ok(Err(error)) => eprintln!("dartq-daemon: watch substrate error: {error}"),
@@ -340,18 +357,56 @@ fn classify(kind: &notify::EventKind) -> Option<EventKind> {
     }
 }
 
-/// The substrate for this build. The poll substrate is the default — the
-/// watch face's proven shape. The OS-event substrate is the target shape
-/// and works where it is proven (delivery, kinds, and path forms are
-/// pinned by the smoke test), but its stream delivered nothing when the
-/// watcher ran on the daemon's own watch thread under test, so it is
-/// opt-in — `DARTQ_WATCH_SUBSTRATE=os` — until that thread-context
-/// integration is root-caused and proven on every face. `None` means the
-/// watch face cannot come up at all — the baseline walk failed, already
-/// logged — and the watch thread exits as it always has.
+/// Which substrate feeds the watch loop. `Os` is the shipped default —
+/// event-driven, no per-tick walk; `Poll` is the proven fallback kept as
+/// the escape hatch (`DARTQ_WATCH_SUBSTRATE=poll`). The env read happens
+/// once at spawn; tests pin the substrate through the value, not the
+/// process-wide variable.
+#[derive(Clone, Copy)]
+enum Substrate {
+    /// The OS-event backend — constructed only where `notify` ships one.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    Os,
+    Poll,
+}
+
+impl Substrate {
+    /// The resolution table, env-free so the tests pin it without racing
+    /// libtest's shared process environment: `DARTQ_WATCH_SUBSTRATE=poll`
+    /// selects the poll substrate; anything else — unset, `os`, or noise —
+    /// takes the OS substrate, with the poll fallback inside
+    /// [`init_source`] when the OS stream cannot arm.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn parse(value: Option<&std::ffi::OsStr>) -> Self {
+        if value.is_some_and(|v| v == "poll") {
+            Self::Poll
+        } else {
+            Self::Os
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn from_env() -> Self {
+        Self::parse(std::env::var_os("DARTQ_WATCH_SUBSTRATE").as_deref())
+    }
+
+    /// Off the shipped platforms there is no OS-event backend: the env
+    /// knob is inert and poll is the only substrate.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn from_env() -> Self {
+        Self::Poll
+    }
+}
+
+/// The substrate for this build. The OS-event substrate is the default —
+/// delivery, kinds, and path forms are pinned by the spawned-thread test —
+/// and the poll substrate remains as the `DARTQ_WATCH_SUBSTRATE=poll`
+/// escape hatch plus the init-failure fallback. `None` means the watch
+/// face cannot come up at all — the baseline walk failed, already logged
+/// — and the watch thread exits as it always has.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn init_source(root: &Path) -> Option<Box<dyn WatchSource>> {
-    if std::env::var_os("DARTQ_WATCH_SUBSTRATE").is_none_or(|value| value != "os") {
+fn init_source(root: &Path, substrate: Substrate) -> Option<Box<dyn WatchSource>> {
+    if let Substrate::Poll = substrate {
         return PollSource::new(root).map(|source| Box::new(source) as Box<dyn WatchSource>);
     }
     match NotifySource::new(root) {
@@ -369,7 +424,7 @@ fn init_source(root: &Path) -> Option<Box<dyn WatchSource>> {
 /// Off the shipped platforms there is no OS-event backend: poll is the
 /// substrate.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn init_source(root: &Path) -> Option<Box<dyn WatchSource>> {
+fn init_source(root: &Path, _substrate: Substrate) -> Option<Box<dyn WatchSource>> {
     PollSource::new(root).map(|source| Box::new(source) as Box<dyn WatchSource>)
 }
 
@@ -512,13 +567,24 @@ impl Watcher {
     /// blocks the caller). A failed spawn only loses the convenience layer —
     /// the daemon logs and serves without watch.
     pub(crate) fn spawn(options: WatchOptions, sender: Sender<Vec<Incoming>>) -> Self {
+        Self::spawn_with(options, sender, Substrate::from_env())
+    }
+
+    /// `spawn` with the substrate chosen by the caller — the tests pin the
+    /// OS substrate this way instead of mutating the process-wide env var
+    /// under libtest's parallel worker threads.
+    fn spawn_with(
+        options: WatchOptions,
+        sender: Sender<Vec<Incoming>>,
+        substrate: Substrate,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let join = thread::Builder::new()
             .name("dartq-daemon-watch".into())
             .spawn({
                 let stop = Arc::clone(&stop);
                 let metrics = Arc::new(WatchMetrics::default());
-                move || watch_loop(&options, &sender, &stop, &metrics)
+                move || watch_loop(&options, &sender, &stop, &metrics, substrate)
             })
             .inspect_err(|error| eprintln!("dartq-daemon: watch thread unavailable: {error}"))
             .ok();
@@ -556,8 +622,9 @@ fn watch_loop(
     sender: &Sender<Vec<Incoming>>,
     stop: &AtomicBool,
     metrics: &WatchMetrics,
+    substrate: Substrate,
 ) {
-    let Some(mut source) = init_source(&options.root) else {
+    let Some(mut source) = init_source(&options.root, substrate) else {
         return;
     };
     let mut debounce = Debounce::default();
@@ -588,6 +655,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
+
+    use crossbeam_channel::{Receiver, RecvTimeoutError};
 
     /// A workspace with one tracked file and nothing else in it. The
     /// sequence suffix makes every call a unique tree: two callers passing
@@ -747,17 +816,10 @@ mod tests {
             sender,
         );
 
-        // Let the baseline scan settle, then make exactly one change.
-        thread::sleep(Duration::from_millis(120));
-        fs::write(&main, "var edited = 42;\n").expect("write");
-
-        let batch = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the write surfaced within the window");
-        let item = batch.into_iter().next().expect("one intake item");
-        let Incoming::Watch { touched } = item else {
-            panic!("watch intake is a Watch item");
-        };
+        // The first write retriggers until the thread answers (the substrate
+        // arms asynchronously; a pre-arm change is absorbed), then the
+        // batch is the touched file, debounced.
+        let (touched, _) = settle_rewrite(&main, "var edited = 42;\n", &receiver);
         assert_eq!(touched, vec![main], "the touched file, debounced");
 
         // Clean shutdown: drop joins the thread; the disconnected channel
@@ -789,23 +851,13 @@ mod tests {
             sender,
         );
 
-        // Let the baseline scan settle, then make exactly one change.
-        thread::sleep(Duration::from_millis(120));
-        fs::write(&main, "var edited = 9;\n").expect("write");
-
-        // The occupied slot drains first; the requeued batch retries tick
-        // by tick and surfaces once the slot is free — the thread kept
-        // walking the whole time (no blocked send, no hang).
-        let occupied = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the pre-occupying item");
-        assert!(occupied.is_empty(), "the slot's filler, not a watch batch");
-        let batch = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the requeued change surfaces after the drain");
-        let Incoming::Watch { touched } = batch.into_iter().next().expect("one intake item") else {
-            panic!("watch intake is a Watch item");
-        };
+        // The occupied slot drains first (the settle skips and counts the
+        // filler); the requeued batch retries tick by tick and surfaces once
+        // the slot is free — the thread kept walking the whole time (no
+        // blocked send, no hang). The first write retriggers until the
+        // thread answers (the substrate arms asynchronously).
+        let (touched, fillers) = settle_rewrite(&main, "var edited = 9;\n", &receiver);
+        assert_eq!(fillers, 1, "the slot's filler, not a watch batch");
         assert_eq!(touched, vec![main], "the requeued batch retried");
 
         drop(watcher);
@@ -831,16 +883,13 @@ mod tests {
             sender,
         );
 
-        // Let the baseline scan settle, then create and delete a file —
-        // each event is one debounced Watch batch.
-        thread::sleep(Duration::from_millis(120));
+        // The creation retriggers until the thread answers (the substrate
+        // arms asynchronously; a pre-arm change is absorbed) — the batch is
+        // the new file — and the later deletion is provably post-arm.
         let extra = root.join("lib/extra.dart");
-        fs::write(&extra, "var b = 2;\n").expect("create");
-        let created = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the creation surfaced within the window");
+        let (created, _) = settle_rewrite(&extra, "var b = 2;\n", &receiver);
         assert_eq!(
-            watch_paths(&created),
+            created,
             vec![extra.clone()],
             "the new file is the batch"
         );
@@ -1092,5 +1141,117 @@ mod tests {
             [Incoming::Watch { touched }] => touched.clone(),
             _ => panic!("watch intake is one Watch item"),
         }
+    }
+
+    /// Rewrites `path` until the watch thread answers with a Watch batch,
+    /// and returns that batch plus the number of empty filler items skipped.
+    ///
+    /// The substrate arms asynchronously on the watch thread, and a change
+    /// landing before the arm is absorbed — the OS stream's since-now and
+    /// the poll baseline alike — so the first trigger retriggers until the
+    /// thread answers instead of racing a fixed settle sleep. Later triggers
+    /// are provably post-arm and never retried. Same-path rewrites dedup in
+    /// the debounce, so the answered batch is still one entry per touched
+    /// path. Bounded: a thread that never answers fails the test, never
+    /// hangs it.
+    fn settle_rewrite(
+        path: &Path,
+        content: &str,
+        receiver: &Receiver<Vec<Incoming>>,
+    ) -> (Vec<PathBuf>, usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut fillers = 0;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the write never surfaced within the window"
+            );
+            fs::write(path, content).expect("write");
+            match receiver.recv_timeout(Duration::from_millis(500)) {
+                Ok(item) if item.is_empty() => fillers += 1,
+                Ok(item) => return (watch_paths(&item), fillers),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("the watch thread exited before answering")
+                }
+            }
+        }
+    }
+
+    /// The OS substrate on the real spawned watch thread — the path the
+    /// daemon itself takes (`Watcher::spawn` → `watch_loop` →
+    /// `init_source`): a real write surfaces as a debounced batch within a
+    /// bounded window, and drop still joins cleanly. The substrate is
+    /// pinned through `spawn_with`, not the env var — libtest's parallel
+    /// workers share the process environment. Out-of-scope paths (a
+    /// non-watched file, a hidden-dir `.dart`) must not appear: the batch
+    /// carries the walk's surface, no more.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn watch_thread_os_substrate_delivers() {
+        let (root, main) = workspace("os-spawned");
+        let (sender, receiver) = crossbeam_channel::bounded::<Vec<Incoming>>(4);
+        let watcher = Watcher::spawn_with(
+            WatchOptions {
+                root: root.clone(),
+                poll_interval: Duration::from_millis(25),
+            },
+            sender,
+            Substrate::Os,
+        );
+
+        // Noise that must never reach the batch: an unwatched extension and
+        // a `.dart` file under a hidden directory (the walk's dot rule).
+        fs::write(root.join("lib/notes.txt"), "n\n").expect("noise file");
+        fs::create_dir_all(root.join(".hidden")).expect("hidden dir");
+        fs::write(root.join(".hidden/ghost.dart"), "var g = 0;\n").expect("hidden dart");
+
+        // The first write retriggers until the thread answers (the
+        // substrate arms asynchronously; a pre-arm change is absorbed); the
+        // answered batch carries the watched file only.
+        let (touched, _) = settle_rewrite(&main, "var edited = 42;\n", &receiver);
+        assert_eq!(
+            touched,
+            vec![main.clone()],
+            "the watched file only: {touched:?}"
+        );
+
+        drop(watcher);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The substrate resolution table: only the explicit `poll` value
+    /// escapes to the fallback substrate — unset, `os`, and noise all take
+    /// the OS substrate (pinned through the env-free `parse` seam because
+    /// libtest's parallel workers share the process environment).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn substrate_parse_selects_poll_only_explicitly() {
+        use std::ffi::OsStr;
+        assert!(matches!(Substrate::parse(None), Substrate::Os));
+        assert!(matches!(
+            Substrate::parse(Some(OsStr::new("os"))),
+            Substrate::Os
+        ));
+        assert!(matches!(
+            Substrate::parse(Some(OsStr::new("noise"))),
+            Substrate::Os
+        ));
+        assert!(matches!(
+            Substrate::parse(Some(OsStr::new("poll"))),
+            Substrate::Poll
+        ));
+    }
+
+    /// The poll escape hatch inits and drains quiet on a clean tree — the
+    /// `Substrate::Poll` arm of `init_source` stays a live fallback, not a
+    /// dead branch.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn substrate_poll_escape_hatch_still_inits() {
+        let (root, _main) = workspace("substrate-poll");
+        let mut source = init_source(&root, Substrate::Poll).expect("poll inits");
+        assert!(source.drain().is_empty(), "a clean tree drains quiet");
+        fs::remove_dir_all(&root).ok();
     }
 }

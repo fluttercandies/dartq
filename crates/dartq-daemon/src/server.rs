@@ -1040,28 +1040,31 @@ mod tests {
             )
         });
 
-        // Settle the watcher's baseline scan, then make exactly one watched
-        // change. The batch flushes on the second 10 ms tick.
-        thread::sleep(Duration::from_millis(150));
-        fs::write(&main, CLEAN_MAIN).expect("watched rewrite");
-
-        // The batch's diff pushes the clear — the batch applied and the
-        // view converged to the touched disk state.
-        wait_for(
-            || {
-                transcript_of(&output)
-                    .iter()
-                    .any(|frame| {
-                        frame["method"] == "dartq/diagnostics"
-                            && frame["params"]["uri"]
-                                .as_str()
-                                .is_some_and(|uri| uri.ends_with("lib/main.dart"))
-                            && frame["params"]["diagnostics"] == json!([])
-                    })
-                    .then_some(())
-            },
-            "the watch batch never pushed the clear",
-        );
+        // The substrate arms asynchronously on the watch thread, and a
+        // change landing before the arm is absorbed — the OS stream's
+        // since-now and the poll baseline alike — so the rewrite retriggers
+        // until the batch's clear push answers instead of racing a fixed
+        // settle sleep. Watch events are hints: each batch syncs the same
+        // clean content and the view converges on the latest disk state.
+        let settle_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                Instant::now() < settle_deadline,
+                "the watch batch never pushed the clear"
+            );
+            fs::write(&main, CLEAN_MAIN).expect("watched rewrite");
+            thread::sleep(Duration::from_millis(250));
+            let cleared = transcript_of(&output).iter().any(|frame| {
+                frame["method"] == "dartq/diagnostics"
+                    && frame["params"]["uri"]
+                        .as_str()
+                        .is_some_and(|uri| uri.ends_with("lib/main.dart"))
+                    && frame["params"]["diagnostics"] == json!([])
+            });
+            if cleared {
+                break;
+            }
+        }
 
         client
             .send(framed(&request(2, "dartq/analyze", json!({}))))
