@@ -18,10 +18,12 @@
 //! official raw-type posture, `instantiateToBounds`,
 //! type_system.dart:719-731) — exact for the sealed-subtype closure
 //! (`sealed class Resource` / `class File extends Resource`), one arity
-//! step short for generic-penetrating questions Phase C's `TypedModel`
-//! migration answers. A clause name that resolves to no registered
-//! declaration contributes no edge — the open direction (a missing edge
-//! under-reports subtype answers, never a false positive).
+//! step short for written clause arguments (`class A extends S<int>`
+//! reads `A <: S<dynamic>`); carrying the real clause trees is the
+//! `TypedModel` migration the diagnostic-layer lanes own. A clause name
+//! that resolves to no registered declaration contributes no edge — the
+//! open direction (a missing edge under-reports subtype answers, never a
+//! false positive).
 //!
 //! # The adapter
 //!
@@ -756,7 +758,14 @@ impl<'a> ResolvedTypeOps<'a> {
                     .intern(UninternedType::Never, ty.nullable),
             ),
             Base::Null => Some(self.null),
-            Base::Unknown => Some(self.invalid),
+            // The unknown type is the asymmetric top `dynamic` at the
+            // resolved face exactly as at the name level
+            // (`NameTypeOps::is_subtype`: everything <: unknown, unknown
+            // <: only tops) — `Invalid` would make every question
+            // vacuously true (subtype.dart's 0c arm), deading the `else`
+            // branch of `var x; x is int` and vetoing every `var`
+            // promotion.
+            Base::Unknown => Some(self.dynamic),
             Base::Function => Some(
                 self.snapshot
                     .table
@@ -785,7 +794,12 @@ impl<'a> ResolvedTypeOps<'a> {
                 .table
                 .intern(UninternedType::Never, node.nullable),
             Base::Null => self.null,
-            Base::Unknown => self.invalid,
+            // As in `map_base`: the asymmetric top, not `Invalid` — an
+            // `Invalid` argument suppresses the enclosing `Interface`
+            // through `map_args`, where the unknown argument's true
+            // answer is `dynamic` (a `var`-inferred or unreduced
+            // argument reads as the top instantiation).
+            Base::Unknown => self.dynamic,
             Base::Function => self
                 .snapshot
                 .table
@@ -1136,6 +1150,82 @@ impl TypeOps for ResolvedTypeOps<'_> {
                 .make_nullable();
         }
         from
+    }
+
+    /// `is_subtype` over the instantiated spellings: both sides map
+    /// through `map_scrutinee` (the written-argument face — `List<int>`
+    /// reads `Interface{List, [int]}`, a bare `List` its to-bounds
+    /// instantiation) and the verdict answers through
+    /// [`TypeSystem::is_subtype`]. An unmappable arm — an unresolved
+    /// head, an arity mismatch — falls back to the name-level typed
+    /// answer verbatim (the under-report direction: the default's
+    /// covariant tree-compare is strictly weaker than the resolved
+    /// hierarchy, never stronger where it cannot see).
+    fn is_subtype_typed(
+        &self,
+        left: FlowTy,
+        left_args: u32,
+        right: FlowTy,
+        right_args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> bool {
+        self.observe_names(names);
+        let l = self.map_scrutinee(left, left_args, arena, names);
+        let r = self.map_scrutinee(right, right_args, arena, names);
+        if self.is_invalid(l) || self.is_invalid(r) {
+            return NameTypeOps.is_subtype_typed(
+                left, left_args, right, right_args, arena, names,
+            );
+        }
+        self.system.is_subtype(l, r)
+    }
+
+    /// `tryPromoteToType` over the instantiated spellings — the oracle
+    /// gate verbatim: `Some(to)` exactly when `to <: from`
+    /// (type_system.dart:1739-1741), `None` otherwise. Both sides map
+    /// with their written arguments, so a strict narrowing
+    /// (`x is Response<T>` after `x is Response` — `Response<T> <:
+    /// Response<dynamic>` holds) promotes, where the bare-`Ty` coverage
+    /// test would veto it. An unmappable arm falls back to the
+    /// name-level posture (optimistic promotion on the undecidable
+    /// cross-base question, the same-base argument refuse kept).
+    fn try_promote_to_typed(
+        &self,
+        to: FlowTy,
+        to_args: u32,
+        from: FlowTy,
+        from_args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> Option<FlowTy> {
+        self.observe_names(names);
+        let t = self.map_scrutinee(to, to_args, arena, names);
+        let f = self.map_scrutinee(from, from_args, arena, names);
+        if self.is_invalid(t) || self.is_invalid(f) {
+            return NameTypeOps.try_promote_to_typed(
+                to, to_args, from, from_args, arena, names,
+            );
+        }
+        // The strict-subtype gate (`isValidPromotionStep`,
+        // flow_analysis.dart:7229-7247): `to <: from` is required, and a
+        // `to` the current type already satisfies (`from <: to` —
+        // identical types included, `x is int` on `int x`) is no step.
+        if self.system.is_subtype(t, f) && !self.system.is_subtype(f, t) {
+            Some(to)
+        } else {
+            None
+        }
+    }
+}
+
+impl ResolvedTypeOps<'_> {
+    /// Whether `ty` mapped to the suppress face: an unresolved head, an
+    /// arity mismatch, or a `Name` the registry refuses — the typed ops
+    /// fall back to `NameTypeOps` through it, the same posture
+    /// `factor_typed` keeps.
+    fn is_invalid(&self, ty: TypeId) -> bool {
+        matches!(self.snapshot.table.get(ty).kind(), TypeKind::Invalid)
     }
 }
 
@@ -1627,17 +1717,20 @@ mod tests {
             |_| None,
         );
         assert!(
-            !codes.contains(&"undefined_getter"),
+            !codes.contains(&"undefined_getter")
+                && !codes.contains(&"undefined_method")
+                && !codes.contains(&"dead_code"),
             "the is! remainder must keep Response: {codes:?}"
         );
-        assert!(
-            !codes.contains(&"undefined_method"),
-            "the is! remainder must keep Response: {codes:?}"
-        );
-        // The name-level parity: the same source must report nothing on
-        // the unmounted fold either — the name-level `factor` already
-        // compares `Ty`s, so this pins the absence of a regression where
-        // the resolved face would diverge.
+        // The deliberate divergence (#2204 C): the unmounted name-level
+        // fold still deads the else branch — `factor(Response,
+        // Response<T>)` on bare `Ty`s compares equal, so the remainder
+        // is `Never` and the read on the `Object` remainder reports
+        // `undefined_getter`. The resolved face's argument-penetrating
+        // `factor_typed` is exactly what Phase C adds; pinning the
+        // name-level answer keeps the boundary honest rather than
+        // pretending parity. (The `undefined_class` pair reports in both
+        // arms — an arm-independent resolution row outside this fix.)
         let strings = StringTable::new();
         let mut files = FileTable::new();
         let file = files.intern(Path::new("main.dart"));
@@ -1693,8 +1786,149 @@ mod tests {
             .map(|d| d.code.name)
             .collect();
         assert!(
-            !codes.contains(&"undefined_getter"),
-            "the name-level fold must stay silent here too: {codes:?}"
+            codes.contains(&"dead_code") && codes.contains(&"undefined_getter"),
+            "the name-level fold keeps the pre-C posture (dead else + \
+             Object member miss): {codes:?}"
+        );
+    }
+
+    /// Phase C acceptance pin: the argument-penetrating subtype verdict.
+    /// `List<int> <: List<num>` answers `true` through the instantiated
+    /// forms — the written-argument tree reaches `arguments_subtype`'s
+    /// covariant pairwise compare and `int <: num` through the builtin
+    /// `int extends num` edge — where the bare `Ty`s can only compare
+    /// names. The reverse answers `false` (`num <: int` fails), and the
+    /// promotion gate follows the same verdict: `List<int>` promotes a
+    /// `List<num>` variable, `List<num>` does not promote a `List<int>`
+    /// one.
+    #[test]
+    fn typed_subtype_penetrates_the_written_arguments() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let elements = unit("class Placeholder {}", &strings, &mut files, "u.dart");
+        let file = files.try_file_id(Path::new("u.dart")).unwrap();
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/u.dart");
+        builder.unit(lib, file);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
+        let ops = ResolvedTypeOps::new(&library_types, &strings);
+
+        // `names` is the recorder's table — ids index into it.
+        let names: Vec<Box<str>> = vec!["List".into(), "int".into(), "num".into()];
+        // Arena row 1 = `[int]`, row 2 = `[num]` — `List<int>` reads
+        // `Ty{base: Name(0), args: 1}`, `List<num>` args: 2.
+        let arena: Vec<Vec<ArgTy>> = vec![
+            Vec::new(),
+            vec![ArgTy {
+                base: Base::Name(1),
+                nullable: false,
+                args: EMPTY_ARGS,
+            }],
+            vec![ArgTy {
+                base: Base::Name(2),
+                nullable: false,
+                args: EMPTY_ARGS,
+            }],
+        ];
+        let list = Ty {
+            base: Base::Name(0),
+            nullable: false,
+        };
+
+        // The acceptance pin: `List<int> <: List<num>` — the
+        // argument-penetrating answer the bare `Ty`s could not give.
+        assert!(ops.is_subtype_typed(list, 1, list, 2, &arena, &names));
+        // And the reverse fails — `num` is no subtype of `int`.
+        assert!(!ops.is_subtype_typed(list, 2, list, 1, &arena, &names));
+        // The promotion gate follows the same verdict: `to <: from`.
+        assert_eq!(
+            ops.try_promote_to_typed(list, 1, list, 2, &arena, &names),
+            Some(list)
+        );
+        assert_eq!(
+            ops.try_promote_to_typed(list, 2, list, 1, &arena, &names),
+            None
+        );
+    }
+
+    /// Phase C acceptance pin: a switch over a generic sealed scrutinee
+    /// still closes — `S<num>`'s written arguments reach `map_scrutinee`
+    /// and the `is_closed` verdict answers on the declaration alone
+    /// (`is_sealed(S)` is arg-agnostic). The post-switch state goes
+    /// unreachable, so the missing tail `return` never reports — the
+    /// `body_might_complete_normally` silence the sealed DEAD rows stand
+    /// on.
+    #[test]
+    fn sealed_generic_scrutinee_switch_stays_silent() {
+        let codes = diagnose_codes(
+            "sealed class S<T> {} \
+             class A extends S<int> {} \
+             class B<T> extends S<T> {} \
+             int f(S<num> s) { \
+               switch (s) { case A(): return 0; case B<num>(): return 1; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"body_might_complete_normally"),
+            "generic sealed switch should close: {codes:?}"
+        );
+    }
+
+    /// Phase C leftover pin: a strict generic narrowing is a real
+    /// promotion step. `x is Response` records the raw head; `x is
+    /// Response<T>` then promotes — `Response<T> <: Response<dynamic>`
+    /// holds through the instantiated forms — where the bare-`Ty`
+    /// coverage test factored the tested type to `Never` and vetoed the
+    /// step. The promoted read resolves `data`, so no `undefined_*`
+    /// reports.
+    #[test]
+    fn strict_generic_narrowing_promotes_after_the_raw_test() {
+        let codes = diagnose_codes(
+            "class Response<T> { T? data; } \
+             void f<T>(Object response) { \
+               if (response is Response) {} \
+               if (response is Response<T>) { response.data; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"undefined_getter")
+                && !codes.contains(&"undefined_method"),
+            "the strict narrowing must promote: {codes:?}"
+        );
+    }
+
+    /// Phase C regression pin: `var`-typed reads must map to the
+    /// asymmetric top `dynamic`, not `Invalid` — `factor(Invalid, int)`
+    /// answered `Never` through subtype.dart's 0c arm and deaded the
+    /// else branch of `var x; x is int`, a false `dead_code` row. With
+    /// `Unknown → dynamic` the unmatched remainder keeps `dynamic` and
+    /// the else branch stays live.
+    #[test]
+    fn var_tested_else_branch_stays_live() {
+        let codes = diagnose_codes(
+            "void g() {} \
+             void f() { \
+               var x; \
+               if (x is int) { return; } \
+               g(); \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"dead_code"),
+            "the var else branch must stay live: {codes:?}"
         );
     }
 }

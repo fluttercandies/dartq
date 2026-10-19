@@ -1415,147 +1415,36 @@ impl Interp<'_> {
     /// The promotion target for a type check (official
     /// `tryPromoteForTypeCheck`'s true branch,
     /// flow_analysis.dart:4137-4151): the tested type itself when it is a
-    /// step over the current type. A tested type already covered by the
-    /// promotion chain (`x is num` on `[int, num]`) and one the current
-    /// type already subsumes (`x is int?` on `int x`) are not steps
-    /// (official `isValidPromotionStep`, :7229-7247); anything else is the
-    /// step. The official `tryPromoteToType` further gates on
-    /// `tested <: current` (`type_system.dart:1729-1760`) — a question the
-    /// name-level seam cannot decide (`int <: num` and `String <: num` are
-    /// both false without a class hierarchy) and the oracle pins require
-    /// the promotion on (`num n`, `is int`), so the undecided case
-    /// promotes optimistically; a resolved back-end re-tightens the gate
-    /// through [`crate::ty::TypeOps::try_promote_to`]. The
-    /// written-argument face of the same question IS decidable here (#611
-    /// step 4): the test is refused when the tested arguments cannot be a
-    /// subtype of the declared ones — the official lattice refuses it too.
+    /// step over the current type — the official's `tryPromoteToType`
+    /// gate (`tested <: current`, type_system.dart:1739-1741) answered
+    /// over the instantiated spellings, previous chain head's written
+    /// arguments included. A tested type the current type already
+    /// subsumes (`x is int?` on `int x`) is no step; a same-base test
+    /// whose written arguments cannot sit under the declared ones
+    /// (`x is List<num>` on `List<int> x`) refuses at the name level
+    /// already. The undecidable cross-base question keeps the
+    /// name-level optimistic answer (`num n`, `is int` — the oracle
+    /// promotes; [`crate::ty::TypeOps::try_promote_to_typed`]'s default)
+    /// and a resolved back-end re-tightens to the real hierarchy.
     fn promotion_candidate(&mut self, var: u32, tested: Ty, tested_args: u32) -> Option<Ty> {
         match tested.base {
             Base::Unknown | Base::Dynamic | Base::Void => None,
             _ => {
-                // The argument gate applies to same-base spellings only
-                // (`x is List` on `List<int> x`): a cross-base raw test
-                // (`option is Some` on `Option<T> option`) spells its own
-                // instantiation, and whether that stands below the declared
-                // one is the hierarchy question this seam cannot decide —
-                // the pattern face's gate
-                // ([`Self::pattern_promotion_candidate`]) already skips the
-                // argument check cross-base for the same reason, and the
-                // undecided case promotes optimistically for the resolved
-                // back-end to re-tighten.
-                let meta = self.vars.get(var as usize);
-                let declared_args = meta.map_or(crate::ty::EMPTY_ARGS, |meta| meta.args);
-                if meta.is_some_and(|meta| meta.ty.base == tested.base)
-                    && !self.args_admit(tested, tested_args, declared_args)
-                {
-                    return None;
-                }
-                self.factored_candidate_args(var, tested, tested_args)
-            }
-        }
-    }
-
-    /// The promotion candidate after the entry gates: the tested type
-    /// itself, gated by the official `tryPromoteForTypeCheck` decision —
-    /// `tryPromoteToType(tested, previous)` returns `to` (`flow_analysis.dart:4142-4151`
-    /// with `type_system.dart:1739-1741`), never a factored remainder.
-    /// The chain factoring survives only as the coverage test: a tested
-    /// type factored to bottom by an earlier promotion is already implied
-    /// (`x is num` on an `[int, num]` chain adds nothing), and a tested
-    /// type the current type already subsumes (`x is int?` on `int x`) is
-    /// no step (official `isValidPromotionStep`, :7229-7247). Returning
-    /// the remainder instead would promote `x` to `Never?` on the
-    /// `x is int?`-after-`int` shape — the `bool`-corruption face.
-    pub(crate) fn factored_candidate(&self, var: u32, tested: Ty) -> Option<Ty> {
-        self.factored_candidate_args(var, tested, crate::ty::EMPTY_ARGS)
-    }
-
-    /// [`Self::factored_candidate`] carrying the tested spelling's written
-    /// arguments: the coverage factoring compares instantiated forms, not
-    /// bare `Ty`s (`Response<T>` is not covered by a `Response` chain entry
-    /// — a strict narrowing is a real step, factor_type.dart's
-    /// instantiated-type arm). Callers without a tested-args face keep the
-    /// argument-less fast path ([`Self::factored_candidate`]).
-    pub(crate) fn factored_candidate_args(
-        &self,
-        var: u32,
-        tested: Ty,
-        tested_args: u32,
-    ) -> Option<Ty> {
-        let model = self.current.model(var);
-        let previous = self.promoted_type_of(var, &model);
-        let mut remainder = tested;
-        let mut remainder_args = tested_args;
-        for (ty, args) in self.lists.iter_entries(model.promoted) {
-            remainder = self.ops.factor_typed(
-                remainder,
-                remainder_args,
-                ty,
-                args,
-                self.args,
-                self.names,
-            );
-            // `factor` answers with a `from`-derived spelling (the kept
-            // remainder) or `Never`; only the `Never` arm loses the
-            // argument face.
-            if remainder == Ty::NEVER {
-                remainder_args = crate::ty::EMPTY_ARGS;
-            }
-        }
-        if self.ops.is_bottom(remainder) || self.ops.is_subtype(previous, tested) {
-            None
-        } else {
-            Some(tested)
-        }
-    }
-
-    /// The argument face of the promotion gate: whether a test spelled
-    /// with `tested_args` can promote a variable declared with
-    /// `declared_args`. Both argument-less is the name-level fast path
-    /// (the ops seam decides, zero arena traffic); a written tested list
-    /// over an argument-less declaration admits (raw `List` spells
-    /// `List<dynamic>`, whose entries admit everything); the reverse
-    /// refuses (`List<dynamic>` is no subtype of `List<int>`) — except
-    /// `Never`, a subtype of every instantiation. Two written lists
-    /// compare element-wise below.
-    pub(crate) fn args_admit(&self, tested: Ty, tested_args: u32, declared_args: u32) -> bool {
-        match (tested_args, declared_args) {
-            (0 | _, 0) => true,
-            (0, _) => tested.base == Base::Never,
-            (t, d) => self.args_subtype(t, d),
-        }
-    }
-
-    /// Element-wise covariance (`List<int>` is a subtype of
-    /// `List<int?>`): every entry pair must be a subtype. Distinct entry
-    /// names are undecidable at this seam and refuse — the official
-    /// lattice would refuse too unless a real subclass relation holds,
-    /// which the name level cannot see. Equal arena ids short-circuit
-    /// (canonical interning makes id equality tree equality).
-    fn args_subtype(&self, t: u32, d: u32) -> bool {
-        let (Some(ts), Some(ds)) = (self.args.get(t as usize), self.args.get(d as usize)) else {
-            return false;
-        };
-        ts.len() == ds.len()
-            && ts
-                .iter()
-                .zip(ds)
-                .all(|(a, b)| a.args == b.args || self.entry_subtype(a, b))
-    }
-
-    /// The name-level subtype question for one argument-tree entry
-    /// (mirrors [`crate::ty::NameTypeOps::is_subtype`]'s decidable arms,
-    /// recursing into written arguments).
-    fn entry_subtype(&self, a: &crate::ty::ArgTy, b: &crate::ty::ArgTy) -> bool {
-        match (a.base, b.base) {
-            (Base::Dynamic | Base::Unknown | Base::Void, _)
-            | (_, Base::Dynamic | Base::Unknown | Base::Void) => true,
-            (Base::Null, _) => b.nullable,
-            (_, Base::Null) => false,
-            _ => {
-                a.base == b.base
-                    && (!a.nullable || b.nullable)
-                    && (a.args == b.args || self.args_subtype(a.args, b.args))
+                let (previous, previous_args) = {
+                    let model = self.current.model(var);
+                    (
+                        self.promoted_type_of(var, &model),
+                        self.promoted_args_of(var, &model),
+                    )
+                };
+                self.ops.try_promote_to_typed(
+                    tested,
+                    tested_args,
+                    previous,
+                    previous_args,
+                    self.args,
+                    self.names,
+                )
             }
         }
     }
@@ -1635,8 +1524,17 @@ impl Interp<'_> {
             // Official `isValidPromotionStep`: the factor output is a
             // subtype of `previous` by construction, so the step is valid
             // exactly when `previous` is not a subtype of it (no mutual
-            // subtypes, no repeats).
-            let factored = if self.ops.is_subtype(previous, factored) {
+            // subtypes, no repeats). The instantiated face decides —
+            // `factor` keeps `previous`'s written-argument tree, which the
+            // typed compare reads.
+            let factored = if self.ops.is_subtype_typed(
+                previous,
+                previous_args,
+                factored,
+                previous_args,
+                self.args,
+                self.names,
+            ) {
                 None
             } else {
                 Some(factored)

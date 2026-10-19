@@ -233,6 +233,143 @@ pub trait TypeOps {
         let _ = (from_args, what_args, arena, names);
         self.factor(from, what)
     }
+
+    /// [`TypeOps::is_subtype`] over the instantiated spellings:
+    /// `left_args`/`right_args` are arena indices into `arena`
+    /// ([`EMPTY_ARGS`] when argument-less) and `names` the recorder's
+    /// lexeme table. The default keeps the name-level posture: different
+    /// bases answer the bare [`TypeOps::is_subtype`] verdict; equal-base
+    /// spellings compare argument trees element-wise below the declared
+    /// arity (covariant — subtype.dart's `arguments_subtype`), which is
+    /// stricter than the bare verdict exactly where the written arguments
+    /// decide (`List<int>` vs `List<num>`: undecidable at the name level,
+    /// name-level-admitting where `dynamic`/`Unknown` stands in for a
+    /// raw-typed declaration). A resolved back-end answers through the
+    /// real hierarchy instead.
+    fn is_subtype_typed(
+        &self,
+        left: Ty,
+        left_args: u32,
+        right: Ty,
+        right_args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> bool {
+        let _ = names;
+        if left.base != right.base {
+            return self.is_subtype(left, right);
+        }
+        if !self.is_subtype(left, right) {
+            return false;
+        }
+        name_args_subtype(left_args, right_args, arena)
+    }
+
+    /// [`TypeOps::try_promote_to`] over the instantiated spellings (the
+    /// official `tryPromoteToType` gate, type_system.dart:1729-1760:
+    /// promote iff `to` is a *strict* subtype of `from` —
+    /// `isValidPromotionStep`, flow_analysis.dart:7229-7247). The
+    /// default's decision order reproduces the name-level posture the
+    /// call sites pinned: a target the current type already satisfies
+    /// (`x is int?` on `int x`, `x is int` on `int x` — identical types
+    /// land here through the mutual-subtype arm) is no step; a
+    /// covered subtype (`to <: from` — `x is int` on `int? x`) is the
+    /// step; a same-base target whose written arguments cannot sit
+    /// under the current ones (`x is List<num>` on `List<int> x` — an
+    /// illegal promotion step the bare `Ty`s cannot see) refuses; every
+    /// other shape promotes optimistically — the undecidable cross-base
+    /// question (`int <: num` needs a real hierarchy, and the oracle
+    /// pins `num n; n is int` ON). A resolved back-end answers
+    /// `Some(to)` exactly on `is_subtype(to, from) && !is_subtype(from,
+    /// to)` — the oracle's strict-subtype gate verbatim, the name-level
+    /// optimistic arm tightened to the truth.
+    fn try_promote_to_typed(
+        &self,
+        to: Ty,
+        to_args: u32,
+        from: Ty,
+        from_args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> Option<Ty> {
+        // A test the current type already satisfies (`x is num` on
+        // `int x`, `x is int?` on `int x`, `x is int` on `int x`) is no
+        // step — `from <: to` refuses before `to <: from` admits, so the
+        // mutual-subtype arm lands here.
+        if self.is_subtype_typed(from, from_args, to, to_args, arena, names) {
+            return None;
+        }
+        if self.is_subtype_typed(to, to_args, from, from_args, arena, names) {
+            return Some(to);
+        }
+        if to.base == from.base
+            && !matches!(to.base, Base::Dynamic | Base::Unknown | Base::Void)
+            && !name_args_admit(to.base, to_args, from_args, arena)
+        {
+            return None;
+        }
+        Some(to)
+    }
+}
+
+/// The name-level argument-subtype question: element-wise covariance over
+/// two written argument lists (`List<int>` <: `List<int?>`). Entries are
+/// [`ArgTy`] nodes; the question is undecidable on distinct entry names —
+/// refuse (the official lattice refuses unless a real subclass relation
+/// holds, invisible at this level). Arity mismatch refuses. An
+/// argument-less `right` list (`EMPTY_ARGS` = the raw-type face, read as
+/// `Name<dynamic>`) admits everything; an argument-less `left` over a
+/// written `right` refuses, matching the raw-to-instantiated direction.
+pub(crate) fn name_args_subtype(left_args: u32, right_args: u32, arena: &[Vec<ArgTy>]) -> bool {
+    let ls = arena.get(left_args as usize).map_or(&[][..], Vec::as_slice);
+    let rs = arena.get(right_args as usize).map_or(&[][..], Vec::as_slice);
+    match (ls.is_empty(), rs.is_empty()) {
+        (_, true) => true,
+        (true, false) => false,
+        (false, false) => {
+            ls.len() == rs.len()
+                && ls.iter().zip(rs).all(|(a, b)| name_entry_subtype(a, b, arena))
+        }
+    }
+}
+
+/// One argument-tree entry pair's name-level subtype answer — mirrors
+/// [`TypeOps::is_subtype`]'s decidable arms on the [`Base`] spelling,
+/// recursing into each entry's own written arguments.
+fn name_entry_subtype(a: &ArgTy, b: &ArgTy, arena: &[Vec<ArgTy>]) -> bool {
+    match (a.base, b.base) {
+        (Base::Dynamic | Base::Unknown | Base::Void, _)
+        | (_, Base::Dynamic | Base::Unknown | Base::Void) => true,
+        (Base::Null, _) => b.nullable,
+        (_, Base::Null) => false,
+        _ => {
+            a.base == b.base
+                && (!a.nullable || b.nullable)
+                && (a.args == b.args || name_args_subtype(a.args, b.args, arena))
+        }
+    }
+}
+
+/// Whether a tested spelling's written arguments can sit under the
+/// declared ones — the same-base arm of the promotion gate
+/// ([`TypeOps::try_promote_to_typed`]'s refuse check). Both argument-less
+/// is the fast path (no information either way); a written `tested` list
+/// over an argument-less declared list admits (the raw type reads
+/// `Name<dynamic>`, whose entries admit everything); the reverse refuses
+/// except `Never` — a subtype of every instantiation.
+pub(crate) fn name_args_admit(
+    tested_base: Base,
+    tested_args: u32,
+    declared_args: u32,
+    arena: &[Vec<ArgTy>],
+) -> bool {
+    let ts = arena.get(tested_args as usize).map_or(&[][..], Vec::as_slice);
+    let ds = arena.get(declared_args as usize).map_or(&[][..], Vec::as_slice);
+    match (ts.is_empty(), ds.is_empty()) {
+        (_, true) => true,
+        (true, false) => tested_base == Base::Never,
+        (false, false) => name_args_subtype(tested_args, declared_args, arena),
+    }
 }
 
 /// The name-level default implementation. Rules, in order:

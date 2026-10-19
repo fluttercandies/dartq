@@ -273,15 +273,24 @@ impl Interp<'_> {
                     && let Some(var) = self.pattern_scrutinee()
                 {
                     let model = self.current.model(var);
-                    let matched_ty = self.promoted_type_of(var, &model);
+                    let (matched_ty, matched_args) = (
+                        self.promoted_type_of(var, &model),
+                        self.promoted_args_of(var, &model),
+                    );
                     let candidate =
                         self.pattern_promotion_candidate(var, declared, declared_args);
                     let (matched_arm, unmatched_arm) =
                         self.branch_type_test(var, declared, declared_args, candidate);
                     self.current = matched_arm;
-                    if !self.ops.is_subtype(matched_ty, declared)
-                        && let Some(chain) =
-                            self.pattern.as_ref().map(|p| p.unmatched.clone())
+                    if !self.ops.is_subtype_typed(
+                        matched_ty,
+                        matched_args,
+                        declared,
+                        declared_args,
+                        self.args,
+                        self.names,
+                    ) && let Some(chain) =
+                        self.pattern.as_ref().map(|p| p.unmatched.clone())
                     {
                         let joined = self.join(Some(chain), Some(unmatched_arm));
                         if let Some(pattern) = self.pattern.as_mut() {
@@ -316,15 +325,24 @@ impl Interp<'_> {
                     && let Some(var) = self.pattern_scrutinee()
                 {
                     let model = self.current.model(var);
-                    let matched_ty = self.promoted_type_of(var, &model);
+                    let (matched_ty, matched_args) = (
+                        self.promoted_type_of(var, &model),
+                        self.promoted_args_of(var, &model),
+                    );
                     let candidate =
                         self.pattern_promotion_candidate(var, declared, declared_args);
                     let (matched_arm, unmatched_arm) =
                         self.branch_type_test(var, declared, declared_args, candidate);
                     self.current = matched_arm;
-                    if !self.ops.is_subtype(matched_ty, declared)
-                        && let Some(chain) =
-                            self.pattern.as_ref().map(|p| p.unmatched.clone())
+                    if !self.ops.is_subtype_typed(
+                        matched_ty,
+                        matched_args,
+                        declared,
+                        declared_args,
+                        self.args,
+                        self.names,
+                    ) && let Some(chain) =
+                        self.pattern.as_ref().map(|p| p.unmatched.clone())
                     {
                         let joined = self.join(Some(chain), Some(unmatched_arm));
                         if let Some(pattern) = self.pattern.as_mut() {
@@ -386,15 +404,24 @@ impl Interp<'_> {
             nullable: false,
         };
         let model = self.current.model(var);
-        let matched = self.promoted_type_of(var, &model);
+        let (matched, matched_args) = (
+            self.promoted_type_of(var, &model),
+            self.promoted_args_of(var, &model),
+        );
         let candidate = self.pattern_promotion_candidate(var, known, args);
         let (matched_arm, unmatched_arm) = self.branch_type_test(var, known, args, candidate);
         self.current = matched_arm;
         if self.disjoint_by_nullability(matched, known) {
             self.unreachable_cur();
         }
-        if !self.ops.is_subtype(matched, known)
-            && let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone())
+        if !self.ops.is_subtype_typed(
+            matched,
+            matched_args,
+            known,
+            args,
+            self.args,
+            self.names,
+        ) && let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone())
         {
             let joined = self.join(Some(chain), Some(unmatched_arm));
             if let Some(pattern) = self.pattern.as_mut() {
@@ -427,29 +454,35 @@ impl Interp<'_> {
 
     /// The pattern-face promotion candidate (official
     /// `tryPromoteForTypeCheck`'s true arm reached through
-    /// `promoteForPattern`): the pattern type factored against every
-    /// standing promotion ([`Interp::factored_candidate`]). The argument
-    /// gate cuts to same-base shapes — the written-vs-declared comparison
-    /// is the raw-spelling question (`case List():` against `List<int> x`
-    /// spells `List<dynamic>`, the match can fail); across bases the
-    /// parameter lists are unrelated and the question is the undecidable
-    /// cross-type subtyping the is-test face answers optimistically.
-    /// The unparameterized head of a cross-base match (`case Some():` on
-    /// `Option<T>`) promotes: the official entry infers the required
-    /// type's arguments downward from the matched type
+    /// `promoteForPattern`): the same [`TypeOps::try_promote_to_typed`]
+    /// gate the is-test face runs — `to <: from` on the instantiated
+    /// spellings, the matched value's promoted type and its written
+    /// arguments as `from`. A same-base pattern whose arguments cannot
+    /// sit under the matched ones (`case List<num>():` against
+    /// `List<int> x`) refuses at the name level already; the unparameterized
+    /// head of a cross-base match (`case Some():` on `Option<T>`)
+    /// promotes: the official entry infers the required type's arguments
+    /// downward from the matched type
     /// (`downwardInferObjectPatternRequiredType`), and the written
-    /// spelling stays the honest name-level stand-in.
+    /// spelling stays the honest name-level stand-in the undecided
+    /// cross-base question promotes through.
     fn pattern_promotion_candidate(&self, var: u32, tested: Ty, tested_args: u32) -> Option<Ty> {
         match tested.base {
             Base::Unknown | Base::Dynamic | Base::Void => None,
             _ => {
-                if let Some(meta) = self.vars.get(var as usize)
-                    && meta.ty.base == tested.base
-                    && !self.args_admit(tested, tested_args, meta.args)
-                {
-                    return None;
-                }
-                self.factored_candidate(var, tested)
+                let model = self.current.model(var);
+                let (matched, matched_args) = (
+                    self.promoted_type_of(var, &model),
+                    self.promoted_args_of(var, &model),
+                );
+                self.ops.try_promote_to_typed(
+                    tested,
+                    tested_args,
+                    matched,
+                    matched_args,
+                    self.args,
+                    self.names,
+                )
             }
         }
     }
