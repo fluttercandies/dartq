@@ -231,6 +231,12 @@ pub enum SemanticCode {
     /// because it has a return type of '{1}'.` — one analyzerCode with a
     /// per-host message (`uniqueName` `..._FROM_FUNCTION`/`_FROM_METHOD`).
     ReturnOfInvalidType(ExecKind),
+    /// `The type '{0}' used in the 'for' loop must implement '{1}'.` — the
+    /// for-each iterable/stream check (`forInOfInvalidType`,
+    /// diagnostic.g.dart:6988-6997; `_checkForEachParts`,
+    /// error_verifier.dart:4890-4958 — `{1}` is `Iterable` or, under an
+    /// `await` keyword, `Stream`).
+    ForInOfInvalidType,
     /// `The receiver can't be null, so the null-aware operator '{0}' is
     /// unnecessary.` (`STATIC_WARNING`)
     InvalidNullAwareOperator,
@@ -1368,6 +1374,7 @@ impl SemanticCode {
                 "EXTENSION_OVERRIDE_ARGUMENT_NOT_ASSIGNABLE",
             ),
             Self::ReturnOfInvalidType(_) => ("return_of_invalid_type", "RETURN_OF_INVALID_TYPE"),
+            Self::ForInOfInvalidType => ("for_in_of_invalid_type", "FOR_IN_OF_INVALID_TYPE"),
             Self::InvalidNullAwareOperator => {
                 ("invalid_null_aware_operator", "INVALID_NULL_AWARE_OPERATOR")
             }
@@ -2025,6 +2032,12 @@ impl SemanticCode {
             Self::UnusedResult => format!("The value of '{a0}' should be used."),
             Self::UndefinedReferencedParameter => {
                 format!("The parameter '{a0}' isn't defined by '{a1}'.")
+            }
+            // The for-each iterable check: `{1}` is the sequence name —
+            // `Iterable`, or `Stream` under an `await` keyword
+            // (diagnostic.g.dart:6988-6997).
+            Self::ForInOfInvalidType => {
+                format!("The type '{a0}' used in the 'for' loop must implement '{a1}'.")
             }
             Self::DeadNullAwareExpression => {
                 "The left operand can't be null, so the right operand is never executed."
@@ -4165,6 +4178,7 @@ mod tests {
             | SemanticCode::ExtraPositionalArguments
             | SemanticCode::ExtraPositionalArgumentsCouldBeNamed
             | SemanticCode::ExtendsNonClass
+            | SemanticCode::ForInOfInvalidType
             | SemanticCode::ImplementsNonClass
             | SemanticCode::InconsistentInheritance
             | SemanticCode::InconsistentInheritanceGetterAndMethod

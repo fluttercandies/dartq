@@ -272,7 +272,7 @@ impl<'a> Engine<'a> {
                     }
                     self.stage_usage(SemanticCode::UnusedField, site.range, &name_text);
                 }
-                DeclKind::Member { container, .. } => {
+                DeclKind::Member { container, is_static, .. } => {
                     // `_isUsedMember` for methods/getters/setters: the
                     // accessibility gate first, then indexed uses, then the
                     // override face (a member overriding a super-name is
@@ -281,10 +281,31 @@ impl<'a> Engine<'a> {
                     // The parameter pass below runs regardless — the
                     // official `visitFormalParameterList` is independent of
                     // the member's own unused-ness.
+                    // #2188: an extension's INSTANCE member spares only on
+                    // an element-attributed application — the oracle's
+                    // `usedElements.members` credit joins on a resolved
+                    // implicit application, never a spelling-level read (a
+                    // same-spelling access that resolves to nothing credits
+                    // the member all the same in the `used_names` arm, so
+                    // the extension arm drops it; statics keep the
+                    // spelling arms — they resolve through the
+                    // container-static path `_E._x`).
+                    let is_extension_instance = !is_static
+                        && self
+                            .index
+                            .get(self.file)
+                            .and_then(|f| f.container(container))
+                            .is_some_and(|c| c.kind == ContainerKind::Extension);
+                    let member_used = if is_extension_instance {
+                        self.extension_member_used.contains(&site.name)
+                            || self.extension_member_used.contains(&bare)
+                    } else {
+                        self.used_names.contains(&bare)
+                    };
                     let spared = site.annotated
                         || (!self.is_nameless(site.name)
                             && self.is_publicly_accessible(site.name, site.kind))
-                        || self.used_names.contains(&bare)
+                        || member_used
                         || matches!(self.walk_super(container, site.name), Walk::Found(_));
                     if !spared {
                         self.stage_usage(SemanticCode::UnusedElement, site.range, &name_text);
@@ -428,42 +449,74 @@ impl<'a> Engine<'a> {
                 correction,
             ));
         }
-        // Members of an unnamed extension (`_isPubliclyAccessible`'s
-        // extension arm — an unnamed extension is never public, so its
-        // members are checked like private declarations): a member no
-        // implicit application resolved reports. Named extensions'
-        // members ride the decl-site arms above; a write-only field still
-        // needs a READ (the `unused_field` rule). The candidates clone
-        // out first — the staging below mutates the engine.
-        let unnamed_members: Vec<(StringId, SourceRange, MemberKind, bool)> = self
-            .index
-            .get(self.file)
-            .map(|f| {
-                f.extension_faces()
-                    .iter()
-                    .filter(|face| face.name.is_none())
-                    .flat_map(|face| {
-                        face.members.iter().map(|(spelling, entry)| {
-                            (
-                                *spelling,
-                                entry.name_range,
-                                entry.kind,
-                                !entry.annotations.is_empty(),
-                            )
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        for (spelling, range, kind, annotated) in unnamed_members {
+        // Members of a non-public extension (`_isPubliclyAccessible`'s
+        // extension arm — a member of an extension is accessible exactly
+        // when the extension is, so unnamed extensions and private-named
+        // extensions (`_E`) both check their members like private
+        // declarations): a member no resolved application credits reports.
+        // The oracle's credit is element-level (`usedElements.members`
+        // gains the member only when the access's `read.element` resolved —
+        // `element_usage_detector.dart`'s `extensionOverride`/named-read
+        // arms): a same-spelling access that never resolved to the member
+        // (the broken-import corpus — an invalid `on` type or receiver
+        // keeps the application probe from applying) credits nothing, so
+        // the bare `used_names`/`read_names` spelling arms do NOT spare
+        // instance members here. Static members keep the spelling arms —
+        // they resolve through the container-static path (`_E._x`), not
+        // the implicit application probe. A write-only field still needs
+        // a READ (the `unused_field` rule). The candidates clone out
+        // first — the staging below mutates the engine.
+        //
+        // Membership split with `decl_sites`: an unnamed extension
+        // declares no sites at all, so its whole member set checks here; a
+        // named extension's members are declaration sites — its
+        // methods/getters/setters ride the `DeclKind::Member` arm above
+        // (the `extension_member_used` credit substituted for the
+        // spelling arm there), and its STATIC fields the `DeclKind::
+        // Member` field arm — leaving this face the named-private
+        // instance fields the site arms are ineligible for.
+        let mut extension_members: Vec<(StringId, SourceRange, MemberKind, bool, bool)> = Vec::new();
+        if let Some(elements) = self.index.get(self.file) {
+            for face in elements.extension_faces() {
+                let named_private = face
+                    .name
+                    .is_some_and(|name| self.is_private_name(name));
+                if !named_private && face.name.is_some() {
+                    continue;
+                }
+                for (spelling, entry) in &face.members {
+                    // A named extension's members are declaration sites —
+                    // this face keeps only its public-named instance fields
+                    // (the `DeclKind::Member` arms own the rest; unnamed
+                    // extensions declare no sites at all).
+                    let site_owned = named_private
+                        && !(entry.kind == MemberKind::Field
+                            && !entry.is_static
+                            && !self.is_private_name(*spelling));
+                    if site_owned {
+                        continue;
+                    }
+                    extension_members.push((
+                        *spelling,
+                        entry.name_range,
+                        entry.kind,
+                        entry.is_static,
+                        !entry.annotations.is_empty(),
+                    ));
+                }
+            }
+        }
+        for (spelling, range, kind, is_static, annotated) in extension_members {
             if range == MemberEntry::MISSING_NAME_RANGE {
                 continue;
             }
             let bare = self.bare_name(spelling);
             let spared = annotated
-                || self.used_names.contains(&bare)
                 || self.extension_member_used.contains(&spelling)
-                || (matches!(kind, MemberKind::Field) && self.read_names.contains(&bare));
+                || (is_static
+                    && (self.used_names.contains(&bare)
+                        || (matches!(kind, MemberKind::Field)
+                            && self.read_names.contains(&bare))));
             if !spared {
                 let code = if matches!(kind, MemberKind::Field) {
                     SemanticCode::UnusedField

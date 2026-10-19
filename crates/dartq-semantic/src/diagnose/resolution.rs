@@ -1742,6 +1742,16 @@ impl<'a> Engine<'a> {
     /// suppressed `Missing` row reports the dedicated code — the resolver's
     /// plain path never fires for the operand (the non-type-pos
     /// suppression holds), and the resolve pass keeps its miss record.
+    ///
+    /// #2193: the split is by syntactic role — a miss inside the target's
+    /// type-argument list (`x is List<Missing>`) reports the name-level
+    /// `non_type_as_type_argument` (the oracle walks the target's argument
+    /// tree through the plain context chain), while a bare operand head
+    /// (`x is Missing`) keeps the operand code. The arg-face rows emit
+    /// here because the window's suppression gates them out of the
+    /// resolve pass's `Missing` arm; their offsets stay in
+    /// `type_arg_miss_rows` — the resolve-pass gate makes the leftovers
+    /// unreachable.
     pub(crate) fn emit_operand_type_miss(&mut self, mark: Option<usize>, code: SemanticCode) {
         let Some(start) = mark else {
             return;
@@ -1749,11 +1759,24 @@ impl<'a> Engine<'a> {
         if start >= self.rows.len() {
             return;
         }
-        let hit = self.rows[start..].iter().find_map(|row| match row.shape {
-            RowShape::TypeUse(TypeVerdict::Missing, true) => Some((row.name, row.range)),
-            _ => None,
-        });
-        if let Some((name, range)) = hit {
+        let mut head_hit: Option<(StringId, SourceRange)> = None;
+        let mut arg_hits: Vec<(StringId, SourceRange)> = Vec::new();
+        for row in &self.rows[start..] {
+            if let RowShape::TypeUse(TypeVerdict::Missing, true) = row.shape {
+                if self.type_arg_miss_rows.contains(&row.range.offset) {
+                    arg_hits.push((row.name, row.range));
+                } else if head_hit.is_none() {
+                    head_hit = Some((row.name, row.range));
+                }
+            }
+        }
+        for (name, range) in arg_hits {
+            if !self.guard.ignore(None, name) {
+                let name_text = self.strings.resolve(name).to_string();
+                self.emit_corrected(SemanticCode::NonTypeAsTypeArgument, range, &name_text);
+            }
+        }
+        if let Some((name, range)) = head_hit {
             if !self.guard.ignore(None, name) {
                 let name_text = self.strings.resolve(name).to_string();
                 self.emit(code, range, &name_text, "");

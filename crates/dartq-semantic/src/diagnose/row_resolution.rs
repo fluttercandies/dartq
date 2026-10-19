@@ -3592,10 +3592,13 @@ mod tests {
     /// not the boolish latch's `bool` (the `AsExpression.staticType` face):
     /// an `int` return position accepts a `dynamic` expression silently,
     /// where a `bool`-collapsed row would report `return_of_invalid_type`.
-    /// The `bool`-target control keeps its own answer: `bool` is not
-    /// assignable to `int`, so the cast's row reports there. The trailing
-    /// bare-statement shape guards the #2225 face-4 false positive: a
-    /// discarded `(x as dynamic);` asks no type question at all.
+    /// The `bool`-target control: `bool` is undeclared in the harness, so
+    /// the cast reports `cast_to_non_type` and the expression's static type
+    /// is the oracle's `InvalidType` — assignable into the `int` return
+    /// position, so no `return_of_invalid_type` stacks on top. The
+    /// trailing bare-statement shape guards the #2225 face-4 false
+    /// positive: a discarded `(x as dynamic);` asks no type question at
+    /// all.
     #[test]
     fn dynamic_cast_paren_keeps_the_dynamic_type() {
         let report = report_units(
@@ -3613,7 +3616,7 @@ mod tests {
         );
         assert_eq!(
             code_names(&report),
-            ["cast_to_non_type", "return_of_invalid_type"],
+            ["cast_to_non_type"],
             "{:?}",
             code_names(&report)
         );
@@ -3685,7 +3688,9 @@ mod tests {
     /// The deep-chain shape: `class C implements Match` breaks the member
     /// walk on the interface hop (`Match` resolves to the unindexed unit) —
     /// the frozen face still answers, so `c.absent` reports and `c.group`
-    /// stays silent.
+    /// stays silent. The rig has no dart:core, so `C`'s own member type
+    /// spellings (`int`, `String`, `int`) carry their `undefined_class`
+    /// rows beside the access miss.
     #[test]
     fn unindexed_interface_hop_reports_absent_members() {
         let report = report_unindexed_unit(
@@ -3702,7 +3707,12 @@ mod tests {
         );
         assert_eq!(
             code_names(&report),
-            ["undefined_getter"],
+            [
+                "undefined_class",
+                "undefined_class",
+                "undefined_class",
+                "undefined_getter"
+            ],
             "{:?}",
             code_names(&report)
         );
@@ -3732,7 +3742,9 @@ mod tests {
     /// `named_formal_for`): a `this._x` field formal's element carries the
     /// public `x` (`correspondingPublicName`, token_impl.dart:364), so
     /// `super(x: 0)` binds silently while `super(y: 0)` keeps its
-    /// `undefined_named_parameter` miss.
+    /// `undefined_named_parameter` miss. The fixture's `_x` is written by
+    /// the field formals and never read — the private field carries its
+    /// `unused_field` row beside the named miss.
     #[test]
     fn super_named_argument_binds_the_public_formal_name() {
         let report = report_units(
@@ -3753,7 +3765,7 @@ mod tests {
         );
         assert_eq!(
             code_names(&report),
-            ["undefined_named_parameter"],
+            ["unused_field", "undefined_named_parameter"],
             "{:?}",
             code_names(&report)
         );
@@ -3804,11 +3816,13 @@ mod tests {
         );
     }
 
-    /// `this` receivers keep the pinned record-only arm on a decidable
-    /// `on`-face miss (the tests.rs `this.real2`/`this.real4` pin): the
-    /// emit-side flip rides with the resolution follow-up.
+    /// A `this` receiver's decidable `on`-face miss inside an extension
+    /// body reports naming the `on` type (#2230's emit-side flip — the
+    /// oracle's `InstanceLookupDomain` names `this`'s static type: the
+    /// extended `C`, never the extension). An unresolved `on` name keeps
+    /// the record-only arm — nothing honest names the report.
     #[test]
-    fn this_miss_inside_extension_body_keeps_the_record_only_arm() {
+    fn this_miss_inside_extension_body_reports_on_the_on_type() {
         let report = report_units(
             &[],
             "main.dart",
@@ -3816,11 +3830,12 @@ mod tests {
              extension X on C { void g() { this.miss(); } }",
             false,
         );
-        assert_eq!(
-            code_names(&report),
-            Vec::<&'static str>::new(),
+        let names = code_names(&report);
+        assert_eq!(names, ["undefined_method"], "{names:?}");
+        assert!(
+            report.diagnostics[0].message.contains("'C'"),
             "{:?}",
-            code_names(&report)
+            report.diagnostics[0].message
         );
     }
 }

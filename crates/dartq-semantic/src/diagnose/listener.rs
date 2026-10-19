@@ -1442,6 +1442,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // by `end_for_in_control_flow`). A push here would strand the loop
         // variable in a frame popped before it closed, or strand a mark that
         // shifts every later close by one.
+
+        // The `_checkForEachParts` iterable face: the iterable's operand
+        // rows closed at `end_for_in_expression` and the `await` keyword
+        // arrives only now, so the assignability ask runs here.
+        if let Some(mark) = self.engine.for_in_marks.pop() {
+            self.engine.check_for_in_iterable(mark, await_kw.is_some());
+        }
     }
 
     fn end_for_in(&mut self, end: Token) {
@@ -5918,6 +5925,10 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_for_in_expression(&mut self, token: Token) {
         self.flow().begin_for_in_expression(token);
+        // The iterable expression's operand window opens here;
+        // `handle_for_in_loop_parts` closes it with the `await` keyword and
+        // runs the `_checkForEachParts` face over the captured rows.
+        self.engine.for_in_marks.push(self.engine.rows.len());
     }
 
     fn begin_for_statement_body(&mut self, token: Token) {

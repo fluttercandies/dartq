@@ -1504,6 +1504,73 @@ impl<'a> Engine<'a> {
         ))
     }
 
+    /// The for-in iterable face (`for_in_of_invalid_type`, the M1
+    /// `_checkForEachParts` arm — error_verifier.dart:4890-4958): the
+    /// iterable's static type must be assignable to `Iterable<dynamic>`,
+    /// or `Stream<dynamic>` under an `await` keyword. The oracle's
+    /// suppression order, mapped onto [`Ty`]:
+    ///
+    /// - `void` rides `checkForUseOfVoidResult`'s own row
+    ///   (`use_of_void_result`) — this face never names it;
+    /// - `dynamic` reports only under `strict-casts` (otherwise the
+    ///   `isNullable` arm absorbs it);
+    /// - a nullable source (`T?`, `Null`, `dynamic`) defers to the
+    ///   nullable-dereference check — this face stays silent;
+    /// - a top type (`dynamic`, `void`, `Object?`) is folded onto the
+    ///   sequence type before the assignability ask — always clean;
+    /// - [`Ty::Unknown`] (a broken iterable's `InvalidType`) returns
+    ///   `None` from `assignable` — suppression.
+    ///
+    /// Only a definite `Some(false)` emits; an undecidable `None` (an
+    /// unindexed edge, a type parameter whose bound the pass can't
+    /// resolve) keeps the under-report direction.
+    pub(crate) fn check_for_in_iterable(&mut self, mark: usize, await_: bool) {
+        let Some((ty, literal, range)) = self.single_row_since(mark) else {
+            return;
+        };
+        // `use_of_void_result`'s row.
+        if ty == Ty::Void {
+            return;
+        }
+        // The strict-casts dynamic arm reports ahead of the nullable arm.
+        if ty == Ty::Dynamic && self.strict.casts {
+            let sequence = if await_ { "Stream" } else { "Iterable" };
+            let a0 = self.ty_display(ty);
+            self.emit(SemanticCode::ForInOfInvalidType, range, &a0, sequence);
+            return;
+        }
+        // `isNullable` — the nullable-dereference face owns it.
+        let nullable = match ty {
+            Ty::Null | Ty::Dynamic => true,
+            Ty::Named { nullable, .. } | Ty::Record { nullable, .. } | Ty::Function { nullable, .. } => {
+                nullable
+            }
+            _ => false,
+        };
+        if nullable {
+            return;
+        }
+        // `isTop` folds the source onto the sequence type — never a row.
+        if matches!(ty, Ty::Void | Ty::Dynamic) {
+            return;
+        }
+        let head = if await_ {
+            self.intern("Stream")
+        } else {
+            self.collection_heads[3]
+        };
+        let target = Ty::Named {
+            name: head,
+            nullable: false,
+            args: self.boundary.intern_list(&[Ty::Dynamic]),
+        };
+        if self.assignable(ty, target, literal) == Some(false) {
+            let sequence = if await_ { "Stream" } else { "Iterable" };
+            let a0 = self.ty_display(ty);
+            self.emit(SemanticCode::ForInOfInvalidType, range, &a0, sequence);
+        }
+    }
+
     /// The declared-container negative for a constructor's return matrix:
     /// both heads are written types and `to` is absent from `from`'s
     /// resolved supertype closure — the same declared-edge evidence the

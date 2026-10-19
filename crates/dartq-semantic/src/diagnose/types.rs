@@ -2404,6 +2404,17 @@ pub(crate) struct Engine<'a> {
     /// rows, and the first one starts the `non_bool_condition` anchor.
     /// Consumed by the condition's own checkpoint.
     pub(crate) cond_mark: Option<usize>,
+    /// The row-stack heights at each open for-in iterable expression's
+    /// start (`begin_for_in_expression` — the statement and collection
+    /// forms fire the same event pair, `begin_for_in_expression`..
+    /// `end_for_in_expression`, inside `parse_for_in_loop_parts_rest`):
+    /// the rows above the top are exactly the iterable's operand rows, and
+    /// `handle_for_in_loop_parts` — which carries the `await` keyword —
+    /// runs the `_checkForEachParts` assignability face
+    /// (`for_in_of_invalid_type`) over them. A stack, not a flag: a
+    /// collection for-element inside an iterable expression nests a second
+    /// begin/handle pair inside the outer window.
+    pub(crate) for_in_marks: Vec<usize>,
     /// The condition carried a pattern clause (`if (e case p)`): the
     /// official driver routes such statements through `analyzeIfCaseStatement`
     /// (type_analyzer.dart:3399-3412) and never reaches
@@ -3365,6 +3376,36 @@ impl PromotionStaging {
     }
 }
 
+/// The invalid-type name set (#2193): the names a `TypeUse` row's
+/// push-time verdict snapshotted `Missing` or `NonType` — the oracle's
+/// `InvalidType` positions. A promoted/read type spelling whose
+/// argument list contains one of these names carries the oracle's
+/// `InvalidType` argument, never a usable `Ty::Named` (the is-test/cast
+/// target whose type-argument name failed the type verdict reports
+/// `non_type_as_type_argument` and suppresses the typed check — a
+/// `Ty::Named` argument here would feed member diagnostics and
+/// promotion decisions the oracle never runs). Keyed by name, not
+/// position: the verdict rows carry spans, but a flow argument name does
+/// not — and a `Missing`/`NonType` verdict is scope-stable for these
+/// rows (a use in a scope where the name resolves pushes no verdict
+/// row).
+pub(crate) type InvalidTypeNames = rustc_hash::FxHashSet<StringId>;
+
+/// Collects the [`InvalidTypeNames`] of one unit: every `TypeUse` row
+/// whose snapshot is `Missing` or `NonType` contributes its name.
+pub(crate) fn invalid_type_names(rows: &[Row]) -> InvalidTypeNames {
+    let mut set = InvalidTypeNames::default();
+    for row in rows {
+        if matches!(
+            row.shape,
+            RowShape::TypeUse(TypeVerdict::Missing | TypeVerdict::NonType, _)
+        ) {
+            set.insert(row.name);
+        }
+    }
+    set
+}
+
 /// A flow fact's promoted type in the semantic lattice; `None` for the
 /// promotions that never stage. A named flow type recovers its spelling
 /// through [`Flow::name_lexeme`] (the S0 parallel name table) and interns
@@ -3380,11 +3421,30 @@ impl PromotionStaging {
 /// lattice and drops the whole staging (the head drop rule's argument
 /// face — staging from a fiction would decide from nothing; the join
 /// misses and the unpromoted verdict stands, the under-report direction).
+/// Kept for the pinned call sites in `tests` (the invalid-name face is a
+/// #2193 add — the pre-#2193 signature has no set to pass).
+#[cfg(test)]
 pub(crate) fn staged_promotion(
     ty: FlowTy,
     args: u32,
     flow: &Flow<'_>,
     strings: &StringTable,
+    pool: &mut ArgPool,
+) -> Option<Ty> {
+    staged_promotion_typed(ty, args, flow, strings, &InvalidTypeNames::default(), pool)
+}
+
+/// [`staged_promotion`] gated on the unit's [`InvalidTypeNames`] (#2193):
+/// a flow argument spelling whose name a `TypeUse` row snapshotted
+/// `Missing`/`NonType` interns as `Ty::Unknown` — the oracle's
+/// `InvalidType` argument — so the staged type never materializes a
+/// usable `Ty::Named` over a failed type verdict.
+pub(crate) fn staged_promotion_typed(
+    ty: FlowTy,
+    args: u32,
+    flow: &Flow<'_>,
+    strings: &StringTable,
+    invalid: &InvalidTypeNames,
     pool: &mut ArgPool,
 ) -> Option<Ty> {
     let name = match ty.base {
@@ -3404,7 +3464,7 @@ pub(crate) fn staged_promotion(
         // type, and staging one would decide from a fiction.
         FlowBase::Void | FlowBase::Never => return None,
     };
-    let args = intern_flow_args(args, flow, strings, pool)?;
+    let args = intern_flow_args(args, flow, strings, invalid, pool)?;
     Some(Ty::Named {
         name,
         nullable: ty.nullable,
@@ -3421,6 +3481,7 @@ pub(crate) fn intern_flow_args(
     args: u32,
     flow: &Flow<'_>,
     strings: &StringTable,
+    invalid: &InvalidTypeNames,
     pool: &mut ArgPool,
 ) -> Option<ArgListId> {
     if args == dartq_flow::ty::EMPTY_ARGS {
@@ -3429,11 +3490,20 @@ pub(crate) fn intern_flow_args(
     let mut list = Vec::with_capacity(flow.type_args_at(args).len());
     for entry in flow.type_args_at(args) {
         let arg = match entry.base {
-            FlowBase::Name(id) => Ty::Named {
-                name: strings.intern(flow.name_lexeme(id)),
-                nullable: entry.nullable,
-                args: intern_flow_args(entry.args, flow, strings, pool)?,
-            },
+            FlowBase::Name(id) => {
+                let name = strings.intern(flow.name_lexeme(id));
+                // An argument name whose type verdict failed is the
+                // oracle's `InvalidType` slot (#2193).
+                if invalid.contains(&name) {
+                    Ty::UNKNOWN
+                } else {
+                    Ty::Named {
+                        name,
+                        nullable: entry.nullable,
+                        args: intern_flow_args(entry.args, flow, strings, invalid, pool)?,
+                    }
+                }
+            }
             FlowBase::Dynamic => Ty::Dynamic,
             FlowBase::Null => Ty::Null,
             FlowBase::Void | FlowBase::Never => return None,
@@ -3579,32 +3649,6 @@ pub(crate) struct ResolvedSuper {
 pub(crate) fn claim_trailing(claimed: &mut Vec<SourceRange>, buffered: &mut Vec<SourceRange>, count: usize) {
     let at = buffered.len().saturating_sub(count);
     claimed.extend(buffered.drain(at..));
-}
-
-/// The anchor span of a declaration-site violation: the single keyword's
-/// span, or the `first`→`second` coverage for the spanned `abstract final …`
-/// pairs (the frozen table carries at most two anchors).
-pub(crate) fn violation_span(
-    violation: &DeclarationViolation,
-    anchors: &[(ModifierKeyword, SourceRange)],
-) -> SourceRange {
-    let span_of = |keyword| {
-        anchors
-            .iter()
-            .find(|(candidate, _)| candidate == keyword)
-            .map(|(_, range)| *range)
-    };
-    let mut spans = violation.anchors.iter().filter_map(span_of);
-    let first = spans
-        .next()
-        .expect("violation anchors name written keywords");
-    match spans.next() {
-        None => first,
-        Some(second) => SourceRange {
-            offset: first.offset,
-            length: second.offset + second.length - first.offset,
-        },
-    }
 }
 
 /// The [`ModifierHierarchy`] over the fold's element index: declarations are

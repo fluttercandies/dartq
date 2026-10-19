@@ -263,6 +263,7 @@ impl<'a> Engine<'a> {
             bool_decided: Vec::new(),
             open_return_span: None,
             cond_mark: None,
+            for_in_marks: Vec::new(),
             cond_case: false,
             if_element_cond: 0,
             record_type_depth: 0,
@@ -1311,28 +1312,54 @@ impl<'a> Engine<'a> {
     /// extension's own name — the suppress-everything face below answers
     /// the same way it always has.
     pub(crate) fn this_static_ty(&self, container: StringId, kind: ContainerKind) -> Ty {
-        if kind == ContainerKind::Extension
-            && let Some(face) = self
-                .index
-                .get(self.file)
-                .and_then(|f| {
-                    f.extension_faces()
-                        .iter()
-                        .find(|face| face.name == Some(container))
-                })
-            && let Some(on) = face.on_type
-        {
-            // The interned `on` type carries its argument list
-            // (`extension E<K, V> on Map<K, V>` gives `this : Map<K, V>`);
-            // a clause that never interned falls back to the bare head.
-            if face.on_ty != Ty::Unknown {
-                return face.on_ty;
+        if kind == ContainerKind::Extension {
+            let elements = self.index.get(self.file);
+            // The named face resolves by name; an unnamed extension's
+            // `this` container is the `""` placeholder, so the face is the
+            // frame-latched rank instead (the same latch
+            // [`Engine::enclosing_extension_on_type`] reads — #2217: a
+            // missed lookup answered `Ty::named("")`, a strictly
+            // non-nullable type, and `on X?`'s `this` read as non-null).
+            let face = elements.and_then(|f| {
+                f.extension_faces()
+                    .iter()
+                    .find(|face| face.name == Some(container))
+            });
+            let face = face.or_else(|| {
+                let innermost = self
+                    .frames
+                    .iter()
+                    .rev()
+                    .find(|f| matches!(f.kind, FrameKind::Container { .. }))?;
+                let FrameKind::Container {
+                    extension_face: Some(rank),
+                    ..
+                } = innermost.kind
+                else {
+                    return None;
+                };
+                elements?
+                    .extension_faces()
+                    .iter()
+                    .filter(|face| face.name.is_none())
+                    .nth(rank)
+            });
+            if let Some(face) = face
+                && let Some(on) = face.on_type
+            {
+                // The interned `on` type carries its argument list
+                // (`extension E<K, V> on Map<K, V>` gives `this :
+                // Map<K, V>`); a clause that never interned falls back to
+                // the bare head.
+                if face.on_ty != Ty::Unknown {
+                    return face.on_ty;
+                }
+                return Ty::Named {
+                    name: on,
+                    nullable: face.on_type_nullable,
+                    args: ArgListId::EMPTY,
+                };
             }
-            return Ty::Named {
-                name: on,
-                nullable: face.on_type_nullable,
-                args: ArgListId::EMPTY,
-            };
         }
         Ty::named(container)
     }

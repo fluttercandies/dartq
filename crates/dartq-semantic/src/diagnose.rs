@@ -324,12 +324,11 @@ use dartq_parser::{
     TokenSpan as Token,
 };
 use dartq_resolution::modifiers::{
-    ClassModifiers, DeclarationViolation, ExplicitBaseFinal, ImplementsStep, InducedModifier,
-    ModifierCode, ModifierHierarchy, ModifierKeyword, Relation, SubtypeRestrictionInput,
-    SuperFacts, base_implemented_candidate, declaration_violations, final_extends_violation,
-    final_implements_candidate, final_mixin_constraint_violation, induced_modifier,
-    interface_extends_violation, may_ignore_class_modifiers, nearest_explicit_base_or_final,
-    sealed_supertype_violation, subtype_restriction_violation,
+    ClassModifiers, ExplicitBaseFinal, ImplementsStep, InducedModifier, ModifierCode,
+    ModifierHierarchy, Relation, SubtypeRestrictionInput, SuperFacts, base_implemented_candidate,
+    final_extends_violation, final_implements_candidate, final_mixin_constraint_violation,
+    induced_modifier, interface_extends_violation, may_ignore_class_modifiers,
+    nearest_explicit_base_or_final, sealed_supertype_violation, subtype_restriction_violation,
 };
 use dartq_resolution::{
     ImportEdge, LibraryClassModifiers, LibraryFeatureFacts, LibraryGraph, LibraryId, Lookup,
@@ -407,6 +406,12 @@ mod literal_constructor_tests;
 mod sealed_contract_tests;
 #[cfg(test)]
 mod tests;
+
+/// The #2216-family producer pins (#2216/#2193/#2188 faces verified
+/// end-to-end): kept as a standalone module so the shared `tests` rig
+/// stays untouched while its lane is in flight.
+#[cfg(test)]
+mod ticket_2216_tests;
 
 /// The #1351 faces pinned end-to-end: the function-type-alias boundedness
 /// gate, the const-eval deferred-creation walk, the formals' reach into
@@ -1019,7 +1024,10 @@ pub fn fold_unit_with_ops<'t>(
     // The flow layer's facts fold in exactly once, before the engine
     // unwraps (#477 S1): the promoted-read rows stage for the assignability
     // families' teardown re-decision, the dead-code rows collect for the
-    // report tail's merge below.
+    // report tail's merge below. The invalid-type name set (#2193) is
+    // snapshot-true already — the `TypeUse` verdicts latched at push
+    // time — so the staged spellings intern against it below.
+    let invalid_names = invalid_type_names(&engine.rows);
     let facts = flow.take_facts();
     let mut promotions = PromotionStaging::default();
     let mut unassigned = UnassignedStaging::default();
@@ -1099,11 +1107,12 @@ pub fn fold_unit_with_ops<'t>(
                 // [`Engine::filter_staged`]'s re-decision reads. The staged
                 // type folds through a type alias first (the flow type at a
                 // span is the resolved interface type).
-                let staged = staged_promotion(
+                let staged = staged_promotion_typed(
                     ty,
                     args,
                     &flow,
                     strings,
+                    &invalid_names,
                     &mut engine.boundary.args.borrow_mut(),
                 );
                 if let Some(promoted) = staged.map(|row| engine.fold_alias_ty(row)) {
@@ -1166,11 +1175,12 @@ pub fn fold_unit_with_ops<'t>(
             // staged type folds through a type alias first (`type_of`
             // answers the resolved interface type).
             FlowFact::ReadType { span, ty, args } => {
-                let staged = staged_promotion(
+                let staged = staged_promotion_typed(
                     ty,
                     args,
                     &flow,
                     strings,
+                    &invalid_names,
                     &mut engine.boundary.args.borrow_mut(),
                 );
                 if let Some(row) = staged.map(|row| engine.fold_alias_ty(row)) {
@@ -1182,11 +1192,12 @@ pub fn fold_unit_with_ops<'t>(
             // teardown join, keyed by the read's offset. The staged type
             // folds through a type alias first.
             FlowFact::ConditionType { span, ty, args } => {
-                let staged = staged_promotion(
+                let staged = staged_promotion_typed(
                     ty,
                     args,
                     &flow,
                     strings,
+                    &invalid_names,
                     &mut engine.boundary.args.borrow_mut(),
                 );
                 if let Some(row) = staged.map(|row| engine.fold_alias_ty(row)) {
@@ -1198,11 +1209,12 @@ pub fn fold_unit_with_ops<'t>(
             // keyed by the clause anchor's offset. The staged type folds
             // through a type alias first.
             FlowFact::MatchedType { span, ty, args } => {
-                let staged = staged_promotion(
+                let staged = staged_promotion_typed(
                     ty,
                     args,
                     &flow,
                     strings,
+                    &invalid_names,
                     &mut engine.boundary.args.borrow_mut(),
                 );
                 if let Some(row) = staged.map(|row| engine.fold_alias_ty(row)) {
