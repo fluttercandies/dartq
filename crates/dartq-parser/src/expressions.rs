@@ -1667,7 +1667,15 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             self.listener.handle_no_type_variables(next);
             return self.parse_function_expression();
         }
-        self.parse_parenthesized_or_record_literal(None)
+        // The parenthesized/record reading runs with function expressions
+        // re-enabled (:8272-8279): the initializer-list gate only bars a
+        // top-level `(params) {}` literal, not one nested inside a group —
+        // `: d = ((old, _) => f(old))` must still parse the inner literal.
+        let saved = self.may_parse_function_expressions;
+        self.may_parse_function_expressions = true;
+        let end = self.parse_parenthesized_or_record_literal(None);
+        self.may_parse_function_expressions = saved;
+        end
     }
 
     /// `looksLikeFunctionBody` (:9296): `{`, `=>`, `async`, or `sync`.

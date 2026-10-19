@@ -32,6 +32,7 @@ mod gate_m0_wave8;
 mod gate_m0_wave9;
 mod gate_pattern_const_shorthand;
 mod gate_ppin;
+mod gate_rc2200_recovery;
 mod goldens;
 mod patterns;
 

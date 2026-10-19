@@ -59,12 +59,14 @@ pub enum TypeInfo {
 
 impl TypeInfo {
     /// Whether the shape's last token is a `?` (official
-    /// `TypeInfo.isNullable`, `type_info.dart`).
+    /// `TypeInfo.isNullable`, `type_info.dart` — complex shapes answer via
+    /// `beforeQuestionMark`, `type_info_impl.dart:598`).
     pub(crate) fn is_nullable(&self) -> bool {
-        matches!(
-            self,
-            TypeInfo::SimpleNullable | TypeInfo::SimpleWith1Arg { nullable: true }
-        )
+        match self {
+            TypeInfo::SimpleNullable | TypeInfo::SimpleWith1Arg { nullable: true } => true,
+            TypeInfo::Complex(c) => c.before_question.is_some(),
+            _ => false,
+        }
     }
 }
 
@@ -682,10 +684,23 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         {
             type_info
         } else {
-            // `asNonNullable`; the complex shapes keep their `?` (documented
-            // reduction — the fast shapes cover the pinned-corpus forms).
+            // `asNonNullable` per shape (`type_info_impl.dart:219/319/575`):
+            // the `?` leaves the type so the conditional parses.
             match type_info {
                 TypeInfo::SimpleNullable => TypeInfo::Simple,
+                TypeInfo::SimpleWith1Arg { nullable: true } => {
+                    TypeInfo::SimpleWith1Arg { nullable: false }
+                }
+                TypeInfo::Complex(mut c) => {
+                    // `ComplexTypeInfo.asNonNullable`: end moves back to the
+                    // token before the `?`; the type-args closer shape (and
+                    // with it `end_raw_compound`) is unchanged.
+                    if let Some(before_q) = c.before_question {
+                        c.end = before_q;
+                        c.before_question = None;
+                    }
+                    TypeInfo::Complex(c)
+                }
                 other => other,
             }
         };
