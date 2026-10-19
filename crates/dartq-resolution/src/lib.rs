@@ -11,6 +11,9 @@
 //! - [`conditional`] — conditional-URI selection for configurable
 //!   import/export directives: first-match-wins selection over
 //!   the declared-variables map with the oracle's primary-URI fallback.
+//! - [`doc_import`] — `@docImport` directive extraction from documentation
+//!   comments (line-splitting, code-block swallowing, import-text string
+//!   literals), feeding the [`uri`]'s doc-import resolution face.
 //! - [`library_graph`] — interned library nodes keyed by canonical URI,
 //!   import/export edges, and the eager export-scope fixpoint pinned to the
 //!   analyzer's worklist behavior (locals beat re-exports, conflicting
@@ -34,6 +37,7 @@
 
 pub mod codes;
 pub mod conditional;
+pub mod doc_import;
 pub mod library_graph;
 pub mod modifiers;
 pub mod namespace;
@@ -44,6 +48,7 @@ pub use codes::{
     ResolutionCode, ResolutionCodeInfo, UNDEFINED_HIDDEN_NAME, UNDEFINED_SHOWN_NAME,
 };
 pub use conditional::{Configuration, SelectedUri, resolve_conditional};
+pub use doc_import::{CommentLexeme, DocComment, DocImportDirective, doc_imports};
 pub use library_graph::{
     CombinatorClause, Combinators, DuplicateCombinatorName, ExportEdge, ExportEntry, ImportEdge,
     LibraryGraph, LibraryGraphBuilder, LibraryId, LocalLookup, UndefinedCombinatorName,

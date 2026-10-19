@@ -155,11 +155,11 @@ pub enum DirectiveKind {
 /// the owning context's own map produces.
 ///
 /// Root/lib-dir resolution is [`PackageConfig::resolve`], dartq-pub's
-/// single shared face — duplicate names are a hard error (pub's
-/// `package_config.dart:44-51` throw, not a silent last-wins), names follow
-/// the loose reader grammar, `packageUri` directories are normalized and
-/// subtree-validated — exactly the policies the identity table applies, so
-/// the two tables can never diverge.
+/// single shared face — duplicate names dedup at parse to their first entry
+/// (package_config's package-table builder), names follow the loose reader
+/// grammar, `packageUri` directories are normalized and subtree-validated —
+/// exactly the policies the identity table applies, so the two tables can
+/// never diverge.
 #[derive(Debug)]
 pub struct PackageTable {
     /// Package lib dirs with their names, sorted by component depth (deepest
@@ -173,8 +173,8 @@ pub struct PackageTable {
     lib_dirs: Vec<(PathBuf, Box<str>)>,
     /// Package name → position in `lib_dirs` — the per-directive hot path's
     /// O(1) `lib_dir` face without a second copy of any lib dir. Names are
-    /// unique (duplicate names are a hard error in the shared dartq-pub
-    /// face), so one name owns one position.
+    /// unique (dartq-pub dedups repeated config names to the first entry at
+    /// parse), so one name owns one position.
     indices: FxHashMap<Box<str>, usize>,
     /// Directory holding `.dart_tool/` — the base of the generated-file
     /// fallback.
@@ -215,9 +215,10 @@ impl PackageTable {
     /// # Errors
     ///
     /// [`PubError`] when [`PackageConfig::resolve`] rejects the config — a
-    /// broken `rootUri`, duplicate names, a name outside the reader
-    /// grammar, or a `packageUri` escaping its root; a broken config,
-    /// reported loudly.
+    /// broken `rootUri`, a name outside the reader grammar, or a
+    /// `packageUri` escaping its root; a broken config, reported loudly.
+    /// Duplicate names never reach here: dartq-pub dedups them to the first
+    /// entry at parse.
     pub fn new(config: &PackageConfig, config_dir: &Path) -> Result<Self, PubError> {
         let resolved = config.resolve(config_dir)?;
         let mut lib_dirs: Vec<(PathBuf, Box<str>)> = Vec::new();
@@ -2494,25 +2495,21 @@ mod tests {
     }
 
     /// The shared dartq-pub face applies to this table too: duplicate
-    /// config names are pub's hard error (`package_config.dart:44-51`, the
-    /// verbatim `ArgumentError` text), never a silent last-wins over the
-    /// lib-dir index.
+    /// config names dedup at parse to their first entry (dartq-pub
+    /// `config.rs` `seen_names`, package_config's package-table builder),
+    /// so the index sees unique names and `lib_dir` answers with the first
+    /// entry's lib dir.
     #[test]
-    fn duplicate_names_fail_loudly() {
+    fn duplicate_names_dedup_first_entry_wins() {
         let config = PackageConfig::parse(
             r#"{"configVersion": 2, "packages": [
                 {"name": "a", "rootUri": "../x"},
                 {"name": "a", "rootUri": "../y"}]}"#,
         )
         .expect("parses");
-        let error =
-            PackageTable::new(&config, Path::new("/p/.dart_tool")).expect_err("duplicate name");
-        assert!(
-            error
-                .to_string()
-                .contains("Duplicate name a in generated package config"),
-            "unexpected error: {error}"
-        );
+        let table =
+            PackageTable::new(&config, Path::new("/p/.dart_tool")).expect("deduped config");
+        assert_eq!(table.lib_dir("a"), Some(Path::new("/p/x")));
     }
 
     // ---- resolve_conditional: configurable directives under the oracle
