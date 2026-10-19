@@ -65,6 +65,12 @@ pub enum PubError {
     /// typed face of the "Found no `pubspec.yaml`" case.
     #[error("workspace: {0}")]
     NoRoot(String),
+    /// Workspace discovery met a `resolution: workspace` pubspec that no
+    /// workspace root above it includes — pub's refusal, but the
+    /// analyzer's floor: it roots the context at the nearest pubspec and
+    /// analyzes (the oracle never consults pub's root walk).
+    #[error("workspace: {0}")]
+    OrphanMember(String),
     /// Workspace discovery or artifact validation failed.
     #[error("workspace: {0}")]
     Workspace(String),

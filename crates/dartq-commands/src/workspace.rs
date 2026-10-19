@@ -525,8 +525,9 @@ fn assemble(
         ))
     })?;
     // pub's root walk. No pubspec anywhere is the BasicWorkspace floor, not
-    // a refusal; every other discovery finding (a workspace-resolution
-    // pubspec with no root above it) stays a usage error. The discriminator
+    // a refusal; an orphan `resolution: workspace` member floors at its own
+    // pubspec (oracle-verified: `dart analyze` reports the member's rows,
+    // rc reflects them); every other discovery finding stays a usage error. The discriminator
     // is the walk's typed no-root variant (`PubError::NoRoot`), the one
     // error that means "no pubspec on the chain". An unparseable pubspec on
     // the chain is the oracle's empty-model floor, not a refusal: the
@@ -539,7 +540,11 @@ fn assemble(
     let workspace = match find_workspace_root(&dir) {
         Ok(workspace) => workspace,
         Err(PubError::NoRoot(_)) => return no_root_posture(&dir, override_config.is_some()),
-        Err(PubError::Pubspec(_)) => match nearest_pubspec_dir(&dir) {
+        // An unparseable pubspec, or a `resolution: workspace` member no
+        // root includes, both floor at the nearest pubspec: the analyzer
+        // builds its context there and analyzes (pub's refusal is pub's
+        // own, never the analyzer's).
+        Err(PubError::Pubspec(_) | PubError::OrphanMember(_)) => match nearest_pubspec_dir(&dir) {
             // A parse failure implies a pubspec on the chain at discovery
             // time; a file deleted between the two walks (TOCTOU) is the
             // same no-pubspec chain, the posture below — not a panic.
@@ -1631,6 +1636,22 @@ mod tests {
     /// `pubspec_overrides.yaml` applied — the shapes the pre-workspace
     /// assembly dropped (a misleading `dart pub get` error, an
     /// override-free graph).
+    /// An orphan `resolution: workspace` member — no root above includes
+    /// it — floors at its own pubspec instead of refusing: the analyzer
+    /// roots its context at the nearest pubspec and analyzes (pub's root
+    /// walk refusal is pub's, never `dart analyze`'s; oracle-probed: the
+    /// member's rows report with the error exit).
+    #[test]
+    fn orphan_workspace_member_floors_at_its_own_pubspec() {
+        let root = workspace("ws_orphan", &[]);
+        fs::write(root.join("pubspec.yaml"), MEMBER_PUBSPEC).expect("orphan pubspec");
+        let (config, dir) =
+            engine_config(&root, Some(&root.join("sdk"))).expect("orphan member assembles");
+        let root = root.canonicalize().expect("root");
+        assert_eq!(dir, root, "the pointed-at dir");
+        assert_eq!(config.config_dir, root.join(".dart_tool"), "its own artifacts");
+    }
+
     #[test]
     fn member_dir_assembles_over_the_root_workspace() {
         let root = member_fixture("ws_member");

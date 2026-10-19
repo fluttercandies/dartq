@@ -903,11 +903,15 @@ impl Interp<'_> {
                 } else if let Some(inner) = self.exprs.last().and_then(|e| e.chain_base) {
                     expr.chain_base = Some(inner);
                 }
-                // The receiver strands, like DotAccess's (the index operand
-                // above it was popped; the receiver stays for the cascade
-                // sections, marked consumed for the operand pops).
-                if let Some(receiver) = self.exprs.last_mut() {
-                    receiver.consumed = true;
+                // The receiver pops unless it is the innermost cascade's
+                // target — the one receiver a selector must leave in place
+                // (the sections chain on it, and `CascadeEnd` truncates to
+                // keep it as the value). Every other receiver's facts merged
+                // into the access's value above; leaving it stranded would
+                // shift every multi-operand consumer's blind pops
+                // (`ArgumentsEnd`, `Send`, `CascadeAccess`).
+                if !self.receiver_is_cascade_target() {
+                    self.exprs.pop();
                 }
                 self.exprs.push(expr);
             }
@@ -1044,18 +1048,15 @@ impl Interp<'_> {
                     // chain.
                     expr.chain_base = Some(inner);
                 }
-                // The receiver strands: the merged result replaces the
-                // access's value on top, and the receiver stays beneath it
-                // (the cascade's sections still read it there) — but marked
-                // consumed, so an operand pop never mistakes it for the
-                // operand beneath (`x = a.b`'s assignment target, `a + b.c`'s
-                // left operand).
-                if let Some(receiver) = self.exprs.last_mut() {
-                    receiver.consumed = true;
+                // The receiver pops unless it is the innermost cascade's
+                // target (same discipline as IndexAccess's).
+                if !self.receiver_is_cascade_target() {
+                    self.exprs.pop();
                 }
                 self.exprs.push(expr);
             }
-            Ev::Send | Ev::SendNoArgs => {                // The callee flows through as the send's result: a bare
+            Ev::Send | Ev::SendNoArgs => {
+                // The callee flows through as the send's result: a bare
                 // identifier keeps its variable reference and promoted type
                 // (a plain assignment's target is exactly such a reference).
                 if let Some(mut callee) = self.exprs.pop() {
@@ -1338,17 +1339,24 @@ impl Interp<'_> {
     /// producers; the missing operand degrades to a trivial value — no
     /// reference, no branches, so it contributes no fact — and the
     /// handler's stack arithmetic stays intact.
-    ///
-    /// A selector's receiver strand ([`Expr::consumed`]) is skipped: it is
-    /// not this consumer's operand — the operand is the selector's merged
-    /// result or the value beneath the strand.
     pub(crate) fn pop_value(&mut self) -> Expr {
-        while let Some(expr) = self.exprs.pop() {
-            if !expr.consumed {
-                return expr;
-            }
+        self.exprs
+            .pop()
+            .unwrap_or_else(|| Expr::trivial(Ty::UNKNOWN))
+    }
+
+    /// Whether the expression stack's top entry is the innermost active
+    /// cascade's target — the one receiver a selector must leave in place
+    /// (the sections chain on it, and `CascadeEnd` truncates to keep it as
+    /// the value). Positional, not identity-based: the target is the entry
+    /// the cascade frame was opened over, so every other receiver — however
+    /// deeply nested in the section's arguments — sits strictly above the
+    /// base and pops.
+    pub(crate) fn receiver_is_cascade_target(&self) -> bool {
+        match self.stack.last() {
+            Some(Frame::Cascade { exprs_base, .. }) => *exprs_base == self.exprs.len(),
+            _ => false,
         }
-        Expr::trivial(Ty::UNKNOWN)
     }
 
     /// Collapses one literal's element values to a single value: each

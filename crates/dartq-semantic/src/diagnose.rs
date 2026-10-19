@@ -332,7 +332,7 @@ use dartq_resolution::modifiers::{
     sealed_supertype_violation, subtype_restriction_violation,
 };
 use dartq_resolution::{
-    ImportEdge, LibraryClassModifiers, LibraryFeatureFacts, LibraryGraph, LibraryId,
+    ImportEdge, LibraryClassModifiers, LibraryFeatureFacts, LibraryGraph, LibraryId, Lookup,
     NamespaceEntry, Namespaces,
 };
 use dartq_scanner::TokenTable;
@@ -1032,12 +1032,76 @@ impl<'a> Boundary<'a> {
         self.args.borrow()
     }
 
+    /// `owner`'s own unit pool — the universe its entries' slots index.
+    fn foreign_pool(&self, owner: FileId) -> &'a crate::model::ArgPool {
+        self.index
+            .get(owner)
+            .expect("projecting a slot whose owner unit is resident")
+            .type_args()
+    }
+
     /// Projects a `Ty` owned by `owner`'s pool into the diagnosing
     /// universe: same-file and argument-less types pass through untouched,
     /// a foreign named type re-interns its argument list bottom-up (the
     /// persisted-restore order — inner lists are canonical before the
     /// outer interns), memoized per `(owner, slot)`.
     fn ty(&self, owner: FileId, ty: Ty) -> Ty {
+        if owner == self.own {
+            return ty;
+        }
+        match ty {
+            // Record and function shapes are pool slots too: a foreign
+            // slot read through the diagnosing pool indexes another
+            // universe (an out-of-bounds read, or silently a different
+            // shape), so both re-intern bottom-up like named arguments.
+            Ty::Record { shape, nullable } => {
+                if shape == crate::model::RecordShapeId::EMPTY {
+                    return ty;
+                }
+                let (positional, named) = {
+                    let foreign = self.foreign_pool(owner);
+                    let shape = foreign.record_shape(shape);
+                    (shape.positional.to_vec(), shape.named.to_vec())
+                };
+                let positional: Vec<Ty> =
+                    positional.into_iter().map(|t| self.ty(owner, t)).collect();
+                let named: Vec<(StringId, Ty)> = named
+                    .into_iter()
+                    .map(|(n, t)| (n, self.ty(owner, t)))
+                    .collect();
+                return self.args.borrow_mut().record(&positional, &named, nullable);
+            }
+            Ty::Function { shape, nullable } => {
+                if shape == crate::model::FnShapeId::EMPTY {
+                    return ty;
+                }
+                let (type_params, return_ty, positional, named) = {
+                    let foreign = self.foreign_pool(owner);
+                    let shape = foreign.function_shape(shape);
+                    (
+                        shape.type_params,
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                    )
+                };
+                let return_ty = self.ty(owner, return_ty);
+                let positional: Vec<Ty> =
+                    positional.into_iter().map(|t| self.ty(owner, t)).collect();
+                let named: Vec<(StringId, Ty)> = named
+                    .into_iter()
+                    .map(|(n, t)| (n, self.ty(owner, t)))
+                    .collect();
+                return self.args.borrow_mut().function(
+                    type_params,
+                    return_ty,
+                    &positional,
+                    &named,
+                    nullable,
+                );
+            }
+            _ => {}
+        }
         let Ty::Named {
             name,
             nullable,
@@ -1046,7 +1110,7 @@ impl<'a> Boundary<'a> {
         else {
             return ty;
         };
-        if args == crate::model::ArgListId::EMPTY || owner == self.own {
+        if args == crate::model::ArgListId::EMPTY {
             return ty;
         }
         if let Some(&local) = self.slots.borrow().get(&(owner, args)) {
@@ -1057,12 +1121,7 @@ impl<'a> Boundary<'a> {
             };
         }
         // The slot came from `owner`'s own entries, so its pool is resident.
-        let foreign = self
-            .index
-            .get(owner)
-            .expect("projecting a slot whose owner unit is resident")
-            .type_args();
-        let list = foreign.get(args);
+        let list: Vec<Ty> = self.foreign_pool(owner).get(args).to_vec();
         let projected: Vec<Ty> = list.iter().map(|&arg| self.ty(owner, arg)).collect();
         let Ty::Named { args: local, .. } =
             self.args.borrow_mut().named(name, nullable, &projected)
@@ -2419,6 +2478,17 @@ struct Engine<'a> {
     /// the flow layer's declared type (#2140), keyed on the declarator
     /// name token.
     var_infer_pending: Option<(StringId, SourceRange)>,
+    /// The staged assignment RHS types by write-target name (#2174's
+    /// inference feed): the latest plain `=` write whose resolved RHS the
+    /// flow staged, as `(write offset, frame depth, resolved type)`. A
+    /// `var`-inferred declarator whose initializer is a bare read of that
+    /// name infers the staged type — the oracle's inference is flow-aware
+    /// (the promoted read type), and the declared slot the loop-head join
+    /// demotes to must carry it (`var max = end` after
+    /// `end = RangeError.checkValidRange(...)` infers `int`, not `int?`).
+    /// The frame guard keeps a write inside one function body from typing
+    /// another's initializer.
+    staged_write_tys: FxHashMap<StringId, (u32, usize, Ty)>,
     /// An enum-constant window is open (`handle_enum_element` doubles as
     /// the previous element's close).
     enum_element_open: bool,
@@ -3627,6 +3697,7 @@ impl<'a> Engine<'a> {
             pending_init_names: Vec::new(),
             arg_gates: Vec::new(),
             var_infer_pending: None,
+            staged_write_tys: FxHashMap::default(),
             enum_element_open: false,
             const_string_begins: Vec::new(),
             ctor_init_latch: None,
@@ -4760,6 +4831,22 @@ impl<'a> Engine<'a> {
     /// static type lives off the row — `this`'s container, a creation's
     /// result (`C()` → `C`). Anything else stays `Unknown` (the
     /// suppress-everything sentinel — under-report, never over-report).
+    /// The flow-aware initializer type for a bare read (#2174's inference
+    /// feed): a read of the name whose latest staged plain-`=` write
+    /// resolved a type (same frame, earlier offset) infers that type — the
+    /// oracle's inference reads the promoted type of the initializer
+    /// expression, and the declared slot the loop-head join demotes to must
+    /// carry it (`var max = end` after
+    /// `end = RangeError.checkValidRange(...)` infers `int`, not `int?`).
+    /// Any other initializer shape keeps the row's own answer.
+    fn staged_read_ty(&self, row: &Row) -> Option<Ty> {
+        if !matches!(row.shape, RowShape::Bare(BareInfo::Plain { .. })) {
+            return None;
+        }
+        let &(offset, frame, ty) = self.staged_write_tys.get(&row.name)?;
+        (offset < row.range.offset && frame == self.frames.len()).then_some(ty)
+    }
+
     fn initializer_static_ty(&self, row: &Row) -> Option<Ty> {
         if row.ty != Ty::UNKNOWN {
             return Some(row.ty);
@@ -15765,6 +15852,38 @@ impl<'a> Engine<'a> {
                                 ty: receiver_ty,
                             }
                         }
+                        // An information-less bare head whose spelling
+                        // resolves to an SDK declaration is a class-static
+                        // face on an unindexed (SDK synthetic) container
+                        // (`RangeError.checkValidRange(...)`): arm the
+                        // container so the member's send types against the
+                        // declared static table instead of the Unknown
+                        // dispatch — whose positional recovery cannot serve
+                        // the merged row (the receiver row is folded away
+                        // here, and the send tiles the merged row's range
+                        // past it). SDK-only: a user-declared spelling
+                        // (a top-level function head, a same-spelled class)
+                        // keeps the Unknown dispatch whose resolve arm the
+                        // cascade/unused-result faces consult, and a local
+                        // read never arms (the local shadows any
+                        // same-spelled declaration). An unresolved spelling
+                        // keeps Unknown too — its own miss row already
+                        // reports.
+                        Receiver::Unknown
+                            if !was_local
+                                && matches!(
+                                    self.namespaces.lookup(self.graph, self.lib, popped.name),
+                                    Lookup::Found(NamespaceEntry::Decl(owner))
+                                    if self.graph.library_of_file(owner).is_some_and(
+                                        |lib| self.graph.uri(lib).starts_with("dart:"),
+                                    )
+                                ) =>
+                        {
+                            Receiver::Container {
+                                name: popped.name,
+                                kind: ContainerKind::Class,
+                            }
+                        }
                         other => other,
                     },
                     RowShape::Receiver(recv) => *recv,
@@ -16690,6 +16809,14 @@ impl<'a> Engine<'a> {
     /// `argument_type_not_assignable` (oracle 3.13.1 is silent there).
     fn tear_off_sig(&self, row: &Row) -> Option<Box<FnVarSig>> {
         if row.qualified || row.intent != Intent::Read {
+            return None;
+        }
+        // A frame local shadows any same-spelled top-level declaration (the
+        // scope precedence `resolve_bare` applies): the read is the local's
+        // own value, never the function's tear-off — the row carries no
+        // resolved-target signal (both faces push a `Plain` shape), so the
+        // shadow check is the gate.
+        if self.frames.iter().any(|f| f.locals.contains(&row.name)) {
             return None;
         }
         // A missing bare row (no in-file declaration at all) still reads
@@ -20216,13 +20343,6 @@ impl<'a> Engine<'a> {
                 .rows
                 .partition_point(|probe| probe.range.offset < row.range.offset);
             let receiver = self.rows.get(index.checked_sub(1)?)?;
-            eprintln!(
-                "DBG fallback prev={:?} end={} row_off={} name={}",
-                receiver.shape,
-                receiver.range.end(),
-                row.range.offset,
-                self.strings.resolve(receiver.name)
-            );
             (receiver.range.end() <= row.range.offset).then_some(receiver.name)
         });
         let Some(container) = container else {
@@ -20249,11 +20369,6 @@ impl<'a> Engine<'a> {
                     container,
                 )
                 .is_some();
-                eprintln!(
-                    "DBG core-table container={} indexed={indexed} member={}",
-                    self.strings.resolve(container),
-                    self.strings.resolve(row.name)
-                );
                 if indexed {
                     return Ty::UNKNOWN;
                 }
@@ -27857,7 +27972,9 @@ impl ParserListener for DiagnoseListener<'_> {
             if let Some((name, decl_range)) = engine.var_infer_pending.take()
                 && let Some(mark) = engine.init_mark
                 && engine.rows.len() == mark + 1
-                && let Some(ty) = engine.initializer_static_ty(&engine.rows[mark])
+                && let Some(ty) = engine
+                    .initializer_static_ty(&engine.rows[mark])
+                    .map(|ty| engine.staged_read_ty(&engine.rows[mark]).unwrap_or(ty))
             {
                 engine.bind_var_type(name, ty);
                 // The promotion face rides the flow layer's declared-type
@@ -29203,9 +29320,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 .last()
                 .or_else(|| after().clone().last())?;
             let from_ty = if rhs_row.intent == Intent::Invoke {
-                let r = engine.callee_return_ty(rhs_row);
-                eprintln!("DBG callee {} -> {r:?}", engine.strings.resolve(rhs_row.name));
-                r
+                engine.callee_return_ty(rhs_row)
             } else {
                 rhs_row.ty
             };
@@ -29215,6 +29330,14 @@ impl ParserListener for DiagnoseListener<'_> {
                 args: ArgListId::EMPTY,
             } = from_ty
             {
+                // The inference feed: the write target's name keys the
+                // resolved RHS type, so a `var`-inferred declarator whose
+                // initializer reads that name infers the promoted type (the
+                // oracle's flow-aware inference).
+                engine.staged_write_tys.insert(
+                    engine.rows[target].name,
+                    (engine.rows[target].range.offset, engine.frames.len(), from_ty),
+                );
                 Some((
                     engine.rows[target].range.offset,
                     engine.strings.resolve(name).to_string(),
@@ -41674,6 +41797,76 @@ mod tests {
         (rep, file_a)
     }
 
+    /// A record type declared in another unit re-interns into the
+    /// diagnosing pool: the foreign shape slot indexes the owner's pool, so
+    /// reading it through the diagnosing pool overran (a panic on the real
+    /// `archive`/`analyzer`/`drift`/`riverpod` corpora) or silently named a
+    /// different shape. The projected record's fields resolve.
+    #[test]
+    fn cross_file_record_type_projects_into_the_diagnosing_pool() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file_a = files.intern(Path::new("a.dart"));
+        let file_m = files.intern(Path::new("main.dart"));
+        // `a.dart` interns two record shapes, so its second slot (1) is
+        // past the empty diagnosing pool's only slot.
+        let source_a = "(int, int) pair() => (1, 2);\n({int x, int y}) point() => (x: 1, y: 2);";
+        let source_m = "import 'a.dart'; void f() { var p = point(); p.x; p.y; pair().$1; }";
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let config = ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        };
+        let scanned_a = dartq_scanner::scan(source_a, config, file_a);
+        let scanned_m = dartq_scanner::scan(source_m, config, file_m);
+        let elements_a = collect(source_a, &scanned_a.tokens, features, &strings);
+        let elements_m = collect(source_m, &scanned_m.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib_a = builder.intern("package:t/a.dart");
+        let lib_m = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file_a, elements_a.clone());
+        index.insert(file_m, elements_m.clone());
+        for (name, _) in elements_a.declarations() {
+            builder.declare(lib_a, name, file_a);
+        }
+        for (name, decl) in elements_m.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_m, name, file_m);
+        }
+        builder.import(
+            lib_m,
+            ImportEdge {
+                target: Some(lib_a),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let rep = diagnose(
+            source_m,
+            &scanned_m.tokens,
+            features,
+            &strings,
+            file_m,
+            lib_m,
+            &graph,
+            &namespaces,
+            &index,
+        );
+        assert!(
+            !code_names(&rep).contains(&"undefined_getter"),
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
     /// The W2 anchor face: the cross-file `invalid_override` row carries the
     /// oracle's context message anchored at the overridden member's name
     /// token in its own file (`diagnostic_factory.dart` `invalidOverride` —
@@ -50546,6 +50739,54 @@ mod ticket_1351_tests {
                       compare ??= defaultCompare;\n  \
                       g(compare);\n\
                       }";
+        let report = unit_report(source);
+        assert_eq!(
+            count_code(&report, "argument_type_not_assignable"),
+            0,
+            "{report:?}"
+        );
+    }
+
+    /// The staged write's promoted read feeds inference: a `var`-inferred
+    /// declarator whose initializer is a bare read of the staged target
+    /// infers the staged type (the oracle's flow-aware inference), so the
+    /// loop-head join demotes to `int`, not `int?` — the condition read and
+    /// every in-loop use stay clean (the corpus face:
+    /// `binarySearchBy`'s `var max = end` after the resolved-RHS write).
+    #[test]
+    fn inferred_local_takes_the_staged_write_type_through_the_loop() {
+        let source = "int check(int a, int? b, int c) => 0;\n\
+                      void f([int start = 0, int? end]) {\n  \
+                      end = check(start, end, 0);\n  \
+                      var max = end;\n  \
+                      while (0 < max) {\n    \
+                      var mid = max - 1;\n    \
+                      max = mid;\n  \
+                      }\n\
+                      }";
+        let report = unit_report(source);
+        assert_eq!(
+            count_code(&report, "argument_type_not_assignable"),
+            0,
+            "{report:?}"
+        );
+    }
+
+    /// A frame local shadows a same-spelled top-level function in the
+    /// argument tear-off face: the read is the local's value, never the
+    /// function's signature-as-a-value (the scope precedence
+    /// `resolve_bare` applies; the corpus face: path's
+    /// `setExtension(String path, String extension)` over the top-level
+    /// `String extension(String, [int])`).
+    #[test]
+    fn local_formal_shadows_the_top_level_tear_off_in_arguments() {
+        let source = "class Ctx {\n  \
+                      String setExtension(String path, String extension) => '';\n\
+                      }\n\
+                      Ctx get context => Ctx();\n\
+                      String extension(String path, [int level = 1]) => '';\n\
+                      String setExtension(String path, String extension) =>\n  \
+                      context.setExtension(path, extension);";
         let report = unit_report(source);
         assert_eq!(
             count_code(&report, "argument_type_not_assignable"),

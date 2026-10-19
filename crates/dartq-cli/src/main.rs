@@ -837,7 +837,7 @@ fn workspace_root_of(dir: &Path) -> PathBuf {
     match dartq_pub::find_workspace_root(dir) {
         Ok(workspace) => workspace.root,
         Err(dartq_pub::PubError::NoRoot(_)) => dir.to_path_buf(),
-        Err(dartq_pub::PubError::Pubspec(_)) => {
+        Err(dartq_pub::PubError::Pubspec(_) | dartq_pub::PubError::OrphanMember(_)) => {
             // The nearest-pubspec floor: the first ancestor carrying a
             // `pubspec.yaml` is the root `assemble` picks for this arm.
             let mut dir = dir;

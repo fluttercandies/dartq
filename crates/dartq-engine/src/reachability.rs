@@ -848,7 +848,7 @@ mod tests {
         );
         write(
             ".dart_tool/package_config.json",
-            r#"{"configVersion": 2, "packages": [{"name": "t", "rootUri": "../", "languageVersion": "3.5"}, {"name": "flutter", "rootUri": "../flutter", "languageVersion": "3.5"}], "generator": "pub"}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "t", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}, {"name": "flutter", "rootUri": "../flutter", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub"}"#,
         );
         write("sdk/version", "3.13.1\n");
         write(

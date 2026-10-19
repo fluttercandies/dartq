@@ -382,14 +382,6 @@ pub(crate) struct Expr {
     /// the shorts opened by the consumed expression, all the way down its
     /// chain).
     pub chain_base: Option<usize>,
-    /// The value was consumed as a selector's receiver (`a.b`'s `a`): the
-    /// selector's merged result replaces the access's value on top, and
-    /// this operand stays beneath only as a strand (the cascade's sections
-    /// still read it there). Operand pops ([`Interp::pop_value`]) skip it —
-    /// a multi-operand consumer (`x = a.b`'s assignment target,
-    /// `a + b.c`'s left operand) must never mistake the strand for the
-    /// operand beneath its own value.
-    pub consumed: bool,
 }
 
 impl Expr {
@@ -405,7 +397,6 @@ impl Expr {
             read_span: None,
             name: None,
             chain_base: None,
-            consumed: false,
         }
     }
 
@@ -421,7 +412,6 @@ impl Expr {
             read_span: None,
             name: None,
             chain_base: None,
-            consumed: false,
         }
     }
 

@@ -99,7 +99,7 @@ pub fn find_workspace_root(from: &Path) -> Result<WorkspaceLayout, PubError> {
                         .iter()
                         .any(|(member, _)| inclusion_key(member) == first_key)
                 {
-                    return Err(PubError::Workspace(format!(
+                    return Err(PubError::OrphanMember(format!(
                         "Found a pubspec.yaml at {}. But it has resolution `{}`. \
                          But found no workspace root including it in parent directories.\n\n\
                          See https://dart.dev/go/pub-workspaces for more information.",
@@ -124,7 +124,7 @@ pub fn find_workspace_root(from: &Path) -> Result<WorkspaceLayout, PubError> {
                         "Found no `pubspec.yaml` file in `{}` or parent directories",
                         from.display()
                     )),
-                    Some((dir, resolution)) => PubError::Workspace(format!(
+                    Some((dir, resolution)) => PubError::OrphanMember(format!(
                         "Found a pubspec.yaml at {}. But it has resolution `{}`. \
                          But found no workspace root including it in parent directories.\n\n\
                          See https://dart.dev/go/pub-workspaces for more information.",
