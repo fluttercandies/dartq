@@ -474,7 +474,98 @@ impl<'a> Engine<'a> {
                 self.stage_usage(code, range, &name_text);
             }
         }
+        self.suppress_same_line_ignored_locals();
         self.report_unused_imports();
+    }
+
+    /// The trailing same-line `// ignore:` face over the local-variable
+    /// rows (`IgnoreInfo.forDart`, ignore_info.dart:119-143): an ignore
+    /// comment whose line carries code before it applies to THAT line, so
+    /// `var x = 0; // ignore: unused_local_variable` spares the row exactly
+    /// as the standalone form does through the module root's
+    /// [`IgnoreSuppression`] — which materializes standalone comments only,
+    /// so the same-line form never reached the table (the archive census
+    /// rows, #2189-c). Scoped to `unused_local_variable`, this cluster's
+    /// verified population; every other code keeps its documented
+    /// under-report. A `//` head counts only after whitespace (or at line
+    /// start), so a `//` inside a string literal never reads as a comment.
+    fn suppress_same_line_ignored_locals(&mut self) {
+        if !self.source.contains("ignore:") {
+            return;
+        }
+        let code = SemanticCode::UnusedLocalVariable.code_info();
+        let mut drop: Vec<usize> = Vec::new();
+        for (index, row) in self.report.usage.iter().enumerate() {
+            if row.code != code {
+                continue;
+            }
+            let byte = self.byte_of(row.range.offset).min(self.source.len());
+            let start = self.source[..byte].rfind('\n').map_or(0, |at| at + 1);
+            let end = self
+                .source[start..]
+                .find('\n')
+                .map_or(self.source.len(), |at| start + at);
+            if self.line_has_trailing_ignore(&self.source[start..end]) {
+                drop.push(index);
+            }
+        }
+        if drop.is_empty() {
+            return;
+        }
+        let mut next = 0usize;
+        let mut index = 0usize;
+        self.report.usage.retain(|_| {
+            let keep = next >= drop.len() || index != drop[next];
+            if !keep {
+                next += 1;
+            }
+            index += 1;
+            keep
+        });
+    }
+
+    /// Whether the line carries a `// ignore:` entry naming
+    /// `unused_local_variable` with code before the comment (the trailing
+    /// form — a standalone comment's entry is the next line's, the root
+    /// face's). A head only counts after whitespace (or at line start) —
+    /// a `//` inside a string literal is not a comment — and the name
+    /// grammar mirrors the root parser's: comma-list, alphanumeric/
+    /// underscore heads, case-insensitive.
+    fn line_has_trailing_ignore(&self, line: &str) -> bool {
+        let bytes = line.as_bytes();
+        let mut from = 0usize;
+        while let Some(at) = line[from..].find("//") {
+            let head = from + at;
+            from = head + 2;
+            // The head guard: a comment head opens after whitespace (or
+            // at the line's start), never mid-token.
+            if head > 0 && !bytes[head - 1].is_ascii_whitespace() {
+                continue;
+            }
+            // The trailing guard: the official same-line form is a
+            // comment with code before it; an all-whitespace prefix is
+            // the standalone form (the next line's — the root face's).
+            if !bytes[..head].iter().any(|b| !b.is_ascii_whitespace()) {
+                continue;
+            }
+            let bare = line[from..]
+                .trim_start_matches('/')
+                .trim_start()
+                .strip_prefix("ignore:");
+            let Some(rest) = bare else {
+                continue;
+            };
+            if rest.split(',').any(|name| {
+                let name = name.trim();
+                let end = name
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(name.len());
+                name[..end].eq_ignore_ascii_case("unused_local_variable")
+            }) {
+                return true;
+            }
+        }
+        false
     }
 
     /// `_isPubliclyAccessible` (`unused_local_elements_verifier.dart`:
@@ -1474,5 +1565,245 @@ impl<'a> Engine<'a> {
                     .iter()
                     .any(|a| self.strings.resolve(*a) == spelling)
         })
+    }
+}
+
+#[cfg(test)]
+mod pins {
+    use super::super::{FileReport, StrictModes, diagnose_with};
+    use crate::collector::collect;
+    use crate::library::ElementIndex;
+    use crate::model::MicroKind;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{LibraryClassModifiers, LibraryGraphBuilder, Namespaces};
+    use dartq_scanner::ScanConfig;
+    use dartq_source::{FileTable, StringTable};
+    use std::path::Path;
+
+    /// Diagnoses `source` as the sole file of a library with no imports —
+    /// the shared single-file rig.
+    fn report(source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        diagnose_with(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        )
+    }
+
+    /// The `unused_local_variable` rows of `report`, as (offset, name-token
+    /// length) pairs in source order.
+    fn unused_local_rows(source: &str) -> Vec<(u32, u32)> {
+        report(source)
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unused_local_variable")
+            .map(|d| (d.range.offset, d.range.length))
+            .collect()
+    }
+
+    /// #2189-a, leak direction (search.dart's `var element = switch (…)`
+    /// shape): the arm's pattern variable is out of scope at the
+    /// post-switch read, which binds the OUTER declaration. Both locals
+    /// are used — the arm variable by the arm body, the outer one by the
+    /// post-switch read — so no row reports.
+    #[test]
+    fn switch_arm_pattern_variable_does_not_steal_post_switch_read() {
+        let source = "class Box {\n\
+                      \x20 Box e = Box();\n\
+                      }\n\
+                      Box sink(Box x) => x;\n\
+                      void t(Box r) {\n\
+                      \x20 var e = switch (r) {\n\
+                      \x20   Box(:var e) => e,\n\
+                      \x20   _ => null,\n\
+                      \x20 };\n\
+                      \x20 sink(e);\n\
+                      }\n";
+        assert_eq!(unused_local_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2189-a, leak boundary: without the post-switch read the outer
+    /// declaration is genuinely unused and reports at its own token — the
+    /// arm variable's in-arm use never spares it.
+    #[test]
+    fn outer_declaration_still_reports_when_only_the_arm_binding_is_read() {
+        let source = "class Box {\n\
+                      \x20 Box e = Box();\n\
+                      }\n\
+                      void t(Box r) {\n\
+                      \x20 var e = switch (r) {\n\
+                      \x20   Box(:var e) => e,\n\
+                      \x20   _ => null,\n\
+                      \x20 };\n\
+                      }\n";
+        let outer_e = source.find("var e = switch").unwrap() as u32 + 4;
+        assert_eq!(unused_local_rows(source), vec![(outer_e, 1)], "{source:?}");
+    }
+
+    /// #2189-a, under-bind direction (driver.dart's
+    /// `if (workingStatistics case var workingStatistics?)` shape): the
+    /// body read binds the pattern variable, and the member increment on
+    /// it is a useful read of the receiver (the official `_isUsefulRead`
+    /// keys on the identifier's own parent, never the statement's
+    /// operator) — the pattern variable reports nothing.
+    #[test]
+    fn if_case_body_increment_spares_the_pattern_variable() {
+        let source = "class C {\n\
+                      \x20 C f = C();\n\
+                      }\n\
+                      void t(C? v) {\n\
+                      \x20 if (v case var v?) {\n\
+                      \x20   v.f++;\n\
+                      \x20 }\n\
+                      }\n";
+        assert_eq!(unused_local_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2189-b (drift versioned_schema.dart's clean-file proof): a local
+    /// read in receiver position of a member WRITE is a use — the
+    /// official `_visitNameExpression` credits the receiver through its
+    /// lexical resolution regardless of the member access.
+    #[test]
+    fn receiver_position_write_spares_the_local() {
+        let source = "class D {\n\
+                      \x20 D rs = D();\n\
+                      }\n\
+                      void t() {\n\
+                      \x20 var n = D();\n\
+                      \x20 n.rs = D();\n\
+                      }\n";
+        assert_eq!(unused_local_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2189-b, broken-member face: the receiver occurrence credits the
+    /// local even where the member access then fails (`n.f++` over an
+    /// undefined member shape still reads `n` usefully).
+    #[test]
+    fn receiver_position_increment_spares_the_local() {
+        let source = "class D {\n\
+                      \x20 D f = D();\n\
+                      }\n\
+                      void t() {\n\
+                      \x20 var n = D();\n\
+                      \x20 n.f++;\n\
+                      }\n";
+        assert_eq!(unused_local_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2189-b boundary: only a bare row IS the local — a plain
+    /// assignment to the local itself stays a write-only life and
+    /// reports.
+    #[test]
+    fn bare_write_target_still_reports() {
+        let source = "class D {}\n\
+                      void t() {\n\
+                      \x20 var v = D();\n\
+                      \x20 v = D();\n\
+                      }\n";
+        let v = source.find("var v").unwrap() as u32 + 4;
+        assert_eq!(unused_local_rows(source), vec![(v, 1)], "{source:?}");
+    }
+
+    /// #2189-c (archive bzip2_encoder/zlib rows): a trailing same-line
+    /// `// ignore: unused_local_variable` suppresses the row anchored on
+    /// that line (`IgnoreInfo.forDart` — a comment with code before it
+    /// applies to its own line).
+    #[test]
+    fn trailing_same_line_ignore_suppresses() {
+        let source = "class D {}\n\
+                      void t() {\n\
+                      \x20 var x = 0; // ignore: unused_local_variable\n\
+                      }\n";
+        assert_eq!(unused_local_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2189-c control: without the comment the row reports.
+    #[test]
+    fn same_line_without_ignore_still_reports() {
+        let source = "class D {}\n\
+                      void t() {\n\
+                      \x20 var x = 0;\n\
+                      }\n";
+        let x = source.find("var x").unwrap() as u32 + 4;
+        assert_eq!(unused_local_rows(source), vec![(x, 1)], "{source:?}");
+    }
+
+    /// #2189-c guard: a `//` inside a string literal is not a comment
+    /// head — the decoy text neither suppresses its own row nor mangles
+    /// the face.
+    #[test]
+    fn ignore_text_inside_string_literal_is_not_a_comment() {
+        let source = "class D {}\n\
+                      void t() {\n\
+                      \x20 var s = '// ignore: unused_local_variable';\n\
+                      }\n";
+        let s = source.find("var s").unwrap() as u32 + 4;
+        assert_eq!(unused_local_rows(source), vec![(s, 1)], "{source:?}");
+    }
+
+    /// #2189-a identity guard: a later sibling switch at the same stack
+    /// depth is never the declaring switch — its arm's read of the same
+    /// name binds the OUTER declaration, and the first switch's arm
+    /// variable keeps only its own arm's use. No row on either.
+    #[test]
+    fn later_sibling_switch_does_not_revive_the_arm_binding() {
+        let source = "class B {\n\
+                      \x20 B e = B();\n\
+                      }\n\
+                      B sink(B x) => x;\n\
+                      void t(B r) {\n\
+                      \x20 var e = B();\n\
+                      \x20 var x = switch (r) {\n\
+                      \x20   B(:var e) => e,\n\
+                      \x20   _ => null,\n\
+                      \x20 };\n\
+                      \x20 var y = switch (r) {\n\
+                      \x20   B(:var z) => e,\n\
+                      \x20   _ => null,\n\
+                      \x20 };\n\
+                      \x20 sink(x);\n\
+                      \x20 sink(y);\n\
+                      }\n";
+        assert_eq!(unused_local_rows(source), vec![], "{source:?}");
     }
 }

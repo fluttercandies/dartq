@@ -1,5 +1,19 @@
 use super::*;
 
+/// The arm-scope sentinel range inside [`LocalDecl::group`]: a case-header
+/// pattern variable (`case A(:var e)`, a switch-expression arm) encodes its
+/// declaring switch-stack depth as `BASE - depth`, so [`Engine::resolve_local`]
+/// can drop the binding once the switch closed — the official scopes a case
+/// pattern's variables to the arm (`unused_local_elements_verifier` visits
+/// them as locals of the arm's scope), and a read past the switch must bind
+/// the outer declaration, never the arm's (the search.dart
+/// `var element = switch (…) { ExecutableInvocationResolution(:var element)
+/// => … }` census shape, #2189-a). Real pattern-declaration group ids count
+/// up from 1; reaching the sentinel range would need ~4 billion pattern
+/// groups in one unit. Depths are syntactic nesting — a fraction of
+/// [`u16::MAX`]; deeper stacks stay untagged (the flat-frame under-report).
+const PATTERN_ARM_SCOPE_BASE: u32 = u32::MAX - u16::MAX as u32;
+
 impl<'a> Engine<'a> {
     /// A local variable declaration (`LocalVariableDeclaration`): the
     /// tracked local of the open frame, and the statement-list duplicate
@@ -132,9 +146,14 @@ impl<'a> Engine<'a> {
         // targets (upstream `visitCompoundAssignment`'s `readCountsAsUse:
         // parent is! ExpressionStatement` — the target's read never counts
         // in a statement window, regardless of the other identifiers in it,
-        // so `x += i;` still spares `i` while cancelling `x`).
-        let mut read_row: Option<SourceRange> = None;
-        let mut rw_rows: Vec<SourceRange> = Vec::new();
+        // so `x += i;` still spares `i` while cancelling `x`). Each row
+        // carries its bare-ness: only a bare row IS the local — a member
+        // row's hit is the RECEIVER's occurrence credit, and the receiver
+        // of `v.m += 1;`/`v.m++;` reads `v` as a plain useful read (the
+        // official `_visitNameExpression`/`_isUsefulRead` — `v`'s own
+        // parent is the member access, never the discarded operator).
+        let mut read_row: Option<(SourceRange, bool)> = None;
+        let mut rw_rows: Vec<(SourceRange, bool)> = Vec::new();
         for row in self.rows.iter().rev() {
             if row.range.end() <= w0 {
                 break;
@@ -143,14 +162,15 @@ impl<'a> Engine<'a> {
             {
                 continue;
             }
+            let bare = matches!(row.shape, RowShape::Bare(_));
             match row.intent {
                 Intent::Read => {
                     if read_row.is_some() {
                         return; // two plain reads: the reads are useful
                     }
-                    read_row = Some(row.range);
+                    read_row = Some((row.range, bare));
                 }
-                Intent::ReadWrite => rw_rows.push(row.range),
+                Intent::ReadWrite => rw_rows.push((row.range, bare)),
                 // invoke/write/operator rows are always uses
                 _ => return,
             }
@@ -184,13 +204,13 @@ impl<'a> Engine<'a> {
             )
         });
         if compound_write {
-            for row_range in &rw_rows {
-                if let Some(hit) = self.local_hits.remove(&row_range.offset) {
+            for (row_range, bare) in &rw_rows {
+                if *bare && let Some(hit) = self.local_hits.remove(&row_range.offset) {
                     self.locals[hit as usize].uses -= 1;
                 }
             }
         }
-        if let Some(row_range) = read_row {
+        if let Some((row_range, bare)) = read_row {
             let head_op = self
                 .text_of(begin)
                 .is_some_and(|text| matches!(text, "!" | "-" | "~" | "++" | "--"));
@@ -198,6 +218,7 @@ impl<'a> Engine<'a> {
                 *offset == row_range.end() && matches!(*text, "!" | "++" | "--")
             });
             if (head_op || tail_op)
+                && bare
                 && let Some(hit) = self.local_hits.remove(&row_range.offset)
             {
                 self.locals[hit as usize].uses -= 1;
@@ -462,6 +483,12 @@ impl<'a> Engine<'a> {
 
     /// The local declaration `name` resolves to, innermost frame first
     /// (the same walk [`Engine::resolve_bare`]'s locals arm runs).
+    ///
+    /// An arm-scoped case-header pattern variable (the sentinel group,
+    /// [`PATTERN_ARM_SCOPE_BASE`]) is a candidate only while its
+    /// declaring switch context is still on the stack — a read past the
+    /// switch falls through to the outer declaration, the official
+    /// arm-scope end (`#2189`-a's leak direction).
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     pub(crate) fn resolve_local(&self, name: StringId) -> Option<u32> {
         for depth in (0..self.frames.len()).rev() {
@@ -473,10 +500,28 @@ impl<'a> Engine<'a> {
                     .copied()
                     .unwrap_or(self.locals.len());
                 // Within one frame, a use follows its declaration
-                // textually: the last entry under the name is it.
+                // textually: the last entry under the name is it — unless
+                // that entry is an arm-scoped pattern variable whose
+                // switch already closed. The tag's stack slot must still
+                // be covered AND held by the declaring switch: a context
+                // whose keyword starts after the declaration is a later
+                // sibling switch at the same depth, never the tag's own.
+                let switches = &self.switch.switches;
                 return self.locals[lo..hi]
                     .iter()
-                    .rposition(|d| d.name == name)
+                    .rposition(|d| {
+                        d.name == name
+                            && match d.group {
+                                Some(g) if g >= PATTERN_ARM_SCOPE_BASE => {
+                                    let slot = (u32::MAX - g) as usize;
+                                    switches.len() >= slot
+                                        && switches.get(slot - 1).is_some_and(|ctx| {
+                                            ctx.switch_kw.offset < d.range.offset
+                                        })
+                                }
+                                _ => true,
+                            }
+                    })
                     .map(|p| (lo + p) as u32);
             }
         }
@@ -666,8 +711,22 @@ impl<'a> Engine<'a> {
         // its group (one used member spares all). The window is the GROUP
         // ID, never a locals index — an index outlived frame pops and read
         // a truncated slot.
+        //
+        // A case-header pattern variable is arm-scoped instead: it takes
+        // the sentinel group ([`PATTERN_ARM_SCOPE_BASE`]) carrying its
+        // declaring switch depth, never joins the window, and never opens
+        // one — the all-or-nothing group is a `PatternVariableDeclaration`
+        // face, while the official visits a case pattern's variables
+        // individually (each is its own local element).
         let group = if matches!(kind, LocalKind::PatternVariable) {
-            if let Some(group) = self.pattern_group_open {
+            let depth = self.switch.switches.len();
+            if self.switch.case_sink_open
+                && !self.switch.if_case_window
+                && depth > 0
+                && depth <= u16::MAX as usize
+            {
+                Some(u32::MAX - depth as u32)
+            } else if let Some(group) = self.pattern_group_open {
                 Some(group)
             } else {
                 self.pattern_group_seq += 1;
