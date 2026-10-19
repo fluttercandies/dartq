@@ -356,6 +356,28 @@ impl ComplexType {
         if self.end_raw_compound {
             return;
         }
+        // A shared compound closer at `from` whose remaining units close
+        // enclosing groups (`List<List<int>>` inside `Future<...>`, all three
+        // closing on one `>>>`): this type closes on an inner unit, so its
+        // official successor is the split remainder — the enclosing closer —
+        // never the real token after the compound. Only the type consuming
+        // the compound's last unit reads past it; anything narrower steals
+        // the enclosing type's `Function`/`?` suffix
+        // (`Future<List<List<int>>> Function()`).
+        let from_offset = parser.offset_of(from);
+        let units = crate::type_args::closer_units(parser.kind_at(from_offset));
+        if units > 1 {
+            let mut open = 0usize;
+            for i in parser.offset_of(self.start)..from_offset {
+                match parser.kind_at(i) {
+                    TokenKind::Lt => open += 1,
+                    kind => open = open.saturating_sub(crate::type_args::closer_units(kind)),
+                }
+            }
+            if open < units {
+                return;
+            }
+        }
         let mut offset = parser.offset_of(from);
         if parser.kind_at(offset + 1) == TokenKind::Question {
             self.before_question = Some(parser.real_id(offset));

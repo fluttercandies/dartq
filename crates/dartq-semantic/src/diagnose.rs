@@ -10582,7 +10582,7 @@ impl<'a> Engine<'a> {
     /// `name`: this file's declaration table first, then the library
     /// namespace (the same resolution order a container use walks).
     fn alias_rhs(&self, name: StringId) -> Option<Ty> {
-        let decl = match lookup_scoped(
+        let (owner, decl) = match lookup_scoped(
             self.graph,
             self.namespaces,
             self.index,
@@ -10590,15 +10590,17 @@ impl<'a> Engine<'a> {
             self.file,
             name,
         ) {
-            ScopedHit::Local(decl) => decl,
+            ScopedHit::Local(decl) => (self.file, decl),
             ScopedHit::Found(NamespaceEntry::Decl(file)) => {
-                self.index.get(file).and_then(|f| f.decl(name))?
+                (file, self.index.get(file).and_then(|f| f.decl(name))?)
             }
             _ => return None,
         };
         match decl.kind {
+            // A foreign alias's RHS is a slot of its owner's pool: project it
+            // into the diagnosing universe before anything reads it.
             MicroKind::TypeAlias if decl.type_params == 0 && decl.var_ty != Ty::UNKNOWN => {
-                Some(decl.var_ty)
+                Some(self.boundary.ty(owner, decl.var_ty))
             }
             _ => None,
         }

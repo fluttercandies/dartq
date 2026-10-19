@@ -30,6 +30,26 @@ fn nested_generics_split_gt_gt() {
     assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
 }
 
+/// A triple-nested group closing on one `>>>` keeps the `Function` suffix
+/// on the OUTER type: the inner types close on inner units of the shared
+/// compound, so their successor is the split remainder, never the real
+/// `Function` after it (the real `drift` corpus shape
+/// `Future<List<List<T>>> Function(...)?` — a debug-assert panic and a
+/// cascade of bogus syntax errors before the fix).
+#[test]
+fn triple_nested_group_keeps_the_function_suffix_outside() {
+    for source in [
+        "Future<List<List<int>>> Function() x",
+        "A<B<C<D<int>>>> Function(int)? x",
+        "A<B<C<int>>>? x",
+    ] {
+        let mut p = setup(source);
+        let end = p.ensure_type_not_void_entry();
+        assert!(p.listener.errors.is_empty(), "{source}: {:?}", p.listener.errors);
+        assert_ne!(p.cursor.lexeme(end.id), ">", "{source}: the suffix belongs to the type");
+    }
+}
+
 #[test]
 fn void_type() {
     let mut p = setup("void");

@@ -286,7 +286,7 @@ pub(crate) fn simple1_closer(
 
 /// `>`-family closer count carried by one token (the unit mapping of
 /// [`Parser::gt_group_len`]).
-fn closer_units(kind: TokenKind) -> usize {
+pub(crate) fn closer_units(kind: TokenKind) -> usize {
     match kind {
         TokenKind::Gt => 1,
         TokenKind::GtEq | TokenKind::GtGt => 2,
