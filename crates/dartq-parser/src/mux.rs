@@ -530,6 +530,38 @@ impl<A: ParserListener, B: ParserListener> ParserListener for MultiplexListener<
         self.b.end_factory(kind, begin, factory, end);
     }
 
+    fn begin_primary_constructor(&mut self, begin: Token) {
+        self.a.begin_primary_constructor(begin);
+        self.b.begin_primary_constructor(begin);
+    }
+
+    fn end_primary_constructor(
+        &mut self,
+        kind: DeclarationKind,
+        begin: Token,
+        end: Token,
+        const_keyword: Option<Token>,
+        has_constructor_name: bool,
+        name: Option<Token>,
+    ) {
+        self.a.end_primary_constructor(
+            kind,
+            begin,
+            end,
+            const_keyword,
+            has_constructor_name,
+            name,
+        );
+        self.b.end_primary_constructor(
+            kind,
+            begin,
+            end,
+            const_keyword,
+            has_constructor_name,
+            name,
+        );
+    }
+
     fn begin_method(
         &mut self,
         kind: DeclarationKind,
@@ -962,6 +994,7 @@ const FORWARDED_METHODS: &[&str] = &[
     "begin_mixin_declaration",
     "begin_named_mixin_application",
     "begin_part",
+    "begin_primary_constructor",
     "begin_record_type",
     "begin_record_type_entry",
     "begin_record_type_named_fields",
@@ -990,6 +1023,7 @@ const FORWARDED_METHODS: &[&str] = &[
     "end_method",
     "end_mixin_declaration",
     "end_named_mixin_application",
+    "end_primary_constructor",
     "end_record_type",
     "end_record_type_entry",
     "end_record_type_named_fields",
@@ -1077,6 +1111,7 @@ mod tests {
         "begin_mixin_declaration",
         "begin_named_mixin_application",
         "begin_part",
+        "begin_primary_constructor",
         "begin_record_type",
         "begin_record_type_entry",
         "begin_top_level_method",
@@ -1100,6 +1135,7 @@ mod tests {
         "end_method",
         "end_mixin_declaration",
         "end_named_mixin_application",
+        "end_primary_constructor",
         "end_record_type",
         "end_record_type_entry",
         "end_record_type_named_fields",
@@ -1131,6 +1167,107 @@ mod tests {
         "handle_type",
         "handle_void_keyword",
         "handle_void_keyword_with_type_arguments",
+    ];
+    /// The complete override surface of `DeclarationCollector`
+    /// (dartq-semantic `src/collector.rs`, `impl ParserListener for
+    /// DeclarationCollector`), sorted — the structural input of the guard
+    /// below. This list must mirror the collector's impl: when the
+    /// collector gains or drops an override, update it in the same edit,
+    /// and the guard forces the chain overrides ⊆ requirements ⊆
+    /// forwarded — an override can no longer be added without the mux
+    /// learning to forward it.
+    const DECLARATION_COLLECTOR_OVERRIDES: &[&str] = &[
+        "begin_block_function_body",
+        "begin_class_declaration",
+        "begin_class_or_mixin_or_extension_body",
+        "begin_constructor",
+        "begin_enum_declaration",
+        "begin_export",
+        "begin_extension_declaration",
+        "begin_extension_type_declaration",
+        "begin_factory",
+        "begin_fields",
+        "begin_formal_parameters",
+        "begin_function_type",
+        "begin_function_typed_formal_parameter",
+        "begin_import",
+        "begin_library_augmentation",
+        "begin_library_name",
+        "begin_method",
+        "begin_mixin_declaration",
+        "begin_named_mixin_application",
+        "begin_part",
+        "begin_primary_constructor",
+        "begin_record_type",
+        "begin_record_type_entry",
+        "begin_top_level_method",
+        "begin_type_arguments",
+        "begin_type_variable",
+        "begin_type_variables",
+        "begin_typedef",
+        "end_class_declaration",
+        "end_constructor",
+        "end_enum_declaration",
+        "end_extension_declaration",
+        "end_extension_type_declaration",
+        "end_factory",
+        "end_fields",
+        "end_formal_parameter",
+        "end_formal_parameters",
+        "end_function_type",
+        "end_function_typed_formal_parameter",
+        "end_metadata",
+        "end_metadata_star",
+        "end_method",
+        "end_mixin_declaration",
+        "end_named_mixin_application",
+        "end_primary_constructor",
+        "end_record_type",
+        "end_record_type_entry",
+        "end_record_type_named_fields",
+        "end_top_level_fields",
+        "end_top_level_method",
+        "end_type_arguments",
+        "end_type_variables",
+        "end_typedef",
+        "handle_async_modifier",
+        "handle_class_extends",
+        "handle_class_header",
+        "handle_class_with_clause",
+        "handle_enum_header",
+        "handle_enum_with_clause",
+        "handle_expression_function_body",
+        "handle_identifier",
+        "handle_implements",
+        "handle_mixin_header",
+        "handle_mixin_on",
+        "handle_named_mixin_application_with_clause",
+        "handle_no_class_body",
+        "handle_no_enum_body",
+        "handle_no_extension_body",
+        "handle_no_extension_type_body",
+        "handle_no_formal_parameters",
+        "handle_no_mixin_body",
+        "handle_no_name",
+        "handle_no_type",
+        "handle_type",
+        "handle_void_keyword",
+        "handle_void_keyword_with_type_arguments",
+    ];
+    /// Primary-constructor-family events `DeclarationCollector` does not
+    /// override, so the family's guard accounting is total: every family
+    /// event is either a requirement above or exempted here with the
+    /// reason. A future override of one must leave this list and enter
+    /// the requirements — the guard rejects a name appearing in both.
+    const DECLARATION_COLLECTOR_EXEMPT: &[&str] = &[
+        // `beginPrimaryConstructorBody` — the collector binds the header's
+        // formals at `begin_primary_constructor` instead.
+        "begin_primary_constructor_body",
+        // `endPrimaryConstructorBody` — same continuation, close event.
+        "end_primary_constructor_body",
+        // `handleNoPrimaryConstructor` — malformed-header recovery the
+        // model does not consume.
+        "handle_no_primary_constructor",
     ];
     const CAPTURER_REQUIREMENTS: &[&str] = &[
         "begin_class_declaration",
@@ -1207,6 +1344,20 @@ mod tests {
         }
         fn end_class_declaration(&mut self, _: Token, _: Token) {
             self.events.push("end_class_declaration");
+        }
+        fn begin_primary_constructor(&mut self, _: Token) {
+            self.events.push("begin_primary_constructor");
+        }
+        fn end_primary_constructor(
+            &mut self,
+            _: DeclarationKind,
+            _: Token,
+            _: Token,
+            _: Option<Token>,
+            _: bool,
+            _: Option<Token>,
+        ) {
+            self.events.push("end_primary_constructor");
         }
         fn begin_method(
             &mut self,
@@ -1287,7 +1438,7 @@ mod tests {
     }
 
     /// A corpus firing every event the recorder overrides.
-    const CORPUS: &str = "typedef IntList = List<int>;\n\nclass Point extends Base implements Draw {\n  int x = 0;\n  void move(int dx) {\n    x = x + dx;\n  }\n}\n\nenum Color { red, green }\n\nmixin Walker on Base {\n  void walk() {}\n}\n\ntypedef Handler = int Function(String name);\n\ntypedef Pred = bool Function()?;\n\nvoid top(int callback(String value)) {}\n\nvoid legacy(int hook()?) {}\n\ntypedef Pair = (bool?, {int n});\n";
+    const CORPUS: &str = "typedef IntList = List<int>;\n\nclass Point extends Base implements Draw {\n  int x = 0;\n  void move(int dx) {\n    x = x + dx;\n  }\n}\n\nenum Color { red, green }\n\nmixin Walker on Base {\n  void walk() {}\n}\n\ntypedef Handler = int Function(String name);\n\ntypedef Pred = bool Function()?;\n\nvoid top(int callback(String value)) {}\n\nvoid legacy(int hook()?) {}\n\ntypedef Pair = (bool?, {int n});\n\nclass Prim(int x) {}\n\nclass Named.named(int y) {}\n\nenum Counted(int c) { cyan }\n\nextension type Meters(int value) {}\n";
 
     /// A recovery-error corpus: the class header never closes.
     const BROKEN: &str = "class {\n";
@@ -1366,11 +1517,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn primary_constructor_events_fan_out_to_both_sides() {
+        // The forwarding-coverage pin for primary constructors: the
+        // semantic collector models `class C(int x)`-style headers from
+        // exactly these events, so a missing mux forward starves the
+        // production fan-out while every single-listener path keeps
+        // working. The corpus covers the unnamed, `.name`-selected, enum,
+        // and extension-type faces.
+        const PRIMARY: &str = "class C(int x) {}\nclass D.named(int y) {}\n\
+                               enum E(int c) { cyan }\nextension type Meters(int v) {}\n";
+        let mut a = Recorder::default();
+        let mut b = Recorder::default();
+        let mut mux = MultiplexListener::new(&mut a, &mut b);
+        let mut p = parser_ref(PRIMARY, &mut mux);
+        p.parse_unit();
+        for event in ["begin_primary_constructor", "end_primary_constructor"] {
+            assert!(a.events.contains(&event), "receiver a missed {event}");
+            assert!(b.events.contains(&event), "receiver b missed {event}");
+        }
+    }
+
     /// The forwarding-coverage guard: every method any in-tree mux consumer
     /// overrides must be in [`FORWARDED_METHODS`], else the event falls
     /// through to the trait's default no-op and every receiver silently
     /// starves. The fan-out equality tests pin only the events their
     /// corpora fire; this pins the contract for all of them.
+    ///
+    /// The collector leg is structural: [`DECLARATION_COLLECTOR_OVERRIDES`]
+    /// mirrors the collector's complete override surface, so the chain
+    /// overrides ⊆ requirements ⊆ forwarded drags a new collector override
+    /// through the mux in the same edit, and the exemptions keep the
+    /// primary-constructor family's accounting total.
     #[test]
     fn every_consumer_override_is_in_the_forward_set() {
         // Sorted and duplicate-free, so a copy-paste slip surfaces as a
@@ -1406,6 +1584,25 @@ mod tests {
                      ParserListener impl and an entry to FORWARDED_METHODS."
                 );
             }
+        }
+        sorted_unique(DECLARATION_COLLECTOR_OVERRIDES);
+        for name in DECLARATION_COLLECTOR_OVERRIDES {
+            assert!(
+                DECLARATION_COLLECTOR_REQUIREMENTS.contains(name),
+                "DeclarationCollector overrides `{name}` but \
+                 DECLARATION_COLLECTOR_REQUIREMENTS omits it: the event \
+                 would hit the mux's default no-op in production. Add the \
+                 entry there, plus the MultiplexListener forward and its \
+                 FORWARDED_METHODS entry, in the same edit."
+            );
+        }
+        sorted_unique(DECLARATION_COLLECTOR_EXEMPT);
+        for name in DECLARATION_COLLECTOR_EXEMPT {
+            assert!(
+                !DECLARATION_COLLECTOR_REQUIREMENTS.contains(name),
+                "`{name}` is both exempted and required: an override moves \
+                 it out of the exemptions into the requirements — pick one."
+            );
         }
     }
 
