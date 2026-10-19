@@ -569,6 +569,7 @@ mod tests {
                 api_signature: dartq_semantic::FileElements::default()
                     .api_signature_with_directives(&strings, b""),
                 directives: Vec::new(),
+                doc_imports: Vec::new(),
                 elements: Arc::new(dartq_semantic::FileElements::default()),
                 diagnostics: Vec::new(),
                 line_index: LineIndex::new(""),

@@ -45,7 +45,7 @@ use dartq_semantic::ApiSignature;
 use dartq_semantic::persisted::{PersistedElements, PersistedRange};
 use dartq_source::{ContentId, FileId, FileTable, LineIndex, SourceRange, StringId, StringTable};
 
-use crate::state::{DirectiveFacts, DirectiveKind, UnitFacts};
+use crate::state::{DirectiveFacts, DirectiveKind, DocImportFacts, UnitFacts};
 
 /// blake3 truncated to 128 bits — the house digest width.
 fn blake3_128(bytes: &[u8]) -> [u8; 16] {
@@ -175,6 +175,9 @@ pub struct PersistedFacts {
     pub api_signature: [u8; 16],
     /// Directives in source order.
     pub directives: Vec<PersistedDirective>,
+    /// The `@docImport`s of the file's validating doc comment
+    /// ([`DocImportFacts`]), extraction order.
+    pub doc_imports: Vec<PersistedDocImport>,
     /// The semantic element model.
     pub elements: PersistedElements,
     /// Syntax + URI-layer diagnostics.
@@ -198,6 +201,15 @@ impl PersistedFacts {
             .iter()
             .map(|directive| PersistedDirective::of(directive, strings, &mut files))
             .collect();
+        let doc_imports = facts
+            .doc_imports
+            .iter()
+            .map(|import| PersistedDocImport {
+                uri: import.uri.as_ref().map(std::string::ToString::to_string),
+                uri_span: PersistedRange::of(import.uri_span),
+                code: import.code.map(PersistedResolutionCode::of),
+            })
+            .collect();
         let diagnostics = facts
             .diagnostics
             .iter()
@@ -206,6 +218,7 @@ impl PersistedFacts {
         Self {
             api_signature: *facts.api_signature.as_bytes(),
             directives,
+            doc_imports,
             elements: PersistedElements::of(&facts.elements, strings),
             diagnostics,
             files: files.paths,
@@ -238,6 +251,15 @@ impl PersistedFacts {
             .into_iter()
             .map(|directive| directive.restore(strings, &files))
             .collect();
+        let doc_imports = self
+            .doc_imports
+            .into_iter()
+            .map(|import| DocImportFacts {
+                uri: import.uri.map(Box::from),
+                uri_span: import.uri_span.source_range(),
+                code: import.code.map(PersistedResolutionCode::resolve),
+            })
+            .collect();
         let diagnostics = self
             .diagnostics
             .into_iter()
@@ -248,11 +270,22 @@ impl PersistedFacts {
             content,
             api_signature: ApiSignature::from_bytes(self.api_signature),
             directives,
+            doc_imports,
             elements: Arc::new(self.elements.into_elements(strings)),
             diagnostics,
             line_index: LineIndex::new(source),
         }
     }
+}
+
+/// One extracted `@docImport` in payload form — the mirror of
+/// [`DocImportFacts`]: the decoded URI (or `None` for interpolation), the
+/// raw literal's UTF-16 span, and the resolved diagnostic code.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedDocImport {
+    pub uri: Option<String>,
+    pub uri_span: PersistedRange,
+    pub code: Option<PersistedResolutionCode>,
 }
 
 /// One extracted, resolved directive in payload form.
@@ -812,6 +845,9 @@ mod tests {
         r#""name":"main","configurations":[{"dotted_name":"dart.library.io","value":null,"#,
         r#""uri":"io.dart","uri_span":{"offset":20,"length":9}},{"dotted_name":"flutter.mode","#,
         r#""value":"release","uri":"release.dart","uri_span":{"offset":36,"length":14}}]}],"#,
+        r#""doc_imports":[{"uri":"package:b/b.dart","uri_span":{"offset":60,"length":17},"#,
+        r#""code":"UriDoesNotExistInDocImport"},{"uri":null,"uri_span":{"offset":80,"length":9},"#,
+        r#""code":"UriWithInterpolation"}],"#,
         r#""elements":{"strings":[],"decls":[],"containers":[],"container_order":[],"#,
         r#""extension_faces":[],"duplicates":[],"arity_violations":[]},"diagnostics":["#,
         r#"{"severity":"Error","code_name":"uri_does_not_exist","code_machine":"URI_DOES_NOT_EXIST","#,
@@ -891,6 +927,24 @@ mod tests {
                     },
                 ],
             }],
+            doc_imports: vec![
+                PersistedDocImport {
+                    uri: Some("package:b/b.dart".to_owned()),
+                    uri_span: PersistedRange::of(SourceRange {
+                        offset: 60,
+                        length: 17,
+                    }),
+                    code: Some(PersistedResolutionCode::UriDoesNotExistInDocImport),
+                },
+                PersistedDocImport {
+                    uri: None,
+                    uri_span: PersistedRange::of(SourceRange {
+                        offset: 80,
+                        length: 9,
+                    }),
+                    code: Some(PersistedResolutionCode::UriWithInterpolation),
+                },
+            ],
             elements: PersistedElements::of(&dartq_semantic::FileElements::default(), &strings),
             diagnostics: vec![
                 PersistedDiagnostic {
@@ -1297,6 +1351,7 @@ mod tests {
                 name: None,
                 configurations: Vec::new(),
             }],
+            doc_imports: Vec::new(),
             elements: PersistedElements::of(&dartq_semantic::FileElements::default(), &strings),
             diagnostics: vec![PersistedDiagnostic {
                 severity: PersistedSeverity::Error,
@@ -1817,6 +1872,7 @@ mod tests {
             content: content_hash(source.as_bytes()),
             api_signature: ApiSignature::from_bytes([9; 16]),
             directives,
+            doc_imports: Vec::new(),
             elements: Arc::new(dartq_semantic::FileElements::default()),
             diagnostics,
             line_index: LineIndex::new(source),
@@ -1956,6 +2012,7 @@ mod tests {
             content: content_hash(source.as_bytes()),
             api_signature: ApiSignature::from_bytes([3; 16]),
             directives: Vec::new(),
+            doc_imports: Vec::new(),
             elements: Arc::new(dartq_semantic::FileElements::default()),
             diagnostics: vec![Arc::new(with_context), Arc::new(without_context)],
             line_index: LineIndex::new(source),
@@ -2025,6 +2082,7 @@ mod tests {
         let payload = PersistedFacts {
             api_signature: [7; 16],
             directives: Vec::new(),
+            doc_imports: Vec::new(),
             elements: PersistedElements::of(&dartq_semantic::FileElements::default(), &strings),
             diagnostics: vec![PersistedDiagnostic {
                 severity: PersistedSeverity::Warning,
@@ -2146,6 +2204,7 @@ mod tests {
             content: content_hash(source.as_bytes()),
             api_signature: ApiSignature::from_bytes([5; 16]),
             directives,
+            doc_imports: Vec::new(),
             elements: Arc::new(dartq_semantic::FileElements::default()),
             diagnostics: Vec::new(),
             line_index: LineIndex::new(source),
@@ -2268,6 +2327,7 @@ mod tests {
             content: content_hash(source.as_bytes()),
             api_signature: ApiSignature::from_bytes([5; 16]),
             directives,
+            doc_imports: Vec::new(),
             elements: Arc::new(dartq_semantic::FileElements::default()),
             diagnostics: Vec::new(),
             line_index: LineIndex::new(source),
@@ -2485,6 +2545,7 @@ mod tests {
                 configurations: Box::default(),
                 configuration_spans: Box::default(),
             }],
+            doc_imports: Vec::new(),
             elements: Arc::new(dartq_semantic::FileElements::default()),
             diagnostics: Vec::new(),
             line_index: LineIndex::new(CLAUSE_ROUND_TRIP_SOURCE),

@@ -11,8 +11,8 @@ use dartq_language::{
 use dartq_package::PackageTable as IdentityTable;
 use dartq_parser::{Message, MultiplexListener, Parser, ParserFeatures, ParserListener, TokenSpan};
 use dartq_resolution::{
-    CombinatorClause, Combinators, Configuration, ResolvedTarget, SelectedUri, UriResolution,
-    UriResolver, resolve_conditional,
+    CombinatorClause, Combinators, CommentLexeme, Configuration, DocComment, ResolvedTarget,
+    SelectedUri, UriResolution, UriResolver, doc_imports, resolve_conditional,
 };
 use dartq_scanner::{Keyword, KeywordStyle, ScanConfig, ScanResult, TokenKind, TokenTable, scan};
 use dartq_sdk::AllowedExperiments;
@@ -26,8 +26,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::event::{EngineEvent, KNOWN_ONLY_GRANT, RevalidateGate};
 use crate::state::{
-    DirectiveFacts, DirectiveKind, EngineState, FACTS_SEMANTIC_VERSION, FactsKey, FeatureGrants,
-    ImportEdge, LibraryId, LibraryInfo, PendingChange, ScannedFace, TargetRows, UnitFacts,
+    DirectiveFacts, DirectiveKind, DocImportFacts, EngineState, FACTS_SEMANTIC_VERSION, FactsKey,
+    FeatureGrants, ImportEdge, LibraryId, LibraryInfo, PendingChange, ScannedFace, TargetRows,
+    UnitFacts,
 };
 
 /// The outcome of one apply.
@@ -627,10 +628,10 @@ fn recompute_facts(
     // *saved* file; every baked diagnostic belongs to the unit, so
     // re-attributing all of them to the consuming file is exact, and the
     // URI diagnostic tail rebuilds one-for-one with the re-resolved coded
-    // directives (resolve_unit's construction invariant: exactly one pushed
-    // diagnostic per coded directive, after every other diagnostic) — a
-    // same-content file at another path re-resolves against its own
-    // directory.
+    // rows (resolve_unit's construction invariant: exactly one pushed
+    // diagnostic per coded row — directive or doc import — after every
+    // other diagnostic) — a same-content file at another path re-resolves
+    // against its own directory.
     let mut warm_to_cache: Vec<(FactsKey, Arc<UnitFacts>)> = Vec::with_capacity(warmed.len());
     {
         let resident = |id: FileId| state.residency.contains_key(&id) || batch.contains(&id);
@@ -666,7 +667,12 @@ fn recompute_facts(
                 .directives
                 .iter()
                 .filter(|directive| directive.code.is_some())
-                .count();
+                .count()
+                + facts
+                    .doc_imports
+                    .iter()
+                    .filter(|import| import.code.is_some())
+                    .count();
             facts
                 .diagnostics
                 .truncate(facts.diagnostics.len() - uri_tail);
@@ -882,13 +888,15 @@ fn compute_unit(
         strings,
         &capture.index,
     ));
-    let (directives, directive_region) = extract_directives(text, &scanned.tokens, strings);
+    let (directives, directive_region, doc_imports) =
+        extract_directives(text, &scanned.tokens, strings);
     let face = directive_face(text, &scanned.tokens, directive_region);
 
     let facts = UnitFacts {
         content,
         api_signature: unit_signature(&elements, &face, strings),
         directives,
+        doc_imports,
         elements,
         // The rows move into their refcounted store form once here (the
         // S4 dedup, #1501): every later consumer — the per-library
@@ -1057,14 +1065,11 @@ fn resolve_unit(
     resolver: &mut UriResolver<'_>,
     declared: &FxHashMap<String, String>,
 ) {
-    // The engine extracts no `@docImport`s at M1, so every resolvable kind
-    // maps to the resolution face's `DirectiveKind::ImportExport`; a
-    // docImport extraction only gains a branch here. Authority-carrying
-    // `dart:` URIs need no pre-validation either: they compose to an empty
-    // library name, fail closed in `SdkSnapshot::uri_to_path`, and surface as
-    // `uri_does_not_exist` — the oracle's own outcome for the same input
-    // (`internalMapDartUri` parses the `dart:` prefix as the library name and
-    // finds no such library).
+    // Authority-carrying `dart:` URIs need no pre-validation: they compose
+    // to an empty library name, fail closed in `SdkSnapshot::uri_to_path`,
+    // and surface as `uri_does_not_exist` — the oracle's own outcome for
+    // the same input (`internalMapDartUri` parses the `dart:` prefix as
+    // the library name and finds no such library).
     for directive in &mut facts.directives {
         // A name-form `part of a.b;` carries its target in `name`, never in
         // a URI: the oracle binds it by library-name matching (analyzer
@@ -1090,6 +1095,18 @@ fn resolve_unit(
             directive.code = code;
         }
     }
+    // The `@docImport`s resolve through the same resolver under the
+    // doc-import face (`state.isDocImport`, library_analyzer.dart:699-719):
+    // identical target lookup, a missing target reported as
+    // `uri_does_not_exist_in_doc_import` instead.
+    for import in &mut facts.doc_imports {
+        let UriResolution { code, .. } = resolver.resolve(
+            file,
+            import.uri.as_deref(),
+            dartq_resolution::DirectiveKind::DocImport,
+        );
+        import.code = code;
+    }
     for directive in &facts.directives {
         if let Some(code) = directive.code {
             let (uri, span) = selected_uri(directive, declared);
@@ -1097,6 +1114,19 @@ fn resolve_unit(
                 code,
                 uri.unwrap_or_default(),
                 span,
+                file,
+            )));
+        }
+    }
+    // Doc-import rows ride the same tail: exactly one pushed diagnostic per
+    // coded row, after every other diagnostic — the warm-start slice counts
+    // this column too.
+    for import in &facts.doc_imports {
+        if let Some(code) = import.code {
+            facts.diagnostics.push(Arc::new(uri_diagnostic(
+                code,
+                import.uri.as_deref().unwrap_or_default(),
+                import.uri_span,
                 file,
             )));
         }
@@ -1355,24 +1385,247 @@ fn capture_first_decl(
 // the "never false-positive" bias until the parser milestone owns these.
 // ---------------------------------------------------------------------------
 
-/// Walks the directive region of a token table, returning the directives and
-/// the region end (the index of the first non-directive token — the boundary
-/// [`directive_face`] hashes over).
+/// The comment kind of one gap lexeme for the dartdoc selection.
+enum GapComment {
+    /// `///…` — a line doc comment (the `Lines` face).
+    Line,
+    /// `/**…` — a doc block (the `Block` face); `/****/` and even `/**/`
+    /// qualify, mirroring the oracle's `lexeme.startsWith('/**')` test.
+    Block,
+    /// Any other comment — ignored by the selection but kept for the `///`
+    /// run's position (the oracle collects `///` tokens across
+    /// non-doc comments).
+    Other,
+}
+
+/// One `@docImport`-hosting doc comment found in a token gap, in the oracle's
+/// attach form (`parser_impl.dart` `findDartDoc` over the comment chain that
+/// precedes the directive keyword).
+struct DartDoc {
+    /// The `///` lexeme byte ranges of the `Lines` face, or the single
+    /// `/**` lexeme range of the `Block` face (tagged by `block`).
+    lexemes: Vec<(usize, usize)>,
+    /// Whether `lexemes` is the one-element `Block` face.
+    block: bool,
+}
+
+/// Scans `text[start..end]` — the whitespace-and-comments gap between two
+/// tokens — for the attached doc comment, mirroring the oracle's
+/// `findDartDoc` chain walk (`parser_impl.dart:11546`): the last `/**`
+/// block wins unless `///` lines follow it, in which case the first `///`
+/// of that run does; `//` and `/*` comments participate in the chain but
+/// never select.
+fn dartdoc_in_gap(text: &str, start: usize, end: usize) -> Option<DartDoc> {
+    let bytes = text.as_bytes();
+    let mut comments: Vec<(usize, usize, GapComment)> = Vec::new();
+    let mut i = start;
+    while i < end {
+        if bytes[i] == b'/' && i + 1 < end && bytes[i + 1] == b'/' {
+            let s = i;
+            i += 2;
+            while i < end && bytes[i] != b'\n' {
+                i += 1;
+            }
+            let kind = if text[s..i].starts_with("///") {
+                GapComment::Line
+            } else {
+                GapComment::Other
+            };
+            comments.push((s, i, kind));
+        } else if bytes[i] == b'/' && i + 1 < end && bytes[i + 1] == b'*' {
+            let s = i;
+            i += 2;
+            let mut depth = 1usize;
+            while i < end && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < end && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i] == b'*' && i + 1 < end && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            let kind = if text[s..i].starts_with("/**") {
+                GapComment::Block
+            } else {
+                GapComment::Other
+            };
+            comments.push((s, i, kind));
+        } else {
+            i += 1;
+        }
+    }
+    // The oracle's selection: `///` selects only while no later `/**`
+    // resets the anchor; the result is the first `///` after the last
+    // `/**`, else the last `/**`, else the first `///` of the chain.
+    let mut dartdoc: Option<usize> = None;
+    let mut multiline = false;
+    for (index, (_, _, kind)) in comments.iter().enumerate() {
+        match kind {
+            GapComment::Line if !multiline => {
+                dartdoc = Some(index);
+                multiline = true;
+            }
+            GapComment::Block => {
+                dartdoc = Some(index);
+                multiline = false;
+            }
+            _ => {}
+        }
+    }
+    let index = dartdoc?;
+    match comments[index].2 {
+        GapComment::Block => Some(DartDoc {
+            lexemes: vec![(comments[index].0, comments[index].1)],
+            block: true,
+        }),
+        GapComment::Line => Some(DartDoc {
+            // Every `///` from the anchor on rides (the oracle's
+            // `DocCommentBuilder.build` keeps `///` tokens across
+            // non-doc comments).
+            lexemes: comments[index..]
+                .iter()
+                .filter(|(_, _, kind)| matches!(kind, GapComment::Line))
+                .map(|(s, e, _)| (*s, *e))
+                .collect(),
+            block: false,
+        }),
+        GapComment::Other => unreachable!("dartdoc never selects a non-doc comment"),
+    }
+}
+
+/// The UTF-16 offset of `text[..byte]`'s end, anchored at `base_utf16` for
+/// `anchor_byte` — i.e. `base_utf16 + utf16_len(text[anchor_byte..byte])`.
+fn utf16_at(text: &str, anchor_byte: usize, base_utf16: u32, byte: usize) -> u32 {
+    base_utf16 + utf16_len_of(&text[anchor_byte..byte])
+}
+
+/// Runs the `@docImport` extraction (`dartq_resolution::doc_imports`) over
+/// `doc`, whose lexemes anchor at `base_utf16` (the UTF-16 offset of
+/// `gap_start`).
+fn extract_doc_imports(
+    text: &str,
+    gap_start: usize,
+    base_utf16: u32,
+    doc: &DartDoc,
+) -> Vec<DocImportFacts> {
+    let found = if doc.block {
+        let (s, e) = doc.lexemes[0];
+        doc_imports(DocComment::Block {
+            utf16: utf16_at(text, gap_start, base_utf16, s),
+            text: &text[s..e],
+        })
+    } else {
+        let lexemes: Vec<CommentLexeme<'_>> = doc
+            .lexemes
+            .iter()
+            .map(|&(s, e)| CommentLexeme {
+                utf16: utf16_at(text, gap_start, base_utf16, s),
+                text: &text[s..e],
+            })
+            .collect();
+        doc_imports(DocComment::Lines(&lexemes))
+    };
+    found
+        .into_iter()
+        .map(|directive| DocImportFacts {
+            uri: directive.uri,
+            uri_span: directive.span,
+            code: None,
+        })
+        .collect()
+}
+
+/// The `(gap_start_byte, base_utf16, gap_end_byte)` before the token at
+/// `index` — the byte range its `precedingComments` chain spans, with the
+/// UTF-16 offset where it starts.
+fn token_gap(text: &str, tokens: &TokenTable, index: usize) -> (usize, u32, usize) {
+    let end = tokens.get(index).expect("in range").byte_offset as usize;
+    if index == 0 {
+        return (0, 0, end);
+    }
+    let prev = tokens.get(index - 1).expect("in range");
+    let start = (prev.byte_offset + prev.byte_len) as usize;
+    let base = prev.utf16_offset + utf16_len_of(tokens.lexeme(text, index - 1));
+    (start, base, end)
+}
+
+/// The `@docImport` rows of the comment attached to the directive whose
+/// keyword sits at `keyword` — the oracle's `_findComment`
+/// (`ast_builder.dart:6519`): the keyword's own comment chain first, then,
+/// when it carries no dartdoc, each preceding annotation's chain in
+/// reverse. `annotations` are the token indices of the `@` tokens of the
+/// directive's metadata, in source order.
+fn directive_doc_imports(
+    text: &str,
+    tokens: &TokenTable,
+    keyword: usize,
+    annotations: &[usize],
+) -> Vec<DocImportFacts> {
+    let (start, base, end) = token_gap(text, tokens, keyword);
+    if let Some(doc) = dartdoc_in_gap(text, start, end) {
+        return extract_doc_imports(text, start, base, &doc);
+    }
+    for &at in annotations.iter().rev() {
+        let (start, base, end) = token_gap(text, tokens, at);
+        if let Some(doc) = dartdoc_in_gap(text, start, end) {
+            return extract_doc_imports(text, start, base, &doc);
+        }
+    }
+    Vec::new()
+}
+
+/// Walks the directive region of a token table, returning the directives,
+/// the region end (the index of the first non-directive token — the
+/// boundary [`directive_face`] hashes over), and the unit's `@docImport`
+/// rows extracted from the one validating doc comment (empty for almost
+/// every file).
+///
+/// The attach rule mirrors the oracle (`file_state.dart:995-1022` +
+/// `_updateKind`): the first `library` directive's comment wins outright;
+/// with no `library`, the first name-form `part of`'s comment; with no
+/// name form, the first URI-form `part of`'s; doc comments on every other
+/// declaration are never validated (analyzer corpus: ~24 such
+/// occurrences, all correctly silent).
 fn extract_directives(
     text: &str,
     tokens: &TokenTable,
     strings: &StringTable,
-) -> (Vec<DirectiveFacts>, usize) {
+) -> (Vec<DirectiveFacts>, usize, Vec<DocImportFacts>) {
     let mut directives = Vec::new();
     let mut i = 0;
+    // The `@` tokens of the trailing annotation run — the metadata the next
+    // directive's `_findComment` fallback reads. A `;`, script tag, or
+    // consumed directive ends the preamble.
+    let mut annotations: Vec<usize> = Vec::new();
+    // The captured doc-import faces, one per oracle candidate slot: the
+    // first `library`, the first name-form `part of`, the first URI-form
+    // `part of`. `Option<Vec>` — `Some(empty)` marks a seen candidate whose
+    // comment carried no dartdoc.
+    let mut library_doc: Option<Vec<DocImportFacts>> = None;
+    let mut part_name_doc: Option<Vec<DocImportFacts>> = None;
+    let mut part_uri_doc: Option<Vec<DocImportFacts>> = None;
     while let Some(token) = tokens.get(i) {
         match token.kind {
-            TokenKind::Semicolon | TokenKind::ScriptTag => i += 1,
-            TokenKind::At => i = skip_annotation(tokens, i + 1),
+            TokenKind::Semicolon | TokenKind::ScriptTag => {
+                annotations.clear();
+                i += 1;
+            }
+            TokenKind::At => {
+                annotations.push(i);
+                i = skip_annotation(tokens, i + 1);
+            }
             TokenKind::Keyword(Keyword::Library) => {
+                if library_doc.is_none() {
+                    library_doc = Some(directive_doc_imports(text, tokens, i, &annotations));
+                }
+                annotations.clear();
                 i = walk_library(text, tokens, i, strings, &mut directives);
             }
             TokenKind::Keyword(Keyword::Import) => {
+                annotations.clear();
                 i = walk_import_export(
                     text,
                     tokens,
@@ -1383,6 +1636,7 @@ fn extract_directives(
                 );
             }
             TokenKind::Keyword(Keyword::Export) => {
+                annotations.clear();
                 i = walk_import_export(
                     text,
                     tokens,
@@ -1393,7 +1647,30 @@ fn extract_directives(
                 );
             }
             TokenKind::Keyword(Keyword::Part) => {
+                let keyword = i;
                 i = walk_part(text, tokens, i, strings, &mut directives);
+                if let Some(last) = directives.last()
+                    && last.kind == DirectiveKind::PartOf
+                {
+                    if last.name.is_none() {
+                        // URI form — an interpolated URI leaves `uri` None
+                        // but the oracle still counts the directive
+                        // (`directive.uri` is the string-literal node).
+                        if part_uri_doc.is_none() {
+                            part_uri_doc =
+                                Some(directive_doc_imports(text, tokens, keyword, &annotations));
+                        }
+                    } else if !last.name.as_deref().unwrap_or_default().is_empty()
+                        && part_name_doc.is_none()
+                    {
+                        // Name form — the empty spelling (`part of ;`)
+                        // carries `libraryName == null` in the oracle and
+                        // never hosts doc imports.
+                        part_name_doc =
+                            Some(directive_doc_imports(text, tokens, keyword, &annotations));
+                    }
+                }
+                annotations.clear();
             }
             _ => break,
         }
@@ -1429,7 +1706,14 @@ fn extract_directives(
         }
         i += 1;
     }
-    (directives, region_end)
+    // The oracle's candidate order (`file_state.dart:_updateKind`): a
+    // `library` directive decides LibraryFileKind outright; otherwise the
+    // name form beats the URI form of `part of`.
+    let doc_imports = library_doc
+        .or(part_name_doc)
+        .or(part_uri_doc)
+        .unwrap_or_default();
+    (directives, region_end, doc_imports)
 }
 
 /// Reads the URI literal starting at `i`. Adjacent string literals
@@ -2064,23 +2348,36 @@ fn relink_directives(
             let previous = Arc::clone(&state.residency[&holder]);
             let mut facts = (*previous).clone();
             // The URI diagnostic tail rebuilds one-for-one with the
-            // re-resolved coded directives: `resolve_unit`'s construction
-            // invariant is exactly one pushed row per coded directive,
-            // after every other diagnostic — the warm-start slice.
+            // re-resolved coded rows: `resolve_unit`'s construction
+            // invariant is exactly one pushed row per coded row (directive
+            // or doc import), after every other diagnostic — the
+            // warm-start slice.
             let uri_tail = facts
                 .directives
                 .iter()
                 .filter(|directive| directive.code.is_some())
-                .count();
+                .count()
+                + facts
+                    .doc_imports
+                    .iter()
+                    .filter(|import| import.code.is_some())
+                    .count();
             facts
                 .diagnostics
                 .truncate(facts.diagnostics.len() - uri_tail);
             resolve_unit(&mut facts, holder, &mut resolver, &state.declared_variables);
+            // Doc-import codes ride the same moved face: a created/removed
+            // target flips them exactly like a directive code.
             let moved = facts
                 .directives
                 .iter()
                 .zip(&previous.directives)
-                .any(|(new, old)| (new.target, new.code) != (old.target, old.code));
+                .any(|(new, old)| (new.target, new.code) != (old.target, old.code))
+                || facts
+                    .doc_imports
+                    .iter()
+                    .zip(&previous.doc_imports)
+                    .any(|(new, old)| new.code != old.code);
             if moved {
                 rewritten.push((holder, facts));
                 relinked.push((holder, previous));
@@ -3565,6 +3862,166 @@ pub(crate) mod tests {
         assert_eq!(diagnostic.range.length, "'c.dart'".len() as u32);
     }
 
+    /// End-to-end `@docImport` (#2206): the doc comment attached to the
+    /// `library` directive resolves through the doc-import face — a missing
+    /// target reports `uri_does_not_exist_in_doc_import` at the URI literal
+    /// (quotes included, the oracle's col-16 anchor = offset 15); the same
+    /// directive on a later declaration stays silent, and an existing
+    /// target reports nothing.
+    #[test]
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+    fn doc_import_reports_at_the_uri_literal() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let source = "/// @docImport 'missing.dart';\nlibrary t;\n";
+        let main = set(&mut state, &lib.join("main.dart"), source);
+        // An existing target resolves silent; a doc comment on a later
+        // declaration is never validated (the corpus's ~24 occurrences).
+        let helper = set(
+            &mut state,
+            &lib.join("helper.dart"),
+            "library helper;\n/// @docImport 'also_missing.dart';\nint h() => 0;\n",
+        );
+        let present = set(
+            &mut state,
+            &lib.join("present.dart"),
+            "/// @docImport 'helper.dart';\nlibrary present;\n",
+        );
+        apply(&mut state, &mut |_| {});
+
+        let facts = &state.residency[&main];
+        let diagnostic = facts
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "uri_does_not_exist_in_doc_import")
+            .expect("the doc-import warning fires");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(
+            diagnostic.message,
+            "Target of URI doesn't exist: 'missing.dart'."
+        );
+        // Oracle col/len shape: offset 15, len = uri + 2 quotes.
+        assert_eq!(diagnostic.range.offset, 15);
+        assert_eq!(diagnostic.range.length, "'missing.dart'".len() as u32);
+
+        let helper_facts = &state.residency[&helper];
+        assert!(
+            helper_facts
+                .diagnostics
+                .iter()
+                .all(|d| d.code.name != "uri_does_not_exist_in_doc_import"),
+            "non-directive doc comment stays silent: {:?}",
+            helper_facts.diagnostics
+        );
+        let present_facts = &state.residency[&present];
+        assert!(
+            present_facts
+                .diagnostics
+                .iter()
+                .all(|d| d.code.name != "uri_does_not_exist_in_doc_import"),
+            "existing target reports nothing: {:?}",
+            present_facts.diagnostics
+        );
+
+        // The `part of` attach (a part file's validating comment): the
+        // name-form part-of's doc comment hosts the directives.
+        let mut state = fixture.state();
+        let library = set(
+            &mut state,
+            &lib.join("named.dart"),
+            "library named;\npart 'p.dart';\n",
+        );
+        let part = set(
+            &mut state,
+            &lib.join("p.dart"),
+            "/// @docImport 'gone.dart';\npart of named;\n",
+        );
+        apply(&mut state, &mut |_| {});
+        let part_facts = &state.residency[&part];
+        let diagnostic = part_facts
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "uri_does_not_exist_in_doc_import")
+            .expect("the part-of doc comment hosts doc imports");
+        assert_eq!(diagnostic.range.offset, 15);
+        assert_eq!(diagnostic.range.length, "'gone.dart'".len() as u32);
+        let lib_facts = &state.residency[&library];
+        assert!(
+            lib_facts
+                .diagnostics
+                .iter()
+                .all(|d| d.code.name != "uri_does_not_exist_in_doc_import"),
+        );
+
+        // The URI-form `part of` attach too (PartOfUriFileKind).
+        let mut state = fixture.state();
+        let library = set(
+            &mut state,
+            &lib.join("uri_lib.dart"),
+            "library uri_lib;\npart 'u.dart';\n",
+        );
+        let part = set(
+            &mut state,
+            &lib.join("u.dart"),
+            "/// @docImport 'gone.dart';\npart of 'uri_lib.dart';\n",
+        );
+        apply(&mut state, &mut |_| {});
+        let part_facts = &state.residency[&part];
+        assert!(
+            part_facts
+                .diagnostics
+                .iter()
+                .any(|d| d.code.name == "uri_does_not_exist_in_doc_import"),
+            "the URI-form part-of doc comment hosts doc imports"
+        );
+        let lib_facts = &state.residency[&library];
+        assert!(
+            lib_facts
+                .diagnostics
+                .iter()
+                .all(|d| d.code.name != "uri_does_not_exist_in_doc_import"),
+        );
+    }
+
+    /// The `/** … */` attach and the metadata fallback: a dartdoc before an
+    /// annotation binds through `_findComment`'s metadata walk (the oracle
+    /// attaches it to the directive all the same).
+    #[test]
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+    fn doc_import_block_comment_and_metadata_fallback() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let block_source = "/**\n * @docImport 'missing.dart';\n */\nlibrary t;\n";
+        let block = set(&mut state, &lib.join("block.dart"), block_source);
+        // The dartdoc attaches to `@meta`'s chain; `_findComment` walks the
+        // metadata back when the keyword's own chain is empty.
+        let meta_source = "/// @docImport 'missing.dart';\n@meta('x')\nlibrary t;\n";
+        let meta = set(&mut state, &lib.join("meta.dart"), meta_source);
+        apply(&mut state, &mut |_| {});
+
+        let facts = &state.residency[&block];
+        let diagnostic = facts
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "uri_does_not_exist_in_doc_import")
+            .expect("the /** doc comment hosts doc imports");
+        // `/**\n * ` (7 bytes) + `@docImport ` (11) → URI literal at 18.
+        let at = block_source.find("'missing.dart'").expect("literal") as u32;
+        assert_eq!(diagnostic.range.offset, at);
+        assert_eq!(diagnostic.range.length, "'missing.dart'".len() as u32);
+
+        let facts = &state.residency[&meta];
+        let diagnostic = facts
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "uri_does_not_exist_in_doc_import")
+            .expect("the metadata fallback binds the dartdoc");
+        assert_eq!(diagnostic.range.offset, 15);
+        assert_eq!(diagnostic.range.length, "'missing.dart'".len() as u32);
+    }
+
     /// The parser's registry-verbatim correctionMessage rides through the
     /// `DiagCollector` into engine diagnostics (#727): the `base_enum`
     /// modifier row carries "Try removing the keyword 'base'." unmodified.
@@ -3667,7 +4124,7 @@ pub(crate) mod tests {
         let (_, _, scanned, warnings) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file, &grants);
         assert!(warnings.is_empty());
         let strings = StringTable::new();
-        let (_, region_end) = extract_directives(text, &scanned.tokens, &strings);
+        let (_, region_end, _) = extract_directives(text, &scanned.tokens, &strings);
         let face = directive_face(text, &scanned.tokens, region_end);
 
         let mut expected = Vec::new();
@@ -3722,7 +4179,7 @@ pub(crate) mod tests {
         let grants = state.grants();
         let (_, _, scanned, _) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file, &grants);
         let strings = StringTable::new();
-        let (_, region_end) = extract_directives(text, &scanned.tokens, &strings);
+        let (_, region_end, _) = extract_directives(text, &scanned.tokens, &strings);
         let face = directive_face(text, &scanned.tokens, region_end);
 
         let retired = "import\u{1}'a\u{1}b.dart'\u{1};\u{1}".as_bytes().to_vec();

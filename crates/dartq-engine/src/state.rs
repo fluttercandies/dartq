@@ -107,6 +107,11 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// `const_initialized_with_non_constant_value` over-report the bit
 /// closes. The same train raised `dartq_semantic::SIGNATURE_VERSION` to
 /// 8.
+/// v14: unit facts carry the extracted `@docImport` rows
+/// (`UnitFacts::doc_imports`, `PersistedFacts::doc_imports`) — a v13
+/// payload restores doc-import-less, so a warm start would drop every
+/// `uri_does_not_exist_in_doc_import` row and mis-slice the URI
+/// diagnostic tail (the tail counts coded doc-import rows too).
 ///
 /// # Bump contract (structural guard)
 ///
@@ -125,7 +130,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// version too.) The bump lane also forks on capture-behavior changes with
 /// no layout delta: a payload the old producer wrote must not be served to
 /// a producer whose capture output diverges from it.
-const FACTS_SHAPE_VERSION: u32 = 13;
+const FACTS_SHAPE_VERSION: u32 = 14;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component of
 /// `EngineSemanticVersion`): the engine facts shape folded with
@@ -208,6 +213,27 @@ const STRING_TABLE_BYTES_PER_ENTRY: usize = 93;
 /// (file, face) like every pairing row.
 const LIVE_PATH_CEILING_FACE: &str = "session live-path ceiling";
 
+/// One `@docImport` directive extracted from the doc comment attached to the
+/// unit's first `library` (library file) or first `part of` directive (part
+/// file) — the oracle's `_resolveDocImports` attach rule
+/// (library_analyzer.dart:808-846): doc comments on any other declaration
+/// are never validated. Extraction is a pure function of the unit's content
+/// (the resolution crate's `doc_imports` over the captured comment lexemes);
+/// `code` is the URI-resolution outcome's diagnostic face, filled by
+/// `resolve_unit` like [`DirectiveFacts::code`].
+#[derive(Clone, Debug)]
+pub struct DocImportFacts {
+    /// The URI string the oracle reports (quotes stripped, escapes decoded,
+    /// adjacent strings concatenated), or `None` for an interpolated URI —
+    /// the `uri_with_interpolation` face, same as a real import.
+    pub uri: Option<Box<str>>,
+    /// UTF-16 span of the URI string literal (raw text, quotes included) —
+    /// the diagnostic anchor.
+    pub uri_span: SourceRange,
+    /// The frozen URI-layer diagnostic code for this outcome, if any.
+    pub code: Option<ResolutionCode>,
+}
+
 /// The directive family of one [`DirectiveFacts`] entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectiveKind {
@@ -285,6 +311,12 @@ pub struct UnitFacts {
     pub(crate) api_signature: dartq_semantic::ApiSignature,
     /// Directives in source order.
     pub directives: Vec<DirectiveFacts>,
+    /// The `@docImport`s of the file's one validating doc comment (empty for
+    /// almost every file): the `library`-/`part of`-attached comment's
+    /// extracted directives, resolved under [`DocImportFacts::code`]. The
+    /// URI diagnostic tail counts one pushed row per coded entry here too,
+    /// the same construction invariant the directive column keeps.
+    pub doc_imports: Vec<DocImportFacts>,
     /// The semantic element model (dartq-semantic `collect`), shared so
     /// every consumer — the batch dedupe, the facts cache, the semdiag
     /// fold — pays a refcount bump, never a deep clone (#308).
