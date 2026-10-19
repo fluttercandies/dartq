@@ -210,7 +210,7 @@ pub(crate) fn member_name(c: &Check<'_>, parent: u32) -> Option<u32> {
         .or_else(|| {
             // Production parses tile the `OperatorName` as the member's
             // immediate left sibling inside the body wrapper, not as a
-            // child (declarations.rs `adjacent_operator_name`).
+            // child (declarations/ `adjacent_operator_name`).
             let owner = c.unit.ast.parent(parent)?;
             let siblings = c.collect_direct(owner);
             let pos = siblings.iter().position(|&kid| kid == parent)?;
@@ -864,13 +864,13 @@ pub(crate) fn same_file_ancestors(c: &Check<'_>, class_row: u32, concrete: bool)
 
 /// Whether the member row carries an `@override` annotation: its left
 /// sibling in the body's child list is the `MetadataStar`, whose `Metadata`
-/// children name the annotations (declarations.rs `has_annotations` idiom).
+/// children name the annotations (declarations/ `has_annotations` idiom).
 pub(crate) fn has_override_annotation(c: &Check<'_>, body: u32, member: u32) -> bool {
     has_annotation_named(c, body, member, "override")
 }
 
 /// The `Metadata` rows of one member: the `MetadataStar` left sibling's
-/// children (declarations.rs `has_annotations` idiom), empty when the
+/// children (declarations/ `has_annotations` idiom), empty when the
 /// member carries no annotations. An operator's `OperatorName` row tiles
 /// as a body-level sibling between the `MetadataStar` and the `Method`
 /// row (the name-token holder lives inside the member for every other
@@ -909,7 +909,7 @@ fn has_annotation_named(c: &Check<'_>, body: u32, member: u32, name: &str) -> bo
 /// The name rows of the instance members of `member` answering `query` and
 /// named `name`. Methods name through their `MethodDeclaration`-context
 /// `Identifier` (or [`NodeKind::OperatorName`] for operators, split off the
-/// `get_set` payload — declarations.rs `get_set_token`), fields through
+/// `get_set` payload — declarations/ `get_set_token`), fields through
 /// their [`NodeKind::InitializedIdentifier`] rows. The returned rows are
 /// the name-bearing rows (an `Identifier`/`OperatorName`, or the field's
 /// name-token holder for the field face).
