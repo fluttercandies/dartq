@@ -1834,7 +1834,11 @@ struct Engine<'a> {
     factory_head_anchors: FxHashMap<usize, SourceRange>,
     /// Unnamed factories (`factory K()`) per container — they register no
     /// constructor site, but key as `new` in the duplicate pass.
-    unnamed_factory_heads: Vec<(StringId, SourceRange)>,
+    unnamed_factory_heads: Vec<(StringId, StringId, SourceRange)>,
+    /// `(container, constructor)` targets of redirecting factories
+    /// (`= C.named`, `= C`): the redirect forwards every parameter, so the
+    /// target's optional formals are supplied (`unused_element_parameter`).
+    factory_redirect_targets: FxHashSet<(StringId, StringId)>,
     /// Per open type-argument group: the type head it belongs to, when the
     /// group follows a type-annotation identifier (`C<int> x`, `const
     /// C<int>()`, `p.C<int>`), plus the row-stack height at `<` — the rows
@@ -3576,6 +3580,7 @@ impl<'a> Engine<'a> {
             factory_head: None,
             factory_head_anchors: FxHashMap::default(),
             unnamed_factory_heads: Vec::new(),
+            factory_redirect_targets: FxHashSet::default(),
             group_heads: Vec::new(),
             pending_type_head: None,
             deferred_args: Vec::new(),
@@ -3875,6 +3880,12 @@ impl<'a> Engine<'a> {
     /// never produced (`ElementImpl.displayName`'s `name ?? '<unnamed>'`).
     fn is_nameless(&self, name: StringId) -> bool {
         self.strings.resolve(name).is_empty()
+    }
+
+    /// The bare `new(` head's site: its name slot is the `(` token, and it
+    /// declares the unnamed constructor.
+    fn is_bare_new_head(&self, name: StringId) -> bool {
+        self.strings.resolve(name) == "("
     }
 
     /// The nameless declaration's anchor: the enclosing container's
@@ -6388,10 +6399,10 @@ impl<'a> Engine<'a> {
             ctor_keys.extend(
                 self.unnamed_factory_heads
                     .iter()
-                    .filter(|(c, range)| {
+                    .filter(|(c, _, range)| {
                         *c == container && decl_start.is_none_or(|start| range.offset >= start)
                     })
-                    .map(|(_, range)| (new_name, *range)),
+                    .map(|&(_, key, range)| (key, range)),
             );
             ctor_keys.sort_by_key(|(_, range)| range.offset);
             let mut seen_ctors: FxHashSet<StringId> = FxHashSet::default();
@@ -8274,6 +8285,18 @@ impl<'a> Engine<'a> {
             && matches!(self.walk_super(c, site.name), Walk::Found(_))
         {
             return;
+        }
+        // A redirecting factory's target receives every parameter the
+        // factory forwards — its optional formals are all supplied.
+        if let (DeclKind::Constructor { container }, Some(_)) = (site.kind, container) {
+            let unnamed = site.name == container
+                || self.is_bare_new_head(site.name)
+                || site.name == self.intern("new");
+            if self.factory_redirect_targets.contains(&(container, site.name))
+                || (unnamed && self.factory_redirect_targets.contains(&(container, container)))
+            {
+                return;
+            }
         }
         let bare = self.bare_name(site.name);
         // Cloned: the emit below mutates the report while the set is read.
@@ -16135,10 +16158,17 @@ impl<'a> Engine<'a> {
     /// residue keeps the settled face). Foreign containers hold no sites
     /// here (`None` — the under-report posture).
     fn ctor_decl_site(&self, container: StringId, selector: StringId) -> Option<&DeclSite> {
-        self.decl_sites
-            .iter()
-            .rev()
-            .find(|s| s.name == selector && matches!(s.kind, DeclKind::Constructor { container: c } if c == container))
+        // The unnamed face has three spellings: the class name (`C()`), the
+        // `.new` selector, and the bare `new` head (`const new();`), whose
+        // head token is the `(` — its site carries that spelling.
+        let new = self.intern("new");
+        let paren = self.intern("(");
+        let unnamed = selector == container || selector == new;
+        self.decl_sites.iter().rev().find(|s| {
+            matches!(s.kind, DeclKind::Constructor { container: c } if c == container)
+                && (s.name == selector
+                    || (unnamed && (s.name == container || s.name == new || s.name == paren)))
+        })
     }
 
     /// Whether `(container, selector)` denotes a declared constructor face
@@ -21572,6 +21602,7 @@ impl<'a> Engine<'a> {
                 DeclKind::Constructor { container: c } if c == container
             ) && (self.bare_name(site.name) == container
                 || self.is_nameless(site.name)
+                || self.is_bare_new_head(site.name)
                 || site.name == self.intern("new"))
         });
         if site_has_unnamed {
@@ -26820,7 +26851,9 @@ impl ParserListener for DiagnoseListener<'_> {
                     )
                 })
                 .filter(|site| {
-                    engine.bare_name(site.name) == enum_name || engine.is_nameless(site.name)
+                    engine.bare_name(site.name) == enum_name
+                        || engine.is_nameless(site.name)
+                        || engine.is_bare_new_head(site.name)
                 })
                 .map(|site| site.name)
                 .collect();
@@ -27646,6 +27679,7 @@ impl ParserListener for DiagnoseListener<'_> {
             && let Some(container) = container
             && let Some(text) = engine.text_of(name)
             && text != "new"
+            && text != "("
             && engine.strings.resolve(container) != text
         {
             engine.ctor_new_head_kills.insert(container);
@@ -27724,11 +27758,19 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.ctor_pending = None;
         engine.in_const_ctor = false;
-        // An unnamed factory joins the duplicate-constructor pass as `new`.
+        // An unnamed factory joins the duplicate-constructor pass as `new`;
+        // a `factory name(` head (primary-constructor syntax) names its own
+        // constructor and keys under that name instead.
         if let Some((head, false)) = engine.factory_head.take()
             && let Some((container, _)) = engine.container_context()
         {
-            engine.unnamed_factory_heads.push((container, head));
+            let text = engine.source.get(head.offset as usize..head.end() as usize).unwrap_or("");
+            let key = if text == "new" || text == engine.strings.resolve(container) {
+                engine.intern("new")
+            } else {
+                engine.intern(text)
+            };
+            engine.unnamed_factory_heads.push((container, key, head));
         }
         // A recovery path whose name event never fired drops the latch.
         engine.factory_ret_open = false;
@@ -30185,9 +30227,7 @@ impl ParserListener for DiagnoseListener<'_> {
                             // `C.named(` is the implicit `const
                             // C.named(...)` — a valid creation folds to its
                             // container's value; no failure row stages.
-                            engine
-                                .const_capture
-                                .push_value(closed.span, ConstantValue::Created(container));
+                            engine.const_capture.push_named_creation(container, closed.span);
                         } else if core_const {
                             engine
                                 .const_capture
@@ -33074,6 +33114,10 @@ impl ParserListener for DiagnoseListener<'_> {
             && let Some(site) = engine.open_exec_site
             && let Some(container) = engine.container_context().map(|(c, _)| c)
         {
+            // The redirect names its target class: a reference for the
+            // `unused_element` face (`factory F.a() = _F;` keeps `_F` used).
+            engine.used_names.insert(target_container);
+            engine.factory_redirect_targets.insert((target_container, target));
             let ctor = engine.decl_sites[site].name;
             // The redirect-target faces
             // (`_checkForRedirectToInvalidReturnType`,
@@ -48649,6 +48693,39 @@ mod tests {
         let r =
             report("class int {} class ANewSyntax { const new(); } void f() { const ANewSyntax(); }");
         assert!(code_names(&r).is_empty(), "{:?} at {:?}", code_names(&r), r.diagnostics);
+    }
+
+    /// The `new`/`factory` head family names its constructors the way the
+    /// oracle does (package:xml shapes): `const new q(...)` is the named
+    /// `q` (not the unnamed face), a bare `const new(...)` is the const
+    /// unnamed face a const factory may redirect to, `factory()` declares
+    /// the unnamed face, two `factory a(` / `factory b(` heads are distinct
+    /// constructors, and an enum's `const new(...)` answers its constants.
+    /// A nested implicit `C.named(...)` argument is itself constant.
+    #[test]
+    fn new_and_factory_heads_name_their_constructors() {
+        let clean = [
+            "class String {} class N { const new q(this.v); final String v; } \
+             const n = N.q('x');",
+            "class int {} abstract class F { const factory F.a(int x) = _F; } \
+             class _F implements F { const new(this.x); final int x; } \
+             const f = F.a(1);",
+            "class int {} class L { factory() => L._(1); new _(this.i); final int i; } \
+             final l = L();",
+            "class String {} class T { T(this.m); factory a(String x) => T(x); \
+             factory b(String x) => T(x); final String m; } final t = T.a('x');",
+            "class String {} enum E { one('a'); const new(this.t); final String t; }",
+            "class Object {} class O { const O.q(this.v); final Object v; } \
+             class P { const P(this.n); final Object n; } const p = P(O.q(1));",
+            // A redirect references its target class and supplies every
+            // optional formal of the target constructor.
+            "class int {} abstract class G { const factory G.a({int? y}) = _G.named; } \
+             class _G implements G { const new named({this.y}); final int? y; }",
+        ];
+        for src in clean {
+            let r = report(src);
+            assert!(code_names(&r).is_empty(), "{src}: {:?}", r.diagnostics);
+        }
     }
 
     /// A primary constructor registers under its header shape: the

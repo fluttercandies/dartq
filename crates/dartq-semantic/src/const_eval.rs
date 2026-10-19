@@ -2656,6 +2656,29 @@ impl ConstCapture {
         }
     }
 
+    /// The implicit named creation `C.named(...)`: the capture keeps the
+    /// `C` head as its own operand (the selector is the call's callee), so
+    /// the value replaces that head and spans from it through the call.
+    pub fn push_named_creation(&mut self, container: StringId, span: SourceRange) {
+        if !self.open() {
+            return;
+        }
+        let mut span = span;
+        let base = self.base();
+        if self.stack.len() > base
+            && let Some(head) = self.stack.last()
+            && matches!(head.expr, Expr::Ident(n) if n == container)
+            && head.span.offset < span.offset
+        {
+            span = SourceRange {
+                offset: head.span.offset,
+                length: span.end() - head.span.offset,
+            };
+            self.stack.pop();
+        }
+        self.push_value(span, ConstantValue::Created(container));
+    }
+
     /// Takes the capture stack's top node (the const constructor's
     /// field-initializer RHS, stashed before the assignment folds it —
     /// the #1351 creation-time walk reads it from the engine's own

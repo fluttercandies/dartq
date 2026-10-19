@@ -2354,7 +2354,13 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     fn end_factory(&mut self, _kind: DeclarationKind, _begin: Token, _factory: Token, _end: Token) {
         let builder = &mut self.builder;
         builder.factory_ctor_open = false;
-        if let Some(capture) = builder.ctor_open.take()
+        // A bare `factory()` head (primary-constructor syntax) fires no name
+        // event: it declares the unnamed face.
+        let capture = builder.ctor_open.take().or(Some(CtorCapture {
+            named: Vec::new(),
+            has_unnamed: true,
+        }));
+        if let Some(capture) = capture
             && let Some(open) = builder.containers.last_mut()
         {
             let mut named = capture.named;
@@ -2409,11 +2415,21 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // constructor spelled with its own keyword — the declared name is
         // the class itself, and the head token carries no name (the parser
         // advances past `new`, leaving the `(` as the name slot).
-        let declared_unnamed = new_kw.is_some()
-            || head_key.is_some_and(|key| {
-                _enclosing_declaration_name
-                    .is_some_and(|enclosing| builder.strings.resolve(key) == enclosing)
-            });
+        // A `new <name>` head (`const new q(...)`, or the `new.q` recovery)
+        // names the constructor `q`: only a bare `new` or the class's own
+        // name declares the unnamed face.
+        let names_enclosing = |key: StringId| {
+            _enclosing_declaration_name
+                .is_some_and(|enclosing| builder.strings.resolve(key) == enclosing)
+        };
+        let new_head_selector = new_kw.and(head_key).filter(|&key| {
+            let text = builder.strings.resolve(key);
+            text != "new"
+                && text.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                && !names_enclosing(key)
+        });
+        let declared_unnamed = new_head_selector.is_none()
+            && (new_kw.is_some() || head_key.is_some_and(names_enclosing));
         // `A()` (or the head recovered): the unnamed shape until a
         // `A.named` continuation says otherwise. The formal table's key is
         // the head token's name — the class name, which is exactly the
@@ -2421,10 +2437,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // the continuation rewrites it to the selector. A `new` head keys
         // the table on the enclosing class's name for the same reason.
         builder.ctor_open = Some(CtorCapture {
-            named: Vec::new(),
+            named: new_head_selector.into_iter().collect(),
             has_unnamed: declared_unnamed,
         });
         builder.pending_ctor_formals = match (head_key, new_kw) {
+            (Some(key), Some(_)) if new_head_selector.is_some() => Some((key, None)),
             (Some(key), Some(_)) => {
                 let key = builder
                     .containers
