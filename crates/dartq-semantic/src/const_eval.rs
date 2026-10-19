@@ -2463,12 +2463,21 @@ impl ConstCapture {
         let callee = self.stack.last().cloned();
         let base = self.base();
         // The callee leaves the operand stack: it never merges with the
-        // arguments.
-        if self.stack.len() > base {
+        // arguments. A `new C(...)` list pushes no callee operand (the
+        // constructor reference is a type, not an expression) and latches
+        // its opaque mark at the `new` keyword — the pop must not eat the
+        // enclosing literal's staged node in that shape (#2187: the eaten
+        // map key shifted every later entry pairing, feeding the duplicate
+        // check keys that were never keys).
+        let callee_pushed = self
+            .opaque_marks
+            .last()
+            .is_none_or(|&mark| self.stack.len() > mark);
+        if callee_pushed && self.stack.len() > base {
             self.stack.pop();
         }
         self.args.push(ArgLevel {
-            callee,
+            callee: callee.filter(|_| callee_pushed),
             mark: self.stack.len(),
             named_pending: false,
             args: Vec::new(),
@@ -3867,5 +3876,343 @@ mod tests {
         assert_eq!(eval_written(&deep), WrittenValue::NotEvaluable);
         let long = vec!["1"; 2000];
         assert_eq!(eval_written(&long), WrittenValue::NotEvaluable);
+    }
+}
+
+/// Source-level pins for the non-const duplicate face's capture window
+/// (#2187): each fixture replays one intl census shape through the live
+/// pipeline and asserts the exact `equal_keys_in_map` /
+/// `equal_elements_in_set` row set. The oracle emits these codes only for
+/// genuinely duplicated plain-literal keys — the capture must feed the
+/// checker each literal's own top-level entries and nothing else (named
+/// arguments, nested literals, and cross-literal debris are not keys).
+#[cfg(test)]
+mod equal_keys_2187 {
+    use crate::collector::collect;
+    use crate::diagnose::{StrictModes, fold_unit};
+    use crate::library::ElementIndex;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{LibraryClassModifiers, LibraryGraphBuilder, Namespaces};
+    use dartq_scanner::{ScanConfig, scan};
+    use dartq_source::{FileTable, SourceRange, StringTable};
+    use std::path::Path;
+
+    /// The `(code, start, end)` triples for the two duplicate-face codes,
+    /// in report order. Parse diagnostics fail the pin first — every
+    /// fixture is syntactically clean.
+    fn duplicate_spans(source: &str) -> Vec<(&'static str, u32, u32)> {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let scanned = scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == crate::model::MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let fold = fold_unit(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        assert!(
+            fold.parse_diagnostics.is_empty(),
+            "parse diagnostics: {:?}",
+            fold.parse_diagnostics
+        );
+        fold.report
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    d.code.name,
+                    "equal_keys_in_map" | "equal_elements_in_set"
+                )
+            })
+            .map(|d| (d.code.name, d.range.offset, d.range.end()))
+            .collect()
+    }
+
+    /// The `(code, text-at-span)` rows for the two duplicate-face codes,
+    /// in report order. Row offsets are UTF-16 code units; the source
+    /// slice converts to bytes first (ASCII sources slice identically).
+    fn duplicate_rows(source: &str) -> Vec<(&'static str, String)> {
+        let u16_to_byte = |u16_off: u32| -> usize {
+            let mut units = 0u32;
+            for (byte_idx, ch) in source.char_indices() {
+                if units >= u16_off {
+                    return byte_idx;
+                }
+                units += ch.len_utf16() as u32;
+            }
+            source.len()
+        };
+        duplicate_spans(source)
+            .into_iter()
+            .map(|(code, start, end)| {
+                let s = u16_to_byte(start);
+                let e = u16_to_byte(end);
+                (code, source[s..e].to_owned())
+            })
+            .collect()
+    }
+
+    /// F1 (the census #6 repro, minimized): named-argument values of `new`
+    /// creations are not map keys — a repeated NAME across blocks stays
+    /// silent. The date_symbol_data_local shape (const list arguments).
+    #[test]
+    fn f1_named_arg_values_are_not_map_keys() {
+        let rows = duplicate_rows(
+            r#"
+class Foo {
+  Foo({String? name, bool? flag});
+}
+final m = <String, Object>{
+  "a": new Foo(NAME: "a", FLAG: true),
+  "b": new Foo(NAME: "b", FLAG: true),
+};
+"#,
+        );
+        assert_eq!(rows, [], "named-argument values must never dup-check");
+    }
+
+    /// F1 variant (the DateSymbols shape): `const [...]` nested argument
+    /// literals under the same non-const map.
+    #[test]
+    fn f1_named_arg_with_const_list_argument_silent() {
+        let rows = duplicate_rows(
+            r#"
+class Bar {
+  Bar({String? name, List<String>? tags});
+}
+final m = <String, Object>{
+  "a": new Bar(NAME: "a", TAGS: const ["x"]),
+  "b": new Bar(NAME: "b", TAGS: const ["y"]),
+};
+"#,
+        );
+        assert_eq!(rows, [], "const list arguments must not shift the pairing");
+    }
+
+    /// F2 (the date_time_patterns shape): nested const-map values under a
+    /// non-const parent map — the parent's own unique keys stay silent.
+    #[test]
+    fn f2_nested_const_map_values_silent() {
+        let rows = duplicate_rows(
+            r#"final m = <String, Map<String, int>>{
+  "a": const {"k": 1},
+  "b": const {"k": 2},
+  "c": const {"k": 3},
+};"#,
+        );
+        assert_eq!(rows, [], "nested const maps must not surface as keys");
+    }
+
+    /// F3 — the over-correction gate: plain-literal true positives must
+    /// keep firing at the later duplicate's own span, and the const twin
+    /// stays silent (upstream `_checkForDuplications` skips const
+    /// literals — the compile-error face owns those).
+    #[test]
+    fn f3_plain_literal_duplicates_still_fire() {
+        let map_src = r#"var m = {"a": 1, "b": 2, "a": 3};"#;
+        assert_eq!(
+            duplicate_rows(map_src),
+            [("equal_keys_in_map", String::from(r#""a""#))],
+            "the plain map's later duplicate key must report at its own span"
+        );
+
+        let set_rows = duplicate_rows(r#"var s = {1, 2, 1};"#);
+        assert_eq!(
+            set_rows,
+            [("equal_elements_in_set", String::from("1"))],
+            "the plain set's later duplicate element must report"
+        );
+
+        let const_rows = duplicate_rows(r#"const m2 = {"a": 1, "a": 2};"#);
+        assert_eq!(
+            const_rows,
+            [],
+            "const literals are the compile-error face, not this check"
+        );
+    }
+
+    /// F4 (the legit oracle case): repeated constructor-argument values
+    /// under distinct keys are not duplicates, while genuinely equal keys
+    /// still report at the later key.
+    #[test]
+    fn f4_ctor_call_values_are_not_keys() {
+        let rows = duplicate_rows(
+            r#"
+class Foo {
+  Foo({String? name});
+}
+final m = <String, Foo>{
+  "a": Foo(NAME: "x"),
+  "b": Foo(NAME: "x"),
+};
+"#,
+        );
+        assert_eq!(rows, [], "repeated values are not repeated keys");
+        assert_eq!(
+            duplicate_rows(r#"final m2 = {"x": 1, "y": 2, "x": 3};"#),
+            [("equal_keys_in_map", String::from(r#""x""#))],
+            "genuinely equal keys still report"
+        );
+    }
+
+    /// F5 (the constants.dart shape): a flat non-const map initializer
+    /// after a preceding top-level invocation initializer — unique keys
+    /// must stay silent across the top-level boundary.
+    #[test]
+    fn f5_flat_final_initializer_silent() {
+        let rows = duplicate_rows(
+            r#"
+final int z = '0'.codeUnitAt(0);
+final Map<String, String> cur = {"A": "A", "B": "B", "C": "C"};
+"#,
+        );
+        assert_eq!(rows, [], "unique keys of a later initializer stay silent");
+    }
+
+    /// The census repro at corpus scale: 60 `NAME == outer key` blocks in
+    /// one outer literal — the per-block pairing must stay exact.
+    #[test]
+    fn f1_scale_named_arg_blocks_stay_silent() {
+        let mut src = String::from(
+            "class Foo {\n  Foo({String? name, bool? flag});\n}\nfinal m = <String, Object>{\n",
+        );
+        for i in 0..60 {
+            src.push_str(&format!(
+                "  \"k{i}\": new Foo(NAME: \"k{i}\", FLAG: true),\n"
+            ));
+        }
+        src.push_str("};\n");
+        let rows = duplicate_rows(&src);
+        assert_eq!(rows, [], "60-block scale: {rows:?}");
+    }
+
+    /// The strongest pins: the four real intl corpus files whose 234
+    /// spurious rows founded this ticket (#2187 census cluster #6). Every
+    /// one must stay silent — the oracle emits `equal_keys_in_map` /
+    /// `equal_elements_in_set` nowhere in these files.
+    #[test]
+    fn real_intl_corpus_files_stay_silent() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/corpus/real/intl/lib");
+        let files = [
+            "date_symbol_data_local.dart",
+            "date_time_patterns.dart",
+            "number_symbols_data.dart",
+            "src/intl/constants.dart",
+        ];
+        for rel in files {
+            let source =
+                std::fs::read_to_string(format!("{root}/{rel}")).expect("corpus file");
+            let rows = duplicate_spans(&source);
+            assert_eq!(rows.len(), 0, "{rel} fired {}: first {rows:?}", rows.len());
+        }
+    }
+
+    /// A multi-byte literal before a map must not corrupt the key
+    /// payloads: the string-leaf interior cuts in bytes through the
+    /// engine's UTF-16→byte conversion, so `£` (2 UTF-8 bytes, 1 UTF-16
+    /// unit) in a neighbour no longer shifts every later literal's value
+    /// (the shift made junk payloads collide — the #2187 constants face).
+    #[test]
+    fn multibyte_neighbour_keeps_key_payloads_true() {
+        let rows = duplicate_rows(
+            "final a = '£';\nfinal m = {\n  \"AB\": 1,\n\"AB\": 2,\n};\n",
+        );
+        assert_eq!(
+            rows,
+            [("equal_keys_in_map", String::from("\"AB\""))],
+            "the true interiors collide, regardless of the £ byte drift"
+        );
+    }
+
+    /// One-unit test span at `offset`.
+    fn span(offset: u32) -> SourceRange {
+        SourceRange { offset, length: 1 }
+    }
+
+    /// Capture-level pin for the `new C(...)` argument list: the list
+    /// pushes no callee operand, so `begin_arguments` must leave the
+    /// enclosing literal's staged key alone — the entry pairs the entry's
+    /// own key with the creation's opaque fold (the eaten key shifted
+    /// every later pairing and fed the duplicate check keys that were
+    /// never keys).
+    #[test]
+    fn new_creation_arguments_leave_the_enclosing_key_staged() {
+        use super::{ConstCapture, ConstantValue, Expr, SetOrMap};
+        use dartq_source::StringTable;
+
+        let strings = StringTable::new();
+        let mut capture = ConstCapture::new(strings.intern("identical"));
+        capture.open_non_const_dup();
+        // Entry 1: key leaf, then the `new Foo(...)` value — the opaque
+        // group latches at `new`, the argument list pushes nothing for the
+        // constructor reference, and the group folds to one opaque leaf.
+        capture.literal(span(1), ConstantValue::Str("a".into()));
+        capture.begin_opaque_group();
+        capture.begin_arguments();
+        capture.literal(span(2), ConstantValue::Str("x".into()));
+        capture.named_argument();
+        capture.end_arguments(span(3));
+        capture.end_opaque_group(span(3));
+        capture.literal_map_entry(span(3));
+        // Entry 2: the same shape — the second key must stage against its
+        // own value, not against entry 1's leftover.
+        capture.literal(span(4), ConstantValue::Str("b".into()));
+        capture.begin_opaque_group();
+        capture.begin_arguments();
+        capture.literal(span(5), ConstantValue::Str("y".into()));
+        capture.named_argument();
+        capture.end_arguments(span(6));
+        capture.end_opaque_group(span(6));
+        capture.literal_map_entry(span(6));
+        let (shape, _) = capture
+            .close_non_const_dup(2, span(7), false)
+            .expect("the literal's own window closes with its entries");
+        let SetOrMap::Map(entries) = shape else {
+            panic!("expected a map shape");
+        };
+        assert_eq!(entries.len(), 2);
+        assert!(
+            matches!(&entries[0].0.expr, Expr::Value(ConstantValue::Str(s)) if s.as_ref() == "a"),
+            "entry 1 keeps its own key, got {:?}",
+            entries[0].0.expr
+        );
+        assert!(
+            matches!(&entries[1].0.expr, Expr::Value(ConstantValue::Str(s)) if s.as_ref() == "b"),
+            "entry 2 keeps its own key (the argument list must not eat it), got {:?}",
+            entries[1].0.expr
+        );
     }
 }

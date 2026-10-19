@@ -966,11 +966,20 @@ impl<'a> Engine<'a> {
 
     /// The raw interior of an interpolation-free string literal (the
     /// begin token spans the whole literal, quotes included; escapes are
-    /// not decoded — no diagnostic observes the contents).
+    /// not decoded — no diagnostic observes the contents). The interior
+    /// cuts in BYTES: `SourceRange` offsets are UTF-16 code units while
+    /// `source` slices by byte, so the span goes through [`Engine::byte_of`]
+    /// — a direct slice drifted one byte per preceding multi-byte char and
+    /// valuated later literals with junk payloads (#2187: the junk collided
+    /// in the duplicate-key check, reporting phantom `equal_keys_in_map`
+    /// rows over every multibyte-heavy corpus file).
     pub fn const_string_leaf(&mut self, begin: SourceRange, end: SourceRange) {
         let text = self
             .source
-            .get(begin.offset as usize + 1..begin.end().saturating_sub(1) as usize)
+            .get(
+                self.byte_of(begin.offset) + 1
+                    ..self.byte_of(begin.end()).saturating_sub(1)
+            )
             .unwrap_or("");
         self.const_capture
             .end_literal_string(0, begin, end, ConstantValue::Str(text.into()));
