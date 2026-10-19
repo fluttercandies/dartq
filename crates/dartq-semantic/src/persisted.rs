@@ -111,6 +111,16 @@ pub enum PersistedTy {
     },
 }
 
+impl Default for PersistedTy {
+    /// The additive-field decode default (`PersistedExtensionFace::on_ty`):
+    /// a pre-slot payload could not capture the `on` clause's arguments —
+    /// `Unknown` suppresses the argument-level gate the field feeds, the
+    /// under-report direction.
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistedMicroKind {
     Class,
@@ -261,6 +271,19 @@ pub struct PersistedExtensionFace {
     /// reads it.
     #[serde(default)]
     pub on_type_nullable: bool,
+    /// Additive after the format shipped (the #539 discipline): the `on`
+    /// clause's full type with its argument list — the applicability
+    /// gate's argument-level comparison. A pre-slot payload decodes to
+    /// `Unknown`, the argument-less direction the gate already suppresses
+    /// on.
+    #[serde(default)]
+    pub on_ty: PersistedTy,
+    /// Additive after the format shipped: the extension's own
+    /// type-parameter spellings (`on List<T>` keeps `[T]`) — an `on`
+    /// argument naming one instantiates against the receiver rather than
+    /// comparing concretely.
+    #[serde(default)]
+    pub type_param_names: Vec<u32>,
     pub members: Vec<(u32, PersistedMemberEntry)>,
 }
 
@@ -509,6 +532,8 @@ impl PersistedElements {
                 name: face.name.map(|name| s.id(name)),
                 on_type: face.on_type.map(|name| s.id(name)),
                 on_type_nullable: face.on_type_nullable,
+                on_ty: s.ty(&face.on_ty),
+                type_param_names: s.ids(&face.type_param_names),
                 members: face
                     .members
                     .iter()
@@ -591,6 +616,12 @@ impl PersistedElements {
                     name: face.name.map(&at_name),
                     on_type: face.on_type.map(&at_name),
                     on_type_nullable: face.on_type_nullable,
+                    on_ty: into_ty(face.on_ty, &ids, &mut type_args),
+                    type_param_names: face
+                        .type_param_names
+                        .into_iter()
+                        .map(&at_name)
+                        .collect(),
                     members: face
                         .members
                         .into_iter()
@@ -1074,6 +1105,8 @@ mod tests {
             name: Some(name("E")),
             on_type: Some(name("int")),
             on_type_nullable: false,
+            on_ty: Ty::named(name("int")),
+            type_param_names: Box::new([]),
             members: [(name("e"), member("e"))].into_iter().collect(),
         });
         elements.duplicates.push(DuplicateDecl {

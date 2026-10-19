@@ -240,32 +240,48 @@ fn named_twin_scoped_call_reports_the_arity_row() {
 }
 
 /// A scoped top-level call resolves with the same rows in an unnamed
-/// extension body as in its named twin (route parity, #1701).
+/// extension body as in its named twin (route parity, #1701). The one
+/// sanctioned divergence is the enclosing member's `unused_element` row:
+/// the oracle's `_isPubliclyAccessible` extension arm reads the
+/// declaration's `isPrivate` — an unnamed extension answers `name ==
+/// null` as private (`unused_local_elements_verifier.dart`,
+/// `ExtensionFragmentImpl.isPrivate`), so an uninvoked member of the
+/// unnamed twin reports while the named twin's public member stays
+/// silent. The pin keeps the full row list, expecting exactly that one
+/// extra row at `t`'s declaration.
 #[test]
 fn unnamed_extension_scoped_call_resolves_like_named_twin() {
     let strings = StringTable::new();
     let named = unit_fold(TWIN_SCOPED_CALL_NAMED, &strings);
     let unnamed = unit_fold(TWIN_SCOPED_CALL_UNNAMED, &strings);
+    let mut expected = rows(&named.report, TWIN_SCOPED_CALL_NAMED);
+    expected.insert(0, ("unused_element", 3));
     assert_eq!(
-        rows(&named.report, TWIN_SCOPED_CALL_NAMED),
+        expected,
         rows(&unnamed.report, TWIN_SCOPED_CALL_UNNAMED),
-        "the unnamed twin's scoped call must resolve exactly like the named one"
+        "the unnamed twin's scoped call must resolve exactly like the named one \
+         (plus the oracle's unused_element on the uninvoked enclosing member)"
     );
 }
 
 /// A typed top-level call resolves with the same rows in an unnamed
 /// extension body as in its named twin: the argument check fires on the
 /// scoped declaration's static type instead of collapsing into the
-/// placeholder-name suppression (#1701).
+/// placeholder-name suppression (#1701). The `unused_element` extra at
+/// `t`'s declaration is the oracle's private-container asymmetry (see the
+/// scoped-call pin for the reasoning), not a resolution divergence.
 #[test]
 fn unnamed_extension_scoped_argument_type_resolves_like_named_twin() {
     let strings = StringTable::new();
     let named = unit_fold(TWIN_ARGUMENT_TYPE_NAMED, &strings);
     let unnamed = unit_fold(TWIN_ARGUMENT_TYPE_UNNAMED, &strings);
+    let mut expected = rows(&named.report, TWIN_ARGUMENT_TYPE_NAMED);
+    expected.push(("unused_element", 4));
     assert_eq!(
-        rows(&named.report, TWIN_ARGUMENT_TYPE_NAMED),
+        expected,
         rows(&unnamed.report, TWIN_ARGUMENT_TYPE_UNNAMED),
-        "the unnamed twin's typed call must resolve exactly like the named one"
+        "the unnamed twin's typed call must resolve exactly like the named one \
+         (plus the oracle's unused_element on the uninvoked enclosing member)"
     );
 }
 
@@ -320,9 +336,16 @@ fn unnamed_extension_own_member_call_reports_the_arity_row() {
          call line, got {:?}",
         rows(&named.report, OWN_MEMBER_NAMED)
     );
+    // The own-member rows align plus the same oracle asymmetry the
+    // scoped-call pin documents: the unnamed twin's uninvoked `t` reports
+    // `unused_element` (the unnamed extension reads private, so its
+    // members are checked like private declarations).
+    let mut expected = rows(&named.report, OWN_MEMBER_NAMED);
+    expected.insert(0, ("unused_element", 3));
     assert_eq!(
-        rows(&named.report, OWN_MEMBER_NAMED),
+        expected,
         rows(&unnamed.report, OWN_MEMBER_UNNAMED),
-        "the unnamed twin's own-member call must report exactly like the named one"
+        "the unnamed twin's own-member call must report exactly like the named one \
+         (plus the oracle's unused_element on the uninvoked enclosing member)"
     );
 }

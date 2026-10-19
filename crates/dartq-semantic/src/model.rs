@@ -1311,6 +1311,22 @@ pub struct ExtensionFace {
     /// predicate), and against a non-nullable receiver the non-nullable
     /// `on` type is the more specific resolution.
     pub on_type_nullable: bool,
+    /// The `on` clause's full interned type (`on Map<LookupName, FieldItem>`
+    /// keeps its argument list): the applicability gate's argument-level
+    /// comparison — the oracle's `_getApplicable` instantiates the extended
+    /// type against the receiver and rejects a face whose arguments cannot
+    /// match (`Map<LookupName, FieldItem>` never applies to a
+    /// `Map<LookupName, MethodItem>` receiver). [`Ty::Unknown`] when the
+    /// clause never produced an honest type; [`Ty::Named`] with an empty
+    /// argument list for a bare head (`on int`) — the head-level gate alone
+    /// decides those.
+    pub on_ty: Ty,
+    /// The extension's own type-parameter spellings (`extension E<T> on
+    /// List<T>` keeps `[T]`), in declaration order. An `on_ty` argument that
+    /// names a type parameter instantiates against the receiver's argument
+    /// (the oracle's `applicableTo` inference), so the argument-level gate
+    /// only compares the concrete arguments.
+    pub type_param_names: Box<[StringId]>,
     /// The extension's members under their lookup spellings (setters under
     /// `name=`), static bit preserved.
     pub members: NameMap<MemberEntry>,

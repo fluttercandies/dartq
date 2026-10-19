@@ -277,6 +277,16 @@ struct Builder<'src, 'tab> {
     /// The latched on-type was written nullable (`on C?`) — the capture
     /// rides the completing `handle_type` question token.
     extension_on_type_nullable: bool,
+    /// The on-clause's full interned type (arguments included): the
+    /// type-capture window's `armed` pair converts at the header's close —
+    /// the on-type is always the last completed type of an extension
+    /// header. `None` until the body-open (or no-body) event takes it.
+    extension_on_ty: Option<Ty>,
+    /// The extension's own type-parameter spellings (`extension E<T> on
+    /// List<T>` keeps `[T]`): the type-var group survives the container's
+    /// count-only attach so the application face can tell an `on`-argument
+    /// that names a type parameter (instantiable) from a concrete one.
+    extension_type_param_names: Vec<StringId>,
     /// The open field group's `abstract`/`external` modifiers (`begin_fields`
     /// latches, `end_fields` clears).
     field_abstract: bool,
@@ -396,6 +406,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             header_capture_open: false,
             extension_on_type: None,
             extension_on_type_nullable: false,
+            extension_on_ty: None,
+            extension_type_param_names: Vec::new(),
             field_abstract: false,
             field_external: false,
             field_final: false,
@@ -797,6 +809,23 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         );
         self.extension_on_type = None;
         self.extension_on_type_nullable = false;
+        self.extension_on_ty = None;
+        // An extension's own type-parameter spellings feed its application
+        // face (an `on`-argument naming one instantiates against the
+        // receiver rather than comparing concretely). The header's type
+        // variables closed before this open (official event order), so the
+        // still-buffered `type_var_group` is the extension's list — but
+        // only when the header actually parsed one: `header_type_params`
+        // carries a count only from a real group, which also keys the take
+        // (a parameterless `extension E` after `class C<T>` must not
+        // inherit C's still-buffered names).
+        self.extension_type_param_names = if kind == ContainerKind::Extension
+            && header_type_params > 0
+        {
+            std::mem::take(&mut self.type_var_group)
+        } else {
+            Vec::new()
+        };
         self.containers.push(OpenContainer {
             name,
             kind,
@@ -842,6 +871,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.drop_pending_annotations();
         self.field_annotations.clear();
         let extension_on_type = self.extension_on_type.take();
+        let extension_on_ty = self.extension_on_ty.take().unwrap_or(Ty::Unknown);
+        let extension_type_param_names =
+            std::mem::take(&mut self.extension_type_param_names).into_boxed_slice();
         let Some(open) = self.containers.pop() else {
             return;
         };
@@ -856,6 +888,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 name: None,
                 on_type: extension_on_type,
                 on_type_nullable: self.extension_on_type_nullable,
+                on_ty: extension_on_ty,
+                type_param_names: extension_type_param_names,
                 members: members.finish(),
             });
             return;
@@ -867,6 +901,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 name: open.name.map(|(name, _)| name),
                 on_type: extension_on_type,
                 on_type_nullable: self.extension_on_type_nullable,
+                on_ty: extension_on_ty,
+                type_param_names: extension_type_param_names,
                 members: members.clone().finish(),
             });
         }
@@ -948,6 +984,26 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         } else {
             residue.extend(buffered.into_iter().map(|(name, _)| name));
         }
+    }
+
+    /// Latches the open extension's `on` clause type into
+    /// [`Builder::extension_on_ty`], arguments included: the on-type is
+    /// always the last completed type of an extension header, so the
+    /// still-armed pair at the header's close is it. A body event for any
+    /// other container kind leaves the armed pair alone — it belongs to
+    /// that declaration's own consumers. A header that never produced an
+    /// honest type leaves `None` (the face's head-level `on_type` gate
+    /// already keeps it out).
+    fn latch_extension_on_ty(&mut self) {
+        if !self.header_capture_open
+            || self
+                .containers
+                .last()
+                .is_none_or(|open| open.kind != ContainerKind::Extension)
+        {
+            return;
+        }
+        self.extension_on_ty = Some(self.take_armed());
     }
 
     /// Splits the buffered window at a clause boundary: the claimed names go
@@ -1556,6 +1612,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // extension-type representation formals stop being captured. The
         // kind is informational here — the container's own kind decides.
         let _ = kind;
+        builder.latch_extension_on_ty();
         builder.header_capture_open = false;
     }
 
@@ -1572,6 +1629,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
     }
 
     fn handle_no_extension_body(&mut self, _semicolon: Token) {
+        self.builder.latch_extension_on_ty();
         self.builder.header_capture_open = false;
     }
 

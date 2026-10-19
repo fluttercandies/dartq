@@ -55,6 +55,7 @@
 use dartq_resolution::{LibraryGraph, LibraryId, LocalLookup, Lookup, NamespaceEntry, Namespaces};
 use dartq_source::{FileId, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::model::{Container, ContainerKind, FileElements, MemberEntry, MicroKind, TopDecl, Ty};
@@ -403,12 +404,22 @@ pub(crate) fn member_lookup_defining<'a>(
     let mut seen: FxHashSet<StringId> = FxHashSet::default();
     let mut owner = file;
     let mut scope_lib = lib;
+    // The `implements` faces met along the `extends`/`with` climb: an
+    // implementor inherits its interfaces' members (the oracle's interface
+    // build), but a superclass's interface — which already merges its
+    // `implements` faces — shadows the implementor's own. Collect per level,
+    // then walk deepest-first once the chain ends.
+    let mut pending_faces: Vec<Vec<(StringId, FileId)>> = Vec::new();
+    let mut owner_lib = lib;
     loop {
         if !seen.insert(name) {
             return None; // malformed cyclic chain: treat as unresolved
         }
-        let (found, found_owner) =
-            resolve_container(graph, namespaces, index, scope_lib, owner, name)?;
+        let Some((found, found_owner)) =
+            resolve_container(graph, namespaces, index, scope_lib, owner, name)
+        else {
+            break;
+        };
         if let Some(entry) = found.members.get(&member).and_then(acceptable) {
             return Some((name, entry));
         }
@@ -417,7 +428,7 @@ pub(crate) fn member_lookup_defining<'a>(
         // superclass names are written in `found_owner` and resolve through
         // that file's library (probed by the container name it declares,
         // #491 S2a).
-        let owner_lib = owner_library(graph, lib, found_owner, name).unwrap_or(scope_lib);
+        owner_lib = owner_library(graph, lib, found_owner, name).unwrap_or(scope_lib);
         for mixin in found.with_clause.iter().rev() {
             if !seen.insert(*mixin) {
                 return None;
@@ -430,10 +441,66 @@ pub(crate) fn member_lookup_defining<'a>(
                 return Some((*mixin, entry));
             }
         }
-        name = found.superclass?;
+        if !found.implements_clause.is_empty() {
+            pending_faces.push(
+                found
+                    .implements_clause
+                    .iter()
+                    .map(|face| (*face, found_owner))
+                    .collect(),
+            );
+        }
+        let Some(superclass) = found.superclass else {
+            break;
+        };
+        name = superclass;
         owner = found_owner;
         scope_lib = owner_lib;
     }
+    // The `extends`/`with` chain exhausted without a hit: the collected
+    // interfaces still contribute members, deepest level first. Each face's
+    // own supertypes expand breadth-first (a class climbs
+    // `extends`/`with`/`implements`, a nested extension type its
+    // `implements` — the same face set `walk_face_list` climbs for the
+    // receiver-side walk).
+    let mut queue: VecDeque<(StringId, FileId)> = pending_faces
+        .iter()
+        .rev()
+        .flatten()
+        .copied()
+        .collect();
+    let mut scope_lib = owner_lib;
+    while let Some((face, face_owner)) = queue.pop_front() {
+        if !seen.insert(face) {
+            continue;
+        }
+        let face_lib = owner_library(graph, lib, face_owner, face).unwrap_or(scope_lib);
+        let Some((face_container, face_container_owner)) =
+            resolve_container(graph, namespaces, index, face_lib, face_owner, face)
+        else {
+            // An unresolvable interface face contributes nothing — the
+            // remaining faces keep walking.
+            continue;
+        };
+        scope_lib = face_lib;
+        if let Some(entry) = face_container
+            .members
+            .get(&member)
+            .filter(|entry| !entry.is_static)
+            .and_then(acceptable)
+        {
+            return Some((face, entry));
+        }
+        for super_face in face_container
+            .superclass
+            .into_iter()
+            .chain(face_container.with_clause.iter().copied())
+            .chain(face_container.implements_clause.iter().copied())
+        {
+            queue.push_back((super_face, face_container_owner));
+        }
+    }
+    None
 }
 
 /// Whether any container on `container`'s supertype chain — the `with`

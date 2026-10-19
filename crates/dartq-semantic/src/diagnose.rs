@@ -345,7 +345,7 @@ use crate::codes::{ArgCountShape, ExecKind, SemanticCode, SuperShape};
 use crate::collector::container_modifiers;
 use crate::const_eval::{
     BinOp, ConstCapture, ConstFault, ConstLookup, ConstantValue, Expr, IdentVerdict, UnOp, Verdict,
-    eval,
+    collect_not_potentially_constant, eval,
 };
 use crate::const_tracker::ConstTracker;
 use crate::library::{
@@ -869,6 +869,13 @@ struct ArgLevel {
     /// parens, the label on a named-only list — whenever no positional
     /// argument supplies the after-the-last face.
     first_label: Option<SourceRange>,
+    /// The callee's row index at group open — [`Engine::open_arguments`]'s
+    /// `top` detection, kept even when `invokes` drops the link (a bare
+    /// `super(`/`this(` initializer-invocation callee, excluded from the
+    /// send walk but still the group head the per-arg faces read).
+    /// `mark` alone cannot serve: `flush_argument` advances it past each
+    /// argument's row.
+    callee_row: Option<usize>,
     mark: usize,
     /// The written signatures of the function literals that closed
     /// directly inside this list (`C((List<int> x) {})`), keyed by the
@@ -2635,11 +2642,28 @@ struct Engine<'a> {
     /// Library-level reference index: every name some reference resolved
     /// to in this file (locals included — shadowing only ever suppresses).
     used_names: FxHashSet<StringId>,
+    /// The `unused_import`-only credit set (`ImportsTracking`,
+    /// scope.dart:228-339): every name that resolved through the namespace
+    /// — including the positions `used_names` deliberately skips for the
+    /// `unused_element` face (the `_insideIsExpression` exclusion is the
+    /// used-elements visitor's, not the import tracker's — an `is`/`as`
+    /// operand type still spares the import that provided it, and a
+    /// self-scope reference still consulted the namespace). The face reads
+    /// `used_names ∪ import_used`.
+    import_used: FxHashSet<StringId>,
     /// Extension member spellings some implicit application resolved to
     /// (the official `usedElements.members` face for extension members —
     /// an applied member is used, unused members of an unnamed extension
     /// report).
     extension_member_used: FxHashSet<StringId>,
+    /// The unit's `accessibleExtensions` face (scope.dart:473-488), built
+    /// on first member-miss: every extension face declared in this library's
+    /// units plus every extension the import edges' export scopes admit
+    /// under their combinators (prefixed imports' faces included — the
+    /// oracle's prefix scopes contribute them to implicit application).
+    /// Each entry pairs the face with its declaring file; `None` until the
+    /// first `extension_application` probe.
+    accessible_extensions: Option<Vec<(&'a ExtensionFace, FileId)>>,
     /// Names a READ-shaped member access resolved to (the `unused_field`
     /// read-only rule: writes never spare a field).
     read_names: FxHashSet<StringId>,
@@ -3740,7 +3764,9 @@ impl<'a> Engine<'a> {
             null_aware_members: FxHashSet::default(),
             cascade_null_aware_op: None,
             used_names: FxHashSet::default(),
+            import_used: FxHashSet::default(),
             extension_member_used: FxHashSet::default(),
+            accessible_extensions: None,
             read_names: FxHashSet::default(),
             member_read_owners: FxHashMap::default(),
             primary_fields: Vec::new(),
@@ -4817,6 +4843,12 @@ impl<'a> Engine<'a> {
                 })
             && let Some(on) = face.on_type
         {
+            // The interned `on` type carries its argument list
+            // (`extension E<K, V> on Map<K, V>` gives `this : Map<K, V>`);
+            // a clause that never interned falls back to the bare head.
+            if face.on_ty != Ty::Unknown {
+                return face.on_ty;
+            }
             return Ty::Named {
                 name: on,
                 nullable: face.on_type_nullable,
@@ -7772,7 +7804,7 @@ impl<'a> Engine<'a> {
                 || self.members.object_members.contains(&getter)
                 || (kind == ContainerKind::Enum && self.members.enum_synth_members.contains(&getter))
                 || !matches!(
-                    self.extension_application(head, getter, false, false),
+                    self.extension_application(head, Ty::UNKNOWN, getter, false, false),
                     ExtensionApp::None
                 )
             {
@@ -8389,7 +8421,12 @@ impl<'a> Engine<'a> {
             .names
             .iter()
             .any(|row| !row.qualified && row.use_kind != NameUse::NamedArgument);
-        let used: Vec<StringId> = self.used_names.iter().copied().collect();
+        let used: Vec<StringId> = self
+            .used_names
+            .iter()
+            .chain(&self.import_used)
+            .copied()
+            .collect();
         for (index, edge) in edges.iter().enumerate() {
             // Copied first: the emit below mutates the report.
             let (uri_text, uri_range, prefix, shown) = {
@@ -8408,7 +8445,9 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let is_used = match prefix {
-                Some(prefix) => self.used_names.contains(&prefix),
+                Some(prefix) => {
+                    self.used_names.contains(&prefix) || self.import_used.contains(&prefix)
+                }
                 None => {
                     bare_miss
                         || used.iter().any(|&n| {
@@ -8434,7 +8473,9 @@ impl<'a> Engine<'a> {
                 if (bare_miss && prefix.is_none()) || self.graph.exported(target, name).is_none() {
                     continue;
                 }
-                let name_used = self.used_names.contains(&name) && edge.combinators.allows(name);
+                let name_used = (self.used_names.contains(&name)
+                    || self.import_used.contains(&name))
+                    && edge.combinators.allows(name);
                 if !name_used {
                     let text = self.strings.resolve(name).to_string();
                     self.stage_usage(SemanticCode::UnusedShownName, range, &text);
@@ -10733,6 +10774,31 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The write target's `getWriteType` — the assignment resolver's
+    /// `writeAcceptedType` face: a field answers its declared type; a
+    /// setter answers its single value formal's declared type (the write
+    /// resolves against `name=`, never the getter's return). `Unknown` for
+    /// executables, accessors with uncaptured formals, and broken chains —
+    /// the under-report direction.
+    fn member_write_ty(&mut self, container: StringId, member: StringId) -> Ty {
+        match self.walk_members(container, member) {
+            Walk::Found(entry) if entry.kind == MemberKind::Field => {
+                self.fold_alias_ty(entry.var_ty)
+            }
+            _ => {
+                let setter = self.setter_spelling(member);
+                match self.walk_members(container, setter) {
+                    Walk::Found(entry) if entry.kind == MemberKind::Setter => entry
+                        .formals
+                        .as_deref()
+                        .and_then(|f| f.positional.first())
+                        .map_or(Ty::UNKNOWN, |formal| self.fold_alias_ty(formal.ty)),
+                    _ => Ty::UNKNOWN,
+                }
+            }
+        }
+    }
+
     /// The promoted-property substitution (#1409): when a flow
     /// [`dartq_flow::FlowFact::PromotedPropertyRead`] row stands at
     /// exactly `range` (a staged check's own span — the merged member
@@ -11531,6 +11597,14 @@ impl<'a> Engine<'a> {
         let mut scope_lib = self.lib;
         let mut seen: FxHashSet<StringId> = FxHashSet::default();
         let mut at_anchor = true;
+        // The `implements` faces met along the `extends`/`with` climb: each
+        // level's interfaces join that level's interface (an implementor
+        // inherits its interfaces' members — the oracle's interface build,
+        // inheritance_manager3), but a superclass's own interface — which
+        // already merges its `implements` faces — shadows an implementor's
+        // faces. Collecting per level and seeding deepest-first preserves
+        // that order while the chain climbs.
+        let mut pending_faces: Vec<Vec<(StringId, FileId)>> = Vec::new();
         loop {
             if !seen.insert(name) {
                 return Walk::ChainBroken;
@@ -11588,18 +11662,32 @@ impl<'a> Engine<'a> {
                     return Walk::Found(self.boundary.member(mixin_owner, *mixin, member, entry));
                 }
             }
+            if !found.implements_clause.is_empty() {
+                pending_faces.push(
+                    found
+                        .implements_clause
+                        .iter()
+                        .map(|face| (*face, found_owner))
+                        .collect(),
+                );
+            }
             let Some(superclass) = found.superclass else {
-                // No superclass: the instance-member interface continues
-                // through the `implements` clause for every kind (an
-                // implementor inherits its interfaces' members — the
-                // InterfaceElement lookup, upstream Dart SDK source,
-                // pkg/analyzer `class hierarchy` face; the extension type's
-                // clause is its whole interface). No faces at all is the
-                // clean miss.
-                if found.implements_clause.is_empty() {
+                // The `extends` chain ends: the collected interfaces still
+                // contribute members — every face met on the climb, deepest
+                // level first (a superclass interface already merged its
+                // `implements` faces, so it shadows the implementor's). The
+                // shared face-list climb then expands each face's own
+                // supertypes transitively. No faces at all is the clean miss.
+                if pending_faces.is_empty() {
                     return Walk::Missing;
                 }
-                return self.walk_implements_members(found, found_owner, owner_lib, member, &mut seen);
+                return self.walk_face_list(
+                    pending_faces.iter().rev().flatten().copied(),
+                    owner_lib,
+                    member,
+                    &mut seen,
+                    false,
+                );
             };
             // The superclass name is written in the declaring container's
             // file and resolves through that container's library (#491 S2a).
@@ -11616,47 +11704,20 @@ impl<'a> Engine<'a> {
         supertype_hop_dead(self.graph, self.namespaces, self.index, lib, file, name)
     }
 
-    /// The extension-type interface-member walk (`extension type E(Directory d)
-    /// implements Directory` — `e.exists()` resolves through `Directory`'s
-    /// member face). Each `implements` entry contributes its own members and,
-    /// transitively, its supertypes' (a class interface climbs its
-    /// `extends`/`with`/`implements`; a nested extension type climbs its own
-    /// `implements`). A resolved member ends the walk (`Found`); an
-    /// unresolvable or cyclic face poisons the chain (`ChainBroken`, the
-    /// under-report boundary) only when nothing answered. The interface names
-    /// are written in `found_owner` and resolve through that container's
-    /// library.
-    fn walk_implements_members(
-        &self,
-        found: &'a Container,
-        found_owner: FileId,
-        scope_lib: LibraryId,
-        member: StringId,
-        seen: &mut FxHashSet<StringId>,
-    ) -> Walk<'a> {
-        self.walk_face_list(
-            found.implements_clause.iter().copied(),
-            found_owner,
-            scope_lib,
-            member,
-            seen,
-            false,
-        )
-    }
-
-    /// The shared breadth-first face-list climb behind
-    /// [`Engine::walk_implements_members`] and the mixin's `on`-constraint
-    /// super walk: each seed name contributes its own (non-static) members
-    /// and, transitively, its supertypes' (a class climbs `extends`/`with`/
+    /// The shared breadth-first face-list climb behind the
+    /// `implements`-face merges of [`Engine::walk_from`], the super walk,
+    /// and the mixin's `on`-constraint super walk: each seed `(name,
+    /// declaring file)` contributes its own (non-static) members and,
+    /// transitively, its supertypes' (a class climbs `extends`/`with`/
     /// `implements`, a mixin interface its own interfaces, a nested extension
     /// type its `implements`). A resolved member ends the walk (`Found`); an
     /// unresolvable or cyclic face poisons the chain (`ChainBroken`, the
-    /// under-report boundary) only when nothing answered. The face names are
-    /// written in `seed_owner` and resolve through that container's library.
+    /// under-report boundary) only when nothing answered. Each face name is
+    /// written in its declaring file and resolves through that container's
+    /// library.
     fn walk_face_list(
         &self,
-        seeds: impl Iterator<Item = StringId>,
-        seed_owner: FileId,
+        seeds: impl Iterator<Item = (StringId, FileId)>,
         mut scope_lib: LibraryId,
         member: StringId,
         seen: &mut FxHashSet<StringId>,
@@ -11664,8 +11725,7 @@ impl<'a> Engine<'a> {
     ) -> Walk<'a> {
         // Breadth-first: the declaration order is the oracle's face order,
         // and a shallower hit shadows a deeper one.
-        let mut queue: VecDeque<(StringId, FileId)> =
-            seeds.map(|face| (face, seed_owner)).collect();
+        let mut queue: VecDeque<(StringId, FileId)> = seeds.collect();
         let mut missing = false;
         while let Some((face, face_owner)) = queue.pop_front() {
             if !seen.insert(face) {
@@ -11756,8 +11816,10 @@ impl<'a> Engine<'a> {
                 let mut seen: FxHashSet<StringId> = FxHashSet::default();
                 seen.insert(container);
                 return self.walk_face_list(
-                    container_decl.on_clause.iter().copied(),
-                    self.file,
+                    container_decl
+                        .on_clause
+                        .iter()
+                        .map(|face| (*face, self.file)),
                     self.lib,
                     member,
                     &mut seen,
@@ -15128,6 +15190,12 @@ impl<'a> Engine<'a> {
                 if self.redirect_target_depth == 0 {
                     match self.type_resolution(name) {
                         (TypeResolution::NonType, anchor) if self.ctor_pos == 0 => {
+                            // A resolving name credits its import in every
+                            // position — `ImportsTracking` counts the scope
+                            // lookup itself (`is`/`as` operand, self-scope
+                            // reference), while `used_names` keeps the
+                            // `unused_element` face's narrower exclusions.
+                            self.import_used.insert(name);
                             // The use-count face rides the same guards as a
                             // defined type (`_useIdentifierElement` — inside
                             // an `is` operand and self-references excepted).
@@ -15157,6 +15225,10 @@ impl<'a> Engine<'a> {
                             return;
                         }
                         (TypeResolution::Type, _) => {
+                            // The import credit is unconditional (see the
+                            // NonType arm): the scope lookup succeeded, so
+                            // the providing import is used.
+                            self.import_used.insert(name);
                             // A defined type reference uses the type (the
                             // official `visitNamedType` →
                             // `_useIdentifierElement` face) — except inside
@@ -15249,6 +15321,11 @@ impl<'a> Engine<'a> {
                         ty: Ty::UNKNOWN,
                     });
                 } else {
+                    // The prefixed type resolved: the prefix scope lookup
+                    // credits the import (`ImportsTracking` — the `is`
+                    // exclusion is the used-elements visitor's, not the
+                    // tracker's).
+                    self.import_used.insert(name);
                     if self.is_type_pos == 0 && !self.in_own_named_scope(name) {
                         self.used_names.insert(name);
                     }
@@ -15881,7 +15958,25 @@ impl<'a> Engine<'a> {
                         },
                         None => Receiver::Unknown,
                     },
-                    _ => Receiver::Unknown,
+                    // The chained-receiver face (`a.b().c`, `x.m.y`): a
+                    // value/member receiver whose expression static type
+                    // names a container resolves its member on that
+                    // container — the official `staticType` of the preceding
+                    // chain node is the member face's receiver type, so the
+                    // folded `a.b()` result feeds `.c` exactly like a
+                    // declared-type read. `receiver_ty` (computed above
+                    // from `receiver_static_ty`: the row's own type wins,
+                    // else the invoked callee's declared return type)
+                    // carries it; a non-named verdict (dynamic, unknown,
+                    // function-type) keeps the Unknown dispatch — no member
+                    // face exists to walk there.
+                    _ => match receiver_ty {
+                        Ty::Named { name, .. } => Receiver::Typed {
+                            type_name: name,
+                            ty: receiver_ty,
+                        },
+                        _ => Receiver::Unknown,
+                    },
                 };
                 if deferred_receiver {
                     self.deferred_miss_rows.push(Row {
@@ -16639,11 +16734,30 @@ impl<'a> Engine<'a> {
         // — the callee is the enum's selected constructor, never a row.
         let enum_const =
             self.in_enum_element.is_some() && self.arg_levels.is_empty();
+        // The head row at group open: `top` when the invocation dispatch
+        // found a callee, else the last row when it is a keyword receiver
+        // (the bare `super(`/`this(` initializer-invocation head `invokes`
+        // excludes). Any other shape — a stale unrelated row — stays
+        // `None`; the per-arg faces read `callee_row` only under
+        // `initializer_depth`.
+        let callee_row = top.or_else(|| {
+            let index = mark.checked_sub(1)?;
+            self.rows
+                .get(index)
+                .filter(|row| {
+                    matches!(
+                        row.shape,
+                        RowShape::Receiver(Receiver::This { .. } | Receiver::Super { .. })
+                    )
+                })
+                .map(|_| index)
+        });
         self.arg_levels.push(ArgLevel {
             args: Vec::new(),
             arg_open: false,
             pending_name: None,
             first_label: None,
+            callee_row,
             mark,
             closures: Vec::new(),
             enum_const,
@@ -20520,9 +20634,11 @@ impl<'a> Engine<'a> {
     }
 
     /// The declared type of the assignment target row (`x = e`, `obj.f = e`):
-    /// a bare name reads its snapshot, a member walks to the field's declared
-    /// type; executables and unknown receivers stay `Unknown`.
-    fn assignment_target_ty(&self, row: &Row) -> Ty {
+    /// a bare name reads its snapshot, a member walk answers the write face —
+    /// the field's declared type or the setter's value formal
+    /// (`writeAcceptedType`); executables and unknown receivers stay
+    /// `Unknown`.
+    fn assignment_target_ty(&mut self, row: &Row) -> Ty {
         match &row.shape {
             RowShape::Bare(BareInfo::Plain { ty }) => *ty,
             RowShape::Bare(BareInfo::Container { name, kind }) => {
@@ -20534,14 +20650,16 @@ impl<'a> Engine<'a> {
             }
             RowShape::Member { recv } => match recv {
                 Receiver::This { container, .. } | Receiver::Super { container, .. } => {
-                    self.member_declared_ty(*container, row.name)
+                    self.member_write_ty(*container, row.name)
                 }
-                Receiver::Typed { type_name, .. } => self.member_declared_ty(*type_name, row.name),
+                Receiver::Typed { type_name, .. } => self.member_write_ty(*type_name, row.name),
                 Receiver::Container {
                     name: container, ..
                 } => {
-                    // F4: the resolved container's field type, projected
-                    // when the container is foreign.
+                    // F4: the resolved container's write face, projected
+                    // when the container is foreign — a static field's
+                    // declared type or the static setter's value formal.
+                    let setter = self.setter_spelling(row.name);
                     resolve_container(
                         self.graph,
                         self.namespaces,
@@ -20550,9 +20668,23 @@ impl<'a> Engine<'a> {
                         self.file,
                         *container,
                     )
-                    .and_then(|(c, owner)| c.members.get(&row.name).map(|e| (owner, e)))
-                    .filter(|(_, e)| e.kind == MemberKind::Field)
-                    .map_or(Ty::UNKNOWN, |(owner, e)| self.boundary.ty(owner, e.var_ty))
+                    .and_then(|(c, owner)| {
+                        c.members
+                            .get(&row.name)
+                            .filter(|e| e.kind == MemberKind::Field)
+                            .map(|e| (owner, e.var_ty))
+                            .or_else(|| {
+                                let formal_ty = c
+                                    .members
+                                    .get(&setter)
+                                    .filter(|e| e.kind == MemberKind::Setter)
+                                    .and_then(|e| e.formals.as_deref())
+                                    .and_then(|f| f.positional.first())
+                                    .map(|formal| formal.ty)?;
+                                Some((owner, formal_ty))
+                            })
+                    })
+                    .map_or(Ty::UNKNOWN, |(owner, ty)| self.boundary.ty(owner, ty))
                 }
                 _ => Ty::UNKNOWN,
             },
@@ -20599,18 +20731,25 @@ impl<'a> Engine<'a> {
         // The right-hand side: exactly one row strictly after the operator
         // (rows are pushed in source order, so the first post-operator row
         // and the absence of a second decide without collecting).
-        let mut rhs = self.rows[target + 1..]
-            .iter()
-            .filter(|row| row.range.offset > limit);
-        let Some(rhs_row) = rhs.next() else {
-            return;
+        // The single-RHS-row window: collect the candidate before any
+        // mutable member-walk call — the iterator borrows `self.rows`, and
+        // `assignment_target_ty` borrows `self` mutably.
+        let rhs_row = {
+            let mut rhs = self.rows[target + 1..]
+                .iter()
+                .filter(|row| row.range.offset > limit);
+            let Some(row) = rhs.next() else {
+                return;
+            };
+            if rhs.next().is_some() {
+                return;
+            }
+            row.clone()
         };
-        if rhs.next().is_some() {
-            return;
-        }
         let (from, range) = (rhs_row.ty, rhs_row.range);
-        let literal = Self::primitive_literal(rhs_row, &self.members.primitive_ids);
-        let to = self.assignment_target_ty(&self.rows[target]);
+        let literal = Self::primitive_literal(&rhs_row, &self.members.primitive_ids);
+        let target_row = self.rows[target].clone();
+        let to = self.assignment_target_ty(&target_row);
         if self.assignable(from, to, literal) == Some(false) {
             if in_initializer {
                 let (from_text, to_text) = (self.ty_display(from), self.ty_display(to));
@@ -21738,6 +21877,37 @@ impl<'a> Engine<'a> {
     /// unresolved callee stays silent (its own invocation code reports) and
     /// only feeds the unresolved-name table.
     fn check_named_argument(&mut self, name: StringId, range: SourceRange) {
+        // A super-constructor invocation's labels bind against the resolved
+        // superclass constructor's named formals
+        // (`required_parameters_verifier.dart`'s super-invocation face —
+        // the callee element resolves like `check_super_constructor`, and
+        // `super(name: v)` reads the unnamed constructor's table while
+        // `super.named(name: v)` reads the selector's).
+        if self.initializer_depth > 0 {
+            if let Some((container, selector)) = self.init_super_callee() {
+                // An unresolvable super-constructor (missing superclass, an
+                // external container the index does not model) stays silent
+                // at the labels — the unresolved-callee posture, same as the
+                // invokes-stack path below; the initializer's own
+                // constructor faces own that report. The names table still
+                // carries the miss only when the callee resolved (the main
+                // path's `!defined` shape: an unresolved callee's label is
+                // not a miss).
+                let (resolved, defined) = match self.super_ctor_named_formals(container, selector)
+                {
+                    Some(formals) => (true, formals.contains(&name)),
+                    None => (false, false),
+                };
+                if resolved && !defined {
+                    let text = self.strings.resolve(name).to_string();
+                    self.emit(SemanticCode::UndefinedNamedParameter, range, &text, "");
+                }
+                if !defined {
+                    self.record_miss(name, range, false, NameUse::NamedArgument);
+                }
+                return;
+            }
+        }
         let Some(callee) = self.invokes.last().and_then(|slot| *slot) else {
             return;
         };
@@ -21802,6 +21972,67 @@ impl<'a> Engine<'a> {
             // itself is live).
             self.record_miss(name, range, false, NameUse::NamedArgument);
         }
+    }
+
+    /// The super-constructor callee an open argument group inside an
+    /// initializer list binds to: `(enclosing container, selector)` —
+    /// `None` = the unnamed face (`super(...)`, `super.new(...)`). The
+    /// group's callee row reads back through the arg level's mark: a
+    /// bare `super(` keeps its [`Receiver::Super`] row (the `invokes` link
+    /// drops it — the keyword never resolves as a member), a folded
+    /// `super.name(` selector row matches its [`PendingInitSuper`] entry.
+    /// `None` when the open group's callee is neither shape (an ordinary
+    /// member call nested in the list's expression, `x = super.m(a: 1)`).
+    fn init_super_callee(&self) -> Option<(StringId, Option<StringId>)> {
+        let level = self.arg_levels.last()?;
+        // The group's callee row was latched at open (`ArgLevel.callee_row`
+        // — `mark` alone cannot serve: `flush_argument` advances it past
+        // each argument's own row).
+        let head = self.rows.get(level.callee_row?)?;
+        if let RowShape::Receiver(Receiver::Super { container, .. }) = &head.shape {
+            return Some((*container, None));
+        }
+        // `super.name(`: the folded Value row's offset matches its
+        // `PendingInitSuper.selector_offset` — only the invoked head shape
+        // redirects (an `x = super.m(...)` expression callee folds the same
+        // Value row but its candidate never armed `invoked`).
+        self.pending_init_super
+            .iter()
+            .rev()
+            .find(|c| c.invoked && c.head && c.selector_offset == head.range.offset)
+            .map(|c| (c.container, Some(c.name)))
+    }
+
+    /// The resolved super-constructor's named-formal spellings
+    /// (`ctor_formals`' named half) for `check_named_argument`: `selector`
+    /// picks the named table, `None` the unnamed face's key (the enclosing
+    /// class's `superclass` spelling — `ctor_formals` keys the unnamed
+    /// entry under the declared name). `None` = unresolvable superclass or
+    /// a constructor the index does not model — the caller stays silent
+    /// (the under-report posture; the oracle's own
+    /// `undefined_constructor_in_initializer` owns that report).
+    fn super_ctor_named_formals(
+        &self,
+        container: StringId,
+        selector: Option<StringId>,
+    ) -> Option<Vec<StringId>> {
+        let superclass = self
+            .index
+            .get(self.file)
+            .and_then(|f| f.container(container))
+            .and_then(|c| c.superclass)?;
+        let (super_container, _) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            superclass,
+        )?;
+        let formals = super_container
+            .ctor_formals
+            .get(&selector.unwrap_or(superclass))?;
+        Some(formals.named.iter().map(|f| f.name).collect())
     }
 
     // —— pass 2 ———————————————————————————————————————————————————————
@@ -22975,7 +23206,18 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        if self.member_defined(container, row, false, receiver_nullable) {
+        // The extension-application face reads the receiver's full static
+        // type: `a.b().c`'s chained `Typed.ty` carries the declared return
+        // type's argument list (`Map<K, FieldItem>`), which the `on`
+        // clause's argument gate compares positionally. `this` reads its
+        // container's instance type (an extension body's `this` is the
+        // extended type). A bare head skips the gate either way.
+        let receiver_ty = match recv {
+            Receiver::Typed { ty, .. } => ty,
+            Receiver::This { container, kind } => self.this_static_ty(container, kind),
+            _ => Ty::UNKNOWN,
+        };
+        if self.member_defined(container, receiver_ty, row, false, receiver_nullable) {
             // The implicit-this face (`_checkForInvalidInstanceMemberAccess2`,
             // error_verifier.dart — `ThisContext.instanceFieldDeclaration`
             // disallows `this`): an instance-member reference — implicit or
@@ -23123,7 +23365,7 @@ impl<'a> Engine<'a> {
         }
         // Extensions never apply to `super` accesses; the nullability
         // flag is inert on this path.
-        if self.member_defined(container, row, true, false) {
+        if self.member_defined(container, Ty::UNKNOWN, row, true, false) {
             self.check_member_unused_result(
                 row,
                 container,
@@ -23202,7 +23444,7 @@ impl<'a> Engine<'a> {
         let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
         // The core-type face knows the receiver's spelling only — the
         // nullability split stays under-report (`false`).
-        match self.extension_application(container, row.name, write, false) {
+        match self.extension_application(container, Ty::UNKNOWN, row.name, write, false) {
             ExtensionApp::None => {}
             // `UnsafeSingle` never surfaces here — the `false` receiver
             // nullability keeps every resolved face safe.
@@ -23385,7 +23627,7 @@ impl<'a> Engine<'a> {
         let mut missing: Vec<String> = Vec::new();
         for spelling in [read, write].into_iter().flatten() {
             if matches!(self.walk_members(name, spelling), Walk::Missing) {
-                match self.extension_application(name, spelling, false, false) {
+                match self.extension_application(name, ty, spelling, false, false) {
                     ExtensionApp::None => {
                         missing.push(self.strings.resolve(spelling).to_string());
                     }
@@ -23435,16 +23677,34 @@ impl<'a> Engine<'a> {
     fn member_defined(
         &mut self,
         container: StringId,
+        receiver_ty: Ty,
         row: &Row,
         super_walk: bool,
         receiver_nullable: bool,
     ) -> bool {
         let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
-        let mut found = self.member_found(container, row.name, super_walk);
-        if !found && write {
-            let spelling = self.setter_spelling(row.name);
-            found = self.member_found(container, spelling, super_walk);
-        }
+        // The write target resolves the SETTER side
+        // (`assignment_expression_resolver.dart` `_resolveSimpleAssignment`:
+        // `writeElement` is the `name=` lookup): a setter or a field
+        // satisfies the write cleanly, while a same-named getter or method
+        // hit still leaves `undefined_setter` silent — the oracle routes it
+        // to the assignment-to-* family (`assignment_to_final_no_setter` on
+        // a getter, `assignment_to_method` on a method), decided elsewhere.
+        // `undefined_setter` fires only when neither spelling declares
+        // anything.
+        let found = if write {
+            let named = if super_walk {
+                self.walk_super(container, row.name)
+            } else {
+                self.walk_members(container, row.name)
+            };
+            matches!(named, Walk::Found(_)) || {
+                let spelling = self.setter_spelling(row.name);
+                self.member_found(container, spelling, super_walk)
+            }
+        } else {
+            self.member_found(container, row.name, super_walk)
+        };
         if found {
             // The nullable-dereference face (nullable_dereference_verifier
             // .dart report): an interface member reached through a
@@ -23476,7 +23736,7 @@ impl<'a> Engine<'a> {
                 .get(self.file)
                 .is_some_and(|f| f.has_extension_member(row.name));
         }
-        match self.extension_application(container, row.name, write, receiver_nullable) {
+        match self.extension_application(container, receiver_ty, row.name, write, receiver_nullable) {
             ExtensionApp::None => false,
             ExtensionApp::Single => true,
             // The member resolved through a non-nullable `on` face against a
@@ -23539,6 +23799,7 @@ impl<'a> Engine<'a> {
     fn extension_application(
         &mut self,
         receiver: StringId,
+        receiver_ty: Ty,
         member: StringId,
         accept_setter: bool,
         receiver_nullable: bool,
@@ -23552,20 +23813,23 @@ impl<'a> Engine<'a> {
         // (`unchecked_use_of_nullable_value`): the `UnsafeSingle` verdict
         // carries that distinction. Equal on-types answer equal — two
         // non-nullable faces stay ambiguous.
-        let empty: Vec<ExtensionFace> = Vec::new();
-        let faces = self.index.get(self.file).map_or(
-            empty.as_slice(),
-            super::model::FileElements::extension_faces,
-        );
+        // The face cache borrows `self` mutably (the lazy fill); every
+        // immutable lookup it needs is hoisted ahead so the borrow region
+        // only spans the walk below.
+        let world = self.name_world();
+        let object = self.intern("Object");
+        let iterable = self.intern("Iterable");
+        let strings = self.strings;
+        // The lazy fill needs `&mut self`; its result slice then lives as a
+        // shared borrow so the argument gate can reach the boundary pool.
+        self.accessible_extension_faces();
+        let boundary = &self.boundary;
+        let faces = self.accessible_extensions.as_deref().unwrap_or(&[]);
         // Applicability is the receiver's subtype relation to the `on`
         // type (`extension_member_resolver.dart` `_getApplicable`: the
         // receiver is assignable to the instantiated extended type), so an
         // extension on `I<T>` applies to `J extends I<T>` — the declared
         // supertype lattice, not name equality.
-        let world = self.name_world();
-        let object = self.intern("Object");
-        let iterable = self.intern("Iterable");
-        let strings = self.strings;
         // The name-level subtype walk plus the faces it cannot see: every
         // type reaches `Object`, and the unindexed SDK collection roots
         // (`List`/`Set` and the `dart:collection` bases, all `Iterable`).
@@ -23581,18 +23845,115 @@ impl<'a> Engine<'a> {
                             .any(|(alias, roots)| *alias == text && roots.contains(&"Iterable"))
                 })
         };
-        let mut applicable: Vec<(&ExtensionFace, StringId)> = Vec::new();
-        for face in faces {
+        // The `on` clause's argument list gates beside the head
+        // (`applicable_extensions.dart:205-281` `applicableTo`: the oracle
+        // infers the extended type's fresh parameters against the receiver
+        // — `on Map<K, FieldItem>` never applies to a
+        // `Map<K, MethodItem>` receiver, while an argument spelling the
+        // extension's own type parameter instantiates and always passes).
+        // The name-level read compares concrete arguments only when the
+        // two sides share the head — a subtype hop's argument projection
+        // stays unmodeled (the under-report direction), and a side that
+        // never interned its list (`Unknown`, a bare head) skips the gate.
+        let arg_applicable = |face: &ExtensionFace, face_file: FileId| {
+            // The face's `on` type interns in its declaring file's pool —
+            // a foreign face's argument list projects across the boundary
+            // before the diagnosing pool reads it (same-file faces pass
+            // through untouched).
+            let on_ty = boundary.ty(face_file, face.on_ty);
+            let (
+                Ty::Named {
+                    name: receiver_head,
+                    args: receiver_args,
+                    ..
+                },
+                Ty::Named {
+                    name: on_head,
+                    args: on_args,
+                    ..
+                },
+            ) = (receiver_ty, on_ty)
+            else {
+                return true;
+            };
+            if receiver_head != on_head {
+                return true;
+            }
+            let receiver_args = boundary.pool().get(receiver_args).to_vec();
+            let on_args = boundary.pool().get(on_args).to_vec();
+            // A raw-head receiver (`Map x`) instantiates to bounds — the
+            // unbounded-`dynamic` row — so a bare `Map` against `on
+            // Map<K, FieldItem>` fails `dynamic <: FieldItem` exactly as
+            // the oracle's `applicableTo` rejects it.
+            let receiver_args = if receiver_args.is_empty() && !on_args.is_empty() {
+                vec![Ty::Dynamic; on_args.len()]
+            } else {
+                receiver_args
+            };
+            if receiver_args.len() != on_args.len() {
+                return true;
+            }
+            receiver_args
+                .iter()
+                .zip(on_args.iter())
+                .all(|(&receiver_arg, &on_arg)| {
+                    // An `on` argument spelling one of the extension's own
+                    // type parameters instantiates against the receiver —
+                    // the inferrer binds it, never constrains it.
+                    if let Ty::Named {
+                        name: arg_name,
+                        args,
+                        ..
+                    } = on_arg
+                        && args == ArgListId::EMPTY
+                        && face.type_param_names.contains(&arg_name)
+                    {
+                        return true;
+                    }
+                    // Covariant positions: the receiver's argument must be
+                    // a subtype of the `on` argument. Only a bare concrete
+                    // pair can fail that test at the name level — a nested
+                    // argument list on either side stays unmodeled and
+                    // compatible (under-report).
+                    let (
+                        Ty::Named {
+                            name: arg_head,
+                            args: arg_args,
+                            ..
+                        },
+                        Ty::Named {
+                            name: receiver_head,
+                            args: receiver_args,
+                            ..
+                        },
+                    ) = (on_arg, receiver_arg)
+                    else {
+                        // A `dynamic` receiver argument is a subtype of a
+                        // top-shaped `on` argument only — a concrete `on`
+                        // argument rejects it (`isSubtypeOf(dynamic, X)`
+                        // fails in the oracle's `applicableTo`); every other
+                        // non-named pair stays compatible.
+                        return !matches!(receiver_arg, Ty::Dynamic)
+                            || matches!(on_arg, Ty::Dynamic);
+                    };
+                    if arg_args != ArgListId::EMPTY || receiver_args != ArgListId::EMPTY {
+                        return true;
+                    }
+                    reaches(receiver_head, arg_head)
+                })
+        };
+        let mut applicable: Vec<(&ExtensionFace, StringId, FileId)> = Vec::new();
+        for &(face, face_file) in faces {
             let Some(on) = face.on_type else { continue };
             if !(face.members.contains_key(&member)
                 || (accept_setter && face.members.contains_key(&setter)))
             {
                 continue;
             }
-            if !reaches(receiver, on) {
+            if !reaches(receiver, on) || !arg_applicable(face, face_file) {
                 continue;
             }
-            applicable.push((face, on));
+            applicable.push((face, on, face_file));
         }
         // `_isMoreSpecific` steps 3-4 at the name level: a face whose `on`
         // type is a strict subtype of another applicable face's dominates
@@ -23601,19 +23962,19 @@ impl<'a> Engine<'a> {
         let dominated = |on: StringId| {
             applicable
                 .iter()
-                .any(|&(_, other)| other != on && reaches(other, on) && !reaches(on, other))
+                .any(|&(_, other, _)| other != on && reaches(other, on) && !reaches(on, other))
         };
-        let mut specific: Vec<(String, String)> = Vec::new();
-        let mut nullable: Vec<(String, String)> = Vec::new();
-        for &(face, on) in &applicable {
+        let mut specific: Vec<(&ExtensionFace, FileId, (String, String))> = Vec::new();
+        let mut nullable: Vec<(&ExtensionFace, FileId, (String, String))> = Vec::new();
+        for &(face, on, face_file) in &applicable {
             if dominated(on) {
                 continue;
             }
             let display = self.extension_display(face);
             if face.on_type_nullable {
-                nullable.push(display);
+                nullable.push((face, face_file, display));
             } else {
-                specific.push(display);
+                specific.push((face, face_file, display));
             }
         }
         // On a nullable receiver a nullable `on` face is the safe match;
@@ -23634,20 +23995,120 @@ impl<'a> Engine<'a> {
         // declaration is spared. Both the read and — when the write
         // accepted it — the setter spelling join; a spelling no face
         // declares never matches a finalize key, so over-inserting is
-        // inert.
+        // inert. The applied face also credits its contributing import
+        // (`ImportsTracking.notifyExtensionUsed`, scope.dart:308-321): the
+        // import that provided the extension is used, an own-library face
+        // contributes nothing.
         // An ambiguous access resolves no member (the oracle leaves every
         // candidate unreferenced — `unused_element` still fires on each).
         if candidates.len() == 1 {
+            let (face, face_file, _) = candidates[0];
             self.extension_member_used.insert(member);
             if accept_setter {
                 self.extension_member_used.insert(setter);
             }
+            self.credit_extension_import(face, face_file);
         }
         match candidates.len() {
             0 => ExtensionApp::None,
             1 if unsafe_match => ExtensionApp::UnsafeSingle,
             1 => ExtensionApp::Single,
-            _ => ExtensionApp::Ambiguous(candidates),
+            _ => ExtensionApp::Ambiguous(
+                candidates
+                    .into_iter()
+                    .map(|(_, _, display)| display)
+                    .collect(),
+            ),
+        }
+    }
+
+    /// The `accessibleExtensions` list `extension_application` probes
+    /// (`LibraryFragmentScope.accessibleExtensions`, scope.dart:473-488):
+    /// every extension face this library declares (all unit files) plus the
+    /// named extension faces each import edge's target exports under its
+    /// combinators — prefixed imports' faces included (a prefix scope still
+    /// contributes its extensions to implicit application), deferred edges
+    /// too (the prefix scope adds a deferred library's elements the same).
+    /// An unnamed extension never reaches the import scope — export entries
+    /// key on names — but an own-library unnamed face applies all the same.
+    /// Built once per pass; the probe list is small and the member-miss
+    /// path re-reads it per access.
+    fn accessible_extension_faces(&mut self) -> &[(&'a ExtensionFace, FileId)] {
+        if self.accessible_extensions.is_none() {
+            let mut faces: Vec<(&'a ExtensionFace, FileId)> = Vec::new();
+            // The oracle's list is a SET of elements
+            // (`LibraryFragmentScope.accessibleExtensions`,
+            // scope.dart:482-487): a face reachable through several routes
+            // — the own unit files AND one or more import edges — enters
+            // the application pool once. Pointer identity is element
+            // identity here: each face lives once in its declaring file's
+            // `extension_faces` pool.
+            let mut seen: FxHashSet<*const ExtensionFace> = FxHashSet::default();
+            let mut push = |faces: &mut Vec<(&'a ExtensionFace, FileId)>,
+                            face: &'a ExtensionFace,
+                            file: FileId| {
+                if seen.insert(face as *const ExtensionFace) {
+                    faces.push((face, file));
+                }
+            };
+            // The diagnosed unit always contributes its own faces first —
+            // `unit_files` is the graph's registration face, which a caller
+            // that never folds a part tree (the test rigs' `declare`-only
+            // shape) leaves empty; the file under diagnosis is a unit of
+            // `self.lib` by construction.
+            if let Some(elements) = self.index.get(self.file) {
+                for face in elements.extension_faces() {
+                    push(&mut faces, face, self.file);
+                }
+            }
+            for &unit in self.graph.unit_files(self.lib) {
+                if unit == self.file {
+                    continue;
+                }
+                if let Some(elements) = self.index.get(unit) {
+                    for face in elements.extension_faces() {
+                        push(&mut faces, face, unit);
+                    }
+                }
+            }
+            for edge in self.graph.import_edges(self.lib) {
+                let Some(target) = edge.target else { continue };
+                for (name, entry) in self.graph.export_scope(target) {
+                    if !edge.combinators.allows(name) {
+                        continue;
+                    }
+                    let Some(elements) = self.index.get(entry.file) else {
+                        continue;
+                    };
+                    for face in elements
+                        .extension_faces()
+                        .iter()
+                        .filter(|face| face.name == Some(name))
+                    {
+                        push(&mut faces, face, entry.file);
+                    }
+                }
+            }
+            self.accessible_extensions = Some(faces);
+        }
+        self.accessible_extensions.as_deref().unwrap_or(&[])
+    }
+
+    /// The `notifyExtensionUsed` credit of one applied face: a face
+    /// declared in another library marks the spelling under which it
+    /// exports — the import-site `unused_import` face spares every import
+    /// that provides the name (the oracle credits the element to each
+    /// import whose export scope carries it; the name-level model credits
+    /// the exported spelling). An own-library face contributes nothing —
+    /// its name resolved locally, never through an import.
+    fn credit_extension_import(&mut self, face: &ExtensionFace, face_file: FileId) {
+        if face_file == self.file
+            || self.graph.library_of_file(face_file) == Some(self.lib)
+        {
+            return;
+        }
+        if let Some(name) = face.name {
+            self.import_used.insert(name);
         }
     }
 
@@ -30092,7 +30553,39 @@ impl ParserListener for DiagnoseListener<'_> {
         // leave the capture before the const-context interpretations of
         // the generic close can touch them.
         self.engine.close_literal_ctor_args(end.range);
-        let closed = self.engine.const_capture.end_arguments(end.range);
+        // A super/redirect-constructor invocation's argument list is the
+        // oracle's `_reportNotPotentialConstantsArguments` site
+        // (`_validateConstructorInitializers`, constant_verifier.dart
+        // :851-868): each argument must be *potentially* constant — the
+        // weaker gate that still fails an unresolved or non-const name
+        // expression (`invalid_constant` at the node, not the creation's
+        // `const_with_non_constant_argument`). The dedicated close returns
+        // the arg nodes and folds the invocation to a non-constant leaf for
+        // the enclosing initializer window — the generic `ClosedArgs`
+        // dispatch never sees a super-arglist (it folds the args away).
+        let init_super = self.engine.initializer_depth > 0
+            && self.engine.init_super_callee().is_some();
+        let closed = if init_super {
+            let closed = self
+                .engine
+                .const_capture
+                .end_init_invocation_arguments(end.range);
+            if let Some(closed) = &closed {
+                let mut spans = Vec::new();
+                for arg in &closed.args {
+                    collect_not_potentially_constant(arg, &self.engine, &mut spans);
+                }
+                let engine = &mut self.engine;
+                for span in spans {
+                    engine.emit(SemanticCode::InvalidConstant, span, "", "");
+                }
+            }
+            // The dedicated close consumed the arg level — nothing left
+            // for the generic close to dispatch on.
+            None
+        } else {
+            self.engine.const_capture.end_arguments(end.range)
+        };
         let engine = &mut self.engine;
         if let Some(closed) = closed {
             if closed.creation_owned {
@@ -30919,6 +31412,41 @@ impl ParserListener for DiagnoseListener<'_> {
         } else {
             None
         };
+        // The pattern head is a `NamedType` reference (the oracle resolves
+        // `ObjectPattern.type` through `visitNamedType` →
+        // `_useIdentifierElement`): a resolved head counts as a name use —
+        // `import_used` unconditionally (the scope lookup itself spares
+        // the providing import), `used_names` under the self-scope
+        // exclusion the element-use face keeps. `p.T(...)`: the first
+        // identifier is the prefix — its live use marks the prefix, and
+        // `second_identifier` carries the imported type's own credit.
+        if let Some(head) = head {
+            engine.import_used.insert(head);
+            if !engine.in_own_named_scope(head) {
+                engine.used_names.insert(head);
+            }
+        } else if dot.is_some()
+            && let (Some(first), Some(second)) = (
+                engine.name_of(first_identifier),
+                second_identifier.and_then(|token| engine.name_of(token)),
+            )
+        {
+            let (_, target) = engine.resolve_bare(first);
+            if matches!(target, RefTarget::Prefix) {
+                engine.used_names.insert(first);
+                engine.import_used.insert(second);
+                if !engine.in_own_named_scope(second) {
+                    engine.used_names.insert(second);
+                }
+            } else {
+                // `Type.selector(...)`: the head type is the first
+                // identifier — its bare reference carries the credits.
+                engine.import_used.insert(first);
+                if !engine.in_own_named_scope(first) {
+                    engine.used_names.insert(first);
+                }
+            }
+        }
         // The Object kind of `checkPatternNeverMatchesValueType`
         // (type_analyzer.dart:723-756): the head type is the pattern's
         // required type.
@@ -42916,6 +43444,180 @@ mod tests {
         );
     }
 
+    /// The `on` clause's argument list gates beside the head
+    /// (`applicable_extensions.dart:205-281` `applicableTo`: the oracle
+    /// instantiates the extended type's parameters against the receiver,
+    /// so `on Map<K, FieldItem>` never applies to a `Map<K, MethodItem>`
+    /// receiver). Two faces sharing the `Map` head split on the argument —
+    /// only the matching one applies, silently; a receiver matching
+    /// neither reports.
+    ///
+    /// Hand-trace: `FieldItem` and `MethodItem` are siblings — neither
+    /// reaches the other, so each `on` face accepts exactly its own
+    /// argument row.
+    #[test]
+    fn on_type_arguments_gate_applicability() {
+        let field = report(
+            "class Map<K, V> {} class LookupName {} class FieldItem {} \
+             class MethodItem {} \
+             extension IdExt on Map<LookupName, FieldItem> { void write() {} } \
+             extension ItemExt on Map<LookupName, FieldItem> { void write() {} } \
+             extension CtorExt on Map<LookupName, MethodItem> { void write() {} } \
+             void f(Map<LookupName, FieldItem> x) { x.write(); }",
+        );
+        assert_eq!(
+            code_names(&field),
+            ["ambiguous_extension_member_access"],
+            "{:?}",
+            code_names(&field)
+        );
+        let method = report(
+            "class Map<K, V> {} class LookupName {} class FieldItem {} \
+             class MethodItem {} \
+             extension IdExt on Map<LookupName, FieldItem> { void write() {} } \
+             extension CtorExt on Map<LookupName, MethodItem> { void write() {} } \
+             void f(Map<LookupName, MethodItem> x) { x.write(); }",
+        );
+        assert!(
+            code_names(&method).is_empty(),
+            "{:?}",
+            code_names(&method)
+        );
+        let neither = report(
+            "class Map<K, V> {} class LookupName {} class FieldItem {} \
+             class MethodItem {} class SetterItem {} \
+             extension IdExt on Map<LookupName, FieldItem> { void write() {} } \
+             extension CtorExt on Map<LookupName, MethodItem> { void write() {} } \
+             void f(Map<LookupName, SetterItem> x) { x.write(); }",
+        );
+        assert_eq!(
+            code_names(&neither),
+            ["undefined_method"],
+            "{:?}",
+            code_names(&neither)
+        );
+    }
+
+    /// An `on` argument spelling one of the extension's own type
+    /// parameters instantiates against the receiver rather than comparing
+    /// concretely (`applicableTo` binds the fresh parameter): `extension
+    /// E<T> on List<T>` applies to `List<Item>`. The negative control: a
+    /// `T` written on a *parameterless* extension is a concrete (and here
+    /// undeclared) type name, never an instantiable parameter — `List<int>`
+    /// does not reach it.
+    #[test]
+    fn on_type_parameter_argument_instantiates() {
+        let applied = report(
+            "class List<T> {} class Item {} \
+             extension E<T> on List<T> { void m() {} } \
+             void f(List<Item> x) { x.m(); }",
+        );
+        assert!(code_names(&applied).is_empty(), "{:?}", code_names(&applied));
+        // A preceding declaration's own type-variable group must not leak
+        // into a parameterless extension's `on` type: `T` below is `class
+        // C`'s parameter, not `E`'s — `List<int>` against `on List<T>`
+        // treats `T` as the concrete (undeclared) name it is, so the face
+        // never applies and the access reports.
+        let leaked = report(
+            "class C<T> {} class List<T> {} \
+             extension E on List<T> { void m() {} } \
+             void f(List<int> x) { x.m(); }",
+        );
+        assert_eq!(
+            code_names(&leaked),
+            [
+                "non_type_as_type_argument",
+                "non_type_as_type_argument",
+                "undefined_method"
+            ],
+            "{:?}",
+            code_names(&leaked)
+        );
+    }
+
+    /// A face reachable through several routes enters the application
+    /// pool once (`LibraryFragmentScope.accessibleExtensions`,
+    /// scope.dart:482-487 — the oracle's list is a set of elements):
+    /// `main` imports `a.dart` twice, so `E` arrives through both edges'
+    /// export scopes, and the access resolves silently instead of
+    /// reporting the same extension twice as ambiguous.
+    #[test]
+    fn multiply_imported_extension_applies_once() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let sources = [
+            ("a.dart", "class C {} extension E on C { void m() {} }"),
+            (
+                "main.dart",
+                "import 'a.dart'; import 'a.dart'; void f(C x) { x.m(); }",
+            ),
+        ];
+        let mut index = ElementIndex::default();
+        let mut tokens_by_file = Vec::new();
+        for (path, source) in sources {
+            let file = files.intern(Path::new(path));
+            let scanned = dartq_scanner::scan(
+                source,
+                ScanConfig {
+                    enable_triple_shift: true,
+                    enable_augmentations: true,
+                },
+                file,
+            );
+            assert!(scanned.diagnostics.is_empty(), "{path}");
+            let elements = collect(source, &scanned.tokens, features, &strings);
+            index.insert(file, elements);
+            tokens_by_file.push(scanned.tokens);
+        }
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let a = builder.intern("package:t/a.dart");
+        let main = builder.intern("package:t/main.dart");
+        for (at, (path, source)) in sources.iter().enumerate() {
+            let lib = if at == 0 { a } else { main };
+            let file = files.intern(Path::new(path));
+            let elements = collect(source, &tokens_by_file[at], features, &strings);
+            for (name, decl) in elements.declarations() {
+                if decl.kind == MicroKind::TypeParam {
+                    continue;
+                }
+                builder.declare(lib, name, file);
+            }
+        }
+        for _ in 0..2 {
+            builder.import(
+                main,
+                ImportEdge {
+                    target: Some(a),
+                    prefix: None,
+                    deferred: false,
+                    combinators: Combinators::unfiltered(),
+                },
+            );
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let main_file = files.intern(Path::new("main.dart"));
+        let report = diagnose(
+            sources[1].1,
+            &tokens_by_file[1],
+            features,
+            &strings,
+            main_file,
+            main,
+            &graph,
+            &namespaces,
+            &index,
+        );
+        assert!(
+            code_names(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
     /// The on-type's own member wins: interface members precede extension
     /// application (`findExtension` runs only after the interface lookup
     /// misses), so no ambiguity fires against an extension on the same type.
@@ -52245,6 +52947,140 @@ mod ticket_1351_tests {
         );
         assert_eq!(
             count_code(&report, "final_not_initialized"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// #2177: a `super.name(...)` invocation in an initializer list binds
+    /// its labels against the resolved super-constructor's named formals —
+    /// a label the super constructor never declared reports
+    /// `undefined_named_parameter` at the label.
+    #[test]
+    fn super_named_argument_binds_against_super_ctor_formals() {
+        let report = unit_report(
+            "class B { const B({int good = 0}); }\n\
+             class C extends B { const C() : super(bad: 1); }",
+        );
+        assert!(
+            code_names(&report).contains(&"undefined_named_parameter"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// #2177: a label the super constructor *does* declare stays silent —
+    /// the same binding, the defined side.
+    #[test]
+    fn super_named_argument_defined_label_stays_silent() {
+        let report = unit_report(
+            "class B { const B({int good = 0}); }\n\
+             class C extends B { const C() : super(good: 1); }",
+        );
+        assert_eq!(
+            count_code(&report, "undefined_named_parameter"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// #2182: a super-constructor invocation's argument that is not
+    /// *potentially* constant — an unresolved name expression — reports
+    /// `invalid_constant` at the node (the oracle's
+    /// `_reportNotPotentialConstantsArguments`, constant_verifier.dart
+    /// :830-834,863-867).
+    #[test]
+    fn super_invocation_unresolved_arg_reports_invalid_constant() {
+        let report = unit_report(
+            "class B { const B(int t); }\n\
+             class C extends B { const C() : super(missing_name); }",
+        );
+        assert!(
+            code_names(&report).contains(&"invalid_constant"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// #2182: a genuinely constant super argument stays silent — a const
+    /// field read through the same arglist folds to a constant and never
+    /// reaches the collector.
+    #[test]
+    fn super_invocation_const_arg_stays_silent() {
+        let report = unit_report(
+            "const int k = 1;\n\
+             class B { const B(int t); }\n\
+             class C extends B { const C() : super(k); }",
+        );
+        assert_eq!(
+            count_code(&report, "invalid_constant"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// #2178: a chained receiver carries its member's declared type —
+    /// `a.b.c` where `b` is a field of type `D` resolves `c` on `D`, so a
+    /// member `D` actually declares is not a false `undefined_method`.
+    #[test]
+    fn chained_receiver_field_type_resolves_member() {
+        let report = unit_report(
+            "class D { void c() {} }\n\
+             class A { D b = D(); }\n\
+             void t(A a) { a.b.c(); }",
+        );
+        assert_eq!(
+            count_code(&report, "undefined_method"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// #2177: a getter-only member under a plain write spelling does NOT
+    /// report `undefined_setter` — the oracle routes it to
+    /// `assignment_to_final_no_setter` (the assignment-to-* family, not
+    /// modeled at this level). `undefined_setter` fires only when neither
+    /// `name` nor `name=` declares anything.
+    #[test]
+    fn getter_only_write_target_stays_off_undefined_setter() {
+        let report = unit_report(
+            "class C { int get onListen => 0; }\n\
+             void t(C c) { c.onListen = 1; }",
+        );
+        assert_eq!(
+            count_code(&report, "undefined_setter"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// #2177: a totally undeclared write target reports `undefined_setter`
+    /// — neither the `name` nor the `name=` spelling resolved.
+    #[test]
+    fn missing_write_target_reports_undefined_setter() {
+        let report = unit_report("class C {}\nvoid t(C c) { c.onListen = 1; }");
+        assert!(
+            code_names(&report).contains(&"undefined_setter"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// #2177: a declared setter satisfies the same write spelling — the
+    /// `name=` member resolves, so no `undefined_setter`.
+    #[test]
+    fn declared_setter_write_target_stays_silent() {
+        let report = unit_report(
+            "class C { set onListen(int v) {} }\n\
+             void t(C c) { c.onListen = 1; }",
+        );
+        assert_eq!(
+            count_code(&report, "undefined_setter"),
             0,
             "{:?}",
             code_names(&report)

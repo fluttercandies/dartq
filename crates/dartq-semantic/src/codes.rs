@@ -342,6 +342,12 @@ pub enum SemanticCode {
     ConstEvalMethodInvocation,
     /// `The compile-time constant expression depends on itself.`
     RecursiveCompileTimeConstant,
+    /// `Invalid constant value.` — a node in a constructor-initializer
+    /// const context (super/redirect argument, assert operand, field
+    /// initializer) that is not *potentially* constant (`value.dart`'s
+    /// `InvalidConstant.genericError` / `constant_verifier.dart`'s
+    /// `_reportNotPotentialConstants` — `diagnostic.g.dart:8621`).
+    InvalidConstant,
     // —— #453: the inheritance-override family (all `COMPILE_TIME_ERROR`) ——
     /// `'{1}.{0}' ('{2}') isn't a valid override of '{3}.{0}' ('{4}').` — an
     /// instance method, getter, operator, or field face whose name-level
@@ -1440,6 +1446,7 @@ impl SemanticCode {
                 "recursive_compile_time_constant",
                 "RECURSIVE_COMPILE_TIME_CONSTANT",
             ),
+            Self::InvalidConstant => ("invalid_constant", "INVALID_CONSTANT"),
             // The override family shares one code name; the setter text is a
             // message-shape distinction (`invalidOverrideSetter` keeps the
             // `invalid_override` name in the registry).
@@ -2287,6 +2294,7 @@ impl SemanticCode {
             Self::RecursiveCompileTimeConstant => {
                 "The compile-time constant expression depends on itself.".to_string()
             }
+            Self::InvalidConstant => "Invalid constant value.".to_string(),
             // One- and two-argument rows reused through `message3`.
             Self::WrongNumberOfParametersForOperatorMinus => self.message3(a0, "", ""),
             Self::UnreachableSwitchCase | Self::UnreachableSwitchDefault => {
@@ -3380,6 +3388,7 @@ mod tests {
             SemanticCode::ConstEvalPrimitiveEquality,
             SemanticCode::ConstEvalMethodInvocation,
             SemanticCode::RecursiveCompileTimeConstant,
+            SemanticCode::InvalidConstant,
             SemanticCode::InvalidOverride,
             SemanticCode::InvalidOverrideSetter,
             SemanticCode::InvalidImplementationOverride,
@@ -3656,6 +3665,7 @@ mod tests {
         SemanticCode::ConstEvalPrimitiveEquality,
         SemanticCode::ConstEvalMethodInvocation,
         SemanticCode::RecursiveCompileTimeConstant,
+        SemanticCode::InvalidConstant,
         SemanticCode::InvalidOverride,
         SemanticCode::InvalidOverrideSetter,
         SemanticCode::InvalidImplementationOverride,
@@ -4165,6 +4175,7 @@ mod tests {
             | SemanticCode::InheritsAbstractMemberThree
             | SemanticCode::InheritsAbstractMemberTwo
             | SemanticCode::InvalidAssignment
+            | SemanticCode::InvalidConstant
             | SemanticCode::InvalidImplementationOverride
             | SemanticCode::InvalidImplementationOverrideSetter
             | SemanticCode::InvalidNullAwareOperator
@@ -4374,6 +4385,7 @@ mod tests {
             SemanticCode::InheritsAbstractMemberThree,
             SemanticCode::InheritsAbstractMemberTwo,
             SemanticCode::InvalidAssignment,
+            SemanticCode::InvalidConstant,
             SemanticCode::InvalidImplementationOverride,
             SemanticCode::InvalidImplementationOverrideSetter,
             SemanticCode::InvalidNullAwareOperator,

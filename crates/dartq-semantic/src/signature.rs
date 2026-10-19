@@ -631,6 +631,13 @@ impl<'a> Face<'a> {
                 Some(on_type) => self.name(on_type),
                 None => self.field("no-on-type"),
             }
+            // The `on` clause's full type: an argument-level edit
+            // (`on Map<A, B>` → `on Map<A, C>`) changes the face's
+            // applicability set, so the gate reads it.
+            self.ty(face.on_ty);
+            for param in &face.type_param_names {
+                self.name(*param);
+            }
             Self::sorted(self.strings, &mut self.inner, face.members.keys().copied());
             for j in 0..self.inner.len() {
                 let member_name = self.inner[j];

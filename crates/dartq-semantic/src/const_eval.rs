@@ -334,6 +334,127 @@ pub fn eval(node: &Node, lookup: &dyn ConstLookup) -> Verdict {
     fold(node, lookup, 0)
 }
 
+/// The potentially-constant leaf scan (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/dart/constant/potentially_constant.dart`,
+/// `_Collector.collect`): a constructor-initializer's super/redirect
+/// argument list and an assert's operands report `invalid_constant` at
+/// each node that is *not potentially constant* — a shape the const
+/// grammar can never produce a constant from, chiefly an unresolved or
+/// non-const name expression. The scan descends into composite operands
+/// (a binary's operand, a literal's element, an interpolation's `$
+/// {expr}`) and collects the failing leaf's span; a whole non-constant
+/// composite (`new`, a non-`identical` call, `x!`, an assignment)
+/// collects at its own node.
+///
+/// The predicate is the weaker of the two const gates — it answers the
+/// *shapes* the grammar admits (`getNotPotentiallyConstants`), not a
+/// value: a bare name is potentially constant when the const resolver
+/// can classify it (any of the `Value`/`Constant`/`InProgress` verdicts
+/// — the oracle's "resolves to a const variable or const-constructor
+/// formal"), while a `NotConstant`/`Unresolved` leaf collects. `Opaque`
+/// is the deferred-valid shape (it stands in for the subset's
+/// unmodeled-but-legal constructs); `Other` is the always-invalid one.
+pub fn collect_not_potentially_constant(
+    node: &Node,
+    lookup: &dyn ConstLookup,
+    out: &mut Vec<SourceRange>,
+) {
+    collect_npc(node, lookup, out, 0);
+}
+
+fn collect_npc(node: &Node, lookup: &dyn ConstLookup, out: &mut Vec<SourceRange>, depth: u32) {
+    if depth > MAX_EVAL_DEPTH {
+        return;
+    }
+    let depth = depth + 1;
+    match &node.expr {
+        Expr::Value(_) | Expr::Opaque => {}
+        Expr::Other => out.push(node.span),
+        Expr::Ident(name) => match lookup.ident(*name) {
+            IdentVerdict::NotConstant | IdentVerdict::Unresolved => out.push(node.span),
+            // A const variable, a resolvable foreign const, or the
+            // in-progress root — the oracle's const-element arms all pass
+            // the potentially-constant gate.
+            IdentVerdict::Value(_) | IdentVerdict::Constant | IdentVerdict::InProgress => {}
+        },
+        Expr::Member { recv, name } => {
+            // `prefix.name`: the import-prefixed face decides through the
+            // same name rule (`_nameExpression` via `prefixed`); a
+            // non-prefixed `recv.name` is potentially constant exactly
+            // when the receiver is (a type or const object head) — the
+            // member spelling itself stays silent (an enum's constant
+            // resolves, and a wrong member's own face reports).
+            if let Expr::Ident(prefix) = recv.expr
+                && let Some(verdict) = lookup.prefixed(prefix, *name)
+            {
+                match verdict {
+                    IdentVerdict::NotConstant | IdentVerdict::Unresolved => {
+                        out.push(node.span);
+                    }
+                    IdentVerdict::Value(_)
+                    | IdentVerdict::Constant
+                    | IdentVerdict::InProgress => {}
+                }
+                return;
+            }
+            // A type-literal receiver (`E.a`, `C.v`) is a potentially
+            // constant head only when the container name resolves to a
+            // const-bearing element — the bare-name rule reads `recv`;
+            // every other receiver recurses like a plain operand.
+            collect_npc(recv, lookup, out, depth);
+        }
+
+        Expr::Binary { left, right, .. } => {
+            collect_npc(left, lookup, out, depth);
+            collect_npc(right, lookup, out, depth);
+        }
+        Expr::Unary { op, operand } => match op {
+            // `++`/`--` is never a constant operator — the whole node
+            // collects (the oracle's `_Collector` adds the operator
+            // application, not the operand).
+            UnOp::Inc => out.push(node.span),
+            UnOp::Neg | UnOp::Not | UnOp::BitNot => collect_npc(operand, lookup, out, depth),
+        },
+        Expr::Cond { cond, then, els } => {
+            collect_npc(cond, lookup, out, depth);
+            collect_npc(then, lookup, out, depth);
+            collect_npc(els, lookup, out, depth);
+        }
+        Expr::Interp { parts } => {
+            for part in parts {
+                collect_npc(part, lookup, out, depth);
+            }
+        }
+        Expr::Adjacent(parts)
+        | Expr::List(parts)
+        | Expr::Set(parts)
+        | Expr::Record(parts) => {
+            for part in parts {
+                collect_npc(part, lookup, out, depth);
+            }
+        }
+        Expr::Map(entries) => {
+            for (key, value) in entries {
+                collect_npc(key, lookup, out, depth);
+                collect_npc(value, lookup, out, depth);
+            }
+        }
+        Expr::Entry(key, value) => {
+            collect_npc(key, lookup, out, depth);
+            collect_npc(value, lookup, out, depth);
+        }
+        // Only `identical(a, b)` is a constant call — its arguments
+        // potentially-const like any operand; every other callee is the
+        // whole-node not-constant shape.
+        Expr::Call { name, args } if lookup.is_identical(*name) => {
+            for arg in args {
+                collect_npc(arg, lookup, out, depth);
+            }
+        }
+        Expr::Call { .. } => out.push(node.span),
+    }
+}
+
 #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
     if depth > MAX_EVAL_DEPTH {
@@ -2527,6 +2648,55 @@ impl ConstCapture {
             );
         }
         None
+    }
+
+    /// Closes a constructor-initializer's super/redirect-constructor
+    /// argument list (`super(...)` / `this(...)` / `super.named(...)`): the
+    /// invocation folds to a non-constant leaf for the enclosing
+    /// initializer window exactly like the generic close's non-ident
+    /// callee path, but the argument nodes return to the engine for the
+    /// `_reportNotPotentialConstantsArguments` scan — the oracle's
+    /// `invalid_constant` face lives on the arglist, not on the folded
+    /// value. Returns `None` when no window is open (the args were never
+    /// captured).
+    pub fn end_init_invocation_arguments(&mut self, end: SourceRange) -> Option<ClosedArgs> {
+        if !self.open() {
+            self.args.clear();
+            return None;
+        }
+        if !self.opaque_marks.is_empty() {
+            self.depth -= 1;
+            self.args.pop();
+            return None;
+        }
+        self.apply_unaries_at(self.depth);
+        self.flush_argument();
+        self.depth -= 1;
+        let level = self.args.pop()?;
+        // The whole invocation is a runtime construct — provably not a
+        // constant for the enclosing window (a redirect or super call can
+        // never fold into a const value). It joins the operand stack as the
+        // initializer window's own node so the root verdict still stands.
+        let span = level
+            .callee
+            .map_or(end, |callee| SourceRange {
+                offset: callee.span.offset,
+                length: end.end().saturating_sub(callee.span.offset),
+            });
+        self.push(
+            Node {
+                expr: Expr::Other,
+                span,
+            },
+            true,
+        );
+        Some(ClosedArgs {
+            callee: None,
+            span,
+            creation_owned: false,
+            ctor_invocation: false,
+            args: level.args,
+        })
     }
 
     // —— the non-const constructs ————————————————————————————————————

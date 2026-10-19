@@ -2454,6 +2454,105 @@ mod tests {
         assert_eq!(expected, actual);
     }
 
+    /// The oracle legitimately emits several rows under one
+    /// (severity, code, file, line, col) key: the implementation-override
+    /// pass reports one row per offending interface-member name, all
+    /// anchored at the class-name token (upstream `inheritance_override.dart`
+    /// — its own TODO admits "The classNameNode is always wrong"), and the
+    /// required-parameters pass reports one row per missing parameter at the
+    /// argument list (`required_parameters_verifier.dart` walks `parameters`
+    /// and reports each miss at the same `errorEntity`). Key-level dedup
+    /// anywhere in the merge would therefore diverge from the oracle on
+    /// healthy corpora — the real reduced shapes (three override rows at one
+    /// class name, two missing-argument rows at one call) must survive
+    /// intact, ordered by the message tiebreaker, byte-identically across
+    /// merges.
+    #[test]
+    fn same_key_rows_survive_the_merge_in_canonical_order() {
+        fn row(
+            files: &mut FileTable,
+            code: (&'static str, &'static str),
+            path: &str,
+            offset: u32,
+            message: &'static str,
+        ) -> Arc<Diagnostic> {
+            let file = files.intern(Path::new(path));
+            Arc::new(Diagnostic::new(
+                Severity::Error,
+                CodeInfo::new(code.0, code.1, DiagnosticType::CompileTimeError, false),
+                message,
+                file,
+                SourceRange {
+                    offset,
+                    length: 16,
+                },
+                None,
+            ))
+        }
+
+        const OVERRIDE: (&str, &str) = (
+            "invalid_implementation_override",
+            "INVALID_IMPLEMENTATION_OVERRIDE",
+        );
+        const MISSING_ARG: (&str, &str) =
+            ("missing_required_argument", "MISSING_REQUIRED_ARGUMENT");
+
+        let mut files = FileTable::new();
+        let library = {
+            let mut rows = vec![
+                row(
+                    &mut files,
+                    MISSING_ARG,
+                    "/w/async_value.dart",
+                    200,
+                    "The named parameter '_error' is required, but there's no corresponding argument.",
+                ),
+                row(
+                    &mut files,
+                    MISSING_ARG,
+                    "/w/async_value.dart",
+                    200,
+                    "The named parameter '_loading' is required, but there's no corresponding argument.",
+                ),
+                row(
+                    &mut files,
+                    OVERRIDE,
+                    "/w/element.dart",
+                    100,
+                    "'FieldElementImpl.baseElement' isn't a valid concrete implementation of 'InternalFieldElement.baseElement'.",
+                ),
+                row(
+                    &mut files,
+                    OVERRIDE,
+                    "/w/element.dart",
+                    100,
+                    "'PropertyInducingElementImpl.fragments' isn't a valid concrete implementation of 'InternalFieldElement.fragments'.",
+                ),
+                row(
+                    &mut files,
+                    OVERRIDE,
+                    "/w/element.dart",
+                    100,
+                    "'ElementImpl.reference' isn't a valid concrete implementation of 'PropertyInducingElementImpl.reference'.",
+                ),
+            ];
+            rows.sort_by(|a, b| compare_canonical(&files, a, b));
+            rows
+        };
+
+        let out = merged(&files, &[library.as_slice()]);
+        assert_eq!(out.len(), 5, "no key dedup: every same-key row survives");
+        // Canonical order groups by (path, offset, code) with the message
+        // tiebreaker inside each same-key group.
+        assert_eq!(out[0].message, "The named parameter '_error' is required, but there's no corresponding argument.");
+        assert_eq!(out[1].message, "The named parameter '_loading' is required, but there's no corresponding argument.");
+        assert_eq!(out[2].message, "'ElementImpl.reference' isn't a valid concrete implementation of 'PropertyInducingElementImpl.reference'.");
+        assert_eq!(out[3].message, "'FieldElementImpl.baseElement' isn't a valid concrete implementation of 'InternalFieldElement.baseElement'.");
+        assert_eq!(out[4].message, "'PropertyInducingElementImpl.fragments' isn't a valid concrete implementation of 'InternalFieldElement.fragments'.");
+        // Determinism: a second merge over the same runs is byte-identical.
+        assert_eq!(merged(&files, &[library.as_slice()]), out);
+    }
+
     /// No runs, or only empty runs: the merge emits nothing.
     #[test]
     fn merge_of_empty_runs_emits_nothing() {
