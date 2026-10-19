@@ -1011,10 +1011,19 @@ impl Engine {
                     }
                 }
             }
-            while let Some(dir) = queue.pop() {
-                let Ok(entries) = std::fs::read_dir(&dir) else {
-                    continue;
+            // The walk fans out per directory over rayon (each subtree's
+            // `read_dir` is independent I/O); the per-entry predicate is the
+            // serial walk's verbatim, and the sort below pins the order.
+            fn walk(
+                dir: &Path,
+                is_excluded: &(dyn Fn(&Path) -> bool + Sync),
+                all_roots: &FxHashSet<PathBuf>,
+            ) -> Vec<PathBuf> {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return Vec::new();
                 };
+                let mut files = Vec::new();
+                let mut subdirs = Vec::new();
                 for entry in entries.flatten() {
                     let Ok(file_type) = entry.file_type() else {
                         continue;
@@ -1027,7 +1036,7 @@ impl Engine {
                         {
                             continue;
                         }
-                        queue.push(path);
+                        subdirs.push(path);
                     } else if path.extension().is_some_and(|ext| ext == "dart")
                         // The dot rule covers files too: the oracle's
                         // `_isExcluded` rejects `.hidden.dart` like any dot
@@ -1041,22 +1050,33 @@ impl Engine {
                         // regular files; a dangling link has no target and
                         // is skipped. Symlinked directories are still never
                         // descended (the `is_dir` arm never queues them).
-                        // Regular files take the cached-type path without a
-                        // syscall.
                         && (file_type.is_file()
                             || (file_type.is_symlink()
                                 && std::fs::metadata(&path)
                                     .is_ok_and(|meta| meta.is_file())))
                         && !is_excluded(&path)
                     {
-                        accepted.push(path);
+                        files.push(path);
                     }
                 }
+                files.extend(
+                    subdirs
+                        .par_iter()
+                        .flat_map_iter(|sub| walk(sub, is_excluded, all_roots))
+                        .collect::<Vec<_>>(),
+                );
+                files
             }
+            accepted.extend(
+                std::mem::take(&mut queue)
+                    .par_iter()
+                    .flat_map_iter(|dir| walk(dir, &is_excluded, &all_roots))
+                    .collect::<Vec<_>>(),
+            );
             // `read_dir` yields entries in platform-dependent order, so the
             // serial walk's enqueue order was never stable run-to-run;
             // sorting pins discovery to one deterministic path order.
-            accepted.sort();
+            accepted.par_sort_unstable();
             // Cold-path I/O: load every accepted file (small files owned,
             // large ones mapped — `open_source`) and count its LOC in
             // parallel — the load is I/O-bound (page-cache
